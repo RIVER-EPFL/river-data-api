@@ -1,0 +1,63 @@
+[workspace]
+members = [".", "migration"]
+resolver = "2"
+
+[package]
+name = "river-db"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+authors = ["RIVER Team"]
+description = "Time-series sensor data API for Vaisala viewLinc"
+license = "MIT"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+# Web framework
+axum = { version = "0.8", features = ["macros"] }
+tower = { version = "0.5", features = ["timeout", "limit"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "limit"] }
+
+# Database
+sea-orm = { version = "1.1", features = ["sqlx-postgres", "runtime-tokio-rustls", "with-uuid", "with-chrono"] }
+sea-orm-migration = { version = "1.1", features = ["sqlx-postgres", "runtime-tokio-rustls"] }
+
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+tokio-stream = "0.1"
+
+# HTTP client (Vaisala)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Serialization
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+csv = "1.3"
+
+# API docs
+utoipa = { version = "5.3", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-scalar = { version = "0.3", features = ["axum"] }
+
+# Utilities
+uuid = { version = "1.11", features = ["v4", "serde"] }
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "2.0"
+futures = "0.3"
+
+# Caching
+moka = { version = "0.12", features = ["future"] }
+
+# Rate limiting
+governor = "0.8"
+tower_governor = "0.6"
+
+# Migration support
+migration = { path = "migration" }
+
+[dev-dependencies]
+tokio-test = "0.4"

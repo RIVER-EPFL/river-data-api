@@ -1,0 +1,32 @@
+# bacon.toml - Configuration for bacon hot-reload
+
+default_job = "run"
+
+[jobs.check]
+command = ["cargo", "check", "--color", "always"]
+need_stdout = false
+
+[jobs.clippy]
+command = ["cargo", "clippy", "--all-targets", "--color", "always"]
+need_stdout = false
+
+[jobs.test]
+command = ["cargo", "test", "--color", "always"]
+need_stdout = true
+
+[jobs.run]
+command = ["cargo", "run", "--color", "always"]
+need_stdout = true
+allow_warnings = true
+background = true
+
+[jobs.doc]
+command = ["cargo", "doc", "--no-deps", "--color", "always"]
+need_stdout = false
+
+[keybindings]
+c = "job:check"
+l = "job:clippy"
+t = "job:test"
+r = "job:run"
+d = "job:doc"

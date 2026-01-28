@@ -1,0 +1,82 @@
+services:
+  traefik:
+    image: traefik:v2.11
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+    ports:
+      - "${TRAEFIK_HTTP_PORT:-88}:80"
+      - "${TRAEFIK_DASHBOARD_PORT:-8088}:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  river-db-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    environment:
+      # Database
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-psql}@river-db-timescale:5432/${POSTGRES_DB:-postgres}
+      # Vaisala API
+      - VAISALA_BASE_URL=${VAISALA_BASE_URL:-http://localhost:9999}
+      - VAISALA_BEARER_TOKEN=${VAISALA_BEARER_TOKEN:-offline-dev-token}
+      - VAISALA_SKIP_TLS_VERIFY=${VAISALA_SKIP_TLS_VERIFY:-true}
+      - VAISALA_MAX_HISTORY_DAYS=${VAISALA_MAX_HISTORY_DAYS:-90}
+      # Sync settings
+      - SYNC_READINGS_INTERVAL_SECONDS=${SYNC_READINGS_INTERVAL_SECONDS:-3600}
+      - SYNC_DEVICE_STATUS_INTERVAL_SECONDS=${SYNC_DEVICE_STATUS_INTERVAL_SECONDS:-3600}
+      - SYNC_RETRY_MAX=${SYNC_RETRY_MAX:-3}
+      - SYNC_RETRY_DELAY_SECONDS=${SYNC_RETRY_DELAY_SECONDS:-60}
+      # API settings
+      - API_HOST=${API_HOST:-0.0.0.0}
+      - API_PORT=${API_PORT:-3000}
+      - API_DEFAULT_PAGE_SIZE=${API_DEFAULT_PAGE_SIZE:-1000}
+      - API_MAX_PAGE_SIZE=${API_MAX_PAGE_SIZE:-10000}
+      # Rate limiting
+      - DISABLE_RATE_LIMITING=${DISABLE_RATE_LIMITING:-false}
+      - RATE_LIMIT_METADATA_PER_SECOND=${RATE_LIMIT_METADATA_PER_SECOND:-1}
+      - RATE_LIMIT_METADATA_BURST=${RATE_LIMIT_METADATA_BURST:-60}
+      - RATE_LIMIT_DATA_PER_SECOND=${RATE_LIMIT_DATA_PER_SECOND:-10}
+      - RATE_LIMIT_DATA_BURST=${RATE_LIMIT_DATA_BURST:-60}
+      - BULK_CONCURRENT_LIMIT=${BULK_CONCURRENT_LIMIT:-5}
+      # Caching
+      - CACHE_TTL_SECONDS=${CACHE_TTL_SECONDS:-300}
+      - CACHE_MAX_BYTES=${CACHE_MAX_BYTES:-209715200}
+      # Application
+      - DEPLOYMENT=${DEPLOYMENT:-dev}
+      - RUST_LOG=${RUST_LOG:-info,river_db=debug,sea_orm=warn,sqlx=warn}
+    ports:
+      - "${API_EXTERNAL_PORT:-3005}:${API_PORT:-3000}"
+    depends_on:
+      river-db-timescale:
+        condition: service_healthy
+    volumes:
+      - ./src:/app/src
+      - ./migration:/app/migration
+      - ./Cargo.toml:/app/Cargo.toml
+      - ./Cargo.lock:/app/Cargo.lock
+      - river-db-rust-data:/app/target
+    labels:
+      - "traefik.http.routers.river-db-api.rule=PathPrefix(`/api`) || PathPrefix(`/healthz`) || PathPrefix(`/docs`)"
+      - "traefik.http.routers.river-db-api.priority=100"
+      - "traefik.http.services.river-db-api.loadbalancer.server.port=${API_PORT:-3000}"
+
+  river-db-timescale:
+    image: timescale/timescaledb:${TIMESCALEDB_VERSION:-2.23.0-pg18}
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-psql}
+      - POSTGRES_DB=${POSTGRES_DB:-postgres}
+    ports:
+      - "${POSTGRES_EXTERNAL_PORT:-5443}:5432"
+    volumes:
+      - river-db-timescale-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  river-db-timescale-data:
+  river-db-rust-data:
