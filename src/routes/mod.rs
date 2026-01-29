@@ -1,4 +1,5 @@
-pub mod sensors;
+pub mod alarms;
+pub mod dashboard;
 pub mod stations;
 pub mod zones;
 
@@ -115,7 +116,11 @@ pub async fn resolve_station(
         stations::list_station_sensors,
         stations::get_station_readings,
         stations::get_station_aggregates,
-        sensors::list_sensors,
+        alarms::list_alarms,
+        alarms::list_active_alarms,
+        alarms::get_alarm,
+        alarms::list_station_alarms,
+        alarms::list_events,
     ),
     components(
         schemas(
@@ -124,18 +129,23 @@ pub async fn resolve_station(
             stations::StationDetailResponse,
             stations::StationRef,
             stations::ZoneRef,
-            sensors::SensorResponse,
+            stations::SensorResponse,
             stations::ReadingsResponse,
             stations::SensorData,
             stations::AggregatesResponse,
             stations::SensorAggregateData,
+            alarms::AlarmResponse,
+            alarms::AlarmSummary,
+            alarms::EventResponse,
+            alarms::EventsListResponse,
         )
     ),
     tags(
         (name = "health", description = "Health check endpoints"),
         (name = "zones", description = "Zone management"),
         (name = "stations", description = "Station management and data"),
-        (name = "sensors", description = "Sensor management"),
+        (name = "alarms", description = "Alarm management"),
+        (name = "events", description = "Event log"),
     ),
     info(
         title = "River DB API",
@@ -163,7 +173,7 @@ pub fn build_router(state: AppState) -> Router {
         );
     }
 
-    // Metadata routes (zones, stations, sensors listings)
+    // Metadata routes (zones, stations, alarms, events listings)
     let metadata_routes_base = Router::new()
         .route("/zones", get(zones::list_zones))
         .route("/zones/{zone_id}", get(zones::get_zone))
@@ -171,7 +181,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/stations", get(stations::list_stations))
         .route("/stations/{station_id}", get(stations::get_station))
         .route("/stations/{station_id}/sensors", get(stations::list_station_sensors))
-        .route("/sensors", get(sensors::list_sensors));
+        .route("/stations/{station_id}/alarms", get(alarms::list_station_alarms))
+        .route("/alarms", get(alarms::list_alarms))
+        .route("/alarms/active", get(alarms::list_active_alarms))
+        .route("/alarms/{alarm_id}", get(alarms::get_alarm))
+        .route("/events", get(alarms::list_events));
 
     // Data routes (readings, aggregates)
     let data_routes_base = Router::new()
@@ -220,11 +234,15 @@ pub fn build_router(state: AppState) -> Router {
     // OpenAPI documentation
     let docs_routes = Router::new().merge(Scalar::with_url("/docs", ApiDoc::openapi()));
 
+    // Dashboard at root
+    let dashboard_routes = Router::new().route("/", get(dashboard::dashboard));
+
     // Combine all routes
     Router::new()
         .nest("/api", api_routes)
         .merge(health_routes)
         .merge(docs_routes)
+        .merge(dashboard_routes)
         .layer(CompressionLayer::new())
         .layer(
             CorsLayer::new()

@@ -1,5 +1,7 @@
 # river-data-api
 
+> **Note:** Not to be mistaken for the river-api project, related to the astrocast project, which will be migrated to this.
+
 Time-series API for RIVER sensor data.
 
 ## Quick Start

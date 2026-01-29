@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
@@ -26,7 +27,18 @@ pub struct StationResponse {
     pub altitude_m: Option<f64>,
 }
 
-/// Detailed station response with zone info
+/// Sensor information embedded in station responses
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SensorResponse {
+    pub id: Uuid,
+    pub name: String,
+    pub sensor_type: String,
+    pub display_units: Option<String>,
+    pub sample_interval_sec: Option<i32>,
+    pub is_active: Option<bool>,
+}
+
+/// Detailed station response with zone info, sensors, and data range
 #[derive(Debug, Serialize, ToSchema)]
 pub struct StationDetailResponse {
     pub id: Uuid,
@@ -35,6 +47,13 @@ pub struct StationDetailResponse {
     pub longitude: Option<f64>,
     pub altitude_m: Option<f64>,
     pub zone: Option<ZoneRef>,
+    pub sensors: Vec<SensorResponse>,
+    /// Earliest reading timestamp for this station
+    pub data_start: Option<DateTime<Utc>>,
+    /// Latest reading timestamp for this station
+    pub data_end: Option<DateTime<Utc>>,
+    /// Total number of readings for this station
+    pub reading_count: i64,
 }
 
 #[derive(Debug, Deserialize, IntoParams)]

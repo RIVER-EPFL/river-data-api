@@ -42,6 +42,10 @@ pub enum Relation {
     Calibrations,
     #[sea_orm(has_one = "super::sync_state::Entity")]
     SyncState,
+    #[sea_orm(has_many = "super::events::Entity")]
+    Events,
+    #[sea_orm(has_many = "super::alarm_locations::Entity")]
+    AlarmLocations,
 }
 
 impl Related<super::stations::Entity> for Entity {
@@ -71,6 +75,28 @@ impl Related<super::calibrations::Entity> for Entity {
 impl Related<super::sync_state::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SyncState.def()
+    }
+}
+
+impl Related<super::events::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Events.def()
+    }
+}
+
+impl Related<super::alarm_locations::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::AlarmLocations.def()
+    }
+}
+
+impl Related<super::alarms::Entity> for Entity {
+    fn to() -> RelationDef {
+        super::alarm_locations::Relation::Alarm.def()
+    }
+
+    fn via() -> Option<RelationDef> {
+        Some(super::alarm_locations::Relation::Sensor.def().rev())
     }
 }
 

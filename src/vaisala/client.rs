@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
-use crate::vaisala::models::{LocationsDataResponse, LocationsHistoryResponse, LocationsResponse};
+use crate::vaisala::models::{
+    ActiveAlarmsResponse, EventsResponse, LocationsDataResponse, LocationsHistoryResponse,
+    LocationsResponse,
+};
 
 pub struct VaisalaClient {
     http_client: Client,
@@ -182,5 +185,159 @@ impl VaisalaClient {
             .json()
             .await
             .map_err(|e| AppError::VaisalaApi(format!("Failed to parse response: {e}")))
+    }
+
+    /// Get active alarms for the authenticated user.
+    ///
+    /// # Arguments
+    ///
+    /// * `location_ids` - Optional filter to specific location IDs
+    /// * `include_system` - Whether to include system-level alarms
+    ///
+    /// # Errors
+    ///
+    /// Returns `AppError::VaisalaApi` if the request fails or returns an error status.
+    pub async fn get_active_alarms(
+        &self,
+        location_ids: Option<&[i32]>,
+        include_system: bool,
+    ) -> AppResult<ActiveAlarmsResponse> {
+        let mut url = format!("{}/active_alarms", self.base_url);
+
+        let mut params = Vec::new();
+        if let Some(ids) = location_ids {
+            let ids_str = format!(
+                "[{}]",
+                ids.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            params.push(format!("location_ids={ids_str}"));
+        }
+        if include_system {
+            params.push("include_system=true".to_string());
+        }
+
+        if !params.is_empty() {
+            url = format!("{}?{}", url, params.join("&"));
+        }
+
+        let response = self
+            .http_client
+            .get(&url)
+            .bearer_auth(&self.bearer_token)
+            .send()
+            .await
+            .map_err(|e| AppError::VaisalaApi(format!("Request failed: {e}")))?;
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(AppError::VaisalaApi("Rate limited (429)".to_string()));
+        }
+
+        if !response.status().is_success() {
+            return Err(AppError::VaisalaApi(format!(
+                "HTTP {}: {}",
+                response.status(),
+                response.text().await.unwrap_or_default()
+            )));
+        }
+
+        let text = response
+            .text()
+            .await
+            .map_err(|e| AppError::VaisalaApi(format!("Failed to get response text: {e}")))?;
+
+        serde_json::from_str(&text).map_err(|e| {
+            tracing::error!(
+                error = %e,
+                body_preview = %text.chars().take(500).collect::<String>(),
+                "Failed to parse active_alarms response"
+            );
+            AppError::VaisalaApi(format!("Failed to parse response: {e}"))
+        })
+    }
+
+    /// Get events with filtering and pagination.
+    ///
+    /// # Arguments
+    ///
+    /// * `date_from` - Start date as epoch timestamp or duration string (e.g., "7d")
+    /// * `date_to` - Optional end date as epoch timestamp
+    /// * `categ_filter` - Optional category filter (system, admin, alarm, transfer)
+    /// * `location_filter` - Optional location IDs to filter
+    /// * `page_number` - Page number (1-indexed)
+    /// * `page_size` - Number of records per page
+    ///
+    /// # Errors
+    ///
+    /// Returns `AppError::VaisalaApi` if the request fails or returns an error status.
+    pub async fn get_events(
+        &self,
+        date_from: &str,
+        date_to: Option<i64>,
+        categ_filter: Option<&str>,
+        location_filter: Option<&[i32]>,
+        page_number: Option<i32>,
+        page_size: Option<i32>,
+    ) -> AppResult<EventsResponse> {
+        let mut url = format!("{}/events?date_from={}", self.base_url, date_from);
+
+        if let Some(to) = date_to {
+            url = format!("{}&date_to={}", url, to);
+        }
+        if let Some(cat) = categ_filter {
+            url = format!("{}&categ_filter={}", url, cat);
+        }
+        if let Some(ids) = location_filter {
+            let ids_str = format!(
+                "[{}]",
+                ids.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            url = format!("{}&location_filter={}", url, ids_str);
+        }
+        if let Some(page) = page_number {
+            url = format!("{}&page_number={}", url, page);
+        }
+        if let Some(size) = page_size {
+            url = format!("{}&page_size={}", url, size);
+        }
+
+        let response = self
+            .http_client
+            .get(&url)
+            .bearer_auth(&self.bearer_token)
+            .send()
+            .await
+            .map_err(|e| AppError::VaisalaApi(format!("Request failed: {e}")))?;
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(AppError::VaisalaApi("Rate limited (429)".to_string()));
+        }
+
+        if !response.status().is_success() {
+            return Err(AppError::VaisalaApi(format!(
+                "HTTP {}: {}",
+                response.status(),
+                response.text().await.unwrap_or_default()
+            )));
+        }
+
+        let text = response
+            .text()
+            .await
+            .map_err(|e| AppError::VaisalaApi(format!("Failed to get response text: {e}")))?;
+
+        serde_json::from_str(&text).map_err(|e| {
+            tracing::error!(
+                error = %e,
+                body_preview = %text.chars().take(500).collect::<String>(),
+                "Failed to parse events response"
+            );
+            AppError::VaisalaApi(format!("Failed to parse response: {e}"))
+        })
     }
 }

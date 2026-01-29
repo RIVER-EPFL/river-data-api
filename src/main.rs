@@ -12,11 +12,11 @@ use river_db::vaisala::VaisalaClient;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
+    // Initialize tracing (sqlx::query disabled to reduce log noise)
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,river_db=debug".into()),
+                .unwrap_or_else(|_| "info,river_db=debug,sqlx::query=warn".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -53,6 +53,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Spawning background sync tasks...");
     tokio::spawn(sync::scheduler::run_readings_sync(state.clone()));
     tokio::spawn(sync::scheduler::run_device_status_sync(state.clone()));
+    tokio::spawn(sync::scheduler::run_alarms_sync(state.clone()));
+    tokio::spawn(sync::scheduler::run_events_sync(state.clone()));
 
     // Build router
     let app = routes::build_router(state);

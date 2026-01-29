@@ -11,6 +11,29 @@ pub struct JsonApiResponse<T> {
     pub meta: Option<serde_json::Value>,
 }
 
+/// JSON API wrapper for paginated responses with meta
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonApiResponseWithMeta<T> {
+    pub jsonapi: JsonApiVersion,
+    pub data: Vec<JsonApiResource<T>>,
+    #[serde(default)]
+    pub links: Option<serde_json::Value>,
+    #[serde(default)]
+    pub meta: Option<PaginationMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaginationMeta {
+    #[serde(default)]
+    pub total_record_count: i32,
+    #[serde(default)]
+    pub page_record_count: i32,
+    #[serde(default)]
+    pub page_size: i32,
+    #[serde(default)]
+    pub page_number: i32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonApiVersion {
     pub version: String,
@@ -136,6 +159,141 @@ pub struct LocationAttributes {
     /// Whether the location is deleted/deactivated
     #[serde(default)]
     pub deleted: bool,
+}
+
+/// Response from `/rest/v1/active_alarms`
+pub type ActiveAlarmsResponse = JsonApiResponse<ActiveAlarmAttributes>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveAlarmAttributes {
+    pub id: i32,
+    pub severity: i16,
+    #[serde(default)]
+    pub description: String,
+    /// Error text (e.g., "Device Historical Data Alarm")
+    #[serde(default, rename = "err")]
+    pub error_text: String,
+    /// Unix epoch timestamp when alarm activated
+    pub when_on: f64,
+    /// Unix epoch timestamp when alarm deactivated (null if still active)
+    #[serde(default)]
+    pub when_off: Option<f64>,
+    /// Unix epoch timestamp when acknowledged
+    #[serde(default)]
+    pub when_ack: Option<f64>,
+    /// Unix epoch timestamp of the alarm condition
+    #[serde(default)]
+    pub when_condition: Option<f64>,
+    /// Duration string (e.g., "2h 30m")
+    #[serde(default)]
+    pub duration: String,
+    /// Duration in seconds
+    #[serde(default)]
+    pub duration_sec: f64,
+    /// True if alarm is currently active
+    #[serde(default)]
+    pub status: bool,
+    /// True if this is a system-level alarm
+    #[serde(default)]
+    pub is_system: bool,
+    /// Device serial number
+    #[serde(default)]
+    pub serial_number: String,
+    /// Location name (denormalized)
+    #[serde(default)]
+    pub location: String,
+    /// Zone name (denormalized)
+    #[serde(default)]
+    pub zone: String,
+    /// Vaisala location IDs affected by this alarm
+    #[serde(default)]
+    pub location_ids: Vec<i32>,
+    /// Whether acknowledgment is required
+    #[serde(default)]
+    pub ack_required: bool,
+    /// Acknowledgment comments
+    #[serde(default)]
+    pub ack_comments: Option<Vec<String>>,
+    /// Action taken during acknowledgment
+    #[serde(default)]
+    pub ack_action_taken: Option<String>,
+    /// Logger description
+    #[serde(default)]
+    pub logger_description: String,
+}
+
+/// Response from `/rest/v1/events`
+pub type EventsResponse = JsonApiResponseWithMeta<EventAttributes>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventAttributes {
+    /// Vaisala event number (unique identifier)
+    pub num: i32,
+    /// Event category (system, admin, alarm, transfer)
+    #[serde(default)]
+    pub category: String,
+    /// Unix epoch timestamp
+    pub timestamp: f64,
+    /// Event message
+    #[serde(default, rename = "msg")]
+    pub message: String,
+    /// User who triggered the event
+    #[serde(default, rename = "user")]
+    pub user_name: String,
+    /// Entity type
+    #[serde(default)]
+    pub entity: String,
+    /// Entity ID
+    #[serde(default)]
+    pub entity_id: i32,
+    /// Location ID (can be int, string like "N/A", or null)
+    #[serde(default)]
+    pub location_id: Option<LocationIdValue>,
+    /// Device ID
+    #[serde(default)]
+    pub device_id: Option<i32>,
+    /// Channel ID
+    #[serde(default)]
+    pub channel_id: Option<i32>,
+    /// Host ID
+    #[serde(default)]
+    pub host_id: Option<i32>,
+    /// Affected location IDs (comma-separated string)
+    #[serde(default)]
+    pub affected_location_ids: Option<String>,
+    /// Comments on the event
+    #[serde(default)]
+    pub comments: Vec<EventComment>,
+    /// Extra fields
+    #[serde(default)]
+    pub extra_fields: Vec<serde_json::Value>,
+}
+
+/// Location ID can be an integer or a string like "N/A"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LocationIdValue {
+    Int(i32),
+    String(String),
+}
+
+impl LocationIdValue {
+    pub fn as_int(&self) -> Option<i32> {
+        match self {
+            Self::Int(i) => Some(*i),
+            Self::String(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventComment {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub timestamp: f64,
 }
 
 /// Response from `/rest/v1/locations_data`

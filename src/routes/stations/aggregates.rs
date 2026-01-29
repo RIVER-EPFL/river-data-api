@@ -386,7 +386,16 @@ pub async fn get_station_aggregates(
         .collect::<Vec<_>>()
         .join(",");
 
-    // Query the continuous aggregate view
+    // Determine bucket interval for on-the-fly aggregation fallback
+    let bucket_interval = match resolution.as_str() {
+        "hourly" => "1 hour",
+        "daily" => "1 day",
+        "weekly" => "1 week",
+        "monthly" => "1 month",
+        _ => "1 hour",
+    };
+
+    // Query the continuous aggregate view first
     let sql = format!(
         r"
         SELECT
@@ -404,7 +413,7 @@ pub async fn get_station_aggregates(
         "
     );
 
-    let results: Vec<AggregateRow> = state
+    let mut results: Vec<AggregateRow> = state
         .db
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -415,6 +424,47 @@ pub async fn get_station_aggregates(
         .into_iter()
         .filter_map(|row| AggregateRow::from_query_result(&row, "").ok())
         .collect();
+
+    // Fallback to on-the-fly aggregation if continuous aggregate has no data
+    // This handles cases where the materialized view hasn't been refreshed yet
+    if results.is_empty() {
+        tracing::info!(
+            resolution = %resolution,
+            start = %query.start,
+            end = %query.end,
+            "continuous_aggregate_empty_fallback_to_raw"
+        );
+
+        let fallback_sql = format!(
+            r"
+            SELECT
+                time_bucket('{bucket_interval}', time) AS bucket,
+                sensor_id,
+                AVG(value) AS avg_value,
+                MIN(value) AS min_value,
+                MAX(value) AS max_value,
+                COUNT(*) AS count
+            FROM readings
+            WHERE sensor_id IN ({sensor_ids_str})
+              AND time >= $1
+              AND time <= $2
+            GROUP BY time_bucket('{bucket_interval}', time), sensor_id
+            ORDER BY bucket ASC, sensor_id ASC
+            "
+        );
+
+        results = state
+            .db
+            .query_all(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                &fallback_sql,
+                vec![query.start.into(), query.end.into()],
+            ))
+            .await?
+            .into_iter()
+            .filter_map(|row| AggregateRow::from_query_result(&row, "").ok())
+            .collect();
+    }
 
     // Build time index and sensor value maps
     let mut time_set: BTreeMap<DateTime<Utc>, usize> = BTreeMap::new();

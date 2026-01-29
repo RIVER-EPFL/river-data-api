@@ -1,9 +1,11 @@
 use chrono::{Duration, Utc};
-use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
+use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set, Statement};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::entity::{device_status, readings, sensors, stations, sync_state, zones};
+use crate::entity::{
+    alarm_locations, alarms, device_status, events, readings, sensors, stations, sync_state, zones,
+};
 use crate::error::AppResult;
 use crate::vaisala::VaisalaClient;
 
@@ -695,4 +697,376 @@ pub async fn needs_full_sync(db: &DatabaseConnection) -> bool {
     }
 
     false
+}
+
+/// Sync active alarms from Vaisala.
+///
+/// Fetches all active alarms and upserts them into the database.
+/// Links alarms to sensors via the alarm_locations junction table.
+///
+/// # Errors
+///
+/// Returns an error if the Vaisala API or database operations fail.
+pub async fn sync_alarms(db: &DatabaseConnection, vaisala: &VaisalaClient) -> AppResult<()> {
+    tracing::info!("Syncing alarms from Vaisala...");
+
+    // Fetch active alarms (include system alarms)
+    let response = vaisala.get_active_alarms(None, true).await?;
+
+    // Build sensor lookup by vaisala_location_id (includes station_id for linking)
+    let all_sensors = sensors::Entity::find().all(db).await?;
+    let sensor_map: HashMap<i32, Uuid> = all_sensors
+        .iter()
+        .map(|s| (s.vaisala_location_id, s.id))
+        .collect();
+    let sensor_station_map: HashMap<i32, Uuid> = all_sensors
+        .iter()
+        .map(|s| (s.vaisala_location_id, s.station_id))
+        .collect();
+
+    // Build existing alarms lookup by vaisala_alarm_id
+    let existing_alarms: HashMap<i32, alarms::Model> = alarms::Entity::find()
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|a| (a.vaisala_alarm_id, a))
+        .collect();
+
+    let now = Utc::now();
+    let mut created = 0;
+    let mut updated = 0;
+
+    // Collect active IDs and total count before consuming the response
+    let active_ids: Vec<i32> = response.data.iter().map(|r| r.attributes.id).collect();
+    let total_alarms = response.data.len();
+
+    for resource in response.data {
+        let attrs = resource.attributes;
+
+        // Convert timestamps
+        let when_on = chrono::DateTime::from_timestamp(attrs.when_on as i64, 0)
+            .unwrap_or_else(Utc::now);
+        let when_off = attrs
+            .when_off
+            .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0));
+        let when_ack = attrs
+            .when_ack
+            .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0));
+        let when_condition = attrs
+            .when_condition
+            .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0));
+
+        let ack_comments = attrs.ack_comments.map(|c| serde_json::json!(c));
+
+        if let Some(existing) = existing_alarms.get(&attrs.id) {
+            // Update existing alarm
+            let mut model: alarms::ActiveModel = existing.clone().into();
+            model.severity = Set(attrs.severity);
+            model.description = Set(attrs.description.clone());
+            model.error_text = Set(if attrs.error_text.is_empty() {
+                None
+            } else {
+                Some(attrs.error_text.clone())
+            });
+            model.when_off = Set(when_off.map(Into::into));
+            model.when_ack = Set(when_ack.map(Into::into));
+            model.duration_sec = Set(Some(attrs.duration_sec));
+            model.status = Set(attrs.status);
+            model.ack_comments = Set(ack_comments);
+            model.ack_action_taken = Set(attrs.ack_action_taken.clone());
+            model.updated_at = Set(Some(now.into()));
+
+            if let Err(e) = model.update(db).await {
+                tracing::warn!(
+                    error = %e,
+                    vaisala_alarm_id = attrs.id,
+                    "Failed to update alarm"
+                );
+            } else {
+                updated += 1;
+            }
+        } else {
+            // Derive station_id from the first location_id that maps to a sensor
+            let station_id = attrs
+                .location_ids
+                .iter()
+                .find_map(|loc_id| sensor_station_map.get(loc_id).copied());
+
+            // Create new alarm
+            let alarm_id = Uuid::new_v4();
+            let alarm = alarms::ActiveModel {
+                id: Set(alarm_id),
+                vaisala_alarm_id: Set(attrs.id),
+                severity: Set(attrs.severity),
+                description: Set(attrs.description.clone()),
+                error_text: Set(if attrs.error_text.is_empty() {
+                    None
+                } else {
+                    Some(attrs.error_text.clone())
+                }),
+                alarm_type: Set(None), // Could derive from description/error_text if needed
+                when_on: Set(when_on.into()),
+                when_off: Set(when_off.map(Into::into)),
+                when_ack: Set(when_ack.map(Into::into)),
+                when_condition: Set(when_condition.map(Into::into)),
+                duration_sec: Set(Some(attrs.duration_sec)),
+                status: Set(attrs.status),
+                is_system: Set(attrs.is_system),
+                serial_number: Set(if attrs.serial_number.is_empty() {
+                    None
+                } else {
+                    Some(attrs.serial_number.clone())
+                }),
+                location_text: Set(if attrs.location.is_empty() {
+                    None
+                } else {
+                    Some(attrs.location.clone())
+                }),
+                zone_text: Set(if attrs.zone.is_empty() {
+                    None
+                } else {
+                    Some(attrs.zone.clone())
+                }),
+                station_id: Set(station_id),
+                ack_required: Set(attrs.ack_required),
+                ack_comments: Set(ack_comments),
+                ack_action_taken: Set(attrs.ack_action_taken.clone()),
+                created_at: Set(Some(now.into())),
+                updated_at: Set(Some(now.into())),
+            };
+
+            match alarm.insert(db).await {
+                Ok(_) => {
+                    created += 1;
+
+                    // Link alarm to sensors via alarm_locations
+                    for location_id in &attrs.location_ids {
+                        if let Some(sensor_id) = sensor_map.get(location_id) {
+                            let link = alarm_locations::ActiveModel {
+                                alarm_id: Set(alarm_id),
+                                sensor_id: Set(*sensor_id),
+                            };
+                            if let Err(e) = link.insert(db).await {
+                                // Ignore duplicate key errors
+                                let msg = e.to_string();
+                                if !msg.contains("duplicate") {
+                                    tracing::warn!(
+                                        error = %e,
+                                        alarm_id = %alarm_id,
+                                        sensor_id = %sensor_id,
+                                        "Failed to link alarm to sensor"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        vaisala_alarm_id = attrs.id,
+                        "Failed to create alarm"
+                    );
+                }
+            }
+        }
+    }
+
+    // Mark alarms as inactive if they're no longer in the active list
+    for (vaisala_id, existing) in &existing_alarms {
+        if existing.status && !active_ids.contains(vaisala_id) {
+            let mut model: alarms::ActiveModel = existing.clone().into();
+            model.status = Set(false);
+            model.when_off = Set(Some(now.into()));
+            model.updated_at = Set(Some(now.into()));
+
+            if let Err(e) = model.update(db).await {
+                tracing::warn!(
+                    error = %e,
+                    vaisala_alarm_id = vaisala_id,
+                    "Failed to mark alarm as inactive"
+                );
+            }
+        }
+    }
+
+    tracing::info!(
+        created,
+        updated,
+        total = total_alarms,
+        "Alarms sync completed"
+    );
+
+    Ok(())
+}
+
+/// Sync events from Vaisala.
+///
+/// Fetches recent events (last 7 days by default) and inserts new ones.
+/// Links events to sensors when location_id maps to a known sensor.
+///
+/// # Errors
+///
+/// Returns an error if the Vaisala API or database operations fail.
+pub async fn sync_events(db: &DatabaseConnection, vaisala: &VaisalaClient) -> AppResult<()> {
+    tracing::info!("Syncing events from Vaisala...");
+
+    // Get latest event time to only fetch newer events
+    let latest_event = events::Entity::find()
+        .order_by_desc(events::Column::Time)
+        .one(db)
+        .await?;
+
+    // Default to 7 days ago if no events exist
+    let date_from = match latest_event {
+        Some(e) => e.time.with_timezone(&Utc).timestamp().to_string(),
+        None => "7d".to_string(),
+    };
+
+    // Build sensor lookup (includes station_id for linking)
+    let all_sensors_for_events = sensors::Entity::find().all(db).await?;
+    let sensor_map_events: HashMap<i32, Uuid> = all_sensors_for_events
+        .iter()
+        .map(|s| (s.vaisala_location_id, s.id))
+        .collect();
+    let sensor_station_map_events: HashMap<i32, Uuid> = all_sensors_for_events
+        .iter()
+        .map(|s| (s.vaisala_location_id, s.station_id))
+        .collect();
+
+    // Fetch events in pages
+    let mut page = 1;
+    let page_size = 1000;
+    let mut total_created = 0;
+
+    loop {
+        let response = vaisala
+            .get_events(&date_from, None, None, None, Some(page), Some(page_size))
+            .await?;
+
+        if response.data.is_empty() {
+            break;
+        }
+
+        for resource in &response.data {
+            let attrs = &resource.attributes;
+
+            // Convert timestamp
+            let time = chrono::DateTime::from_timestamp(attrs.timestamp as i64, 0)
+                .unwrap_or_else(Utc::now);
+
+            // Try to link to sensor and derive station
+            let location_id_int = attrs
+                .location_id
+                .as_ref()
+                .and_then(|lid| lid.as_int());
+            let sensor_id = location_id_int
+                .and_then(|id| sensor_map_events.get(&id).copied());
+            let station_id = location_id_int
+                .and_then(|id| sensor_station_map_events.get(&id).copied());
+
+            let extra_fields = if attrs.extra_fields.is_empty() {
+                None
+            } else {
+                Some(serde_json::json!(attrs.extra_fields))
+            };
+
+            let event = events::ActiveModel {
+                time: Set(time.into()),
+                vaisala_event_num: Set(attrs.num),
+                category: Set(attrs.category.clone()),
+                message: Set(attrs.message.clone()),
+                user_name: Set(if attrs.user_name.is_empty() {
+                    None
+                } else {
+                    Some(attrs.user_name.clone())
+                }),
+                entity: Set(if attrs.entity.is_empty() {
+                    None
+                } else {
+                    Some(attrs.entity.clone())
+                }),
+                entity_id: Set(if attrs.entity_id == 0 {
+                    None
+                } else {
+                    Some(attrs.entity_id)
+                }),
+                sensor_id: Set(sensor_id),
+                station_id: Set(station_id),
+                device_id: Set(attrs.device_id),
+                channel_id: Set(attrs.channel_id),
+                host_id: Set(attrs.host_id),
+                extra_fields: Set(extra_fields),
+            };
+
+            match event.insert(db).await {
+                Ok(_) => total_created += 1,
+                Err(e) => {
+                    // Ignore duplicate key errors (event already exists)
+                    let msg = e.to_string();
+                    if !msg.contains("duplicate") && !msg.contains("unique") {
+                        tracing::warn!(
+                            error = %e,
+                            event_num = attrs.num,
+                            "Failed to insert event"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Check if we've fetched all pages
+        let meta = response.meta.as_ref();
+        let total_records = meta.map(|m| m.total_record_count).unwrap_or(0);
+        let fetched = page * page_size;
+
+        if fetched >= total_records || response.data.len() < page_size as usize {
+            break;
+        }
+
+        page += 1;
+    }
+
+    tracing::info!(created = total_created, "Events sync completed");
+
+    Ok(())
+}
+
+/// Refresh continuous aggregates after new data is synced.
+///
+/// Refreshes the hourly aggregate for recent data (last 24 hours).
+/// This ensures dashboards show aggregated data promptly without waiting
+/// for the scheduled refresh policy.
+///
+/// Note: Only refreshes hourly; daily/weekly/monthly are less time-sensitive
+/// and can rely on their scheduled policies.
+pub async fn refresh_continuous_aggregates(db: &DatabaseConnection) {
+    tracing::debug!("Refreshing continuous aggregates...");
+
+    // Refresh hourly aggregate for recent data (last 24 hours to now)
+    // Using a bounded window is faster than refreshing the entire history
+    let result = db
+        .execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "CALL refresh_continuous_aggregate('readings_hourly', NOW() - INTERVAL '24 hours', NOW())".to_string(),
+        ))
+        .await;
+
+    match result {
+        Ok(_) => tracing::debug!("Hourly continuous aggregate refreshed"),
+        Err(e) => tracing::warn!(error = %e, "Failed to refresh hourly aggregate"),
+    }
+
+    // Also refresh daily for last 7 days (less frequently needed but helps with dashboard)
+    let result = db
+        .execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "CALL refresh_continuous_aggregate('readings_daily', NOW() - INTERVAL '7 days', NOW())".to_string(),
+        ))
+        .await;
+
+    match result {
+        Ok(_) => tracing::debug!("Daily continuous aggregate refreshed"),
+        Err(e) => tracing::warn!(error = %e, "Failed to refresh daily aggregate"),
+    }
 }

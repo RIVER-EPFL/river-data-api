@@ -1,5 +1,8 @@
+pub mod alarm_locations;
+pub mod alarms;
 pub mod calibrations;
 pub mod device_status;
+pub mod events;
 pub mod readings;
 pub mod sensors;
 pub mod stations;

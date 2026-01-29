@@ -2,15 +2,22 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+use chrono::{DateTime, Utc};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement};
 
 use crate::common::AppState;
 use crate::entity::{sensors, stations, zones};
 use crate::error::AppResult;
 use crate::routes::resolve_station;
-use crate::routes::sensors::SensorResponse;
 
-use super::types::{StationDetailResponse, StationResponse, StationsQuery, ZoneRef};
+use super::types::{SensorResponse, StationDetailResponse, StationResponse, StationsQuery, ZoneRef};
+
+#[derive(Debug, FromQueryResult)]
+struct DataRangeRow {
+    min_time: Option<DateTime<Utc>>,
+    max_time: Option<DateTime<Utc>>,
+    count: i64,
+}
 
 /// List all stations
 #[utoipa::path(
@@ -84,6 +91,45 @@ pub async fn get_station(
         None
     };
 
+    // Fetch sensors for this station
+    let sensors_list = sensors::Entity::find()
+        .filter(sensors::Column::StationId.eq(station.id))
+        .filter(sensors::Column::IsActive.eq(true))
+        .order_by_asc(sensors::Column::Name)
+        .all(&state.db)
+        .await?;
+
+    let sensors: Vec<SensorResponse> = sensors_list
+        .into_iter()
+        .map(|s| SensorResponse {
+            id: s.id,
+            name: s.name,
+            sensor_type: s.sensor_type,
+            display_units: s.display_units,
+            sample_interval_sec: s.sample_interval_sec,
+            is_active: s.is_active,
+        })
+        .collect();
+
+    // Get data time range and count for this station's sensors
+    let sql = format!(
+        "SELECT MIN(r.time) as min_time, MAX(r.time) as max_time, COUNT(*) as count
+         FROM readings r
+         JOIN sensors s ON r.sensor_id = s.id
+         WHERE s.station_id = '{}'",
+        station.id
+    );
+
+    let data_range = state
+        .db
+        .query_one(Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql))
+        .await?
+        .and_then(|row| DataRangeRow::from_query_result(&row, "").ok());
+
+    let (data_start, data_end, reading_count) = data_range
+        .map(|r| (r.min_time, r.max_time, r.count))
+        .unwrap_or((None, None, 0));
+
     Ok(Json(StationDetailResponse {
         id: station.id,
         name: station.name,
@@ -91,10 +137,14 @@ pub async fn get_station(
         longitude: station.longitude,
         altitude_m: station.altitude_m,
         zone,
+        sensors,
+        data_start,
+        data_end,
+        reading_count,
     }))
 }
 
-/// List sensors belonging to a station
+/// List sensors for a station
 #[utoipa::path(
     get,
     path = "/api/stations/{station_id}/sensors",
@@ -124,7 +174,6 @@ pub async fn list_station_sensors(
         .into_iter()
         .map(|s| SensorResponse {
             id: s.id,
-            station_id: s.station_id,
             name: s.name,
             sensor_type: s.sensor_type,
             display_units: s.display_units,
@@ -135,3 +184,4 @@ pub async fn list_station_sensors(
 
     Ok(Json(response))
 }
+

@@ -7,7 +7,7 @@ pub use aggregates::{get_station_aggregates, AggregatesResponse, SensorAggregate
 pub use handlers::{get_station, list_station_sensors, list_stations};
 pub use readings::StationReadingsQuery;
 pub use readings::{get_station_readings, ReadingsResponse, SensorData};
-pub use types::{StationDetailResponse, StationRef, StationResponse, StationsQuery, ZoneRef};
+pub use types::{SensorResponse, StationDetailResponse, StationRef, StationResponse, StationsQuery, ZoneRef};
 
 // Re-export utoipa path structs for OpenAPI documentation
 pub use aggregates::__path_get_station_aggregates;

@@ -36,6 +36,8 @@ pub struct Config {
     // Sync settings
     pub sync_readings_interval_seconds: u64,
     pub sync_device_status_interval_seconds: u64,
+    pub sync_alarms_interval_seconds: u64,
+    pub sync_events_interval_seconds: u64,
     pub sync_retry_max: u32,
     pub sync_retry_delay_seconds: u64,
 
@@ -96,6 +98,14 @@ impl Config {
                 .unwrap_or_else(|_| "1800".to_string())
                 .parse()
                 .unwrap_or(1800),
+            sync_alarms_interval_seconds: env::var("SYNC_ALARMS_INTERVAL_SECONDS")
+                .unwrap_or_else(|_| "300".to_string())
+                .parse()
+                .unwrap_or(300), // 5 minutes default
+            sync_events_interval_seconds: env::var("SYNC_EVENTS_INTERVAL_SECONDS")
+                .unwrap_or_else(|_| "600".to_string())
+                .parse()
+                .unwrap_or(600), // 10 minutes default
             sync_retry_max: env::var("SYNC_RETRY_MAX")
                 .unwrap_or_else(|_| "3".to_string())
                 .parse()

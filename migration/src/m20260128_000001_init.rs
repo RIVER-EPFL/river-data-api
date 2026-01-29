@@ -317,6 +317,175 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
+        // ========== ALARMS ==========
+        // Stores current/historical alarm state from Vaisala
+        manager
+            .create_table(
+                Table::create()
+                    .table(Alarms::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(Alarms::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key()
+                            .extra("DEFAULT gen_random_uuid()"),
+                    )
+                    .col(
+                        ColumnDef::new(Alarms::VaisalaAlarmId)
+                            .integer()
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(ColumnDef::new(Alarms::Severity).small_integer().not_null())
+                    .col(ColumnDef::new(Alarms::Description).string_len(256).not_null())
+                    .col(ColumnDef::new(Alarms::ErrorText).string_len(256))
+                    .col(ColumnDef::new(Alarms::AlarmType).string_len(64))
+                    .col(
+                        ColumnDef::new(Alarms::WhenOn)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(Alarms::WhenOff).timestamp_with_time_zone())
+                    .col(ColumnDef::new(Alarms::WhenAck).timestamp_with_time_zone())
+                    .col(ColumnDef::new(Alarms::WhenCondition).timestamp_with_time_zone())
+                    .col(ColumnDef::new(Alarms::DurationSec).double())
+                    .col(ColumnDef::new(Alarms::Status).boolean().not_null().default(true))
+                    .col(ColumnDef::new(Alarms::IsSystem).boolean().not_null().default(false))
+                    .col(ColumnDef::new(Alarms::SerialNumber).string_len(32))
+                    .col(ColumnDef::new(Alarms::LocationText).string_len(256))
+                    .col(ColumnDef::new(Alarms::ZoneText).string_len(64))
+                    .col(ColumnDef::new(Alarms::StationId).uuid())
+                    .col(ColumnDef::new(Alarms::AckRequired).boolean().not_null().default(false))
+                    .col(ColumnDef::new(Alarms::AckComments).json_binary())
+                    .col(ColumnDef::new(Alarms::AckActionTaken).string_len(256))
+                    .col(
+                        ColumnDef::new(Alarms::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .extra("DEFAULT NOW()"),
+                    )
+                    .col(
+                        ColumnDef::new(Alarms::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .extra("DEFAULT NOW()"),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_alarms_station")
+                            .from(Alarms::Table, Alarms::StationId)
+                            .to(Stations::Table, Stations::Id)
+                            .on_delete(ForeignKeyAction::SetNull),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        // Index for active alarm queries
+        db.execute_unprepared(
+            "CREATE INDEX idx_alarms_status_when_on ON alarms (status, when_on DESC)",
+        )
+        .await?;
+
+        // Index for station-level alarm queries
+        db.execute_unprepared(
+            "CREATE INDEX idx_alarms_station ON alarms (station_id, when_on DESC) WHERE station_id IS NOT NULL",
+        )
+        .await?;
+
+        // ========== ALARM_LOCATIONS ==========
+        // Many-to-many linking alarms to sensors
+        manager
+            .create_table(
+                Table::create()
+                    .table(AlarmLocations::Table)
+                    .if_not_exists()
+                    .col(ColumnDef::new(AlarmLocations::AlarmId).uuid().not_null())
+                    .col(ColumnDef::new(AlarmLocations::SensorId).uuid().not_null())
+                    .primary_key(
+                        Index::create()
+                            .col(AlarmLocations::AlarmId)
+                            .col(AlarmLocations::SensorId),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_alarm_locations_alarm")
+                            .from(AlarmLocations::Table, AlarmLocations::AlarmId)
+                            .to(Alarms::Table, Alarms::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_alarm_locations_sensor")
+                            .from(AlarmLocations::Table, AlarmLocations::SensorId)
+                            .to(Sensors::Table, Sensors::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        // Index for sensor-based alarm lookups
+        db.execute_unprepared(
+            "CREATE INDEX idx_alarm_locations_sensor ON alarm_locations (sensor_id)",
+        )
+        .await?;
+
+        // ========== EVENTS (TimescaleDB Hypertable) ==========
+        // Event log from Vaisala /events endpoint
+        manager
+            .create_table(
+                Table::create()
+                    .table(Events::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(Events::Time)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(Events::VaisalaEventNum).integer().not_null())
+                    .col(ColumnDef::new(Events::Category).string_len(64).not_null())
+                    .col(ColumnDef::new(Events::Message).text().not_null())
+                    .col(ColumnDef::new(Events::UserName).string_len(64))
+                    .col(ColumnDef::new(Events::Entity).string_len(64))
+                    .col(ColumnDef::new(Events::EntityId).integer())
+                    .col(ColumnDef::new(Events::SensorId).uuid())
+                    .col(ColumnDef::new(Events::StationId).uuid())
+                    .col(ColumnDef::new(Events::DeviceId).integer())
+                    .col(ColumnDef::new(Events::ChannelId).integer())
+                    .col(ColumnDef::new(Events::HostId).integer())
+                    .col(ColumnDef::new(Events::ExtraFields).json_binary())
+                    .primary_key(
+                        Index::create()
+                            .col(Events::VaisalaEventNum)
+                            .col(Events::Time),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        // Convert to TimescaleDB hypertable (30-day chunks)
+        // Note: Foreign keys are not added to hypertables with compression enabled
+        db.execute_unprepared(
+            "SELECT create_hypertable('events', 'time', chunk_time_interval => INTERVAL '30 days')",
+        )
+        .await?;
+
+        // Index for category-based queries
+        db.execute_unprepared("CREATE INDEX idx_events_category ON events (category, time DESC)")
+            .await?;
+
+        // Index for sensor-based event queries
+        db.execute_unprepared(
+            "CREATE INDEX idx_events_sensor ON events (sensor_id, time DESC) WHERE sensor_id IS NOT NULL",
+        )
+        .await?;
+
+        // Index for station-based event queries
+        db.execute_unprepared(
+            "CREATE INDEX idx_events_station ON events (station_id, time DESC) WHERE station_id IS NOT NULL",
+        )
+        .await?;
+
         // ========== CONTINUOUS AGGREGATES (TimescaleDB-specific) ==========
         db.execute_unprepared(
             r"
@@ -427,6 +596,13 @@ impl MigrationTrait for Migration {
         )
         .await?;
 
+        // NOTE: Continuous aggregates start empty (WITH NO DATA) and are populated by
+        // the refresh policies as data arrives. For a fresh deployment this is correct.
+        // If restoring historical data, manually run:
+        //   CALL refresh_continuous_aggregate('readings_hourly', NULL, NULL);
+        //   CALL refresh_continuous_aggregate('readings_daily', NULL, NULL);
+        //   etc.
+
         // ========== COMPRESSION POLICIES (TimescaleDB-specific) ==========
         db.execute_unprepared(
             r"ALTER TABLE readings SET (
@@ -450,6 +626,18 @@ impl MigrationTrait for Migration {
         db.execute_unprepared("SELECT add_compression_policy('device_status', INTERVAL '90 days')")
             .await?;
 
+        // Events compression (after 90 days)
+        db.execute_unprepared(
+            r"ALTER TABLE events SET (
+                timescaledb.compress,
+                timescaledb.compress_segmentby = 'category'
+            )",
+        )
+        .await?;
+
+        db.execute_unprepared("SELECT add_compression_policy('events', INTERVAL '90 days')")
+            .await?;
+
         Ok(())
     }
 
@@ -457,6 +645,9 @@ impl MigrationTrait for Migration {
         let db = manager.get_connection();
 
         // Remove compression policies
+        db.execute_unprepared("SELECT remove_compression_policy('events', if_exists => true)")
+            .await
+            .ok();
         db.execute_unprepared(
             "SELECT remove_compression_policy('device_status', if_exists => true)",
         )
@@ -498,6 +689,20 @@ impl MigrationTrait for Migration {
             .await?;
 
         // Drop tables in reverse order of dependencies
+        manager
+            .drop_table(Table::drop().table(Events::Table).if_exists().to_owned())
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(AlarmLocations::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(Table::drop().table(Alarms::Table).if_exists().to_owned())
+            .await?;
         manager
             .drop_table(Table::drop().table(SyncState::Table).if_exists().to_owned())
             .await?;
@@ -627,4 +832,56 @@ enum SyncState {
     ErrorMessage,
     RetryCount,
     LastFullSync,
+}
+
+#[derive(DeriveIden)]
+enum Alarms {
+    Table,
+    Id,
+    VaisalaAlarmId,
+    Severity,
+    Description,
+    ErrorText,
+    AlarmType,
+    WhenOn,
+    WhenOff,
+    WhenAck,
+    WhenCondition,
+    DurationSec,
+    Status,
+    IsSystem,
+    SerialNumber,
+    LocationText,
+    ZoneText,
+    StationId,
+    AckRequired,
+    AckComments,
+    AckActionTaken,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(DeriveIden)]
+enum AlarmLocations {
+    Table,
+    AlarmId,
+    SensorId,
+}
+
+#[derive(DeriveIden)]
+enum Events {
+    Table,
+    Time,
+    VaisalaEventNum,
+    Category,
+    Message,
+    UserName,
+    Entity,
+    EntityId,
+    SensorId,
+    StationId,
+    DeviceId,
+    ChannelId,
+    HostId,
+    ExtraFields,
 }
