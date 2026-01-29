@@ -255,6 +255,8 @@ pub async fn get_station_aggregates(
     Query(query): Query<StationAggregatesQuery>,
     headers: HeaderMap,
 ) -> AppResult<Response> {
+    use super::cache;
+
     let station = resolve_station(&state.db, &station_id).await?;
 
     // Validate resolution
@@ -288,6 +290,43 @@ pub async fn get_station_aggregates(
     // Determine format
     let format = determine_format(&query.format, &headers);
 
+    // Build sensor query for this station only
+    let mut sensor_query = sensors::Entity::find()
+        .filter(sensors::Column::IsActive.eq(true))
+        .filter(sensors::Column::StationId.eq(station.id));
+
+    if let Some(ref types) = query.sensor_types {
+        let type_list: Vec<String> = types.split(',').map(|s| s.trim().to_string()).collect();
+        if !type_list.is_empty() {
+            sensor_query = sensor_query.filter(sensors::Column::SensorType.is_in(type_list));
+        }
+    }
+
+    // Get matching sensors (needed for cache freshness check)
+    let sensors_list = sensor_query.all(&state.db).await?;
+    let sensor_ids: Vec<Uuid> = sensors_list.iter().map(|s| s.id).collect();
+
+    // Build cache key
+    let cache_key = cache::cache_key(
+        "aggregates",
+        &[
+            &station.id.to_string(),
+            &resolution,
+            &query.start.to_rfc3339(),
+            &query.end.to_rfc3339(),
+            query.sensor_types.as_deref().unwrap_or(""),
+            &format,
+        ],
+    );
+
+    // Check cache with freshness validation (JSON only)
+    // Aggregates always have end time, so skip freshness check (historical data won't change)
+    if format == "json" {
+        if let Some(cached) = cache::get_cached(&state, &cache_key, &sensor_ids, Some(query.end)).await {
+            return cache::json_response((*cached).to_vec(), true);
+        }
+    }
+
     // For bulk formats, acquire semaphore to limit concurrent requests
     let _permit = if format == "csv" || format == "ndjson" {
         match BULK_SEMAPHORE.clone().try_acquire_owned() {
@@ -306,22 +345,6 @@ pub async fn get_station_aggregates(
     } else {
         None
     };
-
-    // Build sensor query for this station only
-    let mut sensor_query = sensors::Entity::find()
-        .filter(sensors::Column::IsActive.eq(true))
-        .filter(sensors::Column::StationId.eq(station.id));
-
-    if let Some(ref types) = query.sensor_types {
-        let type_list: Vec<String> = types.split(',').map(|s| s.trim().to_string()).collect();
-        if !type_list.is_empty() {
-            sensor_query = sensor_query.filter(sensors::Column::SensorType.is_in(type_list));
-        }
-    }
-
-    // Get matching sensors
-    let sensors_list = sensor_query.all(&state.db).await?;
-    let sensor_ids: Vec<Uuid> = sensors_list.iter().map(|s| s.id).collect();
 
     if sensor_ids.is_empty() {
         return Ok(Json(AggregatesResponse {
@@ -428,17 +451,22 @@ pub async fn get_station_aggregates(
         })
         .collect();
 
+    // Get max time for cache freshness tracking
+    let max_time = times.last().copied();
+
     // Return appropriate format
     match format.as_str() {
         "csv" => build_csv_response(&resolution, &times, &sensor_data),
         "ndjson" => build_ndjson_response(&times, &sensor_data),
-        _ => Ok(Json(AggregatesResponse {
-            resolution,
-            start: query.start,
-            end: query.end,
-            times,
-            sensors: sensor_data,
-        })
-        .into_response()),
+        _ => {
+            let response = AggregatesResponse {
+                resolution,
+                start: query.start,
+                end: query.end,
+                times,
+                sensors: sensor_data,
+            };
+            cache::cache_and_respond(&state, cache_key, &response, max_time).await
+        }
     }
 }

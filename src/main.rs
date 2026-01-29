@@ -4,17 +4,11 @@ use tokio::net::TcpListener;
 use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod common;
-mod config;
-mod entity;
-mod error;
-mod routes;
-mod sync;
-mod vaisala;
-
-use common::AppState;
-use config::Config;
-use vaisala::VaisalaClient;
+use river_db::common::AppState;
+use river_db::config::Config;
+use river_db::routes;
+use river_db::sync;
+use river_db::vaisala::VaisalaClient;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

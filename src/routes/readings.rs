@@ -264,8 +264,9 @@ pub async fn get_station_readings(
     );
 
     // Check cache with freshness validation (JSON only)
+    // Pass query.end so bounded queries skip freshness check (historical data won't change)
     if format == "json" {
-        if let Some(cached) = cache::get_cached(&state, &cache_key, &sensor_ids).await {
+        if let Some(cached) = cache::get_cached(&state, &cache_key, &sensor_ids, query.end).await {
             return cache::json_response((*cached).to_vec(), true);
         }
     }
