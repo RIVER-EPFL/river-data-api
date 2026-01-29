@@ -46,16 +46,36 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         }
         h1 { font-size: 1.25rem; font-weight: 600; }
 
-        .station-buttons {
+        .station-groups {
             display: flex;
-            gap: 0.5rem;
+            gap: 1.5rem;
+            flex-wrap: wrap;
+            align-items: flex-start;
+        }
+        .zone-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.25rem;
+            align-items: center;
+        }
+        .zone-label {
+            font-size: 0.65rem;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            font-weight: 500;
+            text-align: center;
+        }
+        .zone-stations {
+            display: flex;
+            gap: 0.375rem;
             flex-wrap: wrap;
         }
         .station-btn {
-            padding: 0.5rem 1rem;
+            padding: 0.4rem 0.75rem;
             border: 1px solid var(--border);
             border-radius: 0.375rem;
-            font-size: 0.875rem;
+            font-size: 0.8rem;
             background: var(--surface);
             cursor: pointer;
             transition: all 0.15s;
@@ -93,29 +113,23 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         /* Timeline legend - thin colored line below slider */
         .timeline-legend {
             display: flex;
-            height: 4px;
-            border-radius: 2px;
+            height: 6px;
+            border-radius: 3px;
             overflow: visible;
             margin-top: 2rem;  /* Space for pip labels above */
-            margin-bottom: 0.5rem;
+            margin-bottom: 0.25rem;
             margin-left: 0.5rem;
             margin-right: 0.5rem;
         }
-        .timeline-zone-history {
-            background: #94a3b8;  /* Slate gray for history */
-            height: 100%;
-            position: relative;
-        }
-        .timeline-zone-week {
-            background: #3b82f6;  /* Blue for last week */
-            height: 100%;
-            position: relative;
-        }
+        .timeline-zone-history,
+        .timeline-zone-week,
         .timeline-zone-today {
-            background: #10b981;  /* Green for today */
             height: 100%;
             position: relative;
         }
+        .timeline-zone-history { background: #94a3b8; }
+        .timeline-zone-week { background: #3b82f6; }
+        .timeline-zone-today { background: #10b981; }
         /* Boundary markers between zones */
         .timeline-zone-history::after,
         .timeline-zone-week::after {
@@ -123,10 +137,21 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             position: absolute;
             right: 0;
             top: -2px;
-            height: 8px;
+            height: 10px;
             width: 1px;
             background: var(--text);
             opacity: 0.3;
+        }
+        /* Legend labels below the bar */
+        .timeline-labels {
+            display: flex;
+            margin: 0.25rem 0.5rem 0;
+            font-size: 0.6rem;
+            color: var(--muted);
+        }
+        .timeline-labels span {
+            text-align: center;
+            opacity: 0.7;
         }
         /* Reduce pip label clashing */
         .noUi-pips-horizontal {
@@ -256,12 +281,32 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             border: 1px solid var(--border);
             border-radius: 0.5rem;
         }
-        .chart-hint {
-            text-align: center;
+        .chart-footer {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
             font-size: 0.7rem;
             color: var(--muted);
             margin-top: 0.5rem;
+            opacity: 0.5;
+            gap: 1rem;
         }
+        .chart-footer:hover { opacity: 0.8; }
+        .chart-footer a {
+            color: inherit;
+            text-decoration: none;
+        }
+        .chart-footer a:hover { text-decoration: underline; }
+        .footer-left, .footer-right {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            flex-shrink: 0;
+        }
+        .chart-hint {
+            text-align: center;
+        }
+        .footer-separator { margin: 0 0.1rem; }
 
         /* Hover tooltip for all sensor values */
         .hover-tooltip {
@@ -337,29 +382,6 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             color: var(--muted);
         }
 
-        .site-footer {
-            padding: 1rem 0 0;
-            font-size: 0.7rem;
-            color: #999;
-            opacity: 0.4;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 0.5rem;
-            flex-wrap: wrap;
-        }
-        .site-footer:hover { opacity: 0.7; }
-        .site-footer a {
-            color: inherit;
-            text-decoration: none;
-        }
-        .site-footer a:hover { text-decoration: underline; }
-        .footer-left, .footer-right {
-            display: flex;
-            align-items: center;
-            gap: 0.4rem;
-        }
-        .footer-separator { margin: 0 0.2rem; }
 
         .loading-overlay {
             position: absolute;
@@ -379,8 +401,8 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     <div class="container">
         <header>
             <h1>River Sensor Data</h1>
-            <div class="station-buttons" id="station-buttons">
-                <span style="color: var(--muted); font-size: 0.875rem;">Loading stations...</span>
+            <div class="station-groups" id="station-groups">
+                <span style="color: var(--muted); font-size: 0.875rem;">Loading...</span>
             </div>
         </header>
 
@@ -394,6 +416,11 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
                 <div class="timeline-zone-history" id="zone-history"></div>
                 <div class="timeline-zone-week" id="zone-week"></div>
                 <div class="timeline-zone-today" id="zone-today"></div>
+            </div>
+            <div class="timeline-labels" id="timeline-labels">
+                <span id="label-history" style="color: #94a3b8;"></span>
+                <span id="label-week" style="color: #3b82f6;"></span>
+                <span id="label-today" style="color: #10b981;"></span>
             </div>
             <div class="slider-info">
                 <div>
@@ -412,18 +439,17 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <div class="charts-container" id="charts-container">
             <div class="chart-placeholder">Select a station to view data</div>
         </div>
-        <div class="chart-hint">Drag to zoom in · Double-click to zoom out</div>
-
-        <footer class="site-footer">
+        <div class="chart-footer">
             <div class="footer-left">
                 <a href="/docs">API Docs</a>
                 <span class="footer-separator">|</span>
                 <a href="https://github.com/RIVER-EPFL/river-data-api" target="_blank" rel="noopener">Source</a>
             </div>
+            <div class="chart-hint">Drag to zoom · Double-click to reset</div>
             <div class="footer-right">
                 <span>Developed by <a href="https://github.com/evanjt" target="_blank" rel="noopener">Evan Thomas</a> at <a href="https://www.epfl.ch/research/domains/alpole/" target="_blank" rel="noopener">ALPOLE</a>, <a href="https://www.epfl.ch/about/campus/fr/valais-fr/" target="_blank" rel="noopener">EPFL Valais</a></span>
             </div>
-        </footer>
+        </div>
     </div>
 
     <div class="hover-tooltip" id="hover-tooltip">
@@ -503,12 +529,41 @@ function formatDuration(ms) {
 
 // Initialize
 async function init() {
-    const stations = await api('/api/stations');
-    const container = document.getElementById('station-buttons');
+    // Fetch zones and stations
+    const [zones, stations] = await Promise.all([
+        api('/api/zones'),
+        api('/api/stations')
+    ]);
 
-    container.innerHTML = stations.map(s => `
-        <button class="station-btn" data-id="${s.id}">${s.name}</button>
-    `).join('');
+    const container = document.getElementById('station-groups');
+
+    // Group stations by zone
+    const stationsByZone = {};
+    stations.forEach(s => {
+        const zoneId = s.zone_id || 'unknown';
+        if (!stationsByZone[zoneId]) stationsByZone[zoneId] = [];
+        stationsByZone[zoneId].push(s);
+    });
+
+    // Build HTML with zone groups
+    let html = '';
+    zones.forEach(zone => {
+        const zoneStations = stationsByZone[zone.id] || [];
+        if (zoneStations.length === 0) return;
+
+        html += `
+            <div class="zone-group">
+                <div class="zone-label">${zone.name}</div>
+                <div class="zone-stations">
+                    ${zoneStations.map(s => `
+                        <button class="station-btn" data-id="${s.id}">${s.name}</button>
+                    `).join('')}
+                </div>
+            </div>
+        `;
+    });
+
+    container.innerHTML = html;
 
     container.querySelectorAll('.station-btn').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -605,43 +660,52 @@ async function loadStation(stationId) {
     const zoneHistory = document.getElementById('zone-history');
     const zoneWeek = document.getElementById('zone-week');
     const zoneToday = document.getElementById('zone-today');
+    const labelHistory = document.getElementById('label-history');
+    const labelWeek = document.getElementById('label-week');
+    const labelToday = document.getElementById('label-today');
 
     // Reset legend bar visibility
     zoneHistory.style.display = '';
     zoneWeek.style.display = '';
     zoneToday.style.display = '';
+    labelHistory.style.display = '';
+    labelWeek.style.display = '';
+    labelToday.style.display = '';
 
     if (rangeDays > 8) {
-        // 3-zone telescope: 75% history, 15% week, 10% today
+        // 3-zone telescope: 50% history, 30% week, 20% today
         sliderRange = {
             'min': minTs,
-            '75%': weekStart,
-            '90%': todayStart,
+            '50%': weekStart,
+            '80%': todayStart,
             'max': maxTs
         };
-        // Update legend bar widths (no text, just colored line)
-        zoneHistory.style.width = '75%';
-        zoneWeek.style.width = '15%';
-        zoneToday.style.width = '10%';
-        zoneHistory.textContent = '';
-        zoneWeek.textContent = '';
-        zoneToday.textContent = '';
+        // Update legend bar widths and labels
+        zoneHistory.style.width = '50%';
+        zoneWeek.style.width = '30%';
+        zoneToday.style.width = '20%';
+        labelHistory.style.width = '50%';
+        labelWeek.style.width = '30%';
+        labelToday.style.width = '20%';
+        labelHistory.textContent = 'History';
+        labelWeek.textContent = 'Last week';
+        labelToday.textContent = 'Last day';
 
         // Fewer pips to avoid clashing
         pipsConfig = {
             mode: 'positions',
-            values: [0, 20, 40, 60, 75, 90, 100],
+            values: [0, 25, 50, 65, 80, 90, 100],
             density: 100,
             format: {
                 to: v => {
                     const d = new Date(v);
                     const hoursFromEnd = (maxTs - v) / 3600000;
                     const daysFromEnd = hoursFromEnd / 24;
-                    // Today zone: minimal labels
+                    // Today zone: show hours
                     if (hoursFromEnd <= 24) {
                         const h = d.getHours();
                         if (h === 0) return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-                        if (h === 12) return '12:00';
+                        if (h === 6 || h === 12 || h === 18) return h + ':00';
                         return '';
                     }
                     // Week/History: show dates
@@ -650,18 +714,21 @@ async function loadStation(stationId) {
             }
         };
     } else if (rangeDays > 2) {
-        // 2-zone: week + today
+        // 2-zone: 70% week, 30% today
         sliderRange = {
             'min': minTs,
-            '85%': todayStart,
+            '70%': todayStart,
             'max': maxTs
         };
         zoneHistory.style.width = '0%';
         zoneHistory.style.display = 'none';
-        zoneWeek.style.width = '85%';
-        zoneToday.style.width = '15%';
-        zoneWeek.textContent = '';
-        zoneToday.textContent = '';
+        labelHistory.style.display = 'none';
+        zoneWeek.style.width = '70%';
+        zoneToday.style.width = '30%';
+        labelWeek.style.width = '70%';
+        labelToday.style.width = '30%';
+        labelWeek.textContent = 'This week';
+        labelToday.textContent = 'Last day';
 
         pipsConfig = {
             mode: 'positions',
@@ -686,7 +753,10 @@ async function loadStation(stationId) {
         zoneHistory.style.display = 'none';
         zoneWeek.style.display = 'none';
         zoneToday.style.width = '100%';
-        zoneToday.textContent = '';
+        labelHistory.style.display = 'none';
+        labelWeek.style.display = 'none';
+        labelToday.style.width = '100%';
+        labelToday.textContent = 'All data';
 
         pipsConfig = {
             mode: 'count',
@@ -811,7 +881,7 @@ const fetchData = debounce(async () => {
     } finally {
         hideLoading();
     }
-}, 50);
+}, 100);
 
 function showLoading() {
     state.loading = true;
