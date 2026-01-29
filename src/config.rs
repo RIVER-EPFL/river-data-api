@@ -8,14 +8,16 @@ pub enum Deployment {
     Prod,
 }
 
-impl Deployment {
-    #[must_use]
-    pub fn from_str(s: &str) -> Self {
+impl std::str::FromStr for Deployment {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "dev" | "development" => Self::Dev,
-            "stage" | "staging" => Self::Stage,
-            "prod" | "production" => Self::Prod,
-            _ => Self::Local,
+            "dev" | "development" => Ok(Self::Dev),
+            "stage" | "staging" => Ok(Self::Stage),
+            "prod" | "production" => Ok(Self::Prod),
+            "local" | "" => Ok(Self::Local),
+            _ => Err(()),
         }
     }
 }
@@ -147,9 +149,10 @@ impl Config {
                 .unwrap_or(209_715_200), // 200MB default
 
             // Application metadata
-            deployment: Deployment::from_str(
-                &env::var("DEPLOYMENT").unwrap_or_else(|_| "local".to_string()),
-            ),
+            deployment: env::var("DEPLOYMENT")
+                .unwrap_or_else(|_| "local".to_string())
+                .parse()
+                .unwrap_or(Deployment::Local),
         })
     }
 
