@@ -90,35 +90,55 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             color: var(--muted);
             margin-bottom: 0.5rem;
         }
-        /* Timeline legend bar showing time zones */
+        /* Timeline legend - thin colored line below slider */
         .timeline-legend {
             display: flex;
-            height: 1.25rem;
-            border-radius: 0.25rem;
-            overflow: hidden;
+            height: 4px;
+            border-radius: 2px;
+            overflow: visible;
+            margin-top: 2rem;  /* Space for pip labels above */
             margin-bottom: 0.5rem;
-            font-size: 0.65rem;
-            font-weight: 500;
-        }
-        .timeline-legend > div {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: white;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            padding: 0 0.5rem;
+            margin-left: 0.5rem;
+            margin-right: 0.5rem;
         }
         .timeline-zone-history {
             background: #94a3b8;  /* Slate gray for history */
-            flex-grow: 1;
+            height: 100%;
+            position: relative;
         }
         .timeline-zone-week {
             background: #3b82f6;  /* Blue for last week */
+            height: 100%;
+            position: relative;
         }
         .timeline-zone-today {
             background: #10b981;  /* Green for today */
+            height: 100%;
+            position: relative;
+        }
+        /* Boundary markers between zones */
+        .timeline-zone-history::after,
+        .timeline-zone-week::after {
+            content: '';
+            position: absolute;
+            right: 0;
+            top: -2px;
+            height: 8px;
+            width: 1px;
+            background: var(--text);
+            opacity: 0.3;
+        }
+        /* Reduce pip label clashing */
+        .noUi-pips-horizontal {
+            padding-top: 8px;
+            height: 50px;
+        }
+        .noUi-value-horizontal {
+            transform: translateX(-50%);
+            font-size: 0.6rem;
+        }
+        .noUi-marker-horizontal.noUi-marker-large {
+            height: 10px;
         }
         #time-slider {
             margin: 0 0.5rem;
@@ -127,7 +147,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-top: 3rem;  /* Extra space for pip labels */
+            margin-top: 0.5rem;
         }
         .window-info {
             font-size: 0.875rem;
@@ -138,24 +158,6 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             color: var(--muted);
             font-style: italic;
         }
-        .zoom-controls {
-            display: flex;
-            gap: 0.5rem;
-        }
-        .zoom-btn {
-            width: 2rem;
-            height: 2rem;
-            border: 1px solid var(--border);
-            border-radius: 0.25rem;
-            background: var(--surface);
-            cursor: pointer;
-            font-size: 1rem;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        .zoom-btn:hover { background: var(--bg); }
-        .zoom-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
         .controls-row {
             display: flex;
@@ -199,7 +201,9 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             border: 1px solid var(--border);
             border-radius: 0.5rem;
             padding: 0.75rem 1rem;
+            padding-top: 1.5rem;  /* Extra space for y-axis top labels */
             position: relative;
+            overflow: visible;
         }
         .sensor-chart .chart-label {
             position: absolute;
@@ -212,8 +216,35 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             background: var(--surface);
             padding: 0 0.25rem;
         }
+        .sensor-chart .chart-expand {
+            position: absolute;
+            bottom: 0.5rem;
+            right: 0.5rem;
+            width: 1.5rem;
+            height: 1.5rem;
+            border: 1px solid var(--border);
+            border-radius: 0.25rem;
+            background: var(--surface);
+            cursor: pointer;
+            font-size: 0.75rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--muted);
+            z-index: 10;
+            opacity: 0.6;
+            transition: opacity 0.15s;
+        }
+        .sensor-chart .chart-expand:hover {
+            opacity: 1;
+            border-color: var(--accent);
+            color: var(--accent);
+        }
         .sensor-chart .u-wrap {
             cursor: crosshair;
+        }
+        .sensor-chart .u-over {
+            overflow: visible !important;
         }
         .chart-placeholder {
             display: flex;
@@ -306,13 +337,29 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             color: var(--muted);
         }
 
-        footer {
-            text-align: center;
-            padding: 1rem;
-            color: var(--muted);
-            font-size: 0.75rem;
+        .site-footer {
+            padding: 1rem 0 0;
+            font-size: 0.7rem;
+            color: #999;
+            opacity: 0.4;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.5rem;
+            flex-wrap: wrap;
         }
-        footer a { color: var(--accent); }
+        .site-footer:hover { opacity: 0.7; }
+        .site-footer a {
+            color: inherit;
+            text-decoration: none;
+        }
+        .site-footer a:hover { text-decoration: underline; }
+        .footer-left, .footer-right {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+        .footer-separator { margin: 0 0.2rem; }
 
         .loading-overlay {
             position: absolute;
@@ -342,20 +389,16 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
                 <span id="min-date">--</span>
                 <span id="max-date">--</span>
             </div>
-            <div class="timeline-legend" id="timeline-legend">
-                <div class="timeline-zone-history" id="zone-history">History</div>
-                <div class="timeline-zone-week" id="zone-week">Last 7 days</div>
-                <div class="timeline-zone-today" id="zone-today">Today</div>
-            </div>
             <div id="time-slider"></div>
+            <div class="timeline-legend" id="timeline-legend">
+                <div class="timeline-zone-history" id="zone-history"></div>
+                <div class="timeline-zone-week" id="zone-week"></div>
+                <div class="timeline-zone-today" id="zone-today"></div>
+            </div>
             <div class="slider-info">
                 <div>
                     <span class="window-info" id="window-info">--</span>
                     <span class="resolution-info" id="resolution-info"></span>
-                </div>
-                <div class="zoom-controls">
-                    <button class="zoom-btn" id="zoom-out" title="Zoom out">−</button>
-                    <button class="zoom-btn" id="zoom-in" title="Zoom in">+</button>
                 </div>
             </div>
         </div>
@@ -370,16 +413,23 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             <div class="chart-placeholder">Select a station to view data</div>
         </div>
         <div class="chart-hint">Drag to zoom in · Double-click to zoom out</div>
+
+        <footer class="site-footer">
+            <div class="footer-left">
+                <a href="/docs">API Docs</a>
+                <span class="footer-separator">|</span>
+                <a href="https://github.com/RIVER-EPFL/river-data-api" target="_blank" rel="noopener">Source</a>
+            </div>
+            <div class="footer-right">
+                <span>Developed by <a href="https://github.com/evanjt" target="_blank" rel="noopener">Evan Thomas</a> at <a href="https://www.epfl.ch/research/domains/alpole/" target="_blank" rel="noopener">ALPOLE</a>, <a href="https://www.epfl.ch/about/campus/fr/valais-fr/" target="_blank" rel="noopener">EPFL Valais</a></span>
+            </div>
+        </footer>
     </div>
 
     <div class="hover-tooltip" id="hover-tooltip">
         <div class="tooltip-time" id="tooltip-time">--</div>
         <div id="tooltip-values"></div>
     </div>
-
-    <footer>
-        <a href="/docs">API Documentation</a>
-    </footer>
 
     <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/nouislider@15/dist/nouislider.min.js"></script>
@@ -390,6 +440,8 @@ const state = {
     station: null,
     sensors: new Set(),
     sensorsWithData: new Set(),  // Only sensor types that have actual data
+    sensorTypeOrder: [],  // Original order of sensor types (for consistent display)
+    expandedCharts: new Set(),  // Track which charts are expanded
     start: null,
     end: null,
     charts: {},  // Map of sensor type -> uPlot instance
@@ -398,6 +450,9 @@ const state = {
     data: null,
     loading: false,
 };
+
+const CHART_HEIGHT_NORMAL = 180;
+const CHART_HEIGHT_EXPANDED = 400;
 
 // Cursor sync key for all charts
 const syncKey = uPlot.sync("sensors");
@@ -463,9 +518,6 @@ async function init() {
         });
     });
 
-    document.getElementById('zoom-in').addEventListener('click', () => zoom(0.5));
-    document.getElementById('zoom-out').addEventListener('click', () => zoom(2));
-
     // Auto-load first station
     const firstBtn = container.querySelector('.station-btn');
     if (firstBtn) {
@@ -492,9 +544,10 @@ async function loadStation(stationId) {
         return;
     }
 
-    // Assign colors
+    // Assign colors and store original order
     types.forEach((t, i) => sensorColors[t] = colors[i % colors.length]);
     state.sensors = new Set(types);
+    state.sensorTypeOrder = types;  // Preserve original order
 
     toggles.innerHTML = types.map(t => `
         <label class="sensor-toggle">
@@ -566,37 +619,32 @@ async function loadStation(stationId) {
             '90%': todayStart,
             'max': maxTs
         };
-        // Update legend bar widths
+        // Update legend bar widths (no text, just colored line)
         zoneHistory.style.width = '75%';
         zoneWeek.style.width = '15%';
         zoneToday.style.width = '10%';
-        zoneHistory.textContent = 'History';
-        zoneWeek.textContent = 'Last 7 days';
-        zoneToday.textContent = 'Today';
+        zoneHistory.textContent = '';
+        zoneWeek.textContent = '';
+        zoneToday.textContent = '';
 
-        // Pips: evenly in history, daily in week, hourly in today
+        // Fewer pips to avoid clashing
         pipsConfig = {
             mode: 'positions',
-            values: [0, 10, 20, 30, 40, 50, 60, 70, 75, 78, 81, 84, 87, 90, 92, 94, 96, 98, 100],
+            values: [0, 20, 40, 60, 75, 90, 100],
             density: 100,
             format: {
                 to: v => {
                     const d = new Date(v);
                     const hoursFromEnd = (maxTs - v) / 3600000;
                     const daysFromEnd = hoursFromEnd / 24;
-                    // Today zone: show hours
+                    // Today zone: minimal labels
                     if (hoursFromEnd <= 24) {
                         const h = d.getHours();
-                        if (h === 0 || h === 12) {
-                            return h === 0 ? d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '12:00';
-                        }
-                        return h + ':00';
+                        if (h === 0) return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                        if (h === 12) return '12:00';
+                        return '';
                     }
-                    // Week zone: show day names or dates
-                    if (daysFromEnd <= 7) {
-                        return d.toLocaleDateString('en-US', { weekday: 'short', day: 'numeric' });
-                    }
-                    // History: show dates
+                    // Week/History: show dates
                     return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
                 }
             }
@@ -612,19 +660,21 @@ async function loadStation(stationId) {
         zoneHistory.style.display = 'none';
         zoneWeek.style.width = '85%';
         zoneToday.style.width = '15%';
-        zoneWeek.textContent = 'This week';
-        zoneToday.textContent = 'Today';
+        zoneWeek.textContent = '';
+        zoneToday.textContent = '';
 
         pipsConfig = {
             mode: 'positions',
-            values: [0, 12, 24, 36, 48, 60, 72, 85, 88, 91, 94, 97, 100],
+            values: [0, 20, 40, 60, 85, 100],
             format: {
                 to: v => {
                     const d = new Date(v);
                     const hoursFromEnd = (maxTs - v) / 3600000;
                     if (hoursFromEnd <= 24) {
                         const h = d.getHours();
-                        return h === 0 ? d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : h + ':00';
+                        if (h === 0) return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                        if (h === 12) return '12:00';
+                        return '';
                     }
                     return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
                 }
@@ -636,11 +686,11 @@ async function loadStation(stationId) {
         zoneHistory.style.display = 'none';
         zoneWeek.style.display = 'none';
         zoneToday.style.width = '100%';
-        zoneToday.textContent = 'All data';
+        zoneToday.textContent = '';
 
         pipsConfig = {
             mode: 'count',
-            values: 8,
+            values: 6,
             format: {
                 to: v => {
                     const d = new Date(v);
@@ -806,8 +856,9 @@ function updateTooltip(idx, mouseX, mouseY) {
     });
 
     let html = '';
-    Object.keys(state.chartData).sort().forEach(type => {
-        if (!state.sensors.has(type)) return;
+    // Use original sensor type order for consistent display
+    state.sensorTypeOrder.forEach(type => {
+        if (!state.sensors.has(type) || !state.chartData[type]) return;
         const { sensors } = state.chartData[type];
         sensors.forEach(sensor => {
             const values = sensor.values || sensor.avg || [];
@@ -823,19 +874,20 @@ function updateTooltip(idx, mouseX, mouseY) {
     tooltipValues.innerHTML = html;
     tooltip.classList.add('visible');
 
-    // Position tooltip near cursor but not overlapping
+    // Position tooltip below and to the right of cursor
     const rect = tooltip.getBoundingClientRect();
-    let left = mouseX + 15;
-    let top = mouseY - rect.height / 2;
+    let left = mouseX + 20;
+    let top = mouseY + 20;
 
-    // Keep on screen
+    // Keep on screen - prefer bottom-right, fallback to other positions
     if (left + rect.width > window.innerWidth - 10) {
-        left = mouseX - rect.width - 15;
+        left = mouseX - rect.width - 20;  // Move to left side
     }
-    if (top < 10) top = 10;
     if (top + rect.height > window.innerHeight - 10) {
-        top = window.innerHeight - rect.height - 10;
+        top = mouseY - rect.height - 20;  // Move above cursor
     }
+    if (left < 10) left = 10;
+    if (top < 10) top = 10;
 
     tooltip.style.left = left + 'px';
     tooltip.style.top = top + 'px';
@@ -924,15 +976,36 @@ function updateCharts() {
         state.chartData[type] = { sensors: typeSensors, timestamps };
 
         let chartDiv = document.getElementById(`chart-${type}`);
+        const isExpanded = state.expandedCharts.has(type);
+        const chartHeight = isExpanded ? CHART_HEIGHT_EXPANDED : CHART_HEIGHT_NORMAL;
+
         if (!chartDiv) {
             chartDiv = document.createElement('div');
             chartDiv.id = `chart-${type}`;
             chartDiv.className = 'sensor-chart';
-            chartDiv.innerHTML = `<div class="chart-label" style="color: ${sensorColors[type]}">${type} (${typeSensors[0]?.units || ''})</div><div class="chart-area"></div>`;
+            chartDiv.innerHTML = `
+                <div class="chart-label" style="color: ${sensorColors[type]}">${type} (${typeSensors[0]?.units || ''})</div>
+                <div class="chart-area"></div>
+                <button class="chart-expand" data-type="${type}" title="Expand/collapse chart">⤢</button>
+            `;
             container.appendChild(chartDiv);
+
+            // Add expand button handler
+            chartDiv.querySelector('.chart-expand').addEventListener('click', (e) => {
+                const t = e.target.dataset.type;
+                if (state.expandedCharts.has(t)) {
+                    state.expandedCharts.delete(t);
+                } else {
+                    state.expandedCharts.add(t);
+                }
+                updateCharts();
+            });
         }
 
         const chartArea = chartDiv.querySelector('.chart-area');
+        const expandBtn = chartDiv.querySelector('.chart-expand');
+        expandBtn.textContent = isExpanded ? '⤡' : '⤢';
+        expandBtn.title = isExpanded ? 'Collapse chart' : 'Expand chart';
 
         // Build series data for this type
         const seriesData = [timestamps];
@@ -951,7 +1024,7 @@ function updateCharts() {
 
         const opts = {
             width: container.clientWidth - 32,
-            height: 180,
+            height: chartHeight,
             scales: { x: { time: true }, y: { auto: true } },
             axes: [
                 { stroke: '#64748b', grid: { stroke: '#e2e8f0' }, size: 40 },
@@ -1017,8 +1090,9 @@ document.getElementById('charts-container').addEventListener('mouseleave', hideT
 window.addEventListener('resize', debounce(() => {
     const container = document.getElementById('charts-container');
     const width = container.clientWidth - 32;
-    Object.values(state.charts).forEach(chart => {
-        chart.setSize({ width, height: 180 });
+    Object.entries(state.charts).forEach(([type, chart]) => {
+        const height = state.expandedCharts.has(type) ? CHART_HEIGHT_EXPANDED : CHART_HEIGHT_NORMAL;
+        chart.setSize({ width, height });
     });
 }, 100));
 
