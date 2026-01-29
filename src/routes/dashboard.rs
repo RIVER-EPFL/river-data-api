@@ -1144,8 +1144,13 @@ function updateCharts() {
         chartArea.innerHTML = '';
         state.charts[type] = new uPlot(opts, seriesData, chartArea);
 
-        // Double-click to zoom out
-        chartArea.addEventListener('dblclick', () => zoom(2));
+        // Double-click to reset to full timeline
+        chartArea.addEventListener('dblclick', () => {
+            if (!state.station?.data_start || !state.station?.data_end) return;
+            const minTs = new Date(state.station.data_start).getTime();
+            const maxTs = new Date(state.station.data_end).getTime();
+            state.slider.set([minTs, maxTs]);
+        });
     });
 
     // Remove placeholder if we have charts

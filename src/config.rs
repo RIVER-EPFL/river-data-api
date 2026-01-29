@@ -71,13 +71,21 @@ impl Config {
         dotenvy::dotenv().ok();
 
         Ok(Self {
-            // Database
-            database_url: env::var("DATABASE_URL")
-                .map_err(|_| ConfigError::Missing("DATABASE_URL"))?,
+            // Database: prefer DATABASE_URL, fall back to individual DB_* vars
+            database_url: env::var("DATABASE_URL").or_else(|_| {
+                let user = env::var("DB_USER")?;
+                let password = env::var("DB_PASSWORD")?;
+                let host = env::var("DB_HOST")?;
+                let port = env::var("DB_PORT").unwrap_or_else(|_| "5432".to_string());
+                let name = env::var("DB_NAME")?;
+                Ok::<String, env::VarError>(format!(
+                    "postgresql://{user}:{password}@{host}:{port}/{name}"
+                ))
+            }).map_err(|_| ConfigError::Missing("DATABASE_URL or DB_USER/DB_PASSWORD/DB_HOST/DB_NAME"))?,
 
             // Vaisala API
             vaisala_base_url: env::var("VAISALA_BASE_URL")
-                .unwrap_or_else(|_| "https://your-vaisala-server.local/rest/v1".to_string()),
+                .map_err(|_| ConfigError::Missing("VAISALA_BASE_URL"))?,
             vaisala_bearer_token: env::var("VAISALA_BEARER_TOKEN")
                 .map_err(|_| ConfigError::Missing("VAISALA_BEARER_TOKEN"))?,
             vaisala_skip_tls_verify: env::var("VAISALA_SKIP_TLS_VERIFY")

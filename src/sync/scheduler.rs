@@ -92,12 +92,12 @@ pub async fn run_readings_sync(state: AppState) {
         }
 
         // If full sync succeeded, update the last_full_sync timestamp for all sensors
+        // and refresh aggregates for the entire history
         if force_full_sync && sync_succeeded {
             worker::update_last_full_sync_for_all_sensors(&state.db).await;
-        }
-
-        // Refresh continuous aggregates after successful sync
-        if sync_succeeded {
+            worker::refresh_continuous_aggregates_full(&state.db).await;
+        } else if sync_succeeded {
+            // Incremental sync: only refresh recent data
             worker::refresh_continuous_aggregates(&state.db).await;
         }
 

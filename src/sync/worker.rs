@@ -1070,3 +1070,29 @@ pub async fn refresh_continuous_aggregates(db: &DatabaseConnection) {
         Err(e) => tracing::warn!(error = %e, "Failed to refresh daily aggregate"),
     }
 }
+
+/// Refresh all continuous aggregates for the entire data range.
+///
+/// Called after a full sync to ensure all historical data is aggregated.
+/// Uses NULL, NULL to refresh the entire materialized range.
+pub async fn refresh_continuous_aggregates_full(db: &DatabaseConnection) {
+    tracing::info!("Refreshing continuous aggregates for full history...");
+
+    let aggregates = ["readings_hourly", "readings_daily", "readings_weekly", "readings_monthly"];
+
+    for agg in aggregates {
+        let result = db
+            .execute(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!("CALL refresh_continuous_aggregate('{agg}', NULL, NULL)"),
+            ))
+            .await;
+
+        match result {
+            Ok(_) => tracing::info!(aggregate = agg, "Continuous aggregate refreshed"),
+            Err(e) => tracing::warn!(error = %e, aggregate = agg, "Failed to refresh aggregate"),
+        }
+    }
+
+    tracing::info!("Full continuous aggregate refresh completed");
+}

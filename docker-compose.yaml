@@ -16,7 +16,11 @@ services:
       dockerfile: Dockerfile.dev
     environment:
       # Database
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-psql}@river-db-timescale:5432/${POSTGRES_DB:-postgres}
+      - DB_USER=${POSTGRES_USER:-postgres}
+      - DB_PASSWORD=${POSTGRES_PASSWORD:-psql}
+      - DB_HOST=river-db-timescale
+      - DB_PORT=5432
+      - DB_NAME=${POSTGRES_DB:-postgres}
       # Vaisala API
       - VAISALA_BASE_URL=${VAISALA_BASE_URL:-http://localhost:9999}
       - VAISALA_BEARER_TOKEN=${VAISALA_BEARER_TOKEN:-offline-dev-token}
