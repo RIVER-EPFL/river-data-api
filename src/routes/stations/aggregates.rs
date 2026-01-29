@@ -18,9 +18,11 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::sensors;
+use crate::entity::{sensors, zones};
 use crate::error::{AppError, AppResult};
-use crate::routes::resolve_station;
+use crate::routes::{cache, resolve_station};
+
+use super::types::{StationRef, ZoneRef};
 
 /// Maximum time range allowed (90 days)
 const MAX_TIME_RANGE_DAYS: i64 = 90;
@@ -40,6 +42,10 @@ fn default_format() -> String {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AggregatesResponse {
+    /// Zone this data belongs to
+    pub zone: Option<ZoneRef>,
+    /// Station this data belongs to
+    pub station: StationRef,
     /// Aggregation resolution
     pub resolution: String,
     /// Start of time range
@@ -59,8 +65,6 @@ pub struct SensorAggregateData {
     #[serde(rename = "type")]
     pub sensor_type: String,
     pub units: Option<String>,
-    pub station_id: Uuid,
-    pub station: String,
     /// Average values array (same length as times)
     pub avg: Vec<Option<f64>>,
     /// Minimum values array
@@ -247,7 +251,7 @@ pub struct StationAggregatesQuery {
         (status = 400, description = "Invalid resolution or query parameters"),
         (status = 404, description = "Station not found"),
     ),
-    tag = "aggregates"
+    tag = "stations"
 )]
 pub async fn get_station_aggregates(
     State(state): State<AppState>,
@@ -255,9 +259,25 @@ pub async fn get_station_aggregates(
     Query(query): Query<StationAggregatesQuery>,
     headers: HeaderMap,
 ) -> AppResult<Response> {
-    use super::cache;
-
     let station = resolve_station(&state.db, &station_id).await?;
+
+    // Fetch zone info if available
+    let zone_ref = if let Some(zone_id) = station.zone_id {
+        zones::Entity::find_by_id(zone_id)
+            .one(&state.db)
+            .await?
+            .map(|z| ZoneRef {
+                id: z.id,
+                name: z.name,
+            })
+    } else {
+        None
+    };
+
+    let station_ref = StationRef {
+        id: station.id,
+        name: station.name.clone(),
+    };
 
     // Validate resolution
     let view_name = match resolution.as_str() {
@@ -348,6 +368,8 @@ pub async fn get_station_aggregates(
 
     if sensor_ids.is_empty() {
         return Ok(Json(AggregatesResponse {
+            zone: zone_ref,
+            station: station_ref,
             resolution: resolution.clone(),
             start: query.start,
             end: query.end,
@@ -441,8 +463,6 @@ pub async fn get_station_aggregates(
                 name: sensor.name.clone(),
                 sensor_type: sensor.sensor_type.clone(),
                 units: sensor.display_units.clone(),
-                station_id: sensor.station_id,
-                station: station.name.clone(),
                 avg,
                 min,
                 max,
@@ -460,6 +480,8 @@ pub async fn get_station_aggregates(
         "ndjson" => build_ndjson_response(&times, &sensor_data),
         _ => {
             let response = AggregatesResponse {
+                zone: zone_ref,
+                station: station_ref,
                 resolution,
                 start: query.start,
                 end: query.end,

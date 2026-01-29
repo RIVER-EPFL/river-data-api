@@ -1,21 +1,17 @@
-pub mod aggregates;
-pub mod cache;
-pub mod health;
-pub mod hierarchy;
-mod rate_limit;
-pub mod readings;
+pub mod sensors;
+pub mod stations;
+pub mod zones;
 
-use axum::{
-    extract::{Path, State},
-    routing::get,
-    Json, Router,
-};
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Condition, sea_query::Expr};
+// Re-export cache from services for use in route handlers
+pub use crate::services::cache;
+
+use axum::{http::StatusCode, routing::get, Router};
+use sea_orm::{Condition, DatabaseConnection, EntityTrait, QueryFilter, sea_query::Expr};
 use std::sync::Arc;
 use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use uuid::Uuid;
 
-use rate_limit::FallbackIpKeyExtractor;
+use crate::services::FallbackIpKeyExtractor;
 use tower_http::{
     compression::CompressionLayer,
     cors::{Any, CorsLayer},
@@ -26,24 +22,48 @@ use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
 use crate::common::AppState;
-use crate::entity::{sensors, stations, zones};
+use crate::entity::{stations as stations_entity, zones as zones_entity};
 use crate::error::{AppError, AppResult};
+
+// ============================================================================
+// Root Endpoints
+// ============================================================================
+
+/// Health check endpoint
+///
+/// Returns 200 OK if the service is running.
+/// This endpoint is not rate-limited and suitable for Kubernetes probes.
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    responses(
+        (status = 200, description = "Service is healthy"),
+    ),
+    tag = "health"
+)]
+async fn healthz() -> StatusCode {
+    StatusCode::OK
+}
+
+// ============================================================================
+// Resolution Helpers
+// ============================================================================
 
 /// Resolve a zone by UUID or name (case-insensitive)
 pub async fn resolve_zone(
     db: &DatabaseConnection,
     id_or_name: &str,
-) -> AppResult<zones::Model> {
+) -> AppResult<zones_entity::Model> {
     // Try UUID first
     if let Ok(uuid) = id_or_name.parse::<Uuid>() {
-        return zones::Entity::find_by_id(uuid)
+        return zones_entity::Entity::find_by_id(uuid)
             .one(db)
             .await?
-            .ok_or_else(|| AppError::NotFound(format!("Zone '{id_or_name}' not found")));
+            .ok_or_else(|| AppError::NotFound("Zone not found".to_string()));
     }
 
     // Fall back to case-insensitive name lookup using LOWER()
-    zones::Entity::find()
+    zones_entity::Entity::find()
         .filter(
             Condition::all().add(
                 Expr::cust_with_values("LOWER(name) = LOWER($1)", [id_or_name])
@@ -51,24 +71,24 @@ pub async fn resolve_zone(
         )
         .one(db)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("Zone '{id_or_name}' not found")))
+        .ok_or_else(|| AppError::NotFound("Zone not found".to_string()))
 }
 
 /// Resolve a station by UUID or name (case-insensitive)
 pub async fn resolve_station(
     db: &DatabaseConnection,
     id_or_name: &str,
-) -> AppResult<stations::Model> {
+) -> AppResult<stations_entity::Model> {
     // Try UUID first
     if let Ok(uuid) = id_or_name.parse::<Uuid>() {
-        return stations::Entity::find_by_id(uuid)
+        return stations_entity::Entity::find_by_id(uuid)
             .one(db)
             .await?
-            .ok_or_else(|| AppError::NotFound(format!("Station '{id_or_name}' not found")));
+            .ok_or_else(|| AppError::NotFound("Station not found".to_string()));
     }
 
     // Fall back to case-insensitive name lookup using LOWER()
-    stations::Entity::find()
+    stations_entity::Entity::find()
         .filter(
             Condition::all().add(
                 Expr::cust_with_values("LOWER(name) = LOWER($1)", [id_or_name])
@@ -76,37 +96,46 @@ pub async fn resolve_station(
         )
         .one(db)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("Station '{id_or_name}' not found")))
+        .ok_or_else(|| AppError::NotFound("Station not found".to_string()))
 }
+
+// ============================================================================
+// OpenAPI Documentation
+// ============================================================================
 
 #[derive(OpenApi)]
 #[openapi(
     paths(
-        health::healthz,
-        hierarchy::list_zones,
-        hierarchy::list_stations,
-        hierarchy::list_sensors,
-        readings::get_station_readings,
-        aggregates::get_station_aggregates,
-        list_zone_stations,
-        list_station_sensors,
+        healthz,
+        zones::list_zones,
+        zones::get_zone,
+        zones::list_zone_stations,
+        stations::list_stations,
+        stations::get_station,
+        stations::list_station_sensors,
+        stations::get_station_readings,
+        stations::get_station_aggregates,
+        sensors::list_sensors,
     ),
     components(
         schemas(
-            hierarchy::ZoneResponse,
-            hierarchy::StationResponse,
-            hierarchy::SensorResponse,
-            readings::ReadingsResponse,
-            readings::SensorData,
-            aggregates::AggregatesResponse,
-            aggregates::SensorAggregateData,
+            zones::ZoneResponse,
+            stations::StationResponse,
+            stations::StationDetailResponse,
+            stations::StationRef,
+            stations::ZoneRef,
+            sensors::SensorResponse,
+            stations::ReadingsResponse,
+            stations::SensorData,
+            stations::AggregatesResponse,
+            stations::SensorAggregateData,
         )
     ),
     tags(
         (name = "health", description = "Health check endpoints"),
-        (name = "hierarchy", description = "Zones, stations, and sensors"),
-        (name = "readings", description = "Raw sensor readings"),
-        (name = "aggregates", description = "Pre-computed aggregates"),
+        (name = "zones", description = "Zone management"),
+        (name = "stations", description = "Station management and data"),
+        (name = "sensors", description = "Sensor management"),
     ),
     info(
         title = "River DB API",
@@ -115,6 +144,10 @@ pub async fn resolve_station(
     )
 )]
 struct ApiDoc;
+
+// ============================================================================
+// Router Builder
+// ============================================================================
 
 pub fn build_router(state: AppState) -> Router {
     let config = &state.config;
@@ -130,22 +163,25 @@ pub fn build_router(state: AppState) -> Router {
         );
     }
 
-    // Base routes without rate limiting
+    // Metadata routes (zones, stations, sensors listings)
     let metadata_routes_base = Router::new()
-        .route("/zones", get(hierarchy::list_zones))
-        .route("/zones/{zone_id}/stations", get(list_zone_stations))
-        .route("/stations", get(hierarchy::list_stations))
-        .route("/stations/{station_id}/sensors", get(list_station_sensors))
-        .route("/sensors", get(hierarchy::list_sensors));
+        .route("/zones", get(zones::list_zones))
+        .route("/zones/{zone_id}", get(zones::get_zone))
+        .route("/zones/{zone_id}/stations", get(zones::list_zone_stations))
+        .route("/stations", get(stations::list_stations))
+        .route("/stations/{station_id}", get(stations::get_station))
+        .route("/stations/{station_id}/sensors", get(stations::list_station_sensors))
+        .route("/sensors", get(sensors::list_sensors));
 
+    // Data routes (readings, aggregates)
     let data_routes_base = Router::new()
         .route(
             "/stations/{station_id}/readings",
-            get(readings::get_station_readings),
+            get(stations::get_station_readings),
         )
         .route(
             "/stations/{station_id}/aggregates/{resolution}",
-            get(aggregates::get_station_aggregates),
+            get(stations::get_station_aggregates),
         );
 
     // Combine API routes, conditionally applying rate limiting
@@ -179,7 +215,7 @@ pub fn build_router(state: AppState) -> Router {
     .layer(RequestBodyLimitLayer::new(1024 * 1024)); // 1MB body limit
 
     // Health check routes (NO rate limiting)
-    let health_routes = Router::new().route("/healthz", get(health::healthz));
+    let health_routes = Router::new().route("/healthz", get(healthz));
 
     // OpenAPI documentation
     let docs_routes = Router::new().merge(Scalar::with_url("/docs", ApiDoc::openapi()));
@@ -198,88 +234,4 @@ pub fn build_router(state: AppState) -> Router {
         )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
-}
-
-/// List stations belonging to a zone
-#[utoipa::path(
-    get,
-    path = "/api/zones/{zone_id}/stations",
-    params(
-        ("zone_id" = String, Path, description = "Zone UUID or name"),
-    ),
-    responses(
-        (status = 200, description = "Stations retrieved successfully", body = Vec<hierarchy::StationResponse>),
-        (status = 404, description = "Zone not found"),
-    ),
-    tag = "hierarchy"
-)]
-async fn list_zone_stations(
-    State(state): State<AppState>,
-    Path(zone_id): Path<String>,
-) -> AppResult<Json<Vec<hierarchy::StationResponse>>> {
-    let zone = resolve_zone(&state.db, &zone_id).await?;
-
-    // Get stations for this zone
-    let stations_list = stations::Entity::find()
-        .filter(stations::Column::ZoneId.eq(zone.id))
-        .order_by_asc(stations::Column::Name)
-        .all(&state.db)
-        .await?;
-
-    let response: Vec<hierarchy::StationResponse> = stations_list
-        .into_iter()
-        .map(|s| hierarchy::StationResponse {
-            id: s.id,
-            zone_id: s.zone_id,
-            name: s.name,
-            latitude: s.latitude,
-            longitude: s.longitude,
-            altitude_m: s.altitude_m,
-        })
-        .collect();
-
-    Ok(Json(response))
-}
-
-/// List sensors belonging to a station
-#[utoipa::path(
-    get,
-    path = "/api/stations/{station_id}/sensors",
-    params(
-        ("station_id" = String, Path, description = "Station UUID or name"),
-    ),
-    responses(
-        (status = 200, description = "Sensors retrieved successfully", body = Vec<hierarchy::SensorResponse>),
-        (status = 404, description = "Station not found"),
-    ),
-    tag = "hierarchy"
-)]
-async fn list_station_sensors(
-    State(state): State<AppState>,
-    Path(station_id): Path<String>,
-) -> AppResult<Json<Vec<hierarchy::SensorResponse>>> {
-    let station = resolve_station(&state.db, &station_id).await?;
-
-    // Get sensors for this station (active only by default)
-    let sensors_list = sensors::Entity::find()
-        .filter(sensors::Column::StationId.eq(station.id))
-        .filter(sensors::Column::IsActive.eq(true))
-        .order_by_asc(sensors::Column::Name)
-        .all(&state.db)
-        .await?;
-
-    let response: Vec<hierarchy::SensorResponse> = sensors_list
-        .into_iter()
-        .map(|s| hierarchy::SensorResponse {
-            id: s.id,
-            station_id: s.station_id,
-            name: s.name,
-            sensor_type: s.sensor_type,
-            display_units: s.display_units,
-            sample_interval_sec: s.sample_interval_sec,
-            is_active: s.is_active,
-        })
-        .collect();
-
-    Ok(Json(response))
 }

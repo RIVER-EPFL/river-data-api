@@ -45,4 +45,3 @@ impl KeyExtractor for FallbackIpKeyExtractor {
         Ok(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)))
     }
 }
-

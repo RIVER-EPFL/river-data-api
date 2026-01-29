@@ -58,15 +58,6 @@ struct MaxTimeRow {
 ///
 /// Components are joined with `:` separator. Empty components are included
 /// to ensure different queries produce different keys.
-///
-/// # Example
-///
-/// ```
-/// use river_db::routes::cache::cache_key;
-///
-/// let key = cache_key("readings", &["station-uuid", "2025-01-01", "2025-12-31", "", "json"]);
-/// assert_eq!(key, "readings:station-uuid:2025-01-01:2025-12-31::json");
-/// ```
 pub fn cache_key(prefix: &str, components: &[&str]) -> String {
     let mut key = prefix.to_string();
     for c in components {
@@ -265,13 +256,6 @@ pub async fn invalidate(state: &AppState, cache_key: &str) {
 ///
 /// Useful for invalidating all cached data for a specific station
 /// or data type.
-///
-/// # Example
-///
-/// ```text
-/// // Invalidate all readings cache for a station
-/// cache::invalidate_prefix(&state, &format!("readings:{}", station_id)).await;
-/// ```
 pub async fn invalidate_prefix(state: &AppState, prefix: &str) {
     let prefix_owned = prefix.to_string();
     let _ = state.response_cache.invalidate_entries_if(move |key, _| {

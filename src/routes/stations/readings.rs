@@ -18,9 +18,11 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::sensors;
+use crate::entity::{sensors, zones};
 use crate::error::{AppError, AppResult};
-use crate::routes::resolve_station;
+use crate::routes::{cache, resolve_station};
+
+use super::types::{StationRef, ZoneRef};
 
 /// Minimal struct for efficient readings query
 #[derive(Debug, FromQueryResult)]
@@ -47,6 +49,10 @@ fn default_format() -> String {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ReadingsResponse {
+    /// Zone this data belongs to
+    pub zone: Option<ZoneRef>,
+    /// Station this data belongs to
+    pub station: StationRef,
     /// Start of time range (null if no data)
     pub start: Option<DateTime<Utc>>,
     /// End of time range (null if no data)
@@ -64,8 +70,6 @@ pub struct SensorData {
     #[serde(rename = "type")]
     pub sensor_type: String,
     pub units: Option<String>,
-    pub station_id: Uuid,
-    pub station: String,
     /// Values array (same length as times, null for missing data)
     pub values: Vec<Option<f64>>,
 }
@@ -207,7 +211,7 @@ pub struct StationReadingsQuery {
         (status = 400, description = "Invalid query parameters"),
         (status = 404, description = "Station not found"),
     ),
-    tag = "readings"
+    tag = "stations"
 )]
 pub async fn get_station_readings(
     State(state): State<AppState>,
@@ -215,9 +219,25 @@ pub async fn get_station_readings(
     Query(query): Query<StationReadingsQuery>,
     headers: HeaderMap,
 ) -> AppResult<Response> {
-    use super::cache;
-
     let station = resolve_station(&state.db, &station_id).await?;
+
+    // Fetch zone info if available
+    let zone_ref = if let Some(zone_id) = station.zone_id {
+        zones::Entity::find_by_id(zone_id)
+            .one(&state.db)
+            .await?
+            .map(|z| ZoneRef {
+                id: z.id,
+                name: z.name,
+            })
+    } else {
+        None
+    };
+
+    let station_ref = StationRef {
+        id: station.id,
+        name: station.name.clone(),
+    };
 
     // Validate time range if both provided
     if let (Some(start), Some(end)) = (query.start, query.end) {
@@ -292,6 +312,8 @@ pub async fn get_station_readings(
 
     if sensors_list.is_empty() {
         return Ok(Json(ReadingsResponse {
+            zone: zone_ref,
+            station: station_ref,
             start: None,
             end: None,
             times: vec![],
@@ -391,8 +413,6 @@ pub async fn get_station_readings(
                 name: sensor.name.clone(),
                 sensor_type: sensor.sensor_type.clone(),
                 units: sensor.display_units.clone(),
-                station_id: sensor.station_id,
-                station: station.name.clone(),
                 values,
             }
         })
@@ -408,6 +428,8 @@ pub async fn get_station_readings(
         "ndjson" => build_ndjson_response(&times, &sensor_data),
         _ => {
             let response = ReadingsResponse {
+                zone: zone_ref,
+                station: station_ref,
                 start: actual_start,
                 end: actual_end,
                 times,

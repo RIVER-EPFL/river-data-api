@@ -113,30 +113,32 @@ impl Config {
                 .unwrap_or(3000),
 
             // Rate limiting
+            // With response caching, rate limits primarily prevent bandwidth abuse
+            // rather than DB protection. Cache handles repeated queries efficiently.
             disable_rate_limiting: env::var("DISABLE_RATE_LIMITING")
                 .unwrap_or_else(|_| "false".to_string())
                 .parse()
                 .unwrap_or(false),
             rate_limit_metadata_per_second: env::var("RATE_LIMIT_METADATA_PER_SECOND")
-                .unwrap_or_else(|_| "1".to_string())
+                .unwrap_or_else(|_| "50".to_string())
                 .parse()
-                .unwrap_or(1),
+                .unwrap_or(50),
             rate_limit_metadata_burst: env::var("RATE_LIMIT_METADATA_BURST")
-                .unwrap_or_else(|_| "60".to_string())
+                .unwrap_or_else(|_| "200".to_string())
                 .parse()
-                .unwrap_or(60),
+                .unwrap_or(200),
             rate_limit_data_per_second: env::var("RATE_LIMIT_DATA_PER_SECOND")
+                .unwrap_or_else(|_| "100".to_string())
+                .parse()
+                .unwrap_or(100),
+            rate_limit_data_burst: env::var("RATE_LIMIT_DATA_BURST")
+                .unwrap_or_else(|_| "300".to_string())
+                .parse()
+                .unwrap_or(300),
+            bulk_concurrent_limit: env::var("BULK_CONCURRENT_LIMIT")
                 .unwrap_or_else(|_| "10".to_string())
                 .parse()
                 .unwrap_or(10),
-            rate_limit_data_burst: env::var("RATE_LIMIT_DATA_BURST")
-                .unwrap_or_else(|_| "60".to_string())
-                .parse()
-                .unwrap_or(60),
-            bulk_concurrent_limit: env::var("BULK_CONCURRENT_LIMIT")
-                .unwrap_or_else(|_| "5".to_string())
-                .parse()
-                .unwrap_or(5),
 
             // Caching
             cache_ttl_seconds: env::var("CACHE_TTL_SECONDS")
