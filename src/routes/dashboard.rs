@@ -227,6 +227,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             border-radius: 0.5rem;
             padding: 0.75rem 1rem;
             padding-top: 1.5rem;  /* Extra space for y-axis top labels */
+            padding-bottom: 1rem;  /* Extra space for x-axis year labels */
             position: relative;
             overflow: visible;
         }
@@ -288,23 +289,25 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             font-size: 0.7rem;
             color: var(--muted);
             margin-top: 0.5rem;
-            opacity: 0.5;
             gap: 1rem;
         }
-        .chart-footer:hover { opacity: 0.8; }
-        .chart-footer a {
-            color: inherit;
-            text-decoration: none;
-        }
-        .chart-footer a:hover { text-decoration: underline; }
         .footer-left, .footer-right {
             display: flex;
             align-items: center;
             gap: 0.4rem;
             flex-shrink: 0;
+            opacity: 0.5;
+            transition: opacity 0.15s;
         }
+        .footer-left:hover, .footer-right:hover { opacity: 0.8; }
+        .chart-footer a {
+            color: inherit;
+            text-decoration: none;
+        }
+        .chart-footer a:hover { text-decoration: underline; }
         .chart-hint {
             text-align: center;
+            opacity: 0.4;
         }
         .footer-separator { margin: 0 0.1rem; }
 
@@ -460,7 +463,10 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/nouislider@15/dist/nouislider.min.js"></script>
 <script>
-const api = url => fetch(url).then(r => r.json());
+const api = (url, noCache = false) => {
+    const finalUrl = noCache ? `${url}${url.includes('?') ? '&' : '?'}_t=${Date.now()}` : url;
+    return fetch(finalUrl).then(r => r.json());
+};
 
 const state = {
     station: null,
@@ -581,12 +587,15 @@ async function init() {
 }
 
 async function loadStation(stationId) {
-    const station = await api(`/api/stations/${stationId}`);
+    // Always fetch fresh station data to get latest data_start/data_end
+    const station = await api(`/api/stations/${stationId}`, true);
     state.station = station;
 
-    // Clear existing charts
+    // Clear existing charts and their DOM elements
     Object.values(state.charts).forEach(chart => chart.destroy());
     state.charts = {};
+    state.chartData = {};
+    document.getElementById('charts-container').innerHTML = '';
 
     // Build sensor toggles
     const toggles = document.getElementById('sensor-toggles');
@@ -1058,7 +1067,21 @@ function updateCharts() {
                 <div class="chart-area"></div>
                 <button class="chart-expand" data-type="${type}" title="Expand/collapse chart">⤢</button>
             `;
-            container.appendChild(chartDiv);
+            // Insert at correct sorted position to maintain consistent order
+            const currentIndex = enabledTypes.indexOf(type);
+            let insertBefore = null;
+            for (let i = currentIndex + 1; i < enabledTypes.length; i++) {
+                const nextChart = document.getElementById(`chart-${enabledTypes[i]}`);
+                if (nextChart) {
+                    insertBefore = nextChart;
+                    break;
+                }
+            }
+            if (insertBefore) {
+                container.insertBefore(chartDiv, insertBefore);
+            } else {
+                container.appendChild(chartDiv);
+            }
 
             // Add expand button handler
             chartDiv.querySelector('.chart-expand').addEventListener('click', (e) => {
@@ -1095,9 +1118,10 @@ function updateCharts() {
         const opts = {
             width: container.clientWidth - 32,
             height: chartHeight,
+            padding: [10, 10, 0, 0],  // top, right, bottom, left - extra space for labels at edges
             scales: { x: { time: true }, y: { auto: true } },
             axes: [
-                { stroke: '#64748b', grid: { stroke: '#e2e8f0' }, size: 40 },
+                { stroke: '#64748b', grid: { stroke: '#e2e8f0' }, size: 50 },  // Extra height for year on second line
                 { stroke: sensorColors[type], grid: { stroke: '#e2e8f0' }, size: 50, values: (u, vals) => vals.map(v => v == null ? '' : v.toFixed(1)) }
             ],
             series: seriesOpts,
