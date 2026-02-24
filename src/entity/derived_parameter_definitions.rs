@@ -1,12 +1,12 @@
 use crudcrate::{CRUDResource, EntityToModels};
 use sea_orm::entity::prelude::*;
 
-#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels)]
-#[sea_orm(table_name = "projects")]
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels)]
+#[sea_orm(table_name = "derived_parameter_definitions")]
 #[crudcrate(
-    api_struct = "Project",
-    name_singular = "project",
-    name_plural = "projects",
+    api_struct = "DerivedParameterDefinition",
+    name_singular = "derived_parameter_definition",
+    name_plural = "derived_parameter_definitions",
     generate_router
 )]
 pub struct Model {
@@ -16,24 +16,26 @@ pub struct Model {
     #[sea_orm(unique)]
     #[crudcrate(filterable, fulltext)]
     pub name: String,
-    #[crudcrate(filterable)]
-    pub data_source: String,
+    #[crudcrate(fulltext)]
+    pub display_name: String,
+    pub units: String,
+    pub formula: String,
     pub description: Option<String>,
+    #[sea_orm(column_type = "JsonBinary")]
+    pub required_parameter_types: serde_json::Value,
     #[crudcrate(exclude(create, update))]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
-    #[crudcrate(exclude(create, update))]
-    pub discovered_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    #[sea_orm(has_many = "super::sites::Entity")]
-    Sites,
+    #[sea_orm(has_many = "super::parameters::Entity")]
+    Parameters,
 }
 
-impl Related<super::sites::Entity> for Entity {
+impl Related<super::parameters::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::Sites.def()
+        Relation::Parameters.def()
     }
 }
 

@@ -2,11 +2,11 @@ use crudcrate::{CRUDResource, EntityToModels};
 use sea_orm::entity::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels)]
-#[sea_orm(table_name = "projects")]
+#[sea_orm(table_name = "parameter_types")]
 #[crudcrate(
-    api_struct = "Project",
-    name_singular = "project",
-    name_plural = "projects",
+    api_struct = "ParameterType",
+    name_singular = "parameter_type",
+    name_plural = "parameter_types",
     generate_router
 )]
 pub struct Model {
@@ -16,24 +16,31 @@ pub struct Model {
     #[sea_orm(unique)]
     #[crudcrate(filterable, fulltext)]
     pub name: String,
-    #[crudcrate(filterable)]
-    pub data_source: String,
+    #[crudcrate(fulltext)]
+    pub display_name: String,
+    pub default_units: String,
     pub description: Option<String>,
     #[crudcrate(exclude(create, update))]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
-    #[crudcrate(exclude(create, update))]
-    pub discovered_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    #[sea_orm(has_many = "super::sites::Entity")]
-    Sites,
+    #[sea_orm(has_many = "super::sensors::Entity")]
+    Sensors,
+    #[sea_orm(has_many = "super::parameters::Entity")]
+    Parameters,
 }
 
-impl Related<super::sites::Entity> for Entity {
+impl Related<super::sensors::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::Sites.def()
+        Relation::Sensors.def()
+    }
+}
+
+impl Related<super::parameters::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Parameters.def()
     }
 }
 

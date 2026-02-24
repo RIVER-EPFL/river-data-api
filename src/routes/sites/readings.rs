@@ -1,9 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::{
-        header::{self, HeaderMap, HeaderValue},
-        StatusCode,
-    },
+    http::header::HeaderMap,
     response::{IntoResponse, Response},
     Json,
 };
@@ -11,9 +8,6 @@ use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use tokio::sync::Semaphore;
-use tokio_stream::wrappers::ReceiverStream;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
@@ -21,6 +15,7 @@ use crate::common::AppState;
 use crate::entity::{parameters, projects};
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, resolve_site};
+use crate::services::bulk::{self, StreamableParam};
 
 use super::types::{ProjectRef, SiteRef};
 
@@ -39,15 +34,6 @@ struct ReadingRowWithSeverity {
     value: f64,
     severity: Option<i16>,
 }
-
-/// Global semaphore limiting concurrent bulk (CSV/NDJSON) requests.
-static BULK_SEMAPHORE: std::sync::LazyLock<Arc<Semaphore>> = std::sync::LazyLock::new(|| {
-    let limit = std::env::var("BULK_CONCURRENT_LIMIT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
-    Arc::new(Semaphore::new(limit))
-});
 
 fn default_format() -> String {
     "json".to_string()
@@ -83,109 +69,13 @@ pub struct ParameterData {
     pub severities: Option<Vec<Option<i16>>>,
 }
 
-fn determine_format(query_format: &str, headers: &HeaderMap) -> String {
-    if query_format != "json" {
-        return query_format.to_lowercase();
+impl StreamableParam for ParameterData {
+    fn name(&self) -> &str {
+        &self.name
     }
-
-    if let Some(accept) = headers.get(header::ACCEPT)
-        && let Ok(accept_str) = accept.to_str()
-    {
-        if accept_str.contains("application/x-ndjson") {
-            return "ndjson".to_string();
-        }
-        if accept_str.contains("text/csv") {
-            return "csv".to_string();
-        }
+    fn value_at(&self, index: usize) -> Option<f64> {
+        self.values.get(index).and_then(|v| *v)
     }
-
-    "json".to_string()
-}
-
-fn build_csv_response(times: &[DateTime<Utc>], params: &[ParameterData]) -> AppResult<Response> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
-
-    let times = times.to_vec();
-    let params = params.to_vec();
-
-    tokio::spawn(async move {
-        // Header row
-        let mut header = "time".to_string();
-        for param in &params {
-            header.push(',');
-            header.push_str(&param.name);
-        }
-        header.push('\n');
-        let _ = tx.send(Ok(header)).await;
-
-        // Data rows
-        for (i, time) in times.iter().enumerate() {
-            let mut row = time.to_rfc3339();
-            for param in &params {
-                row.push(',');
-                match param.values.get(i).and_then(|v| *v) {
-                    Some(v) => row.push_str(&v.to_string()),
-                    None => {} // Empty for null
-                }
-            }
-            row.push('\n');
-            if tx.send(Ok(row)).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let stream = ReceiverStream::new(rx);
-    let body = axum::body::Body::from_stream(stream);
-
-    Response::builder()
-        .header(header::CONTENT_TYPE, HeaderValue::from_static("text/csv"))
-        .body(body)
-        .map_err(|e| AppError::Internal(e.to_string()))
-}
-
-fn build_ndjson_response(
-    times: &[DateTime<Utc>],
-    params: &[ParameterData],
-) -> AppResult<Response> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
-
-    let times = times.to_vec();
-    let params = params.to_vec();
-
-    tokio::spawn(async move {
-        for (i, time) in times.iter().enumerate() {
-            let mut obj = serde_json::Map::new();
-            obj.insert("time".to_string(), serde_json::json!(time.to_rfc3339()));
-
-            for param in &params {
-                let value = param.values.get(i).and_then(|v| *v);
-                obj.insert(
-                    param.name.clone(),
-                    match value {
-                        Some(v) => serde_json::json!(v),
-                        None => serde_json::Value::Null,
-                    },
-                );
-            }
-
-            let line = format!("{}\n", serde_json::Value::Object(obj));
-            if tx.send(Ok(line)).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let stream = ReceiverStream::new(rx);
-    let body = axum::body::Body::from_stream(stream);
-
-    Response::builder()
-        .header(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/x-ndjson"),
-        )
-        .body(body)
-        .map_err(|e| AppError::Internal(e.to_string()))
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -256,7 +146,7 @@ pub async fn get_site_readings(
         }
 
     // Determine format from query or Accept header
-    let format = determine_format(&query.format, &headers);
+    let format = bulk::determine_format(&query.format, &headers);
 
     // Build parameter query for this site only
     let mut param_query = parameters::Entity::find()
@@ -299,21 +189,7 @@ pub async fn get_site_readings(
             return cache::json_response((*cached).clone(), true);
         }
 
-    // For bulk formats (CSV/NDJSON), acquire semaphore to limit concurrent requests
-    let _permit = if format == "csv" || format == "ndjson" {
-        if let Ok(permit) = BULK_SEMAPHORE.clone().try_acquire_owned() { Some(permit) } else {
-            tracing::warn!(
-                format = %format,
-                status = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                "bulk_request_rejected"
-            );
-            return Err(AppError::ServiceUnavailable(
-                "Too many concurrent bulk requests. Please try again later.".to_string(),
-            ));
-        }
-    } else {
-        None
-    };
+    let _permit = bulk::acquire_bulk_permit(&format)?;
 
     if params_list.is_empty() {
         return Ok(Json(ReadingsResponse {
@@ -337,17 +213,17 @@ pub async fn get_site_readings(
         .join(",");
 
     let select_clause = if include_alarms {
-        r"r.parameter_id, r.time, r.value,
+        r"r.parameter_id, r.time, COALESCE(r.calibrated_value, r.raw_value) AS value,
             CASE
                 WHEN t.parameter_id IS NULL THEN NULL
-                WHEN (t.alarm_min IS NOT NULL AND r.value < t.alarm_min) OR
-                     (t.alarm_max IS NOT NULL AND r.value > t.alarm_max) THEN 2
-                WHEN (t.warning_min IS NOT NULL AND r.value < t.warning_min) OR
-                     (t.warning_max IS NOT NULL AND r.value > t.warning_max) THEN 1
+                WHEN (t.alarm_min IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) < t.alarm_min) OR
+                     (t.alarm_max IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) > t.alarm_max) THEN 2
+                WHEN (t.warning_min IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) < t.warning_min) OR
+                     (t.warning_max IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) > t.warning_max) THEN 1
                 ELSE 0
             END::smallint as severity"
     } else {
-        "r.parameter_id, r.time, r.value"
+        "r.parameter_id, r.time, COALESCE(r.calibrated_value, r.raw_value) AS value"
     };
 
     let from_clause = if include_alarms {
@@ -465,8 +341,8 @@ pub async fn get_site_readings(
     let actual_end = times.last().copied();
 
     match format.as_str() {
-        "csv" => build_csv_response(&times, &param_data),
-        "ndjson" => build_ndjson_response(&times, &param_data),
+        "csv" => bulk::build_csv_response(&times, &param_data),
+        "ndjson" => bulk::build_ndjson_response(&times, &param_data),
         _ => {
             let response = ReadingsResponse {
                 project: project_ref,

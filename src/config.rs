@@ -57,6 +57,14 @@ pub struct Config {
 
     // Application metadata
     pub deployment: Deployment,
+
+    // Keycloak authentication (all optional for gradual adoption)
+    pub keycloak_url: Option<String>,
+    pub keycloak_realm: Option<String>,
+    pub keycloak_client_id: Option<String>,
+
+    // Partner API token auth
+    pub require_partner_auth: bool,
 }
 
 impl Config {
@@ -163,6 +171,17 @@ impl Config {
                 .unwrap_or_else(|_| "local".to_string())
                 .parse()
                 .unwrap_or(Deployment::Local),
+
+            // Keycloak authentication (optional)
+            keycloak_url: env::var("KEYCLOAK_URL").ok().filter(|s| !s.is_empty()),
+            keycloak_realm: env::var("KEYCLOAK_REALM").ok().filter(|s| !s.is_empty()),
+            keycloak_client_id: env::var("KEYCLOAK_CLIENT_ID").ok().filter(|s| !s.is_empty()),
+
+            // Partner API auth
+            require_partner_auth: env::var("REQUIRE_PARTNER_AUTH")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
         })
     }
 

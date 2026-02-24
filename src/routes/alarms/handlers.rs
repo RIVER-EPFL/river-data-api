@@ -2,7 +2,6 @@ use axum::{
     extract::{Path, Query, State},
     http::{
         header::{self, HeaderMap, HeaderValue},
-        StatusCode,
     },
     response::{IntoResponse, Response},
     Json,
@@ -10,8 +9,6 @@ use axum::{
 use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use tokio::sync::Semaphore;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
@@ -19,6 +16,7 @@ use crate::common::AppState;
 use crate::entity::{alarm_thresholds, parameters, projects};
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, resolve_site};
+use crate::services::bulk;
 
 use super::types::{AlarmViolationsResponse, ParameterViolationData, SiteAlarmsQuery};
 use crate::routes::sites::{ProjectRef, SiteRef};
@@ -38,34 +36,6 @@ struct ParameterWithThreshold {
     name: String,
     sensor_type: String,
     display_units: Option<String>,
-}
-
-/// Global semaphore limiting concurrent bulk (CSV/NDJSON) requests.
-static BULK_SEMAPHORE: std::sync::LazyLock<Arc<Semaphore>> = std::sync::LazyLock::new(|| {
-    let limit = std::env::var("BULK_CONCURRENT_LIMIT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
-    Arc::new(Semaphore::new(limit))
-});
-
-fn determine_format(query_format: &str, headers: &HeaderMap) -> String {
-    if query_format != "json" {
-        return query_format.to_lowercase();
-    }
-
-    if let Some(accept) = headers.get(header::ACCEPT)
-        && let Ok(accept_str) = accept.to_str()
-    {
-        if accept_str.contains("application/x-ndjson") {
-            return "ndjson".to_string();
-        }
-        if accept_str.contains("text/csv") {
-            return "csv".to_string();
-        }
-    }
-
-    "json".to_string()
 }
 
 fn build_csv_response(
@@ -214,7 +184,7 @@ pub async fn get_site_alarms(
         ));
     }
 
-    let format = determine_format(&query.format, &headers);
+    let format = bulk::determine_format(&query.format, &headers);
 
     // Build parameter query for this site
     let mut param_query = parameters::Entity::find()
@@ -297,20 +267,7 @@ pub async fn get_site_alarms(
             return cache::json_response((*cached).clone(), true);
         }
 
-    let _permit = if format == "csv" || format == "ndjson" {
-        if let Ok(permit) = BULK_SEMAPHORE.clone().try_acquire_owned() { Some(permit) } else {
-            tracing::warn!(
-                format = %format,
-                status = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                "bulk_request_rejected"
-            );
-            return Err(AppError::ServiceUnavailable(
-                "Too many concurrent bulk requests. Please try again later.".to_string(),
-            ));
-        }
-    } else {
-        None
-    };
+    let _permit = bulk::acquire_bulk_permit(&format)?;
 
     let param_ids_str = params_with_thresholds
         .iter()
@@ -320,18 +277,22 @@ pub async fn get_site_alarms(
 
     let min_severity = query.severity.unwrap_or(1);
 
+    let val_expr = "COALESCE(r.calibrated_value, r.raw_value)";
+
     let violation_condition = if min_severity >= 2 {
-        r"(
-            (t.alarm_min IS NOT NULL AND r.value < t.alarm_min) OR
-            (t.alarm_max IS NOT NULL AND r.value > t.alarm_max)
-        )"
+        format!(
+            "(
+            (t.alarm_min IS NOT NULL AND {val_expr} < t.alarm_min) OR
+            (t.alarm_max IS NOT NULL AND {val_expr} > t.alarm_max)
+        )")
     } else {
-        r"(
-            (t.alarm_min IS NOT NULL AND r.value < t.alarm_min) OR
-            (t.alarm_max IS NOT NULL AND r.value > t.alarm_max) OR
-            (t.warning_min IS NOT NULL AND r.value < t.warning_min) OR
-            (t.warning_max IS NOT NULL AND r.value > t.warning_max)
-        )"
+        format!(
+            "(
+            (t.alarm_min IS NOT NULL AND {val_expr} < t.alarm_min) OR
+            (t.alarm_max IS NOT NULL AND {val_expr} > t.alarm_max) OR
+            (t.warning_min IS NOT NULL AND {val_expr} < t.warning_min) OR
+            (t.warning_max IS NOT NULL AND {val_expr} > t.warning_max)
+        )")
     };
 
     let sql = format!(
@@ -339,12 +300,12 @@ pub async fn get_site_alarms(
         SELECT
             r.parameter_id,
             r.time,
-            r.value,
+            COALESCE(r.calibrated_value, r.raw_value) AS value,
             CASE
-                WHEN (t.alarm_min IS NOT NULL AND r.value < t.alarm_min) OR
-                     (t.alarm_max IS NOT NULL AND r.value > t.alarm_max) THEN 2
-                WHEN (t.warning_min IS NOT NULL AND r.value < t.warning_min) OR
-                     (t.warning_max IS NOT NULL AND r.value > t.warning_max) THEN 1
+                WHEN (t.alarm_min IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) < t.alarm_min) OR
+                     (t.alarm_max IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) > t.alarm_max) THEN 2
+                WHEN (t.warning_min IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) < t.warning_min) OR
+                     (t.warning_max IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) > t.warning_max) THEN 1
                 ELSE 0
             END::smallint as severity
         FROM readings r

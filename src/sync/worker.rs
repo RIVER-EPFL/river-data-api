@@ -3,7 +3,7 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-use crate::entity::{alarm_thresholds, device_status, parameters, projects, readings, sites, source_mappings, sync_state};
+use crate::entity::{alarm_thresholds, device_status, parameter_types, parameters, projects, readings, sensor_calibrations, sensor_deployments, sensors, sites, source_mappings, sync_state};
 use crate::error::AppResult;
 use crate::vaisala::VaisalaClient;
 
@@ -111,13 +111,14 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
                 let project = projects::ActiveModel {
                     id: Set(id),
                     name: Set(project_name.to_string()),
+                    data_source: Set("vaisala".to_string()),
                     description: Set(if attrs.description.is_empty() {
                         None
                     } else {
                         Some(attrs.description.clone())
                     }),
-                    created_at: Set(Some(now.into())),
-                    discovered_at: Set(Some(now.into())),
+                    created_at: Set(Some(now)),
+                    discovered_at: Set(Some(now)),
                 };
 
                 match project.insert(db).await {
@@ -183,8 +184,8 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
                     latitude: Set(None),
                     longitude: Set(None),
                     altitude_m: Set(None),
-                    created_at: Set(Some(now.into())),
-                    discovered_at: Set(Some(now.into())),
+                    created_at: Set(Some(now)),
+                    discovered_at: Set(Some(now)),
                 };
 
                 match site.insert(db).await {
@@ -260,27 +261,21 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
             // Use generic name (strip station prefix)
             let generic_name = derive_generic_name(&attrs.location_name);
 
+            // Ensure parameter_type exists for this sensor_type
+            let param_type_id = get_or_create_parameter_type(db, &sensor_type).await;
+
             let param_id = Uuid::new_v4();
             let param = parameters::ActiveModel {
                 id: Set(param_id),
                 site_id: Set(site_id),
+                parameter_type_id: Set(param_type_id),
                 name: Set(generic_name.clone()),
-                sensor_type: Set(sensor_type),
+                sensor_type: Set(sensor_type.clone()),
                 display_units: Set(Some(attrs.display_units.clone())),
                 units_name: Set(None),
                 units_min: Set(None),
                 units_max: Set(None),
                 decimal_places: Set(Some(attrs.decimal_places)),
-                device_serial_number: Set(if attrs.logger_serial_number.is_empty() {
-                    None
-                } else {
-                    Some(attrs.logger_serial_number.clone())
-                }),
-                probe_serial_number: Set(if attrs.probe_serial_number.is_empty() {
-                    None
-                } else {
-                    Some(attrs.probe_serial_number.clone())
-                }),
                 channel_id: Set(if attrs.channel_id == 0 {
                     None
                 } else {
@@ -292,9 +287,21 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
                     Some(attrs.sample_interval_sec)
                 }),
                 is_active: Set(Some(true)),
-                created_at: Set(Some(now.into())),
-                updated_at: Set(Some(now.into())),
-                discovered_at: Set(Some(now.into())),
+                is_derived: Set(Some(false)),
+                derived_definition_id: Set(None),
+                variable_mappings: Set(None),
+                created_at: Set(Some(now)),
+                updated_at: Set(Some(now)),
+                discovered_at: Set(Some(now)),
+            };
+
+            // Create sensor entity from Vaisala device serial number
+            let _sensor_id_opt = if !attrs.logger_serial_number.is_empty() {
+                create_sensor_and_deployment(
+                    db, &attrs.logger_serial_number, param_type_id, param_id, now,
+                ).await
+            } else {
+                None
             };
 
             match param.insert(db).await {
@@ -359,6 +366,134 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
     );
 
     Ok(())
+}
+
+/// Get or create a parameter_type record for the given sensor_type name.
+/// Returns the UUID of the parameter_type.
+async fn get_or_create_parameter_type(db: &DatabaseConnection, sensor_type: &str) -> Uuid {
+    // Check if it already exists
+    if let Ok(Some(existing)) = parameter_types::Entity::find()
+        .filter(parameter_types::Column::Name.eq(sensor_type))
+        .one(db)
+        .await
+    {
+        return existing.id;
+    }
+
+    // Derive display name and default units from sensor_type
+    let (display_name, default_units) = match sensor_type {
+        "Depth" => ("Water Depth", "mm"),
+        "CDOM" => ("Colored Dissolved Organic Matter", "ppb"),
+        "Turbidity" => ("Turbidity", "NTU"),
+        "Battery" => ("Battery Voltage", "V"),
+        "DO_Temperature" => ("DO Temperature", "°C"),
+        "Dissolved_O2" => ("Dissolved Oxygen", "µM"),
+        "Conductivity" => ("Conductivity", "µS/cm"),
+        "Cond_Temperature" => ("Conductivity Temperature", "°C"),
+        _ => (sensor_type, ""),
+    };
+
+    let id = Uuid::new_v4();
+    let model = parameter_types::ActiveModel {
+        id: Set(id),
+        name: Set(sensor_type.to_string()),
+        display_name: Set(display_name.to_string()),
+        default_units: Set(default_units.to_string()),
+        description: Set(None),
+        created_at: Set(Some(Utc::now())),
+    };
+
+    match model.insert(db).await {
+        Ok(pt) => pt.id,
+        Err(e) => {
+            tracing::warn!(error = %e, sensor_type = sensor_type, "Failed to create parameter_type, retrying lookup");
+            // Race condition: another sync may have created it
+            parameter_types::Entity::find()
+                .filter(parameter_types::Column::Name.eq(sensor_type))
+                .one(db)
+                .await
+                .ok()
+                .flatten()
+                .map(|pt| pt.id)
+                .unwrap_or(id)
+        }
+    }
+}
+
+/// Create a sensor entity and deployment for a newly discovered Vaisala parameter.
+/// Returns the sensor UUID if successful.
+async fn create_sensor_and_deployment(
+    db: &DatabaseConnection,
+    serial_number: &str,
+    parameter_type_id: Uuid,
+    parameter_id: Uuid,
+    now: chrono::DateTime<Utc>,
+) -> Option<Uuid> {
+    // Check if sensor with this serial number already exists
+    let existing = sensors::Entity::find()
+        .filter(sensors::Column::SerialNumber.eq(serial_number))
+        .one(db)
+        .await
+        .ok()
+        .flatten();
+
+    let sensor_id = if let Some(sensor) = existing {
+        sensor.id
+    } else {
+        let id = Uuid::new_v4();
+        let sensor = sensors::ActiveModel {
+            id: Set(id),
+            serial_number: Set(serial_number.to_string()),
+            name: Set(None),
+            parameter_type_id: Set(parameter_type_id),
+            manufacturer: Set(Some("Vaisala".to_string())),
+            model: Set(None),
+            is_active: Set(Some(true)),
+            notes: Set(None),
+            created_at: Set(Some(now)),
+        };
+        match sensor.insert(db).await {
+            Ok(s) => {
+                // Create identity calibration (slope=1, intercept=0)
+                let cal = sensor_calibrations::ActiveModel {
+                    id: Set(Uuid::new_v4()),
+                    sensor_id: Set(s.id),
+                    slope: Set(1.0),
+                    intercept: Set(0.0),
+                    valid_from: Set(now),
+                    performed_by: Set(Some("system".to_string())),
+                    notes: Set(Some("Identity calibration (auto-created)".to_string())),
+                    created_at: Set(Some(now)),
+                };
+                if let Err(e) = cal.insert(db).await {
+                    tracing::warn!(error = %e, "Failed to create identity calibration");
+                }
+                s.id
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, serial = serial_number, "Failed to create sensor");
+                return None;
+            }
+        }
+    };
+
+    // Create deployment (permanent, starting now)
+    let deployment = sensor_deployments::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        sensor_id: Set(sensor_id),
+        parameter_id: Set(parameter_id),
+        deployed_from: Set(now),
+        deployed_until: Set(None),
+        deployment_type: Set("permanent".to_string()),
+        notes: Set(Some("Auto-created from Vaisala sync".to_string())),
+        created_at: Set(Some(now)),
+    };
+
+    if let Err(e) = deployment.insert(db).await {
+        tracing::warn!(error = %e, "Failed to create sensor deployment");
+    }
+
+    Some(sensor_id)
 }
 
 /// Derive sensor type from the Vaisala sensor name.
@@ -554,7 +689,10 @@ pub async fn sync_readings(
             models.push(readings::ActiveModel {
                 parameter_id: Set(*parameter_id),
                 time: Set(time.into()),
-                value: Set(point.value),
+                raw_value: Set(point.value),
+                calibrated_value: Set(Some(point.value)), // Identity calibration: calibrated = raw
+                sensor_id: Set(None),
+                calibration_id: Set(None),
                 logged: Set(Some(point.logged)),
             });
 
@@ -868,7 +1006,7 @@ fn create_threshold_for_sensor_type(parameter_id: &Uuid, sensor_type: &str) -> a
         _ => (None, None, None, None),
     };
 
-    let now = Utc::now().fixed_offset();
+    let now = Utc::now();
     alarm_thresholds::ActiveModel {
         id: Set(Uuid::new_v4()),
         parameter_id: Set(*parameter_id),

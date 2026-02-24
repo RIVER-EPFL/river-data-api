@@ -1,0 +1,74 @@
+use crudcrate::{CRUDResource, EntityToModels};
+use sea_orm::entity::prelude::*;
+
+#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels)]
+#[sea_orm(table_name = "sensors")]
+#[crudcrate(
+    api_struct = "Sensor",
+    name_singular = "sensor",
+    name_plural = "sensors",
+    generate_router
+)]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false)]
+    #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
+    pub id: Uuid,
+    #[sea_orm(unique)]
+    #[crudcrate(filterable, fulltext)]
+    pub serial_number: String,
+    #[crudcrate(fulltext)]
+    pub name: Option<String>,
+    #[crudcrate(filterable)]
+    pub parameter_type_id: Uuid,
+    #[crudcrate(filterable)]
+    pub manufacturer: Option<String>,
+    #[crudcrate(filterable)]
+    pub model: Option<String>,
+    #[crudcrate(filterable)]
+    pub is_active: Option<bool>,
+    pub notes: Option<String>,
+    #[crudcrate(exclude(create, update))]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {
+    #[sea_orm(
+        belongs_to = "super::parameter_types::Entity",
+        from = "Column::ParameterTypeId",
+        to = "super::parameter_types::Column::Id"
+    )]
+    ParameterType,
+    #[sea_orm(has_many = "super::sensor_calibrations::Entity")]
+    SensorCalibrations,
+    #[sea_orm(has_many = "super::sensor_deployments::Entity")]
+    SensorDeployments,
+    #[sea_orm(has_many = "super::readings::Entity")]
+    Readings,
+}
+
+impl Related<super::parameter_types::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::ParameterType.def()
+    }
+}
+
+impl Related<super::sensor_calibrations::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::SensorCalibrations.def()
+    }
+}
+
+impl Related<super::sensor_deployments::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::SensorDeployments.def()
+    }
+}
+
+impl Related<super::readings::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Readings.def()
+    }
+}
+
+impl ActiveModelBehavior for ActiveModel {}

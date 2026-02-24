@@ -1,3 +1,4 @@
+use axum_keycloak_auth::instance::KeycloakAuthInstance;
 use chrono::{DateTime, Utc};
 use moka::future::Cache;
 use sea_orm::DatabaseConnection;
@@ -24,11 +25,17 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub vaisala_client: Arc<VaisalaClient>,
     pub response_cache: ResponseCache,
+    pub keycloak_auth_instance: Option<Arc<KeycloakAuthInstance>>,
 }
 
 impl AppState {
-    #[must_use] 
-    pub fn new(db: DatabaseConnection, config: Config, vaisala_client: VaisalaClient) -> Self {
+    #[must_use]
+    pub fn new(
+        db: DatabaseConnection,
+        config: Config,
+        vaisala_client: VaisalaClient,
+        keycloak_auth_instance: Option<Arc<KeycloakAuthInstance>>,
+    ) -> Self {
         // Cache weighted by byte size, not entry count
         let cache: ResponseCache = Cache::builder()
             .weigher(|_key: &String, value: &CachedResponse| -> u32 {
@@ -44,6 +51,7 @@ impl AppState {
             config: Arc::new(config),
             vaisala_client: Arc::new(vaisala_client),
             response_cache: cache,
+            keycloak_auth_instance,
         }
     }
 }

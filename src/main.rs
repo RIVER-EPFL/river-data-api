@@ -1,11 +1,15 @@
 use sea_orm::Database;
 use sea_orm_migration::MigratorTrait;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use axum_keycloak_auth::instance::{KeycloakAuthInstance, KeycloakConfig};
+use axum_keycloak_auth::Url;
+
 use river_db::common::AppState;
-use river_db::config::Config;
+use river_db::config::{Config, Deployment};
 use river_db::routes;
 use river_db::sync;
 use river_db::vaisala::VaisalaClient;
@@ -46,8 +50,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vaisala_client = VaisalaClient::new(&config);
     tracing::info!("Vaisala client initialized");
 
+    // Initialize Keycloak authentication (optional in dev, required in prod)
+    let keycloak_instance = match (&config.keycloak_url, &config.keycloak_realm) {
+        (Some(url), Some(realm)) => {
+            tracing::info!(url = %url, realm = %realm, "Initializing Keycloak authentication");
+            Some(Arc::new(KeycloakAuthInstance::new(
+                KeycloakConfig::builder()
+                    .server(Url::parse(url).expect("Invalid KEYCLOAK_URL"))
+                    .realm(realm.clone())
+                    .build(),
+            )))
+        }
+        _ => {
+            if matches!(config.deployment, Deployment::Prod) {
+                panic!(
+                    "SECURITY ERROR: Keycloak authentication is required in production. \
+                     Configure KEYCLOAK_URL and KEYCLOAK_REALM environment variables."
+                );
+            }
+            tracing::warn!("Keycloak authentication NOT configured — admin routes unprotected");
+            None
+        }
+    };
+
     // Create application state
-    let state = AppState::new(db, config.clone(), vaisala_client);
+    let state = AppState::new(db, config.clone(), vaisala_client, keycloak_instance);
 
     // Spawn background sync tasks (fire-and-forget, non-blocking)
     tracing::info!("Spawning background sync tasks...");

@@ -634,7 +634,10 @@ async fn fetch_readings(
     query
         .expr_as(Expr::col((p.clone(), Alias::new("name"))), Alias::new("param_name"))
         .column((r.clone(), Alias::new("time")))
-        .column((r.clone(), Alias::new("value")))
+        .expr_as(
+            Expr::cust("COALESCE(r.calibrated_value, r.raw_value)"),
+            Alias::new("value"),
+        )
         .from_as(Alias::new("readings"), r.clone())
         .join_as(
             sea_orm::sea_query::JoinType::Join,

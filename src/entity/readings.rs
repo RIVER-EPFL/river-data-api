@@ -8,7 +8,10 @@ pub struct Model {
     pub parameter_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
     pub time: DateTimeWithTimeZone,
-    pub value: f64,
+    pub raw_value: f64,
+    pub calibrated_value: Option<f64>,
+    pub sensor_id: Option<Uuid>,
+    pub calibration_id: Option<Uuid>,
     pub logged: Option<bool>,
 }
 
@@ -20,11 +23,35 @@ pub enum Relation {
         to = "super::parameters::Column::Id"
     )]
     Parameter,
+    #[sea_orm(
+        belongs_to = "super::sensors::Entity",
+        from = "Column::SensorId",
+        to = "super::sensors::Column::Id"
+    )]
+    Sensor,
+    #[sea_orm(
+        belongs_to = "super::sensor_calibrations::Entity",
+        from = "Column::CalibrationId",
+        to = "super::sensor_calibrations::Column::Id"
+    )]
+    SensorCalibration,
 }
 
 impl Related<super::parameters::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Parameter.def()
+    }
+}
+
+impl Related<super::sensors::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Sensor.def()
+    }
+}
+
+impl Related<super::sensor_calibrations::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::SensorCalibration.def()
     }
 }
 

@@ -1,4 +1,6 @@
+pub mod admin;
 pub mod alarms;
+pub mod config;
 pub mod dashboard;
 pub mod public_api;
 pub mod projects;
@@ -195,6 +197,9 @@ pub fn build_router(state: AppState) -> Router {
     // Public API routes
     let public_routes = public_api::public_router();
 
+    // Admin routes (Keycloak-protected)
+    let admin_routes = admin::admin_router(&state);
+
     // Combine API routes, conditionally applying rate limiting
     let api_routes = if config.disable_rate_limiting {
         Router::new()
@@ -202,6 +207,8 @@ pub fn build_router(state: AppState) -> Router {
                 .merge(metadata_routes_base)
                 .merge(data_routes_base))
             .nest("/public", public_routes)
+            .nest("/admin", admin_routes)
+            .nest("/config", Router::new().route("/keycloak", get(config::get_keycloak_config)))
     } else {
         let metadata_limiter = GovernorConfigBuilder::default()
             .key_extractor(FallbackIpKeyExtractor)
@@ -230,6 +237,8 @@ pub fn build_router(state: AppState) -> Router {
             .nest("/public", public_routes.layer(GovernorLayer {
                 config: data_limiter_arc,
             }))
+            .nest("/admin", admin_routes)
+            .nest("/config", Router::new().route("/keycloak", get(config::get_keycloak_config)))
     }
     .layer(RequestBodyLimitLayer::new(1024 * 1024)); // 1MB body limit
 

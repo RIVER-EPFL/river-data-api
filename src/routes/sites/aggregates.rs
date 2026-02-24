@@ -2,7 +2,6 @@ use axum::{
     extract::{Path, Query, State},
     http::{
         header::{self, HeaderMap, HeaderValue},
-        StatusCode,
     },
     response::{IntoResponse, Response},
     Json,
@@ -11,8 +10,6 @@ use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
-use tokio::sync::Semaphore;
 use tokio_stream::wrappers::ReceiverStream;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
@@ -21,17 +18,9 @@ use crate::common::AppState;
 use crate::entity::{alarm_thresholds, parameters, projects};
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, resolve_site};
+use crate::services::bulk;
 
 use super::types::{ProjectRef, SiteRef};
-
-/// Global semaphore limiting concurrent bulk (CSV/NDJSON) requests.
-static BULK_SEMAPHORE: std::sync::LazyLock<Arc<Semaphore>> = std::sync::LazyLock::new(|| {
-    let limit = std::env::var("BULK_CONCURRENT_LIMIT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
-    Arc::new(Semaphore::new(limit))
-});
 
 fn default_format() -> String {
     "json".to_string()
@@ -83,25 +72,6 @@ struct AggregateRow {
     min_value: Option<f64>,
     max_value: Option<f64>,
     count: i64,
-}
-
-fn determine_format(query_format: &str, headers: &HeaderMap) -> String {
-    if query_format != "json" {
-        return query_format.to_lowercase();
-    }
-
-    if let Some(accept) = headers.get(header::ACCEPT)
-        && let Ok(accept_str) = accept.to_str()
-    {
-        if accept_str.contains("application/x-ndjson") {
-            return "ndjson".to_string();
-        }
-        if accept_str.contains("text/csv") {
-            return "csv".to_string();
-        }
-    }
-
-    "json".to_string()
 }
 
 fn build_csv_response(
@@ -295,7 +265,7 @@ pub async fn get_site_aggregates(
         ));
     }
 
-    let format = determine_format(&query.format, &headers);
+    let format = bulk::determine_format(&query.format, &headers);
 
     let mut param_query = parameters::Entity::find()
         .filter(parameters::Column::IsActive.eq(true))
@@ -331,20 +301,7 @@ pub async fn get_site_aggregates(
             return cache::json_response((*cached).clone(), true);
         }
 
-    let _permit = if format == "csv" || format == "ndjson" {
-        if let Ok(permit) = BULK_SEMAPHORE.clone().try_acquire_owned() { Some(permit) } else {
-            tracing::warn!(
-                format = %format,
-                status = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                "bulk_request_rejected"
-            );
-            return Err(AppError::ServiceUnavailable(
-                "Too many concurrent bulk requests. Please try again later.".to_string(),
-            ));
-        }
-    } else {
-        None
-    };
+    let _permit = bulk::acquire_bulk_permit(&format)?;
 
     if param_ids.is_empty() {
         return Ok(Json(AggregatesResponse {
