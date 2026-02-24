@@ -5,4 +5,5 @@ pub mod parameters;
 pub mod projects;
 pub mod readings;
 pub mod sites;
+pub mod source_mappings;
 pub mod sync_state;

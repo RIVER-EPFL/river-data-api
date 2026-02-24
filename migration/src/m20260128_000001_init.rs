@@ -6,139 +6,123 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        // ========== ZONES ==========
+        // ========== PROJECTS ==========
         manager
             .create_table(
                 Table::create()
-                    .table(Zones::Table)
+                    .table(Projects::Table)
                     .if_not_exists()
                     .col(
-                        ColumnDef::new(Zones::Id)
+                        ColumnDef::new(Projects::Id)
                             .uuid()
                             .not_null()
                             .primary_key()
                             .extra("DEFAULT gen_random_uuid()"),
                     )
-                    .col(ColumnDef::new(Zones::Name).string_len(64).not_null())
-                    .col(ColumnDef::new(Zones::VaisalaPath).string_len(256))
-                    .col(ColumnDef::new(Zones::Description).text())
+                    .col(ColumnDef::new(Projects::Name).string_len(64).not_null())
+                    .col(ColumnDef::new(Projects::Description).text())
                     .col(
-                        ColumnDef::new(Zones::CreatedAt)
+                        ColumnDef::new(Projects::CreatedAt)
                             .timestamp_with_time_zone()
                             .extra("DEFAULT NOW()"),
                     )
-                    .col(ColumnDef::new(Zones::DiscoveredAt).timestamp_with_time_zone())
+                    .col(ColumnDef::new(Projects::DiscoveredAt).timestamp_with_time_zone())
                     .to_owned(),
             )
             .await?;
 
-        // Case-insensitive unique index on zone name
         manager
             .get_connection()
-            .execute_unprepared("CREATE UNIQUE INDEX zones_name_lower_idx ON zones (LOWER(name))")
+            .execute_unprepared("CREATE UNIQUE INDEX projects_name_lower_idx ON projects (LOWER(name))")
             .await?;
 
-        // ========== STATIONS ==========
+        // ========== SITES ==========
         manager
             .create_table(
                 Table::create()
-                    .table(Stations::Table)
+                    .table(Sites::Table)
                     .if_not_exists()
                     .col(
-                        ColumnDef::new(Stations::Id)
+                        ColumnDef::new(Sites::Id)
                             .uuid()
                             .not_null()
                             .primary_key()
                             .extra("DEFAULT gen_random_uuid()"),
                     )
-                    .col(ColumnDef::new(Stations::ZoneId).uuid())
-                    .col(ColumnDef::new(Stations::Name).string_len(64).not_null())
+                    .col(ColumnDef::new(Sites::ProjectId).uuid())
+                    .col(ColumnDef::new(Sites::Name).string_len(64).not_null())
+                    .col(ColumnDef::new(Sites::Latitude).double())
+                    .col(ColumnDef::new(Sites::Longitude).double())
+                    .col(ColumnDef::new(Sites::AltitudeM).double())
                     .col(
-                        ColumnDef::new(Stations::VaisalaNodeId)
-                            .integer()
-                            .not_null()
-                            .unique_key(),
-                    )
-                    .col(ColumnDef::new(Stations::VaisalaPath).string_len(256))
-                    .col(ColumnDef::new(Stations::Latitude).double())
-                    .col(ColumnDef::new(Stations::Longitude).double())
-                    .col(ColumnDef::new(Stations::AltitudeM).double())
-                    .col(
-                        ColumnDef::new(Stations::CreatedAt)
+                        ColumnDef::new(Sites::CreatedAt)
                             .timestamp_with_time_zone()
                             .extra("DEFAULT NOW()"),
                     )
-                    .col(ColumnDef::new(Stations::DiscoveredAt).timestamp_with_time_zone())
+                    .col(ColumnDef::new(Sites::DiscoveredAt).timestamp_with_time_zone())
                     .foreign_key(
                         ForeignKey::create()
-                            .name("fk_stations_zone")
-                            .from(Stations::Table, Stations::ZoneId)
-                            .to(Zones::Table, Zones::Id),
+                            .name("fk_sites_project")
+                            .from(Sites::Table, Sites::ProjectId)
+                            .to(Projects::Table, Projects::Id),
                     )
                     .to_owned(),
             )
             .await?;
 
-        // Case-insensitive unique index on station name
         manager
             .get_connection()
             .execute_unprepared(
-                "CREATE UNIQUE INDEX stations_name_lower_idx ON stations (LOWER(name))",
+                "CREATE UNIQUE INDEX sites_name_lower_idx ON sites (LOWER(name))",
             )
             .await?;
 
-        // ========== SENSORS ==========
+        // ========== PARAMETERS ==========
         manager
             .create_table(
                 Table::create()
-                    .table(Sensors::Table)
+                    .table(Parameters::Table)
                     .if_not_exists()
                     .col(
-                        ColumnDef::new(Sensors::Id)
+                        ColumnDef::new(Parameters::Id)
                             .uuid()
                             .not_null()
                             .primary_key()
                             .extra("DEFAULT gen_random_uuid()"),
                     )
-                    .col(ColumnDef::new(Sensors::StationId).uuid().not_null())
+                    .col(ColumnDef::new(Parameters::SiteId).uuid().not_null())
+                    .col(ColumnDef::new(Parameters::Name).string_len(64).not_null())
+                    .col(ColumnDef::new(Parameters::SensorType).string_len(64).not_null())
+                    .col(ColumnDef::new(Parameters::DisplayUnits).string_len(32))
+                    .col(ColumnDef::new(Parameters::UnitsName).string_len(64))
+                    .col(ColumnDef::new(Parameters::UnitsMin).double())
+                    .col(ColumnDef::new(Parameters::UnitsMax).double())
+                    .col(ColumnDef::new(Parameters::DecimalPlaces).small_integer())
+                    .col(ColumnDef::new(Parameters::DeviceSerialNumber).string_len(32))
+                    .col(ColumnDef::new(Parameters::ProbeSerialNumber).string_len(32))
+                    .col(ColumnDef::new(Parameters::ChannelId).integer())
                     .col(
-                        ColumnDef::new(Sensors::VaisalaLocationId)
-                            .integer()
-                            .not_null()
-                            .unique_key(),
-                    )
-                    .col(ColumnDef::new(Sensors::Name).string_len(64).not_null())
-                    .col(ColumnDef::new(Sensors::SensorType).string_len(64).not_null())
-                    .col(ColumnDef::new(Sensors::DisplayUnits).string_len(32))
-                    .col(ColumnDef::new(Sensors::UnitsName).string_len(64))
-                    .col(ColumnDef::new(Sensors::UnitsMin).double())
-                    .col(ColumnDef::new(Sensors::UnitsMax).double())
-                    .col(ColumnDef::new(Sensors::DecimalPlaces).small_integer())
-                    .col(ColumnDef::new(Sensors::DeviceSerialNumber).string_len(32))
-                    .col(ColumnDef::new(Sensors::ProbeSerialNumber).string_len(32))
-                    .col(ColumnDef::new(Sensors::ChannelId).integer())
-                    .col(
-                        ColumnDef::new(Sensors::SampleIntervalSec)
+                        ColumnDef::new(Parameters::SampleIntervalSec)
                             .integer()
                             .default(600),
                     )
-                    .col(ColumnDef::new(Sensors::IsActive).boolean().default(true))
+                    .col(ColumnDef::new(Parameters::IsActive).boolean().default(true))
                     .col(
-                        ColumnDef::new(Sensors::CreatedAt)
+                        ColumnDef::new(Parameters::CreatedAt)
                             .timestamp_with_time_zone()
                             .extra("DEFAULT NOW()"),
                     )
                     .col(
-                        ColumnDef::new(Sensors::UpdatedAt)
+                        ColumnDef::new(Parameters::UpdatedAt)
                             .timestamp_with_time_zone()
                             .extra("DEFAULT NOW()"),
                     )
-                    .col(ColumnDef::new(Sensors::DiscoveredAt).timestamp_with_time_zone())
+                    .col(ColumnDef::new(Parameters::DiscoveredAt).timestamp_with_time_zone())
                     .foreign_key(
                         ForeignKey::create()
-                            .name("fk_sensors_station")
-                            .from(Sensors::Table, Sensors::StationId)
-                            .to(Stations::Table, Stations::Id),
+                            .name("fk_parameters_site")
+                            .from(Parameters::Table, Parameters::SiteId)
+                            .to(Sites::Table, Sites::Id),
                     )
                     .to_owned(),
             )
@@ -147,21 +131,52 @@ impl MigrationTrait for Migration {
         manager
             .create_index(
                 Index::create()
-                    .name("idx_sensors_station_name")
-                    .table(Sensors::Table)
-                    .col(Sensors::StationId)
-                    .col(Sensors::Name)
+                    .name("idx_parameters_site_name")
+                    .table(Parameters::Table)
+                    .col(Parameters::SiteId)
+                    .col(Parameters::Name)
                     .unique()
                     .to_owned(),
             )
             .await?;
 
+        // ========== SOURCE MAPPINGS ==========
+        manager
+            .create_table(
+                Table::create()
+                    .table(SourceMappings::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(SourceMappings::EntityType)
+                            .string_len(32)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(SourceMappings::SourceKey)
+                            .integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(SourceMappings::EntityId)
+                            .uuid()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(SourceMappings::SourceName).string_len(256))
+                    .primary_key(
+                        Index::create()
+                            .col(SourceMappings::EntityType)
+                            .col(SourceMappings::SourceKey),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
         manager
             .create_index(
                 Index::create()
-                    .name("idx_sensors_vaisala_location_id")
-                    .table(Sensors::Table)
-                    .col(Sensors::VaisalaLocationId)
+                    .name("idx_source_mappings_entity_id")
+                    .table(SourceMappings::Table)
+                    .col(SourceMappings::EntityId)
                     .to_owned(),
             )
             .await?;
@@ -177,34 +192,32 @@ impl MigrationTrait for Migration {
                             .timestamp_with_time_zone()
                             .not_null(),
                     )
-                    .col(ColumnDef::new(Readings::SensorId).uuid().not_null())
+                    .col(ColumnDef::new(Readings::ParameterId).uuid().not_null())
                     .col(ColumnDef::new(Readings::Value).double().not_null())
                     .col(ColumnDef::new(Readings::Logged).boolean().default(true))
                     .primary_key(
                         Index::create()
-                            .col(Readings::SensorId)
+                            .col(Readings::ParameterId)
                             .col(Readings::Time),
                     )
                     .foreign_key(
                         ForeignKey::create()
-                            .name("fk_readings_sensor")
-                            .from(Readings::Table, Readings::SensorId)
-                            .to(Sensors::Table, Sensors::Id),
+                            .name("fk_readings_parameter")
+                            .from(Readings::Table, Readings::ParameterId)
+                            .to(Parameters::Table, Parameters::Id),
                     )
                     .to_owned(),
             )
             .await?;
 
-        // Convert to TimescaleDB hypertable (requires raw SQL)
         let db = manager.get_connection();
         db.execute_unprepared(
             "SELECT create_hypertable('readings', 'time', chunk_time_interval => INTERVAL '7 days')",
         )
         .await?;
 
-        // Index for efficient sensor_id lookups with time range
         db.execute_unprepared(
-            "CREATE INDEX idx_readings_sensor_time ON readings (sensor_id, time DESC)",
+            "CREATE INDEX idx_readings_parameter_time ON readings (parameter_id, time DESC)",
         )
         .await?;
 
@@ -219,7 +232,7 @@ impl MigrationTrait for Migration {
                             .timestamp_with_time_zone()
                             .not_null(),
                     )
-                    .col(ColumnDef::new(DeviceStatus::SensorId).uuid().not_null())
+                    .col(ColumnDef::new(DeviceStatus::ParameterId).uuid().not_null())
                     .col(ColumnDef::new(DeviceStatus::BatteryLevel).small_integer())
                     .col(ColumnDef::new(DeviceStatus::BatteryState).small_integer())
                     .col(ColumnDef::new(DeviceStatus::SignalQuality).small_integer())
@@ -231,14 +244,14 @@ impl MigrationTrait for Migration {
                     )
                     .primary_key(
                         Index::create()
-                            .col(DeviceStatus::SensorId)
+                            .col(DeviceStatus::ParameterId)
                             .col(DeviceStatus::Time),
                     )
                     .foreign_key(
                         ForeignKey::create()
-                            .name("fk_device_status_sensor")
-                            .from(DeviceStatus::Table, DeviceStatus::SensorId)
-                            .to(Sensors::Table, Sensors::Id),
+                            .name("fk_device_status_parameter")
+                            .from(DeviceStatus::Table, DeviceStatus::ParameterId)
+                            .to(Parameters::Table, Parameters::Id),
                     )
                     .to_owned(),
             )
@@ -262,7 +275,7 @@ impl MigrationTrait for Migration {
                             .primary_key()
                             .extra("DEFAULT gen_random_uuid()"),
                     )
-                    .col(ColumnDef::new(Calibrations::SensorId).uuid().not_null())
+                    .col(ColumnDef::new(Calibrations::ParameterId).uuid().not_null())
                     .col(
                         ColumnDef::new(Calibrations::CalibrationTime)
                             .timestamp_with_time_zone()
@@ -277,9 +290,9 @@ impl MigrationTrait for Migration {
                     )
                     .foreign_key(
                         ForeignKey::create()
-                            .name("fk_calibrations_sensor")
-                            .from(Calibrations::Table, Calibrations::SensorId)
-                            .to(Sensors::Table, Sensors::Id),
+                            .name("fk_calibrations_parameter")
+                            .from(Calibrations::Table, Calibrations::ParameterId)
+                            .to(Parameters::Table, Parameters::Id),
                     )
                     .to_owned(),
             )
@@ -292,7 +305,7 @@ impl MigrationTrait for Migration {
                     .table(SyncState::Table)
                     .if_not_exists()
                     .col(
-                        ColumnDef::new(SyncState::SensorId)
+                        ColumnDef::new(SyncState::ParameterId)
                             .uuid()
                             .not_null()
                             .primary_key(),
@@ -309,16 +322,15 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(SyncState::LastFullSync).timestamp_with_time_zone())
                     .foreign_key(
                         ForeignKey::create()
-                            .name("fk_sync_state_sensor")
-                            .from(SyncState::Table, SyncState::SensorId)
-                            .to(Sensors::Table, Sensors::Id),
+                            .name("fk_sync_state_parameter")
+                            .from(SyncState::Table, SyncState::ParameterId)
+                            .to(Parameters::Table, Parameters::Id),
                     )
                     .to_owned(),
             )
             .await?;
 
         // ========== ALARM THRESHOLDS ==========
-        // Parameter-based alarm thresholds per sensor
         manager
             .create_table(
                 Table::create()
@@ -332,7 +344,7 @@ impl MigrationTrait for Migration {
                             .extra("DEFAULT gen_random_uuid()"),
                     )
                     .col(
-                        ColumnDef::new(AlarmThresholds::SensorId)
+                        ColumnDef::new(AlarmThresholds::ParameterId)
                             .uuid()
                             .not_null()
                             .unique_key(),
@@ -354,87 +366,17 @@ impl MigrationTrait for Migration {
                     )
                     .foreign_key(
                         ForeignKey::create()
-                            .name("fk_alarm_thresholds_sensor")
-                            .from(AlarmThresholds::Table, AlarmThresholds::SensorId)
-                            .to(Sensors::Table, Sensors::Id)
+                            .name("fk_alarm_thresholds_parameter")
+                            .from(AlarmThresholds::Table, AlarmThresholds::ParameterId)
+                            .to(Parameters::Table, Parameters::Id)
                             .on_delete(ForeignKeyAction::Cascade),
                     )
                     .to_owned(),
             )
             .await?;
 
-        // Index for sensor-based threshold lookups
         db.execute_unprepared(
-            "CREATE INDEX idx_alarm_thresholds_sensor ON alarm_thresholds (sensor_id)",
-        )
-        .await?;
-
-        // Seed alarm thresholds based on sensor_type defaults
-        // Threshold values from R code:
-        // | Parameter | Warning Range | Alarm Range |
-        // |-----------|--------------|-------------|
-        // | Depth (mm) | 0-100 or 1000-2000 | <0 or >2000 |
-        // | CDOM (ppb) | 100-150 | <0 or >150 |
-        // | Turbidity (NTU) | 100-500 | <0 or >500 |
-        // | Dissolved_O2 (µM) | <120 or >360 | <0 or >625 |
-        // | Conductivity (µS/cm) | <100 or >900 | <0 or >1000 |
-        // | DO_Temperature (°C) | <0.5 or >20 | <0 or >25 |
-        // | Cond_Temperature (°C) | <0.5 or >20 | <0 or >25 |
-        // | Battery (V) | 11.5-12.1 | <11.5 |
-        db.execute_unprepared(
-            r#"
-            INSERT INTO alarm_thresholds (id, sensor_id, warning_min, warning_max, alarm_min, alarm_max, description)
-            SELECT
-                gen_random_uuid(),
-                s.id,
-                CASE s.sensor_type
-                    WHEN 'Depth' THEN 100
-                    WHEN 'CDOM' THEN NULL
-                    WHEN 'Turbidity' THEN NULL
-                    WHEN 'Dissolved_O2' THEN 120
-                    WHEN 'Conductivity' THEN 100
-                    WHEN 'DO_Temperature' THEN 0.5
-                    WHEN 'Cond_Temperature' THEN 0.5
-                    WHEN 'Battery' THEN 12.1
-                    ELSE NULL
-                END as warning_min,
-                CASE s.sensor_type
-                    WHEN 'Depth' THEN 1000
-                    WHEN 'CDOM' THEN 100
-                    WHEN 'Turbidity' THEN 100
-                    WHEN 'Dissolved_O2' THEN 360
-                    WHEN 'Conductivity' THEN 900
-                    WHEN 'DO_Temperature' THEN 20
-                    WHEN 'Cond_Temperature' THEN 20
-                    WHEN 'Battery' THEN NULL
-                    ELSE NULL
-                END as warning_max,
-                CASE s.sensor_type
-                    WHEN 'Depth' THEN 0
-                    WHEN 'CDOM' THEN 0
-                    WHEN 'Turbidity' THEN 0
-                    WHEN 'Dissolved_O2' THEN 0
-                    WHEN 'Conductivity' THEN 0
-                    WHEN 'DO_Temperature' THEN 0
-                    WHEN 'Cond_Temperature' THEN 0
-                    WHEN 'Battery' THEN 11.5
-                    ELSE NULL
-                END as alarm_min,
-                CASE s.sensor_type
-                    WHEN 'Depth' THEN 2000
-                    WHEN 'CDOM' THEN 150
-                    WHEN 'Turbidity' THEN 500
-                    WHEN 'Dissolved_O2' THEN 625
-                    WHEN 'Conductivity' THEN 1000
-                    WHEN 'DO_Temperature' THEN 25
-                    WHEN 'Cond_Temperature' THEN 25
-                    WHEN 'Battery' THEN NULL
-                    ELSE NULL
-                END as alarm_max,
-                'Auto-generated from sensor type defaults'
-            FROM sensors s
-            ON CONFLICT (sensor_id) DO NOTHING
-            "#,
+            "CREATE INDEX idx_alarm_thresholds_parameter ON alarm_thresholds (parameter_id)",
         )
         .await?;
 
@@ -445,14 +387,14 @@ impl MigrationTrait for Migration {
             WITH (timescaledb.continuous) AS
             SELECT
                 time_bucket('1 hour', time) AS bucket,
-                sensor_id,
+                parameter_id,
                 AVG(value) AS avg_value,
                 MIN(value) AS min_value,
                 MAX(value) AS max_value,
                 COUNT(*) AS count,
                 STDDEV(value) AS stddev_value
             FROM readings
-            GROUP BY time_bucket('1 hour', time), sensor_id
+            GROUP BY time_bucket('1 hour', time), parameter_id
             WITH NO DATA
             ",
         )
@@ -464,14 +406,14 @@ impl MigrationTrait for Migration {
             WITH (timescaledb.continuous) AS
             SELECT
                 time_bucket('1 day', time) AS bucket,
-                sensor_id,
+                parameter_id,
                 AVG(value) AS avg_value,
                 MIN(value) AS min_value,
                 MAX(value) AS max_value,
                 COUNT(*) AS count,
                 STDDEV(value) AS stddev_value
             FROM readings
-            GROUP BY time_bucket('1 day', time), sensor_id
+            GROUP BY time_bucket('1 day', time), parameter_id
             WITH NO DATA
             ",
         )
@@ -483,14 +425,14 @@ impl MigrationTrait for Migration {
             WITH (timescaledb.continuous) AS
             SELECT
                 time_bucket('1 week', time) AS bucket,
-                sensor_id,
+                parameter_id,
                 AVG(value) AS avg_value,
                 MIN(value) AS min_value,
                 MAX(value) AS max_value,
                 COUNT(*) AS count,
                 STDDEV(value) AS stddev_value
             FROM readings
-            GROUP BY time_bucket('1 week', time), sensor_id
+            GROUP BY time_bucket('1 week', time), parameter_id
             WITH NO DATA
             ",
         )
@@ -502,14 +444,14 @@ impl MigrationTrait for Migration {
             WITH (timescaledb.continuous) AS
             SELECT
                 time_bucket('1 month', time) AS bucket,
-                sensor_id,
+                parameter_id,
                 AVG(value) AS avg_value,
                 MIN(value) AS min_value,
                 MAX(value) AS max_value,
                 COUNT(*) AS count,
                 STDDEV(value) AS stddev_value
             FROM readings
-            GROUP BY time_bucket('1 month', time), sensor_id
+            GROUP BY time_bucket('1 month', time), parameter_id
             WITH NO DATA
             ",
         )
@@ -548,18 +490,11 @@ impl MigrationTrait for Migration {
         )
         .await?;
 
-        // NOTE: Continuous aggregates start empty (WITH NO DATA) and are populated by
-        // the refresh policies as data arrives. For a fresh deployment this is correct.
-        // If restoring historical data, manually run:
-        //   CALL refresh_continuous_aggregate('readings_hourly', NULL, NULL);
-        //   CALL refresh_continuous_aggregate('readings_daily', NULL, NULL);
-        //   etc.
-
         // ========== COMPRESSION POLICIES (TimescaleDB-specific) ==========
         db.execute_unprepared(
             r"ALTER TABLE readings SET (
                 timescaledb.compress,
-                timescaledb.compress_segmentby = 'sensor_id'
+                timescaledb.compress_segmentby = 'parameter_id'
             )",
         )
         .await?;
@@ -570,7 +505,7 @@ impl MigrationTrait for Migration {
         db.execute_unprepared(
             r"ALTER TABLE device_status SET (
                 timescaledb.compress,
-                timescaledb.compress_segmentby = 'sensor_id'
+                timescaledb.compress_segmentby = 'parameter_id'
             )",
         )
         .await?;
@@ -657,13 +592,21 @@ impl MigrationTrait for Migration {
             .drop_table(Table::drop().table(Readings::Table).if_exists().to_owned())
             .await?;
         manager
-            .drop_table(Table::drop().table(Sensors::Table).if_exists().to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(SourceMappings::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
             .await?;
         manager
-            .drop_table(Table::drop().table(Stations::Table).if_exists().to_owned())
+            .drop_table(Table::drop().table(Parameters::Table).if_exists().to_owned())
             .await?;
         manager
-            .drop_table(Table::drop().table(Zones::Table).if_exists().to_owned())
+            .drop_table(Table::drop().table(Sites::Table).if_exists().to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(Projects::Table).if_exists().to_owned())
             .await?;
 
         Ok(())
@@ -671,24 +614,21 @@ impl MigrationTrait for Migration {
 }
 
 #[derive(DeriveIden)]
-pub enum Zones {
+pub enum Projects {
     Table,
     Id,
     Name,
-    VaisalaPath,
     Description,
     CreatedAt,
     DiscoveredAt,
 }
 
 #[derive(DeriveIden)]
-pub enum Stations {
+pub enum Sites {
     Table,
     Id,
-    ZoneId,
+    ProjectId,
     Name,
-    VaisalaNodeId,
-    VaisalaPath,
     Latitude,
     Longitude,
     AltitudeM,
@@ -697,11 +637,10 @@ pub enum Stations {
 }
 
 #[derive(DeriveIden)]
-pub enum Sensors {
+pub enum Parameters {
     Table,
     Id,
-    StationId,
-    VaisalaLocationId,
+    SiteId,
     Name,
     SensorType,
     DisplayUnits,
@@ -720,10 +659,19 @@ pub enum Sensors {
 }
 
 #[derive(DeriveIden)]
+pub enum SourceMappings {
+    Table,
+    EntityType,
+    SourceKey,
+    EntityId,
+    SourceName,
+}
+
+#[derive(DeriveIden)]
 pub enum Readings {
     Table,
     Time,
-    SensorId,
+    ParameterId,
     Value,
     Logged,
 }
@@ -733,7 +681,7 @@ pub enum Readings {
 pub enum DeviceStatus {
     Table,
     Time,
-    SensorId,
+    ParameterId,
     BatteryLevel,
     BatteryState,
     SignalQuality,
@@ -746,7 +694,7 @@ pub enum DeviceStatus {
 enum Calibrations {
     Table,
     Id,
-    SensorId,
+    ParameterId,
     CalibrationTime,
     PerformedBy,
     Notes,
@@ -756,7 +704,7 @@ enum Calibrations {
 #[derive(DeriveIden)]
 enum SyncState {
     Table,
-    SensorId,
+    ParameterId,
     LastDataTime,
     LastSyncAttempt,
     SyncStatus,
@@ -769,7 +717,7 @@ enum SyncState {
 enum AlarmThresholds {
     Table,
     Id,
-    SensorId,
+    ParameterId,
     WarningMin,
     WarningMax,
     AlarmMin,

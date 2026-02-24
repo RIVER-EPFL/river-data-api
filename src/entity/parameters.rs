@@ -7,8 +7,6 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
     pub site_id: Uuid,
-    #[sea_orm(unique)]
-    pub source_location_id: i32,
     pub name: String,
     pub sensor_type: String,
     pub display_units: Option<String>,

@@ -1,9 +1,9 @@
 use chrono::{Duration, Utc};
 use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Set, Statement};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-use crate::entity::{alarm_thresholds, device_status, parameters, projects, readings, sites, sync_state};
+use crate::entity::{alarm_thresholds, device_status, parameters, projects, readings, sites, source_mappings, sync_state};
 use crate::error::AppResult;
 use crate::vaisala::VaisalaClient;
 
@@ -27,41 +27,44 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
 
     let now = Utc::now();
 
-    // Build maps of existing entities by their source identifiers
-    let existing_projects: HashMap<String, projects::Model> = projects::Entity::find()
-        .all(db)
-        .await?
-        .into_iter()
-        .map(|p| (p.name.clone(), p))
+    // Load all source mappings for dedup and rename detection
+    let mappings: Vec<source_mappings::Model> = source_mappings::Entity::find().all(db).await?;
+
+    let project_mappings: HashMap<i32, (Uuid, Option<String>)> = mappings
+        .iter()
+        .filter(|m| m.entity_type == "project")
+        .map(|m| (m.source_key, (m.entity_id, m.source_name.clone())))
         .collect();
 
-    let existing_sites: HashMap<i32, sites::Model> = sites::Entity::find()
-        .all(db)
-        .await?
-        .into_iter()
-        .map(|s| (s.source_node_id, s))
+    let site_mappings: HashMap<i32, (Uuid, Option<String>)> = mappings
+        .iter()
+        .filter(|m| m.entity_type == "site")
+        .map(|m| (m.source_key, (m.entity_id, m.source_name.clone())))
         .collect();
 
-    let existing_params: HashMap<i32, parameters::Model> = parameters::Entity::find()
+    let param_mappings: HashMap<i32, (Uuid, Option<String>)> = mappings
+        .iter()
+        .filter(|m| m.entity_type == "parameter")
+        .map(|m| (m.source_key, (m.entity_id, m.source_name.clone())))
+        .collect();
+
+    // Build project name → UUID map for FK lookups when creating sites
+    let mut project_ids: HashMap<String, Uuid> = projects::Entity::find()
         .all(db)
         .await?
         .into_iter()
-        .map(|p| (p.source_location_id, p))
+        .map(|p| (p.name.clone(), p.id))
+        .collect();
+
+    // Build site source_key → UUID map for FK lookups when creating parameters
+    let mut site_ids: HashMap<i32, Uuid> = site_mappings
+        .iter()
+        .map(|(key, (id, _))| (*key, *id))
         .collect();
 
     let mut projects_created = 0;
     let mut sites_created = 0;
     let mut params_created = 0;
-
-    // Maps to track newly created projects/sites by name for FK lookups
-    let mut project_ids: HashMap<String, Uuid> = existing_projects
-        .iter()
-        .map(|(name, p)| (name.clone(), p.id))
-        .collect();
-    let mut site_ids: HashMap<i32, Uuid> = existing_sites
-        .iter()
-        .map(|(node_id, s)| (*node_id, s.id))
-        .collect();
 
     let mut new_param_location_ids: Vec<i32> = Vec::new();
 
@@ -78,29 +81,64 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
             // Project: path like "viewLinc/BREATHE" (2 parts, not leaf)
             (2, false) => {
                 let project_name = parts[1];
-                if !project_ids.contains_key(project_name) {
-                    let project = projects::ActiveModel {
-                        id: Set(Uuid::new_v4()),
-                        name: Set(project_name.to_string()),
-                        source_path: Set(Some(attrs.path.clone())),
-                        description: Set(if attrs.description.is_empty() {
-                            None
-                        } else {
-                            Some(attrs.description.clone())
-                        }),
-                        created_at: Set(Some(now.into())),
-                        discovered_at: Set(Some(now.into())),
-                    };
 
-                    match project.insert(db).await {
-                        Ok(p) => {
-                            project_ids.insert(project_name.to_string(), p.id);
-                            projects_created += 1;
-                            tracing::debug!(name = project_name, "Created project");
+                // Check for rename
+                if let Some((_, old_name)) = project_mappings.get(&attrs.node_id) {
+                    if let Some(old) = old_name
+                        && old != project_name
+                    {
+                        tracing::info!(
+                            source_key = attrs.node_id,
+                            old_name = old,
+                            new_name = project_name,
+                            "Vaisala project renamed"
+                        );
+                        let mapping = source_mappings::ActiveModel {
+                            entity_type: Set("project".to_string()),
+                            source_key: Set(attrs.node_id),
+                            entity_id: sea_orm::ActiveValue::NotSet,
+                            source_name: Set(Some(project_name.to_string())),
+                        };
+                        if let Err(e) = mapping.update(db).await {
+                            tracing::warn!(error = %e, "Failed to update project source_name");
                         }
-                        Err(e) => {
-                            tracing::warn!(error = %e, name = project_name, "Failed to create project");
+                    }
+                    continue;
+                }
+
+                // New project
+                let id = Uuid::new_v4();
+                let project = projects::ActiveModel {
+                    id: Set(id),
+                    name: Set(project_name.to_string()),
+                    description: Set(if attrs.description.is_empty() {
+                        None
+                    } else {
+                        Some(attrs.description.clone())
+                    }),
+                    created_at: Set(Some(now.into())),
+                    discovered_at: Set(Some(now.into())),
+                };
+
+                match project.insert(db).await {
+                    Ok(p) => {
+                        // Create source mapping
+                        let mapping = source_mappings::ActiveModel {
+                            entity_type: Set("project".to_string()),
+                            source_key: Set(attrs.node_id),
+                            entity_id: Set(p.id),
+                            source_name: Set(Some(project_name.to_string())),
+                        };
+                        if let Err(e) = mapping.insert(db).await {
+                            tracing::warn!(error = %e, "Failed to create project source mapping");
                         }
+
+                        project_ids.insert(project_name.to_string(), p.id);
+                        projects_created += 1;
+                        tracing::debug!(name = project_name, "Created project");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, name = project_name, "Failed to create project");
                     }
                 }
             }
@@ -110,38 +148,70 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
                 let project_name = parts[1];
                 let site_name = parts[2];
 
-                if !site_ids.contains_key(&attrs.node_id) {
-                    let project_id = project_ids.get(project_name).copied();
-
-                    let site = sites::ActiveModel {
-                        id: Set(Uuid::new_v4()),
-                        project_id: Set(project_id),
-                        name: Set(site_name.to_string()),
-                        source_node_id: Set(attrs.node_id),
-                        source_path: Set(Some(attrs.path.clone())),
-                        latitude: Set(None),
-                        longitude: Set(None),
-                        altitude_m: Set(None),
-                        created_at: Set(Some(now.into())),
-                        discovered_at: Set(Some(now.into())),
-                    };
-
-                    match site.insert(db).await {
-                        Ok(s) => {
-                            site_ids.insert(attrs.node_id, s.id);
-                            sites_created += 1;
-                            tracing::debug!(name = site_name, node_id = attrs.node_id, "Created site");
+                // Check for rename
+                if let Some((_, old_name)) = site_mappings.get(&attrs.node_id) {
+                    if let Some(old) = old_name
+                        && old != site_name
+                    {
+                        tracing::info!(
+                            source_key = attrs.node_id,
+                            old_name = old,
+                            new_name = site_name,
+                            "Vaisala site renamed"
+                        );
+                        let mapping = source_mappings::ActiveModel {
+                            entity_type: Set("site".to_string()),
+                            source_key: Set(attrs.node_id),
+                            entity_id: sea_orm::ActiveValue::NotSet,
+                            source_name: Set(Some(site_name.to_string())),
+                        };
+                        if let Err(e) = mapping.update(db).await {
+                            tracing::warn!(error = %e, "Failed to update site source_name");
                         }
-                        Err(e) => {
-                            tracing::warn!(error = %e, name = site_name, "Failed to create site");
+                    }
+                    continue;
+                }
+
+                // New site
+                let project_id = project_ids.get(project_name).copied();
+                let id = Uuid::new_v4();
+
+                let site = sites::ActiveModel {
+                    id: Set(id),
+                    project_id: Set(project_id),
+                    name: Set(site_name.to_string()),
+                    latitude: Set(None),
+                    longitude: Set(None),
+                    altitude_m: Set(None),
+                    created_at: Set(Some(now.into())),
+                    discovered_at: Set(Some(now.into())),
+                };
+
+                match site.insert(db).await {
+                    Ok(s) => {
+                        let mapping = source_mappings::ActiveModel {
+                            entity_type: Set("site".to_string()),
+                            source_key: Set(attrs.node_id),
+                            entity_id: Set(s.id),
+                            source_name: Set(Some(site_name.to_string())),
+                        };
+                        if let Err(e) = mapping.insert(db).await {
+                            tracing::warn!(error = %e, "Failed to create site source mapping");
                         }
+
+                        site_ids.insert(attrs.node_id, s.id);
+                        sites_created += 1;
+                        tracing::debug!(name = site_name, node_id = attrs.node_id, "Created site");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, name = site_name, "Failed to create site");
                     }
                 }
             }
 
             // Parameter: leaf=true with path like "viewLinc/BREATHE/Martigny/MDepthmm"
             (_, true) if parts.len() >= 4 => {
-                if !existing_params.contains_key(&attrs.node_id) {
+                if !param_mappings.contains_key(&attrs.node_id) {
                     new_param_location_ids.push(attrs.node_id);
                 }
             }
@@ -190,10 +260,10 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
             // Use generic name (strip station prefix)
             let generic_name = derive_generic_name(&attrs.location_name);
 
+            let param_id = Uuid::new_v4();
             let param = parameters::ActiveModel {
-                id: Set(Uuid::new_v4()),
+                id: Set(param_id),
                 site_id: Set(site_id),
-                source_location_id: Set(attrs.id),
                 name: Set(generic_name.clone()),
                 sensor_type: Set(sensor_type),
                 display_units: Set(Some(attrs.display_units.clone())),
@@ -229,6 +299,17 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
 
             match param.insert(db).await {
                 Ok(p) => {
+                    // Create source mapping
+                    let mapping = source_mappings::ActiveModel {
+                        entity_type: Set("parameter".to_string()),
+                        source_key: Set(attrs.id),
+                        entity_id: Set(p.id),
+                        source_name: Set(Some(attrs.location_name.clone())),
+                    };
+                    if let Err(e) = mapping.insert(db).await {
+                        tracing::warn!(error = %e, "Failed to create parameter source mapping");
+                    }
+
                     // Initialize sync_state for the new parameter
                     let sync = sync_state::ActiveModel {
                         parameter_id: Set(p.id),
@@ -352,6 +433,14 @@ pub async fn sync_readings(
     max_history_days: i64,
     force_full_sync: bool,
 ) -> AppResult<()> {
+    // Load source mappings for parameter source_key → entity_id
+    let mappings: Vec<source_mappings::Model> = source_mappings::Entity::find().all(db).await?;
+    let param_map: HashMap<i32, Uuid> = mappings
+        .iter()
+        .filter(|m| m.entity_type == "parameter")
+        .map(|m| (m.source_key, m.entity_id))
+        .collect();
+
     let params_with_state: Vec<(parameters::Model, Option<sync_state::Model>)> =
         parameters::Entity::find()
             .filter(parameters::Column::IsActive.eq(true))
@@ -364,17 +453,32 @@ pub async fn sync_readings(
         return Ok(());
     }
 
-    // Build a map of source_location_id -> (parameter_id, last_data_time)
+    // Build active parameter state: entity_id → last_data_time
+    let active_state: HashMap<Uuid, Option<chrono::DateTime<Utc>>> = params_with_state
+        .iter()
+        .map(|(p, state)| {
+            let last_time = if force_full_sync {
+                None
+            } else {
+                state
+                    .as_ref()
+                    .and_then(|s| s.last_data_time.map(|dt| dt.with_timezone(&Utc)))
+            };
+            (p.id, last_time)
+        })
+        .collect();
+
+    // Build location_map: source_key → (entity_id, last_data_time) for active mapped parameters
     let mut location_map: HashMap<i32, (Uuid, Option<chrono::DateTime<Utc>>)> = HashMap::new();
-    for (param, state) in &params_with_state {
-        let last_time = if force_full_sync {
-            None
-        } else {
-            state
-                .as_ref()
-                .and_then(|s| s.last_data_time.map(|dt| dt.with_timezone(&Utc)))
-        };
-        location_map.insert(param.source_location_id, (param.id, last_time));
+    for (source_key, entity_id) in &param_map {
+        if let Some(last_time) = active_state.get(entity_id) {
+            location_map.insert(*source_key, (*entity_id, *last_time));
+        }
+    }
+
+    if location_map.is_empty() {
+        tracing::debug!("No mapped active parameters to sync");
+        return Ok(());
     }
 
     let now = Utc::now();
@@ -502,20 +606,32 @@ pub async fn sync_readings(
 
 /// Sync device status for all active parameters.
 pub async fn sync_device_status(db: &DatabaseConnection, vaisala: &VaisalaClient) -> AppResult<()> {
-    let params: Vec<parameters::Model> = parameters::Entity::find()
+    // Load source mappings for parameter source_key → entity_id
+    let mappings: Vec<source_mappings::Model> = source_mappings::Entity::find().all(db).await?;
+    let param_map: HashMap<i32, Uuid> = mappings
+        .iter()
+        .filter(|m| m.entity_type == "parameter")
+        .map(|m| (m.source_key, m.entity_id))
+        .collect();
+
+    let active_param_ids: HashSet<Uuid> = parameters::Entity::find()
         .filter(parameters::Column::IsActive.eq(true))
         .all(db)
-        .await?;
+        .await?
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
 
-    if params.is_empty() {
+    // Only include active, mapped parameters
+    let location_map: HashMap<i32, Uuid> = param_map
+        .into_iter()
+        .filter(|(_, entity_id)| active_param_ids.contains(entity_id))
+        .collect();
+
+    if location_map.is_empty() {
         tracing::debug!("No active parameters for device status sync");
         return Ok(());
     }
-
-    let location_map: HashMap<i32, Uuid> = params
-        .iter()
-        .map(|p| (p.source_location_id, p.id))
-        .collect();
 
     let location_ids: Vec<i32> = location_map.keys().copied().collect();
 

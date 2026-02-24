@@ -9,9 +9,6 @@ pub struct Model {
     pub project_id: Option<Uuid>,
     #[sea_orm(unique)]
     pub name: String,
-    #[sea_orm(unique)]
-    pub source_node_id: i32,
-    pub source_path: Option<String>,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
     pub altitude_m: Option<f64>,

@@ -8,7 +8,6 @@ pub struct Model {
     pub id: Uuid,
     #[sea_orm(unique)]
     pub name: String,
-    pub source_path: Option<String>,
     pub description: Option<String>,
     pub created_at: Option<DateTimeWithTimeZone>,
     pub discovered_at: Option<DateTimeWithTimeZone>,
