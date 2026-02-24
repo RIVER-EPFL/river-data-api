@@ -91,7 +91,9 @@ pub fn mount_resilience_router() -> Router<AppState> {
   <body>
     <script
       id="api-reference"
-      data-url="$spec"></script>
+      type="application/json">
+      $spec
+    </script>
     <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
   </body>
 </html>
