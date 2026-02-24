@@ -10,7 +10,7 @@ pub async fn dashboard() -> impl IntoResponse {
     )
 }
 
-const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
+const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -636,8 +636,8 @@ function formatDuration(ms) {
 async function init() {
     // Fetch projects and sites
     const [projects, sites] = await Promise.all([
-        api('/api/projects'),
-        api('/api/sites')
+        api('/api/private/projects'),
+        api('/api/private/sites')
     ]);
 
     const container = document.getElementById('site-groups');
@@ -694,7 +694,7 @@ async function init() {
 
 async function loadSite(siteId) {
     // Always fetch fresh site data to get latest data_start/data_end
-    const site = await api(`/api/sites/${siteId}`, true);
+    const site = await api(`/api/private/sites/${siteId}`, true);
     state.site = site;
 
     // Clear existing charts and their DOM elements
@@ -973,7 +973,7 @@ const fetchData = debounce(async () => {
         resolution = 'weekly avg';
     }
 
-    const url = `/api/sites/${state.site.id}/${endpoint}?start=${state.start.toISOString()}&end=${state.end.toISOString()}&alarms=true`;
+    const url = `/api/private/sites/${state.site.id}/${endpoint}?start=${state.start.toISOString()}&end=${state.end.toISOString()}&alarms=true`;
 
     showLoading();
 
@@ -982,7 +982,7 @@ const fetchData = debounce(async () => {
 
         // Fallback to raw readings if aggregates return empty
         if (!data.times?.length && endpoint !== 'readings') {
-            const fallbackUrl = `/api/sites/${state.site.id}/readings?start=${state.start.toISOString()}&end=${state.end.toISOString()}&alarms=true`;
+            const fallbackUrl = `/api/private/sites/${state.site.id}/readings?start=${state.start.toISOString()}&end=${state.end.toISOString()}&alarms=true`;
             data = await api(fallbackUrl);
             resolution = '10-min raw (fallback)';
         }
@@ -1367,4 +1367,4 @@ init();
 </script>
 </body>
 </html>
-"##;
+"#;

@@ -27,6 +27,7 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[must_use] 
     pub fn new(db: DatabaseConnection, config: Config, vaisala_client: VaisalaClient) -> Self {
         // Cache weighted by byte size, not entry count
         let cache: ResponseCache = Cache::builder()

@@ -66,28 +66,28 @@ pub const DOMGL_FACTOR: f64 = 0.032;
         version = "1.0.0"
     )
 )]
-pub struct ApptitudeApiDoc;
+pub struct MountResilienceApiDoc;
 
 // ============================================================================
 // Router
 // ============================================================================
 
-pub fn apptitude_router() -> Router<AppState> {
+pub fn mount_resilience_router() -> Router<AppState> {
     Router::new()
         .route("/sites", get(sites::list_sites))
         .route("/sites/{site_id}", get(sites::get_site))
         .route("/sites/{site_id}/parameters", get(sites::list_parameters))
         .route("/sites/{site_id}/readings", get(sites::get_readings))
         .route("/sites/{site_id}/aggregates/{resolution}", get(sites::get_aggregates))
-        .merge(Scalar::with_url("/docs", ApptitudeApiDoc::openapi()))
+        .merge(Scalar::with_url("/docs", MountResilienceApiDoc::openapi()))
 }
 
 // ============================================================================
 // Resolution Helpers
 // ============================================================================
 
-/// Resolve an Apptitude project by slug or UUID.
-pub async fn resolve_apptitude_project(
+/// Resolve a public API project by slug or UUID.
+pub async fn resolve_public_project(
     db: &DatabaseConnection,
     project_id: &str,
 ) -> AppResult<(String, projects_entity::Model)> {
@@ -100,8 +100,7 @@ pub async fn resolve_apptitude_project(
         let slug = PROJECTS
             .iter()
             .find(|&(_, &name)| name == project.name)
-            .map(|(&s, _)| s)
-            .unwrap_or("unknown");
+            .map_or("unknown", |(&s, _)| s);
 
         return Ok((slug.to_string(), project));
     }
@@ -126,8 +125,8 @@ pub async fn resolve_apptitude_project(
     Ok((slug.to_string(), project))
 }
 
-/// Resolve an Apptitude site by slug or UUID.
-pub async fn resolve_apptitude_site(
+/// Resolve a public API site by slug or UUID.
+pub async fn resolve_public_site(
     db: &DatabaseConnection,
     site_id: &str,
 ) -> AppResult<(String, sites_entity::Model)> {
@@ -153,8 +152,7 @@ pub async fn resolve_apptitude_site(
         let slug = SITES
             .iter()
             .find(|&(_, &name)| name == site.name)
-            .map(|(s, _)| *s)
-            .unwrap_or("unknown");
+            .map_or("unknown", |(s, _)| *s);
 
         return Ok((slug.to_string(), site));
     }

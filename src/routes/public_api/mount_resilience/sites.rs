@@ -15,7 +15,7 @@ use crate::common::AppState;
 use crate::entity::{projects as projects_entity, sites as sites_entity};
 use crate::error::{AppError, AppResult};
 
-use super::{resolve_apptitude_site, DOMGL_FACTOR, EXPOSED_PARAMS, SITES};
+use super::{resolve_public_site, DOMGL_FACTOR, EXPOSED_PARAMS, SITES};
 
 // ============================================================================
 // Time Format
@@ -88,7 +88,7 @@ fn resolve_requested_params(
             .filter(|s| !s.is_empty())
             .collect()
     } else {
-        all_parameter_names().iter().map(|s| s.to_string()).collect()
+        all_parameter_names().iter().map(std::string::ToString::to_string).collect()
     };
 
     let need_domgl = requested_params.iter().any(|p| p == "DOmgL");
@@ -115,7 +115,7 @@ fn resolve_requested_params(
 /// List available sites.
 #[utoipa::path(
     get,
-    path = "/api/partners/apptitude/sites",
+    path = "/api/public/mountresilience/sites",
     responses(
         (status = 200, body = Vec<SiteRef>),
     ),
@@ -174,7 +174,7 @@ struct DataRangeRow {
 /// Site overview with available parameters and data range.
 #[utoipa::path(
     get,
-    path = "/api/partners/apptitude/sites/{site_id}",
+    path = "/api/public/mountresilience/sites/{site_id}",
     params(
         ("site_id" = String, Path, description = "Slug or UUID"),
     ),
@@ -187,7 +187,7 @@ pub async fn get_site(
     State(state): State<AppState>,
     Path(site_id): Path<String>,
 ) -> AppResult<Json<SiteDetailResponse>> {
-    let (site_slug, site_model) = resolve_apptitude_site(&state.db, &site_id).await?;
+    let (site_slug, site_model) = resolve_public_site(&state.db, &site_id).await?;
 
     let params: Vec<ParameterInfo> = all_parameter_names()
         .iter()
@@ -212,8 +212,7 @@ pub async fn get_site(
         .and_then(|row| DataRangeRow::from_query_result(&row, "").ok());
 
     let (data_start, data_end, reading_count) = range
-        .map(|r| (r.min_time.map(format_time), r.max_time.map(format_time), r.count))
-        .unwrap_or((None, None, 0));
+        .map_or((None, None, 0), |r| (r.min_time.map(format_time), r.max_time.map(format_time), r.count));
 
     Ok(Json(SiteDetailResponse {
         site: SiteRef {
@@ -235,7 +234,7 @@ pub async fn get_site(
 /// List available parameters for a site.
 #[utoipa::path(
     get,
-    path = "/api/partners/apptitude/sites/{site_id}/parameters",
+    path = "/api/public/mountresilience/sites/{site_id}/parameters",
     params(
         ("site_id" = String, Path, description = "Slug or UUID"),
     ),
@@ -248,7 +247,7 @@ pub async fn list_parameters(
     State(state): State<AppState>,
     Path(site_id): Path<String>,
 ) -> AppResult<Json<Vec<ParameterInfo>>> {
-    let _ = resolve_apptitude_site(&state.db, &site_id).await?;
+    let _ = resolve_public_site(&state.db, &site_id).await?;
 
     let params: Vec<ParameterInfo> = all_parameter_names()
         .iter()
@@ -271,7 +270,7 @@ pub struct ReadingsQuery {
     pub start: Option<String>,
     /// Format: YYYY-MM-DD HH:MM:SS or ISO 8601.
     pub end: Option<String>,
-    /// Comma-separated. Available: DOuM, DOmgL, WaterTempdegC. Omit for all.
+    /// Comma-separated. Available: `DOuM`, `DOmgL`, `WaterTempdegC`. Omit for all.
     pub parameters: Option<String>,
     /// json (default) or csv.
     #[serde(default = "default_format")]
@@ -308,7 +307,7 @@ struct ReadingRow {
 /// Raw time-series readings.
 #[utoipa::path(
     get,
-    path = "/api/partners/apptitude/sites/{site_id}/readings",
+    path = "/api/public/mountresilience/sites/{site_id}/readings",
     params(
         ("site_id" = String, Path, description = "Slug or UUID"),
         ReadingsQuery,
@@ -324,7 +323,7 @@ pub async fn get_readings(
     Path(site_id): Path<String>,
     Query(query): Query<ReadingsQuery>,
 ) -> AppResult<Response> {
-    let (site_slug, site_model) = resolve_apptitude_site(&state.db, &site_id).await?;
+    let (site_slug, site_model) = resolve_public_site(&state.db, &site_id).await?;
 
     let start = query.start.as_deref().map(parse_time).transpose()?;
     let end = query.end.as_deref().map(parse_time).transpose()?;
@@ -347,22 +346,19 @@ pub async fn get_readings(
     let actual_end = times_formatted.last().cloned();
 
     let format = query.format.to_lowercase();
-    match format.as_str() {
-        "csv" => build_csv_response(&times_formatted, &output_params),
-        _ => {
-            let response = ReadingsResponse {
-                site: SiteRef {
-                    id: site_slug,
-                    uuid: site_model.id.to_string(),
-                    name: site_model.name,
-                },
-                start: actual_start,
-                end: actual_end,
-                times: times_formatted,
-                parameters: output_params,
-            };
-            Ok(Json(response).into_response())
-        }
+    if format.as_str() == "csv" { build_csv_response(&times_formatted, &output_params) } else {
+        let response = ReadingsResponse {
+            site: SiteRef {
+                id: site_slug,
+                uuid: site_model.id.to_string(),
+                name: site_model.name,
+            },
+            start: actual_start,
+            end: actual_end,
+            times: times_formatted,
+            parameters: output_params,
+        };
+        Ok(Json(response).into_response())
     }
 }
 
@@ -376,7 +372,7 @@ pub struct AggregatesQuery {
     pub start: String,
     /// Format: YYYY-MM-DD HH:MM:SS or ISO 8601.
     pub end: String,
-    /// Comma-separated. Available: DOuM, DOmgL, WaterTempdegC. Omit for all.
+    /// Comma-separated. Available: `DOuM`, `DOmgL`, `WaterTempdegC`. Omit for all.
     pub parameters: Option<String>,
     /// json (default) or csv.
     #[serde(default = "default_format")]
@@ -417,7 +413,7 @@ struct AggregateRow {
 /// Aggregated time-series (hourly, daily, weekly, monthly).
 #[utoipa::path(
     get,
-    path = "/api/partners/apptitude/sites/{site_id}/aggregates/{resolution}",
+    path = "/api/public/mountresilience/sites/{site_id}/aggregates/{resolution}",
     params(
         ("site_id" = String, Path, description = "Slug or UUID"),
         ("resolution" = String, Path, description = "hourly, daily, weekly, or monthly"),
@@ -434,7 +430,7 @@ pub async fn get_aggregates(
     Path((site_id, resolution)): Path<(String, String)>,
     Query(query): Query<AggregatesQuery>,
 ) -> AppResult<Response> {
-    let (site_slug, site_model) = resolve_apptitude_site(&state.db, &site_id).await?;
+    let (site_slug, site_model) = resolve_public_site(&state.db, &site_id).await?;
 
     let view_name = match resolution.as_str() {
         "hourly" => "readings_hourly",
@@ -600,23 +596,20 @@ pub async fn get_aggregates(
     let times_formatted: Vec<String> = times_ordered.iter().map(|t| format_time(*t)).collect();
 
     let format = query.format.to_lowercase();
-    match format.as_str() {
-        "csv" => build_aggregates_csv(&times_formatted, &output_params),
-        _ => {
-            let response = AggregatesResponse {
-                site: SiteRef {
-                    id: site_slug,
-                    uuid: site_model.id.to_string(),
-                    name: site_model.name,
-                },
-                resolution,
-                start: format_time(start),
-                end: format_time(end),
-                times: times_formatted,
-                parameters: output_params,
-            };
-            Ok(Json(response).into_response())
-        }
+    if format.as_str() == "csv" { build_aggregates_csv(&times_formatted, &output_params) } else {
+        let response = AggregatesResponse {
+            site: SiteRef {
+                id: site_slug,
+                uuid: site_model.id.to_string(),
+                name: site_model.name,
+            },
+            resolution,
+            start: format_time(start),
+            end: format_time(end),
+            times: times_formatted,
+            parameters: output_params,
+        };
+        Ok(Json(response).into_response())
     }
 }
 
@@ -624,7 +617,7 @@ pub async fn get_aggregates(
 // Shared helpers
 // ============================================================================
 
-/// Fetch raw readings, build time axis and parameter arrays (including computed DOmgL).
+/// Fetch raw readings, build time axis and parameter arrays (including computed `DOmgL`).
 async fn fetch_readings(
     state: &AppState,
     site_id: uuid::Uuid,
@@ -772,7 +765,7 @@ fn build_csv_response(
         for param in parameters {
             csv_data.push(',');
             if let Some(Some(v)) = param.values.get(i) {
-                csv_data.push_str(&format!("{:.2}", v));
+                csv_data.push_str(&format!("{v:.2}"));
             }
         }
         csv_data.push('\n');
@@ -808,11 +801,11 @@ fn build_aggregates_csv(
         csv_data.push_str(time);
         for param in parameters {
             csv_data.push(',');
-            if let Some(Some(v)) = param.avg.get(i) { csv_data.push_str(&format!("{:.2}", v)); }
+            if let Some(Some(v)) = param.avg.get(i) { csv_data.push_str(&format!("{v:.2}")); }
             csv_data.push(',');
-            if let Some(Some(v)) = param.min.get(i) { csv_data.push_str(&format!("{:.2}", v)); }
+            if let Some(Some(v)) = param.min.get(i) { csv_data.push_str(&format!("{v:.2}")); }
             csv_data.push(',');
-            if let Some(Some(v)) = param.max.get(i) { csv_data.push_str(&format!("{:.2}", v)); }
+            if let Some(Some(v)) = param.max.get(i) { csv_data.push_str(&format!("{v:.2}")); }
             csv_data.push(',');
             if let Some(c) = param.count.get(i) { csv_data.push_str(&c.to_string()); }
         }

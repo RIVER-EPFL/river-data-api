@@ -6,7 +6,7 @@
 //!   Historical data within a fixed time range won't change.
 //!
 //! - **Unbounded queries** (no end time): Check for new data on each request.
-//!   If new readings exist beyond the cached max_time, invalidate and refresh.
+//!   If new readings exist beyond the cached `max_time`, invalidate and refresh.
 //!
 //! # Usage
 //!
@@ -33,7 +33,7 @@
 //! | Unbounded (no end) | TTL + freshness check via MAX(time) |
 //!
 //! The freshness check queries `MAX(time)` for the relevant parameters (~1-2ms)
-//! and compares against the cached response's max_time. If new data exists,
+//! and compares against the cached response's `max_time`. If new data exists,
 //! the cache entry is invalidated and fresh data is fetched.
 
 use axum::{
@@ -58,6 +58,7 @@ struct MaxTimeRow {
 ///
 /// Components are joined with `:` separator. Empty components are included
 /// to ensure different queries produce different keys.
+#[must_use] 
 pub fn cache_key(prefix: &str, components: &[&str]) -> String {
     let mut key = prefix.to_string();
     for c in components {
@@ -88,8 +89,7 @@ pub async fn get_latest_time(
         .join(",");
 
     let sql = format!(
-        "SELECT MAX(time) as max_time FROM readings WHERE parameter_id IN ({})",
-        ids_str
+        "SELECT MAX(time) as max_time FROM readings WHERE parameter_id IN ({ids_str})"
     );
 
     let result = state
@@ -121,7 +121,7 @@ pub async fn get_latest_time(
 ///   check is needed. Cache expires naturally via TTL.
 ///
 /// - **Unbounded queries** (`query_end = None`): Check if new data exists
-///   beyond the cached max_time. If so, invalidate and return None to trigger
+///   beyond the cached `max_time`. If so, invalidate and return None to trigger
 ///   a fresh fetch.
 ///
 /// # Returns
@@ -138,10 +138,10 @@ pub async fn get_cached(
 
     // Only do freshness check for unbounded queries (no end time specified)
     // Bounded queries asking for historical data won't change
-    if query_end.is_none() {
-        if let Ok(Some(latest)) = get_latest_time(state, param_ids).await {
-            if let Some(cached_max) = cached.max_time {
-                if latest > cached_max {
+    if query_end.is_none()
+        && let Ok(Some(latest)) = get_latest_time(state, param_ids).await
+            && let Some(cached_max) = cached.max_time
+                && latest > cached_max {
                     // New data exists beyond what we cached
                     tracing::debug!(
                         cache_key = %cache_key,
@@ -152,9 +152,6 @@ pub async fn get_cached(
                     state.response_cache.invalidate(cache_key).await;
                     return None;
                 }
-            }
-        }
-    }
 
     tracing::debug!(cache_key = %cache_key, "cache_hit");
     Some(cached.data.clone())

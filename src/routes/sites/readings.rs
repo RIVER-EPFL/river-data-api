@@ -209,7 +209,7 @@ pub struct SiteReadingsQuery {
 /// Supports JSON, CSV, and NDJSON formats.
 #[utoipa::path(
     get,
-    path = "/api/sites/{site_id}/readings",
+    path = "/api/private/sites/{site_id}/readings",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
         SiteReadingsQuery
@@ -248,13 +248,12 @@ pub async fn get_site_readings(
     };
 
     // Validate time range if both provided
-    if let (Some(start), Some(end)) = (query.start, query.end) {
-        if end <= start {
+    if let (Some(start), Some(end)) = (query.start, query.end)
+        && end <= start {
             return Err(AppError::BadRequest(
                 "end time must be after start time".to_string(),
             ));
         }
-    }
 
     // Determine format from query or Accept header
     let format = determine_format(&query.format, &headers);
@@ -295,26 +294,22 @@ pub async fn get_site_readings(
     );
 
     // Check cache with freshness validation (JSON only)
-    if format == "json" {
-        if let Some(cached) = cache::get_cached(&state, &cache_key, &param_ids, query.end).await {
-            return cache::json_response((*cached).to_vec(), true);
+    if format == "json"
+        && let Some(cached) = cache::get_cached(&state, &cache_key, &param_ids, query.end).await {
+            return cache::json_response((*cached).clone(), true);
         }
-    }
 
     // For bulk formats (CSV/NDJSON), acquire semaphore to limit concurrent requests
     let _permit = if format == "csv" || format == "ndjson" {
-        match BULK_SEMAPHORE.clone().try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(_) => {
-                tracing::warn!(
-                    format = %format,
-                    status = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                    "bulk_request_rejected"
-                );
-                return Err(AppError::ServiceUnavailable(
-                    "Too many concurrent bulk requests. Please try again later.".to_string(),
-                ));
-            }
+        if let Ok(permit) = BULK_SEMAPHORE.clone().try_acquire_owned() { Some(permit) } else {
+            tracing::warn!(
+                format = %format,
+                status = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                "bulk_request_rejected"
+            );
+            return Err(AppError::ServiceUnavailable(
+                "Too many concurrent bulk requests. Please try again later.".to_string(),
+            ));
         }
     } else {
         None

@@ -1,6 +1,6 @@
 pub mod alarms;
 pub mod dashboard;
-pub mod partners;
+pub mod public_api;
 pub mod projects;
 pub mod sites;
 
@@ -18,8 +18,9 @@ use tower_http::{
     compression::CompressionLayer,
     cors::{Any, CorsLayer},
     limit::RequestBodyLimitLayer,
-    trace::TraceLayer,
+    trace::{DefaultMakeSpan, TraceLayer},
 };
+use tracing::Level;
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
@@ -191,15 +192,16 @@ pub fn build_router(state: AppState) -> Router {
             get(alarms::get_site_alarms),
         );
 
-    // Partner routes (included in api_routes for rate limiting)
-    let partner_routes = partners::partner_router();
+    // Public API routes
+    let public_routes = public_api::public_router();
 
     // Combine API routes, conditionally applying rate limiting
     let api_routes = if config.disable_rate_limiting {
         Router::new()
-            .merge(metadata_routes_base)
-            .merge(data_routes_base)
-            .nest("/partners", partner_routes)
+            .nest("/private", Router::new()
+                .merge(metadata_routes_base)
+                .merge(data_routes_base))
+            .nest("/public", public_routes)
     } else {
         let metadata_limiter = GovernorConfigBuilder::default()
             .key_extractor(FallbackIpKeyExtractor)
@@ -218,13 +220,14 @@ pub fn build_router(state: AppState) -> Router {
         let data_limiter_arc = Arc::new(data_limiter);
 
         Router::new()
-            .merge(metadata_routes_base.layer(GovernorLayer {
-                config: Arc::new(metadata_limiter),
-            }))
-            .merge(data_routes_base.layer(GovernorLayer {
-                config: Arc::clone(&data_limiter_arc),
-            }))
-            .nest("/partners", partner_routes.layer(GovernorLayer {
+            .nest("/private", Router::new()
+                .merge(metadata_routes_base.layer(GovernorLayer {
+                    config: Arc::new(metadata_limiter),
+                }))
+                .merge(data_routes_base.layer(GovernorLayer {
+                    config: Arc::clone(&data_limiter_arc),
+                })))
+            .nest("/public", public_routes.layer(GovernorLayer {
                 config: data_limiter_arc,
             }))
     }
@@ -252,6 +255,27 @@ pub fn build_router(state: AppState) -> Router {
                 .allow_methods(Any)
                 .allow_headers(Any),
         )
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_request(|req: &axum::http::Request<_>, _span: &tracing::Span| {
+                    tracing::info!("--> {} {}", req.method(), req.uri().path());
+                })
+                .on_response(
+                    |res: &axum::http::Response<_>,
+                     latency: std::time::Duration,
+                     _span: &tracing::Span| {
+                        let status = res.status();
+                        let ms = latency.as_millis();
+                        if status.is_server_error() {
+                            tracing::error!("<-- {} {ms}ms", status);
+                        } else if status.is_client_error() {
+                            tracing::warn!("<-- {} {ms}ms", status);
+                        } else {
+                            tracing::info!("<-- {} {ms}ms", status);
+                        }
+                    },
+                ),
+        )
         .with_state(state)
 }

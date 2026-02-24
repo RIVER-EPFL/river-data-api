@@ -22,7 +22,7 @@ struct DataRangeRow {
 /// List all sites
 #[utoipa::path(
     get,
-    path = "/api/sites",
+    path = "/api/private/sites",
     params(SitesQuery),
     responses(
         (status = 200, description = "Sites retrieved successfully", body = Vec<SiteResponse>),
@@ -62,7 +62,7 @@ pub async fn list_sites(
 /// Get a specific site by ID or name
 #[utoipa::path(
     get,
-    path = "/api/sites/{site_id}",
+    path = "/api/private/sites/{site_id}",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
     ),
@@ -127,8 +127,7 @@ pub async fn get_site(
         .and_then(|row| DataRangeRow::from_query_result(&row, "").ok());
 
     let (data_start, data_end, reading_count) = data_range
-        .map(|r| (r.min_time, r.max_time, r.count))
-        .unwrap_or((None, None, 0));
+        .map_or((None, None, 0), |r| (r.min_time, r.max_time, r.count));
 
     Ok(Json(SiteDetailResponse {
         id: site.id,
@@ -147,7 +146,7 @@ pub async fn get_site(
 /// List parameters for a site
 #[utoipa::path(
     get,
-    path = "/api/sites/{site_id}/parameters",
+    path = "/api/private/sites/{site_id}/parameters",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
     ),

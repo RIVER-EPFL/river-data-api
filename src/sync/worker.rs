@@ -19,7 +19,7 @@ const BATCH_SIZE: usize = 1000;
 /// - viewLinc (root, ignored)
 ///   - Project (depth 1, e.g., "BREATHE")
 ///     - Site (depth 2, e.g., "Martigny")
-///       - Parameter (depth 3, leaf=true, e.g., "MDepthmm")
+///       - Parameter (depth 3, leaf=true, e.g., "`MDepthmm`")
 pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) -> AppResult<()> {
     tracing::info!("Discovering locations from Vaisala...");
 
@@ -362,7 +362,7 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
 }
 
 /// Derive sensor type from the Vaisala sensor name.
-/// E.g., "MDepthmm" -> "Depth", "MCDOMppb" -> "CDOM"
+/// E.g., "`MDepthmm`" -> "Depth", "`MCDOMppb`" -> "CDOM"
 /// Handles both old Vaisala names (with station prefix) and new generic names.
 fn derive_parameter_type(name: &str) -> String {
     let patterns: &[(&str, &[&str])] = &[
@@ -389,7 +389,7 @@ fn derive_parameter_type(name: &str) -> String {
 }
 
 /// Convert a Vaisala sensor name to a generic name by stripping the station prefix.
-/// E.g., "MDepthmm" -> "WaterDepthmm", "MCDOMppb" -> "CDOMppb", "DDOuM" -> "DOuM"
+/// E.g., "`MDepthmm`" -> "`WaterDepthmm`", "`MCDOMppb`" -> "`CDOMppb`", "`DDOuM`" -> "`DOuM`"
 fn derive_generic_name(vaisala_name: &str) -> String {
     let mappings: &[(&str, &str)] = &[
         // Depth
@@ -749,7 +749,7 @@ async fn update_sync_state_error(db: &DatabaseConnection, parameter_id: Uuid, er
     }
 }
 
-/// Update last_full_sync timestamp for all parameters.
+/// Update `last_full_sync` timestamp for all parameters.
 pub async fn update_last_full_sync_for_all_parameters(db: &DatabaseConnection) {
     let now = Utc::now();
 
@@ -771,7 +771,7 @@ pub async fn update_last_full_sync_for_all_parameters(db: &DatabaseConnection) {
     }
 }
 
-/// Check if a full re-sync is needed (oldest last_full_sync > 24 hours ago, or never done).
+/// Check if a full re-sync is needed (oldest `last_full_sync` > 24 hours ago, or never done).
 pub async fn needs_full_sync(db: &DatabaseConnection) -> bool {
     let states = match sync_state::Entity::find().all(db).await {
         Ok(s) => s,

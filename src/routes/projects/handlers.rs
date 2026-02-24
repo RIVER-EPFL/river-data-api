@@ -15,7 +15,7 @@ use super::types::ProjectResponse;
 /// List all projects
 #[utoipa::path(
     get,
-    path = "/api/projects",
+    path = "/api/private/projects",
     responses(
         (status = 200, description = "Projects retrieved successfully", body = Vec<ProjectResponse>),
     ),
@@ -42,7 +42,7 @@ pub async fn list_projects(State(state): State<AppState>) -> AppResult<Json<Vec<
 /// Get a specific project by ID or name
 #[utoipa::path(
     get,
-    path = "/api/projects/{project_id}",
+    path = "/api/private/projects/{project_id}",
     params(
         ("project_id" = String, Path, description = "Project UUID or name"),
     ),
@@ -68,7 +68,7 @@ pub async fn get_project(
 /// List sites belonging to a project
 #[utoipa::path(
     get,
-    path = "/api/projects/{project_id}/sites",
+    path = "/api/private/projects/{project_id}/sites",
     params(
         ("project_id" = String, Path, description = "Project UUID or name"),
     ),

@@ -236,7 +236,7 @@ pub struct SiteAggregatesQuery {
 /// Supports JSON, CSV, and NDJSON formats.
 #[utoipa::path(
     get,
-    path = "/api/sites/{site_id}/aggregates/{resolution}",
+    path = "/api/private/sites/{site_id}/aggregates/{resolution}",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
         ("resolution" = String, Path, description = "Aggregation resolution: hourly, daily, weekly, monthly"),
@@ -326,25 +326,21 @@ pub async fn get_site_aggregates(
         ],
     );
 
-    if format == "json" {
-        if let Some(cached) = cache::get_cached(&state, &cache_key, &param_ids, Some(query.end)).await {
-            return cache::json_response((*cached).to_vec(), true);
+    if format == "json"
+        && let Some(cached) = cache::get_cached(&state, &cache_key, &param_ids, Some(query.end)).await {
+            return cache::json_response((*cached).clone(), true);
         }
-    }
 
     let _permit = if format == "csv" || format == "ndjson" {
-        match BULK_SEMAPHORE.clone().try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(_) => {
-                tracing::warn!(
-                    format = %format,
-                    status = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                    "bulk_request_rejected"
-                );
-                return Err(AppError::ServiceUnavailable(
-                    "Too many concurrent bulk requests. Please try again later.".to_string(),
-                ));
-            }
+        if let Ok(permit) = BULK_SEMAPHORE.clone().try_acquire_owned() { Some(permit) } else {
+            tracing::warn!(
+                format = %format,
+                status = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                "bulk_request_rejected"
+            );
+            return Err(AppError::ServiceUnavailable(
+                "Too many concurrent bulk requests. Please try again later.".to_string(),
+            ));
         }
     } else {
         None

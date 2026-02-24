@@ -72,7 +72,7 @@ pub struct LocationHistoryAttributes {
     pub thresholds: Vec<serde_json::Value>,
 }
 
-/// A single data point: [timestamp_epoch, value, logged_bool]
+/// A single data point: [`timestamp_epoch`, value, `logged_bool`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(from = "RawDataPoint")]
 pub struct DataPoint {

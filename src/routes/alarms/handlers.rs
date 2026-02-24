@@ -169,7 +169,7 @@ fn build_ndjson_response(
 /// Returns time-series data with severity levels (1=warning, 2=alarm).
 #[utoipa::path(
     get,
-    path = "/api/sites/{site_id}/alarms",
+    path = "/api/private/sites/{site_id}/alarms",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
         SiteAlarmsQuery
@@ -292,25 +292,21 @@ pub async fn get_site_alarms(
         ],
     );
 
-    if format == "json" {
-        if let Some(cached) = cache::get_cached(&state, &cache_key, &param_ids, Some(query.end)).await {
-            return cache::json_response((*cached).to_vec(), true);
+    if format == "json"
+        && let Some(cached) = cache::get_cached(&state, &cache_key, &param_ids, Some(query.end)).await {
+            return cache::json_response((*cached).clone(), true);
         }
-    }
 
     let _permit = if format == "csv" || format == "ndjson" {
-        match BULK_SEMAPHORE.clone().try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(_) => {
-                tracing::warn!(
-                    format = %format,
-                    status = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                    "bulk_request_rejected"
-                );
-                return Err(AppError::ServiceUnavailable(
-                    "Too many concurrent bulk requests. Please try again later.".to_string(),
-                ));
-            }
+        if let Ok(permit) = BULK_SEMAPHORE.clone().try_acquire_owned() { Some(permit) } else {
+            tracing::warn!(
+                format = %format,
+                status = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                "bulk_request_rejected"
+            );
+            return Err(AppError::ServiceUnavailable(
+                "Too many concurrent bulk requests. Please try again later.".to_string(),
+            ));
         }
     } else {
         None
@@ -325,21 +321,21 @@ pub async fn get_site_alarms(
     let min_severity = query.severity.unwrap_or(1);
 
     let violation_condition = if min_severity >= 2 {
-        r#"(
+        r"(
             (t.alarm_min IS NOT NULL AND r.value < t.alarm_min) OR
             (t.alarm_max IS NOT NULL AND r.value > t.alarm_max)
-        )"#
+        )"
     } else {
-        r#"(
+        r"(
             (t.alarm_min IS NOT NULL AND r.value < t.alarm_min) OR
             (t.alarm_max IS NOT NULL AND r.value > t.alarm_max) OR
             (t.warning_min IS NOT NULL AND r.value < t.warning_min) OR
             (t.warning_max IS NOT NULL AND r.value > t.warning_max)
-        )"#
+        )"
     };
 
     let sql = format!(
-        r#"
+        r"
         SELECT
             r.parameter_id,
             r.time,
@@ -358,7 +354,7 @@ pub async fn get_site_alarms(
           AND r.time <= '{}'
           AND {}
         ORDER BY r.time, r.parameter_id
-        "#,
+        ",
         param_ids_str,
         query.start.to_rfc3339(),
         query.end.to_rfc3339(),
