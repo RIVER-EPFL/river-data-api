@@ -81,10 +81,10 @@ pub fn mount_resilience_router() -> Router<AppState> {
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
-      .introduction .markdown p,
-      .introduction .markdown li {
-        text-align: justify;
-        text-justify: inter-word;
+      .introduction-description .markdown p,
+      .introduction-description .markdown li {
+        text-align: justify !important;
+        text-justify: inter-word !important;
       }
     </style>
   </head>
