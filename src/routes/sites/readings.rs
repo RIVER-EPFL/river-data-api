@@ -18,23 +18,29 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::{sensors, zones};
+use crate::entity::{parameters, projects};
 use crate::error::{AppError, AppResult};
-use crate::routes::{cache, resolve_station};
+use crate::routes::{cache, resolve_site};
 
-use super::types::{StationRef, ZoneRef};
+use super::types::{ProjectRef, SiteRef};
 
 /// Minimal struct for efficient readings query
 #[derive(Debug, FromQueryResult)]
 struct ReadingRow {
-    sensor_id: Uuid,
+    parameter_id: Uuid,
     time: chrono::DateTime<chrono::FixedOffset>,
     value: f64,
 }
 
+#[derive(Debug, FromQueryResult)]
+struct ReadingRowWithSeverity {
+    parameter_id: Uuid,
+    time: chrono::DateTime<chrono::FixedOffset>,
+    value: f64,
+    severity: Option<i16>,
+}
+
 /// Global semaphore limiting concurrent bulk (CSV/NDJSON) requests.
-/// Protects the database from distributed DDoS attacks.
-/// Configurable via BULK_CONCURRENT_LIMIT env var (default: 5).
 static BULK_SEMAPHORE: std::sync::LazyLock<Arc<Semaphore>> = std::sync::LazyLock::new(|| {
     let limit = std::env::var("BULK_CONCURRENT_LIMIT")
         .ok()
@@ -49,22 +55,22 @@ fn default_format() -> String {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ReadingsResponse {
-    /// Zone this data belongs to
-    pub zone: Option<ZoneRef>,
-    /// Station this data belongs to
-    pub station: StationRef,
+    /// Project this data belongs to
+    pub project: Option<ProjectRef>,
+    /// Site this data belongs to
+    pub site: SiteRef,
     /// Start of time range (null if no data)
     pub start: Option<DateTime<Utc>>,
     /// End of time range (null if no data)
     pub end: Option<DateTime<Utc>>,
     /// Array of timestamps (aligned to 10-minute intervals)
     pub times: Vec<DateTime<Utc>>,
-    /// Array of sensors with their values
-    pub sensors: Vec<SensorData>,
+    /// Array of parameters with their values
+    pub parameters: Vec<ParameterData>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct SensorData {
+pub struct ParameterData {
     pub id: Uuid,
     pub name: String,
     #[serde(rename = "type")]
@@ -72,15 +78,16 @@ pub struct SensorData {
     pub units: Option<String>,
     /// Values array (same length as times, null for missing data)
     pub values: Vec<Option<f64>>,
+    /// Severity levels (0=ok, 1=warning, 2=alarm). Only present when alarms=true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severities: Option<Vec<Option<i16>>>,
 }
 
 fn determine_format(query_format: &str, headers: &HeaderMap) -> String {
-    // Query parameter takes precedence
     if query_format != "json" {
         return query_format.to_lowercase();
     }
 
-    // Check Accept header
     if let Some(accept) = headers.get(header::ACCEPT)
         && let Ok(accept_str) = accept.to_str()
     {
@@ -95,18 +102,18 @@ fn determine_format(query_format: &str, headers: &HeaderMap) -> String {
     "json".to_string()
 }
 
-fn build_csv_response(times: &[DateTime<Utc>], sensors: &[SensorData]) -> AppResult<Response> {
+fn build_csv_response(times: &[DateTime<Utc>], params: &[ParameterData]) -> AppResult<Response> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
 
     let times = times.to_vec();
-    let sensors = sensors.to_vec();
+    let params = params.to_vec();
 
     tokio::spawn(async move {
         // Header row
         let mut header = "time".to_string();
-        for sensor in &sensors {
+        for param in &params {
             header.push(',');
-            header.push_str(&sensor.name);
+            header.push_str(&param.name);
         }
         header.push('\n');
         let _ = tx.send(Ok(header)).await;
@@ -114,9 +121,9 @@ fn build_csv_response(times: &[DateTime<Utc>], sensors: &[SensorData]) -> AppRes
         // Data rows
         for (i, time) in times.iter().enumerate() {
             let mut row = time.to_rfc3339();
-            for sensor in &sensors {
+            for param in &params {
                 row.push(',');
-                match sensor.values.get(i).and_then(|v| *v) {
+                match param.values.get(i).and_then(|v| *v) {
                     Some(v) => row.push_str(&v.to_string()),
                     None => {} // Empty for null
                 }
@@ -139,23 +146,22 @@ fn build_csv_response(times: &[DateTime<Utc>], sensors: &[SensorData]) -> AppRes
 
 fn build_ndjson_response(
     times: &[DateTime<Utc>],
-    sensors: &[SensorData],
+    params: &[ParameterData],
 ) -> AppResult<Response> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
 
     let times = times.to_vec();
-    let sensors = sensors.to_vec();
+    let params = params.to_vec();
 
     tokio::spawn(async move {
-        // Each row is a JSON object with time and sensor values
         for (i, time) in times.iter().enumerate() {
             let mut obj = serde_json::Map::new();
             obj.insert("time".to_string(), serde_json::json!(time.to_rfc3339()));
 
-            for sensor in &sensors {
-                let value = sensor.values.get(i).and_then(|v| *v);
+            for param in &params {
+                let value = param.values.get(i).and_then(|v| *v);
                 obj.insert(
-                    sensor.name.clone(),
+                    param.name.clone(),
                     match value {
                         Some(v) => serde_json::json!(v),
                         None => serde_json::Value::Null,
@@ -183,7 +189,7 @@ fn build_ndjson_response(
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
-pub struct StationReadingsQuery {
+pub struct SiteReadingsQuery {
     /// Start time (optional, ISO 8601). If omitted, returns from earliest data.
     pub start: Option<DateTime<Utc>>,
     /// End time (optional, ISO 8601). If omitted, returns to latest data.
@@ -193,50 +199,52 @@ pub struct StationReadingsQuery {
     /// Response format: json (default), ndjson, csv
     #[serde(default = "default_format")]
     pub format: String,
+    /// Include alarm severity data (threshold violations)
+    pub alarms: Option<bool>,
 }
 
-/// Get readings for a specific station
+/// Get readings for a specific site
 ///
-/// Returns time-series data for all sensors in the specified station.
+/// Returns time-series data for all parameters in the specified site.
 /// Supports JSON, CSV, and NDJSON formats.
 #[utoipa::path(
     get,
-    path = "/api/stations/{station_id}/readings",
+    path = "/api/sites/{site_id}/readings",
     params(
-        ("station_id" = String, Path, description = "Station UUID or name"),
-        StationReadingsQuery
+        ("site_id" = String, Path, description = "Site UUID or name"),
+        SiteReadingsQuery
     ),
     responses(
         (status = 200, description = "Readings retrieved successfully", body = ReadingsResponse),
         (status = 400, description = "Invalid query parameters"),
-        (status = 404, description = "Station not found"),
+        (status = 404, description = "Site not found"),
     ),
-    tag = "stations"
+    tag = "sites"
 )]
-pub async fn get_station_readings(
+pub async fn get_site_readings(
     State(state): State<AppState>,
-    Path(station_id): Path<String>,
-    Query(query): Query<StationReadingsQuery>,
+    Path(site_id): Path<String>,
+    Query(query): Query<SiteReadingsQuery>,
     headers: HeaderMap,
 ) -> AppResult<Response> {
-    let station = resolve_station(&state.db, &station_id).await?;
+    let site = resolve_site(&state.db, &site_id).await?;
 
-    // Fetch zone info if available
-    let zone_ref = if let Some(zone_id) = station.zone_id {
-        zones::Entity::find_by_id(zone_id)
+    // Fetch project info if available
+    let project_ref = if let Some(project_id) = site.project_id {
+        projects::Entity::find_by_id(project_id)
             .one(&state.db)
             .await?
-            .map(|z| ZoneRef {
-                id: z.id,
-                name: z.name,
+            .map(|p| ProjectRef {
+                id: p.id,
+                name: p.name,
             })
     } else {
         None
     };
 
-    let station_ref = StationRef {
-        id: station.id,
-        name: station.name.clone(),
+    let site_ref = SiteRef {
+        id: site.id,
+        name: site.name.clone(),
     };
 
     // Validate time range if both provided
@@ -251,42 +259,44 @@ pub async fn get_station_readings(
     // Determine format from query or Accept header
     let format = determine_format(&query.format, &headers);
 
-    // Build sensor query for this station only
-    let mut sensor_query = sensors::Entity::find()
-        .filter(sensors::Column::IsActive.eq(true))
-        .filter(sensors::Column::StationId.eq(station.id));
+    // Build parameter query for this site only
+    let mut param_query = parameters::Entity::find()
+        .filter(parameters::Column::IsActive.eq(true))
+        .filter(parameters::Column::SiteId.eq(site.id));
 
     if let Some(ref types) = query.sensor_types {
         let type_list: Vec<String> = types.split(',').map(|s| s.trim().to_string()).collect();
         if !type_list.is_empty() {
-            sensor_query = sensor_query.filter(sensors::Column::SensorType.is_in(type_list));
+            param_query = param_query.filter(parameters::Column::SensorType.is_in(type_list));
         }
     }
 
-    // Get matching sensors (needed for cache key validation)
-    let sensors_list = sensor_query
-        .order_by_asc(sensors::Column::Name)
+    // Get matching parameters (needed for cache key validation)
+    let params_list = param_query
+        .order_by_asc(parameters::Column::Name)
         .all(&state.db)
         .await?;
 
-    let sensor_ids: Vec<Uuid> = sensors_list.iter().map(|s| s.id).collect();
+    let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.id).collect();
+
+    let include_alarms = query.alarms.unwrap_or(false);
 
     // Build cache key from request parameters
     let cache_key = cache::cache_key(
         "readings",
         &[
-            &station.id.to_string(),
+            &site.id.to_string(),
             &query.start.map(|t| t.to_rfc3339()).unwrap_or_default(),
             &query.end.map(|t| t.to_rfc3339()).unwrap_or_default(),
             query.sensor_types.as_deref().unwrap_or(""),
             &format,
+            if include_alarms { "alarms" } else { "" },
         ],
     );
 
     // Check cache with freshness validation (JSON only)
-    // Pass query.end so bounded queries skip freshness check (historical data won't change)
     if format == "json" {
-        if let Some(cached) = cache::get_cached(&state, &cache_key, &sensor_ids, query.end).await {
+        if let Some(cached) = cache::get_cached(&state, &cache_key, &param_ids, query.end).await {
             return cache::json_response((*cached).to_vec(), true);
         }
     }
@@ -310,97 +320,124 @@ pub async fn get_station_readings(
         None
     };
 
-    if sensors_list.is_empty() {
+    if params_list.is_empty() {
         return Ok(Json(ReadingsResponse {
-            zone: zone_ref,
-            station: station_ref,
+            project: project_ref,
+            site: site_ref,
             start: None,
             end: None,
             times: vec![],
-            sensors: vec![],
+            parameters: vec![],
         })
         .into_response());
     }
 
-    let num_sensors = sensors_list.len();
+    let num_params = params_list.len();
 
-    // Build optimized raw SQL query - only fetch needed columns
-    let sensor_ids_str = sensor_ids
+    // Build optimized raw SQL query
+    let param_ids_str = param_ids
         .iter()
         .map(|id| format!("'{id}'"))
         .collect::<Vec<_>>()
         .join(",");
 
-    // ORDER BY sensor_id, time matches index (sensor_id, time DESC) for efficient retrieval.
-    // Data arrives grouped by sensor, sorted by time - enables streaming processing in Rust.
-    let sql = match (query.start, query.end) {
+    let select_clause = if include_alarms {
+        r"r.parameter_id, r.time, r.value,
+            CASE
+                WHEN t.parameter_id IS NULL THEN NULL
+                WHEN (t.alarm_min IS NOT NULL AND r.value < t.alarm_min) OR
+                     (t.alarm_max IS NOT NULL AND r.value > t.alarm_max) THEN 2
+                WHEN (t.warning_min IS NOT NULL AND r.value < t.warning_min) OR
+                     (t.warning_max IS NOT NULL AND r.value > t.warning_max) THEN 1
+                ELSE 0
+            END::smallint as severity"
+    } else {
+        "r.parameter_id, r.time, r.value"
+    };
+
+    let from_clause = if include_alarms {
+        "readings r LEFT JOIN alarm_thresholds t ON r.parameter_id = t.parameter_id"
+    } else {
+        "readings r"
+    };
+
+    let time_conditions = match (query.start, query.end) {
         (Some(start), Some(end)) => format!(
-            "SELECT sensor_id, time, value FROM readings WHERE sensor_id IN ({}) AND time >= '{}' AND time <= '{}' ORDER BY sensor_id, time",
-            sensor_ids_str,
+            " AND r.time >= '{}' AND r.time <= '{}'",
             start.to_rfc3339(),
             end.to_rfc3339()
         ),
-        (Some(start), None) => format!(
-            "SELECT sensor_id, time, value FROM readings WHERE sensor_id IN ({}) AND time >= '{}' ORDER BY sensor_id, time",
-            sensor_ids_str,
-            start.to_rfc3339()
-        ),
-        (None, Some(end)) => format!(
-            "SELECT sensor_id, time, value FROM readings WHERE sensor_id IN ({}) AND time <= '{}' ORDER BY sensor_id, time",
-            sensor_ids_str,
-            end.to_rfc3339()
-        ),
-        (None, None) => format!(
-            "SELECT sensor_id, time, value FROM readings WHERE sensor_id IN ({}) ORDER BY sensor_id, time",
-            sensor_ids_str
-        ),
+        (Some(start), None) => format!(" AND r.time >= '{}'", start.to_rfc3339()),
+        (None, Some(end)) => format!(" AND r.time <= '{}'", end.to_rfc3339()),
+        (None, None) => String::new(),
     };
 
-    let readings_list: Vec<ReadingRow> = state
+    let sql = format!(
+        "SELECT {select_clause} FROM {from_clause} WHERE r.parameter_id IN ({param_ids_str}){time_conditions} ORDER BY r.parameter_id, r.time"
+    );
+
+    let query_result = state
         .db
         .query_all(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             sql,
         ))
-        .await?
-        .into_iter()
-        .filter_map(|row| ReadingRow::from_query_result(&row, "").ok())
-        .collect();
+        .await?;
 
-    // Data arrives sorted by (sensor_id, time) from DB.
-    // 1. Collect unique times and group values by sensor in single pass
-    let estimated_times = readings_list.len() / num_sensors.max(1);
+    let estimated_times = query_result.len() / num_params.max(1);
     let mut time_set: HashSet<DateTime<Utc>> = HashSet::with_capacity(estimated_times);
-    let mut sensor_values: HashMap<Uuid, Vec<(DateTime<Utc>, f64)>> =
-        HashMap::with_capacity(num_sensors);
+    let mut param_values: HashMap<Uuid, Vec<(DateTime<Utc>, f64)>> =
+        HashMap::with_capacity(num_params);
+    let mut param_severities: HashMap<Uuid, Vec<(DateTime<Utc>, Option<i16>)>> = HashMap::new();
 
-    for row in readings_list {
-        let time = row.time.with_timezone(&Utc);
-        time_set.insert(time);
-        sensor_values
-            .entry(row.sensor_id)
-            .or_insert_with(|| Vec::with_capacity(estimated_times))
-            .push((time, row.value));
+    if include_alarms {
+        for row in query_result {
+            if let Ok(r) = ReadingRowWithSeverity::from_query_result(&row, "") {
+                let time = r.time.with_timezone(&Utc);
+                time_set.insert(time);
+                param_values
+                    .entry(r.parameter_id)
+                    .or_insert_with(|| Vec::with_capacity(estimated_times))
+                    .push((time, r.value));
+                param_severities
+                    .entry(r.parameter_id)
+                    .or_default()
+                    .push((time, r.severity));
+            }
+        }
+    } else {
+        for row in query_result {
+            if let Ok(r) = ReadingRow::from_query_result(&row, "") {
+                let time = r.time.with_timezone(&Utc);
+                time_set.insert(time);
+                param_values
+                    .entry(r.parameter_id)
+                    .or_insert_with(|| Vec::with_capacity(estimated_times))
+                    .push((time, r.value));
+            }
+        }
     }
 
-    // 2. Sort times once (HashSet -> sorted Vec)
     let mut times: Vec<DateTime<Utc>> = time_set.into_iter().collect();
     times.sort_unstable();
 
-    // 3. Build time -> index map for O(1) lookup
     let time_index: HashMap<DateTime<Utc>, usize> = times
         .iter()
         .enumerate()
         .map(|(i, t)| (*t, i))
         .collect();
 
-    // 4. Build sensor data using index map (no nested HashMap lookups)
-    let sensor_data: Vec<SensorData> = sensors_list
+    let param_data: Vec<ParameterData> = params_list
         .iter()
-        .map(|sensor| {
+        .map(|param| {
             let mut values: Vec<Option<f64>> = vec![None; times.len()];
+            let mut severities_vec: Option<Vec<Option<i16>>> = if include_alarms {
+                Some(vec![None; times.len()])
+            } else {
+                None
+            };
 
-            if let Some(readings) = sensor_values.get(&sensor.id) {
+            if let Some(readings) = param_values.get(&param.id) {
                 for (time, value) in readings {
                     if let Some(&idx) = time_index.get(time) {
                         values[idx] = Some(*value);
@@ -408,34 +445,42 @@ pub async fn get_station_readings(
                 }
             }
 
-            SensorData {
-                id: sensor.id,
-                name: sensor.name.clone(),
-                sensor_type: sensor.sensor_type.clone(),
-                units: sensor.display_units.clone(),
+            if let Some(ref mut sev_vec) = severities_vec
+                && let Some(sevs) = param_severities.get(&param.id)
+            {
+                for (time, severity) in sevs {
+                    if let Some(&idx) = time_index.get(time) {
+                        sev_vec[idx] = *severity;
+                    }
+                }
+            }
+
+            ParameterData {
+                id: param.id,
+                name: param.name.clone(),
+                sensor_type: param.sensor_type.clone(),
+                units: param.display_units.clone(),
                 values,
+                severities: severities_vec,
             }
         })
         .collect();
 
-    // Use actual data range
     let actual_start = times.first().copied();
     let actual_end = times.last().copied();
 
-    // Return appropriate format
     match format.as_str() {
-        "csv" => build_csv_response(&times, &sensor_data),
-        "ndjson" => build_ndjson_response(&times, &sensor_data),
+        "csv" => build_csv_response(&times, &param_data),
+        "ndjson" => build_ndjson_response(&times, &param_data),
         _ => {
             let response = ReadingsResponse {
-                zone: zone_ref,
-                station: station_ref,
+                project: project_ref,
+                site: site_ref,
                 start: actual_start,
                 end: actual_end,
                 times,
-                sensors: sensor_data,
+                parameters: param_data,
             };
-            // Cache with max_time for freshness tracking
             cache::cache_and_respond(&state, cache_key, &response, actual_end).await
         }
     }

@@ -53,8 +53,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Spawning background sync tasks...");
     tokio::spawn(sync::scheduler::run_readings_sync(state.clone()));
     tokio::spawn(sync::scheduler::run_device_status_sync(state.clone()));
-    tokio::spawn(sync::scheduler::run_alarms_sync(state.clone()));
-    tokio::spawn(sync::scheduler::run_events_sync(state.clone()));
 
     // Build router
     let app = routes::build_router(state);

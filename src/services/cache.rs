@@ -12,10 +12,10 @@
 //!
 //! ```text
 //! // In your endpoint handler:
-//! let cache_key = cache::cache_key("readings", &[&station_id, &start, &end]);
+//! let cache_key = cache::cache_key("readings", &[&site_id, &start, &end]);
 //!
 //! // Check cache (pass query_end for bounded queries, None for unbounded)
-//! if let Some(cached) = cache::get_cached(&state, &cache_key, &sensor_ids, query.end).await {
+//! if let Some(cached) = cache::get_cached(&state, &cache_key, &param_ids, query.end).await {
 //!     return cache::json_response((*cached).to_vec(), true);
 //! }
 //!
@@ -32,7 +32,7 @@
 //! | Bounded (end specified) | TTL only - data won't change |
 //! | Unbounded (no end) | TTL + freshness check via MAX(time) |
 //!
-//! The freshness check queries `MAX(time)` for the relevant sensors (~1-2ms)
+//! The freshness check queries `MAX(time)` for the relevant parameters (~1-2ms)
 //! and compares against the cached response's max_time. If new data exists,
 //! the cache entry is invalidated and fresh data is fetched.
 
@@ -67,7 +67,7 @@ pub fn cache_key(prefix: &str, components: &[&str]) -> String {
     key
 }
 
-/// Query the latest reading time for given sensor IDs.
+/// Query the latest reading time for given parameter IDs.
 ///
 /// Used for freshness checking on unbounded queries. Returns the MAX(time)
 /// across all readings for the specified sensors.
@@ -75,20 +75,20 @@ pub fn cache_key(prefix: &str, components: &[&str]) -> String {
 /// This query is optimized and typically completes in ~1-2ms.
 pub async fn get_latest_time(
     state: &AppState,
-    sensor_ids: &[uuid::Uuid],
+    param_ids: &[uuid::Uuid],
 ) -> AppResult<Option<DateTime<Utc>>> {
-    if sensor_ids.is_empty() {
+    if param_ids.is_empty() {
         return Ok(None);
     }
 
-    let ids_str = sensor_ids
+    let ids_str = param_ids
         .iter()
         .map(|id| format!("'{id}'"))
         .collect::<Vec<_>>()
         .join(",");
 
     let sql = format!(
-        "SELECT MAX(time) as max_time FROM readings WHERE sensor_id IN ({})",
+        "SELECT MAX(time) as max_time FROM readings WHERE parameter_id IN ({})",
         ids_str
     );
 
@@ -111,7 +111,7 @@ pub async fn get_latest_time(
 ///
 /// * `state` - Application state containing the cache
 /// * `cache_key` - Unique key for this query
-/// * `sensor_ids` - Sensor IDs involved (for freshness check)
+/// * `param_ids` - Sensor IDs involved (for freshness check)
 /// * `query_end` - The query's end time, or None for unbounded queries
 ///
 /// # Freshness Logic
@@ -131,7 +131,7 @@ pub async fn get_latest_time(
 pub async fn get_cached(
     state: &AppState,
     cache_key: &str,
-    sensor_ids: &[uuid::Uuid],
+    param_ids: &[uuid::Uuid],
     query_end: Option<DateTime<Utc>>,
 ) -> Option<Arc<Vec<u8>>> {
     let cached = state.response_cache.get(cache_key).await?;
@@ -139,7 +139,7 @@ pub async fn get_cached(
     // Only do freshness check for unbounded queries (no end time specified)
     // Bounded queries asking for historical data won't change
     if query_end.is_none() {
-        if let Ok(Some(latest)) = get_latest_time(state, sensor_ids).await {
+        if let Ok(Some(latest)) = get_latest_time(state, param_ids).await {
             if let Some(cached_max) = cached.max_time {
                 if latest > cached_max {
                     // New data exists beyond what we cached

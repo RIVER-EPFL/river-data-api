@@ -7,7 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -18,14 +18,11 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::{sensors, zones};
+use crate::entity::{alarm_thresholds, parameters, projects};
 use crate::error::{AppError, AppResult};
-use crate::routes::{cache, resolve_station};
+use crate::routes::{cache, resolve_site};
 
-use super::types::{StationRef, ZoneRef};
-
-/// Maximum time range allowed (90 days)
-const MAX_TIME_RANGE_DAYS: i64 = 90;
+use super::types::{ProjectRef, SiteRef};
 
 /// Global semaphore limiting concurrent bulk (CSV/NDJSON) requests.
 static BULK_SEMAPHORE: std::sync::LazyLock<Arc<Semaphore>> = std::sync::LazyLock::new(|| {
@@ -42,10 +39,10 @@ fn default_format() -> String {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AggregatesResponse {
-    /// Zone this data belongs to
-    pub zone: Option<ZoneRef>,
-    /// Station this data belongs to
-    pub station: StationRef,
+    /// Project this data belongs to
+    pub project: Option<ProjectRef>,
+    /// Site this data belongs to
+    pub site: SiteRef,
     /// Aggregation resolution
     pub resolution: String,
     /// Start of time range
@@ -54,12 +51,12 @@ pub struct AggregatesResponse {
     pub end: DateTime<Utc>,
     /// Array of bucket timestamps
     pub times: Vec<DateTime<Utc>>,
-    /// Array of sensors with their aggregated values
-    pub sensors: Vec<SensorAggregateData>,
+    /// Array of parameters with their aggregated values
+    pub parameters: Vec<ParameterAggregateData>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct SensorAggregateData {
+pub struct ParameterAggregateData {
     pub id: Uuid,
     pub name: String,
     #[serde(rename = "type")]
@@ -73,12 +70,15 @@ pub struct SensorAggregateData {
     pub max: Vec<Option<f64>>,
     /// Count of readings per bucket
     pub count: Vec<i64>,
+    /// Maximum severity level per bucket (0=ok, 1=warning, 2=alarm). Only present when alarms=true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_severity: Option<Vec<Option<i16>>>,
 }
 
 #[derive(Debug, FromQueryResult)]
 struct AggregateRow {
     bucket: DateTime<Utc>,
-    sensor_id: Uuid,
+    parameter_id: Uuid,
     avg_value: Option<f64>,
     min_value: Option<f64>,
     max_value: Option<f64>,
@@ -107,47 +107,41 @@ fn determine_format(query_format: &str, headers: &HeaderMap) -> String {
 fn build_csv_response(
     _resolution: &str,
     times: &[DateTime<Utc>],
-    sensors: &[SensorAggregateData],
+    params: &[ParameterAggregateData],
 ) -> AppResult<Response> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
 
     let times = times.to_vec();
-    let sensors = sensors.to_vec();
+    let params = params.to_vec();
 
     tokio::spawn(async move {
-        // Header row: time, sensor1_avg, sensor1_min, sensor1_max, sensor1_count, sensor2_avg, ...
         let mut header = "time".to_string();
-        for sensor in &sensors {
+        for param in &params {
             header.push_str(&format!(
                 ",{}_avg,{}_min,{}_max,{}_count",
-                sensor.name, sensor.name, sensor.name, sensor.name
+                param.name, param.name, param.name, param.name
             ));
         }
         header.push('\n');
         let _ = tx.send(Ok(header)).await;
 
-        // Data rows
         for (i, time) in times.iter().enumerate() {
             let mut row = time.to_rfc3339();
-            for sensor in &sensors {
-                // avg
+            for param in &params {
                 row.push(',');
-                if let Some(v) = sensor.avg.get(i).and_then(|v| *v) {
+                if let Some(v) = param.avg.get(i).and_then(|v| *v) {
                     row.push_str(&v.to_string());
                 }
-                // min
                 row.push(',');
-                if let Some(v) = sensor.min.get(i).and_then(|v| *v) {
+                if let Some(v) = param.min.get(i).and_then(|v| *v) {
                     row.push_str(&v.to_string());
                 }
-                // max
                 row.push(',');
-                if let Some(v) = sensor.max.get(i).and_then(|v| *v) {
+                if let Some(v) = param.max.get(i).and_then(|v| *v) {
                     row.push_str(&v.to_string());
                 }
-                // count
                 row.push(',');
-                if let Some(c) = sensor.count.get(i) {
+                if let Some(c) = param.count.get(i) {
                     row.push_str(&c.to_string());
                 }
             }
@@ -169,37 +163,37 @@ fn build_csv_response(
 
 fn build_ndjson_response(
     times: &[DateTime<Utc>],
-    sensors: &[SensorAggregateData],
+    params: &[ParameterAggregateData],
 ) -> AppResult<Response> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
 
     let times = times.to_vec();
-    let sensors = sensors.to_vec();
+    let params = params.to_vec();
 
     tokio::spawn(async move {
         for (i, time) in times.iter().enumerate() {
             let mut obj = serde_json::Map::new();
             obj.insert("time".to_string(), serde_json::json!(time.to_rfc3339()));
 
-            for sensor in &sensors {
-                let avg = sensor.avg.get(i).and_then(|v| *v);
-                let min = sensor.min.get(i).and_then(|v| *v);
-                let max = sensor.max.get(i).and_then(|v| *v);
-                let count = sensor.count.get(i).copied().unwrap_or(0);
+            for param in &params {
+                let avg = param.avg.get(i).and_then(|v| *v);
+                let min = param.min.get(i).and_then(|v| *v);
+                let max = param.max.get(i).and_then(|v| *v);
+                let count = param.count.get(i).copied().unwrap_or(0);
 
                 obj.insert(
-                    format!("{}_avg", sensor.name),
+                    format!("{}_avg", param.name),
                     avg.map_or(serde_json::Value::Null, |v| serde_json::json!(v)),
                 );
                 obj.insert(
-                    format!("{}_min", sensor.name),
+                    format!("{}_min", param.name),
                     min.map_or(serde_json::Value::Null, |v| serde_json::json!(v)),
                 );
                 obj.insert(
-                    format!("{}_max", sensor.name),
+                    format!("{}_max", param.name),
                     max.map_or(serde_json::Value::Null, |v| serde_json::json!(v)),
                 );
-                obj.insert(format!("{}_count", sensor.name), serde_json::json!(count));
+                obj.insert(format!("{}_count", param.name), serde_json::json!(count));
             }
 
             let line = format!("{}\n", serde_json::Value::Object(obj));
@@ -222,7 +216,7 @@ fn build_ndjson_response(
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
-pub struct StationAggregatesQuery {
+pub struct SiteAggregatesQuery {
     /// Start time (required, ISO 8601)
     pub start: DateTime<Utc>,
     /// End time (required, ISO 8601)
@@ -232,51 +226,53 @@ pub struct StationAggregatesQuery {
     /// Response format: json (default), ndjson, csv
     #[serde(default = "default_format")]
     pub format: String,
+    /// Include alarm severity data (threshold violations)
+    pub alarms: Option<bool>,
 }
 
-/// Get aggregates for a specific station
+/// Get aggregates for a specific site
 ///
-/// Returns aggregated sensor data for all sensors in the specified station.
+/// Returns aggregated parameter data for all parameters in the specified site.
 /// Supports JSON, CSV, and NDJSON formats.
 #[utoipa::path(
     get,
-    path = "/api/stations/{station_id}/aggregates/{resolution}",
+    path = "/api/sites/{site_id}/aggregates/{resolution}",
     params(
-        ("station_id" = String, Path, description = "Station UUID or name"),
+        ("site_id" = String, Path, description = "Site UUID or name"),
         ("resolution" = String, Path, description = "Aggregation resolution: hourly, daily, weekly, monthly"),
-        StationAggregatesQuery
+        SiteAggregatesQuery
     ),
     responses(
         (status = 200, description = "Aggregates retrieved successfully", body = AggregatesResponse),
         (status = 400, description = "Invalid resolution or query parameters"),
-        (status = 404, description = "Station not found"),
+        (status = 404, description = "Site not found"),
     ),
-    tag = "stations"
+    tag = "sites"
 )]
-pub async fn get_station_aggregates(
+pub async fn get_site_aggregates(
     State(state): State<AppState>,
-    Path((station_id, resolution)): Path<(String, String)>,
-    Query(query): Query<StationAggregatesQuery>,
+    Path((site_id, resolution)): Path<(String, String)>,
+    Query(query): Query<SiteAggregatesQuery>,
     headers: HeaderMap,
 ) -> AppResult<Response> {
-    let station = resolve_station(&state.db, &station_id).await?;
+    let site = resolve_site(&state.db, &site_id).await?;
 
-    // Fetch zone info if available
-    let zone_ref = if let Some(zone_id) = station.zone_id {
-        zones::Entity::find_by_id(zone_id)
+    // Fetch project info if available
+    let project_ref = if let Some(project_id) = site.project_id {
+        projects::Entity::find_by_id(project_id)
             .one(&state.db)
             .await?
-            .map(|z| ZoneRef {
-                id: z.id,
-                name: z.name,
+            .map(|p| ProjectRef {
+                id: p.id,
+                name: p.name,
             })
     } else {
         None
     };
 
-    let station_ref = StationRef {
-        id: station.id,
-        name: station.name.clone(),
+    let site_ref = SiteRef {
+        id: site.id,
+        name: site.name.clone(),
     };
 
     // Validate resolution
@@ -299,55 +295,43 @@ pub async fn get_station_aggregates(
         ));
     }
 
-    // Enforce max time range
-    let duration = query.end - query.start;
-    if duration > Duration::days(MAX_TIME_RANGE_DAYS) {
-        return Err(AppError::BadRequest(format!(
-            "time range exceeds maximum of {MAX_TIME_RANGE_DAYS} days"
-        )));
-    }
-
-    // Determine format
     let format = determine_format(&query.format, &headers);
 
-    // Build sensor query for this station only
-    let mut sensor_query = sensors::Entity::find()
-        .filter(sensors::Column::IsActive.eq(true))
-        .filter(sensors::Column::StationId.eq(station.id));
+    let mut param_query = parameters::Entity::find()
+        .filter(parameters::Column::IsActive.eq(true))
+        .filter(parameters::Column::SiteId.eq(site.id));
 
     if let Some(ref types) = query.sensor_types {
         let type_list: Vec<String> = types.split(',').map(|s| s.trim().to_string()).collect();
         if !type_list.is_empty() {
-            sensor_query = sensor_query.filter(sensors::Column::SensorType.is_in(type_list));
+            param_query = param_query.filter(parameters::Column::SensorType.is_in(type_list));
         }
     }
 
-    // Get matching sensors (needed for cache freshness check)
-    let sensors_list = sensor_query.all(&state.db).await?;
-    let sensor_ids: Vec<Uuid> = sensors_list.iter().map(|s| s.id).collect();
+    let params_list = param_query.all(&state.db).await?;
+    let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.id).collect();
 
-    // Build cache key
+    let include_alarms = query.alarms.unwrap_or(false);
+
     let cache_key = cache::cache_key(
         "aggregates",
         &[
-            &station.id.to_string(),
+            &site.id.to_string(),
             &resolution,
             &query.start.to_rfc3339(),
             &query.end.to_rfc3339(),
             query.sensor_types.as_deref().unwrap_or(""),
             &format,
+            if include_alarms { "alarms" } else { "" },
         ],
     );
 
-    // Check cache with freshness validation (JSON only)
-    // Aggregates always have end time, so skip freshness check (historical data won't change)
     if format == "json" {
-        if let Some(cached) = cache::get_cached(&state, &cache_key, &sensor_ids, Some(query.end)).await {
+        if let Some(cached) = cache::get_cached(&state, &cache_key, &param_ids, Some(query.end)).await {
             return cache::json_response((*cached).to_vec(), true);
         }
     }
 
-    // For bulk formats, acquire semaphore to limit concurrent requests
     let _permit = if format == "csv" || format == "ndjson" {
         match BULK_SEMAPHORE.clone().try_acquire_owned() {
             Ok(permit) => Some(permit),
@@ -366,27 +350,38 @@ pub async fn get_station_aggregates(
         None
     };
 
-    if sensor_ids.is_empty() {
+    if param_ids.is_empty() {
         return Ok(Json(AggregatesResponse {
-            zone: zone_ref,
-            station: station_ref,
+            project: project_ref,
+            site: site_ref,
             resolution: resolution.clone(),
             start: query.start,
             end: query.end,
             times: vec![],
-            sensors: vec![],
+            parameters: vec![],
         })
         .into_response());
     }
 
-    // Build the sensor_ids array for SQL
-    let sensor_ids_str = sensor_ids
+    // Fetch thresholds when alarms are requested (small query, ~22 rows max)
+    let threshold_map: HashMap<Uuid, alarm_thresholds::Model> = if include_alarms {
+        alarm_thresholds::Entity::find()
+            .filter(alarm_thresholds::Column::ParameterId.is_in(param_ids.clone()))
+            .all(&state.db)
+            .await?
+            .into_iter()
+            .map(|t| (t.parameter_id, t))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
+    let param_ids_str = param_ids
         .iter()
         .map(|id| format!("'{id}'"))
         .collect::<Vec<_>>()
         .join(",");
 
-    // Determine bucket interval for on-the-fly aggregation fallback
     let bucket_interval = match resolution.as_str() {
         "hourly" => "1 hour",
         "daily" => "1 day",
@@ -395,21 +390,20 @@ pub async fn get_station_aggregates(
         _ => "1 hour",
     };
 
-    // Query the continuous aggregate view first
     let sql = format!(
         r"
         SELECT
             bucket,
-            sensor_id,
+            parameter_id,
             avg_value,
             min_value,
             max_value,
             count
         FROM {view_name}
-        WHERE sensor_id IN ({sensor_ids_str})
+        WHERE parameter_id IN ({param_ids_str})
           AND bucket >= $1
           AND bucket <= $2
-        ORDER BY bucket ASC, sensor_id ASC
+        ORDER BY bucket ASC, parameter_id ASC
         "
     );
 
@@ -425,8 +419,6 @@ pub async fn get_station_aggregates(
         .filter_map(|row| AggregateRow::from_query_result(&row, "").ok())
         .collect();
 
-    // Fallback to on-the-fly aggregation if continuous aggregate has no data
-    // This handles cases where the materialized view hasn't been refreshed yet
     if results.is_empty() {
         tracing::info!(
             resolution = %resolution,
@@ -439,17 +431,17 @@ pub async fn get_station_aggregates(
             r"
             SELECT
                 time_bucket('{bucket_interval}', time) AS bucket,
-                sensor_id,
+                parameter_id,
                 AVG(value) AS avg_value,
                 MIN(value) AS min_value,
                 MAX(value) AS max_value,
                 COUNT(*) AS count
             FROM readings
-            WHERE sensor_id IN ({sensor_ids_str})
+            WHERE parameter_id IN ({param_ids_str})
               AND time >= $1
               AND time <= $2
-            GROUP BY time_bucket('{bucket_interval}', time), sensor_id
-            ORDER BY bucket ASC, sensor_id ASC
+            GROUP BY time_bucket('{bucket_interval}', time), parameter_id
+            ORDER BY bucket ASC, parameter_id ASC
             "
         );
 
@@ -466,33 +458,36 @@ pub async fn get_station_aggregates(
             .collect();
     }
 
-    // Build time index and sensor value maps
     let mut time_set: BTreeMap<DateTime<Utc>, usize> = BTreeMap::new();
-    let mut sensor_aggs: HashMap<Uuid, HashMap<DateTime<Utc>, (Option<f64>, Option<f64>, Option<f64>, i64)>> =
+    let mut param_aggs: HashMap<Uuid, HashMap<DateTime<Utc>, (Option<f64>, Option<f64>, Option<f64>, i64)>> =
         HashMap::new();
 
     for row in results {
         let time = row.bucket;
         time_set.entry(time).or_insert(0);
-        sensor_aggs
-            .entry(row.sensor_id)
+        param_aggs
+            .entry(row.parameter_id)
             .or_default()
             .insert(time, (row.avg_value, row.min_value, row.max_value, row.count));
     }
 
-    // Build sorted times array
     let times: Vec<DateTime<Utc>> = time_set.keys().copied().collect();
 
-    // Build sensor aggregate data
-    let sensor_data: Vec<SensorAggregateData> = sensors_list
+    let param_data: Vec<ParameterAggregateData> = params_list
         .iter()
-        .map(|sensor| {
-            let aggs_map = sensor_aggs.get(&sensor.id);
+        .map(|param| {
+            let aggs_map = param_aggs.get(&param.id);
+            let threshold = threshold_map.get(&param.id);
 
             let mut avg = Vec::with_capacity(times.len());
             let mut min = Vec::with_capacity(times.len());
             let mut max = Vec::with_capacity(times.len());
             let mut count = Vec::with_capacity(times.len());
+            let mut severity_vec: Option<Vec<Option<i16>>> = if include_alarms {
+                Some(Vec::with_capacity(times.len()))
+            } else {
+                None
+            };
 
             for t in &times {
                 if let Some(aggs) = aggs_map.and_then(|m| m.get(t)) {
@@ -500,43 +495,70 @@ pub async fn get_station_aggregates(
                     min.push(aggs.1);
                     max.push(aggs.2);
                     count.push(aggs.3);
+
+                    if let Some(ref mut sev_vec) = severity_vec {
+                        sev_vec.push(match threshold {
+                            Some(th) => {
+                                let min_val = aggs.1;
+                                let max_val = aggs.2;
+                                if (th.alarm_min.is_some()
+                                    && min_val.is_some_and(|v| v < th.alarm_min.unwrap()))
+                                    || (th.alarm_max.is_some()
+                                        && max_val.is_some_and(|v| v > th.alarm_max.unwrap()))
+                                {
+                                    Some(2i16)
+                                } else if (th.warning_min.is_some()
+                                    && min_val.is_some_and(|v| v < th.warning_min.unwrap()))
+                                    || (th.warning_max.is_some()
+                                        && max_val.is_some_and(|v| v > th.warning_max.unwrap()))
+                                {
+                                    Some(1i16)
+                                } else {
+                                    Some(0i16)
+                                }
+                            }
+                            None => None,
+                        });
+                    }
                 } else {
                     avg.push(None);
                     min.push(None);
                     max.push(None);
                     count.push(0);
+                    if let Some(ref mut sev_vec) = severity_vec {
+                        sev_vec.push(None);
+                    }
                 }
             }
 
-            SensorAggregateData {
-                id: sensor.id,
-                name: sensor.name.clone(),
-                sensor_type: sensor.sensor_type.clone(),
-                units: sensor.display_units.clone(),
+            ParameterAggregateData {
+                id: param.id,
+                name: param.name.clone(),
+                sensor_type: param.sensor_type.clone(),
+                units: param.display_units.clone(),
                 avg,
                 min,
                 max,
                 count,
+                max_severity: severity_vec,
             }
         })
         .collect();
 
-    // Get max time for cache freshness tracking
     let max_time = times.last().copied();
 
-    // Return appropriate format
     match format.as_str() {
-        "csv" => build_csv_response(&resolution, &times, &sensor_data),
-        "ndjson" => build_ndjson_response(&times, &sensor_data),
+        "csv" => build_csv_response(&resolution, &times, &param_data),
+        "ndjson" => build_ndjson_response(&times, &param_data),
         _ => {
             let response = AggregatesResponse {
-                zone: zone_ref,
-                station: station_ref,
+                project: project_ref,
+                site: site_ref,
                 resolution,
                 start: query.start,
                 end: query.end,
                 times,
-                sensors: sensor_data,
+                parameters: param_data,
             };
             cache::cache_and_respond(&state, cache_key, &response, max_time).await
         }

@@ -3,33 +3,33 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
-/// Brief zone reference for embedding in responses
+/// Brief project reference for embedding in responses
 #[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ZoneRef {
+pub struct ProjectRef {
     pub id: Uuid,
     pub name: String,
 }
 
-/// Brief station reference for embedding in responses
+/// Brief site reference for embedding in responses
 #[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct StationRef {
+pub struct SiteRef {
     pub id: Uuid,
     pub name: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct StationResponse {
+pub struct SiteResponse {
     pub id: Uuid,
-    pub zone_id: Option<Uuid>,
+    pub project_id: Option<Uuid>,
     pub name: String,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
     pub altitude_m: Option<f64>,
 }
 
-/// Sensor information embedded in station responses
+/// Parameter information embedded in site responses
 #[derive(Debug, Serialize, ToSchema)]
-pub struct SensorResponse {
+pub struct ParameterResponse {
     pub id: Uuid,
     pub name: String,
     pub sensor_type: String,
@@ -38,26 +38,26 @@ pub struct SensorResponse {
     pub is_active: Option<bool>,
 }
 
-/// Detailed station response with zone info, sensors, and data range
+/// Detailed site response with project info, parameters, and data range
 #[derive(Debug, Serialize, ToSchema)]
-pub struct StationDetailResponse {
+pub struct SiteDetailResponse {
     pub id: Uuid,
     pub name: String,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
     pub altitude_m: Option<f64>,
-    pub zone: Option<ZoneRef>,
-    pub sensors: Vec<SensorResponse>,
-    /// Earliest reading timestamp for this station
+    pub project: Option<ProjectRef>,
+    pub parameters: Vec<ParameterResponse>,
+    /// Earliest reading timestamp for this site
     pub data_start: Option<DateTime<Utc>>,
-    /// Latest reading timestamp for this station
+    /// Latest reading timestamp for this site
     pub data_end: Option<DateTime<Utc>>,
-    /// Total number of readings for this station
+    /// Total number of readings for this site
     pub reading_count: i64,
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
-pub struct StationsQuery {
-    /// Filter by zone ID
-    pub zone_id: Option<Uuid>,
+pub struct SitesQuery {
+    /// Filter by project ID
+    pub project_id: Option<Uuid>,
 }

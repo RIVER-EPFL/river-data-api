@@ -2,13 +2,13 @@ use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
-#[sea_orm(table_name = "sensors")]
+#[sea_orm(table_name = "parameters")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
-    pub station_id: Uuid,
+    pub site_id: Uuid,
     #[sea_orm(unique)]
-    pub vaisala_location_id: i32,
+    pub source_location_id: i32,
     pub name: String,
     pub sensor_type: String,
     pub display_units: Option<String>,
@@ -29,11 +29,11 @@ pub struct Model {
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
     #[sea_orm(
-        belongs_to = "super::stations::Entity",
-        from = "Column::StationId",
-        to = "super::stations::Column::Id"
+        belongs_to = "super::sites::Entity",
+        from = "Column::SiteId",
+        to = "super::sites::Column::Id"
     )]
-    Station,
+    Site,
     #[sea_orm(has_many = "super::readings::Entity")]
     Readings,
     #[sea_orm(has_many = "super::device_status::Entity")]
@@ -42,15 +42,13 @@ pub enum Relation {
     Calibrations,
     #[sea_orm(has_one = "super::sync_state::Entity")]
     SyncState,
-    #[sea_orm(has_many = "super::events::Entity")]
-    Events,
-    #[sea_orm(has_many = "super::alarm_locations::Entity")]
-    AlarmLocations,
+    #[sea_orm(has_one = "super::alarm_thresholds::Entity")]
+    AlarmThresholds,
 }
 
-impl Related<super::stations::Entity> for Entity {
+impl Related<super::sites::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::Station.def()
+        Relation::Site.def()
     }
 }
 
@@ -78,25 +76,9 @@ impl Related<super::sync_state::Entity> for Entity {
     }
 }
 
-impl Related<super::events::Entity> for Entity {
+impl Related<super::alarm_thresholds::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::Events.def()
-    }
-}
-
-impl Related<super::alarm_locations::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::AlarmLocations.def()
-    }
-}
-
-impl Related<super::alarms::Entity> for Entity {
-    fn to() -> RelationDef {
-        super::alarm_locations::Relation::Alarm.def()
-    }
-
-    fn via() -> Option<RelationDef> {
-        Some(super::alarm_locations::Relation::Sensor.def().rev())
+        Relation::AlarmThresholds.def()
     }
 }
 

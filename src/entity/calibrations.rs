@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
-    pub sensor_id: Uuid,
+    pub parameter_id: Uuid,
     pub calibration_time: DateTimeWithTimeZone,
     pub performed_by: Option<String>,
     pub notes: Option<String>,
@@ -16,16 +16,16 @@ pub struct Model {
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
     #[sea_orm(
-        belongs_to = "super::sensors::Entity",
-        from = "Column::SensorId",
-        to = "super::sensors::Column::Id"
+        belongs_to = "super::parameters::Entity",
+        from = "Column::ParameterId",
+        to = "super::parameters::Column::Id"
     )]
-    Sensor,
+    Parameter,
 }
 
-impl Related<super::sensors::Entity> for Entity {
+impl Related<super::parameters::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::Sensor.def()
+        Relation::Parameter.def()
     }
 }
 

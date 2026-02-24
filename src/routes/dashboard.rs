@@ -15,7 +15,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>River Sensor Data</title>
+    <title>River Data</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/nouislider@15/dist/nouislider.min.css">
     <style>
@@ -46,19 +46,19 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         }
         h1 { font-size: 1.25rem; font-weight: 600; }
 
-        .station-groups {
+        .site-groups {
             display: flex;
             gap: 1.5rem;
             flex-wrap: wrap;
             align-items: flex-start;
         }
-        .zone-group {
+        .project-group {
             display: flex;
             flex-direction: column;
             gap: 0.25rem;
             align-items: center;
         }
-        .zone-label {
+        .project-label {
             font-size: 0.65rem;
             color: var(--muted);
             text-transform: uppercase;
@@ -66,12 +66,12 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             font-weight: 500;
             text-align: center;
         }
-        .zone-stations {
+        .project-sites {
             display: flex;
             gap: 0.375rem;
             flex-wrap: wrap;
         }
-        .station-btn {
+        .site-btn {
             padding: 0.4rem 0.75rem;
             border: 1px solid var(--border);
             border-radius: 0.375rem;
@@ -80,11 +80,11 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             cursor: pointer;
             transition: all 0.15s;
         }
-        .station-btn:hover {
+        .site-btn:hover {
             border-color: var(--accent);
             color: var(--accent);
         }
-        .station-btn.active {
+        .site-btn.active {
             background: var(--accent);
             border-color: var(--accent);
             color: white;
@@ -121,18 +121,18 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             margin-left: 0.5rem;
             margin-right: 0.5rem;
         }
-        .timeline-zone-history,
-        .timeline-zone-week,
-        .timeline-zone-today {
+        .timeline-region-history,
+        .timeline-region-week,
+        .timeline-region-today {
             height: 100%;
             position: relative;
         }
-        .timeline-zone-history { background: #94a3b8; }
-        .timeline-zone-week { background: #3b82f6; }
-        .timeline-zone-today { background: #10b981; }
+        .timeline-region-history { background: #94a3b8; }
+        .timeline-region-week { background: #3b82f6; }
+        .timeline-region-today { background: #10b981; }
         /* Boundary markers between zones */
-        .timeline-zone-history::after,
-        .timeline-zone-week::after {
+        .timeline-region-history::after,
+        .timeline-region-week::after {
             content: '';
             position: absolute;
             right: 0;
@@ -191,7 +191,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             flex-wrap: wrap;
             align-items: center;
         }
-        .sensor-toggles {
+        .parameter-toggles {
             background: var(--surface);
             border: 1px solid var(--border);
             border-radius: 0.5rem;
@@ -203,17 +203,46 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             align-items: center;
             flex: 1;
         }
-        .sensor-toggle {
+        .parameter-toggle {
             display: flex;
             align-items: center;
             gap: 0.5rem;
             cursor: pointer;
             font-size: 0.875rem;
         }
-        .sensor-toggle input {
+        .parameter-toggle input {
             width: 1rem;
             height: 1rem;
             accent-color: var(--accent);
+        }
+
+        .alarm-toggle {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.4rem 0.75rem;
+            border: 1px solid var(--border);
+            border-radius: 0.375rem;
+            background: var(--surface);
+            cursor: pointer;
+            font-size: 0.8rem;
+            transition: all 0.15s;
+        }
+        .alarm-toggle:hover {
+            border-color: #ef4444;
+        }
+        .alarm-toggle.active {
+            background: rgba(239, 68, 68, 0.1);
+            border-color: #ef4444;
+        }
+        .alarm-indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #ef4444;
+        }
+        .alarm-toggle:not(.active) .alarm-indicator {
+            background: var(--muted);
         }
 
         .charts-container {
@@ -221,7 +250,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             flex-direction: column;
             gap: 0.5rem;
         }
-        .sensor-chart {
+        .parameter-chart {
             background: var(--surface);
             border: 1px solid var(--border);
             border-radius: 0.5rem;
@@ -231,7 +260,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             position: relative;
             overflow: visible;
         }
-        .sensor-chart .chart-label {
+        .parameter-chart .chart-label {
             position: absolute;
             top: 0.5rem;
             left: 1rem;
@@ -242,7 +271,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             background: var(--surface);
             padding: 0 0.25rem;
         }
-        .sensor-chart .chart-expand {
+        .parameter-chart .chart-expand {
             position: absolute;
             bottom: 0.5rem;
             right: 0.5rem;
@@ -261,15 +290,15 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             opacity: 0.6;
             transition: opacity 0.15s;
         }
-        .sensor-chart .chart-expand:hover {
+        .parameter-chart .chart-expand:hover {
             opacity: 1;
             border-color: var(--accent);
             color: var(--accent);
         }
-        .sensor-chart .u-wrap {
+        .parameter-chart .u-wrap {
             cursor: crosshair;
         }
-        .sensor-chart .u-over {
+        .parameter-chart .u-over {
             overflow: visible !important;
         }
         .chart-placeholder {
@@ -311,7 +340,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         }
         .footer-separator { margin: 0 0.1rem; }
 
-        /* Hover tooltip for all sensor values */
+        /* Hover tooltip for all parameter values */
         .hover-tooltip {
             position: fixed;
             background: var(--surface);
@@ -348,6 +377,17 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             font-weight: 500;
             font-variant-numeric: tabular-nums;
         }
+        .alarm-badge {
+            font-size: 0.65rem;
+            font-weight: 700;
+            padding: 0.1rem 0.35rem;
+            border-radius: 0.2rem;
+            vertical-align: middle;
+            margin-left: 0.3rem;
+            letter-spacing: 0.02em;
+        }
+        .alarm-badge.warning { background: rgba(245, 158, 11, 0.3); color: #b45309; }
+        .alarm-badge.critical { background: rgba(239, 68, 68, 0.3); color: #b91c1c; }
 
         /* noUiSlider custom styles */
         .noUi-target {
@@ -386,25 +426,25 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         }
 
 
-        .loading-overlay {
-            position: absolute;
-            inset: 0;
-            background: rgba(255,255,255,0.8);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 0.875rem;
-            color: var(--muted);
-            border-radius: 0.5rem;
-            z-index: 20;
+        .loading-spinner {
+            display: inline-block;
+            width: 0.75rem;
+            height: 0.75rem;
+            border: 2px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+            margin-left: 0.5rem;
+            vertical-align: middle;
         }
+        @keyframes spin { to { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
     <div class="container">
         <header>
-            <h1>River Sensor Data</h1>
-            <div class="station-groups" id="station-groups">
+            <h1>River Data</h1>
+            <div class="site-groups" id="site-groups">
                 <span style="color: var(--muted); font-size: 0.875rem;">Loading...</span>
             </div>
         </header>
@@ -416,9 +456,9 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             </div>
             <div id="time-slider"></div>
             <div class="timeline-legend" id="timeline-legend">
-                <div class="timeline-zone-history" id="zone-history"></div>
-                <div class="timeline-zone-week" id="zone-week"></div>
-                <div class="timeline-zone-today" id="zone-today"></div>
+                <div class="timeline-region-history" id="region-history"></div>
+                <div class="timeline-region-week" id="region-week"></div>
+                <div class="timeline-region-today" id="region-today"></div>
             </div>
             <div class="timeline-labels" id="timeline-labels">
                 <span id="label-history" style="color: #94a3b8;"></span>
@@ -434,13 +474,17 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         </div>
 
         <div class="controls-row">
-            <div class="sensor-toggles" id="sensor-toggles">
-                <span style="color: var(--muted); font-size: 0.875rem;">Select a station to see sensors</span>
+            <div class="parameter-toggles" id="parameter-toggles">
+                <span style="color: var(--muted); font-size: 0.875rem;">Select a site to see parameters</span>
             </div>
+            <button class="alarm-toggle active" id="alarm-toggle">
+                <span class="alarm-indicator"></span>
+                <span id="alarm-count">Alarms</span>
+            </button>
         </div>
 
         <div class="charts-container" id="charts-container">
-            <div class="chart-placeholder">Select a station to view data</div>
+            <div class="chart-placeholder">Select a site to view data</div>
         </div>
         <div class="chart-footer">
             <div class="footer-left">
@@ -469,34 +513,89 @@ const api = (url, noCache = false) => {
 };
 
 const state = {
-    station: null,
-    sensors: new Set(),
-    sensorsWithData: new Set(),  // Only sensor types that have actual data
-    sensorTypeOrder: [],  // Original order of sensor types (for consistent display)
+    site: null,
+    parameters: new Set(),
+    parametersWithData: new Set(),  // Only parameter types that have actual data
+    parameterTypeOrder: [],  // Original order of parameter types (for consistent display)
     expandedCharts: new Set(),  // Track which charts are expanded
     start: null,
     end: null,
-    charts: {},  // Map of sensor type -> uPlot instance
-    chartData: {},  // Map of sensor type -> { sensors, timestamps }
+    charts: {},  // Map of parameter type -> uPlot instance
+    chartData: {},  // Map of parameter type -> { parameters, timestamps }
     slider: null,
     data: null,
-    loading: false,
+    alarms: [],  // Alarm events for chart bands (extracted from inline severities)
+    showAlarms: true,  // Whether to show alarm bands on charts
 };
 
 const CHART_HEIGHT_NORMAL = 180;
 const CHART_HEIGHT_EXPANDED = 400;
 
 // Cursor sync key for all charts
-const syncKey = uPlot.sync("sensors");
+const syncKey = uPlot.sync("parameters");
 
 // Tooltip elements
 const tooltip = document.getElementById('hover-tooltip');
 const tooltipTime = document.getElementById('tooltip-time');
 const tooltipValues = document.getElementById('tooltip-values');
 
-// Color palette for sensor types
+// Color palette for parameter types
 const colors = ['#2563eb', '#dc2626', '#16a34a', '#ca8a04', '#9333ea', '#0891b2', '#be185d', '#ea580c'];
-const sensorColors = {};
+const parameterColors = {};
+
+// Alarm severity colors (0=info, 1=warning, 2=critical)
+const alarmColors = {
+    0: 'rgba(59, 130, 246, 0.15)',   // Info - blue
+    1: 'rgba(245, 158, 11, 0.25)',   // Warning - amber
+    2: 'rgba(239, 68, 68, 0.35)',    // Critical - red
+};
+const alarmBorderColors = {
+    0: 'rgba(59, 130, 246, 0.5)',
+    1: 'rgba(245, 158, 11, 0.7)',
+    2: 'rgba(239, 68, 68, 0.8)',
+};
+
+// uPlot plugin to draw alarm bands (filtered to matching parameter type)
+function alarmBandsPlugin(paramType) {
+    return {
+        hooks: {
+            draw: [(u) => {
+                if (!state.showAlarms || !state.alarms.length) return;
+                const ctx = u.ctx;
+                const { left, top, width, height } = u.bbox;
+                const [xMin, xMax] = [u.scales.x.min, u.scales.x.max];
+
+                state.alarms.forEach(alarm => {
+                    // Only draw alarms for this chart's parameter type
+                    if (alarm.parameter_type !== paramType) return;
+
+                    const startTs = new Date(alarm.when_on).getTime() / 1000;
+                    const endTs = alarm.when_off
+                        ? new Date(alarm.when_off).getTime() / 1000
+                        : Math.min(Date.now() / 1000, xMax);
+
+                    // Skip if alarm doesn't overlap with visible range
+                    if (endTs < xMin || startTs > xMax) return;
+
+                    const x1 = u.valToPos(Math.max(startTs, xMin), 'x', true);
+                    const x2 = u.valToPos(Math.min(endTs, xMax), 'x', true);
+
+                    // Draw filled band
+                    ctx.fillStyle = alarmColors[alarm.severity] || alarmColors[1];
+                    ctx.fillRect(x1, top, x2 - x1, height);
+
+                    // Draw left edge marker
+                    ctx.strokeStyle = alarmBorderColors[alarm.severity] || alarmBorderColors[1];
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(x1, top);
+                    ctx.lineTo(x1, top + height);
+                    ctx.stroke();
+                });
+            }]
+        }
+    };
+}
 
 // Debounce utility
 function debounce(fn, ms) {
@@ -535,34 +634,34 @@ function formatDuration(ms) {
 
 // Initialize
 async function init() {
-    // Fetch zones and stations
-    const [zones, stations] = await Promise.all([
-        api('/api/zones'),
-        api('/api/stations')
+    // Fetch projects and sites
+    const [projects, sites] = await Promise.all([
+        api('/api/projects'),
+        api('/api/sites')
     ]);
 
-    const container = document.getElementById('station-groups');
+    const container = document.getElementById('site-groups');
 
-    // Group stations by zone
-    const stationsByZone = {};
-    stations.forEach(s => {
-        const zoneId = s.zone_id || 'unknown';
-        if (!stationsByZone[zoneId]) stationsByZone[zoneId] = [];
-        stationsByZone[zoneId].push(s);
+    // Group sites by project
+    const sitesByProject = {};
+    sites.forEach(s => {
+        const projectId = s.project_id || 'unknown';
+        if (!sitesByProject[projectId]) sitesByProject[projectId] = [];
+        sitesByProject[projectId].push(s);
     });
 
-    // Build HTML with zone groups
+    // Build HTML with project groups
     let html = '';
-    zones.forEach(zone => {
-        const zoneStations = stationsByZone[zone.id] || [];
-        if (zoneStations.length === 0) return;
+    projects.forEach(project => {
+        const projectSites = sitesByProject[project.id] || [];
+        if (projectSites.length === 0) return;
 
         html += `
-            <div class="zone-group">
-                <div class="zone-label">${zone.name}</div>
-                <div class="zone-stations">
-                    ${zoneStations.map(s => `
-                        <button class="station-btn" data-id="${s.id}">${s.name}</button>
+            <div class="project-group">
+                <div class="project-label">${project.name}</div>
+                <div class="project-sites">
+                    ${projectSites.map(s => `
+                        <button class="site-btn" data-id="${s.id}">${s.name}</button>
                     `).join('')}
                 </div>
             </div>
@@ -571,25 +670,32 @@ async function init() {
 
     container.innerHTML = html;
 
-    container.querySelectorAll('.station-btn').forEach(btn => {
+    container.querySelectorAll('.site-btn').forEach(btn => {
         btn.addEventListener('click', () => {
-            container.querySelectorAll('.station-btn').forEach(b => b.classList.remove('active'));
+            container.querySelectorAll('.site-btn').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
-            loadStation(btn.dataset.id);
+            loadSite(btn.dataset.id);
         });
     });
 
-    // Auto-load first station
-    const firstBtn = container.querySelector('.station-btn');
+    // Alarm toggle handler
+    document.getElementById('alarm-toggle').addEventListener('click', () => {
+        state.showAlarms = !state.showAlarms;
+        document.getElementById('alarm-toggle').classList.toggle('active', state.showAlarms);
+        Object.values(state.charts).forEach(c => c.redraw());
+    });
+
+    // Auto-load first site
+    const firstBtn = container.querySelector('.site-btn');
     if (firstBtn) {
         firstBtn.click();
     }
 }
 
-async function loadStation(stationId) {
-    // Always fetch fresh station data to get latest data_start/data_end
-    const station = await api(`/api/stations/${stationId}`, true);
-    state.station = station;
+async function loadSite(siteId) {
+    // Always fetch fresh site data to get latest data_start/data_end
+    const site = await api(`/api/sites/${siteId}`, true);
+    state.site = site;
 
     // Clear existing charts and their DOM elements
     Object.values(state.charts).forEach(chart => chart.destroy());
@@ -597,46 +703,46 @@ async function loadStation(stationId) {
     state.chartData = {};
     document.getElementById('charts-container').innerHTML = '';
 
-    // Build sensor toggles
-    const toggles = document.getElementById('sensor-toggles');
-    const types = [...new Set((station.sensors || []).map(s => s.sensor_type).filter(Boolean))].sort();
+    // Build parameter toggles
+    const toggles = document.getElementById('parameter-toggles');
+    const types = [...new Set((site.parameters || []).map(s => s.sensor_type).filter(Boolean))].sort();
 
     if (!types.length) {
-        toggles.innerHTML = '<span style="color: var(--muted); font-size: 0.875rem;">No sensors configured</span>';
-        state.sensors = new Set();
-        document.getElementById('charts-container').innerHTML = '<div class="chart-placeholder">No sensors configured</div>';
+        toggles.innerHTML = '<span style="color: var(--muted); font-size: 0.875rem;">No parameters configured</span>';
+        state.parameters = new Set();
+        document.getElementById('charts-container').innerHTML = '<div class="chart-placeholder">No parameters configured</div>';
         return;
     }
 
     // Assign colors and store original order
-    types.forEach((t, i) => sensorColors[t] = colors[i % colors.length]);
-    state.sensors = new Set(types);
-    state.sensorTypeOrder = types;  // Preserve original order
+    types.forEach((t, i) => parameterColors[t] = colors[i % colors.length]);
+    state.parameters = new Set(types);
+    state.parameterTypeOrder = types;  // Preserve original order
 
     toggles.innerHTML = types.map(t => `
-        <label class="sensor-toggle">
+        <label class="parameter-toggle">
             <input type="checkbox" value="${t}" checked>
-            <span style="color: ${sensorColors[t]}">${t}</span>
+            <span style="color: ${parameterColors[t]}">${t}</span>
         </label>
     `).join('');
 
     toggles.querySelectorAll('input').forEach(cb => {
         cb.addEventListener('change', () => {
-            if (cb.checked) state.sensors.add(cb.value);
-            else state.sensors.delete(cb.value);
+            if (cb.checked) state.parameters.add(cb.value);
+            else state.parameters.delete(cb.value);
             updateCharts();
         });
     });
 
     // Setup slider
-    if (!station.data_start || !station.data_end) {
+    if (!site.data_start || !site.data_end) {
         document.getElementById('slider-section').style.display = 'none';
-        document.getElementById('charts-container').innerHTML = '<div class="chart-placeholder">No data available for this station</div>';
+        document.getElementById('charts-container').innerHTML = '<div class="chart-placeholder">No data available for this site</div>';
         return;
     }
 
-    const minTs = new Date(station.data_start).getTime();
-    const maxTs = new Date(station.data_end).getTime();
+    const minTs = new Date(site.data_start).getTime();
+    const maxTs = new Date(site.data_end).getTime();
 
     document.getElementById('min-date').textContent = formatDate(minTs);
     document.getElementById('max-date').textContent = formatDate(maxTs);
@@ -666,9 +772,9 @@ async function loadStation(stationId) {
 
     let sliderRange;
     let pipsConfig;
-    const zoneHistory = document.getElementById('zone-history');
-    const zoneWeek = document.getElementById('zone-week');
-    const zoneToday = document.getElementById('zone-today');
+    const zoneHistory = document.getElementById('region-history');
+    const zoneWeek = document.getElementById('region-week');
+    const zoneToday = document.getElementById('region-today');
     const labelHistory = document.getElementById('label-history');
     const labelWeek = document.getElementById('label-week');
     const labelToday = document.getElementById('label-today');
@@ -815,10 +921,10 @@ function updateWindowInfo() {
 }
 
 function zoom(factor) {
-    if (!state.slider || !state.station) return;
+    if (!state.slider || !state.site) return;
 
-    const minTs = new Date(state.station.data_start).getTime();
-    const maxTs = new Date(state.station.data_end).getTime();
+    const minTs = new Date(state.site.data_start).getTime();
+    const maxTs = new Date(state.site.data_end).getTime();
 
     const center = (state.start.getTime() + state.end.getTime()) / 2;
     const currentSpan = state.end - state.start;
@@ -843,23 +949,23 @@ function zoom(factor) {
 
 // Fetch data with improved day-based resolution thresholds for stacked charts
 const fetchData = debounce(async () => {
-    if (!state.station || !state.start || !state.end) return;
+    if (!state.site || !state.start || !state.end) return;
 
     const days = (state.end - state.start) / 86400000;
     let endpoint, resolution;
 
-    // Improved thresholds for stacked charts (each chart shows ~1 sensor):
-    // - Raw: up to 14 days (144 pts/day × 14 = 2016 pts max per chart)
-    // - Hourly: 14-120 days (24 pts/day × 120 = 2880 pts max)
-    // - Daily: 120-365 days
-    // - Weekly: beyond 1 year
+    // Resolution thresholds (max ~2-3k points per chart):
+    // - Raw: up to 14 days (144 pts/day × 14 = 2016 pts)
+    // - Hourly: 14-120 days (24 pts/day × 120 = 2880 pts)
+    // - Daily: 120 days - 3 years (365 pts/year × 3 = 1095 pts)
+    // - Weekly: beyond 3 years
     if (days <= 14) {
         endpoint = 'readings';
         resolution = '10-min raw';
     } else if (days <= 120) {
         endpoint = 'aggregates/hourly';
         resolution = 'hourly avg';
-    } else if (days <= 365) {
+    } else if (days <= 1095) {
         endpoint = 'aggregates/daily';
         resolution = 'daily avg';
     } else {
@@ -867,7 +973,7 @@ const fetchData = debounce(async () => {
         resolution = 'weekly avg';
     }
 
-    const url = `/api/stations/${state.station.id}/${endpoint}?start=${state.start.toISOString()}&end=${state.end.toISOString()}`;
+    const url = `/api/sites/${state.site.id}/${endpoint}?start=${state.start.toISOString()}&end=${state.end.toISOString()}&alarms=true`;
 
     showLoading();
 
@@ -876,13 +982,15 @@ const fetchData = debounce(async () => {
 
         // Fallback to raw readings if aggregates return empty
         if (!data.times?.length && endpoint !== 'readings') {
-            const fallbackUrl = `/api/stations/${state.station.id}/readings?start=${state.start.toISOString()}&end=${state.end.toISOString()}`;
+            const fallbackUrl = `/api/sites/${state.site.id}/readings?start=${state.start.toISOString()}&end=${state.end.toISOString()}&alarms=true`;
             data = await api(fallbackUrl);
             resolution = '10-min raw (fallback)';
         }
 
         state.data = data;
         document.getElementById('resolution-info').textContent = `(${resolution})`;
+        state.alarms = extractAlarmsFromData(data);
+        updateAlarmCount();
         updateCharts();
     } catch (e) {
         console.error('Failed to fetch data:', e);
@@ -892,32 +1000,77 @@ const fetchData = debounce(async () => {
     }
 }, 100);
 
+// Extract alarm events from inline severity data in the readings/aggregates response
+// Groups consecutive violations by severity into alarm "events" for chart bands
+function extractAlarmsFromData(data) {
+    if (!data?.times?.length || !data?.parameters?.length) return [];
+
+    const alarms = [];
+
+    data.parameters.forEach(param => {
+        const sevs = param.severities || param.max_severity;
+        if (!sevs) return;
+
+        let currentAlarm = null;
+
+        for (let i = 0; i < data.times.length; i++) {
+            const severity = sevs[i] || 0;
+            const time = data.times[i];
+
+            if (severity > 0) {
+                if (!currentAlarm || currentAlarm.severity !== severity) {
+                    if (currentAlarm) {
+                        currentAlarm.when_off = data.times[i - 1];
+                        alarms.push(currentAlarm);
+                    }
+                    currentAlarm = {
+                        when_on: time,
+                        when_off: null,
+                        severity: severity,
+                        parameter_id: param.id,
+                        parameter_name: param.name,
+                        parameter_type: param.type,
+                    };
+                }
+            } else if (currentAlarm) {
+                currentAlarm.when_off = data.times[i - 1];
+                alarms.push(currentAlarm);
+                currentAlarm = null;
+            }
+        }
+
+        if (currentAlarm) {
+            currentAlarm.when_off = data.times[data.times.length - 1];
+            alarms.push(currentAlarm);
+        }
+    });
+
+    return alarms;
+}
+
+function updateAlarmCount() {
+    const countEl = document.getElementById('alarm-count');
+    if (countEl) {
+        const count = state.alarms.length;
+        countEl.textContent = count > 0 ? `Alarms (${count})` : 'Alarms';
+    }
+}
+
 function showLoading() {
-    state.loading = true;
-    const container = document.getElementById('charts-container');
-    let overlay = container.querySelector('.loading-overlay');
-    if (!overlay) {
-        overlay = document.createElement('div');
-        overlay.className = 'loading-overlay';
-        overlay.textContent = 'Loading...';
-        overlay.style.position = 'fixed';
-        overlay.style.top = '50%';
-        overlay.style.left = '50%';
-        overlay.style.transform = 'translate(-50%, -50%)';
-        container.style.position = 'relative';
-        container.appendChild(overlay);
+    const info = document.getElementById('resolution-info');
+    if (info && !info.querySelector('.loading-spinner')) {
+        info.insertAdjacentHTML('beforeend', '<span class="loading-spinner"></span>');
     }
 }
 
 function hideLoading() {
-    state.loading = false;
-    const overlay = document.getElementById('charts-container').querySelector('.loading-overlay');
-    if (overlay) overlay.remove();
+    const spinner = document.querySelector('.loading-spinner');
+    if (spinner) spinner.remove();
 }
 
-// Check if a sensor has any non-null data
-function hasData(sensor) {
-    const values = sensor.values || sensor.avg || [];
+// Check if a parameter has any non-null data
+function hasData(param) {
+    const values = param.values || param.avg || [];
     return values.some(v => v != null);
 }
 
@@ -935,17 +1088,20 @@ function updateTooltip(idx, mouseX, mouseY) {
     });
 
     let html = '';
-    // Use original sensor type order for consistent display
-    state.sensorTypeOrder.forEach(type => {
-        if (!state.sensors.has(type) || !state.chartData[type]) return;
-        const { sensors } = state.chartData[type];
-        sensors.forEach(sensor => {
-            const values = sensor.values || sensor.avg || [];
+    // Use original parameter type order for consistent display
+    state.parameterTypeOrder.forEach(type => {
+        if (!state.parameters.has(type) || !state.chartData[type]) return;
+        const { params } = state.chartData[type];
+        params.forEach(param => {
+            const values = param.values || param.avg || [];
             const val = values[idx];
-            const color = sensorColors[type] || '#666';
+            const color = parameterColors[type] || '#666';
+            const sevs = param.severities || param.max_severity;
+            const sev = (sevs && state.showAlarms) ? (sevs[idx] || 0) : 0;
+            const badge = sev > 0 ? `<span class="alarm-badge ${sev === 2 ? 'critical' : 'warning'}">${sev === 2 ? 'ALARM' : 'WARN'}</span>` : '';
             html += `<div class="tooltip-row">
-                <span class="tooltip-label" style="color: ${color}">${sensor.name}</span>
-                <span class="tooltip-value">${val != null ? val.toFixed(2) : '--'} ${sensor.units || ''}</span>
+                <span class="tooltip-label" style="color: ${color}">${param.name} ${badge}</span>
+                <span class="tooltip-value">${val != null ? val.toFixed(2) : '--'} ${param.units || ''}</span>
             </div>`;
         });
     });
@@ -988,47 +1144,47 @@ function updateCharts() {
         return;
     }
 
-    const { times, sensors } = state.data;
+    const { times, parameters } = state.data;
 
     // Prepare timestamps once
     const timestamps = times.map(t => new Date(t).getTime() / 1000);
 
-    // Group sensors by type AND filter out those with no data
-    const sensorsByType = {};
-    state.sensorsWithData.clear();
+    // Group parameters by type AND filter out those with no data
+    const paramsByType = {};
+    state.parametersWithData.clear();
 
-    sensors.forEach(sensor => {
-        if (!hasData(sensor)) return;  // Skip sensors with all null values
-        if (!sensorsByType[sensor.type]) sensorsByType[sensor.type] = [];
-        sensorsByType[sensor.type].push(sensor);
-        state.sensorsWithData.add(sensor.type);
+    parameters.forEach(param => {
+        if (!hasData(param)) return;  // Skip parameters with all null values
+        if (!paramsByType[param.type]) paramsByType[param.type] = [];
+        paramsByType[param.type].push(param);
+        state.parametersWithData.add(param.type);
     });
 
-    // Update sensor toggles to only show sensors with data
-    const toggles = document.getElementById('sensor-toggles');
-    const allTypes = [...new Set(sensors.map(s => s.type))].sort();
+    // Update parameter toggles to only show parameters with data
+    const toggles = document.getElementById('parameter-toggles');
+    const allTypes = [...new Set(parameters.map(s => s.type))].sort();
     toggles.innerHTML = allTypes.map(t => {
-        const hasAnyData = state.sensorsWithData.has(t);
-        const checked = state.sensors.has(t) && hasAnyData;
-        return `<label class="sensor-toggle" ${!hasAnyData ? 'style="opacity: 0.4"' : ''}>
+        const hasAnyData = state.parametersWithData.has(t);
+        const checked = state.parameters.has(t) && hasAnyData;
+        return `<label class="parameter-toggle" ${!hasAnyData ? 'style="opacity: 0.4"' : ''}>
             <input type="checkbox" value="${t}" ${checked ? 'checked' : ''} ${!hasAnyData ? 'disabled' : ''}>
-            <span style="color: ${sensorColors[t]}">${t}${!hasAnyData ? ' (no data)' : ''}</span>
+            <span style="color: ${parameterColors[t]}">${t}${!hasAnyData ? ' (no data)' : ''}</span>
         </label>`;
     }).join('');
 
     toggles.querySelectorAll('input:not(:disabled)').forEach(cb => {
         cb.addEventListener('change', () => {
-            if (cb.checked) state.sensors.add(cb.value);
-            else state.sensors.delete(cb.value);
+            if (cb.checked) state.parameters.add(cb.value);
+            else state.parameters.delete(cb.value);
             updateCharts();
         });
     });
 
     // Only show enabled types that have data
-    const enabledTypes = [...state.sensors].filter(t => state.sensorsWithData.has(t)).sort();
+    const enabledTypes = [...state.parameters].filter(t => state.parametersWithData.has(t)).sort();
 
     if (!enabledTypes.length) {
-        container.innerHTML = '<div class="chart-placeholder">No data available for selected sensors</div>';
+        container.innerHTML = '<div class="chart-placeholder">No data available for selected parameters</div>';
         Object.values(state.charts).forEach(chart => chart.destroy());
         state.charts = {};
         state.chartData = {};
@@ -1047,12 +1203,14 @@ function updateCharts() {
     });
 
     // Create/update charts for enabled types with data
+    const chartWidth = container.clientWidth - 32;
+
     enabledTypes.forEach(type => {
-        const typeSensors = sensorsByType[type] || [];
-        if (!typeSensors.length) return;
+        const typeParams = paramsByType[type] || [];
+        if (!typeParams.length) return;
 
         // Store for tooltip
-        state.chartData[type] = { sensors: typeSensors, timestamps };
+        state.chartData[type] = { params: typeParams, timestamps };
 
         let chartDiv = document.getElementById(`chart-${type}`);
         const isExpanded = state.expandedCharts.has(type);
@@ -1061,9 +1219,9 @@ function updateCharts() {
         if (!chartDiv) {
             chartDiv = document.createElement('div');
             chartDiv.id = `chart-${type}`;
-            chartDiv.className = 'sensor-chart';
+            chartDiv.className = 'parameter-chart';
             chartDiv.innerHTML = `
-                <div class="chart-label" style="color: ${sensorColors[type]}">${type} (${typeSensors[0]?.units || ''})</div>
+                <div class="chart-label" style="color: ${parameterColors[type]}">${type} (${typeParams[0]?.units || ''})</div>
                 <div class="chart-area"></div>
                 <button class="chart-expand" data-type="${type}" title="Expand/collapse chart">⤢</button>
             `;
@@ -1083,7 +1241,7 @@ function updateCharts() {
                 container.appendChild(chartDiv);
             }
 
-            // Add expand button handler
+            // Add expand button handler (once per DOM element)
             chartDiv.querySelector('.chart-expand').addEventListener('click', (e) => {
                 const t = e.target.dataset.type;
                 if (state.expandedCharts.has(t)) {
@@ -1092,6 +1250,14 @@ function updateCharts() {
                     state.expandedCharts.add(t);
                 }
                 updateCharts();
+            });
+
+            // Double-click to reset to full timeline (once per DOM element)
+            chartDiv.querySelector('.chart-area').addEventListener('dblclick', () => {
+                if (!state.site?.data_start || !state.site?.data_end) return;
+                const minTs = new Date(state.site.data_start).getTime();
+                const maxTs = new Date(state.site.data_end).getTime();
+                state.slider.set([minTs, maxTs]);
             });
         }
 
@@ -1104,77 +1270,77 @@ function updateCharts() {
         const seriesData = [timestamps];
         const seriesOpts = [{}];
 
-        typeSensors.forEach(sensor => {
-            const values = sensor.values || sensor.avg || [];
+        typeParams.forEach(param => {
+            const values = param.values || param.avg || [];
             seriesData.push(values);
             seriesOpts.push({
-                label: sensor.name,
-                stroke: sensorColors[type] || '#666',
+                label: param.name,
+                stroke: parameterColors[type] || '#666',
                 width: 1.5,
-                value: (u, v) => v == null ? '--' : v.toFixed(2) + (sensor.units ? ' ' + sensor.units : ''),
+                value: (u, v) => v == null ? '--' : v.toFixed(2) + (param.units ? ' ' + param.units : ''),
             });
         });
 
-        const opts = {
-            width: container.clientWidth - 32,
-            height: chartHeight,
-            padding: [10, 10, 0, 0],  // top, right, bottom, left - extra space for labels at edges
-            scales: { x: { time: true }, y: { auto: true } },
-            axes: [
-                { stroke: '#64748b', grid: { stroke: '#e2e8f0' }, size: 50 },  // Extra height for year on second line
-                { stroke: sensorColors[type], grid: { stroke: '#e2e8f0' }, size: 50, values: (u, vals) => vals.map(v => v == null ? '' : v.toFixed(1)) }
-            ],
-            series: seriesOpts,
-            cursor: {
-                sync: {
-                    key: syncKey.key,
-                    setSeries: true,
-                },
-                drag: { x: true, y: false },
-            },
-            hooks: {
-                setCursor: [
-                    (u) => {
-                        const idx = u.cursor.idx;
-                        if (idx != null) {
-                            const bbox = u.root.getBoundingClientRect();
-                            const cx = u.cursor.left + bbox.left;
-                            const cy = u.cursor.top + bbox.top;
-                            updateTooltip(idx, cx, cy);
-                        } else {
-                            hideTooltip();
-                        }
-                    }
+        // Reuse existing chart if series count matches (avoids DOM destruction)
+        const existing = state.charts[type];
+        if (existing && existing.series.length === seriesOpts.length) {
+            existing.setData(seriesData);
+            if (existing.width !== chartWidth || existing.height !== chartHeight) {
+                existing.setSize({ width: chartWidth, height: chartHeight });
+            }
+        } else {
+            // Series count changed or first creation — must recreate
+            if (existing) existing.destroy();
+            chartArea.innerHTML = '';
+
+            const opts = {
+                width: chartWidth,
+                height: chartHeight,
+                padding: [10, 10, 0, 0],
+                scales: { x: { time: true }, y: { auto: true } },
+                axes: [
+                    { stroke: '#64748b', grid: { stroke: '#e2e8f0' }, size: 50 },
+                    { stroke: parameterColors[type], grid: { stroke: '#e2e8f0' }, size: 50, values: (u, vals) => vals.map(v => v == null ? '' : v.toFixed(1)) }
                 ],
-                setSelect: [
-                    (u) => {
-                        if (u.select.width > 0) {
-                            const left = u.posToVal(u.select.left, 'x');
-                            const right = u.posToVal(u.select.left + u.select.width, 'x');
-                            state.slider.set([left * 1000, right * 1000]);
-                            u.setSelect({ width: 0, height: 0 });
+                series: seriesOpts,
+                cursor: {
+                    sync: {
+                        key: syncKey.key,
+                        setSeries: true,
+                    },
+                    drag: { x: true, y: false },
+                },
+                plugins: [alarmBandsPlugin(type)],
+                hooks: {
+                    setCursor: [
+                        (u) => {
+                            const idx = u.cursor.idx;
+                            if (idx != null) {
+                                const bbox = u.root.getBoundingClientRect();
+                                const cx = u.cursor.left + bbox.left;
+                                const cy = u.cursor.top + bbox.top;
+                                updateTooltip(idx, cx, cy);
+                            } else {
+                                hideTooltip();
+                            }
                         }
-                    }
-                ]
-            },
-            legend: { show: false },
-        };
+                    ],
+                    setSelect: [
+                        (u) => {
+                            if (u.select.width > 0) {
+                                const left = u.posToVal(u.select.left, 'x');
+                                const right = u.posToVal(u.select.left + u.select.width, 'x');
+                                state.slider.set([left * 1000, right * 1000]);
+                                u.setSelect({ width: 0, height: 0 });
+                            }
+                        }
+                    ]
+                },
+                legend: { show: false },
+            };
 
-        // Destroy old chart if exists
-        if (state.charts[type]) {
-            state.charts[type].destroy();
+            state.charts[type] = new uPlot(opts, seriesData, chartArea);
         }
-
-        chartArea.innerHTML = '';
-        state.charts[type] = new uPlot(opts, seriesData, chartArea);
-
-        // Double-click to reset to full timeline
-        chartArea.addEventListener('dblclick', () => {
-            if (!state.station?.data_start || !state.station?.data_end) return;
-            const minTs = new Date(state.station.data_start).getTime();
-            const maxTs = new Date(state.station.data_end).getTime();
-            state.slider.set([minTs, maxTs]);
-        });
     });
 
     // Remove placeholder if we have charts
@@ -1183,7 +1349,9 @@ function updateCharts() {
 }
 
 // Hide tooltip when mouse leaves charts container
-document.getElementById('charts-container').addEventListener('mouseleave', hideTooltip);
+document.getElementById('charts-container').addEventListener('mouseleave', () => {
+    hideTooltip();
+});
 
 // Handle resize
 window.addEventListener('resize', debounce(() => {

@@ -1,10 +1,8 @@
-pub mod alarm_locations;
-pub mod alarms;
+pub mod alarm_thresholds;
 pub mod calibrations;
 pub mod device_status;
-pub mod events;
+pub mod parameters;
+pub mod projects;
 pub mod readings;
-pub mod sensors;
-pub mod stations;
+pub mod sites;
 pub mod sync_state;
-pub mod zones;

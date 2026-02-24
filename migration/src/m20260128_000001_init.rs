@@ -317,106 +317,45 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // ========== ALARMS ==========
-        // Stores current/historical alarm state from Vaisala
+        // ========== ALARM THRESHOLDS ==========
+        // Parameter-based alarm thresholds per sensor
         manager
             .create_table(
                 Table::create()
-                    .table(Alarms::Table)
+                    .table(AlarmThresholds::Table)
                     .if_not_exists()
                     .col(
-                        ColumnDef::new(Alarms::Id)
+                        ColumnDef::new(AlarmThresholds::Id)
                             .uuid()
                             .not_null()
                             .primary_key()
                             .extra("DEFAULT gen_random_uuid()"),
                     )
                     .col(
-                        ColumnDef::new(Alarms::VaisalaAlarmId)
-                            .integer()
+                        ColumnDef::new(AlarmThresholds::SensorId)
+                            .uuid()
                             .not_null()
                             .unique_key(),
                     )
-                    .col(ColumnDef::new(Alarms::Severity).small_integer().not_null())
-                    .col(ColumnDef::new(Alarms::Description).string_len(256).not_null())
-                    .col(ColumnDef::new(Alarms::ErrorText).string_len(256))
-                    .col(ColumnDef::new(Alarms::AlarmType).string_len(64))
+                    .col(ColumnDef::new(AlarmThresholds::WarningMin).double())
+                    .col(ColumnDef::new(AlarmThresholds::WarningMax).double())
+                    .col(ColumnDef::new(AlarmThresholds::AlarmMin).double())
+                    .col(ColumnDef::new(AlarmThresholds::AlarmMax).double())
+                    .col(ColumnDef::new(AlarmThresholds::Description).text())
                     .col(
-                        ColumnDef::new(Alarms::WhenOn)
-                            .timestamp_with_time_zone()
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(Alarms::WhenOff).timestamp_with_time_zone())
-                    .col(ColumnDef::new(Alarms::WhenAck).timestamp_with_time_zone())
-                    .col(ColumnDef::new(Alarms::WhenCondition).timestamp_with_time_zone())
-                    .col(ColumnDef::new(Alarms::DurationSec).double())
-                    .col(ColumnDef::new(Alarms::Status).boolean().not_null().default(true))
-                    .col(ColumnDef::new(Alarms::IsSystem).boolean().not_null().default(false))
-                    .col(ColumnDef::new(Alarms::SerialNumber).string_len(32))
-                    .col(ColumnDef::new(Alarms::LocationText).string_len(256))
-                    .col(ColumnDef::new(Alarms::ZoneText).string_len(64))
-                    .col(ColumnDef::new(Alarms::StationId).uuid())
-                    .col(ColumnDef::new(Alarms::AckRequired).boolean().not_null().default(false))
-                    .col(ColumnDef::new(Alarms::AckComments).json_binary())
-                    .col(ColumnDef::new(Alarms::AckActionTaken).string_len(256))
-                    .col(
-                        ColumnDef::new(Alarms::CreatedAt)
+                        ColumnDef::new(AlarmThresholds::CreatedAt)
                             .timestamp_with_time_zone()
                             .extra("DEFAULT NOW()"),
                     )
                     .col(
-                        ColumnDef::new(Alarms::UpdatedAt)
+                        ColumnDef::new(AlarmThresholds::UpdatedAt)
                             .timestamp_with_time_zone()
                             .extra("DEFAULT NOW()"),
                     )
                     .foreign_key(
                         ForeignKey::create()
-                            .name("fk_alarms_station")
-                            .from(Alarms::Table, Alarms::StationId)
-                            .to(Stations::Table, Stations::Id)
-                            .on_delete(ForeignKeyAction::SetNull),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-
-        // Index for active alarm queries
-        db.execute_unprepared(
-            "CREATE INDEX idx_alarms_status_when_on ON alarms (status, when_on DESC)",
-        )
-        .await?;
-
-        // Index for station-level alarm queries
-        db.execute_unprepared(
-            "CREATE INDEX idx_alarms_station ON alarms (station_id, when_on DESC) WHERE station_id IS NOT NULL",
-        )
-        .await?;
-
-        // ========== ALARM_LOCATIONS ==========
-        // Many-to-many linking alarms to sensors
-        manager
-            .create_table(
-                Table::create()
-                    .table(AlarmLocations::Table)
-                    .if_not_exists()
-                    .col(ColumnDef::new(AlarmLocations::AlarmId).uuid().not_null())
-                    .col(ColumnDef::new(AlarmLocations::SensorId).uuid().not_null())
-                    .primary_key(
-                        Index::create()
-                            .col(AlarmLocations::AlarmId)
-                            .col(AlarmLocations::SensorId),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_alarm_locations_alarm")
-                            .from(AlarmLocations::Table, AlarmLocations::AlarmId)
-                            .to(Alarms::Table, Alarms::Id)
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_alarm_locations_sensor")
-                            .from(AlarmLocations::Table, AlarmLocations::SensorId)
+                            .name("fk_alarm_thresholds_sensor")
+                            .from(AlarmThresholds::Table, AlarmThresholds::SensorId)
                             .to(Sensors::Table, Sensors::Id)
                             .on_delete(ForeignKeyAction::Cascade),
                     )
@@ -424,65 +363,78 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Index for sensor-based alarm lookups
+        // Index for sensor-based threshold lookups
         db.execute_unprepared(
-            "CREATE INDEX idx_alarm_locations_sensor ON alarm_locations (sensor_id)",
+            "CREATE INDEX idx_alarm_thresholds_sensor ON alarm_thresholds (sensor_id)",
         )
         .await?;
 
-        // ========== EVENTS (TimescaleDB Hypertable) ==========
-        // Event log from Vaisala /events endpoint
-        manager
-            .create_table(
-                Table::create()
-                    .table(Events::Table)
-                    .if_not_exists()
-                    .col(
-                        ColumnDef::new(Events::Time)
-                            .timestamp_with_time_zone()
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(Events::VaisalaEventNum).integer().not_null())
-                    .col(ColumnDef::new(Events::Category).string_len(64).not_null())
-                    .col(ColumnDef::new(Events::Message).text().not_null())
-                    .col(ColumnDef::new(Events::UserName).string_len(64))
-                    .col(ColumnDef::new(Events::Entity).string_len(64))
-                    .col(ColumnDef::new(Events::EntityId).integer())
-                    .col(ColumnDef::new(Events::SensorId).uuid())
-                    .col(ColumnDef::new(Events::StationId).uuid())
-                    .col(ColumnDef::new(Events::DeviceId).integer())
-                    .col(ColumnDef::new(Events::ChannelId).integer())
-                    .col(ColumnDef::new(Events::HostId).integer())
-                    .col(ColumnDef::new(Events::ExtraFields).json_binary())
-                    .primary_key(
-                        Index::create()
-                            .col(Events::VaisalaEventNum)
-                            .col(Events::Time),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-
-        // Convert to TimescaleDB hypertable (30-day chunks)
-        // Note: Foreign keys are not added to hypertables with compression enabled
+        // Seed alarm thresholds based on sensor_type defaults
+        // Threshold values from R code:
+        // | Parameter | Warning Range | Alarm Range |
+        // |-----------|--------------|-------------|
+        // | Depth (mm) | 0-100 or 1000-2000 | <0 or >2000 |
+        // | CDOM (ppb) | 100-150 | <0 or >150 |
+        // | Turbidity (NTU) | 100-500 | <0 or >500 |
+        // | Dissolved_O2 (µM) | <120 or >360 | <0 or >625 |
+        // | Conductivity (µS/cm) | <100 or >900 | <0 or >1000 |
+        // | DO_Temperature (°C) | <0.5 or >20 | <0 or >25 |
+        // | Cond_Temperature (°C) | <0.5 or >20 | <0 or >25 |
+        // | Battery (V) | 11.5-12.1 | <11.5 |
         db.execute_unprepared(
-            "SELECT create_hypertable('events', 'time', chunk_time_interval => INTERVAL '30 days')",
-        )
-        .await?;
-
-        // Index for category-based queries
-        db.execute_unprepared("CREATE INDEX idx_events_category ON events (category, time DESC)")
-            .await?;
-
-        // Index for sensor-based event queries
-        db.execute_unprepared(
-            "CREATE INDEX idx_events_sensor ON events (sensor_id, time DESC) WHERE sensor_id IS NOT NULL",
-        )
-        .await?;
-
-        // Index for station-based event queries
-        db.execute_unprepared(
-            "CREATE INDEX idx_events_station ON events (station_id, time DESC) WHERE station_id IS NOT NULL",
+            r#"
+            INSERT INTO alarm_thresholds (id, sensor_id, warning_min, warning_max, alarm_min, alarm_max, description)
+            SELECT
+                gen_random_uuid(),
+                s.id,
+                CASE s.sensor_type
+                    WHEN 'Depth' THEN 100
+                    WHEN 'CDOM' THEN NULL
+                    WHEN 'Turbidity' THEN NULL
+                    WHEN 'Dissolved_O2' THEN 120
+                    WHEN 'Conductivity' THEN 100
+                    WHEN 'DO_Temperature' THEN 0.5
+                    WHEN 'Cond_Temperature' THEN 0.5
+                    WHEN 'Battery' THEN 12.1
+                    ELSE NULL
+                END as warning_min,
+                CASE s.sensor_type
+                    WHEN 'Depth' THEN 1000
+                    WHEN 'CDOM' THEN 100
+                    WHEN 'Turbidity' THEN 100
+                    WHEN 'Dissolved_O2' THEN 360
+                    WHEN 'Conductivity' THEN 900
+                    WHEN 'DO_Temperature' THEN 20
+                    WHEN 'Cond_Temperature' THEN 20
+                    WHEN 'Battery' THEN NULL
+                    ELSE NULL
+                END as warning_max,
+                CASE s.sensor_type
+                    WHEN 'Depth' THEN 0
+                    WHEN 'CDOM' THEN 0
+                    WHEN 'Turbidity' THEN 0
+                    WHEN 'Dissolved_O2' THEN 0
+                    WHEN 'Conductivity' THEN 0
+                    WHEN 'DO_Temperature' THEN 0
+                    WHEN 'Cond_Temperature' THEN 0
+                    WHEN 'Battery' THEN 11.5
+                    ELSE NULL
+                END as alarm_min,
+                CASE s.sensor_type
+                    WHEN 'Depth' THEN 2000
+                    WHEN 'CDOM' THEN 150
+                    WHEN 'Turbidity' THEN 500
+                    WHEN 'Dissolved_O2' THEN 625
+                    WHEN 'Conductivity' THEN 1000
+                    WHEN 'DO_Temperature' THEN 25
+                    WHEN 'Cond_Temperature' THEN 25
+                    WHEN 'Battery' THEN NULL
+                    ELSE NULL
+                END as alarm_max,
+                'Auto-generated from sensor type defaults'
+            FROM sensors s
+            ON CONFLICT (sensor_id) DO NOTHING
+            "#,
         )
         .await?;
 
@@ -626,18 +578,6 @@ impl MigrationTrait for Migration {
         db.execute_unprepared("SELECT add_compression_policy('device_status', INTERVAL '90 days')")
             .await?;
 
-        // Events compression (after 90 days)
-        db.execute_unprepared(
-            r"ALTER TABLE events SET (
-                timescaledb.compress,
-                timescaledb.compress_segmentby = 'category'
-            )",
-        )
-        .await?;
-
-        db.execute_unprepared("SELECT add_compression_policy('events', INTERVAL '90 days')")
-            .await?;
-
         Ok(())
     }
 
@@ -645,9 +585,6 @@ impl MigrationTrait for Migration {
         let db = manager.get_connection();
 
         // Remove compression policies
-        db.execute_unprepared("SELECT remove_compression_policy('events', if_exists => true)")
-            .await
-            .ok();
         db.execute_unprepared(
             "SELECT remove_compression_policy('device_status', if_exists => true)",
         )
@@ -690,18 +627,12 @@ impl MigrationTrait for Migration {
 
         // Drop tables in reverse order of dependencies
         manager
-            .drop_table(Table::drop().table(Events::Table).if_exists().to_owned())
-            .await?;
-        manager
             .drop_table(
                 Table::drop()
-                    .table(AlarmLocations::Table)
+                    .table(AlarmThresholds::Table)
                     .if_exists()
                     .to_owned(),
             )
-            .await?;
-        manager
-            .drop_table(Table::drop().table(Alarms::Table).if_exists().to_owned())
             .await?;
         manager
             .drop_table(Table::drop().table(SyncState::Table).if_exists().to_owned())
@@ -835,53 +766,15 @@ enum SyncState {
 }
 
 #[derive(DeriveIden)]
-enum Alarms {
+enum AlarmThresholds {
     Table,
     Id,
-    VaisalaAlarmId,
-    Severity,
+    SensorId,
+    WarningMin,
+    WarningMax,
+    AlarmMin,
+    AlarmMax,
     Description,
-    ErrorText,
-    AlarmType,
-    WhenOn,
-    WhenOff,
-    WhenAck,
-    WhenCondition,
-    DurationSec,
-    Status,
-    IsSystem,
-    SerialNumber,
-    LocationText,
-    ZoneText,
-    StationId,
-    AckRequired,
-    AckComments,
-    AckActionTaken,
     CreatedAt,
     UpdatedAt,
-}
-
-#[derive(DeriveIden)]
-enum AlarmLocations {
-    Table,
-    AlarmId,
-    SensorId,
-}
-
-#[derive(DeriveIden)]
-enum Events {
-    Table,
-    Time,
-    VaisalaEventNum,
-    Category,
-    Message,
-    UserName,
-    Entity,
-    EntityId,
-    SensorId,
-    StationId,
-    DeviceId,
-    ChannelId,
-    HostId,
-    ExtraFields,
 }

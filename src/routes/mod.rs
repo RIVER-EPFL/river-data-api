@@ -1,7 +1,8 @@
 pub mod alarms;
 pub mod dashboard;
-pub mod stations;
-pub mod zones;
+pub mod partners;
+pub mod projects;
+pub mod sites;
 
 // Re-export cache from services for use in route handlers
 pub use crate::services::cache;
@@ -23,7 +24,7 @@ use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
 use crate::common::AppState;
-use crate::entity::{stations as stations_entity, zones as zones_entity};
+use crate::entity::{projects as projects_entity, sites as sites_entity};
 use crate::error::{AppError, AppResult};
 
 // ============================================================================
@@ -50,21 +51,21 @@ async fn healthz() -> StatusCode {
 // Resolution Helpers
 // ============================================================================
 
-/// Resolve a zone by UUID or name (case-insensitive)
-pub async fn resolve_zone(
+/// Resolve a project by UUID or name (case-insensitive)
+pub async fn resolve_project(
     db: &DatabaseConnection,
     id_or_name: &str,
-) -> AppResult<zones_entity::Model> {
+) -> AppResult<projects_entity::Model> {
     // Try UUID first
     if let Ok(uuid) = id_or_name.parse::<Uuid>() {
-        return zones_entity::Entity::find_by_id(uuid)
+        return projects_entity::Entity::find_by_id(uuid)
             .one(db)
             .await?
-            .ok_or_else(|| AppError::NotFound("Zone not found".to_string()));
+            .ok_or_else(|| AppError::NotFound("Project not found".to_string()));
     }
 
     // Fall back to case-insensitive name lookup using LOWER()
-    zones_entity::Entity::find()
+    projects_entity::Entity::find()
         .filter(
             Condition::all().add(
                 Expr::cust_with_values("LOWER(name) = LOWER($1)", [id_or_name])
@@ -72,24 +73,24 @@ pub async fn resolve_zone(
         )
         .one(db)
         .await?
-        .ok_or_else(|| AppError::NotFound("Zone not found".to_string()))
+        .ok_or_else(|| AppError::NotFound("Project not found".to_string()))
 }
 
-/// Resolve a station by UUID or name (case-insensitive)
-pub async fn resolve_station(
+/// Resolve a site by UUID or name (case-insensitive)
+pub async fn resolve_site(
     db: &DatabaseConnection,
     id_or_name: &str,
-) -> AppResult<stations_entity::Model> {
+) -> AppResult<sites_entity::Model> {
     // Try UUID first
     if let Ok(uuid) = id_or_name.parse::<Uuid>() {
-        return stations_entity::Entity::find_by_id(uuid)
+        return sites_entity::Entity::find_by_id(uuid)
             .one(db)
             .await?
-            .ok_or_else(|| AppError::NotFound("Station not found".to_string()));
+            .ok_or_else(|| AppError::NotFound("Site not found".to_string()));
     }
 
     // Fall back to case-insensitive name lookup using LOWER()
-    stations_entity::Entity::find()
+    sites_entity::Entity::find()
         .filter(
             Condition::all().add(
                 Expr::cust_with_values("LOWER(name) = LOWER($1)", [id_or_name])
@@ -97,7 +98,7 @@ pub async fn resolve_station(
         )
         .one(db)
         .await?
-        .ok_or_else(|| AppError::NotFound("Station not found".to_string()))
+        .ok_or_else(|| AppError::NotFound("Site not found".to_string()))
 }
 
 // ============================================================================
@@ -108,49 +109,42 @@ pub async fn resolve_station(
 #[openapi(
     paths(
         healthz,
-        zones::list_zones,
-        zones::get_zone,
-        zones::list_zone_stations,
-        stations::list_stations,
-        stations::get_station,
-        stations::list_station_sensors,
-        stations::get_station_readings,
-        stations::get_station_aggregates,
-        alarms::list_alarms,
-        alarms::list_active_alarms,
-        alarms::get_alarm,
-        alarms::list_station_alarms,
-        alarms::list_events,
+        projects::list_projects,
+        projects::get_project,
+        projects::list_project_sites,
+        sites::list_sites,
+        sites::get_site,
+        sites::list_site_parameters,
+        sites::get_site_readings,
+        sites::get_site_aggregates,
+        alarms::get_site_alarms,
     ),
     components(
         schemas(
-            zones::ZoneResponse,
-            stations::StationResponse,
-            stations::StationDetailResponse,
-            stations::StationRef,
-            stations::ZoneRef,
-            stations::SensorResponse,
-            stations::ReadingsResponse,
-            stations::SensorData,
-            stations::AggregatesResponse,
-            stations::SensorAggregateData,
-            alarms::AlarmResponse,
-            alarms::AlarmSummary,
-            alarms::EventResponse,
-            alarms::EventsListResponse,
+            projects::ProjectResponse,
+            sites::SiteResponse,
+            sites::SiteDetailResponse,
+            sites::SiteRef,
+            sites::ProjectRef,
+            sites::ParameterResponse,
+            sites::ReadingsResponse,
+            sites::ParameterData,
+            sites::AggregatesResponse,
+            sites::ParameterAggregateData,
+            alarms::AlarmViolationsResponse,
+            alarms::ParameterViolationData,
         )
     ),
     tags(
         (name = "health", description = "Health check endpoints"),
-        (name = "zones", description = "Zone management"),
-        (name = "stations", description = "Station management and data"),
-        (name = "alarms", description = "Alarm management"),
-        (name = "events", description = "Event log"),
+        (name = "projects", description = "Project management"),
+        (name = "sites", description = "Site management and data"),
+        (name = "alarms", description = "Threshold-based alarm violations"),
     ),
     info(
-        title = "River DB API",
-        description = "Time-series sensor data API for Vaisala viewLinc",
-        version = "0.1.0"
+        title = "River Data API",
+        description = "Time-series sensor data API",
+        version = "0.2.0"
     )
 )]
 struct ApiDoc;
@@ -173,36 +167,39 @@ pub fn build_router(state: AppState) -> Router {
         );
     }
 
-    // Metadata routes (zones, stations, alarms, events listings)
+    // Metadata routes (projects, sites listings)
     let metadata_routes_base = Router::new()
-        .route("/zones", get(zones::list_zones))
-        .route("/zones/{zone_id}", get(zones::get_zone))
-        .route("/zones/{zone_id}/stations", get(zones::list_zone_stations))
-        .route("/stations", get(stations::list_stations))
-        .route("/stations/{station_id}", get(stations::get_station))
-        .route("/stations/{station_id}/sensors", get(stations::list_station_sensors))
-        .route("/stations/{station_id}/alarms", get(alarms::list_station_alarms))
-        .route("/alarms", get(alarms::list_alarms))
-        .route("/alarms/active", get(alarms::list_active_alarms))
-        .route("/alarms/{alarm_id}", get(alarms::get_alarm))
-        .route("/events", get(alarms::list_events));
+        .route("/projects", get(projects::list_projects))
+        .route("/projects/{project_id}", get(projects::get_project))
+        .route("/projects/{project_id}/sites", get(projects::list_project_sites))
+        .route("/sites", get(sites::list_sites))
+        .route("/sites/{site_id}", get(sites::get_site))
+        .route("/sites/{site_id}/parameters", get(sites::list_site_parameters));
 
-    // Data routes (readings, aggregates)
+    // Data routes (readings, aggregates, alarms)
     let data_routes_base = Router::new()
         .route(
-            "/stations/{station_id}/readings",
-            get(stations::get_station_readings),
+            "/sites/{site_id}/readings",
+            get(sites::get_site_readings),
         )
         .route(
-            "/stations/{station_id}/aggregates/{resolution}",
-            get(stations::get_station_aggregates),
+            "/sites/{site_id}/aggregates/{resolution}",
+            get(sites::get_site_aggregates),
+        )
+        .route(
+            "/sites/{site_id}/alarms",
+            get(alarms::get_site_alarms),
         );
+
+    // Partner routes (included in api_routes for rate limiting)
+    let partner_routes = partners::partner_router();
 
     // Combine API routes, conditionally applying rate limiting
     let api_routes = if config.disable_rate_limiting {
         Router::new()
             .merge(metadata_routes_base)
             .merge(data_routes_base)
+            .nest("/partners", partner_routes)
     } else {
         let metadata_limiter = GovernorConfigBuilder::default()
             .key_extractor(FallbackIpKeyExtractor)
@@ -218,12 +215,17 @@ pub fn build_router(state: AppState) -> Router {
             .finish()
             .expect("Failed to create data rate limiter");
 
+        let data_limiter_arc = Arc::new(data_limiter);
+
         Router::new()
             .merge(metadata_routes_base.layer(GovernorLayer {
                 config: Arc::new(metadata_limiter),
             }))
             .merge(data_routes_base.layer(GovernorLayer {
-                config: Arc::new(data_limiter),
+                config: Arc::clone(&data_limiter_arc),
+            }))
+            .nest("/partners", partner_routes.layer(GovernorLayer {
+                config: data_limiter_arc,
             }))
     }
     .layer(RequestBodyLimitLayer::new(1024 * 1024)); // 1MB body limit
