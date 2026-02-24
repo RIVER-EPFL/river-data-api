@@ -200,15 +200,11 @@ pub fn build_router(state: AppState) -> Router {
     // Admin routes (Keycloak-protected)
     let admin_routes = admin::admin_router(&state);
 
-    // Combine API routes, conditionally applying rate limiting
-    let api_routes = if config.disable_rate_limiting {
+    // Build private routes with optional rate limiting
+    let private_routes_inner = if config.disable_rate_limiting {
         Router::new()
-            .nest("/private", Router::new()
-                .merge(metadata_routes_base)
-                .merge(data_routes_base))
-            .nest("/public", public_routes)
-            .nest("/admin", admin_routes)
-            .nest("/config", Router::new().route("/keycloak", get(config::get_keycloak_config)))
+            .merge(metadata_routes_base)
+            .merge(data_routes_base)
     } else {
         let metadata_limiter = GovernorConfigBuilder::default()
             .key_extractor(FallbackIpKeyExtractor)
@@ -224,23 +220,58 @@ pub fn build_router(state: AppState) -> Router {
             .finish()
             .expect("Failed to create data rate limiter");
 
-        let data_limiter_arc = Arc::new(data_limiter);
-
         Router::new()
-            .nest("/private", Router::new()
-                .merge(metadata_routes_base.layer(GovernorLayer {
-                    config: Arc::new(metadata_limiter),
-                }))
-                .merge(data_routes_base.layer(GovernorLayer {
-                    config: Arc::clone(&data_limiter_arc),
-                })))
-            .nest("/public", public_routes.layer(GovernorLayer {
-                config: data_limiter_arc,
+            .merge(metadata_routes_base.layer(GovernorLayer {
+                config: Arc::new(metadata_limiter),
             }))
-            .nest("/admin", admin_routes)
-            .nest("/config", Router::new().route("/keycloak", get(config::get_keycloak_config)))
-    }
-    .layer(RequestBodyLimitLayer::new(1024 * 1024)); // 1MB body limit
+            .merge(data_routes_base.layer(GovernorLayer {
+                config: Arc::new(data_limiter),
+            }))
+    };
+
+    // Apply Keycloak auth to private routes if configured
+    let private_routes = {
+        let mut r = private_routes_inner;
+        if let Some(instance) = state.keycloak_auth_instance.clone() {
+            use axum_keycloak_auth::{PassthroughMode, layer::KeycloakAuthLayer};
+            r = r.layer(
+                KeycloakAuthLayer::<crate::common::auth::Role>::builder()
+                    .instance(instance)
+                    .passthrough_mode(PassthroughMode::Block)
+                    .persist_raw_claims(false)
+                    .expected_audiences(vec![String::from("account")])
+                    .required_roles(vec![crate::common::auth::Role::User])
+                    .build(),
+            );
+        } else {
+            tracing::warn!("Private routes are not protected by authentication");
+        }
+        r
+    };
+
+    // Build public routes with optional rate limiting
+    let public_routes_final = if config.disable_rate_limiting {
+        public_routes
+    } else {
+        let public_limiter = GovernorConfigBuilder::default()
+            .key_extractor(FallbackIpKeyExtractor)
+            .per_second(config.rate_limit_data_per_second)
+            .burst_size(config.rate_limit_data_burst)
+            .finish()
+            .expect("Failed to create public rate limiter");
+
+        public_routes.layer(GovernorLayer {
+            config: Arc::new(public_limiter),
+        })
+    };
+
+    // Combine all API routes
+    let api_routes = Router::new()
+        .nest("/private", private_routes)
+        .nest("/public", public_routes_final)
+        .nest("/admin", admin_routes)
+        .nest("/config", Router::new().route("/keycloak", get(config::get_keycloak_config)))
+        .layer(RequestBodyLimitLayer::new(1024 * 1024)); // 1MB body limit
 
     // Health check routes (NO rate limiting)
     let health_routes = Router::new().route("/healthz", get(healthz));
@@ -249,7 +280,7 @@ pub fn build_router(state: AppState) -> Router {
     let docs_routes = Router::new().merge(Scalar::with_url("/docs", ApiDoc::openapi()));
 
     // Dashboard at root
-    let dashboard_routes = Router::new().route("/", get(dashboard::dashboard));
+    let dashboard_routes = Router::new().route("/dashboard", get(dashboard::dashboard));
 
     // Combine all routes
     Router::new()
@@ -262,7 +293,8 @@ pub fn build_router(state: AppState) -> Router {
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
-                .allow_headers(Any),
+                .allow_headers(Any)
+                .expose_headers([axum::http::header::CONTENT_RANGE]),
         )
         .layer(
             TraceLayer::new_for_http()

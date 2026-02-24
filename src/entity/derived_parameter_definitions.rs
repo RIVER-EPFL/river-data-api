@@ -1,13 +1,16 @@
 use crudcrate::{CRUDResource, EntityToModels};
 use sea_orm::entity::prelude::*;
 
+use crate::services::operations::DerivedParameterDefinitionOperations;
+
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels)]
 #[sea_orm(table_name = "derived_parameter_definitions")]
 #[crudcrate(
     api_struct = "DerivedParameterDefinition",
     name_singular = "derived_parameter_definition",
     name_plural = "derived_parameter_definitions",
-    generate_router
+    generate_router,
+    operations = DerivedParameterDefinitionOperations
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]

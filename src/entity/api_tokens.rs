@@ -1,13 +1,16 @@
 use crudcrate::{CRUDResource, EntityToModels};
 use sea_orm::entity::prelude::*;
 
+use crate::services::operations::ApiTokenOperations;
+
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels)]
 #[sea_orm(table_name = "api_tokens")]
 #[crudcrate(
     api_struct = "ApiToken",
     name_singular = "api_token",
     name_plural = "api_tokens",
-    generate_router
+    generate_router,
+    operations = ApiTokenOperations
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
@@ -31,6 +34,10 @@ pub struct Model {
     #[crudcrate(exclude(create, update), sortable)]
     pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_by: Option<String>,
+    #[sea_orm(ignore)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
+    pub raw_token: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

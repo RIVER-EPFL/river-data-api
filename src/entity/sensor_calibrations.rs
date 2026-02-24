@@ -1,13 +1,16 @@
 use crudcrate::{CRUDResource, EntityToModels};
 use sea_orm::entity::prelude::*;
 
+use crate::services::operations::SensorCalibrationOperations;
+
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels)]
 #[sea_orm(table_name = "sensor_calibrations")]
 #[crudcrate(
     api_struct = "SensorCalibration",
     name_singular = "sensor_calibration",
     name_plural = "sensor_calibrations",
-    generate_router
+    generate_router,
+    operations = SensorCalibrationOperations
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]

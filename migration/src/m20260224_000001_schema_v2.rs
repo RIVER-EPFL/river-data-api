@@ -39,7 +39,7 @@ impl MigrationTrait for Migration {
 
         manager
             .get_connection()
-            .execute_unprepared("CREATE UNIQUE INDEX projects_name_lower_idx ON projects (LOWER(name))")
+            .execute_unprepared("CREATE UNIQUE INDEX IF NOT EXISTS projects_name_lower_idx ON projects (LOWER(name))")
             .await?;
 
         // ========== SITES ==========
@@ -79,7 +79,7 @@ impl MigrationTrait for Migration {
         manager
             .get_connection()
             .execute_unprepared(
-                "CREATE UNIQUE INDEX sites_name_lower_idx ON sites (LOWER(name))",
+                "CREATE UNIQUE INDEX IF NOT EXISTS sites_name_lower_idx ON sites (LOWER(name))",
             )
             .await?;
 
@@ -219,7 +219,7 @@ impl MigrationTrait for Migration {
         manager
             .get_connection()
             .execute_unprepared(
-                "CREATE INDEX idx_sensor_calibrations_sensor_valid_from ON sensor_calibrations (sensor_id, valid_from DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_sensor_calibrations_sensor_valid_from ON sensor_calibrations (sensor_id, valid_from DESC)",
             )
             .await?;
 
@@ -262,7 +262,7 @@ impl MigrationTrait for Migration {
                         ColumnDef::new(DerivedParameterDefinitions::RequiredParameterTypes)
                             .json_binary()
                             .not_null()
-                            .default("'[]'"),
+                            .default("[]"),
                     )
                     .col(
                         ColumnDef::new(DerivedParameterDefinitions::CreatedAt)
@@ -289,6 +289,7 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(Parameters::SiteId).uuid().not_null())
                     .col(ColumnDef::new(Parameters::ParameterTypeId).uuid().not_null())
                     .col(ColumnDef::new(Parameters::Name).string_len(64).not_null())
+                    .col(ColumnDef::new(Parameters::SensorType).string_len(64).not_null())
                     .col(ColumnDef::new(Parameters::DisplayUnits).string_len(32))
                     .col(ColumnDef::new(Parameters::UnitsName).string_len(64))
                     .col(ColumnDef::new(Parameters::UnitsMin).double())
@@ -419,7 +420,7 @@ impl MigrationTrait for Migration {
         manager
             .get_connection()
             .execute_unprepared(
-                "CREATE INDEX idx_sensor_deployments_sensor_from ON sensor_deployments (sensor_id, deployed_from DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_sensor_deployments_sensor_from ON sensor_deployments (sensor_id, deployed_from DESC)",
             )
             .await?;
 
@@ -510,12 +511,12 @@ impl MigrationTrait for Migration {
 
         let db = manager.get_connection();
         db.execute_unprepared(
-            "SELECT create_hypertable('readings', 'time', chunk_time_interval => INTERVAL '7 days')",
+            "SELECT create_hypertable('readings', 'time', chunk_time_interval => INTERVAL '7 days', if_not_exists => TRUE)",
         )
         .await?;
 
         db.execute_unprepared(
-            "CREATE INDEX idx_readings_parameter_time ON readings (parameter_id, time DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_readings_parameter_time ON readings (parameter_id, time DESC)",
         )
         .await?;
 
@@ -556,7 +557,7 @@ impl MigrationTrait for Migration {
             .await?;
 
         db.execute_unprepared(
-            "SELECT create_hypertable('device_status', 'time', chunk_time_interval => INTERVAL '30 days')",
+            "SELECT create_hypertable('device_status', 'time', chunk_time_interval => INTERVAL '30 days', if_not_exists => TRUE)",
         )
         .await?;
 
@@ -638,7 +639,7 @@ impl MigrationTrait for Migration {
             .await?;
 
         db.execute_unprepared(
-            "CREATE INDEX idx_alarm_thresholds_parameter ON alarm_thresholds (parameter_id)",
+            "CREATE INDEX IF NOT EXISTS idx_alarm_thresholds_parameter ON alarm_thresholds (parameter_id)",
         )
         .await?;
 
@@ -671,7 +672,7 @@ impl MigrationTrait for Migration {
                         ColumnDef::new(ApiTokens::Permissions)
                             .json_binary()
                             .not_null()
-                            .default("'{}'"),
+                            .default("{}"),
                     )
                     .col(
                         ColumnDef::new(ApiTokens::IsActive)
@@ -755,7 +756,7 @@ impl MigrationTrait for Migration {
         // ========== CONTINUOUS AGGREGATES (TimescaleDB-specific) ==========
         db.execute_unprepared(
             r"
-            CREATE MATERIALIZED VIEW readings_hourly
+            CREATE MATERIALIZED VIEW IF NOT EXISTS readings_hourly
             WITH (timescaledb.continuous) AS
             SELECT
                 time_bucket('1 hour', time) AS bucket,
@@ -774,7 +775,7 @@ impl MigrationTrait for Migration {
 
         db.execute_unprepared(
             r"
-            CREATE MATERIALIZED VIEW readings_daily
+            CREATE MATERIALIZED VIEW IF NOT EXISTS readings_daily
             WITH (timescaledb.continuous) AS
             SELECT
                 time_bucket('1 day', time) AS bucket,
@@ -793,7 +794,7 @@ impl MigrationTrait for Migration {
 
         db.execute_unprepared(
             r"
-            CREATE MATERIALIZED VIEW readings_weekly
+            CREATE MATERIALIZED VIEW IF NOT EXISTS readings_weekly
             WITH (timescaledb.continuous) AS
             SELECT
                 time_bucket('1 week', time) AS bucket,
@@ -812,7 +813,7 @@ impl MigrationTrait for Migration {
 
         db.execute_unprepared(
             r"
-            CREATE MATERIALIZED VIEW readings_monthly
+            CREATE MATERIALIZED VIEW IF NOT EXISTS readings_monthly
             WITH (timescaledb.continuous) AS
             SELECT
                 time_bucket('1 month', time) AS bucket,
@@ -1110,6 +1111,7 @@ pub enum Parameters {
     SiteId,
     ParameterTypeId,
     Name,
+    SensorType,
     DisplayUnits,
     UnitsName,
     UnitsMin,
