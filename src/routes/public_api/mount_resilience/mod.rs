@@ -73,41 +73,13 @@ pub struct MountResilienceApiDoc;
 // ============================================================================
 
 pub fn mount_resilience_router() -> Router<AppState> {
-    let custom_html = r#"
-<!doctype html>
-<html>
-  <head>
-    <title>Mount Resilience API Documentation</title>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <style>
-      .introduction-description .markdown p,
-      .introduction-description .markdown li {
-        text-align: justify !important;
-        text-justify: inter-word !important;
-      }
-    </style>
-  </head>
-  <body>
-    <script
-      id="api-reference"
-      type="application/json">
-      $spec
-    </script>
-    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
-  </body>
-</html>
-"#;
-
     Router::new()
         .route("/sites", get(sites::list_sites))
         .route("/sites/{site_id}", get(sites::get_site))
         .route("/sites/{site_id}/parameters", get(sites::list_parameters))
         .route("/sites/{site_id}/readings", get(sites::get_readings))
         .route("/sites/{site_id}/aggregates/{resolution}", get(sites::get_aggregates))
-        .merge(Scalar::new(MountResilienceApiDoc::openapi())
-            .custom_html(custom_html)
-            .path("/docs"))
+        .merge(Scalar::with_url("/docs", MountResilienceApiDoc::openapi()))
 }
 
 // ============================================================================
