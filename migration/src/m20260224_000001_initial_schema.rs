@@ -735,61 +735,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // ========== DATA IMPORTS ==========
-        manager
-            .create_table(
-                Table::create()
-                    .table(DataImports::Table)
-                    .if_not_exists()
-                    .col(
-                        ColumnDef::new(DataImports::Id)
-                            .uuid()
-                            .not_null()
-                            .primary_key()
-                            .extra("DEFAULT gen_random_uuid()"),
-                    )
-                    .col(ColumnDef::new(DataImports::ProjectId).uuid())
-                    .col(
-                        ColumnDef::new(DataImports::SourceType)
-                            .string_len(64)
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(DataImports::FileName).string_len(256))
-                    .col(
-                        ColumnDef::new(DataImports::Status)
-                            .string_len(32)
-                            .not_null()
-                            .default("pending"),
-                    )
-                    .col(
-                        ColumnDef::new(DataImports::RowsImported)
-                            .integer()
-                            .default(0),
-                    )
-                    .col(
-                        ColumnDef::new(DataImports::RowsFailed)
-                            .integer()
-                            .default(0),
-                    )
-                    .col(ColumnDef::new(DataImports::ErrorMessage).text())
-                    .col(ColumnDef::new(DataImports::StartedAt).timestamp_with_time_zone())
-                    .col(ColumnDef::new(DataImports::CompletedAt).timestamp_with_time_zone())
-                    .col(
-                        ColumnDef::new(DataImports::CreatedAt)
-                            .timestamp_with_time_zone()
-                            .extra("DEFAULT NOW()"),
-                    )
-                    .col(ColumnDef::new(DataImports::CreatedBy).string_len(128))
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_data_imports_project")
-                            .from(DataImports::Table, DataImports::ProjectId)
-                            .to(Projects::Table, Projects::Id),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-
         // ========== PUBLIC EXPOSED PARAMETERS ==========
         manager
             .create_table(
@@ -1045,14 +990,6 @@ impl MigrationTrait for Migration {
             .drop_table(
                 Table::drop()
                     .table(PublicExposedParameters::Table)
-                    .if_exists()
-                    .to_owned(),
-            )
-            .await?;
-        manager
-            .drop_table(
-                Table::drop()
-                    .table(DataImports::Table)
                     .if_exists()
                     .to_owned(),
             )
@@ -1318,23 +1255,6 @@ pub enum ApiTokens {
     CreatedAt,
     ExpiresAt,
     LastUsedAt,
-    CreatedBy,
-}
-
-#[derive(DeriveIden)]
-pub enum DataImports {
-    Table,
-    Id,
-    ProjectId,
-    SourceType,
-    FileName,
-    Status,
-    RowsImported,
-    RowsFailed,
-    ErrorMessage,
-    StartedAt,
-    CompletedAt,
-    CreatedAt,
     CreatedBy,
 }
 

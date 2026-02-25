@@ -1,6 +1,5 @@
 use axum::{
     extract::{Path, Query, State},
-    http::header::{self, HeaderValue},
     response::{IntoResponse, Response},
     Json,
 };
@@ -15,6 +14,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::entity::site_parameters as site_parameters_entity;
 use crate::error::{AppError, AppResult};
+use crate::services::bulk::{self, StreamableAggregateParam, StreamableParam};
 use crate::services::public_api_config::{
     get_public_config, ExposedParamConfig, PublicProjectConfig, PublicSiteConfig,
 };
@@ -403,12 +403,21 @@ pub struct ReadingsResponse {
     pub parameters: Vec<ParameterData>,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ParameterData {
     pub name: String,
     pub units: String,
     /// One value per entry in `times`. Null where no reading exists.
     pub values: Vec<Option<f64>>,
+}
+
+impl StreamableParam for ParameterData {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn value_at(&self, index: usize) -> Option<f64> {
+        self.values.get(index).and_then(|v| *v)
+    }
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -487,8 +496,8 @@ pub async fn get_readings(
 
     let format = query.format.to_lowercase();
     match format.as_str() {
-        "csv" => build_csv_response(&times_formatted, &output_params),
-        "ndjson" => build_ndjson_response(&times_formatted, &output_params),
+        "csv" => build_csv_response(times_formatted, &output_params),
+        "ndjson" => build_ndjson_response(times_formatted, &output_params),
         _ => {
             let response = ReadingsResponse {
                 site: SiteRef {
@@ -534,7 +543,7 @@ pub struct AggregatesResponse {
     pub parameters: Vec<ParameterAggregateData>,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ParameterAggregateData {
     pub name: String,
     pub units: String,
@@ -542,6 +551,24 @@ pub struct ParameterAggregateData {
     pub min: Vec<Option<f64>>,
     pub max: Vec<Option<f64>>,
     pub count: Vec<i64>,
+}
+
+impl StreamableAggregateParam for ParameterAggregateData {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn avg_at(&self, index: usize) -> Option<f64> {
+        self.avg.get(index).and_then(|v| *v)
+    }
+    fn min_at(&self, index: usize) -> Option<f64> {
+        self.min.get(index).and_then(|v| *v)
+    }
+    fn max_at(&self, index: usize) -> Option<f64> {
+        self.max.get(index).and_then(|v| *v)
+    }
+    fn count_at(&self, index: usize) -> Option<i64> {
+        self.count.get(index).copied()
+    }
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -781,8 +808,8 @@ pub async fn get_aggregates(
 
     let format = query.format.to_lowercase();
     match format.as_str() {
-        "csv" => build_aggregates_csv(&times_formatted, &output_params),
-        "ndjson" => build_aggregates_ndjson(&times_formatted, &output_params),
+        "csv" => build_aggregates_csv(times_formatted, &output_params),
+        "ndjson" => build_aggregates_ndjson(times_formatted, &output_params),
         _ => {
             let response = AggregatesResponse {
                 site: SiteRef {
@@ -948,149 +975,27 @@ async fn fetch_readings(
 }
 
 // ============================================================================
-// CSV Builders
+// Streaming CSV/NDJSON Builders (delegated to bulk.rs)
 // ============================================================================
 
-fn build_csv_response(times: &[String], parameters: &[ParameterData]) -> AppResult<Response> {
-    let mut csv_data = String::new();
-
-    csv_data.push_str("time");
-    for param in parameters {
-        csv_data.push(',');
-        csv_data.push_str(&param.name);
-    }
-    csv_data.push('\n');
-
-    for (i, time) in times.iter().enumerate() {
-        csv_data.push_str(time);
-        for param in parameters {
-            csv_data.push(',');
-            if let Some(Some(v)) = param.values.get(i) {
-                csv_data.push_str(&format!("{v:.2}"));
-            }
-        }
-        csv_data.push('\n');
-    }
-
-    Response::builder()
-        .header(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/csv; charset=utf-8"),
-        )
-        .header(
-            header::CONTENT_DISPOSITION,
-            HeaderValue::from_static("attachment; filename=\"readings.csv\""),
-        )
-        .body(axum::body::Body::from(csv_data))
-        .map_err(|e| AppError::Internal(e.to_string()))
+fn build_csv_response(times: Vec<String>, parameters: &[ParameterData]) -> AppResult<Response> {
+    bulk::build_csv_response_with_times(times, parameters)
 }
 
 fn build_aggregates_csv(
-    times: &[String],
+    times: Vec<String>,
     parameters: &[ParameterAggregateData],
 ) -> AppResult<Response> {
-    let mut csv_data = String::new();
-
-    csv_data.push_str("time");
-    for param in parameters {
-        csv_data.push_str(&format!(
-            ",{}_avg,{}_min,{}_max,{}_count",
-            param.name, param.name, param.name, param.name
-        ));
-    }
-    csv_data.push('\n');
-
-    for (i, time) in times.iter().enumerate() {
-        csv_data.push_str(time);
-        for param in parameters {
-            csv_data.push(',');
-            if let Some(Some(v)) = param.avg.get(i) {
-                csv_data.push_str(&format!("{v:.2}"));
-            }
-            csv_data.push(',');
-            if let Some(Some(v)) = param.min.get(i) {
-                csv_data.push_str(&format!("{v:.2}"));
-            }
-            csv_data.push(',');
-            if let Some(Some(v)) = param.max.get(i) {
-                csv_data.push_str(&format!("{v:.2}"));
-            }
-            csv_data.push(',');
-            if let Some(c) = param.count.get(i) {
-                csv_data.push_str(&c.to_string());
-            }
-        }
-        csv_data.push('\n');
-    }
-
-    Response::builder()
-        .header(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/csv; charset=utf-8"),
-        )
-        .header(
-            header::CONTENT_DISPOSITION,
-            HeaderValue::from_static("attachment; filename=\"aggregates.csv\""),
-        )
-        .body(axum::body::Body::from(csv_data))
-        .map_err(|e| AppError::Internal(e.to_string()))
+    bulk::build_aggregates_csv_response_with_times(times, parameters)
 }
 
-// ============================================================================
-// NDJSON Builders
-// ============================================================================
-
-fn build_ndjson_response(times: &[String], parameters: &[ParameterData]) -> AppResult<Response> {
-    let mut body = String::new();
-    for (i, time) in times.iter().enumerate() {
-        let mut obj = serde_json::Map::new();
-        obj.insert("time".to_string(), serde_json::json!(time));
-        for param in parameters {
-            let value = param.values.get(i).copied().flatten();
-            obj.insert(
-                param.name.clone(),
-                match value {
-                    Some(v) => serde_json::json!(v),
-                    None => serde_json::Value::Null,
-                },
-            );
-        }
-        body.push_str(&serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_default());
-        body.push('\n');
-    }
-
-    Response::builder()
-        .header(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/x-ndjson"),
-        )
-        .body(axum::body::Body::from(body))
-        .map_err(|e| AppError::Internal(e.to_string()))
+fn build_ndjson_response(times: Vec<String>, parameters: &[ParameterData]) -> AppResult<Response> {
+    bulk::build_ndjson_response_with_times(times, parameters)
 }
 
 fn build_aggregates_ndjson(
-    times: &[String],
+    times: Vec<String>,
     parameters: &[ParameterAggregateData],
 ) -> AppResult<Response> {
-    let mut body = String::new();
-    for (i, time) in times.iter().enumerate() {
-        let mut obj = serde_json::Map::new();
-        obj.insert("time".to_string(), serde_json::json!(time));
-        for param in parameters {
-            obj.insert(format!("{}_avg", param.name), param.avg.get(i).copied().flatten().map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-            obj.insert(format!("{}_min", param.name), param.min.get(i).copied().flatten().map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-            obj.insert(format!("{}_max", param.name), param.max.get(i).copied().flatten().map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-            obj.insert(format!("{}_count", param.name), param.count.get(i).copied().map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-        }
-        body.push_str(&serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_default());
-        body.push('\n');
-    }
-
-    Response::builder()
-        .header(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/x-ndjson"),
-        )
-        .body(axum::body::Body::from(body))
-        .map_err(|e| AppError::Internal(e.to_string()))
+    bulk::build_aggregates_ndjson_response_with_times(times, parameters)
 }

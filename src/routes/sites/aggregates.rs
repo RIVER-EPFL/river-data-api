@@ -1,8 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::{
-        header::{self, HeaderMap, HeaderValue},
-    },
+    http::header::HeaderMap,
     response::{IntoResponse, Response},
     Json,
 };
@@ -10,7 +8,6 @@ use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use tokio_stream::wrappers::ReceiverStream;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
@@ -19,7 +16,7 @@ use crate::common::middleware::ProjectScope;
 use crate::entity::{alarm_thresholds, site_parameters, projects};
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, resolve_site};
-use crate::services::bulk;
+use crate::services::bulk::{self, StreamableAggregateParam};
 
 use super::types::{ProjectRef, SiteRef};
 
@@ -65,6 +62,24 @@ pub struct ParameterAggregateData {
     pub max_severity: Option<Vec<Option<i16>>>,
 }
 
+impl StreamableAggregateParam for ParameterAggregateData {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn avg_at(&self, index: usize) -> Option<f64> {
+        self.avg.get(index).and_then(|v| *v)
+    }
+    fn min_at(&self, index: usize) -> Option<f64> {
+        self.min.get(index).and_then(|v| *v)
+    }
+    fn max_at(&self, index: usize) -> Option<f64> {
+        self.max.get(index).and_then(|v| *v)
+    }
+    fn count_at(&self, index: usize) -> Option<i64> {
+        self.count.get(index).copied()
+    }
+}
+
 #[derive(Debug, FromQueryResult)]
 struct AggregateRow {
     bucket: DateTime<Utc>,
@@ -80,110 +95,14 @@ fn build_csv_response(
     times: &[DateTime<Utc>],
     params: &[ParameterAggregateData],
 ) -> AppResult<Response> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
-
-    let times = times.to_vec();
-    let params = params.to_vec();
-
-    tokio::spawn(async move {
-        let mut header = "time".to_string();
-        for param in &params {
-            header.push_str(&format!(
-                ",{}_avg,{}_min,{}_max,{}_count",
-                param.name, param.name, param.name, param.name
-            ));
-        }
-        header.push('\n');
-        let _ = tx.send(Ok(header)).await;
-
-        for (i, time) in times.iter().enumerate() {
-            let mut row = time.to_rfc3339();
-            for param in &params {
-                row.push(',');
-                if let Some(v) = param.avg.get(i).and_then(|v| *v) {
-                    row.push_str(&v.to_string());
-                }
-                row.push(',');
-                if let Some(v) = param.min.get(i).and_then(|v| *v) {
-                    row.push_str(&v.to_string());
-                }
-                row.push(',');
-                if let Some(v) = param.max.get(i).and_then(|v| *v) {
-                    row.push_str(&v.to_string());
-                }
-                row.push(',');
-                if let Some(c) = param.count.get(i) {
-                    row.push_str(&c.to_string());
-                }
-            }
-            row.push('\n');
-            if tx.send(Ok(row)).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let stream = ReceiverStream::new(rx);
-    let body = axum::body::Body::from_stream(stream);
-
-    Response::builder()
-        .header(header::CONTENT_TYPE, HeaderValue::from_static("text/csv"))
-        .body(body)
-        .map_err(|e| AppError::Internal(e.to_string()))
+    bulk::build_aggregates_csv_response(times, params)
 }
 
 fn build_ndjson_response(
     times: &[DateTime<Utc>],
     params: &[ParameterAggregateData],
 ) -> AppResult<Response> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
-
-    let times = times.to_vec();
-    let params = params.to_vec();
-
-    tokio::spawn(async move {
-        for (i, time) in times.iter().enumerate() {
-            let mut obj = serde_json::Map::new();
-            obj.insert("time".to_string(), serde_json::json!(time.to_rfc3339()));
-
-            for param in &params {
-                let avg = param.avg.get(i).and_then(|v| *v);
-                let min = param.min.get(i).and_then(|v| *v);
-                let max = param.max.get(i).and_then(|v| *v);
-                let count = param.count.get(i).copied().unwrap_or(0);
-
-                obj.insert(
-                    format!("{}_avg", param.name),
-                    avg.map_or(serde_json::Value::Null, |v| serde_json::json!(v)),
-                );
-                obj.insert(
-                    format!("{}_min", param.name),
-                    min.map_or(serde_json::Value::Null, |v| serde_json::json!(v)),
-                );
-                obj.insert(
-                    format!("{}_max", param.name),
-                    max.map_or(serde_json::Value::Null, |v| serde_json::json!(v)),
-                );
-                obj.insert(format!("{}_count", param.name), serde_json::json!(count));
-            }
-
-            let line = format!("{}\n", serde_json::Value::Object(obj));
-            if tx.send(Ok(line)).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let stream = ReceiverStream::new(rx);
-    let body = axum::body::Body::from_stream(stream);
-
-    Response::builder()
-        .header(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/x-ndjson"),
-        )
-        .body(body)
-        .map_err(|e| AppError::Internal(e.to_string()))
+    bulk::build_aggregates_ndjson_response(times, params)
 }
 
 #[derive(Debug, Deserialize, IntoParams)]

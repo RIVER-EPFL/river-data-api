@@ -1,6 +1,5 @@
 pub mod alarm_thresholds;
 pub mod api_tokens;
-pub mod data_imports;
 pub mod derived_parameter_definitions;
 pub mod parameters;
 pub mod projects;

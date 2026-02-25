@@ -1,6 +1,5 @@
 pub mod calibrations;
 pub mod derived;
-pub mod imports;
 pub mod public_config;
 pub mod sync;
 
@@ -10,7 +9,6 @@ use crate::common::auth::Role;
 use crate::entity::{
     alarm_thresholds::AlarmThreshold,
     api_tokens::ApiToken,
-    data_imports::DataImport,
     derived_parameter_definitions::DerivedParameterDefinition,
     parameters::Parameter,
     projects::Project,
@@ -41,12 +39,10 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .nest_service("/derived_parameters", crud(DerivedParameterDefinition::router(db)))
         .nest_service("/alarm_thresholds", crud(AlarmThreshold::router(db)))
         .nest_service("/tokens", crud(ApiToken::router(db)))
-        .nest_service("/data_imports", crud(DataImport::router(db)))
         .nest_service("/public_exposed_parameters", crud(PublicExposedParameter::router(db)))
         // Custom action routes under /actions/ to avoid conflict with nest_service catch-all
         .route("/actions/sensor_calibrations/{id}/recalculate", post(calibrations::recalculate_calibration))
         .route("/actions/derived_parameters/{id}/recompute", post(derived::recompute_derived))
-        .route("/actions/data_imports/upload", post(imports::upload_csv))
         .route("/actions/invalidate_public_config/{slug}", post(public_config::invalidate_public_config));
 
     // Apply Keycloak auth layer if configured
