@@ -23,17 +23,33 @@ pub struct Model {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     #[crudcrate(exclude(create, update))]
     pub discovered_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[crudcrate(filterable)]
+    pub is_public: bool,
+    #[crudcrate(filterable)]
+    pub public_slug: Option<String>,
+    pub public_api_title: Option<String>,
+    pub public_api_description: Option<String>,
+    pub public_api_version: Option<String>,
+    pub public_contact_email: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
     #[sea_orm(has_many = "super::sites::Entity")]
     Sites,
+    #[sea_orm(has_many = "super::public_exposed_parameters::Entity")]
+    PublicExposedParameters,
 }
 
 impl Related<super::sites::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Sites.def()
+    }
+}
+
+impl Related<super::public_exposed_parameters::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::PublicExposedParameters.def()
     }
 }
 

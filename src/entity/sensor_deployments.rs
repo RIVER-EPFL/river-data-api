@@ -16,7 +16,7 @@ pub struct Model {
     #[crudcrate(filterable)]
     pub sensor_id: Uuid,
     #[crudcrate(filterable)]
-    pub parameter_id: Uuid,
+    pub site_id: Uuid,
     #[crudcrate(sortable)]
     pub deployed_from: chrono::DateTime<chrono::Utc>,
     #[crudcrate(sortable)]
@@ -37,11 +37,11 @@ pub enum Relation {
     )]
     Sensor,
     #[sea_orm(
-        belongs_to = "super::parameters::Entity",
-        from = "Column::ParameterId",
-        to = "super::parameters::Column::Id"
+        belongs_to = "super::sites::Entity",
+        from = "Column::SiteId",
+        to = "super::sites::Column::Id"
     )]
-    Parameter,
+    Site,
 }
 
 impl Related<super::sensors::Entity> for Entity {
@@ -50,9 +50,9 @@ impl Related<super::sensors::Entity> for Entity {
     }
 }
 
-impl Related<super::parameters::Entity> for Entity {
+impl Related<super::sites::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::Parameter.def()
+        Relation::Site.def()
     }
 }
 

@@ -8,7 +8,7 @@ use crate::error::AppResult;
 
 #[derive(Serialize)]
 pub struct SyncStateResponse {
-    pub parameter_id: uuid::Uuid,
+    pub site_parameter_id: uuid::Uuid,
     pub last_data_time: Option<String>,
     pub last_sync_attempt: Option<String>,
     pub sync_status: Option<String>,
@@ -27,14 +27,14 @@ async fn list_sync_states(
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<SyncStateResponse>>> {
     let states = sync_state::Entity::find()
-        .order_by_asc(sync_state::Column::ParameterId)
+        .order_by_asc(sync_state::Column::SiteParameterId)
         .all(&state.db)
         .await?;
 
     let response: Vec<SyncStateResponse> = states
         .into_iter()
         .map(|s| SyncStateResponse {
-            parameter_id: s.parameter_id,
+            site_parameter_id: s.site_parameter_id,
             last_data_time: s.last_data_time.map(|t| t.to_rfc3339()),
             last_sync_attempt: s.last_sync_attempt.map(|t| t.to_rfc3339()),
             sync_status: s.sync_status,
@@ -50,18 +50,24 @@ async fn list_sync_states(
 async fn trigger_sync(
     State(state): State<AppState>,
 ) -> AppResult<Json<serde_json::Value>> {
-    // Fire-and-forget: trigger a full sync in the background
-    let state_clone = state.clone();
+    let Some(ref vaisala_client) = state.vaisala_client else {
+        return Err(crate::error::AppError::ServiceUnavailable(
+            "Vaisala sync not configured".to_string(),
+        ));
+    };
+    let vaisala_client = vaisala_client.clone();
+    let db = state.db.clone();
+    let max_history_days = state.config.vaisala.as_ref().map(|v| v.max_history_days).unwrap_or(90);
     tokio::spawn(async move {
         tracing::info!("Manual sync triggered via admin API");
-        if let Err(e) = crate::sync::worker::sync_locations(&state_clone.db, &state_clone.vaisala_client).await {
+        if let Err(e) = crate::connectors::vaisala::sync::sync_locations(&db, &vaisala_client).await {
             tracing::error!(error = %e, "Manual location sync failed");
         }
-        if let Err(e) = crate::sync::worker::sync_readings(
-            &state_clone.db,
-            &state_clone.vaisala_client,
-            state_clone.config.vaisala_max_history_days,
-            true, // force full sync
+        if let Err(e) = crate::connectors::vaisala::sync::sync_readings(
+            &db,
+            &vaisala_client,
+            max_history_days,
+            true,
         ).await {
             tracing::error!(error = %e, "Manual readings sync failed");
         }

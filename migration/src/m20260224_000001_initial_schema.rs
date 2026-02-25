@@ -33,6 +33,21 @@ impl MigrationTrait for Migration {
                             .extra("DEFAULT NOW()"),
                     )
                     .col(ColumnDef::new(Projects::DiscoveredAt).timestamp_with_time_zone())
+                    .col(
+                        ColumnDef::new(Projects::IsPublic)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .col(ColumnDef::new(Projects::PublicSlug).string_len(64).unique_key())
+                    .col(ColumnDef::new(Projects::PublicApiTitle).string_len(128))
+                    .col(ColumnDef::new(Projects::PublicApiDescription).text())
+                    .col(
+                        ColumnDef::new(Projects::PublicApiVersion)
+                            .string_len(16)
+                            .default("1.0.0"),
+                    )
+                    .col(ColumnDef::new(Projects::PublicContactEmail).string_len(128))
                     .to_owned(),
             )
             .await?;
@@ -66,6 +81,7 @@ impl MigrationTrait for Migration {
                             .extra("DEFAULT NOW()"),
                     )
                     .col(ColumnDef::new(Sites::DiscoveredAt).timestamp_with_time_zone())
+                    .col(ColumnDef::new(Sites::PublicSlug).string_len(64))
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_sites_project")
@@ -83,38 +99,46 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // ========== PARAMETER TYPES (global catalog) ==========
+        // Partial unique index: public_slug must be unique within a project when set
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "CREATE UNIQUE INDEX IF NOT EXISTS sites_project_public_slug_idx ON sites (project_id, public_slug) WHERE public_slug IS NOT NULL",
+            )
+            .await?;
+
+        // ========== PARAMETERS (global catalog, was parameter_types) ==========
         manager
             .create_table(
                 Table::create()
-                    .table(ParameterTypes::Table)
+                    .table(Parameters::Table)
                     .if_not_exists()
                     .col(
-                        ColumnDef::new(ParameterTypes::Id)
+                        ColumnDef::new(Parameters::Id)
                             .uuid()
                             .not_null()
                             .primary_key()
                             .extra("DEFAULT gen_random_uuid()"),
                     )
                     .col(
-                        ColumnDef::new(ParameterTypes::Name)
+                        ColumnDef::new(Parameters::Name)
                             .string_len(64)
                             .unique_key()
                             .not_null(),
                     )
                     .col(
-                        ColumnDef::new(ParameterTypes::DisplayName)
+                        ColumnDef::new(Parameters::DisplayName)
                             .string_len(128)
                             .not_null(),
                     )
                     .col(
-                        ColumnDef::new(ParameterTypes::DefaultUnits)
+                        ColumnDef::new(Parameters::DefaultUnits)
                             .string_len(32)
                             .not_null(),
                     )
-                    .col(ColumnDef::new(ParameterTypes::Description).text())
+                    .col(ColumnDef::new(Parameters::Description).text())
                     .col(
-                        ColumnDef::new(ParameterTypes::CreatedAt)
+                        ColumnDef::new(Parameters::CreatedAt)
                             .timestamp_with_time_zone()
                             .extra("DEFAULT NOW()"),
                     )
@@ -137,13 +161,11 @@ impl MigrationTrait for Migration {
                     )
                     .col(
                         ColumnDef::new(Sensors::SerialNumber)
-                            .string_len(64)
-                            .unique_key()
-                            .not_null(),
+                            .string_len(64),
                     )
                     .col(ColumnDef::new(Sensors::Name).string_len(128))
                     .col(
-                        ColumnDef::new(Sensors::ParameterTypeId)
+                        ColumnDef::new(Sensors::ParameterId)
                             .uuid()
                             .not_null(),
                     )
@@ -158,11 +180,19 @@ impl MigrationTrait for Migration {
                     )
                     .foreign_key(
                         ForeignKey::create()
-                            .name("fk_sensors_parameter_type")
-                            .from(Sensors::Table, Sensors::ParameterTypeId)
-                            .to(ParameterTypes::Table, ParameterTypes::Id),
+                            .name("fk_sensors_parameter")
+                            .from(Sensors::Table, Sensors::ParameterId)
+                            .to(Parameters::Table, Parameters::Id),
                     )
                     .to_owned(),
+            )
+            .await?;
+
+        // Compound unique index for non-null serial numbers
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "CREATE UNIQUE INDEX IF NOT EXISTS sensors_serial_param_idx ON sensors (serial_number, parameter_id) WHERE serial_number IS NOT NULL"
             )
             .await?;
 
@@ -273,69 +303,69 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // ========== PARAMETERS ==========
+        // ========== SITE PARAMETERS (was parameters — site-specific config) ==========
         manager
             .create_table(
                 Table::create()
-                    .table(Parameters::Table)
+                    .table(SiteParameters::Table)
                     .if_not_exists()
                     .col(
-                        ColumnDef::new(Parameters::Id)
+                        ColumnDef::new(SiteParameters::Id)
                             .uuid()
                             .not_null()
                             .primary_key()
                             .extra("DEFAULT gen_random_uuid()"),
                     )
-                    .col(ColumnDef::new(Parameters::SiteId).uuid().not_null())
-                    .col(ColumnDef::new(Parameters::ParameterTypeId).uuid().not_null())
-                    .col(ColumnDef::new(Parameters::Name).string_len(64).not_null())
-                    .col(ColumnDef::new(Parameters::SensorType).string_len(64).not_null())
-                    .col(ColumnDef::new(Parameters::DisplayUnits).string_len(32))
-                    .col(ColumnDef::new(Parameters::UnitsName).string_len(64))
-                    .col(ColumnDef::new(Parameters::UnitsMin).double())
-                    .col(ColumnDef::new(Parameters::UnitsMax).double())
-                    .col(ColumnDef::new(Parameters::DecimalPlaces).small_integer())
-                    .col(ColumnDef::new(Parameters::ChannelId).integer())
+                    .col(ColumnDef::new(SiteParameters::SiteId).uuid().not_null())
+                    .col(ColumnDef::new(SiteParameters::ParameterId).uuid().not_null())
+                    .col(ColumnDef::new(SiteParameters::Name).string_len(64).not_null())
+                    .col(ColumnDef::new(SiteParameters::SensorType).string_len(64).not_null())
+                    .col(ColumnDef::new(SiteParameters::DisplayUnits).string_len(32))
+                    .col(ColumnDef::new(SiteParameters::UnitsName).string_len(64))
+                    .col(ColumnDef::new(SiteParameters::UnitsMin).double())
+                    .col(ColumnDef::new(SiteParameters::UnitsMax).double())
+                    .col(ColumnDef::new(SiteParameters::DecimalPlaces).small_integer())
+                    .col(ColumnDef::new(SiteParameters::ChannelId).integer())
                     .col(
-                        ColumnDef::new(Parameters::SampleIntervalSec)
+                        ColumnDef::new(SiteParameters::SampleIntervalSec)
                             .integer()
                             .default(600),
                     )
-                    .col(ColumnDef::new(Parameters::IsActive).boolean().default(true))
+                    .col(ColumnDef::new(SiteParameters::IsActive).boolean().default(true))
                     .col(
-                        ColumnDef::new(Parameters::IsDerived)
+                        ColumnDef::new(SiteParameters::IsDerived)
                             .boolean()
                             .default(false),
                     )
-                    .col(ColumnDef::new(Parameters::DerivedDefinitionId).uuid())
-                    .col(ColumnDef::new(Parameters::VariableMappings).json_binary())
+                    .col(ColumnDef::new(SiteParameters::DerivedDefinitionId).uuid())
+                    .col(ColumnDef::new(SiteParameters::VariableMappings).json_binary())
                     .col(
-                        ColumnDef::new(Parameters::CreatedAt)
+                        ColumnDef::new(SiteParameters::CreatedAt)
                             .timestamp_with_time_zone()
                             .extra("DEFAULT NOW()"),
                     )
                     .col(
-                        ColumnDef::new(Parameters::UpdatedAt)
+                        ColumnDef::new(SiteParameters::UpdatedAt)
                             .timestamp_with_time_zone()
                             .extra("DEFAULT NOW()"),
                     )
-                    .col(ColumnDef::new(Parameters::DiscoveredAt).timestamp_with_time_zone())
+                    .col(ColumnDef::new(SiteParameters::DiscoveredAt).timestamp_with_time_zone())
                     .foreign_key(
                         ForeignKey::create()
-                            .name("fk_parameters_site")
-                            .from(Parameters::Table, Parameters::SiteId)
+                            .name("fk_site_parameters_site")
+                            .from(SiteParameters::Table, SiteParameters::SiteId)
                             .to(Sites::Table, Sites::Id),
                     )
                     .foreign_key(
                         ForeignKey::create()
-                            .name("fk_parameters_parameter_type")
-                            .from(Parameters::Table, Parameters::ParameterTypeId)
-                            .to(ParameterTypes::Table, ParameterTypes::Id),
+                            .name("fk_site_parameters_parameter")
+                            .from(SiteParameters::Table, SiteParameters::ParameterId)
+                            .to(Parameters::Table, Parameters::Id),
                     )
                     .foreign_key(
                         ForeignKey::create()
-                            .name("fk_parameters_derived_definition")
-                            .from(Parameters::Table, Parameters::DerivedDefinitionId)
+                            .name("fk_site_parameters_derived_definition")
+                            .from(SiteParameters::Table, SiteParameters::DerivedDefinitionId)
                             .to(
                                 DerivedParameterDefinitions::Table,
                                 DerivedParameterDefinitions::Id,
@@ -345,19 +375,32 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
+        // UNIQUE constraint on (site_id, parameter_id)
         manager
             .create_index(
                 Index::create()
-                    .name("idx_parameters_site_name")
-                    .table(Parameters::Table)
-                    .col(Parameters::SiteId)
-                    .col(Parameters::Name)
+                    .name("idx_site_parameters_site_param")
+                    .table(SiteParameters::Table)
+                    .col(SiteParameters::SiteId)
+                    .col(SiteParameters::ParameterId)
                     .unique()
                     .to_owned(),
             )
             .await?;
 
-        // ========== SENSOR DEPLOYMENTS ==========
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_site_parameters_site_name")
+                    .table(SiteParameters::Table)
+                    .col(SiteParameters::SiteId)
+                    .col(SiteParameters::Name)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+
+        // ========== SENSOR DEPLOYMENTS (now links sensor → site) ==========
         manager
             .create_table(
                 Table::create()
@@ -376,7 +419,7 @@ impl MigrationTrait for Migration {
                             .not_null(),
                     )
                     .col(
-                        ColumnDef::new(SensorDeployments::ParameterId)
+                        ColumnDef::new(SensorDeployments::SiteId)
                             .uuid()
                             .not_null(),
                     )
@@ -409,9 +452,9 @@ impl MigrationTrait for Migration {
                     )
                     .foreign_key(
                         ForeignKey::create()
-                            .name("fk_sensor_deployments_parameter")
-                            .from(SensorDeployments::Table, SensorDeployments::ParameterId)
-                            .to(Parameters::Table, Parameters::Id),
+                            .name("fk_sensor_deployments_site")
+                            .from(SensorDeployments::Table, SensorDeployments::SiteId)
+                            .to(Sites::Table, Sites::Id),
                     )
                     .to_owned(),
             )
@@ -446,6 +489,11 @@ impl MigrationTrait for Migration {
                             .not_null(),
                     )
                     .col(ColumnDef::new(SourceMappings::SourceName).string_len(256))
+                    .col(
+                        ColumnDef::new(SourceMappings::SourceSystem)
+                            .string_len(64)
+                            .default("vaisala"),
+                    )
                     .primary_key(
                         Index::create()
                             .col(SourceMappings::EntityType)
@@ -466,26 +514,36 @@ impl MigrationTrait for Migration {
             .await?;
 
         // ========== READINGS (TimescaleDB Hypertable) ==========
+        // PK: (site_id, parameter_id, time)
         manager
             .create_table(
                 Table::create()
                     .table(Readings::Table)
                     .if_not_exists()
+                    .col(ColumnDef::new(Readings::SiteId).uuid().not_null())
+                    .col(ColumnDef::new(Readings::ParameterId).uuid().not_null())
                     .col(
                         ColumnDef::new(Readings::Time)
                             .timestamp_with_time_zone()
                             .not_null(),
                     )
-                    .col(ColumnDef::new(Readings::ParameterId).uuid().not_null())
                     .col(ColumnDef::new(Readings::RawValue).double().not_null())
                     .col(ColumnDef::new(Readings::CalibratedValue).double())
                     .col(ColumnDef::new(Readings::SensorId).uuid())
                     .col(ColumnDef::new(Readings::CalibrationId).uuid())
+                    .col(ColumnDef::new(Readings::DeploymentId).uuid())
                     .col(ColumnDef::new(Readings::Logged).boolean().default(true))
                     .primary_key(
                         Index::create()
+                            .col(Readings::SiteId)
                             .col(Readings::ParameterId)
                             .col(Readings::Time),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_readings_site")
+                            .from(Readings::Table, Readings::SiteId)
+                            .to(Sites::Table, Sites::Id),
                     )
                     .foreign_key(
                         ForeignKey::create()
@@ -505,6 +563,12 @@ impl MigrationTrait for Migration {
                             .from(Readings::Table, Readings::CalibrationId)
                             .to(SensorCalibrations::Table, SensorCalibrations::Id),
                     )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_readings_deployment")
+                            .from(Readings::Table, Readings::DeploymentId)
+                            .to(SensorDeployments::Table, SensorDeployments::Id),
+                    )
                     .to_owned(),
             )
             .await?;
@@ -516,48 +580,7 @@ impl MigrationTrait for Migration {
         .await?;
 
         db.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_readings_parameter_time ON readings (parameter_id, time DESC)",
-        )
-        .await?;
-
-        // ========== DEVICE STATUS (TimescaleDB Hypertable) ==========
-        manager
-            .create_table(
-                Table::create()
-                    .table(DeviceStatus::Table)
-                    .if_not_exists()
-                    .col(
-                        ColumnDef::new(DeviceStatus::Time)
-                            .timestamp_with_time_zone()
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(DeviceStatus::ParameterId).uuid().not_null())
-                    .col(ColumnDef::new(DeviceStatus::BatteryLevel).small_integer())
-                    .col(ColumnDef::new(DeviceStatus::BatteryState).small_integer())
-                    .col(ColumnDef::new(DeviceStatus::SignalQuality).small_integer())
-                    .col(ColumnDef::new(DeviceStatus::StatusValue).string_len(32))
-                    .col(
-                        ColumnDef::new(DeviceStatus::Unreachable)
-                            .boolean()
-                            .default(false),
-                    )
-                    .primary_key(
-                        Index::create()
-                            .col(DeviceStatus::ParameterId)
-                            .col(DeviceStatus::Time),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_device_status_parameter")
-                            .from(DeviceStatus::Table, DeviceStatus::ParameterId)
-                            .to(Parameters::Table, Parameters::Id),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-
-        db.execute_unprepared(
-            "SELECT create_hypertable('device_status', 'time', chunk_time_interval => INTERVAL '30 days', if_not_exists => TRUE)",
+            "CREATE INDEX IF NOT EXISTS idx_readings_site_param_time ON readings (site_id, parameter_id, time DESC)",
         )
         .await?;
 
@@ -568,7 +591,7 @@ impl MigrationTrait for Migration {
                     .table(SyncState::Table)
                     .if_not_exists()
                     .col(
-                        ColumnDef::new(SyncState::ParameterId)
+                        ColumnDef::new(SyncState::SiteParameterId)
                             .uuid()
                             .not_null()
                             .primary_key(),
@@ -585,9 +608,9 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(SyncState::LastFullSync).timestamp_with_time_zone())
                     .foreign_key(
                         ForeignKey::create()
-                            .name("fk_sync_state_parameter")
-                            .from(SyncState::Table, SyncState::ParameterId)
-                            .to(Parameters::Table, Parameters::Id),
+                            .name("fk_sync_state_site_parameter")
+                            .from(SyncState::Table, SyncState::SiteParameterId)
+                            .to(SiteParameters::Table, SiteParameters::Id),
                     )
                     .to_owned(),
             )
@@ -609,9 +632,9 @@ impl MigrationTrait for Migration {
                     .col(
                         ColumnDef::new(AlarmThresholds::ParameterId)
                             .uuid()
-                            .not_null()
-                            .unique_key(),
+                            .not_null(),
                     )
+                    .col(ColumnDef::new(AlarmThresholds::SiteId).uuid())
                     .col(ColumnDef::new(AlarmThresholds::WarningMin).double())
                     .col(ColumnDef::new(AlarmThresholds::WarningMax).double())
                     .col(ColumnDef::new(AlarmThresholds::AlarmMin).double())
@@ -634,12 +657,26 @@ impl MigrationTrait for Migration {
                             .to(Parameters::Table, Parameters::Id)
                             .on_delete(ForeignKeyAction::Cascade),
                     )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_alarm_thresholds_site")
+                            .from(AlarmThresholds::Table, AlarmThresholds::SiteId)
+                            .to(Sites::Table, Sites::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
                     .to_owned(),
             )
             .await?;
 
+        // UNIQUE constraint on (parameter_id, site_id) for site-specific thresholds
         db.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_alarm_thresholds_parameter ON alarm_thresholds (parameter_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_alarm_thresholds_param_site ON alarm_thresholds (parameter_id, site_id) WHERE site_id IS NOT NULL",
+        )
+        .await?;
+
+        // Partial unique for global defaults (site_id IS NULL)
+        db.execute_unprepared(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_alarm_thresholds_param_global ON alarm_thresholds (parameter_id) WHERE site_id IS NULL",
         )
         .await?;
 
@@ -753,13 +790,95 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
+        // ========== PUBLIC EXPOSED PARAMETERS ==========
+        manager
+            .create_table(
+                Table::create()
+                    .table(PublicExposedParameters::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(PublicExposedParameters::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key()
+                            .extra("DEFAULT gen_random_uuid()"),
+                    )
+                    .col(
+                        ColumnDef::new(PublicExposedParameters::ProjectId)
+                            .uuid()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(PublicExposedParameters::ParameterId)
+                            .uuid()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(PublicExposedParameters::PublicName)
+                            .string_len(64)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(PublicExposedParameters::PublicUnits)
+                            .string_len(32)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(PublicExposedParameters::Description).text())
+                    .col(
+                        ColumnDef::new(PublicExposedParameters::SortOrder)
+                            .integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(
+                        ColumnDef::new(PublicExposedParameters::IncludeDerived)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .col(
+                        ColumnDef::new(PublicExposedParameters::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .extra("DEFAULT NOW()"),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_public_exposed_params_project")
+                            .from(PublicExposedParameters::Table, PublicExposedParameters::ProjectId)
+                            .to(Projects::Table, Projects::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_public_exposed_params_parameter")
+                            .from(PublicExposedParameters::Table, PublicExposedParameters::ParameterId)
+                            .to(Parameters::Table, Parameters::Id),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_public_exposed_params_project_name")
+                    .table(PublicExposedParameters::Table)
+                    .col(PublicExposedParameters::ProjectId)
+                    .col(PublicExposedParameters::PublicName)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+
         // ========== CONTINUOUS AGGREGATES (TimescaleDB-specific) ==========
+        // Now grouped by (site_id, parameter_id) instead of just parameter_id
         db.execute_unprepared(
             r"
             CREATE MATERIALIZED VIEW IF NOT EXISTS readings_hourly
             WITH (timescaledb.continuous) AS
             SELECT
                 time_bucket('1 hour', time) AS bucket,
+                site_id,
                 parameter_id,
                 AVG(COALESCE(calibrated_value, raw_value)) AS avg_value,
                 MIN(COALESCE(calibrated_value, raw_value)) AS min_value,
@@ -767,7 +886,7 @@ impl MigrationTrait for Migration {
                 COUNT(*) AS count,
                 STDDEV(COALESCE(calibrated_value, raw_value)) AS stddev_value
             FROM readings
-            GROUP BY time_bucket('1 hour', time), parameter_id
+            GROUP BY time_bucket('1 hour', time), site_id, parameter_id
             WITH NO DATA
             ",
         )
@@ -779,6 +898,7 @@ impl MigrationTrait for Migration {
             WITH (timescaledb.continuous) AS
             SELECT
                 time_bucket('1 day', time) AS bucket,
+                site_id,
                 parameter_id,
                 AVG(COALESCE(calibrated_value, raw_value)) AS avg_value,
                 MIN(COALESCE(calibrated_value, raw_value)) AS min_value,
@@ -786,7 +906,7 @@ impl MigrationTrait for Migration {
                 COUNT(*) AS count,
                 STDDEV(COALESCE(calibrated_value, raw_value)) AS stddev_value
             FROM readings
-            GROUP BY time_bucket('1 day', time), parameter_id
+            GROUP BY time_bucket('1 day', time), site_id, parameter_id
             WITH NO DATA
             ",
         )
@@ -798,6 +918,7 @@ impl MigrationTrait for Migration {
             WITH (timescaledb.continuous) AS
             SELECT
                 time_bucket('1 week', time) AS bucket,
+                site_id,
                 parameter_id,
                 AVG(COALESCE(calibrated_value, raw_value)) AS avg_value,
                 MIN(COALESCE(calibrated_value, raw_value)) AS min_value,
@@ -805,7 +926,7 @@ impl MigrationTrait for Migration {
                 COUNT(*) AS count,
                 STDDEV(COALESCE(calibrated_value, raw_value)) AS stddev_value
             FROM readings
-            GROUP BY time_bucket('1 week', time), parameter_id
+            GROUP BY time_bucket('1 week', time), site_id, parameter_id
             WITH NO DATA
             ",
         )
@@ -817,6 +938,7 @@ impl MigrationTrait for Migration {
             WITH (timescaledb.continuous) AS
             SELECT
                 time_bucket('1 month', time) AS bucket,
+                site_id,
                 parameter_id,
                 AVG(COALESCE(calibrated_value, raw_value)) AS avg_value,
                 MIN(COALESCE(calibrated_value, raw_value)) AS min_value,
@@ -824,7 +946,7 @@ impl MigrationTrait for Migration {
                 COUNT(*) AS count,
                 STDDEV(COALESCE(calibrated_value, raw_value)) AS stddev_value
             FROM readings
-            GROUP BY time_bucket('1 month', time), parameter_id
+            GROUP BY time_bucket('1 month', time), site_id, parameter_id
             WITH NO DATA
             ",
         )
@@ -864,26 +986,16 @@ impl MigrationTrait for Migration {
         .await?;
 
         // ========== COMPRESSION POLICIES (TimescaleDB-specific) ==========
+        // Segmented by site_id, parameter_id for efficient per-site queries
         db.execute_unprepared(
             r"ALTER TABLE readings SET (
                 timescaledb.compress,
-                timescaledb.compress_segmentby = 'parameter_id'
+                timescaledb.compress_segmentby = 'site_id, parameter_id'
             )",
         )
         .await?;
 
         db.execute_unprepared("SELECT add_compression_policy('readings', INTERVAL '30 days')")
-            .await?;
-
-        db.execute_unprepared(
-            r"ALTER TABLE device_status SET (
-                timescaledb.compress,
-                timescaledb.compress_segmentby = 'parameter_id'
-            )",
-        )
-        .await?;
-
-        db.execute_unprepared("SELECT add_compression_policy('device_status', INTERVAL '90 days')")
             .await?;
 
         Ok(())
@@ -893,11 +1005,6 @@ impl MigrationTrait for Migration {
         let db = manager.get_connection();
 
         // Remove compression policies
-        db.execute_unprepared(
-            "SELECT remove_compression_policy('device_status', if_exists => true)",
-        )
-        .await
-        .ok();
         db.execute_unprepared("SELECT remove_compression_policy('readings', if_exists => true)")
             .await
             .ok();
@@ -937,6 +1044,14 @@ impl MigrationTrait for Migration {
         manager
             .drop_table(
                 Table::drop()
+                    .table(PublicExposedParameters::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
                     .table(DataImports::Table)
                     .if_exists()
                     .to_owned(),
@@ -962,14 +1077,6 @@ impl MigrationTrait for Migration {
             .drop_table(Table::drop().table(SyncState::Table).if_exists().to_owned())
             .await?;
         manager
-            .drop_table(
-                Table::drop()
-                    .table(DeviceStatus::Table)
-                    .if_exists()
-                    .to_owned(),
-            )
-            .await?;
-        manager
             .drop_table(Table::drop().table(Readings::Table).if_exists().to_owned())
             .await?;
         manager
@@ -989,7 +1096,12 @@ impl MigrationTrait for Migration {
             )
             .await?;
         manager
-            .drop_table(Table::drop().table(Parameters::Table).if_exists().to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(SiteParameters::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
             .await?;
         manager
             .drop_table(
@@ -1011,12 +1123,7 @@ impl MigrationTrait for Migration {
             .drop_table(Table::drop().table(Sensors::Table).if_exists().to_owned())
             .await?;
         manager
-            .drop_table(
-                Table::drop()
-                    .table(ParameterTypes::Table)
-                    .if_exists()
-                    .to_owned(),
-            )
+            .drop_table(Table::drop().table(Parameters::Table).if_exists().to_owned())
             .await?;
         manager
             .drop_table(Table::drop().table(Sites::Table).if_exists().to_owned())
@@ -1038,6 +1145,12 @@ pub enum Projects {
     DataSource,
     CreatedAt,
     DiscoveredAt,
+    IsPublic,
+    PublicSlug,
+    PublicApiTitle,
+    PublicApiDescription,
+    PublicApiVersion,
+    PublicContactEmail,
 }
 
 #[derive(DeriveIden)]
@@ -1051,10 +1164,11 @@ pub enum Sites {
     AltitudeM,
     CreatedAt,
     DiscoveredAt,
+    PublicSlug,
 }
 
 #[derive(DeriveIden)]
-pub enum ParameterTypes {
+pub enum Parameters {
     Table,
     Id,
     Name,
@@ -1070,7 +1184,7 @@ pub enum Sensors {
     Id,
     SerialNumber,
     Name,
-    ParameterTypeId,
+    ParameterId,
     Manufacturer,
     Model,
     IsActive,
@@ -1105,11 +1219,11 @@ pub enum DerivedParameterDefinitions {
 }
 
 #[derive(DeriveIden)]
-pub enum Parameters {
+pub enum SiteParameters {
     Table,
     Id,
     SiteId,
-    ParameterTypeId,
+    ParameterId,
     Name,
     SensorType,
     DisplayUnits,
@@ -1133,7 +1247,7 @@ pub enum SensorDeployments {
     Table,
     Id,
     SensorId,
-    ParameterId,
+    SiteId,
     DeployedFrom,
     DeployedUntil,
     DeploymentType,
@@ -1148,38 +1262,27 @@ pub enum SourceMappings {
     SourceKey,
     EntityId,
     SourceName,
+    SourceSystem,
 }
 
 #[derive(DeriveIden)]
 pub enum Readings {
     Table,
-    Time,
+    SiteId,
     ParameterId,
+    Time,
     RawValue,
     CalibratedValue,
     SensorId,
     CalibrationId,
+    DeploymentId,
     Logged,
-}
-
-#[derive(DeriveIden)]
-#[allow(clippy::enum_variant_names)]
-pub enum DeviceStatus {
-    Table,
-    Time,
-    ParameterId,
-    BatteryLevel,
-    BatteryState,
-    SignalQuality,
-    #[sea_orm(iden = "device_status")]
-    StatusValue,
-    Unreachable,
 }
 
 #[derive(DeriveIden)]
 enum SyncState {
     Table,
-    ParameterId,
+    SiteParameterId,
     LastDataTime,
     LastSyncAttempt,
     SyncStatus,
@@ -1193,6 +1296,7 @@ enum AlarmThresholds {
     Table,
     Id,
     ParameterId,
+    SiteId,
     WarningMin,
     WarningMax,
     AlarmMin,
@@ -1232,4 +1336,18 @@ pub enum DataImports {
     CompletedAt,
     CreatedAt,
     CreatedBy,
+}
+
+#[derive(DeriveIden)]
+pub enum PublicExposedParameters {
+    Table,
+    Id,
+    ProjectId,
+    ParameterId,
+    PublicName,
+    PublicUnits,
+    Description,
+    SortOrder,
+    IncludeDerived,
+    CreatedAt,
 }

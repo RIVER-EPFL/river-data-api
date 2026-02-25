@@ -1,6 +1,7 @@
 use axum::{extract::{Multipart, State}, Json};
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, ConnectionTrait, Set, Statement};
+use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Set, Statement};
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::common::AppState;
@@ -86,7 +87,13 @@ async fn process_csv_import(
     let mut rows_imported = 0i32;
     let mut rows_failed = 0i32;
 
-    // Expected CSV columns: parameter_id, time, raw_value, calibrated_value (optional)
+    // Track affected timestamps per site for derived computation
+    let mut affected: HashMap<Uuid, HashSet<chrono::DateTime<chrono::Utc>>> = HashMap::new();
+
+    // Cache site_parameter_id -> (site_id, parameter_id) lookups
+    let mut sp_cache: HashMap<Uuid, Option<(Uuid, Uuid)>> = HashMap::new();
+
+    // Expected CSV columns: site_parameter_id, time, raw_value, calibrated_value (optional)
     for result in rdr.records() {
         let record = match result {
             Ok(r) => r,
@@ -96,7 +103,7 @@ async fn process_csv_import(
             }
         };
 
-        let parameter_id = match record.get(0).and_then(|s| s.parse::<Uuid>().ok()) {
+        let site_parameter_id = match record.get(0).and_then(|s| s.parse::<Uuid>().ok()) {
             Some(v) => v,
             None => { rows_failed += 1; continue; }
         };
@@ -110,13 +117,32 @@ async fn process_csv_import(
         };
         let calibrated_value: Option<f64> = record.get(3).and_then(|s| s.parse::<f64>().ok());
 
+        // Resolve site_parameter_id to (site_id, parameter_id) for readings PK
+        let ids = if let Some(cached) = sp_cache.get(&site_parameter_id) {
+            *cached
+        } else {
+            let lookup = crate::entity::site_parameters::Entity::find_by_id(site_parameter_id)
+                .one(db).await
+                .ok()
+                .flatten()
+                .map(|sp| (sp.site_id, sp.parameter_id));
+            sp_cache.insert(site_parameter_id, lookup);
+            lookup
+        };
+
+        let Some((site_id, parameter_id)) = ids else {
+            rows_failed += 1;
+            continue;
+        };
+
         let res = db
             .execute(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                r"INSERT INTO readings (parameter_id, time, raw_value, calibrated_value)
-                  VALUES ($1, $2, $3, $4)
-                  ON CONFLICT (parameter_id, time) DO UPDATE SET raw_value = $3, calibrated_value = $4",
+                r"INSERT INTO readings (site_id, parameter_id, time, raw_value, calibrated_value)
+                  VALUES ($1, $2, $3, $4, $5)
+                  ON CONFLICT (site_id, parameter_id, time) DO UPDATE SET raw_value = $4, calibrated_value = $5",
                 [
+                    site_id.into(),
                     parameter_id.into(),
                     time.into(),
                     raw_value.into(),
@@ -126,8 +152,20 @@ async fn process_csv_import(
             .await;
 
         match res {
-            Ok(_) => rows_imported += 1,
+            Ok(_) => {
+                rows_imported += 1;
+                affected.entry(site_id).or_default().insert(time.to_utc());
+            }
             Err(_) => rows_failed += 1,
+        }
+    }
+
+    // Compute derived parameters for affected timestamps
+    for (site_id, timestamps) in &affected {
+        for time in timestamps {
+            if let Err(e) = crate::services::calibration::recalculate_derived_at_timestamp(db, *site_id, *time).await {
+                tracing::warn!(error = %e, site_id = %site_id, "Derived computation failed for import");
+            }
         }
     }
 

@@ -27,15 +27,11 @@ pub struct Config {
     // Database
     pub database_url: String,
 
-    // Vaisala API
-    pub vaisala_base_url: String,
-    pub vaisala_bearer_token: String,
-    pub vaisala_skip_tls_verify: bool,
-    pub vaisala_max_history_days: i64,
+    // Vaisala API (optional - sync disabled if not configured)
+    pub vaisala: Option<crate::connectors::vaisala::config::VaisalaConfig>,
 
     // Sync settings
     pub sync_readings_interval_seconds: u64,
-    pub sync_device_status_interval_seconds: u64,
     pub sync_retry_max: u32,
     pub sync_retry_delay_seconds: u64,
 
@@ -63,8 +59,6 @@ pub struct Config {
     pub keycloak_realm: Option<String>,
     pub keycloak_client_id: Option<String>,
 
-    // Partner API token auth
-    pub require_partner_auth: bool,
 }
 
 impl Config {
@@ -89,29 +83,32 @@ impl Config {
                 ))
             }).map_err(|_| ConfigError::Missing("DATABASE_URL or DB_USER/DB_PASSWORD/DB_HOST/DB_NAME"))?,
 
-            // Vaisala API
-            vaisala_base_url: env::var("VAISALA_BASE_URL")
-                .map_err(|_| ConfigError::Missing("VAISALA_BASE_URL"))?,
-            vaisala_bearer_token: env::var("VAISALA_BEARER_TOKEN")
-                .map_err(|_| ConfigError::Missing("VAISALA_BEARER_TOKEN"))?,
-            vaisala_skip_tls_verify: env::var("VAISALA_SKIP_TLS_VERIFY")
-                .unwrap_or_else(|_| "true".to_string())
-                .parse()
-                .unwrap_or(true),
-            vaisala_max_history_days: env::var("VAISALA_MAX_HISTORY_DAYS")
-                .unwrap_or_else(|_| "90".to_string())
-                .parse()
-                .unwrap_or(90),
+            // Vaisala API (optional - sync disabled if not configured)
+            vaisala: {
+                let base_url = env::var("VAISALA_BASE_URL").ok();
+                let bearer_token = env::var("VAISALA_BEARER_TOKEN").ok();
+                match (base_url, bearer_token) {
+                    (Some(base_url), Some(bearer_token)) => Some(crate::connectors::vaisala::config::VaisalaConfig {
+                        base_url,
+                        bearer_token,
+                        skip_tls_verify: env::var("VAISALA_SKIP_TLS_VERIFY")
+                            .unwrap_or_else(|_| "true".to_string())
+                            .parse()
+                            .unwrap_or(true),
+                        max_history_days: env::var("VAISALA_MAX_HISTORY_DAYS")
+                            .unwrap_or_else(|_| "90".to_string())
+                            .parse()
+                            .unwrap_or(90),
+                    }),
+                    _ => None,
+                }
+            },
 
             // Sync settings
             sync_readings_interval_seconds: env::var("SYNC_READINGS_INTERVAL_SECONDS")
                 .unwrap_or_else(|_| "300".to_string())
                 .parse()
                 .unwrap_or(300),
-            sync_device_status_interval_seconds: env::var("SYNC_DEVICE_STATUS_INTERVAL_SECONDS")
-                .unwrap_or_else(|_| "1800".to_string())
-                .parse()
-                .unwrap_or(1800),
             sync_retry_max: env::var("SYNC_RETRY_MAX")
                 .unwrap_or_else(|_| "3".to_string())
                 .parse()
@@ -177,11 +174,6 @@ impl Config {
             keycloak_realm: env::var("KEYCLOAK_REALM").ok().filter(|s| !s.is_empty()),
             keycloak_client_id: env::var("KEYCLOAK_CLIENT_ID").ok().filter(|s| !s.is_empty()),
 
-            // Partner API auth
-            require_partner_auth: env::var("REQUIRE_PARTNER_AUTH")
-                .unwrap_or_else(|_| "false".to_string())
-                .parse()
-                .unwrap_or(false),
         })
     }
 

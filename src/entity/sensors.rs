@@ -13,13 +13,12 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
     pub id: Uuid,
-    #[sea_orm(unique)]
     #[crudcrate(filterable, fulltext)]
-    pub serial_number: String,
+    pub serial_number: Option<String>,
     #[crudcrate(fulltext)]
     pub name: Option<String>,
     #[crudcrate(filterable)]
-    pub parameter_type_id: Uuid,
+    pub parameter_id: Uuid,
     #[crudcrate(filterable)]
     pub manufacturer: Option<String>,
     #[crudcrate(filterable)]
@@ -34,11 +33,11 @@ pub struct Model {
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
     #[sea_orm(
-        belongs_to = "super::parameter_types::Entity",
-        from = "Column::ParameterTypeId",
-        to = "super::parameter_types::Column::Id"
+        belongs_to = "super::parameters::Entity",
+        from = "Column::ParameterId",
+        to = "super::parameters::Column::Id"
     )]
-    ParameterType,
+    Parameter,
     #[sea_orm(has_many = "super::sensor_calibrations::Entity")]
     SensorCalibrations,
     #[sea_orm(has_many = "super::sensor_deployments::Entity")]
@@ -47,9 +46,9 @@ pub enum Relation {
     Readings,
 }
 
-impl Related<super::parameter_types::Entity> for Entity {
+impl Related<super::parameters::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::ParameterType.def()
+        Relation::Parameter.def()
     }
 }
 

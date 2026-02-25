@@ -2,9 +2,9 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use std::time::Duration;
 
-use crate::config::Config;
+use super::config::VaisalaConfig;
 use crate::error::{AppError, AppResult};
-use crate::vaisala::models::{LocationsDataResponse, LocationsHistoryResponse, LocationsResponse};
+use super::models::{LocationsDataResponse, LocationsHistoryResponse, LocationsResponse};
 
 pub struct VaisalaClient {
     http_client: Client,
@@ -14,17 +14,17 @@ pub struct VaisalaClient {
 
 impl VaisalaClient {
     #[must_use]
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &VaisalaConfig) -> Self {
         let http_client = Client::builder()
-            .danger_accept_invalid_certs(config.vaisala_skip_tls_verify)
+            .danger_accept_invalid_certs(config.skip_tls_verify)
             .timeout(Duration::from_secs(300)) // 5 minutes for large history requests
             .build()
             .expect("Failed to create HTTP client");
 
         Self {
             http_client,
-            base_url: config.vaisala_base_url.clone(),
-            bearer_token: config.vaisala_bearer_token.clone(),
+            base_url: config.base_url.clone(),
+            bearer_token: config.bearer_token.clone(),
         }
     }
 

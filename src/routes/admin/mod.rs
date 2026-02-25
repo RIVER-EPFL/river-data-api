@@ -1,6 +1,7 @@
 pub mod calibrations;
 pub mod derived;
 pub mod imports;
+pub mod public_config;
 pub mod sync;
 
 use axum::{routing::post, Router};
@@ -11,12 +12,13 @@ use crate::entity::{
     api_tokens::ApiToken,
     data_imports::DataImport,
     derived_parameter_definitions::DerivedParameterDefinition,
-    parameter_types::ParameterType,
     parameters::Parameter,
     projects::Project,
+    public_exposed_parameters::PublicExposedParameter,
     sensor_calibrations::SensorCalibration,
     sensor_deployments::SensorDeployment,
     sensors::Sensor,
+    site_parameters::SiteParameter,
     sites::Site,
 };
 
@@ -31,8 +33,8 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         // crudcrate-generated CRUD routers (state self-contained via DatabaseConnection)
         .nest_service("/projects", crud(Project::router(db)))
         .nest_service("/sites", crud(Site::router(db)))
-        .nest_service("/parameter_types", crud(ParameterType::router(db)))
         .nest_service("/parameters", crud(Parameter::router(db)))
+        .nest_service("/site_parameters", crud(SiteParameter::router(db)))
         .nest_service("/sensors", crud(Sensor::router(db)))
         .nest_service("/sensor_calibrations", crud(SensorCalibration::router(db)))
         .nest_service("/sensor_deployments", crud(SensorDeployment::router(db)))
@@ -40,10 +42,12 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .nest_service("/alarm_thresholds", crud(AlarmThreshold::router(db)))
         .nest_service("/tokens", crud(ApiToken::router(db)))
         .nest_service("/data_imports", crud(DataImport::router(db)))
+        .nest_service("/public_exposed_parameters", crud(PublicExposedParameter::router(db)))
         // Custom action routes under /actions/ to avoid conflict with nest_service catch-all
         .route("/actions/sensor_calibrations/{id}/recalculate", post(calibrations::recalculate_calibration))
         .route("/actions/derived_parameters/{id}/recompute", post(derived::recompute_derived))
-        .route("/actions/data_imports/upload", post(imports::upload_csv));
+        .route("/actions/data_imports/upload", post(imports::upload_csv))
+        .route("/actions/invalidate_public_config/{slug}", post(public_config::invalidate_public_config));
 
     // Apply Keycloak auth layer if configured
     if let Some(instance) = state.keycloak_auth_instance.clone() {

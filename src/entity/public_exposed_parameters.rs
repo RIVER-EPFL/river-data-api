@@ -1,12 +1,12 @@
 use crudcrate::{CRUDResource, EntityToModels};
 use sea_orm::entity::prelude::*;
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels)]
-#[sea_orm(table_name = "alarm_thresholds")]
+#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels)]
+#[sea_orm(table_name = "public_exposed_parameters")]
 #[crudcrate(
-    api_struct = "AlarmThreshold",
-    name_singular = "alarm_threshold",
-    name_plural = "alarm_thresholds",
+    api_struct = "PublicExposedParameter",
+    name_singular = "public_exposed_parameter",
+    name_plural = "public_exposed_parameters",
     generate_router
 )]
 pub struct Model {
@@ -14,45 +14,44 @@ pub struct Model {
     #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
     pub id: Uuid,
     #[crudcrate(filterable)]
+    pub project_id: Uuid,
+    #[crudcrate(filterable)]
     pub parameter_id: Uuid,
     #[crudcrate(filterable)]
-    pub site_id: Option<Uuid>,
-    pub warning_min: Option<f64>,
-    pub warning_max: Option<f64>,
-    pub alarm_min: Option<f64>,
-    pub alarm_max: Option<f64>,
+    pub public_name: String,
+    pub public_units: String,
     pub description: Option<String>,
+    pub sort_order: i32,
+    pub include_derived: bool,
     #[crudcrate(exclude(create, update))]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
-    #[crudcrate(exclude(create, update))]
-    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
+    #[sea_orm(
+        belongs_to = "super::projects::Entity",
+        from = "Column::ProjectId",
+        to = "super::projects::Column::Id"
+    )]
+    Project,
     #[sea_orm(
         belongs_to = "super::parameters::Entity",
         from = "Column::ParameterId",
         to = "super::parameters::Column::Id"
     )]
     Parameter,
-    #[sea_orm(
-        belongs_to = "super::sites::Entity",
-        from = "Column::SiteId",
-        to = "super::sites::Column::Id"
-    )]
-    Site,
+}
+
+impl Related<super::projects::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Project.def()
+    }
 }
 
 impl Related<super::parameters::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Parameter.def()
-    }
-}
-
-impl Related<super::sites::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::Site.def()
     }
 }
 

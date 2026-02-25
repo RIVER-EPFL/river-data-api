@@ -1,7 +1,6 @@
 pub mod admin;
 pub mod alarms;
 pub mod config;
-pub mod dashboard;
 pub mod public_api;
 pub mod projects;
 pub mod sites;
@@ -9,7 +8,7 @@ pub mod sites;
 // Re-export cache from services for use in route handlers
 pub use crate::services::cache;
 
-use axum::{http::StatusCode, routing::get, Router};
+use axum::{http::StatusCode, middleware, routing::get, Router};
 use sea_orm::{Condition, DatabaseConnection, EntityTrait, QueryFilter, sea_query::Expr};
 use std::sync::Arc;
 use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
@@ -144,6 +143,7 @@ pub async fn resolve_site(
         (name = "sites", description = "Site management and data"),
         (name = "alarms", description = "Threshold-based alarm violations"),
     ),
+    modifiers(&SecurityAddon),
     info(
         title = "River Data API",
         description = "Time-series sensor data API",
@@ -151,6 +151,35 @@ pub async fn resolve_site(
     )
 )]
 struct ApiDoc;
+
+struct SecurityAddon;
+
+impl utoipa::Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            "keycloak_jwt",
+            utoipa::openapi::security::SecurityScheme::Http(
+                utoipa::openapi::security::HttpBuilder::new()
+                    .scheme(utoipa::openapi::security::HttpAuthScheme::Bearer)
+                    .bearer_format("JWT")
+                    .description(Some("Keycloak JWT token (for browser/admin access)"))
+                    .build(),
+            ),
+        );
+        components.add_security_scheme(
+            "api_token",
+            utoipa::openapi::security::SecurityScheme::Http(
+                utoipa::openapi::security::HttpBuilder::new()
+                    .scheme(utoipa::openapi::security::HttpAuthScheme::Bearer)
+                    .description(Some(
+                        "API token (created via admin UI, for external scripts/partners)",
+                    ))
+                    .build(),
+            ),
+        );
+    }
+}
 
 // ============================================================================
 // Router Builder
@@ -170,16 +199,17 @@ pub fn build_router(state: AppState) -> Router {
         );
     }
 
-    // Metadata routes (projects, sites listings)
+    // Metadata routes (projects, sites listings) — require read_metadata permission
     let metadata_routes_base = Router::new()
         .route("/projects", get(projects::list_projects))
         .route("/projects/{project_id}", get(projects::get_project))
         .route("/projects/{project_id}/sites", get(projects::list_project_sites))
         .route("/sites", get(sites::list_sites))
         .route("/sites/{site_id}", get(sites::get_site))
-        .route("/sites/{site_id}/parameters", get(sites::list_site_parameters));
+        .route("/sites/{site_id}/parameters", get(sites::list_site_parameters))
+        .layer(middleware::from_fn(crate::common::middleware::require_read_metadata));
 
-    // Data routes (readings, aggregates, alarms)
+    // Data routes (readings, aggregates, alarms) — require read_data permission
     let data_routes_base = Router::new()
         .route(
             "/sites/{site_id}/readings",
@@ -192,7 +222,8 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/sites/{site_id}/alarms",
             get(alarms::get_site_alarms),
-        );
+        )
+        .layer(middleware::from_fn(crate::common::middleware::require_read_data));
 
     // Public API routes
     let public_routes = public_api::public_router();
@@ -229,22 +260,29 @@ pub fn build_router(state: AppState) -> Router {
             }))
     };
 
-    // Apply Keycloak auth to private routes if configured
+    // Apply dual auth (Keycloak JWT OR API token) to private routes
     let private_routes = {
-        let mut r = private_routes_inner;
+        // Dual auth middleware runs after Keycloak and checks:
+        // KeycloakAuthStatus::Success → authenticated via JWT
+        // Otherwise → try validate_bearer_token() for API token auth
+        let mut r = private_routes_inner
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::common::middleware::private_auth_middleware,
+            ));
         if let Some(instance) = state.keycloak_auth_instance.clone() {
             use axum_keycloak_auth::{PassthroughMode, layer::KeycloakAuthLayer};
             r = r.layer(
                 KeycloakAuthLayer::<crate::common::auth::Role>::builder()
                     .instance(instance)
-                    .passthrough_mode(PassthroughMode::Block)
+                    .passthrough_mode(PassthroughMode::Pass)
                     .persist_raw_claims(false)
                     .expected_audiences(vec![String::from("account")])
                     .required_roles(vec![crate::common::auth::Role::User])
                     .build(),
             );
         } else {
-            tracing::warn!("Private routes are not protected by authentication");
+            tracing::warn!("Private routes are not protected by Keycloak (API tokens still work)");
         }
         r
     };
@@ -279,15 +317,11 @@ pub fn build_router(state: AppState) -> Router {
     // OpenAPI documentation
     let docs_routes = Router::new().merge(Scalar::with_url("/docs", ApiDoc::openapi()));
 
-    // Dashboard at root
-    let dashboard_routes = Router::new().route("/dashboard", get(dashboard::dashboard));
-
     // Combine all routes
     Router::new()
         .nest("/api", api_routes)
         .merge(health_routes)
         .merge(docs_routes)
-        .merge(dashboard_routes)
         .layer(CompressionLayer::new())
         .layer(
             CorsLayer::new()

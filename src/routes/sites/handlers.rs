@@ -6,8 +6,9 @@ use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement};
 
 use crate::common::AppState;
-use crate::entity::{parameters, projects, sites};
-use crate::error::AppResult;
+use crate::common::middleware::ProjectScope;
+use crate::entity::{site_parameters, projects, sites};
+use crate::error::{AppError, AppResult};
 use crate::routes::resolve_site;
 
 use super::types::{ParameterResponse, ProjectRef, SiteDetailResponse, SiteResponse, SitesQuery};
@@ -32,10 +33,21 @@ struct DataRangeRow {
 pub async fn list_sites(
     State(state): State<AppState>,
     Query(query): Query<SitesQuery>,
+    ProjectScope(scope): ProjectScope,
 ) -> AppResult<Json<Vec<SiteResponse>>> {
     let mut db_query = sites::Entity::find();
 
-    if let Some(project_id) = query.project_id {
+    // Token project scope takes precedence; query param can further narrow within scope
+    if let Some(scope_project) = scope {
+        if let Some(query_project) = query.project_id
+            && query_project != scope_project
+        {
+            return Err(AppError::Forbidden(
+                "Token is scoped to a different project".to_string(),
+            ));
+        }
+        db_query = db_query.filter(sites::Column::ProjectId.eq(scope_project));
+    } else if let Some(project_id) = query.project_id {
         db_query = db_query.filter(sites::Column::ProjectId.eq(project_id));
     }
 
@@ -75,8 +87,18 @@ pub async fn list_sites(
 pub async fn get_site(
     State(state): State<AppState>,
     Path(site_id): Path<String>,
+    ProjectScope(scope): ProjectScope,
 ) -> AppResult<Json<SiteDetailResponse>> {
     let site = resolve_site(&state.db, &site_id).await?;
+
+    // Enforce project scope
+    if let Some(scope_project) = scope
+        && site.project_id != Some(scope_project)
+    {
+        return Err(AppError::Forbidden(
+            "Token is scoped to a different project".to_string(),
+        ));
+    }
 
     // Fetch project info if available
     let project = if let Some(project_id) = site.project_id {
@@ -92,10 +114,10 @@ pub async fn get_site(
     };
 
     // Fetch parameters for this site
-    let params_list = parameters::Entity::find()
-        .filter(parameters::Column::SiteId.eq(site.id))
-        .filter(parameters::Column::IsActive.eq(true))
-        .order_by_asc(parameters::Column::Name)
+    let params_list = site_parameters::Entity::find()
+        .filter(site_parameters::Column::SiteId.eq(site.id))
+        .filter(site_parameters::Column::IsActive.eq(true))
+        .order_by_asc(site_parameters::Column::Name)
         .all(&state.db)
         .await?;
 
@@ -111,18 +133,18 @@ pub async fn get_site(
         })
         .collect();
 
-    // Get data time range and count for this site's parameters
-    let sql = format!(
-        "SELECT MIN(r.time) as min_time, MAX(r.time) as max_time, COUNT(*) as count
-         FROM readings r
-         JOIN parameters p ON r.parameter_id = p.id
-         WHERE p.site_id = '{}'",
-        site.id
-    );
+    // Get data time range and count for this site's readings
+    let sql = "SELECT MIN(r.time) as min_time, MAX(r.time) as max_time, COUNT(*) as count \
+         FROM readings r \
+         WHERE r.site_id = $1";
 
     let data_range = state
         .db
-        .query_one(Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql))
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+            vec![site.id.into()],
+        ))
         .await?
         .and_then(|row| DataRangeRow::from_query_result(&row, "").ok());
 
@@ -159,13 +181,23 @@ pub async fn get_site(
 pub async fn list_site_parameters(
     State(state): State<AppState>,
     Path(site_id): Path<String>,
+    ProjectScope(scope): ProjectScope,
 ) -> AppResult<Json<Vec<ParameterResponse>>> {
     let site = resolve_site(&state.db, &site_id).await?;
 
-    let params_list = parameters::Entity::find()
-        .filter(parameters::Column::SiteId.eq(site.id))
-        .filter(parameters::Column::IsActive.eq(true))
-        .order_by_asc(parameters::Column::Name)
+    // Enforce project scope
+    if let Some(scope_project) = scope
+        && site.project_id != Some(scope_project)
+    {
+        return Err(AppError::Forbidden(
+            "Token is scoped to a different project".to_string(),
+        ));
+    }
+
+    let params_list = site_parameters::Entity::find()
+        .filter(site_parameters::Column::SiteId.eq(site.id))
+        .filter(site_parameters::Column::IsActive.eq(true))
+        .order_by_asc(site_parameters::Column::Name)
         .all(&state.db)
         .await?;
 

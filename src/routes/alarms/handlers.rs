@@ -13,7 +13,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::{alarm_thresholds, parameters, projects};
+use crate::common::middleware::ProjectScope;
+use crate::entity::{alarm_thresholds, site_parameters, projects};
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, resolve_site};
 use crate::services::bulk;
@@ -155,9 +156,19 @@ pub async fn get_site_alarms(
     State(state): State<AppState>,
     Path(site_id): Path<String>,
     Query(query): Query<SiteAlarmsQuery>,
+    ProjectScope(scope): ProjectScope,
     headers: HeaderMap,
 ) -> AppResult<Response> {
     let site = resolve_site(&state.db, &site_id).await?;
+
+    // Enforce project scope
+    if let Some(scope_project) = scope
+        && site.project_id != Some(scope_project)
+    {
+        return Err(AppError::Forbidden(
+            "Token is scoped to a different project".to_string(),
+        ));
+    }
 
     // Fetch project info if available
     let project_ref = if let Some(project_id) = site.project_id {
@@ -186,20 +197,20 @@ pub async fn get_site_alarms(
 
     let format = bulk::determine_format(&query.format, &headers);
 
-    // Build parameter query for this site
-    let mut param_query = parameters::Entity::find()
-        .filter(parameters::Column::IsActive.eq(true))
-        .filter(parameters::Column::SiteId.eq(site.id));
+    // Build site_parameter query for this site
+    let mut param_query = site_parameters::Entity::find()
+        .filter(site_parameters::Column::IsActive.eq(true))
+        .filter(site_parameters::Column::SiteId.eq(site.id));
 
     if let Some(ref types) = query.sensor_types {
         let type_list: Vec<String> = types.split(',').map(|s| s.trim().to_string()).collect();
         if !type_list.is_empty() {
-            param_query = param_query.filter(parameters::Column::SensorType.is_in(type_list));
+            param_query = param_query.filter(site_parameters::Column::SensorType.is_in(type_list));
         }
     }
 
     let params_list = param_query
-        .order_by_asc(parameters::Column::Name)
+        .order_by_asc(site_parameters::Column::Name)
         .all(&state.db)
         .await?;
 
@@ -215,23 +226,32 @@ pub async fn get_site_alarms(
         .into_response());
     }
 
-    // Get thresholds for these parameters
-    let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.id).collect();
+    // Get thresholds for these parameters (using global parameter_ids)
+    let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.parameter_id).collect();
     let thresholds = alarm_thresholds::Entity::find()
         .filter(alarm_thresholds::Column::ParameterId.is_in(param_ids.clone()))
+        .filter(
+            sea_orm::Condition::any()
+                .add(alarm_thresholds::Column::SiteId.eq(site.id))
+                .add(alarm_thresholds::Column::SiteId.is_null()),
+        )
         .all(&state.db)
         .await?;
 
-    let threshold_map: HashMap<Uuid, alarm_thresholds::Model> = thresholds
-        .into_iter()
-        .map(|t| (t.parameter_id, t))
-        .collect();
+    // Prefer site-specific thresholds over global ones
+    let mut threshold_map: HashMap<Uuid, alarm_thresholds::Model> = HashMap::new();
+    for t in thresholds {
+        let existing = threshold_map.get(&t.parameter_id);
+        if existing.is_none() || t.site_id.is_some() {
+            threshold_map.insert(t.parameter_id, t);
+        }
+    }
 
     let params_with_thresholds: Vec<ParameterWithThreshold> = params_list
         .iter()
-        .filter(|p| threshold_map.contains_key(&p.id))
+        .filter(|p| threshold_map.contains_key(&p.parameter_id))
         .map(|p| ParameterWithThreshold {
-            id: p.id,
+            id: p.parameter_id,
             name: p.name.clone(),
             sensor_type: p.sensor_type.clone(),
             display_units: p.display_units.clone(),
@@ -269,11 +289,15 @@ pub async fn get_site_alarms(
 
     let _permit = bulk::acquire_bulk_permit(&format)?;
 
-    let param_ids_str = params_with_thresholds
+    let alarm_param_ids: Vec<uuid::Uuid> = params_with_thresholds.iter().map(|p| p.id).collect();
+    // $1 = site_id, $2..=$N+1 = parameter_ids
+    let placeholders: Vec<String> = alarm_param_ids
         .iter()
-        .map(|p| format!("'{}'", p.id))
-        .collect::<Vec<_>>()
-        .join(",");
+        .enumerate()
+        .map(|(i, _)| format!("${}", i + 2))
+        .collect();
+    let start_param = alarm_param_ids.len() + 2;
+    let end_param = start_param + 1;
 
     let min_severity = query.severity.unwrap_or(1);
 
@@ -309,24 +333,31 @@ pub async fn get_site_alarms(
                 ELSE 0
             END::smallint as severity
         FROM readings r
-        JOIN alarm_thresholds t ON r.parameter_id = t.parameter_id
-        WHERE r.parameter_id IN ({})
-          AND r.time >= '{}'
-          AND r.time <= '{}'
+        JOIN alarm_thresholds t ON r.parameter_id = t.parameter_id AND (t.site_id = r.site_id OR t.site_id IS NULL)
+        WHERE r.site_id = $1
+          AND r.parameter_id IN ({})
+          AND r.time >= ${}
+          AND r.time <= ${}
           AND {}
         ORDER BY r.time, r.parameter_id
         ",
-        param_ids_str,
-        query.start.to_rfc3339(),
-        query.end.to_rfc3339(),
+        placeholders.join(","),
+        start_param,
+        end_param,
         violation_condition
     );
 
+    let mut values: Vec<sea_orm::Value> = vec![site.id.into()];
+    values.extend(alarm_param_ids.iter().map(|id| (*id).into()));
+    values.push(query.start.into());
+    values.push(query.end.into());
+
     let violations: Vec<ViolationRow> = state
         .db
-        .query_all(Statement::from_string(
+        .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            sql,
+            &sql,
+            values,
         ))
         .await?
         .into_iter()

@@ -12,7 +12,8 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::{parameters, projects};
+use crate::common::middleware::ProjectScope;
+use crate::entity::{site_parameters, projects};
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, resolve_site};
 use crate::services::bulk::{self, StreamableParam};
@@ -115,9 +116,19 @@ pub async fn get_site_readings(
     State(state): State<AppState>,
     Path(site_id): Path<String>,
     Query(query): Query<SiteReadingsQuery>,
+    ProjectScope(scope): ProjectScope,
     headers: HeaderMap,
 ) -> AppResult<Response> {
     let site = resolve_site(&state.db, &site_id).await?;
+
+    // Enforce project scope
+    if let Some(scope_project) = scope
+        && site.project_id != Some(scope_project)
+    {
+        return Err(AppError::Forbidden(
+            "Token is scoped to a different project".to_string(),
+        ));
+    }
 
     // Fetch project info if available
     let project_ref = if let Some(project_id) = site.project_id {
@@ -148,25 +159,32 @@ pub async fn get_site_readings(
     // Determine format from query or Accept header
     let format = bulk::determine_format(&query.format, &headers);
 
-    // Build parameter query for this site only
-    let mut param_query = parameters::Entity::find()
-        .filter(parameters::Column::IsActive.eq(true))
-        .filter(parameters::Column::SiteId.eq(site.id));
+    // Build site_parameter query for this site only
+    let mut param_query = site_parameters::Entity::find()
+        .filter(site_parameters::Column::IsActive.eq(true))
+        .filter(site_parameters::Column::SiteId.eq(site.id));
 
     if let Some(ref types) = query.sensor_types {
         let type_list: Vec<String> = types.split(',').map(|s| s.trim().to_string()).collect();
         if !type_list.is_empty() {
-            param_query = param_query.filter(parameters::Column::SensorType.is_in(type_list));
+            param_query = param_query.filter(site_parameters::Column::SensorType.is_in(type_list));
         }
     }
 
-    // Get matching parameters (needed for cache key validation)
+    // Get matching site_parameters (needed for cache key validation)
     let params_list = param_query
-        .order_by_asc(parameters::Column::Name)
+        .order_by_asc(site_parameters::Column::Name)
         .all(&state.db)
         .await?;
 
-    let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.id).collect();
+    // Global parameter IDs from site_parameters (readings table uses global parameter_id)
+    let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.parameter_id).collect();
+
+    // Map from global parameter_id -> site_parameter info for building response
+    let _param_info_map: HashMap<Uuid, &site_parameters::Model> = params_list
+        .iter()
+        .map(|p| (p.parameter_id, p))
+        .collect();
 
     let include_alarms = query.alarms.unwrap_or(false);
 
@@ -205,12 +223,15 @@ pub async fn get_site_readings(
 
     let num_params = params_list.len();
 
-    // Build optimized raw SQL query
-    let param_ids_str = param_ids
+    // Build parameterized raw SQL query
+    // $1 = site_id, $2..=$N+1 = parameter_ids
+    let mut values: Vec<sea_orm::Value> = vec![site.id.into()];
+    let placeholders: Vec<String> = param_ids
         .iter()
-        .map(|id| format!("'{id}'"))
-        .collect::<Vec<_>>()
-        .join(",");
+        .enumerate()
+        .map(|(i, _)| format!("${}", i + 2))
+        .collect();
+    values.extend(param_ids.iter().map(|id| (*id).into()));
 
     let select_clause = if include_alarms {
         r"r.parameter_id, r.time, COALESCE(r.calibrated_value, r.raw_value) AS value,
@@ -227,31 +248,43 @@ pub async fn get_site_readings(
     };
 
     let from_clause = if include_alarms {
-        "readings r LEFT JOIN alarm_thresholds t ON r.parameter_id = t.parameter_id"
+        "readings r LEFT JOIN alarm_thresholds t ON r.parameter_id = t.parameter_id AND (t.site_id = r.site_id OR t.site_id IS NULL)"
     } else {
         "readings r"
     };
 
+    let next_param = param_ids.len() + 2;
     let time_conditions = match (query.start, query.end) {
-        (Some(start), Some(end)) => format!(
-            " AND r.time >= '{}' AND r.time <= '{}'",
-            start.to_rfc3339(),
-            end.to_rfc3339()
-        ),
-        (Some(start), None) => format!(" AND r.time >= '{}'", start.to_rfc3339()),
-        (None, Some(end)) => format!(" AND r.time <= '{}'", end.to_rfc3339()),
+        (Some(start), Some(end)) => {
+            let cond = format!(" AND r.time >= ${} AND r.time <= ${}", next_param, next_param + 1);
+            values.push(start.into());
+            values.push(end.into());
+            cond
+        }
+        (Some(start), None) => {
+            let cond = format!(" AND r.time >= ${next_param}");
+            values.push(start.into());
+            cond
+        }
+        (None, Some(end)) => {
+            let cond = format!(" AND r.time <= ${next_param}");
+            values.push(end.into());
+            cond
+        }
         (None, None) => String::new(),
     };
 
     let sql = format!(
-        "SELECT {select_clause} FROM {from_clause} WHERE r.parameter_id IN ({param_ids_str}){time_conditions} ORDER BY r.parameter_id, r.time"
+        "SELECT {select_clause} FROM {from_clause} WHERE r.site_id = $1 AND r.parameter_id IN ({}){time_conditions} ORDER BY r.parameter_id, r.time",
+        placeholders.join(",")
     );
 
     let query_result = state
         .db
-        .query_all(Statement::from_string(
+        .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            sql,
+            &sql,
+            values,
         ))
         .await?;
 
@@ -300,7 +333,8 @@ pub async fn get_site_readings(
 
     let param_data: Vec<ParameterData> = params_list
         .iter()
-        .map(|param| {
+        .map(|sp| {
+            let global_param_id = sp.parameter_id;
             let mut values: Vec<Option<f64>> = vec![None; times.len()];
             let mut severities_vec: Option<Vec<Option<i16>>> = if include_alarms {
                 Some(vec![None; times.len()])
@@ -308,7 +342,7 @@ pub async fn get_site_readings(
                 None
             };
 
-            if let Some(readings) = param_values.get(&param.id) {
+            if let Some(readings) = param_values.get(&global_param_id) {
                 for (time, value) in readings {
                     if let Some(&idx) = time_index.get(time) {
                         values[idx] = Some(*value);
@@ -317,7 +351,7 @@ pub async fn get_site_readings(
             }
 
             if let Some(ref mut sev_vec) = severities_vec
-                && let Some(sevs) = param_severities.get(&param.id)
+                && let Some(sevs) = param_severities.get(&global_param_id)
             {
                 for (time, severity) in sevs {
                     if let Some(&idx) = time_index.get(time) {
@@ -327,10 +361,10 @@ pub async fn get_site_readings(
             }
 
             ParameterData {
-                id: param.id,
-                name: param.name.clone(),
-                sensor_type: param.sensor_type.clone(),
-                units: param.display_units.clone(),
+                id: sp.id,
+                name: sp.name.clone(),
+                sensor_type: sp.sensor_type.clone(),
+                units: sp.display_units.clone(),
                 values,
                 severities: severities_vec,
             }

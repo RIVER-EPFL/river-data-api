@@ -25,6 +25,7 @@ pub struct Model {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     #[crudcrate(exclude(create, update))]
     pub discovered_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub public_slug: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -35,8 +36,12 @@ pub enum Relation {
         to = "super::projects::Column::Id"
     )]
     Project,
-    #[sea_orm(has_many = "super::parameters::Entity")]
-    Parameters,
+    #[sea_orm(has_many = "super::site_parameters::Entity")]
+    SiteParameters,
+    #[sea_orm(has_many = "super::sensor_deployments::Entity")]
+    SensorDeployments,
+    #[sea_orm(has_many = "super::readings::Entity")]
+    Readings,
 }
 
 impl Related<super::projects::Entity> for Entity {
@@ -45,9 +50,21 @@ impl Related<super::projects::Entity> for Entity {
     }
 }
 
-impl Related<super::parameters::Entity> for Entity {
+impl Related<super::site_parameters::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::Parameters.def()
+        Relation::SiteParameters.def()
+    }
+}
+
+impl Related<super::sensor_deployments::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::SensorDeployments.def()
+    }
+}
+
+impl Related<super::readings::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Readings.def()
     }
 }
 

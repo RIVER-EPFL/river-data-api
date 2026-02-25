@@ -15,7 +15,8 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::{alarm_thresholds, parameters, projects};
+use crate::common::middleware::ProjectScope;
+use crate::entity::{alarm_thresholds, site_parameters, projects};
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, resolve_site};
 use crate::services::bulk;
@@ -223,9 +224,19 @@ pub async fn get_site_aggregates(
     State(state): State<AppState>,
     Path((site_id, resolution)): Path<(String, String)>,
     Query(query): Query<SiteAggregatesQuery>,
+    ProjectScope(scope): ProjectScope,
     headers: HeaderMap,
 ) -> AppResult<Response> {
     let site = resolve_site(&state.db, &site_id).await?;
+
+    // Enforce project scope
+    if let Some(scope_project) = scope
+        && site.project_id != Some(scope_project)
+    {
+        return Err(AppError::Forbidden(
+            "Token is scoped to a different project".to_string(),
+        ));
+    }
 
     // Fetch project info if available
     let project_ref = if let Some(project_id) = site.project_id {
@@ -267,19 +278,20 @@ pub async fn get_site_aggregates(
 
     let format = bulk::determine_format(&query.format, &headers);
 
-    let mut param_query = parameters::Entity::find()
-        .filter(parameters::Column::IsActive.eq(true))
-        .filter(parameters::Column::SiteId.eq(site.id));
+    let mut param_query = site_parameters::Entity::find()
+        .filter(site_parameters::Column::IsActive.eq(true))
+        .filter(site_parameters::Column::SiteId.eq(site.id));
 
     if let Some(ref types) = query.sensor_types {
         let type_list: Vec<String> = types.split(',').map(|s| s.trim().to_string()).collect();
         if !type_list.is_empty() {
-            param_query = param_query.filter(parameters::Column::SensorType.is_in(type_list));
+            param_query = param_query.filter(site_parameters::Column::SensorType.is_in(type_list));
         }
     }
 
     let params_list = param_query.all(&state.db).await?;
-    let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.id).collect();
+    // Global parameter IDs from site_parameters (readings/aggregates use global parameter_id)
+    let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.parameter_id).collect();
 
     let include_alarms = query.alarms.unwrap_or(false);
 
@@ -317,31 +329,40 @@ pub async fn get_site_aggregates(
     }
 
     // Fetch thresholds when alarms are requested (small query, ~22 rows max)
+    // Prefer site-specific thresholds over global ones
     let threshold_map: HashMap<Uuid, alarm_thresholds::Model> = if include_alarms {
-        alarm_thresholds::Entity::find()
+        let all_thresholds = alarm_thresholds::Entity::find()
             .filter(alarm_thresholds::Column::ParameterId.is_in(param_ids.clone()))
+            .filter(
+                sea_orm::Condition::any()
+                    .add(alarm_thresholds::Column::SiteId.eq(site.id))
+                    .add(alarm_thresholds::Column::SiteId.is_null()),
+            )
             .all(&state.db)
-            .await?
-            .into_iter()
-            .map(|t| (t.parameter_id, t))
-            .collect()
+            .await?;
+        let mut map: HashMap<Uuid, alarm_thresholds::Model> = HashMap::new();
+        for t in all_thresholds {
+            let existing = map.get(&t.parameter_id);
+            // Insert if no existing entry, or if this one is site-specific (preferred)
+            if existing.is_none() || t.site_id.is_some() {
+                map.insert(t.parameter_id, t);
+            }
+        }
+        map
     } else {
         HashMap::new()
     };
 
-    let param_ids_str = param_ids
+    // $1 = site_id, $2..=$N+1 = parameter_ids
+    let placeholders: Vec<String> = param_ids
         .iter()
-        .map(|id| format!("'{id}'"))
-        .collect::<Vec<_>>()
-        .join(",");
-
-    let bucket_interval = match resolution.as_str() {
-        "hourly" => "1 hour",
-        "daily" => "1 day",
-        "weekly" => "1 week",
-        "monthly" => "1 month",
-        _ => "1 hour",
-    };
+        .enumerate()
+        .map(|(i, _)| format!("${}", i + 2))
+        .collect();
+    let mut param_values: Vec<sea_orm::Value> = vec![site.id.into()];
+    param_values.extend(param_ids.iter().map(|id| (*id).into()));
+    let start_param = param_ids.len() + 2;
+    let end_param = start_param + 1;
 
     let sql = format!(
         r"
@@ -353,63 +374,32 @@ pub async fn get_site_aggregates(
             max_value,
             count
         FROM {view_name}
-        WHERE parameter_id IN ({param_ids_str})
-          AND bucket >= $1
-          AND bucket <= $2
+        WHERE site_id = $1
+          AND parameter_id IN ({})
+          AND bucket >= ${}
+          AND bucket <= ${}
         ORDER BY bucket ASC, parameter_id ASC
-        "
+        ",
+        placeholders.join(","),
+        start_param,
+        end_param,
     );
 
-    let mut results: Vec<AggregateRow> = state
+    let mut values: Vec<sea_orm::Value> = param_values.clone();
+    values.push(query.start.into());
+    values.push(query.end.into());
+
+    let results: Vec<AggregateRow> = state
         .db
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
-            vec![query.start.into(), query.end.into()],
+            values,
         ))
         .await?
         .into_iter()
         .filter_map(|row| AggregateRow::from_query_result(&row, "").ok())
         .collect();
-
-    if results.is_empty() {
-        tracing::info!(
-            resolution = %resolution,
-            start = %query.start,
-            end = %query.end,
-            "continuous_aggregate_empty_fallback_to_raw"
-        );
-
-        let fallback_sql = format!(
-            r"
-            SELECT
-                time_bucket('{bucket_interval}', time) AS bucket,
-                parameter_id,
-                AVG(value) AS avg_value,
-                MIN(value) AS min_value,
-                MAX(value) AS max_value,
-                COUNT(*) AS count
-            FROM readings
-            WHERE parameter_id IN ({param_ids_str})
-              AND time >= $1
-              AND time <= $2
-            GROUP BY time_bucket('{bucket_interval}', time), parameter_id
-            ORDER BY bucket ASC, parameter_id ASC
-            "
-        );
-
-        results = state
-            .db
-            .query_all(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                &fallback_sql,
-                vec![query.start.into(), query.end.into()],
-            ))
-            .await?
-            .into_iter()
-            .filter_map(|row| AggregateRow::from_query_result(&row, "").ok())
-            .collect();
-    }
 
     let mut time_set: BTreeMap<DateTime<Utc>, usize> = BTreeMap::new();
     let mut param_aggs: HashMap<Uuid, HashMap<DateTime<Utc>, (Option<f64>, Option<f64>, Option<f64>, i64)>> =
@@ -429,8 +419,9 @@ pub async fn get_site_aggregates(
     let param_data: Vec<ParameterAggregateData> = params_list
         .iter()
         .map(|param| {
-            let aggs_map = param_aggs.get(&param.id);
-            let threshold = threshold_map.get(&param.id);
+            let global_param_id = param.parameter_id;
+            let aggs_map = param_aggs.get(&global_param_id);
+            let threshold = threshold_map.get(&global_param_id);
 
             let mut avg = Vec::with_capacity(times.len());
             let mut min = Vec::with_capacity(times.len());

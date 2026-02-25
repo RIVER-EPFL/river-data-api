@@ -1,11 +1,13 @@
 use chrono::{Duration, Utc};
-use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Set, Statement};
+use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-use crate::entity::{alarm_thresholds, device_status, parameter_types, parameters, projects, readings, sensor_calibrations, sensor_deployments, sensors, sites, source_mappings, sync_state};
+use crate::entity::{alarm_thresholds, parameters, projects, readings, sensor_calibrations, sensor_deployments, sensors, site_parameters, sites, source_mappings, sync_state};
 use crate::error::AppResult;
-use crate::vaisala::VaisalaClient;
+use crate::services::calibration::recalculate_derived_at_timestamp;
+use super::state::{update_sync_state_success, update_sync_state_error};
+use super::VaisalaClient;
 
 /// Batch size for bulk inserts
 const BATCH_SIZE: usize = 1000;
@@ -44,11 +46,11 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
 
     let param_mappings: HashMap<i32, (Uuid, Option<String>)> = mappings
         .iter()
-        .filter(|m| m.entity_type == "parameter")
+        .filter(|m| m.entity_type == "site_parameter")
         .map(|m| (m.source_key, (m.entity_id, m.source_name.clone())))
         .collect();
 
-    // Build project name → UUID map for FK lookups when creating sites
+    // Build project name -> UUID map for FK lookups when creating sites
     let mut project_ids: HashMap<String, Uuid> = projects::Entity::find()
         .all(db)
         .await?
@@ -56,7 +58,7 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
         .map(|p| (p.name.clone(), p.id))
         .collect();
 
-    // Build site source_key → UUID map for FK lookups when creating parameters
+    // Build site source_key -> UUID map for FK lookups when creating parameters
     let mut site_ids: HashMap<i32, Uuid> = site_mappings
         .iter()
         .map(|(key, (id, _))| (*key, *id))
@@ -98,6 +100,7 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
                             source_key: Set(attrs.node_id),
                             entity_id: sea_orm::ActiveValue::NotSet,
                             source_name: Set(Some(project_name.to_string())),
+                            source_system: Set(Some("vaisala".to_string())),
                         };
                         if let Err(e) = mapping.update(db).await {
                             tracing::warn!(error = %e, "Failed to update project source_name");
@@ -119,6 +122,12 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
                     }),
                     created_at: Set(Some(now)),
                     discovered_at: Set(Some(now)),
+                    is_public: Set(false),
+                    public_slug: Set(None),
+                    public_api_title: Set(None),
+                    public_api_description: Set(None),
+                    public_api_version: Set(None),
+                    public_contact_email: Set(None),
                 };
 
                 match project.insert(db).await {
@@ -129,6 +138,7 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
                             source_key: Set(attrs.node_id),
                             entity_id: Set(p.id),
                             source_name: Set(Some(project_name.to_string())),
+                            source_system: Set(Some("vaisala".to_string())),
                         };
                         if let Err(e) = mapping.insert(db).await {
                             tracing::warn!(error = %e, "Failed to create project source mapping");
@@ -165,6 +175,7 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
                             source_key: Set(attrs.node_id),
                             entity_id: sea_orm::ActiveValue::NotSet,
                             source_name: Set(Some(site_name.to_string())),
+                            source_system: Set(Some("vaisala".to_string())),
                         };
                         if let Err(e) = mapping.update(db).await {
                             tracing::warn!(error = %e, "Failed to update site source_name");
@@ -186,6 +197,7 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
                     altitude_m: Set(None),
                     created_at: Set(Some(now)),
                     discovered_at: Set(Some(now)),
+                    public_slug: Set(None),
                 };
 
                 match site.insert(db).await {
@@ -195,6 +207,7 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
                             source_key: Set(attrs.node_id),
                             entity_id: Set(s.id),
                             source_name: Set(Some(site_name.to_string())),
+                            source_system: Set(Some("vaisala".to_string())),
                         };
                         if let Err(e) = mapping.insert(db).await {
                             tracing::warn!(error = %e, "Failed to create site source mapping");
@@ -261,14 +274,14 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
             // Use generic name (strip station prefix)
             let generic_name = derive_generic_name(&attrs.location_name);
 
-            // Ensure parameter_type exists for this sensor_type
-            let param_type_id = get_or_create_parameter_type(db, &sensor_type).await;
+            // Ensure global parameter exists for this sensor_type
+            let global_param_id = get_or_create_parameter(db, &sensor_type).await;
 
             let param_id = Uuid::new_v4();
-            let param = parameters::ActiveModel {
+            let param = site_parameters::ActiveModel {
                 id: Set(param_id),
                 site_id: Set(site_id),
-                parameter_type_id: Set(param_type_id),
+                parameter_id: Set(global_param_id),
                 name: Set(generic_name.clone()),
                 sensor_type: Set(sensor_type.clone()),
                 display_units: Set(Some(attrs.display_units.clone())),
@@ -295,31 +308,23 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
                 discovered_at: Set(Some(now)),
             };
 
-            // Create sensor entity from Vaisala device serial number
-            let _sensor_id_opt = if !attrs.logger_serial_number.is_empty() {
-                create_sensor_and_deployment(
-                    db, &attrs.logger_serial_number, param_type_id, param_id, now,
-                ).await
-            } else {
-                None
-            };
-
             match param.insert(db).await {
                 Ok(p) => {
                     // Create source mapping
                     let mapping = source_mappings::ActiveModel {
-                        entity_type: Set("parameter".to_string()),
+                        entity_type: Set("site_parameter".to_string()),
                         source_key: Set(attrs.id),
                         entity_id: Set(p.id),
                         source_name: Set(Some(attrs.location_name.clone())),
+                        source_system: Set(Some("vaisala".to_string())),
                     };
                     if let Err(e) = mapping.insert(db).await {
-                        tracing::warn!(error = %e, "Failed to create parameter source mapping");
+                        tracing::warn!(error = %e, "Failed to create site_parameter source mapping");
                     }
 
-                    // Initialize sync_state for the new parameter
+                    // Initialize sync_state for the new site_parameter
                     let sync = sync_state::ActiveModel {
-                        parameter_id: Set(p.id),
+                        site_parameter_id: Set(p.id),
                         last_data_time: Set(None),
                         last_sync_attempt: Set(None),
                         sync_status: Set(Some("pending".to_string())),
@@ -327,16 +332,27 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
                         retry_count: Set(Some(0)),
                         last_full_sync: Set(None),
                     };
-                    let _ = sync.insert(db).await;
+                    if let Err(e) = sync.insert(db).await {
+                        tracing::warn!(error = %e, site_parameter_id = %p.id, "Failed to initialize sync state");
+                    }
 
                     // Create alarm threshold based on sensor_type
-                    let threshold = create_threshold_for_sensor_type(&p.id, &sensor_type_for_threshold);
+                    let threshold = create_threshold_for_sensor_type(global_param_id, site_id, &sensor_type_for_threshold);
                     if let Err(e) = threshold.insert(db).await {
                         tracing::warn!(
                             error = %e,
-                            parameter_id = %p.id,
+                            parameter_id = %global_param_id,
+                            site_id = %site_id,
                             "Failed to create alarm threshold"
                         );
+                    }
+
+                    // Create sensor entity from Vaisala device serial number
+                    // (must happen after site_parameter insert due to FK constraint)
+                    if !attrs.logger_serial_number.is_empty() {
+                        create_sensor_and_deployment(
+                            db, &attrs.logger_serial_number, global_param_id, site_id, now,
+                        ).await;
                     }
 
                     params_created += 1;
@@ -344,14 +360,14 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
                         name = generic_name,
                         vaisala_name = attrs.location_name,
                         location_id = attrs.id,
-                        "Created parameter"
+                        "Created site_parameter"
                     );
                 }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
                         name = attrs.location_name,
-                        "Failed to create parameter"
+                        "Failed to create site_parameter"
                     );
                 }
             }
@@ -368,12 +384,12 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
     Ok(())
 }
 
-/// Get or create a parameter_type record for the given sensor_type name.
-/// Returns the UUID of the parameter_type.
-async fn get_or_create_parameter_type(db: &DatabaseConnection, sensor_type: &str) -> Uuid {
+/// Get or create a global parameter record for the given sensor_type name.
+/// Returns the UUID of the parameter.
+async fn get_or_create_parameter(db: &DatabaseConnection, sensor_type: &str) -> Uuid {
     // Check if it already exists
-    if let Ok(Some(existing)) = parameter_types::Entity::find()
-        .filter(parameter_types::Column::Name.eq(sensor_type))
+    if let Ok(Some(existing)) = parameters::Entity::find()
+        .filter(parameters::Column::Name.eq(sensor_type))
         .one(db)
         .await
     {
@@ -386,15 +402,15 @@ async fn get_or_create_parameter_type(db: &DatabaseConnection, sensor_type: &str
         "CDOM" => ("Colored Dissolved Organic Matter", "ppb"),
         "Turbidity" => ("Turbidity", "NTU"),
         "Battery" => ("Battery Voltage", "V"),
-        "DO_Temperature" => ("DO Temperature", "°C"),
-        "Dissolved_O2" => ("Dissolved Oxygen", "µM"),
-        "Conductivity" => ("Conductivity", "µS/cm"),
-        "Cond_Temperature" => ("Conductivity Temperature", "°C"),
+        "DO_Temperature" => ("DO Temperature", "\u{00b0}C"),
+        "Dissolved_O2" => ("Dissolved Oxygen", "\u{00b5}M"),
+        "Conductivity" => ("Conductivity", "\u{00b5}S/cm"),
+        "Cond_Temperature" => ("Conductivity Temperature", "\u{00b0}C"),
         _ => (sensor_type, ""),
     };
 
     let id = Uuid::new_v4();
-    let model = parameter_types::ActiveModel {
+    let model = parameters::ActiveModel {
         id: Set(id),
         name: Set(sensor_type.to_string()),
         display_name: Set(display_name.to_string()),
@@ -404,34 +420,35 @@ async fn get_or_create_parameter_type(db: &DatabaseConnection, sensor_type: &str
     };
 
     match model.insert(db).await {
-        Ok(pt) => pt.id,
+        Ok(p) => p.id,
         Err(e) => {
-            tracing::warn!(error = %e, sensor_type = sensor_type, "Failed to create parameter_type, retrying lookup");
+            tracing::warn!(error = %e, sensor_type = sensor_type, "Failed to create parameter, retrying lookup");
             // Race condition: another sync may have created it
-            parameter_types::Entity::find()
-                .filter(parameter_types::Column::Name.eq(sensor_type))
+            parameters::Entity::find()
+                .filter(parameters::Column::Name.eq(sensor_type))
                 .one(db)
                 .await
                 .ok()
                 .flatten()
-                .map(|pt| pt.id)
+                .map(|p| p.id)
                 .unwrap_or(id)
         }
     }
 }
 
-/// Create a sensor entity and deployment for a newly discovered Vaisala parameter.
+/// Create a sensor entity and deployment for a newly discovered Vaisala site_parameter.
 /// Returns the sensor UUID if successful.
 async fn create_sensor_and_deployment(
     db: &DatabaseConnection,
     serial_number: &str,
-    parameter_type_id: Uuid,
     parameter_id: Uuid,
+    site_id: Uuid,
     now: chrono::DateTime<Utc>,
 ) -> Option<Uuid> {
-    // Check if sensor with this serial number already exists
+    // Check if sensor with this serial number AND parameter already exists
     let existing = sensors::Entity::find()
         .filter(sensors::Column::SerialNumber.eq(serial_number))
+        .filter(sensors::Column::ParameterId.eq(parameter_id))
         .one(db)
         .await
         .ok()
@@ -443,9 +460,9 @@ async fn create_sensor_and_deployment(
         let id = Uuid::new_v4();
         let sensor = sensors::ActiveModel {
             id: Set(id),
-            serial_number: Set(serial_number.to_string()),
+            serial_number: Set(Some(serial_number.to_string())),
             name: Set(None),
-            parameter_type_id: Set(parameter_type_id),
+            parameter_id: Set(parameter_id),
             manufacturer: Set(Some("Vaisala".to_string())),
             model: Set(None),
             is_active: Set(Some(true)),
@@ -481,7 +498,7 @@ async fn create_sensor_and_deployment(
     let deployment = sensor_deployments::ActiveModel {
         id: Set(Uuid::new_v4()),
         sensor_id: Set(sensor_id),
-        parameter_id: Set(parameter_id),
+        site_id: Set(site_id),
         deployed_from: Set(now),
         deployed_until: Set(None),
         deployment_type: Set("permanent".to_string()),
@@ -568,27 +585,27 @@ pub async fn sync_readings(
     max_history_days: i64,
     force_full_sync: bool,
 ) -> AppResult<()> {
-    // Load source mappings for parameter source_key → entity_id
+    // Load source mappings for site_parameter source_key -> entity_id
     let mappings: Vec<source_mappings::Model> = source_mappings::Entity::find().all(db).await?;
     let param_map: HashMap<i32, Uuid> = mappings
         .iter()
-        .filter(|m| m.entity_type == "parameter")
+        .filter(|m| m.entity_type == "site_parameter")
         .map(|m| (m.source_key, m.entity_id))
         .collect();
 
-    let params_with_state: Vec<(parameters::Model, Option<sync_state::Model>)> =
-        parameters::Entity::find()
-            .filter(parameters::Column::IsActive.eq(true))
+    let params_with_state: Vec<(site_parameters::Model, Option<sync_state::Model>)> =
+        site_parameters::Entity::find()
+            .filter(site_parameters::Column::IsActive.eq(true))
             .find_also_related(sync_state::Entity)
             .all(db)
             .await?;
 
     if params_with_state.is_empty() {
-        tracing::debug!("No active parameters to sync");
+        tracing::debug!("No active site_parameters to sync");
         return Ok(());
     }
 
-    // Build active parameter state: entity_id → last_data_time
+    // Build active site_parameter state: entity_id -> last_data_time
     let active_state: HashMap<Uuid, Option<chrono::DateTime<Utc>>> = params_with_state
         .iter()
         .map(|(p, state)| {
@@ -603,7 +620,7 @@ pub async fn sync_readings(
         })
         .collect();
 
-    // Build location_map: source_key → (entity_id, last_data_time) for active mapped parameters
+    // Build location_map: source_key -> (entity_id, last_data_time) for active mapped parameters
     let mut location_map: HashMap<i32, (Uuid, Option<chrono::DateTime<Utc>>)> = HashMap::new();
     for (source_key, entity_id) in &param_map {
         if let Some(last_time) = active_state.get(entity_id) {
@@ -612,7 +629,7 @@ pub async fn sync_readings(
     }
 
     if location_map.is_empty() {
-        tracing::debug!("No mapped active parameters to sync");
+        tracing::debug!("No mapped active site_parameters to sync");
         return Ok(());
     }
 
@@ -640,19 +657,80 @@ pub async fn sync_readings(
         Ok(h) => h,
         Err(e) => {
             tracing::error!(error = %e, "Failed to fetch locations history");
-            for (param, _) in &params_with_state {
-                update_sync_state_error(db, param.id, &e.to_string()).await;
+            for (sp, _) in &params_with_state {
+                update_sync_state_error(db, sp.id, &e.to_string()).await;
             }
             return Err(e);
         }
     };
 
+    // Build site_parameter_id -> (site_id, global parameter_id) map for readings and derived computation
+    let sp_info_map: HashMap<Uuid, (Uuid, Uuid)> = params_with_state
+        .iter()
+        .map(|(sp, _)| (sp.id, (sp.site_id, sp.parameter_id)))
+        .collect();
+
+    // Build sensor/calibration/deployment lookup for each site_parameter.
+    // This enables recalculate_for_calibration() to find readings by sensor_id.
+    let sensor_lookup: HashMap<Uuid, (Option<Uuid>, Option<Uuid>, Option<Uuid>)> = {
+        let mut lookup = HashMap::new();
+        for (sp_id, (site_id, param_id)) in &sp_info_map {
+            // Find active deployment for this site_parameter's parameter at this site.
+            // Join through sensors to match the global parameter_id.
+            let deployment = sensor_deployments::Entity::find()
+                .filter(sensor_deployments::Column::SiteId.eq(*site_id))
+                .filter(sensor_deployments::Column::DeployedUntil.is_null())
+                .find_also_related(sensors::Entity)
+                .all(db)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .find(|(_dep, sensor)| {
+                    sensor.as_ref().is_some_and(|s| s.parameter_id == *param_id)
+                });
+
+            if let Some((dep, _sensor)) = deployment {
+                // Find the latest calibration for this sensor (valid_from <= now)
+                let calibration = sensor_calibrations::Entity::find()
+                    .filter(sensor_calibrations::Column::SensorId.eq(dep.sensor_id))
+                    .order_by_desc(sensor_calibrations::Column::ValidFrom)
+                    .one(db)
+                    .await
+                    .ok()
+                    .flatten();
+
+                lookup.insert(
+                    *sp_id,
+                    (
+                        Some(dep.sensor_id),
+                        calibration.map(|c| c.id),
+                        Some(dep.id),
+                    ),
+                );
+            } else {
+                lookup.insert(*sp_id, (None, None, None));
+            }
+        }
+        lookup
+    };
+
+    // Track affected timestamps per site for derived parameter computation
+    let mut site_timestamps: HashMap<Uuid, HashSet<chrono::DateTime<Utc>>> = HashMap::new();
+
     for resource in history.data {
         let attrs = resource.attributes;
-        let Some((parameter_id, last_time)) = location_map.get(&attrs.id) else {
+        let Some((site_parameter_id, last_time)) = location_map.get(&attrs.id) else {
             tracing::warn!(
                 location_id = attrs.id,
                 "Received data for unknown location"
+            );
+            continue;
+        };
+
+        let Some((site_id, parameter_id)) = sp_info_map.get(site_parameter_id) else {
+            tracing::warn!(
+                site_parameter_id = %site_parameter_id,
+                "Could not resolve site_id/parameter_id for site_parameter"
             );
             continue;
         };
@@ -666,7 +744,7 @@ pub async fn sync_readings(
 
         if new_points.is_empty() {
             tracing::debug!(
-                parameter_id = %parameter_id,
+                site_parameter_id = %site_parameter_id,
                 location_id = attrs.id,
                 "No new samples"
             );
@@ -677,6 +755,7 @@ pub async fn sync_readings(
 
         let mut models: Vec<readings::ActiveModel> = Vec::with_capacity(new_points.len());
         let mut latest_timestamp: Option<i64> = None;
+        let mut rounded_times: Vec<chrono::DateTime<Utc>> = Vec::with_capacity(new_points.len());
 
         for point in new_points {
             let raw_time = chrono::DateTime::from_timestamp(point.timestamp, 0)
@@ -686,13 +765,22 @@ pub async fn sync_readings(
             let time = chrono::DateTime::from_timestamp(rounded_epoch, 0)
                 .unwrap_or(raw_time);
 
+            rounded_times.push(time);
+
+            let (s_id, c_id, d_id) = sensor_lookup
+                .get(site_parameter_id)
+                .copied()
+                .unwrap_or((None, None, None));
+
             models.push(readings::ActiveModel {
+                site_id: Set(*site_id),
                 parameter_id: Set(*parameter_id),
                 time: Set(time.into()),
                 raw_value: Set(point.value),
                 calibrated_value: Set(Some(point.value)), // Identity calibration: calibrated = raw
-                sensor_id: Set(None),
-                calibration_id: Set(None),
+                sensor_id: Set(s_id),
+                calibration_id: Set(c_id),
+                deployment_id: Set(d_id),
                 logged: Set(Some(point.logged)),
             });
 
@@ -705,6 +793,7 @@ pub async fn sync_readings(
             if let Err(e) = readings::Entity::insert_many(chunk.to_vec())
                 .on_conflict(
                     sea_orm::sea_query::OnConflict::columns([
+                        readings::Column::SiteId,
                         readings::Column::ParameterId,
                         readings::Column::Time,
                     ])
@@ -728,273 +817,51 @@ pub async fn sync_readings(
         if let Some(ts) = latest_timestamp
             && let Some(latest) = chrono::DateTime::from_timestamp(ts, 0)
         {
-            update_sync_state_success(db, *parameter_id, latest).await;
+            update_sync_state_success(db, *site_parameter_id, latest).await;
         }
 
         tracing::info!(
             count = sample_count,
-            parameter_id = %parameter_id,
+            site_parameter_id = %site_parameter_id,
             location_id = attrs.id,
             "Synced readings"
         );
-    }
 
-    Ok(())
-}
-
-/// Sync device status for all active parameters.
-pub async fn sync_device_status(db: &DatabaseConnection, vaisala: &VaisalaClient) -> AppResult<()> {
-    // Load source mappings for parameter source_key → entity_id
-    let mappings: Vec<source_mappings::Model> = source_mappings::Entity::find().all(db).await?;
-    let param_map: HashMap<i32, Uuid> = mappings
-        .iter()
-        .filter(|m| m.entity_type == "parameter")
-        .map(|m| (m.source_key, m.entity_id))
-        .collect();
-
-    let active_param_ids: HashSet<Uuid> = parameters::Entity::find()
-        .filter(parameters::Column::IsActive.eq(true))
-        .all(db)
-        .await?
-        .into_iter()
-        .map(|p| p.id)
-        .collect();
-
-    // Only include active, mapped parameters
-    let location_map: HashMap<i32, Uuid> = param_map
-        .into_iter()
-        .filter(|(_, entity_id)| active_param_ids.contains(entity_id))
-        .collect();
-
-    if location_map.is_empty() {
-        tracing::debug!("No active parameters for device status sync");
-        return Ok(());
-    }
-
-    let location_ids: Vec<i32> = location_map.keys().copied().collect();
-
-    tracing::info!(parameter_count = location_ids.len(), "Syncing device status");
-
-    let data = vaisala.get_locations_data(&location_ids).await?;
-
-    let now = Utc::now();
-
-    for resource in data.data {
-        let attrs = resource.attributes;
-        let Some(parameter_id) = location_map.get(&attrs.id) else {
-            continue;
-        };
-
-        let status = device_status::ActiveModel {
-            parameter_id: Set(*parameter_id),
-            time: Set(now.into()),
-            battery_level: Set(Some(attrs.battery_level)),
-            battery_state: Set(Some(attrs.battery_state)),
-            signal_quality: Set(Some(attrs.signal_quality)),
-            device_status: Set(Some(attrs.device_status)),
-            unreachable: Set(Some(attrs.unreachable)),
-        };
-
-        if let Err(e) = status.insert(db).await {
-            tracing::warn!(
-                parameter_id = %parameter_id,
-                error = %e,
-                "Failed to insert device status"
-            );
+        // Track rounded timestamps per site for derived computation
+        let entry = site_timestamps.entry(*site_id).or_default();
+        for t in rounded_times {
+            entry.insert(t);
         }
     }
 
-    tracing::info!("Device status sync completed");
-    Ok(())
-}
-
-async fn update_sync_state_success(
-    db: &DatabaseConnection,
-    parameter_id: Uuid,
-    latest_time: chrono::DateTime<Utc>,
-) {
-    let state = sync_state::ActiveModel {
-        parameter_id: Set(parameter_id),
-        last_data_time: Set(Some(latest_time.into())),
-        last_sync_attempt: Set(Some(Utc::now().into())),
-        sync_status: Set(Some("success".to_string())),
-        error_message: Set(None),
-        retry_count: Set(Some(0)),
-        last_full_sync: sea_orm::ActiveValue::NotSet,
-    };
-
-    if let Err(e) = sync_state::Entity::insert(state)
-        .on_conflict(
-            sea_orm::sea_query::OnConflict::column(sync_state::Column::ParameterId)
-                .update_columns([
-                    sync_state::Column::LastDataTime,
-                    sync_state::Column::LastSyncAttempt,
-                    sync_state::Column::SyncStatus,
-                    sync_state::Column::ErrorMessage,
-                    sync_state::Column::RetryCount,
-                ])
-                .to_owned(),
-        )
-        .exec(db)
-        .await
-    {
-        tracing::warn!(
-            parameter_id = %parameter_id,
-            error = %e,
-            "Failed to update sync state"
-        );
-    }
-}
-
-async fn update_sync_state_error(db: &DatabaseConnection, parameter_id: Uuid, error: &str) {
-    let current = sync_state::Entity::find_by_id(parameter_id)
-        .one(db)
-        .await
-        .ok()
-        .flatten();
-
-    let retry_count = current.and_then(|s| s.retry_count).unwrap_or(0) + 1;
-
-    let state = sync_state::ActiveModel {
-        parameter_id: Set(parameter_id),
-        last_data_time: Set(None),
-        last_sync_attempt: Set(Some(Utc::now().into())),
-        sync_status: Set(Some("error".to_string())),
-        error_message: Set(Some(error.to_string())),
-        retry_count: Set(Some(retry_count)),
-        last_full_sync: sea_orm::ActiveValue::NotSet,
-    };
-
-    if let Err(e) = sync_state::Entity::insert(state)
-        .on_conflict(
-            sea_orm::sea_query::OnConflict::column(sync_state::Column::ParameterId)
-                .update_columns([
-                    sync_state::Column::LastSyncAttempt,
-                    sync_state::Column::SyncStatus,
-                    sync_state::Column::ErrorMessage,
-                    sync_state::Column::RetryCount,
-                ])
-                .to_owned(),
-        )
-        .exec(db)
-        .await
-    {
-        tracing::warn!(
-            parameter_id = %parameter_id,
-            error = %e,
-            "Failed to update sync state error"
-        );
-    }
-}
-
-/// Update `last_full_sync` timestamp for all parameters.
-pub async fn update_last_full_sync_for_all_parameters(db: &DatabaseConnection) {
-    let now = Utc::now();
-
-    let states = match sync_state::Entity::find().all(db).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to fetch sync states for full sync update");
-            return;
-        }
-    };
-
-    for state in states {
-        let mut active: sync_state::ActiveModel = state.into();
-        active.last_full_sync = Set(Some(now.into()));
-
-        if let Err(e) = active.update(db).await {
-            tracing::warn!(error = %e, "Failed to update last_full_sync");
-        }
-    }
-}
-
-/// Check if a full re-sync is needed (oldest `last_full_sync` > 24 hours ago, or never done).
-pub async fn needs_full_sync(db: &DatabaseConnection) -> bool {
-    let states = match sync_state::Entity::find().all(db).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to check full sync status, assuming needed");
-            return true;
-        }
-    };
-
-    if states.is_empty() {
-        return true;
-    }
-
-    let now = Utc::now();
-    let threshold = Duration::hours(24);
-
-    for state in states {
-        match state.last_full_sync {
-            None => return true,
-            Some(last) => {
-                let last_utc = last.with_timezone(&Utc);
-                if now - last_utc > threshold {
-                    return true;
-                }
+    // Compute derived parameter values for affected timestamps
+    let mut derived_count = 0u64;
+    let mut derived_sites = 0u64;
+    for (site_id, timestamps) in &site_timestamps {
+        derived_sites += 1;
+        for time in timestamps {
+            match recalculate_derived_at_timestamp(db, *site_id, *time).await {
+                Ok(()) => derived_count += 1,
+                Err(e) => tracing::warn!(
+                    error = %e, site_id = %site_id, time = %time,
+                    "Failed to compute derived values"
+                ),
             }
         }
     }
-
-    false
-}
-
-/// Refresh continuous aggregates after new data is synced.
-pub async fn refresh_continuous_aggregates(db: &DatabaseConnection) {
-    tracing::debug!("Refreshing continuous aggregates...");
-
-    let result = db
-        .execute(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "CALL refresh_continuous_aggregate('readings_hourly', NOW() - INTERVAL '24 hours', NOW())".to_string(),
-        ))
-        .await;
-
-    match result {
-        Ok(_) => tracing::debug!("Hourly continuous aggregate refreshed"),
-        Err(e) => tracing::warn!(error = %e, "Failed to refresh hourly aggregate"),
+    if derived_count > 0 {
+        tracing::info!(
+            derived_timestamps = derived_count,
+            sites = derived_sites,
+            "Computed derived parameter values"
+        );
     }
 
-    let result = db
-        .execute(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "CALL refresh_continuous_aggregate('readings_daily', NOW() - INTERVAL '7 days', NOW())".to_string(),
-        ))
-        .await;
-
-    match result {
-        Ok(_) => tracing::debug!("Daily continuous aggregate refreshed"),
-        Err(e) => tracing::warn!(error = %e, "Failed to refresh daily aggregate"),
-    }
-}
-
-/// Refresh all continuous aggregates for the entire data range.
-pub async fn refresh_continuous_aggregates_full(db: &DatabaseConnection) {
-    tracing::info!("Refreshing continuous aggregates for full history...");
-
-    let aggregates = ["readings_hourly", "readings_daily", "readings_weekly", "readings_monthly"];
-
-    for agg in aggregates {
-        let result = db
-            .execute(Statement::from_string(
-                sea_orm::DatabaseBackend::Postgres,
-                format!("CALL refresh_continuous_aggregate('{agg}', NULL, NULL)"),
-            ))
-            .await;
-
-        match result {
-            Ok(_) => tracing::info!(aggregate = agg, "Continuous aggregate refreshed"),
-            Err(e) => tracing::warn!(error = %e, aggregate = agg, "Failed to refresh aggregate"),
-        }
-    }
-
-    tracing::info!("Full continuous aggregate refresh completed");
+    Ok(())
 }
 
 /// Create an alarm threshold record based on sensor type.
-fn create_threshold_for_sensor_type(parameter_id: &Uuid, sensor_type: &str) -> alarm_thresholds::ActiveModel {
+fn create_threshold_for_sensor_type(parameter_id: Uuid, site_id: Uuid, sensor_type: &str) -> alarm_thresholds::ActiveModel {
     let (warning_min, warning_max, alarm_min, alarm_max) = match sensor_type {
         "Depth" => (Some(100.0), Some(1000.0), Some(0.0), Some(2000.0)),
         "CDOM" => (None, Some(100.0), Some(0.0), Some(150.0)),
@@ -1009,7 +876,8 @@ fn create_threshold_for_sensor_type(parameter_id: &Uuid, sensor_type: &str) -> a
     let now = Utc::now();
     alarm_thresholds::ActiveModel {
         id: Set(Uuid::new_v4()),
-        parameter_id: Set(*parameter_id),
+        parameter_id: Set(parameter_id),
+        site_id: Set(Some(site_id)),
         warning_min: Set(warning_min),
         warning_max: Set(warning_max),
         alarm_min: Set(alarm_min),

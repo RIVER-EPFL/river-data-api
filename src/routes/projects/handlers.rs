@@ -4,9 +4,11 @@ use axum::{
 };
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 
+
 use crate::common::AppState;
+use crate::common::middleware::ProjectScope;
 use crate::entity::{projects, sites};
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::routes::resolve_project;
 use crate::routes::sites::SiteResponse;
 
@@ -21,8 +23,15 @@ use super::types::ProjectResponse;
     ),
     tag = "projects"
 )]
-pub async fn list_projects(State(state): State<AppState>) -> AppResult<Json<Vec<ProjectResponse>>> {
-    let projects_list = projects::Entity::find()
+pub async fn list_projects(
+    State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+) -> AppResult<Json<Vec<ProjectResponse>>> {
+    let mut db_query = projects::Entity::find();
+    if let Some(scope_project) = scope {
+        db_query = db_query.filter(projects::Column::Id.eq(scope_project));
+    }
+    let projects_list = db_query
         .order_by_asc(projects::Column::Name)
         .all(&state.db)
         .await?;
@@ -55,8 +64,18 @@ pub async fn list_projects(State(state): State<AppState>) -> AppResult<Json<Vec<
 pub async fn get_project(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    ProjectScope(scope): ProjectScope,
 ) -> AppResult<Json<ProjectResponse>> {
     let project = resolve_project(&state.db, &project_id).await?;
+
+    // Enforce project scope
+    if let Some(scope_project) = scope
+        && project.id != scope_project
+    {
+        return Err(AppError::Forbidden(
+            "Token is scoped to a different project".to_string(),
+        ));
+    }
 
     Ok(Json(ProjectResponse {
         id: project.id,
@@ -81,8 +100,18 @@ pub async fn get_project(
 pub async fn list_project_sites(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    ProjectScope(scope): ProjectScope,
 ) -> AppResult<Json<Vec<SiteResponse>>> {
     let project = resolve_project(&state.db, &project_id).await?;
+
+    // Enforce project scope
+    if let Some(scope_project) = scope
+        && project.id != scope_project
+    {
+        return Err(AppError::Forbidden(
+            "Token is scoped to a different project".to_string(),
+        ));
+    }
 
     let sites_list = sites::Entity::find()
         .filter(sites::Column::ProjectId.eq(project.id))
