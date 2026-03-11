@@ -1,17 +1,17 @@
 pub mod admin;
 pub mod alarms;
 pub mod config;
-pub mod public_api;
 pub mod projects;
+pub mod public_api;
 pub mod sites;
 
 // Re-export cache from services for use in route handlers
 pub use crate::services::cache;
 
-use axum::{http::StatusCode, middleware, routing::get, Router};
+use axum::{Router, http::StatusCode, middleware, routing::get};
 use sea_orm::{Condition, DatabaseConnection, EntityTrait, QueryFilter, sea_query::Expr};
 use std::sync::Arc;
-use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 use uuid::Uuid;
 
 use crate::services::FallbackIpKeyExtractor;
@@ -68,11 +68,10 @@ pub async fn resolve_project(
 
     // Fall back to case-insensitive name lookup using LOWER()
     projects_entity::Entity::find()
-        .filter(
-            Condition::all().add(
-                Expr::cust_with_values("LOWER(name) = LOWER($1)", [id_or_name])
-            )
-        )
+        .filter(Condition::all().add(Expr::cust_with_values(
+            "LOWER(name) = LOWER($1)",
+            [id_or_name],
+        )))
         .one(db)
         .await?
         .ok_or_else(|| AppError::NotFound("Project not found".to_string()))
@@ -93,11 +92,10 @@ pub async fn resolve_site(
 
     // Fall back to case-insensitive name lookup using LOWER()
     sites_entity::Entity::find()
-        .filter(
-            Condition::all().add(
-                Expr::cust_with_values("LOWER(name) = LOWER($1)", [id_or_name])
-            )
-        )
+        .filter(Condition::all().add(Expr::cust_with_values(
+            "LOWER(name) = LOWER($1)",
+            [id_or_name],
+        )))
         .one(db)
         .await?
         .ok_or_else(|| AppError::NotFound("Site not found".to_string()))
@@ -203,27 +201,31 @@ pub fn build_router(state: AppState) -> Router {
     let metadata_routes_base = Router::new()
         .route("/projects", get(projects::list_projects))
         .route("/projects/{project_id}", get(projects::get_project))
-        .route("/projects/{project_id}/sites", get(projects::list_project_sites))
+        .route(
+            "/projects/{project_id}/sites",
+            get(projects::list_project_sites),
+        )
         .route("/sites", get(sites::list_sites))
         .route("/sites/{site_id}", get(sites::get_site))
-        .route("/sites/{site_id}/parameters", get(sites::list_site_parameters))
-        .layer(middleware::from_fn(crate::common::middleware::require_read_metadata));
+        .route(
+            "/sites/{site_id}/parameters",
+            get(sites::list_site_parameters),
+        )
+        .layer(middleware::from_fn(
+            crate::common::middleware::require_read_metadata,
+        ));
 
     // Data routes (readings, aggregates, alarms) — require read_data permission
     let data_routes_base = Router::new()
-        .route(
-            "/sites/{site_id}/readings",
-            get(sites::get_site_readings),
-        )
+        .route("/sites/{site_id}/readings", get(sites::get_site_readings))
         .route(
             "/sites/{site_id}/aggregates/{resolution}",
             get(sites::get_site_aggregates),
         )
-        .route(
-            "/sites/{site_id}/alarms",
-            get(alarms::get_site_alarms),
-        )
-        .layer(middleware::from_fn(crate::common::middleware::require_read_data));
+        .route("/sites/{site_id}/alarms", get(alarms::get_site_alarms))
+        .layer(middleware::from_fn(
+            crate::common::middleware::require_read_data,
+        ));
 
     // Public API routes
     let public_routes = public_api::public_router();
@@ -265,11 +267,10 @@ pub fn build_router(state: AppState) -> Router {
         // Dual auth middleware runs after Keycloak and checks:
         // KeycloakAuthStatus::Success → authenticated via JWT
         // Otherwise → try validate_bearer_token() for API token auth
-        let mut r = private_routes_inner
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                crate::common::middleware::private_auth_middleware,
-            ));
+        let mut r = private_routes_inner.layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::common::middleware::private_auth_middleware,
+        ));
         if let Some(instance) = state.keycloak_auth_instance.clone() {
             use axum_keycloak_auth::{PassthroughMode, layer::KeycloakAuthLayer};
             r = r.layer(
@@ -308,7 +309,10 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/private", private_routes)
         .nest("/public", public_routes_final)
         .nest("/admin", admin_routes)
-        .nest("/config", Router::new().route("/keycloak", get(config::get_keycloak_config)))
+        .nest(
+            "/config",
+            Router::new().route("/keycloak", get(config::get_keycloak_config)),
+        )
         .layer(RequestBodyLimitLayer::new(1024 * 1024)); // 1MB body limit
 
     // Health check routes (NO rate limiting)

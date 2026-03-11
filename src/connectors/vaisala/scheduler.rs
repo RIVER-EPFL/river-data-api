@@ -1,9 +1,9 @@
 use std::time::Duration;
 use tokio::time::interval;
 
-use crate::common::AppState;
-use super::sync as vaisala_sync;
 use super::state;
+use super::sync as vaisala_sync;
+use crate::common::AppState;
 
 /// Run the readings sync task on a schedule.
 ///
@@ -16,7 +16,12 @@ pub async fn run_readings_sync(state: AppState) {
     };
 
     let interval_secs = state.config.sync_readings_interval_seconds;
-    let max_history_days = state.config.vaisala.as_ref().map(|v| v.max_history_days).unwrap_or(90);
+    let max_history_days = state
+        .config
+        .vaisala
+        .as_ref()
+        .map(|v| v.max_history_days)
+        .unwrap_or(90);
     let retry_delay_secs = state.config.sync_retry_delay_seconds;
     let max_retries = state.config.sync_retry_max;
 
@@ -106,4 +111,3 @@ pub async fn run_readings_sync(state: AppState) {
         ticker.tick().await;
     }
 }
-

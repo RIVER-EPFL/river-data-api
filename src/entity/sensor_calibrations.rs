@@ -3,7 +3,9 @@ use sea_orm::entity::prelude::*;
 
 use crate::services::operations::SensorCalibrationOperations;
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels)]
+#[derive(
+    Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
+)]
 #[sea_orm(table_name = "sensor_calibrations")]
 #[crudcrate(
     api_struct = "SensorCalibration",

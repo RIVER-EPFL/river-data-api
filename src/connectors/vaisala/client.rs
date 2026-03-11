@@ -3,8 +3,8 @@ use reqwest::Client;
 use std::time::Duration;
 
 use super::config::VaisalaConfig;
-use crate::error::{AppError, AppResult};
 use super::models::{LocationsDataResponse, LocationsHistoryResponse, LocationsResponse};
+use crate::error::{AppError, AppResult};
 
 pub struct VaisalaClient {
     http_client: Client,
@@ -90,7 +90,10 @@ impl VaisalaClient {
         let url = match date_to {
             Some(to) => format!(
                 "{}/locations_history?location_ids={}&date_from={}&date_to={}",
-                self.base_url, ids_str, date_from_epoch, to.timestamp()
+                self.base_url,
+                ids_str,
+                date_from_epoch,
+                to.timestamp()
             ),
             None => format!(
                 "{}/locations_history?location_ids={}&date_from={}",
@@ -153,10 +156,7 @@ impl VaisalaClient {
                 .join(",")
         );
 
-        let url = format!(
-            "{}/locations_data?location_ids={}",
-            self.base_url, ids_str
-        );
+        let url = format!("{}/locations_data?location_ids={}", self.base_url, ids_str);
 
         let response = self
             .http_client

@@ -1,4 +1,7 @@
-use axum::{extract::{Path, State}, Json};
+use axum::{
+    Json,
+    extract::{Path, State},
+};
 
 use crate::common::AppState;
 use crate::error::AppResult;
@@ -9,5 +12,7 @@ pub async fn invalidate_public_config(
     Path(slug): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
     invalidate_config(&state.public_config_cache, &slug).await;
-    Ok(Json(serde_json::json!({ "status": "invalidated", "slug": slug })))
+    Ok(Json(
+        serde_json::json!({ "status": "invalidated", "slug": slug }),
+    ))
 }

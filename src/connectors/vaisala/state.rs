@@ -42,7 +42,11 @@ pub async fn update_sync_state_success(
     }
 }
 
-pub async fn update_sync_state_error(db: &DatabaseConnection, site_parameter_id: Uuid, error: &str) {
+pub async fn update_sync_state_error(
+    db: &DatabaseConnection,
+    site_parameter_id: Uuid,
+    error: &str,
+) {
     let current = sync_state::Entity::find_by_id(site_parameter_id)
         .one(db)
         .await
@@ -156,7 +160,8 @@ pub async fn refresh_continuous_aggregates(db: &DatabaseConnection) {
     let result = db
         .execute(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "CALL refresh_continuous_aggregate('readings_daily', NOW() - INTERVAL '7 days', NOW())".to_string(),
+            "CALL refresh_continuous_aggregate('readings_daily', NOW() - INTERVAL '7 days', NOW())"
+                .to_string(),
         ))
         .await;
 
@@ -170,7 +175,12 @@ pub async fn refresh_continuous_aggregates(db: &DatabaseConnection) {
 pub async fn refresh_continuous_aggregates_full(db: &DatabaseConnection) {
     tracing::info!("Refreshing continuous aggregates for full history...");
 
-    let aggregates = ["readings_hourly", "readings_daily", "readings_weekly", "readings_monthly"];
+    let aggregates = [
+        "readings_hourly",
+        "readings_daily",
+        "readings_weekly",
+        "readings_monthly",
+    ];
 
     for agg in aggregates {
         let result = db

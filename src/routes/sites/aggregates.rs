@@ -1,8 +1,8 @@
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::header::HeaderMap,
     response::{IntoResponse, Response},
-    Json,
 };
 use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, Statement};
@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
-use crate::entity::{alarm_thresholds, site_parameters, projects};
+use crate::entity::{alarm_thresholds, projects, site_parameters};
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, resolve_site};
 use crate::services::bulk::{self, StreamableAggregateParam};
@@ -228,9 +228,11 @@ pub async fn get_site_aggregates(
     );
 
     if format == "json"
-        && let Some(cached) = cache::get_cached(&state, &cache_key, &param_ids, Some(query.end)).await {
-            return cache::json_response((*cached).clone(), true);
-        }
+        && let Some(cached) =
+            cache::get_cached(&state, &cache_key, &param_ids, Some(query.end)).await
+    {
+        return cache::json_response((*cached).clone(), true);
+    }
 
     let _permit = bulk::acquire_bulk_permit(&format)?;
 
@@ -321,16 +323,18 @@ pub async fn get_site_aggregates(
         .collect();
 
     let mut time_set: BTreeMap<DateTime<Utc>, usize> = BTreeMap::new();
-    let mut param_aggs: HashMap<Uuid, HashMap<DateTime<Utc>, (Option<f64>, Option<f64>, Option<f64>, i64)>> =
-        HashMap::new();
+    let mut param_aggs: HashMap<
+        Uuid,
+        HashMap<DateTime<Utc>, (Option<f64>, Option<f64>, Option<f64>, i64)>,
+    > = HashMap::new();
 
     for row in results {
         let time = row.bucket;
         time_set.entry(time).or_insert(0);
-        param_aggs
-            .entry(row.parameter_id)
-            .or_default()
-            .insert(time, (row.avg_value, row.min_value, row.max_value, row.count));
+        param_aggs.entry(row.parameter_id).or_default().insert(
+            time,
+            (row.avg_value, row.min_value, row.max_value, row.count),
+        );
     }
 
     let times: Vec<DateTime<Utc>> = time_set.keys().copied().collect();

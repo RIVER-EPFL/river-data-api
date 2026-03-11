@@ -45,14 +45,21 @@ async fn test_readings_basic_time_range() {
     assert!(body["start"].is_string(), "should have start timestamp");
     assert!(body["end"].is_string(), "should have end timestamp");
     assert!(body["times"].is_array(), "should have times array");
-    assert!(body["parameters"].is_array(), "should have parameters array");
+    assert!(
+        body["parameters"].is_array(),
+        "should have parameters array"
+    );
 
     // Site reference
     assert_eq!(body["site"]["id"].as_str().unwrap(), site_id);
 
     // 12 hours at 10-min intervals = 73 readings (inclusive boundaries: 00:00..=12:00)
     let times = body["times"].as_array().unwrap();
-    assert_eq!(times.len(), 73, "12h at 10-min intervals (inclusive) = 73 readings");
+    assert_eq!(
+        times.len(),
+        73,
+        "12h at 10-min intervals (inclusive) = 73 readings"
+    );
 
     // Site 1 has 5 parameters
     let params = body["parameters"].as_array().unwrap();
@@ -97,10 +104,7 @@ async fn test_readings_sensor_types_filter() {
     let params = body["parameters"].as_array().unwrap();
     assert_eq!(params.len(), 2, "should return only 2 filtered parameters");
 
-    let types: Vec<&str> = params
-        .iter()
-        .map(|p| p["type"].as_str().unwrap())
-        .collect();
+    let types: Vec<&str> = params.iter().map(|p| p["type"].as_str().unwrap()).collect();
     assert!(types.contains(&"DO_Temperature"));
     assert!(types.contains(&"Turbidity"));
 }
@@ -168,11 +172,8 @@ async fn test_readings_no_time_range() {
     let site_id = common::SITE1_ID;
 
     // No start/end → defaults to full data range
-    let (status, body) = common::get_json(
-        &app,
-        &format!("/api/private/sites/{site_id}/readings"),
-    )
-    .await;
+    let (status, body) =
+        common::get_json(&app, &format!("/api/private/sites/{site_id}/readings")).await;
 
     assert_eq!(status, 200);
 
@@ -322,7 +323,11 @@ async fn test_aggregates_daily() {
     assert_eq!(status, 200);
 
     let times = body["times"].as_array().unwrap();
-    assert_eq!(times.len(), 2, "should have 2 daily buckets for 2-day range");
+    assert_eq!(
+        times.len(),
+        2,
+        "should have 2 daily buckets for 2-day range"
+    );
 
     let params = body["parameters"].as_array().unwrap();
     for param in params {
@@ -476,7 +481,10 @@ async fn test_alarms_basic() {
     assert!(body["project"].is_object(), "should have project object");
     assert!(body["site"].is_object(), "should have site object");
     assert!(body["times"].is_array(), "should have times array");
-    assert!(body["parameters"].is_array(), "should have parameters array");
+    assert!(
+        body["parameters"].is_array(),
+        "should have parameters array"
+    );
 
     let times = body["times"].as_array().unwrap();
     assert!(
@@ -485,10 +493,7 @@ async fn test_alarms_basic() {
     );
 
     let params = body["parameters"].as_array().unwrap();
-    assert!(
-        !params.is_empty(),
-        "should have parameters with violations"
-    );
+    assert!(!params.is_empty(), "should have parameters with violations");
 
     for param in params {
         assert!(param["id"].is_string());
@@ -498,11 +503,7 @@ async fn test_alarms_basic() {
         let values = param["values"].as_array().unwrap();
         let severities = param["severities"].as_array().unwrap();
 
-        assert_eq!(
-            values.len(),
-            times.len(),
-            "values should align with times"
-        );
+        assert_eq!(values.len(), times.len(), "values should align with times");
         assert_eq!(
             severities.len(),
             times.len(),
@@ -554,7 +555,10 @@ async fn test_alarms_severity_filter() {
         for sev in severities {
             if !sev.is_null() {
                 let s = sev.as_i64().unwrap();
-                assert_eq!(s, 2, "with severity=2 filter, all severities should be 2, got: {s}");
+                assert_eq!(
+                    s, 2,
+                    "with severity=2 filter, all severities should be 2, got: {s}"
+                );
             }
         }
     }
@@ -593,14 +597,7 @@ async fn test_alarms_missing_params_returns_400() {
     let site_id = common::SITE1_ID;
 
     // No start or end
-    let (status, _body) = common::get(
-        &app,
-        &format!("/api/private/sites/{site_id}/alarms"),
-    )
-    .await;
+    let (status, _body) = common::get(&app, &format!("/api/private/sites/{site_id}/alarms")).await;
 
-    assert_eq!(
-        status, 400,
-        "alarms without start/end should return 400"
-    );
+    assert_eq!(status, 400, "alarms without start/end should return 400");
 }

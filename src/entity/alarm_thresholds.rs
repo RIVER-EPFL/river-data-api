@@ -1,7 +1,9 @@
 use crudcrate::{CRUDResource, EntityToModels};
 use sea_orm::entity::prelude::*;
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels)]
+#[derive(
+    Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
+)]
 #[sea_orm(table_name = "alarm_thresholds")]
 #[crudcrate(
     api_struct = "AlarmThreshold",

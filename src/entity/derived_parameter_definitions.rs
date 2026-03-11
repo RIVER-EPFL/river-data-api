@@ -3,7 +3,9 @@ use sea_orm::entity::prelude::*;
 
 use crate::services::operations::DerivedParameterDefinitionOperations;
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels)]
+#[derive(
+    Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
+)]
 #[sea_orm(table_name = "derived_parameter_definitions")]
 #[crudcrate(
     api_struct = "DerivedParameterDefinition",

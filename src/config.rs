@@ -58,7 +58,6 @@ pub struct Config {
     pub keycloak_url: Option<String>,
     pub keycloak_realm: Option<String>,
     pub keycloak_client_id: Option<String>,
-
 }
 
 impl Config {
@@ -72,34 +71,40 @@ impl Config {
 
         Ok(Self {
             // Database: prefer DATABASE_URL, fall back to individual DB_* vars
-            database_url: env::var("DATABASE_URL").or_else(|_| {
-                let user = env::var("DB_USER")?;
-                let password = env::var("DB_PASSWORD")?;
-                let host = env::var("DB_HOST")?;
-                let port = env::var("DB_PORT").unwrap_or_else(|_| "5432".to_string());
-                let name = env::var("DB_NAME")?;
-                Ok::<String, env::VarError>(format!(
-                    "postgresql://{user}:{password}@{host}:{port}/{name}"
-                ))
-            }).map_err(|_| ConfigError::Missing("DATABASE_URL or DB_USER/DB_PASSWORD/DB_HOST/DB_NAME"))?,
+            database_url: env::var("DATABASE_URL")
+                .or_else(|_| {
+                    let user = env::var("DB_USER")?;
+                    let password = env::var("DB_PASSWORD")?;
+                    let host = env::var("DB_HOST")?;
+                    let port = env::var("DB_PORT").unwrap_or_else(|_| "5432".to_string());
+                    let name = env::var("DB_NAME")?;
+                    Ok::<String, env::VarError>(format!(
+                        "postgresql://{user}:{password}@{host}:{port}/{name}"
+                    ))
+                })
+                .map_err(|_| {
+                    ConfigError::Missing("DATABASE_URL or DB_USER/DB_PASSWORD/DB_HOST/DB_NAME")
+                })?,
 
             // Vaisala API (optional - sync disabled if not configured)
             vaisala: {
                 let base_url = env::var("VAISALA_BASE_URL").ok();
                 let bearer_token = env::var("VAISALA_BEARER_TOKEN").ok();
                 match (base_url, bearer_token) {
-                    (Some(base_url), Some(bearer_token)) => Some(crate::connectors::vaisala::config::VaisalaConfig {
-                        base_url,
-                        bearer_token,
-                        skip_tls_verify: env::var("VAISALA_SKIP_TLS_VERIFY")
-                            .unwrap_or_else(|_| "true".to_string())
-                            .parse()
-                            .unwrap_or(true),
-                        max_history_days: env::var("VAISALA_MAX_HISTORY_DAYS")
-                            .unwrap_or_else(|_| "90".to_string())
-                            .parse()
-                            .unwrap_or(90),
-                    }),
+                    (Some(base_url), Some(bearer_token)) => {
+                        Some(crate::connectors::vaisala::config::VaisalaConfig {
+                            base_url,
+                            bearer_token,
+                            skip_tls_verify: env::var("VAISALA_SKIP_TLS_VERIFY")
+                                .unwrap_or_else(|_| "true".to_string())
+                                .parse()
+                                .unwrap_or(true),
+                            max_history_days: env::var("VAISALA_MAX_HISTORY_DAYS")
+                                .unwrap_or_else(|_| "90".to_string())
+                                .parse()
+                                .unwrap_or(90),
+                        })
+                    }
                     _ => None,
                 }
             },
@@ -172,8 +177,9 @@ impl Config {
             // Keycloak authentication (optional)
             keycloak_url: env::var("KEYCLOAK_URL").ok().filter(|s| !s.is_empty()),
             keycloak_realm: env::var("KEYCLOAK_REALM").ok().filter(|s| !s.is_empty()),
-            keycloak_client_id: env::var("KEYCLOAK_CLIENT_ID").ok().filter(|s| !s.is_empty()),
-
+            keycloak_client_id: env::var("KEYCLOAK_CLIENT_ID")
+                .ok()
+                .filter(|s| !s.is_empty()),
         })
     }
 

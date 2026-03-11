@@ -1,4 +1,4 @@
-use axum::{extract::State, routing::get, routing::post, Json, Router};
+use axum::{Json, Router, extract::State, routing::get, routing::post};
 use sea_orm::{EntityTrait, QueryOrder};
 use serde::Serialize;
 
@@ -47,9 +47,7 @@ async fn list_sync_states(
     Ok(Json(response))
 }
 
-async fn trigger_sync(
-    State(state): State<AppState>,
-) -> AppResult<Json<serde_json::Value>> {
+async fn trigger_sync(State(state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
     let Some(ref vaisala_client) = state.vaisala_client else {
         return Err(crate::error::AppError::ServiceUnavailable(
             "Vaisala sync not configured".to_string(),
@@ -57,10 +55,16 @@ async fn trigger_sync(
     };
     let vaisala_client = vaisala_client.clone();
     let db = state.db.clone();
-    let max_history_days = state.config.vaisala.as_ref().map(|v| v.max_history_days).unwrap_or(90);
+    let max_history_days = state
+        .config
+        .vaisala
+        .as_ref()
+        .map(|v| v.max_history_days)
+        .unwrap_or(90);
     tokio::spawn(async move {
         tracing::info!("Manual sync triggered via admin API");
-        if let Err(e) = crate::connectors::vaisala::sync::sync_locations(&db, &vaisala_client).await {
+        if let Err(e) = crate::connectors::vaisala::sync::sync_locations(&db, &vaisala_client).await
+        {
             tracing::error!(error = %e, "Manual location sync failed");
         }
         if let Err(e) = crate::connectors::vaisala::sync::sync_readings(
@@ -68,7 +72,9 @@ async fn trigger_sync(
             &vaisala_client,
             max_history_days,
             true,
-        ).await {
+        )
+        .await
+        {
             tracing::error!(error = %e, "Manual readings sync failed");
         }
     });

@@ -525,7 +525,8 @@ fn generate_value(cfg: &ParamConfig, step: usize) -> f64 {
     let base = cfg.value_mean + cfg.value_amplitude * phase.sin();
 
     // Deterministic pseudo-noise: small variation from step index
-    let noise = ((t * 7.3 + 11.0).sin() * 3.7 + (t * 13.1).cos() * 2.1) * 0.02 * cfg.value_amplitude;
+    let noise =
+        ((t * 7.3 + 11.0).sin() * 3.7 + (t * 13.1).cos() * 2.1) * 0.02 * cfg.value_amplitude;
 
     let mut value = base + noise;
 

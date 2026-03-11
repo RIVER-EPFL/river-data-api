@@ -5,8 +5,8 @@ use tokio::net::TcpListener;
 use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use axum_keycloak_auth::instance::{KeycloakAuthInstance, KeycloakConfig};
 use axum_keycloak_auth::Url;
+use axum_keycloak_auth::instance::{KeycloakAuthInstance, KeycloakConfig};
 
 use river_db::common::AppState;
 use river_db::config::{Config, Deployment};

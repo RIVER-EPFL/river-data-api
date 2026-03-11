@@ -1,13 +1,15 @@
 use axum::{
-    extract::{Path, Query, State},
     Json,
+    extract::{Path, Query, State},
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement,
+};
 
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
-use crate::entity::{site_parameters, projects, sites};
+use crate::entity::{projects, site_parameters, sites};
 use crate::error::{AppError, AppResult};
 use crate::routes::resolve_site;
 
@@ -148,8 +150,8 @@ pub async fn get_site(
         .await?
         .and_then(|row| DataRangeRow::from_query_result(&row, "").ok());
 
-    let (data_start, data_end, reading_count) = data_range
-        .map_or((None, None, 0), |r| (r.min_time, r.max_time, r.count));
+    let (data_start, data_end, reading_count) =
+        data_range.map_or((None, None, 0), |r| (r.min_time, r.max_time, r.count));
 
     Ok(Json(SiteDetailResponse {
         id: site.id,

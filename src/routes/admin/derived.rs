@@ -1,4 +1,7 @@
-use axum::{extract::{Path, State}, Json};
+use axum::{
+    Json,
+    extract::{Path, State},
+};
 use uuid::Uuid;
 
 use crate::common::AppState;
@@ -47,12 +50,18 @@ pub async fn recompute_derived(
 
                     let total = rows.len();
                     for (i, row) in rows.iter().enumerate() {
-                        let time: chrono::DateTime<chrono::FixedOffset> = match row.try_get("", "time") {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
+                        let time: chrono::DateTime<chrono::FixedOffset> =
+                            match row.try_get("", "time") {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
                         let utc_time = time.with_timezone(&chrono::Utc);
-                        if let Err(e) = crate::services::calibration::recalculate_derived_at_timestamp(&db, site_id, utc_time).await {
+                        if let Err(e) =
+                            crate::services::calibration::recalculate_derived_at_timestamp(
+                                &db, site_id, utc_time,
+                            )
+                            .await
+                        {
                             tracing::error!(error = %e, time = %time, "Failed to recompute derived value");
                         }
                         if (i + 1) % 1000 == 0 {

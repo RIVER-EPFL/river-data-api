@@ -39,7 +39,11 @@ impl MigrationTrait for Migration {
                             .not_null()
                             .default(false),
                     )
-                    .col(ColumnDef::new(Projects::PublicSlug).string_len(64).unique_key())
+                    .col(
+                        ColumnDef::new(Projects::PublicSlug)
+                            .string_len(64)
+                            .unique_key(),
+                    )
                     .col(ColumnDef::new(Projects::PublicApiTitle).string_len(128))
                     .col(ColumnDef::new(Projects::PublicApiDescription).text())
                     .col(
@@ -159,16 +163,9 @@ impl MigrationTrait for Migration {
                             .primary_key()
                             .extra("DEFAULT gen_random_uuid()"),
                     )
-                    .col(
-                        ColumnDef::new(Sensors::SerialNumber)
-                            .string_len(64),
-                    )
+                    .col(ColumnDef::new(Sensors::SerialNumber).string_len(64))
                     .col(ColumnDef::new(Sensors::Name).string_len(128))
-                    .col(
-                        ColumnDef::new(Sensors::ParameterId)
-                            .uuid()
-                            .not_null(),
-                    )
+                    .col(ColumnDef::new(Sensors::ParameterId).uuid().not_null())
                     .col(ColumnDef::new(Sensors::Manufacturer).string_len(128))
                     .col(ColumnDef::new(Sensors::Model).string_len(128))
                     .col(ColumnDef::new(Sensors::IsActive).boolean().default(true))
@@ -323,9 +320,21 @@ impl MigrationTrait for Migration {
                             .extra("DEFAULT gen_random_uuid()"),
                     )
                     .col(ColumnDef::new(SiteParameters::SiteId).uuid().not_null())
-                    .col(ColumnDef::new(SiteParameters::ParameterId).uuid().not_null())
-                    .col(ColumnDef::new(SiteParameters::Name).string_len(64).not_null())
-                    .col(ColumnDef::new(SiteParameters::SensorType).string_len(64).not_null())
+                    .col(
+                        ColumnDef::new(SiteParameters::ParameterId)
+                            .uuid()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(SiteParameters::Name)
+                            .string_len(64)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(SiteParameters::SensorType)
+                            .string_len(64)
+                            .not_null(),
+                    )
                     .col(ColumnDef::new(SiteParameters::DisplayUnits).string_len(32))
                     .col(ColumnDef::new(SiteParameters::UnitsName).string_len(64))
                     .col(ColumnDef::new(SiteParameters::UnitsMin).double())
@@ -337,7 +346,11 @@ impl MigrationTrait for Migration {
                             .integer()
                             .default(600),
                     )
-                    .col(ColumnDef::new(SiteParameters::IsActive).boolean().default(true))
+                    .col(
+                        ColumnDef::new(SiteParameters::IsActive)
+                            .boolean()
+                            .default(true),
+                    )
                     .col(
                         ColumnDef::new(SiteParameters::IsDerived)
                             .boolean()
@@ -424,19 +437,14 @@ impl MigrationTrait for Migration {
                             .uuid()
                             .not_null(),
                     )
-                    .col(
-                        ColumnDef::new(SensorDeployments::SiteId)
-                            .uuid()
-                            .not_null(),
-                    )
+                    .col(ColumnDef::new(SensorDeployments::SiteId).uuid().not_null())
                     .col(
                         ColumnDef::new(SensorDeployments::DeployedFrom)
                             .timestamp_with_time_zone()
                             .not_null(),
                     )
                     .col(
-                        ColumnDef::new(SensorDeployments::DeployedUntil)
-                            .timestamp_with_time_zone(),
+                        ColumnDef::new(SensorDeployments::DeployedUntil).timestamp_with_time_zone(),
                     )
                     .col(
                         ColumnDef::new(SensorDeployments::DeploymentType)
@@ -489,11 +497,7 @@ impl MigrationTrait for Migration {
                             .integer()
                             .not_null(),
                     )
-                    .col(
-                        ColumnDef::new(SourceMappings::EntityId)
-                            .uuid()
-                            .not_null(),
-                    )
+                    .col(ColumnDef::new(SourceMappings::EntityId).uuid().not_null())
                     .col(ColumnDef::new(SourceMappings::SourceName).string_len(256))
                     .col(
                         ColumnDef::new(SourceMappings::SourceSystem)
@@ -699,11 +703,7 @@ impl MigrationTrait for Migration {
                             .primary_key()
                             .extra("DEFAULT gen_random_uuid()"),
                     )
-                    .col(
-                        ColumnDef::new(ApiTokens::Name)
-                            .string_len(128)
-                            .not_null(),
-                    )
+                    .col(ColumnDef::new(ApiTokens::Name).string_len(128).not_null())
                     .col(
                         ColumnDef::new(ApiTokens::TokenHash)
                             .string_len(64)
@@ -807,14 +807,20 @@ impl MigrationTrait for Migration {
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_public_exposed_params_project")
-                            .from(PublicExposedParameters::Table, PublicExposedParameters::ProjectId)
+                            .from(
+                                PublicExposedParameters::Table,
+                                PublicExposedParameters::ProjectId,
+                            )
                             .to(Projects::Table, Projects::Id)
                             .on_delete(ForeignKeyAction::Cascade),
                     )
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_public_exposed_params_parameter")
-                            .from(PublicExposedParameters::Table, PublicExposedParameters::ParameterId)
+                            .from(
+                                PublicExposedParameters::Table,
+                                PublicExposedParameters::ParameterId,
+                            )
                             .to(Parameters::Table, Parameters::Id),
                     )
                     .to_owned(),
@@ -1013,12 +1019,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
         manager
-            .drop_table(
-                Table::drop()
-                    .table(ApiTokens::Table)
-                    .if_exists()
-                    .to_owned(),
-            )
+            .drop_table(Table::drop().table(ApiTokens::Table).if_exists().to_owned())
             .await?;
         manager
             .drop_table(
@@ -1078,7 +1079,12 @@ impl MigrationTrait for Migration {
             .drop_table(Table::drop().table(Sensors::Table).if_exists().to_owned())
             .await?;
         manager
-            .drop_table(Table::drop().table(Parameters::Table).if_exists().to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Parameters::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
             .await?;
         manager
             .drop_table(Table::drop().table(Sites::Table).if_exists().to_owned())

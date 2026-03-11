@@ -119,9 +119,7 @@ pub async fn require_read_metadata(request: Request, next: Next) -> Response {
                     .into_response()
             }
         }
-        None => {
-            AppError::Unauthorized("Authentication required".to_string()).into_response()
-        }
+        None => AppError::Unauthorized("Authentication required".to_string()).into_response(),
     }
 }
 
@@ -137,9 +135,7 @@ pub async fn require_read_data(request: Request, next: Next) -> Response {
                 AppError::Forbidden("Token lacks read_data permission".to_string()).into_response()
             }
         }
-        None => {
-            AppError::Unauthorized("Authentication required".to_string()).into_response()
-        }
+        None => AppError::Unauthorized("Authentication required".to_string()).into_response(),
     }
 }
 

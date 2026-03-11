@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     extract::{Path, Query, State},
     response::{IntoResponse, Response},
-    Json,
 };
 use chrono::{DateTime, NaiveDateTime, Utc};
 use sea_orm::sea_query::{Alias, Expr, Order, PostgresQueryBuilder, Query as SeaQuery};
@@ -16,7 +16,7 @@ use crate::entity::site_parameters as site_parameters_entity;
 use crate::error::{AppError, AppResult};
 use crate::services::bulk::{self, StreamableAggregateParam, StreamableParam};
 use crate::services::public_api_config::{
-    get_public_config, ExposedParamConfig, PublicProjectConfig, PublicSiteConfig,
+    ExposedParamConfig, PublicProjectConfig, PublicSiteConfig, get_public_config,
 };
 
 // ============================================================================
@@ -95,9 +95,7 @@ fn all_public_param_names(config: &PublicProjectConfig) -> Vec<String> {
 }
 
 /// Build parameter_id -> ExposedParamConfig lookup from the project config.
-fn build_param_to_config_map(
-    config: &PublicProjectConfig,
-) -> HashMap<Uuid, &ExposedParamConfig> {
+fn build_param_to_config_map(config: &PublicProjectConfig) -> HashMap<Uuid, &ExposedParamConfig> {
     config
         .exposed_params
         .iter()
@@ -307,11 +305,7 @@ pub async fn get_site(
             values.push((*id).into());
         }
 
-        let stmt = Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &sql,
-            values,
-        );
+        let stmt = Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, &sql, values);
 
         let range = state
             .db
@@ -492,8 +486,7 @@ pub async fn get_readings(
         .filter(|rp| requested_names.contains(&rp.public_name))
         .collect();
 
-    let (times_formatted, output_params) =
-        fetch_readings(&state, &resolved, start, end).await?;
+    let (times_formatted, output_params) = fetch_readings(&state, &resolved, start, end).await?;
 
     let actual_start = times_formatted.first().cloned();
     let actual_end = times_formatted.last().cloned();
@@ -752,22 +745,17 @@ pub async fn get_aggregates(
         let public_name = lookup
             .map(|(name, _, _, _)| name.to_string())
             .unwrap_or_else(|| row.param_id.clone());
-        let (factor, offset) = lookup
-            .map(|(_, _, f, o)| (*f, *o))
-            .unwrap_or((1.0, 0.0));
+        let (factor, offset) = lookup.map(|(_, _, f, o)| (*f, *o)).unwrap_or((1.0, 0.0));
 
-        param_aggs
-            .entry(public_name)
-            .or_default()
-            .push((
-                row.bucket,
-                AggValues {
-                    avg: row.avg_value.map(|v| v * factor + offset),
-                    min: row.min_value.map(|v| v * factor + offset),
-                    max: row.max_value.map(|v| v * factor + offset),
-                    count: row.count,
-                },
-            ));
+        param_aggs.entry(public_name).or_default().push((
+            row.bucket,
+            AggValues {
+                avg: row.avg_value.map(|v| v * factor + offset),
+                min: row.min_value.map(|v| v * factor + offset),
+                max: row.max_value.map(|v| v * factor + offset),
+                count: row.count,
+            },
+        ));
     }
 
     times_ordered.sort_unstable();
@@ -938,9 +926,7 @@ async fn fetch_readings(
         let public_name = lookup
             .map(|(name, _, _, _)| name.to_string())
             .unwrap_or_else(|| row.param_id.clone());
-        let (factor, offset) = lookup
-            .map(|(_, _, f, o)| (*f, *o))
-            .unwrap_or((1.0, 0.0));
+        let (factor, offset) = lookup.map(|(_, _, f, o)| (*f, *o)).unwrap_or((1.0, 0.0));
         let converted_value = row.value * factor + offset;
 
         param_values

@@ -225,14 +225,12 @@ async fn test_get_site_by_name() {
     let (_db, app) = setup().await;
 
     // Exact case
-    let (status, body) =
-        common::get_json(&app, "/api/private/sites/Upstream%20Station").await;
+    let (status, body) = common::get_json(&app, "/api/private/sites/Upstream%20Station").await;
     assert_eq!(status, 200);
     assert_eq!(body["id"], common::SITE1_ID);
 
     // Different case
-    let (status, body) =
-        common::get_json(&app, "/api/private/sites/downstream%20station").await;
+    let (status, body) = common::get_json(&app, "/api/private/sites/downstream%20station").await;
     assert_eq!(status, 200);
     assert_eq!(body["id"], common::SITE2_ID);
 }

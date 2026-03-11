@@ -76,10 +76,7 @@ pub async fn list_public_slugs(
         .await
         .map_err(crate::error::AppError::Database)?;
 
-    Ok(projects
-        .into_iter()
-        .filter_map(|p| p.public_slug)
-        .collect())
+    Ok(projects.into_iter().filter_map(|p| p.public_slug).collect())
 }
 
 /// Invalidate a cached config by slug.

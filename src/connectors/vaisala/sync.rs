@@ -1,13 +1,18 @@
 use chrono::{Duration, Utc};
-use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
+};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-use crate::entity::{alarm_thresholds, parameters, projects, readings, sensor_calibrations, sensor_deployments, sensors, site_parameters, sites, source_mappings, sync_state};
+use super::VaisalaClient;
+use super::state::{update_sync_state_error, update_sync_state_success};
+use crate::entity::{
+    alarm_thresholds, parameters, projects, readings, sensor_calibrations, sensor_deployments,
+    sensors, site_parameters, sites, source_mappings, sync_state,
+};
 use crate::error::AppResult;
 use crate::services::calibration::recalculate_derived_at_timestamp;
-use super::state::{update_sync_state_success, update_sync_state_error};
-use super::VaisalaClient;
 
 /// Batch size for bulk inserts
 const BATCH_SIZE: usize = 1000;
@@ -238,7 +243,10 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
 
     // Fetch detailed info for new parameters and create them
     if !new_param_location_ids.is_empty() {
-        tracing::debug!(count = new_param_location_ids.len(), "Fetching parameter details");
+        tracing::debug!(
+            count = new_param_location_ids.len(),
+            "Fetching parameter details"
+        );
 
         let param_data = vaisala.get_locations_data(&new_param_location_ids).await?;
 
@@ -337,7 +345,11 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
                     }
 
                     // Create alarm threshold based on sensor_type
-                    let threshold = create_threshold_for_sensor_type(global_param_id, site_id, &sensor_type_for_threshold);
+                    let threshold = create_threshold_for_sensor_type(
+                        global_param_id,
+                        site_id,
+                        &sensor_type_for_threshold,
+                    );
                     if let Err(e) = threshold.insert(db).await {
                         tracing::warn!(
                             error = %e,
@@ -351,8 +363,13 @@ pub async fn sync_locations(db: &DatabaseConnection, vaisala: &VaisalaClient) ->
                     // (must happen after site_parameter insert due to FK constraint)
                     if !attrs.logger_serial_number.is_empty() {
                         create_sensor_and_deployment(
-                            db, &attrs.logger_serial_number, global_param_id, site_id, now,
-                        ).await;
+                            db,
+                            &attrs.logger_serial_number,
+                            global_param_id,
+                            site_id,
+                            now,
+                        )
+                        .await;
                     }
 
                     params_created += 1;
@@ -702,11 +719,7 @@ pub async fn sync_readings(
 
                 lookup.insert(
                     *sp_id,
-                    (
-                        Some(dep.sensor_id),
-                        calibration.map(|c| c.id),
-                        Some(dep.id),
-                    ),
+                    (Some(dep.sensor_id), calibration.map(|c| c.id), Some(dep.id)),
                 );
             } else {
                 lookup.insert(*sp_id, (None, None, None));
@@ -721,10 +734,7 @@ pub async fn sync_readings(
     for resource in history.data {
         let attrs = resource.attributes;
         let Some((site_parameter_id, last_time)) = location_map.get(&attrs.id) else {
-            tracing::warn!(
-                location_id = attrs.id,
-                "Received data for unknown location"
-            );
+            tracing::warn!(location_id = attrs.id, "Received data for unknown location");
             continue;
         };
 
@@ -759,12 +769,11 @@ pub async fn sync_readings(
         let mut rounded_times: Vec<chrono::DateTime<Utc>> = Vec::with_capacity(new_points.len());
 
         for point in new_points {
-            let raw_time = chrono::DateTime::from_timestamp(point.timestamp, 0)
-                .unwrap_or_else(Utc::now);
+            let raw_time =
+                chrono::DateTime::from_timestamp(point.timestamp, 0).unwrap_or_else(Utc::now);
             let epoch = raw_time.timestamp();
             let rounded_epoch = ((epoch + 300) / 600) * 600;
-            let time = chrono::DateTime::from_timestamp(rounded_epoch, 0)
-                .unwrap_or(raw_time);
+            let time = chrono::DateTime::from_timestamp(rounded_epoch, 0).unwrap_or(raw_time);
 
             rounded_times.push(time);
 
@@ -862,7 +871,11 @@ pub async fn sync_readings(
 }
 
 /// Create an alarm threshold record based on sensor type.
-fn create_threshold_for_sensor_type(parameter_id: Uuid, site_id: Uuid, sensor_type: &str) -> alarm_thresholds::ActiveModel {
+fn create_threshold_for_sensor_type(
+    parameter_id: Uuid,
+    site_id: Uuid,
+    sensor_type: &str,
+) -> alarm_thresholds::ActiveModel {
     let (warning_min, warning_max, alarm_min, alarm_max) = match sensor_type {
         "Depth" => (Some(100.0), Some(1000.0), Some(0.0), Some(2000.0)),
         "CDOM" => (None, Some(100.0), Some(0.0), Some(150.0)),

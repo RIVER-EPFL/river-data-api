@@ -1,20 +1,20 @@
 use axum::{
-    extract::{Path, Query, State},
-    http::{
-        header::{self, HeaderMap, HeaderValue},
-    },
-    response::{IntoResponse, Response},
     Json,
+    extract::{Path, Query, State},
+    http::header::{self, HeaderMap, HeaderValue},
+    response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement,
+};
 use std::collections::{HashMap, HashSet};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
-use crate::entity::{alarm_thresholds, site_parameters, projects};
+use crate::entity::{alarm_thresholds, projects, site_parameters};
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, resolve_site};
 use crate::services::bulk;
@@ -104,14 +104,8 @@ fn build_ndjson_response(
 
             for param in &params {
                 if let (Some(v), Some(s)) = (param.values.get(i), param.severities.get(i)) {
-                    obj.insert(
-                        format!("{}_value", param.name),
-                        serde_json::json!(v),
-                    );
-                    obj.insert(
-                        format!("{}_severity", param.name),
-                        serde_json::json!(s),
-                    );
+                    obj.insert(format!("{}_value", param.name), serde_json::json!(v));
+                    obj.insert(format!("{}_severity", param.name), serde_json::json!(s));
                 }
             }
 
@@ -283,9 +277,11 @@ pub async fn get_site_alarms(
     );
 
     if format == "json"
-        && let Some(cached) = cache::get_cached(&state, &cache_key, &param_ids, Some(query.end)).await {
-            return cache::json_response((*cached).clone(), true);
-        }
+        && let Some(cached) =
+            cache::get_cached(&state, &cache_key, &param_ids, Some(query.end)).await
+    {
+        return cache::json_response((*cached).clone(), true);
+    }
 
     let _permit = bulk::acquire_bulk_permit(&format)?;
 
@@ -308,7 +304,8 @@ pub async fn get_site_alarms(
             "(
             (t.alarm_min IS NOT NULL AND {val_expr} < t.alarm_min) OR
             (t.alarm_max IS NOT NULL AND {val_expr} > t.alarm_max)
-        )")
+        )"
+        )
     } else {
         format!(
             "(
@@ -316,7 +313,8 @@ pub async fn get_site_alarms(
             (t.alarm_max IS NOT NULL AND {val_expr} > t.alarm_max) OR
             (t.warning_min IS NOT NULL AND {val_expr} < t.warning_min) OR
             (t.warning_max IS NOT NULL AND {val_expr} > t.warning_max)
-        )")
+        )"
+        )
     };
 
     let sql = format!(
@@ -391,11 +389,8 @@ pub async fn get_site_alarms(
     let mut times: Vec<DateTime<Utc>> = time_set.into_iter().collect();
     times.sort_unstable();
 
-    let time_index: HashMap<DateTime<Utc>, usize> = times
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (*t, i))
-        .collect();
+    let time_index: HashMap<DateTime<Utc>, usize> =
+        times.iter().enumerate().map(|(i, t)| (*t, i)).collect();
 
     let param_data: Vec<ParameterViolationData> = params_with_thresholds
         .iter()

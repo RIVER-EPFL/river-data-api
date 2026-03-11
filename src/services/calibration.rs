@@ -82,7 +82,8 @@ pub async fn recalculate_for_calibration(
     if rows_affected > 0 {
         // Find distinct (site_id, time) pairs that were just recalibrated
         let affected_rows = if let Some(ref next) = next_cal {
-            let next_from: chrono::DateTime<chrono::FixedOffset> = next.try_get("", "valid_from")?;
+            let next_from: chrono::DateTime<chrono::FixedOffset> =
+                next.try_get("", "valid_from")?;
             db.query_all(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r"SELECT DISTINCT site_id, time FROM readings
@@ -209,7 +210,12 @@ pub async fn recalculate_derived_at_timestamp(
                 r"INSERT INTO readings (site_id, parameter_id, time, raw_value, calibrated_value)
                   VALUES ($1, $2, $3, $4, $4)
                   ON CONFLICT (site_id, parameter_id, time) DO UPDATE SET calibrated_value = $4",
-                [derived_site_id.into(), derived_parameter_id.into(), time.into(), result.into()],
+                [
+                    derived_site_id.into(),
+                    derived_parameter_id.into(),
+                    time.into(),
+                    result.into(),
+                ],
             ))
             .await?;
         }

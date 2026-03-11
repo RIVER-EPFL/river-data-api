@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::services::public_api_config::{PublicConfigCache, new_public_config_cache};
 use crate::connectors::vaisala::VaisalaClient;
+use crate::services::public_api_config::{PublicConfigCache, new_public_config_cache};
 
 /// Cached response with metadata for freshness checking
 #[derive(Clone)]

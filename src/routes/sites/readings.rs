@@ -1,11 +1,13 @@
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::header::HeaderMap,
     response::{IntoResponse, Response},
-    Json,
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use utoipa::{IntoParams, ToSchema};
@@ -13,7 +15,7 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
-use crate::entity::{site_parameters, projects};
+use crate::entity::{projects, site_parameters};
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, resolve_site};
 use crate::services::bulk::{self, StreamableParam};
@@ -150,11 +152,12 @@ pub async fn get_site_readings(
 
     // Validate time range if both provided
     if let (Some(start), Some(end)) = (query.start, query.end)
-        && end <= start {
-            return Err(AppError::BadRequest(
-                "end time must be after start time".to_string(),
-            ));
-        }
+        && end <= start
+    {
+        return Err(AppError::BadRequest(
+            "end time must be after start time".to_string(),
+        ));
+    }
 
     // Determine format from query or Accept header
     let format = bulk::determine_format(&query.format, &headers);
@@ -181,10 +184,8 @@ pub async fn get_site_readings(
     let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.parameter_id).collect();
 
     // Map from global parameter_id -> site_parameter info for building response
-    let _param_info_map: HashMap<Uuid, &site_parameters::Model> = params_list
-        .iter()
-        .map(|p| (p.parameter_id, p))
-        .collect();
+    let _param_info_map: HashMap<Uuid, &site_parameters::Model> =
+        params_list.iter().map(|p| (p.parameter_id, p)).collect();
 
     let include_alarms = query.alarms.unwrap_or(false);
 
@@ -203,9 +204,10 @@ pub async fn get_site_readings(
 
     // Check cache with freshness validation (JSON only)
     if format == "json"
-        && let Some(cached) = cache::get_cached(&state, &cache_key, &param_ids, query.end).await {
-            return cache::json_response((*cached).clone(), true);
-        }
+        && let Some(cached) = cache::get_cached(&state, &cache_key, &param_ids, query.end).await
+    {
+        return cache::json_response((*cached).clone(), true);
+    }
 
     let _permit = bulk::acquire_bulk_permit(&format)?;
 
@@ -256,7 +258,11 @@ pub async fn get_site_readings(
     let next_param = param_ids.len() + 2;
     let time_conditions = match (query.start, query.end) {
         (Some(start), Some(end)) => {
-            let cond = format!(" AND r.time >= ${} AND r.time <= ${}", next_param, next_param + 1);
+            let cond = format!(
+                " AND r.time >= ${} AND r.time <= ${}",
+                next_param,
+                next_param + 1
+            );
             values.push(start.into());
             values.push(end.into());
             cond
@@ -325,11 +331,8 @@ pub async fn get_site_readings(
     let mut times: Vec<DateTime<Utc>> = time_set.into_iter().collect();
     times.sort_unstable();
 
-    let time_index: HashMap<DateTime<Utc>, usize> = times
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (*t, i))
-        .collect();
+    let time_index: HashMap<DateTime<Utc>, usize> =
+        times.iter().enumerate().map(|(i, t)| (*t, i)).collect();
 
     let param_data: Vec<ParameterData> = params_list
         .iter()

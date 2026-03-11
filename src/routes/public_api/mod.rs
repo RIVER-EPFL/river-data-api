@@ -1,6 +1,6 @@
 pub mod handlers;
 
-use axum::{Json, extract::State, routing::get, Router};
+use axum::{Json, Router, extract::State, routing::get};
 use utoipa::OpenApi;
 
 use crate::common::AppState;
@@ -17,17 +17,15 @@ use crate::services::public_api_config::list_public_slugs;
         handlers::get_readings,
         handlers::get_aggregates,
     ),
-    components(
-        schemas(
-            handlers::SiteRef,
-            handlers::ParameterInfo,
-            handlers::SiteDetailResponse,
-            handlers::ReadingsResponse,
-            handlers::ParameterData,
-            handlers::AggregatesResponse,
-            handlers::ParameterAggregateData,
-        )
-    ),
+    components(schemas(
+        handlers::SiteRef,
+        handlers::ParameterInfo,
+        handlers::SiteDetailResponse,
+        handlers::ReadingsResponse,
+        handlers::ParameterData,
+        handlers::AggregatesResponse,
+        handlers::ParameterAggregateData,
+    )),
     info(
         title = "Public Sensor Data API",
         description = "Environmental sensor time-series data.",
@@ -42,10 +40,7 @@ pub fn public_router() -> Router<AppState> {
     Router::new()
         .route("/", get(discovery))
         .route("/{project_slug}/sites", get(handlers::list_sites))
-        .route(
-            "/{project_slug}/sites/{site_id}",
-            get(handlers::get_site),
-        )
+        .route("/{project_slug}/sites/{site_id}", get(handlers::get_site))
         .route(
             "/{project_slug}/sites/{site_id}/parameters",
             get(handlers::list_parameters),
@@ -102,14 +97,13 @@ async fn serve_docs(
     }
 
     // Set server URL so Scalar "Try It" points to the correct base path
-    spec.servers = Some(vec![utoipa::openapi::server::Server::new(
-        format!("/api/public/{project_slug}"),
-    )]);
+    spec.servers = Some(vec![utoipa::openapi::server::Server::new(format!(
+        "/api/public/{project_slug}"
+    ))]);
 
     // Rewrite paths: strip the /api/public/{project_slug} prefix since server URL handles it
     let prefix = "/api/public/{project_slug}";
-    let old_paths: std::collections::BTreeMap<String, _> =
-        std::mem::take(&mut spec.paths.paths);
+    let old_paths: std::collections::BTreeMap<String, _> = std::mem::take(&mut spec.paths.paths);
     for (path_key, path_item) in old_paths {
         let new_key = if path_key.starts_with(prefix) {
             path_key

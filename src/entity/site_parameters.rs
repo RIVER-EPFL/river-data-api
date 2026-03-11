@@ -1,7 +1,9 @@
 use crudcrate::{CRUDResource, EntityToModels};
 use sea_orm::entity::prelude::*;
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels)]
+#[derive(
+    Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
+)]
 #[sea_orm(table_name = "site_parameters")]
 #[crudcrate(
     api_struct = "SiteParameter",
