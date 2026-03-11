@@ -172,6 +172,12 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(Sensors::Manufacturer).string_len(128))
                     .col(ColumnDef::new(Sensors::Model).string_len(128))
                     .col(ColumnDef::new(Sensors::IsActive).boolean().default(true))
+                    .col(
+                        ColumnDef::new(Sensors::IsLabInstrument)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
                     .col(ColumnDef::new(Sensors::Notes).text())
                     .col(
                         ColumnDef::new(Sensors::CreatedAt)
@@ -776,6 +782,18 @@ impl MigrationTrait for Migration {
                             .default(0),
                     )
                     .col(
+                        ColumnDef::new(PublicExposedParameters::ConversionFactor)
+                            .double()
+                            .not_null()
+                            .default(1.0),
+                    )
+                    .col(
+                        ColumnDef::new(PublicExposedParameters::ConversionOffset)
+                            .double()
+                            .not_null()
+                            .default(0.0),
+                    )
+                    .col(
                         ColumnDef::new(PublicExposedParameters::IncludeDerived)
                             .boolean()
                             .not_null()
@@ -1125,6 +1143,7 @@ pub enum Sensors {
     Manufacturer,
     Model,
     IsActive,
+    IsLabInstrument,
     Notes,
     CreatedAt,
 }
@@ -1268,6 +1287,8 @@ pub enum PublicExposedParameters {
     PublicUnits,
     Description,
     SortOrder,
+    ConversionFactor,
+    ConversionOffset,
     IncludeDerived,
     CreatedAt,
 }

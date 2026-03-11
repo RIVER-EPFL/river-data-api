@@ -1869,6 +1869,7 @@ version = "0.2.0"
 dependencies = [
  "dotenvy",
  "sea-orm-migration",
+ "sea-orm-timescale",
  "tokio",
  "uuid",
 ]
@@ -2712,6 +2713,7 @@ dependencies = [
  "reqwest",
  "sea-orm",
  "sea-orm-migration",
+ "sea-orm-timescale",
  "serde",
  "serde_json",
  "serial_test",
@@ -3015,6 +3017,17 @@ dependencies = [
  "sea-schema",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "sea-orm-timescale"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2448d5f9549a26adafe570c984653ddb23a6a2c3ce5d525306595201e68b60e9"
+dependencies = [
+ "chrono",
+ "sea-orm",
+ "sea-query",
 ]
 
 [[package]]
