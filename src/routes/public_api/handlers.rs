@@ -140,6 +140,8 @@ async fn resolve_site_parameters(
                     parameter_id: sp.parameter_id,
                     public_name: ep_config.public_name.clone(),
                     public_units: ep_config.public_units.clone(),
+                    conversion_factor: ep_config.conversion_factor,
+                    conversion_offset: ep_config.conversion_offset,
                 });
             }
         }
@@ -155,6 +157,8 @@ struct ResolvedParam {
     parameter_id: Uuid,
     public_name: String,
     public_units: String,
+    conversion_factor: f64,
+    conversion_offset: f64,
 }
 
 /// Parse the `parameters` query string and filter against the project's exposed params.
@@ -669,12 +673,17 @@ pub async fn get_aggregates(
     }
 
     // Build a map from parameter_id -> (public_name, public_units)
-    let id_to_public: HashMap<Uuid, (&str, &str)> = resolved
+    let id_to_public: HashMap<Uuid, (&str, &str, f64, f64)> = resolved
         .iter()
         .map(|rp| {
             (
                 rp.parameter_id,
-                (rp.public_name.as_str(), rp.public_units.as_str()),
+                (
+                    rp.public_name.as_str(),
+                    rp.public_units.as_str(),
+                    rp.conversion_factor,
+                    rp.conversion_offset,
+                ),
             )
         })
         .collect();
@@ -737,12 +746,15 @@ pub async fn get_aggregates(
         if time_set.insert(row.bucket) {
             times_ordered.push(row.bucket);
         }
-        // Map DB parameter_id back to public name
+        // Map DB parameter_id back to public name and apply unit conversion
         let param_uuid = row.param_id.parse::<Uuid>().ok();
-        let public_name = param_uuid
-            .and_then(|uuid| id_to_public.get(&uuid))
-            .map(|(name, _)| name.to_string())
+        let lookup = param_uuid.and_then(|uuid| id_to_public.get(&uuid));
+        let public_name = lookup
+            .map(|(name, _, _, _)| name.to_string())
             .unwrap_or_else(|| row.param_id.clone());
+        let (factor, offset) = lookup
+            .map(|(_, _, f, o)| (*f, *o))
+            .unwrap_or((1.0, 0.0));
 
         param_aggs
             .entry(public_name)
@@ -750,9 +762,9 @@ pub async fn get_aggregates(
             .push((
                 row.bucket,
                 AggValues {
-                    avg: row.avg_value,
-                    min: row.min_value,
-                    max: row.max_value,
+                    avg: row.avg_value.map(|v| v * factor + offset),
+                    min: row.min_value.map(|v| v * factor + offset),
+                    max: row.max_value.map(|v| v * factor + offset),
                     count: row.count,
                 },
             ));
@@ -846,12 +858,17 @@ async fn fetch_readings(
     }
 
     // Build a map from parameter_id -> (public_name, public_units)
-    let id_to_public: HashMap<Uuid, (&str, &str)> = resolved
+    let id_to_public: HashMap<Uuid, (&str, &str, f64, f64)> = resolved
         .iter()
         .map(|rp| {
             (
                 rp.parameter_id,
-                (rp.public_name.as_str(), rp.public_units.as_str()),
+                (
+                    rp.public_name.as_str(),
+                    rp.public_units.as_str(),
+                    rp.conversion_factor,
+                    rp.conversion_offset,
+                ),
             )
         })
         .collect();
@@ -915,17 +932,21 @@ async fn fetch_readings(
             times_ordered.push(time);
         }
 
-        // Map DB parameter_id back to public name
+        // Map DB parameter_id back to public name and apply unit conversion
         let param_uuid = row.param_id.parse::<Uuid>().ok();
-        let public_name = param_uuid
-            .and_then(|uuid| id_to_public.get(&uuid))
-            .map(|(name, _)| name.to_string())
+        let lookup = param_uuid.and_then(|uuid| id_to_public.get(&uuid));
+        let public_name = lookup
+            .map(|(name, _, _, _)| name.to_string())
             .unwrap_or_else(|| row.param_id.clone());
+        let (factor, offset) = lookup
+            .map(|(_, _, f, o)| (*f, *o))
+            .unwrap_or((1.0, 0.0));
+        let converted_value = row.value * factor + offset;
 
         param_values
             .entry(public_name)
             .or_default()
-            .push((time, row.value));
+            .push((time, converted_value));
     }
 
     times_ordered.sort_unstable();

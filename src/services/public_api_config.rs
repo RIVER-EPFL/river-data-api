@@ -37,6 +37,8 @@ pub struct ExposedParamConfig {
     pub parameter_id: Uuid,
     pub description: Option<String>,
     pub sort_order: i32,
+    pub conversion_factor: f64,
+    pub conversion_offset: f64,
     pub include_derived: bool,
 }
 
@@ -134,6 +136,8 @@ async fn load_public_config(
             parameter_id: e.parameter_id,
             description: e.description,
             sort_order: e.sort_order,
+            conversion_factor: e.conversion_factor.unwrap_or(1.0),
+            conversion_offset: e.conversion_offset.unwrap_or(0.0),
             include_derived: e.include_derived,
         })
         .collect();

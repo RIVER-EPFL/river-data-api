@@ -1,7 +1,7 @@
 use crudcrate::{CRUDResource, EntityToModels};
 use sea_orm::entity::prelude::*;
 
-#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels)]
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels)]
 #[sea_orm(table_name = "public_exposed_parameters")]
 #[crudcrate(
     api_struct = "PublicExposedParameter",
@@ -22,6 +22,8 @@ pub struct Model {
     pub public_units: String,
     pub description: Option<String>,
     pub sort_order: i32,
+    pub conversion_factor: Option<f64>,
+    pub conversion_offset: Option<f64>,
     pub include_derived: bool,
     #[crudcrate(exclude(create, update))]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,

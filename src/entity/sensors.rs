@@ -25,6 +25,8 @@ pub struct Model {
     pub model: Option<String>,
     #[crudcrate(filterable)]
     pub is_active: Option<bool>,
+    #[crudcrate(filterable)]
+    pub is_lab_instrument: Option<bool>,
     pub notes: Option<String>,
     #[crudcrate(exclude(create, update))]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,

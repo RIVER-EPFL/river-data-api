@@ -23,6 +23,7 @@ tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip",
 # Database
 sea-orm = { version = "1.1", features = ["sqlx-postgres", "runtime-tokio-rustls", "with-uuid", "with-chrono", "with-json"] }
 sea-orm-migration = { version = "1.1", features = ["sqlx-postgres", "runtime-tokio-rustls"] }
+sea-orm-timescale = "0.2.0"
 
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }

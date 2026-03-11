@@ -466,6 +466,7 @@ async fn create_sensor_and_deployment(
             manufacturer: Set(Some("Vaisala".to_string())),
             model: Set(None),
             is_active: Set(Some(true)),
+            is_lab_instrument: Set(Some(false)),
             notes: Set(None),
             created_at: Set(Some(now)),
         };
