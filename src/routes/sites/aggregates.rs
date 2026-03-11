@@ -8,7 +8,9 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, Statement};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter};
+use sea_orm::prelude::DateTimeWithTimeZone;
+use sea_orm::sea_query::{Alias, Expr, Order, SelectStatement as SeaQuery};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -77,12 +79,24 @@ pub struct ParameterAggregateData {
 
 #[derive(Debug, FromQueryResult)]
 struct AggregateRow {
-    bucket: DateTime<Utc>,
+    bucket: DateTimeWithTimeZone,
     parameter_id: Uuid,
     avg_value: Option<f64>,
     min_value: Option<f64>,
     max_value: Option<f64>,
     count: i64,
+}
+
+fn resolution_to_view(resolution: &str) -> Result<&'static str, AppError> {
+    match resolution {
+        "hourly" => Ok("readings_hourly"),
+        "daily" => Ok("readings_daily"),
+        "weekly" => Ok("readings_weekly"),
+        "monthly" => Ok("readings_monthly"),
+        _ => Err(AppError::BadRequest(format!(
+            "Invalid resolution: {resolution}. Must be one of: hourly, daily, weekly, monthly"
+        ))),
+    }
 }
 
 fn determine_format(query_format: &str, headers: &HeaderMap) -> String {
@@ -275,18 +289,8 @@ pub async fn get_site_aggregates(
         name: site.name.clone(),
     };
 
-    // Validate resolution
-    let view_name = match resolution.as_str() {
-        "hourly" => "readings_hourly",
-        "daily" => "readings_daily",
-        "weekly" => "readings_weekly",
-        "monthly" => "readings_monthly",
-        _ => {
-            return Err(AppError::BadRequest(format!(
-                "Invalid resolution: {resolution}. Must be one of: hourly, daily, weekly, monthly"
-            )));
-        }
-    };
+    // Validate resolution and map to view name
+    let view_name = resolution_to_view(&resolution)?;
 
     // Validate time range
     if query.end <= query.start {
@@ -372,99 +376,48 @@ pub async fn get_site_aggregates(
         HashMap::new()
     };
 
-    let param_ids_str = param_ids
-        .iter()
-        .map(|id| format!("'{id}'"))
-        .collect::<Vec<_>>()
-        .join(",");
+    // Query continuous aggregate view directly
+    let view = Alias::new(view_name);
 
-    let bucket_interval = match resolution.as_str() {
-        "hourly" => "1 hour",
-        "daily" => "1 day",
-        "weekly" => "1 week",
-        "monthly" => "1 month",
-        _ => "1 hour",
-    };
+    let (sql, values) = SeaQuery::new()
+        .column(Alias::new("bucket"))
+        .column(Alias::new("parameter_id"))
+        .column(Alias::new("avg_value"))
+        .column(Alias::new("min_value"))
+        .column(Alias::new("max_value"))
+        .column(Alias::new("count"))
+        .from(view)
+        .and_where(Expr::col(Alias::new("parameter_id")).is_in(param_ids.clone()))
+        .and_where(Expr::col(Alias::new("bucket")).gte(query.start))
+        .and_where(Expr::col(Alias::new("bucket")).lt(query.end))
+        .order_by(Alias::new("bucket"), Order::Asc)
+        .build(sea_orm::sea_query::PostgresQueryBuilder);
 
-    let sql = format!(
-        r"
-        SELECT
-            bucket,
-            parameter_id,
-            avg_value,
-            min_value,
-            max_value,
-            count
-        FROM {view_name}
-        WHERE parameter_id IN ({param_ids_str})
-          AND bucket >= $1
-          AND bucket <= $2
-        ORDER BY bucket ASC, parameter_id ASC
-        "
+    let stmt = sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        sql,
+        values.0,
     );
 
-    let mut results: Vec<AggregateRow> = state
+    let rows: Vec<AggregateRow> = state
         .db
-        .query_all(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &sql,
-            vec![query.start.into(), query.end.into()],
-        ))
+        .query_all(stmt)
         .await?
         .into_iter()
         .filter_map(|row| AggregateRow::from_query_result(&row, "").ok())
         .collect();
 
-    if results.is_empty() {
-        tracing::info!(
-            resolution = %resolution,
-            start = %query.start,
-            end = %query.end,
-            "continuous_aggregate_empty_fallback_to_raw"
-        );
-
-        let fallback_sql = format!(
-            r"
-            SELECT
-                time_bucket('{bucket_interval}', time) AS bucket,
-                parameter_id,
-                AVG(value) AS avg_value,
-                MIN(value) AS min_value,
-                MAX(value) AS max_value,
-                COUNT(*) AS count
-            FROM readings
-            WHERE parameter_id IN ({param_ids_str})
-              AND time >= $1
-              AND time <= $2
-            GROUP BY time_bucket('{bucket_interval}', time), parameter_id
-            ORDER BY bucket ASC, parameter_id ASC
-            "
-        );
-
-        results = state
-            .db
-            .query_all(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                &fallback_sql,
-                vec![query.start.into(), query.end.into()],
-            ))
-            .await?
-            .into_iter()
-            .filter_map(|row| AggregateRow::from_query_result(&row, "").ok())
-            .collect();
-    }
-
     let mut time_set: BTreeMap<DateTime<Utc>, usize> = BTreeMap::new();
     let mut param_aggs: HashMap<Uuid, HashMap<DateTime<Utc>, (Option<f64>, Option<f64>, Option<f64>, i64)>> =
         HashMap::new();
 
-    for row in results {
-        let time = row.bucket;
-        time_set.entry(time).or_insert(0);
+    for row in &rows {
+        let bucket = row.bucket.with_timezone(&Utc);
+        time_set.entry(bucket).or_insert(0);
         param_aggs
             .entry(row.parameter_id)
             .or_default()
-            .insert(time, (row.avg_value, row.min_value, row.max_value, row.count));
+            .insert(bucket, (row.avg_value, row.min_value, row.max_value, row.count));
     }
 
     let times: Vec<DateTime<Utc>> = time_set.keys().copied().collect();

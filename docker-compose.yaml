@@ -60,6 +60,8 @@ services:
       - ./Cargo.toml:/app/Cargo.toml
       - ./Cargo.lock:/app/Cargo.lock
       - river-db-rust-data:/app/target
+      # CrudCrate local development (path dependency)
+      - /home/ejthomas/projects/personal/crudcrate/crudcrate:/home/ejthomas/projects/personal/crudcrate/crudcrate
     labels:
       - "traefik.http.routers.river-db-api.rule=PathPrefix(`/api`) || PathPrefix(`/healthz`) || PathPrefix(`/docs`)"
       - "traefik.http.routers.river-db-api.priority=100"

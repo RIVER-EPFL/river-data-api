@@ -329,12 +329,19 @@ pub async fn get_site_readings(
 
     let num_params = params_list.len();
 
-    // Build optimized raw SQL query
-    let param_ids_str = param_ids
+    // Build optimized raw SQL query with parameterized values
+    let mut params: Vec<sea_orm::Value> = Vec::new();
+
+    // Build parameter_id IN clause with numbered placeholders
+    let placeholders: Vec<String> = param_ids
         .iter()
-        .map(|id| format!("'{id}'"))
-        .collect::<Vec<_>>()
-        .join(",");
+        .enumerate()
+        .map(|(i, id)| {
+            params.push((*id).into());
+            format!("${}", i + 1)
+        })
+        .collect();
+    let in_clause = placeholders.join(",");
 
     let select_clause = if include_alarms {
         r"r.parameter_id, r.time, r.value,
@@ -356,26 +363,27 @@ pub async fn get_site_readings(
         "readings r"
     };
 
-    let time_conditions = match (query.start, query.end) {
-        (Some(start), Some(end)) => format!(
-            " AND r.time >= '{}' AND r.time <= '{}'",
-            start.to_rfc3339(),
-            end.to_rfc3339()
-        ),
-        (Some(start), None) => format!(" AND r.time >= '{}'", start.to_rfc3339()),
-        (None, Some(end)) => format!(" AND r.time <= '{}'", end.to_rfc3339()),
-        (None, None) => String::new(),
-    };
+    // Build time conditions with numbered placeholders
+    let mut time_conditions = String::new();
+    if let Some(start) = query.start {
+        params.push(start.into());
+        time_conditions.push_str(&format!(" AND r.time >= ${}", params.len()));
+    }
+    if let Some(end) = query.end {
+        params.push(end.into());
+        time_conditions.push_str(&format!(" AND r.time <= ${}", params.len()));
+    }
 
     let sql = format!(
-        "SELECT {select_clause} FROM {from_clause} WHERE r.parameter_id IN ({param_ids_str}){time_conditions} ORDER BY r.parameter_id, r.time"
+        "SELECT {select_clause} FROM {from_clause} WHERE r.parameter_id IN ({in_clause}){time_conditions} ORDER BY r.parameter_id, r.time"
     );
 
     let query_result = state
         .db
-        .query_all(Statement::from_string(
+        .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             sql,
+            params,
         ))
         .await?;
 

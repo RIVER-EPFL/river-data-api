@@ -112,17 +112,18 @@ pub async fn get_site(
         .collect();
 
     // Get data time range and count for this site's parameters
-    let sql = format!(
-        "SELECT MIN(r.time) as min_time, MAX(r.time) as max_time, COUNT(*) as count
+    let sql = "SELECT MIN(r.time) as min_time, MAX(r.time) as max_time, COUNT(*) as count
          FROM readings r
          JOIN parameters p ON r.parameter_id = p.id
-         WHERE p.site_id = '{}'",
-        site.id
-    );
+         WHERE p.site_id = $1";
 
     let data_range = state
         .db
-        .query_one(Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql))
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+            vec![site.id.into()],
+        ))
         .await?
         .and_then(|row| DataRangeRow::from_query_result(&row, "").ok());
 
