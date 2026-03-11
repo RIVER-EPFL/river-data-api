@@ -1,9 +1,14 @@
 pub mod alarm_thresholds;
-pub mod calibrations;
-pub mod device_status;
+pub mod api_tokens;
+pub mod derived_parameter_definitions;
 pub mod parameters;
 pub mod projects;
+pub mod public_exposed_parameters;
 pub mod readings;
+pub mod sensor_calibrations;
+pub mod sensor_deployments;
+pub mod sensors;
+pub mod site_parameters;
 pub mod sites;
 pub mod source_mappings;
 pub mod sync_state;

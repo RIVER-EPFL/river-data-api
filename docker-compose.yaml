@@ -49,6 +49,11 @@ services:
       # Application
       - DEPLOYMENT=${DEPLOYMENT:-dev}
       - RUST_LOG=${RUST_LOG:-info,river_db=debug,sea_orm=warn,sqlx=warn}
+      # Authentication
+      - KEYCLOAK_URL=${KEYCLOAK_URL:-}
+      - KEYCLOAK_REALM=${KEYCLOAK_REALM:-}
+      - KEYCLOAK_CLIENT_ID=${KEYCLOAK_CLIENT_ID:-}
+      - REQUIRE_PARTNER_AUTH=${REQUIRE_PARTNER_AUTH:-false}
     ports:
       - "${API_EXTERNAL_PORT:-3005}:${API_PORT:-3000}"
     depends_on:
@@ -63,7 +68,7 @@ services:
       # CrudCrate local development (path dependency)
       - /home/ejthomas/projects/personal/crudcrate/crudcrate:/home/ejthomas/projects/personal/crudcrate/crudcrate
     labels:
-      - "traefik.http.routers.river-db-api.rule=PathPrefix(`/api`) || PathPrefix(`/healthz`) || PathPrefix(`/docs`)"
+      - "traefik.http.routers.river-db-api.rule=PathPrefix(`/api`) || PathPrefix(`/healthz`) || PathPrefix(`/docs`) || PathPrefix(`/dashboard`)"
       - "traefik.http.routers.river-db-api.priority=100"
       - "traefik.http.services.river-db-api.loadbalancer.server.port=${API_PORT:-3000}"
 
@@ -82,6 +87,23 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    profiles: [auth]
+    command: start-dev --import-realm
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - "8180:8080"
+    volumes:
+      - ./keycloak-realm-dev.json:/opt/keycloak/data/import/realm.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 && cat <&3 | grep -q '200 OK'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
 volumes:
   river-db-timescale-data:

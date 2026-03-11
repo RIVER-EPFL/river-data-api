@@ -1,3 +1,4 @@
+use axum_keycloak_auth::instance::KeycloakAuthInstance;
 use chrono::{DateTime, Utc};
 use moka::future::Cache;
 use sea_orm::DatabaseConnection;
@@ -5,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::vaisala::VaisalaClient;
+use crate::services::public_api_config::{PublicConfigCache, new_public_config_cache};
+use crate::connectors::vaisala::VaisalaClient;
 
 /// Cached response with metadata for freshness checking
 #[derive(Clone)]
@@ -22,13 +24,20 @@ pub type ResponseCache = Cache<String, CachedResponse>;
 pub struct AppState {
     pub db: DatabaseConnection,
     pub config: Arc<Config>,
-    pub vaisala_client: Arc<VaisalaClient>,
+    pub vaisala_client: Option<Arc<VaisalaClient>>,
     pub response_cache: ResponseCache,
+    pub public_config_cache: PublicConfigCache,
+    pub keycloak_auth_instance: Option<Arc<KeycloakAuthInstance>>,
 }
 
 impl AppState {
-    #[must_use] 
-    pub fn new(db: DatabaseConnection, config: Config, vaisala_client: VaisalaClient) -> Self {
+    #[must_use]
+    pub fn new(
+        db: DatabaseConnection,
+        config: Config,
+        vaisala_client: Option<VaisalaClient>,
+        keycloak_auth_instance: Option<Arc<KeycloakAuthInstance>>,
+    ) -> Self {
         // Cache weighted by byte size, not entry count
         let cache: ResponseCache = Cache::builder()
             .weigher(|_key: &String, value: &CachedResponse| -> u32 {
@@ -42,8 +51,10 @@ impl AppState {
         Self {
             db,
             config: Arc::new(config),
-            vaisala_client: Arc::new(vaisala_client),
+            vaisala_client: vaisala_client.map(|c| Arc::new(c)),
             response_cache: cache,
+            public_config_cache: new_public_config_cache(),
+            keycloak_auth_instance,
         }
     }
 }

@@ -1,14 +1,17 @@
 use sea_orm::Database;
 use sea_orm_migration::MigratorTrait;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use axum_keycloak_auth::instance::{KeycloakAuthInstance, KeycloakConfig};
+use axum_keycloak_auth::Url;
+
 use river_db::common::AppState;
-use river_db::config::Config;
+use river_db::config::{Config, Deployment};
+use river_db::connectors::vaisala::{self, VaisalaClient};
 use river_db::routes;
-use river_db::sync;
-use river_db::vaisala::VaisalaClient;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -42,17 +45,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     migration::Migrator::up(&db, None).await?;
     tracing::info!("Migrations completed");
 
-    // Create Vaisala client
-    let vaisala_client = VaisalaClient::new(&config);
-    tracing::info!("Vaisala client initialized");
+    // Create Vaisala client (optional - sync disabled if not configured)
+    let vaisala_client = config.vaisala.as_ref().map(VaisalaClient::new);
+    if vaisala_client.is_some() {
+        tracing::info!("Vaisala client initialized");
+    } else {
+        tracing::info!("Vaisala not configured, sync tasks will be skipped");
+    }
+
+    // Initialize Keycloak authentication (optional in dev, required in prod)
+    let keycloak_instance = match (&config.keycloak_url, &config.keycloak_realm) {
+        (Some(url), Some(realm)) => {
+            tracing::info!(url = %url, realm = %realm, "Initializing Keycloak authentication");
+            Some(Arc::new(KeycloakAuthInstance::new(
+                KeycloakConfig::builder()
+                    .server(Url::parse(url).expect("Invalid KEYCLOAK_URL"))
+                    .realm(realm.clone())
+                    .build(),
+            )))
+        }
+        _ => {
+            if matches!(config.deployment, Deployment::Prod) {
+                panic!(
+                    "SECURITY ERROR: Keycloak authentication is required in production. \
+                     Configure KEYCLOAK_URL and KEYCLOAK_REALM environment variables."
+                );
+            }
+            tracing::warn!("Keycloak authentication NOT configured — admin routes unprotected");
+            None
+        }
+    };
 
     // Create application state
-    let state = AppState::new(db, config.clone(), vaisala_client);
+    let state = AppState::new(db, config.clone(), vaisala_client, keycloak_instance);
 
     // Spawn background sync tasks (fire-and-forget, non-blocking)
-    tracing::info!("Spawning background sync tasks...");
-    tokio::spawn(sync::scheduler::run_readings_sync(state.clone()));
-    tokio::spawn(sync::scheduler::run_device_status_sync(state.clone()));
+    if state.vaisala_client.is_some() {
+        tracing::info!("Spawning background sync tasks...");
+        tokio::spawn(vaisala::scheduler::run_readings_sync(state.clone()));
+    } else {
+        tracing::info!("Vaisala not configured, skipping sync tasks");
+    }
 
     // Build router
     let app = routes::build_router(state);

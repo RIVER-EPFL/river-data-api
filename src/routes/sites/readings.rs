@@ -1,9 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::{
-        header::{self, HeaderMap, HeaderValue},
-        StatusCode,
-    },
+    http::header::HeaderMap,
     response::{IntoResponse, Response},
     Json,
 };
@@ -11,16 +8,15 @@ use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use tokio::sync::Semaphore;
-use tokio_stream::wrappers::ReceiverStream;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::{parameters, projects};
+use crate::common::middleware::ProjectScope;
+use crate::entity::{site_parameters, projects};
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, resolve_site};
+use crate::services::bulk::{self, StreamableParam};
 
 use super::types::{ProjectRef, SiteRef};
 
@@ -39,15 +35,6 @@ struct ReadingRowWithSeverity {
     value: f64,
     severity: Option<i16>,
 }
-
-/// Global semaphore limiting concurrent bulk (CSV/NDJSON) requests.
-static BULK_SEMAPHORE: std::sync::LazyLock<Arc<Semaphore>> = std::sync::LazyLock::new(|| {
-    let limit = std::env::var("BULK_CONCURRENT_LIMIT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
-    Arc::new(Semaphore::new(limit))
-});
 
 fn default_format() -> String {
     "json".to_string()
@@ -83,109 +70,13 @@ pub struct ParameterData {
     pub severities: Option<Vec<Option<i16>>>,
 }
 
-fn determine_format(query_format: &str, headers: &HeaderMap) -> String {
-    if query_format != "json" {
-        return query_format.to_lowercase();
+impl StreamableParam for ParameterData {
+    fn name(&self) -> &str {
+        &self.name
     }
-
-    if let Some(accept) = headers.get(header::ACCEPT)
-        && let Ok(accept_str) = accept.to_str()
-    {
-        if accept_str.contains("application/x-ndjson") {
-            return "ndjson".to_string();
-        }
-        if accept_str.contains("text/csv") {
-            return "csv".to_string();
-        }
+    fn value_at(&self, index: usize) -> Option<f64> {
+        self.values.get(index).and_then(|v| *v)
     }
-
-    "json".to_string()
-}
-
-fn build_csv_response(times: &[DateTime<Utc>], params: &[ParameterData]) -> AppResult<Response> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
-
-    let times = times.to_vec();
-    let params = params.to_vec();
-
-    tokio::spawn(async move {
-        // Header row
-        let mut header = "time".to_string();
-        for param in &params {
-            header.push(',');
-            header.push_str(&param.name);
-        }
-        header.push('\n');
-        let _ = tx.send(Ok(header)).await;
-
-        // Data rows
-        for (i, time) in times.iter().enumerate() {
-            let mut row = time.to_rfc3339();
-            for param in &params {
-                row.push(',');
-                match param.values.get(i).and_then(|v| *v) {
-                    Some(v) => row.push_str(&v.to_string()),
-                    None => {} // Empty for null
-                }
-            }
-            row.push('\n');
-            if tx.send(Ok(row)).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let stream = ReceiverStream::new(rx);
-    let body = axum::body::Body::from_stream(stream);
-
-    Response::builder()
-        .header(header::CONTENT_TYPE, HeaderValue::from_static("text/csv"))
-        .body(body)
-        .map_err(|e| AppError::Internal(e.to_string()))
-}
-
-fn build_ndjson_response(
-    times: &[DateTime<Utc>],
-    params: &[ParameterData],
-) -> AppResult<Response> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
-
-    let times = times.to_vec();
-    let params = params.to_vec();
-
-    tokio::spawn(async move {
-        for (i, time) in times.iter().enumerate() {
-            let mut obj = serde_json::Map::new();
-            obj.insert("time".to_string(), serde_json::json!(time.to_rfc3339()));
-
-            for param in &params {
-                let value = param.values.get(i).and_then(|v| *v);
-                obj.insert(
-                    param.name.clone(),
-                    match value {
-                        Some(v) => serde_json::json!(v),
-                        None => serde_json::Value::Null,
-                    },
-                );
-            }
-
-            let line = format!("{}\n", serde_json::Value::Object(obj));
-            if tx.send(Ok(line)).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let stream = ReceiverStream::new(rx);
-    let body = axum::body::Body::from_stream(stream);
-
-    Response::builder()
-        .header(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/x-ndjson"),
-        )
-        .body(body)
-        .map_err(|e| AppError::Internal(e.to_string()))
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -225,9 +116,19 @@ pub async fn get_site_readings(
     State(state): State<AppState>,
     Path(site_id): Path<String>,
     Query(query): Query<SiteReadingsQuery>,
+    ProjectScope(scope): ProjectScope,
     headers: HeaderMap,
 ) -> AppResult<Response> {
     let site = resolve_site(&state.db, &site_id).await?;
+
+    // Enforce project scope
+    if let Some(scope_project) = scope
+        && site.project_id != Some(scope_project)
+    {
+        return Err(AppError::Forbidden(
+            "Token is scoped to a different project".to_string(),
+        ));
+    }
 
     // Fetch project info if available
     let project_ref = if let Some(project_id) = site.project_id {
@@ -256,27 +157,34 @@ pub async fn get_site_readings(
         }
 
     // Determine format from query or Accept header
-    let format = determine_format(&query.format, &headers);
+    let format = bulk::determine_format(&query.format, &headers);
 
-    // Build parameter query for this site only
-    let mut param_query = parameters::Entity::find()
-        .filter(parameters::Column::IsActive.eq(true))
-        .filter(parameters::Column::SiteId.eq(site.id));
+    // Build site_parameter query for this site only
+    let mut param_query = site_parameters::Entity::find()
+        .filter(site_parameters::Column::IsActive.eq(true))
+        .filter(site_parameters::Column::SiteId.eq(site.id));
 
     if let Some(ref types) = query.sensor_types {
         let type_list: Vec<String> = types.split(',').map(|s| s.trim().to_string()).collect();
         if !type_list.is_empty() {
-            param_query = param_query.filter(parameters::Column::SensorType.is_in(type_list));
+            param_query = param_query.filter(site_parameters::Column::SensorType.is_in(type_list));
         }
     }
 
-    // Get matching parameters (needed for cache key validation)
+    // Get matching site_parameters (needed for cache key validation)
     let params_list = param_query
-        .order_by_asc(parameters::Column::Name)
+        .order_by_asc(site_parameters::Column::Name)
         .all(&state.db)
         .await?;
 
-    let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.id).collect();
+    // Global parameter IDs from site_parameters (readings table uses global parameter_id)
+    let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.parameter_id).collect();
+
+    // Map from global parameter_id -> site_parameter info for building response
+    let _param_info_map: HashMap<Uuid, &site_parameters::Model> = params_list
+        .iter()
+        .map(|p| (p.parameter_id, p))
+        .collect();
 
     let include_alarms = query.alarms.unwrap_or(false);
 
@@ -299,21 +207,7 @@ pub async fn get_site_readings(
             return cache::json_response((*cached).clone(), true);
         }
 
-    // For bulk formats (CSV/NDJSON), acquire semaphore to limit concurrent requests
-    let _permit = if format == "csv" || format == "ndjson" {
-        if let Ok(permit) = BULK_SEMAPHORE.clone().try_acquire_owned() { Some(permit) } else {
-            tracing::warn!(
-                format = %format,
-                status = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                "bulk_request_rejected"
-            );
-            return Err(AppError::ServiceUnavailable(
-                "Too many concurrent bulk requests. Please try again later.".to_string(),
-            ));
-        }
-    } else {
-        None
-    };
+    let _permit = bulk::acquire_bulk_permit(&format)?;
 
     if params_list.is_empty() {
         return Ok(Json(ReadingsResponse {
@@ -329,61 +223,68 @@ pub async fn get_site_readings(
 
     let num_params = params_list.len();
 
-    // Build optimized raw SQL query with parameterized values
-    let mut params: Vec<sea_orm::Value> = Vec::new();
-
-    // Build parameter_id IN clause with numbered placeholders
+    // Build parameterized raw SQL query
+    // $1 = site_id, $2..=$N+1 = parameter_ids
+    let mut values: Vec<sea_orm::Value> = vec![site.id.into()];
     let placeholders: Vec<String> = param_ids
         .iter()
         .enumerate()
-        .map(|(i, id)| {
-            params.push((*id).into());
-            format!("${}", i + 1)
-        })
+        .map(|(i, _)| format!("${}", i + 2))
         .collect();
-    let in_clause = placeholders.join(",");
+    values.extend(param_ids.iter().map(|id| (*id).into()));
 
     let select_clause = if include_alarms {
-        r"r.parameter_id, r.time, r.value,
+        r"r.parameter_id, r.time, COALESCE(r.calibrated_value, r.raw_value) AS value,
             CASE
                 WHEN t.parameter_id IS NULL THEN NULL
-                WHEN (t.alarm_min IS NOT NULL AND r.value < t.alarm_min) OR
-                     (t.alarm_max IS NOT NULL AND r.value > t.alarm_max) THEN 2
-                WHEN (t.warning_min IS NOT NULL AND r.value < t.warning_min) OR
-                     (t.warning_max IS NOT NULL AND r.value > t.warning_max) THEN 1
+                WHEN (t.alarm_min IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) < t.alarm_min) OR
+                     (t.alarm_max IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) > t.alarm_max) THEN 2
+                WHEN (t.warning_min IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) < t.warning_min) OR
+                     (t.warning_max IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) > t.warning_max) THEN 1
                 ELSE 0
             END::smallint as severity"
     } else {
-        "r.parameter_id, r.time, r.value"
+        "r.parameter_id, r.time, COALESCE(r.calibrated_value, r.raw_value) AS value"
     };
 
     let from_clause = if include_alarms {
-        "readings r LEFT JOIN alarm_thresholds t ON r.parameter_id = t.parameter_id"
+        "readings r LEFT JOIN alarm_thresholds t ON r.parameter_id = t.parameter_id AND (t.site_id = r.site_id OR t.site_id IS NULL)"
     } else {
         "readings r"
     };
 
-    // Build time conditions with numbered placeholders
-    let mut time_conditions = String::new();
-    if let Some(start) = query.start {
-        params.push(start.into());
-        time_conditions.push_str(&format!(" AND r.time >= ${}", params.len()));
-    }
-    if let Some(end) = query.end {
-        params.push(end.into());
-        time_conditions.push_str(&format!(" AND r.time <= ${}", params.len()));
-    }
+    let next_param = param_ids.len() + 2;
+    let time_conditions = match (query.start, query.end) {
+        (Some(start), Some(end)) => {
+            let cond = format!(" AND r.time >= ${} AND r.time <= ${}", next_param, next_param + 1);
+            values.push(start.into());
+            values.push(end.into());
+            cond
+        }
+        (Some(start), None) => {
+            let cond = format!(" AND r.time >= ${next_param}");
+            values.push(start.into());
+            cond
+        }
+        (None, Some(end)) => {
+            let cond = format!(" AND r.time <= ${next_param}");
+            values.push(end.into());
+            cond
+        }
+        (None, None) => String::new(),
+    };
 
     let sql = format!(
-        "SELECT {select_clause} FROM {from_clause} WHERE r.parameter_id IN ({in_clause}){time_conditions} ORDER BY r.parameter_id, r.time"
+        "SELECT {select_clause} FROM {from_clause} WHERE r.site_id = $1 AND r.parameter_id IN ({}){time_conditions} ORDER BY r.parameter_id, r.time",
+        placeholders.join(",")
     );
 
     let query_result = state
         .db
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            sql,
-            params,
+            &sql,
+            values,
         ))
         .await?;
 
@@ -432,7 +333,8 @@ pub async fn get_site_readings(
 
     let param_data: Vec<ParameterData> = params_list
         .iter()
-        .map(|param| {
+        .map(|sp| {
+            let global_param_id = sp.parameter_id;
             let mut values: Vec<Option<f64>> = vec![None; times.len()];
             let mut severities_vec: Option<Vec<Option<i16>>> = if include_alarms {
                 Some(vec![None; times.len()])
@@ -440,7 +342,7 @@ pub async fn get_site_readings(
                 None
             };
 
-            if let Some(readings) = param_values.get(&param.id) {
+            if let Some(readings) = param_values.get(&global_param_id) {
                 for (time, value) in readings {
                     if let Some(&idx) = time_index.get(time) {
                         values[idx] = Some(*value);
@@ -449,7 +351,7 @@ pub async fn get_site_readings(
             }
 
             if let Some(ref mut sev_vec) = severities_vec
-                && let Some(sevs) = param_severities.get(&param.id)
+                && let Some(sevs) = param_severities.get(&global_param_id)
             {
                 for (time, severity) in sevs {
                     if let Some(&idx) = time_index.get(time) {
@@ -459,10 +361,10 @@ pub async fn get_site_readings(
             }
 
             ParameterData {
-                id: param.id,
-                name: param.name.clone(),
-                sensor_type: param.sensor_type.clone(),
-                units: param.display_units.clone(),
+                id: sp.id,
+                name: sp.name.clone(),
+                sensor_type: sp.sensor_type.clone(),
+                units: sp.display_units.clone(),
                 values,
                 severities: severities_vec,
             }
@@ -473,8 +375,8 @@ pub async fn get_site_readings(
     let actual_end = times.last().copied();
 
     match format.as_str() {
-        "csv" => build_csv_response(&times, &param_data),
-        "ndjson" => build_ndjson_response(&times, &param_data),
+        "csv" => bulk::build_csv_response(&times, &param_data),
+        "ndjson" => bulk::build_ndjson_response(&times, &param_data),
         _ => {
             let response = ReadingsResponse {
                 project: project_ref,

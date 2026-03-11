@@ -10,6 +10,7 @@ pub struct Model {
     pub source_key: i32,
     pub entity_id: Uuid,
     pub source_name: Option<String>,
+    pub source_system: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

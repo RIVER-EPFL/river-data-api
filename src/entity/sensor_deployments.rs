@@ -1,12 +1,12 @@
 use crudcrate::{CRUDResource, EntityToModels};
 use sea_orm::entity::prelude::*;
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels)]
-#[sea_orm(table_name = "alarm_thresholds")]
+#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels)]
+#[sea_orm(table_name = "sensor_deployments")]
 #[crudcrate(
-    api_struct = "AlarmThreshold",
-    name_singular = "alarm_threshold",
-    name_plural = "alarm_thresholds",
+    api_struct = "SensorDeployment",
+    name_singular = "sensor_deployment",
+    name_plural = "sensor_deployments",
     generate_router
 )]
 pub struct Model {
@@ -14,28 +14,28 @@ pub struct Model {
     #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
     pub id: Uuid,
     #[crudcrate(filterable)]
-    pub parameter_id: Uuid,
+    pub sensor_id: Uuid,
     #[crudcrate(filterable)]
-    pub site_id: Option<Uuid>,
-    pub warning_min: Option<f64>,
-    pub warning_max: Option<f64>,
-    pub alarm_min: Option<f64>,
-    pub alarm_max: Option<f64>,
-    pub description: Option<String>,
+    pub site_id: Uuid,
+    #[crudcrate(sortable)]
+    pub deployed_from: chrono::DateTime<chrono::Utc>,
+    #[crudcrate(sortable)]
+    pub deployed_until: Option<chrono::DateTime<chrono::Utc>>,
+    #[crudcrate(filterable)]
+    pub deployment_type: String,
+    pub notes: Option<String>,
     #[crudcrate(exclude(create, update))]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
-    #[crudcrate(exclude(create, update))]
-    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
     #[sea_orm(
-        belongs_to = "super::parameters::Entity",
-        from = "Column::ParameterId",
-        to = "super::parameters::Column::Id"
+        belongs_to = "super::sensors::Entity",
+        from = "Column::SensorId",
+        to = "super::sensors::Column::Id"
     )]
-    Parameter,
+    Sensor,
     #[sea_orm(
         belongs_to = "super::sites::Entity",
         from = "Column::SiteId",
@@ -44,9 +44,9 @@ pub enum Relation {
     Site,
 }
 
-impl Related<super::parameters::Entity> for Entity {
+impl Related<super::sensors::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::Parameter.def()
+        Relation::Sensor.def()
     }
 }
 
