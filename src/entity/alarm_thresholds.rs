@@ -24,6 +24,8 @@ pub struct Model {
     pub alarm_min: Option<f64>,
     pub alarm_max: Option<f64>,
     pub description: Option<String>,
+    pub string_alarm_values: Option<serde_json::Value>,
+    pub string_warning_values: Option<serde_json::Value>,
     #[crudcrate(exclude(create, update))]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     #[crudcrate(exclude(create, update))]

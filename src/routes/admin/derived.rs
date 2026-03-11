@@ -21,8 +21,8 @@ pub async fn recompute_derived(
                 sea_orm::DatabaseBackend::Postgres,
                 r"SELECT DISTINCT r.time
                   FROM readings r
-                  JOIN parameters p ON r.parameter_id = p.id
-                  WHERE p.derived_definition_id = $1
+                  JOIN site_parameters sp ON r.site_id = sp.site_id AND r.parameter_id = sp.parameter_id
+                  WHERE sp.derived_definition_id = $1
                   ORDER BY r.time",
                 [id.into()],
             ))
@@ -34,7 +34,7 @@ pub async fn recompute_derived(
                 let site_row = db
                     .query_one(Statement::from_sql_and_values(
                         sea_orm::DatabaseBackend::Postgres,
-                        r"SELECT DISTINCT p.site_id FROM parameters p WHERE p.derived_definition_id = $1 LIMIT 1",
+                        r"SELECT DISTINCT sp.site_id FROM site_parameters sp WHERE sp.derived_definition_id = $1 LIMIT 1",
                         [id.into()],
                     ))
                     .await;

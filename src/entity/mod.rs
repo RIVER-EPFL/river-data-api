@@ -11,4 +11,5 @@ pub mod sensors;
 pub mod site_parameters;
 pub mod sites;
 pub mod source_mappings;
+pub mod status_events;
 pub mod sync_state;

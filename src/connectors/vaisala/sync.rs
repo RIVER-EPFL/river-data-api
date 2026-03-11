@@ -432,6 +432,8 @@ async fn get_or_create_parameter(db: &DatabaseConnection, sensor_type: &str) -> 
         name: Set(sensor_type.to_string()),
         display_name: Set(display_name.to_string()),
         default_units: Set(default_units.to_string()),
+        category: Set("measurement".to_string()),
+        data_type: Set("numeric".to_string()),
         description: Set(None),
         created_at: Set(Some(Utc::now())),
     };
@@ -897,6 +899,8 @@ fn create_threshold_for_sensor_type(
         alarm_min: Set(alarm_min),
         alarm_max: Set(alarm_max),
         description: Set(Some("Auto-generated from sensor type defaults".to_string())),
+        string_alarm_values: Set(None),
+        string_warning_values: Set(None),
         created_at: Set(Some(now)),
         updated_at: Set(Some(now)),
     }

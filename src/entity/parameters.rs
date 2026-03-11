@@ -28,6 +28,12 @@ pub struct Model {
     #[crudcrate(fulltext)]
     pub display_name: String,
     pub default_units: String,
+    #[sea_orm(column_type = "String(StringLen::N(32))")]
+    #[crudcrate(filterable)]
+    pub category: String,
+    #[sea_orm(column_type = "String(StringLen::N(16))")]
+    #[crudcrate(filterable)]
+    pub data_type: String,
     pub description: Option<String>,
     #[crudcrate(exclude(create, update))]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -43,6 +49,8 @@ pub enum Relation {
     AlarmThresholds,
     #[sea_orm(has_many = "super::public_exposed_parameters::Entity")]
     PublicExposedParameters,
+    #[sea_orm(has_many = "super::status_events::Entity")]
+    StatusEvents,
 }
 
 impl Related<super::sensors::Entity> for Entity {
@@ -66,6 +74,12 @@ impl Related<super::alarm_thresholds::Entity> for Entity {
 impl Related<super::public_exposed_parameters::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::PublicExposedParameters.def()
+    }
+}
+
+impl Related<super::status_events::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::StatusEvents.def()
     }
 }
 
