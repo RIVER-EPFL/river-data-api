@@ -20,7 +20,7 @@ async fn setup() -> (sea_orm::DatabaseConnection, axum::Router) {
 }
 
 // =============================================================================
-// Projects: GET /api/private/projects
+// Projects: GET /api/service/projects
 // =============================================================================
 
 #[tokio::test]
@@ -28,7 +28,7 @@ async fn setup() -> (sea_orm::DatabaseConnection, axum::Router) {
 async fn test_list_projects() {
     let (_db, app) = setup().await;
 
-    let (status, body) = common::get_json(&app, "/api/private/projects").await;
+    let (status, body) = common::get_json(&app, "/api/service/projects").await;
     assert_eq!(status, 200);
 
     let projects = body.as_array().expect("response should be an array");
@@ -41,7 +41,7 @@ async fn test_list_projects() {
 }
 
 // =============================================================================
-// Projects: GET /api/private/projects/{id} — by UUID
+// Projects: GET /api/service/projects/{id} — by UUID
 // =============================================================================
 
 #[tokio::test]
@@ -49,7 +49,7 @@ async fn test_list_projects() {
 async fn test_get_project_by_uuid() {
     let (_db, app) = setup().await;
 
-    let uri = format!("/api/private/projects/{}", common::PROJECT_ID);
+    let uri = format!("/api/service/projects/{}", common::PROJECT_ID);
     let (status, body) = common::get_json(&app, &uri).await;
     assert_eq!(status, 200);
 
@@ -59,7 +59,7 @@ async fn test_get_project_by_uuid() {
 }
 
 // =============================================================================
-// Projects: GET /api/private/projects/{name} — case-insensitive name lookup
+// Projects: GET /api/service/projects/{name} — case-insensitive name lookup
 // =============================================================================
 
 #[tokio::test]
@@ -69,19 +69,19 @@ async fn test_get_project_by_name() {
 
     // Exact case
     let (status, body) =
-        common::get_json(&app, "/api/private/projects/Test%20River%20Project").await;
+        common::get_json(&app, "/api/service/projects/Test%20River%20Project").await;
     assert_eq!(status, 200);
     assert_eq!(body["id"], common::PROJECT_ID);
 
     // Different case — proves LOWER() lookup works
     let (status, body) =
-        common::get_json(&app, "/api/private/projects/TEST%20RIVER%20PROJECT").await;
+        common::get_json(&app, "/api/service/projects/TEST%20RIVER%20PROJECT").await;
     assert_eq!(status, 200);
     assert_eq!(body["id"], common::PROJECT_ID);
 }
 
 // =============================================================================
-// Projects: GET /api/private/projects/{id}/sites
+// Projects: GET /api/service/projects/{id}/sites
 // =============================================================================
 
 #[tokio::test]
@@ -89,7 +89,7 @@ async fn test_get_project_by_name() {
 async fn test_list_project_sites() {
     let (_db, app) = setup().await;
 
-    let uri = format!("/api/private/projects/{}/sites", common::PROJECT_ID);
+    let uri = format!("/api/service/projects/{}/sites", common::PROJECT_ID);
     let (status, body) = common::get_json(&app, &uri).await;
     assert_eq!(status, 200);
 
@@ -113,7 +113,7 @@ async fn test_list_project_sites() {
 }
 
 // =============================================================================
-// Projects: GET /api/private/projects/{bad_uuid} — 404
+// Projects: GET /api/service/projects/{bad_uuid} — 404
 // =============================================================================
 
 #[tokio::test]
@@ -123,7 +123,7 @@ async fn test_get_project_not_found() {
 
     let (status, body) = common::get_json(
         &app,
-        "/api/private/projects/00000000-0000-0000-0000-ffffffffffff",
+        "/api/service/projects/00000000-0000-0000-0000-ffffffffffff",
     )
     .await;
     assert_eq!(status, 404);
@@ -131,7 +131,7 @@ async fn test_get_project_not_found() {
 }
 
 // =============================================================================
-// Sites: GET /api/private/sites
+// Sites: GET /api/service/sites
 // =============================================================================
 
 #[tokio::test]
@@ -139,7 +139,7 @@ async fn test_get_project_not_found() {
 async fn test_list_sites() {
     let (_db, app) = setup().await;
 
-    let (status, body) = common::get_json(&app, "/api/private/sites").await;
+    let (status, body) = common::get_json(&app, "/api/service/sites").await;
     assert_eq!(status, 200);
 
     let sites = body.as_array().expect("response should be an array");
@@ -151,7 +151,7 @@ async fn test_list_sites() {
 }
 
 // =============================================================================
-// Sites: GET /api/private/sites/{id} — enriched detail
+// Sites: GET /api/service/sites/{id} — enriched detail
 // =============================================================================
 
 #[tokio::test]
@@ -160,7 +160,7 @@ async fn test_get_site_detail() {
     let (_db, app) = setup().await;
 
     // --- Site 1: full enriched response ---
-    let uri = format!("/api/private/sites/{}", common::SITE1_ID);
+    let uri = format!("/api/service/sites/{}", common::SITE1_ID);
     let (status, body) = common::get_json(&app, &uri).await;
     assert_eq!(status, 200);
 
@@ -204,7 +204,7 @@ async fn test_get_site_detail() {
     );
 
     // --- Site 2: verify different param count ---
-    let uri = format!("/api/private/sites/{}", common::SITE2_ID);
+    let uri = format!("/api/service/sites/{}", common::SITE2_ID);
     let (status, body) = common::get_json(&app, &uri).await;
     assert_eq!(status, 200);
     assert_eq!(body["parameters"].as_array().unwrap().len(), 4);
@@ -216,7 +216,7 @@ async fn test_get_site_detail() {
 }
 
 // =============================================================================
-// Sites: GET /api/private/sites/{name} — case-insensitive name lookup
+// Sites: GET /api/service/sites/{name} — case-insensitive name lookup
 // =============================================================================
 
 #[tokio::test]
@@ -225,18 +225,18 @@ async fn test_get_site_by_name() {
     let (_db, app) = setup().await;
 
     // Exact case
-    let (status, body) = common::get_json(&app, "/api/private/sites/Upstream%20Station").await;
+    let (status, body) = common::get_json(&app, "/api/service/sites/Upstream%20Station").await;
     assert_eq!(status, 200);
     assert_eq!(body["id"], common::SITE1_ID);
 
     // Different case
-    let (status, body) = common::get_json(&app, "/api/private/sites/downstream%20station").await;
+    let (status, body) = common::get_json(&app, "/api/service/sites/downstream%20station").await;
     assert_eq!(status, 200);
     assert_eq!(body["id"], common::SITE2_ID);
 }
 
 // =============================================================================
-// Sites: GET /api/private/sites/{id}/parameters
+// Sites: GET /api/service/sites/{id}/parameters
 // =============================================================================
 
 #[tokio::test]
@@ -244,7 +244,7 @@ async fn test_get_site_by_name() {
 async fn test_list_site_parameters() {
     let (_db, app) = setup().await;
 
-    let uri = format!("/api/private/sites/{}/parameters", common::SITE1_ID);
+    let uri = format!("/api/service/sites/{}/parameters", common::SITE1_ID);
     let (status, body) = common::get_json(&app, &uri).await;
     assert_eq!(status, 200);
 
@@ -264,7 +264,7 @@ async fn test_list_site_parameters() {
 }
 
 // =============================================================================
-// Sites: GET /api/private/sites/{bad_uuid} — 404
+// Sites: GET /api/service/sites/{bad_uuid} — 404
 // =============================================================================
 
 #[tokio::test]
@@ -274,7 +274,7 @@ async fn test_get_site_not_found() {
 
     let (status, body) = common::get_json(
         &app,
-        "/api/private/sites/00000000-0000-0000-0000-ffffffffffff",
+        "/api/service/sites/00000000-0000-0000-0000-ffffffffffff",
     )
     .await;
     assert_eq!(status, 404);

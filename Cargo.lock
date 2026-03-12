@@ -2692,6 +2692,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "river-data-sync-vaisala"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dotenvy",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "river-db"
 version = "0.2.0"
 dependencies = [

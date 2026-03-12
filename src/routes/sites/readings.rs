@@ -102,7 +102,7 @@ pub struct SiteReadingsQuery {
 /// Supports JSON, CSV, and NDJSON formats.
 #[utoipa::path(
     get,
-    path = "/api/private/sites/{site_id}/readings",
+    path = "/api/service/sites/{site_id}/readings",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
         SiteReadingsQuery

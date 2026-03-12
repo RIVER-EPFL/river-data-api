@@ -134,7 +134,7 @@ fn build_ndjson_response(
 /// Returns time-series data with severity levels (1=warning, 2=alarm).
 #[utoipa::path(
     get,
-    path = "/api/private/sites/{site_id}/alarms",
+    path = "/api/service/sites/{site_id}/alarms",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
         SiteAlarmsQuery

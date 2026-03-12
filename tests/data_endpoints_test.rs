@@ -20,7 +20,7 @@ async fn setup() -> (sea_orm::DatabaseConnection, axum::Router) {
 }
 
 // ============================================================================
-// Readings endpoint: GET /api/private/sites/{site_id}/readings
+// Readings endpoint: GET /api/service/sites/{site_id}/readings
 // ============================================================================
 
 #[tokio::test]
@@ -32,7 +32,7 @@ async fn test_readings_basic_time_range() {
     let (status, body) = common::get_json(
         &app,
         &format!(
-            "/api/private/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z"
+            "/api/service/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z"
         ),
     )
     .await;
@@ -94,7 +94,7 @@ async fn test_readings_sensor_types_filter() {
     let (status, body) = common::get_json(
         &app,
         &format!(
-            "/api/private/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z&sensor_types=DO_Temperature,Turbidity"
+            "/api/service/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z&sensor_types=DO_Temperature,Turbidity"
         ),
     )
     .await;
@@ -119,7 +119,7 @@ async fn test_readings_with_alarms() {
     let (status, body) = common::get_json(
         &app,
         &format!(
-            "/api/private/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z&alarms=true"
+            "/api/service/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z&alarms=true"
         ),
     )
     .await;
@@ -173,7 +173,7 @@ async fn test_readings_no_time_range() {
 
     // No start/end → defaults to full data range
     let (status, body) =
-        common::get_json(&app, &format!("/api/private/sites/{site_id}/readings")).await;
+        common::get_json(&app, &format!("/api/service/sites/{site_id}/readings")).await;
 
     assert_eq!(status, 200);
 
@@ -195,7 +195,7 @@ async fn test_readings_nonexistent_site_returns_404() {
 
     let (status, _body) = common::get(
         &app,
-        "/api/private/sites/00000000-0000-4000-a000-999999999999/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z",
+        "/api/service/sites/00000000-0000-4000-a000-999999999999/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z",
     )
     .await;
 
@@ -212,7 +212,7 @@ async fn test_readings_invalid_time_range_returns_400() {
     let (status, _body) = common::get(
         &app,
         &format!(
-            "/api/private/sites/{site_id}/readings?start=2025-01-16T00:00:00Z&end=2025-01-15T00:00:00Z"
+            "/api/service/sites/{site_id}/readings?start=2025-01-16T00:00:00Z&end=2025-01-15T00:00:00Z"
         ),
     )
     .await;
@@ -221,7 +221,7 @@ async fn test_readings_invalid_time_range_returns_400() {
 }
 
 // ============================================================================
-// Aggregates endpoint: GET /api/private/sites/{site_id}/aggregates/{resolution}
+// Aggregates endpoint: GET /api/service/sites/{site_id}/aggregates/{resolution}
 // ============================================================================
 
 #[tokio::test]
@@ -233,7 +233,7 @@ async fn test_aggregates_hourly() {
     let (status, body) = common::get_json(
         &app,
         &format!(
-            "/api/private/sites/{site_id}/aggregates/hourly?start=2025-01-15T00:00:00Z&end=2025-01-16T00:00:00Z"
+            "/api/service/sites/{site_id}/aggregates/hourly?start=2025-01-15T00:00:00Z&end=2025-01-16T00:00:00Z"
         ),
     )
     .await;
@@ -315,7 +315,7 @@ async fn test_aggregates_daily() {
     let (status, body) = common::get_json(
         &app,
         &format!(
-            "/api/private/sites/{site_id}/aggregates/daily?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"
+            "/api/service/sites/{site_id}/aggregates/daily?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"
         ),
     )
     .await;
@@ -352,7 +352,7 @@ async fn test_aggregates_sensor_types_filter() {
     let (status, body) = common::get_json(
         &app,
         &format!(
-            "/api/private/sites/{site_id}/aggregates/hourly?start=2025-01-15T00:00:00Z&end=2025-01-16T00:00:00Z&sensor_types=Conductivity"
+            "/api/service/sites/{site_id}/aggregates/hourly?start=2025-01-15T00:00:00Z&end=2025-01-16T00:00:00Z&sensor_types=Conductivity"
         ),
     )
     .await;
@@ -373,7 +373,7 @@ async fn test_aggregates_with_alarms() {
     let (status, body) = common::get_json(
         &app,
         &format!(
-            "/api/private/sites/{site_id}/aggregates/hourly?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z&alarms=true"
+            "/api/service/sites/{site_id}/aggregates/hourly?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z&alarms=true"
         ),
     )
     .await;
@@ -427,7 +427,7 @@ async fn test_aggregates_invalid_resolution_returns_400() {
     let (status, _body) = common::get(
         &app,
         &format!(
-            "/api/private/sites/{site_id}/aggregates/minutely?start=2025-01-15T00:00:00Z&end=2025-01-16T00:00:00Z"
+            "/api/service/sites/{site_id}/aggregates/minutely?start=2025-01-15T00:00:00Z&end=2025-01-16T00:00:00Z"
         ),
     )
     .await;
@@ -447,7 +447,7 @@ async fn test_aggregates_missing_params_returns_400() {
     // No start or end
     let (status, _body) = common::get(
         &app,
-        &format!("/api/private/sites/{site_id}/aggregates/hourly"),
+        &format!("/api/service/sites/{site_id}/aggregates/hourly"),
     )
     .await;
 
@@ -458,7 +458,7 @@ async fn test_aggregates_missing_params_returns_400() {
 }
 
 // ============================================================================
-// Alarms endpoint: GET /api/private/sites/{site_id}/alarms
+// Alarms endpoint: GET /api/service/sites/{site_id}/alarms
 // ============================================================================
 
 #[tokio::test]
@@ -470,7 +470,7 @@ async fn test_alarms_basic() {
     let (status, body) = common::get_json(
         &app,
         &format!(
-            "/api/private/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"
+            "/api/service/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"
         ),
     )
     .await;
@@ -542,7 +542,7 @@ async fn test_alarms_severity_filter() {
     let (status, body) = common::get_json(
         &app,
         &format!(
-            "/api/private/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z&severity=2"
+            "/api/service/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z&severity=2"
         ),
     )
     .await;
@@ -573,7 +573,7 @@ async fn test_alarms_sensor_types_filter() {
     let (status, body) = common::get_json(
         &app,
         &format!(
-            "/api/private/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z&sensor_types=DO_Temperature"
+            "/api/service/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z&sensor_types=DO_Temperature"
         ),
     )
     .await;
@@ -597,7 +597,7 @@ async fn test_alarms_missing_params_returns_400() {
     let site_id = common::SITE1_ID;
 
     // No start or end
-    let (status, _body) = common::get(&app, &format!("/api/private/sites/{site_id}/alarms")).await;
+    let (status, _body) = common::get(&app, &format!("/api/service/sites/{site_id}/alarms")).await;
 
     assert_eq!(status, 400, "alarms without start/end should return 400");
 }

@@ -126,7 +126,7 @@ pub struct SiteAggregatesQuery {
 /// Supports JSON, CSV, and NDJSON formats.
 #[utoipa::path(
     get,
-    path = "/api/private/sites/{site_id}/aggregates/{resolution}",
+    path = "/api/service/sites/{site_id}/aggregates/{resolution}",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
         ("resolution" = String, Path, description = "Aggregation resolution: hourly, daily, weekly, monthly"),

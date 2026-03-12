@@ -21,7 +21,7 @@ async fn test_infra_seed_and_healthz() {
     assert_eq!(status, 200, "healthz should return 200");
 
     // Verify seed data: should have 1 project
-    let (status, json) = common::get_json(&app, "/api/private/projects").await;
+    let (status, json) = common::get_json(&app, "/api/service/projects").await;
     assert_eq!(status, 200, "projects endpoint should return 200");
     let projects = json.as_array().expect("projects should be an array");
     assert!(!projects.is_empty(), "should have at least 1 project");

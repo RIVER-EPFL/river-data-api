@@ -3,6 +3,7 @@ pub mod alarms;
 pub mod config;
 pub mod projects;
 pub mod public_api;
+pub mod service;
 pub mod sites;
 
 // Re-export cache from services for use in route handlers
@@ -197,35 +198,8 @@ pub fn build_router(state: AppState) -> Router {
         );
     }
 
-    // Metadata routes (projects, sites listings) — require read_metadata permission
-    let metadata_routes_base = Router::new()
-        .route("/projects", get(projects::list_projects))
-        .route("/projects/{project_id}", get(projects::get_project))
-        .route(
-            "/projects/{project_id}/sites",
-            get(projects::list_project_sites),
-        )
-        .route("/sites", get(sites::list_sites))
-        .route("/sites/{site_id}", get(sites::get_site))
-        .route(
-            "/sites/{site_id}/parameters",
-            get(sites::list_site_parameters),
-        )
-        .layer(middleware::from_fn(
-            crate::common::middleware::require_read_metadata,
-        ));
-
-    // Data routes (readings, aggregates, alarms) — require read_data permission
-    let data_routes_base = Router::new()
-        .route("/sites/{site_id}/readings", get(sites::get_site_readings))
-        .route(
-            "/sites/{site_id}/aggregates/{resolution}",
-            get(sites::get_site_aggregates),
-        )
-        .route("/sites/{site_id}/alarms", get(alarms::get_site_alarms))
-        .layer(middleware::from_fn(
-            crate::common::middleware::require_read_data,
-        ));
+    // Service tier router (replaces old /api/private/)
+    let service_routes_inner = service::service_router(&state);
 
     // Public API routes
     let public_routes = public_api::public_router();
@@ -233,43 +207,27 @@ pub fn build_router(state: AppState) -> Router {
     // Admin routes (Keycloak-protected)
     let admin_routes = admin::admin_router(&state);
 
-    // Build private routes with optional rate limiting
-    let private_routes_inner = if config.disable_rate_limiting {
-        Router::new()
-            .merge(metadata_routes_base)
-            .merge(data_routes_base)
+    // Apply optional rate limiting to service tier
+    let service_routes_rated = if config.disable_rate_limiting {
+        service_routes_inner
     } else {
-        let metadata_limiter = GovernorConfigBuilder::default()
-            .key_extractor(FallbackIpKeyExtractor)
-            .per_second(config.rate_limit_metadata_per_second)
-            .burst_size(config.rate_limit_metadata_burst)
-            .finish()
-            .expect("Failed to create metadata rate limiter");
-
-        let data_limiter = GovernorConfigBuilder::default()
+        let service_limiter = GovernorConfigBuilder::default()
             .key_extractor(FallbackIpKeyExtractor)
             .per_second(config.rate_limit_data_per_second)
             .burst_size(config.rate_limit_data_burst)
             .finish()
-            .expect("Failed to create data rate limiter");
+            .expect("Failed to create service rate limiter");
 
-        Router::new()
-            .merge(metadata_routes_base.layer(GovernorLayer {
-                config: Arc::new(metadata_limiter),
-            }))
-            .merge(data_routes_base.layer(GovernorLayer {
-                config: Arc::new(data_limiter),
-            }))
+        service_routes_inner.layer(GovernorLayer {
+            config: Arc::new(service_limiter),
+        })
     };
 
-    // Apply dual auth (Keycloak JWT OR API token) to private routes
-    let private_routes = {
-        // Dual auth middleware runs after Keycloak and checks:
-        // KeycloakAuthStatus::Success → authenticated via JWT
-        // Otherwise → try validate_bearer_token() for API token auth
-        let mut r = private_routes_inner.layer(middleware::from_fn_with_state(
+    // Apply dual auth (Keycloak JWT OR API token) to service routes
+    let service_routes = {
+        let mut r = service_routes_rated.layer(middleware::from_fn_with_state(
             state.clone(),
-            crate::common::middleware::private_auth_middleware,
+            crate::common::middleware::service_auth_middleware,
         ));
         if let Some(instance) = state.keycloak_auth_instance.clone() {
             use axum_keycloak_auth::{PassthroughMode, layer::KeycloakAuthLayer};
@@ -283,7 +241,7 @@ pub fn build_router(state: AppState) -> Router {
                     .build(),
             );
         } else {
-            tracing::warn!("Private routes are not protected by Keycloak (API tokens still work)");
+            tracing::warn!("Service routes are not protected by Keycloak (API tokens still work)");
         }
         r
     };
@@ -305,15 +263,21 @@ pub fn build_router(state: AppState) -> Router {
     };
 
     // Combine all API routes
+    // Body limits: service tier manages its own (10MB on batch readings),
+    // admin and config get 1MB limit.
     let api_routes = Router::new()
-        .nest("/private", private_routes)
+        .nest("/service", service_routes)
         .nest("/public", public_routes_final)
-        .nest("/admin", admin_routes)
+        .nest(
+            "/admin",
+            admin_routes.layer(RequestBodyLimitLayer::new(1024 * 1024)),
+        )
         .nest(
             "/config",
-            Router::new().route("/keycloak", get(config::get_keycloak_config)),
-        )
-        .layer(RequestBodyLimitLayer::new(1024 * 1024)); // 1MB body limit
+            Router::new()
+                .route("/keycloak", get(config::get_keycloak_config))
+                .layer(RequestBodyLimitLayer::new(1024 * 1024)),
+        );
 
     // Health check routes (NO rate limiting)
     let health_routes = Router::new().route("/healthz", get(healthz));

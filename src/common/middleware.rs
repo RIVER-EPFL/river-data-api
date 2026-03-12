@@ -1,6 +1,6 @@
 use axum::{
     extract::{FromRequestParts, Request},
-    http::request::Parts,
+    http::{Method, request::Parts},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -38,6 +38,10 @@ pub struct TokenPermissions {
     pub read_metadata: bool,
     #[serde(default = "default_true")]
     pub read_data: bool,
+    #[serde(default)]
+    pub write_metadata: bool,
+    #[serde(default)]
+    pub write_data: bool,
 }
 
 fn default_true() -> bool {
@@ -49,6 +53,8 @@ impl Default for TokenPermissions {
         Self {
             read_metadata: true,
             read_data: true,
+            write_metadata: false,
+            write_data: false,
         }
     }
 }
@@ -65,7 +71,7 @@ impl TokenPermissions {
 /// Runs after `KeycloakAuthLayer` in `PassthroughMode::Pass` mode.
 /// Checks the Keycloak auth status first; if that failed, tries API token validation.
 /// Inserts `AuthContext` into request extensions on success.
-pub async fn private_auth_middleware(
+pub async fn service_auth_middleware(
     state: axum::extract::State<AppState>,
     mut request: Request,
     next: Next,
@@ -133,6 +139,66 @@ pub async fn require_read_data(request: Request, next: Next) -> Response {
                 next.run(request).await
             } else {
                 AppError::Forbidden("Token lacks read_data permission".to_string()).into_response()
+            }
+        }
+        None => AppError::Unauthorized("Authentication required".to_string()).into_response(),
+    }
+}
+
+/// Scope middleware: requires `write_metadata` permission.
+/// Keycloak users pass through unconditionally.
+pub async fn require_write_metadata(request: Request, next: Next) -> Response {
+    match request.extensions().get::<AuthContext>() {
+        Some(AuthContext::Keycloak) => next.run(request).await,
+        Some(AuthContext::ApiToken { permissions, .. }) => {
+            if permissions.write_metadata {
+                next.run(request).await
+            } else {
+                AppError::Forbidden("Token lacks write_metadata permission".to_string())
+                    .into_response()
+            }
+        }
+        None => AppError::Unauthorized("Authentication required".to_string()).into_response(),
+    }
+}
+
+/// Scope middleware: requires `write_data` permission.
+/// Keycloak users pass through unconditionally.
+pub async fn require_write_data(request: Request, next: Next) -> Response {
+    match request.extensions().get::<AuthContext>() {
+        Some(AuthContext::Keycloak) => next.run(request).await,
+        Some(AuthContext::ApiToken { permissions, .. }) => {
+            if permissions.write_data {
+                next.run(request).await
+            } else {
+                AppError::Forbidden("Token lacks write_data permission".to_string())
+                    .into_response()
+            }
+        }
+        None => AppError::Unauthorized("Authentication required".to_string()).into_response(),
+    }
+}
+
+/// Method-aware scope middleware for CrudCrate routes.
+/// GET/HEAD → requires `read_metadata`; all other methods → requires `write_metadata`.
+/// Keycloak users pass through unconditionally.
+pub async fn require_crud_permissions(request: Request, next: Next) -> Response {
+    let is_read = matches!(*request.method(), Method::GET | Method::HEAD);
+    match request.extensions().get::<AuthContext>() {
+        Some(AuthContext::Keycloak) => next.run(request).await,
+        Some(AuthContext::ApiToken { permissions, .. }) => {
+            if is_read {
+                if permissions.read_metadata {
+                    next.run(request).await
+                } else {
+                    AppError::Forbidden("Token lacks read_metadata permission".to_string())
+                        .into_response()
+                }
+            } else if permissions.write_metadata {
+                next.run(request).await
+            } else {
+                AppError::Forbidden("Token lacks write_metadata permission".to_string())
+                    .into_response()
             }
         }
         None => AppError::Unauthorized("Authentication required".to_string()).into_response(),
