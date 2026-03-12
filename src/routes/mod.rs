@@ -102,6 +102,61 @@ pub async fn resolve_site(
         .ok_or_else(|| AppError::NotFound("Site not found".to_string()))
 }
 
+/// Resolve a site by UUID or name, fetching the related project in the same query.
+/// Returns (site, Option<project>) to avoid a separate N+1 project lookup.
+pub async fn resolve_site_with_project(
+    db: &DatabaseConnection,
+    id_or_name: &str,
+) -> AppResult<(sites_entity::Model, Option<projects_entity::Model>)> {
+    // Try UUID first
+    if let Ok(uuid) = id_or_name.parse::<Uuid>() {
+        return sites_entity::Entity::find_by_id(uuid)
+            .find_also_related(projects_entity::Entity)
+            .one(db)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Site not found".to_string()));
+    }
+
+    // Fall back to case-insensitive name lookup using LOWER()
+    sites_entity::Entity::find()
+        .filter(Condition::all().add(Expr::cust_with_values(
+            "LOWER(sites.name) = LOWER($1)",
+            [id_or_name],
+        )))
+        .find_also_related(projects_entity::Entity)
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Site not found".to_string()))
+}
+
+// ============================================================================
+// Time Range Validation
+// ============================================================================
+
+/// Validate that a required time range has end > start.
+pub fn validate_time_range(
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+) -> AppResult<()> {
+    if end <= start {
+        return Err(AppError::BadRequest(
+            "end time must be after start time".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an optional time range (only checks if both are provided).
+pub fn validate_optional_time_range(
+    start: Option<chrono::DateTime<chrono::Utc>>,
+    end: Option<chrono::DateTime<chrono::Utc>>,
+) -> AppResult<()> {
+    if let (Some(s), Some(e)) = (start, end) {
+        validate_time_range(s, e)?;
+    }
+    Ok(())
+}
+
 // ============================================================================
 // OpenAPI Documentation
 // ============================================================================
@@ -110,14 +165,11 @@ pub async fn resolve_site(
 #[openapi(
     paths(
         healthz,
-        projects::list_projects,
-        projects::get_project,
         projects::list_project_sites,
-        sites::list_sites,
-        sites::get_site,
         sites::list_site_parameters,
         sites::get_site_readings,
         sites::get_site_aggregates,
+        sites::get_site_status_events,
         alarms::get_site_alarms,
     ),
     components(
@@ -132,6 +184,7 @@ pub async fn resolve_site(
             sites::ParameterData,
             sites::AggregatesResponse,
             sites::ParameterAggregateData,
+            sites::StatusEventsResponse,
             alarms::AlarmViolationsResponse,
             alarms::ParameterViolationData,
         )
@@ -266,7 +319,7 @@ pub fn build_router(state: AppState) -> Router {
     // Body limits: service tier manages its own (10MB on batch readings),
     // admin and config get 1MB limit.
     let api_routes = Router::new()
-        .nest("/service", service_routes)
+        .nest_service("/service", service_routes)
         .nest("/public", public_routes_final)
         .nest(
             "/admin",

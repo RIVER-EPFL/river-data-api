@@ -12,6 +12,7 @@ pub struct SyncConfig {
 
     // Sync intervals (seconds)
     pub sync_interval_seconds: u64,
+    pub device_status_interval_seconds: u64,
     pub max_history_days: i64,
 
     // Retry configuration
@@ -30,6 +31,7 @@ impl SyncConfig {
             vaisala_skip_tls_verify: env_bool("VAISALA_SKIP_TLS_VERIFY", true),
 
             sync_interval_seconds: env_u64("SYNC_INTERVAL_SECONDS", 300),
+            device_status_interval_seconds: env_u64("DEVICE_STATUS_INTERVAL_SECONDS", 1800),
             max_history_days: env_i64("MAX_HISTORY_DAYS", 90),
 
             retry_delay_seconds: env_u64("RETRY_DELAY_SECONDS", 60),

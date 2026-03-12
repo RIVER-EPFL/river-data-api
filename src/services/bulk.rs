@@ -7,14 +7,14 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::error::{AppError, AppResult};
 
-/// Global semaphore limiting concurrent bulk (CSV/NDJSON) requests.
-static BULK_SEMAPHORE: std::sync::LazyLock<Arc<Semaphore>> = std::sync::LazyLock::new(|| {
-    let limit = std::env::var("BULK_CONCURRENT_LIMIT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
+/// Semaphore limiting concurrent bulk (CSV/NDJSON) requests.
+/// Created from the config value at startup via `new_bulk_semaphore`.
+pub fn new_bulk_semaphore(limit: usize) -> Arc<Semaphore> {
     Arc::new(Semaphore::new(limit))
-});
+}
+
+/// Type alias for the bulk semaphore shared via AppState.
+pub type BulkSemaphore = Arc<Semaphore>;
 
 /// Determine response format from query param and Accept header.
 pub fn determine_format(query_format: &str, headers: &HeaderMap) -> String {
@@ -38,9 +38,12 @@ pub fn determine_format(query_format: &str, headers: &HeaderMap) -> String {
 
 /// Try to acquire a bulk semaphore permit for CSV/NDJSON requests.
 /// Returns None for JSON format, Some(permit) for bulk formats, or error if too many concurrent.
-pub fn acquire_bulk_permit(format: &str) -> AppResult<Option<OwnedSemaphorePermit>> {
+pub fn acquire_bulk_permit(
+    format: &str,
+    semaphore: &BulkSemaphore,
+) -> AppResult<Option<OwnedSemaphorePermit>> {
     if format == "csv" || format == "ndjson" {
-        match BULK_SEMAPHORE.clone().try_acquire_owned() {
+        match semaphore.clone().try_acquire_owned() {
             Ok(permit) => Ok(Some(permit)),
             Err(_) => {
                 tracing::warn!(format = %format, "bulk_request_rejected");

@@ -20,10 +20,10 @@ async fn test_infra_seed_and_healthz() {
     let (status, _body) = common::get(&app, "/healthz").await;
     assert_eq!(status, 200, "healthz should return 200");
 
-    // Verify seed data: should have 1 project
+    // Verify seed data: should have 1 project (CrudCrate list format)
     let (status, json) = common::get_json(&app, "/api/service/projects").await;
     assert_eq!(status, 200, "projects endpoint should return 200");
-    let projects = json.as_array().expect("projects should be an array");
+    let projects = json["data"].as_array().expect("projects should have data array");
     assert!(!projects.is_empty(), "should have at least 1 project");
 
     common::cleanup_test_db(&db).await;

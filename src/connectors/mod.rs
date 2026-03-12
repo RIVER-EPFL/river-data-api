@@ -1,5 +1,3 @@
-pub mod vaisala;
-
 use async_trait::async_trait;
 use sea_orm::DatabaseConnection;
 

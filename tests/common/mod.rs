@@ -7,7 +7,6 @@ use axum::Router;
 use chrono::{DateTime, Duration, Utc};
 use river_db::common::AppState;
 use river_db::config::Config;
-use river_db::vaisala::VaisalaClient;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 
@@ -90,8 +89,7 @@ pub async fn setup_test_db() -> DatabaseConnection {
 /// but with rate limiting disabled.
 pub fn build_test_app(db: DatabaseConnection) -> Router {
     let config = test_config();
-    let vaisala_client = VaisalaClient::new(&config);
-    let state = AppState::new(db, config, vaisala_client);
+    let state = AppState::new(db, config, None);
     river_db::routes::build_router(state)
 }
 
@@ -99,14 +97,6 @@ pub fn build_test_app(db: DatabaseConnection) -> Router {
 fn test_config() -> Config {
     Config {
         database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
-        vaisala_base_url: "http://localhost:9999".to_string(),
-        vaisala_bearer_token: "test-token".to_string(),
-        vaisala_skip_tls_verify: true,
-        vaisala_max_history_days: 90,
-        sync_readings_interval_seconds: 9999,
-        sync_device_status_interval_seconds: 9999,
-        sync_retry_max: 0,
-        sync_retry_delay_seconds: 60,
         api_host: "127.0.0.1".to_string(),
         api_port: 0,
         disable_rate_limiting: true,
@@ -118,6 +108,9 @@ fn test_config() -> Config {
         cache_ttl_seconds: 0, // disable caching in tests
         cache_max_bytes: 0,
         deployment: river_db::config::Deployment::Local,
+        keycloak_url: None,
+        keycloak_realm: None,
+        keycloak_client_id: None,
     }
 }
 

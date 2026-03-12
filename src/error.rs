@@ -16,9 +16,6 @@ pub enum AppError {
     #[error("Internal error: {0}")]
     Internal(String),
 
-    #[error("Vaisala API error: {0}")]
-    VaisalaApi(String),
-
     #[error("Configuration error: {0}")]
     Config(#[from] crate::config::ConfigError),
 
@@ -52,10 +49,6 @@ impl IntoResponse for AppError {
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Internal server error".to_string(),
                 )
-            }
-            Self::VaisalaApi(msg) => {
-                tracing::error!("Vaisala API error: {msg}");
-                (StatusCode::BAD_GATEWAY, format!("Vaisala API error: {msg}"))
             }
             Self::Config(e) => {
                 tracing::error!("Config error: {e:?}");

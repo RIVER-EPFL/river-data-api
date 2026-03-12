@@ -14,9 +14,9 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
-use crate::entity::{alarm_thresholds, projects, site_parameters};
+use crate::entity::{alarm_thresholds, site_parameters};
 use crate::error::{AppError, AppResult};
-use crate::routes::{cache, resolve_site};
+use crate::routes::{cache, resolve_site_with_project, validate_time_range};
 use crate::services::bulk;
 
 use super::types::{AlarmViolationsResponse, ParameterViolationData, SiteAlarmsQuery};
@@ -134,7 +134,7 @@ fn build_ndjson_response(
 /// Returns time-series data with severity levels (1=warning, 2=alarm).
 #[utoipa::path(
     get,
-    path = "/api/service/sites/{site_id}/alarms",
+    path = "/{site_id}/alarms",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
         SiteAlarmsQuery
@@ -153,7 +153,7 @@ pub async fn get_site_alarms(
     ProjectScope(scope): ProjectScope,
     headers: HeaderMap,
 ) -> AppResult<Response> {
-    let site = resolve_site(&state.db, &site_id).await?;
+    let (site, project) = resolve_site_with_project(&state.db, &site_id).await?;
 
     // Enforce project scope
     if let Some(scope_project) = scope
@@ -164,30 +164,17 @@ pub async fn get_site_alarms(
         ));
     }
 
-    // Fetch project info if available
-    let project_ref = if let Some(project_id) = site.project_id {
-        projects::Entity::find_by_id(project_id)
-            .one(&state.db)
-            .await?
-            .map(|p| ProjectRef {
-                id: p.id,
-                name: p.name,
-            })
-    } else {
-        None
-    };
+    let project_ref = project.map(|p| ProjectRef {
+        id: p.id,
+        name: p.name,
+    });
 
     let site_ref = SiteRef {
         id: site.id,
         name: site.name.clone(),
     };
 
-    // Validate time range
-    if query.end <= query.start {
-        return Err(AppError::BadRequest(
-            "end time must be after start time".to_string(),
-        ));
-    }
+    validate_time_range(query.start, query.end)?;
 
     let format = bulk::determine_format(&query.format, &headers);
 
@@ -283,7 +270,7 @@ pub async fn get_site_alarms(
         return cache::json_response((*cached).clone(), true);
     }
 
-    let _permit = bulk::acquire_bulk_permit(&format)?;
+    let _permit = bulk::acquire_bulk_permit(&format, &state.bulk_semaphore)?;
 
     let alarm_param_ids: Vec<uuid::Uuid> = params_with_thresholds.iter().map(|p| p.id).collect();
     // $1 = site_id, $2..=$N+1 = parameter_ids

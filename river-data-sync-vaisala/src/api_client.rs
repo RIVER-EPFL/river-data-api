@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::models::{
     CrudListResponse, Parameter, Project, ReadingInput, Site, SiteParameter, SourceMapping,
-    SyncState,
+    StatusEventInput, SyncState,
 };
 use crate::vaisala_client::SyncError;
 
@@ -302,6 +302,36 @@ impl ApiClient {
             .send()
             .await
             .map_err(|e| SyncError::Api(format!("insert_readings_batch failed: {e}")))?;
+        self.check_response(&resp)?;
+        let result: BatchResponse = resp
+            .json()
+            .await
+            .map_err(|e| SyncError::Api(format!("parse batch response: {e}")))?;
+        Ok(result.inserted)
+    }
+
+    // ========================================================================
+    // Batch Status Events
+    // ========================================================================
+
+    pub async fn insert_status_events_batch(
+        &self,
+        events: &[StatusEventInput],
+    ) -> Result<u64, SyncError> {
+        #[derive(serde::Deserialize)]
+        struct BatchResponse {
+            inserted: u64,
+        }
+
+        let body = serde_json::json!({ "events": events });
+        let resp = self
+            .http_client
+            .post(self.url("/status_events/batch"))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| SyncError::Api(format!("insert_status_events_batch failed: {e}")))?;
         self.check_response(&resp)?;
         let result: BatchResponse = resp
             .json()

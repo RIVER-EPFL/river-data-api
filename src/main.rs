@@ -10,7 +10,6 @@ use axum_keycloak_auth::instance::{KeycloakAuthInstance, KeycloakConfig};
 
 use river_db::common::AppState;
 use river_db::config::{Config, Deployment};
-use river_db::connectors::vaisala::{self, VaisalaClient};
 use river_db::routes;
 
 #[tokio::main]
@@ -45,14 +44,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     migration::Migrator::up(&db, None).await?;
     tracing::info!("Migrations completed");
 
-    // Create Vaisala client (optional - sync disabled if not configured)
-    let vaisala_client = config.vaisala.as_ref().map(VaisalaClient::new);
-    if vaisala_client.is_some() {
-        tracing::info!("Vaisala client initialized");
-    } else {
-        tracing::info!("Vaisala not configured, sync tasks will be skipped");
-    }
-
     // Initialize Keycloak authentication (optional in dev, required in prod)
     let keycloak_instance = match (&config.keycloak_url, &config.keycloak_realm) {
         (Some(url), Some(realm)) => {
@@ -77,15 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create application state
-    let state = AppState::new(db, config.clone(), vaisala_client, keycloak_instance);
-
-    // Spawn background sync tasks (fire-and-forget, non-blocking)
-    if state.vaisala_client.is_some() {
-        tracing::info!("Spawning background sync tasks...");
-        tokio::spawn(vaisala::scheduler::run_readings_sync(state.clone()));
-    } else {
-        tracing::info!("Vaisala not configured, skipping sync tasks");
-    }
+    let state = AppState::new(db, config.clone(), keycloak_instance);
 
     // Build router
     let app = routes::build_router(state);

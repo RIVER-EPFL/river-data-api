@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::connectors::vaisala::VaisalaClient;
+use crate::services::bulk::{BulkSemaphore, new_bulk_semaphore};
 use crate::services::public_api_config::{PublicConfigCache, new_public_config_cache};
 
 /// Cached response with metadata for freshness checking
@@ -24,10 +24,10 @@ pub type ResponseCache = Cache<String, CachedResponse>;
 pub struct AppState {
     pub db: DatabaseConnection,
     pub config: Arc<Config>,
-    pub vaisala_client: Option<Arc<VaisalaClient>>,
     pub response_cache: ResponseCache,
     pub public_config_cache: PublicConfigCache,
     pub keycloak_auth_instance: Option<Arc<KeycloakAuthInstance>>,
+    pub bulk_semaphore: BulkSemaphore,
 }
 
 impl AppState {
@@ -35,7 +35,6 @@ impl AppState {
     pub fn new(
         db: DatabaseConnection,
         config: Config,
-        vaisala_client: Option<VaisalaClient>,
         keycloak_auth_instance: Option<Arc<KeycloakAuthInstance>>,
     ) -> Self {
         // Cache weighted by byte size, not entry count
@@ -48,13 +47,15 @@ impl AppState {
             .time_to_live(Duration::from_secs(config.cache_ttl_seconds))
             .build();
 
+        let bulk_semaphore = new_bulk_semaphore(config.bulk_concurrent_limit);
+
         Self {
             db,
             config: Arc::new(config),
-            vaisala_client: vaisala_client.map(|c| Arc::new(c)),
             response_cache: cache,
             public_config_cache: new_public_config_cache(),
             keycloak_auth_instance,
+            bulk_semaphore,
         }
     }
 }

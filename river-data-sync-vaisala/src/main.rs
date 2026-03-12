@@ -48,7 +48,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.vaisala_skip_tls_verify,
     );
 
-    // Run the sync scheduler (blocks forever)
+    // Spawn device status sync as independent background task
+    let ds_config = config.clone();
+    let ds_api = ApiClient::new(&ds_config.api_base_url, &ds_config.api_token);
+    let ds_vaisala = VaisalaClient::new(
+        &ds_config.vaisala_base_url,
+        &ds_config.vaisala_bearer_token,
+        ds_config.vaisala_skip_tls_verify,
+    );
+    tokio::spawn(async move {
+        scheduler::run_device_status_sync(&ds_config, &ds_api, &ds_vaisala).await;
+    });
+
+    // Run the readings sync scheduler (blocks forever)
     scheduler::run_sync(&config, &api, &vaisala).await;
 
     Ok(())

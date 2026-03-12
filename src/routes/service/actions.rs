@@ -3,7 +3,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::connectors::vaisala::state;
+use crate::services::sync_state as state;
 use crate::error::AppResult;
 use crate::services::calibration::recalculate_derived_at_timestamp;
 

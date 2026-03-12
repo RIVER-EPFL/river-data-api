@@ -1,27 +1,28 @@
 pub mod actions;
 pub mod readings_batch;
 pub mod source_mappings;
+pub mod status_events_batch;
 
 use axum::{Router, middleware, routing::{get, post, put}};
 use tower_http::limit::RequestBodyLimitLayer;
+use utoipa_axum::router::OpenApiRouter;
 
 use crate::common::AppState;
+use crate::common::middleware::{
+    require_crud_permissions, require_read_metadata, require_write_data, require_write_metadata,
+};
 use crate::entity::{
     alarm_thresholds::AlarmThreshold,
     api_tokens::ApiToken,
     derived_parameter_definitions::DerivedParameterDefinition,
     parameters::Parameter,
-    projects::Project,
     public_exposed_parameters::PublicExposedParameter,
     sensor_calibrations::SensorCalibration,
     sensor_deployments::SensorDeployment,
     sensors::Sensor,
     site_parameters::SiteParameter,
-    sites::Site,
     sync_state::SyncState,
 };
-
-use super::{alarms, projects as projects_routes, sites as sites_routes};
 
 /// Build the `/api/service/` router.
 ///
@@ -31,89 +32,59 @@ use super::{alarms, projects as projects_routes, sites as sites_routes};
 ///
 /// Auth: Keycloak JWT OR API token (dual auth, same as old /api/private/).
 /// Permissions are enforced per route group via middleware layers.
-pub fn service_router(state: &AppState) -> Router<AppState> {
+///
+/// Uses OpenApiRouter + nest() to avoid the catch-all wildcards that
+/// nest_service() creates, which conflict with hand-crafted routes.
+pub fn service_router(state: &AppState) -> Router<()> {
     let db = &state.db;
 
-    // Convert crudcrate OpenApiRouters to axum::Router for nesting
-    let crud = |r: utoipa_axum::router::OpenApiRouter| -> Router<()> { r.into() };
+    let with_crud_perms = |r: OpenApiRouter| -> OpenApiRouter {
+        r.layer(middleware::from_fn(require_crud_permissions))
+    };
 
     // ========================================================================
-    // CrudCrate CRUD routers — read requires read_metadata, write requires write_metadata
+    // Entity routers — CrudCrate CRUD + hand-crafted custom routes
     // ========================================================================
-
-    // CrudCrate routers handle GET/POST/PATCH/DELETE internally.
-    // We apply read_metadata for the whole mount, then overlay write_metadata
-    // for mutating methods using a method-based middleware.
     //
-    // Since CrudCrate routers use nest_service (opaque services), we can't
-    // selectively layer per-method. Instead, we split into read-only and
-    // write-capable groups. CrudCrate mounts are read+write, so we apply
-    // write_metadata to all CrudCrate routes (Keycloak users pass through).
+    // Projects and Sites use per-entity views that merge CrudCrate CRUD
+    // routes with custom endpoints (e.g., /{id}/sites, /{id}/readings).
+    // Other entities use CrudCrate directly with require_crud_permissions.
+    //
+    // OpenApiRouter.nest() adds prefixed individual routes (no catch-all),
+    // so CrudCrate's GET /{id} coexists with custom GET /{id}/readings.
 
-    let crud_routes = Router::new()
-        .nest_service("/projects", crud(Project::router(db)))
-        .nest_service("/sites", crud(Site::router(db)))
-        .nest_service("/parameters", crud(Parameter::router(db)))
-        .nest_service("/site_parameters", crud(SiteParameter::router(db)))
-        .nest_service("/sensors", crud(Sensor::router(db)))
-        .nest_service("/sensor_calibrations", crud(SensorCalibration::router(db)))
-        .nest_service("/sensor_deployments", crud(SensorDeployment::router(db)))
-        .nest_service(
+    let entity_router: Router<()> = OpenApiRouter::new()
+        .nest("/projects", super::projects::views::service_router(state))
+        .nest("/sites", super::sites::views::service_router(state))
+        .nest("/parameters", with_crud_perms(Parameter::router(db)))
+        .nest(
+            "/site_parameters",
+            with_crud_perms(SiteParameter::router(db)),
+        )
+        .nest("/sensors", with_crud_perms(Sensor::router(db)))
+        .nest(
+            "/sensor_calibrations",
+            with_crud_perms(SensorCalibration::router(db)),
+        )
+        .nest(
+            "/sensor_deployments",
+            with_crud_perms(SensorDeployment::router(db)),
+        )
+        .nest(
             "/derived_parameters",
-            crud(DerivedParameterDefinition::router(db)),
+            with_crud_perms(DerivedParameterDefinition::router(db)),
         )
-        .nest_service("/alarm_thresholds", crud(AlarmThreshold::router(db)))
-        .nest_service("/tokens", crud(ApiToken::router(db)))
-        .nest_service(
+        .nest(
+            "/alarm_thresholds",
+            with_crud_perms(AlarmThreshold::router(db)),
+        )
+        .nest("/tokens", with_crud_perms(ApiToken::router(db)))
+        .nest(
             "/public_exposed_parameters",
-            crud(PublicExposedParameter::router(db)),
+            with_crud_perms(PublicExposedParameter::router(db)),
         )
-        .nest_service("/sync_states", crud(SyncState::router(db)))
-        .layer(middleware::from_fn(
-            crate::common::middleware::require_crud_permissions,
-        ));
-
-    // ========================================================================
-    // Hand-crafted metadata routes (from old /api/private/) — require read_metadata
-    // ========================================================================
-
-    let metadata_routes = Router::new()
-        .route("/projects", get(projects_routes::list_projects))
-        .route("/projects/{project_id}", get(projects_routes::get_project))
-        .route(
-            "/projects/{project_id}/sites",
-            get(projects_routes::list_project_sites),
-        )
-        .route("/sites", get(sites_routes::list_sites))
-        .route("/sites/{site_id}", get(sites_routes::get_site))
-        .route(
-            "/sites/{site_id}/parameters",
-            get(sites_routes::list_site_parameters),
-        )
-        .layer(middleware::from_fn(
-            crate::common::middleware::require_read_metadata,
-        ));
-
-    // ========================================================================
-    // Hand-crafted data read routes (from old /api/private/) — require read_data
-    // ========================================================================
-
-    let data_read_routes = Router::new()
-        .route(
-            "/sites/{site_id}/readings",
-            get(sites_routes::get_site_readings),
-        )
-        .route(
-            "/sites/{site_id}/aggregates/{resolution}",
-            get(sites_routes::get_site_aggregates),
-        )
-        .route(
-            "/sites/{site_id}/alarms",
-            get(alarms::get_site_alarms),
-        )
-        .layer(middleware::from_fn(
-            crate::common::middleware::require_read_data,
-        ));
+        .nest("/sync_states", with_crud_perms(SyncState::router(db)))
+        .into();
 
     // ========================================================================
     // Source mappings — read requires read_metadata, write requires write_metadata
@@ -121,19 +92,20 @@ pub fn service_router(state: &AppState) -> Router<AppState> {
 
     let source_mappings_read = Router::new()
         .route("/source_mappings", get(source_mappings::list_source_mappings))
-        .layer(middleware::from_fn(
-            crate::common::middleware::require_read_metadata,
-        ));
+        .layer(middleware::from_fn(require_read_metadata))
+        .with_state(state.clone());
 
     let source_mappings_write = Router::new()
-        .route("/source_mappings", post(source_mappings::upsert_source_mapping))
+        .route(
+            "/source_mappings",
+            post(source_mappings::upsert_source_mapping),
+        )
         .route(
             "/source_mappings/{entity_type}/{source_key}",
             put(source_mappings::update_source_mapping),
         )
-        .layer(middleware::from_fn(
-            crate::common::middleware::require_write_metadata,
-        ));
+        .layer(middleware::from_fn(require_write_metadata))
+        .with_state(state.clone());
 
     // ========================================================================
     // Data write routes — require write_data
@@ -143,6 +115,10 @@ pub fn service_router(state: &AppState) -> Router<AppState> {
         .route(
             "/readings/batch",
             post(readings_batch::insert_batch_readings),
+        )
+        .route(
+            "/status_events/batch",
+            post(status_events_batch::insert_batch_status_events),
         )
         // Raise body limit to 10MB for batch inserts
         .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
@@ -158,18 +134,15 @@ pub fn service_router(state: &AppState) -> Router<AppState> {
             "/actions/update_last_full_sync",
             post(actions::update_last_full_sync),
         )
-        .layer(middleware::from_fn(
-            crate::common::middleware::require_write_data,
-        ));
+        .layer(middleware::from_fn(require_write_data))
+        .with_state(state.clone());
 
     // ========================================================================
     // Combine all service routes
     // ========================================================================
 
     Router::new()
-        .merge(crud_routes)
-        .merge(metadata_routes)
-        .merge(data_read_routes)
+        .merge(entity_router)
         .merge(source_mappings_read)
         .merge(source_mappings_write)
         .merge(data_write_routes)

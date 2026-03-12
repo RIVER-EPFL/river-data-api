@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::api_client::ApiClient;
-use crate::models::ReadingInput;
+use crate::models::{ReadingInput, StatusEventInput};
 use crate::vaisala_client::{SyncError, VaisalaClient};
 
 const BATCH_SIZE: usize = 1000;
@@ -226,7 +226,7 @@ pub async fn sync_locations(
                         "name": sensor_type,
                         "display_name": display_name,
                         "default_units": default_units,
-                        "category": "measurement",
+                        "category": derive_category(&sensor_type),
                         "data_type": "numeric",
                     }))
                     .await
@@ -502,6 +502,127 @@ pub async fn sync_readings(
     }
 
     Ok(())
+}
+
+/// Sync device status from Vaisala into status_events via the API.
+///
+/// Calls `get_locations_data` for all mapped active parameters and posts any
+/// non-empty `device_status` strings to the status_events batch endpoint.
+pub async fn sync_device_status(
+    api: &ApiClient,
+    vaisala: &VaisalaClient,
+) -> Result<(), SyncError> {
+    let mappings = api.list_source_mappings(Some("site_parameter")).await?;
+    let param_map: HashMap<i32, Uuid> = mappings
+        .iter()
+        .map(|m| (m.source_key, m.entity_id))
+        .collect();
+
+    let site_params = api.list_site_parameters().await?;
+    let active_params: Vec<_> = site_params
+        .iter()
+        .filter(|sp| sp.is_active.unwrap_or(true))
+        .collect();
+
+    // Build sp_id -> (site_id, parameter_id) lookup
+    let sp_info: HashMap<Uuid, (Uuid, Uuid)> = active_params
+        .iter()
+        .map(|sp| (sp.id, (sp.site_id, sp.parameter_id)))
+        .collect();
+
+    let location_ids: Vec<i32> = param_map
+        .iter()
+        .filter(|(_, sp_id)| sp_info.contains_key(sp_id))
+        .map(|(key, _)| *key)
+        .collect();
+
+    if location_ids.is_empty() {
+        tracing::debug!("No mapped parameters for device status sync");
+        return Ok(());
+    }
+
+    tracing::info!(
+        location_count = location_ids.len(),
+        "Syncing device status"
+    );
+
+    let data = vaisala.get_locations_data(&location_ids).await?;
+    let now = Utc::now();
+
+    // Ensure "Device_Status" global parameter exists
+    let existing_params = api.list_parameters().await?;
+    let device_status_param_id = if let Some(p) = existing_params.iter().find(|p| p.name == "Device_Status") {
+        p.id
+    } else {
+        match api
+            .create_parameter(&serde_json::json!({
+                "name": "Device_Status",
+                "display_name": "Device Status",
+                "default_units": "",
+                "category": "device_health",
+                "data_type": "string",
+            }))
+            .await
+        {
+            Ok(p) => p.id,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to create Device_Status parameter");
+                return Err(e);
+            }
+        }
+    };
+
+    // Collect unique sites with device_status values
+    let mut seen_sites: HashSet<Uuid> = HashSet::new();
+    let mut events: Vec<StatusEventInput> = Vec::new();
+
+    for resource in data.data {
+        let attrs = resource.attributes;
+
+        if attrs.device_status.is_empty() {
+            continue;
+        }
+
+        let Some(sp_id) = param_map.get(&attrs.id) else {
+            continue;
+        };
+        let Some((site_id, _)) = sp_info.get(sp_id) else {
+            continue;
+        };
+
+        // Only one status event per site per sync cycle
+        if !seen_sites.insert(*site_id) {
+            continue;
+        }
+
+        events.push(StatusEventInput {
+            site_id: *site_id,
+            parameter_id: device_status_param_id,
+            time: now,
+            value: attrs.device_status.clone(),
+            sensor_id: None,
+        });
+    }
+
+    if events.is_empty() {
+        tracing::debug!("No device status events to insert");
+        return Ok(());
+    }
+
+    match api.insert_status_events_batch(&events).await {
+        Ok(count) => tracing::info!(inserted = count, "Device status sync complete"),
+        Err(e) => tracing::warn!(error = %e, "Failed to insert status events"),
+    }
+
+    Ok(())
+}
+
+/// Derive the parameter category from the sensor type.
+fn derive_category(sensor_type: &str) -> &'static str {
+    match sensor_type {
+        "Battery" => "device_health",
+        _ => "measurement",
+    }
 }
 
 fn derive_parameter_type(name: &str) -> String {

@@ -276,3 +276,13 @@ pub struct ReadingInput {
     pub calibration_id: Option<uuid::Uuid>,
     pub deployment_id: Option<uuid::Uuid>,
 }
+
+/// Status event for batch insert
+#[derive(Debug, Serialize)]
+pub struct StatusEventInput {
+    pub site_id: uuid::Uuid,
+    pub parameter_id: uuid::Uuid,
+    pub time: chrono::DateTime<chrono::Utc>,
+    pub value: String,
+    pub sensor_id: Option<uuid::Uuid>,
+}

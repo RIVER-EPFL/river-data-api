@@ -83,6 +83,28 @@ pub async fn run_sync(config: &SyncConfig, api: &ApiClient, vaisala: &VaisalaCli
     }
 }
 
+/// Run the device status sync task on a separate schedule.
+pub async fn run_device_status_sync(config: &SyncConfig, api: &ApiClient, vaisala: &VaisalaClient) {
+    tracing::info!(
+        interval_secs = config.device_status_interval_seconds,
+        "Starting device status sync scheduler"
+    );
+
+    let mut ticker = interval(Duration::from_secs(config.device_status_interval_seconds));
+    ticker.tick().await; // First tick fires immediately
+
+    loop {
+        tracing::debug!("Running device status sync...");
+
+        match sync::sync_device_status(api, vaisala).await {
+            Ok(()) => tracing::debug!("Device status sync completed"),
+            Err(e) => tracing::warn!(error = %e, "Device status sync failed"),
+        }
+
+        ticker.tick().await;
+    }
+}
+
 /// Check if any sync state needs a full re-sync (> 24 hours since last full sync).
 async fn needs_full_sync(api: &ApiClient) -> bool {
     let states = match api.list_sync_states().await {

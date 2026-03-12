@@ -29,9 +29,6 @@ sea-orm-timescale = "0.2.0"
 tokio = { version = "1.43", features = ["full"] }
 tokio-stream = "0.1"
 
-# HTTP client (Vaisala)
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-
 # Serialization
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }

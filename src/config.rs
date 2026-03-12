@@ -27,14 +27,6 @@ pub struct Config {
     // Database
     pub database_url: String,
 
-    // Vaisala API (optional - sync disabled if not configured)
-    pub vaisala: Option<crate::connectors::vaisala::config::VaisalaConfig>,
-
-    // Sync settings
-    pub sync_readings_interval_seconds: u64,
-    pub sync_retry_max: u32,
-    pub sync_retry_delay_seconds: u64,
-
     // API settings
     pub api_host: String,
     pub api_port: u16,
@@ -85,43 +77,6 @@ impl Config {
                 .map_err(|_| {
                     ConfigError::Missing("DATABASE_URL or DB_USER/DB_PASSWORD/DB_HOST/DB_NAME")
                 })?,
-
-            // Vaisala API (optional - sync disabled if not configured)
-            vaisala: {
-                let base_url = env::var("VAISALA_BASE_URL").ok();
-                let bearer_token = env::var("VAISALA_BEARER_TOKEN").ok();
-                match (base_url, bearer_token) {
-                    (Some(base_url), Some(bearer_token)) => {
-                        Some(crate::connectors::vaisala::config::VaisalaConfig {
-                            base_url,
-                            bearer_token,
-                            skip_tls_verify: env::var("VAISALA_SKIP_TLS_VERIFY")
-                                .unwrap_or_else(|_| "true".to_string())
-                                .parse()
-                                .unwrap_or(true),
-                            max_history_days: env::var("VAISALA_MAX_HISTORY_DAYS")
-                                .unwrap_or_else(|_| "90".to_string())
-                                .parse()
-                                .unwrap_or(90),
-                        })
-                    }
-                    _ => None,
-                }
-            },
-
-            // Sync settings
-            sync_readings_interval_seconds: env::var("SYNC_READINGS_INTERVAL_SECONDS")
-                .unwrap_or_else(|_| "300".to_string())
-                .parse()
-                .unwrap_or(300),
-            sync_retry_max: env::var("SYNC_RETRY_MAX")
-                .unwrap_or_else(|_| "3".to_string())
-                .parse()
-                .unwrap_or(3),
-            sync_retry_delay_seconds: env::var("SYNC_RETRY_DELAY_SECONDS")
-                .unwrap_or_else(|_| "60".to_string())
-                .parse()
-                .unwrap_or(60),
 
             // API settings
             api_host: env::var("API_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
