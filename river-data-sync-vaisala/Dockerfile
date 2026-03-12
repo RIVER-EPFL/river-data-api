@@ -8,11 +8,13 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/li
 # Copy workspace root files for dependency resolution
 COPY Cargo.toml Cargo.lock ./
 COPY migration/Cargo.toml migration/Cargo.toml
+COPY river-data-sync-common/Cargo.toml river-data-sync-common/Cargo.toml
 
-# Copy the sync microservice
+# Copy the shared crate and sync microservice
+COPY river-data-sync-common/ river-data-sync-common/
 COPY river-data-sync-vaisala/ river-data-sync-vaisala/
 
-# Create dummy main crate src to satisfy workspace
+# Create dummy crates to satisfy workspace
 RUN mkdir -p src && echo "fn main() {}" > src/main.rs
 RUN mkdir -p migration/src && echo "fn main() {}" > migration/src/main.rs && touch migration/src/lib.rs
 

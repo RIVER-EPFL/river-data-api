@@ -11,12 +11,13 @@ use serial_test::serial;
 // Helper: setup, cleanup, seed, and build app
 // ============================================================================
 
-async fn setup() -> (sea_orm::DatabaseConnection, axum::Router) {
+async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
     let db = common::setup_test_db().await;
     common::cleanup_test_db(&db).await;
     common::seed_test_data(&db).await;
+    let token = common::seed_api_token(&db, common::full_permissions(), None).await;
     let app = common::build_test_app(db.clone());
-    (db, app)
+    (db, app, token)
 }
 
 // =============================================================================
@@ -26,9 +27,9 @@ async fn setup() -> (sea_orm::DatabaseConnection, axum::Router) {
 #[tokio::test]
 #[serial]
 async fn test_list_projects() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
 
-    let (status, body) = common::get_json(&app, "/api/service/projects").await;
+    let (status, body) = common::get_json_with_token(&app, "/api/service/projects", &token).await;
     assert_eq!(status, 200);
 
     let projects = body["data"].as_array().expect("response should have data array");
@@ -47,10 +48,10 @@ async fn test_list_projects() {
 #[tokio::test]
 #[serial]
 async fn test_get_project_by_uuid() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
 
     let uri = format!("/api/service/projects/{}", common::PROJECT_ID);
-    let (status, body) = common::get_json(&app, &uri).await;
+    let (status, body) = common::get_json_with_token(&app, &uri, &token).await;
     assert_eq!(status, 200);
 
     assert_eq!(body["id"], common::PROJECT_ID);
@@ -65,10 +66,10 @@ async fn test_get_project_by_uuid() {
 #[tokio::test]
 #[serial]
 async fn test_list_project_sites() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
 
     let uri = format!("/api/service/projects/{}/sites", common::PROJECT_ID);
-    let (status, body) = common::get_json(&app, &uri).await;
+    let (status, body) = common::get_json_with_token(&app, &uri, &token).await;
     assert_eq!(status, 200);
 
     let sites = body.as_array().expect("response should be an array");
@@ -97,11 +98,12 @@ async fn test_list_project_sites() {
 #[tokio::test]
 #[serial]
 async fn test_get_project_not_found() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
 
-    let (status, _body) = common::get(
+    let (status, _body) = common::get_with_token(
         &app,
         "/api/service/projects/00000000-0000-0000-0000-ffffffffffff",
+        &token,
     )
     .await;
     assert_eq!(status, 404);
@@ -114,9 +116,9 @@ async fn test_get_project_not_found() {
 #[tokio::test]
 #[serial]
 async fn test_list_sites() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
 
-    let (status, body) = common::get_json(&app, "/api/service/sites").await;
+    let (status, body) = common::get_json_with_token(&app, "/api/service/sites", &token).await;
     assert_eq!(status, 200);
 
     let sites = body["data"].as_array().expect("response should have data array");
@@ -130,10 +132,10 @@ async fn test_list_sites() {
 #[tokio::test]
 #[serial]
 async fn test_get_site_by_uuid() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
 
     let uri = format!("/api/service/sites/{}", common::SITE1_ID);
-    let (status, body) = common::get_json(&app, &uri).await;
+    let (status, body) = common::get_json_with_token(&app, &uri, &token).await;
     assert_eq!(status, 200);
 
     assert_eq!(body["id"], common::SITE1_ID);
@@ -149,10 +151,10 @@ async fn test_get_site_by_uuid() {
 #[tokio::test]
 #[serial]
 async fn test_list_site_parameters() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
 
     let uri = format!("/api/service/sites/{}/parameters", common::SITE1_ID);
-    let (status, body) = common::get_json(&app, &uri).await;
+    let (status, body) = common::get_json_with_token(&app, &uri, &token).await;
     assert_eq!(status, 200);
 
     let params = body.as_array().expect("response should be an array");
@@ -177,11 +179,12 @@ async fn test_list_site_parameters() {
 #[tokio::test]
 #[serial]
 async fn test_get_site_not_found() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
 
-    let (status, _body) = common::get(
+    let (status, _body) = common::get_with_token(
         &app,
         "/api/service/sites/00000000-0000-0000-0000-ffffffffffff",
+        &token,
     )
     .await;
     assert_eq!(status, 404);

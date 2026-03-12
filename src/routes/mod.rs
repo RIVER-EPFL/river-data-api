@@ -315,11 +315,18 @@ pub fn build_router(state: AppState) -> Router {
         })
     };
 
+    // Sync control routes — separate auth path (body-based creds + session tokens,
+    // NOT dual auth via service_auth_middleware)
+    let sync_control_routes = service::sync_control_router(&state);
+
     // Combine all API routes
     // Body limits: service tier manages its own (10MB on batch readings),
     // admin and config get 1MB limit.
+    // Note: nest() routes take priority over nest_service() wildcards,
+    // so sync control paths are matched before the service catch-all.
     let api_routes = Router::new()
         .nest_service("/service", service_routes)
+        .nest("/service", sync_control_routes)
         .nest("/public", public_routes_final)
         .nest(
             "/admin",

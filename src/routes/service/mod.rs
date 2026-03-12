@@ -2,6 +2,7 @@ pub mod actions;
 pub mod readings_batch;
 pub mod source_mappings;
 pub mod status_events_batch;
+pub mod sync_control;
 
 use axum::{Router, middleware, routing::{get, post, put}};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -9,7 +10,8 @@ use utoipa_axum::router::OpenApiRouter;
 
 use crate::common::AppState;
 use crate::common::middleware::{
-    require_crud_permissions, require_read_metadata, require_write_data, require_write_metadata,
+    require_crud_permissions, require_read_data, require_read_metadata, require_write_data,
+    require_write_metadata,
 };
 use crate::entity::{
     alarm_thresholds::AlarmThreshold,
@@ -138,6 +140,18 @@ pub fn service_router(state: &AppState) -> Router<()> {
         .with_state(state.clone());
 
     // ========================================================================
+    // Data read routes — require read_data
+    // ========================================================================
+
+    let data_read_routes = Router::new()
+        .route(
+            "/actions/preview_derived",
+            post(actions::preview_derived),
+        )
+        .layer(middleware::from_fn(require_read_data))
+        .with_state(state.clone());
+
+    // ========================================================================
     // Combine all service routes
     // ========================================================================
 
@@ -146,4 +160,34 @@ pub fn service_router(state: &AppState) -> Router<()> {
         .merge(source_mappings_read)
         .merge(source_mappings_write)
         .merge(data_write_routes)
+        .merge(data_read_routes)
+}
+
+/// Build the sync control plane routes.
+///
+/// These are mounted under `/api/service/` but bypass `service_auth_middleware`
+/// because they use their own auth mechanisms:
+/// - Enroll: client_id + client_secret in the JSON body
+/// - Heartbeat/commands: sync session token via `sync_service_auth_middleware`
+///
+/// Returns `Router<AppState>` so the caller can nest it alongside other
+/// `AppState`-typed routers; `with_state()` is applied by `build_router()`.
+pub fn sync_control_router(state: &AppState) -> Router<AppState> {
+    let sync_enroll_routes: Router<AppState> = Router::new()
+        .route("/sync/enroll", post(sync_control::enroll));
+
+    let sync_authenticated_routes: Router<AppState> = Router::new()
+        .route("/sync/heartbeat", post(sync_control::heartbeat))
+        .route(
+            "/sync/commands/{id}",
+            axum::routing::patch(sync_control::update_command),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::common::middleware::sync_service_auth_middleware,
+        ));
+
+    Router::new()
+        .merge(sync_enroll_routes)
+        .merge(sync_authenticated_routes)
 }

@@ -15,15 +15,15 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
     pub id: Uuid,
-    #[crudcrate(filterable)]
+    #[crudcrate(filterable, sortable)]
     pub project_id: Option<Uuid>,
     #[sea_orm(unique)]
-    #[crudcrate(filterable, fulltext)]
+    #[crudcrate(filterable, fulltext, sortable)]
     pub name: String,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
     pub altitude_m: Option<f64>,
-    #[crudcrate(exclude(create, update))]
+    #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     #[crudcrate(exclude(create, update))]
     pub discovered_at: Option<chrono::DateTime<chrono::Utc>>,

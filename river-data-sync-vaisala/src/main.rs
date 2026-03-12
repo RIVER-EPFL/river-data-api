@@ -1,7 +1,7 @@
 mod api_client;
 mod config;
 mod models;
-mod scheduler;
+mod service;
 mod sync;
 mod vaisala_client;
 
@@ -9,10 +9,13 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use api_client::ApiClient;
 use config::SyncConfig;
+use river_data_sync_common::models::RunnerConfig;
+use river_data_sync_common::runner::SyncServiceRunner;
+use service::VaisalaSyncService;
 use vaisala_client::VaisalaClient;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize tracing
     tracing_subscriber::registry()
         .with(
@@ -27,41 +30,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load .env if present
     let _ = dotenvy::dotenv();
 
-    // Load configuration (fail-fast)
+    // Load Vaisala-specific configuration (fail-fast)
     let config = SyncConfig::from_env().map_err(|e| {
         tracing::error!(error = %e, "Configuration error");
+        e
+    })?;
+
+    // Load runner configuration (control plane credentials)
+    let runner_config = RunnerConfig::from_env().map_err(|e| {
+        tracing::error!(error = %e, "Runner configuration error");
         e
     })?;
 
     tracing::info!(
         api_base_url = %config.api_base_url,
         vaisala_base_url = %config.vaisala_base_url,
-        sync_interval_secs = config.sync_interval_seconds,
+        sync_interval_secs = runner_config.sync_interval_secs,
+        instance_id = %runner_config.instance_id,
         "Configuration loaded"
     );
 
-    // Create clients
-    let api = ApiClient::new(&config.api_base_url, &config.api_token);
+    // Create clients — token will be set by the runner after enrollment
+    let api = ApiClient::new(&config.api_base_url, "");
     let vaisala = VaisalaClient::new(
         &config.vaisala_base_url,
         &config.vaisala_bearer_token,
         config.vaisala_skip_tls_verify,
     );
 
-    // Spawn device status sync as independent background task
-    let ds_config = config.clone();
-    let ds_api = ApiClient::new(&ds_config.api_base_url, &ds_config.api_token);
-    let ds_vaisala = VaisalaClient::new(
-        &ds_config.vaisala_base_url,
-        &ds_config.vaisala_bearer_token,
-        ds_config.vaisala_skip_tls_verify,
-    );
-    tokio::spawn(async move {
-        scheduler::run_device_status_sync(&ds_config, &ds_api, &ds_vaisala).await;
-    });
+    // Create service and runner
+    let svc = VaisalaSyncService::new(config, api, vaisala);
+    let runner = SyncServiceRunner::new(svc, runner_config);
 
-    // Run the readings sync scheduler (blocks forever)
-    scheduler::run_sync(&config, &api, &vaisala).await;
+    // Run (blocks until shutdown signal)
+    runner.run().await?;
 
     Ok(())
 }

@@ -12,7 +12,7 @@ use crate::vaisala_client::SyncError;
 pub struct ApiClient {
     http_client: Client,
     base_url: String,
-    token: String,
+    token: std::sync::RwLock<String>,
 }
 
 impl ApiClient {
@@ -25,8 +25,19 @@ impl ApiClient {
         Self {
             http_client,
             base_url: base_url.trim_end_matches('/').to_string(),
-            token: token.to_string(),
+            token: std::sync::RwLock::new(token.to_string()),
         }
+    }
+
+    /// Update the bearer token (called by the runner on each heartbeat).
+    pub fn set_token(&self, token: &str) {
+        if let Ok(mut t) = self.token.write() {
+            *t = token.to_string();
+        }
+    }
+
+    fn current_token(&self) -> String {
+        self.token.read().map(|t| t.clone()).unwrap_or_default()
     }
 
     fn url(&self, path: &str) -> String {
@@ -41,7 +52,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .get(self.url("/projects"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .send()
             .await
             .map_err(|e| SyncError::Api(format!("list_projects failed: {e}")))?;
@@ -57,7 +68,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .post(self.url("/projects"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .json(project)
             .send()
             .await
@@ -77,7 +88,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .get(self.url("/sites"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .send()
             .await
             .map_err(|e| SyncError::Api(format!("list_sites failed: {e}")))?;
@@ -93,7 +104,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .post(self.url("/sites"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .json(site)
             .send()
             .await
@@ -112,7 +123,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .get(self.url("/parameters"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .send()
             .await
             .map_err(|e| SyncError::Api(format!("list_parameters failed: {e}")))?;
@@ -131,7 +142,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .post(self.url("/parameters"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .json(param)
             .send()
             .await
@@ -150,7 +161,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .get(self.url("/site_parameters"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .send()
             .await
             .map_err(|e| SyncError::Api(format!("list_site_parameters failed: {e}")))?;
@@ -169,7 +180,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .post(self.url("/site_parameters"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .json(sp)
             .send()
             .await
@@ -195,7 +206,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .get(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .send()
             .await
             .map_err(|e| SyncError::Api(format!("list_source_mappings failed: {e}")))?;
@@ -212,7 +223,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .post(self.url("/source_mappings"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .json(mapping)
             .send()
             .await
@@ -231,7 +242,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .get(self.url("/sync_states"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .send()
             .await
             .map_err(|e| SyncError::Api(format!("list_sync_states failed: {e}")))?;
@@ -251,7 +262,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .patch(self.url(&format!("/sync_states/{site_parameter_id}")))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .json(update)
             .send()
             .await
@@ -269,7 +280,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .post(self.url("/sync_states"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .json(state)
             .send()
             .await
@@ -297,7 +308,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .post(self.url("/readings/batch"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .json(&body)
             .send()
             .await
@@ -327,7 +338,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .post(self.url("/status_events/batch"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .json(&body)
             .send()
             .await
@@ -349,7 +360,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .post(self.url("/actions/refresh_aggregates"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .json(&body)
             .send()
             .await
@@ -376,7 +387,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .post(self.url("/actions/compute_derived"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .json(&body)
             .send()
             .await
@@ -396,7 +407,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .post(self.url("/alarm_thresholds"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .json(threshold)
             .send()
             .await
@@ -414,7 +425,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .post(self.url("/sensors"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .json(sensor)
             .send()
             .await
@@ -432,7 +443,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .post(self.url("/sensor_calibrations"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .json(cal)
             .send()
             .await
@@ -450,7 +461,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .post(self.url("/sensor_deployments"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .json(dep)
             .send()
             .await
@@ -465,7 +476,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .post(self.url("/actions/update_last_full_sync"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .json(&serde_json::json!({}))
             .send()
             .await
@@ -479,7 +490,7 @@ impl ApiClient {
         let resp = self
             .http_client
             .get(self.url("/sensors"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.current_token())
             .send()
             .await
             .map_err(|e| SyncError::Api(format!("list_sensors failed: {e}")))?;

@@ -193,11 +193,12 @@ fn build_status_events_csv(events: &[StatusEventData]) -> AppResult<Response> {
                 .sensor_id
                 .map(|id| id.to_string())
                 .unwrap_or_default();
+            let escaped_value = format!("\"{}\"", event.value.replace('"', "\"\""));
             let row = format!(
                 "{},{},{},{}\n",
                 event.time.to_rfc3339(),
                 event.parameter_id,
-                event.value,
+                escaped_value,
                 sensor_id_str
             );
             if tx.send(Ok(row)).await.is_err() {

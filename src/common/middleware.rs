@@ -205,6 +205,64 @@ pub async fn require_crud_permissions(request: Request, next: Next) -> Response 
     }
 }
 
+/// Auth context for sync service session tokens.
+#[derive(Debug, Clone)]
+pub struct SyncServiceContext {
+    pub service_id: Uuid,
+}
+
+/// Middleware that validates sync service session tokens.
+/// These are short-lived tokens from the `sync_service_tokens` table.
+pub async fn sync_service_auth_middleware(
+    state: axum::extract::State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let auth_header = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|v| v.trim().to_string());
+
+    let Some(raw_token) = auth_header else {
+        return AppError::Unauthorized("Bearer token required".to_string()).into_response();
+    };
+
+    if raw_token.is_empty() {
+        return AppError::Unauthorized("Bearer token required".to_string()).into_response();
+    }
+
+    let token_hash = crate::services::api_token::hash_token(&raw_token);
+
+    // Look up token in sync_service_tokens
+    use crate::entity::sync_service_tokens;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    let token = sync_service_tokens::Entity::find()
+        .filter(sync_service_tokens::Column::TokenHash.eq(&token_hash))
+        .one(&state.db)
+        .await;
+
+    let token = match token {
+        Ok(Some(t)) => t,
+        _ => {
+            return AppError::Unauthorized("Invalid session token".to_string()).into_response();
+        }
+    };
+
+    // Check expiry
+    if token.expires_at.with_timezone(&chrono::Utc) < chrono::Utc::now() {
+        return AppError::Unauthorized("Session token expired".to_string()).into_response();
+    }
+
+    request.extensions_mut().insert(SyncServiceContext {
+        service_id: token.service_id,
+    });
+
+    next.run(request).await
+}
+
 /// Extractor that yields the project scope from `AuthContext::ApiToken`, if any.
 ///
 /// Returns `None` for Keycloak users or unscoped API tokens.

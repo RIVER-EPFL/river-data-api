@@ -11,12 +11,13 @@ use serial_test::serial;
 // Helper: setup, cleanup, seed, and build app
 // ============================================================================
 
-async fn setup() -> (sea_orm::DatabaseConnection, axum::Router) {
+async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
     let db = common::setup_test_db().await;
     common::cleanup_test_db(&db).await;
     common::seed_test_data(&db).await;
+    let token = common::seed_api_token(&db, common::full_permissions(), None).await;
     let app = common::build_test_app(db.clone());
-    (db, app)
+    (db, app, token)
 }
 
 // ============================================================================
@@ -26,14 +27,15 @@ async fn setup() -> (sea_orm::DatabaseConnection, axum::Router) {
 #[tokio::test]
 #[serial]
 async fn test_readings_basic_time_range() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
     let site_id = common::SITE1_ID;
 
-    let (status, body) = common::get_json(
+    let (status, body) = common::get_json_with_token(
         &app,
         &format!(
             "/api/service/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z"
         ),
+        &token,
     )
     .await;
 
@@ -88,14 +90,15 @@ async fn test_readings_basic_time_range() {
 #[tokio::test]
 #[serial]
 async fn test_readings_sensor_types_filter() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
     let site_id = common::SITE1_ID;
 
-    let (status, body) = common::get_json(
+    let (status, body) = common::get_json_with_token(
         &app,
         &format!(
             "/api/service/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z&sensor_types=DO_Temperature,Turbidity"
         ),
+        &token,
     )
     .await;
 
@@ -112,15 +115,16 @@ async fn test_readings_sensor_types_filter() {
 #[tokio::test]
 #[serial]
 async fn test_readings_with_alarms() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
     let site_id = common::SITE1_ID;
 
     // Use full 48h range to include injected alarm values at steps 50, 100, 200
-    let (status, body) = common::get_json(
+    let (status, body) = common::get_json_with_token(
         &app,
         &format!(
             "/api/service/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z&alarms=true"
         ),
+        &token,
     )
     .await;
 
@@ -131,7 +135,6 @@ async fn test_readings_with_alarms() {
 
     let mut found_nonzero_severity = false;
     for param in params {
-        // When alarms=true, each parameter should have severities array
         assert!(
             param["severities"].is_array(),
             "parameter should have severities array when alarms=true"
@@ -168,12 +171,16 @@ async fn test_readings_with_alarms() {
 #[tokio::test]
 #[serial]
 async fn test_readings_no_time_range() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
     let site_id = common::SITE1_ID;
 
     // No start/end → defaults to full data range
-    let (status, body) =
-        common::get_json(&app, &format!("/api/service/sites/{site_id}/readings")).await;
+    let (status, body) = common::get_json_with_token(
+        &app,
+        &format!("/api/service/sites/{site_id}/readings"),
+        &token,
+    )
+    .await;
 
     assert_eq!(status, 200);
 
@@ -183,7 +190,6 @@ async fn test_readings_no_time_range() {
         "should return data when no time range specified"
     );
 
-    // start/end in response should reflect actual data range
     assert!(body["start"].is_string(), "response should have start");
     assert!(body["end"].is_string(), "response should have end");
 }
@@ -191,11 +197,12 @@ async fn test_readings_no_time_range() {
 #[tokio::test]
 #[serial]
 async fn test_readings_nonexistent_site_returns_404() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
 
-    let (status, _body) = common::get(
+    let (status, _body) = common::get_with_token(
         &app,
         "/api/service/sites/00000000-0000-4000-a000-999999999999/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z",
+        &token,
     )
     .await;
 
@@ -205,15 +212,16 @@ async fn test_readings_nonexistent_site_returns_404() {
 #[tokio::test]
 #[serial]
 async fn test_readings_invalid_time_range_returns_400() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
     let site_id = common::SITE1_ID;
 
     // end before start
-    let (status, _body) = common::get(
+    let (status, _body) = common::get_with_token(
         &app,
         &format!(
             "/api/service/sites/{site_id}/readings?start=2025-01-16T00:00:00Z&end=2025-01-15T00:00:00Z"
         ),
+        &token,
     )
     .await;
 
@@ -227,20 +235,20 @@ async fn test_readings_invalid_time_range_returns_400() {
 #[tokio::test]
 #[serial]
 async fn test_aggregates_hourly() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
     let site_id = common::SITE1_ID;
 
-    let (status, body) = common::get_json(
+    let (status, body) = common::get_json_with_token(
         &app,
         &format!(
             "/api/service/sites/{site_id}/aggregates/hourly?start=2025-01-15T00:00:00Z&end=2025-01-16T00:00:00Z"
         ),
+        &token,
     )
     .await;
 
     assert_eq!(status, 200);
 
-    // Top-level structure
     assert!(body["project"].is_object(), "should have project object");
     assert!(body["site"].is_object(), "should have site object");
     assert_eq!(
@@ -253,7 +261,6 @@ async fn test_aggregates_hourly() {
     assert!(body["times"].is_array());
     assert!(body["parameters"].is_array());
 
-    // time_bucket can produce 25 buckets for a 24h range (inclusive boundary)
     let times = body["times"].as_array().unwrap();
     assert!(
         times.len() == 24 || times.len() == 25,
@@ -279,7 +286,6 @@ async fn test_aggregates_hourly() {
         assert_eq!(max.len(), times.len(), "max length should match times");
         assert_eq!(count.len(), times.len(), "count length should match times");
 
-        // Verify avg is between min and max, and count > 0 for each bucket
         for i in 0..times.len() {
             if let (Some(avg_val), Some(min_val), Some(max_val)) =
                 (avg[i].as_f64(), min[i].as_f64(), max[i].as_f64())
@@ -297,7 +303,6 @@ async fn test_aggregates_hourly() {
             );
         }
 
-        // Each hour should have ~6 readings (10-min intervals)
         let first_count = count[0].as_i64().unwrap();
         assert!(
             first_count >= 5 && first_count <= 7,
@@ -309,14 +314,15 @@ async fn test_aggregates_hourly() {
 #[tokio::test]
 #[serial]
 async fn test_aggregates_daily() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
     let site_id = common::SITE1_ID;
 
-    let (status, body) = common::get_json(
+    let (status, body) = common::get_json_with_token(
         &app,
         &format!(
             "/api/service/sites/{site_id}/aggregates/daily?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"
         ),
+        &token,
     )
     .await;
 
@@ -334,7 +340,6 @@ async fn test_aggregates_daily() {
         let count = param["count"].as_array().unwrap();
         assert_eq!(count.len(), 2);
 
-        // ~144 readings per day (24h × 6 readings/h)
         let day1_count = count[0].as_i64().unwrap();
         assert!(
             day1_count >= 140 && day1_count <= 148,
@@ -346,14 +351,15 @@ async fn test_aggregates_daily() {
 #[tokio::test]
 #[serial]
 async fn test_aggregates_sensor_types_filter() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
     let site_id = common::SITE1_ID;
 
-    let (status, body) = common::get_json(
+    let (status, body) = common::get_json_with_token(
         &app,
         &format!(
             "/api/service/sites/{site_id}/aggregates/hourly?start=2025-01-15T00:00:00Z&end=2025-01-16T00:00:00Z&sensor_types=Conductivity"
         ),
+        &token,
     )
     .await;
 
@@ -367,14 +373,15 @@ async fn test_aggregates_sensor_types_filter() {
 #[tokio::test]
 #[serial]
 async fn test_aggregates_with_alarms() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
     let site_id = common::SITE1_ID;
 
-    let (status, body) = common::get_json(
+    let (status, body) = common::get_json_with_token(
         &app,
         &format!(
             "/api/service/sites/{site_id}/aggregates/hourly?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z&alarms=true"
         ),
+        &token,
     )
     .await;
 
@@ -421,14 +428,15 @@ async fn test_aggregates_with_alarms() {
 #[tokio::test]
 #[serial]
 async fn test_aggregates_invalid_resolution_returns_400() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
     let site_id = common::SITE1_ID;
 
-    let (status, _body) = common::get(
+    let (status, _body) = common::get_with_token(
         &app,
         &format!(
             "/api/service/sites/{site_id}/aggregates/minutely?start=2025-01-15T00:00:00Z&end=2025-01-16T00:00:00Z"
         ),
+        &token,
     )
     .await;
 
@@ -441,13 +449,13 @@ async fn test_aggregates_invalid_resolution_returns_400() {
 #[tokio::test]
 #[serial]
 async fn test_aggregates_missing_params_returns_400() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
     let site_id = common::SITE1_ID;
 
-    // No start or end
-    let (status, _body) = common::get(
+    let (status, _body) = common::get_with_token(
         &app,
         &format!("/api/service/sites/{site_id}/aggregates/hourly"),
+        &token,
     )
     .await;
 
@@ -464,20 +472,20 @@ async fn test_aggregates_missing_params_returns_400() {
 #[tokio::test]
 #[serial]
 async fn test_alarms_basic() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
     let site_id = common::SITE1_ID;
 
-    let (status, body) = common::get_json(
+    let (status, body) = common::get_json_with_token(
         &app,
         &format!(
             "/api/service/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"
         ),
+        &token,
     )
     .await;
 
     assert_eq!(status, 200);
 
-    // Top-level structure
     assert!(body["project"].is_object(), "should have project object");
     assert!(body["site"].is_object(), "should have site object");
     assert!(body["times"].is_array(), "should have times array");
@@ -510,9 +518,6 @@ async fn test_alarms_basic() {
             "severities should align with times"
         );
 
-        // Alarms response aligns all parameters to a shared times array.
-        // Parameters without a violation at a given time get severity 0.
-        // So severities can be 0, 1, or 2.
         for sev in severities {
             if !sev.is_null() {
                 let s = sev.as_i64().unwrap();
@@ -524,8 +529,6 @@ async fn test_alarms_basic() {
         }
     }
 
-    // The shared times array should only contain times where at least one
-    // parameter has a violation — verify at least some exist
     assert!(
         !times.is_empty(),
         "seeded data with threshold-exceeding values should produce violations"
@@ -535,15 +538,15 @@ async fn test_alarms_basic() {
 #[tokio::test]
 #[serial]
 async fn test_alarms_severity_filter() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
     let site_id = common::SITE1_ID;
 
-    // Filter for only alarm-level (severity=2)
-    let (status, body) = common::get_json(
+    let (status, body) = common::get_json_with_token(
         &app,
         &format!(
             "/api/service/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z&severity=2"
         ),
+        &token,
     )
     .await;
 
@@ -567,14 +570,15 @@ async fn test_alarms_severity_filter() {
 #[tokio::test]
 #[serial]
 async fn test_alarms_sensor_types_filter() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
     let site_id = common::SITE1_ID;
 
-    let (status, body) = common::get_json(
+    let (status, body) = common::get_json_with_token(
         &app,
         &format!(
             "/api/service/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z&sensor_types=DO_Temperature"
         ),
+        &token,
     )
     .await;
 
@@ -593,11 +597,11 @@ async fn test_alarms_sensor_types_filter() {
 #[tokio::test]
 #[serial]
 async fn test_alarms_missing_params_returns_400() {
-    let (_db, app) = setup().await;
+    let (_db, app, token) = setup().await;
     let site_id = common::SITE1_ID;
 
-    // No start or end
-    let (status, _body) = common::get(&app, &format!("/api/service/sites/{site_id}/alarms")).await;
+    let (status, _body) =
+        common::get_with_token(&app, &format!("/api/service/sites/{site_id}/alarms"), &token).await;
 
     assert_eq!(status, 400, "alarms without start/end should return 400");
 }

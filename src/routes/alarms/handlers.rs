@@ -228,6 +228,8 @@ pub async fn get_site_alarms(
         }
     }
 
+    let selected_threshold_ids: Vec<Uuid> = threshold_map.values().map(|t| t.id).collect();
+
     let params_with_thresholds: Vec<ParameterWithThreshold> = params_list
         .iter()
         .filter(|p| threshold_map.contains_key(&p.parameter_id))
@@ -279,7 +281,14 @@ pub async fn get_site_alarms(
         .enumerate()
         .map(|(i, _)| format!("${}", i + 2))
         .collect();
-    let start_param = alarm_param_ids.len() + 2;
+    // $N+2..=$N+M+1 = threshold_ids
+    let threshold_offset = alarm_param_ids.len() + 2;
+    let threshold_placeholders: Vec<String> = selected_threshold_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("${}", threshold_offset + i))
+        .collect();
+    let start_param = threshold_offset + selected_threshold_ids.len();
     let end_param = start_param + 1;
 
     let min_severity = query.severity.unwrap_or(1);
@@ -318,7 +327,7 @@ pub async fn get_site_alarms(
                 ELSE 0
             END::smallint as severity
         FROM readings r
-        JOIN alarm_thresholds t ON r.parameter_id = t.parameter_id AND (t.site_id = r.site_id OR t.site_id IS NULL)
+        JOIN alarm_thresholds t ON r.parameter_id = t.parameter_id AND t.id IN ({})
         WHERE r.site_id = $1
           AND r.parameter_id IN ({})
           AND r.time >= ${}
@@ -326,6 +335,7 @@ pub async fn get_site_alarms(
           AND {}
         ORDER BY r.time, r.parameter_id
         ",
+        threshold_placeholders.join(","),
         placeholders.join(","),
         start_param,
         end_param,
@@ -334,6 +344,7 @@ pub async fn get_site_alarms(
 
     let mut values: Vec<sea_orm::Value> = vec![site.id.into()];
     values.extend(alarm_param_ids.iter().map(|id| (*id).into()));
+    values.extend(selected_threshold_ids.iter().map(|id| (*id).into()));
     values.push(query.start.into());
     values.push(query.end.into());
 

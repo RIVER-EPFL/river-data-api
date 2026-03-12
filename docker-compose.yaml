@@ -72,14 +72,17 @@ services:
     environment:
       # River Data API connection
       - API_BASE_URL=http://river-db-api:${API_PORT:-3000}/api/service
-      - API_TOKEN=${SYNC_API_TOKEN:-}
+      # Control plane credentials (create via dashboard → Services tab)
+      - SERVICE_CLIENT_ID=${SERVICE_CLIENT_ID:-}
+      - SERVICE_CLIENT_SECRET=${SERVICE_CLIENT_SECRET:-}
+      - INSTANCE_ID=${INSTANCE_ID:-vaisala-dev-01}
       # Vaisala viewLinc connection
       - VAISALA_BASE_URL=${VAISALA_BASE_URL:-https://10.95.35.5/rest/v1}
       - VAISALA_BEARER_TOKEN=${VAISALA_BEARER_TOKEN:-}
       - VAISALA_SKIP_TLS_VERIFY=${VAISALA_SKIP_TLS_VERIFY:-true}
-      # Sync intervals
-      - SYNC_INTERVAL_SECONDS=${SYNC_INTERVAL_SECONDS:-300}
-      - DEVICE_STATUS_INTERVAL_SECONDS=${DEVICE_STATUS_INTERVAL_SECONDS:-1800}
+      # Runner config
+      - SYNC_INTERVAL_SECS=${SYNC_INTERVAL_SECS:-300}
+      - HEARTBEAT_INTERVAL_SECS=${HEARTBEAT_INTERVAL_SECS:-30}
       - MAX_HISTORY_DAYS=${MAX_HISTORY_DAYS:-90}
       # Retry configuration
       - RETRY_MAX=${RETRY_MAX:-3}

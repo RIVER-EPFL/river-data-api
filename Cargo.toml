@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "migration", "river-data-sync-vaisala"]
+members = [".", "migration", "river-data-sync-vaisala", "river-data-sync-common"]
 resolver = "2"
 
 [package]

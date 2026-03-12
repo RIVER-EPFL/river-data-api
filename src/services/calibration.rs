@@ -205,6 +205,9 @@ pub async fn recalculate_derived_at_timestamp(
 
         // Evaluate formula
         if let Ok(result) = evaluate_formula(&formula, &variables) {
+            if !result.is_finite() {
+                continue;
+            }
             db.execute(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r"INSERT INTO readings (site_id, parameter_id, time, raw_value, calibrated_value)
