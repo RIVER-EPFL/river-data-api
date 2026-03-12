@@ -135,6 +135,8 @@ pub fn evaluate_formula(formula: &str, variables: &HashMap<String, f64>) -> Resu
 }
 
 /// Recalculate derived parameter values at a specific timestamp for a site.
+/// Uses topological sort to ensure derived-from-derived formulas are evaluated
+/// in the correct order (dependencies first).
 pub async fn recalculate_derived_at_timestamp(
     db: &DatabaseConnection,
     site_id: Uuid,
@@ -152,19 +154,107 @@ pub async fn recalculate_derived_at_timestamp(
         ))
         .await?;
 
-    for row in derived_params {
-        let _site_param_id: Uuid = row.try_get("", "id")?;
+    if derived_params.is_empty() {
+        return Ok(());
+    }
+
+    // Parse all derived params into a working struct
+    struct DerivedWork {
+        site_param_id: Uuid,
+        mappings: serde_json::Value,
+        formula: String,
+        derived_site_id: Uuid,
+        derived_parameter_id: Uuid,
+    }
+
+    let mut work_items: Vec<DerivedWork> = Vec::new();
+    for row in &derived_params {
+        let site_param_id: Uuid = row.try_get("", "id")?;
         let mappings: serde_json::Value = row.try_get("", "variable_mappings")?;
         let formula: String = row.try_get("", "formula")?;
         let derived_site_id: Uuid = row.try_get("", "site_id")?;
         let derived_parameter_id: Uuid = row.try_get("", "parameter_id")?;
+        work_items.push(DerivedWork {
+            site_param_id,
+            mappings,
+            formula,
+            derived_site_id,
+            derived_parameter_id,
+        });
+    }
 
-        let Some(mapping_obj) = mappings.as_object() else {
+    // Build a set of parameter_ids that are derived at this site
+    let derived_param_ids: std::collections::HashSet<Uuid> =
+        work_items.iter().map(|w| w.derived_parameter_id).collect();
+
+    // Build dependency graph: for each derived param, which other derived params
+    // at this site does it depend on (via variable_mappings)?
+    let mut deps: HashMap<Uuid, Vec<Uuid>> = HashMap::new(); // sp_id → [dep sp_ids]
+    let mut sp_to_param: HashMap<Uuid, Uuid> = HashMap::new();
+
+    for item in &work_items {
+        sp_to_param.insert(item.site_param_id, item.derived_parameter_id);
+        let mut item_deps = Vec::new();
+
+        if let Some(mapping_obj) = item.mappings.as_object() {
+            for (_var_name, source_val) in mapping_obj {
+                if let Some(source_id_str) = source_val.as_str() {
+                    if let Ok(source_sp_id) = source_id_str.parse::<Uuid>() {
+                        // Check if this source sp maps to a derived parameter at this site
+                        if let Some(other) = work_items.iter().find(|w| w.site_param_id == source_sp_id) {
+                            if derived_param_ids.contains(&other.derived_parameter_id) {
+                                item_deps.push(other.site_param_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        deps.insert(item.site_param_id, item_deps);
+    }
+
+    // Topological sort: iteratively find items with all deps satisfied
+    let mut evaluated: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut ordered: Vec<usize> = Vec::with_capacity(work_items.len());
+    let mut remaining: Vec<usize> = (0..work_items.len()).collect();
+
+    for _ in 0..work_items.len() + 1 {
+        let mut progress = false;
+        remaining.retain(|&idx| {
+            let sp_id = work_items[idx].site_param_id;
+            let item_deps = deps.get(&sp_id).cloned().unwrap_or_default();
+            if item_deps.iter().all(|dep| evaluated.contains(dep)) {
+                evaluated.insert(sp_id);
+                ordered.push(idx);
+                progress = true;
+                false // remove from remaining
+            } else {
+                true // keep in remaining
+            }
+        });
+        if remaining.is_empty() || !progress {
+            break;
+        }
+    }
+
+    // Any remaining items have unsatisfiable deps (shouldn't happen with creation-time validation)
+    if !remaining.is_empty() {
+        tracing::warn!(
+            site_id = %site_id,
+            remaining = remaining.len(),
+            "Topological sort could not resolve all derived parameter dependencies"
+        );
+    }
+
+    // Evaluate in sorted order
+    for idx in ordered {
+        let item = &work_items[idx];
+
+        let Some(mapping_obj) = item.mappings.as_object() else {
             continue;
         };
 
         // Gather source values
-        // variable_mappings stores site_parameter UUIDs; resolve each to (site_id, parameter_id)
         let mut variables = HashMap::new();
         let mut all_present = true;
 
@@ -204,7 +294,7 @@ pub async fn recalculate_derived_at_timestamp(
         }
 
         // Evaluate formula
-        if let Ok(result) = evaluate_formula(&formula, &variables) {
+        if let Ok(result) = evaluate_formula(&item.formula, &variables) {
             if !result.is_finite() {
                 continue;
             }
@@ -214,8 +304,8 @@ pub async fn recalculate_derived_at_timestamp(
                   VALUES ($1, $2, $3, $4, $4)
                   ON CONFLICT (site_id, parameter_id, time) DO UPDATE SET calibrated_value = $4",
                 [
-                    derived_site_id.into(),
-                    derived_parameter_id.into(),
+                    item.derived_site_id.into(),
+                    item.derived_parameter_id.into(),
                     time.into(),
                     result.into(),
                 ],

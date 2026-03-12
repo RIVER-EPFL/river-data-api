@@ -132,7 +132,7 @@ impl MigrationTrait for Migration {
             "CREATE INDEX IF NOT EXISTS idx_sensor_calibrations_sensor_valid_from ON sensor_calibrations (sensor_id, valid_from DESC)",
         ).await?;
 
-        // -- C4: derived_parameter_definitions
+        // -- C4a: derived_parameter_definitions
         db.execute_unprepared(
             r"CREATE TABLE IF NOT EXISTS derived_parameter_definitions (
                 id UUID NOT NULL PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -141,9 +141,30 @@ impl MigrationTrait for Migration {
                 units VARCHAR(32) NOT NULL,
                 formula TEXT NOT NULL,
                 description TEXT,
-                required_parameter_types JSONB NOT NULL DEFAULT '[]',
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )",
+        )
+        .await?;
+
+        // -- C4b: derived_parameter_sources (junction table)
+        db.execute_unprepared(
+            r"CREATE TABLE IF NOT EXISTS derived_parameter_sources (
+                id UUID NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
+                derived_definition_id UUID NOT NULL REFERENCES derived_parameter_definitions(id) ON DELETE CASCADE,
+                parameter_id UUID NOT NULL REFERENCES parameters(id) ON DELETE RESTRICT,
+                variable_name VARCHAR(128) NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (derived_definition_id, variable_name),
+                UNIQUE (derived_definition_id, parameter_id)
+            )",
+        )
+        .await?;
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_dps_definition ON derived_parameter_sources(derived_definition_id)",
+        )
+        .await?;
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_dps_parameter ON derived_parameter_sources(parameter_id)",
         )
         .await?;
 

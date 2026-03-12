@@ -23,6 +23,7 @@ use crate::entity::{
     api_tokens::ApiToken,
     constants::Constant,
     derived_parameter_definitions::DerivedParameterDefinition,
+    derived_parameter_sources::DerivedParameterSource,
     field_trips::FieldTrip,
     notes::Note,
     parameters::Parameter,
@@ -84,6 +85,10 @@ pub fn service_router(state: &AppState) -> Router<()> {
         .nest(
             "/derived_parameters",
             with_crud_perms(DerivedParameterDefinition::router(db)),
+        )
+        .nest(
+            "/derived_parameter_sources",
+            with_crud_perms(DerivedParameterSource::router(db)),
         )
         .nest(
             "/alarm_thresholds",

@@ -3,6 +3,7 @@ pub mod annotations;
 pub mod api_tokens;
 pub mod constants;
 pub mod derived_parameter_definitions;
+pub mod derived_parameter_sources;
 pub mod field_trips;
 pub mod notes;
 pub mod parameters;

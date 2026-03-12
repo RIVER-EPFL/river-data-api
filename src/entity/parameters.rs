@@ -51,6 +51,8 @@ pub enum Relation {
     PublicExposedParameters,
     #[sea_orm(has_many = "super::status_events::Entity")]
     StatusEvents,
+    #[sea_orm(has_many = "super::derived_parameter_sources::Entity")]
+    DerivedParameterSources,
 }
 
 impl Related<super::sensors::Entity> for Entity {
@@ -80,6 +82,12 @@ impl Related<super::public_exposed_parameters::Entity> for Entity {
 impl Related<super::status_events::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::StatusEvents.def()
+    }
+}
+
+impl Related<super::derived_parameter_sources::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::DerivedParameterSources.def()
     }
 }
 

@@ -4,7 +4,7 @@ use sea_orm::entity::prelude::*;
 use crate::services::operations::DerivedParameterDefinitionOperations;
 
 #[derive(
-    Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
+    Clone, Debug, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
 )]
 #[sea_orm(table_name = "derived_parameter_definitions")]
 #[crudcrate(
@@ -26,21 +26,30 @@ pub struct Model {
     pub units: String,
     pub formula: String,
     pub description: Option<String>,
-    #[sea_orm(column_type = "JsonBinary")]
-    pub required_parameter_types: serde_json::Value,
     #[crudcrate(exclude(create, update))]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update), join(one, all))]
+    pub sources: Vec<super::derived_parameter_sources::DerivedParameterSource>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
     #[sea_orm(has_many = "super::site_parameters::Entity")]
     SiteParameters,
+    #[sea_orm(has_many = "super::derived_parameter_sources::Entity")]
+    DerivedParameterSources,
 }
 
 impl Related<super::site_parameters::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SiteParameters.def()
+    }
+}
+
+impl Related<super::derived_parameter_sources::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::DerivedParameterSources.def()
     }
 }
 

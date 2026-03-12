@@ -119,6 +119,8 @@ fn test_config() -> Config {
         keycloak_url: None,
         keycloak_realm: None,
         keycloak_client_id: None,
+        keycloak_admin_client_id: None,
+        keycloak_admin_client_secret: None,
     }
 }
 
@@ -137,7 +139,7 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
         // Truncate all tables with CASCADE
         "TRUNCATE alarm_thresholds, sync_state, sensor_calibrations, sensor_deployments, \
          readings, status_events, source_mappings, public_exposed_parameters, api_tokens, \
-         site_parameters, sensors, derived_parameter_definitions, parameters, sites, projects CASCADE",
+         site_parameters, sensors, derived_parameter_sources, derived_parameter_definitions, parameters, sites, projects CASCADE",
     ];
 
     for sql in &stmts {

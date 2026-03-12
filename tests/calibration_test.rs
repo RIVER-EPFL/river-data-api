@@ -84,8 +84,8 @@ async fn test_derived_parameter_skips_infinity() {
     exec(
         &db,
         &format!(
-            "INSERT INTO derived_parameter_definitions (id, name, display_name, units, formula, required_parameter_types) \
-             VALUES ('{derived_def_id}', 'TempOverDO', 'Temp / DO', 'ratio', 'temp / do_val', '[]'::jsonb)"
+            "INSERT INTO derived_parameter_definitions (id, name, display_name, units, formula) \
+             VALUES ('{derived_def_id}', 'TempOverDO', 'Temp / DO', 'ratio', 'temp / do_val')"
         ),
     )
     .await;

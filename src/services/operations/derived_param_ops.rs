@@ -6,6 +6,9 @@ use uuid::Uuid;
 
 use crate::entity::derived_parameter_definitions::DerivedParameterDefinition;
 
+/// Maximum allowed derived-from-derived chain depth.
+const MAX_DERIVED_CHAIN_DEPTH: u32 = 3;
+
 /// Math functions/constants recognized by meval — not variable names
 const MATH_BUILTINS: &[&str] = &[
     "sqrt", "abs", "ln", "log", "exp", "sin", "cos", "tan", "asin", "acos", "atan",
@@ -57,42 +60,182 @@ fn extract_variable_names(formula: &str) -> Vec<String> {
     vars
 }
 
-/// Resolve variable names to parameter type names by querying the parameters table
-async fn resolve_required_param_types(
+/// Resolve each formula variable to a parameter UUID, with strict validation.
+/// Returns Vec<(variable_name, parameter_id)>.
+async fn resolve_variables(
     db: &DatabaseConnection,
     formula: &str,
-) -> Result<serde_json::Value, ApiError> {
+) -> Result<Vec<(String, Uuid)>, ApiError> {
     let var_names = extract_variable_names(formula);
-    if var_names.is_empty() {
-        return Ok(serde_json::json!([]));
-    }
+    let mut resolved = Vec::with_capacity(var_names.len());
 
-    // Query parameters table to find matching names
-    // We resolve variable names against the global parameters (parameter_types) table
-    let mut matched = Vec::new();
     for var_name in &var_names {
         let row = db
             .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                r"SELECT name FROM parameters WHERE name = $1 LIMIT 1",
+                r"SELECT id FROM parameters WHERE name = $1 LIMIT 1",
                 [var_name.clone().into()],
             ))
             .await
             .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
 
         if let Some(row) = row {
-            let name: String = row
-                .try_get("", "name")
+            let id: Uuid = row
+                .try_get("", "id")
                 .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-            matched.push(name);
+            resolved.push((var_name.clone(), id));
         } else {
-            // Variable not found in parameter types — still include it as-is
-            // (the formula may reference parameter type names that haven't been created yet)
-            matched.push(var_name.clone());
+            return Err(ApiError::bad_request(format!(
+                "Formula variable '{}' does not match any parameter in the catalog",
+                var_name
+            )));
         }
     }
 
-    Ok(serde_json::json!(matched))
+    Ok(resolved)
+}
+
+/// Check if a parameter is the output of a derived definition.
+/// Returns the derived_definition_id if so.
+async fn find_derived_definition_for_param(
+    db: &DatabaseConnection,
+    parameter_id: Uuid,
+) -> Result<Option<Uuid>, ApiError> {
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT dpd.id FROM derived_parameter_definitions dpd
+              JOIN parameters p ON p.name = dpd.name
+              WHERE p.id = $1",
+            [parameter_id.into()],
+        ))
+        .await
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+
+    Ok(row
+        .map(|r| r.try_get::<Uuid>("", "id").ok())
+        .flatten())
+}
+
+/// Recursively compute the depth of a derived parameter chain.
+/// Returns 0 for non-derived parameters.
+fn compute_chain_depth<'a>(
+    db: &'a DatabaseConnection,
+    parameter_id: Uuid,
+    visited: &'a mut HashSet<Uuid>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u32, ApiError>> + Send + 'a>> {
+    Box::pin(async move {
+        if visited.contains(&parameter_id) {
+            return Err(ApiError::bad_request(
+                "Circular dependency detected in derived parameter chain".to_string(),
+            ));
+        }
+        visited.insert(parameter_id);
+
+        let def_id = match find_derived_definition_for_param(db, parameter_id).await? {
+            Some(id) => id,
+            None => return Ok(0), // Not a derived parameter
+        };
+
+        // Get this definition's sources
+        let source_rows = db
+            .query_all(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r"SELECT parameter_id FROM derived_parameter_sources WHERE derived_definition_id = $1",
+                [def_id.into()],
+            ))
+            .await
+            .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+
+        let mut max_child_depth = 0u32;
+        for row in &source_rows {
+            let child_param_id: Uuid = row
+                .try_get("", "parameter_id")
+                .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+            let child_depth = compute_chain_depth(db, child_param_id, visited).await?;
+            max_child_depth = max_child_depth.max(child_depth);
+        }
+
+        Ok(1 + max_child_depth)
+    })
+}
+
+/// Validate that adding dependencies doesn't create cycles or exceed max depth.
+async fn validate_dependency_chain(
+    db: &DatabaseConnection,
+    definition_name: &str,
+    resolved_params: &[(String, Uuid)],
+) -> Result<(), ApiError> {
+    for (var_name, parameter_id) in resolved_params {
+        let mut visited = HashSet::new();
+
+        // Check if this source parameter's chain leads back to our definition
+        // by checking if any ancestor has the same name as our definition
+        let depth = compute_chain_depth(db, *parameter_id, &mut visited).await?;
+
+        if depth >= MAX_DERIVED_CHAIN_DEPTH {
+            return Err(ApiError::bad_request(format!(
+                "Derived formula chain depth exceeds maximum of {} levels (variable '{}' has depth {})",
+                MAX_DERIVED_CHAIN_DEPTH, var_name, depth
+            )));
+        }
+
+        // Cycle check: if the source parameter resolves to a derived definition
+        // whose chain references a parameter with the same name as this definition,
+        // that would create a cycle
+        if let Some(_def_id) = find_derived_definition_for_param(db, *parameter_id).await? {
+            // Check if any parameter in the chain matches our definition name
+            let cycle_row = db
+                .query_one(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    r"SELECT 1 FROM parameters WHERE name = $1 AND id = $2",
+                    [definition_name.into(), (*parameter_id).into()],
+                ))
+                .await
+                .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+
+            if cycle_row.is_some() {
+                return Err(ApiError::bad_request(
+                    "Circular dependency detected: formula references its own output parameter"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Delete existing sources and insert new ones for a derived definition.
+async fn sync_sources(
+    db: &DatabaseConnection,
+    definition_id: Uuid,
+    resolved_params: &[(String, Uuid)],
+) -> Result<(), ApiError> {
+    // Delete existing rows
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"DELETE FROM derived_parameter_sources WHERE derived_definition_id = $1",
+        [definition_id.into()],
+    ))
+    .await
+    .map_err(|e| ApiError::internal(format!("Failed to clear old sources: {e}"), None))?;
+
+    // Insert new rows
+    for (var_name, param_id) in resolved_params {
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"INSERT INTO derived_parameter_sources (derived_definition_id, parameter_id, variable_name)
+              VALUES ($1, $2, $3)",
+            [definition_id.into(), (*param_id).into(), var_name.clone().into()],
+        ))
+        .await
+        .map_err(|e| {
+            ApiError::internal(format!("Failed to insert source '{}': {}", var_name, e), None)
+        })?;
+    }
+
+    Ok(())
 }
 
 pub struct DerivedParameterDefinitionOperations;
@@ -103,10 +246,12 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
 
     async fn before_create(
         &self,
-        _db: &DatabaseConnection,
+        db: &DatabaseConnection,
         data: &<DerivedParameterDefinition as CRUDResource>::CreateModel,
     ) -> Result<(), ApiError> {
         validate_formula(&data.formula)?;
+        let resolved = resolve_variables(db, &data.formula).await?;
+        validate_dependency_chain(db, &data.name, &resolved).await?;
         Ok(())
     }
 
@@ -115,27 +260,40 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
         db: &DatabaseConnection,
         entity: &mut DerivedParameterDefinition,
     ) -> Result<(), ApiError> {
-        let resolved = resolve_required_param_types(db, &entity.formula).await?;
-        // Update the entity's required_parameter_types in the database
-        db.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE derived_parameter_definitions SET required_parameter_types = $1 WHERE id = $2",
-            [resolved.clone().into(), entity.id.into()],
-        ))
-        .await
-        .map_err(|e| ApiError::internal(format!("Failed to update required_parameter_types: {e}"), None))?;
-        entity.required_parameter_types = resolved;
+        let resolved = resolve_variables(db, &entity.formula).await?;
+        sync_sources(db, entity.id, &resolved).await?;
+
+        // Populate the sources field on the response
+        entity.sources = resolved
+            .into_iter()
+            .map(|(var_name, param_id)| {
+                crate::entity::derived_parameter_sources::DerivedParameterSource {
+                    id: Uuid::nil(), // Will be fetched by CrudCrate on next read
+                    derived_definition_id: entity.id,
+                    parameter_id: param_id,
+                    variable_name: var_name,
+                    created_at: None,
+                }
+            })
+            .collect();
+
         Ok(())
     }
 
     async fn before_update(
         &self,
-        _db: &DatabaseConnection,
+        db: &DatabaseConnection,
         _id: Uuid,
         data: &<DerivedParameterDefinition as CRUDResource>::UpdateModel,
     ) -> Result<(), ApiError> {
         if let Some(Some(ref formula)) = data.formula {
             validate_formula(formula)?;
+            // We validate variables here but need the definition name for cycle check.
+            // We'll do full validation in after_update when we have the entity.
+            let resolved = resolve_variables(db, formula).await?;
+            // We can't easily get the name from the UpdateModel, so cycle/depth
+            // validation happens in after_update
+            drop(resolved);
         }
         Ok(())
     }
@@ -145,15 +303,24 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
         db: &DatabaseConnection,
         entity: &mut DerivedParameterDefinition,
     ) -> Result<(), ApiError> {
-        let resolved = resolve_required_param_types(db, &entity.formula).await?;
-        db.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE derived_parameter_definitions SET required_parameter_types = $1 WHERE id = $2",
-            [resolved.clone().into(), entity.id.into()],
-        ))
-        .await
-        .map_err(|e| ApiError::internal(format!("Failed to update required_parameter_types: {e}"), None))?;
-        entity.required_parameter_types = resolved;
+        let resolved = resolve_variables(db, &entity.formula).await?;
+        validate_dependency_chain(db, &entity.name, &resolved).await?;
+        sync_sources(db, entity.id, &resolved).await?;
+
+        // Populate the sources field on the response
+        entity.sources = resolved
+            .into_iter()
+            .map(|(var_name, param_id)| {
+                crate::entity::derived_parameter_sources::DerivedParameterSource {
+                    id: Uuid::nil(),
+                    derived_definition_id: entity.id,
+                    parameter_id: param_id,
+                    variable_name: var_name,
+                    created_at: None,
+                }
+            })
+            .collect();
+
         Ok(())
     }
 }

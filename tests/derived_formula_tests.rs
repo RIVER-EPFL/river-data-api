@@ -82,8 +82,7 @@ async fn create_derived_param(
         "display_name": format!("Test {name}"),
         "units": "test_units",
         "formula": formula,
-        "description": "Auto-created by test",
-        "required_parameter_types": []
+        "description": "Auto-created by test"
     });
     let (status, text) =
         common::post_json_with_token(app, "/api/service/derived_parameters", &body, token).await;
@@ -100,7 +99,7 @@ async fn cleanup_derived_param(app: &axum::Router, token: &str, id: &str) {
 }
 
 // =============================================================================
-// 1. Create with valid formula — required_parameter_types auto-populated
+// 1. Create with valid formula — sources auto-populated
 // =============================================================================
 
 #[tokio::test]
@@ -110,7 +109,7 @@ async fn test_create_derived_parameter_valid_formula() {
     let name = format!("valid_formula_{}", uuid::Uuid::new_v4());
 
     let (status, json) =
-        create_derived_param(&app, &token, &name, "sqrt(Turbidity) * 2 + CDOM").await;
+        create_derived_param(&app, &token, &name, "sqrt(Turbidity) * 2 + Dissolved_O2").await;
 
     assert!(
         (200..300).contains(&status),
@@ -118,26 +117,39 @@ async fn test_create_derived_parameter_valid_formula() {
     );
 
     let id = json["id"].as_str().expect("response should have id");
-    assert_eq!(json["formula"], "sqrt(Turbidity) * 2 + CDOM");
+    assert_eq!(json["formula"], "sqrt(Turbidity) * 2 + Dissolved_O2");
 
-    // required_parameter_types should be auto-populated with the variable names
-    let rpt = json["required_parameter_types"]
+    // sources should be auto-populated with variable names and parameter UUIDs
+    let sources = json["sources"]
         .as_array()
-        .expect("required_parameter_types should be array");
-    let rpt_strings: Vec<&str> = rpt.iter().filter_map(|v| v.as_str()).collect();
-    assert!(
-        rpt_strings.contains(&"Turbidity"),
-        "required_parameter_types should contain Turbidity, got: {rpt_strings:?}"
-    );
-    assert!(
-        rpt_strings.contains(&"CDOM"),
-        "required_parameter_types should contain CDOM, got: {rpt_strings:?}"
-    );
+        .expect("sources should be array");
     assert_eq!(
-        rpt_strings.len(),
+        sources.len(),
         2,
-        "should have exactly 2 required parameter types, got: {rpt_strings:?}"
+        "should have exactly 2 sources, got: {sources:?}"
     );
+
+    let var_names: Vec<&str> = sources
+        .iter()
+        .filter_map(|s| s["variable_name"].as_str())
+        .collect();
+    assert!(
+        var_names.contains(&"Turbidity"),
+        "sources should contain Turbidity, got: {var_names:?}"
+    );
+    assert!(
+        var_names.contains(&"Dissolved_O2"),
+        "sources should contain Dissolved_O2, got: {var_names:?}"
+    );
+
+    // Each source should have a valid parameter_id UUID
+    for source in sources {
+        let param_id = source["parameter_id"].as_str().expect("should have parameter_id");
+        assert!(
+            uuid::Uuid::parse_str(param_id).is_ok(),
+            "parameter_id should be a valid UUID, got: {param_id}"
+        );
+    }
 
     cleanup_derived_param(&app, &token, id).await;
 }
@@ -158,7 +170,7 @@ async fn test_create_derived_parameter_invalid_formula() {
 }
 
 // =============================================================================
-// 3. Create with constants only — required_parameter_types is empty
+// 3. Create with constants only — sources is empty
 // =============================================================================
 
 #[tokio::test]
@@ -176,19 +188,19 @@ async fn test_create_derived_parameter_constants_only() {
 
     let id = json["id"].as_str().expect("response should have id");
 
-    let rpt = json["required_parameter_types"]
+    let sources = json["sources"]
         .as_array()
-        .expect("required_parameter_types should be array");
+        .expect("sources should be array");
     assert!(
-        rpt.is_empty(),
-        "Constants-only formula should have empty required_parameter_types, got: {rpt:?}"
+        sources.is_empty(),
+        "Constants-only formula should have empty sources, got: {sources:?}"
     );
 
     cleanup_derived_param(&app, &token, id).await;
 }
 
 // =============================================================================
-// 4. Update formula — required_parameter_types changes
+// 4. Update formula — sources change
 // =============================================================================
 
 #[tokio::test]
@@ -205,18 +217,17 @@ async fn test_update_derived_parameter_formula() {
     );
     let id = json["id"].as_str().expect("response should have id");
 
-    // Verify initial required_parameter_types
-    let rpt = json["required_parameter_types"]
+    // Verify initial sources
+    let sources = json["sources"]
         .as_array()
-        .expect("required_parameter_types should be array");
-    let rpt_strings: Vec<&str> = rpt.iter().filter_map(|v| v.as_str()).collect();
+        .expect("sources should be array");
+    let var_names: Vec<&str> = sources
+        .iter()
+        .filter_map(|s| s["variable_name"].as_str())
+        .collect();
     assert!(
-        rpt_strings.contains(&"Turbidity"),
-        "Initial rpt should contain Turbidity"
-    );
-    assert!(
-        !rpt_strings.contains(&"Conductivity"),
-        "Initial rpt should NOT contain Conductivity"
+        var_names.contains(&"Turbidity"),
+        "Initial sources should contain Turbidity"
     );
 
     // Update formula to reference different variables
@@ -234,22 +245,25 @@ async fn test_update_derived_parameter_formula() {
         "Update should succeed, got {put_status}: {put_json}"
     );
 
-    // Verify required_parameter_types changed
-    let updated_rpt = put_json["required_parameter_types"]
+    // Verify sources changed
+    let updated_sources = put_json["sources"]
         .as_array()
-        .expect("updated required_parameter_types should be array");
-    let updated_strings: Vec<&str> = updated_rpt.iter().filter_map(|v| v.as_str()).collect();
+        .expect("updated sources should be array");
+    let updated_names: Vec<&str> = updated_sources
+        .iter()
+        .filter_map(|s| s["variable_name"].as_str())
+        .collect();
     assert!(
-        updated_strings.contains(&"Conductivity"),
-        "Updated rpt should contain Conductivity, got: {updated_strings:?}"
+        updated_names.contains(&"Conductivity"),
+        "Updated sources should contain Conductivity, got: {updated_names:?}"
     );
     assert!(
-        updated_strings.contains(&"Depth"),
-        "Updated rpt should contain Depth, got: {updated_strings:?}"
+        updated_names.contains(&"Depth"),
+        "Updated sources should contain Depth, got: {updated_names:?}"
     );
     assert!(
-        !updated_strings.contains(&"Turbidity"),
-        "Updated rpt should NOT contain Turbidity anymore, got: {updated_strings:?}"
+        !updated_names.contains(&"Turbidity"),
+        "Updated sources should NOT contain Turbidity anymore, got: {updated_names:?}"
     );
 
     cleanup_derived_param(&app, &token, id).await;
@@ -314,7 +328,26 @@ async fn test_preview_derived_invalid_formula() {
 }
 
 // =============================================================================
-// 7. Formula injection attempts — meval rejects non-math expressions
+// 7. Formula referencing nonexistent parameter — strict validation returns 400
+// =============================================================================
+
+#[tokio::test]
+#[serial]
+async fn test_formula_nonexistent_parameter_returns_400() {
+    let (_db, app, token) = setup().await;
+    let name = format!("nonexistent_param_{}", uuid::Uuid::new_v4());
+
+    let (status, json) =
+        create_derived_param(&app, &token, &name, "NonexistentParam * 2").await;
+
+    assert_eq!(
+        status, 400,
+        "Formula referencing nonexistent parameter should return 400, got: {json}"
+    );
+}
+
+// =============================================================================
+// 8. Formula injection attempts — rejected by strict validation or meval
 // =============================================================================
 
 #[tokio::test]
@@ -334,15 +367,14 @@ async fn test_formula_injection_attempt() {
         let name = format!("injection_{}", uuid::Uuid::new_v4());
         let (status, json) = create_derived_param(&app, &token, &name, formula).await;
 
-        // meval should either reject the formula as unparseable (400) or treat
-        // the tokens as unknown variables (2xx with those tokens in required_parameter_types).
-        // Either way, no code execution should occur.
+        // meval should reject as unparseable (400) or strict validation rejects
+        // unknown variable names (400). Either way, not 500.
         assert_ne!(
             status, 500,
             "Formula '{formula}' should not cause 500. Response: {json}"
         );
 
-        // If it was accepted (2xx), clean up
+        // If it was somehow accepted (2xx), clean up
         if (200..300).contains(&status) {
             if let Some(id) = json["id"].as_str() {
                 cleanup_derived_param(&app, &token, id).await;
@@ -352,7 +384,7 @@ async fn test_formula_injection_attempt() {
 }
 
 // =============================================================================
-// 8. Boundary: sqrt of negative — meval returns NaN, does not crash
+// 9. Boundary: sqrt of negative — meval returns NaN, does not crash
 // =============================================================================
 
 #[test]
@@ -376,7 +408,7 @@ fn test_formula_boundary_sqrt_negative() {
 }
 
 // =============================================================================
-// 9. Boundary: division by zero — meval returns Inf, does not crash
+// 10. Boundary: division by zero — meval returns Inf, does not crash
 // =============================================================================
 
 #[test]
