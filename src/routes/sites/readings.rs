@@ -28,6 +28,8 @@ struct ReadingRow {
     parameter_id: Uuid,
     time: chrono::DateTime<chrono::FixedOffset>,
     value: f64,
+    is_flagged: Option<bool>,
+    flag_reason: Option<String>,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -36,6 +38,8 @@ struct ReadingRowWithSeverity {
     time: chrono::DateTime<chrono::FixedOffset>,
     value: f64,
     severity: Option<i16>,
+    is_flagged: Option<bool>,
+    flag_reason: Option<String>,
 }
 
 fn default_format() -> String {
@@ -70,6 +74,12 @@ pub struct ParameterData {
     /// Severity levels (0=ok, 1=warning, 2=alarm). Only present when alarms=true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub severities: Option<Vec<Option<i16>>>,
+    /// Boolean flags marking outliers (same length as times). Only present when include_flagged=true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flagged: Option<Vec<Option<bool>>>,
+    /// Reasons for flagging (same length as times). Only present when include_flagged=true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flag_reasons: Option<Vec<Option<String>>>,
 }
 
 impl StreamableParam for ParameterData {
@@ -94,6 +104,10 @@ pub struct SiteReadingsQuery {
     pub format: String,
     /// Include alarm severity data (threshold violations)
     pub alarms: Option<bool>,
+    /// Filter by measurement type: continuous (default), spot, derived
+    pub measurement_type: Option<String>,
+    /// Include flagged readings with flag metadata (default: true). When false, excludes flagged readings entirely.
+    pub include_flagged: Option<bool>,
 }
 
 /// Get readings for a specific site
@@ -173,6 +187,9 @@ pub async fn get_site_readings(
         params_list.iter().map(|p| (p.parameter_id, p)).collect();
 
     let include_alarms = query.alarms.unwrap_or(false);
+    let include_flagged = query.include_flagged.unwrap_or(true);
+
+    let measurement_type_filter = query.measurement_type.as_deref().unwrap_or("");
 
     // Build cache key from request parameters
     let cache_key = cache::cache_key(
@@ -184,6 +201,8 @@ pub async fn get_site_readings(
             query.sensor_types.as_deref().unwrap_or(""),
             &format,
             if include_alarms { "alarms" } else { "" },
+            measurement_type_filter,
+            if include_flagged { "flagged" } else { "no_flagged" },
         ],
     );
 
@@ -229,9 +248,10 @@ pub async fn get_site_readings(
                 WHEN (t.warning_min IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) < t.warning_min) OR
                      (t.warning_max IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) > t.warning_max) THEN 1
                 ELSE 0
-            END::smallint as severity"
+            END::smallint as severity,
+            r.is_flagged, r.flag_reason"
     } else {
-        "r.parameter_id, r.time, COALESCE(r.calibrated_value, r.raw_value) AS value"
+        "r.parameter_id, r.time, COALESCE(r.calibrated_value, r.raw_value) AS value, r.is_flagged, r.flag_reason"
     };
 
     let from_clause = if include_alarms {
@@ -265,8 +285,22 @@ pub async fn get_site_readings(
         (None, None) => String::new(),
     };
 
+    let measurement_type_condition = if !measurement_type_filter.is_empty() {
+        let idx = values.len() + 1;
+        values.push(measurement_type_filter.to_string().into());
+        format!(" AND r.measurement_type = ${idx}")
+    } else {
+        String::new()
+    };
+
+    let flagged_condition = if !include_flagged {
+        " AND (r.is_flagged IS NOT TRUE)"
+    } else {
+        ""
+    };
+
     let sql = format!(
-        "SELECT {select_clause} FROM {from_clause} WHERE r.site_id = $1 AND r.parameter_id IN ({}){time_conditions} ORDER BY r.parameter_id, r.time",
+        "SELECT {select_clause} FROM {from_clause} WHERE r.site_id = $1 AND r.parameter_id IN ({}){time_conditions}{measurement_type_condition}{flagged_condition} ORDER BY r.parameter_id, r.time",
         placeholders.join(",")
     );
 
@@ -284,6 +318,8 @@ pub async fn get_site_readings(
     let mut param_values: HashMap<Uuid, Vec<(DateTime<Utc>, f64)>> =
         HashMap::with_capacity(num_params);
     let mut param_severities: HashMap<Uuid, Vec<(DateTime<Utc>, Option<i16>)>> = HashMap::new();
+    let mut param_flags: HashMap<Uuid, Vec<(DateTime<Utc>, Option<bool>, Option<String>)>> =
+        HashMap::new();
 
     if include_alarms {
         for row in query_result {
@@ -298,6 +334,12 @@ pub async fn get_site_readings(
                     .entry(r.parameter_id)
                     .or_default()
                     .push((time, r.severity));
+                if include_flagged {
+                    param_flags
+                        .entry(r.parameter_id)
+                        .or_default()
+                        .push((time, r.is_flagged, r.flag_reason));
+                }
             }
         }
     } else {
@@ -309,6 +351,12 @@ pub async fn get_site_readings(
                     .entry(r.parameter_id)
                     .or_insert_with(|| Vec::with_capacity(estimated_times))
                     .push((time, r.value));
+                if include_flagged {
+                    param_flags
+                        .entry(r.parameter_id)
+                        .or_default()
+                        .push((time, r.is_flagged, r.flag_reason));
+                }
             }
         }
     }
@@ -325,6 +373,16 @@ pub async fn get_site_readings(
             let global_param_id = sp.parameter_id;
             let mut values: Vec<Option<f64>> = vec![None; times.len()];
             let mut severities_vec: Option<Vec<Option<i16>>> = if include_alarms {
+                Some(vec![None; times.len()])
+            } else {
+                None
+            };
+            let mut flagged_vec: Option<Vec<Option<bool>>> = if include_flagged {
+                Some(vec![None; times.len()])
+            } else {
+                None
+            };
+            let mut flag_reasons_vec: Option<Vec<Option<String>>> = if include_flagged {
                 Some(vec![None; times.len()])
             } else {
                 None
@@ -348,6 +406,19 @@ pub async fn get_site_readings(
                 }
             }
 
+            if let Some(flags) = param_flags.get(&global_param_id) {
+                for (time, is_flag, reason) in flags {
+                    if let Some(&idx) = time_index.get(time) {
+                        if let Some(ref mut fv) = flagged_vec {
+                            fv[idx] = *is_flag;
+                        }
+                        if let Some(ref mut rv) = flag_reasons_vec {
+                            rv[idx] = reason.clone();
+                        }
+                    }
+                }
+            }
+
             ParameterData {
                 id: sp.id,
                 name: sp.name.clone(),
@@ -355,6 +426,8 @@ pub async fn get_site_readings(
                 units: sp.display_units.clone(),
                 values,
                 severities: severities_vec,
+                flagged: flagged_vec,
+                flag_reasons: flag_reasons_vec,
             }
         })
         .collect();

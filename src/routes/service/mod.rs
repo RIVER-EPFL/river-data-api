@@ -1,10 +1,14 @@
 pub mod actions;
+pub mod field_trips;
+pub mod grab_samples;
+pub mod reading_flags;
 pub mod readings_batch;
+pub mod search;
 pub mod source_mappings;
 pub mod status_events_batch;
 pub mod sync_control;
 
-use axum::{Router, middleware, routing::{get, post, put}};
+use axum::{Router, middleware, routing::{get, patch, post, put}};
 use tower_http::limit::RequestBodyLimitLayer;
 use utoipa_axum::router::OpenApiRouter;
 
@@ -15,14 +19,19 @@ use crate::common::middleware::{
 };
 use crate::entity::{
     alarm_thresholds::AlarmThreshold,
+    annotations::Annotation,
     api_tokens::ApiToken,
+    constants::Constant,
     derived_parameter_definitions::DerivedParameterDefinition,
+    field_trips::FieldTrip,
+    notes::Note,
     parameters::Parameter,
     public_exposed_parameters::PublicExposedParameter,
     sensor_calibrations::SensorCalibration,
     sensor_deployments::SensorDeployment,
     sensors::Sensor,
     site_parameters::SiteParameter,
+    standard_curves::StandardCurve,
     sync_state::SyncState,
 };
 
@@ -86,6 +95,17 @@ pub fn service_router(state: &AppState) -> Router<()> {
             with_crud_perms(PublicExposedParameter::router(db)),
         )
         .nest("/sync_states", with_crud_perms(SyncState::router(db)))
+        .nest(
+            "/standard_curves",
+            with_crud_perms(StandardCurve::router(db)),
+        )
+        .nest("/notes", with_crud_perms(Note::router(db)))
+        .nest(
+            "/annotations",
+            with_crud_perms(Annotation::router(db)),
+        )
+        .nest("/constants", with_crud_perms(Constant::router(db)))
+        .nest("/field_trips", with_crud_perms(FieldTrip::router(db)))
         .into();
 
     // ========================================================================
@@ -125,6 +145,22 @@ pub fn service_router(state: &AppState) -> Router<()> {
         // Raise body limit to 10MB for batch inserts
         .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
         .route(
+            "/grab_samples",
+            post(grab_samples::insert_grab_samples),
+        )
+        .route(
+            "/actions/field_trip_batch",
+            post(field_trips::create_field_trip_batch),
+        )
+        .route(
+            "/readings/flag",
+            patch(reading_flags::flag_readings),
+        )
+        .route(
+            "/readings/unflag",
+            patch(reading_flags::unflag_readings),
+        )
+        .route(
             "/actions/refresh_aggregates",
             post(actions::refresh_aggregates),
         )
@@ -148,7 +184,18 @@ pub fn service_router(state: &AppState) -> Router<()> {
             "/actions/preview_derived",
             post(actions::preview_derived),
         )
+        .route("/alarms/active", get(super::alarms::get_active_alarms))
+        .route("/alarms/summary", get(super::alarms::get_alarm_summary))
         .layer(middleware::from_fn(require_read_data))
+        .with_state(state.clone());
+
+    // ========================================================================
+    // Metadata read routes — require read_metadata
+    // ========================================================================
+
+    let metadata_read_routes = Router::new()
+        .route("/search", get(search::search))
+        .layer(middleware::from_fn(require_read_metadata))
         .with_state(state.clone());
 
     // ========================================================================
@@ -159,6 +206,7 @@ pub fn service_router(state: &AppState) -> Router<()> {
         .merge(entity_router)
         .merge(source_mappings_read)
         .merge(source_mappings_write)
+        .merge(metadata_read_routes)
         .merge(data_write_routes)
         .merge(data_read_routes)
 }

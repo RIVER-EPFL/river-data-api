@@ -50,6 +50,10 @@ pub async fn insert_batch_readings(
                 calibration_id: Set(r.calibration_id),
                 deployment_id: Set(r.deployment_id),
                 logged: Set(Some(true)),
+                measurement_type: Set(Some("continuous".to_string())),
+                is_flagged: Set(Some(false)),
+                flag_reason: Set(None),
+                field_trip_id: Set(None),
             }
         })
         .collect();

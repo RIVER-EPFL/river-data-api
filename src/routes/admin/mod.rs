@@ -2,6 +2,7 @@ pub mod calibrations;
 pub mod derived;
 pub mod public_config;
 pub mod sync;
+pub mod users;
 
 use crate::common::AppState;
 use crate::common::auth::Role;
@@ -12,7 +13,7 @@ use crate::entity::{
     sensor_calibrations::SensorCalibration, sensor_deployments::SensorDeployment, sensors::Sensor,
     site_parameters::SiteParameter, sites::Site,
 };
-use axum::{Router, routing::post};
+use axum::{Router, routing::{get, post}};
 
 pub fn admin_router(state: &AppState) -> Router<AppState> {
     let db = &state.db;
@@ -52,7 +53,23 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .route(
             "/actions/invalidate_public_config/{slug}",
             post(public_config::invalidate_public_config),
+        )
+        .route(
+            "/alarms/active",
+            get(super::alarms::get_active_alarms),
+        )
+        .route(
+            "/alarms/summary",
+            get(super::alarms::get_alarm_summary),
         );
+
+    // Keycloak user management proxy (only if admin client secret configured)
+    if state.keycloak_admin.is_some() {
+        router = router
+            .nest("/users", users::router())
+            .route("/roles", get(users::list_roles));
+        tracing::info!("User management routes enabled");
+    }
 
     // Apply Keycloak auth layer if configured
     if let Some(instance) = state.keycloak_auth_instance.clone() {

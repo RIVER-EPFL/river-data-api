@@ -167,10 +167,12 @@ pub fn validate_optional_time_range(
         healthz,
         projects::list_project_sites,
         sites::list_site_parameters,
+        sites::get_site_detail,
         sites::get_site_readings,
         sites::get_site_aggregates,
         sites::get_site_status_events,
         alarms::get_site_alarms,
+        sites::get_site_annotations,
     ),
     components(
         schemas(
@@ -185,6 +187,7 @@ pub fn validate_optional_time_range(
             sites::AggregatesResponse,
             sites::ParameterAggregateData,
             sites::StatusEventsResponse,
+            sites::AnnotationResponse,
             alarms::AlarmViolationsResponse,
             alarms::ParameterViolationData,
         )

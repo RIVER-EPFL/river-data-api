@@ -19,7 +19,10 @@ use crate::error::{AppError, AppResult};
 use crate::routes::{cache, resolve_site_with_project, validate_time_range};
 use crate::services::bulk;
 
-use super::types::{AlarmViolationsResponse, ParameterViolationData, SiteAlarmsQuery};
+use super::types::{
+    ActiveAlarm, ActiveAlarmsResponse, AlarmSeverityCounts, AlarmSiteSummary, AlarmSummaryResponse,
+    AlarmThresholdInfo, AlarmViolationsResponse, ParameterViolationData, SiteAlarmsQuery,
+};
 use crate::routes::sites::{ProjectRef, SiteRef};
 
 /// Row from the violations query
@@ -434,4 +437,216 @@ pub async fn get_site_alarms(
             cache::cache_and_respond(&state, cache_key, &response, actual_end).await
         }
     }
+}
+
+/// Row from the active alarms query
+#[derive(Debug, FromQueryResult)]
+struct ActiveAlarmRow {
+    site_id: Uuid,
+    site_name: String,
+    parameter_id: Uuid,
+    parameter_name: String,
+    current_value: f64,
+    time: chrono::DateTime<chrono::FixedOffset>,
+    warning_min: Option<f64>,
+    warning_max: Option<f64>,
+    alarm_min: Option<f64>,
+    alarm_max: Option<f64>,
+    severity: i16,
+}
+
+/// Fetch active alarm violations across all sites
+async fn fetch_active_alarm_rows(
+    db: &sea_orm::DatabaseConnection,
+    scope: Option<Uuid>,
+) -> AppResult<Vec<ActiveAlarmRow>> {
+    let project_filter = if scope.is_some() {
+        "AND s.project_id = $1"
+    } else {
+        ""
+    };
+
+    let sql = format!(
+        r"
+        WITH ranked_thresholds AS (
+            SELECT DISTINCT ON (t.parameter_id, sp.site_id)
+                sp.site_id,
+                t.parameter_id,
+                sp.name AS parameter_name,
+                t.warning_min,
+                t.warning_max,
+                t.alarm_min,
+                t.alarm_max
+            FROM alarm_thresholds t
+            JOIN site_parameters sp
+                ON sp.parameter_id = t.parameter_id
+                AND sp.is_active = true
+            WHERE t.site_id = sp.site_id OR t.site_id IS NULL
+            ORDER BY t.parameter_id, sp.site_id, t.site_id NULLS LAST
+        ),
+        latest_readings AS (
+            SELECT DISTINCT ON (r.site_id, r.parameter_id)
+                r.site_id,
+                r.parameter_id,
+                r.time,
+                COALESCE(r.calibrated_value, r.raw_value) AS value
+            FROM readings r
+            JOIN ranked_thresholds rt
+                ON rt.site_id = r.site_id
+                AND rt.parameter_id = r.parameter_id
+            ORDER BY r.site_id, r.parameter_id, r.time DESC
+        )
+        SELECT
+            lr.site_id,
+            s.name AS site_name,
+            lr.parameter_id,
+            rt.parameter_name,
+            lr.value AS current_value,
+            lr.time,
+            rt.warning_min,
+            rt.warning_max,
+            rt.alarm_min,
+            rt.alarm_max,
+            CASE
+                WHEN (rt.alarm_min IS NOT NULL AND lr.value < rt.alarm_min) OR
+                     (rt.alarm_max IS NOT NULL AND lr.value > rt.alarm_max) THEN 2::smallint
+                WHEN (rt.warning_min IS NOT NULL AND lr.value < rt.warning_min) OR
+                     (rt.warning_max IS NOT NULL AND lr.value > rt.warning_max) THEN 1::smallint
+                ELSE 0::smallint
+            END AS severity
+        FROM latest_readings lr
+        JOIN ranked_thresholds rt
+            ON rt.site_id = lr.site_id
+            AND rt.parameter_id = lr.parameter_id
+        JOIN sites s ON s.id = lr.site_id
+        WHERE (
+            (rt.alarm_min IS NOT NULL AND lr.value < rt.alarm_min) OR
+            (rt.alarm_max IS NOT NULL AND lr.value > rt.alarm_max) OR
+            (rt.warning_min IS NOT NULL AND lr.value < rt.warning_min) OR
+            (rt.warning_max IS NOT NULL AND lr.value > rt.warning_max)
+        )
+        {project_filter}
+        ORDER BY severity DESC, s.name, rt.parameter_name
+        "
+    );
+
+    let values: Vec<sea_orm::Value> = if let Some(project_id) = scope {
+        vec![project_id.into()]
+    } else {
+        vec![]
+    };
+
+    let rows: Vec<ActiveAlarmRow> = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            values,
+        ))
+        .await?
+        .into_iter()
+        .filter_map(|row| ActiveAlarmRow::from_query_result(&row, "").ok())
+        .collect();
+
+    Ok(rows)
+}
+
+/// Get currently active alarm violations across all sites
+///
+/// For each alarm threshold, checks the latest reading to see if it
+/// violates warning or alarm limits. Returns all current violations.
+#[utoipa::path(
+    get,
+    path = "/alarms/active",
+    responses(
+        (status = 200, description = "Active alarm violations", body = ActiveAlarmsResponse),
+    ),
+    tag = "alarms"
+)]
+pub async fn get_active_alarms(
+    State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+) -> AppResult<Json<ActiveAlarmsResponse>> {
+    let rows = fetch_active_alarm_rows(&state.db, scope).await?;
+
+    let alarms: Vec<ActiveAlarm> = rows
+        .into_iter()
+        .map(|row| ActiveAlarm {
+            site_id: row.site_id,
+            site_name: row.site_name,
+            parameter_id: row.parameter_id,
+            parameter_name: row.parameter_name,
+            current_value: row.current_value,
+            threshold: AlarmThresholdInfo {
+                warning_min: row.warning_min,
+                warning_max: row.warning_max,
+                alarm_min: row.alarm_min,
+                alarm_max: row.alarm_max,
+            },
+            severity: row.severity,
+            since: row.time.with_timezone(&Utc),
+        })
+        .collect();
+
+    let total = alarms.len();
+    Ok(Json(ActiveAlarmsResponse { alarms, total }))
+}
+
+/// Get a summary of active alarm violations
+///
+/// Returns counts by severity and by site.
+#[utoipa::path(
+    get,
+    path = "/alarms/summary",
+    responses(
+        (status = 200, description = "Alarm summary", body = AlarmSummaryResponse),
+    ),
+    tag = "alarms"
+)]
+pub async fn get_alarm_summary(
+    State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+) -> AppResult<Json<AlarmSummaryResponse>> {
+    let rows = fetch_active_alarm_rows(&state.db, scope).await?;
+
+    let mut warning_count = 0usize;
+    let mut alarm_count = 0usize;
+    let mut site_map: HashMap<Uuid, (String, usize, usize)> = HashMap::new();
+
+    for row in &rows {
+        match row.severity {
+            2 => alarm_count += 1,
+            1 => warning_count += 1,
+            _ => {}
+        }
+        let entry = site_map
+            .entry(row.site_id)
+            .or_insert_with(|| (row.site_name.clone(), 0, 0));
+        match row.severity {
+            2 => entry.2 += 1,
+            1 => entry.1 += 1,
+            _ => {}
+        }
+    }
+
+    let total = rows.len();
+
+    let mut by_site: Vec<AlarmSiteSummary> = site_map
+        .into_iter()
+        .map(|(site_id, (site_name, warnings, alarms))| AlarmSiteSummary {
+            site_id,
+            site_name,
+            warning_count: warnings,
+            alarm_count: alarms,
+        })
+        .collect();
+    by_site.sort_by(|a, b| a.site_name.cmp(&b.site_name));
+
+    Ok(Json(AlarmSummaryResponse {
+        total,
+        by_severity: AlarmSeverityCounts {
+            warning: warning_count,
+            alarm: alarm_count,
+        },
+        by_site,
+    }))
 }

@@ -50,6 +50,10 @@ pub struct Config {
     pub keycloak_url: Option<String>,
     pub keycloak_realm: Option<String>,
     pub keycloak_client_id: Option<String>,
+
+    // Keycloak admin proxy (optional — enables user management)
+    pub keycloak_admin_client_id: Option<String>,
+    pub keycloak_admin_client_secret: Option<String>,
 }
 
 impl Config {
@@ -133,6 +137,14 @@ impl Config {
             keycloak_url: env::var("KEYCLOAK_URL").ok().filter(|s| !s.is_empty()),
             keycloak_realm: env::var("KEYCLOAK_REALM").ok().filter(|s| !s.is_empty()),
             keycloak_client_id: env::var("KEYCLOAK_CLIENT_ID")
+                .ok()
+                .filter(|s| !s.is_empty()),
+
+            // Keycloak admin proxy (optional)
+            keycloak_admin_client_id: env::var("KEYCLOAK_ADMIN_CLIENT_ID")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            keycloak_admin_client_secret: env::var("KEYCLOAK_ADMIN_CLIENT_SECRET")
                 .ok()
                 .filter(|s| !s.is_empty()),
         })

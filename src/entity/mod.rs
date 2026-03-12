@@ -1,6 +1,10 @@
 pub mod alarm_thresholds;
+pub mod annotations;
 pub mod api_tokens;
+pub mod constants;
 pub mod derived_parameter_definitions;
+pub mod field_trips;
+pub mod notes;
 pub mod parameters;
 pub mod projects;
 pub mod public_exposed_parameters;
@@ -11,6 +15,7 @@ pub mod sensors;
 pub mod site_parameters;
 pub mod sites;
 pub mod source_mappings;
+pub mod standard_curves;
 pub mod status_events;
 pub mod sync_commands;
 pub mod sync_service_credentials;

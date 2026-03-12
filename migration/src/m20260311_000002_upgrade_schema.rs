@@ -5,7 +5,8 @@ use sea_orm_migration::prelude::*;
 /// Transforms the v0.2.0 schema (site-specific parameters, device_status table,
 /// readings keyed by parameter_id) into the HEAD schema (global parameter catalog,
 /// site_parameters, sensors, calibrations, readings keyed by site_id+parameter_id,
-/// status_events, and non-numeric alarm support).
+/// status_events, sync control plane, annotations, notes, standard curves,
+/// constants, field trips, reading flags, and grab sample support).
 ///
 /// Uses raw SQL throughout because TimescaleDB DDL (hypertable recreation,
 /// continuous aggregates) cannot be expressed in the SeaORM table builder API.
@@ -250,6 +251,187 @@ impl MigrationTrait for Migration {
             "SELECT create_hypertable('status_events', 'time', chunk_time_interval => INTERVAL '30 days', if_not_exists => TRUE)",
         ).await?;
 
+        // -- C10: sync_services (service registry)
+        db.execute_unprepared(
+            "CREATE TABLE IF NOT EXISTS sync_services (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                service_type TEXT NOT NULL,
+                instance_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'starting',
+                current_operation TEXT,
+                last_heartbeat TIMESTAMPTZ,
+                last_sync_completed_at TIMESTAMPTZ,
+                last_error TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(service_type, instance_id)
+            )",
+        )
+        .await?;
+
+        // -- C11: sync_commands (command queue)
+        db.execute_unprepared(
+            "CREATE TABLE IF NOT EXISTS sync_commands (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                service_id UUID NOT NULL REFERENCES sync_services(id) ON DELETE CASCADE,
+                command TEXT NOT NULL,
+                payload JSONB,
+                status TEXT NOT NULL DEFAULT 'pending',
+                result JSONB,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '5 minutes',
+                acknowledged_at TIMESTAMPTZ,
+                completed_at TIMESTAMPTZ
+            )",
+        )
+        .await?;
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_sync_commands_pending
+             ON sync_commands(service_id, status) WHERE status = 'pending'",
+        )
+        .await?;
+
+        // -- C12: sync_service_credentials
+        db.execute_unprepared(
+            "CREATE TABLE IF NOT EXISTS sync_service_credentials (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                client_id TEXT NOT NULL UNIQUE,
+                client_secret_hash TEXT NOT NULL,
+                service_type TEXT NOT NULL,
+                service_id UUID REFERENCES sync_services(id),
+                revoked BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+        )
+        .await?;
+
+        // -- C13: sync_service_tokens
+        db.execute_unprepared(
+            "CREATE TABLE IF NOT EXISTS sync_service_tokens (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                service_id UUID NOT NULL REFERENCES sync_services(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+        )
+        .await?;
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_sync_service_tokens_lookup
+             ON sync_service_tokens(token_hash)",
+        )
+        .await?;
+
+        // -- C14: annotations
+        db.execute_unprepared(
+            r#"CREATE TABLE IF NOT EXISTS annotations (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                site_id UUID NOT NULL REFERENCES sites(id),
+                parameter_id UUID NOT NULL REFERENCES parameters(id),
+                start_time TIMESTAMPTZ NOT NULL,
+                end_time TIMESTAMPTZ NOT NULL,
+                text TEXT NOT NULL,
+                category VARCHAR(50) NOT NULL DEFAULT 'other',
+                created_by VARCHAR(255),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )"#,
+        )
+        .await?;
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_annotations_site_param ON annotations(site_id, parameter_id)",
+        )
+        .await?;
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_annotations_time ON annotations(start_time, end_time)",
+        )
+        .await?;
+
+        // -- C15: notes
+        db.execute_unprepared(
+            "CREATE TABLE IF NOT EXISTS notes (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                site_id UUID NOT NULL REFERENCES sites(id),
+                text TEXT NOT NULL,
+                verified BOOLEAN NOT NULL DEFAULT FALSE,
+                created_by VARCHAR(255),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )",
+        )
+        .await?;
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_notes_site ON notes(site_id)",
+        )
+        .await?;
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at DESC)",
+        )
+        .await?;
+
+        // -- C16: standard_curves
+        db.execute_unprepared(
+            "CREATE TABLE IF NOT EXISTS standard_curves (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                parameter_id UUID NOT NULL REFERENCES parameters(id),
+                valid_from TIMESTAMPTZ NOT NULL,
+                slope DOUBLE PRECISION NOT NULL,
+                intercept DOUBLE PRECISION NOT NULL,
+                r_squared DOUBLE PRECISION,
+                notes TEXT,
+                created_by VARCHAR(255),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )",
+        )
+        .await?;
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_standard_curves_param ON standard_curves(parameter_id)",
+        )
+        .await?;
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_standard_curves_valid ON standard_curves(valid_from DESC)",
+        )
+        .await?;
+
+        // -- C17: constants (with seed data)
+        db.execute_unprepared(
+            "CREATE TABLE IF NOT EXISTS constants (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                name VARCHAR(255) NOT NULL UNIQUE,
+                value DOUBLE PRECISION NOT NULL,
+                units VARCHAR(100),
+                description TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )",
+        )
+        .await?;
+        db.execute_unprepared(
+            "INSERT INTO constants (name, value, units, description) VALUES
+                ('gas_constant', 8.314, 'J/(mol\u{00b7}K)', 'Universal gas constant R'),
+                ('barometric_coefficient_a', 101325, 'Pa', 'Standard atmospheric pressure at sea level'),
+                ('barometric_exponent', 5.25588, NULL, 'Exponent in barometric formula'),
+                ('barometric_altitude_coeff', 2.25577e-5, '1/m', 'Altitude coefficient in barometric formula'),
+                ('water_density_4c', 999.97, 'kg/m\u{00b3}', 'Density of water at 4\u{00b0}C')
+            ON CONFLICT (name) DO NOTHING",
+        )
+        .await?;
+
+        // -- C18: field_trips
+        db.execute_unprepared(
+            "CREATE TABLE IF NOT EXISTS field_trips (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                date DATE NOT NULL,
+                participants TEXT,
+                notes TEXT,
+                created_by VARCHAR(255),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )",
+        )
+        .await?;
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_field_trips_date ON field_trips(date DESC)",
+        )
+        .await?;
+
         // =====================================================================
         // Phase D: Populate new tables from old data
         // =====================================================================
@@ -379,7 +561,7 @@ impl MigrationTrait for Migration {
         db.execute_unprepared("ALTER TABLE readings RENAME TO old_readings")
             .await?;
 
-        // -- E4: Create new readings table + hypertable
+        // -- E4: Create new readings table with all columns + hypertable
         db.execute_unprepared(
             r"CREATE TABLE readings (
                 site_id UUID NOT NULL,
@@ -391,12 +573,17 @@ impl MigrationTrait for Migration {
                 calibration_id UUID,
                 deployment_id UUID,
                 logged BOOLEAN DEFAULT true,
+                measurement_type VARCHAR(20) NOT NULL DEFAULT 'continuous',
+                is_flagged BOOLEAN DEFAULT FALSE,
+                flag_reason TEXT,
+                field_trip_id UUID,
                 PRIMARY KEY (site_id, parameter_id, time),
                 CONSTRAINT fk_readings_site FOREIGN KEY (site_id) REFERENCES sites(id),
                 CONSTRAINT fk_readings_parameter FOREIGN KEY (parameter_id) REFERENCES parameters(id),
                 CONSTRAINT fk_readings_sensor FOREIGN KEY (sensor_id) REFERENCES sensors(id),
                 CONSTRAINT fk_readings_calibration FOREIGN KEY (calibration_id) REFERENCES sensor_calibrations(id),
-                CONSTRAINT fk_readings_deployment FOREIGN KEY (deployment_id) REFERENCES sensor_deployments(id)
+                CONSTRAINT fk_readings_deployment FOREIGN KEY (deployment_id) REFERENCES sensor_deployments(id),
+                CONSTRAINT readings_measurement_type_check CHECK (measurement_type IN ('continuous', 'spot', 'derived'))
             )",
         ).await?;
         db.execute_unprepared(
@@ -479,7 +666,7 @@ impl MigrationTrait for Migration {
         // -- E8: Drop old readings
         db.execute_unprepared("DROP TABLE old_readings").await?;
 
-        // -- E9: Recreate continuous aggregates
+        // -- E9: Create continuous aggregates (with measurement_type + flag filters)
         db.execute_unprepared(
             r"CREATE MATERIALIZED VIEW IF NOT EXISTS readings_hourly
             WITH (timescaledb.continuous) AS
@@ -493,6 +680,7 @@ impl MigrationTrait for Migration {
                 COUNT(*) AS count,
                 STDDEV(COALESCE(calibrated_value, raw_value)) AS stddev_value
             FROM readings
+            WHERE measurement_type = 'continuous' AND is_flagged IS NOT TRUE
             GROUP BY time_bucket('1 hour', time), site_id, parameter_id
             WITH NO DATA",
         )
@@ -511,6 +699,7 @@ impl MigrationTrait for Migration {
                 COUNT(*) AS count,
                 STDDEV(COALESCE(calibrated_value, raw_value)) AS stddev_value
             FROM readings
+            WHERE measurement_type = 'continuous' AND is_flagged IS NOT TRUE
             GROUP BY time_bucket('1 day', time), site_id, parameter_id
             WITH NO DATA",
         )
@@ -529,6 +718,7 @@ impl MigrationTrait for Migration {
                 COUNT(*) AS count,
                 STDDEV(COALESCE(calibrated_value, raw_value)) AS stddev_value
             FROM readings
+            WHERE measurement_type = 'continuous' AND is_flagged IS NOT TRUE
             GROUP BY time_bucket('1 week', time), site_id, parameter_id
             WITH NO DATA",
         )
@@ -547,6 +737,7 @@ impl MigrationTrait for Migration {
                 COUNT(*) AS count,
                 STDDEV(COALESCE(calibrated_value, raw_value)) AS stddev_value
             FROM readings
+            WHERE measurement_type = 'continuous' AND is_flagged IS NOT TRUE
             GROUP BY time_bucket('1 month', time), site_id, parameter_id
             WITH NO DATA",
         )
@@ -684,7 +875,7 @@ impl MigrationTrait for Migration {
             "UPDATE source_mappings SET entity_type = 'site_parameter' WHERE entity_type = 'parameter'",
         ).await?;
 
-        // Nullability fixes (merged from m20260311_000002_fix_nullability)
+        // Nullability fixes
         db.execute_unprepared("ALTER TABLE sensors ALTER COLUMN is_lab_instrument DROP NOT NULL")
             .await?;
         db.execute_unprepared(

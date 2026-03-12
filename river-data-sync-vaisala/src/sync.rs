@@ -504,10 +504,38 @@ pub async fn sync_readings(
     Ok(())
 }
 
+/// Ensure a device_health global parameter exists, returning its UUID.
+///
+/// Looks up `name` in `param_cache`; if missing, creates it via the API and
+/// inserts the resulting UUID into the cache.
+async fn ensure_health_parameter(
+    api: &ApiClient,
+    param_cache: &mut HashMap<String, Uuid>,
+    name: &str,
+    display_name: &str,
+    data_type: &str,
+) -> Result<Uuid, SyncError> {
+    if let Some(id) = param_cache.get(name) {
+        return Ok(*id);
+    }
+    let p = api
+        .create_parameter(&serde_json::json!({
+            "name": name,
+            "display_name": display_name,
+            "default_units": "",
+            "category": "device_health",
+            "data_type": data_type,
+        }))
+        .await?;
+    param_cache.insert(name.to_string(), p.id);
+    Ok(p.id)
+}
+
 /// Sync device status from Vaisala into status_events via the API.
 ///
-/// Calls `get_locations_data` for all mapped active parameters and posts any
-/// non-empty `device_status` strings to the status_events batch endpoint.
+/// Calls `get_locations_data` for all mapped active parameters and posts
+/// device_status, battery_level, signal_quality, line_powered, and unreachable
+/// values to the status_events batch endpoint.
 pub async fn sync_device_status(
     api: &ApiClient,
     vaisala: &VaisalaClient,
@@ -549,39 +577,36 @@ pub async fn sync_device_status(
     let data = vaisala.get_locations_data(&location_ids).await?;
     let now = Utc::now();
 
-    // Ensure "Device_Status" global parameter exists
+    // Build a cache of existing global parameters by name
     let existing_params = api.list_parameters().await?;
-    let device_status_param_id = if let Some(p) = existing_params.iter().find(|p| p.name == "Device_Status") {
-        p.id
-    } else {
-        match api
-            .create_parameter(&serde_json::json!({
-                "name": "Device_Status",
-                "display_name": "Device Status",
-                "default_units": "",
-                "category": "device_health",
-                "data_type": "string",
-            }))
-            .await
-        {
-            Ok(p) => p.id,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to create Device_Status parameter");
-                return Err(e);
-            }
-        }
-    };
+    let mut param_cache: HashMap<String, Uuid> = existing_params
+        .into_iter()
+        .map(|p| (p.name.clone(), p.id))
+        .collect();
 
-    // Collect unique sites with device_status values
+    // Ensure all device_health parameters exist
+    let device_status_id = ensure_health_parameter(
+        api, &mut param_cache, "Device_Status", "Device Status", "string",
+    ).await?;
+    let battery_level_id = ensure_health_parameter(
+        api, &mut param_cache, "Battery_Level", "Battery Level", "integer",
+    ).await?;
+    let signal_quality_id = ensure_health_parameter(
+        api, &mut param_cache, "Signal_Quality", "Signal Quality", "integer",
+    ).await?;
+    let line_powered_id = ensure_health_parameter(
+        api, &mut param_cache, "Line_Powered", "Line Powered", "integer",
+    ).await?;
+    let unreachable_id = ensure_health_parameter(
+        api, &mut param_cache, "Unreachable", "Unreachable", "boolean",
+    ).await?;
+
+    // Collect one set of health events per site per sync cycle
     let mut seen_sites: HashSet<Uuid> = HashSet::new();
     let mut events: Vec<StatusEventInput> = Vec::new();
 
     for resource in data.data {
         let attrs = resource.attributes;
-
-        if attrs.device_status.is_empty() {
-            continue;
-        }
 
         let Some(sp_id) = param_map.get(&attrs.id) else {
             continue;
@@ -590,16 +615,55 @@ pub async fn sync_device_status(
             continue;
         };
 
-        // Only one status event per site per sync cycle
+        // One set of health events per site per sync cycle
         if !seen_sites.insert(*site_id) {
             continue;
         }
 
+        // Device status (string) — only if non-empty
+        if !attrs.device_status.is_empty() {
+            events.push(StatusEventInput {
+                site_id: *site_id,
+                parameter_id: device_status_id,
+                time: now,
+                value: attrs.device_status.clone(),
+                sensor_id: None,
+            });
+        }
+
+        // Battery level (integer)
         events.push(StatusEventInput {
             site_id: *site_id,
-            parameter_id: device_status_param_id,
+            parameter_id: battery_level_id,
             time: now,
-            value: attrs.device_status.clone(),
+            value: attrs.battery_level.to_string(),
+            sensor_id: None,
+        });
+
+        // Signal quality (integer)
+        events.push(StatusEventInput {
+            site_id: *site_id,
+            parameter_id: signal_quality_id,
+            time: now,
+            value: attrs.signal_quality.to_string(),
+            sensor_id: None,
+        });
+
+        // Line powered (integer)
+        events.push(StatusEventInput {
+            site_id: *site_id,
+            parameter_id: line_powered_id,
+            time: now,
+            value: attrs.line_powered.to_string(),
+            sensor_id: None,
+        });
+
+        // Unreachable (boolean)
+        events.push(StatusEventInput {
+            site_id: *site_id,
+            parameter_id: unreachable_id,
+            time: now,
+            value: attrs.unreachable.to_string(),
             sensor_id: None,
         });
     }
