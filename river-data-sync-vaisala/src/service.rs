@@ -101,14 +101,18 @@ impl SyncService for VaisalaSyncService {
         }
 
         // Run device status sync (non-fatal)
-        if let Err(e) = sync::sync_device_status(&self.api, &self.vaisala).await {
-            tracing::warn!(error = %e, "Device status sync failed");
-        }
+        let status_count = match sync::sync_device_status(&self.api, &self.vaisala).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(error = %e, "Device status sync failed");
+                0
+            }
+        };
 
         let elapsed = start.elapsed();
         Ok(SyncResult {
             readings_synced: 0,
-            status_events_synced: 0,
+            status_events_synced: status_count,
             full_sync: force_full,
             duration_ms: elapsed.as_millis() as u64,
         })

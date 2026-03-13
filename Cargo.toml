@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "migration", "river-data-sync-vaisala", "river-data-sync-common"]
+members = [".", "migration", "river-data-sync-vaisala", "river-data-sync-common", "river-data-toolbox"]
 resolver = "2"
 
 [package]
@@ -79,6 +79,9 @@ async-trait = "0.1"
 
 # Migration support
 migration = { path = "migration" }
+
+# Hydrochemistry calculation tools
+river-data-toolbox = { path = "river-data-toolbox" }
 
 [dev-dependencies]
 tokio-test = "0.4"

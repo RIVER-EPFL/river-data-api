@@ -7,11 +7,12 @@ pub mod users;
 use crate::common::AppState;
 use crate::common::auth::Role;
 use crate::entity::{
-    alarm_thresholds::AlarmThreshold, api_tokens::ApiToken,
-    derived_parameter_definitions::DerivedParameterDefinition, parameters::Parameter,
-    projects::Project, public_exposed_parameters::PublicExposedParameter,
+    alarm_thresholds::AlarmThreshold, api_tokens::ApiToken, constants::Constant,
+    derived_parameter_definitions::DerivedParameterDefinition, field_trips::FieldTrip,
+    notes::Note, parameters::Parameter, projects::Project,
+    public_exposed_parameters::PublicExposedParameter,
     sensor_calibrations::SensorCalibration, sensor_deployments::SensorDeployment, sensors::Sensor,
-    site_parameters::SiteParameter, sites::Site,
+    site_parameters::SiteParameter, sites::Site, standard_curves::StandardCurve,
 };
 use axum::{Router, routing::{get, post}};
 
@@ -41,6 +42,10 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
             "/public_exposed_parameters",
             crud(PublicExposedParameter::router(db)),
         )
+        .nest_service("/standard_curves", crud(StandardCurve::router(db)))
+        .nest_service("/notes", crud(Note::router(db)))
+        .nest_service("/constants", crud(Constant::router(db)))
+        .nest_service("/field_trips", crud(FieldTrip::router(db)))
         // Custom action routes under /actions/ to avoid conflict with nest_service catch-all
         .route(
             "/actions/sensor_calibrations/{id}/recalculate",
@@ -61,6 +66,11 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .route(
             "/alarms/summary",
             get(super::alarms::get_alarm_summary),
+        )
+        .route("/search", get(super::service::search::search))
+        .route(
+            "/actions/preview_derived",
+            post(super::service::actions::preview_derived),
         );
 
     // Keycloak user management proxy (only if admin client secret configured)

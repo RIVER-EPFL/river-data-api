@@ -539,7 +539,7 @@ async fn ensure_health_parameter(
 pub async fn sync_device_status(
     api: &ApiClient,
     vaisala: &VaisalaClient,
-) -> Result<(), SyncError> {
+) -> Result<u64, SyncError> {
     let mappings = api.list_source_mappings(Some("site_parameter")).await?;
     let param_map: HashMap<i32, Uuid> = mappings
         .iter()
@@ -566,7 +566,7 @@ pub async fn sync_device_status(
 
     if location_ids.is_empty() {
         tracing::debug!("No mapped parameters for device status sync");
-        return Ok(());
+        return Ok(0);
     }
 
     tracing::info!(
@@ -670,15 +670,21 @@ pub async fn sync_device_status(
 
     if events.is_empty() {
         tracing::debug!("No device status events to insert");
-        return Ok(());
+        return Ok(0);
     }
 
-    match api.insert_status_events_batch(&events).await {
-        Ok(count) => tracing::info!(inserted = count, "Device status sync complete"),
-        Err(e) => tracing::warn!(error = %e, "Failed to insert status events"),
-    }
+    let count = match api.insert_status_events_batch(&events).await {
+        Ok(count) => {
+            tracing::info!(inserted = count, "Device status sync complete");
+            count
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to insert status events");
+            0
+        }
+    };
 
-    Ok(())
+    Ok(count)
 }
 
 /// Derive the parameter category from the sensor type.

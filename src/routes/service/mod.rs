@@ -7,6 +7,7 @@ pub mod search;
 pub mod source_mappings;
 pub mod status_events_batch;
 pub mod sync_control;
+pub mod tools;
 
 use axum::{Router, middleware, routing::{get, patch, post, put}};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -191,6 +192,11 @@ pub fn service_router(state: &AppState) -> Router<()> {
         )
         .route("/alarms/active", get(super::alarms::get_active_alarms))
         .route("/alarms/summary", get(super::alarms::get_alarm_summary))
+        .route("/tools", get(tools::list_tools))
+        .route(
+            "/tools/{tool_name}/calculate",
+            post(tools::calculate_tool),
+        )
         .layer(middleware::from_fn(require_read_data))
         .with_state(state.clone());
 
