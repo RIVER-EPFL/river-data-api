@@ -451,13 +451,12 @@ pub async fn get_readings(
     let start = query.start.as_deref().map(parse_time).transpose()?;
     let end = query.end.as_deref().map(parse_time).transpose()?;
 
-    if let (Some(s), Some(e)) = (start, end) {
-        if e <= s {
+    if let (Some(s), Some(e)) = (start, end)
+        && e <= s {
             return Err(AppError::BadRequest(
                 "end time must be after start time".to_string(),
             ));
         }
-    }
 
     let requested_names = resolve_requested_param_names(query.parameters.as_deref(), &config)?;
 

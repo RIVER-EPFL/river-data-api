@@ -198,16 +198,14 @@ pub async fn recalculate_derived_at_timestamp(
 
         if let Some(mapping_obj) = item.mappings.as_object() {
             for (_var_name, source_val) in mapping_obj {
-                if let Some(source_id_str) = source_val.as_str() {
-                    if let Ok(source_sp_id) = source_id_str.parse::<Uuid>() {
+                if let Some(source_id_str) = source_val.as_str()
+                    && let Ok(source_sp_id) = source_id_str.parse::<Uuid>() {
                         // Check if this source sp maps to a derived parameter at this site
-                        if let Some(other) = work_items.iter().find(|w| w.site_param_id == source_sp_id) {
-                            if derived_param_ids.contains(&other.derived_parameter_id) {
+                        if let Some(other) = work_items.iter().find(|w| w.site_param_id == source_sp_id)
+                            && derived_param_ids.contains(&other.derived_parameter_id) {
                                 item_deps.push(other.site_param_id);
                             }
-                        }
                     }
-                }
             }
         }
         deps.insert(item.site_param_id, item_deps);

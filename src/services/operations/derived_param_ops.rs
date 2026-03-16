@@ -113,8 +113,7 @@ async fn find_derived_definition_for_param(
         .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
 
     Ok(row
-        .map(|r| r.try_get::<Uuid>("", "id").ok())
-        .flatten())
+        .and_then(|r| r.try_get::<Uuid>("", "id").ok()))
 }
 
 /// Recursively compute the depth of a derived parameter chain.

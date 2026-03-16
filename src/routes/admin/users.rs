@@ -65,11 +65,10 @@ async fn get_admin_token(state: &AppState) -> AppResult<String> {
     // Check cache (reuse if >30s before expiry)
     {
         let cache = admin.token_cache.lock().await;
-        if let Some((token, expiry)) = cache.as_ref() {
-            if *expiry > Utc::now() + chrono::Duration::seconds(30) {
+        if let Some((token, expiry)) = cache.as_ref()
+            && *expiry > Utc::now() + chrono::Duration::seconds(30) {
                 return Ok(token.clone());
             }
-        }
     }
 
     let url = format!(
