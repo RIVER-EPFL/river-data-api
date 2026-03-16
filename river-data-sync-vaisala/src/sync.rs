@@ -2,15 +2,16 @@ use chrono::{Duration, Utc};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-use crate::api_client::ApiClient;
-use crate::models::{ReadingInput, StatusEventInput};
+use river_data_sync_common::models::{ReadingInput, StatusEventInput, SyncState};
+use river_data_sync_common::river_data_client::RiverDataClient;
+
 use crate::vaisala_client::{SyncError, VaisalaClient};
 
 const BATCH_SIZE: usize = 1000;
 
 /// Discover and sync projects, sites, and parameters from Vaisala via the API.
 pub async fn sync_locations(
-    api: &ApiClient,
+    api: &RiverDataClient,
     vaisala: &VaisalaClient,
 ) -> Result<(), SyncError> {
     tracing::info!("Discovering locations from Vaisala...");
@@ -328,7 +329,7 @@ pub async fn sync_locations(
 
 /// Sync readings for all active parameters via the API.
 pub async fn sync_readings(
-    api: &ApiClient,
+    api: &RiverDataClient,
     vaisala: &VaisalaClient,
     max_history_days: i64,
     force_full_sync: bool,
@@ -343,7 +344,7 @@ pub async fn sync_readings(
     // Load site_parameters and sync states
     let site_params = api.list_site_parameters().await?;
     let sync_states = api.list_sync_states().await?;
-    let sync_state_map: HashMap<Uuid, crate::models::SyncState> = sync_states
+    let sync_state_map: HashMap<Uuid, SyncState> = sync_states
         .into_iter()
         .map(|s| (s.site_parameter_id, s))
         .collect();
@@ -509,7 +510,7 @@ pub async fn sync_readings(
 /// Looks up `name` in `param_cache`; if missing, creates it via the API and
 /// inserts the resulting UUID into the cache.
 async fn ensure_health_parameter(
-    api: &ApiClient,
+    api: &RiverDataClient,
     param_cache: &mut HashMap<String, Uuid>,
     name: &str,
     display_name: &str,
@@ -537,7 +538,7 @@ async fn ensure_health_parameter(
 /// device_status, battery_level, signal_quality, line_powered, and unreachable
 /// values to the status_events batch endpoint.
 pub async fn sync_device_status(
-    api: &ApiClient,
+    api: &RiverDataClient,
     vaisala: &VaisalaClient,
 ) -> Result<u64, SyncError> {
     let mappings = api.list_source_mappings(Some("site_parameter")).await?;
@@ -760,7 +761,7 @@ fn threshold_defaults(
 }
 
 async fn create_sensor_and_deployment_via_api(
-    api: &ApiClient,
+    api: &RiverDataClient,
     serial_number: &str,
     parameter_id: Uuid,
     site_id: Uuid,

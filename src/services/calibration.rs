@@ -3,12 +3,13 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Apply a linear calibration: calibrated = slope * raw + intercept
+#[must_use] 
 pub fn apply_calibration(raw: f64, slope: f64, intercept: f64) -> f64 {
     slope * raw + intercept
 }
 
-/// Recalculate calibrated_value for readings affected by a calibration.
-/// Finds the next calibration's valid_from as the upper boundary.
+/// Recalculate `calibrated_value` for readings affected by a calibration.
+/// Finds the next calibration's `valid_from` as the upper boundary.
 /// After updating, cascades recalculation to any derived parameters that
 /// depend on the recalibrated readings.
 /// Returns the number of updated rows.
@@ -216,7 +217,7 @@ pub async fn recalculate_derived_at_timestamp(
     let mut ordered: Vec<usize> = Vec::with_capacity(work_items.len());
     let mut remaining: Vec<usize> = (0..work_items.len()).collect();
 
-    for _ in 0..work_items.len() + 1 {
+    for _ in 0..=work_items.len() {
         let mut progress = false;
         remaining.retain(|&idx| {
             let sp_id = work_items[idx].site_param_id;

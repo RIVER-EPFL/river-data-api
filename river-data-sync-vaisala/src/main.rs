@@ -1,4 +1,3 @@
-mod api_client;
 mod config;
 mod models;
 mod service;
@@ -7,9 +6,9 @@ mod vaisala_client;
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use api_client::ApiClient;
 use config::SyncConfig;
 use river_data_sync_common::models::RunnerConfig;
+use river_data_sync_common::river_data_client::RiverDataClient;
 use river_data_sync_common::runner::SyncServiceRunner;
 use service::VaisalaSyncService;
 use vaisala_client::VaisalaClient;
@@ -51,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     // Create clients — token will be set by the runner after enrollment
-    let api = ApiClient::new(&config.api_base_url, "");
+    let api = RiverDataClient::new(&config.api_base_url, "");
     let vaisala = VaisalaClient::new(
         &config.vaisala_base_url,
         &config.vaisala_bearer_token,

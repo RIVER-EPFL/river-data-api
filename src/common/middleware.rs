@@ -60,7 +60,8 @@ impl Default for TokenPermissions {
 }
 
 impl TokenPermissions {
-    /// Parse from a serde_json::Value, falling back to defaults on any error.
+    /// Parse from a `serde_json::Value`, falling back to defaults on any error.
+    #[must_use] 
     pub fn from_json(value: &serde_json::Value) -> Self {
         serde_json::from_value(value.clone()).unwrap_or_default()
     }
@@ -179,7 +180,7 @@ pub async fn require_write_data(request: Request, next: Next) -> Response {
     }
 }
 
-/// Method-aware scope middleware for CrudCrate routes.
+/// Method-aware scope middleware for `CrudCrate` routes.
 /// GET/HEAD → requires `read_metadata`; all other methods → requires `write_metadata`.
 /// Keycloak users pass through unconditionally.
 pub async fn require_crud_permissions(request: Request, next: Next) -> Response {

@@ -235,8 +235,7 @@ pub async fn heartbeat(
         let _ = sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
-                "UPDATE sync_commands SET status = 'expired' WHERE service_id = '{}' AND status = 'pending' AND expires_at < NOW()",
-                sid
+                "UPDATE sync_commands SET status = 'expired' WHERE service_id = '{sid}' AND status = 'pending' AND expires_at < NOW()"
             ),
         );
         // Use raw exec
@@ -244,8 +243,7 @@ pub async fn heartbeat(
         let _ = db_clone.execute(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
-                "UPDATE sync_commands SET status = 'expired' WHERE service_id = '{}' AND status = 'pending' AND expires_at < NOW()",
-                sid
+                "UPDATE sync_commands SET status = 'expired' WHERE service_id = '{sid}' AND status = 'pending' AND expires_at < NOW()"
             ),
         )).await;
     });

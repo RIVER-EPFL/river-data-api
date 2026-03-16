@@ -182,7 +182,7 @@ fn extract_variables(formula: &str) -> Vec<String> {
                 && !builtins.contains(t)
                 && seen.insert(t.to_string())
         })
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect()
 }
 
@@ -308,8 +308,8 @@ pub async fn preview_derived(
     }
 
     // Deduplicate and sort times
-    let mut time_set: Vec<i64> = all_times.iter().map(|t| t.timestamp_millis()).collect();
-    time_set.sort();
+    let mut time_set: Vec<i64> = all_times.iter().map(chrono::DateTime::timestamp_millis).collect();
+    time_set.sort_unstable();
     time_set.dedup();
 
     let times: Vec<chrono::DateTime<chrono::Utc>> = time_set

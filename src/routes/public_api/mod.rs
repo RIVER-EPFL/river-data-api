@@ -35,7 +35,7 @@ use crate::services::public_api_config::list_public_slugs;
 pub struct PublicApiDoc;
 
 /// Router for all public API integrations.
-/// Routes: /api/public/{project_slug}/sites/...
+/// Routes: /`api/public/{project_slug}/sites`/...
 pub fn public_router() -> Router<AppState> {
     Router::new()
         .route("/", get(discovery))

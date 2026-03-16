@@ -4,7 +4,6 @@
 
 pub mod common;
 pub mod config;
-pub mod connectors;
 pub mod entity;
 pub mod error;
 pub mod routes;

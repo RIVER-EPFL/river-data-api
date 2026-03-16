@@ -43,6 +43,7 @@ pub struct ExposedParamConfig {
 }
 
 /// Create a new public config cache with a 5-minute TTL.
+#[must_use] 
 pub fn new_public_config_cache() -> PublicConfigCache {
     Cache::builder()
         .max_capacity(100)

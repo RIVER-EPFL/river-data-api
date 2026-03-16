@@ -45,26 +45,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Migrations completed");
 
     // Initialize Keycloak authentication (optional in dev, required in prod)
-    let keycloak_instance = match (&config.keycloak_url, &config.keycloak_realm) {
-        (Some(url), Some(realm)) => {
-            tracing::info!(url = %url, realm = %realm, "Initializing Keycloak authentication");
-            Some(Arc::new(KeycloakAuthInstance::new(
-                KeycloakConfig::builder()
-                    .server(Url::parse(url).expect("Invalid KEYCLOAK_URL"))
-                    .realm(realm.clone())
-                    .build(),
-            )))
+    let keycloak_instance = if let (Some(url), Some(realm)) = (&config.keycloak_url, &config.keycloak_realm) {
+        tracing::info!(url = %url, realm = %realm, "Initializing Keycloak authentication");
+        Some(Arc::new(KeycloakAuthInstance::new(
+            KeycloakConfig::builder()
+                .server(Url::parse(url).expect("Invalid KEYCLOAK_URL"))
+                .realm(realm.clone())
+                .build(),
+        )))
+    } else {
+        if matches!(config.deployment, Deployment::Prod) {
+            panic!(
+                "SECURITY ERROR: Keycloak authentication is required in production. \
+                 Configure KEYCLOAK_URL and KEYCLOAK_REALM environment variables."
+            );
         }
-        _ => {
-            if matches!(config.deployment, Deployment::Prod) {
-                panic!(
-                    "SECURITY ERROR: Keycloak authentication is required in production. \
-                     Configure KEYCLOAK_URL and KEYCLOAK_REALM environment variables."
-                );
-            }
-            tracing::warn!("Keycloak authentication NOT configured — admin routes unprotected");
-            None
-        }
+        tracing::warn!("Keycloak authentication NOT configured — admin routes unprotected");
+        None
     };
 
     // Create application state

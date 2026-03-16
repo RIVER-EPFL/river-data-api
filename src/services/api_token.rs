@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use crate::entity::api_tokens;
 
 /// Hash a raw API token using SHA-256 and return the hex string.
+#[must_use] 
 pub fn hash_token(raw_token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(raw_token.as_bytes());
@@ -12,6 +13,7 @@ pub fn hash_token(raw_token: &str) -> String {
 }
 
 /// Generate a cryptographically random API token (64 hex characters).
+#[must_use] 
 pub fn generate_token() -> String {
     use rand::Rng;
     let bytes: [u8; 32] = rand::rng().random();

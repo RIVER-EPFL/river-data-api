@@ -163,6 +163,6 @@ impl VaisalaClient {
 pub enum SyncError {
     #[error("Vaisala API error: {0}")]
     Vaisala(String),
-    #[error("River Data API error: {0}")]
-    Api(String),
+    #[error(transparent)]
+    RiverData(#[from] river_data_sync_common::error::RiverDataClientError),
 }

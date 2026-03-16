@@ -103,3 +103,104 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
 }
+
+// ============================================================================
+// River Data API types (shared across sync services)
+// ============================================================================
+
+/// CrudCrate list response format
+#[derive(Debug, Deserialize)]
+pub struct CrudListResponse<T> {
+    pub data: Vec<T>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub total: Option<u64>,
+}
+
+/// Project from the API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Project {
+    pub id: Uuid,
+    pub name: String,
+    pub data_source: String,
+    pub description: Option<String>,
+}
+
+/// Site from the API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Site {
+    pub id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub name: String,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub altitude_m: Option<f64>,
+}
+
+/// Global parameter from the API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Parameter {
+    pub id: Uuid,
+    pub name: String,
+    pub display_name: String,
+    pub default_units: String,
+    pub category: String,
+    pub data_type: String,
+}
+
+/// Site parameter from the API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiteParameter {
+    pub id: Uuid,
+    pub site_id: Uuid,
+    pub parameter_id: Uuid,
+    pub name: String,
+    pub sensor_type: String,
+    pub is_active: Option<bool>,
+    pub is_derived: Option<bool>,
+}
+
+/// Source mapping from the API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceMapping {
+    pub entity_type: String,
+    pub source_key: i32,
+    pub entity_id: Uuid,
+    pub source_name: Option<String>,
+    pub source_system: Option<String>,
+}
+
+/// Sync state from the API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncState {
+    pub site_parameter_id: Uuid,
+    pub last_data_time: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_sync_attempt: Option<chrono::DateTime<chrono::Utc>>,
+    pub sync_status: Option<String>,
+    pub error_message: Option<String>,
+    pub retry_count: Option<i32>,
+    pub last_full_sync: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Reading for batch insert
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadingInput {
+    pub site_id: Uuid,
+    pub parameter_id: Uuid,
+    pub time: chrono::DateTime<chrono::Utc>,
+    pub raw_value: f64,
+    pub calibrated_value: Option<f64>,
+    pub sensor_id: Option<Uuid>,
+    pub calibration_id: Option<Uuid>,
+    pub deployment_id: Option<Uuid>,
+}
+
+/// Status event for batch insert
+#[derive(Debug, Serialize)]
+pub struct StatusEventInput {
+    pub site_id: Uuid,
+    pub parameter_id: Uuid,
+    pub time: chrono::DateTime<chrono::Utc>,
+    pub value: String,
+    pub sensor_id: Option<Uuid>,
+}

@@ -9,11 +9,12 @@ use crate::error::{AppError, AppResult};
 
 /// Semaphore limiting concurrent bulk (CSV/NDJSON) requests.
 /// Created from the config value at startup via `new_bulk_semaphore`.
+#[must_use] 
 pub fn new_bulk_semaphore(limit: usize) -> Arc<Semaphore> {
     Arc::new(Semaphore::new(limit))
 }
 
-/// Type alias for the bulk semaphore shared via AppState.
+/// Type alias for the bulk semaphore shared via `AppState`.
 pub type BulkSemaphore = Arc<Semaphore>;
 
 /// Determine response format from query param and Accept header.
@@ -43,14 +44,11 @@ pub fn acquire_bulk_permit(
     semaphore: &BulkSemaphore,
 ) -> AppResult<Option<OwnedSemaphorePermit>> {
     if format == "csv" || format == "ndjson" {
-        match semaphore.clone().try_acquire_owned() {
-            Ok(permit) => Ok(Some(permit)),
-            Err(_) => {
-                tracing::warn!(format = %format, "bulk_request_rejected");
-                Err(AppError::ServiceUnavailable(
-                    "Too many concurrent bulk requests. Please try again later.".to_string(),
-                ))
-            }
+        if let Ok(permit) = semaphore.clone().try_acquire_owned() { Ok(Some(permit)) } else {
+            tracing::warn!(format = %format, "bulk_request_rejected");
+            Err(AppError::ServiceUnavailable(
+                "Too many concurrent bulk requests. Please try again later.".to_string(),
+            ))
         }
     } else {
         Ok(None)

@@ -39,15 +39,15 @@ use crate::entity::{
 
 /// Build the `/api/service/` router.
 ///
-/// Combines CrudCrate CRUD routers (entity management) with hand-crafted
+/// Combines `CrudCrate` CRUD routers (entity management) with hand-crafted
 /// data endpoints (readings, aggregates, alarms) and new write endpoints
 /// (batch readings, source mappings, sync state, action triggers).
 ///
 /// Auth: Keycloak JWT OR API token (dual auth, same as old /api/private/).
 /// Permissions are enforced per route group via middleware layers.
 ///
-/// Uses OpenApiRouter + nest() to avoid the catch-all wildcards that
-/// nest_service() creates, which conflict with hand-crafted routes.
+/// Uses `OpenApiRouter` + `nest()` to avoid the catch-all wildcards that
+/// `nest_service()` creates, which conflict with hand-crafted routes.
 pub fn service_router(state: &AppState) -> Router<()> {
     let db = &state.db;
 
@@ -226,7 +226,7 @@ pub fn service_router(state: &AppState) -> Router<()> {
 ///
 /// These are mounted under `/api/service/` but bypass `service_auth_middleware`
 /// because they use their own auth mechanisms:
-/// - Enroll: client_id + client_secret in the JSON body
+/// - Enroll: `client_id` + `client_secret` in the JSON body
 /// - Heartbeat/commands: sync session token via `sync_service_auth_middleware`
 ///
 /// Returns `Router<AppState>` so the caller can nest it alongside other

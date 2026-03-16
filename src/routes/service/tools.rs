@@ -558,7 +558,7 @@ pub async fn list_tools() -> Json<Vec<&'static ToolInfo>> {
     Json(TOOLS.iter().collect())
 }
 
-/// Dynamic dispatcher for /tools/{tool_name}/calculate
+/// Dynamic dispatcher for /`tools/{tool_name}/calculate`
 pub async fn calculate_tool(
     Path(tool_name): Path<String>,
     body: axum::body::Bytes,

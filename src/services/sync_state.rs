@@ -119,7 +119,7 @@ pub async fn needs_full_sync(db: &DatabaseConnection) -> bool {
     false
 }
 
-/// Update `last_full_sync` timestamp for all site_parameters.
+/// Update `last_full_sync` timestamp for all `site_parameters`.
 pub async fn update_last_full_sync_for_all_parameters(db: &DatabaseConnection) {
     let now = Utc::now();
 

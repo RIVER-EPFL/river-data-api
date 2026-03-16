@@ -94,7 +94,7 @@ fn all_public_param_names(config: &PublicProjectConfig) -> Vec<String> {
         .collect()
 }
 
-/// Build parameter_id -> ExposedParamConfig lookup from the project config.
+/// Build `parameter_id` -> `ExposedParamConfig` lookup from the project config.
 fn build_param_to_config_map(config: &PublicProjectConfig) -> HashMap<Uuid, &ExposedParamConfig> {
     config
         .exposed_params
@@ -103,8 +103,8 @@ fn build_param_to_config_map(config: &PublicProjectConfig) -> HashMap<Uuid, &Exp
         .collect()
 }
 
-/// Resolve which DB site_parameters at a site match the exposed config.
-/// Returns a list of (site_id, parameter_id, public_name, public_units, is_derived).
+/// Resolve which DB `site_parameters` at a site match the exposed config.
+/// Returns a list of (`site_id`, `parameter_id`, `public_name`, `public_units`, `is_derived`).
 async fn resolve_site_parameters(
     db: &sea_orm::DatabaseConnection,
     site_id: Uuid,
@@ -741,10 +741,8 @@ pub async fn get_aggregates(
         // Map DB parameter_id back to public name and apply unit conversion
         let param_uuid = row.param_id.parse::<Uuid>().ok();
         let lookup = param_uuid.and_then(|uuid| id_to_public.get(&uuid));
-        let public_name = lookup
-            .map(|(name, _, _, _)| name.to_string())
-            .unwrap_or_else(|| row.param_id.clone());
-        let (factor, offset) = lookup.map(|(_, _, f, o)| (*f, *o)).unwrap_or((1.0, 0.0));
+        let public_name = lookup.map_or_else(|| row.param_id.clone(), |(name, _, _, _)| name.to_string());
+        let (factor, offset) = lookup.map_or((1.0, 0.0), |(_, _, f, o)| (*f, *o));
 
         param_aggs.entry(public_name).or_default().push((
             row.bucket,
@@ -774,8 +772,7 @@ pub async fn get_aggregates(
         let units = resolved
             .iter()
             .find(|rp| &rp.public_name == name)
-            .map(|rp| rp.public_units.as_str())
-            .unwrap_or("");
+            .map_or("", |rp| rp.public_units.as_str());
 
         let mut avg = vec![None; num_times];
         let mut min = vec![None; num_times];
@@ -922,10 +919,8 @@ async fn fetch_readings(
         // Map DB parameter_id back to public name and apply unit conversion
         let param_uuid = row.param_id.parse::<Uuid>().ok();
         let lookup = param_uuid.and_then(|uuid| id_to_public.get(&uuid));
-        let public_name = lookup
-            .map(|(name, _, _, _)| name.to_string())
-            .unwrap_or_else(|| row.param_id.clone());
-        let (factor, offset) = lookup.map(|(_, _, f, o)| (*f, *o)).unwrap_or((1.0, 0.0));
+        let public_name = lookup.map_or_else(|| row.param_id.clone(), |(name, _, _, _)| name.to_string());
+        let (factor, offset) = lookup.map_or((1.0, 0.0), |(_, _, f, o)| (*f, *o));
         let converted_value = row.value * factor + offset;
 
         param_values
@@ -947,7 +942,7 @@ async fn fetch_readings(
     // Build output in the order the resolved params appear (sorted by public name)
     // Deduplicate public names (multiple DB params can map to same public name)
     let mut seen_names: Vec<String> = Vec::new();
-    for rp in resolved.iter() {
+    for rp in resolved {
         if !seen_names.contains(&rp.public_name) {
             seen_names.push(rp.public_name.clone());
         }
@@ -958,8 +953,7 @@ async fn fetch_readings(
         let units = resolved
             .iter()
             .find(|rp| &rp.public_name == public_name)
-            .map(|rp| rp.public_units.as_str())
-            .unwrap_or("");
+            .map_or("", |rp| rp.public_units.as_str());
 
         let mut values = vec![None; num_times];
         if let Some(readings) = param_values.get(public_name.as_str()) {

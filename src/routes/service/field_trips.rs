@@ -56,8 +56,7 @@ pub async fn create_field_trip_batch(
         let found_ids: std::collections::HashSet<Uuid> = found_sites.iter().map(|s| s.id).collect();
         let missing: Vec<_> = site_ids.iter().filter(|id| !found_ids.contains(id)).collect();
         return Err(AppError::BadRequest(format!(
-            "Sites not found: {:?}",
-            missing
+            "Sites not found: {missing:?}"
         )));
     }
 
@@ -81,8 +80,7 @@ pub async fn create_field_trip_batch(
                 let site_name = found_sites
                     .iter()
                     .find(|s| s.id == station.site_id)
-                    .map(|s| s.name.as_str())
-                    .unwrap_or("unknown");
+                    .map_or("unknown", |s| s.name.as_str());
                 return Err(AppError::BadRequest(format!(
                     "Parameter {} is not configured for site {}",
                     r.parameter_id, site_name

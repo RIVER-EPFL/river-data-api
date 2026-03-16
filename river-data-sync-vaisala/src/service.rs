@@ -1,21 +1,21 @@
 use std::time::Instant;
 
 use river_data_sync_common::models::SyncResult;
+use river_data_sync_common::river_data_client::RiverDataClient;
 use river_data_sync_common::runner::SyncService;
 
-use crate::api_client::ApiClient;
 use crate::config::SyncConfig;
 use crate::sync;
 use crate::vaisala_client::VaisalaClient;
 
 pub struct VaisalaSyncService {
     config: SyncConfig,
-    api: ApiClient,
+    api: RiverDataClient,
     vaisala: VaisalaClient,
 }
 
 impl VaisalaSyncService {
-    pub fn new(config: SyncConfig, api: ApiClient, vaisala: VaisalaClient) -> Self {
+    pub fn new(config: SyncConfig, api: RiverDataClient, vaisala: VaisalaClient) -> Self {
         Self {
             config,
             api,
@@ -124,7 +124,7 @@ impl SyncService for VaisalaSyncService {
 }
 
 /// Check if any sync state needs a full re-sync (> 24 hours since last full sync).
-async fn needs_full_sync(api: &ApiClient) -> bool {
+async fn needs_full_sync(api: &RiverDataClient) -> bool {
     let states = match api.list_sync_states().await {
         Ok(s) => s,
         Err(e) => {

@@ -680,7 +680,8 @@ impl MigrationTrait for Migration {
             FROM device_status ds
             JOIN old_parameters op ON op.id = ds.parameter_id
             JOIN parameters dp ON dp.name = 'Device_Status'
-            WHERE ds.device_status IS NOT NULL",
+            WHERE ds.device_status IS NOT NULL
+            ON CONFLICT DO NOTHING",
         )
         .await?;
 

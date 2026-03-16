@@ -61,7 +61,7 @@ fn extract_variable_names(formula: &str) -> Vec<String> {
 }
 
 /// Resolve each formula variable to a parameter UUID, with strict validation.
-/// Returns Vec<(variable_name, parameter_id)>.
+/// Returns Vec<(`variable_name`, `parameter_id`)>.
 async fn resolve_variables(
     db: &DatabaseConnection,
     formula: &str,
@@ -86,8 +86,7 @@ async fn resolve_variables(
             resolved.push((var_name.clone(), id));
         } else {
             return Err(ApiError::bad_request(format!(
-                "Formula variable '{}' does not match any parameter in the catalog",
-                var_name
+                "Formula variable '{var_name}' does not match any parameter in the catalog"
             )));
         }
     }
@@ -96,7 +95,7 @@ async fn resolve_variables(
 }
 
 /// Check if a parameter is the output of a derived definition.
-/// Returns the derived_definition_id if so.
+/// Returns the `derived_definition_id` if so.
 async fn find_derived_definition_for_param(
     db: &DatabaseConnection,
     parameter_id: Uuid,
@@ -174,8 +173,7 @@ async fn validate_dependency_chain(
 
         if depth >= MAX_DERIVED_CHAIN_DEPTH {
             return Err(ApiError::bad_request(format!(
-                "Derived formula chain depth exceeds maximum of {} levels (variable '{}' has depth {})",
-                MAX_DERIVED_CHAIN_DEPTH, var_name, depth
+                "Derived formula chain depth exceeds maximum of {MAX_DERIVED_CHAIN_DEPTH} levels (variable '{var_name}' has depth {depth})"
             )));
         }
 
@@ -230,7 +228,7 @@ async fn sync_sources(
         ))
         .await
         .map_err(|e| {
-            ApiError::internal(format!("Failed to insert source '{}': {}", var_name, e), None)
+            ApiError::internal(format!("Failed to insert source '{var_name}': {e}"), None)
         })?;
     }
 

@@ -74,10 +74,10 @@ pub struct ParameterData {
     /// Severity levels (0=ok, 1=warning, 2=alarm). Only present when alarms=true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub severities: Option<Vec<Option<i16>>>,
-    /// Boolean flags marking outliers (same length as times). Only present when include_flagged=true.
+    /// Boolean flags marking outliers (same length as times). Only present when `include_flagged=true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flagged: Option<Vec<Option<bool>>>,
-    /// Reasons for flagging (same length as times). Only present when include_flagged=true.
+    /// Reasons for flagging (same length as times). Only present when `include_flagged=true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flag_reasons: Option<Vec<Option<String>>>,
 }
@@ -285,18 +285,18 @@ pub async fn get_site_readings(
         (None, None) => String::new(),
     };
 
-    let measurement_type_condition = if !measurement_type_filter.is_empty() {
+    let measurement_type_condition = if measurement_type_filter.is_empty() {
+        String::new()
+    } else {
         let idx = values.len() + 1;
         values.push(measurement_type_filter.to_string().into());
         format!(" AND r.measurement_type = ${idx}")
-    } else {
-        String::new()
     };
 
-    let flagged_condition = if !include_flagged {
-        " AND (r.is_flagged IS NOT TRUE)"
-    } else {
+    let flagged_condition = if include_flagged {
         ""
+    } else {
+        " AND (r.is_flagged IS NOT TRUE)"
     };
 
     let sql = format!(
