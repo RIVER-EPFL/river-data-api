@@ -4,8 +4,8 @@ use uuid::Uuid;
 
 use crate::error::RiverDataClientError;
 use crate::models::{
-    CrudListResponse, Parameter, Project, ReadingInput, Site, SiteParameter, SourceMapping,
-    StatusEventInput, SyncState,
+    Parameter, Project, ReadingInput, SensorCalibration, SensorDeployment, Site, SiteParameter,
+    SourceMapping, StatusEventInput, SyncState,
 };
 
 /// HTTP client wrapping calls to /api/service/ endpoints.
@@ -44,6 +44,16 @@ impl RiverDataClient {
         format!("{}/api/service{}", self.base_url, path)
     }
 
+    /// Build a CrudCrate-compatible list URL with pagination query params.
+    /// CrudCrate expects `sort`, `range`, and `filter` query params.
+    fn list_url(&self, path: &str) -> String {
+        format!(
+            "{}/api/service{}?sort=%5B%22id%22%2C%22ASC%22%5D&range=%5B0%2C9999%5D&filter=%7B%7D",
+            self.base_url,
+            path,
+        )
+    }
+
     // ========================================================================
     // Projects
     // ========================================================================
@@ -51,17 +61,15 @@ impl RiverDataClient {
     pub async fn list_projects(&self) -> Result<Vec<Project>, RiverDataClientError> {
         let resp = self
             .http_client
-            .get(self.url("/projects"))
+            .get(self.list_url("/projects"))
             .bearer_auth(&self.current_token())
             .send()
             .await
             .map_err(|e| RiverDataClientError::Api(format!("list_projects failed: {e}")))?;
         self.check_response(&resp)?;
-        let body: CrudListResponse<Project> = resp
-            .json()
+        resp.json()
             .await
-            .map_err(|e| RiverDataClientError::Api(format!("parse projects: {e}")))?;
-        Ok(body.data)
+            .map_err(|e| RiverDataClientError::Api(format!("parse projects: {e}")))
     }
 
     pub async fn create_project(&self, project: &serde_json::Value) -> Result<Project, RiverDataClientError> {
@@ -87,17 +95,15 @@ impl RiverDataClient {
     pub async fn list_sites(&self) -> Result<Vec<Site>, RiverDataClientError> {
         let resp = self
             .http_client
-            .get(self.url("/sites"))
+            .get(self.list_url("/sites"))
             .bearer_auth(&self.current_token())
             .send()
             .await
             .map_err(|e| RiverDataClientError::Api(format!("list_sites failed: {e}")))?;
         self.check_response(&resp)?;
-        let body: CrudListResponse<Site> = resp
-            .json()
+        resp.json()
             .await
-            .map_err(|e| RiverDataClientError::Api(format!("parse sites: {e}")))?;
-        Ok(body.data)
+            .map_err(|e| RiverDataClientError::Api(format!("parse sites: {e}")))
     }
 
     pub async fn create_site(&self, site: &serde_json::Value) -> Result<Site, RiverDataClientError> {
@@ -122,17 +128,15 @@ impl RiverDataClient {
     pub async fn list_parameters(&self) -> Result<Vec<Parameter>, RiverDataClientError> {
         let resp = self
             .http_client
-            .get(self.url("/parameters"))
+            .get(self.list_url("/parameters"))
             .bearer_auth(&self.current_token())
             .send()
             .await
             .map_err(|e| RiverDataClientError::Api(format!("list_parameters failed: {e}")))?;
         self.check_response(&resp)?;
-        let body: CrudListResponse<Parameter> = resp
-            .json()
+        resp.json()
             .await
-            .map_err(|e| RiverDataClientError::Api(format!("parse parameters: {e}")))?;
-        Ok(body.data)
+            .map_err(|e| RiverDataClientError::Api(format!("parse parameters: {e}")))
     }
 
     pub async fn create_parameter(
@@ -160,17 +164,15 @@ impl RiverDataClient {
     pub async fn list_site_parameters(&self) -> Result<Vec<SiteParameter>, RiverDataClientError> {
         let resp = self
             .http_client
-            .get(self.url("/site_parameters"))
+            .get(self.list_url("/site_parameters"))
             .bearer_auth(&self.current_token())
             .send()
             .await
             .map_err(|e| RiverDataClientError::Api(format!("list_site_parameters failed: {e}")))?;
         self.check_response(&resp)?;
-        let body: CrudListResponse<SiteParameter> = resp
-            .json()
+        resp.json()
             .await
-            .map_err(|e| RiverDataClientError::Api(format!("parse site_parameters: {e}")))?;
-        Ok(body.data)
+            .map_err(|e| RiverDataClientError::Api(format!("parse site_parameters: {e}")))
     }
 
     pub async fn create_site_parameter(
@@ -198,10 +200,18 @@ impl RiverDataClient {
     pub async fn list_source_mappings(
         &self,
         entity_type: Option<&str>,
+        source_system: Option<&str>,
     ) -> Result<Vec<SourceMapping>, RiverDataClientError> {
         let mut url = self.url("/source_mappings");
+        let mut params: Vec<String> = Vec::new();
         if let Some(et) = entity_type {
-            url = format!("{url}?entity_type={et}");
+            params.push(format!("entity_type={et}"));
+        }
+        if let Some(ss) = source_system {
+            params.push(format!("source_system={ss}"));
+        }
+        if !params.is_empty() {
+            url = format!("{url}?{}", params.join("&"));
         }
         let resp = self
             .http_client
@@ -247,11 +257,9 @@ impl RiverDataClient {
             .await
             .map_err(|e| RiverDataClientError::Api(format!("list_sync_states failed: {e}")))?;
         self.check_response(&resp)?;
-        let body: CrudListResponse<SyncState> = resp
-            .json()
+        resp.json()
             .await
-            .map_err(|e| RiverDataClientError::Api(format!("parse sync_states: {e}")))?;
-        Ok(body.data)
+            .map_err(|e| RiverDataClientError::Api(format!("parse sync_states: {e}")))
     }
 
     pub async fn update_sync_state(
@@ -259,11 +267,16 @@ impl RiverDataClient {
         site_parameter_id: Uuid,
         update: &serde_json::Value,
     ) -> Result<SyncState, RiverDataClientError> {
+        // CrudCrate PUT requires the primary key in the body
+        let mut body = update.clone();
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("site_parameter_id".to_string(), serde_json::json!(site_parameter_id));
+        }
         let resp = self
             .http_client
-            .patch(self.url(&format!("/sync_states/{site_parameter_id}")))
+            .put(self.url(&format!("/sync_states/{site_parameter_id}")))
             .bearer_auth(&self.current_token())
-            .json(update)
+            .json(&body)
             .send()
             .await
             .map_err(|e| RiverDataClientError::Api(format!("update_sync_state failed: {e}")))?;
@@ -485,21 +498,125 @@ impl RiverDataClient {
         Ok(())
     }
 
+    // ========================================================================
+    // Sensor Deployments
+    // ========================================================================
+
+    pub async fn list_sensor_deployments(
+        &self,
+    ) -> Result<Vec<SensorDeployment>, RiverDataClientError> {
+        let resp = self
+            .http_client
+            .get(self.list_url("/sensor_deployments"))
+            .bearer_auth(&self.current_token())
+            .send()
+            .await
+            .map_err(|e| {
+                RiverDataClientError::Api(format!("list_sensor_deployments failed: {e}"))
+            })?;
+        self.check_response(&resp)?;
+        resp.json()
+            .await
+            .map_err(|e| RiverDataClientError::Api(format!("parse sensor_deployments: {e}")))
+    }
+
+    // ========================================================================
+    // Sensor Calibrations
+    // ========================================================================
+
+    pub async fn list_sensor_calibrations(
+        &self,
+    ) -> Result<Vec<SensorCalibration>, RiverDataClientError> {
+        let resp = self
+            .http_client
+            .get(self.list_url("/sensor_calibrations"))
+            .bearer_auth(&self.current_token())
+            .send()
+            .await
+            .map_err(|e| {
+                RiverDataClientError::Api(format!("list_sensor_calibrations failed: {e}"))
+            })?;
+        self.check_response(&resp)?;
+        resp.json()
+            .await
+            .map_err(|e| RiverDataClientError::Api(format!("parse sensor_calibrations: {e}")))
+    }
+
     #[allow(dead_code)]
     pub async fn list_sensors(&self) -> Result<Vec<serde_json::Value>, RiverDataClientError> {
         let resp = self
             .http_client
-            .get(self.url("/sensors"))
+            .get(self.list_url("/sensors"))
             .bearer_auth(&self.current_token())
             .send()
             .await
             .map_err(|e| RiverDataClientError::Api(format!("list_sensors failed: {e}")))?;
         self.check_response(&resp)?;
-        let body: CrudListResponse<serde_json::Value> = resp
-            .json()
+        resp.json()
             .await
-            .map_err(|e| RiverDataClientError::Api(format!("parse sensors: {e}")))?;
-        Ok(body.data)
+            .map_err(|e| RiverDataClientError::Api(format!("parse sensors: {e}")))
+    }
+
+    // ========================================================================
+    // Command Updates (from sync loop, via service API)
+    // ========================================================================
+
+    pub async fn update_command(
+        &self,
+        command_id: Uuid,
+        status: &str,
+        result: Option<serde_json::Value>,
+    ) -> Result<(), RiverDataClientError> {
+        let body = serde_json::json!({ "status": status, "result": result });
+        let resp = self
+            .http_client
+            .patch(self.url(&format!("/sync/commands/{command_id}")))
+            .bearer_auth(&self.current_token())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| RiverDataClientError::Api(format!("update_command failed: {e}")))?;
+        self.check_response(&resp)?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // Sync Events
+    // ========================================================================
+
+    pub async fn create_sync_event(
+        &self,
+        event: &serde_json::Value,
+    ) -> Result<serde_json::Value, RiverDataClientError> {
+        let resp = self
+            .http_client
+            .post(self.url("/sync/events"))
+            .bearer_auth(&self.current_token())
+            .json(event)
+            .send()
+            .await
+            .map_err(|e| RiverDataClientError::Api(format!("create_sync_event failed: {e}")))?;
+        self.check_response(&resp)?;
+        resp.json()
+            .await
+            .map_err(|e| RiverDataClientError::Api(format!("parse sync_event: {e}")))
+    }
+
+    pub async fn update_sync_event(
+        &self,
+        event_id: Uuid,
+        update: &serde_json::Value,
+    ) -> Result<(), RiverDataClientError> {
+        let resp = self
+            .http_client
+            .patch(self.url(&format!("/sync/events/{event_id}")))
+            .bearer_auth(&self.current_token())
+            .json(update)
+            .send()
+            .await
+            .map_err(|e| RiverDataClientError::Api(format!("update_sync_event failed: {e}")))?;
+        self.check_response(&resp)?;
+        Ok(())
     }
 
     // ========================================================================

@@ -63,6 +63,17 @@ pub struct SyncResult {
     pub status_events_synced: u64,
     pub full_sync: bool,
     pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub log: Vec<String>,
+}
+
+/// What triggered a sync cycle.
+#[derive(Debug)]
+pub enum SyncTrigger {
+    Scheduled,
+    Command { id: Uuid, full: bool },
 }
 
 // ============================================================================
@@ -107,15 +118,6 @@ fn env_u64(key: &str, default: u64) -> u64 {
 // ============================================================================
 // River Data API types (shared across sync services)
 // ============================================================================
-
-/// CrudCrate list response format
-#[derive(Debug, Deserialize)]
-pub struct CrudListResponse<T> {
-    pub data: Vec<T>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub total: Option<u64>,
-}
 
 /// Project from the API
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,11 +165,32 @@ pub struct SiteParameter {
 /// Source mapping from the API
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceMapping {
+    pub source_system: String,
     pub entity_type: String,
-    pub source_key: i32,
+    pub source_key: String,
     pub entity_id: Uuid,
     pub source_name: Option<String>,
-    pub source_system: Option<String>,
+}
+
+/// Sensor deployment from the API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SensorDeployment {
+    pub id: Uuid,
+    pub sensor_id: Uuid,
+    pub site_id: Uuid,
+    pub deployed_from: chrono::DateTime<chrono::Utc>,
+    pub deployed_until: Option<chrono::DateTime<chrono::Utc>>,
+    pub deployment_type: Option<String>,
+}
+
+/// Sensor calibration from the API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SensorCalibration {
+    pub id: Uuid,
+    pub sensor_id: Uuid,
+    pub slope: f64,
+    pub intercept: f64,
+    pub valid_from: chrono::DateTime<chrono::Utc>,
 }
 
 /// Sync state from the API

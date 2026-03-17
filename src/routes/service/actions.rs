@@ -26,12 +26,17 @@ pub async fn refresh_aggregates(
     let full = payload.full;
 
     tokio::spawn(async move {
-        if full {
-            tracing::info!("Triggered full aggregate refresh via service API");
-            state::refresh_continuous_aggregates_full(&db).await;
-        } else {
-            tracing::info!("Triggered incremental aggregate refresh via service API");
-            state::refresh_continuous_aggregates(&db).await;
+        match tokio::time::timeout(std::time::Duration::from_secs(600), async {
+            if full {
+                tracing::info!("Triggered full aggregate refresh via service API");
+                state::refresh_continuous_aggregates_full(&db).await;
+            } else {
+                tracing::info!("Triggered incremental aggregate refresh via service API");
+                state::refresh_continuous_aggregates(&db).await;
+            }
+        }).await {
+            Ok(()) => {}
+            Err(_) => tracing::error!("Aggregate refresh task timed out after 10 minutes"),
         }
     });
 
@@ -78,28 +83,33 @@ pub async fn compute_derived(
         .sum();
 
     tokio::spawn(async move {
-        tracing::info!(
-            sites = payload.site_timestamps.len(),
-            timestamps = total_timestamps,
-            "Computing derived values via service API"
-        );
+        match tokio::time::timeout(std::time::Duration::from_secs(600), async {
+            tracing::info!(
+                sites = payload.site_timestamps.len(),
+                timestamps = total_timestamps,
+                "Computing derived values via service API"
+            );
 
-        let mut computed = 0u64;
-        for st in &payload.site_timestamps {
-            for time in &st.timestamps {
-                match recalculate_derived_at_timestamp(&db, st.site_id, *time).await {
-                    Ok(()) => computed += 1,
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        site_id = %st.site_id,
-                        time = %time,
-                        "Failed to compute derived values"
-                    ),
+            let mut computed = 0u64;
+            for st in &payload.site_timestamps {
+                for time in &st.timestamps {
+                    match recalculate_derived_at_timestamp(&db, st.site_id, *time).await {
+                        Ok(()) => computed += 1,
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            site_id = %st.site_id,
+                            time = %time,
+                            "Failed to compute derived values"
+                        ),
+                    }
                 }
             }
-        }
 
-        tracing::info!(computed, "Derived computation complete");
+            tracing::info!(computed, "Derived computation complete");
+        }).await {
+            Ok(()) => {}
+            Err(_) => tracing::error!("Compute derived task timed out after 10 minutes"),
+        }
     });
 
     Ok(Json(
@@ -193,6 +203,9 @@ pub async fn preview_derived(
     use sea_orm::{ConnectionTrait, Statement};
 
     // Validate formula
+    if payload.formula.len() > 1000 {
+        return Err(AppError::BadRequest("Formula too long (max 1000 characters)".to_string()));
+    }
     payload
         .formula
         .parse::<meval::Expr>()

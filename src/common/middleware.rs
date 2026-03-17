@@ -109,7 +109,46 @@ pub async fn service_auth_middleware(
         return next.run(request).await;
     }
 
-    // Neither auth method succeeded
+    // Try sync service session token as last resort.
+    // The sync microservice authenticates via /api/service/sync/enroll but then
+    // needs to call regular service-tier endpoints (source_mappings, readings/batch, etc.).
+    let sync_header = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|v| v.trim());
+
+    if let Some(raw) = sync_header
+        && !raw.is_empty()
+    {
+        let token_hash = crate::services::api_token::hash_token(raw);
+
+        use crate::entity::sync_service_tokens;
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        if let Ok(Some(token)) = sync_service_tokens::Entity::find()
+            .filter(sync_service_tokens::Column::TokenHash.eq(&token_hash))
+            .one(&state.db)
+            .await
+        {
+            if token.expires_at.with_timezone(&chrono::Utc) >= chrono::Utc::now() {
+                request.extensions_mut().insert(AuthContext::ApiToken {
+                    token_id: token.service_id,
+                    permissions: TokenPermissions {
+                        read_metadata: true,
+                        read_data: true,
+                        write_metadata: true,
+                        write_data: true,
+                    },
+                    project_scope: None,
+                });
+                return next.run(request).await;
+            }
+        }
+    }
+
+    // No auth method succeeded
     AppError::Unauthorized("Valid Keycloak JWT or API token required".to_string()).into_response()
 }
 

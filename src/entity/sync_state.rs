@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
-    #[crudcrate(primary_key, exclude(create))]
+    #[crudcrate(primary_key)]
     pub site_parameter_id: Uuid,
     #[crudcrate(sortable)]
     pub last_data_time: Option<DateTimeWithTimeZone>,

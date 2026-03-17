@@ -21,6 +21,10 @@ pub struct Model {
 pub enum Relation {
     #[sea_orm(has_many = "super::sync_commands::Entity")]
     SyncCommands,
+    #[sea_orm(has_many = "super::sync_events::Entity")]
+    SyncEvents,
+    #[sea_orm(has_many = "super::sync_service_credentials::Entity")]
+    SyncServiceCredentials,
     #[sea_orm(has_many = "super::sync_service_tokens::Entity")]
     SyncServiceTokens,
 }
@@ -28,6 +32,18 @@ pub enum Relation {
 impl Related<super::sync_commands::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SyncCommands.def()
+    }
+}
+
+impl Related<super::sync_events::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::SyncEvents.def()
+    }
+}
+
+impl Related<super::sync_service_credentials::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::SyncServiceCredentials.def()
     }
 }
 

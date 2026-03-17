@@ -10,6 +10,8 @@ pub struct Model {
     pub parameter_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
     pub time: DateTimeWithTimeZone,
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub replicate_index: i16,
     pub raw_value: f64,
     pub calibrated_value: Option<f64>,
     pub sensor_id: Option<Uuid>,

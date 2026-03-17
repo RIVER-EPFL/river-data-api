@@ -35,10 +35,16 @@ impl SyncService for VaisalaSyncService {
         full: bool,
     ) -> Result<SyncResult, Box<dyn std::error::Error + Send + Sync>> {
         let start = Instant::now();
+        let mut errors = Vec::new();
+        let mut log = Vec::new();
 
         // Discover locations on every sync cycle (idempotent)
-        if let Err(e) = sync::sync_locations(&self.api, &self.vaisala).await {
-            tracing::error!(error = %e, "Failed to discover locations from Vaisala");
+        match sync::sync_locations(&self.api, &self.vaisala).await {
+            Ok(()) => log.push("Location discovery: OK".to_string()),
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to discover locations from Vaisala");
+                errors.push(format!("Location discovery: {e}"));
+            }
         }
 
         let force_full = if full {
@@ -49,10 +55,12 @@ impl SyncService for VaisalaSyncService {
 
         if force_full {
             tracing::info!("Running full re-sync");
+            log.push("Full re-sync mode".to_string());
         }
 
         // Run readings sync with retry
         let mut retries = 0u32;
+        let mut readings_synced: u64 = 0;
 
         let sync_ok = loop {
             match sync::sync_readings(
@@ -63,7 +71,17 @@ impl SyncService for VaisalaSyncService {
             )
             .await
             {
-                Ok(()) => break true,
+                Ok(summary) => {
+                    readings_synced = summary.total_readings as u64;
+                    log.push(format!(
+                        "Readings sync: {} readings across {} parameters",
+                        summary.total_readings, summary.parameters_synced
+                    ));
+                    for entry in &summary.per_parameter {
+                        log.push(format!("  {entry}"));
+                    }
+                    break true;
+                }
                 Err(e) => {
                     retries += 1;
                     if retries <= self.config.retry_max {
@@ -73,6 +91,7 @@ impl SyncService for VaisalaSyncService {
                             max_retries = self.config.retry_max,
                             "Readings sync failed, retrying"
                         );
+                        log.push(format!("Readings sync: retry {retries}/{} - {e}", self.config.retry_max));
                         tokio::time::sleep(std::time::Duration::from_secs(
                             self.config.retry_delay_seconds,
                         ))
@@ -83,7 +102,8 @@ impl SyncService for VaisalaSyncService {
                             max_retries = self.config.retry_max,
                             "Readings sync failed after max retries"
                         );
-                        return Err(e.into());
+                        errors.push(format!("Readings sync: {e}"));
+                        break false;
                     }
                 }
             }
@@ -91,35 +111,64 @@ impl SyncService for VaisalaSyncService {
 
         if sync_ok {
             if force_full {
-                if let Err(e) = self.api.update_last_full_sync().await {
-                    tracing::warn!(error = %e, "Failed to update last_full_sync");
+                match self.api.update_last_full_sync().await {
+                    Ok(()) => log.push("Update last_full_sync: OK".to_string()),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to update last_full_sync");
+                        errors.push(format!("Update last_full_sync: {e}"));
+                    }
                 }
             }
-            if let Err(e) = self.api.refresh_aggregates(force_full).await {
-                tracing::warn!(error = %e, "Failed to trigger aggregate refresh");
+            match self.api.refresh_aggregates(force_full).await {
+                Ok(()) => log.push(format!("Aggregate refresh (full={}): OK", force_full)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to trigger aggregate refresh");
+                    errors.push(format!("Aggregate refresh: {e}"));
+                }
             }
         }
 
         // Run device status sync (non-fatal)
         let status_count = match sync::sync_device_status(&self.api, &self.vaisala).await {
-            Ok(n) => n,
+            Ok(n) => {
+                log.push(format!("Device status sync: {n} events"));
+                n
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "Device status sync failed");
+                errors.push(format!("Device status sync: {e}"));
                 0
             }
         };
 
+        // If readings sync completely failed, return error
+        if !sync_ok {
+            let elapsed = start.elapsed();
+            return Err(format!(
+                "Readings sync failed after {} retries ({}ms): {}",
+                self.config.retry_max,
+                elapsed.as_millis(),
+                errors.join("; ")
+            ).into());
+        }
+
         let elapsed = start.elapsed();
         Ok(SyncResult {
-            readings_synced: 0,
+            readings_synced,
             status_events_synced: status_count,
             full_sync: force_full,
             duration_ms: elapsed.as_millis() as u64,
+            errors,
+            log,
         })
     }
 
     fn update_token(&self, token: &str) {
         self.api.set_token(token);
+    }
+
+    fn river_data_client(&self) -> Option<&RiverDataClient> {
+        Some(&self.api)
     }
 }
 

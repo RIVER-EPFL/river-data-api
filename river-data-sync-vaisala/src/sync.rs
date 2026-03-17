@@ -2,7 +2,7 @@ use chrono::{Duration, Utc};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-use river_data_sync_common::models::{ReadingInput, StatusEventInput, SyncState};
+use river_data_sync_common::models::{ReadingInput, SensorCalibration, SensorDeployment, StatusEventInput, SyncState};
 use river_data_sync_common::river_data_client::RiverDataClient;
 
 use crate::vaisala_client::{SyncError, VaisalaClient};
@@ -18,25 +18,25 @@ pub async fn sync_locations(
 
     let locations = vaisala.get_locations().await?;
 
-    // Load all source mappings for dedup and rename detection
-    let mappings = api.list_source_mappings(None).await?;
+    // Load all vaisala source mappings for dedup and rename detection
+    let mappings = api.list_source_mappings(None, Some("vaisala")).await?;
 
-    let project_mappings: HashMap<i32, (Uuid, Option<String>)> = mappings
+    let project_mappings: HashMap<String, (Uuid, Option<String>)> = mappings
         .iter()
         .filter(|m| m.entity_type == "project")
-        .map(|m| (m.source_key, (m.entity_id, m.source_name.clone())))
+        .map(|m| (m.source_key.clone(), (m.entity_id, m.source_name.clone())))
         .collect();
 
-    let site_mappings: HashMap<i32, (Uuid, Option<String>)> = mappings
+    let site_mappings: HashMap<String, (Uuid, Option<String>)> = mappings
         .iter()
         .filter(|m| m.entity_type == "site")
-        .map(|m| (m.source_key, (m.entity_id, m.source_name.clone())))
+        .map(|m| (m.source_key.clone(), (m.entity_id, m.source_name.clone())))
         .collect();
 
-    let param_mappings: HashMap<i32, (Uuid, Option<String>)> = mappings
+    let param_mappings: HashMap<String, (Uuid, Option<String>)> = mappings
         .iter()
         .filter(|m| m.entity_type == "site_parameter")
-        .map(|m| (m.source_key, (m.entity_id, m.source_name.clone())))
+        .map(|m| (m.source_key.clone(), (m.entity_id, m.source_name.clone())))
         .collect();
 
     // Build project name -> UUID map
@@ -46,10 +46,10 @@ pub async fn sync_locations(
         .map(|p| (p.name.clone(), p.id))
         .collect();
 
-    // Build site source_key -> UUID map
+    // Build site source_key -> UUID map (i32 keys for Vaisala node_id lookups)
     let mut site_ids: HashMap<i32, Uuid> = site_mappings
         .iter()
-        .map(|(key, (id, _))| (*key, *id))
+        .filter_map(|(key, (id, _))| key.parse::<i32>().ok().map(|k| (k, *id)))
         .collect();
 
     let mut projects_created = 0u32;
@@ -71,28 +71,29 @@ pub async fn sync_locations(
         }
 
         let parts: Vec<&str> = attrs.path.split('/').collect();
+        let node_key = attrs.node_id.to_string();
 
         match (parts.len(), attrs.leaf) {
             // Project
             (2, false) => {
                 let project_name = parts[1];
 
-                if let Some((_, old_name)) = project_mappings.get(&attrs.node_id) {
+                if let Some((_, old_name)) = project_mappings.get(&node_key) {
                     if let Some(old) = old_name {
                         if old != project_name {
                             tracing::info!(
-                                source_key = attrs.node_id,
+                                source_key = %node_key,
                                 old_name = old,
                                 new_name = project_name,
                                 "Vaisala project renamed"
                             );
                             let _ = api
                                 .upsert_source_mapping(&serde_json::json!({
-                                    "entity_type": "project",
-                                    "source_key": attrs.node_id,
-                                    "entity_id": project_mappings[&attrs.node_id].0,
-                                    "source_name": project_name,
                                     "source_system": "vaisala",
+                                    "entity_type": "project",
+                                    "source_key": node_key,
+                                    "entity_id": project_mappings[&node_key].0,
+                                    "source_name": project_name,
                                 }))
                                 .await;
                         }
@@ -112,11 +113,11 @@ pub async fn sync_locations(
                     Ok(p) => {
                         let _ = api
                             .upsert_source_mapping(&serde_json::json!({
+                                "source_system": "vaisala",
                                 "entity_type": "project",
-                                "source_key": attrs.node_id,
+                                "source_key": node_key,
                                 "entity_id": p.id,
                                 "source_name": project_name,
-                                "source_system": "vaisala",
                             }))
                             .await;
                         project_ids.insert(project_name.to_string(), p.id);
@@ -131,22 +132,22 @@ pub async fn sync_locations(
                 let project_name = parts[1];
                 let site_name = parts[2];
 
-                if let Some((_, old_name)) = site_mappings.get(&attrs.node_id) {
+                if let Some((_, old_name)) = site_mappings.get(&node_key) {
                     if let Some(old) = old_name {
                         if old != site_name {
                             tracing::info!(
-                                source_key = attrs.node_id,
+                                source_key = %node_key,
                                 old_name = old,
                                 new_name = site_name,
                                 "Vaisala site renamed"
                             );
                             let _ = api
                                 .upsert_source_mapping(&serde_json::json!({
-                                    "entity_type": "site",
-                                    "source_key": attrs.node_id,
-                                    "entity_id": site_mappings[&attrs.node_id].0,
-                                    "source_name": site_name,
                                     "source_system": "vaisala",
+                                    "entity_type": "site",
+                                    "source_key": node_key,
+                                    "entity_id": site_mappings[&node_key].0,
+                                    "source_name": site_name,
                                 }))
                                 .await;
                         }
@@ -165,11 +166,11 @@ pub async fn sync_locations(
                     Ok(s) => {
                         let _ = api
                             .upsert_source_mapping(&serde_json::json!({
+                                "source_system": "vaisala",
                                 "entity_type": "site",
-                                "source_key": attrs.node_id,
+                                "source_key": node_key,
                                 "entity_id": s.id,
                                 "source_name": site_name,
-                                "source_system": "vaisala",
                             }))
                             .await;
                         site_ids.insert(attrs.node_id, s.id);
@@ -181,7 +182,7 @@ pub async fn sync_locations(
 
             // Parameter (leaf)
             (_, true) if parts.len() >= 4 => {
-                if !param_mappings.contains_key(&attrs.node_id) {
+                if !param_mappings.contains_key(&node_key) {
                     new_param_location_ids.push(attrs.node_id);
                 }
             }
@@ -243,6 +244,8 @@ pub async fn sync_locations(
                 }
             };
 
+            let location_key = attrs.id.to_string();
+
             // Create site_parameter
             match api
                 .create_site_parameter(&serde_json::json!({
@@ -263,11 +266,11 @@ pub async fn sync_locations(
                     // Create source mapping
                     let _ = api
                         .upsert_source_mapping(&serde_json::json!({
+                            "source_system": "vaisala",
                             "entity_type": "site_parameter",
-                            "source_key": attrs.id,
+                            "source_key": location_key,
                             "entity_id": sp.id,
                             "source_name": attrs.location_name,
-                            "source_system": "vaisala",
                         }))
                         .await;
 
@@ -287,6 +290,7 @@ pub async fn sync_locations(
                         .create_alarm_threshold(&serde_json::json!({
                             "parameter_id": global_param_id,
                             "site_id": site_id,
+                            "alarm_type": "range",
                             "warning_min": warning_min,
                             "warning_max": warning_max,
                             "alarm_min": alarm_min,
@@ -327,18 +331,28 @@ pub async fn sync_locations(
     Ok(())
 }
 
+/// Summary of a readings sync pass.
+pub struct ReadingsSyncSummary {
+    pub parameters_synced: usize,
+    pub total_readings: usize,
+    pub per_parameter: Vec<String>,
+}
+
 /// Sync readings for all active parameters via the API.
 pub async fn sync_readings(
     api: &RiverDataClient,
     vaisala: &VaisalaClient,
     max_history_days: i64,
     force_full_sync: bool,
-) -> Result<(), SyncError> {
-    // Load source mappings for site_parameter
-    let mappings = api.list_source_mappings(Some("site_parameter")).await?;
+) -> Result<ReadingsSyncSummary, SyncError> {
+    // Load vaisala source mappings for site_parameter
+    let mappings = api
+        .list_source_mappings(Some("site_parameter"), Some("vaisala"))
+        .await?;
+    // Parse source_key (String) back to i32 for Vaisala location_id lookups
     let param_map: HashMap<i32, Uuid> = mappings
         .iter()
-        .map(|m| (m.source_key, m.entity_id))
+        .filter_map(|m| m.source_key.parse::<i32>().ok().map(|k| (k, m.entity_id)))
         .collect();
 
     // Load site_parameters and sync states
@@ -356,8 +370,35 @@ pub async fn sync_readings(
 
     if active_params.is_empty() {
         tracing::debug!("No active site_parameters to sync");
-        return Ok(());
+        return Ok(ReadingsSyncSummary {
+            parameters_synced: 0,
+            total_readings: 0,
+            per_parameter: vec!["No active parameters to sync".to_string()],
+        });
     }
+
+    // P1: Load sensor deployments and calibrations for linking
+    let deployments = api.list_sensor_deployments().await.unwrap_or_default();
+    let calibrations = api.list_sensor_calibrations().await.unwrap_or_default();
+
+    // Build site_id -> active deployments lookup
+    let active_deployments: HashMap<Uuid, &SensorDeployment> = deployments
+        .iter()
+        .filter(|d| d.deployed_until.is_none())
+        .map(|d| (d.site_id, d))
+        .collect();
+
+    // Build sensor_id -> latest calibration lookup
+    let latest_calibrations: HashMap<Uuid, &SensorCalibration> = {
+        let mut map: HashMap<Uuid, &SensorCalibration> = HashMap::new();
+        for cal in &calibrations {
+            let entry = map.entry(cal.sensor_id).or_insert(cal);
+            if cal.valid_from > entry.valid_from {
+                *entry = cal;
+            }
+        }
+        map
+    };
 
     // Build location_map: source_key -> (site_parameter_id, site_id, parameter_id, last_data_time)
     let now = Utc::now();
@@ -381,7 +422,11 @@ pub async fn sync_readings(
 
     if location_map.is_empty() {
         tracing::debug!("No mapped active site_parameters to sync");
-        return Ok(());
+        return Ok(ReadingsSyncSummary {
+            parameters_synced: 0,
+            total_readings: 0,
+            per_parameter: vec!["No mapped active parameters".to_string()],
+        });
     }
 
     let location_ids: Vec<i32> = location_map.keys().copied().collect();
@@ -403,6 +448,9 @@ pub async fn sync_readings(
 
     // Track affected timestamps per site for derived computation
     let mut site_timestamps: HashMap<Uuid, HashSet<chrono::DateTime<Utc>>> = HashMap::new();
+    let mut total_readings_synced: usize = 0;
+    let mut params_synced: usize = 0;
+    let mut per_param_log: Vec<String> = Vec::new();
 
     for resource in history.data {
         let attrs = resource.attributes;
@@ -421,6 +469,15 @@ pub async fn sync_readings(
             continue;
         }
 
+        // P1: Look up active deployment and calibration for this site
+        let deployment = active_deployments.get(site_id);
+        let calibration = deployment
+            .and_then(|d| latest_calibrations.get(&d.sensor_id));
+
+        let sensor_id = deployment.map(|d| d.sensor_id);
+        let calibration_id = calibration.map(|c| c.id);
+        let deployment_id = deployment.map(|d| d.id);
+
         let sample_count = new_points.len();
         let mut readings: Vec<ReadingInput> = Vec::with_capacity(new_points.len());
         let mut latest_timestamp: Option<i64> = None;
@@ -435,15 +492,22 @@ pub async fn sync_readings(
 
             rounded_times.push(time);
 
+            // P1: Apply calibration if available
+            let calibrated_value = if let Some(cal) = calibration {
+                Some(point.value * cal.slope + cal.intercept)
+            } else {
+                Some(point.value)
+            };
+
             readings.push(ReadingInput {
                 site_id: *site_id,
                 parameter_id: *parameter_id,
                 time,
                 raw_value: point.value,
-                calibrated_value: Some(point.value),
-                sensor_id: None,
-                calibration_id: None,
-                deployment_id: None,
+                calibrated_value,
+                sensor_id,
+                calibration_id,
+                deployment_id,
             });
 
             if latest_timestamp.is_none_or(|lt| point.timestamp > lt) {
@@ -451,17 +515,25 @@ pub async fn sync_readings(
             }
         }
 
-        // Insert in batches
+        // Insert in batches, tracking how many were actually new
+        let mut actually_inserted: usize = 0;
         for chunk in readings.chunks(BATCH_SIZE) {
-            if let Err(e) = api.insert_readings_batch(chunk).await {
-                tracing::warn!(error = %e, batch_size = chunk.len(), "Failed to insert reading batch");
+            match api.insert_readings_batch(chunk).await {
+                Ok(n) => actually_inserted += n as usize,
+                Err(e) => tracing::warn!(error = %e, batch_size = chunk.len(), "Failed to insert reading batch"),
             }
         }
 
-        // Update sync state
+        // Update sync state — carry forward last_full_sync to prevent CrudCrate PUT
+        // from nullifying it (which would trigger a full re-sync every cycle)
         if let Some(ts) = latest_timestamp {
             if let Some(latest) = chrono::DateTime::from_timestamp(ts, 0) {
-                let _ = api
+                let last_full_sync = sync_state_map
+                    .get(sp_id)
+                    .and_then(|s| s.last_full_sync)
+                    .map(|t| t.to_rfc3339());
+
+                if let Err(e) = api
                     .update_sync_state(
                         *sp_id,
                         &serde_json::json!({
@@ -470,18 +542,44 @@ pub async fn sync_readings(
                             "sync_status": "success",
                             "error_message": null,
                             "retry_count": 0,
+                            "last_full_sync": last_full_sync,
                         }),
                     )
-                    .await;
+                    .await
+                {
+                    per_param_log.push(format!(
+                        "  sync_state update failed for {}: {e}",
+                        &sp_id.to_string()[..8]
+                    ));
+                }
             }
         }
 
         tracing::info!(
-            count = sample_count,
+            new = actually_inserted,
+            total = sample_count,
             site_parameter_id = %sp_id,
             location_id = attrs.id,
             "Synced readings"
         );
+
+        let is_backfill = last_time.is_none();
+        total_readings_synced += actually_inserted;
+        params_synced += 1;
+        let duplicates = sample_count - actually_inserted;
+        let mut detail = format!(
+            "loc {} ({}): {} new readings",
+            attrs.id,
+            &sp_id.to_string()[..8],
+            actually_inserted,
+        );
+        if duplicates > 0 {
+            detail.push_str(&format!(" ({duplicates} duplicates skipped)"));
+        }
+        if is_backfill {
+            detail.push_str(" (backfill)");
+        }
+        per_param_log.push(detail);
 
         // Track timestamps for derived computation
         let entry = site_timestamps.entry(*site_id).or_default();
@@ -502,7 +600,11 @@ pub async fn sync_readings(
         }
     }
 
-    Ok(())
+    Ok(ReadingsSyncSummary {
+        parameters_synced: params_synced,
+        total_readings: total_readings_synced,
+        per_parameter: per_param_log,
+    })
 }
 
 /// Ensure a device_health global parameter exists, returning its UUID.
@@ -541,10 +643,13 @@ pub async fn sync_device_status(
     api: &RiverDataClient,
     vaisala: &VaisalaClient,
 ) -> Result<u64, SyncError> {
-    let mappings = api.list_source_mappings(Some("site_parameter")).await?;
+    let mappings = api
+        .list_source_mappings(Some("site_parameter"), Some("vaisala"))
+        .await?;
+    // Parse source_key (String) back to i32 for Vaisala location_id lookups
     let param_map: HashMap<i32, Uuid> = mappings
         .iter()
-        .map(|m| (m.source_key, m.entity_id))
+        .filter_map(|m| m.source_key.parse::<i32>().ok().map(|k| (k, m.entity_id)))
         .collect();
 
     let site_params = api.list_site_parameters().await?;

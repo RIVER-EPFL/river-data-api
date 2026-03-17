@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::{sync_commands, sync_service_credentials, sync_service_tokens, sync_services};
+use crate::entity::{sync_commands, sync_events, sync_service_credentials, sync_service_tokens, sync_services};
 use crate::error::{AppError, AppResult};
 use crate::services::api_token::{generate_token, hash_token};
 
@@ -192,6 +192,16 @@ pub async fn heartbeat(
         return Err(AppError::Unauthorized("Invalid client_secret".to_string()));
     }
 
+    // Validate status
+    const VALID_SERVICE_STATUSES: &[&str] = &["starting", "idle", "syncing", "error", "stopping"];
+    if !VALID_SERVICE_STATUSES.contains(&req.status.as_str()) {
+        return Err(AppError::BadRequest(format!(
+            "Invalid status '{}'. Valid: {}",
+            req.status,
+            VALID_SERVICE_STATUSES.join(", ")
+        )));
+    }
+
     // Update service status
     let service = sync_services::Entity::find_by_id(req.service_id)
         .one(&state.db)
@@ -232,19 +242,11 @@ pub async fn heartbeat(
     let db_clone = state.db.clone();
     let sid = req.service_id;
     tokio::spawn(async move {
-        let _ = sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "UPDATE sync_commands SET status = 'expired' WHERE service_id = '{sid}' AND status = 'pending' AND expires_at < NOW()"
-            ),
-        );
-        // Use raw exec
         use sea_orm::ConnectionTrait;
-        let _ = db_clone.execute(sea_orm::Statement::from_string(
+        let _ = db_clone.execute(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "UPDATE sync_commands SET status = 'expired' WHERE service_id = '{sid}' AND status = 'pending' AND expires_at < NOW()"
-            ),
+            "UPDATE sync_commands SET status = 'expired' WHERE service_id = $1 AND status = 'pending' AND expires_at < NOW()",
+            [sid.into()],
         )).await;
     });
 
@@ -284,6 +286,116 @@ pub async fn update_command(
     if req.status == "completed" || req.status == "failed" {
         active.completed_at = Set(Some(Utc::now().into()));
     }
+    active.update(&state.db).await?;
+
+    Ok(Json(serde_json::json!({"updated": true})))
+}
+
+// ============================================================================
+// Sync Events
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct CreateSyncEventRequest {
+    pub service_id: Uuid,
+    pub command_id: Option<Uuid>,
+    pub event_type: Option<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateSyncEventRequest {
+    pub status: Option<String>,
+    pub readings_synced: Option<i64>,
+    pub status_events_synced: Option<i64>,
+    pub errors: Option<serde_json::Value>,
+    pub log: Option<serde_json::Value>,
+    pub duration_ms: Option<i64>,
+}
+
+pub async fn create_sync_event(
+    State(state): State<AppState>,
+    Json(req): Json<CreateSyncEventRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    const VALID_EVENT_TYPES: &[&str] = &["scheduled", "manual", "command"];
+    const VALID_EVENT_STATUSES: &[&str] = &["running", "completed", "failed", "cancelled"];
+
+    if let Some(ref event_type) = req.event_type {
+        if !VALID_EVENT_TYPES.contains(&event_type.as_str()) {
+            return Err(AppError::BadRequest(format!(
+                "Invalid event_type '{}'. Valid: {}",
+                event_type,
+                VALID_EVENT_TYPES.join(", ")
+            )));
+        }
+    }
+
+    if let Some(ref status) = req.status {
+        if !VALID_EVENT_STATUSES.contains(&status.as_str()) {
+            return Err(AppError::BadRequest(format!(
+                "Invalid status '{}'. Valid: {}",
+                status,
+                VALID_EVENT_STATUSES.join(", ")
+            )));
+        }
+    }
+
+    let event = sync_events::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        service_id: Set(req.service_id),
+        command_id: Set(req.command_id),
+        event_type: Set(req.event_type.unwrap_or_else(|| "scheduled".to_string())),
+        status: Set(req.status.unwrap_or_else(|| "running".to_string())),
+        readings_synced: Set(0),
+        status_events_synced: Set(0),
+        errors: Set(None),
+        log: Set(None),
+        started_at: Set(Utc::now().into()),
+        completed_at: Set(None),
+        duration_ms: Set(None),
+    };
+
+    let inserted = event.insert(&state.db).await?;
+
+    Ok(Json(serde_json::json!({
+        "id": inserted.id.to_string(),
+        "service_id": inserted.service_id,
+        "status": inserted.status,
+    })))
+}
+
+pub async fn update_sync_event(
+    State(state): State<AppState>,
+    Path(event_id): Path<Uuid>,
+    Json(req): Json<UpdateSyncEventRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let event = sync_events::Entity::find_by_id(event_id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Sync event not found".to_string()))?;
+
+    let mut active: sync_events::ActiveModel = event.into();
+
+    if let Some(status) = req.status {
+        active.status = Set(status);
+    }
+    if let Some(readings) = req.readings_synced {
+        active.readings_synced = Set(readings);
+    }
+    if let Some(status_events) = req.status_events_synced {
+        active.status_events_synced = Set(status_events);
+    }
+    if let Some(errors) = req.errors {
+        active.errors = Set(Some(errors));
+    }
+    if let Some(log) = req.log {
+        active.log = Set(Some(log));
+    }
+    if let Some(duration) = req.duration_ms {
+        active.duration_ms = Set(Some(duration));
+    }
+    active.completed_at = Set(Some(Utc::now().into()));
+
     active.update(&state.db).await?;
 
     Ok(Json(serde_json::json!({"updated": true})))

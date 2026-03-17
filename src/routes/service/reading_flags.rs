@@ -78,6 +78,29 @@ pub async fn flag_readings(
         total_updated += result.rows_affected();
     }
 
+    // Refresh continuous aggregates for the affected time range
+    if total_updated > 0 {
+        let min_time = payload.readings.iter().map(|r| r.time).min();
+        let max_time = payload.readings.iter().map(|r| r.time).max();
+        if let (Some(min_t), Some(max_t)) = (min_time, max_time) {
+            for view in ["readings_hourly", "readings_daily", "readings_weekly", "readings_monthly"] {
+                let sql = format!(
+                    "CALL refresh_continuous_aggregate('{}', $1::timestamptz, $2::timestamptz + INTERVAL '1 second')",
+                    view
+                );
+                if let Err(e) = state.db.execute(
+                    sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        &sql,
+                        vec![min_t.into(), max_t.into()],
+                    )
+                ).await {
+                    tracing::warn!(view, error = %e, "Failed to refresh continuous aggregate after flagging");
+                }
+            }
+        }
+    }
+
     tracing::info!(updated = total_updated, reason = %payload.reason, "Flagged readings");
     Ok(Json(FlagReadingsResponse {
         updated: total_updated,
@@ -126,6 +149,29 @@ pub async fn unflag_readings(
             .await?;
 
         total_updated += result.rows_affected();
+    }
+
+    // Refresh continuous aggregates for the affected time range
+    if total_updated > 0 {
+        let min_time = payload.readings.iter().map(|r| r.time).min();
+        let max_time = payload.readings.iter().map(|r| r.time).max();
+        if let (Some(min_t), Some(max_t)) = (min_time, max_time) {
+            for view in ["readings_hourly", "readings_daily", "readings_weekly", "readings_monthly"] {
+                let sql = format!(
+                    "CALL refresh_continuous_aggregate('{}', $1::timestamptz, $2::timestamptz + INTERVAL '1 second')",
+                    view
+                );
+                if let Err(e) = state.db.execute(
+                    sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        &sql,
+                        vec![min_t.into(), max_t.into()],
+                    )
+                ).await {
+                    tracing::warn!(view, error = %e, "Failed to refresh continuous aggregate after unflagging");
+                }
+            }
+        }
     }
 
     tracing::info!(updated = total_updated, "Unflagged readings");

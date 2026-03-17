@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/li
 COPY Cargo.toml Cargo.lock ./
 COPY migration/Cargo.toml migration/Cargo.toml
 COPY river-data-sync-common/Cargo.toml river-data-sync-common/Cargo.toml
+COPY river-data-toolbox/Cargo.toml river-data-toolbox/Cargo.toml
 
 # Copy the shared crate and sync microservice
 COPY river-data-sync-common/ river-data-sync-common/
@@ -17,6 +18,7 @@ COPY river-data-sync-vaisala/ river-data-sync-vaisala/
 # Create dummy crates to satisfy workspace
 RUN mkdir -p src && echo "fn main() {}" > src/main.rs
 RUN mkdir -p migration/src && echo "fn main() {}" > migration/src/main.rs && touch migration/src/lib.rs
+RUN mkdir -p river-data-toolbox/src && echo "" > river-data-toolbox/src/lib.rs
 
 # Build only the sync crate (and cache dependencies)
 RUN cargo build --release -p river-data-sync-vaisala

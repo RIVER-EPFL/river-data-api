@@ -5,7 +5,6 @@ use sea_orm::entity::prelude::*;
     Clone,
     Debug,
     PartialEq,
-    Eq,
     DeriveEntityModel,
     serde::Serialize,
     serde::Deserialize,
@@ -35,6 +34,10 @@ pub struct Model {
     #[crudcrate(filterable)]
     pub data_type: String,
     pub description: Option<String>,
+    pub default_warning_min: Option<f64>,
+    pub default_warning_max: Option<f64>,
+    pub default_alarm_min: Option<f64>,
+    pub default_alarm_max: Option<f64>,
     #[crudcrate(exclude(create, update))]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }

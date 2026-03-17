@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::{sync_commands, sync_service_credentials, sync_services, sync_service_tokens, sync_state};
+use crate::entity::{sync_commands, sync_events, sync_service_credentials, sync_services, sync_service_tokens, sync_state};
 use crate::error::{AppError, AppResult};
 use crate::services::api_token::{generate_token, hash_token};
 
@@ -152,6 +152,7 @@ pub fn router() -> Router<AppState> {
         .route("/services/{id}/commands", post(issue_command))
         .route("/services/{id}/revoke", post(revoke_service))
         .route("/commands", get(list_commands))
+        .route("/events", get(list_sync_events))
         .route("/credentials", get(list_credentials).post(create_credential))
         .route("/credentials/{id}/revoke", post(revoke_credential))
 }
@@ -327,6 +328,64 @@ async fn revoke_credential(
 
     Ok(Json(serde_json::json!({"revoked": true})))
 }
+
+// ============================================================================
+// Sync Events
+// ============================================================================
+
+#[derive(Serialize)]
+pub struct SyncEventResponse {
+    pub id: Uuid,
+    pub service_id: Uuid,
+    pub command_id: Option<Uuid>,
+    pub event_type: String,
+    pub status: String,
+    pub readings_synced: i64,
+    pub status_events_synced: i64,
+    pub errors: Option<serde_json::Value>,
+    pub log: Option<serde_json::Value>,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub duration_ms: Option<i64>,
+}
+
+fn sync_event_to_response(e: sync_events::Model) -> SyncEventResponse {
+    SyncEventResponse {
+        id: e.id,
+        service_id: e.service_id,
+        command_id: e.command_id,
+        event_type: e.event_type,
+        status: e.status,
+        readings_synced: e.readings_synced,
+        status_events_synced: e.status_events_synced,
+        errors: e.errors,
+        log: e.log,
+        started_at: e.started_at.to_rfc3339(),
+        completed_at: e.completed_at.map(|t| t.to_rfc3339()),
+        duration_ms: e.duration_ms,
+    }
+}
+
+async fn list_sync_events(
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<SyncEventResponse>>> {
+    let events = sync_events::Entity::find()
+        .order_by_desc(sync_events::Column::StartedAt)
+        .all(&state.db)
+        .await?;
+
+    let response: Vec<SyncEventResponse> = events
+        .into_iter()
+        .take(100)
+        .map(sync_event_to_response)
+        .collect();
+
+    Ok(Json(response))
+}
+
+// ============================================================================
+// Revoke Service
+// ============================================================================
 
 async fn revoke_service(
     State(state): State<AppState>,

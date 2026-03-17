@@ -73,8 +73,10 @@ async fn get_admin_token(state: &AppState) -> AppResult<String> {
 
     let url = format!(
         "{}/realms/{}/protocol/openid-connect/token",
-        state.config.keycloak_url.as_ref().unwrap(),
-        state.config.keycloak_realm.as_ref().unwrap(),
+        state.config.keycloak_url.as_ref()
+            .ok_or_else(|| AppError::ServiceUnavailable("Keycloak not configured".to_string()))?,
+        state.config.keycloak_realm.as_ref()
+            .ok_or_else(|| AppError::ServiceUnavailable("Keycloak not configured".to_string()))?,
     );
 
     let resp = admin
@@ -119,16 +121,19 @@ async fn get_admin_token(state: &AppState) -> AppResult<String> {
     Ok(token)
 }
 
-fn admin_base_url(state: &AppState) -> String {
-    format!(
+fn admin_base_url(state: &AppState) -> AppResult<String> {
+    Ok(format!(
         "{}/admin/realms/{}",
-        state.config.keycloak_url.as_ref().unwrap(),
-        state.config.keycloak_realm.as_ref().unwrap(),
-    )
+        state.config.keycloak_url.as_ref()
+            .ok_or_else(|| AppError::ServiceUnavailable("Keycloak not configured".to_string()))?,
+        state.config.keycloak_realm.as_ref()
+            .ok_or_else(|| AppError::ServiceUnavailable("Keycloak not configured".to_string()))?,
+    ))
 }
 
-fn admin_client(state: &AppState) -> &KeycloakAdmin {
-    state.keycloak_admin.as_ref().unwrap()
+fn admin_client(state: &AppState) -> AppResult<&KeycloakAdmin> {
+    state.keycloak_admin.as_ref()
+        .ok_or_else(|| AppError::ServiceUnavailable("Keycloak not configured".to_string()))
 }
 
 /// Transform a Keycloak user JSON into our simplified format.
@@ -153,8 +158,8 @@ async fn list_users(
     Query(query): Query<ListQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let token = get_admin_token(&state).await?;
-    let client = admin_client(&state);
-    let base = admin_base_url(&state);
+    let client = admin_client(&state)?;
+    let base = admin_base_url(&state)?;
 
     // Parse React Admin range: [start, end] (inclusive)
     let (first, max) = if let Some(range) = &query.range {
@@ -239,8 +244,8 @@ async fn get_user(
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
     let token = get_admin_token(&state).await?;
-    let client = admin_client(&state);
-    let base = admin_base_url(&state);
+    let client = admin_client(&state)?;
+    let base = admin_base_url(&state)?;
 
     let resp = client
         .http_client
@@ -279,8 +284,8 @@ async fn create_user(
     Json(req): Json<CreateUserRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let token = get_admin_token(&state).await?;
-    let client = admin_client(&state);
-    let base = admin_base_url(&state);
+    let client = admin_client(&state)?;
+    let base = admin_base_url(&state)?;
 
     let mut body = serde_json::json!({
         "username": req.username,
@@ -350,8 +355,8 @@ async fn update_user(
     Json(req): Json<serde_json::Value>,
 ) -> AppResult<Json<serde_json::Value>> {
     let token = get_admin_token(&state).await?;
-    let client = admin_client(&state);
-    let base = admin_base_url(&state);
+    let client = admin_client(&state)?;
+    let base = admin_base_url(&state)?;
 
     // Get current user to merge with updates
     let current_resp = client
@@ -417,8 +422,8 @@ async fn delete_user(
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
     let token = get_admin_token(&state).await?;
-    let client = admin_client(&state);
-    let base = admin_base_url(&state);
+    let client = admin_client(&state)?;
+    let base = admin_base_url(&state)?;
 
     let resp = client
         .http_client
@@ -448,8 +453,8 @@ async fn assign_roles(
     Json(req): Json<AssignRolesRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     let token = get_admin_token(&state).await?;
-    let client = admin_client(&state);
-    let base = admin_base_url(&state);
+    let client = admin_client(&state)?;
+    let base = admin_base_url(&state)?;
 
     set_user_roles(client, &token, &base, &id, &req.roles).await?;
 
@@ -460,8 +465,8 @@ pub async fn list_roles(
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<serde_json::Value>>> {
     let token = get_admin_token(&state).await?;
-    let client = admin_client(&state);
-    let base = admin_base_url(&state);
+    let client = admin_client(&state)?;
+    let base = admin_base_url(&state)?;
 
     let resp = client
         .http_client

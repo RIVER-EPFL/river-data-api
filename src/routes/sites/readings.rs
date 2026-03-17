@@ -108,6 +108,8 @@ pub struct SiteReadingsQuery {
     pub measurement_type: Option<String>,
     /// Include flagged readings with flag metadata (default: true). When false, excludes flagged readings entirely.
     pub include_flagged: Option<bool>,
+    /// Include replicate readings (default: false). When false, only returns replicate_index = 0.
+    pub include_replicates: Option<bool>,
 }
 
 /// Get readings for a specific site
@@ -188,6 +190,7 @@ pub async fn get_site_readings(
 
     let include_alarms = query.alarms.unwrap_or(false);
     let include_flagged = query.include_flagged.unwrap_or(true);
+    let include_replicates = query.include_replicates.unwrap_or(false);
 
     let measurement_type_filter = query.measurement_type.as_deref().unwrap_or("");
 
@@ -203,6 +206,7 @@ pub async fn get_site_readings(
             if include_alarms { "alarms" } else { "" },
             measurement_type_filter,
             if include_flagged { "flagged" } else { "no_flagged" },
+            if include_replicates { "replicates" } else { "" },
         ],
     );
 
@@ -299,8 +303,14 @@ pub async fn get_site_readings(
         " AND (r.is_flagged IS NOT TRUE)"
     };
 
+    let replicate_condition = if include_replicates {
+        ""
+    } else {
+        " AND r.replicate_index = 0"
+    };
+
     let sql = format!(
-        "SELECT {select_clause} FROM {from_clause} WHERE r.site_id = $1 AND r.parameter_id IN ({}){time_conditions}{measurement_type_condition}{flagged_condition} ORDER BY r.parameter_id, r.time",
+        "SELECT {select_clause} FROM {from_clause} WHERE r.site_id = $1 AND r.parameter_id IN ({}){time_conditions}{measurement_type_condition}{flagged_condition}{replicate_condition} ORDER BY r.parameter_id, r.time",
         placeholders.join(",")
     );
 

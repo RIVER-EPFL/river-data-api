@@ -1,6 +1,8 @@
 use crudcrate::{CRUDResource, EntityToModels};
 use sea_orm::entity::prelude::*;
 
+use crate::services::operations::SiteParameterOperations;
+
 #[derive(
     Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
 )]
@@ -9,7 +11,8 @@ use sea_orm::entity::prelude::*;
     api_struct = "SiteParameter",
     name_singular = "site_parameter",
     name_plural = "site_parameters",
-    generate_router
+    generate_router,
+    operations = SiteParameterOperations
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]

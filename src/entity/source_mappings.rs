@@ -5,12 +5,13 @@ use serde::{Deserialize, Serialize};
 #[sea_orm(table_name = "source_mappings")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
+    pub source_system: String,
+    #[sea_orm(primary_key, auto_increment = false)]
     pub entity_type: String,
     #[sea_orm(primary_key, auto_increment = false)]
-    pub source_key: i32,
+    pub source_key: String,
     pub entity_id: Uuid,
     pub source_name: Option<String>,
-    pub source_system: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

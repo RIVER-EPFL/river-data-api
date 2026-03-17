@@ -1,5 +1,6 @@
 pub mod calibrations;
 pub mod derived;
+pub mod merge;
 pub mod public_config;
 pub mod sync;
 pub mod users;
@@ -58,6 +59,10 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .route(
             "/actions/invalidate_public_config/{slug}",
             post(public_config::invalidate_public_config),
+        )
+        .route(
+            "/actions/merge_site_parameters",
+            post(merge::merge_site_parameters_handler),
         )
         .route(
             "/alarms/active",

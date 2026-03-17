@@ -18,39 +18,38 @@ pub struct SourceMappingQuery {
 
 #[derive(Debug, Serialize)]
 pub struct SourceMappingResponse {
+    pub source_system: String,
     pub entity_type: String,
-    pub source_key: i32,
+    pub source_key: String,
     pub entity_id: Uuid,
     pub source_name: Option<String>,
-    pub source_system: Option<String>,
 }
 
 impl From<source_mappings::Model> for SourceMappingResponse {
     fn from(m: source_mappings::Model) -> Self {
         Self {
+            source_system: m.source_system,
             entity_type: m.entity_type,
             source_key: m.source_key,
             entity_id: m.entity_id,
             source_name: m.source_name,
-            source_system: m.source_system,
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
 pub struct UpsertSourceMappingRequest {
+    pub source_system: String,
     pub entity_type: String,
-    pub source_key: i32,
+    pub source_key: String,
     pub entity_id: Uuid,
     pub source_name: Option<String>,
-    pub source_system: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateSourceMappingRequest {
     pub entity_id: Uuid,
     pub source_name: Option<String>,
-    pub source_system: Option<String>,
 }
 
 pub async fn list_source_mappings(
@@ -76,24 +75,24 @@ pub async fn upsert_source_mapping(
     Json(payload): Json<UpsertSourceMappingRequest>,
 ) -> AppResult<Json<SourceMappingResponse>> {
     let model = source_mappings::ActiveModel {
+        source_system: Set(payload.source_system.clone()),
         entity_type: Set(payload.entity_type.clone()),
-        source_key: Set(payload.source_key),
+        source_key: Set(payload.source_key.clone()),
         entity_id: Set(payload.entity_id),
         source_name: Set(payload.source_name.clone()),
-        source_system: Set(payload.source_system.clone()),
     };
 
-    // Try insert, on conflict update
+    // Try insert, on conflict update — conflict on full 3-part PK
     let _result = source_mappings::Entity::insert(model)
         .on_conflict(
             sea_orm::sea_query::OnConflict::columns([
+                source_mappings::Column::SourceSystem,
                 source_mappings::Column::EntityType,
                 source_mappings::Column::SourceKey,
             ])
             .update_columns([
                 source_mappings::Column::EntityId,
                 source_mappings::Column::SourceName,
-                source_mappings::Column::SourceSystem,
             ])
             .to_owned(),
         )
@@ -102,8 +101,9 @@ pub async fn upsert_source_mapping(
 
     // Re-fetch the upserted row
     let inserted = source_mappings::Entity::find_by_id((
+        payload.source_system.clone(),
         payload.entity_type.clone(),
-        payload.source_key,
+        payload.source_key.clone(),
     ))
     .one(&state.db)
     .await?
@@ -114,18 +114,18 @@ pub async fn upsert_source_mapping(
 
 pub async fn update_source_mapping(
     State(state): State<AppState>,
-    Path((entity_type, source_key)): Path<(String, i32)>,
+    Path((source_system, entity_type, source_key)): Path<(String, String, String)>,
     Json(payload): Json<UpdateSourceMappingRequest>,
 ) -> AppResult<Json<SourceMappingResponse>> {
-    let existing = source_mappings::Entity::find_by_id((entity_type.clone(), source_key))
-        .one(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Source mapping not found".to_string()))?;
+    let existing =
+        source_mappings::Entity::find_by_id((source_system, entity_type, source_key))
+            .one(&state.db)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Source mapping not found".to_string()))?;
 
     let mut active: source_mappings::ActiveModel = existing.into();
     active.entity_id = Set(payload.entity_id);
     active.source_name = Set(payload.source_name);
-    active.source_system = Set(payload.source_system);
 
     let updated = active.update(&state.db).await?;
     Ok(Json(updated.into()))

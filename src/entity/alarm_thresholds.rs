@@ -19,6 +19,8 @@ pub struct Model {
     pub parameter_id: Uuid,
     #[crudcrate(filterable)]
     pub site_id: Option<Uuid>,
+    #[crudcrate(filterable)]
+    pub alarm_type: String,
     pub warning_min: Option<f64>,
     pub warning_max: Option<f64>,
     pub alarm_min: Option<f64>,

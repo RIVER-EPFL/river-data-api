@@ -112,6 +112,7 @@ pub async fn create_field_trip_batch(
                 site_id: Set(station.site_id),
                 parameter_id: Set(r.parameter_id),
                 time: Set(r.time.into()),
+                replicate_index: Set(0),
                 raw_value: Set(r.value),
                 calibrated_value: Set(None),
                 sensor_id: Set(r.sensor_id),
@@ -135,6 +136,7 @@ pub async fn create_field_trip_batch(
                     readings::Column::SiteId,
                     readings::Column::ParameterId,
                     readings::Column::Time,
+                    readings::Column::ReplicateIndex,
                 ])
                 .do_nothing()
                 .to_owned(),

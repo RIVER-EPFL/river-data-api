@@ -1,7 +1,25 @@
-use axum::{Json, extract::Path};
+use axum::{Json, extract::{Path, State}};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 
+use crate::common::AppState;
 use crate::error::{AppError, AppResult};
+
+// ============================================================================
+// Constant lookup helper
+// ============================================================================
+
+async fn get_constant(db: &DatabaseConnection, name: &str, default: f64) -> f64 {
+    use crate::entity::constants;
+    constants::Entity::find()
+        .filter(constants::Column::Name.eq(name))
+        .one(db)
+        .await
+        .ok()
+        .flatten()
+        .map(|c| c.value)
+        .unwrap_or(default)
+}
 
 // ============================================================================
 // Common types
@@ -264,8 +282,17 @@ pub enum Pco2Variant {
     P2,
 }
 
-pub async fn calculate_pco2(Json(payload): Json<Pco2Request>) -> AppResult<Json<ToolResult>> {
-    let constants = river_data_toolbox::GasConstants::default();
+pub async fn calculate_pco2(db: &DatabaseConnection, Json(payload): Json<Pco2Request>) -> AppResult<Json<ToolResult>> {
+    let defaults = river_data_toolbox::GasConstants::default();
+    let constants = river_data_toolbox::GasConstants {
+        kh_co2: get_constant(db, "kh_co2", defaults.kh_co2).await,
+        c_const: get_constant(db, "c_const", defaults.c_const).await,
+        gas_const_r_atm: get_constant(db, "gas_const_r_atm", defaults.gas_const_r_atm).await,
+        gas_const_r_mol: get_constant(db, "gas_const_r_mol", defaults.gas_const_r_mol).await,
+        kh_ch4: get_constant(db, "kh_ch4", defaults.kh_ch4).await,
+        ch4_temp_const: get_constant(db, "ch4_temp_const", defaults.ch4_temp_const).await,
+        ch4_in_sa: get_constant(db, "ch4_in_sa", defaults.ch4_in_sa).await,
+    };
 
     let pco2 = match payload.variant {
         Pco2Variant::Simple => {
@@ -312,12 +339,12 @@ pub struct DicRequest {
     pub h3po4_added: Option<f64>,
 }
 
-pub async fn calculate_dic(Json(payload): Json<DicRequest>) -> AppResult<Json<ToolResult>> {
+pub async fn calculate_dic(db: &DatabaseConnection, Json(payload): Json<DicRequest>) -> AppResult<Json<ToolResult>> {
     let constants = river_data_toolbox::DICConstants {
-        h_co2_29815k: payload.h_co2_29815k.unwrap_or(0.034),
-        gas_const_r_mol: payload.gas_const_r_mol.unwrap_or(8.314),
-        vial_volume: payload.vial_volume.unwrap_or(12.0),
-        h3po4_added: payload.h3po4_added.unwrap_or(0.1),
+        h_co2_29815k: payload.h_co2_29815k.unwrap_or(get_constant(db, "h_co2_29815k", 0.034).await),
+        gas_const_r_mol: payload.gas_const_r_mol.unwrap_or(get_constant(db, "gas_const_r_mol", 8.314).await),
+        vial_volume: payload.vial_volume.unwrap_or(get_constant(db, "vial_volume", 12.0).await),
+        h3po4_added: payload.h3po4_added.unwrap_or(get_constant(db, "h3po4_added", 0.1).await),
     };
 
     let dic = river_data_toolbox::dic_concentration(
@@ -560,6 +587,7 @@ pub async fn list_tools() -> Json<Vec<&'static ToolInfo>> {
 
 /// Dynamic dispatcher for /`tools/{tool_name}/calculate`
 pub async fn calculate_tool(
+    State(state): State<AppState>,
     Path(tool_name): Path<String>,
     body: axum::body::Bytes,
 ) -> AppResult<Json<ToolResult>> {
@@ -570,8 +598,8 @@ pub async fn calculate_tool(
         "nutrients" => calculate_nutrients(Json(parse_body(&body)?)).await,
         "ions" => calculate_ions(Json(parse_body(&body)?)).await,
         "alkalinity" => calculate_alkalinity(Json(parse_body(&body)?)).await,
-        "pco2" => calculate_pco2(Json(parse_body(&body)?)).await,
-        "dic" => calculate_dic(Json(parse_body(&body)?)).await,
+        "pco2" => calculate_pco2(&state.db, Json(parse_body(&body)?)).await,
+        "dic" => calculate_dic(&state.db, Json(parse_body(&body)?)).await,
         "dom" => calculate_dom(Json(parse_body(&body)?)).await,
         "field_data" => calculate_field_data(Json(parse_body(&body)?)).await,
         "co2_air" => calculate_co2_air(Json(parse_body(&body)?)).await,

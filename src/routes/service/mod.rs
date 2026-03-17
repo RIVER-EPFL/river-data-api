@@ -129,7 +129,7 @@ pub fn service_router(state: &AppState) -> Router<()> {
             post(source_mappings::upsert_source_mapping),
         )
         .route(
-            "/source_mappings/{entity_type}/{source_key}",
+            "/source_mappings/{source_system}/{entity_type}/{source_key}",
             put(source_mappings::update_source_mapping),
         )
         .layer(middleware::from_fn(require_write_metadata))
@@ -240,6 +240,14 @@ pub fn sync_control_router(state: &AppState) -> Router<AppState> {
         .route(
             "/sync/commands/{id}",
             axum::routing::patch(sync_control::update_command),
+        )
+        .route(
+            "/sync/events",
+            post(sync_control::create_sync_event),
+        )
+        .route(
+            "/sync/events/{id}",
+            axum::routing::patch(sync_control::update_sync_event),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),

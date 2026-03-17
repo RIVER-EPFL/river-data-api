@@ -19,6 +19,8 @@ pub struct GrabSampleReading {
     pub sensor_id: Option<Uuid>,
     pub value: f64,
     pub time: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub replicate_index: Option<i16>,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,6 +72,7 @@ pub async fn insert_grab_samples(
                 site_id: Set(payload.site_id),
                 parameter_id: Set(r.parameter_id),
                 time: Set(r.time.into()),
+                replicate_index: Set(r.replicate_index.unwrap_or(0)),
                 raw_value: Set(r.value),
                 calibrated_value: Set(None),
                 sensor_id: Set(r.sensor_id),
@@ -92,6 +95,7 @@ pub async fn insert_grab_samples(
                 readings::Column::SiteId,
                 readings::Column::ParameterId,
                 readings::Column::Time,
+                readings::Column::ReplicateIndex,
             ])
             .do_nothing()
             .to_owned(),

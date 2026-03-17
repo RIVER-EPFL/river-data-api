@@ -44,6 +44,7 @@ pub async fn insert_batch_readings(
                 site_id: Set(r.site_id),
                 parameter_id: Set(r.parameter_id),
                 time: Set(r.time.into()),
+                replicate_index: Set(0),
                 raw_value: Set(r.raw_value),
                 calibrated_value: Set(r.calibrated_value),
                 sensor_id: Set(r.sensor_id),
@@ -68,14 +69,15 @@ pub async fn insert_batch_readings(
                     readings::Column::SiteId,
                     readings::Column::ParameterId,
                     readings::Column::Time,
+                    readings::Column::ReplicateIndex,
                 ])
                 .do_nothing()
                 .to_owned(),
             )
-            .exec(&state.db)
+            .exec_without_returning(&state.db)
             .await
         {
-            Ok(_) => inserted += chunk.len(),
+            Ok(rows) => inserted += rows as usize,
             Err(e) => {
                 let msg = e.to_string();
                 // "None of the records" means all were duplicates (not an error)

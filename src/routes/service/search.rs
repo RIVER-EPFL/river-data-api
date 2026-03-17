@@ -64,6 +64,12 @@ pub async fn search(
         ));
     }
 
+    if query.len() > 200 {
+        return Err(AppError::BadRequest(
+            "Search query too long (max 200 characters)".to_string(),
+        ));
+    }
+
     let pattern = format!("%{query}%");
 
     let (sites, sensors, parameters, projects) = tokio::try_join!(
