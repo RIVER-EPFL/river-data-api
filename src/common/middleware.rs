@@ -111,7 +111,7 @@ pub async fn service_auth_middleware(
 
     // Try sync service session token as last resort.
     // The sync microservice authenticates via /api/service/sync/enroll but then
-    // needs to call regular service-tier endpoints (source_mappings, readings/batch, etc.).
+    // needs to call regular service-tier endpoints (streams, ingest, readings/batch, etc.).
     let sync_header = request
         .headers()
         .get(axum::http::header::AUTHORIZATION)

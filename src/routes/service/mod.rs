@@ -1,15 +1,16 @@
 pub mod actions;
 pub mod field_trips;
 pub mod grab_samples;
+pub mod ingest;
 pub mod reading_flags;
 pub mod readings_batch;
 pub mod search;
-pub mod source_mappings;
 pub mod status_events_batch;
+pub mod streams;
 pub mod sync_control;
 pub mod tools;
 
-use axum::{Router, middleware, routing::{get, patch, post, put}};
+use axum::{Router, middleware, routing::{get, patch, post}};
 use tower_http::limit::RequestBodyLimitLayer;
 use utoipa_axum::router::OpenApiRouter;
 
@@ -23,6 +24,7 @@ use crate::entity::{
     annotations::Annotation,
     api_tokens::ApiToken,
     constants::Constant,
+    data_streams::DataStream,
     derived_parameter_definitions::DerivedParameterDefinition,
     derived_parameter_sources::DerivedParameterSource,
     field_trips::FieldTrip,
@@ -34,20 +36,15 @@ use crate::entity::{
     sensors::Sensor,
     site_parameters::SiteParameter,
     standard_curves::StandardCurve,
-    sync_state::SyncState,
 };
 
 /// Build the `/api/service/` router.
 ///
 /// Combines `CrudCrate` CRUD routers (entity management) with hand-crafted
-/// data endpoints (readings, aggregates, alarms) and new write endpoints
-/// (batch readings, source mappings, sync state, action triggers).
+/// data endpoints (readings, aggregates, alarms) and stream-based ingestion.
 ///
-/// Auth: Keycloak JWT OR API token (dual auth, same as old /api/private/).
+/// Auth: Keycloak JWT OR API token (dual auth).
 /// Permissions are enforced per route group via middleware layers.
-///
-/// Uses `OpenApiRouter` + `nest()` to avoid the catch-all wildcards that
-/// `nest_service()` creates, which conflict with hand-crafted routes.
 pub fn service_router(state: &AppState) -> Router<()> {
     let db = &state.db;
 
@@ -58,13 +55,6 @@ pub fn service_router(state: &AppState) -> Router<()> {
     // ========================================================================
     // Entity routers — CrudCrate CRUD + hand-crafted custom routes
     // ========================================================================
-    //
-    // Projects and Sites use per-entity views that merge CrudCrate CRUD
-    // routes with custom endpoints (e.g., /{id}/sites, /{id}/readings).
-    // Other entities use CrudCrate directly with require_crud_permissions.
-    //
-    // OpenApiRouter.nest() adds prefixed individual routes (no catch-all),
-    // so CrudCrate's GET /{id} coexists with custom GET /{id}/readings.
 
     let entity_router: Router<()> = OpenApiRouter::new()
         .nest("/projects", super::projects::views::service_router(state))
@@ -100,7 +90,10 @@ pub fn service_router(state: &AppState) -> Router<()> {
             "/public_exposed_parameters",
             with_crud_perms(PublicExposedParameter::router(db)),
         )
-        .nest("/sync_states", with_crud_perms(SyncState::router(db)))
+        .nest(
+            "/data_streams",
+            with_crud_perms(DataStream::router(db)),
+        )
         .nest(
             "/standard_curves",
             with_crud_perms(StandardCurve::router(db)),
@@ -115,23 +108,19 @@ pub fn service_router(state: &AppState) -> Router<()> {
         .into();
 
     // ========================================================================
-    // Source mappings — read requires read_metadata, write requires write_metadata
+    // Stream routes — registration, listing, pair/unpair
     // ========================================================================
 
-    let source_mappings_read = Router::new()
-        .route("/source_mappings", get(source_mappings::list_source_mappings))
+    let stream_read_routes = Router::new()
+        .route("/streams", get(streams::list_streams))
+        .route("/streams/{id}", get(streams::get_stream))
         .layer(middleware::from_fn(require_read_metadata))
         .with_state(state.clone());
 
-    let source_mappings_write = Router::new()
-        .route(
-            "/source_mappings",
-            post(source_mappings::upsert_source_mapping),
-        )
-        .route(
-            "/source_mappings/{source_system}/{entity_type}/{source_key}",
-            put(source_mappings::update_source_mapping),
-        )
+    let stream_write_routes = Router::new()
+        .route("/streams/register", post(streams::register_stream))
+        .route("/streams/{id}/pair", post(streams::pair_stream))
+        .route("/streams/{id}/unpair", post(streams::unpair_stream))
         .layer(middleware::from_fn(require_write_metadata))
         .with_state(state.clone());
 
@@ -140,6 +129,11 @@ pub fn service_router(state: &AppState) -> Router<()> {
     // ========================================================================
 
     let data_write_routes = Router::new()
+        .route("/ingest", post(ingest::ingest_readings))
+        .route(
+            "/ingest/status_events",
+            post(ingest::ingest_status_events),
+        )
         .route(
             "/readings/batch",
             post(readings_batch::insert_batch_readings),
@@ -173,10 +167,6 @@ pub fn service_router(state: &AppState) -> Router<()> {
         .route(
             "/actions/compute_derived",
             post(actions::compute_derived),
-        )
-        .route(
-            "/actions/update_last_full_sync",
-            post(actions::update_last_full_sync),
         )
         .layer(middleware::from_fn(require_write_data))
         .with_state(state.clone());
@@ -215,8 +205,8 @@ pub fn service_router(state: &AppState) -> Router<()> {
 
     Router::new()
         .merge(entity_router)
-        .merge(source_mappings_read)
-        .merge(source_mappings_write)
+        .merge(stream_read_routes)
+        .merge(stream_write_routes)
         .merge(metadata_read_routes)
         .merge(data_write_routes)
         .merge(data_read_routes)

@@ -1,0 +1,290 @@
+use axum::{Json, extract::State};
+use chrono::Utc;
+use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Set, Statement};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::common::AppState;
+use crate::entity::{data_streams, readings, status_events};
+use crate::error::{AppError, AppResult};
+
+// ============================================================================
+// Stream-based Readings Ingest
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct IngestReadingsRequest {
+    pub stream_id: Uuid,
+    pub readings: Vec<IngestReading>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IngestReading {
+    pub time: chrono::DateTime<Utc>,
+    pub raw_value: f64,
+    #[serde(default)]
+    pub replicate_index: i16,
+    pub sensor_id: Option<Uuid>,
+    pub calibration_id: Option<Uuid>,
+    pub deployment_id: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestResponse {
+    pub inserted: usize,
+    pub stream_id: Uuid,
+    pub paired: bool,
+}
+
+const BATCH_SIZE: usize = 1000;
+
+/// `POST /api/service/ingest` — stream-based data ingestion.
+///
+/// 1. Always inserts into `readings` with `stream_id`.
+/// 2. If stream is paired → fills `site_id`, `parameter_id` from pairing, applies identity calibration.
+/// 3. If unpaired → inserts with `site_id = NULL`, `calibrated_value = raw_value`.
+/// 4. Updates `data_streams.last_data_time`.
+pub async fn ingest_readings(
+    State(state): State<AppState>,
+    Json(payload): Json<IngestReadingsRequest>,
+) -> AppResult<Json<IngestResponse>> {
+    if payload.readings.is_empty() {
+        return Ok(Json(IngestResponse {
+            inserted: 0,
+            stream_id: payload.stream_id,
+            paired: false,
+        }));
+    }
+
+    let db = &state.db;
+
+    // Look up stream to get pairing info
+    let stream = data_streams::Entity::find_by_id(payload.stream_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
+
+    // Resolve pairing: site_id and parameter_id from site_parameter
+    let (site_id, parameter_id) = if let Some(sp_id) = stream.site_parameter_id {
+        let sp = db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r"SELECT site_id, parameter_id FROM site_parameters WHERE id = $1",
+                [sp_id.into()],
+            ))
+            .await?;
+
+        if let Some(row) = sp {
+            let sid: Uuid = row.try_get("", "site_id").map_err(|e| {
+                AppError::Internal(format!("Failed to read site_id: {e}"))
+            })?;
+            let pid: Uuid = row.try_get("", "parameter_id").map_err(|e| {
+                AppError::Internal(format!("Failed to read parameter_id: {e}"))
+            })?;
+            (Some(sid), Some(pid))
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
+    let paired = site_id.is_some();
+
+    // Build reading models
+    let models: Vec<readings::ActiveModel> = payload
+        .readings
+        .iter()
+        .map(|r| readings::ActiveModel {
+            stream_id: Set(payload.stream_id),
+            time: Set(r.time.into()),
+            replicate_index: Set(r.replicate_index),
+            site_id: Set(site_id),
+            parameter_id: Set(parameter_id),
+            raw_value: Set(r.raw_value),
+            calibrated_value: Set(Some(r.raw_value)), // identity calibration
+            sensor_id: Set(r.sensor_id),
+            calibration_id: Set(r.calibration_id),
+            deployment_id: Set(r.deployment_id),
+            logged: Set(Some(true)),
+            measurement_type: Set(Some("continuous".to_string())),
+            is_flagged: Set(Some(false)),
+            flag_reason: Set(None),
+            field_trip_id: Set(None),
+        })
+        .collect();
+
+    let total = models.len();
+    let mut inserted = 0usize;
+
+    for chunk in models.chunks(BATCH_SIZE) {
+        match readings::Entity::insert_many(chunk.to_vec())
+            .on_conflict(
+                sea_orm::sea_query::OnConflict::columns([
+                    readings::Column::StreamId,
+                    readings::Column::Time,
+                    readings::Column::ReplicateIndex,
+                ])
+                .do_nothing()
+                .to_owned(),
+            )
+            .exec_without_returning(db)
+            .await
+        {
+            Ok(rows) => inserted += rows as usize,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("None of the records") {
+                    // All duplicates in this chunk
+                } else {
+                    tracing::warn!(error = %e, batch_size = chunk.len(), "Failed to insert reading batch");
+                    return Err(AppError::Database(e));
+                }
+            }
+        }
+    }
+
+    // Update last_data_time on the stream
+    if let Some(max_time) = payload.readings.iter().map(|r| r.time).max() {
+        let should_update = stream
+            .last_data_time
+            .map(|t| max_time > t.with_timezone(&Utc))
+            .unwrap_or(true);
+
+        if should_update {
+            let mut active: data_streams::ActiveModel = stream.into();
+            active.last_data_time = Set(Some(max_time.into()));
+            active.updated_at = Set(Utc::now().into());
+            if let Err(e) = active.update(db).await {
+                tracing::warn!(error = %e, "Failed to update stream last_data_time");
+            }
+        }
+    }
+
+    tracing::info!(total, inserted, stream_id = %payload.stream_id, paired, "Ingest complete");
+    Ok(Json(IngestResponse {
+        inserted,
+        stream_id: payload.stream_id,
+        paired,
+    }))
+}
+
+// ============================================================================
+// Stream-based Status Events Ingest
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct IngestStatusEventsRequest {
+    pub stream_id: Uuid,
+    pub events: Vec<IngestStatusEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IngestStatusEvent {
+    pub time: chrono::DateTime<Utc>,
+    pub value: String,
+    pub sensor_id: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestStatusEventsResponse {
+    pub inserted: usize,
+    pub stream_id: Uuid,
+    pub paired: bool,
+}
+
+/// `POST /api/service/ingest/status_events` — stream-based status event ingestion.
+pub async fn ingest_status_events(
+    State(state): State<AppState>,
+    Json(payload): Json<IngestStatusEventsRequest>,
+) -> AppResult<Json<IngestStatusEventsResponse>> {
+    if payload.events.is_empty() {
+        return Ok(Json(IngestStatusEventsResponse {
+            inserted: 0,
+            stream_id: payload.stream_id,
+            paired: false,
+        }));
+    }
+
+    let db = &state.db;
+
+    let stream = data_streams::Entity::find_by_id(payload.stream_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
+
+    let (site_id, parameter_id) = if let Some(sp_id) = stream.site_parameter_id {
+        let sp = db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r"SELECT site_id, parameter_id FROM site_parameters WHERE id = $1",
+                [sp_id.into()],
+            ))
+            .await?;
+
+        if let Some(row) = sp {
+            let sid: Uuid = row.try_get("", "site_id").map_err(|e| {
+                AppError::Internal(format!("Failed to read site_id: {e}"))
+            })?;
+            let pid: Uuid = row.try_get("", "parameter_id").map_err(|e| {
+                AppError::Internal(format!("Failed to read parameter_id: {e}"))
+            })?;
+            (Some(sid), Some(pid))
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
+    let paired = site_id.is_some();
+
+    let models: Vec<status_events::ActiveModel> = payload
+        .events
+        .iter()
+        .map(|e| status_events::ActiveModel {
+            stream_id: Set(payload.stream_id),
+            time: Set(e.time.into()),
+            site_id: Set(site_id),
+            parameter_id: Set(parameter_id),
+            value: Set(e.value.clone()),
+            sensor_id: Set(e.sensor_id),
+        })
+        .collect();
+
+    let total = models.len();
+    let mut inserted = 0usize;
+
+    for chunk in models.chunks(BATCH_SIZE) {
+        match status_events::Entity::insert_many(chunk.to_vec())
+            .on_conflict(
+                sea_orm::sea_query::OnConflict::columns([
+                    status_events::Column::StreamId,
+                    status_events::Column::Time,
+                ])
+                .do_nothing()
+                .to_owned(),
+            )
+            .exec_without_returning(db)
+            .await
+        {
+            Ok(rows) => inserted += rows as usize,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("None of the records") {
+                    // All duplicates
+                } else {
+                    tracing::warn!(error = %e, batch_size = chunk.len(), "Failed to insert status event batch");
+                    return Err(AppError::Database(e));
+                }
+            }
+        }
+    }
+
+    tracing::info!(total, inserted, stream_id = %payload.stream_id, paired, "Status events ingest complete");
+    Ok(Json(IngestStatusEventsResponse {
+        inserted,
+        stream_id: payload.stream_id,
+        paired,
+    }))
+}

@@ -14,14 +14,14 @@ pub struct MergeSiteParametersRequest {
 pub struct MergeSiteParametersResponse {
     pub merged_readings: u64,
     pub merged_status_events: u64,
-    pub source_mappings_updated: u64,
+    pub streams_updated: u64,
     pub deployments_moved: u64,
     pub source_deleted: bool,
 }
 
 /// Merge two site_parameters: absorb source into target.
 ///
-/// Moves readings, status_events, source_mappings, sync_state, and
+/// Moves readings, status_events, data_streams, and
 /// sensor_deployments from source to target, then deletes the source.
 /// Duplicate readings (same PK) are skipped via ON CONFLICT DO NOTHING.
 pub async fn merge_site_parameters(
@@ -54,22 +54,19 @@ pub async fn merge_site_parameters(
     let merged_status_events =
         move_status_events(db, source_site_id, source_param_id, target_param_id).await?;
 
-    // Step 3: Update source_mappings to point to target
-    let source_mappings_updated = update_source_mappings(db, source_id, target_id).await?;
+    // Step 3: Update data_streams to point to target site_parameter
+    let streams_updated = update_data_streams(db, source_id, target_id).await?;
 
-    // Step 4: Merge sync_state (keep the more recent last_data_time)
-    merge_sync_state(db, source_id, target_id).await?;
-
-    // Step 5: Move sensor_deployments to target site_parameter's parameter_id
+    // Step 4: Move sensor_deployments to target site_parameter's parameter_id
     let deployments_moved = move_sensor_deployments(db, source_param_id, target_param_id).await?;
 
-    // Step 6: Delete the source site_parameter (readings/status_events already moved)
+    // Step 5: Delete the source site_parameter (readings/status_events already moved)
     delete_source(db, source_id, source_site_id, source_param_id).await?;
 
     Ok(MergeSiteParametersResponse {
         merged_readings,
         merged_status_events,
-        source_mappings_updated,
+        streams_updated,
         deployments_moved,
         source_deleted: true,
     })
@@ -128,25 +125,14 @@ async fn move_readings(
 ) -> AppResult<u64> {
     use sea_orm::{ConnectionTrait, Statement};
 
-    // Insert source readings into target, skip duplicates
+    // Update parameter_id on readings from source to target
     let sql = r#"
-        WITH moved AS (
-            INSERT INTO readings (site_id, parameter_id, time, replicate_index, raw_value,
-                calibrated_value, sensor_id, calibration_id, deployment_id, logged,
-                measurement_type, is_flagged, flag_reason, field_trip_id)
-            SELECT site_id, $1, time, replicate_index, raw_value,
-                calibrated_value, sensor_id, calibration_id, deployment_id, logged,
-                measurement_type, is_flagged, flag_reason, field_trip_id
-            FROM readings
-            WHERE site_id = $2 AND parameter_id = $3
-            ON CONFLICT DO NOTHING
-            RETURNING 1
-        )
-        SELECT COUNT(*) as cnt FROM moved
+        UPDATE readings SET parameter_id = $1
+        WHERE site_id = $2 AND parameter_id = $3
     "#;
 
     let result = db
-        .query_one(Statement::from_sql_and_values(
+        .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             sql,
             vec![target_param_id.into(), site_id.into(), source_param_id.into()],
@@ -154,11 +140,7 @@ async fn move_readings(
         .await
         .map_err(AppError::Database)?;
 
-    let count: i64 = result
-        .map(|r| r.try_get("", "cnt").unwrap_or(0))
-        .unwrap_or(0);
-
-    Ok(count as u64)
+    Ok(result.rows_affected())
 }
 
 async fn move_status_events(
@@ -170,19 +152,12 @@ async fn move_status_events(
     use sea_orm::{ConnectionTrait, Statement};
 
     let sql = r#"
-        WITH moved AS (
-            INSERT INTO status_events (site_id, parameter_id, time, value, sensor_id)
-            SELECT site_id, $1, time, value, sensor_id
-            FROM status_events
-            WHERE site_id = $2 AND parameter_id = $3
-            ON CONFLICT DO NOTHING
-            RETURNING 1
-        )
-        SELECT COUNT(*) as cnt FROM moved
+        UPDATE status_events SET parameter_id = $1
+        WHERE site_id = $2 AND parameter_id = $3
     "#;
 
     let result = db
-        .query_one(Statement::from_sql_and_values(
+        .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             sql,
             vec![target_param_id.into(), site_id.into(), source_param_id.into()],
@@ -190,21 +165,17 @@ async fn move_status_events(
         .await
         .map_err(AppError::Database)?;
 
-    let count: i64 = result
-        .map(|r| r.try_get("", "cnt").unwrap_or(0))
-        .unwrap_or(0);
-
-    Ok(count as u64)
+    Ok(result.rows_affected())
 }
 
-async fn update_source_mappings(
+async fn update_data_streams(
     db: &DatabaseConnection,
     source_id: Uuid,
     target_id: Uuid,
 ) -> AppResult<u64> {
     use sea_orm::{ConnectionTrait, Statement};
 
-    let sql = "UPDATE source_mappings SET entity_id = $1 WHERE entity_id = $2";
+    let sql = "UPDATE data_streams SET site_parameter_id = $1 WHERE site_parameter_id = $2";
     let result = db
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -215,44 +186,6 @@ async fn update_source_mappings(
         .map_err(AppError::Database)?;
 
     Ok(result.rows_affected())
-}
-
-async fn merge_sync_state(
-    db: &DatabaseConnection,
-    source_id: Uuid,
-    target_id: Uuid,
-) -> AppResult<()> {
-    use sea_orm::{ConnectionTrait, Statement};
-
-    // Update target's last_data_time to the max of source and target
-    let sql = r#"
-        UPDATE sync_state t
-        SET last_data_time = GREATEST(t.last_data_time, s.last_data_time),
-            last_sync_attempt = GREATEST(t.last_sync_attempt, s.last_sync_attempt)
-        FROM sync_state s
-        WHERE t.site_parameter_id = $1
-          AND s.site_parameter_id = $2
-    "#;
-
-    db.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        sql,
-        vec![target_id.into(), source_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
-
-    // Delete source sync_state
-    let sql = "DELETE FROM sync_state WHERE site_parameter_id = $1";
-    db.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        sql,
-        vec![source_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
-
-    Ok(())
 }
 
 async fn move_sensor_deployments(

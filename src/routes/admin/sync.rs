@@ -5,23 +5,23 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::{sync_commands, sync_events, sync_service_credentials, sync_services, sync_service_tokens, sync_state};
+use crate::entity::{data_streams, sync_commands, sync_events, sync_service_credentials, sync_services, sync_service_tokens};
 use crate::error::{AppError, AppResult};
 use crate::services::api_token::{generate_token, hash_token};
 
 // ============================================================================
-// Existing: Sync State
+// Stream State (replaces old Sync State)
 // ============================================================================
 
 #[derive(Serialize)]
-pub struct SyncStateResponse {
-    pub site_parameter_id: uuid::Uuid,
+pub struct StreamStateResponse {
+    pub id: Uuid,
+    pub source_system: String,
+    pub source_key: String,
+    pub source_name: Option<String>,
+    pub site_parameter_id: Option<Uuid>,
+    pub is_active: bool,
     pub last_data_time: Option<String>,
-    pub last_sync_attempt: Option<String>,
-    pub sync_status: Option<String>,
-    pub error_message: Option<String>,
-    pub retry_count: Option<i32>,
-    pub last_full_sync: Option<String>,
 }
 
 // ============================================================================
@@ -163,22 +163,22 @@ pub fn router() -> Router<AppState> {
 
 async fn list_sync_states(
     State(state): State<AppState>,
-) -> AppResult<Json<Vec<SyncStateResponse>>> {
-    let states = sync_state::Entity::find()
-        .order_by_asc(sync_state::Column::SiteParameterId)
+) -> AppResult<Json<Vec<StreamStateResponse>>> {
+    let streams = data_streams::Entity::find()
+        .order_by_asc(data_streams::Column::SourceSystem)
         .all(&state.db)
         .await?;
 
-    let response: Vec<SyncStateResponse> = states
+    let response: Vec<StreamStateResponse> = streams
         .into_iter()
-        .map(|s| SyncStateResponse {
+        .map(|s| StreamStateResponse {
+            id: s.id,
+            source_system: s.source_system,
+            source_key: s.source_key,
+            source_name: s.source_name,
             site_parameter_id: s.site_parameter_id,
+            is_active: s.is_active,
             last_data_time: s.last_data_time.map(|t| t.to_rfc3339()),
-            last_sync_attempt: s.last_sync_attempt.map(|t| t.to_rfc3339()),
-            sync_status: s.sync_status,
-            error_message: s.error_message,
-            retry_count: s.retry_count,
-            last_full_sync: s.last_full_sync.map(|t| t.to_rfc3339()),
         })
         .collect();
 

@@ -119,111 +119,60 @@ fn env_u64(key: &str, default: u64) -> u64 {
 // River Data API types (shared across sync services)
 // ============================================================================
 
-/// Project from the API
+/// Data stream from the API
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Project {
+pub struct DataStream {
     pub id: Uuid,
-    pub name: String,
-    pub data_source: String,
-    pub description: Option<String>,
-}
-
-/// Site from the API
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Site {
-    pub id: Uuid,
-    pub project_id: Option<Uuid>,
-    pub name: String,
-    pub latitude: Option<f64>,
-    pub longitude: Option<f64>,
-    pub altitude_m: Option<f64>,
-}
-
-/// Global parameter from the API
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Parameter {
-    pub id: Uuid,
-    pub name: String,
-    pub display_name: String,
-    pub default_units: String,
-    pub category: String,
-    pub data_type: String,
-}
-
-/// Site parameter from the API
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SiteParameter {
-    pub id: Uuid,
-    pub site_id: Uuid,
-    pub parameter_id: Uuid,
-    pub name: String,
-    pub sensor_type: String,
-    pub is_active: Option<bool>,
-    pub is_derived: Option<bool>,
-}
-
-/// Source mapping from the API
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SourceMapping {
     pub source_system: String,
-    pub entity_type: String,
     pub source_key: String,
-    pub entity_id: Uuid,
     pub source_name: Option<String>,
-}
-
-/// Sensor deployment from the API
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SensorDeployment {
-    pub id: Uuid,
-    pub sensor_id: Uuid,
-    pub site_id: Uuid,
-    pub deployed_from: chrono::DateTime<chrono::Utc>,
-    pub deployed_until: Option<chrono::DateTime<chrono::Utc>>,
-    pub deployment_type: Option<String>,
-}
-
-/// Sensor calibration from the API
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SensorCalibration {
-    pub id: Uuid,
-    pub sensor_id: Uuid,
-    pub slope: f64,
-    pub intercept: f64,
-    pub valid_from: chrono::DateTime<chrono::Utc>,
-}
-
-/// Sync state from the API
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncState {
-    pub site_parameter_id: Uuid,
+    pub source_path: Option<String>,
+    pub metadata: serde_json::Value,
+    pub site_parameter_id: Option<Uuid>,
+    pub is_active: bool,
     pub last_data_time: Option<chrono::DateTime<chrono::Utc>>,
-    pub last_sync_attempt: Option<chrono::DateTime<chrono::Utc>>,
-    pub sync_status: Option<String>,
-    pub error_message: Option<String>,
-    pub retry_count: Option<i32>,
-    pub last_full_sync: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Reading for batch insert
+/// Stream registration request
+#[derive(Debug, Serialize)]
+pub struct RegisterStreamRequest {
+    pub source_system: String,
+    pub source_key: String,
+    pub source_name: Option<String>,
+    pub source_path: Option<String>,
+    pub metadata: serde_json::Value,
+}
+
+/// Ingest readings request
+#[derive(Debug, Serialize)]
+pub struct IngestReadingsRequest {
+    pub stream_id: Uuid,
+    pub readings: Vec<IngestReading>,
+}
+
+/// Single reading for ingest
 #[derive(Debug, Clone, Serialize)]
-pub struct ReadingInput {
-    pub site_id: Uuid,
-    pub parameter_id: Uuid,
+pub struct IngestReading {
     pub time: chrono::DateTime<chrono::Utc>,
     pub raw_value: f64,
-    pub calibrated_value: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sensor_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub calibration_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub deployment_id: Option<Uuid>,
 }
 
-/// Status event for batch insert
+/// Ingest status events request
 #[derive(Debug, Serialize)]
-pub struct StatusEventInput {
-    pub site_id: Uuid,
-    pub parameter_id: Uuid,
+pub struct IngestStatusEventsRequest {
+    pub stream_id: Uuid,
+    pub events: Vec<IngestStatusEvent>,
+}
+
+/// Single status event for ingest
+#[derive(Debug, Serialize)]
+pub struct IngestStatusEvent {
     pub time: chrono::DateTime<chrono::Utc>,
     pub value: String,
-    pub sensor_id: Option<Uuid>,
 }

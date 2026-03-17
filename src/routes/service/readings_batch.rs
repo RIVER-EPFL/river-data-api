@@ -1,11 +1,12 @@
 use axum::{Json, extract::State};
-use sea_orm::EntityTrait;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::readings;
-use crate::error::AppResult;
+use crate::entity::{data_streams, readings};
+use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Deserialize)]
 pub struct BatchReadingsRequest {
@@ -31,18 +32,91 @@ pub struct BatchReadingsResponse {
 
 const BATCH_SIZE: usize = 1000;
 
+/// Get or create an "api" stream for a given (site_id, parameter_id) pair.
+async fn get_or_create_api_stream(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    parameter_id: Uuid,
+) -> Result<Uuid, AppError> {
+    let source_key = format!("{site_id}:{parameter_id}");
+
+    // Try to find existing
+    if let Some(stream) = data_streams::Entity::find()
+        .filter(data_streams::Column::SourceSystem.eq("api"))
+        .filter(data_streams::Column::SourceKey.eq(&source_key))
+        .one(db)
+        .await?
+    {
+        return Ok(stream.id);
+    }
+
+    // Create new
+    let now = chrono::Utc::now();
+    let id = Uuid::new_v4();
+    let model = data_streams::ActiveModel {
+        id: Set(id),
+        source_system: Set("api".to_string()),
+        source_key: Set(source_key),
+        source_name: Set(Some("API batch insert".to_string())),
+        source_path: Set(None),
+        metadata: Set(serde_json::json!({})),
+        site_parameter_id: Set(None),
+        is_active: Set(true),
+        discovered_at: Set(now.into()),
+        paired_at: Set(None),
+        last_data_time: Set(None),
+        created_at: Set(now.into()),
+        updated_at: Set(now.into()),
+    };
+
+    data_streams::Entity::insert(model)
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::columns([
+                data_streams::Column::SourceSystem,
+                data_streams::Column::SourceKey,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await
+        .map_err(AppError::Database)?;
+
+    // Re-fetch in case of race condition
+    let stream = data_streams::Entity::find()
+        .filter(data_streams::Column::SourceSystem.eq("api"))
+        .filter(data_streams::Column::SourceKey.eq(format!("{site_id}:{parameter_id}")))
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::Internal("Failed to create API stream".to_string()))?;
+
+    Ok(stream.id)
+}
+
 pub async fn insert_batch_readings(
     State(state): State<AppState>,
     Json(payload): Json<BatchReadingsRequest>,
 ) -> AppResult<Json<BatchReadingsResponse>> {
+    // Collect unique (site_id, parameter_id) pairs and resolve stream_ids
+    let mut stream_cache: HashMap<(Uuid, Uuid), Uuid> = HashMap::new();
+
+    for r in &payload.readings {
+        let key = (r.site_id, r.parameter_id);
+        if !stream_cache.contains_key(&key) {
+            let stream_id = get_or_create_api_stream(&state.db, r.site_id, r.parameter_id).await?;
+            stream_cache.insert(key, stream_id);
+        }
+    }
+
     let models: Vec<readings::ActiveModel> = payload
         .readings
         .into_iter()
         .map(|r| {
-            use sea_orm::Set;
+            let stream_id = stream_cache[&(r.site_id, r.parameter_id)];
             readings::ActiveModel {
-                site_id: Set(r.site_id),
-                parameter_id: Set(r.parameter_id),
+                stream_id: Set(stream_id),
+                site_id: Set(Some(r.site_id)),
+                parameter_id: Set(Some(r.parameter_id)),
                 time: Set(r.time.into()),
                 replicate_index: Set(0),
                 raw_value: Set(r.raw_value),
@@ -66,8 +140,7 @@ pub async fn insert_batch_readings(
         match readings::Entity::insert_many(chunk.to_vec())
             .on_conflict(
                 sea_orm::sea_query::OnConflict::columns([
-                    readings::Column::SiteId,
-                    readings::Column::ParameterId,
+                    readings::Column::StreamId,
                     readings::Column::Time,
                     readings::Column::ReplicateIndex,
                 ])
@@ -80,7 +153,6 @@ pub async fn insert_batch_readings(
             Ok(rows) => inserted += rows as usize,
             Err(e) => {
                 let msg = e.to_string();
-                // "None of the records" means all were duplicates (not an error)
                 if msg.contains("None of the records") {
                     // All duplicates in this chunk
                 } else {

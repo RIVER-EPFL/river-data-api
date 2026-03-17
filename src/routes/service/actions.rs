@@ -44,18 +44,6 @@ pub async fn refresh_aggregates(
 }
 
 // ============================================================================
-// Update Last Full Sync
-// ============================================================================
-
-pub async fn update_last_full_sync(
-    State(app_state): State<AppState>,
-) -> AppResult<Json<serde_json::Value>> {
-    tracing::info!("Updating last_full_sync for all parameters via service API");
-    state::update_last_full_sync_for_all_parameters(&app_state.db).await;
-    Ok(Json(serde_json::json!({ "status": "ok" })))
-}
-
-// ============================================================================
 // Compute Derived
 // ============================================================================
 
@@ -249,8 +237,7 @@ pub async fn preview_derived(
     }
 
     // Resolve variable names → site_parameters at this site
-    // variable name = parameter type name → parameters.name → site_parameters.parameter_type_id
-    let mut param_info: Vec<(String, Uuid, Uuid, String)> = Vec::new(); // (var_name, site_param_id, parameter_id, units)
+    let mut param_info: Vec<(String, Uuid, Uuid, String)> = Vec::new();
 
     for var_name in &var_names {
         let row = db
@@ -278,13 +265,11 @@ pub async fn preview_derived(
                 .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
             param_info.push((var_name.clone(), sp_id, parameter_id, units));
         }
-        // If not found at this site, skip — we'll produce nulls for those timestamps
     }
 
     // Fetch readings for all resolved parameters within time range
-    // Build a time → variable → value map
     let mut all_times: Vec<chrono::DateTime<chrono::Utc>> = Vec::new();
-    let mut source_data: HashMap<String, HashMap<i64, f64>> = HashMap::new(); // var_name → (timestamp_ms → value)
+    let mut source_data: HashMap<String, HashMap<i64, f64>> = HashMap::new();
     let mut source_units: HashMap<String, String> = HashMap::new();
 
     for (var_name, _sp_id, parameter_id, units) in &param_info {
@@ -295,10 +280,11 @@ pub async fn preview_derived(
                 sea_orm::DatabaseBackend::Postgres,
                 r"SELECT time, COALESCE(calibrated_value, raw_value) as val
                   FROM readings
-                  WHERE parameter_id = $1 AND time >= $2 AND time <= $3
+                  WHERE parameter_id = $1 AND site_id = $2 AND time >= $3 AND time <= $4
                   ORDER BY time ASC",
                 [
                     (*parameter_id).into(),
+                    payload.site_id.into(),
                     payload.start.into(),
                     payload.end.into(),
                 ],
@@ -356,7 +342,6 @@ pub async fn preview_derived(
     let mut derived_errors: Vec<Option<String>> = Vec::with_capacity(times.len());
 
     for ms in &time_set {
-        // Build variable map for this timestamp
         let mut vars = HashMap::new();
         let mut all_present = true;
 

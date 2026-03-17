@@ -69,8 +69,6 @@ pub enum Relation {
         to = "super::derived_parameter_definitions::Column::Id"
     )]
     DerivedParameterDefinition,
-    #[sea_orm(has_one = "super::sync_state::Entity")]
-    SyncState,
 }
 
 impl Related<super::sites::Entity> for Entity {
@@ -88,12 +86,6 @@ impl Related<super::parameters::Entity> for Entity {
 impl Related<super::derived_parameter_definitions::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::DerivedParameterDefinition.def()
-    }
-}
-
-impl Related<super::sync_state::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::SyncState.def()
     }
 }
 

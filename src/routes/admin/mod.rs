@@ -9,6 +9,7 @@ use crate::common::AppState;
 use crate::common::auth::Role;
 use crate::entity::{
     alarm_thresholds::AlarmThreshold, api_tokens::ApiToken, constants::Constant,
+    data_streams::DataStream,
     derived_parameter_definitions::DerivedParameterDefinition, field_trips::FieldTrip,
     notes::Note, parameters::Parameter, projects::Project,
     public_exposed_parameters::PublicExposedParameter,
@@ -47,6 +48,7 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .nest_service("/notes", crud(Note::router(db)))
         .nest_service("/constants", crud(Constant::router(db)))
         .nest_service("/field_trips", crud(FieldTrip::router(db)))
+        .nest_service("/data_streams", crud(DataStream::router(db)))
         // Custom action routes under /actions/ to avoid conflict with nest_service catch-all
         .route(
             "/actions/sensor_calibrations/{id}/recalculate",

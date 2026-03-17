@@ -1,10 +1,11 @@
 use axum::{Json, extract::State};
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::{field_trips, readings, site_parameters, sites};
+use crate::entity::{data_streams, field_trips, readings, site_parameters, sites};
 use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +36,63 @@ pub struct FieldTripBatchResponse {
     pub field_trip_id: Uuid,
     pub total_inserted: usize,
     pub stations_count: usize,
+}
+
+/// Get or create a "field_trip" stream for a given (site_id, parameter_id) pair.
+async fn get_or_create_field_trip_stream(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    parameter_id: Uuid,
+) -> Result<Uuid, AppError> {
+    let source_key = format!("{site_id}:{parameter_id}");
+
+    if let Some(stream) = data_streams::Entity::find()
+        .filter(data_streams::Column::SourceSystem.eq("field_trip"))
+        .filter(data_streams::Column::SourceKey.eq(&source_key))
+        .one(db)
+        .await?
+    {
+        return Ok(stream.id);
+    }
+
+    let now = chrono::Utc::now();
+    let model = data_streams::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        source_system: Set("field_trip".to_string()),
+        source_key: Set(source_key),
+        source_name: Set(Some("Field trip sample".to_string())),
+        source_path: Set(None),
+        metadata: Set(serde_json::json!({})),
+        site_parameter_id: Set(None),
+        is_active: Set(true),
+        discovered_at: Set(now.into()),
+        paired_at: Set(None),
+        last_data_time: Set(None),
+        created_at: Set(now.into()),
+        updated_at: Set(now.into()),
+    };
+
+    data_streams::Entity::insert(model)
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::columns([
+                data_streams::Column::SourceSystem,
+                data_streams::Column::SourceKey,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await
+        .map_err(AppError::Database)?;
+
+    let stream = data_streams::Entity::find()
+        .filter(data_streams::Column::SourceSystem.eq("field_trip"))
+        .filter(data_streams::Column::SourceKey.eq(format!("{site_id}:{parameter_id}")))
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::Internal("Failed to create field trip stream".to_string()))?;
+
+    Ok(stream.id)
 }
 
 pub async fn create_field_trip_batch(
@@ -102,15 +160,29 @@ pub async fn create_field_trip_batch(
     let field_trip = field_trip.insert(&state.db).await?;
     let field_trip_id = field_trip.id;
 
-    // Insert all readings across all stations
+    // Resolve stream_ids and insert readings
+    let mut stream_cache: HashMap<(Uuid, Uuid), Uuid> = HashMap::new();
     let mut all_models: Vec<readings::ActiveModel> = Vec::new();
     let stations_count = payload.stations.len();
 
     for station in payload.stations {
         for r in station.readings {
+            let key = (station.site_id, r.parameter_id);
+            if !stream_cache.contains_key(&key) {
+                let stream_id = get_or_create_field_trip_stream(
+                    &state.db,
+                    station.site_id,
+                    r.parameter_id,
+                )
+                .await?;
+                stream_cache.insert(key, stream_id);
+            }
+            let stream_id = stream_cache[&key];
+
             all_models.push(readings::ActiveModel {
-                site_id: Set(station.site_id),
-                parameter_id: Set(r.parameter_id),
+                stream_id: Set(stream_id),
+                site_id: Set(Some(station.site_id)),
+                parameter_id: Set(Some(r.parameter_id)),
                 time: Set(r.time.into()),
                 replicate_index: Set(0),
                 raw_value: Set(r.value),
@@ -133,20 +205,20 @@ pub async fn create_field_trip_batch(
         match readings::Entity::insert_many(all_models)
             .on_conflict(
                 sea_orm::sea_query::OnConflict::columns([
-                    readings::Column::SiteId,
-                    readings::Column::ParameterId,
+                    readings::Column::StreamId,
                     readings::Column::Time,
                     readings::Column::ReplicateIndex,
                 ])
                 .do_nothing()
                 .to_owned(),
             )
-            .exec(&state.db)
+            .exec_without_returning(&state.db)
             .await
         {
-            Ok(_) => {
+            Ok(rows) => {
                 tracing::info!(
                     total,
+                    inserted = rows,
                     stations_count,
                     field_trip_id = %field_trip_id,
                     "Field trip batch inserted"

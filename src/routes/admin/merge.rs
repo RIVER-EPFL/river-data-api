@@ -21,7 +21,7 @@ pub async fn merge_site_parameters_handler(
     tracing::info!(
         merged_readings = result.merged_readings,
         merged_status_events = result.merged_status_events,
-        source_mappings_updated = result.source_mappings_updated,
+        streams_updated = result.streams_updated,
         "Site parameter merge complete"
     );
 

@@ -5,17 +5,23 @@ use serde::{Deserialize, Serialize};
 #[sea_orm(table_name = "status_events")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
-    pub site_id: Uuid,
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub parameter_id: Uuid,
+    pub stream_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
     pub time: DateTimeWithTimeZone,
+    pub site_id: Option<Uuid>,
+    pub parameter_id: Option<Uuid>,
     pub value: String,
     pub sensor_id: Option<Uuid>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
+    #[sea_orm(
+        belongs_to = "super::data_streams::Entity",
+        from = "Column::StreamId",
+        to = "super::data_streams::Column::Id"
+    )]
+    DataStream,
     #[sea_orm(
         belongs_to = "super::sites::Entity",
         from = "Column::SiteId",
@@ -34,6 +40,12 @@ pub enum Relation {
         to = "super::sensors::Column::Id"
     )]
     Sensor,
+}
+
+impl Related<super::data_streams::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::DataStream.def()
+    }
 }
 
 impl Related<super::sites::Entity> for Entity {

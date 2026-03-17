@@ -1,10 +1,11 @@
 use axum::{Json, extract::State};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::{readings, site_parameters, sites};
+use crate::entity::{data_streams, readings, site_parameters, sites};
 use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Deserialize)]
@@ -26,6 +27,64 @@ pub struct GrabSampleReading {
 #[derive(Debug, Serialize)]
 pub struct GrabSampleResponse {
     pub inserted: usize,
+}
+
+/// Get or create a "grab_sample" stream for a given (site_id, parameter_id) pair.
+async fn get_or_create_grab_stream(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    parameter_id: Uuid,
+) -> Result<Uuid, AppError> {
+    let source_key = format!("{site_id}:{parameter_id}");
+
+    if let Some(stream) = data_streams::Entity::find()
+        .filter(data_streams::Column::SourceSystem.eq("grab_sample"))
+        .filter(data_streams::Column::SourceKey.eq(&source_key))
+        .one(db)
+        .await?
+    {
+        return Ok(stream.id);
+    }
+
+    let now = chrono::Utc::now();
+    let id = Uuid::new_v4();
+    let model = data_streams::ActiveModel {
+        id: Set(id),
+        source_system: Set("grab_sample".to_string()),
+        source_key: Set(source_key),
+        source_name: Set(Some("Grab sample".to_string())),
+        source_path: Set(None),
+        metadata: Set(serde_json::json!({})),
+        site_parameter_id: Set(None),
+        is_active: Set(true),
+        discovered_at: Set(now.into()),
+        paired_at: Set(None),
+        last_data_time: Set(None),
+        created_at: Set(now.into()),
+        updated_at: Set(now.into()),
+    };
+
+    data_streams::Entity::insert(model)
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::columns([
+                data_streams::Column::SourceSystem,
+                data_streams::Column::SourceKey,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await
+        .map_err(AppError::Database)?;
+
+    let stream = data_streams::Entity::find()
+        .filter(data_streams::Column::SourceSystem.eq("grab_sample"))
+        .filter(data_streams::Column::SourceKey.eq(format!("{site_id}:{parameter_id}")))
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::Internal("Failed to create grab sample stream".to_string()))?;
+
+    Ok(stream.id)
 }
 
 pub async fn insert_grab_samples(
@@ -62,15 +121,25 @@ pub async fn insert_grab_samples(
         }
     }
 
-    // Build readings with measurement_type = 'spot'
+    // Resolve stream_ids for each unique (site_id, parameter_id)
+    let mut stream_cache: HashMap<Uuid, Uuid> = HashMap::new();
+    for r in &payload.readings {
+        if !stream_cache.contains_key(&r.parameter_id) {
+            let stream_id =
+                get_or_create_grab_stream(&state.db, payload.site_id, r.parameter_id).await?;
+            stream_cache.insert(r.parameter_id, stream_id);
+        }
+    }
+
     let models: Vec<readings::ActiveModel> = payload
         .readings
         .into_iter()
         .map(|r| {
-            use sea_orm::Set;
+            let stream_id = stream_cache[&r.parameter_id];
             readings::ActiveModel {
-                site_id: Set(payload.site_id),
-                parameter_id: Set(r.parameter_id),
+                stream_id: Set(stream_id),
+                site_id: Set(Some(payload.site_id)),
+                parameter_id: Set(Some(r.parameter_id)),
                 time: Set(r.time.into()),
                 replicate_index: Set(r.replicate_index.unwrap_or(0)),
                 raw_value: Set(r.value),
@@ -92,20 +161,19 @@ pub async fn insert_grab_samples(
     match readings::Entity::insert_many(models)
         .on_conflict(
             sea_orm::sea_query::OnConflict::columns([
-                readings::Column::SiteId,
-                readings::Column::ParameterId,
+                readings::Column::StreamId,
                 readings::Column::Time,
                 readings::Column::ReplicateIndex,
             ])
             .do_nothing()
             .to_owned(),
         )
-        .exec(&state.db)
+        .exec_without_returning(&state.db)
         .await
     {
-        Ok(_) => {
-            tracing::info!(total, site = %site.name, "Grab samples inserted");
-            Ok(Json(GrabSampleResponse { inserted: total }))
+        Ok(rows) => {
+            tracing::info!(total, inserted = rows, site = %site.name, "Grab samples inserted");
+            Ok(Json(GrabSampleResponse { inserted: rows as usize }))
         }
         Err(e) => {
             let msg = e.to_string();
