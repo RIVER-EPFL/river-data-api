@@ -225,7 +225,27 @@ async fn list_users(
         _ => 0,
     };
 
-    let users: Vec<serde_json::Value> = kc_users.iter().map(simplify_user).collect();
+    // Fetch roles for each user concurrently (small user count, admin-only)
+    let role_futures: Vec<_> = kc_users
+        .iter()
+        .map(|u| {
+            let user_id = u["id"].as_str().unwrap_or_default().to_string();
+            let token = token.clone();
+            let base = base.clone();
+            async move { fetch_user_roles(client, &token, &base, &user_id).await }
+        })
+        .collect();
+    let all_roles = futures::future::join_all(role_futures).await;
+
+    let users: Vec<serde_json::Value> = kc_users
+        .iter()
+        .zip(all_roles)
+        .map(|(u, roles)| {
+            let mut user = simplify_user(u);
+            user["roles"] = serde_json::json!(roles);
+            user
+        })
+        .collect();
 
     let end = first + users.len().saturating_sub(1);
     let content_range = format!("users {first}-{end}/{total}");

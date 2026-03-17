@@ -431,8 +431,21 @@ pub fn build_router(state: AppState) -> Router {
             tracing::info!(origins = ?origins, "CORS: restricted origins");
             CorsLayer::new()
                 .allow_origin(allowed)
-                .allow_methods(tower_http::cors::Any)
-                .allow_headers(tower_http::cors::Any)
+                .allow_methods([
+                    axum::http::Method::GET,
+                    axum::http::Method::POST,
+                    axum::http::Method::PUT,
+                    axum::http::Method::PATCH,
+                    axum::http::Method::DELETE,
+                    axum::http::Method::HEAD,
+                    axum::http::Method::OPTIONS,
+                ])
+                .allow_headers([
+                    axum::http::header::AUTHORIZATION,
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::header::ACCEPT,
+                    axum::http::HeaderName::from_static("x-request-id"),
+                ])
                 .allow_credentials(true)
                 .expose_headers([
                     axum::http::header::CONTENT_RANGE,
