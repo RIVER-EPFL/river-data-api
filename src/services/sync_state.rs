@@ -1,17 +1,32 @@
+use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 
 /// Refresh continuous aggregates after new data is synced.
-pub async fn refresh_continuous_aggregates(db: &DatabaseConnection) {
-    tracing::debug!("Refreshing continuous aggregates...");
+///
+/// If `since` is provided, uses that as the start of the refresh window
+/// (useful after backfills or imports). Otherwise defaults to recent windows.
+pub async fn refresh_continuous_aggregates(
+    db: &DatabaseConnection,
+    since: Option<DateTime<Utc>>,
+) {
+    tracing::debug!(?since, "Refreshing continuous aggregates...");
+
+    let hourly_start = since
+        .map(|s| format!("'{}'::timestamptz", s.to_rfc3339()))
+        .unwrap_or_else(|| "NOW() - INTERVAL '24 hours'".to_string());
+
+    let daily_start = since
+        .map(|s| format!("'{}'::timestamptz", s.to_rfc3339()))
+        .unwrap_or_else(|| "NOW() - INTERVAL '7 days'".to_string());
 
     let result = db
         .execute(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "CALL refresh_continuous_aggregate('readings_hourly', NOW() - INTERVAL '24 hours', NOW())".to_string(),
+            format!("CALL refresh_continuous_aggregate('readings_hourly', {hourly_start}, NOW())"),
         ))
         .await;
 
-    match result {
+    match &result {
         Ok(_) => tracing::debug!("Hourly continuous aggregate refreshed"),
         Err(e) => tracing::warn!(error = %e, "Failed to refresh hourly aggregate"),
     }
@@ -19,12 +34,11 @@ pub async fn refresh_continuous_aggregates(db: &DatabaseConnection) {
     let result = db
         .execute(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "CALL refresh_continuous_aggregate('readings_daily', NOW() - INTERVAL '7 days', NOW())"
-                .to_string(),
+            format!("CALL refresh_continuous_aggregate('readings_daily', {daily_start}, NOW())"),
         ))
         .await;
 
-    match result {
+    match &result {
         Ok(_) => tracing::debug!("Daily continuous aggregate refreshed"),
         Err(e) => tracing::warn!(error = %e, "Failed to refresh daily aggregate"),
     }

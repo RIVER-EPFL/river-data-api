@@ -98,7 +98,7 @@ pub async fn service_auth_middleware(
         .map(String::from);
 
     if let Some(header_value) = auth_header
-        && let Some(token_model) = validate_bearer_token(&state.db, &header_value).await
+        && let Some(token_model) = validate_bearer_token(&state.db, &header_value, &state.token_cache).await
     {
         let permissions = TokenPermissions::from_json(&token_model.permissions);
         request.extensions_mut().insert(AuthContext::ApiToken {

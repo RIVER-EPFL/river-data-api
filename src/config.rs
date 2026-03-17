@@ -54,6 +54,23 @@ pub struct Config {
     // Keycloak admin proxy (optional — enables user management)
     pub keycloak_admin_client_id: Option<String>,
     pub keycloak_admin_client_secret: Option<String>,
+
+    // CORS
+    pub cors_allowed_origins: Vec<String>,
+
+    // Connection pool
+    pub db_max_connections: u32,
+    pub db_min_connections: u32,
+
+    // Request timeout (seconds)
+    pub request_timeout_seconds: u64,
+
+    // Time range limits (days)
+    pub max_readings_time_range_days: i64,
+    pub max_aggregates_time_range_days: i64,
+    pub public_max_readings_time_range_days: i64,
+    pub public_max_aggregates_time_range_days: i64,
+    pub default_readings_lookback_days: i64,
 }
 
 impl Config {
@@ -147,6 +164,52 @@ impl Config {
             keycloak_admin_client_secret: env::var("KEYCLOAK_ADMIN_CLIENT_SECRET")
                 .ok()
                 .filter(|s| !s.is_empty()),
+
+            // CORS
+            cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS")
+                .unwrap_or_else(|_| "http://localhost:5173,http://localhost:3005".to_string())
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+
+            // Connection pool
+            db_max_connections: env::var("DB_MAX_CONNECTIONS")
+                .unwrap_or_else(|_| "25".to_string())
+                .parse()
+                .unwrap_or(25),
+            db_min_connections: env::var("DB_MIN_CONNECTIONS")
+                .unwrap_or_else(|_| "5".to_string())
+                .parse()
+                .unwrap_or(5),
+
+            // Request timeout
+            request_timeout_seconds: env::var("REQUEST_TIMEOUT_SECONDS")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()
+                .unwrap_or(60),
+
+            // Time range limits
+            max_readings_time_range_days: env::var("MAX_READINGS_TIME_RANGE_DAYS")
+                .unwrap_or_else(|_| "90".to_string())
+                .parse()
+                .unwrap_or(90),
+            max_aggregates_time_range_days: env::var("MAX_AGGREGATES_TIME_RANGE_DAYS")
+                .unwrap_or_else(|_| "365".to_string())
+                .parse()
+                .unwrap_or(365),
+            public_max_readings_time_range_days: env::var("PUBLIC_MAX_READINGS_TIME_RANGE_DAYS")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()
+                .unwrap_or(30),
+            public_max_aggregates_time_range_days: env::var("PUBLIC_MAX_AGGREGATES_TIME_RANGE_DAYS")
+                .unwrap_or_else(|_| "180".to_string())
+                .parse()
+                .unwrap_or(180),
+            default_readings_lookback_days: env::var("DEFAULT_READINGS_LOOKBACK_DAYS")
+                .unwrap_or_else(|_| "7".to_string())
+                .parse()
+                .unwrap_or(7),
         })
     }
 

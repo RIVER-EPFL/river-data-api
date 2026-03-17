@@ -39,6 +39,13 @@ services:
       # Application
       - DEPLOYMENT=${DEPLOYMENT:-dev}
       - RUST_LOG=${RUST_LOG:-info,river_db=debug,sea_orm=warn,sqlx=warn}
+      # CORS
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:3005}
+      # Connection pool
+      - DB_MAX_CONNECTIONS=${DB_MAX_CONNECTIONS:-25}
+      - DB_MIN_CONNECTIONS=${DB_MIN_CONNECTIONS:-5}
+      # Timeouts
+      - REQUEST_TIMEOUT_SECONDS=${REQUEST_TIMEOUT_SECONDS:-60}
       # Authentication
       - KEYCLOAK_URL=${KEYCLOAK_URL:-}
       - KEYCLOAK_REALM=${KEYCLOAK_REALM:-}
@@ -50,7 +57,7 @@ services:
       river-db-timescale:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:${API_PORT:-3000}/healthz || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:${API_PORT:-3000}/readyz || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 10

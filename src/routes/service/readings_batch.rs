@@ -164,5 +164,16 @@ pub async fn insert_batch_readings(
     }
 
     tracing::info!(total, inserted, "Batch readings insert complete");
+
+    // Invalidate response cache for all affected sites
+    if inserted > 0 {
+        let affected_site_ids: std::collections::HashSet<Uuid> =
+            stream_cache.keys().map(|(site_id, _)| *site_id).collect();
+        for site_id in affected_site_ids {
+            crate::services::cache::invalidate_prefix(&state, &format!("readings:{site_id}")).await;
+            crate::services::cache::invalidate_prefix(&state, &format!("aggregates:{site_id}")).await;
+        }
+    }
+
     Ok(Json(BatchReadingsResponse { inserted }))
 }

@@ -1,9 +1,12 @@
 use axum::{Json, extract::{Path, State}};
 use chrono::Utc;
+use moka::future::Cache;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, EntityTrait, QueryFilter, Set,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::common::AppState;
@@ -12,6 +15,16 @@ use crate::error::{AppError, AppResult};
 use crate::services::api_token::{generate_token, hash_token};
 
 const SESSION_TOKEN_TTL_MINUTES: i64 = 15;
+
+/// In-memory cache of raw session tokens by service_id.
+/// Avoids creating a new DB row on every 30s heartbeat.
+/// TTL slightly shorter than the token's DB expiry so we rotate before expiry.
+static SESSION_TOKEN_CACHE: LazyLock<Cache<Uuid, String>> = LazyLock::new(|| {
+    Cache::builder()
+        .max_capacity(100)
+        .time_to_live(Duration::from_secs((SESSION_TOKEN_TTL_MINUTES as u64 - 2) * 60))
+        .build()
+});
 
 // ============================================================================
 // Request / Response Types
@@ -215,8 +228,15 @@ pub async fn heartbeat(
     active.updated_at = Set(Utc::now().into());
     active.update(&state.db).await?;
 
-    // Generate new session token
-    let session_token = create_session_token(&state.db, req.service_id).await?;
+    // Reuse existing session token if cached (avoids ~2,880 DB rows/day per service).
+    // The cache TTL is 13 min vs the token's 15 min DB expiry, so we rotate with margin.
+    let session_token = if let Some(cached) = SESSION_TOKEN_CACHE.get(&req.service_id).await {
+        cached
+    } else {
+        let token = create_session_token(&state.db, req.service_id).await?;
+        SESSION_TOKEN_CACHE.insert(req.service_id, token.clone()).await;
+        token
+    };
 
     // Fetch pending commands
     let pending = sync_commands::Entity::find()

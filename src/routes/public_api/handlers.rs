@@ -448,15 +448,39 @@ pub async fn get_readings(
     let config = get_public_config(&state.db, &state.public_config_cache, &project_slug).await?;
     let site = resolve_site_from_config(&config, &site_id)?;
 
-    let start = query.start.as_deref().map(parse_time).transpose()?;
-    let end = query.end.as_deref().map(parse_time).transpose()?;
+    let start_parsed = query.start.as_deref().map(parse_time).transpose()?;
+    let end_parsed = query.end.as_deref().map(parse_time).transpose()?;
 
-    if let (Some(s), Some(e)) = (start, end)
-        && e <= s {
+    // Enforce public API time range limits
+    let max_days = state.config.public_max_readings_time_range_days;
+    let default_lookback = state.config.default_readings_lookback_days;
+    let effective_start = start_parsed.unwrap_or_else(|| {
+        chrono::Utc::now() - chrono::Duration::days(default_lookback)
+    });
+
+    if let Some(e) = end_parsed {
+        if e <= effective_start {
             return Err(AppError::BadRequest(
                 "end time must be after start time".to_string(),
             ));
         }
+        let span = e - effective_start;
+        if span.num_days() > max_days {
+            return Err(AppError::BadRequest(format!(
+                "Time range exceeds maximum of {max_days} days for public readings"
+            )));
+        }
+    } else {
+        let span = chrono::Utc::now() - effective_start;
+        if span.num_days() > max_days {
+            return Err(AppError::BadRequest(format!(
+                "Time range exceeds maximum of {max_days} days for public readings"
+            )));
+        }
+    }
+
+    let start = Some(effective_start);
+    let end = end_parsed;
 
     let requested_names = resolve_requested_param_names(query.parameters.as_deref(), &config)?;
 
@@ -619,6 +643,15 @@ pub async fn get_aggregates(
         return Err(AppError::BadRequest(
             "end time must be after start time".to_string(),
         ));
+    }
+
+    // Enforce public API time range limits for aggregates
+    let max_days = state.config.public_max_aggregates_time_range_days;
+    let span = end - start;
+    if span.num_days() > max_days {
+        return Err(AppError::BadRequest(format!(
+            "Time range exceeds maximum of {max_days} days for public aggregates"
+        )));
     }
 
     let requested_names = resolve_requested_param_names(query.parameters.as_deref(), &config)?;

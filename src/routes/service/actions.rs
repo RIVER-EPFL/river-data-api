@@ -32,7 +32,7 @@ pub async fn refresh_aggregates(
                 state::refresh_continuous_aggregates_full(&db).await;
             } else {
                 tracing::info!("Triggered incremental aggregate refresh via service API");
-                state::refresh_continuous_aggregates(&db).await;
+                state::refresh_continuous_aggregates(&db, None).await;
             }
         }).await {
             Ok(()) => {}

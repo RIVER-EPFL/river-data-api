@@ -121,6 +121,15 @@ fn test_config() -> Config {
         keycloak_client_id: None,
         keycloak_admin_client_id: None,
         keycloak_admin_client_secret: None,
+        cors_allowed_origins: vec!["*".to_string()],
+        db_max_connections: 25,
+        db_min_connections: 1,
+        request_timeout_seconds: 60,
+        max_readings_time_range_days: 90,
+        max_aggregates_time_range_days: 365,
+        public_max_readings_time_range_days: 30,
+        public_max_aggregates_time_range_days: 180,
+        default_readings_lookback_days: 7,
     }
 }
 

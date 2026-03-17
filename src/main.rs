@@ -1,6 +1,7 @@
-use sea_orm::Database;
+use sea_orm::{ConnectOptions, Database};
 use sea_orm_migration::MigratorTrait;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -34,10 +35,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Configuration loaded"
     );
 
-    // Connect to database (fail-fast)
+    // Connect to database with pool tuning (fail-fast)
     tracing::info!("Connecting to database...");
-    let db = Database::connect(&config.database_url).await?;
-    tracing::info!("Database connection established");
+    let mut db_opts = ConnectOptions::new(&config.database_url);
+    db_opts
+        .max_connections(config.db_max_connections)
+        .min_connections(config.db_min_connections)
+        .connect_timeout(Duration::from_secs(5))
+        .idle_timeout(Duration::from_secs(300))
+        .sqlx_logging(false)
+        .set_schema_search_path("public");
+    let db = Database::connect(db_opts).await?;
+    tracing::info!(
+        max_connections = config.db_max_connections,
+        min_connections = config.db_min_connections,
+        "Database connection pool established"
+    );
+
+    // Set statement timeout as defense-in-depth against runaway queries
+    use sea_orm::ConnectionTrait;
+    db.execute(sea_orm::Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SET statement_timeout = '30s'".to_string(),
+    ))
+    .await?;
+    tracing::info!("Statement timeout set to 30s");
 
     // Run migrations
     tracing::info!("Running migrations...");

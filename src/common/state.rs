@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::config::Config;
+use crate::services::api_token::TokenCache;
 use crate::services::bulk::{BulkSemaphore, new_bulk_semaphore};
 use crate::services::public_api_config::{PublicConfigCache, new_public_config_cache};
 
@@ -39,6 +40,7 @@ pub struct AppState {
     pub keycloak_auth_instance: Option<Arc<KeycloakAuthInstance>>,
     pub bulk_semaphore: BulkSemaphore,
     pub keycloak_admin: Option<KeycloakAdmin>,
+    pub token_cache: TokenCache,
 }
 
 impl AppState {
@@ -75,6 +77,8 @@ impl AppState {
             }
         });
 
+        let token_cache = crate::services::api_token::new_token_cache();
+
         Self {
             db,
             config: Arc::new(config),
@@ -83,6 +87,7 @@ impl AppState {
             keycloak_auth_instance,
             bulk_semaphore,
             keycloak_admin,
+            token_cache,
         }
     }
 }

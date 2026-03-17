@@ -17,7 +17,7 @@ use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
 use crate::entity::site_parameters;
 use crate::error::{AppError, AppResult};
-use crate::routes::{cache, resolve_site_with_project, validate_optional_time_range};
+use crate::routes::{cache, enforce_time_range, resolve_site_with_project};
 use crate::services::bulk::{self, StreamableParam};
 
 use super::types::{ProjectRef, SiteRef};
@@ -158,7 +158,13 @@ pub async fn get_site_readings(
         name: site.name.clone(),
     };
 
-    validate_optional_time_range(query.start, query.end)?;
+    // Enforce time range limits
+    let (effective_start, effective_end) = enforce_time_range(
+        query.start,
+        query.end,
+        state.config.max_readings_time_range_days,
+        state.config.default_readings_lookback_days,
+    )?;
 
     // Determine format from query or Accept header
     let format = bulk::determine_format(&query.format, &headers);
@@ -199,8 +205,8 @@ pub async fn get_site_readings(
         "readings",
         &[
             &site.id.to_string(),
-            &query.start.map(|t| t.to_rfc3339()).unwrap_or_default(),
-            &query.end.map(|t| t.to_rfc3339()).unwrap_or_default(),
+            &effective_start.to_rfc3339(),
+            &effective_end.map(|t| t.to_rfc3339()).unwrap_or_default(),
             query.sensor_types.as_deref().unwrap_or(""),
             &format,
             if include_alarms { "alarms" } else { "" },
@@ -212,7 +218,7 @@ pub async fn get_site_readings(
 
     // Check cache with freshness validation (JSON only)
     if format == "json"
-        && let Some(cached) = cache::get_cached(&state, &cache_key, &param_ids, query.end).await
+        && let Some(cached) = cache::get_cached(&state, &cache_key, &param_ids, effective_end).await
     {
         return cache::json_response((*cached).clone(), true);
     }
@@ -265,28 +271,22 @@ pub async fn get_site_readings(
     };
 
     let next_param = param_ids.len() + 2;
-    let time_conditions = match (query.start, query.end) {
-        (Some(start), Some(end)) => {
+    let time_conditions = match effective_end {
+        Some(end) => {
             let cond = format!(
                 " AND r.time >= ${} AND r.time <= ${}",
                 next_param,
                 next_param + 1
             );
-            values.push(start.into());
+            values.push(effective_start.into());
             values.push(end.into());
             cond
         }
-        (Some(start), None) => {
+        None => {
             let cond = format!(" AND r.time >= ${next_param}");
-            values.push(start.into());
+            values.push(effective_start.into());
             cond
         }
-        (None, Some(end)) => {
-            let cond = format!(" AND r.time <= ${next_param}");
-            values.push(end.into());
-            cond
-        }
-        (None, None) => String::new(),
     };
 
     let measurement_type_condition = if measurement_type_filter.is_empty() {

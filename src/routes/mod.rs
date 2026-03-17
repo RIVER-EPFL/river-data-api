@@ -9,16 +9,18 @@ pub mod sites;
 // Re-export cache from services for use in route handlers
 pub use crate::services::cache;
 
-use axum::{Router, http::StatusCode, middleware, routing::get};
-use sea_orm::{Condition, DatabaseConnection, EntityTrait, QueryFilter, sea_query::Expr};
+use axum::{Router, http::StatusCode, middleware, response::Response, routing::get};
+use sea_orm::{Condition, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Statement, sea_query::Expr};
 use std::sync::Arc;
+use std::time::Duration;
+use tower::ServiceBuilder;
 use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 use uuid::Uuid;
 
 use crate::services::FallbackIpKeyExtractor;
 use tower_http::{
     compression::CompressionLayer,
-    cors::{Any, CorsLayer},
+    cors::CorsLayer,
     limit::RequestBodyLimitLayer,
     trace::{DefaultMakeSpan, TraceLayer},
 };
@@ -34,20 +36,43 @@ use crate::error::{AppError, AppResult};
 // Root Endpoints
 // ============================================================================
 
-/// Health check endpoint
-///
-/// Returns 200 OK if the service is running.
-/// This endpoint is not rate-limited and suitable for Kubernetes probes.
+/// Liveness probe — returns 200 if the process is running.
 #[utoipa::path(
     get,
     path = "/healthz",
     responses(
-        (status = 200, description = "Service is healthy"),
+        (status = 200, description = "Service is alive"),
     ),
     tag = "health"
 )]
 async fn healthz() -> StatusCode {
     StatusCode::OK
+}
+
+/// Readiness probe — returns 200 only if the database is reachable.
+#[utoipa::path(
+    get,
+    path = "/readyz",
+    responses(
+        (status = 200, description = "Service is ready"),
+        (status = 503, description = "Database unreachable"),
+    ),
+    tag = "health"
+)]
+async fn readyz(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> StatusCode {
+    let result = state
+        .db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT 1".to_string(),
+        ))
+        .await;
+    match result {
+        Ok(Some(_)) => StatusCode::OK,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    }
 }
 
 // ============================================================================
@@ -155,6 +180,44 @@ pub fn validate_optional_time_range(
         validate_time_range(s, e)?;
     }
     Ok(())
+}
+
+/// Enforce a maximum time range span and require `start`.
+/// If `start` is None, defaults to `now - default_lookback_days`.
+/// Returns the effective (start, end) after applying defaults and validation.
+pub fn enforce_time_range(
+    start: Option<chrono::DateTime<chrono::Utc>>,
+    end: Option<chrono::DateTime<chrono::Utc>>,
+    max_days: i64,
+    default_lookback_days: i64,
+) -> AppResult<(chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>)> {
+    let effective_start = start.unwrap_or_else(|| {
+        chrono::Utc::now() - chrono::Duration::days(default_lookback_days)
+    });
+
+    if let Some(e) = end {
+        if e <= effective_start {
+            return Err(AppError::BadRequest(
+                "end time must be after start time".to_string(),
+            ));
+        }
+        let span = e - effective_start;
+        if span.num_days() > max_days {
+            return Err(AppError::BadRequest(format!(
+                "Time range exceeds maximum of {max_days} days"
+            )));
+        }
+    } else {
+        // No end specified — check span against now
+        let span = chrono::Utc::now() - effective_start;
+        if span.num_days() > max_days {
+            return Err(AppError::BadRequest(format!(
+                "Time range exceeds maximum of {max_days} days (provide a narrower start or add an end time)"
+            )));
+        }
+    }
+
+    Ok((effective_start, end))
 }
 
 // ============================================================================
@@ -343,29 +406,72 @@ pub fn build_router(state: AppState) -> Router {
         );
 
     // Health check routes (NO rate limiting)
-    let health_routes = Router::new().route("/healthz", get(healthz));
+    let health_routes = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz));
 
     // OpenAPI documentation
     let docs_routes = Router::new().merge(Scalar::with_url("/docs", ApiDoc::openapi()));
+
+    // Build CORS layer from config
+    let cors = {
+        let origins = &config.cors_allowed_origins;
+        if origins.is_empty() || origins.iter().any(|o| o == "*") {
+            tracing::warn!("CORS: allowing all origins");
+            CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any)
+                .expose_headers([axum::http::header::CONTENT_RANGE])
+        } else {
+            let allowed: Vec<axum::http::HeaderValue> = origins
+                .iter()
+                .filter_map(|o| o.parse().ok())
+                .collect();
+            tracing::info!(origins = ?origins, "CORS: restricted origins");
+            CorsLayer::new()
+                .allow_origin(allowed)
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any)
+                .allow_credentials(true)
+                .expose_headers([
+                    axum::http::header::CONTENT_RANGE,
+                    axum::http::HeaderName::from_static("x-request-id"),
+                ])
+        }
+    };
+
+    let timeout = Duration::from_secs(config.request_timeout_seconds);
+    tracing::info!(timeout_seconds = config.request_timeout_seconds, "Request timeout configured");
 
     // Combine all routes
     Router::new()
         .nest("/api", api_routes)
         .merge(health_routes)
         .merge(docs_routes)
-        .layer(CompressionLayer::new())
         .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any)
-                .expose_headers([axum::http::header::CONTENT_RANGE]),
+            ServiceBuilder::new()
+                .layer(axum::error_handling::HandleErrorLayer::new(|_: tower::BoxError| async {
+                    StatusCode::REQUEST_TIMEOUT
+                }))
+                .timeout(timeout),
         )
+        .layer(CompressionLayer::new())
+        .layer(cors)
         .layer(
             TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .make_span_with(
+                    DefaultMakeSpan::new()
+                        .level(Level::INFO)
+                        .include_headers(false),
+                )
                 .on_request(|req: &axum::http::Request<_>, _span: &tracing::Span| {
-                    tracing::info!("--> {} {}", req.method(), req.uri().path());
+                    let request_id = req
+                        .headers()
+                        .get("x-request-id")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("-");
+                    tracing::info!(request_id = %request_id, "--> {} {}", req.method(), req.uri().path());
                 })
                 .on_response(
                     |res: &axum::http::Response<_>,
@@ -383,5 +489,35 @@ pub fn build_router(state: AppState) -> Router {
                     },
                 ),
         )
+        .layer(axum::middleware::from_fn(request_id_middleware))
         .with_state(state)
+}
+
+/// Middleware that generates a unique request ID for each request.
+async fn request_id_middleware(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    request.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-request-id"),
+        axum::http::HeaderValue::from_str(&request_id).unwrap_or_else(|_| {
+            axum::http::HeaderValue::from_static("unknown")
+        }),
+    );
+
+    let mut response = next.run(request).await;
+    if let Ok(val) = axum::http::HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static("x-request-id"),
+            val,
+        );
+    }
+    response
 }
