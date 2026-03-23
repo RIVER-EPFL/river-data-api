@@ -1,11 +1,11 @@
 use axum::{Json, Router, extract::{Path, State}, routing::{get, post}};
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{ActiveModelTrait, ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, Set, sea_query::Expr};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::{data_streams, sync_commands, sync_events, sync_service_credentials, sync_services, sync_service_tokens};
+use crate::entity::{data_streams, parameters, projects, site_parameters, sites, sync_commands, sync_events, sync_service_credentials, sync_services, sync_service_tokens};
 use crate::error::{AppError, AppResult};
 use crate::services::api_token::{generate_token, hash_token};
 
@@ -19,6 +19,8 @@ pub struct StreamStateResponse {
     pub source_system: String,
     pub source_key: String,
     pub source_name: Option<String>,
+    pub source_path: Option<String>,
+    pub metadata: serde_json::Value,
     pub site_parameter_id: Option<Uuid>,
     pub is_active: bool,
     pub last_data_time: Option<String>,
@@ -155,6 +157,8 @@ pub fn router() -> Router<AppState> {
         .route("/events", get(list_sync_events))
         .route("/credentials", get(list_credentials).post(create_credential))
         .route("/credentials/{id}/revoke", post(revoke_credential))
+        .route("/discovery", get(get_discovery))
+        .route("/apply-discovery", post(apply_discovery))
 }
 
 // ============================================================================
@@ -176,6 +180,8 @@ async fn list_sync_states(
             source_system: s.source_system,
             source_key: s.source_key,
             source_name: s.source_name,
+            source_path: s.source_path,
+            metadata: s.metadata,
             site_parameter_id: s.site_parameter_id,
             is_active: s.is_active,
             last_data_time: s.last_data_time.map(|t| t.to_rfc3339()),
@@ -410,4 +416,634 @@ async fn revoke_service(
         .await?;
 
     Ok(Json(serde_json::json!({"revoked": true})))
+}
+
+// ============================================================================
+// Stream Discovery & Auto-Pairing
+// ============================================================================
+
+#[derive(Serialize)]
+pub struct DiscoveryMatch {
+    pub id: Uuid,
+    pub name: String,
+}
+
+#[derive(Serialize)]
+pub struct DiscoverySuggestion {
+    #[serde(rename = "match")]
+    pub matched: Option<DiscoveryMatch>,
+    pub confidence: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_units: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct DiscoverySuggestions {
+    pub project: DiscoverySuggestion,
+    pub site: DiscoverySuggestion,
+    pub parameter: DiscoverySuggestion,
+    pub site_parameter: DiscoverySuggestion,
+}
+
+#[derive(Serialize)]
+pub struct DiscoveryStreamInfo {
+    pub id: Uuid,
+    pub source_name: Option<String>,
+    pub source_path: Option<String>,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Serialize)]
+pub struct DiscoveryItem {
+    pub stream: DiscoveryStreamInfo,
+    pub suggestions: DiscoverySuggestions,
+    pub action: String,
+}
+
+fn match_confidence(name: &str, candidates: &[(Uuid, String)]) -> DiscoverySuggestion {
+    let lower = name.to_lowercase();
+    // Exact case-insensitive match
+    if let Some((id, cname)) = candidates.iter().find(|(_, n)| n.to_lowercase() == lower) {
+        return DiscoverySuggestion {
+            matched: Some(DiscoveryMatch { id: *id, name: cname.clone() }),
+            confidence: "exact".to_string(),
+            suggested_name: None,
+            suggested_units: None,
+        };
+    }
+    // Fuzzy: substring containment
+    if let Some((id, cname)) = candidates.iter().find(|(_, n)| {
+        n.to_lowercase().contains(&lower) || lower.contains(&n.to_lowercase())
+    }) {
+        return DiscoverySuggestion {
+            matched: Some(DiscoveryMatch { id: *id, name: cname.clone() }),
+            confidence: "fuzzy".to_string(),
+            suggested_name: None,
+            suggested_units: None,
+        };
+    }
+    DiscoverySuggestion {
+        matched: None,
+        confidence: "none".to_string(),
+        suggested_name: Some(name.to_string()),
+        suggested_units: None,
+    }
+}
+
+/// `GET /api/admin/sync/discovery` — returns structured discovery report for unpaired streams.
+async fn get_discovery(
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<DiscoveryItem>>> {
+    let db = &state.db;
+
+    // Fetch unpaired streams
+    let streams = data_streams::Entity::find()
+        .filter(data_streams::Column::SiteParameterId.is_null())
+        .filter(data_streams::Column::IsActive.eq(true))
+        .all(db)
+        .await?;
+
+    if streams.is_empty() {
+        return Ok(Json(vec![]));
+    }
+
+    // Fetch all existing entities for matching
+    let all_projects: Vec<(Uuid, String)> = projects::Entity::find()
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|p| (p.id, p.name))
+        .collect();
+
+    let all_sites: Vec<(Uuid, String, Option<Uuid>)> = sites::Entity::find()
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|s| (s.id, s.name, s.project_id))
+        .collect();
+
+    let all_params: Vec<(Uuid, String)> = parameters::Entity::find()
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|p| (p.id, p.name))
+        .collect();
+
+    let all_site_params: Vec<(Uuid, Uuid, Uuid)> = site_parameters::Entity::find()
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|sp| (sp.id, sp.site_id, sp.parameter_id))
+        .collect();
+
+    let site_candidates: Vec<(Uuid, String)> = all_sites.iter().map(|(id, name, _)| (*id, name.clone())).collect();
+
+    let mut items = Vec::new();
+
+    for stream in streams {
+        // Parse hierarchy from metadata or source_path
+        let hierarchy = stream.metadata.get("hierarchy").cloned();
+        let (project_name, site_name, param_name) = if let Some(h) = &hierarchy {
+            (
+                h.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                h.get("site").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                h.get("parameter").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            )
+        } else if let Some(ref path) = stream.source_path {
+            let segs: Vec<&str> = path.split('/').collect();
+            (
+                segs.get(1).unwrap_or(&"").to_string(),
+                segs.get(2).unwrap_or(&"").to_string(),
+                segs.get(3).unwrap_or(&"").to_string(),
+            )
+        } else {
+            (String::new(), String::new(), stream.source_name.clone().unwrap_or_default())
+        };
+
+        let units = stream.metadata.get("units")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Match project
+        let project_suggestion = if project_name.is_empty() {
+            DiscoverySuggestion {
+                matched: None,
+                confidence: "none".to_string(),
+                suggested_name: None,
+                suggested_units: None,
+            }
+        } else {
+            match_confidence(&project_name, &all_projects)
+        };
+
+        // Match site (prefer sites within matched project)
+        let site_suggestion = if site_name.is_empty() {
+            DiscoverySuggestion {
+                matched: None,
+                confidence: "none".to_string(),
+                suggested_name: None,
+                suggested_units: None,
+            }
+        } else {
+            // Try to match within project first
+            let project_id = project_suggestion.matched.as_ref().map(|m| m.id);
+            let site_within_project: Vec<(Uuid, String)> = if let Some(pid) = project_id {
+                all_sites.iter()
+                    .filter(|(_, _, proj)| *proj == Some(pid))
+                    .map(|(id, name, _)| (*id, name.clone()))
+                    .collect()
+            } else {
+                vec![]
+            };
+
+            let suggestion = if !site_within_project.is_empty() {
+                match_confidence(&site_name, &site_within_project)
+            } else {
+                match_confidence(&site_name, &site_candidates)
+            };
+            suggestion
+        };
+
+        // Match parameter
+        let mut param_suggestion = if param_name.is_empty() {
+            DiscoverySuggestion {
+                matched: None,
+                confidence: "none".to_string(),
+                suggested_name: Some(stream.source_name.clone().unwrap_or_default()),
+                suggested_units: if units.is_empty() { None } else { Some(units.clone()) },
+            }
+        } else {
+            let mut s = match_confidence(&param_name, &all_params);
+            if s.confidence == "none" {
+                s.suggested_units = if units.is_empty() { None } else { Some(units.clone()) };
+            }
+            s
+        };
+        // Always set suggested_units on parameter if available and not already set
+        if param_suggestion.suggested_units.is_none() && !units.is_empty() {
+            param_suggestion.suggested_units = Some(units.clone());
+        }
+
+        // Match site_parameter
+        let sp_suggestion = if let (Some(site_match), Some(param_match)) =
+            (&site_suggestion.matched, &param_suggestion.matched)
+        {
+            if let Some(sp) = all_site_params.iter().find(|(_, sid, pid)| {
+                *sid == site_match.id && *pid == param_match.id
+            }) {
+                DiscoverySuggestion {
+                    matched: Some(DiscoveryMatch {
+                        id: sp.0,
+                        name: format!("{}:{}", site_match.name, param_match.name),
+                    }),
+                    confidence: "exact".to_string(),
+                    suggested_name: None,
+                    suggested_units: None,
+                }
+            } else {
+                DiscoverySuggestion {
+                    matched: None,
+                    confidence: "none".to_string(),
+                    suggested_name: None,
+                    suggested_units: None,
+                }
+            }
+        } else {
+            DiscoverySuggestion {
+                matched: None,
+                confidence: "none".to_string(),
+                suggested_name: None,
+                suggested_units: None,
+            }
+        };
+
+        // Determine action
+        let action = if sp_suggestion.confidence == "exact" {
+            "pair_existing"
+        } else if project_suggestion.confidence != "none"
+            && site_suggestion.confidence != "none"
+        {
+            "create_and_pair"
+        } else {
+            "needs_input"
+        };
+
+        items.push(DiscoveryItem {
+            stream: DiscoveryStreamInfo {
+                id: stream.id,
+                source_name: stream.source_name,
+                source_path: stream.source_path,
+                metadata: stream.metadata,
+            },
+            suggestions: DiscoverySuggestions {
+                project: project_suggestion,
+                site: site_suggestion,
+                parameter: param_suggestion,
+                site_parameter: sp_suggestion,
+            },
+            action: action.to_string(),
+        });
+    }
+
+    Ok(Json(items))
+}
+
+// ============================================================================
+// Apply Discovery
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct ApplyDiscoveryRequest {
+    pub actions: Vec<ApplyAction>,
+}
+
+#[derive(Deserialize)]
+pub struct ApplyAction {
+    pub stream_id: Uuid,
+    #[serde(default)]
+    pub create_project: Option<CreateProjectAction>,
+    #[serde(default)]
+    pub create_site: Option<CreateSiteAction>,
+    #[serde(default)]
+    pub create_parameter: Option<CreateParameterAction>,
+    #[serde(default)]
+    pub create_site_parameter: Option<CreateSiteParameterAction>,
+    /// UUID of existing site_parameter, or "new" to auto-create from above fields
+    pub pair_to: String,
+    #[serde(default)]
+    pub use_project_id: Option<Uuid>,
+    #[serde(default)]
+    pub use_site_id: Option<Uuid>,
+    #[serde(default)]
+    pub use_parameter_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+pub struct CreateProjectAction {
+    pub name: String,
+}
+
+#[derive(Deserialize)]
+pub struct CreateSiteAction {
+    pub name: String,
+}
+
+#[derive(Deserialize)]
+pub struct CreateParameterAction {
+    pub name: String,
+    #[serde(default = "default_display_name")]
+    pub display_name: String,
+    #[serde(default)]
+    pub default_units: String,
+    #[serde(default = "default_category")]
+    pub category: String,
+}
+
+fn default_display_name() -> String { String::new() }
+fn default_category() -> String { "measurement".to_string() }
+
+#[derive(Deserialize)]
+pub struct CreateSiteParameterAction {
+    #[serde(default)]
+    pub display_units: Option<String>,
+    #[serde(default)]
+    pub sample_interval_sec: Option<i32>,
+    #[serde(default)]
+    pub channel_id: Option<i32>,
+}
+
+#[derive(Serialize)]
+pub struct ApplyDiscoveryResponse {
+    pub projects_created: u32,
+    pub sites_created: u32,
+    pub parameters_created: u32,
+    pub site_parameters_created: u32,
+    pub streams_paired: u32,
+    pub total_backfilled: u64,
+    pub errors: Vec<String>,
+}
+
+/// `POST /api/admin/sync/apply-discovery` — batch-processes discovery actions.
+async fn apply_discovery(
+    State(state): State<AppState>,
+    Json(req): Json<ApplyDiscoveryRequest>,
+) -> AppResult<Json<ApplyDiscoveryResponse>> {
+    let db = &state.db;
+    let mut resp = ApplyDiscoveryResponse {
+        projects_created: 0,
+        sites_created: 0,
+        parameters_created: 0,
+        site_parameters_created: 0,
+        streams_paired: 0,
+        total_backfilled: 0,
+        errors: vec![],
+    };
+
+    for action in req.actions {
+        let result = process_action(db, &action).await;
+        match result {
+            Ok(stats) => {
+                resp.projects_created += stats.0;
+                resp.sites_created += stats.1;
+                resp.parameters_created += stats.2;
+                resp.site_parameters_created += stats.3;
+                resp.streams_paired += stats.4;
+                resp.total_backfilled += stats.5;
+            }
+            Err(e) => {
+                resp.errors.push(format!(
+                    "Stream {}: {}",
+                    action.stream_id, e
+                ));
+            }
+        }
+    }
+
+    // Trigger aggregate refresh if any readings were backfilled
+    if resp.total_backfilled > 0 {
+        let db_clone = db.clone();
+        tokio::spawn(async move {
+            crate::services::sync_state::refresh_continuous_aggregates_full(&db_clone).await;
+        });
+    }
+
+    Ok(Json(resp))
+}
+
+/// Process a single apply-discovery action.
+/// Returns (projects_created, sites_created, params_created, site_params_created, streams_paired, backfilled).
+async fn process_action(
+    db: &sea_orm::DatabaseConnection,
+    action: &ApplyAction,
+) -> Result<(u32, u32, u32, u32, u32, u64), String> {
+    let mut projects_created = 0u32;
+    let mut sites_created = 0u32;
+    let mut params_created = 0u32;
+    let mut site_params_created = 0u32;
+
+    // Resolve or create project
+    let project_id = if let Some(pid) = action.use_project_id {
+        pid
+    } else if let Some(ref cp) = action.create_project {
+        // Try to find existing first (case-insensitive)
+        let existing = projects::Entity::find()
+            .filter(Expr::cust_with_values(
+                "LOWER(name) = $1",
+                [cp.name.to_lowercase()],
+            ))
+            .one(db)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if let Some(existing) = existing {
+            existing.id
+        } else {
+            let p = projects::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                name: Set(cp.name.clone()),
+                description: Set(None),
+                data_source: Set("vaisala".to_string()),
+                is_public: Set(false),
+                public_slug: Set(None),
+                public_api_title: Set(None),
+                public_api_description: Set(None),
+                public_api_version: Set(None),
+                public_contact_email: Set(None),
+                created_at: Set(Some(Utc::now())),
+                discovered_at: Set(Some(Utc::now())),
+            };
+            let inserted = p.insert(db).await.map_err(|e| e.to_string())?;
+            projects_created += 1;
+            inserted.id
+        }
+    } else {
+        return Err("No project specified".to_string());
+    };
+
+    // Resolve or create site
+    let site_id = if let Some(sid) = action.use_site_id {
+        sid
+    } else if let Some(ref cs) = action.create_site {
+        let existing = sites::Entity::find()
+            .filter(Expr::cust_with_values(
+                "LOWER(name) = $1",
+                [cs.name.to_lowercase()],
+            ))
+            .one(db)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if let Some(existing) = existing {
+            existing.id
+        } else {
+            let s = sites::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                project_id: Set(Some(project_id)),
+                name: Set(cs.name.clone()),
+                latitude: Set(None),
+                longitude: Set(None),
+                altitude_m: Set(None),
+                public_slug: Set(None),
+                created_at: Set(Some(Utc::now())),
+                discovered_at: Set(Some(Utc::now())),
+            };
+            let inserted = s.insert(db).await.map_err(|e| e.to_string())?;
+            sites_created += 1;
+            inserted.id
+        }
+    } else {
+        return Err("No site specified".to_string());
+    };
+
+    // Resolve or create parameter
+    let parameter_id = if let Some(pid) = action.use_parameter_id {
+        pid
+    } else if let Some(ref cp) = action.create_parameter {
+        let existing = parameters::Entity::find()
+            .filter(Expr::cust_with_values(
+                "LOWER(name) = $1",
+                [cp.name.to_lowercase()],
+            ))
+            .one(db)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if let Some(existing) = existing {
+            existing.id
+        } else {
+            let display_name = if cp.display_name.is_empty() {
+                cp.name.clone()
+            } else {
+                cp.display_name.clone()
+            };
+            let p = parameters::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                name: Set(cp.name.clone()),
+                display_name: Set(display_name),
+                default_units: Set(cp.default_units.clone()),
+                category: Set(cp.category.clone()),
+                data_type: Set("numeric".to_string()),
+                description: Set(None),
+                default_warning_min: Set(None),
+                default_warning_max: Set(None),
+                default_alarm_min: Set(None),
+                default_alarm_max: Set(None),
+                created_at: Set(Some(Utc::now())),
+            };
+            let inserted = p.insert(db).await.map_err(|e| e.to_string())?;
+            params_created += 1;
+            inserted.id
+        }
+    } else {
+        return Err("No parameter specified".to_string());
+    };
+
+    // Resolve or create site_parameter
+    let site_parameter_id = if action.pair_to == "new" {
+        // Check if already exists
+        let existing = site_parameters::Entity::find()
+            .filter(
+                Condition::all()
+                    .add(site_parameters::Column::SiteId.eq(site_id))
+                    .add(site_parameters::Column::ParameterId.eq(parameter_id)),
+            )
+            .one(db)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if let Some(existing) = existing {
+            existing.id
+        } else {
+            let csp = &action.create_site_parameter;
+            // Get the parameter name for the site_parameter name
+            let param = parameters::Entity::find_by_id(parameter_id)
+                .one(db)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("Parameter not found")?;
+
+            let sp = site_parameters::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                site_id: Set(site_id),
+                parameter_id: Set(parameter_id),
+                name: Set(param.name),
+                sensor_type: Set(String::new()),
+                display_units: Set(csp.as_ref().and_then(|c| c.display_units.clone())),
+                units_name: Set(None),
+                units_min: Set(None),
+                units_max: Set(None),
+                decimal_places: Set(None),
+                channel_id: Set(csp.as_ref().and_then(|c| c.channel_id)),
+                sample_interval_sec: Set(csp.as_ref().and_then(|c| c.sample_interval_sec)),
+                is_active: Set(Some(true)),
+                is_derived: Set(Some(false)),
+                derived_definition_id: Set(None),
+                variable_mappings: Set(None),
+                created_at: Set(Some(Utc::now())),
+                updated_at: Set(Some(Utc::now())),
+                discovered_at: Set(Some(Utc::now())),
+            };
+            let inserted = sp.insert(db).await.map_err(|e| e.to_string())?;
+            site_params_created += 1;
+            inserted.id
+        }
+    } else {
+        Uuid::parse_str(&action.pair_to).map_err(|_| "Invalid site_parameter_id".to_string())?
+    };
+
+    // Pair the stream
+    let stream = data_streams::Entity::find_by_id(action.stream_id)
+        .one(db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("Stream not found")?;
+
+    if stream.site_parameter_id.is_some() {
+        return Err("Stream is already paired".to_string());
+    }
+
+    let sp = site_parameters::Entity::find_by_id(site_parameter_id)
+        .one(db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("Site parameter not found")?;
+
+    let now = Utc::now();
+    let mut active: data_streams::ActiveModel = stream.into();
+    active.site_parameter_id = Set(Some(site_parameter_id));
+    active.paired_at = Set(Some(now.into()));
+    active.updated_at = Set(now.into());
+    active.update(db).await.map_err(|e| e.to_string())?;
+
+    // Backfill readings
+    use sea_orm::{ConnectionTrait, Statement};
+    let result = db
+        .execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE readings
+              SET site_id = $1, parameter_id = $2,
+                  calibrated_value = COALESCE(calibrated_value, raw_value)
+              WHERE stream_id = $3 AND site_id IS NULL",
+            [sp.site_id.into(), sp.parameter_id.into(), action.stream_id.into()],
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let backfilled = result.rows_affected();
+
+    // Backfill status_events too
+    let _ = db
+        .execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE status_events
+              SET site_id = $1, parameter_id = $2
+              WHERE stream_id = $3 AND site_id IS NULL",
+            [sp.site_id.into(), sp.parameter_id.into(), action.stream_id.into()],
+        ))
+        .await;
+
+    Ok((projects_created, sites_created, params_created, site_params_created, 1, backfilled))
 }

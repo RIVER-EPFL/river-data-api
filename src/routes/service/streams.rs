@@ -12,6 +12,66 @@ use crate::error::{AppError, AppResult};
 use crate::services::sync_state::refresh_continuous_aggregates_full;
 
 // ============================================================================
+// Stream Stats
+// ============================================================================
+
+#[derive(Debug, Serialize)]
+pub struct StreamStatsResponse {
+    pub stream_id: Uuid,
+    pub reading_count: i64,
+    pub min_time: Option<chrono::DateTime<Utc>>,
+    pub max_time: Option<chrono::DateTime<Utc>>,
+    pub latest_value: Option<f64>,
+}
+
+/// `GET /api/service/streams/{id}/stats` — reading stats for a stream.
+pub async fn stream_stats(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<StreamStatsResponse>> {
+    // Verify stream exists
+    data_streams::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
+
+    let row = state.db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT COUNT(*) as count, MIN(time) as min_time, MAX(time) as max_time FROM readings WHERE stream_id = $1",
+            [id.into()],
+        ))
+        .await?;
+
+    let (count, min_time, max_time) = if let Some(row) = row {
+        let count: i64 = row.try_get("", "count").unwrap_or(0);
+        let min_time: Option<chrono::DateTime<chrono::FixedOffset>> = row.try_get("", "min_time").ok();
+        let max_time: Option<chrono::DateTime<chrono::FixedOffset>> = row.try_get("", "max_time").ok();
+        (count, min_time.map(|t| t.with_timezone(&Utc)), max_time.map(|t| t.with_timezone(&Utc)))
+    } else {
+        (0, None, None)
+    };
+
+    // Get latest value
+    let latest_row = state.db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT raw_value FROM readings WHERE stream_id = $1 ORDER BY time DESC LIMIT 1",
+            [id.into()],
+        ))
+        .await?;
+    let latest_value: Option<f64> = latest_row.and_then(|r| r.try_get("", "raw_value").ok());
+
+    Ok(Json(StreamStatsResponse {
+        stream_id: id,
+        reading_count: count,
+        min_time,
+        max_time,
+        latest_value,
+    }))
+}
+
+// ============================================================================
 // Stream Registration
 // ============================================================================
 

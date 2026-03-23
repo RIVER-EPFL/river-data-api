@@ -89,11 +89,12 @@ async fn create_session_token(
     let token = sync_service_tokens::ActiveModel {
         id: Set(Uuid::new_v4()),
         service_id: Set(service_id),
-        token_hash: Set(token_hash),
+        token_hash: Set(token_hash.clone()),
         expires_at: Set((Utc::now() + chrono::Duration::minutes(SESSION_TOKEN_TTL_MINUTES)).into()),
         created_at: Set(Utc::now().into()),
     };
     token.insert(db).await?;
+    tracing::debug!(%service_id, token_hash_prefix = %&token_hash[..8], "Session token created");
 
     // Fire-and-forget: clean up expired tokens for this service
     let db_clone = db.clone();
@@ -176,8 +177,10 @@ pub async fn enroll(
         cred_active.update(&state.db).await?;
     }
 
-    // Generate session token
+    // Generate session token and cache it (so the next heartbeat returns this token,
+    // not a stale one from before re-enrollment).
     let session_token = create_session_token(&state.db, service_id).await?;
+    SESSION_TOKEN_CACHE.insert(service_id, session_token.clone()).await;
 
     Ok(Json(EnrollResponse {
         service_id,
@@ -206,7 +209,7 @@ pub async fn heartbeat(
     }
 
     // Validate status
-    const VALID_SERVICE_STATUSES: &[&str] = &["starting", "idle", "syncing", "error", "stopping"];
+    const VALID_SERVICE_STATUSES: &[&str] = &["starting", "idle", "running", "paused", "syncing", "error", "stopping"];
     if !VALID_SERVICE_STATUSES.contains(&req.status.as_str()) {
         return Err(AppError::BadRequest(format!(
             "Invalid status '{}'. Valid: {}",
@@ -337,8 +340,8 @@ pub async fn create_sync_event(
     State(state): State<AppState>,
     Json(req): Json<CreateSyncEventRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    const VALID_EVENT_TYPES: &[&str] = &["scheduled", "manual", "command"];
-    const VALID_EVENT_STATUSES: &[&str] = &["running", "completed", "failed", "cancelled"];
+    const VALID_EVENT_TYPES: &[&str] = &["scheduled", "manual", "command", "triggered", "full_sync"];
+    const VALID_EVENT_STATUSES: &[&str] = &["running", "completed", "partial", "failed", "cancelled"];
 
     if let Some(ref event_type) = req.event_type {
         if !VALID_EVENT_TYPES.contains(&event_type.as_str()) {
@@ -394,7 +397,10 @@ pub async fn update_sync_event(
         .await?
         .ok_or_else(|| AppError::NotFound("Sync event not found".to_string()))?;
 
+    let service_id = event.service_id;
     let mut active: sync_events::ActiveModel = event.into();
+
+    let is_terminal = matches!(req.status.as_deref(), Some("completed" | "partial"));
 
     if let Some(status) = req.status {
         active.status = Set(status);
@@ -417,6 +423,19 @@ pub async fn update_sync_event(
     active.completed_at = Set(Some(Utc::now().into()));
 
     active.update(&state.db).await?;
+
+    // Update last_sync_completed_at on the service when sync finishes successfully
+    if is_terminal {
+        if let Some(service) = sync_services::Entity::find_by_id(service_id)
+            .one(&state.db)
+            .await?
+        {
+            let mut svc_active: sync_services::ActiveModel = service.into();
+            svc_active.last_sync_completed_at = Set(Some(Utc::now().into()));
+            svc_active.updated_at = Set(Utc::now().into());
+            svc_active.update(&state.db).await?;
+        }
+    }
 
     Ok(Json(serde_json::json!({"updated": true})))
 }

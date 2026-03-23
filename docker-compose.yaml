@@ -66,6 +66,9 @@ services:
     volumes:
       - ./src:/app/src
       - ./migration:/app/migration
+      - ./river-data-sync-common/src:/app/river-data-sync-common/src
+      - ./river-data-sync-vaisala/src:/app/river-data-sync-vaisala/src
+      - ./river-data-toolbox/src:/app/river-data-toolbox/src
       - ./Cargo.toml:/app/Cargo.toml
       - ./Cargo.lock:/app/Cargo.lock
       - river-db-rust-data:/app/target

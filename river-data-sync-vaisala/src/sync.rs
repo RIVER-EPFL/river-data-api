@@ -11,10 +11,28 @@ use crate::vaisala_client::{SyncError, VaisalaClient};
 
 const BATCH_SIZE: usize = 1000;
 
+/// Parse a Vaisala source path into hierarchy components.
+///
+/// Path format: `viewLinc/PROJECT/SITE/PARAMETER`
+/// Returns (project, site, parameter) names extracted from the path.
+fn parse_hierarchy(path: &str) -> serde_json::Value {
+    let segments: Vec<&str> = path.split('/').collect();
+    // [0]="viewLinc" (skip), [1]=project, [2]=site, [3]=parameter
+    serde_json::json!({
+        "project": segments.get(1).unwrap_or(&""),
+        "site": segments.get(2).unwrap_or(&""),
+        "parameter": segments.get(3).unwrap_or(&""),
+    })
+}
+
 /// Discover locations from Vaisala and register them as data streams.
 ///
 /// No entity creation (projects, sites, parameters, sensors, calibrations, etc.)
 /// — sync services only register streams and push data.
+///
+/// Enriches stream metadata with hierarchy (project/site/parameter parsed from
+/// source_path), device info (serial numbers), units, and sample interval from
+/// the Vaisala `locations_data` endpoint.
 pub async fn discover_streams(
     api: &RiverDataClient,
     vaisala: &VaisalaClient,
@@ -22,6 +40,32 @@ pub async fn discover_streams(
     tracing::info!("Discovering streams from Vaisala...");
 
     let locations = vaisala.get_locations().await?;
+
+    // Collect leaf location IDs for the locations_data call
+    let leaf_ids: Vec<i32> = locations
+        .data
+        .iter()
+        .filter(|r| !r.attributes.deleted && r.attributes.leaf)
+        .map(|r| r.attributes.node_id)
+        .collect();
+
+    // Fetch device metadata for all leaf locations
+    let location_data_map: HashMap<i32, _> = if !leaf_ids.is_empty() {
+        match vaisala.get_locations_data(&leaf_ids).await {
+            Ok(data) => data
+                .data
+                .into_iter()
+                .map(|r| (r.attributes.id, r.attributes))
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to fetch locations_data, proceeding without device metadata");
+                HashMap::new()
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+
     let mut stream_map: HashMap<i32, Uuid> = HashMap::new();
 
     for resource in &locations.data {
@@ -34,14 +78,32 @@ pub async fn discover_streams(
         // Extract leaf name from path (last segment)
         let leaf_name = attrs.path.split('/').last().unwrap_or(&attrs.text);
 
+        // Build enriched metadata
+        let hierarchy = parse_hierarchy(&attrs.path);
+        let mut metadata = serde_json::json!({
+            "vaisala_node_id": attrs.node_id,
+            "hierarchy": hierarchy,
+        });
+
+        // Merge device metadata from locations_data if available
+        if let Some(ld) = location_data_map.get(&attrs.node_id) {
+            metadata["device"] = serde_json::json!({
+                "logger_serial": &ld.logger_serial_number,
+                "probe_serial": &ld.probe_serial_number,
+                "logger_device": &ld.logger_device,
+                "device_class": &ld.device_class,
+            });
+            metadata["units"] = serde_json::json!(&ld.display_units);
+            metadata["sample_interval_sec"] = serde_json::json!(ld.sample_interval_sec);
+            metadata["channel_id"] = serde_json::json!(ld.channel_id);
+        }
+
         let req = RegisterStreamRequest {
             source_system: "vaisala".to_string(),
             source_key: location_key.clone(),
             source_name: Some(leaf_name.to_string()),
             source_path: Some(attrs.path.clone()),
-            metadata: serde_json::json!({
-                "vaisala_node_id": attrs.node_id,
-            }),
+            metadata,
         };
 
         match api.register_stream(&req).await {

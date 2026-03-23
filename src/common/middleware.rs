@@ -286,13 +286,19 @@ pub async fn sync_service_auth_middleware(
 
     let token = match token {
         Ok(Some(t)) => t,
-        _ => {
+        Ok(None) => {
+            tracing::debug!(token_hash_prefix = %&token_hash[..8], "Sync token not found in DB");
+            return AppError::Unauthorized("Invalid session token".to_string()).into_response();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "DB error looking up sync token");
             return AppError::Unauthorized("Invalid session token".to_string()).into_response();
         }
     };
 
     // Check expiry
     if token.expires_at.with_timezone(&chrono::Utc) < chrono::Utc::now() {
+        tracing::debug!(service_id = %token.service_id, "Sync token expired");
         return AppError::Unauthorized("Session token expired".to_string()).into_response();
     }
 

@@ -33,6 +33,7 @@ impl MigrationTrait for Migration {
                 public_slug VARCHAR(64),
                 public_api_title VARCHAR(128),
                 public_api_description TEXT,
+                public_api_version VARCHAR(32),
                 public_contact_email VARCHAR(128),
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 discovered_at TIMESTAMPTZ
@@ -509,7 +510,7 @@ impl MigrationTrait for Migration {
                 log JSONB,
                 started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 completed_at TIMESTAMPTZ,
-                duration_ms BIGINT NOT NULL DEFAULT 0
+                duration_ms BIGINT DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_sync_events_service ON sync_events (service_id, started_at DESC);
             "#,
