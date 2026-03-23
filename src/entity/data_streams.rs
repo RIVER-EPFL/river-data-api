@@ -34,6 +34,8 @@ pub struct Model {
     #[crudcrate(filterable)]
     pub site_parameter_id: Option<Uuid>,
     #[crudcrate(filterable)]
+    pub sensor_id: Option<Uuid>,
+    #[crudcrate(filterable)]
     pub is_active: bool,
     #[crudcrate(sortable, exclude(create, update))]
     pub discovered_at: DateTimeWithTimeZone,
@@ -55,11 +57,23 @@ pub enum Relation {
         to = "super::site_parameters::Column::Id"
     )]
     SiteParameter,
+    #[sea_orm(
+        belongs_to = "super::sensors::Entity",
+        from = "Column::SensorId",
+        to = "super::sensors::Column::Id"
+    )]
+    Sensor,
 }
 
 impl Related<super::site_parameters::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SiteParameter.def()
+    }
+}
+
+impl Related<super::sensors::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Sensor.def()
     }
 }
 

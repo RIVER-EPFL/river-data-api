@@ -432,7 +432,7 @@ pub async fn get_site_readings(
             ParameterData {
                 id: sp.id,
                 name: sp.name.clone(),
-                sensor_type: sp.sensor_type.clone(),
+                sensor_type: if sp.sensor_type.is_empty() { sp.name.clone() } else { sp.sensor_type.clone() },
                 units: sp.display_units.clone(),
                 values,
                 severities: severities_vec,

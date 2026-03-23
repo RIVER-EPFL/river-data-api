@@ -91,6 +91,70 @@ pub fn d13c_dic(
     dividend / divisor
 }
 
+/// Result of replicate DIC calculations (A + B).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DicReplicateResult {
+    pub dic_a: f64,
+    pub dic_b: f64,
+    pub dic_avg: f64,
+    pub dic_std: f64,
+    pub d13c_a: Option<f64>,
+    pub d13c_b: Option<f64>,
+    pub d13c_avg: Option<f64>,
+    pub d13c_std: Option<f64>,
+}
+
+/// Compute DIC and optional δ13C-DIC for two replicates, returning individual values plus avg/SD.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn dic_replicates(
+    // Replicate A inputs
+    a_acid_sample_wt: f64,
+    a_acid_wt: f64,
+    a_overpressure: f64,
+    a_sa_added: f64,
+    a_co2_dry: f64,
+    a_d13co2: Option<f64>,
+    // Replicate B inputs
+    b_acid_sample_wt: f64,
+    b_acid_wt: f64,
+    b_overpressure: f64,
+    b_sa_added: f64,
+    b_co2_dry: f64,
+    b_d13co2: Option<f64>,
+    // Shared
+    lab_temp_c: f64,
+    constants: &DICConstants,
+) -> DicReplicateResult {
+    let dic_a = dic_concentration(a_acid_sample_wt, a_acid_wt, a_overpressure, a_sa_added, a_co2_dry, lab_temp_c, constants);
+    let dic_b = dic_concentration(b_acid_sample_wt, b_acid_wt, b_overpressure, b_sa_added, b_co2_dry, lab_temp_c, constants);
+
+    let dic_avg = crate::common::mean(&[dic_a, dic_b]);
+    let dic_std = crate::common::std_dev(&[dic_a, dic_b]);
+
+    let d13c_a = a_d13co2.map(|d| d13c_dic(a_acid_sample_wt, a_acid_wt, a_overpressure, d, lab_temp_c, constants));
+    let d13c_b = b_d13co2.map(|d| d13c_dic(b_acid_sample_wt, b_acid_wt, b_overpressure, d, lab_temp_c, constants));
+
+    let (d13c_avg, d13c_std) = match (d13c_a, d13c_b) {
+        (Some(a), Some(b)) => (
+            Some(crate::common::mean(&[a, b])),
+            Some(crate::common::std_dev(&[a, b])),
+        ),
+        _ => (None, None),
+    };
+
+    DicReplicateResult {
+        dic_a,
+        dic_b,
+        dic_avg,
+        dic_std,
+        d13c_a,
+        d13c_b,
+        d13c_avg,
+        d13c_std,
+    }
+}
+
 /// Convenience: compute both DIC and δ13C-DIC together.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
@@ -162,5 +226,27 @@ mod tests {
         // acid_sample_weight == acid_weight => sampleV = 0 => division by zero
         let result = dic_concentration(5.0, 5.0, 0.5, 5.0, 500.0, 22.0, &c);
         assert!(result.is_nan(), "expected NaN for zero sample volume");
+    }
+
+    #[test]
+    fn test_dic_replicates_avg_between_a_and_b() {
+        let c = test_constants();
+        // Use slightly different inputs for A and B to get different DIC values
+        let result = dic_replicates(
+            15.0, 5.0, 0.5, 5.0, 500.0, Some(-15.0), // A
+            15.5, 5.0, 0.6, 5.0, 520.0, Some(-14.0), // B
+            22.0,
+            &c,
+        );
+        // avg should be between a and b
+        assert!(result.dic_avg >= result.dic_a.min(result.dic_b), "avg should be >= min(a,b)");
+        assert!(result.dic_avg <= result.dic_a.max(result.dic_b), "avg should be <= max(a,b)");
+        // std should be positive and finite
+        assert!(result.dic_std > 0.0 && result.dic_std.is_finite(), "std should be positive, got {}", result.dic_std);
+        // d13c should also be present
+        assert!(result.d13c_avg.is_some());
+        assert!(result.d13c_std.is_some());
+        assert!(result.d13c_a.is_some());
+        assert!(result.d13c_b.is_some());
     }
 }

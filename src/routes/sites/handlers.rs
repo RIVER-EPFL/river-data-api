@@ -51,13 +51,16 @@ pub async fn list_site_parameters(
 
     let response: Vec<ParameterResponse> = params_list
         .into_iter()
-        .map(|p| ParameterResponse {
-            id: p.id,
-            name: p.name,
-            sensor_type: p.sensor_type,
-            display_units: p.display_units,
-            sample_interval_sec: p.sample_interval_sec,
-            is_active: p.is_active,
+        .map(|p| {
+            let sensor_type = if p.sensor_type.is_empty() { p.name.clone() } else { p.sensor_type };
+            ParameterResponse {
+                id: p.id,
+                name: p.name,
+                sensor_type,
+                display_units: p.display_units,
+                sample_interval_sec: p.sample_interval_sec,
+                is_active: p.is_active,
+            }
         })
         .collect();
 
@@ -110,13 +113,16 @@ pub async fn get_site_detail(
 
     let parameters: Vec<ParameterResponse> = params_list
         .into_iter()
-        .map(|p| ParameterResponse {
-            id: p.id,
-            name: p.name,
-            sensor_type: p.sensor_type,
-            display_units: p.display_units,
-            sample_interval_sec: p.sample_interval_sec,
-            is_active: p.is_active,
+        .map(|p| {
+            let sensor_type = if p.sensor_type.is_empty() { p.name.clone() } else { p.sensor_type };
+            ParameterResponse {
+                id: p.id,
+                name: p.name,
+                sensor_type,
+                display_units: p.display_units,
+                sample_interval_sec: p.sample_interval_sec,
+                is_active: p.is_active,
+            }
         })
         .collect();
 

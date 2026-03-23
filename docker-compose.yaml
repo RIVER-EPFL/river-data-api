@@ -138,6 +138,67 @@ services:
       timeout: 5s
       retries: 10
 
+  # ── Portal source databases (dev only) ──────────────────────────────
+  portal-db-cnet:
+    image: mariadb:10.3
+    profiles: [portal]
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: cnet_db
+      MYSQL_USER: sync_reader
+      MYSQL_PASSWORD: sync_reader
+    ports:
+      - "3310:3306"
+    volumes:
+      - ../../../../dumps/cnet_db_prod.sql:/docker-entrypoint-initdb.d/01-data.sql
+      - portal-cnet-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  portal-db-metalp:
+    image: mariadb:10.3
+    profiles: [portal]
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: metalp_db
+      MYSQL_USER: sync_reader
+      MYSQL_PASSWORD: sync_reader
+    ports:
+      - "3311:3306"
+    volumes:
+      - ../../../../dumps/metalp_db_prod.sql:/docker-entrypoint-initdb.d/01-data.sql
+      - portal-metalp-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  portal-db-nomis:
+    image: mariadb:10.3
+    profiles: [portal]
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: nomis_db
+      MYSQL_USER: sync_reader
+      MYSQL_PASSWORD: sync_reader
+    ports:
+      - "3312:3306"
+    volumes:
+      - ../../../../dumps/nomis_db_prod.sql:/docker-entrypoint-initdb.d/01-data.sql
+      - portal-nomis-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
 volumes:
   river-db-timescale-data:
   river-db-rust-data:
+  portal-cnet-data:
+  portal-metalp-data:
+  portal-nomis-data:

@@ -37,6 +37,8 @@ pub struct Model {
     #[crudcrate(filterable)]
     pub is_lab_instrument: Option<bool>,
     pub notes: Option<String>,
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub metadata: Option<serde_json::Value>,
     #[crudcrate(exclude(create, update))]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }

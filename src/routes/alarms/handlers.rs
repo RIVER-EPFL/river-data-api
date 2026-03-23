@@ -239,7 +239,7 @@ pub async fn get_site_alarms(
         .map(|p| ParameterWithThreshold {
             id: p.parameter_id,
             name: p.name.clone(),
-            sensor_type: p.sensor_type.clone(),
+            sensor_type: if p.sensor_type.is_empty() { p.name.clone() } else { p.sensor_type.clone() },
             display_units: p.display_units.clone(),
         })
         .collect();
@@ -411,7 +411,7 @@ pub async fn get_site_alarms(
             Some(ParameterViolationData {
                 id: param.id,
                 name: param.name.clone(),
-                sensor_type: param.sensor_type.clone(),
+                sensor_type: if param.sensor_type.is_empty() { param.name.clone() } else { param.sensor_type.clone() },
                 units: param.display_units.clone(),
                 values,
                 severities,

@@ -11,6 +11,7 @@ use crate::error::{AppError, AppResult};
 #[derive(Debug, Deserialize)]
 pub struct GrabSampleRequest {
     pub site_id: Uuid,
+    pub field_trip_id: Option<Uuid>,
     pub readings: Vec<GrabSampleReading>,
 }
 
@@ -56,6 +57,7 @@ async fn get_or_create_grab_stream(
         source_path: Set(None),
         metadata: Set(serde_json::json!({})),
         site_parameter_id: Set(None),
+        sensor_id: Set(None),
         is_active: Set(true),
         discovered_at: Set(now.into()),
         paired_at: Set(None),
@@ -151,7 +153,7 @@ pub async fn insert_grab_samples(
                 measurement_type: Set(Some("spot".to_string())),
                 is_flagged: Set(Some(false)),
                 flag_reason: Set(None),
-                field_trip_id: Set(None),
+                field_trip_id: Set(payload.field_trip_id),
             }
         })
         .collect();

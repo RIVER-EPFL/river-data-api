@@ -59,8 +59,8 @@ pub async fn calculate_doc(Json(payload): Json<DocRequest>) -> AppResult<Json<To
     Ok(Json(ToolResult {
         tool: "doc".to_string(),
         results: serde_json::json!({
-            "doc_avg": avg,
-            "doc_sd": sd,
+            "DOC_avg_ppb": avg,
+            "DOC_sd_ppb": sd,
         }),
     }))
 }
@@ -86,25 +86,15 @@ pub async fn calculate_tss_afdm(
         payload.vol_filtered_ml,
     );
 
-    let (afdm, pct_organic) = match payload.wgt_ashed_g {
-        Some(ashed) => {
-            let a = river_data_toolbox::afdm_mg_l(
-                payload.wgt_dried_g,
-                ashed,
-                payload.vol_filtered_ml,
-            );
-            let pct = river_data_toolbox::percent_organic(tss, a);
-            (Some(a), Some(pct))
-        }
-        None => (None, None),
-    };
+    let afdm = payload.wgt_ashed_g.map(|ashed| {
+        river_data_toolbox::afdm_mg_l(payload.wgt_dried_g, ashed, payload.vol_filtered_ml)
+    });
 
     Ok(Json(ToolResult {
         tool: "tss_afdm".to_string(),
         results: serde_json::json!({
-            "tss_mg_l": tss,
-            "afdm_mg_l": afdm,
-            "percent_organic": pct_organic,
+            "TSS_dry_weight_mgL": tss,
+            "AFDM_mgL": afdm,
         }),
     }))
 }
@@ -153,11 +143,19 @@ pub async fn calculate_chlorophyll(
         ),
     };
 
+    let mut results = serde_json::Map::new();
+    match payload.method {
+        ChlorophyllMethod::Acid => {
+            results.insert("Chla_acid_ugL_avg".into(), serde_json::json!(chla));
+        }
+        ChlorophyllMethod::NoAcid => {
+            results.insert("Chla_noacid_ugL_avg".into(), serde_json::json!(chla));
+        }
+    }
+
     Ok(Json(ToolResult {
         tool: "chlorophyll".to_string(),
-        results: serde_json::json!({
-            "chla_ug_l": chla,
-        }),
+        results: serde_json::Value::Object(results),
     }))
 }
 
@@ -167,7 +165,10 @@ pub async fn calculate_chlorophyll(
 
 #[derive(Debug, Deserialize)]
 pub struct NutrientsRequest {
-    pub replicates: Vec<f64>,
+    /// Multi-species mode: each key is a species name, value is replicates
+    pub species: Option<std::collections::HashMap<String, Vec<f64>>>,
+    /// Legacy single-species mode
+    pub replicates: Option<Vec<f64>>,
     pub nox: Option<f64>,
     pub no2: Option<f64>,
 }
@@ -175,19 +176,31 @@ pub struct NutrientsRequest {
 pub async fn calculate_nutrients(
     Json(payload): Json<NutrientsRequest>,
 ) -> AppResult<Json<ToolResult>> {
-    let result = river_data_toolbox::nutrient_from_replicates(&payload.replicates);
-    let no3 = match (payload.nox, payload.no2) {
-        (Some(nox), Some(no2)) => Some(river_data_toolbox::nitrate_from_nox_no2(nox, no2)),
-        _ => None,
-    };
+    let mut results = serde_json::Map::new();
+
+    if let Some(species) = &payload.species {
+        // Multi-species mode
+        let multi = river_data_toolbox::multi_nutrient_replicates(species);
+        for (name, nr) in &multi {
+            let upper = name.to_uppercase();
+            results.insert(format!("NUT_{upper}_avg"), serde_json::json!(nr.mean));
+            results.insert(format!("NUT_{upper}_sd"), serde_json::json!(nr.std_dev));
+        }
+    } else if let Some(replicates) = &payload.replicates {
+        // Legacy single-species mode
+        let result = river_data_toolbox::nutrient_from_replicates(replicates);
+        let no3 = match (payload.nox, payload.no2) {
+            (Some(nox), Some(no2)) => Some(river_data_toolbox::nitrate_from_nox_no2(nox, no2)),
+            _ => None,
+        };
+        results.insert("NUT_avg".into(), serde_json::json!(result.mean));
+        results.insert("NUT_sd".into(), serde_json::json!(result.std_dev));
+        results.insert("NUT_NO3_avg".into(), serde_json::json!(no3));
+    }
 
     Ok(Json(ToolResult {
         tool: "nutrients".to_string(),
-        results: serde_json::json!({
-            "mean": result.mean,
-            "std_dev": result.std_dev,
-            "no3": no3,
-        }),
+        results: serde_json::Value::Object(results),
     }))
 }
 
@@ -226,7 +239,7 @@ pub async fn calculate_ions(Json(payload): Json<IonsRequest>) -> AppResult<Json<
         results: serde_json::json!({
             "sum_cations_meq": result.sum_cations_meq,
             "sum_anions_meq": result.sum_anions_meq,
-            "balance_percent": result.balance_percent,
+            "balance_percent": result.balance_percent
         }),
     }))
 }
@@ -240,6 +253,7 @@ pub struct AlkalinityRequest {
     pub sample_weight_g: f64,
     pub acid_normality: f64,
     pub titrant_volume_ml: f64,
+    pub initial_ph: Option<f64>,
 }
 
 pub async fn calculate_alkalinity(
@@ -251,12 +265,17 @@ pub async fn calculate_alkalinity(
         payload.titrant_volume_ml,
     );
 
+    let mut results = serde_json::Map::new();
+    results.insert("alkalinity_meq_l".into(), serde_json::json!(result.alkalinity_meq_l));
+    results.insert("alkalinity_mg_l_caco3".into(), serde_json::json!(result.alkalinity_mg_l_caco3));
+
+    if let Some(ph) = payload.initial_ph {
+        results.insert("WTW_pH_1".into(), serde_json::json!(ph));
+    }
+
     Ok(Json(ToolResult {
         tool: "alkalinity".to_string(),
-        results: serde_json::json!({
-            "alkalinity_meq_l": result.alkalinity_meq_l,
-            "alkalinity_mg_l_caco3": result.alkalinity_mg_l_caco3,
-        }),
+        results: serde_json::Value::Object(results),
     }))
 }
 
@@ -264,13 +283,12 @@ pub async fn calculate_alkalinity(
 // pCO2 Tool
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
-pub struct Pco2Request {
-    pub co2_aq_umol: f64,
-    pub water_temp_c: f64,
-    pub pressure_hpa: Option<f64>,
-    #[serde(default)]
-    pub variant: Pco2Variant,
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pco2Mode {
+    #[default]
+    Simple,
+    FullPipeline,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -282,9 +300,44 @@ pub enum Pco2Variant {
     P2,
 }
 
-pub async fn calculate_pco2(db: &DatabaseConnection, Json(payload): Json<Pco2Request>) -> AppResult<Json<ToolResult>> {
+#[derive(Debug, Deserialize)]
+pub struct Pco2Request {
+    // Simple mode fields (existing)
+    pub co2_aq_umol: Option<f64>,
+    pub water_temp_c: f64,
+    pub pressure_hpa: Option<f64>,
+    #[serde(default)]
+    pub variant: Pco2Variant,
+
+    // Mode selector
+    #[serde(default)]
+    pub mode: Pco2Mode,
+
+    // Full pipeline fields (new)
+    pub co2_ppm: Option<f64>,
+    pub h2o_percent: Option<f64>,
+    pub ch4_ppm: Option<f64>,
+    pub d13co2_permil: Option<f64>,
+    pub lab_temp_c: Option<f64>,
+    pub lab_pressure_atm: Option<f64>,
+    pub vol_sa_ml: Option<f64>,
+    pub vol_water_ml: Option<f64>,
+
+    // Replicate B (optional, for full pipeline mode)
+    pub replicate_b: Option<Pco2ReplicateBInput>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Pco2ReplicateBInput {
+    pub co2_ppm: f64,
+    pub h2o_percent: f64,
+    pub ch4_ppm: f64,
+    pub d13co2_permil: Option<f64>,
+}
+
+async fn load_gas_constants(db: &DatabaseConnection) -> river_data_toolbox::GasConstants {
     let defaults = river_data_toolbox::GasConstants::default();
-    let constants = river_data_toolbox::GasConstants {
+    river_data_toolbox::GasConstants {
         kh_co2: get_constant(db, "kh_co2", defaults.kh_co2).await,
         c_const: get_constant(db, "c_const", defaults.c_const).await,
         gas_const_r_atm: get_constant(db, "gas_const_r_atm", defaults.gas_const_r_atm).await,
@@ -292,37 +345,145 @@ pub async fn calculate_pco2(db: &DatabaseConnection, Json(payload): Json<Pco2Req
         kh_ch4: get_constant(db, "kh_ch4", defaults.kh_ch4).await,
         ch4_temp_const: get_constant(db, "ch4_temp_const", defaults.ch4_temp_const).await,
         ch4_in_sa: get_constant(db, "ch4_in_sa", defaults.ch4_in_sa).await,
-    };
+    }
+}
 
-    let pco2 = match payload.variant {
-        Pco2Variant::Simple => {
-            river_data_toolbox::pco2_from_co2aq(payload.co2_aq_umol, payload.water_temp_c, &constants)
-        }
-        Pco2Variant::P1 => {
-            let bp = payload.pressure_hpa.ok_or_else(|| {
-                AppError::BadRequest("pressure_hpa required for P1 variant".to_string())
-            })?;
-            river_data_toolbox::pco2_p1(payload.co2_aq_umol, payload.water_temp_c, bp, &constants)
-        }
-        Pco2Variant::P2 => {
-            let bp = payload.pressure_hpa.ok_or_else(|| {
-                AppError::BadRequest("pressure_hpa required for P2 variant".to_string())
-            })?;
-            river_data_toolbox::pco2_p2(payload.co2_aq_umol, payload.water_temp_c, bp, &constants)
-        }
-    };
+/// Helper to require an `Option<f64>` field for full pipeline mode.
+fn require_field(val: Option<f64>, name: &str) -> AppResult<f64> {
+    val.ok_or_else(|| AppError::BadRequest(format!("{name} is required for full_pipeline mode")))
+}
 
-    Ok(Json(ToolResult {
-        tool: "pco2".to_string(),
-        results: serde_json::json!({
-            "pco2_uatm": pco2,
-        }),
-    }))
+pub async fn calculate_pco2(db: &DatabaseConnection, Json(payload): Json<Pco2Request>) -> AppResult<Json<ToolResult>> {
+    let constants = load_gas_constants(db).await;
+
+    match payload.mode {
+        Pco2Mode::Simple => {
+            let co2_aq = payload.co2_aq_umol.ok_or_else(|| {
+                AppError::BadRequest("co2_aq_umol is required for simple mode".to_string())
+            })?;
+
+            let pco2 = match payload.variant {
+                Pco2Variant::Simple => {
+                    river_data_toolbox::pco2_from_co2aq(co2_aq, payload.water_temp_c, &constants)
+                }
+                Pco2Variant::P1 => {
+                    let bp = payload.pressure_hpa.ok_or_else(|| {
+                        AppError::BadRequest("pressure_hpa required for P1 variant".to_string())
+                    })?;
+                    river_data_toolbox::pco2_p1(co2_aq, payload.water_temp_c, bp, &constants)
+                }
+                Pco2Variant::P2 => {
+                    let bp = payload.pressure_hpa.ok_or_else(|| {
+                        AppError::BadRequest("pressure_hpa required for P2 variant".to_string())
+                    })?;
+                    river_data_toolbox::pco2_p2(co2_aq, payload.water_temp_c, bp, &constants)
+                }
+            };
+
+            let key = match payload.variant {
+                Pco2Variant::Simple => "pCO2_HS_uatm_avg",
+                Pco2Variant::P1 => "pCO2_HS_P1_uatm_avg",
+                Pco2Variant::P2 => "pCO2_HS_P2_uatm_avg",
+            };
+            let mut results = serde_json::Map::new();
+            results.insert(key.into(), serde_json::json!(pco2));
+
+            Ok(Json(ToolResult {
+                tool: "pco2".to_string(),
+                results: serde_json::Value::Object(results),
+            }))
+        }
+
+        Pco2Mode::FullPipeline => {
+            let co2_ppm = require_field(payload.co2_ppm, "co2_ppm")?;
+            let h2o_percent = require_field(payload.h2o_percent, "h2o_percent")?;
+            let ch4_ppm = require_field(payload.ch4_ppm, "ch4_ppm")?;
+            let lab_temp_c = require_field(payload.lab_temp_c, "lab_temp_c")?;
+            let lab_pressure_atm = require_field(payload.lab_pressure_atm, "lab_pressure_atm")?;
+            let vol_sa_ml = require_field(payload.vol_sa_ml, "vol_sa_ml")?;
+            let vol_water_ml = require_field(payload.vol_water_ml, "vol_water_ml")?;
+            let field_pressure_hpa = payload.pressure_hpa.ok_or_else(|| {
+                AppError::BadRequest("pressure_hpa is required for full_pipeline mode".to_string())
+            })?;
+
+            let input_a = river_data_toolbox::Pco2FullInput {
+                co2_ppm,
+                h2o_percent,
+                ch4_ppm,
+                d13co2_permil: payload.d13co2_permil,
+                lab_temp_c,
+                lab_pressure_atm,
+                vol_sa_ml,
+                vol_water_ml,
+                water_temp_c: payload.water_temp_c,
+                field_pressure_hpa,
+            };
+
+            let mut results = serde_json::Map::new();
+
+            if let Some(rep_b) = &payload.replicate_b {
+                let input_b = river_data_toolbox::Pco2FullInput {
+                    co2_ppm: rep_b.co2_ppm,
+                    h2o_percent: rep_b.h2o_percent,
+                    ch4_ppm: rep_b.ch4_ppm,
+                    d13co2_permil: rep_b.d13co2_permil,
+                    // Shared lab/field conditions
+                    lab_temp_c,
+                    lab_pressure_atm,
+                    vol_sa_ml,
+                    vol_water_ml,
+                    water_temp_c: payload.water_temp_c,
+                    field_pressure_hpa,
+                };
+
+                let rep = river_data_toolbox::pco2_replicates(&input_a, &input_b, &constants);
+
+                results.insert("CO2_HS_Um_A".into(), serde_json::json!(rep.a.co2_hs_umol));
+                results.insert("CO2_HS_Um_B".into(), serde_json::json!(rep.b.co2_hs_umol));
+                results.insert("CO2_HS_Um_avg".into(), serde_json::json!(rep.co2_hs_umol_avg));
+                results.insert("CO2_HS_Um_sd".into(), serde_json::json!(rep.co2_hs_umol_sd));
+                results.insert("pCO2_HS_uatm_avg".into(), serde_json::json!(rep.pco2_uatm_avg));
+                results.insert("pCO2_HS_uatm_sd".into(), serde_json::json!(rep.pco2_uatm_sd));
+                results.insert("pCO2_HS_P1_uatm_avg".into(), serde_json::json!(rep.pco2_p1_uatm_avg));
+                results.insert("pCO2_HS_P1_uatm_sd".into(), serde_json::json!(rep.pco2_p1_uatm_sd));
+                results.insert("pCO2_HS_P2_uatm_avg".into(), serde_json::json!(rep.pco2_p2_uatm_avg));
+                results.insert("pCO2_HS_P2_uatm_sd".into(), serde_json::json!(rep.pco2_p2_uatm_sd));
+                results.insert("d13C_CO2_avg".into(), serde_json::json!(rep.d13co2_permil_avg));
+                results.insert("d13C_CO2_sd".into(), serde_json::json!(rep.d13co2_permil_sd));
+                results.insert("CH4_umol_L_avg".into(), serde_json::json!(rep.ch4_dissolved_umol_avg));
+                results.insert("CH4_umol_L_sd".into(), serde_json::json!(rep.ch4_dissolved_umol_sd));
+            } else {
+                let r = river_data_toolbox::pco2_full_pipeline(&input_a, &constants);
+
+                results.insert("CO2_HS_Um_avg".into(), serde_json::json!(r.co2_hs_umol));
+                results.insert("pCO2_HS_uatm_avg".into(), serde_json::json!(r.pco2_uatm));
+                results.insert("pCO2_HS_P1_uatm_avg".into(), serde_json::json!(r.pco2_p1_uatm));
+                results.insert("pCO2_HS_P2_uatm_avg".into(), serde_json::json!(r.pco2_p2_uatm));
+                results.insert("d13C_CO2_avg".into(), serde_json::json!(r.d13co2_permil));
+                results.insert("CH4_umol_L_avg".into(), serde_json::json!(r.ch4_dissolved_umol));
+            }
+
+            Ok(Json(ToolResult {
+                tool: "pco2".to_string(),
+                results: serde_json::Value::Object(results),
+            }))
+        }
+    }
 }
 
 // ============================================================================
 // DIC Tool
 // ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct DicReplicateBInput {
+    pub acid_sample_weight_g: f64,
+    pub acid_weight_g: f64,
+    pub vol_overpressure_ml: f64,
+    pub sa_added_ml: f64,
+    pub co2_dry_ppm: f64,
+    pub d13co2_permil: Option<f64>,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct DicRequest {
@@ -337,6 +498,7 @@ pub struct DicRequest {
     pub gas_const_r_mol: Option<f64>,
     pub vial_volume: Option<f64>,
     pub h3po4_added: Option<f64>,
+    pub replicate_b: Option<DicReplicateBInput>,
 }
 
 pub async fn calculate_dic(db: &DatabaseConnection, Json(payload): Json<DicRequest>) -> AppResult<Json<ToolResult>> {
@@ -347,34 +509,57 @@ pub async fn calculate_dic(db: &DatabaseConnection, Json(payload): Json<DicReque
         h3po4_added: payload.h3po4_added.unwrap_or(get_constant(db, "h3po4_added", 0.1).await),
     };
 
-    let dic = river_data_toolbox::dic_concentration(
-        payload.acid_sample_weight_g,
-        payload.acid_weight_g,
-        payload.vol_overpressure_ml,
-        payload.sa_added_ml,
-        payload.co2_dry_ppm,
-        payload.lab_temp_c,
-        &constants,
-    );
+    if let Some(ref rep_b) = payload.replicate_b {
+        let rep = river_data_toolbox::dic_replicates(
+            payload.acid_sample_weight_g, payload.acid_weight_g, payload.vol_overpressure_ml, payload.sa_added_ml, payload.co2_dry_ppm, payload.d13co2_permil,
+            rep_b.acid_sample_weight_g, rep_b.acid_weight_g, rep_b.vol_overpressure_ml, rep_b.sa_added_ml, rep_b.co2_dry_ppm, rep_b.d13co2_permil,
+            payload.lab_temp_c,
+            &constants,
+        );
 
-    let d13c = payload.d13co2_permil.map(|d13| {
-        river_data_toolbox::d13c_dic(
+        Ok(Json(ToolResult {
+            tool: "dic".to_string(),
+            results: serde_json::json!({
+                "DIC_A": rep.dic_a,
+                "DIC_B": rep.dic_b,
+                "DIC_avg": rep.dic_avg,
+                "DIC_std": rep.dic_std,
+                "d13C_DIC_A": rep.d13c_a,
+                "d13C_DIC_B": rep.d13c_b,
+                "d13C_DIC_avg": rep.d13c_avg,
+                "d13C_DIC_std": rep.d13c_std,
+            }),
+        }))
+    } else {
+        let dic = river_data_toolbox::dic_concentration(
             payload.acid_sample_weight_g,
             payload.acid_weight_g,
             payload.vol_overpressure_ml,
-            d13,
+            payload.sa_added_ml,
+            payload.co2_dry_ppm,
             payload.lab_temp_c,
             &constants,
-        )
-    });
+        );
 
-    Ok(Json(ToolResult {
-        tool: "dic".to_string(),
-        results: serde_json::json!({
-            "dic_umol_l": dic,
-            "d13c_dic_permil": d13c,
-        }),
-    }))
+        let d13c = payload.d13co2_permil.map(|d13| {
+            river_data_toolbox::d13c_dic(
+                payload.acid_sample_weight_g,
+                payload.acid_weight_g,
+                payload.vol_overpressure_ml,
+                d13,
+                payload.lab_temp_c,
+                &constants,
+            )
+        });
+
+        Ok(Json(ToolResult {
+            tool: "dic".to_string(),
+            results: serde_json::json!({
+                "DIC_avg": dic,
+                "d13C_DIC_avg": d13c,
+            }),
+        }))
+    }
 }
 
 // ============================================================================
@@ -387,24 +572,44 @@ pub struct DomRequest {
     pub doc_avg_ppb: Option<f64>,
     pub abs_numerator: Option<f64>,
     pub abs_denominator: Option<f64>,
+    pub peak_a: Option<f64>,
+    pub peak_c: Option<f64>,
+    pub peak_m: Option<f64>,
+    pub peak_t: Option<f64>,
 }
 
 pub async fn calculate_dom(Json(payload): Json<DomRequest>) -> AppResult<Json<ToolResult>> {
+    let mut results = serde_json::Map::new();
+
     let suva = match (payload.a254, payload.doc_avg_ppb) {
         (Some(a), Some(d)) => Some(river_data_toolbox::suva(a, d)),
         _ => None,
     };
+    results.insert("SUVA".into(), serde_json::json!(suva));
+
     let ratio = match (payload.abs_numerator, payload.abs_denominator) {
         (Some(n), Some(d)) => Some(river_data_toolbox::absorbance_ratio(n, d)),
         _ => None,
     };
+    results.insert("absorbance_ratio".into(), serde_json::json!(ratio));
+
+    // Named fluorescence peak ratios
+    if let (Some(pa), Some(pt)) = (payload.peak_a, payload.peak_t) {
+        results.insert("A_T".into(), serde_json::json!(river_data_toolbox::absorbance_ratio(pa, pt)));
+    }
+    if let (Some(pc), Some(pa)) = (payload.peak_c, payload.peak_a) {
+        results.insert("C_A".into(), serde_json::json!(river_data_toolbox::absorbance_ratio(pc, pa)));
+    }
+    if let (Some(pc), Some(pm)) = (payload.peak_c, payload.peak_m) {
+        results.insert("C_M".into(), serde_json::json!(river_data_toolbox::absorbance_ratio(pc, pm)));
+    }
+    if let (Some(pc), Some(pt)) = (payload.peak_c, payload.peak_t) {
+        results.insert("C_T".into(), serde_json::json!(river_data_toolbox::absorbance_ratio(pc, pt)));
+    }
 
     Ok(Json(ToolResult {
         tool: "dom".to_string(),
-        results: serde_json::json!({
-            "suva": suva,
-            "absorbance_ratio": ratio,
-        }),
+        results: serde_json::Value::Object(results),
     }))
 }
 
@@ -419,30 +624,61 @@ pub struct FieldDataRequest {
     pub raw_co2: Option<f64>,
     pub pressure_hpa: Option<f64>,
     pub std_curve: Option<StdCurve>,
+    pub raw_co2_min: Option<f64>,
+    pub raw_co2_avg: Option<f64>,
+    pub raw_co2_max: Option<f64>,
+    pub reach_depths: Option<Vec<f64>>,
 }
 
 pub async fn calculate_field_data(
     Json(payload): Json<FieldDataRequest>,
 ) -> AppResult<Json<ToolResult>> {
+    let mut results = serde_json::Map::new();
+
     let bp = match (payload.elevation_m, payload.temp_c) {
         (Some(e), Some(t)) => Some(river_data_toolbox::barometric_pressure_from_altitude(e, t)),
         _ => None,
     };
+    results.insert("Field_BP_altitude".into(), serde_json::json!(bp));
 
-    let co2_corr = match (payload.raw_co2, payload.pressure_hpa, payload.temp_c) {
-        (Some(co2), Some(p), Some(t)) => {
-            let curve = payload.std_curve.as_ref().map(|c| (c.slope, c.intercept));
-            Some(river_data_toolbox::co2_correction(co2, p, t, curve))
+    let curve = payload.std_curve.as_ref().map(|c| (c.slope, c.intercept));
+
+    // Multi-point CO2: min/avg/max
+    if payload.raw_co2_min.is_some() || payload.raw_co2_avg.is_some() || payload.raw_co2_max.is_some() {
+        if let (Some(p), Some(t)) = (payload.pressure_hpa, payload.temp_c) {
+            if let Some(co2_min) = payload.raw_co2_min {
+                results.insert("Vaisala_CO2_min_corr".into(), serde_json::json!(river_data_toolbox::co2_correction(co2_min, p, t, curve)));
+            }
+            if let Some(co2_avg) = payload.raw_co2_avg {
+                results.insert("Vaisala_CO2_avg_corr".into(), serde_json::json!(river_data_toolbox::co2_correction(co2_avg, p, t, curve)));
+            }
+            if let Some(co2_max) = payload.raw_co2_max {
+                results.insert("Vaisala_CO2_max_corr".into(), serde_json::json!(river_data_toolbox::co2_correction(co2_max, p, t, curve)));
+            }
         }
-        _ => None,
-    };
+    } else {
+        // Legacy single CO2 mode
+        let co2_corr = match (payload.raw_co2, payload.pressure_hpa, payload.temp_c) {
+            (Some(co2), Some(p), Some(t)) => {
+                Some(river_data_toolbox::co2_correction(co2, p, t, curve))
+            }
+            _ => None,
+        };
+        results.insert("Vaisala_CO2_avg_corr".into(), serde_json::json!(co2_corr));
+    }
+
+    // Reach depth stats
+    if let Some(ref depths) = payload.reach_depths {
+        if !depths.is_empty() {
+            let (avg, sd) = river_data_toolbox::reach_depth_stats(depths);
+            results.insert("Reach_depth_avg_cm".into(), serde_json::json!(avg));
+            results.insert("Reach_depth_sd_cm".into(), serde_json::json!(sd));
+        }
+    }
 
     Ok(Json(ToolResult {
         tool: "field_data".to_string(),
-        results: serde_json::json!({
-            "barometric_pressure_hpa": bp,
-            "co2_corrected": co2_corr,
-        }),
+        results: serde_json::Value::Object(results),
     }))
 }
 
@@ -470,8 +706,8 @@ pub async fn calculate_co2_air(
     Ok(Json(ToolResult {
         tool: "co2_air".to_string(),
         results: serde_json::json!({
-            "co2_dry": co2,
-            "ch4_dry": ch4,
+            "lab_co2air_co2_dry": co2,
+            "lab_co2air_ch4_dry": ch4,
         }),
     }))
 }
@@ -548,9 +784,74 @@ pub async fn calculate_benthic(
         tool: "benthic".to_string(),
         results: serde_json::json!({
             "rock_surface_area_m2": area,
-            "afdm_per_m2": afdm_per_m2,
+            "benthic_AFDM_avg_gm2": afdm_per_m2,
             "chla_per_m2": chla_per_m2,
         }),
+    }))
+}
+
+// ============================================================================
+// Chlorophyll-Benthic Unified Tool (multi-replicate)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ChlaBenthicRequest {
+    pub acid_slope: f64,
+    pub acid_intercept: f64,
+    pub noacid_slope: f64,
+    pub noacid_intercept: f64,
+    pub replicates: Vec<ChlaBenthicReplicateInput>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChlaBenthicReplicateInput {
+    pub fluor_before: f64,
+    pub fluor_after: Option<f64>,
+    pub vol_total_ml: f64,
+    pub vol_after_ml: f64,
+    pub diameters_cm: Vec<f64>,
+    pub afdm_g_filter: Option<f64>,
+}
+
+pub async fn calculate_chla_benthic(
+    Json(payload): Json<ChlaBenthicRequest>,
+) -> AppResult<Json<ToolResult>> {
+    let inputs: Vec<river_data_toolbox::ChlaReplicateInput> = payload
+        .replicates
+        .into_iter()
+        .map(|r| river_data_toolbox::ChlaReplicateInput {
+            fluor_before: r.fluor_before,
+            fluor_after: r.fluor_after,
+            vol_total_ml: r.vol_total_ml,
+            vol_after_ml: r.vol_after_ml,
+            diameters_cm: r.diameters_cm,
+            afdm_g_filter: r.afdm_g_filter,
+        })
+        .collect();
+
+    let result = river_data_toolbox::chla_benthic_replicates(
+        &inputs,
+        payload.acid_slope,
+        payload.acid_intercept,
+        payload.noacid_slope,
+        payload.noacid_intercept,
+    );
+
+    let mut results = serde_json::Map::new();
+    results.insert("Chla_acid_ugL_avg".into(), serde_json::json!(result.chla_acid_ug_l_avg));
+    results.insert("Chla_acid_ugL_sd".into(), serde_json::json!(result.chla_acid_ug_l_sd));
+    results.insert("Chla_noacid_ugL_avg".into(), serde_json::json!(result.chla_noacid_ug_l_avg));
+    results.insert("Chla_noacid_ugL_sd".into(), serde_json::json!(result.chla_noacid_ug_l_sd));
+    results.insert("Chla_acid_ugm2_avg".into(), serde_json::json!(result.chla_acid_ug_m2_avg));
+    results.insert("Chla_acid_ugm2_sd".into(), serde_json::json!(result.chla_acid_ug_m2_sd));
+    results.insert("Chla_noacid_ugm2_avg".into(), serde_json::json!(result.chla_noacid_ug_m2_avg));
+    results.insert("Chla_noacid_ugm2_sd".into(), serde_json::json!(result.chla_noacid_ug_m2_sd));
+    results.insert("benthic_AFDM_avg_gm2".into(), serde_json::json!(result.afdm_g_m2_avg));
+    results.insert("benthic_AFDM_sd_gm2".into(), serde_json::json!(result.afdm_g_m2_sd));
+
+    Ok(Json(ToolResult {
+        tool: "chla_benthic".to_string(),
+        results: serde_json::Value::Object(results),
     }))
 }
 
@@ -579,6 +880,7 @@ const TOOLS: &[ToolInfo] = &[
     ToolInfo { name: "co2_air", description: "CO2/CH4 dry concentrations from wet measurements", endpoint: "/api/service/tools/co2_air/calculate" },
     ToolInfo { name: "isotopes", description: "Deuterium excess, 17O excess", endpoint: "/api/service/tools/isotopes/calculate" },
     ToolInfo { name: "benthic", description: "Rock surface area, per-m2 normalizations", endpoint: "/api/service/tools/benthic/calculate" },
+    ToolInfo { name: "chla_benthic", description: "Unified Chlorophyll-Benthic multi-replicate (acid + no-acid Chl-a, AFDM, per-m2)", endpoint: "/api/service/tools/chla_benthic/calculate" },
 ];
 
 pub async fn list_tools() -> Json<Vec<&'static ToolInfo>> {
@@ -605,6 +907,7 @@ pub async fn calculate_tool(
         "co2_air" => calculate_co2_air(Json(parse_body(&body)?)).await,
         "isotopes" => calculate_isotopes(Json(parse_body(&body)?)).await,
         "benthic" => calculate_benthic(Json(parse_body(&body)?)).await,
+        "chla_benthic" => calculate_chla_benthic(Json(parse_body(&body)?)).await,
         _ => Err(AppError::NotFound(format!("Unknown tool: {tool_name}"))),
     }
 }

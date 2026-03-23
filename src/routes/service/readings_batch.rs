@@ -61,6 +61,7 @@ async fn get_or_create_api_stream(
         source_path: Set(None),
         metadata: Set(serde_json::json!({})),
         site_parameter_id: Set(None),
+        sensor_id: Set(None),
         is_active: Set(true),
         discovered_at: Set(now.into()),
         paired_at: Set(None),
@@ -107,6 +108,15 @@ pub async fn insert_batch_readings(
             stream_cache.insert(key, stream_id);
         }
     }
+
+    // Collect (site_id, time) pairs before consuming readings for derived auto-compute
+    let site_timestamps_for_derived: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = {
+        let mut map: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = HashMap::new();
+        for r in &payload.readings {
+            map.entry(r.site_id).or_default().push(r.time);
+        }
+        map
+    };
 
     let models: Vec<readings::ActiveModel> = payload
         .readings
@@ -165,14 +175,36 @@ pub async fn insert_batch_readings(
 
     tracing::info!(total, inserted, "Batch readings insert complete");
 
-    // Invalidate response cache for all affected sites
+    // Invalidate response cache and auto-compute derived parameters for all affected sites
     if inserted > 0 {
         let affected_site_ids: std::collections::HashSet<Uuid> =
             stream_cache.keys().map(|(site_id, _)| *site_id).collect();
-        for site_id in affected_site_ids {
+        for site_id in &affected_site_ids {
             crate::services::cache::invalidate_prefix(&state, &format!("readings:{site_id}")).await;
             crate::services::cache::invalidate_prefix(&state, &format!("aggregates:{site_id}")).await;
         }
+
+        // Auto-compute derived values for affected sites
+        let db_clone = state.db.clone();
+        tokio::spawn(async move {
+            for (site_id, timestamps) in site_timestamps_for_derived {
+                for time in timestamps {
+                    if let Err(e) =
+                        crate::services::calibration::recalculate_derived_at_timestamp(
+                            &db_clone, site_id, time,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            site_id = %site_id,
+                            time = %time,
+                            "Failed to auto-compute derived values after batch insert"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     Ok(Json(BatchReadingsResponse { inserted }))

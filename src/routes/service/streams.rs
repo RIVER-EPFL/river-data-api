@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::entity::{data_streams, site_parameters};
 use crate::error::{AppError, AppResult};
+use crate::services::operations::{close_sensor_deployment, create_sensor_for_stream};
 use crate::services::sync_state::refresh_continuous_aggregates_full;
 
 // ============================================================================
@@ -98,6 +99,7 @@ pub struct StreamResponse {
     pub source_path: Option<String>,
     pub metadata: serde_json::Value,
     pub site_parameter_id: Option<Uuid>,
+    pub sensor_id: Option<Uuid>,
     pub is_active: bool,
     pub discovered_at: chrono::DateTime<Utc>,
     pub paired_at: Option<chrono::DateTime<Utc>>,
@@ -114,6 +116,7 @@ impl From<data_streams::Model> for StreamResponse {
             source_path: m.source_path,
             metadata: m.metadata,
             site_parameter_id: m.site_parameter_id,
+            sensor_id: m.sensor_id,
             is_active: m.is_active,
             discovered_at: m.discovered_at.with_timezone(&Utc),
             paired_at: m.paired_at.map(|t| t.with_timezone(&Utc)),
@@ -137,6 +140,7 @@ pub async fn register_stream(
         source_path: Set(payload.source_path.clone()),
         metadata: Set(payload.metadata.clone()),
         site_parameter_id: Set(None),
+        sensor_id: Set(None),
         is_active: Set(true),
         discovered_at: Set(now.into()),
         paired_at: Set(None),
@@ -272,22 +276,39 @@ pub async fn pair_stream(
 
     let now = Utc::now();
 
+    // Create/reuse sensor for this stream
+    let sensor_ctx =
+        create_sensor_for_stream(db, &stream, sp.parameter_id, sp.site_id).await?;
+
     // Update stream: set pairing
+    // Re-fetch stream since create_sensor_for_stream may have updated sensor_id
+    let stream = data_streams::Entity::find_by_id(stream_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::Internal("Failed to re-fetch stream".to_string()))?;
     let mut active: data_streams::ActiveModel = stream.into();
     active.site_parameter_id = Set(Some(payload.site_parameter_id));
     active.paired_at = Set(Some(now.into()));
     active.updated_at = Set(now.into());
     active.update(db).await?;
 
-    // Backfill: update readings with site_id + parameter_id, apply identity calibration
+    // Backfill: update readings with site_id + parameter_id + sensor context, apply identity calibration
     let result = db
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE readings
               SET site_id = $1, parameter_id = $2,
+                  sensor_id = $4, calibration_id = $5, deployment_id = $6,
                   calibrated_value = COALESCE(calibrated_value, raw_value)
               WHERE stream_id = $3 AND site_id IS NULL",
-            [sp.site_id.into(), sp.parameter_id.into(), stream_id.into()],
+            [
+                sp.site_id.into(),
+                sp.parameter_id.into(),
+                stream_id.into(),
+                sensor_ctx.sensor_id.into(),
+                sensor_ctx.calibration_id.into(),
+                sensor_ctx.deployment_id.into(),
+            ],
         ))
         .await?;
 
@@ -297,9 +318,14 @@ pub async fn pair_stream(
     db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE status_events
-          SET site_id = $1, parameter_id = $2
+          SET site_id = $1, parameter_id = $2, sensor_id = $4
           WHERE stream_id = $3 AND site_id IS NULL",
-        [sp.site_id.into(), sp.parameter_id.into(), stream_id.into()],
+        [
+            sp.site_id.into(),
+            sp.parameter_id.into(),
+            stream_id.into(),
+            sensor_ctx.sensor_id.into(),
+        ],
     ))
     .await?;
 
@@ -352,16 +378,25 @@ pub async fn unpair_stream(
         return Err(AppError::BadRequest("Stream is not paired".to_string()));
     }
 
+    // Close sensor deployment if stream has a sensor
+    if let Some(sensor_id) = stream.sensor_id {
+        if let Some(sp_id) = stream.site_parameter_id {
+            if let Ok(Some(sp)) = site_parameters::Entity::find_by_id(sp_id).one(db).await {
+                let _ = close_sensor_deployment(db, sensor_id, sp.site_id).await;
+            }
+        }
+    }
+
     let now = Utc::now();
 
-    // Clear pairing on stream
+    // Clear pairing on stream (keep sensor_id — sensor persists)
     let mut active: data_streams::ActiveModel = stream.into();
     active.site_parameter_id = Set(None);
     active.paired_at = Set(None);
     active.updated_at = Set(now.into());
     active.update(db).await?;
 
-    // Clear site_id/parameter_id on readings
+    // Clear site_id/parameter_id on readings (keep sensor_id/calibration_id/deployment_id)
     let result = db
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,

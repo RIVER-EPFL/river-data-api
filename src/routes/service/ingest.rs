@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::entity::{data_streams, readings, status_events};
 use crate::error::{AppError, AppResult};
+use crate::services::operations::resolve_sensor_context;
 
 // ============================================================================
 // Stream-based Readings Ingest
@@ -91,6 +92,17 @@ pub async fn ingest_readings(
 
     let paired = site_id.is_some();
 
+    // Resolve sensor context from stream's linked sensor (if any)
+    let sensor_ctx = if paired {
+        if let Some(sid) = site_id {
+            resolve_sensor_context(db, &stream, sid).await
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Build reading models
     let models: Vec<readings::ActiveModel> = payload
         .readings
@@ -103,9 +115,9 @@ pub async fn ingest_readings(
             parameter_id: Set(parameter_id),
             raw_value: Set(r.raw_value),
             calibrated_value: Set(Some(r.raw_value)), // identity calibration
-            sensor_id: Set(r.sensor_id),
-            calibration_id: Set(r.calibration_id),
-            deployment_id: Set(r.deployment_id),
+            sensor_id: Set(r.sensor_id.or(sensor_ctx.as_ref().map(|c| c.sensor_id))),
+            calibration_id: Set(r.calibration_id.or(sensor_ctx.as_ref().map(|c| c.calibration_id))),
+            deployment_id: Set(r.deployment_id.or(sensor_ctx.as_ref().map(|c| c.deployment_id))),
             logged: Set(Some(true)),
             measurement_type: Set(Some("continuous".to_string())),
             is_flagged: Set(Some(false)),
@@ -158,6 +170,32 @@ pub async fn ingest_readings(
             if let Err(e) = active.update(db).await {
                 tracing::warn!(error = %e, "Failed to update stream last_data_time");
             }
+        }
+    }
+
+    // Auto-compute derived parameters for newly ingested timestamps
+    if paired && inserted > 0 {
+        if let Some(sid) = site_id {
+            let db_clone = state.db.clone();
+            let timestamps: Vec<chrono::DateTime<Utc>> =
+                payload.readings.iter().map(|r| r.time).collect();
+            tokio::spawn(async move {
+                for time in timestamps {
+                    if let Err(e) =
+                        crate::services::calibration::recalculate_derived_at_timestamp(
+                            &db_clone, sid, time,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            site_id = %sid,
+                            time = %time,
+                            "Failed to auto-compute derived values after ingest"
+                        );
+                    }
+                }
+            });
         }
     }
 

@@ -8,6 +8,7 @@ use crate::common::AppState;
 use crate::entity::{data_streams, parameters, projects, site_parameters, sites, sync_commands, sync_events, sync_service_credentials, sync_services, sync_service_tokens};
 use crate::error::{AppError, AppResult};
 use crate::services::api_token::{generate_token, hash_token};
+use crate::services::operations::{create_sensor_for_stream, extract_vaisala_device_serial};
 
 // ============================================================================
 // Stream State (replaces old Sync State)
@@ -456,9 +457,16 @@ pub struct DiscoveryStreamInfo {
 }
 
 #[derive(Serialize)]
+pub struct DiscoverySensorInfo {
+    pub existing_sensor_id: Option<Uuid>,
+    pub vaisala_device_serial: Option<String>,
+}
+
+#[derive(Serialize)]
 pub struct DiscoveryItem {
     pub stream: DiscoveryStreamInfo,
     pub suggestions: DiscoverySuggestions,
+    pub sensor_info: DiscoverySensorInfo,
     pub action: String,
 }
 
@@ -671,6 +679,11 @@ async fn get_discovery(
             "needs_input"
         };
 
+        let sensor_info = DiscoverySensorInfo {
+            existing_sensor_id: stream.sensor_id,
+            vaisala_device_serial: extract_vaisala_device_serial(&stream.metadata),
+        };
+
         items.push(DiscoveryItem {
             stream: DiscoveryStreamInfo {
                 id: stream.id,
@@ -684,6 +697,7 @@ async fn get_discovery(
                 parameter: param_suggestion,
                 site_parameter: sp_suggestion,
             },
+            sensor_info,
             action: action.to_string(),
         });
     }
@@ -761,9 +775,20 @@ pub struct ApplyDiscoveryResponse {
     pub sites_created: u32,
     pub parameters_created: u32,
     pub site_parameters_created: u32,
+    pub sensors_created: u32,
     pub streams_paired: u32,
     pub total_backfilled: u64,
     pub errors: Vec<String>,
+}
+
+struct ActionStats {
+    projects_created: u32,
+    sites_created: u32,
+    parameters_created: u32,
+    site_parameters_created: u32,
+    sensors_created: u32,
+    streams_paired: u32,
+    backfilled: u64,
 }
 
 /// `POST /api/admin/sync/apply-discovery` — batch-processes discovery actions.
@@ -777,6 +802,7 @@ async fn apply_discovery(
         sites_created: 0,
         parameters_created: 0,
         site_parameters_created: 0,
+        sensors_created: 0,
         streams_paired: 0,
         total_backfilled: 0,
         errors: vec![],
@@ -786,12 +812,13 @@ async fn apply_discovery(
         let result = process_action(db, &action).await;
         match result {
             Ok(stats) => {
-                resp.projects_created += stats.0;
-                resp.sites_created += stats.1;
-                resp.parameters_created += stats.2;
-                resp.site_parameters_created += stats.3;
-                resp.streams_paired += stats.4;
-                resp.total_backfilled += stats.5;
+                resp.projects_created += stats.projects_created;
+                resp.sites_created += stats.sites_created;
+                resp.parameters_created += stats.parameters_created;
+                resp.site_parameters_created += stats.site_parameters_created;
+                resp.sensors_created += stats.sensors_created;
+                resp.streams_paired += stats.streams_paired;
+                resp.total_backfilled += stats.backfilled;
             }
             Err(e) => {
                 resp.errors.push(format!(
@@ -814,11 +841,10 @@ async fn apply_discovery(
 }
 
 /// Process a single apply-discovery action.
-/// Returns (projects_created, sites_created, params_created, site_params_created, streams_paired, backfilled).
 async fn process_action(
     db: &sea_orm::DatabaseConnection,
     action: &ApplyAction,
-) -> Result<(u32, u32, u32, u32, u32, u64), String> {
+) -> Result<ActionStats, String> {
     let mut projects_created = 0u32;
     let mut sites_created = 0u32;
     let mut params_created = 0u32;
@@ -1011,6 +1037,22 @@ async fn process_action(
         .map_err(|e| e.to_string())?
         .ok_or("Site parameter not found")?;
 
+    // Create/reuse sensor for this stream
+    let mut sensors_created = 0u32;
+    let sensor_ctx = create_sensor_for_stream(db, &stream, sp.parameter_id, sp.site_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if stream.sensor_id.is_none() {
+        sensors_created = 1;
+    }
+
+    // Re-fetch stream (sensor_id may have been updated)
+    let stream = data_streams::Entity::find_by_id(action.stream_id)
+        .one(db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("Stream not found after sensor creation")?;
+
     let now = Utc::now();
     let mut active: data_streams::ActiveModel = stream.into();
     active.site_parameter_id = Set(Some(site_parameter_id));
@@ -1018,16 +1060,24 @@ async fn process_action(
     active.updated_at = Set(now.into());
     active.update(db).await.map_err(|e| e.to_string())?;
 
-    // Backfill readings
+    // Backfill readings with sensor context
     use sea_orm::{ConnectionTrait, Statement};
     let result = db
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE readings
               SET site_id = $1, parameter_id = $2,
+                  sensor_id = $4, calibration_id = $5, deployment_id = $6,
                   calibrated_value = COALESCE(calibrated_value, raw_value)
               WHERE stream_id = $3 AND site_id IS NULL",
-            [sp.site_id.into(), sp.parameter_id.into(), action.stream_id.into()],
+            [
+                sp.site_id.into(),
+                sp.parameter_id.into(),
+                action.stream_id.into(),
+                sensor_ctx.sensor_id.into(),
+                sensor_ctx.calibration_id.into(),
+                sensor_ctx.deployment_id.into(),
+            ],
         ))
         .await
         .map_err(|e| e.to_string())?;
@@ -1039,11 +1089,24 @@ async fn process_action(
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE status_events
-              SET site_id = $1, parameter_id = $2
+              SET site_id = $1, parameter_id = $2, sensor_id = $4
               WHERE stream_id = $3 AND site_id IS NULL",
-            [sp.site_id.into(), sp.parameter_id.into(), action.stream_id.into()],
+            [
+                sp.site_id.into(),
+                sp.parameter_id.into(),
+                action.stream_id.into(),
+                sensor_ctx.sensor_id.into(),
+            ],
         ))
         .await;
 
-    Ok((projects_created, sites_created, params_created, site_params_created, 1, backfilled))
+    Ok(ActionStats {
+        projects_created,
+        sites_created,
+        parameters_created: params_created,
+        site_parameters_created: site_params_created,
+        sensors_created,
+        streams_paired: 1,
+        backfilled,
+    })
 }

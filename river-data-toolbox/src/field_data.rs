@@ -36,6 +36,12 @@ pub fn co2_correction(
     corrected * pressure_hpa * 298.0 / (1013.0 * (273.0 + temp_c))
 }
 
+/// Compute mean and standard deviation of reach depth measurements.
+#[must_use]
+pub fn reach_depth_stats(depths: &[f64]) -> (f64, f64) {
+    (crate::common::mean(depths), crate::common::std_dev(depths))
+}
+
 /// Select the best available pressure value.
 ///
 /// From R pattern: use field_pressure if it's in [700, 1050] hPa, else fall back to altitude_pressure.
