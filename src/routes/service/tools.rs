@@ -1,9 +1,13 @@
 use axum::{Json, extract::{Path, State}};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
+use tokio::sync::OnceCell;
 
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
+
+/// Cached gas constants — loaded from DB once, then reused for all pCO2 calculations.
+static GAS_CONSTANTS: OnceCell<river_data_toolbox::GasConstants> = OnceCell::const_new();
 
 // ============================================================================
 // Constant lookup helper
@@ -355,7 +359,9 @@ fn require_field(val: Option<f64>, name: &str) -> AppResult<f64> {
 }
 
 pub async fn calculate_pco2(db: &DatabaseConnection, Json(payload): Json<Pco2Request>) -> AppResult<Json<ToolResult>> {
-    let constants = load_gas_constants(db).await;
+    let constants = GAS_CONSTANTS
+        .get_or_init(|| load_gas_constants(db))
+        .await;
 
     match payload.mode {
         Pco2Mode::Simple => {
