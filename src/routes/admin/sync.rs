@@ -254,19 +254,38 @@ async fn issue_command(
 
 async fn list_commands(
     State(state): State<AppState>,
-) -> AppResult<Json<Vec<SyncCommandResponse>>> {
-    use sea_orm::QuerySelect;
+    axum::extract::Query(params): axum::extract::Query<SyncEventsQuery>,
+) -> AppResult<(axum::http::StatusCode, axum::http::HeaderMap, Json<Vec<SyncCommandResponse>>)> {
+    use sea_orm::PaginatorTrait;
 
-    let commands: Vec<SyncCommandResponse> = sync_commands::Entity::find()
+    let per_page = params.per_page.min(100);
+    let page = params.page.max(1) - 1;
+
+    let paginator = sync_commands::Entity::find()
         .order_by_desc(sync_commands::Column::CreatedAt)
-        .limit(50)
-        .all(&state.db)
+        .paginate(&state.db, per_page);
+
+    let total = paginator.num_items().await?;
+    let commands: Vec<SyncCommandResponse> = paginator
+        .fetch_page(page)
         .await?
         .into_iter()
         .map(command_to_response)
         .collect();
 
-    Ok(Json(commands))
+    let mut headers = axum::http::HeaderMap::new();
+    let start = page * per_page;
+    let end = start + commands.len() as u64;
+    let range_value = if commands.is_empty() {
+        format!("items */{total}")
+    } else {
+        format!("items {start}-{end}/{total}")
+    };
+    if let Ok(hv) = range_value.parse() {
+        headers.insert("Content-Range", hv);
+    }
+
+    Ok((axum::http::StatusCode::OK, headers, Json(commands)))
 }
 
 async fn create_credential(

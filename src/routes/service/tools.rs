@@ -348,9 +348,10 @@ async fn load_gas_constants(db: &DatabaseConnection) -> river_data_toolbox::GasC
     }
 }
 
-/// Helper to require an `Option<f64>` field for full pipeline mode.
+/// Helper to require an `Option<f64>` field, rejecting NaN and Infinity.
 fn require_field(val: Option<f64>, name: &str) -> AppResult<f64> {
-    val.ok_or_else(|| AppError::BadRequest(format!("{name} is required for full_pipeline mode")))
+    val.filter(|v| v.is_finite())
+        .ok_or_else(|| AppError::BadRequest(format!("{name} is required and must be a finite number")))
 }
 
 pub async fn calculate_pco2(db: &DatabaseConnection, Json(payload): Json<Pco2Request>) -> AppResult<Json<ToolResult>> {
