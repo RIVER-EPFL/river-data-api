@@ -1392,105 +1392,136 @@ async fn bulk_pair(
         param_map.insert(p.name.to_lowercase(), id);
     }
 
-    // 4. Fetch unpaired streams, create site_parameters, and pair
+    // 4. Fetch unpaired streams, build site_parameter mappings, then batch-pair
+    use sea_orm::Statement;
+
     let streams = data_streams::Entity::find()
         .filter(data_streams::Column::SourceSystem.eq(&req.source_system))
         .filter(data_streams::Column::SiteParameterId.is_null())
         .all(&txn)
         .await?;
 
+    // Build param name→id lookup for parameter display names
+    let param_name_lookup: HashMap<Uuid, String> = {
+        let all = parameters::Entity::find().all(&txn).await?;
+        all.into_iter().map(|p| (p.id, p.name)).collect()
+    };
+
+    // First pass: determine unique (site_id, parameter_id) pairs and create site_parameters
     let mut sp_cache: HashMap<(Uuid, Uuid), Uuid> = HashMap::new();
     let mut sp_created = 0u32;
-    let mut paired = 0u32;
+    let mut stream_to_sp: Vec<(Uuid, Uuid)> = Vec::with_capacity(streams.len()); // stream_id → site_parameter_id
 
-    for stream in streams {
-        // Extract site name from source_path segment 3
+    for stream in &streams {
         let site_name = stream.source_path.as_deref()
             .and_then(|p| p.split('/').nth(2))
             .unwrap_or("")
             .to_lowercase();
-        // Extract parameter display name from source_name
         let param_name = stream.source_name.as_deref()
             .and_then(|n| n.split(" - ").nth(1))
             .unwrap_or("")
             .to_lowercase();
 
-        let Some(&site_id) = site_map.get(&site_name) else { continue };
-        let Some(&parameter_id) = param_map.get(&param_name) else { continue };
+        let Some(&site_id) = site_map.get(&site_name) else {
+            stream_to_sp.push((stream.id, Uuid::nil()));
+            continue;
+        };
+        let Some(&parameter_id) = param_map.get(&param_name) else {
+            stream_to_sp.push((stream.id, Uuid::nil()));
+            continue;
+        };
 
-        // Get or create site_parameter
         let sp_key = (site_id, parameter_id);
         let site_parameter_id = if let Some(&sp_id) = sp_cache.get(&sp_key) {
             sp_id
         } else {
-            let existing = site_parameters::Entity::find()
-                .filter(
-                    Condition::all()
-                        .add(site_parameters::Column::SiteId.eq(site_id))
-                        .add(site_parameters::Column::ParameterId.eq(parameter_id)),
-                )
-                .one(&txn).await?;
-            let id = if let Some(existing) = existing {
-                existing.id
-            } else {
-                let id = Uuid::new_v4();
-                let param = parameters::Entity::find_by_id(parameter_id)
-                    .one(&txn).await?;
-                let param_name_val = param.map(|p| p.name).unwrap_or_default();
-                site_parameters::ActiveModel {
-                    id: Set(id),
-                    site_id: Set(site_id),
-                    parameter_id: Set(parameter_id),
-                    name: Set(param_name_val),
-                    sensor_type: Set(String::new()),
-                    display_units: Set(None), units_name: Set(None),
-                    units_min: Set(None), units_max: Set(None),
-                    decimal_places: Set(None), channel_id: Set(None),
-                    sample_interval_sec: Set(None),
-                    is_active: Set(Some(true)),
-                    is_derived: Set(Some(false)),
-                    derived_definition_id: Set(None),
-                    variable_mappings: Set(None),
-                    created_at: Set(Some(Utc::now())),
-                    updated_at: Set(Some(Utc::now())),
-                    discovered_at: Set(Some(Utc::now())),
-                }.insert(&txn).await?;
-                sp_created += 1;
-                id
-            };
+            let id = Uuid::new_v4();
+            let param_name_val = param_name_lookup.get(&parameter_id).cloned().unwrap_or_default();
+            site_parameters::ActiveModel {
+                id: Set(id),
+                site_id: Set(site_id),
+                parameter_id: Set(parameter_id),
+                name: Set(param_name_val),
+                sensor_type: Set(String::new()),
+                display_units: Set(None), units_name: Set(None),
+                units_min: Set(None), units_max: Set(None),
+                decimal_places: Set(None), channel_id: Set(None),
+                sample_interval_sec: Set(None),
+                is_active: Set(Some(true)),
+                is_derived: Set(Some(false)),
+                derived_definition_id: Set(None),
+                variable_mappings: Set(None),
+                created_at: Set(Some(Utc::now())),
+                updated_at: Set(Some(Utc::now())),
+                discovered_at: Set(Some(Utc::now())),
+            }.insert(&txn).await?;
+            sp_created += 1;
             sp_cache.insert(sp_key, id);
             id
         };
 
-        // Pair the stream
-        let stream_id = stream.id;
-        let now = Utc::now();
-        let mut active: data_streams::ActiveModel = stream.into();
-        active.site_parameter_id = Set(Some(site_parameter_id));
-        active.paired_at = Set(Some(now.into()));
-        active.updated_at = Set(now.into());
-        active.update(&txn).await?;
-
-        // Backfill readings with site_id and parameter_id
-        use sea_orm::Statement;
-        txn.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings SET site_id = $1, parameter_id = $2,
-              calibrated_value = COALESCE(calibrated_value, raw_value)
-              WHERE stream_id = $3 AND site_id IS NULL",
-            [site_id.into(), parameter_id.into(), stream_id.into()],
-        )).await?;
-
-        // Backfill status_events too
-        let _ = txn.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE status_events SET site_id = $1, parameter_id = $2
-              WHERE stream_id = $3 AND site_id IS NULL",
-            [site_id.into(), parameter_id.into(), stream_id.into()],
-        )).await;
-
-        paired += 1;
+        stream_to_sp.push((stream.id, site_parameter_id));
     }
+
+    // Second pass: batch-pair streams using a single UPDATE with a VALUES join
+    // Process in chunks to avoid oversized SQL
+    let valid_pairs: Vec<(Uuid, Uuid)> = stream_to_sp.into_iter()
+        .filter(|(_, sp_id)| !sp_id.is_nil())
+        .collect();
+
+    let paired = valid_pairs.len() as u32;
+    let now = Utc::now();
+
+    for chunk in valid_pairs.chunks(1000) {
+        // Build VALUES clause: ($1, $2), ($3, $4), ...
+        let mut values_parts: Vec<String> = Vec::new();
+        let mut params: Vec<sea_orm::Value> = Vec::new();
+        for (i, (stream_id, sp_id)) in chunk.iter().enumerate() {
+            let base = i * 2 + 1;
+            values_parts.push(format!("(${}, ${})", base, base + 1));
+            params.push((*stream_id).into());
+            params.push((*sp_id).into());
+        }
+
+        let values_sql = values_parts.join(",");
+        let now_param_idx = chunk.len() * 2 + 1;
+        params.push(now.into());
+
+        // Batch update data_streams
+        let sql = format!(
+            "UPDATE data_streams SET site_parameter_id = v.sp_id, paired_at = ${now_param_idx}, updated_at = ${now_param_idx} \
+             FROM (VALUES {values_sql}) AS v(stream_id, sp_id) \
+             WHERE data_streams.id = v.stream_id::uuid"
+        );
+        txn.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres, &sql, params,
+        )).await?;
+    }
+
+    // Third pass: batch-backfill readings using a single JOIN update
+    txn.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"UPDATE readings r
+          SET site_id = sp.site_id, parameter_id = sp.parameter_id,
+              calibrated_value = COALESCE(r.calibrated_value, r.raw_value)
+          FROM data_streams ds
+          JOIN site_parameters sp ON ds.site_parameter_id = sp.id
+          WHERE r.stream_id = ds.id AND r.site_id IS NULL
+            AND ds.source_system = $1",
+        [req.source_system.clone().into()],
+    )).await?;
+
+    // Backfill status_events too
+    let _ = txn.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"UPDATE status_events se
+          SET site_id = sp.site_id, parameter_id = sp.parameter_id
+          FROM data_streams ds
+          JOIN site_parameters sp ON ds.site_parameter_id = sp.id
+          WHERE se.stream_id = ds.id AND se.site_id IS NULL
+            AND ds.source_system = $1",
+        [req.source_system.clone().into()],
+    )).await;
 
     txn.commit().await?;
 
