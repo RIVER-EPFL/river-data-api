@@ -11,23 +11,6 @@ use crate::services::api_token::{generate_token, hash_token};
 use crate::services::operations::{create_sensor_for_stream, extract_vaisala_device_serial};
 
 // ============================================================================
-// Stream State (replaces old Sync State)
-// ============================================================================
-
-#[derive(Serialize)]
-pub struct StreamStateResponse {
-    pub id: Uuid,
-    pub source_system: String,
-    pub source_key: String,
-    pub source_name: Option<String>,
-    pub source_path: Option<String>,
-    pub metadata: serde_json::Value,
-    pub site_parameter_id: Option<Uuid>,
-    pub is_active: bool,
-    pub last_data_time: Option<String>,
-}
-
-// ============================================================================
 // Sync Services
 // ============================================================================
 
@@ -149,7 +132,6 @@ pub struct CredentialResponse {
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/state", get(list_sync_states))
         .route("/services", get(list_services))
         .route("/services/{id}", get(get_service))
         .route("/services/{id}/commands", post(issue_command))
@@ -165,32 +147,6 @@ pub fn router() -> Router<AppState> {
 // ============================================================================
 // Handlers
 // ============================================================================
-
-async fn list_sync_states(
-    State(state): State<AppState>,
-) -> AppResult<Json<Vec<StreamStateResponse>>> {
-    let streams = data_streams::Entity::find()
-        .order_by_asc(data_streams::Column::SourceSystem)
-        .all(&state.db)
-        .await?;
-
-    let response: Vec<StreamStateResponse> = streams
-        .into_iter()
-        .map(|s| StreamStateResponse {
-            id: s.id,
-            source_system: s.source_system,
-            source_key: s.source_key,
-            source_name: s.source_name,
-            source_path: s.source_path,
-            metadata: s.metadata,
-            site_parameter_id: s.site_parameter_id,
-            is_active: s.is_active,
-            last_data_time: s.last_data_time.map(|t| t.to_rfc3339()),
-        })
-        .collect();
-
-    Ok(Json(response))
-}
 
 async fn list_services(
     State(state): State<AppState>,
