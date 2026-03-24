@@ -173,14 +173,16 @@ pub async fn ingest_readings(
         }
     }
 
-    // Auto-compute derived parameters for newly ingested timestamps
+    // Auto-compute derived parameters for newly ingested timestamps (batched)
     if paired && inserted > 0 {
         if let Some(sid) = site_id {
             let db_clone = state.db.clone();
-            let timestamps: Vec<chrono::DateTime<Utc>> =
+            let mut unique_timestamps: Vec<chrono::DateTime<Utc>> =
                 payload.readings.iter().map(|r| r.time).collect();
+            unique_timestamps.sort();
+            unique_timestamps.dedup();
             tokio::spawn(async move {
-                for time in timestamps {
+                for time in unique_timestamps {
                     if let Err(e) =
                         crate::services::calibration::recalculate_derived_at_timestamp(
                             &db_clone, sid, time,

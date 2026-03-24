@@ -891,7 +891,10 @@ async fn fetch_readings(
         .collect();
 
     // All resolved params come from the same site
-    let site_id = resolved.first().map(|rp| rp.site_id).unwrap();
+    let site_id = resolved
+        .first()
+        .map(|rp| rp.site_id)
+        .ok_or_else(|| AppError::NotFound("No resolved parameters found".to_string()))?;
 
     let r = Alias::new("r");
     let p = Alias::new("p");

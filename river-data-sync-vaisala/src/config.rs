@@ -24,7 +24,7 @@ impl SyncConfig {
 
             vaisala_base_url: require_env("VAISALA_BASE_URL")?,
             vaisala_bearer_token: require_env("VAISALA_BEARER_TOKEN")?,
-            vaisala_skip_tls_verify: env_bool("VAISALA_SKIP_TLS_VERIFY", true),
+            vaisala_skip_tls_verify: env_bool("VAISALA_SKIP_TLS_VERIFY", false),
 
             max_history_days: env_i64("MAX_HISTORY_DAYS", 90),
 

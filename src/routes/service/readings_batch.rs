@@ -109,11 +109,15 @@ pub async fn insert_batch_readings(
         }
     }
 
-    // Collect (site_id, time) pairs before consuming readings for derived auto-compute
+    // Collect unique (site_id, time) pairs for derived auto-compute
     let site_timestamps_for_derived: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = {
         let mut map: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = HashMap::new();
         for r in &payload.readings {
             map.entry(r.site_id).or_default().push(r.time);
+        }
+        for timestamps in map.values_mut() {
+            timestamps.sort();
+            timestamps.dedup();
         }
         map
     };
