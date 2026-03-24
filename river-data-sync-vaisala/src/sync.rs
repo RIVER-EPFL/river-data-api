@@ -237,24 +237,38 @@ pub async fn sync_readings(
 
         // Insert in batches
         let mut actually_inserted: usize = 0;
+        let mut failed_batches: usize = 0;
         for chunk in readings.chunks(BATCH_SIZE) {
             match api.ingest_readings(*stream_id, chunk).await {
                 Ok(n) => actually_inserted += n as usize,
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    batch_size = chunk.len(),
-                    "Failed to ingest reading batch"
-                ),
+                Err(e) => {
+                    failed_batches += 1;
+                    tracing::warn!(
+                        error = %e,
+                        batch_size = chunk.len(),
+                        "Failed to ingest reading batch"
+                    );
+                }
             }
         }
 
-        tracing::info!(
-            new = actually_inserted,
-            total = sample_count,
-            stream_id = %stream_id,
-            location_id = attrs.id,
-            "Synced readings"
-        );
+        if failed_batches > 0 {
+            tracing::warn!(
+                inserted = actually_inserted,
+                failed_batches,
+                total = sample_count,
+                stream_id = %stream_id,
+                "Partial sync failure: some batches failed"
+            );
+        } else {
+            tracing::info!(
+                new = actually_inserted,
+                total = sample_count,
+                stream_id = %stream_id,
+                location_id = attrs.id,
+                "Synced readings"
+            );
+        }
 
         let is_backfill = last_time.is_none();
         total_readings_synced += actually_inserted;
