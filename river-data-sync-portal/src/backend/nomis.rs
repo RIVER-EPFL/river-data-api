@@ -151,65 +151,42 @@ impl PortalBackend for NomisBackend {
                 },
             });
 
-            // Location-level water quality params
-            for (col, name, units) in LOCATION_PARAMS {
-                let source_key = format!("{id_location}:{col}");
-                let mut meta = base_metadata.clone();
-                meta["units"] = serde_json::json!(units);
-                meta["table"] = serde_json::json!("location");
+            // Helper to build descriptors with hierarchy metadata
+            let mut add_params = |params: &[(&str, &str, &str)], table: &str, key_prefix: &str, path_prefix: &str| {
+                for (col, name, units) in params {
+                    let source_key = if key_prefix.is_empty() {
+                        format!("{id_location}:{col}")
+                    } else {
+                        format!("{id_location}:{key_prefix}:{col}")
+                    };
+                    let mut meta = base_metadata.clone();
+                    meta["units"] = serde_json::json!(units);
+                    meta["table"] = serde_json::json!(table);
+                    meta["hierarchy"] = serde_json::json!({
+                        "project": "NOMIS",
+                        "site": id_location,
+                        "parameter": name,
+                    });
 
-                descriptors.push(StreamDescriptor {
-                    source_key,
-                    source_name: format!("{id_location} - {name}"),
-                    source_path: format!("nomis/{id_glacier}/{id_location}/{col}"),
-                    metadata: meta,
-                });
-            }
+                    let source_path = if path_prefix.is_empty() {
+                        format!("nomis/{id_glacier}/{id_location}/{col}")
+                    } else {
+                        format!("nomis/{id_glacier}/{id_location}/{path_prefix}/{col}")
+                    };
 
-            // biogeo_1 params
-            for (col, name, units) in BIOGEO1_PARAMS {
-                let source_key = format!("{id_location}:biogeo1:{col}");
-                let mut meta = base_metadata.clone();
-                meta["units"] = serde_json::json!(units);
-                meta["table"] = serde_json::json!("biogeo_1");
+                    descriptors.push(StreamDescriptor {
+                        source_key,
+                        source_name: format!("{id_location} - {name}"),
+                        source_path,
+                        metadata: meta,
+                    });
+                }
+            };
 
-                descriptors.push(StreamDescriptor {
-                    source_key,
-                    source_name: format!("{id_location} - {name}"),
-                    source_path: format!("nomis/{id_glacier}/{id_location}/biogeo1/{col}"),
-                    metadata: meta,
-                });
-            }
-
-            // biogeo_1u params (TSS)
-            for (col, name, units) in BIOGEO1U_PARAMS {
-                let source_key = format!("{id_location}:biogeo1u:{col}");
-                let mut meta = base_metadata.clone();
-                meta["units"] = serde_json::json!(units);
-                meta["table"] = serde_json::json!("biogeo_1u");
-
-                descriptors.push(StreamDescriptor {
-                    source_key,
-                    source_name: format!("{id_location} - {name}"),
-                    source_path: format!("nomis/{id_glacier}/{id_location}/biogeo1u/{col}"),
-                    metadata: meta,
-                });
-            }
-
-            // biogeo_3u params (DOM/DOC)
-            for (col, name, units) in BIOGEO3U_PARAMS {
-                let source_key = format!("{id_location}:biogeo3u:{col}");
-                let mut meta = base_metadata.clone();
-                meta["units"] = serde_json::json!(units);
-                meta["table"] = serde_json::json!("biogeo_3u");
-
-                descriptors.push(StreamDescriptor {
-                    source_key,
-                    source_name: format!("{id_location} - {name}"),
-                    source_path: format!("nomis/{id_glacier}/{id_location}/biogeo3u/{col}"),
-                    metadata: meta,
-                });
-            }
+            add_params(LOCATION_PARAMS, "location", "", "");
+            add_params(BIOGEO1_PARAMS, "biogeo_1", "biogeo1", "biogeo1");
+            add_params(BIOGEO1U_PARAMS, "biogeo_1u", "biogeo1u", "biogeo1u");
+            add_params(BIOGEO3U_PARAMS, "biogeo_3u", "biogeo3u", "biogeo3u");
         }
 
         tracing::info!(
