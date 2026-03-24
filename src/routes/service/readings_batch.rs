@@ -37,6 +37,21 @@ pub async fn insert_batch_readings(
     State(state): State<AppState>,
     Json(payload): Json<BatchReadingsRequest>,
 ) -> AppResult<Json<BatchReadingsResponse>> {
+    // Validate timestamps are within reasonable bounds
+    let now = chrono::Utc::now();
+    let min_time = now - chrono::Duration::days(365 * 10); // 10 years ago
+    let max_time = now + chrono::Duration::days(1); // 1 day in the future
+    for r in &payload.readings {
+        if r.time < min_time || r.time > max_time {
+            return Err(crate::error::AppError::BadRequest(format!(
+                "Reading timestamp {} is outside valid range ({} to {})",
+                r.time.to_rfc3339(),
+                min_time.to_rfc3339(),
+                max_time.to_rfc3339(),
+            )));
+        }
+    }
+
     // Collect unique (site_id, parameter_id) pairs and resolve stream_ids
     let mut stream_cache: HashMap<(Uuid, Uuid), Uuid> = HashMap::new();
 
