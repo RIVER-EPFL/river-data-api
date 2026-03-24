@@ -1117,6 +1117,9 @@ struct GroupedSite {
     glacier: Option<String>,
     stream_count: usize,
     existing_id: Option<Uuid>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+    altitude_m: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -1145,8 +1148,8 @@ async fn grouped_discovery(
 
     // Group by project (from source_path segment 1 or hierarchy metadata)
     let mut project_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    // Group by site (from source_path segment 3)
-    let mut site_info: std::collections::HashMap<String, (Option<String>, usize)> = std::collections::HashMap::new();
+    // Group by site (from source_path segment 3) → (glacier_name, count, lat, lon, alt)
+    let mut site_info: std::collections::HashMap<String, (Option<String>, usize, Option<f64>, Option<f64>, Option<f64>)> = std::collections::HashMap::new();
     // Group by parameter (from source_name display name, extract the part after " - ")
     let mut param_info: std::collections::HashMap<String, (String, usize)> = std::collections::HashMap::new();
 
@@ -1169,7 +1172,11 @@ async fn grouped_discovery(
             .and_then(|v| v.as_str())
             .map(|s| s.trim_matches('"').to_string());
         if !site_name.is_empty() {
-            let entry = site_info.entry(site_name).or_insert((glacier_name.clone(), 0));
+            let coords = stream.metadata.get("coordinates");
+            let lat = coords.and_then(|c| c.get("latitude")).and_then(|v| v.as_f64());
+            let lon = coords.and_then(|c| c.get("longitude")).and_then(|v| v.as_f64());
+            let alt = coords.and_then(|c| c.get("altitude_m")).and_then(|v| v.as_f64());
+            let entry = site_info.entry(site_name).or_insert((glacier_name.clone(), 0, lat, lon, alt));
             entry.1 += 1;
         }
 
@@ -1209,11 +1216,11 @@ async fn grouped_discovery(
         .collect();
 
     let mut grouped_sites: Vec<GroupedSite> = site_info.into_iter()
-        .map(|(name, (glacier, count))| {
+        .map(|(name, (glacier, count, lat, lon, alt))| {
             let existing_id = existing_sites.iter()
                 .find(|(_, n)| *n == name.to_lowercase())
                 .map(|(id, _)| *id);
-            GroupedSite { name, glacier, stream_count: count, existing_id }
+            GroupedSite { name, glacier, stream_count: count, existing_id, latitude: lat, longitude: lon, altitude_m: alt }
         })
         .collect();
     grouped_sites.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1259,6 +1266,9 @@ struct BulkPairRequest {
 struct BulkPairSite {
     name: String,
     existing_id: Option<Uuid>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+    altitude_m: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -1337,7 +1347,7 @@ async fn bulk_pair(
                     id: Set(id),
                     project_id: Set(Some(project_id)),
                     name: Set(s.name.clone()),
-                    latitude: Set(None), longitude: Set(None), altitude_m: Set(None),
+                    latitude: Set(s.latitude), longitude: Set(s.longitude), altitude_m: Set(s.altitude_m),
                     public_slug: Set(None),
                     created_at: Set(Some(Utc::now())),
                     discovered_at: Set(Some(Utc::now())),
@@ -1453,12 +1463,32 @@ async fn bulk_pair(
         };
 
         // Pair the stream
+        let stream_id = stream.id;
         let now = Utc::now();
         let mut active: data_streams::ActiveModel = stream.into();
         active.site_parameter_id = Set(Some(site_parameter_id));
         active.paired_at = Set(Some(now.into()));
         active.updated_at = Set(now.into());
         active.update(&txn).await?;
+
+        // Backfill readings with site_id and parameter_id
+        use sea_orm::Statement;
+        txn.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE readings SET site_id = $1, parameter_id = $2,
+              calibrated_value = COALESCE(calibrated_value, raw_value)
+              WHERE stream_id = $3 AND site_id IS NULL",
+            [site_id.into(), parameter_id.into(), stream_id.into()],
+        )).await?;
+
+        // Backfill status_events too
+        let _ = txn.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE status_events SET site_id = $1, parameter_id = $2
+              WHERE stream_id = $3 AND site_id IS NULL",
+            [site_id.into(), parameter_id.into(), stream_id.into()],
+        )).await;
+
         paired += 1;
     }
 

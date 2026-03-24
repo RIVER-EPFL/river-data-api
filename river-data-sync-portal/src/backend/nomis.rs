@@ -121,11 +121,13 @@ impl PortalBackend for NomisBackend {
         &self,
         pool: &MySqlPool,
     ) -> Result<Vec<StreamDescriptor>, SyncError> {
-        // Fetch locations with glacier info
+        // Fetch locations with glacier info and coordinates
         let locations = sqlx::query(
-            "SELECT l.id_location, l.id_glacier, l.type, g.gl_name, g.rgi_v6 \
+            "SELECT l.id_location, l.id_glacier, l.type, g.gl_name, g.rgi_v6, \
+                    gu.lat_sp, gu.lon_sp, gu.ele_sp \
              FROM location l \
-             JOIN glacier g ON l.id_glacier = g.id_glacier"
+             JOIN glacier g ON l.id_glacier = g.id_glacier \
+             LEFT JOIN glacier_ud gu ON l.id_glacier = gu.id_glacier AND l.type = gu.site"
         )
         .fetch_all(pool)
         .await?;
@@ -138,6 +140,9 @@ impl PortalBackend for NomisBackend {
             let loc_type: Option<String> = loc.get("type");
             let gl_name: Option<String> = loc.get("gl_name");
             let rgi: Option<String> = loc.get("rgi_v6");
+            let lat: Option<f64> = loc.try_get("lat_sp").ok();
+            let lon: Option<f64> = loc.try_get("lon_sp").ok();
+            let ele: Option<i32> = loc.try_get("ele_sp").ok();
 
             let base_metadata = serde_json::json!({
                 "glacier": {
@@ -148,6 +153,11 @@ impl PortalBackend for NomisBackend {
                 "location": {
                     "id": id_location,
                     "type": loc_type,
+                },
+                "coordinates": {
+                    "latitude": lat,
+                    "longitude": lon,
+                    "altitude_m": ele,
                 },
             });
 
