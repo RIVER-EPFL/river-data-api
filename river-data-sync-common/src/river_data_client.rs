@@ -55,7 +55,7 @@ impl RiverDataClient {
         let resp = self
             .http_client
             .post(self.url("/streams/register"))
-            .bearer_auth(&self.current_token())
+            .bearer_auth(self.current_token())
             .json(req)
             .send()
             .await
@@ -87,7 +87,7 @@ impl RiverDataClient {
         let resp = self
             .http_client
             .get(&url)
-            .bearer_auth(&self.current_token())
+            .bearer_auth(self.current_token())
             .send()
             .await
             .map_err(|e| RiverDataClientError::Api(format!("list_streams failed: {e}")))?;
@@ -119,7 +119,7 @@ impl RiverDataClient {
         let resp = self
             .http_client
             .post(self.url("/ingest"))
-            .bearer_auth(&self.current_token())
+            .bearer_auth(self.current_token())
             .json(&body)
             .send()
             .await
@@ -150,7 +150,7 @@ impl RiverDataClient {
         let resp = self
             .http_client
             .post(self.url("/ingest/status_events"))
-            .bearer_auth(&self.current_token())
+            .bearer_auth(self.current_token())
             .json(&body)
             .send()
             .await
@@ -174,7 +174,7 @@ impl RiverDataClient {
         let resp = self
             .http_client
             .post(self.url("/actions/refresh_aggregates"))
-            .bearer_auth(&self.current_token())
+            .bearer_auth(self.current_token())
             .json(&body)
             .send()
             .await
@@ -201,7 +201,7 @@ impl RiverDataClient {
         let resp = self
             .http_client
             .post(self.url("/actions/compute_derived"))
-            .bearer_auth(&self.current_token())
+            .bearer_auth(self.current_token())
             .json(&body)
             .send()
             .await
@@ -224,7 +224,7 @@ impl RiverDataClient {
         let resp = self
             .http_client
             .patch(self.url(&format!("/sync/commands/{command_id}")))
-            .bearer_auth(&self.current_token())
+            .bearer_auth(self.current_token())
             .json(&body)
             .send()
             .await
@@ -244,7 +244,7 @@ impl RiverDataClient {
         let resp = self
             .http_client
             .post(self.url("/sync/events"))
-            .bearer_auth(&self.current_token())
+            .bearer_auth(self.current_token())
             .json(event)
             .send()
             .await
@@ -263,7 +263,7 @@ impl RiverDataClient {
         let resp = self
             .http_client
             .patch(self.url(&format!("/sync/events/{event_id}")))
-            .bearer_auth(&self.current_token())
+            .bearer_auth(self.current_token())
             .json(update)
             .send()
             .await
