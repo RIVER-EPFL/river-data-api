@@ -1,4 +1,15 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Deserialize a number that may arrive as float into i64.
+fn deserialize_timestamp<'de, D: Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
+    let v: f64 = Deserialize::deserialize(d)?;
+    Ok(v as i64)
+}
+
+fn deserialize_timestamp_opt<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+    let v: Option<f64> = Deserialize::deserialize(d)?;
+    Ok(v.map(|f| f as i64))
+}
 
 // ============================================================================
 // Vaisala API response types (from connectors/vaisala/models.rs)
@@ -36,7 +47,7 @@ pub struct LocationHistoryAttributes {
     pub id: i32,
     pub name: String,
     pub zone: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_timestamp_opt")]
     pub timestamp: Option<i64>,
     #[serde(default)]
     pub value: Option<f64>,
@@ -46,13 +57,13 @@ pub struct LocationHistoryAttributes {
     pub display_units: Option<String>,
     #[serde(default)]
     pub max: Option<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_timestamp_opt")]
     pub max_time: Option<i64>,
     #[serde(default)]
     pub avg: Option<f64>,
     #[serde(default)]
     pub min: Option<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_timestamp_opt")]
     pub min_time: Option<i64>,
     #[serde(default)]
     pub seconds: Option<i64>,
@@ -166,7 +177,7 @@ pub struct LocationDataAttributes {
     pub description: String,
     #[serde(default)]
     pub logger_device: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_timestamp")]
     pub timestamp: i64,
     #[serde(default)]
     pub device_status: String,

@@ -83,7 +83,7 @@ services:
       dockerfile: river-data-sync-vaisala/Dockerfile
     environment:
       # River Data API connection
-      - API_BASE_URL=http://river-db-api:${API_PORT:-3000}/api/service
+      - API_BASE_URL=http://river-db-api:${API_PORT:-3000}
       # Control plane credentials (create via dashboard → Services tab)
       - SERVICE_CLIENT_ID=${SERVICE_CLIENT_ID:-}
       - SERVICE_CLIENT_SECRET=${SERVICE_CLIENT_SECRET:-}
@@ -103,6 +103,88 @@ services:
       - RUST_LOG=${SYNC_RUST_LOG:-info}
     depends_on:
       river-db-api:
+        condition: service_healthy
+
+  # ── Portal sync microservices ───────────────────────────────────────
+  river-data-sync-cnet:
+    build:
+      context: .
+      dockerfile: river-data-sync-portal/Dockerfile
+    profiles: [portal]
+    environment:
+      - PORTAL_TYPE=cnet
+      - PORTAL_DB_HOST=portal-db-cnet
+      - PORTAL_DB_PORT=3306
+      - PORTAL_DB_USER=sync_reader
+      - PORTAL_DB_PASSWORD=sync_reader
+      - PORTAL_DB_NAME=cnet_db
+      - API_BASE_URL=http://river-db-api:${API_PORT:-3000}
+      - SERVICE_CLIENT_ID=${CNET_SERVICE_CLIENT_ID:-}
+      - SERVICE_CLIENT_SECRET=${CNET_SERVICE_CLIENT_SECRET:-}
+      - INSTANCE_ID=cnet-dev-01
+      - SYNC_INTERVAL_SECONDS=${PORTAL_SYNC_INTERVAL:-21600}
+      - HEARTBEAT_INTERVAL_SECONDS=30
+      - RETRY_MAX=3
+      - RETRY_DELAY_SECONDS=60
+      - RUST_LOG=${SYNC_RUST_LOG:-info}
+    depends_on:
+      river-db-api:
+        condition: service_healthy
+      portal-db-cnet:
+        condition: service_healthy
+
+  river-data-sync-metalp:
+    build:
+      context: .
+      dockerfile: river-data-sync-portal/Dockerfile
+    profiles: [portal]
+    environment:
+      - PORTAL_TYPE=metalp
+      - PORTAL_DB_HOST=portal-db-metalp
+      - PORTAL_DB_PORT=3306
+      - PORTAL_DB_USER=sync_reader
+      - PORTAL_DB_PASSWORD=sync_reader
+      - PORTAL_DB_NAME=metalp_db
+      - API_BASE_URL=http://river-db-api:${API_PORT:-3000}
+      - SERVICE_CLIENT_ID=${METALP_SERVICE_CLIENT_ID:-}
+      - SERVICE_CLIENT_SECRET=${METALP_SERVICE_CLIENT_SECRET:-}
+      - INSTANCE_ID=metalp-dev-01
+      - SYNC_INTERVAL_SECONDS=${PORTAL_SYNC_INTERVAL:-21600}
+      - HEARTBEAT_INTERVAL_SECONDS=30
+      - RETRY_MAX=3
+      - RETRY_DELAY_SECONDS=60
+      - RUST_LOG=${SYNC_RUST_LOG:-info}
+    depends_on:
+      river-db-api:
+        condition: service_healthy
+      portal-db-metalp:
+        condition: service_healthy
+
+  river-data-sync-nomis:
+    build:
+      context: .
+      dockerfile: river-data-sync-portal/Dockerfile
+    profiles: [portal]
+    environment:
+      - PORTAL_TYPE=nomis
+      - PORTAL_DB_HOST=portal-db-nomis
+      - PORTAL_DB_PORT=3306
+      - PORTAL_DB_USER=sync_reader
+      - PORTAL_DB_PASSWORD=sync_reader
+      - PORTAL_DB_NAME=nomis_db
+      - API_BASE_URL=http://river-db-api:${API_PORT:-3000}
+      - SERVICE_CLIENT_ID=${NOMIS_SERVICE_CLIENT_ID:-}
+      - SERVICE_CLIENT_SECRET=${NOMIS_SERVICE_CLIENT_SECRET:-}
+      - INSTANCE_ID=nomis-dev-01
+      - SYNC_INTERVAL_SECONDS=${PORTAL_SYNC_INTERVAL:-21600}
+      - HEARTBEAT_INTERVAL_SECONDS=30
+      - RETRY_MAX=3
+      - RETRY_DELAY_SECONDS=60
+      - RUST_LOG=${SYNC_RUST_LOG:-info}
+    depends_on:
+      river-db-api:
+        condition: service_healthy
+      portal-db-nomis:
         condition: service_healthy
 
   river-db-timescale:
@@ -150,7 +232,7 @@ services:
     ports:
       - "3310:3306"
     volumes:
-      - ../../../../dumps/cnet_db_prod.sql:/docker-entrypoint-initdb.d/01-data.sql
+      - /home/ejthomas/projects/RIVER/dumps/cnet_db_prod.sql:/docker-entrypoint-initdb.d/01-data.sql:ro
       - portal-cnet-data:/var/lib/mysql
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
@@ -169,7 +251,7 @@ services:
     ports:
       - "3311:3306"
     volumes:
-      - ../../../../dumps/metalp_db_prod.sql:/docker-entrypoint-initdb.d/01-data.sql
+      - /home/ejthomas/projects/RIVER/dumps/metalp_db_prod.sql:/docker-entrypoint-initdb.d/01-data.sql:ro
       - portal-metalp-data:/var/lib/mysql
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
@@ -188,7 +270,7 @@ services:
     ports:
       - "3312:3306"
     volumes:
-      - ../../../../dumps/nomis_db_prod.sql:/docker-entrypoint-initdb.d/01-data.sql
+      - /home/ejthomas/projects/RIVER/dumps/nomis_db_prod.sql:/docker-entrypoint-initdb.d/01-data.sql:ro
       - portal-nomis-data:/var/lib/mysql
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]

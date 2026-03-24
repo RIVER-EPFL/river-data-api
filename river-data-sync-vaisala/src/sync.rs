@@ -228,6 +228,7 @@ pub async fn sync_readings(
             readings.push(IngestReading {
                 time,
                 raw_value: point.value,
+                replicate_index: 0,
                 sensor_id: None,
                 calibration_id: None,
                 deployment_id: None,

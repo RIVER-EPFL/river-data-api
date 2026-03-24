@@ -255,15 +255,14 @@ async fn issue_command(
 async fn list_commands(
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<SyncCommandResponse>>> {
-    let commands = sync_commands::Entity::find()
-        .order_by_desc(sync_commands::Column::CreatedAt)
-        .all(&state.db)
-        .await?;
+    use sea_orm::QuerySelect;
 
-    // Return last 50 commands
-    let commands: Vec<SyncCommandResponse> = commands
+    let commands: Vec<SyncCommandResponse> = sync_commands::Entity::find()
+        .order_by_desc(sync_commands::Column::CreatedAt)
+        .limit(50)
+        .all(&state.db)
+        .await?
         .into_iter()
-        .take(50)
         .map(command_to_response)
         .collect();
 
@@ -373,21 +372,56 @@ fn sync_event_to_response(e: sync_events::Model) -> SyncEventResponse {
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct SyncEventsQuery {
+    #[serde(default = "default_page")]
+    page: u64,
+    #[serde(default = "default_per_page")]
+    per_page: u64,
+}
+
+fn default_page() -> u64 { 1 }
+fn default_per_page() -> u64 { 25 }
+
 async fn list_sync_events(
     State(state): State<AppState>,
-) -> AppResult<Json<Vec<SyncEventResponse>>> {
-    let events = sync_events::Entity::find()
+    axum::extract::Query(params): axum::extract::Query<SyncEventsQuery>,
+) -> AppResult<(axum::http::StatusCode, axum::http::HeaderMap, Json<Vec<SyncEventResponse>>)> {
+    use sea_orm::PaginatorTrait;
+
+    let per_page = params.per_page.min(100);
+    let page = params.page.max(1) - 1; // 0-indexed for SeaORM
+
+    let paginator = sync_events::Entity::find()
         .order_by_desc(sync_events::Column::StartedAt)
-        .all(&state.db)
-        .await?;
+        .paginate(&state.db, per_page);
+
+    let total = paginator.num_items().await?;
+    let events = paginator.fetch_page(page).await?;
 
     let response: Vec<SyncEventResponse> = events
         .into_iter()
-        .take(100)
         .map(sync_event_to_response)
         .collect();
 
-    Ok(Json(response))
+    let mut headers = axum::http::HeaderMap::new();
+    let range_value = if response.is_empty() {
+        format!("items */{total}")
+    } else {
+        let start = page * per_page;
+        let end = start + response.len() as u64 - 1;
+        format!("items {start}-{end}/{total}")
+    };
+    headers.insert(
+        "Content-Range",
+        range_value.parse().unwrap(),
+    );
+    headers.insert(
+        "Access-Control-Expose-Headers",
+        "Content-Range".parse().unwrap(),
+    );
+
+    Ok((axum::http::StatusCode::OK, headers, Json(response)))
 }
 
 // ============================================================================

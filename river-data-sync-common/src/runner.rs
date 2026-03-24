@@ -81,6 +81,7 @@ impl<S: SyncService> SyncServiceRunner<S> {
         // Shared state
         let (pause_tx, pause_rx) = watch::channel(false);
         let (sync_tx, sync_rx) = mpsc::channel::<SyncTrigger>(16);
+        let (current_op_tx, current_op_rx) = watch::channel::<Option<String>>(None);
 
         // Spawn heartbeat loop
         let hb_service = self.service.clone();
@@ -96,6 +97,7 @@ impl<S: SyncService> SyncServiceRunner<S> {
                 hb_service,
                 hb_sync_tx,
                 hb_pause_tx,
+                current_op_rx,
             )
             .await;
         });
@@ -110,6 +112,7 @@ impl<S: SyncService> SyncServiceRunner<S> {
                 sync_interval,
                 pause_rx,
                 sync_rx,
+                current_op_tx,
             )
             .await;
         });
@@ -137,6 +140,7 @@ impl<S: SyncService> SyncServiceRunner<S> {
         service: Arc<S>,
         sync_tx: mpsc::Sender<SyncTrigger>,
         pause_tx: watch::Sender<bool>,
+        current_op_rx: watch::Receiver<Option<String>>,
     ) {
         let mut interval =
             tokio::time::interval(Duration::from_secs(config.heartbeat_interval_secs));
@@ -145,10 +149,19 @@ impl<S: SyncService> SyncServiceRunner<S> {
         loop {
             interval.tick().await;
 
-            let status = if *pause_tx.borrow() { "paused" } else { "running" };
+            let is_paused = *pause_tx.borrow();
+            let current_op = current_op_rx.borrow().clone();
+
+            let status = if is_paused {
+                "paused"
+            } else if current_op.is_some() {
+                "syncing"
+            } else {
+                "idle"
+            };
 
             match client
-                .heartbeat(service_id, &config.client_secret, status, None)
+                .heartbeat(service_id, &config.client_secret, status, current_op.as_deref())
                 .await
             {
                 Ok(resp) => {
@@ -256,6 +269,7 @@ impl<S: SyncService> SyncServiceRunner<S> {
         sync_interval_secs: u64,
         pause_rx: watch::Receiver<bool>,
         mut sync_rx: mpsc::Receiver<SyncTrigger>,
+        current_op_tx: watch::Sender<Option<String>>,
     ) {
         let mut interval = tokio::time::interval(Duration::from_secs(sync_interval_secs));
         interval.tick().await; // skip first immediate tick
@@ -287,6 +301,10 @@ impl<S: SyncService> SyncServiceRunner<S> {
                 SyncTrigger::Scheduled => "scheduled",
             };
 
+            // Signal current operation to heartbeat loop
+            let op_label = if full { "Full Sync" } else { "Syncing" };
+            let _ = current_op_tx.send(Some(op_label.to_string()));
+
             // Create sync event (running)
             let event_id = if let Some(api) = service.river_data_client() {
                 match api.create_sync_event(&serde_json::json!({
@@ -306,6 +324,9 @@ impl<S: SyncService> SyncServiceRunner<S> {
             };
 
             let result = service.sync(full).await;
+
+            // Clear current operation
+            let _ = current_op_tx.send(None);
 
             // Update sync event with result
             if let (Some(eid), Some(api)) = (event_id, service.river_data_client()) {

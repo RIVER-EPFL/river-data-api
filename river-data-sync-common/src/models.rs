@@ -155,12 +155,18 @@ pub struct IngestReadingsRequest {
 pub struct IngestReading {
     pub time: chrono::DateTime<chrono::Utc>,
     pub raw_value: f64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub replicate_index: i16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sensor_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub calibration_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deployment_id: Option<Uuid>,
+}
+
+fn is_zero(v: &i16) -> bool {
+    *v == 0
 }
 
 /// Ingest status events request

@@ -400,7 +400,8 @@ pub async fn update_sync_event(
     let service_id = event.service_id;
     let mut active: sync_events::ActiveModel = event.into();
 
-    let is_terminal = matches!(req.status.as_deref(), Some("completed" | "partial"));
+    let is_terminal = matches!(req.status.as_deref(), Some("completed" | "partial" | "failed" | "cancelled"));
+    let is_success = matches!(req.status.as_deref(), Some("completed" | "partial"));
 
     if let Some(status) = req.status {
         active.status = Set(status);
@@ -420,12 +421,15 @@ pub async fn update_sync_event(
     if let Some(duration) = req.duration_ms {
         active.duration_ms = Set(Some(duration));
     }
-    active.completed_at = Set(Some(Utc::now().into()));
+    if is_terminal {
+        active.completed_at = Set(Some(Utc::now().into()));
+    }
 
     active.update(&state.db).await?;
 
     // Update last_sync_completed_at on the service when sync finishes successfully
-    if is_terminal {
+    // (only for completed/partial, not failed/cancelled)
+    if is_success {
         if let Some(service) = sync_services::Entity::find_by_id(service_id)
             .one(&state.db)
             .await?
