@@ -142,6 +142,8 @@ pub fn router() -> Router<AppState> {
         .route("/credentials/{id}/revoke", post(revoke_credential))
         .route("/discovery", get(get_discovery))
         .route("/apply-discovery", post(apply_discovery))
+        .route("/grouped-discovery", post(grouped_discovery))
+        .route("/bulk-pair", post(bulk_pair))
 }
 
 // ============================================================================
@@ -1082,4 +1084,409 @@ async fn process_action<C: ConnectionTrait>(
         streams_paired: 1,
         backfilled,
     })
+}
+
+// ============================================================================
+// Grouped Discovery + Bulk Pair
+// ============================================================================
+
+#[derive(Deserialize)]
+struct GroupedDiscoveryRequest {
+    source_system: String,
+}
+
+#[derive(Serialize)]
+struct GroupedDiscoveryResponse {
+    source_system: String,
+    total_streams: usize,
+    projects: Vec<GroupedProject>,
+    sites: Vec<GroupedSite>,
+    parameters: Vec<GroupedParameter>,
+}
+
+#[derive(Serialize)]
+struct GroupedProject {
+    name: String,
+    stream_count: usize,
+    existing_id: Option<Uuid>,
+}
+
+#[derive(Serialize)]
+struct GroupedSite {
+    name: String,
+    glacier: Option<String>,
+    stream_count: usize,
+    existing_id: Option<Uuid>,
+}
+
+#[derive(Serialize)]
+struct GroupedParameter {
+    name: String,
+    display_name: String,
+    units: String,
+    stream_count: usize,
+    existing_id: Option<Uuid>,
+}
+
+/// `POST /api/admin/sync/grouped-discovery` — server-side grouping of unpaired streams.
+async fn grouped_discovery(
+    State(state): State<AppState>,
+    Json(req): Json<GroupedDiscoveryRequest>,
+) -> AppResult<Json<GroupedDiscoveryResponse>> {
+    let db = &state.db;
+
+    let streams = data_streams::Entity::find()
+        .filter(data_streams::Column::SourceSystem.eq(&req.source_system))
+        .filter(data_streams::Column::SiteParameterId.is_null())
+        .all(db)
+        .await?;
+
+    let total_streams = streams.len();
+
+    // Group by project (from source_path segment 1 or hierarchy metadata)
+    let mut project_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // Group by site (from source_path segment 3)
+    let mut site_info: std::collections::HashMap<String, (Option<String>, usize)> = std::collections::HashMap::new();
+    // Group by parameter (from source_name display name, extract the part after " - ")
+    let mut param_info: std::collections::HashMap<String, (String, usize)> = std::collections::HashMap::new();
+
+    for stream in &streams {
+        // Project: use hierarchy metadata or capitalize source_system
+        let project_name = stream.metadata.get("hierarchy")
+            .and_then(|h| h.get("project"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| req.source_system.to_uppercase());
+        *project_counts.entry(project_name).or_default() += 1;
+
+        // Site: extract from source_path segment 3 (e.g., "nomis/GL1/GL1_DN/..." → "GL1_DN")
+        let site_name = stream.source_path.as_deref()
+            .and_then(|p| p.split('/').nth(2))
+            .unwrap_or("")
+            .to_string();
+        let glacier_name = stream.metadata.get("glacier")
+            .and_then(|g| g.get("name"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim_matches('"').to_string());
+        if !site_name.is_empty() {
+            let entry = site_info.entry(site_name).or_insert((glacier_name.clone(), 0));
+            entry.1 += 1;
+        }
+
+        // Parameter: extract display name from source_name (e.g., "GL1_DN - Conductivity" → "Conductivity")
+        let param_display = stream.source_name.as_deref()
+            .and_then(|n| n.split(" - ").nth(1))
+            .unwrap_or("")
+            .to_string();
+        let units = stream.metadata.get("units")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !param_display.is_empty() {
+            let entry = param_info.entry(param_display.clone()).or_insert((units, 0));
+            entry.1 += 1;
+        }
+    }
+
+    // Match against existing entities
+    let existing_projects: Vec<(Uuid, String)> = projects::Entity::find()
+        .all(db).await?
+        .into_iter().map(|p| (p.id, p.name.to_lowercase())).collect();
+    let existing_sites: Vec<(Uuid, String)> = sites::Entity::find()
+        .all(db).await?
+        .into_iter().map(|s| (s.id, s.name.to_lowercase())).collect();
+    let existing_params: Vec<(Uuid, String, String)> = parameters::Entity::find()
+        .all(db).await?
+        .into_iter().map(|p| (p.id, p.name.to_lowercase(), p.display_name)).collect();
+
+    let grouped_projects: Vec<GroupedProject> = project_counts.into_iter()
+        .map(|(name, count)| {
+            let existing_id = existing_projects.iter()
+                .find(|(_, n)| *n == name.to_lowercase())
+                .map(|(id, _)| *id);
+            GroupedProject { name, stream_count: count, existing_id }
+        })
+        .collect();
+
+    let mut grouped_sites: Vec<GroupedSite> = site_info.into_iter()
+        .map(|(name, (glacier, count))| {
+            let existing_id = existing_sites.iter()
+                .find(|(_, n)| *n == name.to_lowercase())
+                .map(|(id, _)| *id);
+            GroupedSite { name, glacier, stream_count: count, existing_id }
+        })
+        .collect();
+    grouped_sites.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut grouped_params: Vec<GroupedParameter> = param_info.into_iter()
+        .map(|(display_name, (units, count))| {
+            let existing_id = existing_params.iter()
+                .find(|(_, n, _)| *n == display_name.to_lowercase())
+                .map(|(id, _, _)| *id);
+            GroupedParameter {
+                name: display_name.clone(),
+                display_name,
+                units,
+                stream_count: count,
+                existing_id,
+            }
+        })
+        .collect();
+    grouped_params.sort_by(|a, b| a.name.cmp(&b.name));
+
+    Ok(Json(GroupedDiscoveryResponse {
+        source_system: req.source_system,
+        total_streams,
+        projects: grouped_projects,
+        sites: grouped_sites,
+        parameters: grouped_params,
+    }))
+}
+
+// ── Bulk Pair ──
+
+#[derive(Deserialize)]
+struct BulkPairRequest {
+    source_system: String,
+    project_name: String,
+    /// Sites to create or use. Each has name + optional existing_id.
+    sites: Vec<BulkPairSite>,
+    /// Parameters to create or use. Each has name, display_name, units + optional existing_id.
+    parameters: Vec<BulkPairParameter>,
+}
+
+#[derive(Deserialize)]
+struct BulkPairSite {
+    name: String,
+    existing_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+struct BulkPairParameter {
+    name: String,
+    display_name: String,
+    units: String,
+    existing_id: Option<Uuid>,
+}
+
+#[derive(Serialize)]
+struct BulkPairResponse {
+    project_created: bool,
+    sites_created: u32,
+    parameters_created: u32,
+    site_parameters_created: u32,
+    streams_paired: u32,
+}
+
+/// `POST /api/admin/sync/bulk-pair` — creates entities and pairs all matching streams in one transaction.
+async fn bulk_pair(
+    State(state): State<AppState>,
+    Json(req): Json<BulkPairRequest>,
+) -> AppResult<Json<BulkPairResponse>> {
+    use std::collections::HashMap;
+
+    let db = &state.db;
+    let txn = db.begin().await?;
+
+    // 1. Resolve or create project
+    let project_created;
+    let project_id = {
+        let existing = projects::Entity::find()
+            .filter(Expr::cust_with_values("LOWER(name) = $1", [req.project_name.to_lowercase()]))
+            .one(&txn).await?;
+        if let Some(p) = existing {
+            project_created = false;
+            p.id
+        } else {
+            let id = Uuid::new_v4();
+            projects::ActiveModel {
+                id: Set(id),
+                name: Set(req.project_name.clone()),
+                description: Set(None),
+                data_source: Set(req.source_system.clone()),
+                is_public: Set(false),
+                public_slug: Set(None),
+                public_api_title: Set(None),
+                public_api_description: Set(None),
+                public_api_version: Set(None),
+                public_contact_email: Set(None),
+                created_at: Set(Some(Utc::now())),
+                discovered_at: Set(Some(Utc::now())),
+            }.insert(&txn).await?;
+            project_created = true;
+            id
+        }
+    };
+
+    // 2. Resolve or create sites → build name→id map
+    let mut site_map: HashMap<String, Uuid> = HashMap::new();
+    let mut sites_created = 0u32;
+    for s in &req.sites {
+        let id = if let Some(eid) = s.existing_id {
+            eid
+        } else {
+            // Check if already exists (case-insensitive)
+            let existing = sites::Entity::find()
+                .filter(Expr::cust_with_values("LOWER(name) = $1", [s.name.to_lowercase()]))
+                .one(&txn).await?;
+            if let Some(existing) = existing {
+                existing.id
+            } else {
+                let id = Uuid::new_v4();
+                sites::ActiveModel {
+                    id: Set(id),
+                    project_id: Set(Some(project_id)),
+                    name: Set(s.name.clone()),
+                    latitude: Set(None), longitude: Set(None), altitude_m: Set(None),
+                    public_slug: Set(None),
+                    created_at: Set(Some(Utc::now())),
+                    discovered_at: Set(Some(Utc::now())),
+                }.insert(&txn).await?;
+                sites_created += 1;
+                id
+            }
+        };
+        site_map.insert(s.name.to_lowercase(), id);
+    }
+
+    // 3. Resolve or create parameters → build name→id map
+    let mut param_map: HashMap<String, Uuid> = HashMap::new();
+    let mut params_created = 0u32;
+    for p in &req.parameters {
+        let id = if let Some(eid) = p.existing_id {
+            eid
+        } else {
+            let existing = parameters::Entity::find()
+                .filter(Expr::cust_with_values("LOWER(name) = $1", [p.name.to_lowercase()]))
+                .one(&txn).await?;
+            if let Some(existing) = existing {
+                existing.id
+            } else {
+                let id = Uuid::new_v4();
+                parameters::ActiveModel {
+                    id: Set(id),
+                    name: Set(p.name.clone()),
+                    display_name: Set(p.display_name.clone()),
+                    default_units: Set(p.units.clone()),
+                    category: Set("measurement".to_string()),
+                    data_type: Set("numeric".to_string()),
+                    description: Set(None),
+                    default_warning_min: Set(None), default_warning_max: Set(None),
+                    default_alarm_min: Set(None), default_alarm_max: Set(None),
+                    created_at: Set(Some(Utc::now())),
+                }.insert(&txn).await?;
+                params_created += 1;
+                id
+            }
+        };
+        param_map.insert(p.name.to_lowercase(), id);
+    }
+
+    // 4. Fetch unpaired streams, create site_parameters, and pair
+    let streams = data_streams::Entity::find()
+        .filter(data_streams::Column::SourceSystem.eq(&req.source_system))
+        .filter(data_streams::Column::SiteParameterId.is_null())
+        .all(&txn)
+        .await?;
+
+    let mut sp_cache: HashMap<(Uuid, Uuid), Uuid> = HashMap::new();
+    let mut sp_created = 0u32;
+    let mut paired = 0u32;
+
+    for stream in streams {
+        // Extract site name from source_path segment 3
+        let site_name = stream.source_path.as_deref()
+            .and_then(|p| p.split('/').nth(2))
+            .unwrap_or("")
+            .to_lowercase();
+        // Extract parameter display name from source_name
+        let param_name = stream.source_name.as_deref()
+            .and_then(|n| n.split(" - ").nth(1))
+            .unwrap_or("")
+            .to_lowercase();
+
+        let Some(&site_id) = site_map.get(&site_name) else { continue };
+        let Some(&parameter_id) = param_map.get(&param_name) else { continue };
+
+        // Get or create site_parameter
+        let sp_key = (site_id, parameter_id);
+        let site_parameter_id = if let Some(&sp_id) = sp_cache.get(&sp_key) {
+            sp_id
+        } else {
+            let existing = site_parameters::Entity::find()
+                .filter(
+                    Condition::all()
+                        .add(site_parameters::Column::SiteId.eq(site_id))
+                        .add(site_parameters::Column::ParameterId.eq(parameter_id)),
+                )
+                .one(&txn).await?;
+            let id = if let Some(existing) = existing {
+                existing.id
+            } else {
+                let id = Uuid::new_v4();
+                let param = parameters::Entity::find_by_id(parameter_id)
+                    .one(&txn).await?;
+                let param_name_val = param.map(|p| p.name).unwrap_or_default();
+                site_parameters::ActiveModel {
+                    id: Set(id),
+                    site_id: Set(site_id),
+                    parameter_id: Set(parameter_id),
+                    name: Set(param_name_val),
+                    sensor_type: Set(String::new()),
+                    display_units: Set(None), units_name: Set(None),
+                    units_min: Set(None), units_max: Set(None),
+                    decimal_places: Set(None), channel_id: Set(None),
+                    sample_interval_sec: Set(None),
+                    is_active: Set(Some(true)),
+                    is_derived: Set(Some(false)),
+                    derived_definition_id: Set(None),
+                    variable_mappings: Set(None),
+                    created_at: Set(Some(Utc::now())),
+                    updated_at: Set(Some(Utc::now())),
+                    discovered_at: Set(Some(Utc::now())),
+                }.insert(&txn).await?;
+                sp_created += 1;
+                id
+            };
+            sp_cache.insert(sp_key, id);
+            id
+        };
+
+        // Pair the stream
+        let now = Utc::now();
+        let mut active: data_streams::ActiveModel = stream.into();
+        active.site_parameter_id = Set(Some(site_parameter_id));
+        active.paired_at = Set(Some(now.into()));
+        active.updated_at = Set(now.into());
+        active.update(&txn).await?;
+        paired += 1;
+    }
+
+    txn.commit().await?;
+
+    // Trigger aggregate refresh in background
+    if paired > 0 {
+        let db_clone = db.clone();
+        tokio::spawn(async move {
+            crate::services::sync_state::refresh_continuous_aggregates_full(&db_clone).await;
+        });
+    }
+
+    tracing::info!(
+        source_system = %req.source_system,
+        project_created,
+        sites_created,
+        params_created,
+        sp_created,
+        paired,
+        "Bulk pair complete"
+    );
+
+    Ok(Json(BulkPairResponse {
+        project_created,
+        sites_created,
+        parameters_created: params_created,
+        site_parameters_created: sp_created,
+        streams_paired: paired,
+    }))
 }
