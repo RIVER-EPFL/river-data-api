@@ -158,14 +158,14 @@ pub async fn resolve_site_with_project(
 // Time Range Validation
 // ============================================================================
 
-/// Validate that a required time range has end > start.
+/// Validate that a required time range has end >= start.
 pub fn validate_time_range(
     start: chrono::DateTime<chrono::Utc>,
     end: chrono::DateTime<chrono::Utc>,
 ) -> AppResult<()> {
-    if end <= start {
+    if end < start {
         return Err(AppError::BadRequest(
-            "end time must be after start time".to_string(),
+            "end time must not be before start time".to_string(),
         ));
     }
     Ok(())

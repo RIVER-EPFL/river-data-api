@@ -80,8 +80,29 @@ impl NomisBackend {
 
 /// Parse NOMIS date strings which can be "dd.mm.yyyy" or "dd.mm.yy".
 fn parse_nomis_date(s: &str) -> Option<NaiveDate> {
-    NaiveDate::parse_from_str(s.trim(), "%d.%m.%Y")
-        .or_else(|_| NaiveDate::parse_from_str(s.trim(), "%d.%m.%y"))
+    let trimmed = s.trim();
+    // Try 4-digit year first, but only if the year part actually has 4 digits
+    let parts: Vec<&str> = trimmed.split('.').collect();
+    if parts.len() == 3 {
+        let year_part = parts[2];
+        if year_part.len() == 4 {
+            if let Ok(d) = NaiveDate::parse_from_str(trimmed, "%d.%m.%Y") {
+                return Some(d);
+            }
+        }
+        // 2-digit year: map to 2000+
+        if year_part.len() <= 2 {
+            if let Ok(year) = year_part.parse::<i32>() {
+                let full_year = 2000 + year;
+                if let (Ok(day), Ok(month)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                    return NaiveDate::from_ymd_opt(full_year, month, day);
+                }
+            }
+        }
+    }
+    // Fallback
+    NaiveDate::parse_from_str(trimmed, "%d.%m.%Y")
+        .or_else(|_| NaiveDate::parse_from_str(trimmed, "%d.%m.%y"))
         .ok()
 }
 
@@ -256,7 +277,7 @@ impl PortalBackend for NomisBackend {
                     }
 
                     let value: Option<f64> = row.try_get::<Option<f64>, _>(*col).unwrap_or(None);
-                    if let Some(val) = value {
+                    if let Some(val) = value.filter(|&v| v > -9000.0) {
                         per_stream.entry(source_key).or_default().push(ReadingValue {
                             time: timestamp,
                             value: val,
@@ -303,7 +324,7 @@ impl PortalBackend for NomisBackend {
                     }
 
                     let value: Option<f64> = row.try_get::<Option<f64>, _>(*col).unwrap_or(None);
-                    if let Some(val) = value {
+                    if let Some(val) = value.filter(|&v| v > -9000.0) {
                         per_stream.entry(source_key).or_default().push(ReadingValue {
                             time: timestamp,
                             value: val,
@@ -349,7 +370,7 @@ impl PortalBackend for NomisBackend {
                     }
 
                     let value: Option<f64> = row.try_get::<Option<f64>, _>(*col).unwrap_or(None);
-                    if let Some(val) = value {
+                    if let Some(val) = value.filter(|&v| v > -9000.0) {
                         per_stream.entry(source_key).or_default().push(ReadingValue {
                             time: timestamp,
                             value: val,
@@ -397,7 +418,7 @@ impl PortalBackend for NomisBackend {
                     }
 
                     let value: Option<f64> = row.try_get::<Option<f64>, _>(*col).unwrap_or(None);
-                    if let Some(val) = value {
+                    if let Some(val) = value.filter(|&v| v > -9000.0) {
                         per_stream.entry(source_key).or_default().push(ReadingValue {
                             time: timestamp,
                             value: val,
