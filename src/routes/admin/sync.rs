@@ -908,217 +908,169 @@ async fn apply_discovery(
     Ok(Json(resp))
 }
 
-/// Process a single apply-discovery action.
-async fn process_action<C: ConnectionTrait>(
+/// Resolve an existing entity or create one by name (case-insensitive match).
+async fn resolve_or_create_project<C: ConnectionTrait>(
     db: &C,
-    action: &ApplyAction,
-) -> Result<ActionStats, String> {
-    let mut projects_created = 0u32;
-    let mut sites_created = 0u32;
-    let mut params_created = 0u32;
-    let mut site_params_created = 0u32;
-
-    // Resolve or create project
-    let project_id = if let Some(pid) = action.use_project_id {
-        pid
-    } else if let Some(ref cp) = action.create_project {
-        // Try to find existing first (case-insensitive)
-        let existing = projects::Entity::find()
-            .filter(Expr::cust_with_values(
-                "LOWER(name) = $1",
-                [cp.name.to_lowercase()],
-            ))
-            .one(db)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        if let Some(existing) = existing {
-            existing.id
-        } else {
-            let p = projects::ActiveModel {
-                id: Set(Uuid::new_v4()),
-                name: Set(cp.name.clone()),
-                description: Set(None),
-                data_source: Set("vaisala".to_string()),
-                is_public: Set(false),
-                public_slug: Set(None),
-                public_api_title: Set(None),
-                public_api_description: Set(None),
-                public_api_version: Set(None),
-                public_contact_email: Set(None),
-                created_at: Set(Some(Utc::now())),
-                discovered_at: Set(Some(Utc::now())),
-            };
-            let inserted = p.insert(db).await.map_err(|e| e.to_string())?;
-            projects_created += 1;
-            inserted.id
-        }
-    } else {
-        return Err("No project specified".to_string());
+    use_id: Option<Uuid>,
+    create: Option<&CreateProjectAction>,
+) -> Result<(Uuid, bool), String> {
+    if let Some(pid) = use_id {
+        return Ok((pid, false));
+    }
+    let cp = create.ok_or("No project specified")?;
+    let existing = projects::Entity::find()
+        .filter(Expr::cust_with_values("LOWER(name) = $1", [cp.name.to_lowercase()]))
+        .one(db).await.map_err(|e| e.to_string())?;
+    if let Some(existing) = existing {
+        return Ok((existing.id, false));
+    }
+    let p = projects::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        name: Set(cp.name.clone()),
+        description: Set(None),
+        data_source: Set("vaisala".to_string()),
+        is_public: Set(false),
+        public_slug: Set(None),
+        public_api_title: Set(None),
+        public_api_description: Set(None),
+        public_api_version: Set(None),
+        public_contact_email: Set(None),
+        created_at: Set(Some(Utc::now())),
+        discovered_at: Set(Some(Utc::now())),
     };
+    let inserted = p.insert(db).await.map_err(|e| e.to_string())?;
+    Ok((inserted.id, true))
+}
 
-    // Resolve or create site
-    let site_id = if let Some(sid) = action.use_site_id {
-        sid
-    } else if let Some(ref cs) = action.create_site {
-        let existing = sites::Entity::find()
-            .filter(Expr::cust_with_values(
-                "LOWER(name) = $1",
-                [cs.name.to_lowercase()],
-            ))
-            .one(db)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        if let Some(existing) = existing {
-            existing.id
-        } else {
-            let s = sites::ActiveModel {
-                id: Set(Uuid::new_v4()),
-                project_id: Set(Some(project_id)),
-                name: Set(cs.name.clone()),
-                latitude: Set(None),
-                longitude: Set(None),
-                altitude_m: Set(None),
-                public_slug: Set(None),
-                created_at: Set(Some(Utc::now())),
-                discovered_at: Set(Some(Utc::now())),
-            };
-            let inserted = s.insert(db).await.map_err(|e| e.to_string())?;
-            sites_created += 1;
-            inserted.id
-        }
-    } else {
-        return Err("No site specified".to_string());
+async fn resolve_or_create_site<C: ConnectionTrait>(
+    db: &C,
+    use_id: Option<Uuid>,
+    create: Option<&CreateSiteAction>,
+    project_id: Uuid,
+) -> Result<(Uuid, bool), String> {
+    if let Some(sid) = use_id {
+        return Ok((sid, false));
+    }
+    let cs = create.ok_or("No site specified")?;
+    let existing = sites::Entity::find()
+        .filter(Expr::cust_with_values("LOWER(name) = $1", [cs.name.to_lowercase()]))
+        .one(db).await.map_err(|e| e.to_string())?;
+    if let Some(existing) = existing {
+        return Ok((existing.id, false));
+    }
+    let s = sites::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        project_id: Set(Some(project_id)),
+        name: Set(cs.name.clone()),
+        latitude: Set(None), longitude: Set(None), altitude_m: Set(None),
+        public_slug: Set(None),
+        created_at: Set(Some(Utc::now())),
+        discovered_at: Set(Some(Utc::now())),
     };
+    let inserted = s.insert(db).await.map_err(|e| e.to_string())?;
+    Ok((inserted.id, true))
+}
 
-    // Resolve or create parameter
-    let parameter_id = if let Some(pid) = action.use_parameter_id {
-        pid
-    } else if let Some(ref cp) = action.create_parameter {
-        let existing = parameters::Entity::find()
-            .filter(Expr::cust_with_values(
-                "LOWER(name) = $1",
-                [cp.name.to_lowercase()],
-            ))
-            .one(db)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        if let Some(existing) = existing {
-            existing.id
-        } else {
-            let display_name = if cp.display_name.is_empty() {
-                cp.name.clone()
-            } else {
-                cp.display_name.clone()
-            };
-            let p = parameters::ActiveModel {
-                id: Set(Uuid::new_v4()),
-                name: Set(cp.name.clone()),
-                display_name: Set(display_name),
-                default_units: Set(cp.default_units.clone()),
-                category: Set(cp.category.clone()),
-                data_type: Set("numeric".to_string()),
-                description: Set(None),
-                default_warning_min: Set(None),
-                default_warning_max: Set(None),
-                default_alarm_min: Set(None),
-                default_alarm_max: Set(None),
-                created_at: Set(Some(Utc::now())),
-            };
-            let inserted = p.insert(db).await.map_err(|e| e.to_string())?;
-            params_created += 1;
-            inserted.id
-        }
-    } else {
-        return Err("No parameter specified".to_string());
+async fn resolve_or_create_parameter<C: ConnectionTrait>(
+    db: &C,
+    use_id: Option<Uuid>,
+    create: Option<&CreateParameterAction>,
+) -> Result<(Uuid, bool), String> {
+    if let Some(pid) = use_id {
+        return Ok((pid, false));
+    }
+    let cp = create.ok_or("No parameter specified")?;
+    let existing = parameters::Entity::find()
+        .filter(Expr::cust_with_values("LOWER(name) = $1", [cp.name.to_lowercase()]))
+        .one(db).await.map_err(|e| e.to_string())?;
+    if let Some(existing) = existing {
+        return Ok((existing.id, false));
+    }
+    let display_name = if cp.display_name.is_empty() { cp.name.clone() } else { cp.display_name.clone() };
+    let p = parameters::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        name: Set(cp.name.clone()),
+        display_name: Set(display_name),
+        default_units: Set(cp.default_units.clone()),
+        category: Set(cp.category.clone()),
+        data_type: Set("numeric".to_string()),
+        description: Set(None),
+        default_warning_min: Set(None), default_warning_max: Set(None),
+        default_alarm_min: Set(None), default_alarm_max: Set(None),
+        created_at: Set(Some(Utc::now())),
     };
+    let inserted = p.insert(db).await.map_err(|e| e.to_string())?;
+    Ok((inserted.id, true))
+}
 
-    // Resolve or create site_parameter
-    let site_parameter_id = if action.pair_to == "new" {
-        // Check if already exists
-        let existing = site_parameters::Entity::find()
-            .filter(
-                Condition::all()
-                    .add(site_parameters::Column::SiteId.eq(site_id))
-                    .add(site_parameters::Column::ParameterId.eq(parameter_id)),
-            )
-            .one(db)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        if let Some(existing) = existing {
-            existing.id
-        } else {
-            let csp = &action.create_site_parameter;
-            // Get the parameter name for the site_parameter name
-            let param = parameters::Entity::find_by_id(parameter_id)
-                .one(db)
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or("Parameter not found")?;
-
-            let sp = site_parameters::ActiveModel {
-                id: Set(Uuid::new_v4()),
-                site_id: Set(site_id),
-                parameter_id: Set(parameter_id),
-                name: Set(param.name),
-                sensor_type: Set(String::new()),
-                display_units: Set(csp.as_ref().and_then(|c| c.display_units.clone())),
-                units_name: Set(None),
-                units_min: Set(None),
-                units_max: Set(None),
-                decimal_places: Set(None),
-                channel_id: Set(csp.as_ref().and_then(|c| c.channel_id)),
-                sample_interval_sec: Set(csp.as_ref().and_then(|c| c.sample_interval_sec)),
-                is_active: Set(Some(true)),
-                is_derived: Set(Some(false)),
-                derived_definition_id: Set(None),
-                variable_mappings: Set(None),
-                created_at: Set(Some(Utc::now())),
-                updated_at: Set(Some(Utc::now())),
-                discovered_at: Set(Some(Utc::now())),
-            };
-            let inserted = sp.insert(db).await.map_err(|e| e.to_string())?;
-            site_params_created += 1;
-            inserted.id
-        }
-    } else {
-        Uuid::parse_str(&action.pair_to).map_err(|_| "Invalid site_parameter_id".to_string())?
+async fn resolve_or_create_site_parameter<C: ConnectionTrait>(
+    db: &C,
+    pair_to: &str,
+    create: Option<&CreateSiteParameterAction>,
+    site_id: Uuid,
+    parameter_id: Uuid,
+) -> Result<(Uuid, bool), String> {
+    if pair_to != "new" {
+        let id = Uuid::parse_str(pair_to).map_err(|_| "Invalid site_parameter_id".to_string())?;
+        return Ok((id, false));
+    }
+    let existing = site_parameters::Entity::find()
+        .filter(Condition::all()
+            .add(site_parameters::Column::SiteId.eq(site_id))
+            .add(site_parameters::Column::ParameterId.eq(parameter_id)))
+        .one(db).await.map_err(|e| e.to_string())?;
+    if let Some(existing) = existing {
+        return Ok((existing.id, false));
+    }
+    let param = parameters::Entity::find_by_id(parameter_id)
+        .one(db).await.map_err(|e| e.to_string())?
+        .ok_or("Parameter not found")?;
+    let sp = site_parameters::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        site_id: Set(site_id),
+        parameter_id: Set(parameter_id),
+        name: Set(param.name),
+        sensor_type: Set(String::new()),
+        display_units: Set(create.and_then(|c| c.display_units.clone())),
+        units_name: Set(None), units_min: Set(None), units_max: Set(None),
+        decimal_places: Set(None),
+        channel_id: Set(create.and_then(|c| c.channel_id)),
+        sample_interval_sec: Set(create.and_then(|c| c.sample_interval_sec)),
+        is_active: Set(Some(true)),
+        is_derived: Set(Some(false)),
+        derived_definition_id: Set(None),
+        variable_mappings: Set(None),
+        created_at: Set(Some(Utc::now())),
+        updated_at: Set(Some(Utc::now())),
+        discovered_at: Set(Some(Utc::now())),
     };
+    let inserted = sp.insert(db).await.map_err(|e| e.to_string())?;
+    Ok((inserted.id, true))
+}
 
-    // Pair the stream
-    let stream = data_streams::Entity::find_by_id(action.stream_id)
-        .one(db)
-        .await
-        .map_err(|e| e.to_string())?
+/// Pair a stream to a site_parameter, create sensor, and backfill readings/status_events.
+async fn pair_and_backfill<C: ConnectionTrait>(
+    db: &C,
+    stream_id: Uuid,
+    site_parameter_id: Uuid,
+) -> Result<(u32, u64), String> {
+    let stream = data_streams::Entity::find_by_id(stream_id)
+        .one(db).await.map_err(|e| e.to_string())?
         .ok_or("Stream not found")?;
-
     if stream.site_parameter_id.is_some() {
         return Err("Stream is already paired".to_string());
     }
-
     let sp = site_parameters::Entity::find_by_id(site_parameter_id)
-        .one(db)
-        .await
-        .map_err(|e| e.to_string())?
+        .one(db).await.map_err(|e| e.to_string())?
         .ok_or("Site parameter not found")?;
 
-    // Create/reuse sensor for this stream
-    let mut sensors_created = 0u32;
+    let sensors_created = if stream.sensor_id.is_none() { 1u32 } else { 0 };
     let sensor_ctx = create_sensor_for_stream(db, &stream, sp.parameter_id, sp.site_id)
-        .await
-        .map_err(|e| e.to_string())?;
-    if stream.sensor_id.is_none() {
-        sensors_created = 1;
-    }
+        .await.map_err(|e| e.to_string())?;
 
-    // Re-fetch stream (sensor_id may have been updated)
-    let stream = data_streams::Entity::find_by_id(action.stream_id)
-        .one(db)
-        .await
-        .map_err(|e| e.to_string())?
+    // Re-fetch stream (sensor_id may have been updated by create_sensor_for_stream)
+    let stream = data_streams::Entity::find_by_id(stream_id)
+        .one(db).await.map_err(|e| e.to_string())?
         .ok_or("Stream not found after sensor creation")?;
 
     let now = Utc::now();
@@ -1128,51 +1080,48 @@ async fn process_action<C: ConnectionTrait>(
     active.updated_at = Set(now.into());
     active.update(db).await.map_err(|e| e.to_string())?;
 
-    // Backfill readings with sensor context
     use sea_orm::Statement;
-    let result = db
-        .execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings
-              SET site_id = $1, parameter_id = $2,
-                  sensor_id = $4, calibration_id = $5, deployment_id = $6,
-                  calibrated_value = COALESCE(calibrated_value, raw_value)
-              WHERE stream_id = $3 AND site_id IS NULL",
-            [
-                sp.site_id.into(),
-                sp.parameter_id.into(),
-                action.stream_id.into(),
-                sensor_ctx.sensor_id.into(),
-                sensor_ctx.calibration_id.into(),
-                sensor_ctx.deployment_id.into(),
-            ],
-        ))
-        .await
-        .map_err(|e| e.to_string())?;
-
+    let result = db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"UPDATE readings
+          SET site_id = $1, parameter_id = $2,
+              sensor_id = $4, calibration_id = $5, deployment_id = $6,
+              calibrated_value = COALESCE(calibrated_value, raw_value)
+          WHERE stream_id = $3 AND site_id IS NULL",
+        [sp.site_id.into(), sp.parameter_id.into(), stream_id.into(),
+         sensor_ctx.sensor_id.into(), sensor_ctx.calibration_id.into(), sensor_ctx.deployment_id.into()],
+    )).await.map_err(|e| e.to_string())?;
     let backfilled = result.rows_affected();
 
-    // Backfill status_events too
-    let _ = db
-        .execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE status_events
-              SET site_id = $1, parameter_id = $2, sensor_id = $4
-              WHERE stream_id = $3 AND site_id IS NULL",
-            [
-                sp.site_id.into(),
-                sp.parameter_id.into(),
-                action.stream_id.into(),
-                sensor_ctx.sensor_id.into(),
-            ],
-        ))
-        .await;
+    let _ = db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"UPDATE status_events
+          SET site_id = $1, parameter_id = $2, sensor_id = $4
+          WHERE stream_id = $3 AND site_id IS NULL",
+        [sp.site_id.into(), sp.parameter_id.into(), stream_id.into(), sensor_ctx.sensor_id.into()],
+    )).await;
+
+    Ok((sensors_created, backfilled))
+}
+
+/// Process a single apply-discovery action using extracted helpers.
+async fn process_action<C: ConnectionTrait>(
+    db: &C,
+    action: &ApplyAction,
+) -> Result<ActionStats, String> {
+    let (project_id, proj_new) = resolve_or_create_project(db, action.use_project_id, action.create_project.as_ref()).await?;
+    let (site_id, site_new) = resolve_or_create_site(db, action.use_site_id, action.create_site.as_ref(), project_id).await?;
+    let (parameter_id, param_new) = resolve_or_create_parameter(db, action.use_parameter_id, action.create_parameter.as_ref()).await?;
+    let (site_parameter_id, sp_new) = resolve_or_create_site_parameter(
+        db, &action.pair_to, action.create_site_parameter.as_ref(), site_id, parameter_id,
+    ).await?;
+    let (sensors_created, backfilled) = pair_and_backfill(db, action.stream_id, site_parameter_id).await?;
 
     Ok(ActionStats {
-        projects_created,
-        sites_created,
-        parameters_created: params_created,
-        site_parameters_created: site_params_created,
+        projects_created: u32::from(proj_new),
+        sites_created: u32::from(site_new),
+        parameters_created: u32::from(param_new),
+        site_parameters_created: u32::from(sp_new),
         sensors_created,
         streams_paired: 1,
         backfilled,
