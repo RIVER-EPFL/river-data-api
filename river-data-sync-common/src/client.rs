@@ -165,3 +165,43 @@ impl ControlPlaneClient {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_creates_client() {
+        let client = ControlPlaneClient::new("http://localhost:3000").unwrap();
+        assert_eq!(client.session_token(), None);
+    }
+
+    #[test]
+    fn test_base_url_strips_trailing_slash() {
+        let client = ControlPlaneClient::new("http://localhost:3000/").unwrap();
+        assert_eq!(client.service_url("/enroll"), "http://localhost:3000/api/service/sync/enroll");
+    }
+
+    #[test]
+    fn test_service_url_construction() {
+        let client = ControlPlaneClient::new("http://api:3000").unwrap();
+        assert_eq!(client.service_url("/enroll"), "http://api:3000/api/service/sync/enroll");
+        assert_eq!(client.service_url("/heartbeat"), "http://api:3000/api/service/sync/heartbeat");
+        assert_eq!(
+            client.service_url("/commands/some-uuid"),
+            "http://api:3000/api/service/sync/commands/some-uuid"
+        );
+    }
+
+    #[test]
+    fn test_session_token_management() {
+        let mut client = ControlPlaneClient::new("http://localhost:3000").unwrap();
+        assert_eq!(client.session_token(), None);
+
+        client.set_session_token("tok-123".to_string());
+        assert_eq!(client.session_token(), Some("tok-123"));
+
+        client.set_session_token("tok-456".to_string());
+        assert_eq!(client.session_token(), Some("tok-456"));
+    }
+}

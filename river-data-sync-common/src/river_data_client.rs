@@ -287,3 +287,60 @@ impl RiverDataClient {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_url_construction() {
+        let client = RiverDataClient::new("http://localhost:3000", "tok").unwrap();
+        assert_eq!(client.url("/streams"), "http://localhost:3000/api/service/streams");
+        assert_eq!(client.url("/ingest"), "http://localhost:3000/api/service/ingest");
+    }
+
+    #[test]
+    fn test_url_strips_trailing_slash() {
+        let client = RiverDataClient::new("http://localhost:3000/", "tok").unwrap();
+        assert_eq!(client.url("/streams"), "http://localhost:3000/api/service/streams");
+    }
+
+    #[test]
+    fn test_token_set_and_get() {
+        let client = RiverDataClient::new("http://localhost:3000", "initial").unwrap();
+        assert_eq!(client.current_token(), "initial");
+
+        client.set_token("rotated");
+        assert_eq!(client.current_token(), "rotated");
+    }
+
+    #[test]
+    fn test_token_empty_default() {
+        let client = RiverDataClient::new("http://localhost:3000", "").unwrap();
+        assert_eq!(client.current_token(), "");
+    }
+
+    #[test]
+    fn test_concurrent_token_access() {
+        use std::sync::Arc;
+        let client = Arc::new(RiverDataClient::new("http://localhost:3000", "v1").unwrap());
+
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let c = client.clone();
+                std::thread::spawn(move || {
+                    c.set_token(&format!("v{i}"));
+                    let _ = c.current_token();
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Token should be one of the set values (not empty or corrupted)
+        let token = client.current_token();
+        assert!(token.starts_with('v'), "unexpected token: {token}");
+    }
+}

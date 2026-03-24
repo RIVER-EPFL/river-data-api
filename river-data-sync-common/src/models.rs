@@ -115,6 +115,145 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_enroll_request_serialization() {
+        let req = EnrollRequest {
+            client_id: "svc_abc".to_string(),
+            client_secret: "secret123".to_string(),
+            instance_id: "vaisala-01".to_string(),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["client_id"], "svc_abc");
+        assert_eq!(json["instance_id"], "vaisala-01");
+    }
+
+    #[test]
+    fn test_enroll_response_deserialization() {
+        let json = serde_json::json!({
+            "service_id": "550e8400-e29b-41d4-a716-446655440000",
+            "session_token": "tok-abc"
+        });
+        let resp: EnrollResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.session_token, "tok-abc");
+    }
+
+    #[test]
+    fn test_heartbeat_response_with_commands() {
+        let json = serde_json::json!({
+            "session_token": "new-tok",
+            "pending_commands": [
+                {
+                    "id": "550e8400-e29b-41d4-a716-446655440000",
+                    "command": "trigger_sync",
+                    "payload": null
+                }
+            ]
+        });
+        let resp: HeartbeatResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.pending_commands.len(), 1);
+        assert_eq!(resp.pending_commands[0].command, "trigger_sync");
+    }
+
+    #[test]
+    fn test_heartbeat_response_empty_commands() {
+        let json = serde_json::json!({
+            "session_token": "tok",
+            "pending_commands": []
+        });
+        let resp: HeartbeatResponse = serde_json::from_value(json).unwrap();
+        assert!(resp.pending_commands.is_empty());
+    }
+
+    #[test]
+    fn test_sync_result_default() {
+        let r = SyncResult::default();
+        assert_eq!(r.readings_synced, 0);
+        assert_eq!(r.status_events_synced, 0);
+        assert!(!r.full_sync);
+        assert!(r.errors.is_empty());
+    }
+
+    #[test]
+    fn test_sync_result_serialization_skips_empty() {
+        let r = SyncResult {
+            readings_synced: 100,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["readings_synced"], 100);
+        assert!(json.get("errors").is_none()); // skipped because empty
+    }
+
+    #[test]
+    fn test_ingest_reading_serialization() {
+        let r = IngestReading {
+            time: chrono::Utc::now(),
+            raw_value: 42.5,
+            replicate_index: 0,
+            sensor_id: None,
+            calibration_id: None,
+            deployment_id: None,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["raw_value"], 42.5);
+        // replicate_index=0 should be skipped
+        assert!(json.get("replicate_index").is_none());
+        // sensor_id=None should be skipped
+        assert!(json.get("sensor_id").is_none());
+    }
+
+    #[test]
+    fn test_ingest_reading_with_replicate() {
+        let r = IngestReading {
+            time: chrono::Utc::now(),
+            raw_value: 1.0,
+            replicate_index: 2,
+            sensor_id: None,
+            calibration_id: None,
+            deployment_id: None,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["replicate_index"], 2);
+    }
+
+    #[test]
+    fn test_register_stream_request() {
+        let req = RegisterStreamRequest {
+            source_system: "vaisala".to_string(),
+            source_key: "loc_1270".to_string(),
+            source_name: Some("MDepthmm".to_string()),
+            source_path: None,
+            metadata: serde_json::json!({"device": "25284027"}),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["source_system"], "vaisala");
+        assert_eq!(json["metadata"]["device"], "25284027");
+    }
+
+    #[test]
+    fn test_data_stream_deserialization() {
+        let json = serde_json::json!({
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "source_system": "vaisala",
+            "source_key": "loc_1270",
+            "source_name": "MDepthmm",
+            "source_path": null,
+            "metadata": {},
+            "site_parameter_id": null,
+            "is_active": true,
+            "last_data_time": null
+        });
+        let stream: DataStream = serde_json::from_value(json).unwrap();
+        assert_eq!(stream.source_system, "vaisala");
+        assert!(stream.is_active);
+        assert!(stream.site_parameter_id.is_none());
+    }
+}
+
 // ============================================================================
 // River Data API types (shared across sync services)
 // ============================================================================
