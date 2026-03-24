@@ -44,7 +44,7 @@ impl<S: SyncService> SyncServiceRunner<S> {
     }
 
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut client = ControlPlaneClient::new(&self.config.api_base_url);
+        let mut client = ControlPlaneClient::new(&self.config.api_base_url)?;
 
         // Enroll
         tracing::info!(

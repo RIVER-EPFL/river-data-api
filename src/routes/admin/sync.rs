@@ -1,6 +1,6 @@
 use axum::{Json, Router, extract::{Path, State}, routing::{get, post}};
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, Set, sea_query::Expr};
+use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, Condition, EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait, sea_query::Expr};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -328,9 +328,17 @@ async fn revoke_credential(
         .ok_or_else(|| AppError::NotFound("Credential not found".to_string()))?;
 
     // Mark credential as revoked
-    let mut active: sync_service_credentials::ActiveModel = cred.into();
+    let mut active: sync_service_credentials::ActiveModel = cred.clone().into();
     active.revoked = Set(true);
     active.update(&state.db).await?;
+
+    // Invalidate all session tokens for this service to prevent continued access
+    if let Some(service_id) = cred.service_id {
+        sync_service_tokens::Entity::delete_many()
+            .filter(sync_service_tokens::Column::ServiceId.eq(service_id))
+            .exec(&state.db)
+            .await?;
+    }
 
     Ok(Json(serde_json::json!({"revoked": true})))
 }
@@ -826,11 +834,16 @@ struct ActionStats {
 }
 
 /// `POST /api/admin/sync/apply-discovery` — batch-processes discovery actions.
+///
+/// Runs all actions within a single database transaction so that partial failures
+/// don't leave orphaned entities or inconsistent pairing state.
 async fn apply_discovery(
     State(state): State<AppState>,
     Json(req): Json<ApplyDiscoveryRequest>,
 ) -> AppResult<Json<ApplyDiscoveryResponse>> {
     let db = &state.db;
+    let txn = db.begin().await?;
+
     let mut resp = ApplyDiscoveryResponse {
         projects_created: 0,
         sites_created: 0,
@@ -843,7 +856,7 @@ async fn apply_discovery(
     };
 
     for action in req.actions {
-        let result = process_action(db, &action).await;
+        let result = process_action(&txn, &action).await;
         match result {
             Ok(stats) => {
                 resp.projects_created += stats.projects_created;
@@ -863,6 +876,8 @@ async fn apply_discovery(
         }
     }
 
+    txn.commit().await?;
+
     // Trigger aggregate refresh if any readings were backfilled
     if resp.total_backfilled > 0 {
         let db_clone = db.clone();
@@ -875,8 +890,8 @@ async fn apply_discovery(
 }
 
 /// Process a single apply-discovery action.
-async fn process_action(
-    db: &sea_orm::DatabaseConnection,
+async fn process_action<C: ConnectionTrait>(
+    db: &C,
     action: &ApplyAction,
 ) -> Result<ActionStats, String> {
     let mut projects_created = 0u32;
@@ -1095,7 +1110,7 @@ async fn process_action(
     active.update(db).await.map_err(|e| e.to_string())?;
 
     // Backfill readings with sensor context
-    use sea_orm::{ConnectionTrait, Statement};
+    use sea_orm::Statement;
     let result = db
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,

@@ -27,17 +27,16 @@ pub struct ControlPlaneClient {
 }
 
 impl ControlPlaneClient {
-    pub fn new(base_url: &str) -> Self {
+    pub fn new(base_url: &str) -> Result<Self, reqwest::Error> {
         let http = Client::builder()
             .timeout(Duration::from_secs(30))
-            .build()
-            .expect("Failed to create HTTP client");
+            .build()?;
 
-        Self {
+        Ok(Self {
             http,
             base_url: base_url.trim_end_matches('/').to_string(),
             session_token: None,
-        }
+        })
     }
 
     pub fn session_token(&self) -> Option<&str> {

@@ -50,12 +50,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     // Create clients — token will be set by the runner after enrollment
-    let api = RiverDataClient::new(&config.api_base_url, "");
+    let api = RiverDataClient::new(&config.api_base_url, "")?;
     let vaisala = VaisalaClient::new(
         &config.vaisala_base_url,
         &config.vaisala_bearer_token,
         config.vaisala_skip_tls_verify,
-    );
+    )?;
 
     // Create service and runner
     let svc = VaisalaSyncService::new(config, api, vaisala);

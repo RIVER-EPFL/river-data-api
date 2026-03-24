@@ -11,19 +11,17 @@ pub struct VaisalaClient {
 }
 
 impl VaisalaClient {
-    #[must_use]
-    pub fn new(base_url: &str, bearer_token: &str, skip_tls_verify: bool) -> Self {
+    pub fn new(base_url: &str, bearer_token: &str, skip_tls_verify: bool) -> Result<Self, reqwest::Error> {
         let http_client = Client::builder()
             .danger_accept_invalid_certs(skip_tls_verify)
             .timeout(Duration::from_secs(300))
-            .build()
-            .expect("Failed to create HTTP client");
+            .build()?;
 
-        Self {
+        Ok(Self {
             http_client,
             base_url: base_url.to_string(),
             bearer_token: bearer_token.to_string(),
-        }
+        })
     }
 
     pub async fn get_locations(&self) -> Result<LocationsResponse, SyncError> {

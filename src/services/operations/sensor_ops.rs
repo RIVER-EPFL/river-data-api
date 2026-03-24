@@ -66,8 +66,8 @@ fn extract_source_metadata(stream_metadata: &serde_json::Value) -> Option<serde_
 /// If the stream already has a `sensor_id`, reuses that sensor (ensures deployment exists for the target site).
 /// Otherwise creates a new sensor with identity calibration and deployment.
 /// Updates `data_streams.sensor_id` to link the stream to the sensor.
-pub async fn create_sensor_for_stream(
-    db: &DatabaseConnection,
+pub async fn create_sensor_for_stream<C: ConnectionTrait>(
+    db: &C,
     stream: &data_streams::Model,
     parameter_id: Uuid,
     site_id: Uuid,
@@ -134,8 +134,8 @@ pub async fn create_sensor_for_stream(
 }
 
 /// Find the latest calibration for a sensor, or create an identity calibration if none exists.
-async fn get_latest_calibration(
-    db: &DatabaseConnection,
+async fn get_latest_calibration<C: ConnectionTrait>(
+    db: &C,
     sensor_id: Uuid,
 ) -> AppResult<Uuid> {
     let cal = sensor_calibrations::Entity::find()
@@ -164,8 +164,8 @@ async fn get_latest_calibration(
 }
 
 /// Find an active deployment for sensor+site, or create one.
-async fn find_or_create_deployment(
-    db: &DatabaseConnection,
+async fn find_or_create_deployment<C: ConnectionTrait>(
+    db: &C,
     sensor_id: Uuid,
     site_id: Uuid,
 ) -> AppResult<Uuid> {

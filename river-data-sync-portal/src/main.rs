@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     // Create river-data API client (token will be set after enrollment)
-    let api = RiverDataClient::new(&runner_config.api_base_url, "");
+    let api = RiverDataClient::new(&runner_config.api_base_url, "")?;
 
     // Create and run the sync service
     let service = PortalSyncService::new(portal_config, api, pool, backend);

@@ -16,17 +16,16 @@ pub struct RiverDataClient {
 }
 
 impl RiverDataClient {
-    pub fn new(base_url: &str, token: &str) -> Self {
+    pub fn new(base_url: &str, token: &str) -> Result<Self, reqwest::Error> {
         let http_client = Client::builder()
             .timeout(Duration::from_secs(60))
-            .build()
-            .expect("Failed to create API HTTP client");
+            .build()?;
 
-        Self {
+        Ok(Self {
             http_client,
             base_url: base_url.trim_end_matches('/').to_string(),
             token: std::sync::RwLock::new(token.to_string()),
-        }
+        })
     }
 
     /// Update the bearer token (called by the runner on each heartbeat).
