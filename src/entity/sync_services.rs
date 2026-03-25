@@ -1,19 +1,41 @@
+use crudcrate::{CRUDResource, EntityToModels};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    DeriveEntityModel,
+    Serialize,
+    Deserialize,
+    EntityToModels,
+)]
 #[sea_orm(table_name = "sync_services")]
+#[crudcrate(
+    api_struct = "SyncService",
+    name_singular = "sync_service",
+    name_plural = "sync_services",
+    generate_router
+)]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
+    #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
     pub id: Uuid,
+    #[crudcrate(filterable)]
     pub service_type: String,
+    #[crudcrate(filterable)]
     pub instance_id: String,
+    #[crudcrate(filterable)]
     pub status: String,
     pub current_operation: Option<String>,
+    #[crudcrate(sortable, exclude(create, update))]
     pub last_heartbeat: Option<DateTimeWithTimeZone>,
     pub last_sync_completed_at: Option<DateTimeWithTimeZone>,
     pub last_error: Option<String>,
+    #[crudcrate(sortable, exclude(create, update))]
     pub created_at: DateTimeWithTimeZone,
+    #[crudcrate(sortable, exclude(create, update))]
     pub updated_at: DateTimeWithTimeZone,
 }
 

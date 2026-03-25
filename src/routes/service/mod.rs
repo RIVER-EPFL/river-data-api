@@ -29,6 +29,7 @@ use crate::entity::{
     derived_parameter_sources::DerivedParameterSource,
     field_trips::FieldTrip,
     notes::Note,
+    pairing_plans::PairingPlan,
     parameters::Parameter,
     public_exposed_parameters::PublicExposedParameter,
     sensor_calibrations::SensorCalibration,
@@ -36,6 +37,9 @@ use crate::entity::{
     sensors::Sensor,
     site_parameters::SiteParameter,
     standard_curves::StandardCurve,
+    sync_commands::SyncCommand,
+    sync_events::SyncEvent,
+    sync_services::SyncService,
 };
 
 /// Build the `/api/service/` router.
@@ -105,6 +109,22 @@ pub fn service_router(state: &AppState) -> Router<()> {
         )
         .nest("/constants", with_crud_perms(Constant::router(db)))
         .nest("/field_trips", with_crud_perms(FieldTrip::router(db)))
+        .nest(
+            "/sync_services",
+            with_crud_perms(SyncService::router(db)),
+        )
+        .nest(
+            "/sync_commands",
+            with_crud_perms(SyncCommand::router(db)),
+        )
+        .nest(
+            "/sync_events",
+            with_crud_perms(SyncEvent::router(db)),
+        )
+        .nest(
+            "/pairing_plans",
+            with_crud_perms(PairingPlan::router(db)),
+        )
         .into();
 
     // ========================================================================

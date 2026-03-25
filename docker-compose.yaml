@@ -84,9 +84,9 @@ services:
     environment:
       # River Data API connection
       - API_BASE_URL=http://river-db-api:${API_PORT:-3000}
-      # Control plane credentials (create via dashboard → Services tab)
-      - SERVICE_CLIENT_ID=${SERVICE_CLIENT_ID:-}
-      - SERVICE_CLIENT_SECRET=${SERVICE_CLIENT_SECRET:-}
+      # Control plane credentials (auto-seeded by dev-seed-credentials service)
+      - SERVICE_CLIENT_ID=${SERVICE_CLIENT_ID:-svc_dev_vaisala}
+      - SERVICE_CLIENT_SECRET=${SERVICE_CLIENT_SECRET:-dev_vaisala_secret}
       - INSTANCE_ID=${INSTANCE_ID:-vaisala-dev-01}
       # Vaisala viewLinc connection
       - VAISALA_BASE_URL=${VAISALA_BASE_URL:-https://10.95.35.5/rest/v1}
@@ -119,8 +119,8 @@ services:
       - PORTAL_DB_PASSWORD=sync_reader
       - PORTAL_DB_NAME=cnet_db
       - API_BASE_URL=http://river-db-api:${API_PORT:-3000}
-      - SERVICE_CLIENT_ID=${CNET_SERVICE_CLIENT_ID:-}
-      - SERVICE_CLIENT_SECRET=${CNET_SERVICE_CLIENT_SECRET:-}
+      - SERVICE_CLIENT_ID=${CNET_SERVICE_CLIENT_ID:-svc_dev_cnet}
+      - SERVICE_CLIENT_SECRET=${CNET_SERVICE_CLIENT_SECRET:-dev_cnet_secret}
       - INSTANCE_ID=cnet-dev-01
       - SYNC_INTERVAL_SECONDS=${PORTAL_SYNC_INTERVAL:-21600}
       - HEARTBEAT_INTERVAL_SECONDS=30
@@ -146,8 +146,8 @@ services:
       - PORTAL_DB_PASSWORD=sync_reader
       - PORTAL_DB_NAME=metalp_db
       - API_BASE_URL=http://river-db-api:${API_PORT:-3000}
-      - SERVICE_CLIENT_ID=${METALP_SERVICE_CLIENT_ID:-}
-      - SERVICE_CLIENT_SECRET=${METALP_SERVICE_CLIENT_SECRET:-}
+      - SERVICE_CLIENT_ID=${METALP_SERVICE_CLIENT_ID:-svc_dev_metalp}
+      - SERVICE_CLIENT_SECRET=${METALP_SERVICE_CLIENT_SECRET:-dev_metalp_secret}
       - INSTANCE_ID=metalp-dev-01
       - SYNC_INTERVAL_SECONDS=${PORTAL_SYNC_INTERVAL:-21600}
       - HEARTBEAT_INTERVAL_SECONDS=30
@@ -173,8 +173,8 @@ services:
       - PORTAL_DB_PASSWORD=sync_reader
       - PORTAL_DB_NAME=nomis_db
       - API_BASE_URL=http://river-db-api:${API_PORT:-3000}
-      - SERVICE_CLIENT_ID=${NOMIS_SERVICE_CLIENT_ID:-}
-      - SERVICE_CLIENT_SECRET=${NOMIS_SERVICE_CLIENT_SECRET:-}
+      - SERVICE_CLIENT_ID=${NOMIS_SERVICE_CLIENT_ID:-svc_dev_nomis}
+      - SERVICE_CLIENT_SECRET=${NOMIS_SERVICE_CLIENT_SECRET:-dev_nomis_secret}
       - INSTANCE_ID=nomis-dev-01
       - SYNC_INTERVAL_SECONDS=${PORTAL_SYNC_INTERVAL:-21600}
       - HEARTBEAT_INTERVAL_SECONDS=30
@@ -186,6 +186,30 @@ services:
         condition: service_healthy
       portal-db-nomis:
         condition: service_healthy
+
+  # ── Dev credential seeder (one-shot, seeds sync service credentials) ──
+  dev-seed-credentials:
+    image: timescale/timescaledb:${TIMESCALEDB_VERSION:-2.23.0-pg18}
+    depends_on:
+      river-db-api:
+        condition: service_healthy
+    environment:
+      - PGPASSWORD=${POSTGRES_PASSWORD:-psql}
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        until pg_isready -h river-db-timescale -U ${POSTGRES_USER:-postgres}; do sleep 1; done
+        psql -h river-db-timescale -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres} <<'SQL'
+          CREATE EXTENSION IF NOT EXISTS pgcrypto;
+          INSERT INTO sync_service_credentials (id, client_id, client_secret_hash, service_type, revoked, created_at)
+          VALUES
+            (gen_random_uuid(), 'svc_dev_vaisala', encode(digest('dev_vaisala_secret', 'sha256'), 'hex'), 'vaisala', false, now()),
+            (gen_random_uuid(), 'svc_dev_cnet',    encode(digest('dev_cnet_secret', 'sha256'), 'hex'),    'cnet',    false, now()),
+            (gen_random_uuid(), 'svc_dev_metalp',  encode(digest('dev_metalp_secret', 'sha256'), 'hex'),  'metalp',  false, now()),
+            (gen_random_uuid(), 'svc_dev_nomis',   encode(digest('dev_nomis_secret', 'sha256'), 'hex'),   'nomis',   false, now())
+          ON CONFLICT (client_id) DO NOTHING;
+        SQL
+    restart: "no"
 
   river-db-timescale:
     image: timescale/timescaledb:${TIMESCALEDB_VERSION:-2.23.0-pg18}

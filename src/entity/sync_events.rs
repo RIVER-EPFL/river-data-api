@@ -1,14 +1,33 @@
+use crudcrate::{CRUDResource, EntityToModels};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    DeriveEntityModel,
+    Serialize,
+    Deserialize,
+    EntityToModels,
+)]
 #[sea_orm(table_name = "sync_events")]
+#[crudcrate(
+    api_struct = "SyncEvent",
+    name_singular = "sync_event",
+    name_plural = "sync_events",
+    generate_router
+)]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
+    #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
     pub id: Uuid,
+    #[crudcrate(filterable)]
     pub service_id: Uuid,
     pub command_id: Option<Uuid>,
+    #[crudcrate(filterable)]
     pub event_type: String,
+    #[crudcrate(filterable)]
     pub status: String,
     pub readings_synced: i64,
     pub status_events_synced: i64,
@@ -16,7 +35,9 @@ pub struct Model {
     pub errors: Option<serde_json::Value>,
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub log: Option<serde_json::Value>,
+    #[crudcrate(sortable)]
     pub started_at: DateTimeWithTimeZone,
+    #[crudcrate(sortable)]
     pub completed_at: Option<DateTimeWithTimeZone>,
     pub duration_ms: Option<i64>,
 }
