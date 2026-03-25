@@ -1498,6 +1498,12 @@ async fn bulk_pair(
         )).await?;
     }
 
+    // Raise TimescaleDB decompression limit for the bulk backfill
+    txn.execute(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
+    )).await?;
+
     // Third pass: batch-backfill readings using a single JOIN update
     txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
