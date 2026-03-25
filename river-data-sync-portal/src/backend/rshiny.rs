@@ -119,7 +119,7 @@ impl RshinyBackend {
                 name: row.get("name"),
                 full_name: row.get("full_name"),
                 catchment: row.get("catchment"),
-                elevation: row.get::<Option<f64>, _>("elevation"),
+                elevation: row.get::<Option<i32>, _>("elevation").map(|v| v as f64),
             })
             .collect();
 
