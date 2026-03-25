@@ -193,6 +193,16 @@ impl PortalBackend for RshinyBackend {
                             "section": col.section,
                         },
                         "units": col.units,
+                        "hierarchy": {
+                            "project": source_system.to_uppercase(),
+                            "site": station.name,
+                            "parameter": col.display_name,
+                        },
+                        "coordinates": {
+                            "latitude": serde_json::Value::Null,
+                            "longitude": serde_json::Value::Null,
+                            "altitude_m": station.elevation,
+                        },
                     }),
                 });
             }
