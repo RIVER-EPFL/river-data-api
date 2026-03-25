@@ -196,9 +196,9 @@ pub fn enforce_time_range(
     });
 
     if let Some(e) = end {
-        if e <= effective_start {
+        if e < effective_start {
             return Err(AppError::BadRequest(
-                "end time must be after start time".to_string(),
+                "end time must not be before start time".to_string(),
             ));
         }
         let span = e - effective_start;

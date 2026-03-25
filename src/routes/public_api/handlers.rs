@@ -459,9 +459,9 @@ pub async fn get_readings(
     });
 
     if let Some(e) = end_parsed {
-        if e <= effective_start {
+        if e < effective_start {
             return Err(AppError::BadRequest(
-                "end time must be after start time".to_string(),
+                "end time must not be before start time".to_string(),
             ));
         }
         let span = e - effective_start;
@@ -639,9 +639,9 @@ pub async fn get_aggregates(
 
     let start = parse_time(&query.start)?;
     let end = parse_time(&query.end)?;
-    if end <= start {
+    if end < start {
         return Err(AppError::BadRequest(
-            "end time must be after start time".to_string(),
+            "end time must not be before start time".to_string(),
         ));
     }
 
