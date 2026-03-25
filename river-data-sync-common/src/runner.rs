@@ -64,8 +64,9 @@ impl<S: SyncService> SyncServiceRunner<S> {
             {
                 Ok(resp) => break resp,
                 Err(ControlPlaneError::CredentialsRevoked) => {
-                    tracing::error!("Credentials revoked or invalid — cannot enroll. Exiting.");
-                    return Err("Credentials revoked".into());
+                    // Credentials may not be seeded yet — retry instead of exiting
+                    tracing::warn!("Credentials not found or invalid, retrying in 10s");
+                    tokio::time::sleep(Duration::from_secs(10)).await;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Enrollment failed, retrying in 10s");
