@@ -43,6 +43,8 @@ pub struct Model {
     pub paired_at: Option<DateTimeWithTimeZone>,
     #[crudcrate(sortable)]
     pub last_data_time: Option<DateTimeWithTimeZone>,
+    #[crudcrate(filterable, exclude(create, update))]
+    pub pairing_plan_id: Option<Uuid>,
     #[crudcrate(exclude(create, update))]
     pub created_at: DateTimeWithTimeZone,
     #[crudcrate(exclude(create, update))]
@@ -63,6 +65,12 @@ pub enum Relation {
         to = "super::sensors::Column::Id"
     )]
     Sensor,
+    #[sea_orm(
+        belongs_to = "super::pairing_plans::Entity",
+        from = "Column::PairingPlanId",
+        to = "super::pairing_plans::Column::Id"
+    )]
+    PairingPlan,
 }
 
 impl Related<super::site_parameters::Entity> for Entity {
@@ -74,6 +82,12 @@ impl Related<super::site_parameters::Entity> for Entity {
 impl Related<super::sensors::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Sensor.def()
+    }
+}
+
+impl Related<super::pairing_plans::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::PairingPlan.def()
     }
 }
 

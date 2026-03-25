@@ -7,6 +7,7 @@ pub mod derived_parameter_definitions;
 pub mod derived_parameter_sources;
 pub mod field_trips;
 pub mod notes;
+pub mod pairing_plans;
 pub mod parameters;
 pub mod projects;
 pub mod public_exposed_parameters;

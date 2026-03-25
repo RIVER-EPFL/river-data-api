@@ -144,6 +144,11 @@ pub fn router() -> Router<AppState> {
         .route("/apply-discovery", post(apply_discovery))
         .route("/grouped-discovery", post(grouped_discovery))
         .route("/bulk-pair", post(bulk_pair))
+        // Pairing Plans (new unified workflow)
+        .route("/pairing-plans", get(list_pairing_plans).post(create_pairing_plan))
+        .route("/pairing-plans/{id}", get(get_pairing_plan).patch(update_pairing_plan))
+        .route("/pairing-plans/{id}/apply", post(apply_pairing_plan))
+        .route("/pairing-plans/{id}/revert", post(revert_pairing_plan))
 }
 
 // ============================================================================
@@ -1556,4 +1561,134 @@ async fn bulk_pair(
         site_parameters_created: sp_created,
         streams_paired: paired,
     }))
+}
+
+// ============================================================================
+// Pairing Plans (Unified Workflow)
+// ============================================================================
+
+#[derive(Deserialize)]
+struct CreatePairingPlanRequest {
+    source_system: String,
+}
+
+async fn create_pairing_plan(
+    State(state): State<AppState>,
+    Json(req): Json<CreatePairingPlanRequest>,
+) -> AppResult<Json<crate::entity::pairing_plans::Model>> {
+    let plan = crate::services::pairing::create_plan(&state.db, &req.source_system).await?;
+    Ok(Json(plan))
+}
+
+async fn list_pairing_plans(
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<crate::entity::pairing_plans::Model>>> {
+    use sea_orm::QueryOrder;
+    let plans = crate::entity::pairing_plans::Entity::find()
+        .order_by_desc(crate::entity::pairing_plans::Column::CreatedAt)
+        .all(&state.db)
+        .await?;
+    Ok(Json(plans))
+}
+
+async fn get_pairing_plan(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<crate::entity::pairing_plans::Model>> {
+    let plan = crate::entity::pairing_plans::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
+    Ok(Json(plan))
+}
+
+#[derive(Deserialize)]
+struct UpdatePairingPlanRequest {
+    updates: Vec<PlanEntryUpdate>,
+}
+
+#[derive(Deserialize)]
+struct PlanEntryUpdate {
+    stream_id: Uuid,
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    project_name: Option<String>,
+    #[serde(default)]
+    site_name: Option<String>,
+    #[serde(default)]
+    parameter_name: Option<String>,
+    #[serde(default)]
+    parameter_units: Option<String>,
+}
+
+async fn update_pairing_plan(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdatePairingPlanRequest>,
+) -> AppResult<Json<crate::entity::pairing_plans::Model>> {
+    let plan = crate::entity::pairing_plans::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
+
+    if plan.status != "draft" {
+        return Err(AppError::BadRequest("Can only edit draft plans".to_string()));
+    }
+
+    let mut entries: Vec<crate::services::pairing::PlanEntry> =
+        serde_json::from_value(plan.entries.clone())
+            .map_err(|e| AppError::Internal(format!("Failed to parse entries: {e}")))?;
+
+    for update in &req.updates {
+        if let Some(entry) = entries.iter_mut().find(|e| e.stream_id == update.stream_id) {
+            if let Some(ref action) = update.action {
+                entry.action = action.clone();
+            }
+            if let Some(ref name) = update.project_name {
+                entry.project.name = name.clone();
+                entry.project.id = None;
+                entry.project.create = true;
+            }
+            if let Some(ref name) = update.site_name {
+                entry.site.name = name.clone();
+                entry.site.id = None;
+                entry.site.create = true;
+            }
+            if let Some(ref name) = update.parameter_name {
+                entry.parameter.name = name.clone();
+                entry.parameter.id = None;
+                entry.parameter.create = true;
+            }
+            if let Some(ref units) = update.parameter_units {
+                entry.parameter.units = units.clone();
+            }
+        }
+    }
+
+    let summary = serde_json::to_value(crate::services::pairing::compute_summary_pub(&entries))
+        .unwrap_or_default();
+
+    let mut active: crate::entity::pairing_plans::ActiveModel = plan.into();
+    active.entries = Set(serde_json::to_value(&entries).unwrap_or_default());
+    active.summary = Set(summary);
+    let updated = active.update(&state.db).await?;
+
+    Ok(Json(updated))
+}
+
+async fn apply_pairing_plan(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<crate::services::pairing::ApplyResult>> {
+    let result = crate::services::pairing::apply_plan(&state.db, id).await?;
+    Ok(Json(result))
+}
+
+async fn revert_pairing_plan(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<serde_json::Value>> {
+    let reverted = crate::services::pairing::revert_plan(&state.db, id).await?;
+    Ok(Json(serde_json::json!({ "reverted": reverted })))
 }

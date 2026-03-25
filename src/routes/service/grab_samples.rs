@@ -62,6 +62,7 @@ async fn get_or_create_grab_stream(
         discovered_at: Set(now.into()),
         paired_at: Set(None),
         last_data_time: Set(None),
+        pairing_plan_id: Set(None),
         created_at: Set(now.into()),
         updated_at: Set(now.into()),
     };
