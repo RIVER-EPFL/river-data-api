@@ -83,6 +83,11 @@ impl<S: SyncService> SyncServiceRunner<S> {
         let (sync_tx, sync_rx) = mpsc::channel::<SyncTrigger>(16);
         let (current_op_tx, current_op_rx) = watch::channel::<Option<String>>(None);
 
+        // Trigger a full sync immediately after enrollment so the service
+        // doesn't wait for the first interval tick (which could be hours).
+        let _ = sync_tx.send(SyncTrigger::Scheduled).await;
+        tracing::info!("Queued initial sync after enrollment");
+
         // Spawn heartbeat loop
         let hb_service = self.service.clone();
         let hb_config = self.config.clone();
