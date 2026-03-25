@@ -103,6 +103,28 @@ impl RshinyBackend {
             }
         }
 
+        // Validate columns against actual data table schema to skip stale/missing columns
+        let actual_columns: std::collections::HashSet<String> = sqlx::query(
+            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS \
+             WHERE TABLE_NAME = 'data' AND TABLE_SCHEMA = DATABASE()"
+        )
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(|row| row.get::<String, _>("COLUMN_NAME"))
+        .collect();
+
+        let before = columns.len();
+        columns.retain(|c| actual_columns.contains(&c.column_name));
+        let dropped = before - columns.len();
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                total = columns.len(),
+                "Dropped param columns not found in data table"
+            );
+        }
+
         tracing::info!(count = columns.len(), "Discovered parameter columns from plotting tables");
         Ok(columns)
     }

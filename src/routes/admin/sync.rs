@@ -149,6 +149,7 @@ pub fn router() -> Router<AppState> {
         .route("/pairing-plans/{id}", get(get_pairing_plan).patch(update_pairing_plan))
         .route("/pairing-plans/{id}/apply", post(apply_pairing_plan))
         .route("/pairing-plans/{id}/revert", post(revert_pairing_plan))
+        .route("/unpaired-summary", get(unpaired_summary))
 }
 
 // ============================================================================
@@ -1691,4 +1692,31 @@ async fn revert_pairing_plan(
 ) -> AppResult<Json<serde_json::Value>> {
     let reverted = crate::services::pairing::revert_plan(&state.db, id).await?;
     Ok(Json(serde_json::json!({ "reverted": reverted })))
+}
+
+// ============================================================================
+// Unpaired Summary
+// ============================================================================
+
+async fn unpaired_summary(
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<serde_json::Value>>> {
+    use sea_orm::{ConnectionTrait, Statement};
+    let rows = state.db.query_all(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT source_system, \
+                COUNT(*) FILTER (WHERE site_parameter_id IS NULL) as unpaired, \
+                COUNT(*) FILTER (WHERE site_parameter_id IS NOT NULL) as paired \
+         FROM data_streams GROUP BY source_system ORDER BY source_system".to_owned(),
+    )).await?;
+
+    let result: Vec<serde_json::Value> = rows.iter().map(|row| {
+        use sea_orm::QueryResult;
+        let source_system: String = row.try_get("", "source_system").unwrap_or_default();
+        let unpaired: i64 = row.try_get("", "unpaired").unwrap_or(0);
+        let paired: i64 = row.try_get("", "paired").unwrap_or(0);
+        serde_json::json!({ "source_system": source_system, "unpaired": unpaired, "paired": paired })
+    }).collect();
+
+    Ok(Json(result))
 }
