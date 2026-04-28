@@ -23,12 +23,12 @@ pub struct Model {
     #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
     pub id: Uuid,
     #[sea_orm(unique)]
-    #[crudcrate(filterable, fulltext)]
+    #[crudcrate(filterable, fulltext, sortable)]
     pub name: String,
     #[crudcrate(filterable)]
     pub data_source: String,
     pub description: Option<String>,
-    #[crudcrate(exclude(create, update))]
+    #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     #[crudcrate(exclude(create, update))]
     pub discovered_at: Option<chrono::DateTime<chrono::Utc>>,

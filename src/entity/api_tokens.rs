@@ -18,7 +18,7 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
     pub id: Uuid,
-    #[crudcrate(filterable, fulltext)]
+    #[crudcrate(filterable, fulltext, sortable)]
     pub name: String,
     #[sea_orm(unique)]
     #[crudcrate(exclude(create, update))]
@@ -29,7 +29,7 @@ pub struct Model {
     pub permissions: serde_json::Value,
     #[crudcrate(filterable)]
     pub is_active: bool,
-    #[crudcrate(exclude(create, update))]
+    #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     #[crudcrate(sortable)]
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,

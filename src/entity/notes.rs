@@ -21,7 +21,7 @@ pub struct Model {
     pub text: String,
     pub verified: bool,
     pub created_by: Option<String>,
-    #[crudcrate(exclude(create, update))]
+    #[crudcrate(exclude(create, update), sortable)]
     pub created_at: chrono::DateTime<chrono::Utc>,
     #[crudcrate(exclude(create, update))]
     pub updated_at: chrono::DateTime<chrono::Utc>,

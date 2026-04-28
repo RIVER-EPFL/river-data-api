@@ -22,9 +22,9 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
     pub id: Uuid,
-    #[crudcrate(filterable, fulltext)]
+    #[crudcrate(filterable, fulltext, sortable)]
     pub serial_number: Option<String>,
-    #[crudcrate(fulltext)]
+    #[crudcrate(fulltext, sortable)]
     pub name: Option<String>,
     #[crudcrate(filterable)]
     pub parameter_id: Uuid,
@@ -39,7 +39,7 @@ pub struct Model {
     pub notes: Option<String>,
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub metadata: Option<serde_json::Value>,
-    #[crudcrate(exclude(create, update))]
+    #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 

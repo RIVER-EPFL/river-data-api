@@ -22,10 +22,11 @@ pub struct Model {
     #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
     pub id: Uuid,
     #[sea_orm(unique)]
-    #[crudcrate(filterable, fulltext)]
+    #[crudcrate(filterable, fulltext, sortable)]
     pub name: String,
-    #[crudcrate(fulltext)]
+    #[crudcrate(fulltext, sortable)]
     pub display_name: String,
+    #[crudcrate(sortable)]
     pub default_units: String,
     #[sea_orm(column_type = "String(StringLen::N(32))")]
     #[crudcrate(filterable)]
@@ -38,7 +39,7 @@ pub struct Model {
     pub default_warning_max: Option<f64>,
     pub default_alarm_min: Option<f64>,
     pub default_alarm_max: Option<f64>,
-    #[crudcrate(exclude(create, update))]
+    #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 

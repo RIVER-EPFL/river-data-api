@@ -22,7 +22,7 @@ pub struct Model {
     pub site_id: Uuid,
     #[crudcrate(filterable)]
     pub parameter_id: Uuid,
-    #[crudcrate(filterable, fulltext)]
+    #[crudcrate(filterable, fulltext, sortable)]
     pub name: String,
     #[crudcrate(filterable)]
     pub sensor_type: String,
@@ -41,7 +41,7 @@ pub struct Model {
     pub derived_definition_id: Option<Uuid>,
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub variable_mappings: Option<serde_json::Value>,
-    #[crudcrate(exclude(create, update))]
+    #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     #[crudcrate(exclude(create, update))]
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,

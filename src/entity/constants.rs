@@ -16,7 +16,7 @@ pub struct Model {
     #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
     pub id: Uuid,
     #[sea_orm(unique)]
-    #[crudcrate(filterable)]
+    #[crudcrate(filterable, sortable)]
     pub name: String,
     pub value: f64,
     pub units: Option<String>,
