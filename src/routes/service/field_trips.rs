@@ -29,6 +29,10 @@ pub struct SampleReading {
     pub sensor_id: Option<Uuid>,
     pub value: f64,
     pub time: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub replicate_index: Option<i16>,
+    #[serde(default)]
+    pub sample_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -186,7 +190,7 @@ pub async fn create_field_trip_batch(
                 site_id: Set(Some(station.site_id)),
                 parameter_id: Set(Some(r.parameter_id)),
                 time: Set(r.time.into()),
-                replicate_index: Set(0),
+                replicate_index: Set(r.replicate_index.unwrap_or(0)),
                 raw_value: Set(r.value),
                 calibrated_value: Set(None),
                 sensor_id: Set(r.sensor_id),
@@ -197,6 +201,7 @@ pub async fn create_field_trip_batch(
                 is_flagged: Set(Some(false)),
                 flag_reason: Set(None),
                 field_trip_id: Set(Some(field_trip_id)),
+                sample_id: Set(r.sample_id),
             });
         }
     }

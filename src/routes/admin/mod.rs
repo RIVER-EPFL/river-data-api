@@ -12,9 +12,11 @@ use crate::entity::{
     data_streams::DataStream,
     derived_parameter_definitions::DerivedParameterDefinition, field_trips::FieldTrip,
     notes::Note, parameters::Parameter, projects::Project,
-    public_exposed_parameters::PublicExposedParameter,
+    public_exposed_parameters::PublicExposedParameter, samples::Sample,
     sensor_calibrations::SensorCalibration, sensor_deployments::SensorDeployment, sensors::Sensor,
     site_parameters::SiteParameter, sites::Site, standard_curves::StandardCurve,
+    sync_commands::SyncCommand, sync_events::SyncEvent, sync_services::SyncService,
+    sync_service_credentials::SyncServiceCredential,
 };
 use axum::{Router, routing::{get, post}};
 
@@ -48,7 +50,15 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .nest_service("/notes", crud(Note::router(db)))
         .nest_service("/constants", crud(Constant::router(db)))
         .nest_service("/field_trips", crud(FieldTrip::router(db)))
+        .nest_service("/samples", crud(Sample::router(db)))
         .nest_service("/data_streams", crud(DataStream::router(db)))
+        .nest_service("/sync_services", crud(SyncService::router(db)))
+        .nest_service("/sync_commands", crud(SyncCommand::router(db)))
+        .nest_service("/sync_events", crud(SyncEvent::router(db)))
+        .nest_service(
+            "/sync_service_credentials",
+            crud(SyncServiceCredential::router(db)),
+        )
         // Custom action routes under /actions/ to avoid conflict with nest_service catch-all
         .route(
             "/actions/sensor_calibrations/{id}/recalculate",

@@ -22,6 +22,7 @@ pub struct Model {
     pub is_flagged: Option<bool>,
     pub flag_reason: Option<String>,
     pub field_trip_id: Option<Uuid>,
+    pub sample_id: Option<Uuid>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -68,6 +69,13 @@ pub enum Relation {
         to = "super::field_trips::Column::Id"
     )]
     FieldTrip,
+    #[sea_orm(
+        belongs_to = "super::samples::Entity",
+        from = "Column::SampleId",
+        to = "super::samples::Column::Id",
+        on_delete = "SetNull"
+    )]
+    Sample,
 }
 
 impl Related<super::data_streams::Entity> for Entity {
@@ -109,6 +117,12 @@ impl Related<super::sensor_deployments::Entity> for Entity {
 impl Related<super::field_trips::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::FieldTrip.def()
+    }
+}
+
+impl Related<super::samples::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Sample.def()
     }
 }
 

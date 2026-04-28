@@ -123,6 +123,7 @@ pub async fn ingest_readings(
             is_flagged: Set(Some(false)),
             flag_reason: Set(None),
             field_trip_id: Set(None),
+            sample_id: Set(None),
         })
         .collect();
 

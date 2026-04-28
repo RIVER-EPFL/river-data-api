@@ -20,8 +20,11 @@ pub struct Model {
     #[sea_orm(unique)]
     #[crudcrate(filterable, fulltext, sortable)]
     pub name: String,
+    #[crudcrate(sortable)]
     pub latitude: Option<f64>,
+    #[crudcrate(sortable)]
     pub longitude: Option<f64>,
+    #[crudcrate(sortable)]
     pub altitude_m: Option<f64>,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,

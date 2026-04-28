@@ -23,6 +23,10 @@ pub struct GrabSampleReading {
     pub time: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub replicate_index: Option<i16>,
+    /// Optional grouping by user-declared sample. When set, the server trigger
+    /// updates the referenced `samples` row's aggregate columns.
+    #[serde(default)]
+    pub sample_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -155,6 +159,7 @@ pub async fn insert_grab_samples(
                 is_flagged: Set(Some(false)),
                 flag_reason: Set(None),
                 field_trip_id: Set(payload.field_trip_id),
+                sample_id: Set(r.sample_id),
             }
         })
         .collect();

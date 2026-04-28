@@ -32,6 +32,7 @@ use crate::entity::{
     pairing_plans::PairingPlan,
     parameters::Parameter,
     public_exposed_parameters::PublicExposedParameter,
+    samples::Sample,
     sensor_calibrations::SensorCalibration,
     sensor_deployments::SensorDeployment,
     sensors::Sensor,
@@ -109,6 +110,7 @@ pub fn service_router(state: &AppState) -> Router<()> {
         )
         .nest("/constants", with_crud_perms(Constant::router(db)))
         .nest("/field_trips", with_crud_perms(FieldTrip::router(db)))
+        .nest("/samples", with_crud_perms(Sample::router(db)))
         .nest(
             "/sync_services",
             with_crud_perms(SyncService::router(db)),
@@ -243,8 +245,24 @@ pub fn service_router(state: &AppState) -> Router<()> {
 /// Returns `Router<AppState>` so the caller can nest it alongside other
 /// `AppState`-typed routers; `with_state()` is applied by `build_router()`.
 pub fn sync_control_router(state: &AppState) -> Router<AppState> {
-    let sync_enroll_routes: Router<AppState> = Router::new()
-        .route("/sync/enroll", post(sync_control::enroll));
+    let sync_enroll_routes: Router<AppState> = {
+        use std::sync::Arc;
+        use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
+        use crate::services::FallbackIpKeyExtractor;
+
+        let enroll_limiter = GovernorConfigBuilder::default()
+            .key_extractor(FallbackIpKeyExtractor)
+            .per_second(3)
+            .burst_size(10)
+            .finish()
+            .expect("Failed to create enroll rate limiter");
+
+        Router::new()
+            .route("/sync/enroll", post(sync_control::enroll))
+            .layer(GovernorLayer {
+                config: Arc::new(enroll_limiter),
+            })
+    };
 
     let sync_authenticated_routes: Router<AppState> = Router::new()
         .route("/sync/heartbeat", post(sync_control::heartbeat))

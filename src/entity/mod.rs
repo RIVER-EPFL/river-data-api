@@ -12,6 +12,7 @@ pub mod parameters;
 pub mod projects;
 pub mod public_exposed_parameters;
 pub mod readings;
+pub mod samples;
 pub mod sensor_calibrations;
 pub mod sensor_deployments;
 pub mod sensors;

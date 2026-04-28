@@ -24,6 +24,10 @@ pub struct ReadingInput {
     pub sensor_id: Option<Uuid>,
     pub calibration_id: Option<Uuid>,
     pub deployment_id: Option<Uuid>,
+    #[serde(default)]
+    pub replicate_index: Option<i16>,
+    #[serde(default)]
+    pub sample_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,7 +90,7 @@ pub async fn insert_batch_readings(
                 site_id: Set(Some(r.site_id)),
                 parameter_id: Set(Some(r.parameter_id)),
                 time: Set(r.time.into()),
-                replicate_index: Set(0),
+                replicate_index: Set(r.replicate_index.unwrap_or(0)),
                 raw_value: Set(r.raw_value),
                 calibrated_value: Set(r.calibrated_value),
                 sensor_id: Set(r.sensor_id),
@@ -97,6 +101,7 @@ pub async fn insert_batch_readings(
                 is_flagged: Set(Some(false)),
                 flag_reason: Set(None),
                 field_trip_id: Set(None),
+                sample_id: Set(r.sample_id),
             }
         })
         .collect();
