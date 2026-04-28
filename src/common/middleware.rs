@@ -8,12 +8,13 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::auth::Role;
 use crate::error::AppError;
 use crate::services::api_token::validate_bearer_token;
 
 // Type alias for the Keycloak auth status used throughout this module.
 type KcStatus = axum_keycloak_auth::KeycloakAuthStatus<
-    crate::common::auth::Role,
+    Role,
     axum_keycloak_auth::decode::ProfileAndEmail,
 >;
 
@@ -21,13 +22,26 @@ type KcStatus = axum_keycloak_auth::KeycloakAuthStatus<
 #[derive(Debug, Clone)]
 pub enum AuthContext {
     /// Authenticated via Keycloak JWT (admin UI, browser sessions).
-    Keycloak,
+    Keycloak { roles: Vec<Role> },
     /// Authenticated via API token (external scripts, curl).
     ApiToken {
         token_id: Uuid,
         permissions: TokenPermissions,
         project_scope: Option<Uuid>,
     },
+}
+
+impl AuthContext {
+    fn has_role(&self, target: &Role) -> bool {
+        match self {
+            AuthContext::Keycloak { roles } => roles.contains(target),
+            AuthContext::ApiToken { .. } => false,
+        }
+    }
+
+    fn is_admin(&self) -> bool {
+        self.has_role(&Role::Administrator)
+    }
 }
 
 /// Structured permissions for API tokens.
@@ -80,8 +94,15 @@ pub async fn service_auth_middleware(
     // Check if Keycloak auth succeeded (inserted by KeycloakAuthLayer in Pass mode)
     if let Some(status) = request.extensions().get::<KcStatus>() {
         match status {
-            axum_keycloak_auth::KeycloakAuthStatus::Success(_) => {
-                request.extensions_mut().insert(AuthContext::Keycloak);
+            axum_keycloak_auth::KeycloakAuthStatus::Success(token) => {
+                let roles: Vec<Role> = token
+                    .roles
+                    .iter()
+                    .map(|kr| kr.role().clone())
+                    .collect();
+                request
+                    .extensions_mut()
+                    .insert(AuthContext::Keycloak { roles });
                 return next.run(request).await;
             }
             axum_keycloak_auth::KeycloakAuthStatus::Failure(_) => {
@@ -153,10 +174,10 @@ pub async fn service_auth_middleware(
 }
 
 /// Scope middleware: requires `read_metadata` permission.
-/// Keycloak users pass through unconditionally.
+/// Keycloak admins and users both have read access.
 pub async fn require_read_metadata(request: Request, next: Next) -> Response {
     match request.extensions().get::<AuthContext>() {
-        Some(AuthContext::Keycloak) => next.run(request).await,
+        Some(AuthContext::Keycloak { .. }) => next.run(request).await,
         Some(AuthContext::ApiToken { permissions, .. }) => {
             if permissions.read_metadata {
                 next.run(request).await
@@ -170,10 +191,10 @@ pub async fn require_read_metadata(request: Request, next: Next) -> Response {
 }
 
 /// Scope middleware: requires `read_data` permission.
-/// Keycloak users pass through unconditionally.
+/// Keycloak admins and users both have read access.
 pub async fn require_read_data(request: Request, next: Next) -> Response {
     match request.extensions().get::<AuthContext>() {
-        Some(AuthContext::Keycloak) => next.run(request).await,
+        Some(AuthContext::Keycloak { .. }) => next.run(request).await,
         Some(AuthContext::ApiToken { permissions, .. }) => {
             if permissions.read_data {
                 next.run(request).await
@@ -186,10 +207,16 @@ pub async fn require_read_data(request: Request, next: Next) -> Response {
 }
 
 /// Scope middleware: requires `write_metadata` permission.
-/// Keycloak users pass through unconditionally.
+/// Only Keycloak admins can write metadata.
 pub async fn require_write_metadata(request: Request, next: Next) -> Response {
     match request.extensions().get::<AuthContext>() {
-        Some(AuthContext::Keycloak) => next.run(request).await,
+        Some(ctx @ AuthContext::Keycloak { .. }) => {
+            if ctx.is_admin() {
+                next.run(request).await
+            } else {
+                AppError::Forbidden("Requires riverdata-admin role".to_string()).into_response()
+            }
+        }
         Some(AuthContext::ApiToken { permissions, .. }) => {
             if permissions.write_metadata {
                 next.run(request).await
@@ -203,10 +230,10 @@ pub async fn require_write_metadata(request: Request, next: Next) -> Response {
 }
 
 /// Scope middleware: requires `write_data` permission.
-/// Keycloak users pass through unconditionally.
+/// Keycloak admins and users can write data.
 pub async fn require_write_data(request: Request, next: Next) -> Response {
     match request.extensions().get::<AuthContext>() {
-        Some(AuthContext::Keycloak) => next.run(request).await,
+        Some(AuthContext::Keycloak { .. }) => next.run(request).await,
         Some(AuthContext::ApiToken { permissions, .. }) => {
             if permissions.write_data {
                 next.run(request).await
@@ -220,12 +247,18 @@ pub async fn require_write_data(request: Request, next: Next) -> Response {
 }
 
 /// Method-aware scope middleware for `CrudCrate` routes.
-/// GET/HEAD → requires `read_metadata`; all other methods → requires `write_metadata`.
-/// Keycloak users pass through unconditionally.
+/// GET/HEAD → any authenticated user; mutations → requires admin role or write_metadata token.
 pub async fn require_crud_permissions(request: Request, next: Next) -> Response {
     let is_read = matches!(*request.method(), Method::GET | Method::HEAD);
     match request.extensions().get::<AuthContext>() {
-        Some(AuthContext::Keycloak) => next.run(request).await,
+        Some(ctx @ AuthContext::Keycloak { .. }) => {
+            if is_read || ctx.is_admin() {
+                next.run(request).await
+            } else {
+                AppError::Forbidden("Requires riverdata-admin role for mutations".to_string())
+                    .into_response()
+            }
+        }
         Some(AuthContext::ApiToken { permissions, .. }) => {
             if is_read {
                 if permissions.read_metadata {
@@ -249,6 +282,18 @@ pub async fn require_crud_permissions(request: Request, next: Next) -> Response 
 #[derive(Debug, Clone)]
 pub struct SyncServiceContext {
     pub service_id: Uuid,
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for SyncServiceContext {
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<SyncServiceContext>()
+            .cloned()
+            .ok_or_else(|| AppError::Unauthorized("Sync service authentication required".to_string()))
+    }
 }
 
 /// Middleware that validates sync service session tokens.
@@ -325,7 +370,7 @@ impl<S: Send + Sync> FromRequestParts<S> for ProjectScope {
             .get::<AuthContext>()
             .and_then(|ctx| match ctx {
                 AuthContext::ApiToken { project_scope, .. } => *project_scope,
-                AuthContext::Keycloak => None,
+                AuthContext::Keycloak { .. } => None,
             });
         Ok(ProjectScope(scope))
     }

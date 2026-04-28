@@ -5,18 +5,18 @@
   "roles": {
     "realm": [
       {
-        "name": "admin",
-        "description": "Administrator with full access"
+        "name": "riverdata-admin",
+        "description": "River Data administrator with full access"
       },
       {
-        "name": "user",
-        "description": "Standard user with read access"
+        "name": "riverdata-user",
+        "description": "River Data standard user with read access"
       }
     ]
   },
   "clients": [
     {
-      "clientId": "river-data-ui",
+      "clientId": "river-data-ui-local",
       "enabled": true,
       "publicClient": true,
       "directAccessGrantsEnabled": true,
@@ -28,10 +28,10 @@
       "attributes": {}
     },
     {
-      "clientId": "river-data-api",
+      "clientId": "river-data-api-local",
       "enabled": true,
       "publicClient": false,
-      "secret": "river-data-api-secret",
+      "secret": "river-data-api-local-secret",
       "directAccessGrantsEnabled": true,
       "serviceAccountsEnabled": true,
       "protocol": "openid-connect",
@@ -54,7 +54,7 @@
           "temporary": false
         }
       ],
-      "realmRoles": ["admin", "user"]
+      "realmRoles": ["riverdata-admin", "riverdata-user"]
     },
     {
       "username": "user",
@@ -69,7 +69,7 @@
           "temporary": false
         }
       ],
-      "realmRoles": ["user"]
+      "realmRoles": ["riverdata-user"]
     }
   ]
 }
