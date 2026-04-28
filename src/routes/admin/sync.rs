@@ -423,17 +423,12 @@ async fn revoke_service(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
-    // Find credential linked to this service
-    let cred = sync_service_credentials::Entity::find()
+    // Revoke ALL credentials linked to this service
+    sync_service_credentials::Entity::update_many()
+        .col_expr(sync_service_credentials::Column::Revoked, Expr::value(true))
         .filter(sync_service_credentials::Column::ServiceId.eq(id))
-        .one(&state.db)
+        .exec(&state.db)
         .await?;
-
-    if let Some(cred) = cred {
-        let mut active: sync_service_credentials::ActiveModel = cred.into();
-        active.revoked = Set(true);
-        active.update(&state.db).await?;
-    }
 
     // Delete all session tokens for this service
     sync_service_tokens::Entity::delete_many()

@@ -167,7 +167,7 @@ impl<S: SyncService> SyncServiceRunner<S> {
             };
 
             match client
-                .heartbeat(service_id, &config.client_secret, status, current_op.as_deref())
+                .heartbeat(service_id, status, current_op.as_deref())
                 .await
             {
                 Ok(resp) => {

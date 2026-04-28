@@ -25,7 +25,6 @@ pub struct EnrollResponse {
 #[derive(Debug, Serialize)]
 pub struct HeartbeatRequest {
     pub service_id: Uuid,
-    pub client_secret: String,
     pub status: String,
     pub current_operation: Option<String>,
 }
@@ -96,8 +95,7 @@ impl RunnerConfig {
             api_base_url: require_env("API_BASE_URL")?,
             client_id: require_env("SERVICE_CLIENT_ID")?,
             client_secret: require_env("SERVICE_CLIENT_SECRET")?,
-            instance_id: std::env::var("INSTANCE_ID")
-                .unwrap_or_else(|_| "default".to_string()),
+            instance_id: std::env::var("INSTANCE_ID").unwrap_or_else(|_| "default".to_string()),
             heartbeat_interval_secs: env_u64("HEARTBEAT_INTERVAL_SECONDS", 30),
             sync_interval_secs: env_u64("SYNC_INTERVAL_SECONDS", 300),
         })

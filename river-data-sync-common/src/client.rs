@@ -92,13 +92,11 @@ impl ControlPlaneClient {
     pub async fn heartbeat(
         &mut self,
         service_id: Uuid,
-        client_secret: &str,
         status: &str,
         current_operation: Option<&str>,
     ) -> Result<HeartbeatResponse, ControlPlaneError> {
         let req = HeartbeatRequest {
             service_id,
-            client_secret: client_secret.to_string(),
             status: status.to_string(),
             current_operation: current_operation.map(String::from),
         };

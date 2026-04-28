@@ -10,6 +10,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::middleware::SyncServiceContext;
 use crate::entity::{sync_commands, sync_events, sync_service_credentials, sync_service_tokens, sync_services};
 use crate::error::{AppError, AppResult};
 use crate::services::api_token::{generate_token, hash_token};
@@ -46,7 +47,6 @@ pub struct EnrollResponse {
 #[derive(Deserialize)]
 pub struct HeartbeatRequest {
     pub service_id: Uuid,
-    pub client_secret: String,
     pub status: String,
     pub current_operation: Option<String>,
 }
@@ -192,22 +192,6 @@ pub async fn heartbeat(
     State(state): State<AppState>,
     Json(req): Json<HeartbeatRequest>,
 ) -> AppResult<Json<HeartbeatResponse>> {
-    // Validate client_secret by finding the credential linked to this service
-    let cred = sync_service_credentials::Entity::find()
-        .filter(sync_service_credentials::Column::ServiceId.eq(req.service_id))
-        .one(&state.db)
-        .await?
-        .ok_or_else(|| AppError::Unauthorized("No credential found for service".to_string()))?;
-
-    if cred.revoked {
-        return Err(AppError::Unauthorized("Credentials have been revoked".to_string()));
-    }
-
-    let secret_hash = hash_token(&req.client_secret);
-    if secret_hash != cred.client_secret_hash {
-        return Err(AppError::Unauthorized("Invalid client_secret".to_string()));
-    }
-
     // Validate status
     const VALID_SERVICE_STATUSES: &[&str] = &["starting", "idle", "running", "paused", "syncing", "error", "stopping"];
     if !VALID_SERVICE_STATUSES.contains(&req.status.as_str()) {
@@ -281,6 +265,7 @@ pub async fn heartbeat(
 
 pub async fn update_command(
     State(state): State<AppState>,
+    ctx: SyncServiceContext,
     Path(command_id): Path<Uuid>,
     Json(req): Json<CommandUpdateRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
@@ -288,6 +273,10 @@ pub async fn update_command(
         .one(&state.db)
         .await?
         .ok_or_else(|| AppError::NotFound("Command not found".to_string()))?;
+
+    if cmd.service_id != ctx.service_id {
+        return Err(AppError::Forbidden("Command does not belong to this service".to_string()));
+    }
 
     let valid_statuses = ["acknowledged", "completed", "failed"];
     if !valid_statuses.contains(&req.status.as_str()) {
@@ -338,8 +327,13 @@ pub struct UpdateSyncEventRequest {
 
 pub async fn create_sync_event(
     State(state): State<AppState>,
+    ctx: SyncServiceContext,
     Json(req): Json<CreateSyncEventRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
+    if req.service_id != ctx.service_id {
+        return Err(AppError::Forbidden("Event service_id does not match authenticated service".to_string()));
+    }
+
     const VALID_EVENT_TYPES: &[&str] = &["scheduled", "manual", "command", "triggered", "full_sync"];
     const VALID_EVENT_STATUSES: &[&str] = &["running", "completed", "partial", "failed", "cancelled"];
 
@@ -389,6 +383,7 @@ pub async fn create_sync_event(
 
 pub async fn update_sync_event(
     State(state): State<AppState>,
+    ctx: SyncServiceContext,
     Path(event_id): Path<Uuid>,
     Json(req): Json<UpdateSyncEventRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
@@ -396,6 +391,10 @@ pub async fn update_sync_event(
         .one(&state.db)
         .await?
         .ok_or_else(|| AppError::NotFound("Sync event not found".to_string()))?;
+
+    if event.service_id != ctx.service_id {
+        return Err(AppError::Forbidden("Event does not belong to this service".to_string()));
+    }
 
     let service_id = event.service_id;
     let mut active: sync_events::ActiveModel = event.into();
