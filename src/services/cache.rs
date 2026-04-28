@@ -37,7 +37,7 @@
 //! the cache entry is invalidated and fresh data is fetched.
 
 use axum::{
-    http::{header, HeaderValue},
+    http::{HeaderValue, header},
     response::Response,
 };
 use chrono::{DateTime, Utc};
@@ -58,7 +58,7 @@ struct MaxTimeRow {
 ///
 /// Components are joined with `:` separator. Empty components are included
 /// to ensure different queries produce different keys.
-#[must_use] 
+#[must_use]
 pub fn cache_key(prefix: &str, components: &[&str]) -> String {
     let mut key = prefix.to_string();
     for c in components {
@@ -82,21 +82,20 @@ pub async fn get_latest_time(
         return Ok(None);
     }
 
-    let ids_str = param_ids
-        .iter()
-        .map(|id| format!("'{id}'"))
-        .collect::<Vec<_>>()
-        .join(",");
+    let placeholders: Vec<String> = (1..=param_ids.len()).map(|i| format!("${i}")).collect();
+    let values: Vec<sea_orm::Value> = param_ids.iter().map(|id| (*id).into()).collect();
 
     let sql = format!(
-        "SELECT MAX(time) as max_time FROM readings WHERE parameter_id IN ({ids_str})"
+        "SELECT MAX(time) as max_time FROM readings WHERE parameter_id IN ({})",
+        placeholders.join(",")
     );
 
     let result = state
         .db
-        .query_one(Statement::from_string(
+        .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            sql,
+            &sql,
+            values,
         ))
         .await?;
 
@@ -140,18 +139,19 @@ pub async fn get_cached(
     // Bounded queries asking for historical data won't change
     if query_end.is_none()
         && let Ok(Some(latest)) = get_latest_time(state, param_ids).await
-            && let Some(cached_max) = cached.max_time
-                && latest > cached_max {
-                    // New data exists beyond what we cached
-                    tracing::debug!(
-                        cache_key = %cache_key,
-                        cached_max = %cached_max,
-                        latest = %latest,
-                        "cache_stale"
-                    );
-                    state.response_cache.invalidate(cache_key).await;
-                    return None;
-                }
+        && let Some(cached_max) = cached.max_time
+        && latest > cached_max
+    {
+        // New data exists beyond what we cached
+        tracing::debug!(
+            cache_key = %cache_key,
+            cached_max = %cached_max,
+            latest = %latest,
+            "cache_stale"
+        );
+        state.response_cache.invalidate(cache_key).await;
+        return None;
+    }
 
     tracing::debug!(cache_key = %cache_key, "cache_hit");
     Some(cached.data.clone())
@@ -205,7 +205,10 @@ pub async fn store_cached(
 pub fn json_response(data: Vec<u8>, cache_hit: bool) -> AppResult<Response> {
     let cache_header = if cache_hit { "HIT" } else { "MISS" };
     Response::builder()
-        .header(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )
         .header("X-Cache", HeaderValue::from_static(cache_header))
         .body(axum::body::Body::from(data))
         .map_err(|e| AppError::Internal(e.to_string()))
@@ -232,8 +235,7 @@ pub async fn cache_and_respond<T: Serialize>(
     response: &T,
     max_time: Option<DateTime<Utc>>,
 ) -> AppResult<Response> {
-    let json_bytes = serde_json::to_vec(response)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let json_bytes = serde_json::to_vec(response).map_err(|e| AppError::Internal(e.to_string()))?;
 
     store_cached(state, cache_key, json_bytes.clone(), max_time).await;
 
@@ -255,8 +257,8 @@ pub async fn invalidate(state: &AppState, cache_key: &str) {
 /// or data type.
 pub async fn invalidate_prefix(state: &AppState, prefix: &str) {
     let prefix_owned = prefix.to_string();
-    let _ = state.response_cache.invalidate_entries_if(move |key, _| {
-        key.starts_with(&prefix_owned)
-    });
+    let _ = state
+        .response_cache
+        .invalidate_entries_if(move |key, _| key.starts_with(&prefix_owned));
     tracing::debug!(prefix = %prefix, "cache_prefix_invalidated");
 }

@@ -1,82 +1,97 @@
+use crudcrate::{CRUDResource, EntityToModels};
 use sea_orm::entity::prelude::*;
-use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    DeriveEntityModel,
+    serde::Serialize,
+    serde::Deserialize,
+    EntityToModels,
+)]
 #[sea_orm(table_name = "parameters")]
+#[crudcrate(
+    api_struct = "Parameter",
+    name_singular = "parameter",
+    name_plural = "parameters",
+    generate_router
+)]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
+    #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
     pub id: Uuid,
-    pub site_id: Uuid,
+    #[sea_orm(unique)]
+    #[crudcrate(filterable, fulltext, sortable)]
     pub name: String,
-    pub sensor_type: String,
-    pub display_units: Option<String>,
-    pub units_name: Option<String>,
-    pub units_min: Option<f64>,
-    pub units_max: Option<f64>,
-    pub decimal_places: Option<i16>,
-    pub device_serial_number: Option<String>,
-    pub probe_serial_number: Option<String>,
-    pub channel_id: Option<i32>,
-    pub sample_interval_sec: Option<i32>,
-    pub is_active: Option<bool>,
-    pub created_at: Option<DateTimeWithTimeZone>,
-    pub updated_at: Option<DateTimeWithTimeZone>,
-    pub discovered_at: Option<DateTimeWithTimeZone>,
+    #[crudcrate(fulltext, sortable)]
+    pub display_name: String,
+    #[crudcrate(sortable)]
+    pub default_units: String,
+    #[sea_orm(column_type = "String(StringLen::N(32))")]
+    #[crudcrate(filterable)]
+    pub category: String,
+    #[sea_orm(column_type = "String(StringLen::N(16))")]
+    #[crudcrate(filterable)]
+    pub data_type: String,
+    pub description: Option<String>,
+    pub default_warning_min: Option<f64>,
+    pub default_warning_max: Option<f64>,
+    pub default_alarm_min: Option<f64>,
+    pub default_alarm_max: Option<f64>,
+    #[crudcrate(exclude(create, update), sortable)]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    #[sea_orm(
-        belongs_to = "super::sites::Entity",
-        from = "Column::SiteId",
-        to = "super::sites::Column::Id"
-    )]
-    Site,
-    #[sea_orm(has_many = "super::readings::Entity")]
-    Readings,
-    #[sea_orm(has_many = "super::device_status::Entity")]
-    DeviceStatus,
-    #[sea_orm(has_many = "super::calibrations::Entity")]
-    Calibrations,
-    #[sea_orm(has_one = "super::sync_state::Entity")]
-    SyncState,
-    #[sea_orm(has_one = "super::alarm_thresholds::Entity")]
+    #[sea_orm(has_many = "super::sensors::Entity")]
+    Sensors,
+    #[sea_orm(has_many = "super::site_parameters::Entity")]
+    SiteParameters,
+    #[sea_orm(has_many = "super::alarm_thresholds::Entity")]
     AlarmThresholds,
+    #[sea_orm(has_many = "super::public_exposed_parameters::Entity")]
+    PublicExposedParameters,
+    #[sea_orm(has_many = "super::status_events::Entity")]
+    StatusEvents,
+    #[sea_orm(has_many = "super::derived_parameter_sources::Entity")]
+    DerivedParameterSources,
 }
 
-impl Related<super::sites::Entity> for Entity {
+impl Related<super::sensors::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::Site.def()
+        Relation::Sensors.def()
     }
 }
 
-impl Related<super::readings::Entity> for Entity {
+impl Related<super::site_parameters::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::Readings.def()
-    }
-}
-
-impl Related<super::device_status::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::DeviceStatus.def()
-    }
-}
-
-impl Related<super::calibrations::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::Calibrations.def()
-    }
-}
-
-impl Related<super::sync_state::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::SyncState.def()
+        Relation::SiteParameters.def()
     }
 }
 
 impl Related<super::alarm_thresholds::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::AlarmThresholds.def()
+    }
+}
+
+impl Related<super::public_exposed_parameters::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::PublicExposedParameters.def()
+    }
+}
+
+impl Related<super::status_events::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::StatusEvents.def()
+    }
+}
+
+impl Related<super::derived_parameter_sources::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::DerivedParameterSources.def()
     }
 }
 

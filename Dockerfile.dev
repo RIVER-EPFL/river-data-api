@@ -1,5 +1,20 @@
 FROM rust:1.93
-RUN cargo install cargo-watch
+RUN cargo install bacon
 WORKDIR /app
-COPY . .
-ENTRYPOINT ["cargo", "watch", "--poll", "-x", "run"]
+# Only copy manifests for initial dependency fetch — source is volume-mounted at runtime
+COPY Cargo.toml Cargo.lock ./
+COPY migration/Cargo.toml migration/Cargo.toml
+COPY river-data-sync-common/Cargo.toml river-data-sync-common/Cargo.toml
+COPY river-data-sync-vaisala/Cargo.toml river-data-sync-vaisala/Cargo.toml
+COPY river-data-sync-portal/Cargo.toml river-data-sync-portal/Cargo.toml
+COPY river-data-toolbox/Cargo.toml river-data-toolbox/Cargo.toml
+# Create stub source files so cargo can resolve the workspace
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs \
+    && mkdir -p migration/src && echo "fn main() {}" > migration/src/main.rs && echo "" > migration/src/lib.rs \
+    && mkdir -p river-data-sync-common/src && echo "" > river-data-sync-common/src/lib.rs \
+    && mkdir -p river-data-sync-vaisala/src && echo "fn main() {}" > river-data-sync-vaisala/src/main.rs \
+    && mkdir -p river-data-sync-portal/src && echo "fn main() {}" > river-data-sync-portal/src/main.rs \
+    && mkdir -p river-data-toolbox/src && echo "" > river-data-toolbox/src/lib.rs
+# Pre-fetch dependencies (cached across rebuilds)
+RUN cargo fetch
+ENTRYPOINT ["bacon", "--headless", "run"]

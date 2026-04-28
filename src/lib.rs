@@ -8,5 +8,3 @@ pub mod entity;
 pub mod error;
 pub mod routes;
 pub mod services;
-pub mod sync;
-pub mod vaisala;

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "migration"]
+members = [".", "migration", "river-data-sync-vaisala", "river-data-sync-portal", "river-data-sync-common", "river-data-toolbox"]
 resolver = "2"
 
 [package]
@@ -16,20 +16,18 @@ unsafe_code = "forbid"
 
 [dependencies]
 # Web framework
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "multipart"] }
 tower = { version = "0.5", features = ["timeout", "limit"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "limit"] }
 
 # Database
-sea-orm = { version = "1.1", features = ["sqlx-postgres", "runtime-tokio-rustls", "with-uuid", "with-chrono"] }
+sea-orm = { version = "1.1", features = ["sqlx-postgres", "runtime-tokio-rustls", "with-uuid", "with-chrono", "with-json"] }
 sea-orm-migration = { version = "1.1", features = ["sqlx-postgres", "runtime-tokio-rustls"] }
+sea-orm-timescale = "0.2.0"
 
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
 tokio-stream = "0.1"
-
-# HTTP client (Vaisala)
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 # Serialization
 chrono = { version = "0.4", features = ["serde"] }
@@ -39,7 +37,11 @@ csv = "1.3"
 
 # API docs
 utoipa = { version = "5.3", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-axum = "0.2"
 utoipa-scalar = { version = "0.3", features = ["axum"] }
+
+# HTTP (required by crudcrate generated code)
+hyper = "1"
 
 # Utilities
 uuid = { version = "1.11", features = ["v4", "serde"] }
@@ -52,14 +54,40 @@ futures = "0.3"
 # Caching
 moka = { version = "0.12", features = ["future"] }
 
+# Authentication
+axum-keycloak-auth = "0.8"
+
+# Admin CRUD
+crudcrate = { version = "0.7.1", features = ["postgresql", "derive"] }
+
+# HTTP client (Keycloak admin proxy)
+reqwest = { version = "0.12", features = ["json"] }
+
+# Crypto / token generation
+sha2 = "0.10"
+rand = "0.9"
+
+# Formula evaluation (sandboxed math expressions)
+meval = "0.2"
+
 # Rate limiting
 governor = "0.8"
 tower_governor = "0.6"
 
+# Async traits
+async-trait = "0.1"
+
 # Migration support
 migration = { path = "migration" }
+
+# Hydrochemistry calculation tools
+river-data-toolbox = { path = "river-data-toolbox" }
 
 [dev-dependencies]
 tokio-test = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
 serde_json = "1.0"
+serial_test = "3"
+tower = { version = "0.5", features = ["util"] }
+hyper = "1"
+http-body-util = "0.1"

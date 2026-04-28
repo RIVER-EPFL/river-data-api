@@ -1,0 +1,68 @@
+use crudcrate::{CRUDResource, EntityToModels};
+use sea_orm::entity::prelude::*;
+
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    DeriveEntityModel,
+    serde::Serialize,
+    serde::Deserialize,
+    EntityToModels,
+)]
+#[sea_orm(table_name = "sensor_deployments")]
+#[crudcrate(
+    api_struct = "SensorDeployment",
+    name_singular = "sensor_deployment",
+    name_plural = "sensor_deployments",
+    generate_router
+)]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false)]
+    #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
+    pub id: Uuid,
+    #[crudcrate(filterable)]
+    pub sensor_id: Uuid,
+    #[crudcrate(filterable)]
+    pub site_id: Uuid,
+    #[crudcrate(sortable)]
+    pub deployed_from: chrono::DateTime<chrono::Utc>,
+    #[crudcrate(sortable)]
+    pub deployed_until: Option<chrono::DateTime<chrono::Utc>>,
+    #[crudcrate(filterable)]
+    pub deployment_type: String,
+    pub notes: Option<String>,
+    #[crudcrate(exclude(create, update))]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {
+    #[sea_orm(
+        belongs_to = "super::sensors::Entity",
+        from = "Column::SensorId",
+        to = "super::sensors::Column::Id"
+    )]
+    Sensor,
+    #[sea_orm(
+        belongs_to = "super::sites::Entity",
+        from = "Column::SiteId",
+        to = "super::sites::Column::Id"
+    )]
+    Site,
+}
+
+impl Related<super::sensors::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Sensor.def()
+    }
+}
+
+impl Related<super::sites::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Site.def()
+    }
+}
+
+impl ActiveModelBehavior for ActiveModel {}

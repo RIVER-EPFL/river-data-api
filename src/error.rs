@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde_json::json;
 
@@ -16,9 +16,6 @@ pub enum AppError {
     #[error("Internal error: {0}")]
     Internal(String),
 
-    #[error("Vaisala API error: {0}")]
-    VaisalaApi(String),
-
     #[error("Configuration error: {0}")]
     Config(#[from] crate::config::ConfigError),
 
@@ -27,6 +24,12 @@ pub enum AppError {
 
     #[error("Not found: {0}")]
     NotFound(String),
+
+    #[error("Unauthorized: {0}")]
+    Unauthorized(String),
+
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
 }
 
 impl IntoResponse for AppError {
@@ -47,10 +50,6 @@ impl IntoResponse for AppError {
                     "Internal server error".to_string(),
                 )
             }
-            Self::VaisalaApi(msg) => {
-                tracing::error!("Vaisala API error: {msg}");
-                (StatusCode::BAD_GATEWAY, format!("Vaisala API error: {msg}"))
-            }
             Self::Config(e) => {
                 tracing::error!("Config error: {e:?}");
                 (
@@ -60,6 +59,8 @@ impl IntoResponse for AppError {
             }
             Self::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
+            Self::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
+            Self::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
         };
 
         let body = Json(json!({

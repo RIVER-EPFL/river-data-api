@@ -55,3 +55,58 @@ pub struct SiteAlarmsQuery {
 fn default_format() -> String {
     "json".to_string()
 }
+
+/// Information about an alarm threshold configuration
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AlarmThresholdInfo {
+    pub warning_min: Option<f64>,
+    pub warning_max: Option<f64>,
+    pub alarm_min: Option<f64>,
+    pub alarm_max: Option<f64>,
+}
+
+/// A single active alarm violation
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ActiveAlarm {
+    pub site_id: Uuid,
+    pub site_name: String,
+    pub parameter_id: Uuid,
+    pub parameter_name: String,
+    pub current_value: f64,
+    pub threshold: AlarmThresholdInfo,
+    /// 1=warning, 2=alarm
+    pub severity: i16,
+    /// Timestamp of the latest violating reading
+    pub since: DateTime<Utc>,
+}
+
+/// Response for active alarms endpoint
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ActiveAlarmsResponse {
+    pub alarms: Vec<ActiveAlarm>,
+    pub total: usize,
+}
+
+/// Severity counts for alarm summary
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AlarmSeverityCounts {
+    pub warning: usize,
+    pub alarm: usize,
+}
+
+/// Per-site alarm counts for alarm summary
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AlarmSiteSummary {
+    pub site_id: Uuid,
+    pub site_name: String,
+    pub warning_count: usize,
+    pub alarm_count: usize,
+}
+
+/// Response for alarm summary endpoint
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AlarmSummaryResponse {
+    pub total: usize,
+    pub by_severity: AlarmSeverityCounts,
+    pub by_site: Vec<AlarmSiteSummary>,
+}

@@ -5,26 +5,124 @@ use serde::{Deserialize, Serialize};
 #[sea_orm(table_name = "readings")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
-    pub parameter_id: Uuid,
+    pub stream_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
     pub time: DateTimeWithTimeZone,
-    pub value: f64,
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub replicate_index: i16,
+    pub site_id: Option<Uuid>,
+    pub parameter_id: Option<Uuid>,
+    pub raw_value: f64,
+    pub calibrated_value: Option<f64>,
+    pub sensor_id: Option<Uuid>,
+    pub calibration_id: Option<Uuid>,
+    pub deployment_id: Option<Uuid>,
     pub logged: Option<bool>,
+    pub measurement_type: Option<String>,
+    pub is_flagged: Option<bool>,
+    pub flag_reason: Option<String>,
+    pub field_trip_id: Option<Uuid>,
+    pub sample_id: Option<Uuid>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
+    #[sea_orm(
+        belongs_to = "super::data_streams::Entity",
+        from = "Column::StreamId",
+        to = "super::data_streams::Column::Id"
+    )]
+    DataStream,
+    #[sea_orm(
+        belongs_to = "super::sites::Entity",
+        from = "Column::SiteId",
+        to = "super::sites::Column::Id"
+    )]
+    Site,
     #[sea_orm(
         belongs_to = "super::parameters::Entity",
         from = "Column::ParameterId",
         to = "super::parameters::Column::Id"
     )]
     Parameter,
+    #[sea_orm(
+        belongs_to = "super::sensors::Entity",
+        from = "Column::SensorId",
+        to = "super::sensors::Column::Id"
+    )]
+    Sensor,
+    #[sea_orm(
+        belongs_to = "super::sensor_calibrations::Entity",
+        from = "Column::CalibrationId",
+        to = "super::sensor_calibrations::Column::Id"
+    )]
+    SensorCalibration,
+    #[sea_orm(
+        belongs_to = "super::sensor_deployments::Entity",
+        from = "Column::DeploymentId",
+        to = "super::sensor_deployments::Column::Id"
+    )]
+    SensorDeployment,
+    #[sea_orm(
+        belongs_to = "super::field_trips::Entity",
+        from = "Column::FieldTripId",
+        to = "super::field_trips::Column::Id"
+    )]
+    FieldTrip,
+    #[sea_orm(
+        belongs_to = "super::samples::Entity",
+        from = "Column::SampleId",
+        to = "super::samples::Column::Id",
+        on_delete = "SetNull"
+    )]
+    Sample,
+}
+
+impl Related<super::data_streams::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::DataStream.def()
+    }
+}
+
+impl Related<super::sites::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Site.def()
+    }
 }
 
 impl Related<super::parameters::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Parameter.def()
+    }
+}
+
+impl Related<super::sensors::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Sensor.def()
+    }
+}
+
+impl Related<super::sensor_calibrations::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::SensorCalibration.def()
+    }
+}
+
+impl Related<super::sensor_deployments::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::SensorDeployment.def()
+    }
+}
+
+impl Related<super::field_trips::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::FieldTrip.def()
+    }
+}
+
+impl Related<super::samples::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Sample.def()
     }
 }
 

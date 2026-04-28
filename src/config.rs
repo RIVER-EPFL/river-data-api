@@ -27,18 +27,6 @@ pub struct Config {
     // Database
     pub database_url: String,
 
-    // Vaisala API
-    pub vaisala_base_url: String,
-    pub vaisala_bearer_token: String,
-    pub vaisala_skip_tls_verify: bool,
-    pub vaisala_max_history_days: i64,
-
-    // Sync settings
-    pub sync_readings_interval_seconds: u64,
-    pub sync_device_status_interval_seconds: u64,
-    pub sync_retry_max: u32,
-    pub sync_retry_delay_seconds: u64,
-
     // API settings
     pub api_host: String,
     pub api_port: u16,
@@ -57,6 +45,32 @@ pub struct Config {
 
     // Application metadata
     pub deployment: Deployment,
+
+    // Keycloak authentication (all optional for gradual adoption)
+    pub keycloak_url: Option<String>,
+    pub keycloak_realm: Option<String>,
+    pub keycloak_client_id: Option<String>,
+
+    // Keycloak admin proxy (optional — enables user management)
+    pub keycloak_admin_client_id: Option<String>,
+    pub keycloak_admin_client_secret: Option<String>,
+
+    // CORS
+    pub cors_allowed_origins: Vec<String>,
+
+    // Connection pool
+    pub db_max_connections: u32,
+    pub db_min_connections: u32,
+
+    // Request timeout (seconds)
+    pub request_timeout_seconds: u64,
+
+    // Time range limits (days)
+    pub max_readings_time_range_days: i64,
+    pub max_aggregates_time_range_days: i64,
+    pub public_max_readings_time_range_days: i64,
+    pub public_max_aggregates_time_range_days: i64,
+    pub default_readings_lookback_days: i64,
 }
 
 impl Config {
@@ -70,48 +84,20 @@ impl Config {
 
         Ok(Self {
             // Database: prefer DATABASE_URL, fall back to individual DB_* vars
-            database_url: env::var("DATABASE_URL").or_else(|_| {
-                let user = env::var("DB_USER")?;
-                let password = env::var("DB_PASSWORD")?;
-                let host = env::var("DB_HOST")?;
-                let port = env::var("DB_PORT").unwrap_or_else(|_| "5432".to_string());
-                let name = env::var("DB_NAME")?;
-                Ok::<String, env::VarError>(format!(
-                    "postgresql://{user}:{password}@{host}:{port}/{name}"
-                ))
-            }).map_err(|_| ConfigError::Missing("DATABASE_URL or DB_USER/DB_PASSWORD/DB_HOST/DB_NAME"))?,
-
-            // Vaisala API
-            vaisala_base_url: env::var("VAISALA_BASE_URL")
-                .map_err(|_| ConfigError::Missing("VAISALA_BASE_URL"))?,
-            vaisala_bearer_token: env::var("VAISALA_BEARER_TOKEN")
-                .map_err(|_| ConfigError::Missing("VAISALA_BEARER_TOKEN"))?,
-            vaisala_skip_tls_verify: env::var("VAISALA_SKIP_TLS_VERIFY")
-                .unwrap_or_else(|_| "true".to_string())
-                .parse()
-                .unwrap_or(true),
-            vaisala_max_history_days: env::var("VAISALA_MAX_HISTORY_DAYS")
-                .unwrap_or_else(|_| "90".to_string())
-                .parse()
-                .unwrap_or(90),
-
-            // Sync settings
-            sync_readings_interval_seconds: env::var("SYNC_READINGS_INTERVAL_SECONDS")
-                .unwrap_or_else(|_| "300".to_string())
-                .parse()
-                .unwrap_or(300),
-            sync_device_status_interval_seconds: env::var("SYNC_DEVICE_STATUS_INTERVAL_SECONDS")
-                .unwrap_or_else(|_| "1800".to_string())
-                .parse()
-                .unwrap_or(1800),
-            sync_retry_max: env::var("SYNC_RETRY_MAX")
-                .unwrap_or_else(|_| "3".to_string())
-                .parse()
-                .unwrap_or(3),
-            sync_retry_delay_seconds: env::var("SYNC_RETRY_DELAY_SECONDS")
-                .unwrap_or_else(|_| "60".to_string())
-                .parse()
-                .unwrap_or(60),
+            database_url: env::var("DATABASE_URL")
+                .or_else(|_| {
+                    let user = env::var("DB_USER")?;
+                    let password = env::var("DB_PASSWORD")?;
+                    let host = env::var("DB_HOST")?;
+                    let port = env::var("DB_PORT").unwrap_or_else(|_| "5432".to_string());
+                    let name = env::var("DB_NAME")?;
+                    Ok::<String, env::VarError>(format!(
+                        "postgresql://{user}:{password}@{host}:{port}/{name}"
+                    ))
+                })
+                .map_err(|_| {
+                    ConfigError::Missing("DATABASE_URL or DB_USER/DB_PASSWORD/DB_HOST/DB_NAME")
+                })?,
 
             // API settings
             api_host: env::var("API_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
@@ -163,6 +149,67 @@ impl Config {
                 .unwrap_or_else(|_| "local".to_string())
                 .parse()
                 .unwrap_or(Deployment::Local),
+
+            // Keycloak authentication (optional)
+            keycloak_url: env::var("KEYCLOAK_URL").ok().filter(|s| !s.is_empty()),
+            keycloak_realm: env::var("KEYCLOAK_REALM").ok().filter(|s| !s.is_empty()),
+            keycloak_client_id: env::var("KEYCLOAK_CLIENT_ID")
+                .ok()
+                .filter(|s| !s.is_empty()),
+
+            // Keycloak admin proxy (optional)
+            keycloak_admin_client_id: env::var("KEYCLOAK_ADMIN_CLIENT_ID")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            keycloak_admin_client_secret: env::var("KEYCLOAK_ADMIN_CLIENT_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty()),
+
+            // CORS
+            cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS")
+                .unwrap_or_else(|_| "http://localhost:5173,http://localhost:3005".to_string())
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+
+            // Connection pool
+            db_max_connections: env::var("DB_MAX_CONNECTIONS")
+                .unwrap_or_else(|_| "25".to_string())
+                .parse()
+                .unwrap_or(25),
+            db_min_connections: env::var("DB_MIN_CONNECTIONS")
+                .unwrap_or_else(|_| "5".to_string())
+                .parse()
+                .unwrap_or(5),
+
+            // Request timeout
+            request_timeout_seconds: env::var("REQUEST_TIMEOUT_SECONDS")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()
+                .unwrap_or(60),
+
+            // Time range limits
+            max_readings_time_range_days: env::var("MAX_READINGS_TIME_RANGE_DAYS")
+                .unwrap_or_else(|_| "90".to_string())
+                .parse()
+                .unwrap_or(90),
+            max_aggregates_time_range_days: env::var("MAX_AGGREGATES_TIME_RANGE_DAYS")
+                .unwrap_or_else(|_| "365".to_string())
+                .parse()
+                .unwrap_or(365),
+            public_max_readings_time_range_days: env::var("PUBLIC_MAX_READINGS_TIME_RANGE_DAYS")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()
+                .unwrap_or(30),
+            public_max_aggregates_time_range_days: env::var("PUBLIC_MAX_AGGREGATES_TIME_RANGE_DAYS")
+                .unwrap_or_else(|_| "180".to_string())
+                .parse()
+                .unwrap_or(180),
+            default_readings_lookback_days: env::var("DEFAULT_READINGS_LOOKBACK_DAYS")
+                .unwrap_or_else(|_| "7".to_string())
+                .parse()
+                .unwrap_or(7),
         })
     }
 

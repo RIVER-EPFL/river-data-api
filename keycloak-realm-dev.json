@@ -1,0 +1,75 @@
+{
+  "realm": "river-data",
+  "enabled": true,
+  "registrationAllowed": false,
+  "roles": {
+    "realm": [
+      {
+        "name": "riverdata-admin",
+        "description": "River Data administrator with full access"
+      },
+      {
+        "name": "riverdata-user",
+        "description": "River Data standard user with read access"
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "river-data-ui-local",
+      "enabled": true,
+      "publicClient": true,
+      "directAccessGrantsEnabled": true,
+      "redirectUris": ["http://localhost:*", "http://localhost:3005/*"],
+      "webOrigins": ["*"],
+      "protocol": "openid-connect",
+      "standardFlowEnabled": true,
+      "defaultClientScopes": ["openid", "profile", "email", "roles"],
+      "attributes": {}
+    },
+    {
+      "clientId": "river-data-api-local",
+      "enabled": true,
+      "publicClient": false,
+      "secret": "river-data-api-local-secret",
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": true,
+      "protocol": "openid-connect",
+      "standardFlowEnabled": false,
+      "defaultClientScopes": ["openid", "profile", "email", "roles"],
+      "attributes": {}
+    }
+  ],
+  "users": [
+    {
+      "username": "admin",
+      "enabled": true,
+      "email": "admin@local.dev",
+      "firstName": "Admin",
+      "lastName": "User",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "admin",
+          "temporary": false
+        }
+      ],
+      "realmRoles": ["riverdata-admin", "riverdata-user"]
+    },
+    {
+      "username": "user",
+      "enabled": true,
+      "email": "user@local.dev",
+      "firstName": "Regular",
+      "lastName": "User",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "user",
+          "temporary": false
+        }
+      ],
+      "realmRoles": ["riverdata-user"]
+    }
+  ]
+}

@@ -1,37 +1,24 @@
 use axum::{
-    extract::{Path, Query, State},
-    http::{
-        header::{self, HeaderMap, HeaderValue},
-        StatusCode,
-    },
-    response::{IntoResponse, Response},
     Json,
+    extract::{Path, Query, State},
+    http::header::HeaderMap,
+    response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
-use tokio::sync::Semaphore;
-use tokio_stream::wrappers::ReceiverStream;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::{alarm_thresholds, parameters, projects};
+use crate::common::middleware::ProjectScope;
+use crate::entity::{alarm_thresholds, site_parameters};
 use crate::error::{AppError, AppResult};
-use crate::routes::{cache, resolve_site};
+use crate::routes::{cache, resolve_site_with_project, validate_time_range};
+use crate::services::bulk::{self, StreamableAggregateParam};
 
 use super::types::{ProjectRef, SiteRef};
-
-/// Global semaphore limiting concurrent bulk (CSV/NDJSON) requests.
-static BULK_SEMAPHORE: std::sync::LazyLock<Arc<Semaphore>> = std::sync::LazyLock::new(|| {
-    let limit = std::env::var("BULK_CONCURRENT_LIMIT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
-    Arc::new(Semaphore::new(limit))
-});
 
 fn default_format() -> String {
     "json".to_string()
@@ -75,6 +62,24 @@ pub struct ParameterAggregateData {
     pub max_severity: Option<Vec<Option<i16>>>,
 }
 
+impl StreamableAggregateParam for ParameterAggregateData {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn avg_at(&self, index: usize) -> Option<f64> {
+        self.avg.get(index).and_then(|v| *v)
+    }
+    fn min_at(&self, index: usize) -> Option<f64> {
+        self.min.get(index).and_then(|v| *v)
+    }
+    fn max_at(&self, index: usize) -> Option<f64> {
+        self.max.get(index).and_then(|v| *v)
+    }
+    fn count_at(&self, index: usize) -> Option<i64> {
+        self.count.get(index).copied()
+    }
+}
+
 #[derive(Debug, FromQueryResult)]
 struct AggregateRow {
     bucket: DateTime<Utc>,
@@ -85,134 +90,19 @@ struct AggregateRow {
     count: i64,
 }
 
-fn determine_format(query_format: &str, headers: &HeaderMap) -> String {
-    if query_format != "json" {
-        return query_format.to_lowercase();
-    }
-
-    if let Some(accept) = headers.get(header::ACCEPT)
-        && let Ok(accept_str) = accept.to_str()
-    {
-        if accept_str.contains("application/x-ndjson") {
-            return "ndjson".to_string();
-        }
-        if accept_str.contains("text/csv") {
-            return "csv".to_string();
-        }
-    }
-
-    "json".to_string()
-}
-
 fn build_csv_response(
     _resolution: &str,
     times: &[DateTime<Utc>],
     params: &[ParameterAggregateData],
 ) -> AppResult<Response> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
-
-    let times = times.to_vec();
-    let params = params.to_vec();
-
-    tokio::spawn(async move {
-        let mut header = "time".to_string();
-        for param in &params {
-            header.push_str(&format!(
-                ",{}_avg,{}_min,{}_max,{}_count",
-                param.name, param.name, param.name, param.name
-            ));
-        }
-        header.push('\n');
-        let _ = tx.send(Ok(header)).await;
-
-        for (i, time) in times.iter().enumerate() {
-            let mut row = time.to_rfc3339();
-            for param in &params {
-                row.push(',');
-                if let Some(v) = param.avg.get(i).and_then(|v| *v) {
-                    row.push_str(&v.to_string());
-                }
-                row.push(',');
-                if let Some(v) = param.min.get(i).and_then(|v| *v) {
-                    row.push_str(&v.to_string());
-                }
-                row.push(',');
-                if let Some(v) = param.max.get(i).and_then(|v| *v) {
-                    row.push_str(&v.to_string());
-                }
-                row.push(',');
-                if let Some(c) = param.count.get(i) {
-                    row.push_str(&c.to_string());
-                }
-            }
-            row.push('\n');
-            if tx.send(Ok(row)).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let stream = ReceiverStream::new(rx);
-    let body = axum::body::Body::from_stream(stream);
-
-    Response::builder()
-        .header(header::CONTENT_TYPE, HeaderValue::from_static("text/csv"))
-        .body(body)
-        .map_err(|e| AppError::Internal(e.to_string()))
+    bulk::build_aggregates_csv_response(times, params)
 }
 
 fn build_ndjson_response(
     times: &[DateTime<Utc>],
     params: &[ParameterAggregateData],
 ) -> AppResult<Response> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
-
-    let times = times.to_vec();
-    let params = params.to_vec();
-
-    tokio::spawn(async move {
-        for (i, time) in times.iter().enumerate() {
-            let mut obj = serde_json::Map::new();
-            obj.insert("time".to_string(), serde_json::json!(time.to_rfc3339()));
-
-            for param in &params {
-                let avg = param.avg.get(i).and_then(|v| *v);
-                let min = param.min.get(i).and_then(|v| *v);
-                let max = param.max.get(i).and_then(|v| *v);
-                let count = param.count.get(i).copied().unwrap_or(0);
-
-                obj.insert(
-                    format!("{}_avg", param.name),
-                    avg.map_or(serde_json::Value::Null, |v| serde_json::json!(v)),
-                );
-                obj.insert(
-                    format!("{}_min", param.name),
-                    min.map_or(serde_json::Value::Null, |v| serde_json::json!(v)),
-                );
-                obj.insert(
-                    format!("{}_max", param.name),
-                    max.map_or(serde_json::Value::Null, |v| serde_json::json!(v)),
-                );
-                obj.insert(format!("{}_count", param.name), serde_json::json!(count));
-            }
-
-            let line = format!("{}\n", serde_json::Value::Object(obj));
-            if tx.send(Ok(line)).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let stream = ReceiverStream::new(rx);
-    let body = axum::body::Body::from_stream(stream);
-
-    Response::builder()
-        .header(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/x-ndjson"),
-        )
-        .body(body)
-        .map_err(|e| AppError::Internal(e.to_string()))
+    bulk::build_aggregates_ndjson_response(times, params)
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -236,7 +126,7 @@ pub struct SiteAggregatesQuery {
 /// Supports JSON, CSV, and NDJSON formats.
 #[utoipa::path(
     get,
-    path = "/api/private/sites/{site_id}/aggregates/{resolution}",
+    path = "/{site_id}/aggregates/{resolution}",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
         ("resolution" = String, Path, description = "Aggregation resolution: hourly, daily, weekly, monthly"),
@@ -253,22 +143,24 @@ pub async fn get_site_aggregates(
     State(state): State<AppState>,
     Path((site_id, resolution)): Path<(String, String)>,
     Query(query): Query<SiteAggregatesQuery>,
+    ProjectScope(scope): ProjectScope,
     headers: HeaderMap,
 ) -> AppResult<Response> {
-    let site = resolve_site(&state.db, &site_id).await?;
+    let (site, project) = resolve_site_with_project(&state.db, &site_id).await?;
 
-    // Fetch project info if available
-    let project_ref = if let Some(project_id) = site.project_id {
-        projects::Entity::find_by_id(project_id)
-            .one(&state.db)
-            .await?
-            .map(|p| ProjectRef {
-                id: p.id,
-                name: p.name,
-            })
-    } else {
-        None
-    };
+    // Enforce project scope
+    if let Some(scope_project) = scope
+        && site.project_id != Some(scope_project)
+    {
+        return Err(AppError::Forbidden(
+            "Token is scoped to a different project".to_string(),
+        ));
+    }
+
+    let project_ref = project.map(|p| ProjectRef {
+        id: p.id,
+        name: p.name,
+    });
 
     let site_ref = SiteRef {
         id: site.id,
@@ -288,28 +180,33 @@ pub async fn get_site_aggregates(
         }
     };
 
-    // Validate time range
-    if query.end <= query.start {
-        return Err(AppError::BadRequest(
-            "end time must be after start time".to_string(),
-        ));
+    validate_time_range(query.start, query.end)?;
+
+    // Enforce max aggregate time range
+    let span = query.end - query.start;
+    if span.num_days() > state.config.max_aggregates_time_range_days {
+        return Err(AppError::BadRequest(format!(
+            "Time range exceeds maximum of {} days for aggregates",
+            state.config.max_aggregates_time_range_days
+        )));
     }
 
-    let format = determine_format(&query.format, &headers);
+    let format = bulk::determine_format(&query.format, &headers);
 
-    let mut param_query = parameters::Entity::find()
-        .filter(parameters::Column::IsActive.eq(true))
-        .filter(parameters::Column::SiteId.eq(site.id));
+    let mut param_query = site_parameters::Entity::find()
+        .filter(site_parameters::Column::IsActive.eq(true))
+        .filter(site_parameters::Column::SiteId.eq(site.id));
 
     if let Some(ref types) = query.sensor_types {
         let type_list: Vec<String> = types.split(',').map(|s| s.trim().to_string()).collect();
         if !type_list.is_empty() {
-            param_query = param_query.filter(parameters::Column::SensorType.is_in(type_list));
+            param_query = param_query.filter(site_parameters::Column::SensorType.is_in(type_list));
         }
     }
 
     let params_list = param_query.all(&state.db).await?;
-    let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.id).collect();
+    // Global parameter IDs from site_parameters (readings/aggregates use global parameter_id)
+    let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.parameter_id).collect();
 
     let include_alarms = query.alarms.unwrap_or(false);
 
@@ -327,24 +224,13 @@ pub async fn get_site_aggregates(
     );
 
     if format == "json"
-        && let Some(cached) = cache::get_cached(&state, &cache_key, &param_ids, Some(query.end)).await {
-            return cache::json_response((*cached).clone(), true);
-        }
+        && let Some(cached) =
+            cache::get_cached(&state, &cache_key, &param_ids, Some(query.end)).await
+    {
+        return cache::json_response((*cached).clone(), true);
+    }
 
-    let _permit = if format == "csv" || format == "ndjson" {
-        if let Ok(permit) = BULK_SEMAPHORE.clone().try_acquire_owned() { Some(permit) } else {
-            tracing::warn!(
-                format = %format,
-                status = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                "bulk_request_rejected"
-            );
-            return Err(AppError::ServiceUnavailable(
-                "Too many concurrent bulk requests. Please try again later.".to_string(),
-            ));
-        }
-    } else {
-        None
-    };
+    let _permit = bulk::acquire_bulk_permit(&format, &state.bulk_semaphore)?;
 
     if param_ids.is_empty() {
         return Ok(Json(AggregatesResponse {
@@ -360,31 +246,40 @@ pub async fn get_site_aggregates(
     }
 
     // Fetch thresholds when alarms are requested (small query, ~22 rows max)
+    // Prefer site-specific thresholds over global ones
     let threshold_map: HashMap<Uuid, alarm_thresholds::Model> = if include_alarms {
-        alarm_thresholds::Entity::find()
+        let all_thresholds = alarm_thresholds::Entity::find()
             .filter(alarm_thresholds::Column::ParameterId.is_in(param_ids.clone()))
+            .filter(
+                sea_orm::Condition::any()
+                    .add(alarm_thresholds::Column::SiteId.eq(site.id))
+                    .add(alarm_thresholds::Column::SiteId.is_null()),
+            )
             .all(&state.db)
-            .await?
-            .into_iter()
-            .map(|t| (t.parameter_id, t))
-            .collect()
+            .await?;
+        let mut map: HashMap<Uuid, alarm_thresholds::Model> = HashMap::new();
+        for t in all_thresholds {
+            let existing = map.get(&t.parameter_id);
+            // Insert if no existing entry, or if this one is site-specific (preferred)
+            if existing.is_none() || t.site_id.is_some() {
+                map.insert(t.parameter_id, t);
+            }
+        }
+        map
     } else {
         HashMap::new()
     };
 
-    let param_ids_str = param_ids
+    // $1 = site_id, $2..=$N+1 = parameter_ids
+    let placeholders: Vec<String> = param_ids
         .iter()
-        .map(|id| format!("'{id}'"))
-        .collect::<Vec<_>>()
-        .join(",");
-
-    let bucket_interval = match resolution.as_str() {
-        "hourly" => "1 hour",
-        "daily" => "1 day",
-        "weekly" => "1 week",
-        "monthly" => "1 month",
-        _ => "1 hour",
-    };
+        .enumerate()
+        .map(|(i, _)| format!("${}", i + 2))
+        .collect();
+    let mut param_values: Vec<sea_orm::Value> = vec![site.id.into()];
+    param_values.extend(param_ids.iter().map(|id| (*id).into()));
+    let start_param = param_ids.len() + 2;
+    let end_param = start_param + 1;
 
     let sql = format!(
         r"
@@ -396,75 +291,46 @@ pub async fn get_site_aggregates(
             max_value,
             count
         FROM {view_name}
-        WHERE parameter_id IN ({param_ids_str})
-          AND bucket >= $1
-          AND bucket <= $2
+        WHERE site_id = $1
+          AND parameter_id IN ({})
+          AND bucket >= ${}
+          AND bucket <= ${}
         ORDER BY bucket ASC, parameter_id ASC
-        "
+        ",
+        placeholders.join(","),
+        start_param,
+        end_param,
     );
 
-    let mut results: Vec<AggregateRow> = state
+    let mut values: Vec<sea_orm::Value> = param_values.clone();
+    values.push(query.start.into());
+    values.push(query.end.into());
+
+    let results: Vec<AggregateRow> = state
         .db
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
-            vec![query.start.into(), query.end.into()],
+            values,
         ))
         .await?
         .into_iter()
         .filter_map(|row| AggregateRow::from_query_result(&row, "").ok())
         .collect();
 
-    if results.is_empty() {
-        tracing::info!(
-            resolution = %resolution,
-            start = %query.start,
-            end = %query.end,
-            "continuous_aggregate_empty_fallback_to_raw"
-        );
-
-        let fallback_sql = format!(
-            r"
-            SELECT
-                time_bucket('{bucket_interval}', time) AS bucket,
-                parameter_id,
-                AVG(value) AS avg_value,
-                MIN(value) AS min_value,
-                MAX(value) AS max_value,
-                COUNT(*) AS count
-            FROM readings
-            WHERE parameter_id IN ({param_ids_str})
-              AND time >= $1
-              AND time <= $2
-            GROUP BY time_bucket('{bucket_interval}', time), parameter_id
-            ORDER BY bucket ASC, parameter_id ASC
-            "
-        );
-
-        results = state
-            .db
-            .query_all(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                &fallback_sql,
-                vec![query.start.into(), query.end.into()],
-            ))
-            .await?
-            .into_iter()
-            .filter_map(|row| AggregateRow::from_query_result(&row, "").ok())
-            .collect();
-    }
-
     let mut time_set: BTreeMap<DateTime<Utc>, usize> = BTreeMap::new();
-    let mut param_aggs: HashMap<Uuid, HashMap<DateTime<Utc>, (Option<f64>, Option<f64>, Option<f64>, i64)>> =
-        HashMap::new();
+    let mut param_aggs: HashMap<
+        Uuid,
+        HashMap<DateTime<Utc>, (Option<f64>, Option<f64>, Option<f64>, i64)>,
+    > = HashMap::new();
 
     for row in results {
         let time = row.bucket;
         time_set.entry(time).or_insert(0);
-        param_aggs
-            .entry(row.parameter_id)
-            .or_default()
-            .insert(time, (row.avg_value, row.min_value, row.max_value, row.count));
+        param_aggs.entry(row.parameter_id).or_default().insert(
+            time,
+            (row.avg_value, row.min_value, row.max_value, row.count),
+        );
     }
 
     let times: Vec<DateTime<Utc>> = time_set.keys().copied().collect();
@@ -472,8 +338,9 @@ pub async fn get_site_aggregates(
     let param_data: Vec<ParameterAggregateData> = params_list
         .iter()
         .map(|param| {
-            let aggs_map = param_aggs.get(&param.id);
-            let threshold = threshold_map.get(&param.id);
+            let global_param_id = param.parameter_id;
+            let aggs_map = param_aggs.get(&global_param_id);
+            let threshold = threshold_map.get(&global_param_id);
 
             let mut avg = Vec::with_capacity(times.len());
             let mut min = Vec::with_capacity(times.len());
@@ -530,7 +397,7 @@ pub async fn get_site_aggregates(
             ParameterAggregateData {
                 id: param.id,
                 name: param.name.clone(),
-                sensor_type: param.sensor_type.clone(),
+                sensor_type: if param.sensor_type.is_empty() { param.name.clone() } else { param.sensor_type.clone() },
                 units: param.display_units.clone(),
                 avg,
                 min,

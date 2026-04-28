@@ -1,0 +1,45 @@
+{
+  "tool": "ions",
+  "cases": [
+    {
+      "name": "typical_alpine_freshwater",
+      "description": "Ca/HCO3-dominated alpine stream with slight cation excess",
+      "function": "charge_balance",
+      "inputs": {
+        "cations": [
+          ["Na", 5.0],
+          ["K", 2.0],
+          ["Ca", 20.0],
+          ["Mg", 3.0]
+        ],
+        "anions": [
+          ["Cl", 8.0],
+          ["SO4", 10.0],
+          ["HCO3", 50.0],
+          ["NO3", 2.0]
+        ]
+      },
+      "expected": {
+        "sum_cations_meq": 1.513556,
+        "sum_anions_meq": 1.285541,
+        "balance_percent": 8.146
+      },
+      "tolerance": 0.01
+    },
+    {
+      "name": "perfectly_balanced_nacl",
+      "description": "Pure NaCl at 1 meq/L each — balance should be ~0%",
+      "function": "charge_balance",
+      "inputs": {
+        "cations": [["Na", 22.990]],
+        "anions": [["Cl", 35.453]]
+      },
+      "expected": {
+        "sum_cations_meq": 1.0,
+        "sum_anions_meq": 1.0,
+        "balance_percent": 0.0
+      },
+      "tolerance": 0.01
+    }
+  ]
+}
