@@ -9,6 +9,7 @@ use chrono::Utc;
 use serde::Deserialize;
 
 use crate::common::AppState;
+use crate::common::auth::Role;
 use crate::common::state::KeycloakAdmin;
 use crate::error::{AppError, AppResult};
 
@@ -171,61 +172,26 @@ async fn list_users(
         (0, 25)
     };
 
-    // Parse filter for search query
-    let search = query.filter.as_ref().and_then(|f| {
-        let v: serde_json::Value = serde_json::from_str(f).ok()?;
+    // Parse filters
+    let filter_json = query.filter.as_ref().and_then(|f| {
+        serde_json::from_str::<serde_json::Value>(f).ok()
+    });
+    let search = filter_json.as_ref().and_then(|v| {
         v.get("q")
             .or_else(|| v.get("search"))
             .and_then(|s| s.as_str())
-            .map(String::from)
+            .map(|s| s.to_lowercase())
+    });
+    let admin_filter = filter_json.as_ref().and_then(|v| {
+        v.get("admin").and_then(|a| a.as_bool())
     });
 
-    // Fetch users from Keycloak
-    let mut req = client
-        .http_client
-        .get(format!("{base}/users"))
-        .bearer_auth(&token)
-        .query(&[
-            ("first", first.to_string()),
-            ("max", max.to_string()),
-        ]);
-    if let Some(ref s) = search {
-        req = req.query(&[("search", s.as_str())]);
-    }
+    // Fetch only users with the riverdata-user role (not the entire realm)
+    let user_role = Role::User.to_string();
+    let admin_role = Role::Administrator.to_string();
+    let kc_users = fetch_role_users(client, &token, &base, &user_role).await;
 
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(format!("Keycloak request failed: {e}")))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(AppError::Internal(format!(
-            "Keycloak users request failed ({status}): {body}"
-        )));
-    }
-
-    let kc_users: Vec<serde_json::Value> = resp
-        .json()
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to parse users: {e}")))?;
-
-    // Get total count
-    let mut count_req = client
-        .http_client
-        .get(format!("{base}/users/count"))
-        .bearer_auth(&token);
-    if let Some(ref s) = search {
-        count_req = count_req.query(&[("search", s.as_str())]);
-    }
-
-    let total: usize = match count_req.send().await {
-        Ok(r) if r.status().is_success() => r.json().await.unwrap_or(0),
-        _ => 0,
-    };
-
-    // Fetch roles for each user concurrently (small user count, admin-only)
+    // Fetch roles for each user concurrently
     let role_futures: Vec<_> = kc_users
         .iter()
         .map(|u| {
@@ -237,7 +203,7 @@ async fn list_users(
         .collect();
     let all_roles = futures::future::join_all(role_futures).await;
 
-    let users: Vec<serde_json::Value> = kc_users
+    let mut users: Vec<serde_json::Value> = kc_users
         .iter()
         .zip(all_roles)
         .map(|(u, roles)| {
@@ -247,7 +213,32 @@ async fn list_users(
         })
         .collect();
 
-    let end = first + users.len().saturating_sub(1);
+    // Apply admin filter
+    if let Some(want_admin) = admin_filter {
+        users.retain(|u| {
+            let is_admin = u["roles"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|v| v.as_str() == Some(&admin_role)));
+            is_admin == want_admin
+        });
+    }
+
+    // Apply search filter (case-insensitive on username, email, firstName, lastName)
+    if let Some(ref q) = search {
+        users.retain(|u| {
+            ["username", "email", "firstName", "lastName"]
+                .iter()
+                .any(|field| {
+                    u[*field]
+                        .as_str()
+                        .is_some_and(|v| v.to_lowercase().contains(q))
+                })
+        });
+    }
+
+    let total = users.len();
+    let page: Vec<serde_json::Value> = users.into_iter().skip(first).take(max).collect();
+    let end = first + page.len().saturating_sub(1);
     let content_range = format!("users {first}-{end}/{total}");
 
     let mut headers = HeaderMap::new();
@@ -256,7 +247,7 @@ async fn list_users(
         HeaderValue::from_str(&content_range).unwrap(),
     );
 
-    Ok((headers, Json(users)))
+    Ok((headers, Json(page)))
 }
 
 async fn get_user(
@@ -519,6 +510,26 @@ pub async fn list_roles(
 // ============================================================================
 // Role Helpers
 // ============================================================================
+
+async fn fetch_role_users(
+    client: &KeycloakAdmin,
+    token: &str,
+    base: &str,
+    role_name: &str,
+) -> Vec<serde_json::Value> {
+    let resp = client
+        .http_client
+        .get(format!("{base}/roles/{role_name}/users"))
+        .bearer_auth(token)
+        .query(&[("first", "0"), ("max", "1000")])
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
+        _ => vec![],
+    }
+}
 
 async fn fetch_user_roles(
     client: &KeycloakAdmin,
