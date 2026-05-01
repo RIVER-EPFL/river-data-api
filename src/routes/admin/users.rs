@@ -517,17 +517,32 @@ async fn fetch_role_users(
     base: &str,
     role_name: &str,
 ) -> Vec<serde_json::Value> {
+    let url = format!("{base}/roles/{role_name}/users");
+    tracing::debug!("Fetching role users from: {url}");
     let resp = client
         .http_client
-        .get(format!("{base}/roles/{role_name}/users"))
+        .get(&url)
         .bearer_auth(token)
         .query(&[("first", "0"), ("max", "1000")])
         .send()
         .await;
 
     match resp {
-        Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
-        _ => vec![],
+        Ok(r) if r.status().is_success() => {
+            let users: Vec<serde_json::Value> = r.json().await.unwrap_or_default();
+            tracing::debug!("Got {} users with role {role_name}", users.len());
+            users
+        }
+        Ok(r) => {
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            tracing::warn!("Keycloak role users request failed ({status}): {body}");
+            vec![]
+        }
+        Err(e) => {
+            tracing::warn!("Keycloak role users request error: {e}");
+            vec![]
+        }
     }
 }
 
