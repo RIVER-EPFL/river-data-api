@@ -26,6 +26,8 @@ pub struct Model {
     pub units: String,
     pub formula: String,
     pub description: Option<String>,
+    #[crudcrate(exclude(create, update))]
+    pub output_parameter_id: Option<Uuid>,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     #[sea_orm(ignore)]

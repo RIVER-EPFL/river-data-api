@@ -18,7 +18,8 @@ use sea_orm::entity::prelude::*;
     name_plural = "sensor_deployments",
     generate_router,
     derive_partial_eq,
-    derive_eq
+    derive_eq,
+    operations = crate::services::operations::sensor_deployment_ops::SensorDeploymentOperations
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]

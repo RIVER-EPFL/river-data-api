@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 use chrono::Utc;
-use crudcrate::{ApiError, CRUDOperations};
+use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
     QueryFilter, QueryOrder, Set, Statement,
 };
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::entity::{data_streams, sensor_calibrations, sensor_deployments, sensors};
@@ -12,6 +13,14 @@ use crate::entity::sensors::Sensor;
 use crate::error::AppResult;
 
 pub struct SensorOperations;
+
+fn build_in_clause(count: usize) -> String {
+    (1..=count).map(|i| format!("${i}")).collect::<Vec<_>>().join(", ")
+}
+
+fn uuid_values(ids: &[Uuid]) -> Vec<sea_orm::Value> {
+    ids.iter().map(|id| (*id).into()).collect()
+}
 
 #[async_trait]
 impl CRUDOperations for SensorOperations {
@@ -53,6 +62,128 @@ impl CRUDOperations for SensorOperations {
         entity.last_calibration_at = cal_row
             .and_then(|r| r.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "last_cal").ok())
             .map(|t| t.with_timezone(&Utc));
+
+        // Also populate current_site fields for detail view
+        let dep_row = db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r"SELECT sd.site_id, s.name as site_name
+                  FROM sensor_deployments sd JOIN sites s ON s.id = sd.site_id
+                  WHERE sd.sensor_id = $1 AND sd.deployed_until IS NULL
+                  LIMIT 1",
+                [id.into()],
+            ))
+            .await
+            .map_err(ApiError::database)?;
+
+        if let Some(row) = dep_row {
+            entity.current_site_id = row.try_get("", "site_id").ok();
+            entity.current_site_name = row.try_get("", "site_name").ok();
+        }
+
+        Ok(())
+    }
+
+    async fn after_get_all(
+        &self,
+        db: &DatabaseConnection,
+        entities: &mut Vec<<Sensor as CRUDResource>::ListModel>,
+    ) -> Result<(), ApiError> {
+        if entities.is_empty() {
+            return Ok(());
+        }
+
+        let ids: Vec<Uuid> = entities.iter().map(|e| e.id).collect();
+        let placeholders = build_in_clause(ids.len());
+        let values = uuid_values(&ids);
+
+        // Query 1: Active deployments + site names
+        let dep_sql = format!(
+            r"SELECT sd.sensor_id, sd.site_id, s.name as site_name
+              FROM sensor_deployments sd JOIN sites s ON s.id = sd.site_id
+              WHERE sd.sensor_id IN ({placeholders}) AND sd.deployed_until IS NULL"
+        );
+        let dep_rows = db
+            .query_all(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres, &dep_sql, values.clone(),
+            ))
+            .await
+            .map_err(ApiError::database)?;
+
+        let mut site_by_sensor: HashMap<Uuid, (Uuid, String)> = HashMap::new();
+        for row in &dep_rows {
+            if let (Ok(sensor_id), Ok(site_id), Ok(site_name)) = (
+                row.try_get::<Uuid>("", "sensor_id"),
+                row.try_get::<Uuid>("", "site_id"),
+                row.try_get::<String>("", "site_name"),
+            ) {
+                site_by_sensor.entry(sensor_id).or_insert((site_id, site_name));
+            }
+        }
+
+        // Query 2: Latest reading per sensor
+        let reading_sql = format!(
+            r"SELECT DISTINCT ON (sensor_id) sensor_id, time, COALESCE(calibrated_value, raw_value) as value
+              FROM readings
+              WHERE sensor_id IN ({placeholders})
+              ORDER BY sensor_id, time DESC"
+        );
+        let reading_rows = db
+            .query_all(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres, &reading_sql, values.clone(),
+            ))
+            .await
+            .map_err(ApiError::database)?;
+
+        let mut reading_by_sensor: HashMap<Uuid, (chrono::DateTime<Utc>, f64)> = HashMap::new();
+        for row in &reading_rows {
+            if let (Ok(sensor_id), Ok(time), Ok(value)) = (
+                row.try_get::<Uuid>("", "sensor_id"),
+                row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "time"),
+                row.try_get::<f64>("", "value"),
+            ) {
+                reading_by_sensor.insert(sensor_id, (time.with_timezone(&Utc), value));
+            }
+        }
+
+        // Query 3: Latest calibration per sensor
+        let cal_sql = format!(
+            r"SELECT DISTINCT ON (sensor_id) sensor_id, valid_from
+              FROM sensor_calibrations
+              WHERE sensor_id IN ({placeholders})
+              ORDER BY sensor_id, valid_from DESC"
+        );
+        let cal_rows = db
+            .query_all(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres, &cal_sql, values,
+            ))
+            .await
+            .map_err(ApiError::database)?;
+
+        let mut cal_by_sensor: HashMap<Uuid, chrono::DateTime<Utc>> = HashMap::new();
+        for row in &cal_rows {
+            if let (Ok(sensor_id), Ok(valid_from)) = (
+                row.try_get::<Uuid>("", "sensor_id"),
+                row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "valid_from"),
+            ) {
+                cal_by_sensor.insert(sensor_id, valid_from.with_timezone(&Utc));
+            }
+        }
+
+        // Populate entities
+        for entity in entities.iter_mut() {
+            if let Some((site_id, site_name)) = site_by_sensor.get(&entity.id) {
+                entity.current_site_id = Some(*site_id);
+                entity.current_site_name = Some(site_name.clone());
+            }
+            if let Some((time, value)) = reading_by_sensor.get(&entity.id) {
+                entity.last_reading_at = Some(*time);
+                entity.last_reading_value = Some(*value);
+            }
+            if let Some(cal_time) = cal_by_sensor.get(&entity.id) {
+                entity.last_calibration_at = Some(*cal_time);
+            }
+        }
 
         Ok(())
     }

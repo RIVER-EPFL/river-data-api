@@ -235,6 +235,70 @@ async fn sync_sources(
     Ok(())
 }
 
+/// Ensure a row in the `parameters` table exists for a derived definition's output,
+/// and link it via `output_parameter_id`. Returns the parameter UUID.
+async fn ensure_output_parameter(
+    db: &DatabaseConnection,
+    entity: &mut DerivedParameterDefinition,
+) -> Result<Uuid, ApiError> {
+    // Reuse existing link if present
+    if let Some(existing_id) = entity.output_parameter_id {
+        // Keep the parameter row in sync
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE parameters SET display_name = $2, default_units = $3, description = $4
+              WHERE id = $1",
+            [
+                existing_id.into(),
+                entity.display_name.clone().into(),
+                entity.units.clone().into(),
+                entity.description.clone().unwrap_or_default().into(),
+            ],
+        ))
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to update output parameter: {e}"), None))?;
+        return Ok(existing_id);
+    }
+
+    // Create or find the output parameter
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"INSERT INTO parameters (id, name, display_name, default_units, category, data_type, description)
+              VALUES (gen_random_uuid(), $1, $2, $3, 'derived', 'float', $4)
+              ON CONFLICT (name) DO UPDATE SET
+                display_name = EXCLUDED.display_name,
+                default_units = EXCLUDED.default_units,
+                description = EXCLUDED.description
+              RETURNING id",
+            [
+                entity.name.clone().into(),
+                entity.display_name.clone().into(),
+                entity.units.clone().into(),
+                entity.description.clone().unwrap_or_default().into(),
+            ],
+        ))
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to ensure output parameter: {e}"), None))?
+        .ok_or_else(|| ApiError::internal("No row returned from parameter upsert".to_string(), None))?;
+
+    let param_id: Uuid = row
+        .try_get("", "id")
+        .map_err(|e| ApiError::internal(format!("Failed to read parameter id: {e}"), None))?;
+
+    // Store the link on the definition
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"UPDATE derived_parameter_definitions SET output_parameter_id = $1 WHERE id = $2",
+        [param_id.into(), entity.id.into()],
+    ))
+    .await
+    .map_err(|e| ApiError::internal(format!("Failed to link output parameter: {e}"), None))?;
+
+    entity.output_parameter_id = Some(param_id);
+    Ok(param_id)
+}
+
 pub struct DerivedParameterDefinitionOperations;
 
 #[async_trait]
@@ -259,6 +323,10 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
     ) -> Result<(), ApiError> {
         let resolved = resolve_variables(db, &entity.formula).await?;
         sync_sources(db, entity.id, &resolved).await?;
+
+        // Auto-create a corresponding entry in the parameters table so this
+        // derived output can be referenced as a parameter_id in site_parameters.
+        ensure_output_parameter(db, entity).await?;
 
         // Populate the sources field on the response
         entity.sources = resolved
@@ -303,6 +371,9 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
         let resolved = resolve_variables(db, &entity.formula).await?;
         validate_dependency_chain(db, &entity.name, &resolved).await?;
         sync_sources(db, entity.id, &resolved).await?;
+
+        // Keep the output parameter in sync
+        ensure_output_parameter(db, entity).await?;
 
         // Populate the sources field on the response
         entity.sources = resolved

@@ -92,6 +92,10 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .route(
             "/actions/preview_derived",
             post(super::service::actions::preview_derived),
+        )
+        .route(
+            "/actions/rollback_deployment",
+            post(super::service::actions::rollback_deployment),
         );
 
     // Keycloak user management proxy (only if admin client secret configured)

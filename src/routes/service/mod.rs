@@ -189,6 +189,10 @@ pub fn service_router(state: &AppState) -> Router<()> {
             "/actions/compute_derived",
             post(actions::compute_derived),
         )
+        .route(
+            "/actions/rollback_deployment",
+            post(actions::rollback_deployment),
+        )
         .layer(middleware::from_fn(require_write_data))
         .with_state(state.clone());
 

@@ -106,6 +106,122 @@ pub async fn compute_derived(
 }
 
 // ============================================================================
+// Rollback Deployment
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct RollbackDeploymentRequest {
+    pub deployment_id: Uuid,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RollbackDeploymentResponse {
+    pub status: String,
+    pub readings_reassigned: u64,
+    pub previous_deployment_id: Option<Uuid>,
+}
+
+pub async fn rollback_deployment(
+    State(app_state): State<AppState>,
+    Json(payload): Json<RollbackDeploymentRequest>,
+) -> AppResult<Json<RollbackDeploymentResponse>> {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let db = &app_state.db;
+
+    // 1. Load the target deployment
+    let target = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT id, sensor_id, site_id, deployed_from FROM sensor_deployments WHERE id = $1",
+            [payload.deployment_id.into()],
+        ))
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
+        .ok_or_else(|| AppError::NotFound("Deployment not found".into()))?;
+
+    let sensor_id: Uuid = target.try_get("", "sensor_id").map_err(|e| AppError::Internal(format!("{e}")))?;
+    let target_deployed_from: chrono::DateTime<chrono::FixedOffset> =
+        target.try_get("", "deployed_from").map_err(|e| AppError::Internal(format!("{e}")))?;
+
+    // 2. Find the previous deployment for the same sensor
+    let previous = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT id, site_id FROM sensor_deployments
+              WHERE sensor_id = $1 AND deployed_from < $2 AND id != $3
+              ORDER BY deployed_from DESC LIMIT 1",
+            [sensor_id.into(), target_deployed_from.into(), payload.deployment_id.into()],
+        ))
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+
+    let previous_deployment_id: Option<Uuid> = previous.as_ref().and_then(|r| r.try_get("", "id").ok());
+    let previous_site_id: Option<Uuid> = previous.as_ref().and_then(|r| r.try_get("", "site_id").ok());
+
+    // 3. Re-open the previous deployment
+    if let Some(prev_id) = previous_deployment_id {
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE sensor_deployments SET deployed_until = NULL WHERE id = $1",
+            [prev_id.into()],
+        ))
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    }
+
+    // 4. Reassign readings from the rolled-back deployment
+    let reassign_result = if let (Some(prev_id), Some(prev_site)) = (previous_deployment_id, previous_site_id) {
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE readings SET deployment_id = $1, site_id = $2 WHERE deployment_id = $3",
+            [prev_id.into(), prev_site.into(), payload.deployment_id.into()],
+        ))
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
+    } else {
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE readings SET deployment_id = NULL WHERE deployment_id = $1",
+            [payload.deployment_id.into()],
+        ))
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
+    };
+
+    let readings_reassigned = reassign_result.rows_affected();
+
+    // 5. Delete the rolled-back deployment
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"DELETE FROM sensor_deployments WHERE id = $1",
+        [payload.deployment_id.into()],
+    ))
+    .await
+    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+
+    tracing::info!(
+        deployment_id = %payload.deployment_id,
+        sensor_id = %sensor_id,
+        readings_reassigned,
+        previous = ?previous_deployment_id,
+        "Rolled back deployment"
+    );
+
+    // 6. Background aggregate refresh
+    let db_clone = db.clone();
+    tokio::spawn(async move {
+        state::refresh_continuous_aggregates(&db_clone, None).await;
+    });
+
+    Ok(Json(RollbackDeploymentResponse {
+        status: "rolled_back".to_string(),
+        readings_reassigned,
+        previous_deployment_id,
+    }))
+}
+
+// ============================================================================
 // Preview Derived Formula
 // ============================================================================
 

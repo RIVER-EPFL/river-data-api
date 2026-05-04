@@ -41,17 +41,26 @@ pub struct Model {
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     #[sea_orm(ignore)]
-    #[crudcrate(non_db_attr = true, exclude(create, update), join(one, all, depth = 1))]
+    #[crudcrate(non_db_attr = true, exclude(create, update), join(one, depth = 1))]
     pub deployments: Vec<super::sensor_deployments::SensorDeployment>,
     #[sea_orm(ignore)]
     #[crudcrate(non_db_attr = true, exclude(create, update, list))]
     pub reading_count: Option<i64>,
     #[sea_orm(ignore)]
-    #[crudcrate(non_db_attr = true, exclude(create, update, list))]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
     pub last_reading_at: Option<chrono::DateTime<chrono::Utc>>,
     #[sea_orm(ignore)]
-    #[crudcrate(non_db_attr = true, exclude(create, update, list))]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
     pub last_calibration_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
+    pub current_site_id: Option<Uuid>,
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
+    pub current_site_name: Option<String>,
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
+    pub last_reading_value: Option<f64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
