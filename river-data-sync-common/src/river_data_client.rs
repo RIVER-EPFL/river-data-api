@@ -66,35 +66,77 @@ impl RiverDataClient {
             .map_err(|e| RiverDataClientError::Api(format!("parse stream: {e}")))
     }
 
-    /// List streams, optionally filtered by source_system and/or paired status.
+    /// List streams, optionally filtered by source_system and/or active status.
+    ///
+    /// Uses the CrudCrate `/data_streams` endpoint with pagination to avoid
+    /// loading all rows in a single request.
     pub async fn list_streams(
         &self,
         source_system: Option<&str>,
         is_active: Option<bool>,
     ) -> Result<Vec<DataStream>, RiverDataClientError> {
-        let mut url = self.url("/streams");
-        let mut params: Vec<String> = Vec::new();
+        const PAGE_SIZE: usize = 1000;
+        let mut all_items: Vec<DataStream> = Vec::new();
+        let mut offset: usize = 0;
+
+        let mut filter = serde_json::Map::new();
         if let Some(ss) = source_system {
-            params.push(format!("source_system={ss}"));
+            filter.insert(
+                "source_system".into(),
+                serde_json::Value::String(ss.to_string()),
+            );
         }
         if let Some(active) = is_active {
-            params.push(format!("is_active={active}"));
+            filter.insert("is_active".into(), serde_json::Value::Bool(active));
         }
-        if !params.is_empty() {
-            url = format!("{url}?{}", params.join("&"));
+        let filter_str = serde_json::Value::Object(filter).to_string();
+
+        loop {
+            let end = offset + PAGE_SIZE - 1;
+            let range_str = format!("[{offset},{end}]");
+
+            let resp = self
+                .http_client
+                .get(self.url("/data_streams"))
+                .query(&[
+                    ("filter", filter_str.as_str()),
+                    ("range", range_str.as_str()),
+                    ("sort", r#"["id","ASC"]"#),
+                ])
+                .bearer_auth(self.current_token())
+                .send()
+                .await
+                .map_err(|e| RiverDataClientError::Api(format!("list_streams failed: {e}")))?;
+            self.check_response(&resp)?;
+
+            let total = Self::parse_content_range_total(&resp);
+
+            let page: Vec<DataStream> = resp
+                .json()
+                .await
+                .map_err(|e| RiverDataClientError::Api(format!("parse streams: {e}")))?;
+
+            let page_len = page.len();
+            all_items.extend(page);
+
+            match total {
+                Some(t) if all_items.len() >= t => break,
+                None => break,
+                _ => {}
+            }
+            if page_len < PAGE_SIZE {
+                break;
+            }
+            offset += PAGE_SIZE;
         }
 
-        let resp = self
-            .http_client
-            .get(&url)
-            .bearer_auth(self.current_token())
-            .send()
-            .await
-            .map_err(|e| RiverDataClientError::Api(format!("list_streams failed: {e}")))?;
-        self.check_response(&resp)?;
-        resp.json()
-            .await
-            .map_err(|e| RiverDataClientError::Api(format!("parse streams: {e}")))
+        Ok(all_items)
+    }
+
+    fn parse_content_range_total(resp: &reqwest::Response) -> Option<usize> {
+        let header = resp.headers().get("content-range")?.to_str().ok()?;
+        let total_str = header.rsplit('/').next()?;
+        total_str.parse().ok()
     }
 
     // ========================================================================
@@ -295,14 +337,37 @@ mod tests {
     #[test]
     fn test_url_construction() {
         let client = RiverDataClient::new("http://localhost:3000", "tok").unwrap();
-        assert_eq!(client.url("/streams"), "http://localhost:3000/api/service/streams");
+        assert_eq!(client.url("/data_streams"), "http://localhost:3000/api/service/data_streams");
         assert_eq!(client.url("/ingest"), "http://localhost:3000/api/service/ingest");
     }
 
     #[test]
     fn test_url_strips_trailing_slash() {
         let client = RiverDataClient::new("http://localhost:3000/", "tok").unwrap();
-        assert_eq!(client.url("/streams"), "http://localhost:3000/api/service/streams");
+        assert_eq!(client.url("/data_streams"), "http://localhost:3000/api/service/data_streams");
+    }
+
+    #[test]
+    fn test_parse_content_range_total() {
+        use reqwest::Response;
+
+        let resp = http::Response::builder()
+            .header("content-range", "data_streams 0-999/29400")
+            .body("")
+            .unwrap();
+        let resp: Response = resp.into();
+        assert_eq!(RiverDataClient::parse_content_range_total(&resp), Some(29400));
+
+        let resp = http::Response::builder()
+            .header("content-range", "data_streams 0-21/22")
+            .body("")
+            .unwrap();
+        let resp: Response = resp.into();
+        assert_eq!(RiverDataClient::parse_content_range_total(&resp), Some(22));
+
+        let resp = http::Response::builder().body("").unwrap();
+        let resp: Response = resp.into();
+        assert_eq!(RiverDataClient::parse_content_range_total(&resp), None);
     }
 
     #[test]

@@ -709,6 +709,7 @@ async fn resolve_or_create_param(
     if let Some(&id) = cache.get(&key) {
         return Ok(id);
     }
+    // 1. Exact name match (case-insensitive)
     let existing = parameters::Entity::find()
         .filter(Expr::cust_with_values("LOWER(name) = $1", [key.clone()]))
         .one(txn).await?;
@@ -716,15 +717,26 @@ async fn resolve_or_create_param(
         cache.insert(key, existing.id);
         return Ok(existing.id);
     }
+    // 2. Alias match: check if any parameter has this name in its aliases array
+    let alias_match = parameters::Entity::find()
+        .filter(Expr::cust_with_values("$1 = ANY(aliases)", [param_ref.name.clone()]))
+        .one(txn).await?;
+    if let Some(matched) = alias_match {
+        cache.insert(key, matched.id);
+        return Ok(matched.id);
+    }
+    // 3. No match — create new with inferred category
+    let category = infer_category(&param_ref.name);
     let id = Uuid::new_v4();
     parameters::ActiveModel {
         id: Set(id),
         name: Set(param_ref.name.clone()),
         display_name: Set(param_ref.name.clone()),
         default_units: Set(param_ref.units.clone()),
-        category: Set("measurement".to_string()),
+        category: Set(category),
         data_type: Set("numeric".to_string()),
         description: Set(None),
+        aliases: Set(vec![]),
         default_warning_min: Set(None), default_warning_max: Set(None),
         default_alarm_min: Set(None), default_alarm_max: Set(None),
         created_at: Set(Some(Utc::now())),
@@ -732,4 +744,48 @@ async fn resolve_or_create_param(
     *created_count += 1;
     cache.insert(key, id);
     Ok(id)
+}
+
+fn infer_category(name: &str) -> String {
+    let lower = name.to_lowercase();
+    if lower.contains("nitrat") || lower.contains("nitrit") || lower.contains("ammon")
+        || lower.contains("phosph") || lower.contains("nitrogen") || lower.contains("nutrient")
+    {
+        "Nutrients".to_string()
+    } else if lower.contains("peak ") || lower.contains("cdom") || lower.contains("fluor")
+        || lower.contains("humif") || lower.contains("bix") || lower.contains("hix")
+        || lower.contains("suva") || lower.contains("absorb") || lower.contains("e2/e3")
+        || lower.contains("e4/e6") || lower.contains("slope ratio") || lower.contains("spectral")
+    {
+        "DOM".to_string()
+    } else if lower.contains("calcium") || lower.contains("magnesium") || lower.contains("sodium")
+        || lower.contains("potassium") || lower.contains("chloride") || lower.contains("sulfate")
+        || lower.contains("fluoride") || lower.contains("bromide") || lower.contains("lithium")
+    {
+        "Ions".to_string()
+    } else if lower.contains("isotop") || lower.contains("δ") || lower.contains("d-excess")
+        || lower.contains("d18o") || lower.contains("d13c")
+    {
+        "Isotopes".to_string()
+    } else if lower.contains("co2") || lower.contains("pco2") || lower.contains("methane")
+        || lower.contains("ch4")
+    {
+        "pCO2".to_string()
+    } else if lower.contains("dissolved organic carbon") || lower.contains("doc") {
+        "DOC".to_string()
+    } else if lower.contains("dissolved inorganic carbon") || lower.contains("dic") {
+        "DIC".to_string()
+    } else if lower.contains("temperatur") || lower.contains("conductiv") || lower.contains("turbid")
+        || lower.contains("dissolved oxygen") || lower.contains("alkalin") || lower == "ph"
+    {
+        "Physicochemical".to_string()
+    } else if lower.contains("depth") || lower.contains("water level") {
+        "Hydrology".to_string()
+    } else if lower.contains("battery") || lower.contains("signal") || lower.contains("batt") {
+        "device_health".to_string()
+    } else if lower.contains("suspend") || lower.contains("tss") || lower.contains("afdm") {
+        "TSS".to_string()
+    } else {
+        "measurement".to_string()
+    }
 }

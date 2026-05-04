@@ -134,8 +134,6 @@ pub fn service_router(state: &AppState) -> Router<()> {
     // ========================================================================
 
     let stream_read_routes = Router::new()
-        .route("/streams", get(streams::list_streams))
-        .route("/streams/{id}", get(streams::get_stream))
         .route("/streams/{id}/stats", get(streams::stream_stats))
         .layer(middleware::from_fn(require_read_metadata))
         .with_state(state.clone());

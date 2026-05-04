@@ -1,4 +1,4 @@
-use sea_orm::DatabaseConnection;
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -248,4 +248,301 @@ async fn delete_source(
     .map_err(AppError::Database)?;
 
     Ok(())
+}
+
+// ============================================================================
+// Parameter-level merge
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct MergeParametersRequest {
+    pub source_parameter_id: Uuid,
+    pub target_parameter_id: Uuid,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MergeParametersResponse {
+    pub sites_merged: u64,
+    pub sites_reassigned: u64,
+    pub readings_moved: u64,
+    pub streams_updated: u64,
+    pub source_deleted: bool,
+}
+
+pub async fn merge_parameters(
+    db: &DatabaseConnection,
+    req: &MergeParametersRequest,
+) -> AppResult<MergeParametersResponse> {
+    let source_id = req.source_parameter_id;
+    let target_id = req.target_parameter_id;
+
+    if source_id == target_id {
+        return Err(AppError::BadRequest(
+            "Source and target must be different".to_string(),
+        ));
+    }
+
+    let txn = db.begin().await.map_err(AppError::Database)?;
+    let pg = sea_orm::DatabaseBackend::Postgres;
+
+    // Validate both parameters exist
+    let count: i64 = txn
+        .query_one(Statement::from_sql_and_values(
+            pg,
+            "SELECT COUNT(*) as c FROM parameters WHERE id = ANY($1)",
+            vec![vec![source_id, target_id].into()],
+        ))
+        .await
+        .map_err(AppError::Database)?
+        .ok_or_else(|| AppError::NotFound("Parameter query failed".into()))?
+        .try_get("", "c")
+        .map_err(AppError::Database)?;
+    if count < 2 {
+        return Err(AppError::NotFound(
+            "One or both parameters not found".to_string(),
+        ));
+    }
+
+    let mut sites_merged: u64 = 0;
+    let mut sites_reassigned: u64 = 0;
+    let mut total_readings: u64 = 0;
+    let mut total_streams: u64 = 0;
+
+    // Find all site_parameters for the source parameter
+    let source_sps = txn
+        .query_all(Statement::from_sql_and_values(
+            pg,
+            "SELECT id, site_id FROM site_parameters WHERE parameter_id = $1",
+            vec![source_id.into()],
+        ))
+        .await
+        .map_err(AppError::Database)?;
+
+    for row in &source_sps {
+        let sp_id: Uuid = row.try_get("", "id").map_err(AppError::Database)?;
+        let site_id: Uuid = row.try_get("", "site_id").map_err(AppError::Database)?;
+
+        // Check if target parameter already has a site_parameter at this site
+        let target_sp = txn
+            .query_one(Statement::from_sql_and_values(
+                pg,
+                "SELECT id FROM site_parameters WHERE site_id = $1 AND parameter_id = $2",
+                vec![site_id.into(), target_id.into()],
+            ))
+            .await
+            .map_err(AppError::Database)?;
+
+        if let Some(target_row) = target_sp {
+            // Conflict: both exist at this site — do per-site merge
+            let target_sp_id: Uuid =
+                target_row.try_get("", "id").map_err(AppError::Database)?;
+
+            // Move readings
+            let r = txn
+                .execute(Statement::from_sql_and_values(
+                    pg,
+                    "UPDATE readings SET parameter_id = $1 WHERE site_id = $2 AND parameter_id = $3",
+                    vec![target_id.into(), site_id.into(), source_id.into()],
+                ))
+                .await
+                .map_err(AppError::Database)?;
+            total_readings += r.rows_affected();
+
+            // Move status_events
+            txn.execute(Statement::from_sql_and_values(
+                pg,
+                "UPDATE status_events SET parameter_id = $1 WHERE site_id = $2 AND parameter_id = $3",
+                vec![target_id.into(), site_id.into(), source_id.into()],
+            ))
+            .await
+            .map_err(AppError::Database)?;
+
+            // Move data_streams from source SP to target SP
+            let s = txn
+                .execute(Statement::from_sql_and_values(
+                    pg,
+                    "UPDATE data_streams SET site_parameter_id = $1 WHERE site_parameter_id = $2",
+                    vec![target_sp_id.into(), sp_id.into()],
+                ))
+                .await
+                .map_err(AppError::Database)?;
+            total_streams += s.rows_affected();
+
+            // Delete alarm_thresholds for source at this site
+            txn.execute(Statement::from_sql_and_values(
+                pg,
+                "DELETE FROM alarm_thresholds WHERE parameter_id = $1 AND site_id = $2",
+                vec![source_id.into(), site_id.into()],
+            ))
+            .await
+            .map_err(AppError::Database)?;
+
+            // Delete leftover readings/status_events for source at this site
+            txn.execute(Statement::from_sql_and_values(
+                pg,
+                "DELETE FROM readings WHERE site_id = $1 AND parameter_id = $2",
+                vec![site_id.into(), source_id.into()],
+            ))
+            .await
+            .map_err(AppError::Database)?;
+            txn.execute(Statement::from_sql_and_values(
+                pg,
+                "DELETE FROM status_events WHERE site_id = $1 AND parameter_id = $2",
+                vec![site_id.into(), source_id.into()],
+            ))
+            .await
+            .map_err(AppError::Database)?;
+
+            // Delete the source site_parameter
+            txn.execute(Statement::from_sql_and_values(
+                pg,
+                "DELETE FROM site_parameters WHERE id = $1",
+                vec![sp_id.into()],
+            ))
+            .await
+            .map_err(AppError::Database)?;
+
+            sites_merged += 1;
+        } else {
+            // No conflict: just reassign the site_parameter to target
+            txn.execute(Statement::from_sql_and_values(
+                pg,
+                "UPDATE site_parameters SET parameter_id = $1 WHERE id = $2",
+                vec![target_id.into(), sp_id.into()],
+            ))
+            .await
+            .map_err(AppError::Database)?;
+
+            // Also update denormalized parameter_id on readings
+            let r = txn
+                .execute(Statement::from_sql_and_values(
+                    pg,
+                    "UPDATE readings SET parameter_id = $1 WHERE site_id = $2 AND parameter_id = $3",
+                    vec![target_id.into(), site_id.into(), source_id.into()],
+                ))
+                .await
+                .map_err(AppError::Database)?;
+            total_readings += r.rows_affected();
+
+            txn.execute(Statement::from_sql_and_values(
+                pg,
+                "UPDATE status_events SET parameter_id = $1 WHERE site_id = $2 AND parameter_id = $3",
+                vec![target_id.into(), site_id.into(), source_id.into()],
+            ))
+            .await
+            .map_err(AppError::Database)?;
+
+            sites_reassigned += 1;
+        }
+    }
+
+    // Reassign sensors (handle UNIQUE(serial_number, parameter_id) by deleting conflicting source sensors)
+    txn.execute(Statement::from_sql_and_values(
+        pg,
+        r#"DELETE FROM sensors WHERE parameter_id = $1
+           AND serial_number IN (SELECT serial_number FROM sensors WHERE parameter_id = $2)"#,
+        vec![source_id.into(), target_id.into()],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+    txn.execute(Statement::from_sql_and_values(
+        pg,
+        "UPDATE sensors SET parameter_id = $1 WHERE parameter_id = $2",
+        vec![target_id.into(), source_id.into()],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+
+    // Reassign derived_parameter_sources (delete if target already referenced)
+    txn.execute(Statement::from_sql_and_values(
+        pg,
+        r#"DELETE FROM derived_parameter_sources WHERE parameter_id = $1
+           AND derived_definition_id IN (
+               SELECT derived_definition_id FROM derived_parameter_sources WHERE parameter_id = $2
+           )"#,
+        vec![source_id.into(), target_id.into()],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+    txn.execute(Statement::from_sql_and_values(
+        pg,
+        "UPDATE derived_parameter_sources SET parameter_id = $1 WHERE parameter_id = $2",
+        vec![target_id.into(), source_id.into()],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+
+    // Delete global alarm_thresholds for source
+    txn.execute(Statement::from_sql_and_values(
+        pg,
+        "DELETE FROM alarm_thresholds WHERE parameter_id = $1",
+        vec![source_id.into()],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+
+    // Reassign annotations
+    txn.execute(Statement::from_sql_and_values(
+        pg,
+        "UPDATE annotations SET parameter_id = $1 WHERE parameter_id = $2",
+        vec![target_id.into(), source_id.into()],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+
+    // Reassign samples
+    txn.execute(Statement::from_sql_and_values(
+        pg,
+        "UPDATE samples SET parameter_id = $1 WHERE parameter_id = $2",
+        vec![target_id.into(), source_id.into()],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+
+    // Reassign standard_curves
+    txn.execute(Statement::from_sql_and_values(
+        pg,
+        "UPDATE standard_curves SET parameter_id = $1 WHERE parameter_id = $2",
+        vec![target_id.into(), source_id.into()],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+
+    // Reassign public_exposed_parameters (delete conflicts)
+    txn.execute(Statement::from_sql_and_values(
+        pg,
+        r#"DELETE FROM public_exposed_parameters WHERE parameter_id = $1
+           AND project_id IN (
+               SELECT project_id FROM public_exposed_parameters WHERE parameter_id = $2
+           )"#,
+        vec![source_id.into(), target_id.into()],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+    txn.execute(Statement::from_sql_and_values(
+        pg,
+        "UPDATE public_exposed_parameters SET parameter_id = $1 WHERE parameter_id = $2",
+        vec![target_id.into(), source_id.into()],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+
+    // Delete the source parameter
+    txn.execute(Statement::from_sql_and_values(
+        pg,
+        "DELETE FROM parameters WHERE id = $1",
+        vec![source_id.into()],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+
+    txn.commit().await.map_err(AppError::Database)?;
+
+    Ok(MergeParametersResponse {
+        sites_merged,
+        sites_reassigned,
+        readings_moved: total_readings,
+        streams_updated: total_streams,
+        source_deleted: true,
+    })
 }

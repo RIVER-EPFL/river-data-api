@@ -180,56 +180,6 @@ pub async fn register_stream(
 }
 
 // ============================================================================
-// List Streams
-// ============================================================================
-
-#[derive(Debug, Deserialize)]
-pub struct ListStreamsQuery {
-    pub source_system: Option<String>,
-    pub paired: Option<bool>,
-    pub is_active: Option<bool>,
-}
-
-pub async fn list_streams(
-    State(state): State<AppState>,
-    axum::extract::Query(query): axum::extract::Query<ListStreamsQuery>,
-) -> AppResult<Json<Vec<StreamResponse>>> {
-    let mut finder = data_streams::Entity::find();
-
-    if let Some(ref ss) = query.source_system {
-        finder = finder.filter(data_streams::Column::SourceSystem.eq(ss.as_str()));
-    }
-    if let Some(paired) = query.paired {
-        if paired {
-            finder = finder.filter(data_streams::Column::SiteParameterId.is_not_null());
-        } else {
-            finder = finder.filter(data_streams::Column::SiteParameterId.is_null());
-        }
-    }
-    if let Some(active) = query.is_active {
-        finder = finder.filter(data_streams::Column::IsActive.eq(active));
-    }
-
-    let streams = finder.all(&state.db).await?;
-    Ok(Json(streams.into_iter().map(Into::into).collect()))
-}
-
-// ============================================================================
-// Get Stream
-// ============================================================================
-
-pub async fn get_stream(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> AppResult<Json<StreamResponse>> {
-    let stream = data_streams::Entity::find_by_id(id)
-        .one(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
-    Ok(Json(stream.into()))
-}
-
-// ============================================================================
 // Pair Stream
 // ============================================================================
 

@@ -4,8 +4,6 @@ use sea_orm::entity::prelude::*;
 #[derive(
     Clone,
     Debug,
-    PartialEq,
-    Eq,
     DeriveEntityModel,
     serde::Serialize,
     serde::Deserialize,
@@ -41,6 +39,9 @@ pub struct Model {
     pub metadata: Option<serde_json::Value>,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update), join(one, all, depth = 1))]
+    pub deployments: Vec<super::sensor_deployments::SensorDeployment>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

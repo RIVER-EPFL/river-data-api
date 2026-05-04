@@ -1,11 +1,11 @@
 use axum::{Json, extract::State};
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::{data_streams, field_trips, readings, site_parameters, sites};
+use crate::entity::{data_streams, field_trips, readings, samples, site_parameters, sites};
 use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Deserialize)]
@@ -40,6 +40,7 @@ pub struct FieldTripBatchResponse {
     pub field_trip_id: Uuid,
     pub total_inserted: usize,
     pub stations_count: usize,
+    pub samples_created: usize,
 }
 
 /// Get or create a "field_trip" stream for a given (site_id, parameter_id) pair.
@@ -153,26 +154,27 @@ pub async fn create_field_trip_batch(
         }
     }
 
+    let txn = state.db.begin().await?;
+
     // Create the field trip record
     let field_trip = field_trips::ActiveModel {
         id: Set(Uuid::new_v4()),
         date: Set(payload.date),
         participants: Set(payload.participants),
-        notes: Set(payload.notes),
-        created_by: Set(payload.created_by),
+        notes: Set(payload.notes.clone()),
+        created_by: Set(payload.created_by.clone()),
         created_at: Set(chrono::Utc::now()),
     };
 
-    let field_trip = field_trip.insert(&state.db).await?;
+    let field_trip = field_trip.insert(&txn).await?;
     let field_trip_id = field_trip.id;
 
-    // Resolve stream_ids and insert readings
+    // Resolve stream_ids
     let mut stream_cache: HashMap<(Uuid, Uuid), Uuid> = HashMap::new();
-    let mut all_models: Vec<readings::ActiveModel> = Vec::new();
     let stations_count = payload.stations.len();
 
-    for station in payload.stations {
-        for r in station.readings {
+    for station in &payload.stations {
+        for r in &station.readings {
             let key = (station.site_id, r.parameter_id);
             if !stream_cache.contains_key(&key) {
                 let stream_id = get_or_create_field_trip_stream(
@@ -183,26 +185,86 @@ pub async fn create_field_trip_batch(
                 .await?;
                 stream_cache.insert(key, stream_id);
             }
-            let stream_id = stream_cache[&key];
+        }
+    }
 
-            all_models.push(readings::ActiveModel {
-                stream_id: Set(stream_id),
-                site_id: Set(Some(station.site_id)),
-                parameter_id: Set(Some(r.parameter_id)),
-                time: Set(r.time.into()),
-                replicate_index: Set(r.replicate_index.unwrap_or(0)),
-                raw_value: Set(r.value),
-                calibrated_value: Set(None),
-                sensor_id: Set(r.sensor_id),
-                calibration_id: Set(None),
-                deployment_id: Set(None),
-                logged: Set(Some(true)),
-                measurement_type: Set(Some("spot".to_string())),
-                is_flagged: Set(Some(false)),
-                flag_reason: Set(None),
-                field_trip_id: Set(Some(field_trip_id)),
-                sample_id: Set(r.sample_id),
-            });
+    // Auto-create samples per station for replicate groups
+    let mut total_samples_created = 0usize;
+    let mut all_models: Vec<readings::ActiveModel> = Vec::new();
+
+    for station in payload.stations {
+        // Group this station's readings by (parameter_id, time)
+        let mut groups: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Vec<SampleReading>> =
+            HashMap::new();
+        for r in station.readings {
+            groups.entry((r.parameter_id, r.time)).or_default().push(r);
+        }
+
+        // Create samples for groups with 2+ readings
+        let mut station_sample_map: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Uuid> =
+            HashMap::new();
+        for (key, group) in &groups {
+            let all_have_sample = group.iter().all(|r| r.sample_id.is_some());
+            if group.len() >= 2 && !all_have_sample {
+                let sample = samples::ActiveModel {
+                    id: Set(Uuid::new_v4()),
+                    site_id: Set(station.site_id),
+                    parameter_id: Set(key.0),
+                    collected_at: Set(key.1),
+                    label: Set(None),
+                    notes: Set(None),
+                    field_trip_id: Set(Some(field_trip_id)),
+                    created_by: Set(payload.created_by.clone()),
+                    created_at: Set(Some(chrono::Utc::now())),
+                    mean: Set(None),
+                    stdev: Set(None),
+                    n: Set(0),
+                    min_value: Set(None),
+                    max_value: Set(None),
+                    updated_at: Set(None),
+                };
+                let sample = sample.insert(&txn).await?;
+                station_sample_map.insert(*key, sample.id);
+                total_samples_created += 1;
+            }
+        }
+
+        // Build reading models with auto-assigned sample_id and replicate_index
+        for (key, group) in groups {
+            let mut index_counter: i16 = 0;
+            for r in group {
+                let stream_id = stream_cache[&(station.site_id, r.parameter_id)];
+                let sample_id =
+                    r.sample_id.or_else(|| station_sample_map.get(&key).copied());
+
+                let replicate_index = if let Some(idx) = r.replicate_index {
+                    idx
+                } else if sample_id.is_some() {
+                    index_counter += 1;
+                    index_counter
+                } else {
+                    0
+                };
+
+                all_models.push(readings::ActiveModel {
+                    stream_id: Set(stream_id),
+                    site_id: Set(Some(station.site_id)),
+                    parameter_id: Set(Some(r.parameter_id)),
+                    time: Set(r.time.into()),
+                    replicate_index: Set(replicate_index),
+                    raw_value: Set(r.value),
+                    calibrated_value: Set(None),
+                    sensor_id: Set(r.sensor_id),
+                    calibration_id: Set(None),
+                    deployment_id: Set(None),
+                    logged: Set(Some(true)),
+                    measurement_type: Set(Some("spot".to_string())),
+                    is_flagged: Set(Some(false)),
+                    flag_reason: Set(None),
+                    field_trip_id: Set(Some(field_trip_id)),
+                    sample_id: Set(sample_id),
+                });
+            }
         }
     }
 
@@ -219,7 +281,7 @@ pub async fn create_field_trip_batch(
                 .do_nothing()
                 .to_owned(),
             )
-            .exec_without_returning(&state.db)
+            .exec_without_returning(&txn)
             .await
         {
             Ok(rows) => {
@@ -227,6 +289,7 @@ pub async fn create_field_trip_batch(
                     total,
                     inserted = rows,
                     stations_count,
+                    samples_created = total_samples_created,
                     field_trip_id = %field_trip_id,
                     "Field trip batch inserted"
                 );
@@ -240,9 +303,12 @@ pub async fn create_field_trip_batch(
         }
     }
 
+    txn.commit().await?;
+
     Ok(Json(FieldTripBatchResponse {
         field_trip_id,
         total_inserted: total,
         stations_count,
+        samples_created: total_samples_created,
     }))
 }

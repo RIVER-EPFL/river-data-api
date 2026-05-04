@@ -1,17 +1,18 @@
 use axum::{Json, extract::State};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::{data_streams, readings, site_parameters, sites};
+use crate::entity::{data_streams, readings, samples, site_parameters, sites};
 use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Deserialize)]
 pub struct GrabSampleRequest {
     pub site_id: Uuid,
     pub field_trip_id: Option<Uuid>,
+    pub created_by: Option<String>,
     pub readings: Vec<GrabSampleReading>,
 }
 
@@ -32,6 +33,7 @@ pub struct GrabSampleReading {
 #[derive(Debug, Serialize)]
 pub struct GrabSampleResponse {
     pub inserted: usize,
+    pub samples_created: usize,
 }
 
 /// Get or create a "grab_sample" stream for a given (site_id, parameter_id) pair.
@@ -94,6 +96,52 @@ async fn get_or_create_grab_stream(
     Ok(stream.id)
 }
 
+/// Group readings by (parameter_id, time) and auto-create `samples` rows for
+/// groups with 2+ readings. Returns a map from group key to sample_id.
+async fn auto_create_samples(
+    txn: &sea_orm::DatabaseTransaction,
+    readings: &[GrabSampleReading],
+    site_id: Uuid,
+    field_trip_id: Option<Uuid>,
+    created_by: Option<&str>,
+) -> Result<HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Uuid>, AppError> {
+    let mut groups: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), usize> = HashMap::new();
+    for r in readings {
+        if r.sample_id.is_some() {
+            continue;
+        }
+        *groups.entry((r.parameter_id, r.time)).or_default() += 1;
+    }
+
+    let mut sample_map = HashMap::new();
+    for ((parameter_id, time), count) in groups {
+        if count < 2 {
+            continue;
+        }
+        let sample = samples::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            site_id: Set(site_id),
+            parameter_id: Set(parameter_id),
+            collected_at: Set(time),
+            label: Set(None),
+            notes: Set(None),
+            field_trip_id: Set(field_trip_id),
+            created_by: Set(created_by.map(String::from)),
+            created_at: Set(Some(chrono::Utc::now())),
+            mean: Set(None),
+            stdev: Set(None),
+            n: Set(0),
+            min_value: Set(None),
+            max_value: Set(None),
+            updated_at: Set(None),
+        };
+        let sample = sample.insert(txn).await?;
+        sample_map.insert((parameter_id, time), sample.id);
+    }
+
+    Ok(sample_map)
+}
+
 pub async fn insert_grab_samples(
     State(state): State<AppState>,
     Json(payload): Json<GrabSampleRequest>,
@@ -138,17 +186,50 @@ pub async fn insert_grab_samples(
         }
     }
 
+    let txn = state.db.begin().await?;
+
+    // Auto-create samples for replicate groups (2+ readings per parameter+time)
+    let sample_map = auto_create_samples(
+        &txn,
+        &payload.readings,
+        payload.site_id,
+        payload.field_trip_id,
+        payload.created_by.as_deref(),
+    )
+    .await?;
+
+    let samples_created = sample_map.len();
+
+    // Track replicate_index per (parameter_id, time) group for auto-assignment
+    let mut index_counters: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), i16> = HashMap::new();
+
     let models: Vec<readings::ActiveModel> = payload
         .readings
         .into_iter()
         .map(|r| {
             let stream_id = stream_cache[&r.parameter_id];
+            let group_key = (r.parameter_id, r.time);
+
+            // Determine sample_id: client-provided takes precedence, else auto-created
+            let sample_id = r.sample_id.or_else(|| sample_map.get(&group_key).copied());
+
+            // Auto-assign replicate_index: if part of a sample, start at 1
+            let replicate_index = if let Some(idx) = r.replicate_index {
+                idx
+            } else if sample_id.is_some() {
+                let counter = index_counters.entry(group_key).or_insert(0);
+                *counter += 1;
+                *counter
+            } else {
+                0
+            };
+
             readings::ActiveModel {
                 stream_id: Set(stream_id),
                 site_id: Set(Some(payload.site_id)),
                 parameter_id: Set(Some(r.parameter_id)),
                 time: Set(r.time.into()),
-                replicate_index: Set(r.replicate_index.unwrap_or(0)),
+                replicate_index: Set(replicate_index),
                 raw_value: Set(r.value),
                 calibrated_value: Set(None),
                 sensor_id: Set(r.sensor_id),
@@ -159,14 +240,14 @@ pub async fn insert_grab_samples(
                 is_flagged: Set(Some(false)),
                 flag_reason: Set(None),
                 field_trip_id: Set(payload.field_trip_id),
-                sample_id: Set(r.sample_id),
+                sample_id: Set(sample_id),
             }
         })
         .collect();
 
     let total = models.len();
 
-    match readings::Entity::insert_many(models)
+    let inserted = match readings::Entity::insert_many(models)
         .on_conflict(
             sea_orm::sea_query::OnConflict::columns([
                 readings::Column::StreamId,
@@ -176,20 +257,25 @@ pub async fn insert_grab_samples(
             .do_nothing()
             .to_owned(),
         )
-        .exec_without_returning(&state.db)
+        .exec_without_returning(&txn)
         .await
     {
-        Ok(rows) => {
-            tracing::info!(total, inserted = rows, site = %site.name, "Grab samples inserted");
-            Ok(Json(GrabSampleResponse { inserted: rows as usize }))
-        }
+        Ok(rows) => rows as usize,
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("None of the records") {
-                Ok(Json(GrabSampleResponse { inserted: 0 }))
+                0
             } else {
-                Err(AppError::Database(e))
+                return Err(AppError::Database(e));
             }
         }
-    }
+    };
+
+    txn.commit().await?;
+
+    tracing::info!(total, inserted, samples_created, site = %site.name, "Grab samples inserted");
+    Ok(Json(GrabSampleResponse {
+        inserted,
+        samples_created,
+    }))
 }

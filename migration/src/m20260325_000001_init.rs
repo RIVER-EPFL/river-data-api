@@ -66,12 +66,13 @@ impl MigrationTrait for Migration {
             r#"
             CREATE TABLE IF NOT EXISTS parameters (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                name VARCHAR(64) NOT NULL,
+                name VARCHAR(128) NOT NULL,
                 display_name VARCHAR(128) NOT NULL,
                 default_units VARCHAR(32) NOT NULL DEFAULT '',
                 category VARCHAR(32) NOT NULL DEFAULT 'measurement',
                 data_type VARCHAR(32) NOT NULL DEFAULT 'numeric',
                 description TEXT,
+                aliases TEXT[] NOT NULL DEFAULT '{}',
                 default_warning_min DOUBLE PRECISION,
                 default_warning_max DOUBLE PRECISION,
                 default_alarm_min DOUBLE PRECISION,
@@ -730,72 +731,97 @@ impl MigrationTrait for Migration {
 
         db.execute_unprepared(
             r#"
-            INSERT INTO parameters (id, name, display_name, default_units, category, data_type, description)
+            INSERT INTO parameters (id, name, display_name, default_units, category, data_type, description, aliases)
             VALUES
-                (gen_random_uuid(), 'DOC_avg_ppb',           'DOC Average',               'ppb',     'DOC',        'numeric', 'Dissolved Organic Carbon average of replicates'),
-                (gen_random_uuid(), 'DOC_sd_ppb',            'DOC Std Dev',               'ppb',     'DOC',        'numeric', 'Dissolved Organic Carbon standard deviation'),
-                (gen_random_uuid(), 'TSS_dry_weight_mgL',    'TSS Dry Weight',            'mg/L',    'TSS',        'numeric', 'Total Suspended Solids from filter weights'),
-                (gen_random_uuid(), 'AFDM_mgL',              'AFDM',                      'mg/L',    'TSS',        'numeric', 'Ash-Free Dry Mass'),
-                (gen_random_uuid(), 'Chla_acid_ugL_avg',     'Chla Acid Average',         'ug/L',    'Chla',       'numeric', 'Chlorophyll-a (acid method) average'),
-                (gen_random_uuid(), 'Chla_acid_ugL_sd',      'Chla Acid Std Dev',         'ug/L',    'Chla',       'numeric', 'Chlorophyll-a (acid method) standard deviation'),
-                (gen_random_uuid(), 'Chla_noacid_ugL_avg',   'Chla Non-Acid Average',     'ug/L',    'Chla',       'numeric', 'Chlorophyll-a (non-acid method) average'),
-                (gen_random_uuid(), 'Chla_noacid_ugL_sd',    'Chla Non-Acid Std Dev',     'ug/L',    'Chla',       'numeric', 'Chlorophyll-a (non-acid method) standard deviation'),
-                (gen_random_uuid(), 'Chla_acid_ugm2_avg',    'Chla Acid per m2',          'ug/m2',   'Chla',       'numeric', 'Chlorophyll-a (acid) per square meter average'),
-                (gen_random_uuid(), 'Chla_acid_ugm2_sd',     'Chla Acid per m2 SD',       'ug/m2',   'Chla',       'numeric', 'Chlorophyll-a (acid) per square meter std dev'),
-                (gen_random_uuid(), 'Chla_noacid_ugm2_avg',  'Chla Non-Acid per m2',      'ug/m2',   'Chla',       'numeric', 'Chlorophyll-a (non-acid) per square meter average'),
-                (gen_random_uuid(), 'Chla_noacid_ugm2_sd',   'Chla Non-Acid per m2 SD',   'ug/m2',   'Chla',       'numeric', 'Chlorophyll-a (non-acid) per square meter std dev'),
-                (gen_random_uuid(), 'CO2_HS_Um_avg',         'CO2 Headspace Average',     'umol/L',  'pCO2',       'numeric', 'CO2 headspace concentration average'),
-                (gen_random_uuid(), 'CO2_HS_Um_sd',          'CO2 Headspace SD',          'umol/L',  'pCO2',       'numeric', 'CO2 headspace concentration std dev'),
-                (gen_random_uuid(), 'pCO2_HS_uatm_avg',      'pCO2 Average',              'uatm',    'pCO2',       'numeric', 'Partial pressure CO2 average'),
-                (gen_random_uuid(), 'pCO2_HS_uatm_sd',       'pCO2 SD',                   'uatm',    'pCO2',       'numeric', 'Partial pressure CO2 std dev'),
-                (gen_random_uuid(), 'pCO2_HS_P1_uatm_avg',   'pCO2 P1 Average',           'uatm',    'pCO2',       'numeric', 'pCO2 method P1 average'),
-                (gen_random_uuid(), 'pCO2_HS_P1_uatm_sd',    'pCO2 P1 SD',                'uatm',    'pCO2',       'numeric', 'pCO2 method P1 std dev'),
-                (gen_random_uuid(), 'pCO2_HS_P2_uatm_avg',   'pCO2 P2 Average',           'uatm',    'pCO2',       'numeric', 'pCO2 method P2 average'),
-                (gen_random_uuid(), 'pCO2_HS_P2_uatm_sd',    'pCO2 P2 SD',                'uatm',    'pCO2',       'numeric', 'pCO2 method P2 std dev'),
-                (gen_random_uuid(), 'd13C_CO2_avg',          'd13C-CO2 Average',          'permil',  'pCO2',       'numeric', 'd13C of CO2 average'),
-                (gen_random_uuid(), 'd13C_CO2_sd',           'd13C-CO2 SD',               'permil',  'pCO2',       'numeric', 'd13C of CO2 std dev'),
-                (gen_random_uuid(), 'CH4_umol_L_avg',        'CH4 Dissolved Average',     'umol/L',  'pCO2',       'numeric', 'Dissolved CH4 average'),
-                (gen_random_uuid(), 'CH4_umol_L_sd',         'CH4 Dissolved SD',          'umol/L',  'pCO2',       'numeric', 'Dissolved CH4 std dev'),
-                (gen_random_uuid(), 'DIC_avg',               'DIC Average',               'umol/L',  'DIC',        'numeric', 'Dissolved Inorganic Carbon average'),
-                (gen_random_uuid(), 'DIC_std',               'DIC Std Dev',               'umol/L',  'DIC',        'numeric', 'Dissolved Inorganic Carbon std dev'),
-                (gen_random_uuid(), 'd13C_DIC_avg',          'd13C-DIC Average',          'permil',  'DIC',        'numeric', 'd13C of DIC average'),
-                (gen_random_uuid(), 'd13C_DIC_std',          'd13C-DIC Std Dev',          'permil',  'DIC',        'numeric', 'd13C of DIC std dev'),
-                (gen_random_uuid(), 'SUVA',                  'SUVA',                      'L/mg*m',  'DOM',        'numeric', 'Specific UV Absorbance at 254nm'),
-                (gen_random_uuid(), 'A_T',                   'A/T Ratio',                 'ratio',   'DOM',        'numeric', 'DOM fluorescence peak ratio A/T'),
-                (gen_random_uuid(), 'C_A',                   'C/A Ratio',                 'ratio',   'DOM',        'numeric', 'DOM fluorescence peak ratio C/A'),
-                (gen_random_uuid(), 'C_M',                   'C/M Ratio',                 'ratio',   'DOM',        'numeric', 'DOM fluorescence peak ratio C/M'),
-                (gen_random_uuid(), 'C_T',                   'C/T Ratio',                 'ratio',   'DOM',        'numeric', 'DOM fluorescence peak ratio C/T'),
-                (gen_random_uuid(), 'NUT_P_avg',             'PO4 Average',               'ug/L',    'Nutrients',  'numeric', 'Phosphate average of replicates'),
-                (gen_random_uuid(), 'NUT_P_sd',              'PO4 Std Dev',               'ug/L',    'Nutrients',  'numeric', 'Phosphate std dev'),
-                (gen_random_uuid(), 'NUT_NH4_avg',           'NH4 Average',               'ug/L',    'Nutrients',  'numeric', 'Ammonium average of replicates'),
-                (gen_random_uuid(), 'NUT_NH4_sd',            'NH4 Std Dev',               'ug/L',    'Nutrients',  'numeric', 'Ammonium std dev'),
-                (gen_random_uuid(), 'NUT_NOx_avg',           'NOx Average',               'ug/L',    'Nutrients',  'numeric', 'Nitrate+Nitrite average of replicates'),
-                (gen_random_uuid(), 'NUT_NOx_sd',            'NOx Std Dev',               'ug/L',    'Nutrients',  'numeric', 'Nitrate+Nitrite std dev'),
-                (gen_random_uuid(), 'NUT_NO2_avg',           'NO2 Average',               'ug/L',    'Nutrients',  'numeric', 'Nitrite average of replicates'),
-                (gen_random_uuid(), 'NUT_NO2_sd',            'NO2 Std Dev',               'ug/L',    'Nutrients',  'numeric', 'Nitrite std dev'),
-                (gen_random_uuid(), 'NUT_NO3_avg',           'NO3 Average',               'ug/L',    'Nutrients',  'numeric', 'Nitrate average (NOx - NO2)'),
-                (gen_random_uuid(), 'NUT_NO3_sd',            'NO3 Std Dev',               'ug/L',    'Nutrients',  'numeric', 'Nitrate std dev'),
-                (gen_random_uuid(), 'NUT_TDP_avg',           'TDP Average',               'ug/L',    'Nutrients',  'numeric', 'Total Dissolved Phosphorus average'),
-                (gen_random_uuid(), 'NUT_TDP_sd',            'TDP Std Dev',               'ug/L',    'Nutrients',  'numeric', 'Total Dissolved Phosphorus std dev'),
-                (gen_random_uuid(), 'NUT_TDN_avg',           'TDN Average',               'ug/L',    'Nutrients',  'numeric', 'Total Dissolved Nitrogen average'),
-                (gen_random_uuid(), 'NUT_TDN_sd',            'TDN Std Dev',               'ug/L',    'Nutrients',  'numeric', 'Total Dissolved Nitrogen std dev'),
-                (gen_random_uuid(), 'Field_BP_altitude',     'Barometric Pressure (alt)', 'hPa',     'Field data', 'numeric', 'Barometric pressure calculated from altitude'),
-                (gen_random_uuid(), 'Vaisala_CO2_min_corr',  'Vaisala CO2 Min Corrected', 'ppm',     'Field data', 'numeric', 'Vaisala CO2 minimum corrected for T/P'),
-                (gen_random_uuid(), 'Vaisala_CO2_avg_corr',  'Vaisala CO2 Avg Corrected', 'ppm',     'Field data', 'numeric', 'Vaisala CO2 average corrected for T/P'),
-                (gen_random_uuid(), 'Vaisala_CO2_max_corr',  'Vaisala CO2 Max Corrected', 'ppm',     'Field data', 'numeric', 'Vaisala CO2 maximum corrected for T/P'),
-                (gen_random_uuid(), 'Reach_depth_avg_cm',    'Reach Depth Average',       'cm',      'Field data', 'numeric', 'Average of reach depth replicates'),
-                (gen_random_uuid(), 'Reach_depth_sd_cm',     'Reach Depth Std Dev',       'cm',      'Field data', 'numeric', 'Std dev of reach depth replicates'),
-                (gen_random_uuid(), 'lab_co2air_ch4_dry',    'CH4 Dry (Air)',             'ppm',     'CO2_air',    'numeric', 'CH4 dry concentration from wet measurement'),
-                (gen_random_uuid(), 'lab_co2air_co2_dry',    'CO2 Dry (Air)',             'ppm',     'CO2_air',    'numeric', 'CO2 dry concentration from wet measurement'),
-                (gen_random_uuid(), 'benthic_AFDM_avg_gm2',  'Benthic AFDM Average',     'g/m2',    'Benthic',    'numeric', 'Benthic AFDM per square meter average'),
-                (gen_random_uuid(), 'benthic_AFDM_sd_gm2',   'Benthic AFDM Std Dev',     'g/m2',    'Benthic',    'numeric', 'Benthic AFDM per square meter std dev'),
-                (gen_random_uuid(), 'd_excess',              'Deuterium Excess',          'permil',  'Isotopes',   'numeric', 'Deuterium excess (dD - 8*d18O)'),
-                (gen_random_uuid(), 'o17_excess_permeg',     '17O Excess',                'per_meg', 'Isotopes',   'numeric', '17-oxygen excess in per meg'),
-                (gen_random_uuid(), 'alkalinity_meq_l',      'Alkalinity (meq/L)',        'meq/L',   'Alkalinity', 'numeric', 'Gran titration alkalinity'),
-                (gen_random_uuid(), 'alkalinity_mg_l_caco3', 'Alkalinity (CaCO3)',        'mg/L',    'Alkalinity', 'numeric', 'Alkalinity as mg/L CaCO3'),
-                (gen_random_uuid(), 'sum_cations_meq',       'Cations Sum',               'meq/L',   'Ions',       'numeric', 'Sum of cation charge equivalents'),
-                (gen_random_uuid(), 'sum_anions_meq',        'Anions Sum',                'meq/L',   'Ions',       'numeric', 'Sum of anion charge equivalents'),
-                (gen_random_uuid(), 'balance_percent',       'Ion Balance',               '%',       'Ions',       'numeric', 'Ion charge balance percentage')
+                -- Nutrients
+                (gen_random_uuid(), 'nitrate',           'Nitrate',                       'mg/L',    'Nutrients',       'numeric', NULL, ARRAY['Nitrate - Lab [mg/L]', 'Nitrate [µg/L]', 'NO3', 'NUT_NO3_avg']),
+                (gen_random_uuid(), 'nitrite',           'Nitrite',                       'mg/L',    'Nutrients',       'numeric', NULL, ARRAY['Nitrite - Lab [mg/L]', 'Nitrite [µg/L]', 'NO2', 'NUT_NO2_avg']),
+                (gen_random_uuid(), 'ammonium',          'Ammonium',                      'µg/L',    'Nutrients',       'numeric', NULL, ARRAY['Ammonium - Lab [mg/L]', 'Ammonium - Lab [µg/L]', 'Ammonia [µg/L]', 'NH4', 'NUT_NH4_avg']),
+                (gen_random_uuid(), 'nox',               'NOx (Nitrate + Nitrite)',       'µg/L',    'Nutrients',       'numeric', NULL, ARRAY['NUT_NOx_avg']),
+                (gen_random_uuid(), 'phosphate',         'Phosphate',                     'mg/L',    'Nutrients',       'numeric', NULL, ARRAY['Phosphate - Lab [mg/L]', 'NUT_P_avg']),
+                (gen_random_uuid(), 'srp',               'Soluble Reactive Phosphorus',   'µg/L',    'Nutrients',       'numeric', NULL, ARRAY['Soluble reactive phosphorus [µg/L]', 'Soluble reactive phosphorus [µg/L] (Quikchem)', 'Soluble reactive phosphorus [µg/L] (old method)']),
+                (gen_random_uuid(), 'total_nitrogen',    'Total Nitrogen',                'mg/L',    'Nutrients',       'numeric', NULL, ARRAY['NUT_TDN_avg', 'Total Dissolved Nitrogen']),
+                (gen_random_uuid(), 'total_phosphorus',  'Total Phosphorus',              'mg/L',    'Nutrients',       'numeric', NULL, ARRAY['NUT_TDP_avg', 'Total Dissolved Phosphorus']),
+
+                -- Ions
+                (gen_random_uuid(), 'calcium',           'Calcium',                       'mg/L',    'Ions',            'numeric', NULL, ARRAY['Calcium - Lab [mg/L]']),
+                (gen_random_uuid(), 'magnesium',         'Magnesium',                     'mg/L',    'Ions',            'numeric', NULL, ARRAY['Magnesium - Lab [mg/L]']),
+                (gen_random_uuid(), 'sodium',            'Sodium',                        'mg/L',    'Ions',            'numeric', NULL, ARRAY['Sodium - Lab [mg/L]']),
+                (gen_random_uuid(), 'potassium',         'Potassium',                     'mg/L',    'Ions',            'numeric', NULL, ARRAY['Potassium - Lab [mg/L]']),
+                (gen_random_uuid(), 'chloride',          'Chloride',                      'mg/L',    'Ions',            'numeric', NULL, ARRAY['Chloride - Lab [mg/L]']),
+                (gen_random_uuid(), 'sulfate',           'Sulfate',                       'mg/L',    'Ions',            'numeric', NULL, ARRAY['Sulfate - Lab [mg/L]']),
+                (gen_random_uuid(), 'fluoride',          'Fluoride',                      'mg/L',    'Ions',            'numeric', NULL, ARRAY['Fluoride - Lab [mg/L]']),
+                (gen_random_uuid(), 'bromide',           'Bromide',                       'mg/L',    'Ions',            'numeric', NULL, ARRAY['Bromide - Lab [mg/L]']),
+                (gen_random_uuid(), 'lithium',           'Lithium',                       'mg/L',    'Ions',            'numeric', NULL, ARRAY['Li - [mg/L]']),
+                (gen_random_uuid(), 'ion_balance',       'Ion Balance',                   '%',       'Ions',            'numeric', NULL, ARRAY['balance_percent']),
+
+                -- Isotopes
+                (gen_random_uuid(), 'd18o',              'δ¹⁸O',                          '‰',       'Isotopes',        'numeric', NULL, ARRAY['δ¹⁸O', 'Oxygen Isotope (δ18O)', 'd18O']),
+                (gen_random_uuid(), 'd2h',               'δD',                            '‰',       'Isotopes',        'numeric', NULL, ARRAY['δD', 'Hydrogen Isotope (δD)', 'dD']),
+                (gen_random_uuid(), 'd17o',              'δ¹⁷O',                          '‰',       'Isotopes',        'numeric', NULL, ARRAY['δ¹⁷O']),
+                (gen_random_uuid(), 'd_excess',          'D-excess',                      '‰',       'Isotopes',        'numeric', NULL, ARRAY['D-excess', 'Deuterium Excess']),
+                (gen_random_uuid(), 'o17_excess',        '¹⁷O-excess',                    'per meg',  'Isotopes',        'numeric', NULL, ARRAY['¹⁷O-excess', 'o17_excess_permeg']),
+                (gen_random_uuid(), 'dic_d13c',          'DIC δ¹³C',                      '‰',       'Isotopes',        'numeric', NULL, ARRAY['Dissolved inorganic carbon isotope - Calc. [‰]', 'd13C_DIC_avg']),
+                (gen_random_uuid(), 'co2_d13c',          'CO₂ δ¹³C',                      '‰',       'Isotopes',        'numeric', NULL, ARRAY['Water carbon dixoide isotope - Calc. [‰]', 'Air carbon dioxide isotope - Calc. [‰]', 'd13C_CO2_avg']),
+
+                -- DOC
+                (gen_random_uuid(), 'doc',               'Dissolved Organic Carbon',      'ppb',     'DOC',             'numeric', NULL, ARRAY['Dissolved organic carbon - Lab [ppb]', 'DOC_avg_ppb']),
+
+                -- DIC
+                (gen_random_uuid(), 'dic',               'Dissolved Inorganic Carbon',    'mmol/L',  'DIC',             'numeric', NULL, ARRAY['Dissolved inorganic carbon concentration - Calc. [mmol/L]', 'DIC_avg']),
+
+                -- pCO2 / Greenhouse gases
+                (gen_random_uuid(), 'water_co2',         'Water CO₂',                     'ppm',     'pCO2',            'numeric', NULL, ARRAY['Water carbon dioxide conc. - Calc. [ppm]', 'Water carbon dioxide conc. - Field [ppm]', 'Water CO2', 'MCO2ppm', 'SCO2ppm']),
+                (gen_random_uuid(), 'air_co2',           'Air CO₂',                       'ppm',     'pCO2',            'numeric', NULL, ARRAY['Air carbon dioxide conc. - Lab [ppm]', 'lab_co2air_co2_dry']),
+                (gen_random_uuid(), 'pco2',              'pCO₂',                          'µatm',    'pCO2',            'numeric', NULL, ARRAY['pCO2_HS_uatm_avg']),
+                (gen_random_uuid(), 'methane',           'Dissolved Methane',             'µmol/L',  'pCO2',            'numeric', NULL, ARRAY['CH4_umol_L_avg', 'Methane Check', 'lab_co2air_ch4_dry']),
+
+                -- Physicochemical
+                (gen_random_uuid(), 'temperature',       'Temperature',                   '°C',      'Physicochemical', 'numeric', NULL, ARRAY['Temperature - Field [°C]', 'Water Temperature', 'MDOdegC', 'SDOdegC', 'DDOTdegC', 'VDOTdegC', 'MCondTdegC', 'SCondTdegC']),
+                (gen_random_uuid(), 'conductivity',      'Conductivity',                  'µS/cm',   'Physicochemical', 'numeric', NULL, ARRAY['Conductivity - Field [µS/cm]', 'MConduSCm', 'SConduScm']),
+                (gen_random_uuid(), 'turbidity',         'Turbidity',                     'NTU',     'Physicochemical', 'numeric', NULL, ARRAY['Turbidity - Field [NTU]', 'MTurbNTU', 'STurbNTU']),
+                (gen_random_uuid(), 'ph',                'pH',                            '-',       'Physicochemical', 'numeric', NULL, ARRAY['pH - Field []']),
+                (gen_random_uuid(), 'dissolved_oxygen',  'Dissolved Oxygen',              'µM',      'Physicochemical', 'numeric', NULL, ARRAY['Dissolved Oxygen - Field [mg/L]', 'Dissolved Oxygen - Field [%]', 'MDOuM', 'SDOuM', 'DDOuM', 'VDOuM']),
+                (gen_random_uuid(), 'alkalinity',        'Alkalinity',                    'meq/L',   'Physicochemical', 'numeric', NULL, ARRAY['Alkalinity - Lab [meq/L]', 'alkalinity_meq_l']),
+                (gen_random_uuid(), 'barometric_pressure', 'Barometric Pressure',         'hPa',     'Physicochemical', 'numeric', NULL, ARRAY['Field_BP_altitude']),
+
+                -- Hydrology
+                (gen_random_uuid(), 'water_depth',       'Water Depth',                   'mm',      'Hydrology',       'numeric', NULL, ARRAY['MDepthmm', 'SDepthmm', 'Reach depth - Field [cm] [Gage_obl_cm]', 'Reach depth - Field [cm] [Gage_vert_cm]', 'Reach depth - Field [cm] [Reach_depth_avg_cm]']),
+
+                -- DOM
+                (gen_random_uuid(), 'cdom',              'CDOM',                          'ppb',     'DOM',             'numeric', NULL, ARRAY['MCDOMppb', 'SCDOMppb']),
+                (gen_random_uuid(), 'peak_a',            'Peak A (Humic)',                'RU',      'DOM',             'numeric', NULL, ARRAY['Peak A', 'Peak A (Humic)']),
+                (gen_random_uuid(), 'peak_b',            'Peak B (Protein)',              'RU',      'DOM',             'numeric', NULL, ARRAY['Peak B', 'Peak B (Protein)']),
+                (gen_random_uuid(), 'peak_c',            'Peak C (Humic)',                'RU',      'DOM',             'numeric', NULL, ARRAY['Peak C', 'Peak C (Humic)']),
+                (gen_random_uuid(), 'peak_m',            'Peak M (Marine Humic)',         'RU',      'DOM',             'numeric', NULL, ARRAY['Peak M', 'Peak M (Marine Humic)']),
+                (gen_random_uuid(), 'peak_t',            'Peak T (Protein)',              'RU',      'DOM',             'numeric', NULL, ARRAY['Peak T', 'Peak T (Protein)']),
+                (gen_random_uuid(), 'peak_r',            'Peak R',                        'RU',      'DOM',             'numeric', NULL, ARRAY['Peak R']),
+                (gen_random_uuid(), 'bix',               'Biological Index BIX',          '-',       'DOM',             'numeric', NULL, ARRAY['Biological Index BIX', 'Biological index']),
+                (gen_random_uuid(), 'hix',               'Humification Index HIX',        '-',       'DOM',             'numeric', NULL, ARRAY['Humification Index HIX', 'Humification index']),
+                (gen_random_uuid(), 'fi',                'Fluorescence Index FI',         '-',       'DOM',             'numeric', NULL, ARRAY['Fluorescence Index FI', 'The fluorescence index']),
+                (gen_random_uuid(), 'e2_e3',             'E2/E3 Ratio',                   '-',       'DOM',             'numeric', NULL, ARRAY['E2/E3', 'E2/E3 Ratio']),
+                (gen_random_uuid(), 'e4_e6',             'E4/E6 Ratio',                   '-',       'DOM',             'numeric', NULL, ARRAY['E4/E6', 'E4/E6 Ratio']),
+                (gen_random_uuid(), 'suva',              'SUVA',                          'L/(mg·m)', 'DOM',            'numeric', NULL, ARRAY['Specific ultraviolet absorbance', 'SUVA']),
+                (gen_random_uuid(), 's275_295',          'Spectral Slope S275-295',       'nm⁻¹',    'DOM',             'numeric', NULL, ARRAY['S275-295', 'Spectral Slope S275-295']),
+                (gen_random_uuid(), 's300_700',          'Spectral Slope S300-700',       'nm⁻¹',    'DOM',             'numeric', NULL, ARRAY['S300-700', 'Spectral Slope S300-700']),
+                (gen_random_uuid(), 's350_400',          'Spectral Slope S350-400',       'nm⁻¹',    'DOM',             'numeric', NULL, ARRAY['S350-400', 'Spectral Slope S350-400']),
+                (gen_random_uuid(), 'slope_ratio',       'Slope Ratio SR',                '-',       'DOM',             'numeric', NULL, ARRAY['SR', 'Slope Ratio SR']),
+                (gen_random_uuid(), 'a254',              'Absorbance 254nm',              'm⁻¹',     'DOM',             'numeric', NULL, ARRAY['a254', 'Absorption at 254nm']),
+                (gen_random_uuid(), 'a300',              'Absorbance 300nm',              'm⁻¹',     'DOM',             'numeric', NULL, ARRAY['a300', 'Absorption at 300nm']),
+                (gen_random_uuid(), 'peak_a_t',          'Peak A/T Ratio',                '-',       'DOM',             'numeric', NULL, ARRAY['Peak A/Peak T', 'A_T']),
+                (gen_random_uuid(), 'peak_c_a',          'Peak C/A Ratio',                '-',       'DOM',             'numeric', NULL, ARRAY['Peak C/Peak A', 'C_A']),
+                (gen_random_uuid(), 'peak_c_m',          'Peak C/M Ratio',                '-',       'DOM',             'numeric', NULL, ARRAY['Peak C/Peak M', 'C_M']),
+                (gen_random_uuid(), 'peak_c_t',          'Peak C/T Ratio',                '-',       'DOM',             'numeric', NULL, ARRAY['Peak C/Peak T', 'C_T']),
+
+                -- TSS / Benthic
+                (gen_random_uuid(), 'tss',               'Total Suspended Solids',        'mg/L',    'TSS',             'numeric', NULL, ARRAY['Total suspended solids - Lab [mg/L]', 'TSS_dry_weight_mgL']),
+                (gen_random_uuid(), 'afdm',              'Ash-Free Dry Mass',             'mg/L',    'TSS',             'numeric', NULL, ARRAY['Ashed free dry mass - Lab [mg/L]', 'AFDM_mgL']),
+                (gen_random_uuid(), 'benthic_afdm',      'Benthic AFDM',                  'g/m²',    'Benthic',         'numeric', NULL, ARRAY['Benthic ashed free dry mass - Lab [g/m2]', 'benthic_AFDM_avg_gm2']),
+                (gen_random_uuid(), 'chlorophyll_a',     'Chlorophyll a',                 'µg/L',    'Benthic',         'numeric', NULL, ARRAY['Chlorophyll a - Lab [µg/L]', 'Chla', 'Chla_acid_ugL_avg', 'Chla_noacid_ugL_avg']),
+
+                -- Device Health
+                (gen_random_uuid(), 'battery_voltage',   'Battery Voltage',               'V',       'device_health',   'numeric', NULL, ARRAY['MBattV', 'SBattV', 'DBattV', 'VBattV'])
+
             ON CONFLICT (LOWER(name)) DO NOTHING;
             "#,
         )

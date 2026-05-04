@@ -15,7 +15,8 @@ use sea_orm::entity::prelude::*;
     api_struct = "Parameter",
     name_singular = "parameter",
     name_plural = "parameters",
-    generate_router
+    generate_router,
+    derive_partial_eq
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
@@ -35,6 +36,8 @@ pub struct Model {
     #[crudcrate(filterable)]
     pub data_type: String,
     pub description: Option<String>,
+    #[crudcrate(filterable)]
+    pub aliases: Vec<String>,
     pub default_warning_min: Option<f64>,
     pub default_warning_max: Option<f64>,
     pub default_alarm_min: Option<f64>,

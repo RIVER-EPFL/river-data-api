@@ -77,6 +77,10 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
             post(merge::merge_site_parameters_handler),
         )
         .route(
+            "/actions/merge_parameters",
+            post(merge::merge_parameters_handler),
+        )
+        .route(
             "/alarms/active",
             get(super::alarms::get_active_alarms),
         )

@@ -33,6 +33,15 @@ async fn get_constant(db: &DatabaseConnection, name: &str, default: f64) -> f64 
 pub struct ToolResult {
     pub tool: String,
     pub results: serde_json::Value,
+    pub inputs_used: Vec<String>,
+    pub inputs_ignored: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ToolParamInfo {
+    pub name: &'static str,
+    pub label: &'static str,
+    pub required: bool,
 }
 
 // ============================================================================
@@ -66,6 +75,8 @@ pub async fn calculate_doc(Json(payload): Json<DocRequest>) -> AppResult<Json<To
             "DOC_avg_ppb": avg,
             "DOC_sd_ppb": sd,
         }),
+        inputs_used: vec![],
+        inputs_ignored: vec![],
     }))
 }
 
@@ -100,6 +111,8 @@ pub async fn calculate_tss_afdm(
             "TSS_dry_weight_mgL": tss,
             "AFDM_mgL": afdm,
         }),
+        inputs_used: vec![],
+        inputs_ignored: vec![],
     }))
 }
 
@@ -160,6 +173,8 @@ pub async fn calculate_chlorophyll(
     Ok(Json(ToolResult {
         tool: "chlorophyll".to_string(),
         results: serde_json::Value::Object(results),
+        inputs_used: vec![],
+        inputs_ignored: vec![],
     }))
 }
 
@@ -205,6 +220,8 @@ pub async fn calculate_nutrients(
     Ok(Json(ToolResult {
         tool: "nutrients".to_string(),
         results: serde_json::Value::Object(results),
+        inputs_used: vec![],
+        inputs_ignored: vec![],
     }))
 }
 
@@ -245,6 +262,8 @@ pub async fn calculate_ions(Json(payload): Json<IonsRequest>) -> AppResult<Json<
             "sum_anions_meq": result.sum_anions_meq,
             "balance_percent": result.balance_percent
         }),
+        inputs_used: vec![],
+        inputs_ignored: vec![],
     }))
 }
 
@@ -280,6 +299,8 @@ pub async fn calculate_alkalinity(
     Ok(Json(ToolResult {
         tool: "alkalinity".to_string(),
         results: serde_json::Value::Object(results),
+        inputs_used: vec![],
+        inputs_ignored: vec![],
     }))
 }
 
@@ -398,6 +419,8 @@ pub async fn calculate_pco2(db: &DatabaseConnection, Json(payload): Json<Pco2Req
             Ok(Json(ToolResult {
                 tool: "pco2".to_string(),
                 results: serde_json::Value::Object(results),
+                inputs_used: vec![],
+                inputs_ignored: vec![],
             }))
         }
 
@@ -473,6 +496,8 @@ pub async fn calculate_pco2(db: &DatabaseConnection, Json(payload): Json<Pco2Req
             Ok(Json(ToolResult {
                 tool: "pco2".to_string(),
                 results: serde_json::Value::Object(results),
+                inputs_used: vec![],
+                inputs_ignored: vec![],
             }))
         }
     }
@@ -536,6 +561,8 @@ pub async fn calculate_dic(db: &DatabaseConnection, Json(payload): Json<DicReque
                 "d13C_DIC_avg": rep.d13c_avg,
                 "d13C_DIC_std": rep.d13c_std,
             }),
+            inputs_used: vec![],
+            inputs_ignored: vec![],
         }))
     } else {
         let dic = river_data_toolbox::dic_concentration(
@@ -565,6 +592,8 @@ pub async fn calculate_dic(db: &DatabaseConnection, Json(payload): Json<DicReque
                 "DIC_avg": dic,
                 "d13C_DIC_avg": d13c,
             }),
+            inputs_used: vec![],
+            inputs_ignored: vec![],
         }))
     }
 }
@@ -617,6 +646,8 @@ pub async fn calculate_dom(Json(payload): Json<DomRequest>) -> AppResult<Json<To
     Ok(Json(ToolResult {
         tool: "dom".to_string(),
         results: serde_json::Value::Object(results),
+        inputs_used: vec![],
+        inputs_ignored: vec![],
     }))
 }
 
@@ -686,6 +717,8 @@ pub async fn calculate_field_data(
     Ok(Json(ToolResult {
         tool: "field_data".to_string(),
         results: serde_json::Value::Object(results),
+        inputs_used: vec![],
+        inputs_ignored: vec![],
     }))
 }
 
@@ -716,6 +749,8 @@ pub async fn calculate_co2_air(
             "lab_co2air_co2_dry": co2,
             "lab_co2air_ch4_dry": ch4,
         }),
+        inputs_used: vec![],
+        inputs_ignored: vec![],
     }))
 }
 
@@ -748,6 +783,8 @@ pub async fn calculate_isotopes(
             "d_excess": d_excess,
             "o17_excess_permeg": o17_excess,
         }),
+        inputs_used: vec![],
+        inputs_ignored: vec![],
     }))
 }
 
@@ -794,6 +831,8 @@ pub async fn calculate_benthic(
             "benthic_AFDM_avg_gm2": afdm_per_m2,
             "chla_per_m2": chla_per_m2,
         }),
+        inputs_used: vec![],
+        inputs_ignored: vec![],
     }))
 }
 
@@ -859,6 +898,8 @@ pub async fn calculate_chla_benthic(
     Ok(Json(ToolResult {
         tool: "chla_benthic".to_string(),
         results: serde_json::Value::Object(results),
+        inputs_used: vec![],
+        inputs_ignored: vec![],
     }))
 }
 
@@ -871,23 +912,147 @@ pub struct ToolInfo {
     name: &'static str,
     description: &'static str,
     endpoint: &'static str,
+    params: &'static [ToolParamInfo],
+    match_keywords: &'static [&'static str],
 }
 
+const DOC_PARAMS: &[ToolParamInfo] = &[
+    ToolParamInfo { name: "replicates", label: "Replicates (array)", required: true },
+    ToolParamInfo { name: "std_curve", label: "Standard Curve (slope/intercept)", required: false },
+];
+
+const TSS_AFDM_PARAMS: &[ToolParamInfo] = &[
+    ToolParamInfo { name: "wgt_dried_g", label: "Dried Weight (g)", required: true },
+    ToolParamInfo { name: "wgt_prefilt_g", label: "Pre-filter Weight (g)", required: true },
+    ToolParamInfo { name: "wgt_ashed_g", label: "Ashed Weight (g)", required: false },
+    ToolParamInfo { name: "vol_filtered_ml", label: "Volume Filtered (mL)", required: true },
+];
+
+const CHLOROPHYLL_PARAMS: &[ToolParamInfo] = &[
+    ToolParamInfo { name: "method", label: "Method (acid/no_acid)", required: true },
+    ToolParamInfo { name: "fluorescence_before", label: "Fluorescence Before", required: true },
+    ToolParamInfo { name: "fluorescence_after", label: "Fluorescence After", required: false },
+    ToolParamInfo { name: "slope", label: "Slope", required: true },
+    ToolParamInfo { name: "intercept", label: "Intercept", required: true },
+];
+
+const NUTRIENTS_PARAMS: &[ToolParamInfo] = &[
+    ToolParamInfo { name: "species", label: "Species (multi-species map)", required: false },
+    ToolParamInfo { name: "replicates", label: "Replicates (single-species)", required: false },
+    ToolParamInfo { name: "nox", label: "NOx", required: false },
+    ToolParamInfo { name: "no2", label: "NO2", required: false },
+];
+
+const IONS_PARAMS: &[ToolParamInfo] = &[
+    ToolParamInfo { name: "cations", label: "Cations (array)", required: true },
+    ToolParamInfo { name: "anions", label: "Anions (array)", required: true },
+];
+
+const ALKALINITY_PARAMS: &[ToolParamInfo] = &[
+    ToolParamInfo { name: "sample_weight_g", label: "Sample Weight (g)", required: true },
+    ToolParamInfo { name: "acid_normality", label: "Acid Normality", required: true },
+    ToolParamInfo { name: "titrant_volume_ml", label: "Titrant Volume (mL)", required: true },
+    ToolParamInfo { name: "initial_ph", label: "Initial pH", required: false },
+];
+
+const PCO2_PARAMS: &[ToolParamInfo] = &[
+    ToolParamInfo { name: "mode", label: "Mode (simple/full_pipeline)", required: false },
+    ToolParamInfo { name: "variant", label: "Variant (simple/p1/p2)", required: false },
+    ToolParamInfo { name: "co2_aq_umol", label: "CO2aq (umol)", required: false },
+    ToolParamInfo { name: "water_temp_c", label: "Water Temp (°C)", required: true },
+    ToolParamInfo { name: "pressure_hpa", label: "Pressure (hPa)", required: false },
+    ToolParamInfo { name: "co2_ppm", label: "CO2 (ppm)", required: false },
+    ToolParamInfo { name: "h2o_percent", label: "H2O (%)", required: false },
+    ToolParamInfo { name: "ch4_ppm", label: "CH4 (ppm)", required: false },
+    ToolParamInfo { name: "d13co2_permil", label: "d13CO2 (permil)", required: false },
+    ToolParamInfo { name: "lab_temp_c", label: "Lab Temp (°C)", required: false },
+    ToolParamInfo { name: "lab_pressure_atm", label: "Lab Pressure (atm)", required: false },
+    ToolParamInfo { name: "vol_sa_ml", label: "Vol SA (mL)", required: false },
+    ToolParamInfo { name: "vol_water_ml", label: "Vol Water (mL)", required: false },
+    ToolParamInfo { name: "replicate_b", label: "Replicate B", required: false },
+];
+
+const DIC_PARAMS: &[ToolParamInfo] = &[
+    ToolParamInfo { name: "acid_sample_weight_g", label: "Acid Sample Weight (g)", required: true },
+    ToolParamInfo { name: "acid_weight_g", label: "Acid Weight (g)", required: true },
+    ToolParamInfo { name: "vol_overpressure_ml", label: "Vol Overpressure (mL)", required: true },
+    ToolParamInfo { name: "sa_added_ml", label: "SA Added (mL)", required: true },
+    ToolParamInfo { name: "co2_dry_ppm", label: "CO2 Dry (ppm)", required: true },
+    ToolParamInfo { name: "d13co2_permil", label: "d13CO2 (permil)", required: false },
+    ToolParamInfo { name: "lab_temp_c", label: "Lab Temp (°C)", required: true },
+    ToolParamInfo { name: "h_co2_29815k", label: "H CO2 @298.15K", required: false },
+    ToolParamInfo { name: "gas_const_r_mol", label: "Gas Const R (mol)", required: false },
+    ToolParamInfo { name: "vial_volume", label: "Vial Volume (mL)", required: false },
+    ToolParamInfo { name: "h3po4_added", label: "H3PO4 Added (mL)", required: false },
+    ToolParamInfo { name: "replicate_b", label: "Replicate B", required: false },
+];
+
+const DOM_PARAMS: &[ToolParamInfo] = &[
+    ToolParamInfo { name: "a254", label: "Absorbance @254nm", required: false },
+    ToolParamInfo { name: "doc_avg_ppb", label: "DOC Avg (ppb)", required: false },
+    ToolParamInfo { name: "abs_numerator", label: "Absorbance Numerator", required: false },
+    ToolParamInfo { name: "abs_denominator", label: "Absorbance Denominator", required: false },
+    ToolParamInfo { name: "peak_a", label: "Peak A", required: false },
+    ToolParamInfo { name: "peak_c", label: "Peak C", required: false },
+    ToolParamInfo { name: "peak_m", label: "Peak M", required: false },
+    ToolParamInfo { name: "peak_t", label: "Peak T", required: false },
+];
+
+const FIELD_DATA_PARAMS: &[ToolParamInfo] = &[
+    ToolParamInfo { name: "elevation_m", label: "Elevation (m)", required: false },
+    ToolParamInfo { name: "temp_c", label: "Temperature (°C)", required: false },
+    ToolParamInfo { name: "pressure_hpa", label: "Pressure (hPa)", required: false },
+    ToolParamInfo { name: "raw_co2", label: "Raw CO2 (ppm)", required: false },
+    ToolParamInfo { name: "raw_co2_min", label: "Raw CO2 Min (ppm)", required: false },
+    ToolParamInfo { name: "raw_co2_avg", label: "Raw CO2 Avg (ppm)", required: false },
+    ToolParamInfo { name: "raw_co2_max", label: "Raw CO2 Max (ppm)", required: false },
+    ToolParamInfo { name: "std_curve", label: "Standard Curve (slope/intercept)", required: false },
+    ToolParamInfo { name: "reach_depths", label: "Reach Depths (cm)", required: false },
+];
+
+const CO2_AIR_PARAMS: &[ToolParamInfo] = &[
+    ToolParamInfo { name: "co2_wet", label: "CO2 Wet (ppm)", required: false },
+    ToolParamInfo { name: "ch4_wet", label: "CH4 Wet (ppm)", required: false },
+    ToolParamInfo { name: "h2o_percent", label: "H2O (%)", required: true },
+];
+
+const ISOTOPES_PARAMS: &[ToolParamInfo] = &[
+    ToolParamInfo { name: "d_d", label: "dD (permil)", required: false },
+    ToolParamInfo { name: "d18o", label: "d18O (permil)", required: false },
+    ToolParamInfo { name: "d17o", label: "d17O (permil)", required: false },
+];
+
+const BENTHIC_PARAMS: &[ToolParamInfo] = &[
+    ToolParamInfo { name: "diameters_cm", label: "Rock Diameters (cm)", required: true },
+    ToolParamInfo { name: "afdm_g_filter", label: "AFDM per Filter (g)", required: false },
+    ToolParamInfo { name: "chla_ug_l", label: "Chl-a (ug/L)", required: false },
+    ToolParamInfo { name: "volume_filtered_ml", label: "Volume Filtered (mL)", required: true },
+    ToolParamInfo { name: "total_volume_ml", label: "Total Volume (mL)", required: true },
+];
+
+const CHLA_BENTHIC_PARAMS: &[ToolParamInfo] = &[
+    ToolParamInfo { name: "acid_slope", label: "Acid Slope", required: true },
+    ToolParamInfo { name: "acid_intercept", label: "Acid Intercept", required: true },
+    ToolParamInfo { name: "noacid_slope", label: "No-acid Slope", required: true },
+    ToolParamInfo { name: "noacid_intercept", label: "No-acid Intercept", required: true },
+    ToolParamInfo { name: "replicates", label: "Replicates (array)", required: true },
+];
+
 const TOOLS: &[ToolInfo] = &[
-    ToolInfo { name: "doc", description: "Dissolved Organic Carbon (replicate avg/sd with optional standard curve)", endpoint: "/api/service/tools/doc/calculate" },
-    ToolInfo { name: "tss_afdm", description: "Total Suspended Solids & Ash-Free Dry Mass", endpoint: "/api/service/tools/tss_afdm/calculate" },
-    ToolInfo { name: "chlorophyll", description: "Chlorophyll-a (acid and no-acid methods)", endpoint: "/api/service/tools/chlorophyll/calculate" },
-    ToolInfo { name: "nutrients", description: "Nutrient replicates (PO4, NH4, NOx, NO2, TDP, TDN)", endpoint: "/api/service/tools/nutrients/calculate" },
-    ToolInfo { name: "ions", description: "IC ion charge balance verification", endpoint: "/api/service/tools/ions/calculate" },
-    ToolInfo { name: "alkalinity", description: "Gran titration alkalinity (meq/L, mg/L CaCO3)", endpoint: "/api/service/tools/alkalinity/calculate" },
-    ToolInfo { name: "pco2", description: "pCO2 from headspace CO2aq (simple, P1, P2 variants)", endpoint: "/api/service/tools/pco2/calculate" },
-    ToolInfo { name: "dic", description: "DIC concentration and d13C-DIC from acid digestion", endpoint: "/api/service/tools/dic/calculate" },
-    ToolInfo { name: "dom", description: "SUVA, absorbance ratios, spectral slopes", endpoint: "/api/service/tools/dom/calculate" },
-    ToolInfo { name: "field_data", description: "Barometric pressure from altitude, CO2 correction", endpoint: "/api/service/tools/field_data/calculate" },
-    ToolInfo { name: "co2_air", description: "CO2/CH4 dry concentrations from wet measurements", endpoint: "/api/service/tools/co2_air/calculate" },
-    ToolInfo { name: "isotopes", description: "Deuterium excess, 17O excess", endpoint: "/api/service/tools/isotopes/calculate" },
-    ToolInfo { name: "benthic", description: "Rock surface area, per-m2 normalizations", endpoint: "/api/service/tools/benthic/calculate" },
-    ToolInfo { name: "chla_benthic", description: "Unified Chlorophyll-Benthic multi-replicate (acid + no-acid Chl-a, AFDM, per-m2)", endpoint: "/api/service/tools/chla_benthic/calculate" },
+    ToolInfo { name: "doc", description: "Dissolved Organic Carbon (replicate avg/sd with optional standard curve)", endpoint: "/api/service/tools/doc/calculate", params: DOC_PARAMS, match_keywords: &["doc", "organic carbon", "dissolved organic"] },
+    ToolInfo { name: "tss_afdm", description: "Total Suspended Solids & Ash-Free Dry Mass", endpoint: "/api/service/tools/tss_afdm/calculate", params: TSS_AFDM_PARAMS, match_keywords: &["tss", "afdm", "suspended solid", "dry mass"] },
+    ToolInfo { name: "chlorophyll", description: "Chlorophyll-a (acid and no-acid methods)", endpoint: "/api/service/tools/chlorophyll/calculate", params: CHLOROPHYLL_PARAMS, match_keywords: &["chlorophyll", "chla", "chl"] },
+    ToolInfo { name: "nutrients", description: "Nutrient replicates (PO4, NH4, NOx, NO2, TDP, TDN)", endpoint: "/api/service/tools/nutrients/calculate", params: NUTRIENTS_PARAMS, match_keywords: &["po4", "nh4", "nox", "no2", "no3", "tdp", "tdn", "nutrient", "phosph", "nitrate", "nitrite", "ammonium"] },
+    ToolInfo { name: "ions", description: "IC ion charge balance verification", endpoint: "/api/service/tools/ions/calculate", params: IONS_PARAMS, match_keywords: &["ion", "anion", "cation", "charge balance", "ca2", "mg2", "na", "cl", "so4", "hco3"] },
+    ToolInfo { name: "alkalinity", description: "Gran titration alkalinity (meq/L, mg/L CaCO3)", endpoint: "/api/service/tools/alkalinity/calculate", params: ALKALINITY_PARAMS, match_keywords: &["alkalinity", "alk", "titration", "caco3"] },
+    ToolInfo { name: "pco2", description: "pCO2 from headspace CO2aq (simple, P1, P2 variants)", endpoint: "/api/service/tools/pco2/calculate", params: PCO2_PARAMS, match_keywords: &["co2", "pco2", "headspace", "carbon dioxide"] },
+    ToolInfo { name: "dic", description: "DIC concentration and d13C-DIC from acid digestion", endpoint: "/api/service/tools/dic/calculate", params: DIC_PARAMS, match_keywords: &["dic", "d13c", "inorganic carbon"] },
+    ToolInfo { name: "dom", description: "SUVA, absorbance ratios, spectral slopes", endpoint: "/api/service/tools/dom/calculate", params: DOM_PARAMS, match_keywords: &["dom", "suva", "a254", "absorbance", "dissolved organic"] },
+    ToolInfo { name: "field_data", description: "Barometric pressure from altitude, CO2 correction", endpoint: "/api/service/tools/field_data/calculate", params: FIELD_DATA_PARAMS, match_keywords: &["field", "elevation", "altitude", "baro", "pressure", "co2", "depth", "reach"] },
+    ToolInfo { name: "co2_air", description: "CO2/CH4 dry concentrations from wet measurements", endpoint: "/api/service/tools/co2_air/calculate", params: CO2_AIR_PARAMS, match_keywords: &["co2_air", "ch4", "methane", "co2"] },
+    ToolInfo { name: "isotopes", description: "Deuterium excess, 17O excess", endpoint: "/api/service/tools/isotopes/calculate", params: ISOTOPES_PARAMS, match_keywords: &["isotop", "d18o", "deuterium", "d17o", "o18", "o17"] },
+    ToolInfo { name: "benthic", description: "Rock surface area, per-m2 normalizations", endpoint: "/api/service/tools/benthic/calculate", params: BENTHIC_PARAMS, match_keywords: &["benthic", "rock", "surface area", "periphyton"] },
+    ToolInfo { name: "chla_benthic", description: "Unified Chlorophyll-Benthic multi-replicate (acid + no-acid Chl-a, AFDM, per-m2)", endpoint: "/api/service/tools/chla_benthic/calculate", params: CHLA_BENTHIC_PARAMS, match_keywords: &["chla_benthic", "chlorophyll", "benthic", "afdm"] },
 ];
 
 pub async fn list_tools() -> Json<Vec<&'static ToolInfo>> {
@@ -900,7 +1065,23 @@ pub async fn calculate_tool(
     Path(tool_name): Path<String>,
     body: axum::body::Bytes,
 ) -> AppResult<Json<ToolResult>> {
-    match tool_name.as_str() {
+    let tool_info = TOOLS.iter().find(|t| t.name == tool_name.as_str())
+        .ok_or_else(|| AppError::NotFound(format!("Unknown tool: {tool_name}")))?;
+
+    let input_keys: Vec<String> = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.as_object().map(|o| o.keys().cloned().collect()))
+        .unwrap_or_default();
+
+    let known_names: Vec<&str> = tool_info.params.iter().map(|p| p.name).collect();
+    let inputs_used: Vec<String> = input_keys.iter()
+        .filter(|k| known_names.contains(&k.as_str()))
+        .cloned().collect();
+    let inputs_ignored: Vec<String> = input_keys.iter()
+        .filter(|k| !known_names.contains(&k.as_str()))
+        .cloned().collect();
+
+    let mut result = match tool_name.as_str() {
         "doc" => calculate_doc(Json(parse_body(&body)?)).await,
         "tss_afdm" => calculate_tss_afdm(Json(parse_body(&body)?)).await,
         "chlorophyll" => calculate_chlorophyll(Json(parse_body(&body)?)).await,
@@ -916,7 +1097,12 @@ pub async fn calculate_tool(
         "benthic" => calculate_benthic(Json(parse_body(&body)?)).await,
         "chla_benthic" => calculate_chla_benthic(Json(parse_body(&body)?)).await,
         _ => Err(AppError::NotFound(format!("Unknown tool: {tool_name}"))),
-    }
+    }?.0;
+
+    result.inputs_used = inputs_used;
+    result.inputs_ignored = inputs_ignored;
+
+    Ok(Json(result))
 }
 
 fn parse_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> AppResult<T> {

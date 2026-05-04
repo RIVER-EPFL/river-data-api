@@ -110,6 +110,8 @@ pub struct SiteReadingsQuery {
     pub include_flagged: Option<bool>,
     /// Include replicate readings (default: false). When false, only returns replicate_index = 0.
     pub include_replicates: Option<bool>,
+    /// Filter by sample ID to retrieve replicates for a specific sample.
+    pub sample_id: Option<Uuid>,
 }
 
 /// Get readings for a specific site
@@ -196,7 +198,7 @@ pub async fn get_site_readings(
 
     let include_alarms = query.alarms.unwrap_or(false);
     let include_flagged = query.include_flagged.unwrap_or(true);
-    let include_replicates = query.include_replicates.unwrap_or(false);
+    let include_replicates = query.include_replicates.unwrap_or(false) || query.sample_id.is_some();
 
     let measurement_type_filter = query.measurement_type.as_deref().unwrap_or("");
 
@@ -213,6 +215,7 @@ pub async fn get_site_readings(
             measurement_type_filter,
             if include_flagged { "flagged" } else { "no_flagged" },
             if include_replicates { "replicates" } else { "" },
+            &query.sample_id.map(|id| id.to_string()).unwrap_or_default(),
         ],
     );
 
@@ -309,8 +312,16 @@ pub async fn get_site_readings(
         " AND r.replicate_index = 0"
     };
 
+    let sample_id_condition = if let Some(sid) = query.sample_id {
+        let idx = values.len() + 1;
+        values.push(sid.into());
+        format!(" AND r.sample_id = ${idx}")
+    } else {
+        String::new()
+    };
+
     let sql = format!(
-        "SELECT {select_clause} FROM {from_clause} WHERE r.site_id = $1 AND r.parameter_id IN ({}){time_conditions}{measurement_type_condition}{flagged_condition}{replicate_condition} ORDER BY r.parameter_id, r.time",
+        "SELECT {select_clause} FROM {from_clause} WHERE r.site_id = $1 AND r.parameter_id IN ({}){time_conditions}{measurement_type_condition}{flagged_condition}{replicate_condition}{sample_id_condition} ORDER BY r.parameter_id, r.time",
         placeholders.join(",")
     );
 
