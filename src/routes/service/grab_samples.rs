@@ -11,7 +11,6 @@ use crate::error::{AppError, AppResult};
 #[derive(Debug, Deserialize)]
 pub struct GrabSampleRequest {
     pub site_id: Uuid,
-    pub field_trip_id: Option<Uuid>,
     pub created_by: Option<String>,
     pub readings: Vec<GrabSampleReading>,
 }
@@ -113,7 +112,6 @@ async fn auto_create_samples(
     txn: &sea_orm::DatabaseTransaction,
     readings: &[GrabSampleReading],
     site_id: Uuid,
-    field_trip_id: Option<Uuid>,
     created_by: Option<&str>,
 ) -> Result<HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Uuid>, AppError> {
     let mut groups: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), usize> = HashMap::new();
@@ -136,7 +134,6 @@ async fn auto_create_samples(
             collected_at: Set(time),
             label: Set(None),
             notes: Set(None),
-            field_trip_id: Set(field_trip_id),
             created_by: Set(created_by.map(String::from)),
             created_at: Set(Some(chrono::Utc::now())),
             mean: Set(None),
@@ -210,7 +207,6 @@ pub async fn insert_grab_samples(
         &txn,
         &payload.readings,
         payload.site_id,
-        payload.field_trip_id,
         payload.created_by.as_deref(),
     )
     .await?;
@@ -256,7 +252,6 @@ pub async fn insert_grab_samples(
                 measurement_type: Set(Some("spot".to_string())),
                 is_flagged: Set(Some(false)),
                 flag_reason: Set(None),
-                field_trip_id: Set(payload.field_trip_id),
                 sample_id: Set(sample_id),
             }
         })

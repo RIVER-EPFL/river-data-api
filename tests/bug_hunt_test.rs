@@ -25,7 +25,7 @@ async fn bug1_flagged_readings_still_in_aggregates() {
     common::db::exec(
         &db,
         &format!(
-            "INSERT INTO projects (id, name) VALUES ('{pid}', 'Bug1 Project')",
+            "INSERT INTO projects (id, name, data_source) VALUES ('{pid}', 'Bug1 Project', 'test')",
             pid = common::PROJECT_ID
         ),
     )
@@ -175,7 +175,7 @@ async fn bug3_merge_drops_conflicting_readings() {
     common::db::exec(
         &db,
         &format!(
-            "INSERT INTO projects (id, name) VALUES ('{pid}', 'Merge Test')",
+            "INSERT INTO projects (id, name, data_source) VALUES ('{pid}', 'Merge Test', 'test')",
             pid = common::PROJECT_ID
         ),
     )
@@ -394,7 +394,7 @@ async fn bug8_time_range_off_by_one() {
     common::db::exec(
         &db,
         &format!(
-            "INSERT INTO projects (id, name) VALUES ('{pid}', 'Bug8 Project')",
+            "INSERT INTO projects (id, name, data_source) VALUES ('{pid}', 'Bug8 Project', 'test')",
             pid = common::PROJECT_ID
         ),
     )

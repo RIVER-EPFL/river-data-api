@@ -21,7 +21,6 @@ pub struct Model {
     pub measurement_type: Option<String>,
     pub is_flagged: Option<bool>,
     pub flag_reason: Option<String>,
-    pub field_trip_id: Option<Uuid>,
     pub sample_id: Option<Uuid>,
 }
 
@@ -64,12 +63,6 @@ pub enum Relation {
     )]
     SensorDeployment,
     #[sea_orm(
-        belongs_to = "super::field_trips::Entity",
-        from = "Column::FieldTripId",
-        to = "super::field_trips::Column::Id"
-    )]
-    FieldTrip,
-    #[sea_orm(
         belongs_to = "super::samples::Entity",
         from = "Column::SampleId",
         to = "super::samples::Column::Id",
@@ -111,12 +104,6 @@ impl Related<super::sensor_calibrations::Entity> for Entity {
 impl Related<super::sensor_deployments::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SensorDeployment.def()
-    }
-}
-
-impl Related<super::field_trips::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::FieldTrip.def()
     }
 }
 

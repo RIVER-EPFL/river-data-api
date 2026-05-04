@@ -1,5 +1,4 @@
 pub mod actions;
-pub mod field_trips;
 pub mod grab_samples;
 pub mod ingest;
 pub mod reading_flags;
@@ -27,7 +26,6 @@ use crate::entity::{
     data_streams::DataStream,
     derived_parameter_definitions::DerivedParameterDefinition,
     derived_parameter_sources::DerivedParameterSource,
-    field_trips::FieldTrip,
     notes::Note,
     pairing_plans::PairingPlan,
     parameters::Parameter,
@@ -109,7 +107,6 @@ pub fn service_router(state: &AppState) -> Router<()> {
             with_crud_perms(Annotation::router(db)),
         )
         .nest("/constants", with_crud_perms(Constant::router(db)))
-        .nest("/field_trips", with_crud_perms(FieldTrip::router(db)))
         .nest("/samples", with_crud_perms(Sample::router(db)))
         .nest(
             "/sync_services",
@@ -168,10 +165,6 @@ pub fn service_router(state: &AppState) -> Router<()> {
         .route(
             "/grab_samples",
             post(grab_samples::insert_grab_samples),
-        )
-        .route(
-            "/actions/field_trip_batch",
-            post(field_trips::create_field_trip_batch),
         )
         .route(
             "/readings/flag",

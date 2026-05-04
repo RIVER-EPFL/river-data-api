@@ -35,8 +35,6 @@ pub struct Model {
     pub label: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub notes: Option<String>,
-    #[crudcrate(filterable)]
-    pub field_trip_id: Option<Uuid>,
     pub created_by: Option<String>,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -70,12 +68,6 @@ pub enum Relation {
         to = "super::parameters::Column::Id"
     )]
     Parameter,
-    #[sea_orm(
-        belongs_to = "super::field_trips::Entity",
-        from = "Column::FieldTripId",
-        to = "super::field_trips::Column::Id"
-    )]
-    FieldTrip,
     #[sea_orm(has_many = "super::readings::Entity")]
     Readings,
 }
@@ -89,12 +81,6 @@ impl Related<super::sites::Entity> for Entity {
 impl Related<super::parameters::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Parameter.def()
-    }
-}
-
-impl Related<super::field_trips::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::FieldTrip.def()
     }
 }
 

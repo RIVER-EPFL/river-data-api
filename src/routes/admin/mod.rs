@@ -10,7 +10,7 @@ use crate::common::auth::Role;
 use crate::entity::{
     alarm_thresholds::AlarmThreshold, api_tokens::ApiToken, constants::Constant,
     data_streams::DataStream,
-    derived_parameter_definitions::DerivedParameterDefinition, field_trips::FieldTrip,
+    derived_parameter_definitions::DerivedParameterDefinition,
     notes::Note, parameters::Parameter, projects::Project,
     public_exposed_parameters::PublicExposedParameter, samples::Sample,
     sensor_calibrations::SensorCalibration, sensor_deployments::SensorDeployment, sensors::Sensor,
@@ -49,7 +49,6 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .nest_service("/standard_curves", crud(StandardCurve::router(db)))
         .nest_service("/notes", crud(Note::router(db)))
         .nest_service("/constants", crud(Constant::router(db)))
-        .nest_service("/field_trips", crud(FieldTrip::router(db)))
         .nest_service("/samples", crud(Sample::router(db)))
         .nest_service("/data_streams", crud(DataStream::router(db)))
         .nest_service("/sync_services", crud(SyncService::router(db)))

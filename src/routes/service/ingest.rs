@@ -122,7 +122,6 @@ pub async fn ingest_readings(
             measurement_type: Set(Some("continuous".to_string())),
             is_flagged: Set(Some(false)),
             flag_reason: Set(None),
-            field_trip_id: Set(None),
             sample_id: Set(None),
         })
         .collect();

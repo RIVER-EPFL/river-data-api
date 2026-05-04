@@ -16,6 +16,7 @@ pub async fn seed_test_data(db: &DatabaseConnection) {
     seed_parameters(db).await;
     seed_site_parameters(db).await;
     seed_alarm_thresholds(db).await;
+    seed_streams_for_site_params(db).await;
     seed_readings(db).await;
     refresh_continuous_aggregates(db).await;
 }
@@ -28,8 +29,8 @@ async fn seed_project(db: &DatabaseConnection) {
     exec(
         db,
         &format!(
-            "INSERT INTO projects (id, name, description) VALUES \
-             ('{PROJECT_ID}', 'Test River Project', 'E2E test project')"
+            "INSERT INTO projects (id, name, description, data_source) VALUES \
+             ('{PROJECT_ID}', 'Test River Project', 'E2E test project', 'test')"
         ),
     )
     .await;
@@ -181,6 +182,33 @@ fn generate_value(cfg: &ParamConfig, step: usize) -> f64 {
     value.clamp(cfg.units_min, cfg.units_max)
 }
 
+async fn seed_streams_for_site_params(db: &DatabaseConnection) {
+    let configs = param_configs();
+    let mut values = Vec::with_capacity(configs.len());
+
+    for (i, p) in configs.iter().enumerate() {
+        let stream_uuid = format!("00000000-0000-4000-d000-{:012}", i + 1);
+        values.push(format!(
+            "('{stream_uuid}', 'test-seed', 'seed-{sp_id}', 'Seed {name}', '{sp_id}', NOW(), true)",
+            name = p.name,
+            sp_id = p.site_param_id,
+        ));
+    }
+
+    exec(
+        db,
+        &format!(
+            "INSERT INTO data_streams (id, source_system, source_key, source_name, site_parameter_id, paired_at, is_active) VALUES {}",
+            values.join(", ")
+        ),
+    )
+    .await;
+}
+
+fn stream_id_for_param(cfg_index: usize) -> String {
+    format!("00000000-0000-4000-d000-{:012}", cfg_index + 1)
+}
+
 async fn seed_readings(db: &DatabaseConnection) {
     let configs = param_configs();
     let bt = base_time();
@@ -188,14 +216,15 @@ async fn seed_readings(db: &DatabaseConnection) {
     const BATCH_SIZE: usize = 500;
     let mut batch_values: Vec<String> = Vec::with_capacity(BATCH_SIZE);
 
-    for cfg in &configs {
+    for (cfg_idx, cfg) in configs.iter().enumerate() {
+        let stream = stream_id_for_param(cfg_idx);
         for step in 0..READINGS_PER_PARAM {
             let time = bt + Duration::minutes((step as i64) * 10);
             let value = generate_value(cfg, step);
             let time_str = time.to_rfc3339();
 
             batch_values.push(format!(
-                "('{site_id}', '{param_id}', '{time_str}', {value})",
+                "('{stream}', '{site_id}', '{param_id}', '{time_str}', {value})",
                 site_id = cfg.site_id,
                 param_id = cfg.global_param_id,
             ));
@@ -214,7 +243,7 @@ async fn seed_readings(db: &DatabaseConnection) {
 
 async fn flush_readings(db: &DatabaseConnection, values: &[String]) {
     let sql = format!(
-        "INSERT INTO readings (site_id, parameter_id, time, raw_value) VALUES {} ON CONFLICT DO NOTHING",
+        "INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value) VALUES {} ON CONFLICT DO NOTHING",
         values.join(", ")
     );
     exec(db, &sql).await;

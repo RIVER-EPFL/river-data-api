@@ -21,12 +21,15 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
         "SELECT remove_continuous_aggregate_policy('readings_weekly', if_not_exists => true)",
         "SELECT remove_continuous_aggregate_policy('readings_daily', if_not_exists => true)",
         "SELECT remove_continuous_aggregate_policy('readings_hourly', if_not_exists => true)",
-        "TRUNCATE alarm_thresholds, sensor_calibrations, sensor_deployments, \
-         readings, status_events, public_exposed_parameters, api_tokens, \
-         site_parameters, sensors, derived_parameter_sources, derived_parameter_definitions, \
-         parameters, sites, projects, data_streams, sync_services, sync_commands, sync_events, \
-         sync_service_credentials, sync_service_tokens, annotations, notes, field_trips, \
-         constants, standard_curves, samples, pairing_plans CASCADE",
+        "TRUNCATE readings, status_events, samples, \
+         sync_service_tokens, sync_events, sync_commands, sync_services, sync_service_credentials, \
+         pairing_plans, data_streams, \
+         annotations, notes, \
+         alarm_thresholds, public_exposed_parameters, api_tokens, \
+         sensor_calibrations, sensor_deployments, sensors, \
+         derived_parameter_sources, derived_parameter_definitions, \
+         standard_curves, constants, \
+         site_parameters, parameters, sites, projects CASCADE",
     ];
 
     for sql in &stmts {
