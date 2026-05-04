@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
-use crate::entity::site_parameters;
+use crate::entity::{parameters, site_parameters};
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, enforce_time_range, resolve_site_with_project};
 use crate::services::bulk::{self, StreamableParam};
@@ -66,6 +66,8 @@ pub struct ReadingsResponse {
 pub struct ParameterData {
     pub id: Uuid,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     #[serde(rename = "type")]
     pub sensor_type: String,
     pub units: Option<String>,
@@ -196,6 +198,17 @@ pub async fn get_site_readings(
     let _param_info_map: HashMap<Uuid, &site_parameters::Model> =
         params_list.iter().map(|p| (p.parameter_id, p)).collect();
 
+    // Fetch global parameter display_names
+    let global_params = parameters::Entity::find()
+        .filter(parameters::Column::Id.is_in(param_ids.clone()))
+        .all(&state.db)
+        .await?;
+    let display_name_map: HashMap<Uuid, String> = global_params
+        .into_iter()
+        .filter(|p| !p.display_name.is_empty())
+        .map(|p| (p.id, p.display_name))
+        .collect();
+
     let include_alarms = query.alarms.unwrap_or(false);
     let include_flagged = query.include_flagged.unwrap_or(true);
     let include_replicates = query.include_replicates.unwrap_or(false) || query.sample_id.is_some();
@@ -320,8 +333,14 @@ pub async fn get_site_readings(
         String::new()
     };
 
+    let order_clause = if include_replicates {
+        "ORDER BY r.parameter_id, r.time, r.replicate_index"
+    } else {
+        "ORDER BY r.parameter_id, r.time"
+    };
+
     let sql = format!(
-        "SELECT {select_clause} FROM {from_clause} WHERE r.site_id = $1 AND r.parameter_id IN ({}){time_conditions}{measurement_type_condition}{flagged_condition}{replicate_condition}{sample_id_condition} ORDER BY r.parameter_id, r.time",
+        "SELECT {select_clause} FROM {from_clause} WHERE r.site_id = $1 AND r.parameter_id IN ({}){time_conditions}{measurement_type_condition}{flagged_condition}{replicate_condition}{sample_id_condition} {order_clause}",
         placeholders.join(",")
     );
 
@@ -335,6 +354,96 @@ pub async fn get_site_readings(
         .await?;
 
     let estimated_times = query_result.len() / num_params.max(1);
+
+    // When include_replicates is true, multiple rows can share the same timestamp
+    // (different replicate_index). We use sequential indexing to preserve all rows
+    // instead of the HashSet deduplication that would collapse them.
+    if include_replicates {
+        let mut param_rows: HashMap<Uuid, Vec<(DateTime<Utc>, f64, Option<bool>, Option<String>)>> =
+            HashMap::with_capacity(num_params);
+
+        for row in &query_result {
+            if let Ok(r) = ReadingRow::from_query_result(row, "") {
+                let time = r.time.with_timezone(&Utc);
+                param_rows
+                    .entry(r.parameter_id)
+                    .or_insert_with(|| Vec::with_capacity(estimated_times))
+                    .push((time, r.value, r.is_flagged, r.flag_reason));
+            }
+        }
+
+        // Build times from the parameter with the most rows (all params should have same
+        // timestamps when querying by sample_id, but be defensive)
+        let max_param = param_rows.values().max_by_key(|v| v.len());
+        let times: Vec<DateTime<Utc>> = max_param
+            .map(|rows| rows.iter().map(|(t, ..)| *t).collect())
+            .unwrap_or_default();
+
+        let param_data: Vec<ParameterData> = params_list
+            .iter()
+            .map(|sp| {
+                let rows = param_rows.get(&sp.parameter_id);
+                let len = times.len();
+                let mut values = vec![None; len];
+                let mut flagged_vec: Option<Vec<Option<bool>>> = if include_flagged {
+                    Some(vec![None; len])
+                } else {
+                    None
+                };
+                let mut flag_reasons_vec: Option<Vec<Option<String>>> = if include_flagged {
+                    Some(vec![None; len])
+                } else {
+                    None
+                };
+
+                if let Some(rows) = rows {
+                    for (i, (_, value, is_flag, reason)) in rows.iter().enumerate() {
+                        if i < len {
+                            values[i] = Some(*value);
+                            if let Some(ref mut fv) = flagged_vec {
+                                fv[i] = *is_flag;
+                            }
+                            if let Some(ref mut rv) = flag_reasons_vec {
+                                rv[i] = reason.clone();
+                            }
+                        }
+                    }
+                }
+
+                ParameterData {
+                    id: sp.id,
+                    name: sp.name.clone(),
+                    display_name: display_name_map.get(&sp.parameter_id).cloned(),
+                    sensor_type: if sp.sensor_type.is_empty() { sp.name.clone() } else { sp.sensor_type.clone() },
+                    units: sp.display_units.clone(),
+                    values,
+                    severities: None,
+                    flagged: flagged_vec,
+                    flag_reasons: flag_reasons_vec,
+                }
+            })
+            .collect();
+
+        let actual_start = times.first().copied();
+        let actual_end = times.last().copied();
+
+        return match format.as_str() {
+            "csv" => bulk::build_csv_response(&times, &param_data),
+            "ndjson" => bulk::build_ndjson_response(&times, &param_data),
+            _ => {
+                let response = ReadingsResponse {
+                    project: project_ref,
+                    site: site_ref,
+                    start: actual_start,
+                    end: actual_end,
+                    times,
+                    parameters: param_data,
+                };
+                cache::cache_and_respond(&state, cache_key, &response, actual_end).await
+            }
+        };
+    }
+
     let mut time_set: HashSet<DateTime<Utc>> = HashSet::with_capacity(estimated_times);
     let mut param_values: HashMap<Uuid, Vec<(DateTime<Utc>, f64)>> =
         HashMap::with_capacity(num_params);
@@ -443,6 +552,7 @@ pub async fn get_site_readings(
             ParameterData {
                 id: sp.id,
                 name: sp.name.clone(),
+                display_name: display_name_map.get(&sp.parameter_id).cloned(),
                 sensor_type: if sp.sensor_type.is_empty() { sp.name.clone() } else { sp.sensor_type.clone() },
                 units: sp.display_units.clone(),
                 values,

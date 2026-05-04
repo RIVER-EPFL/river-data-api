@@ -30,11 +30,12 @@ pub struct Model {
     #[crudcrate(sortable)]
     pub default_units: String,
     #[sea_orm(column_type = "String(StringLen::N(32))")]
-    #[crudcrate(filterable)]
+    #[crudcrate(filterable, sortable)]
     pub category: String,
     #[sea_orm(column_type = "String(StringLen::N(16))")]
-    #[crudcrate(filterable)]
+    #[crudcrate(filterable, sortable)]
     pub data_type: String,
+    #[crudcrate(sortable)]
     pub description: Option<String>,
     #[crudcrate(filterable)]
     pub aliases: Vec<String>,

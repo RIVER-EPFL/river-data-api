@@ -1,4 +1,6 @@
+use async_trait::async_trait;
 use chrono::Utc;
+use crudcrate::{ApiError, CRUDOperations};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
     QueryFilter, QueryOrder, Set, Statement,
@@ -6,7 +8,55 @@ use sea_orm::{
 use uuid::Uuid;
 
 use crate::entity::{data_streams, sensor_calibrations, sensor_deployments, sensors};
+use crate::entity::sensors::Sensor;
 use crate::error::AppResult;
+
+pub struct SensorOperations;
+
+#[async_trait]
+impl CRUDOperations for SensorOperations {
+    type Resource = Sensor;
+
+    async fn after_get_one(
+        &self,
+        db: &DatabaseConnection,
+        entity: &mut Sensor,
+    ) -> Result<(), ApiError> {
+        let id = entity.id;
+
+        let reading_row = db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT COUNT(*) as count, MAX(time) as last_time FROM readings WHERE sensor_id = $1",
+                [id.into()],
+            ))
+            .await
+            .map_err(ApiError::database)?;
+
+        if let Some(row) = reading_row {
+            entity.reading_count = Some(row.try_get("", "count").unwrap_or(0));
+            entity.last_reading_at = row
+                .try_get::<chrono::DateTime<chrono::FixedOffset>>("", "last_time")
+                .ok()
+                .map(|t| t.with_timezone(&Utc));
+        }
+
+        let cal_row = db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT MAX(valid_from) as last_cal FROM sensor_calibrations WHERE sensor_id = $1",
+                [id.into()],
+            ))
+            .await
+            .map_err(ApiError::database)?;
+
+        entity.last_calibration_at = cal_row
+            .and_then(|r| r.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "last_cal").ok())
+            .map(|t| t.with_timezone(&Utc));
+
+        Ok(())
+    }
+}
 
 /// Resolved sensor context for readings.
 #[derive(Debug, Clone)]

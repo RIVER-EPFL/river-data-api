@@ -14,7 +14,8 @@ use sea_orm::entity::prelude::*;
     api_struct = "Sensor",
     name_singular = "sensor",
     name_plural = "sensors",
-    generate_router
+    generate_router,
+    operations = crate::services::operations::sensor_ops::SensorOperations
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
@@ -42,6 +43,15 @@ pub struct Model {
     #[sea_orm(ignore)]
     #[crudcrate(non_db_attr = true, exclude(create, update), join(one, all, depth = 1))]
     pub deployments: Vec<super::sensor_deployments::SensorDeployment>,
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update, list))]
+    pub reading_count: Option<i64>,
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update, list))]
+    pub last_reading_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update, list))]
+    pub last_calibration_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

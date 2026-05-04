@@ -41,6 +41,7 @@ async fn get_or_create_grab_stream(
     db: &sea_orm::DatabaseConnection,
     site_id: Uuid,
     parameter_id: Uuid,
+    site_parameter_id: Option<Uuid>,
 ) -> Result<Uuid, AppError> {
     let source_key = format!("{site_id}:{parameter_id}");
 
@@ -50,6 +51,16 @@ async fn get_or_create_grab_stream(
         .one(db)
         .await?
     {
+        // Auto-pair existing unpaired stream
+        if stream.site_parameter_id.is_none() {
+            if let Some(sp_id) = site_parameter_id {
+                let mut active: data_streams::ActiveModel = stream.clone().into();
+                active.site_parameter_id = Set(Some(sp_id));
+                active.paired_at = Set(Some(chrono::Utc::now().into()));
+                active.updated_at = Set(chrono::Utc::now().into());
+                active.update(db).await?;
+            }
+        }
         return Ok(stream.id);
     }
 
@@ -62,11 +73,11 @@ async fn get_or_create_grab_stream(
         source_name: Set(Some("Grab sample".to_string())),
         source_path: Set(None),
         metadata: Set(serde_json::json!({})),
-        site_parameter_id: Set(None),
+        site_parameter_id: Set(site_parameter_id),
         sensor_id: Set(None),
         is_active: Set(true),
         discovered_at: Set(now.into()),
-        paired_at: Set(None),
+        paired_at: Set(site_parameter_id.map(|_| now.into())),
         last_data_time: Set(None),
         pairing_plan_id: Set(None),
         created_at: Set(now.into()),
@@ -166,6 +177,10 @@ pub async fn insert_grab_samples(
 
     let valid_param_ids: std::collections::HashSet<Uuid> =
         site_params.iter().map(|sp| sp.parameter_id).collect();
+    let sp_lookup: HashMap<Uuid, Uuid> = site_params
+        .iter()
+        .map(|sp| (sp.parameter_id, sp.id))
+        .collect();
 
     for r in &payload.readings {
         if !valid_param_ids.contains(&r.parameter_id) {
@@ -180,8 +195,10 @@ pub async fn insert_grab_samples(
     let mut stream_cache: HashMap<Uuid, Uuid> = HashMap::new();
     for r in &payload.readings {
         if !stream_cache.contains_key(&r.parameter_id) {
+            let sp_id = sp_lookup.get(&r.parameter_id).copied();
             let stream_id =
-                get_or_create_grab_stream(&state.db, payload.site_id, r.parameter_id).await?;
+                get_or_create_grab_stream(&state.db, payload.site_id, r.parameter_id, sp_id)
+                    .await?;
             stream_cache.insert(r.parameter_id, stream_id);
         }
     }
