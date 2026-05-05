@@ -530,11 +530,8 @@ pub async fn revert_plan(
 
     txn.commit().await?;
 
-    // Refresh aggregates
-    let db_clone = db.clone();
-    tokio::spawn(async move {
-        crate::services::sync_state::refresh_continuous_aggregates_full(&db_clone).await;
-    });
+    // Refresh aggregates synchronously so callers see consistent state
+    crate::services::sync_state::refresh_continuous_aggregates_full(db).await;
 
     tracing::info!(plan_id = %plan_id, reverted, "Pairing plan reverted");
     Ok(reverted)
@@ -643,7 +640,7 @@ async fn resolve_or_create_project<C: ConnectionTrait>(
         id: Set(id),
         name: Set(entity_ref.name.clone()),
         description: Set(None),
-        data_source: Set(source_system.to_string()),
+        data_source: Set(Some(source_system.to_string())),
         is_public: Set(false),
         public_slug: Set(None),
         public_api_title: Set(None),

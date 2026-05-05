@@ -26,7 +26,7 @@ pub struct Model {
     #[crudcrate(filterable, fulltext, sortable)]
     pub name: String,
     #[crudcrate(filterable)]
-    pub data_source: String,
+    pub data_source: Option<String>,
     pub description: Option<String>,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,

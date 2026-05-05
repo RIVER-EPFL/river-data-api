@@ -202,7 +202,7 @@ pub fn enforce_time_range(
             ));
         }
         let span = e - effective_start;
-        if span.num_days() > max_days {
+        if span > chrono::Duration::days(max_days) {
             return Err(AppError::BadRequest(format!(
                 "Time range exceeds maximum of {max_days} days"
             )));
@@ -210,7 +210,7 @@ pub fn enforce_time_range(
     } else {
         // No end specified — check span against now
         let span = chrono::Utc::now() - effective_start;
-        if span.num_days() > max_days {
+        if span > chrono::Duration::days(max_days) {
             return Err(AppError::BadRequest(format!(
                 "Time range exceeds maximum of {max_days} days (provide a narrower start or add an end time)"
             )));
