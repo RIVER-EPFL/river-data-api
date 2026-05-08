@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use river_data_sync_common::models::SyncResult;
@@ -12,6 +13,7 @@ pub struct VaisalaSyncService {
     config: SyncConfig,
     api: RiverDataClient,
     vaisala: VaisalaClient,
+    has_discovered: AtomicBool,
 }
 
 impl VaisalaSyncService {
@@ -20,6 +22,7 @@ impl VaisalaSyncService {
             config,
             api,
             vaisala,
+            has_discovered: AtomicBool::new(false),
         }
     }
 }
@@ -38,15 +41,21 @@ impl SyncService for VaisalaSyncService {
         let mut errors = Vec::new();
         let mut log = Vec::new();
 
-        // Discover streams on every sync cycle (idempotent)
-        match sync::discover_streams(&self.api, &self.vaisala).await {
-            Ok(stream_map) => log.push(format!(
-                "Stream discovery: {} streams registered",
-                stream_map.len()
-            )),
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to discover streams from Vaisala");
-                errors.push(format!("Stream discovery: {e}"));
+        // Discovery: once on startup + on full sync (not every cycle)
+        let should_discover = full || !self.has_discovered.load(Ordering::Relaxed);
+        if should_discover {
+            match sync::discover_streams(&self.api, &self.vaisala).await {
+                Ok(stream_map) => {
+                    self.has_discovered.store(true, Ordering::Relaxed);
+                    log.push(format!(
+                        "Stream discovery: {} streams registered",
+                        stream_map.len()
+                    ));
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to discover streams from Vaisala");
+                    errors.push(format!("Stream discovery: {e}"));
+                }
             }
         }
 
