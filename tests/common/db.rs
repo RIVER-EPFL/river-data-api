@@ -24,6 +24,7 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
         "TRUNCATE readings, status_events, samples, \
          sync_service_tokens, sync_events, sync_commands, sync_services, sync_service_credentials, \
          pairing_plans, data_streams, \
+         reprocessing_jobs, \
          annotations, notes, \
          alarm_thresholds, public_exposed_parameters, api_tokens, \
          sensor_calibrations, sensor_deployments, sensors, \

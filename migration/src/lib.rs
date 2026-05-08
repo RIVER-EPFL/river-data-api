@@ -7,6 +7,7 @@ mod m20260504_000001_fk_indexes;
 mod m20260504_000002_derived_output_param;
 mod m20260504_000003_drop_field_trips;
 mod m20260508_000001_exclude_flagged_from_aggregates;
+mod m20260509_000001_reprocessing;
 
 pub struct Migrator;
 
@@ -21,6 +22,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260504_000002_derived_output_param::Migration),
             Box::new(m20260504_000003_drop_field_trips::Migration),
             Box::new(m20260508_000001_exclude_flagged_from_aggregates::Migration),
+            Box::new(m20260509_000001_reprocessing::Migration),
         ]
     }
 }

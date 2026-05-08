@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -333,4 +334,200 @@ pub async fn recalculate_derived_at_timestamp(
     }
 
     Ok(())
+}
+
+/// Recompute `valid_until` for all calibrations of a sensor.
+/// Sets each calibration's `valid_until` to the next calibration's `valid_from`.
+/// The latest calibration gets `valid_until = NULL` (open-ended).
+pub async fn recompute_valid_until(
+    db: &DatabaseConnection,
+    sensor_id: Uuid,
+) -> Result<(), sea_orm::DbErr> {
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"WITH ordered AS (
+            SELECT id,
+                   LEAD(valid_from) OVER (ORDER BY valid_from) AS next_from
+            FROM sensor_calibrations
+            WHERE sensor_id = $1
+        )
+        UPDATE sensor_calibrations sc
+        SET valid_until = ordered.next_from
+        FROM ordered
+        WHERE sc.id = ordered.id AND sc.sensor_id = $1",
+        [sensor_id.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Reprocess all readings for a sensor: re-derive calibration_id, deployment_id,
+/// site_id, and calibrated_value from current calibration and deployment windows.
+/// Then cascade to derived parameters and refresh aggregates.
+pub async fn reprocess_sensor_readings(
+    db: &DatabaseConnection,
+    sensor_id: Uuid,
+) -> Result<usize, sea_orm::DbErr> {
+    // Reassign calibration_id and recalculate calibrated_value
+    let cal_result = db
+        .execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE readings r
+            SET calibration_id = cw.id,
+                calibrated_value = cw.slope * r.raw_value + cw.intercept
+            FROM (
+                SELECT id, slope, intercept, valid_from,
+                       COALESCE(valid_until, 'infinity'::timestamptz) AS valid_until
+                FROM sensor_calibrations
+                WHERE sensor_id = $1
+            ) cw
+            WHERE r.sensor_id = $1
+              AND r.time >= cw.valid_from
+              AND r.time < cw.valid_until",
+            [sensor_id.into()],
+        ))
+        .await?;
+    let readings_updated = cal_result.rows_affected() as usize;
+
+    // Reassign deployment_id and site_id
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"UPDATE readings r
+        SET deployment_id = dw.id,
+            site_id = dw.site_id
+        FROM (
+            SELECT id, site_id, deployed_from,
+                   COALESCE(deployed_until, 'infinity'::timestamptz) AS deployed_until
+            FROM sensor_deployments
+            WHERE sensor_id = $1
+        ) dw
+        WHERE r.sensor_id = $1
+          AND r.time >= dw.deployed_from
+          AND r.time < dw.deployed_until",
+        [sensor_id.into()],
+    ))
+    .await?;
+
+    // Cascade to derived parameters
+    let affected = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT DISTINCT site_id, time FROM readings
+              WHERE sensor_id = $1 AND site_id IS NOT NULL",
+            [sensor_id.into()],
+        ))
+        .await?;
+
+    for row in &affected {
+        let site_id: Uuid = row.try_get("", "site_id")?;
+        let time: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
+        let utc_time = time.with_timezone(&Utc);
+        if let Err(e) = recalculate_derived_at_timestamp(db, site_id, utc_time).await {
+            tracing::warn!(
+                error = %e,
+                site_id = %site_id,
+                time = %utc_time,
+                "Failed to cascade reprocessing to derived parameter"
+            );
+        }
+    }
+
+    // Refresh aggregates for affected time range
+    let time_range = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT MIN(time) AS min_time, MAX(time) AS max_time
+              FROM readings WHERE sensor_id = $1",
+            [sensor_id.into()],
+        ))
+        .await?;
+
+    if let Some(ref range) = time_range {
+        let min_time: Option<DateTime<Utc>> = range.try_get("", "min_time").ok();
+        if let Some(since) = min_time {
+            crate::services::sync_state::refresh_continuous_aggregates(db, Some(since)).await;
+        }
+    }
+
+    Ok(readings_updated)
+}
+
+/// Create a reprocessing job record and spawn the reprocessing task.
+/// The job tracks status (pending → running → completed/failed).
+pub async fn spawn_reprocessing_job(
+    db: &DatabaseConnection,
+    sensor_id: Uuid,
+    trigger_type: &str,
+    trigger_id: Option<Uuid>,
+) -> Result<Uuid, sea_orm::DbErr> {
+    let job_id = Uuid::new_v4();
+    let trigger_id_sql = trigger_id
+        .map(|id| format!("'{id}'"))
+        .unwrap_or_else(|| "NULL".to_string());
+
+    db.execute(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status) \
+             VALUES ('{job_id}', '{sensor_id}', '{trigger_type}', {trigger_id_sql}, 'pending')"
+        ),
+    ))
+    .await?;
+
+    let db = db.clone();
+    let trigger_type = trigger_type.to_string();
+    tokio::spawn(async move {
+        let _ = db
+            .execute(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "UPDATE reprocessing_jobs SET status = 'running' WHERE id = '{job_id}'"
+                ),
+            ))
+            .await;
+
+        match reprocess_sensor_readings(&db, sensor_id).await {
+            Ok(count) => {
+                let _ = db
+                    .execute(Statement::from_string(
+                        sea_orm::DatabaseBackend::Postgres,
+                        format!(
+                            "UPDATE reprocessing_jobs \
+                             SET status = 'completed', readings_updated = {count}, \
+                                 completed_at = NOW() \
+                             WHERE id = '{job_id}'"
+                        ),
+                    ))
+                    .await;
+                tracing::info!(
+                    sensor_id = %sensor_id,
+                    readings_updated = count,
+                    trigger = %trigger_type,
+                    "Reprocessing completed"
+                );
+            }
+            Err(e) => {
+                let msg = e.to_string().replace('\'', "''");
+                let _ = db
+                    .execute(Statement::from_string(
+                        sea_orm::DatabaseBackend::Postgres,
+                        format!(
+                            "UPDATE reprocessing_jobs \
+                             SET status = 'failed', error_message = '{msg}', \
+                                 completed_at = NOW() \
+                             WHERE id = '{job_id}'"
+                        ),
+                    ))
+                    .await;
+                tracing::error!(
+                    error = %e,
+                    sensor_id = %sensor_id,
+                    trigger = %trigger_type,
+                    "Reprocessing failed"
+                );
+            }
+        }
+    });
+
+    Ok(job_id)
 }

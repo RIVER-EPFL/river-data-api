@@ -27,6 +27,8 @@ pub struct Model {
     pub performed_by: Option<String>,
     pub notes: Option<String>,
     #[crudcrate(exclude(create, update))]
+    pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    #[crudcrate(exclude(create, update))]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 

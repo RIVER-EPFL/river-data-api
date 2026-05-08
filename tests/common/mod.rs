@@ -2,6 +2,7 @@ pub mod client;
 pub mod db;
 pub mod fixtures;
 pub mod seed;
+pub mod sensor_lifecycle;
 
 use river_db::common::AppState;
 use river_db::config::Config;

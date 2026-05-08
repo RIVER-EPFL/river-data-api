@@ -1,0 +1,38 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      timescaledb:
+        image: timescale/timescaledb:2.23.0-pg18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: psql
+          POSTGRES_DB: river_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        env:
+          DATABASE_URL: postgresql://postgres:psql@localhost:5432/river_test
+          RUST_LOG: warn
+        run: cargo test --tests -- --test-threads=1
