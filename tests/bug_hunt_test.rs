@@ -103,7 +103,9 @@ async fn bug1_flagged_readings_still_in_aggregates() {
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
-                "SELECT avg_value FROM readings_hourly WHERE site_id = '{sid}' AND parameter_id = '{gid}'",
+                "SELECT avg_value FROM readings_hourly \
+                 WHERE site_id = '{sid}' AND parameter_id = '{gid}' \
+                 AND bucket >= '2025-06-01' AND bucket < '2025-06-02'",
                 sid = common::SITE1_ID,
                 gid = common::GLOBAL_PARAM_TEMP_ID
             ),
@@ -138,7 +140,9 @@ async fn bug1_flagged_readings_still_in_aggregates() {
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
-                "SELECT avg_value, count FROM readings_hourly WHERE site_id = '{sid}' AND parameter_id = '{gid}'",
+                "SELECT avg_value, count FROM readings_hourly \
+                 WHERE site_id = '{sid}' AND parameter_id = '{gid}' \
+                 AND bucket >= '2025-06-01' AND bucket < '2025-06-02'",
                 sid = common::SITE1_ID,
                 gid = common::GLOBAL_PARAM_TEMP_ID
             ),
@@ -355,27 +359,73 @@ async fn bug4_calibration_formula_correctness() {
 }
 
 // ============================================================================
-// Bug 5: Slope=0 produces constant calibrated_value with no warning
+// Bug 5: Slope=0 should be rejected by validation
 // ============================================================================
 
 #[tokio::test]
-async fn bug5_slope_zero_produces_constant_value() {
-    let result1 = river_db::services::calibration::apply_calibration(0.0, 0.0, 5.0);
-    let result2 = river_db::services::calibration::apply_calibration(100.0, 0.0, 5.0);
-    let result3 = river_db::services::calibration::apply_calibration(999.0, 0.0, 5.0);
+#[serial]
+async fn bug5_slope_zero_rejected_by_validation() {
+    let db = common::setup_test_db().await;
+    common::cleanup_test_db(&db).await;
 
-    // All produce the same value regardless of raw input
-    assert_eq!(result1, 5.0);
-    assert_eq!(result2, 5.0);
-    assert_eq!(result3, 5.0);
+    common::db::exec(
+        &db,
+        &format!(
+            "INSERT INTO projects (id, name, data_source) VALUES ('{pid}', 'Bug5 Project', 'test')",
+            pid = common::PROJECT_ID
+        ),
+    )
+    .await;
+    common::db::exec(
+        &db,
+        &format!(
+            "INSERT INTO sites (id, project_id, name) VALUES ('{sid}', '{pid}', 'Bug5 Site')",
+            sid = common::SITE1_ID,
+            pid = common::PROJECT_ID
+        ),
+    )
+    .await;
 
-    // BUG: This should ideally fail or at least warn.
-    // For now, document that slope=0 is silently accepted.
-    // The real fix is validation on sensor_calibration create/update.
-    // This test passes but documents the problematic behavior.
-    panic!(
-        "slope=0 calibration silently accepted: ALL inputs produce constant value 5.0. \
-         This is almost certainly a data entry error but no validation prevents it."
+    common::db::exec(
+        &db,
+        &format!(
+            "INSERT INTO parameters (id, name, display_name, default_units, category, data_type) \
+             VALUES ('{gid}', 'Temperature', 'Temperature', '°C', 'measurement', 'numeric')",
+            gid = common::GLOBAL_PARAM_TEMP_ID
+        ),
+    )
+    .await;
+
+    let sensor_id = "00000000-0000-4000-e000-000000000001";
+    common::db::exec(
+        &db,
+        &format!(
+            "INSERT INTO sensors (id, serial_number, parameter_id, manufacturer, model) \
+             VALUES ('{sensor_id}', 'TEST-001', '{pid}', 'TestCo', 'T1')",
+            pid = common::GLOBAL_PARAM_TEMP_ID
+        ),
+    )
+    .await;
+
+    let app = common::build_test_app(db.clone());
+    let token = common::seed_api_token(&db, common::full_permissions(), None).await;
+
+    let (status, body) = common::post_json_with_token(
+        &app,
+        "/api/service/sensor_calibrations",
+        &serde_json::json!({
+            "sensor_id": sensor_id,
+            "slope": 0.0,
+            "intercept": 5.0,
+            "valid_from": "2025-01-01T00:00:00Z"
+        }),
+        &token,
+    )
+    .await;
+
+    assert_eq!(
+        status, 400,
+        "slope=0 should be rejected but got {status}: {body}"
     );
 }
 

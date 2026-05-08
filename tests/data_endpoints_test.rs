@@ -170,7 +170,7 @@ async fn test_readings_with_alarms() {
 
 #[tokio::test]
 #[serial]
-async fn test_readings_no_time_range() {
+async fn test_readings_with_explicit_time_range() {
     let (_db, app, token) = setup().await;
     let site_id = common::SITE1_ID;
 
@@ -187,7 +187,7 @@ async fn test_readings_no_time_range() {
     let times = body["times"].as_array().unwrap();
     assert!(
         !times.is_empty(),
-        "should return data when no time range specified"
+        "should return data for the given time range"
     );
 
     assert!(body["start"].is_string(), "response should have start");
