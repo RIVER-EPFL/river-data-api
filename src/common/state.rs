@@ -1,6 +1,7 @@
 use axum_keycloak_auth::instance::KeycloakAuthInstance;
 use chrono::{DateTime, Utc};
 use moka::future::Cache;
+use river_data_core::server::SyncState;
 use sea_orm::DatabaseConnection;
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,5 +90,11 @@ impl AppState {
             keycloak_admin,
             token_cache,
         }
+    }
+}
+
+impl SyncState for AppState {
+    fn db(&self) -> &DatabaseConnection {
+        &self.db
     }
 }

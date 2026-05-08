@@ -6,7 +6,6 @@ pub mod readings_batch;
 pub mod search;
 pub mod status_events_batch;
 pub mod streams;
-pub mod sync_control;
 pub mod tools;
 
 use axum::{Router, middleware, routing::{get, patch, post}};
@@ -230,55 +229,28 @@ pub fn service_router(state: &AppState) -> Router<()> {
         .merge(data_read_routes)
 }
 
-/// Build the sync control plane routes.
+/// Build the sync control plane routes from the core library.
 ///
-/// These are mounted under `/api/service/` but bypass `service_auth_middleware`
-/// because they use their own auth mechanisms:
-/// - Enroll: `client_id` + `client_secret` in the JSON body
-/// - Heartbeat/commands: sync session token via `sync_service_auth_middleware`
-///
-/// Returns `Router<AppState>` so the caller can nest it alongside other
-/// `AppState`-typed routers; `with_state()` is applied by `build_router()`.
-pub fn sync_control_router(state: &AppState) -> Router<AppState> {
-    let sync_enroll_routes: Router<AppState> = {
-        use std::sync::Arc;
-        use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
-        use crate::services::FallbackIpKeyExtractor;
+/// Mounted under `/api/service/sync` — bypasses `service_auth_middleware`.
+/// Auth is handled by the library's `SyncServiceContext` extractor (session tokens).
+/// Enrollment is unauthenticated (credentials in body), with rate limiting.
+pub fn sync_control_router(_state: &AppState) -> Router<AppState> {
+    use std::sync::Arc;
+    use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
+    use crate::services::FallbackIpKeyExtractor;
 
-        let enroll_limiter = GovernorConfigBuilder::default()
-            .key_extractor(FallbackIpKeyExtractor)
-            .per_second(3)
-            .burst_size(10)
-            .finish()
-            .expect("Failed to create enroll rate limiter");
+    let (service_routes, _admin_routes) = river_data_core::server::routes::<AppState>();
 
-        Router::new()
-            .route("/sync/enroll", post(sync_control::enroll))
-            .layer(GovernorLayer {
-                config: Arc::new(enroll_limiter),
-            })
-    };
-
-    let sync_authenticated_routes: Router<AppState> = Router::new()
-        .route("/sync/heartbeat", post(sync_control::heartbeat))
-        .route(
-            "/sync/commands/{id}",
-            axum::routing::patch(sync_control::update_command),
-        )
-        .route(
-            "/sync/events",
-            post(sync_control::create_sync_event),
-        )
-        .route(
-            "/sync/events/{id}",
-            axum::routing::patch(sync_control::update_sync_event),
-        )
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            crate::common::middleware::sync_service_auth_middleware,
-        ));
+    let enroll_limiter = GovernorConfigBuilder::default()
+        .key_extractor(FallbackIpKeyExtractor)
+        .per_second(3)
+        .burst_size(10)
+        .finish()
+        .expect("Failed to create enroll rate limiter");
 
     Router::new()
-        .merge(sync_enroll_routes)
-        .merge(sync_authenticated_routes)
+        .nest("/sync", service_routes)
+        .layer(GovernorLayer {
+            config: Arc::new(enroll_limiter),
+        })
 }

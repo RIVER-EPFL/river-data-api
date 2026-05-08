@@ -83,6 +83,9 @@ migration = { path = "migration" }
 # Hydrochemistry calculation tools
 river-data-toolbox = { path = "river-data-toolbox" }
 
+# Core sync control plane library
+river-data-core = { path = "../river-data-core", features = ["server"] }
+
 [dev-dependencies]
 tokio-test = "0.4"
 reqwest = { version = "0.12", features = ["json"] }

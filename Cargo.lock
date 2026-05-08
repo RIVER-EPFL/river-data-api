@@ -2692,6 +2692,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "river-data-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "moka",
+ "rand 0.9.2",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "river-data-sync-common"
 version = "0.1.0"
 dependencies = [
@@ -2772,6 +2791,7 @@ dependencies = [
  "moka",
  "rand 0.9.2",
  "reqwest",
+ "river-data-core",
  "river-data-toolbox",
  "sea-orm",
  "sea-orm-migration",
