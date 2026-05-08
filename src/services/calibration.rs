@@ -297,12 +297,31 @@ pub async fn recalculate_derived_at_timestamp(
             if !result.is_finite() {
                 continue;
             }
+
+            let stream_row = db
+                .query_one(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    r"SELECT id FROM data_streams WHERE site_parameter_id = $1 LIMIT 1",
+                    [item.site_param_id.into()],
+                ))
+                .await?;
+
+            let Some(stream_row) = stream_row else {
+                tracing::warn!(
+                    site_parameter_id = %item.site_param_id,
+                    "No data stream found for derived site_parameter, skipping"
+                );
+                continue;
+            };
+            let stream_id: Uuid = stream_row.try_get("", "id")?;
+
             db.execute(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                r"INSERT INTO readings (site_id, parameter_id, time, raw_value, calibrated_value)
-                  VALUES ($1, $2, $3, $4, $4)
-                  ON CONFLICT (site_id, parameter_id, time) DO UPDATE SET calibrated_value = $4",
+                r"INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, replicate_index)
+                  VALUES ($1, $2, $3, $4, $5, $5, 0)
+                  ON CONFLICT (stream_id, time, replicate_index) DO UPDATE SET calibrated_value = $5",
                 [
+                    stream_id.into(),
                     item.derived_site_id.into(),
                     item.derived_parameter_id.into(),
                     time.into(),

@@ -261,30 +261,55 @@ async fn ensure_output_parameter(
     }
 
     // Create or find the output parameter
-    let row = db
+    let existing = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"INSERT INTO parameters (id, name, display_name, default_units, category, data_type, description)
-              VALUES (gen_random_uuid(), $1, $2, $3, 'derived', 'float', $4)
-              ON CONFLICT (name) DO UPDATE SET
-                display_name = EXCLUDED.display_name,
-                default_units = EXCLUDED.default_units,
-                description = EXCLUDED.description
-              RETURNING id",
+            r"SELECT id FROM parameters WHERE LOWER(name) = LOWER($1) LIMIT 1",
+            [entity.name.clone().into()],
+        ))
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to lookup output parameter: {e}"), None))?;
+
+    let param_id = if let Some(row) = existing {
+        let id: Uuid = row
+            .try_get("", "id")
+            .map_err(|e| ApiError::internal(format!("Failed to read parameter id: {e}"), None))?;
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE parameters SET display_name = $2, default_units = $3, description = $4
+              WHERE id = $1",
             [
-                entity.name.clone().into(),
+                id.into(),
                 entity.display_name.clone().into(),
                 entity.units.clone().into(),
                 entity.description.clone().unwrap_or_default().into(),
             ],
         ))
         .await
-        .map_err(|e| ApiError::internal(format!("Failed to ensure output parameter: {e}"), None))?
-        .ok_or_else(|| ApiError::internal("No row returned from parameter upsert".to_string(), None))?;
-
-    let param_id: Uuid = row
-        .try_get("", "id")
-        .map_err(|e| ApiError::internal(format!("Failed to read parameter id: {e}"), None))?;
+        .map_err(|e| ApiError::internal(format!("Failed to update output parameter: {e}"), None))?;
+        id
+    } else {
+        let row = db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r"INSERT INTO parameters (id, name, display_name, default_units, category, data_type, description)
+                  VALUES (gen_random_uuid(), $1, $2, $3, 'derived', 'float', $4)
+                  RETURNING id",
+                [
+                    entity.name.clone().into(),
+                    entity.display_name.clone().into(),
+                    entity.units.clone().into(),
+                    entity.description.clone().unwrap_or_default().into(),
+                ],
+            ))
+            .await
+            .map_err(|e| ApiError::internal(format!("Failed to insert output parameter: {e}"), None))?
+            .ok_or_else(|| {
+                ApiError::internal("No row returned from parameter insert".to_string(), None)
+            })?;
+        row.try_get::<Uuid>("", "id")
+            .map_err(|e| ApiError::internal(format!("Failed to read parameter id: {e}"), None))?
+    };
 
     // Store the link on the definition
     db.execute(Statement::from_sql_and_values(

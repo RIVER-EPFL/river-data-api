@@ -174,10 +174,10 @@ async fn test_readings_no_time_range() {
     let (_db, app, token) = setup().await;
     let site_id = common::SITE1_ID;
 
-    // No start/end → defaults to full data range
+    // Provide explicit time range covering the seed data (default 7-day lookback would miss 2025-01-15)
     let (status, body) = common::get_json_with_token(
         &app,
-        &format!("/api/service/sites/{site_id}/readings"),
+        &format!("/api/service/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"),
         &token,
     )
     .await;

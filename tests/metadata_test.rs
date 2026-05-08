@@ -32,7 +32,7 @@ async fn test_list_projects() {
     let (status, body) = common::get_json_with_token(&app, "/api/service/projects", &token).await;
     assert_eq!(status, 200);
 
-    let projects = body["data"].as_array().expect("response should have data array");
+    let projects = body.as_array().expect("response should be an array");
     assert_eq!(projects.len(), 1);
 
     let p = &projects[0];
@@ -121,7 +121,7 @@ async fn test_list_sites() {
     let (status, body) = common::get_json_with_token(&app, "/api/service/sites", &token).await;
     assert_eq!(status, 200);
 
-    let sites = body["data"].as_array().expect("response should have data array");
+    let sites = body.as_array().expect("response should be an array");
     assert_eq!(sites.len(), 2);
 }
 

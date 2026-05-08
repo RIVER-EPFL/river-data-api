@@ -41,13 +41,13 @@ async fn test_csv_value_with_comma_is_properly_quoted() {
 
     let site_id = common::SITE1_ID;
     let param_id = common::GLOBAL_PARAM_TEMP_ID;
+    let stream_id = "00000000-0000-4000-d000-000000000001";
 
-    // Insert a status event with a comma in the value
     exec(
         &db,
         &format!(
-            "INSERT INTO status_events (site_id, parameter_id, time, value) \
-             VALUES ('{site_id}', '{param_id}', '2025-01-15T06:00:00Z', 'running,ok')"
+            "INSERT INTO status_events (stream_id, site_id, parameter_id, time, value) \
+             VALUES ('{stream_id}', '{site_id}', '{param_id}', '2025-01-15T06:00:00Z', 'running,ok')"
         ),
     )
     .await;
@@ -144,12 +144,13 @@ async fn test_status_events_ndjson_format() {
 
     let site_id = common::SITE1_ID;
     let param_id = common::GLOBAL_PARAM_TEMP_ID;
+    let stream_id = "00000000-0000-4000-d000-000000000001";
 
     exec(
         &db,
         &format!(
-            "INSERT INTO status_events (site_id, parameter_id, time, value) \
-             VALUES ('{site_id}', '{param_id}', '2025-01-15T06:00:00Z', 'online')"
+            "INSERT INTO status_events (stream_id, site_id, parameter_id, time, value) \
+             VALUES ('{stream_id}', '{site_id}', '{param_id}', '2025-01-15T06:00:00Z', 'online')"
         ),
     )
     .await;
