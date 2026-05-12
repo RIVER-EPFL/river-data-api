@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "migration", "river-data-toolbox"]
+members = [".", "migration"]
 resolver = "2"
 
 [package]
@@ -80,11 +80,8 @@ async-trait = "0.1"
 # Migration support
 migration = { path = "migration" }
 
-# Hydrochemistry calculation tools
-river-data-toolbox = { path = "river-data-toolbox" }
-
-# Core sync control plane library
-river-data-core = { version = "0.1.1", features = ["server"] }
+# Core library (sync control plane + hydrochemistry toolbox)
+river-data-core = { path = "../river-data-core", features = ["server", "toolbox"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

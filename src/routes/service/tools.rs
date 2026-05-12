@@ -7,7 +7,7 @@ use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 
 /// Cached gas constants — loaded from DB once, then reused for all pCO2 calculations.
-static GAS_CONSTANTS: OnceCell<river_data_toolbox::GasConstants> = OnceCell::const_new();
+static GAS_CONSTANTS: OnceCell<river_data_core::toolbox::GasConstants> = OnceCell::const_new();
 
 // ============================================================================
 // Constant lookup helper
@@ -66,8 +66,8 @@ pub async fn calculate_doc(Json(payload): Json<DocRequest>) -> AppResult<Json<To
         .std_curve
         .as_ref()
         .map(|c| (c.slope, c.intercept));
-    let avg = river_data_toolbox::doc_average(&payload.replicates, curve);
-    let sd = river_data_toolbox::doc_std_dev(&payload.replicates, curve);
+    let avg = river_data_core::toolbox::doc_average(&payload.replicates, curve);
+    let sd = river_data_core::toolbox::doc_std_dev(&payload.replicates, curve);
 
     Ok(Json(ToolResult {
         tool: "doc".to_string(),
@@ -95,14 +95,14 @@ pub struct TssAfdmRequest {
 pub async fn calculate_tss_afdm(
     Json(payload): Json<TssAfdmRequest>,
 ) -> AppResult<Json<ToolResult>> {
-    let tss = river_data_toolbox::tss_mg_l(
+    let tss = river_data_core::toolbox::tss_mg_l(
         payload.wgt_dried_g,
         payload.wgt_prefilt_g,
         payload.vol_filtered_ml,
     );
 
     let afdm = payload.wgt_ashed_g.map(|ashed| {
-        river_data_toolbox::afdm_mg_l(payload.wgt_dried_g, ashed, payload.vol_filtered_ml)
+        river_data_core::toolbox::afdm_mg_l(payload.wgt_dried_g, ashed, payload.vol_filtered_ml)
     });
 
     Ok(Json(ToolResult {
@@ -146,14 +146,14 @@ pub async fn calculate_chlorophyll(
                     "fluorescence_after required for acid method".to_string(),
                 )
             })?;
-            river_data_toolbox::chla_acid(
+            river_data_core::toolbox::chla_acid(
                 payload.fluorescence_before,
                 after,
                 payload.slope,
                 payload.intercept,
             )
         }
-        ChlorophyllMethod::NoAcid => river_data_toolbox::chla_no_acid(
+        ChlorophyllMethod::NoAcid => river_data_core::toolbox::chla_no_acid(
             payload.fluorescence_before,
             payload.slope,
             payload.intercept,
@@ -199,7 +199,7 @@ pub async fn calculate_nutrients(
 
     if let Some(species) = &payload.species {
         // Multi-species mode
-        let multi = river_data_toolbox::multi_nutrient_replicates(species);
+        let multi = river_data_core::toolbox::multi_nutrient_replicates(species);
         for (name, nr) in &multi {
             let upper = name.to_uppercase();
             results.insert(format!("NUT_{upper}_avg"), serde_json::json!(nr.mean));
@@ -207,9 +207,9 @@ pub async fn calculate_nutrients(
         }
     } else if let Some(replicates) = &payload.replicates {
         // Legacy single-species mode
-        let result = river_data_toolbox::nutrient_from_replicates(replicates);
+        let result = river_data_core::toolbox::nutrient_from_replicates(replicates);
         let no3 = match (payload.nox, payload.no2) {
-            (Some(nox), Some(no2)) => Some(river_data_toolbox::nitrate_from_nox_no2(nox, no2)),
+            (Some(nox), Some(no2)) => Some(river_data_core::toolbox::nitrate_from_nox_no2(nox, no2)),
             _ => None,
         };
         results.insert("NUT_avg".into(), serde_json::json!(result.mean));
@@ -253,7 +253,7 @@ pub async fn calculate_ions(Json(payload): Json<IonsRequest>) -> AppResult<Json<
         .map(|e| (e.name.as_str(), e.concentration_mg_l))
         .collect();
 
-    let result = river_data_toolbox::charge_balance(&cations, &anions);
+    let result = river_data_core::toolbox::charge_balance(&cations, &anions);
 
     Ok(Json(ToolResult {
         tool: "ions".to_string(),
@@ -282,7 +282,7 @@ pub struct AlkalinityRequest {
 pub async fn calculate_alkalinity(
     Json(payload): Json<AlkalinityRequest>,
 ) -> AppResult<Json<ToolResult>> {
-    let result = river_data_toolbox::gran_titration(
+    let result = river_data_core::toolbox::gran_titration(
         payload.sample_weight_g,
         payload.acid_normality,
         payload.titrant_volume_ml,
@@ -360,9 +360,9 @@ pub struct Pco2ReplicateBInput {
     pub d13co2_permil: Option<f64>,
 }
 
-async fn load_gas_constants(db: &DatabaseConnection) -> river_data_toolbox::GasConstants {
-    let defaults = river_data_toolbox::GasConstants::default();
-    river_data_toolbox::GasConstants {
+async fn load_gas_constants(db: &DatabaseConnection) -> river_data_core::toolbox::GasConstants {
+    let defaults = river_data_core::toolbox::GasConstants::default();
+    river_data_core::toolbox::GasConstants {
         kh_co2: get_constant(db, "kh_co2", defaults.kh_co2).await,
         c_const: get_constant(db, "c_const", defaults.c_const).await,
         gas_const_r_atm: get_constant(db, "gas_const_r_atm", defaults.gas_const_r_atm).await,
@@ -392,19 +392,19 @@ pub async fn calculate_pco2(db: &DatabaseConnection, Json(payload): Json<Pco2Req
 
             let pco2 = match payload.variant {
                 Pco2Variant::Simple => {
-                    river_data_toolbox::pco2_from_co2aq(co2_aq, payload.water_temp_c, &constants)
+                    river_data_core::toolbox::pco2_from_co2aq(co2_aq, payload.water_temp_c, &constants)
                 }
                 Pco2Variant::P1 => {
                     let bp = payload.pressure_hpa.ok_or_else(|| {
                         AppError::BadRequest("pressure_hpa required for P1 variant".to_string())
                     })?;
-                    river_data_toolbox::pco2_p1(co2_aq, payload.water_temp_c, bp, &constants)
+                    river_data_core::toolbox::pco2_p1(co2_aq, payload.water_temp_c, bp, &constants)
                 }
                 Pco2Variant::P2 => {
                     let bp = payload.pressure_hpa.ok_or_else(|| {
                         AppError::BadRequest("pressure_hpa required for P2 variant".to_string())
                     })?;
-                    river_data_toolbox::pco2_p2(co2_aq, payload.water_temp_c, bp, &constants)
+                    river_data_core::toolbox::pco2_p2(co2_aq, payload.water_temp_c, bp, &constants)
                 }
             };
 
@@ -436,7 +436,7 @@ pub async fn calculate_pco2(db: &DatabaseConnection, Json(payload): Json<Pco2Req
                 AppError::BadRequest("pressure_hpa is required for full_pipeline mode".to_string())
             })?;
 
-            let input_a = river_data_toolbox::Pco2FullInput {
+            let input_a = river_data_core::toolbox::Pco2FullInput {
                 co2_ppm,
                 h2o_percent,
                 ch4_ppm,
@@ -452,7 +452,7 @@ pub async fn calculate_pco2(db: &DatabaseConnection, Json(payload): Json<Pco2Req
             let mut results = serde_json::Map::new();
 
             if let Some(rep_b) = &payload.replicate_b {
-                let input_b = river_data_toolbox::Pco2FullInput {
+                let input_b = river_data_core::toolbox::Pco2FullInput {
                     co2_ppm: rep_b.co2_ppm,
                     h2o_percent: rep_b.h2o_percent,
                     ch4_ppm: rep_b.ch4_ppm,
@@ -466,7 +466,7 @@ pub async fn calculate_pco2(db: &DatabaseConnection, Json(payload): Json<Pco2Req
                     field_pressure_hpa,
                 };
 
-                let rep = river_data_toolbox::pco2_replicates(&input_a, &input_b, &constants);
+                let rep = river_data_core::toolbox::pco2_replicates(&input_a, &input_b, &constants);
 
                 results.insert("CO2_HS_Um_A".into(), serde_json::json!(rep.a.co2_hs_umol));
                 results.insert("CO2_HS_Um_B".into(), serde_json::json!(rep.b.co2_hs_umol));
@@ -483,7 +483,7 @@ pub async fn calculate_pco2(db: &DatabaseConnection, Json(payload): Json<Pco2Req
                 results.insert("CH4_umol_L_avg".into(), serde_json::json!(rep.ch4_dissolved_umol_avg));
                 results.insert("CH4_umol_L_sd".into(), serde_json::json!(rep.ch4_dissolved_umol_sd));
             } else {
-                let r = river_data_toolbox::pco2_full_pipeline(&input_a, &constants);
+                let r = river_data_core::toolbox::pco2_full_pipeline(&input_a, &constants);
 
                 results.insert("CO2_HS_Um_avg".into(), serde_json::json!(r.co2_hs_umol));
                 results.insert("pCO2_HS_uatm_avg".into(), serde_json::json!(r.pco2_uatm));
@@ -534,7 +534,7 @@ pub struct DicRequest {
 }
 
 pub async fn calculate_dic(db: &DatabaseConnection, Json(payload): Json<DicRequest>) -> AppResult<Json<ToolResult>> {
-    let constants = river_data_toolbox::DICConstants {
+    let constants = river_data_core::toolbox::DICConstants {
         h_co2_29815k: payload.h_co2_29815k.unwrap_or(get_constant(db, "h_co2_29815k", 0.034).await),
         gas_const_r_mol: payload.gas_const_r_mol.unwrap_or(get_constant(db, "gas_const_r_mol", 8.314).await),
         vial_volume: payload.vial_volume.unwrap_or(get_constant(db, "vial_volume", 12.0).await),
@@ -542,7 +542,7 @@ pub async fn calculate_dic(db: &DatabaseConnection, Json(payload): Json<DicReque
     };
 
     if let Some(ref rep_b) = payload.replicate_b {
-        let rep = river_data_toolbox::dic_replicates(
+        let rep = river_data_core::toolbox::dic_replicates(
             payload.acid_sample_weight_g, payload.acid_weight_g, payload.vol_overpressure_ml, payload.sa_added_ml, payload.co2_dry_ppm, payload.d13co2_permil,
             rep_b.acid_sample_weight_g, rep_b.acid_weight_g, rep_b.vol_overpressure_ml, rep_b.sa_added_ml, rep_b.co2_dry_ppm, rep_b.d13co2_permil,
             payload.lab_temp_c,
@@ -565,7 +565,7 @@ pub async fn calculate_dic(db: &DatabaseConnection, Json(payload): Json<DicReque
             inputs_ignored: vec![],
         }))
     } else {
-        let dic = river_data_toolbox::dic_concentration(
+        let dic = river_data_core::toolbox::dic_concentration(
             payload.acid_sample_weight_g,
             payload.acid_weight_g,
             payload.vol_overpressure_ml,
@@ -576,7 +576,7 @@ pub async fn calculate_dic(db: &DatabaseConnection, Json(payload): Json<DicReque
         );
 
         let d13c = payload.d13co2_permil.map(|d13| {
-            river_data_toolbox::d13c_dic(
+            river_data_core::toolbox::d13c_dic(
                 payload.acid_sample_weight_g,
                 payload.acid_weight_g,
                 payload.vol_overpressure_ml,
@@ -618,29 +618,29 @@ pub async fn calculate_dom(Json(payload): Json<DomRequest>) -> AppResult<Json<To
     let mut results = serde_json::Map::new();
 
     let suva = match (payload.a254, payload.doc_avg_ppb) {
-        (Some(a), Some(d)) => Some(river_data_toolbox::suva(a, d)),
+        (Some(a), Some(d)) => Some(river_data_core::toolbox::suva(a, d)),
         _ => None,
     };
     results.insert("SUVA".into(), serde_json::json!(suva));
 
     let ratio = match (payload.abs_numerator, payload.abs_denominator) {
-        (Some(n), Some(d)) => Some(river_data_toolbox::absorbance_ratio(n, d)),
+        (Some(n), Some(d)) => Some(river_data_core::toolbox::absorbance_ratio(n, d)),
         _ => None,
     };
     results.insert("absorbance_ratio".into(), serde_json::json!(ratio));
 
     // Named fluorescence peak ratios
     if let (Some(pa), Some(pt)) = (payload.peak_a, payload.peak_t) {
-        results.insert("A_T".into(), serde_json::json!(river_data_toolbox::absorbance_ratio(pa, pt)));
+        results.insert("A_T".into(), serde_json::json!(river_data_core::toolbox::absorbance_ratio(pa, pt)));
     }
     if let (Some(pc), Some(pa)) = (payload.peak_c, payload.peak_a) {
-        results.insert("C_A".into(), serde_json::json!(river_data_toolbox::absorbance_ratio(pc, pa)));
+        results.insert("C_A".into(), serde_json::json!(river_data_core::toolbox::absorbance_ratio(pc, pa)));
     }
     if let (Some(pc), Some(pm)) = (payload.peak_c, payload.peak_m) {
-        results.insert("C_M".into(), serde_json::json!(river_data_toolbox::absorbance_ratio(pc, pm)));
+        results.insert("C_M".into(), serde_json::json!(river_data_core::toolbox::absorbance_ratio(pc, pm)));
     }
     if let (Some(pc), Some(pt)) = (payload.peak_c, payload.peak_t) {
-        results.insert("C_T".into(), serde_json::json!(river_data_toolbox::absorbance_ratio(pc, pt)));
+        results.insert("C_T".into(), serde_json::json!(river_data_core::toolbox::absorbance_ratio(pc, pt)));
     }
 
     Ok(Json(ToolResult {
@@ -674,7 +674,7 @@ pub async fn calculate_field_data(
     let mut results = serde_json::Map::new();
 
     let bp = match (payload.elevation_m, payload.temp_c) {
-        (Some(e), Some(t)) => Some(river_data_toolbox::barometric_pressure_from_altitude(e, t)),
+        (Some(e), Some(t)) => Some(river_data_core::toolbox::barometric_pressure_from_altitude(e, t)),
         _ => None,
     };
     results.insert("Field_BP_altitude".into(), serde_json::json!(bp));
@@ -685,20 +685,20 @@ pub async fn calculate_field_data(
     if payload.raw_co2_min.is_some() || payload.raw_co2_avg.is_some() || payload.raw_co2_max.is_some() {
         if let (Some(p), Some(t)) = (payload.pressure_hpa, payload.temp_c) {
             if let Some(co2_min) = payload.raw_co2_min {
-                results.insert("Vaisala_CO2_min_corr".into(), serde_json::json!(river_data_toolbox::co2_correction(co2_min, p, t, curve)));
+                results.insert("Vaisala_CO2_min_corr".into(), serde_json::json!(river_data_core::toolbox::co2_correction(co2_min, p, t, curve)));
             }
             if let Some(co2_avg) = payload.raw_co2_avg {
-                results.insert("Vaisala_CO2_avg_corr".into(), serde_json::json!(river_data_toolbox::co2_correction(co2_avg, p, t, curve)));
+                results.insert("Vaisala_CO2_avg_corr".into(), serde_json::json!(river_data_core::toolbox::co2_correction(co2_avg, p, t, curve)));
             }
             if let Some(co2_max) = payload.raw_co2_max {
-                results.insert("Vaisala_CO2_max_corr".into(), serde_json::json!(river_data_toolbox::co2_correction(co2_max, p, t, curve)));
+                results.insert("Vaisala_CO2_max_corr".into(), serde_json::json!(river_data_core::toolbox::co2_correction(co2_max, p, t, curve)));
             }
         }
     } else {
         // Legacy single CO2 mode
         let co2_corr = match (payload.raw_co2, payload.pressure_hpa, payload.temp_c) {
             (Some(co2), Some(p), Some(t)) => {
-                Some(river_data_toolbox::co2_correction(co2, p, t, curve))
+                Some(river_data_core::toolbox::co2_correction(co2, p, t, curve))
             }
             _ => None,
         };
@@ -708,7 +708,7 @@ pub async fn calculate_field_data(
     // Reach depth stats
     if let Some(ref depths) = payload.reach_depths {
         if !depths.is_empty() {
-            let (avg, sd) = river_data_toolbox::reach_depth_stats(depths);
+            let (avg, sd) = river_data_core::toolbox::reach_depth_stats(depths);
             results.insert("Reach_depth_avg_cm".into(), serde_json::json!(avg));
             results.insert("Reach_depth_sd_cm".into(), serde_json::json!(sd));
         }
@@ -738,10 +738,10 @@ pub async fn calculate_co2_air(
 ) -> AppResult<Json<ToolResult>> {
     let co2 = payload
         .co2_wet
-        .map(|c| river_data_toolbox::co2_air::co2_dry(c, payload.h2o_percent));
+        .map(|c| river_data_core::toolbox::co2_air::co2_dry(c, payload.h2o_percent));
     let ch4 = payload
         .ch4_wet
-        .map(|c| river_data_toolbox::co2_air::ch4_dry_air(c, payload.h2o_percent));
+        .map(|c| river_data_core::toolbox::co2_air::ch4_dry_air(c, payload.h2o_percent));
 
     Ok(Json(ToolResult {
         tool: "co2_air".to_string(),
@@ -769,11 +769,11 @@ pub async fn calculate_isotopes(
     Json(payload): Json<IsotopesRequest>,
 ) -> AppResult<Json<ToolResult>> {
     let d_excess = match (payload.d_d, payload.d18o) {
-        (Some(dd), Some(d18)) => Some(river_data_toolbox::deuterium_excess(dd, d18)),
+        (Some(dd), Some(d18)) => Some(river_data_core::toolbox::deuterium_excess(dd, d18)),
         _ => None,
     };
     let o17_excess = match (payload.d17o, payload.d18o) {
-        (Some(d17), Some(d18)) => Some(river_data_toolbox::o17_excess(d17, d18)),
+        (Some(d17), Some(d18)) => Some(river_data_core::toolbox::o17_excess(d17, d18)),
         _ => None,
     };
 
@@ -804,10 +804,10 @@ pub struct BenthicRequest {
 pub async fn calculate_benthic(
     Json(payload): Json<BenthicRequest>,
 ) -> AppResult<Json<ToolResult>> {
-    let area = river_data_toolbox::rock_surface_area_m2(&payload.diameters_cm);
+    let area = river_data_core::toolbox::rock_surface_area_m2(&payload.diameters_cm);
 
     let afdm_per_m2 = payload.afdm_g_filter.map(|afdm| {
-        river_data_toolbox::per_m2(
+        river_data_core::toolbox::per_m2(
             afdm,
             payload.total_volume_ml,
             payload.volume_filtered_ml,
@@ -816,7 +816,7 @@ pub async fn calculate_benthic(
     });
 
     let chla_per_m2 = payload.chla_ug_l.map(|chla| {
-        river_data_toolbox::per_m2(
+        river_data_core::toolbox::per_m2(
             chla * 0.005,
             payload.total_volume_ml,
             payload.volume_filtered_ml,
@@ -862,10 +862,10 @@ pub struct ChlaBenthicReplicateInput {
 pub async fn calculate_chla_benthic(
     Json(payload): Json<ChlaBenthicRequest>,
 ) -> AppResult<Json<ToolResult>> {
-    let inputs: Vec<river_data_toolbox::ChlaReplicateInput> = payload
+    let inputs: Vec<river_data_core::toolbox::ChlaReplicateInput> = payload
         .replicates
         .into_iter()
-        .map(|r| river_data_toolbox::ChlaReplicateInput {
+        .map(|r| river_data_core::toolbox::ChlaReplicateInput {
             fluor_before: r.fluor_before,
             fluor_after: r.fluor_after,
             vol_total_ml: r.vol_total_ml,
@@ -875,7 +875,7 @@ pub async fn calculate_chla_benthic(
         })
         .collect();
 
-    let result = river_data_toolbox::chla_benthic_replicates(
+    let result = river_data_core::toolbox::chla_benthic_replicates(
         &inputs,
         payload.acid_slope,
         payload.acid_intercept,

@@ -2627,9 +2627,7 @@ dependencies = [
 
 [[package]]
 name = "river-data-core"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34a91955ddbc96fc17e251a4b23c491e9e4e57fa889ad0c104cd7dbb2ebfeba9"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2644,15 +2642,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "river-data-toolbox"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -2676,7 +2665,6 @@ dependencies = [
  "rand 0.9.2",
  "reqwest",
  "river-data-core",
- "river-data-toolbox",
  "sea-orm",
  "sea-orm-migration",
  "sea-orm-timescale",
