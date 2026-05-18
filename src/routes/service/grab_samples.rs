@@ -23,10 +23,6 @@ pub struct GrabSampleReading {
     pub time: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub replicate_index: Option<i16>,
-    /// Optional grouping by user-declared sample. When set, the server trigger
-    /// updates the referenced `samples` row's aggregate columns.
-    #[serde(default)]
-    pub sample_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,9 +112,6 @@ async fn auto_create_samples(
 ) -> Result<HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Uuid>, AppError> {
     let mut groups: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), usize> = HashMap::new();
     for r in readings {
-        if r.sample_id.is_some() {
-            continue;
-        }
         *groups.entry((r.parameter_id, r.time)).or_default() += 1;
     }
 
@@ -223,8 +216,7 @@ pub async fn insert_grab_samples(
             let stream_id = stream_cache[&r.parameter_id];
             let group_key = (r.parameter_id, r.time);
 
-            // Determine sample_id: client-provided takes precedence, else auto-created
-            let sample_id = r.sample_id.or_else(|| sample_map.get(&group_key).copied());
+            let sample_id = sample_map.get(&group_key).copied();
 
             // Auto-assign replicate_index: if part of a sample, start at 1
             let replicate_index = if let Some(idx) = r.replicate_index {

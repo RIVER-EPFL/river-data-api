@@ -673,6 +673,13 @@ async fn resolve_or_create_site(
         .filter(Expr::cust_with_values("LOWER(name) = $1", [key.clone()]))
         .one(txn).await?;
     if let Some(existing) = existing {
+        if existing.latitude.is_none() && site_ref.latitude.is_some() {
+            let mut update: sites::ActiveModel = existing.clone().into();
+            update.latitude = Set(site_ref.latitude);
+            update.longitude = Set(site_ref.longitude);
+            update.altitude_m = Set(site_ref.altitude_m);
+            update.update(txn).await?;
+        }
         cache.insert(key, existing.id);
         return Ok(existing.id);
     }
