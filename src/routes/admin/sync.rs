@@ -25,6 +25,7 @@ pub fn router() -> Router<AppState> {
         .route("/pairing-plans/{id}", get(get_pairing_plan).patch(update_pairing_plan))
         .route("/pairing-plans/{id}/apply", post(apply_pairing_plan))
         .route("/pairing-plans/{id}/revert", post(revert_pairing_plan))
+        .route("/pairing-plans/{id}/site-metadata", get(plan_site_metadata))
         .route("/unpaired-summary", get(unpaired_summary))
 }
 
@@ -1301,6 +1302,82 @@ async fn unpaired_summary(
         let unpaired: i64 = row.try_get("", "unpaired").unwrap_or(0);
         let paired: i64 = row.try_get("", "paired").unwrap_or(0);
         serde_json::json!({ "source_system": source_system, "unpaired": unpaired, "paired": paired })
+    }).collect();
+
+    Ok(Json(result))
+}
+
+// ============================================================================
+// Plan Site Metadata
+// ============================================================================
+
+async fn plan_site_metadata(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Vec<serde_json::Value>>> {
+    use sea_orm::Statement;
+
+    let plan = crate::entity::pairing_plans::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
+
+    let entries: Vec<crate::services::pairing::PlanEntry> =
+        serde_json::from_value(plan.entries.clone())
+            .map_err(|e| AppError::Internal(format!("Failed to parse entries: {e}")))?;
+
+    let stream_ids: Vec<Uuid> = entries.iter().map(|e| e.stream_id).collect();
+    if stream_ids.is_empty() {
+        return Ok(Json(vec![]));
+    }
+
+    let ids_str: Vec<String> = stream_ids.iter().map(|id| format!("'{id}'")).collect();
+    let ids_list = ids_str.join(",");
+
+    let sql = format!(
+        "SELECT DISTINCT ON (metadata->'hierarchy'->>'site') \
+            metadata->'hierarchy'->>'site' as site_name, \
+            metadata->'coordinates'->>'latitude' as latitude, \
+            metadata->'coordinates'->>'longitude' as longitude, \
+            metadata->'coordinates'->>'altitude_m' as altitude_m, \
+            metadata->'glacier'->>'name' as glacier_name, \
+            metadata->'glacier'->>'rgi_v6' as glacier_rgi, \
+            metadata->'location'->>'type' as location_type, \
+            metadata->'station'->>'catchment' as catchment, \
+            metadata->'station'->>'full_name' as full_name, \
+            metadata->'station'->>'elevation' as elevation, \
+            metadata->'device'->>'logger_serial' as device_serial, \
+            metadata->>'channel_id' as channel_id, \
+            metadata->>'sample_interval_sec' as sample_interval_sec \
+         FROM data_streams WHERE id IN ({ids_list}) \
+         ORDER BY metadata->'hierarchy'->>'site'"
+    );
+
+    let rows = state.db.query_all(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql,
+    )).await?;
+
+    let result: Vec<serde_json::Value> = rows.iter().map(|row| {
+        let get = |col: &str| -> Option<String> {
+            row.try_get::<Option<String>>("", col).ok().flatten().filter(|s| s != "null" && !s.is_empty())
+        };
+        let site_name: String = row.try_get("", "site_name").unwrap_or_default();
+        serde_json::json!({
+            "site_name": site_name,
+            "latitude": get("latitude").and_then(|s| s.parse::<f64>().ok()),
+            "longitude": get("longitude").and_then(|s| s.parse::<f64>().ok()),
+            "altitude_m": get("altitude_m").and_then(|s| s.parse::<f64>().ok()),
+            "glacier_name": get("glacier_name"),
+            "glacier_rgi": get("glacier_rgi"),
+            "location_type": get("location_type"),
+            "catchment": get("catchment"),
+            "full_name": get("full_name"),
+            "elevation": get("elevation").and_then(|s| s.parse::<f64>().ok()),
+            "device_serial": get("device_serial"),
+            "channel_id": get("channel_id"),
+            "sample_interval_sec": get("sample_interval_sec").and_then(|s| s.parse::<i64>().ok()),
+        })
     }).collect();
 
     Ok(Json(result))

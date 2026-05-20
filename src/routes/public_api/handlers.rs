@@ -94,13 +94,12 @@ fn all_public_param_names(config: &PublicProjectConfig) -> Vec<String> {
         .collect()
 }
 
-/// Build `parameter_id` -> `ExposedParamConfig` lookup from the project config.
-fn build_param_to_config_map(config: &PublicProjectConfig) -> HashMap<Uuid, &ExposedParamConfig> {
-    config
-        .exposed_params
-        .iter()
-        .map(|ep| (ep.parameter_id, ep))
-        .collect()
+fn build_param_to_config_map(config: &PublicProjectConfig) -> HashMap<Uuid, Vec<&ExposedParamConfig>> {
+    let mut map: HashMap<Uuid, Vec<&ExposedParamConfig>> = HashMap::new();
+    for ep in &config.exposed_params {
+        map.entry(ep.parameter_id).or_default().push(ep);
+    }
+    map
 }
 
 /// Resolve which DB `site_parameters` at a site match the exposed config.
@@ -129,18 +128,18 @@ async fn resolve_site_parameters(
     for sp in params {
         let is_derived = sp.is_derived.unwrap_or(false);
 
-        if let Some(ep_config) = param_to_config.get(&sp.parameter_id) {
-            // Non-derived params are always included
-            // Derived params are included only if the config has include_derived=true
-            if !is_derived || ep_config.include_derived {
-                resolved.push(ResolvedParam {
-                    site_id: sp.site_id,
-                    parameter_id: sp.parameter_id,
-                    public_name: ep_config.public_name.clone(),
-                    public_units: ep_config.public_units.clone(),
-                    conversion_factor: ep_config.conversion_factor,
-                    conversion_offset: ep_config.conversion_offset,
-                });
+        if let Some(ep_configs) = param_to_config.get(&sp.parameter_id) {
+            for ep_config in ep_configs {
+                if !is_derived || ep_config.include_derived {
+                    resolved.push(ResolvedParam {
+                        site_id: sp.site_id,
+                        parameter_id: sp.parameter_id,
+                        public_name: ep_config.public_name.clone(),
+                        public_units: ep_config.public_units.clone(),
+                        conversion_factor: ep_config.conversion_factor,
+                        conversion_offset: ep_config.conversion_offset,
+                    });
+                }
             }
         }
     }
@@ -679,7 +678,12 @@ pub async fn get_aggregates(
         .filter(|rp| requested_names.contains(&rp.public_name))
         .collect();
 
-    let param_ids: Vec<Uuid> = resolved.iter().map(|rp| rp.parameter_id).collect();
+    let param_ids: Vec<Uuid> = {
+        let mut ids: Vec<Uuid> = resolved.iter().map(|rp| rp.parameter_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
 
     if param_ids.is_empty() {
         let response = AggregatesResponse {
@@ -697,21 +701,18 @@ pub async fn get_aggregates(
         return Ok(Json(response).into_response());
     }
 
-    // Build a map from parameter_id -> (public_name, public_units)
-    let id_to_public: HashMap<Uuid, (&str, &str, f64, f64)> = resolved
-        .iter()
-        .map(|rp| {
-            (
-                rp.parameter_id,
-                (
-                    rp.public_name.as_str(),
-                    rp.public_units.as_str(),
-                    rp.conversion_factor,
-                    rp.conversion_offset,
-                ),
-            )
-        })
-        .collect();
+    let mut id_to_publics: HashMap<Uuid, Vec<(&str, &str, f64, f64)>> = HashMap::new();
+    for rp in &resolved {
+        id_to_publics
+            .entry(rp.parameter_id)
+            .or_default()
+            .push((
+                rp.public_name.as_str(),
+                rp.public_units.as_str(),
+                rp.conversion_factor,
+                rp.conversion_offset,
+            ));
+    }
 
     // Build parameterized query against continuous aggregate
     let view = Alias::new(view_name);
@@ -771,21 +772,20 @@ pub async fn get_aggregates(
         if time_set.insert(row.bucket) {
             times_ordered.push(row.bucket);
         }
-        // Map DB parameter_id back to public name and apply unit conversion
         let param_uuid = row.param_id.parse::<Uuid>().ok();
-        let lookup = param_uuid.and_then(|uuid| id_to_public.get(&uuid));
-        let public_name = lookup.map_or_else(|| row.param_id.clone(), |(name, _, _, _)| name.to_string());
-        let (factor, offset) = lookup.map_or((1.0, 0.0), |(_, _, f, o)| (*f, *o));
-
-        param_aggs.entry(public_name).or_default().push((
-            row.bucket,
-            AggValues {
-                avg: row.avg_value.map(|v| v * factor + offset),
-                min: row.min_value.map(|v| v * factor + offset),
-                max: row.max_value.map(|v| v * factor + offset),
-                count: row.count,
-            },
-        ));
+        if let Some(configs) = param_uuid.and_then(|uuid| id_to_publics.get(&uuid)) {
+            for (name, _units, factor, offset) in configs {
+                param_aggs.entry(name.to_string()).or_default().push((
+                    row.bucket,
+                    AggValues {
+                        avg: row.avg_value.map(|v| v * factor + offset),
+                        min: row.min_value.map(|v| v * factor + offset),
+                        max: row.max_value.map(|v| v * factor + offset),
+                        count: row.count,
+                    },
+                ));
+            }
+        }
     }
 
     times_ordered.sort_unstable();
@@ -868,27 +868,29 @@ async fn fetch_readings(
     start: Option<DateTime<Utc>>,
     end: Option<DateTime<Utc>>,
 ) -> AppResult<(Vec<String>, Vec<ParameterData>)> {
-    let param_ids: Vec<Uuid> = resolved.iter().map(|rp| rp.parameter_id).collect();
+    let param_ids: Vec<Uuid> = {
+        let mut ids: Vec<Uuid> = resolved.iter().map(|rp| rp.parameter_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
 
     if param_ids.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
 
-    // Build a map from parameter_id -> (public_name, public_units)
-    let id_to_public: HashMap<Uuid, (&str, &str, f64, f64)> = resolved
-        .iter()
-        .map(|rp| {
-            (
-                rp.parameter_id,
-                (
-                    rp.public_name.as_str(),
-                    rp.public_units.as_str(),
-                    rp.conversion_factor,
-                    rp.conversion_offset,
-                ),
-            )
-        })
-        .collect();
+    let mut id_to_publics: HashMap<Uuid, Vec<(&str, &str, f64, f64)>> = HashMap::new();
+    for rp in resolved {
+        id_to_publics
+            .entry(rp.parameter_id)
+            .or_default()
+            .push((
+                rp.public_name.as_str(),
+                rp.public_units.as_str(),
+                rp.conversion_factor,
+                rp.conversion_offset,
+            ));
+    }
 
     // All resolved params come from the same site
     let site_id = resolved
@@ -952,17 +954,16 @@ async fn fetch_readings(
             times_ordered.push(time);
         }
 
-        // Map DB parameter_id back to public name and apply unit conversion
         let param_uuid = row.param_id.parse::<Uuid>().ok();
-        let lookup = param_uuid.and_then(|uuid| id_to_public.get(&uuid));
-        let public_name = lookup.map_or_else(|| row.param_id.clone(), |(name, _, _, _)| name.to_string());
-        let (factor, offset) = lookup.map_or((1.0, 0.0), |(_, _, f, o)| (*f, *o));
-        let converted_value = row.value * factor + offset;
-
-        param_values
-            .entry(public_name)
-            .or_default()
-            .push((time, converted_value));
+        if let Some(configs) = param_uuid.and_then(|uuid| id_to_publics.get(&uuid)) {
+            for (name, _units, factor, offset) in configs {
+                let converted_value = row.value * factor + offset;
+                param_values
+                    .entry(name.to_string())
+                    .or_default()
+                    .push((time, converted_value));
+            }
+        }
     }
 
     times_ordered.sort_unstable();

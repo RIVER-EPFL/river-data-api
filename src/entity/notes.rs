@@ -19,6 +19,7 @@ pub struct Model {
     pub site_id: Uuid,
     #[sea_orm(column_type = "Text")]
     pub text: String,
+    #[crudcrate(on_create = false)]
     pub verified: bool,
     pub created_by: Option<String>,
     #[crudcrate(exclude(create, update), sortable)]
