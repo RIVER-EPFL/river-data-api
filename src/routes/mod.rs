@@ -1,13 +1,14 @@
 pub mod admin;
 pub mod alarms;
 pub mod config;
+pub mod private;
 pub mod projects;
+pub mod public;
 pub mod public_api;
 pub mod service;
 pub mod sites;
 
-// Re-export cache from services for use in route handlers
-pub use crate::services::cache;
+pub use crate::common::cache;
 
 use axum::{Router, http::StatusCode, middleware, response::Response, routing::get};
 use sea_orm::{Condition, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Statement, sea_query::Expr};

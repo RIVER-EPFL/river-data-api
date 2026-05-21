@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::services::api_token::TokenCache;
-use crate::services::bulk::{BulkSemaphore, new_bulk_semaphore};
+use super::bulk::{BulkSemaphore, new_bulk_semaphore};
 use crate::services::public_api_config::{PublicConfigCache, new_public_config_cache};
 
 /// Cached Keycloak admin API credentials and token.
