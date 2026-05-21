@@ -1,1 +1,2 @@
-// Public API routes will be migrated here from routes/public_api/.
+pub mod views;
+pub mod services;

@@ -1,0 +1,116 @@
+use sea_orm::entity::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+#[sea_orm(table_name = "readings")]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub stream_id: Uuid,
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub time: DateTimeWithTimeZone,
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub replicate_index: i16,
+    pub site_id: Option<Uuid>,
+    pub parameter_id: Option<Uuid>,
+    pub raw_value: f64,
+    pub calibrated_value: Option<f64>,
+    pub sensor_id: Option<Uuid>,
+    pub calibration_id: Option<Uuid>,
+    pub deployment_id: Option<Uuid>,
+    pub logged: Option<bool>,
+    pub measurement_type: Option<String>,
+    pub is_flagged: Option<bool>,
+    pub flag_reason: Option<String>,
+    pub sample_id: Option<Uuid>,
+}
+
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {
+    #[sea_orm(
+        belongs_to = "crate::entity::data_streams::Entity",
+        from = "Column::StreamId",
+        to = "crate::entity::data_streams::Column::Id"
+    )]
+    DataStream,
+    #[sea_orm(
+        belongs_to = "crate::entity::sites::Entity",
+        from = "Column::SiteId",
+        to = "crate::entity::sites::Column::Id"
+    )]
+    Site,
+    #[sea_orm(
+        belongs_to = "crate::entity::parameters::Entity",
+        from = "Column::ParameterId",
+        to = "crate::entity::parameters::Column::Id"
+    )]
+    Parameter,
+    #[sea_orm(
+        belongs_to = "crate::entity::sensors::Entity",
+        from = "Column::SensorId",
+        to = "crate::entity::sensors::Column::Id"
+    )]
+    Sensor,
+    #[sea_orm(
+        belongs_to = "crate::entity::sensor_calibrations::Entity",
+        from = "Column::CalibrationId",
+        to = "crate::entity::sensor_calibrations::Column::Id"
+    )]
+    SensorCalibration,
+    #[sea_orm(
+        belongs_to = "crate::entity::sensor_deployments::Entity",
+        from = "Column::DeploymentId",
+        to = "crate::entity::sensor_deployments::Column::Id"
+    )]
+    SensorDeployment,
+    #[sea_orm(
+        belongs_to = "crate::entity::samples::Entity",
+        from = "Column::SampleId",
+        to = "crate::entity::samples::Column::Id",
+        on_delete = "SetNull"
+    )]
+    Sample,
+}
+
+impl Related<crate::entity::data_streams::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::DataStream.def()
+    }
+}
+
+impl Related<crate::entity::sites::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Site.def()
+    }
+}
+
+impl Related<crate::entity::parameters::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Parameter.def()
+    }
+}
+
+impl Related<crate::entity::sensors::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Sensor.def()
+    }
+}
+
+impl Related<crate::entity::sensor_calibrations::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::SensorCalibration.def()
+    }
+}
+
+impl Related<crate::entity::sensor_deployments::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::SensorDeployment.def()
+    }
+}
+
+impl Related<crate::entity::samples::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Sample.def()
+    }
+}
+
+impl ActiveModelBehavior for ActiveModel {}
