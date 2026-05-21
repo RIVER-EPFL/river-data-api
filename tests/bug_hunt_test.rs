@@ -294,9 +294,9 @@ async fn bug3_merge_drops_conflicting_readings() {
     assert_eq!(count_before, 3, "Should have 3 readings before merge");
 
     // Perform merge: source → target
-    let merge_result = river_db::services::merge::merge_site_parameters(
+    let merge_result = river_db::routes::private::admin::merge_services::merge_site_parameters(
         &db,
-        &river_db::services::merge::MergeSiteParametersRequest {
+        &river_db::routes::private::admin::merge_services::MergeSiteParametersRequest {
             source_site_parameter_id: common::PARAM_S1_TEMP_ID.parse().unwrap(),
             target_site_parameter_id: common::PARAM_S1_DO_ID.parse().unwrap(),
         },
@@ -343,15 +343,15 @@ async fn bug3_merge_drops_conflicting_readings() {
 async fn bug4_calibration_formula_correctness() {
     // Test the actual formula against expected lab calibration results.
     // The code uses: calibrated = slope * raw + intercept
-    let result = river_db::services::calibration::apply_calibration(10.0, 2.0, 5.0);
+    let result = river_db::routes::private::sensor_calibrations::services::apply_calibration(10.0, 2.0, 5.0);
     assert_eq!(result, 25.0, "calibrated = 2.0 * 10.0 + 5.0 = 25.0");
 
     // Identity calibration (slope=1, intercept=0)
-    let result = river_db::services::calibration::apply_calibration(42.0, 1.0, 0.0);
+    let result = river_db::routes::private::sensor_calibrations::services::apply_calibration(42.0, 1.0, 0.0);
     assert_eq!(result, 42.0, "Identity calibration should return raw value");
 
     // Negative intercept
-    let result = river_db::services::calibration::apply_calibration(100.0, 1.0, -273.15);
+    let result = river_db::routes::private::sensor_calibrations::services::apply_calibration(100.0, 1.0, -273.15);
     assert!(
         (result - (-173.15)).abs() < 0.001,
         "Kelvin to Celsius: 100 - 273.15 = -173.15, got {result}"

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::{data_streams, site_parameters};
+use crate::routes::private::{data_streams, site_parameters};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::operations::{close_sensor_deployment, create_sensor_for_stream};
 use crate::common::sync_state::refresh_continuous_aggregates_full;

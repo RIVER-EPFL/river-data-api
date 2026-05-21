@@ -17,7 +17,7 @@ impl CRUDOperations for SiteParameterOperations {
         entity: &mut SiteParameter,
     ) -> Result<(), ApiError> {
         // Look up the parent parameter's default thresholds
-        let parameter = crate::entity::parameters::Entity::find_by_id(entity.parameter_id)
+        let parameter = crate::routes::private::parameters::Entity::find_by_id(entity.parameter_id)
             .one(db)
             .await
             .map_err(ApiError::database)?;
@@ -36,9 +36,9 @@ impl CRUDOperations for SiteParameterOperations {
         }
 
         // Skip if an alarm_threshold already exists for this parameter + site
-        let existing = crate::entity::alarm_thresholds::Entity::find()
-            .filter(crate::entity::alarm_thresholds::Column::ParameterId.eq(entity.parameter_id))
-            .filter(crate::entity::alarm_thresholds::Column::SiteId.eq(entity.site_id))
+        let existing = crate::routes::private::alarm_thresholds::Entity::find()
+            .filter(crate::routes::private::alarm_thresholds::Column::ParameterId.eq(entity.parameter_id))
+            .filter(crate::routes::private::alarm_thresholds::Column::SiteId.eq(entity.site_id))
             .one(db)
             .await
             .map_err(ApiError::database)?;
@@ -47,7 +47,7 @@ impl CRUDOperations for SiteParameterOperations {
             return Ok(());
         }
 
-        let threshold = crate::entity::alarm_thresholds::ActiveModel {
+        let threshold = crate::routes::private::alarm_thresholds::ActiveModel {
             id: Set(Uuid::new_v4()),
             parameter_id: Set(entity.parameter_id),
             site_id: Set(Some(entity.site_id)),

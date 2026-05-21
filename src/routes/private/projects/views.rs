@@ -6,7 +6,7 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
-use crate::entity::sites;
+use crate::routes::private::sites;
 use crate::error::{AppError, AppResult};
 use crate::routes::resolve_project;
 use crate::routes::private::sites::types::SiteResponse;

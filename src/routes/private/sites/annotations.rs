@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
-use crate::entity::annotations;
+use crate::routes::private::annotations;
 use crate::error::{AppError, AppResult};
 use crate::routes::{resolve_site, validate_optional_time_range};
 

@@ -20,7 +20,7 @@ fn test_division_by_zero_produces_non_finite() {
     vars.insert("a".to_string(), 1.0);
     vars.insert("b".to_string(), 0.0);
 
-    let result = river_db::services::calibration::evaluate_formula("a / b", &vars);
+    let result = river_db::routes::private::sensor_calibrations::services::evaluate_formula("a / b", &vars);
     // evaluate_formula returns Ok(Infinity) — the caller must check is_finite()
     assert!(result.is_ok(), "meval should not error on division by zero");
     let value = result.unwrap();
@@ -36,7 +36,7 @@ fn test_missing_variable_returns_error() {
     vars.insert("a".to_string(), 1.0);
     // "b" is missing
 
-    let result = river_db::services::calibration::evaluate_formula("a + b", &vars);
+    let result = river_db::routes::private::sensor_calibrations::services::evaluate_formula("a + b", &vars);
     assert!(result.is_err(), "missing variable should produce an error");
 }
 
@@ -46,7 +46,7 @@ fn test_normal_formula_evaluation() {
     vars.insert("a".to_string(), 3.0);
     vars.insert("b".to_string(), 4.0);
 
-    let result = river_db::services::calibration::evaluate_formula("a * b + 2", &vars);
+    let result = river_db::routes::private::sensor_calibrations::services::evaluate_formula("a * b + 2", &vars);
     assert!(result.is_ok());
     let value = result.unwrap();
     assert!((value - 14.0).abs() < 1e-10, "3*4+2 should be 14, got {value}");
@@ -148,7 +148,7 @@ async fn test_derived_parameter_skips_infinity() {
     let time_dt: chrono::DateTime<chrono::Utc> = time.parse().unwrap();
 
     let result =
-        river_db::services::calibration::recalculate_derived_at_timestamp(&db, site_uuid, time_dt)
+        river_db::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(&db, site_uuid, time_dt)
             .await;
     assert!(result.is_ok(), "recalculate should not error: {result:?}");
 

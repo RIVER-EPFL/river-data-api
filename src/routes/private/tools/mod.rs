@@ -14,7 +14,7 @@ static GAS_CONSTANTS: OnceCell<river_data_core::toolbox::GasConstants> = OnceCel
 // ============================================================================
 
 async fn get_constant(db: &DatabaseConnection, name: &str, default: f64) -> f64 {
-    use crate::entity::constants;
+    use crate::routes::private::constants;
     constants::Entity::find()
         .filter(constants::Column::Name.eq(name))
         .one(db)

@@ -3,7 +3,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::common::AppState;
 use crate::common::middleware::{require_crud_permissions, require_read_data, require_read_metadata};
-use crate::entity::sites::Site;
+use crate::routes::private::sites::Site;
 
 pub fn service_router(state: &AppState) -> OpenApiRouter {
     let crud = Site::router(&state.db)

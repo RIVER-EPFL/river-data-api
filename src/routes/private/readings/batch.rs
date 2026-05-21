@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::readings;
+use crate::routes::private::readings;
 use crate::error::AppResult;
 use crate::routes::private::data_streams::operations::get_or_create_api_stream;
 

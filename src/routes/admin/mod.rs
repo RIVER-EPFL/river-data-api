@@ -1,34 +1,44 @@
-pub mod calibrations;
-pub mod derived;
-pub mod merge;
-pub mod public_config;
-pub mod sync;
-pub mod users;
+use axum::{Router, routing::{get, post}};
 
 use crate::common::AppState;
 use crate::common::auth::Role;
-use crate::entity::{
-    alarm_thresholds::AlarmThreshold, api_tokens::ApiToken, constants::Constant,
+use crate::routes::private::{
+    alarm_thresholds::AlarmThreshold,
+    api_tokens::ApiToken,
+    constants::Constant,
     data_streams::DataStream,
-    derived_parameter_definitions::DerivedParameterDefinition,
-    notes::Note, parameters::Parameter, projects::Project,
-    public_exposed_parameters::PublicExposedParameter, samples::Sample,
-    sensor_calibrations::SensorCalibration, sensor_deployments::SensorDeployment, sensors::Sensor,
-    site_parameters::SiteParameter, sites::Site, standard_curves::StandardCurve,
-    sync_commands::SyncCommand, sync_events::SyncEvent, sync_services::SyncService,
-    sync_service_credentials::SyncServiceCredential,
+    derived_parameters::definition_model::DerivedParameterDefinition,
+    notes::Note,
+    parameters::Parameter,
+    projects::Project,
+    public_exposed_parameters::PublicExposedParameter,
+    samples::Sample,
+    sensor_calibrations::SensorCalibration,
+    sensor_deployments::SensorDeployment,
+    sensors::Sensor,
+    site_parameters::SiteParameter,
+    sites::Site,
+    standard_curves::StandardCurve,
+    sync::commands_model::SyncCommand,
+    sync::credentials_model::SyncServiceCredential,
+    sync::events_model::SyncEvent,
+    sync::services_model::SyncService,
 };
-use axum::{Router, routing::{get, post}};
+
+use crate::routes::private::{
+    admin::{calibrations, derived, merge, public_config, users},
+    alarms::views as alarm_views,
+    search,
+    sync::views as sync_views,
+};
 
 pub fn admin_router(state: &AppState) -> Router<AppState> {
     let db = &state.db;
 
-    // Convert crudcrate OpenApiRouters to axum::Router for nesting
     let crud = |r: utoipa_axum::router::OpenApiRouter| -> Router<()> { r.into() };
 
     let mut router = Router::new()
-        .nest("/sync", sync::router())
-        // crudcrate-generated CRUD routers (state self-contained via DatabaseConnection)
+        .nest("/sync", sync_views::router())
         .nest_service("/projects", crud(Project::router(db)))
         .nest_service("/sites", crud(Site::router(db)))
         .nest_service("/parameters", crud(Parameter::router(db)))
@@ -36,16 +46,10 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .nest_service("/sensors", crud(Sensor::router(db)))
         .nest_service("/sensor_calibrations", crud(SensorCalibration::router(db)))
         .nest_service("/sensor_deployments", crud(SensorDeployment::router(db)))
-        .nest_service(
-            "/derived_parameters",
-            crud(DerivedParameterDefinition::router(db)),
-        )
+        .nest_service("/derived_parameters", crud(DerivedParameterDefinition::router(db)))
         .nest_service("/alarm_thresholds", crud(AlarmThreshold::router(db)))
         .nest_service("/tokens", crud(ApiToken::router(db)))
-        .nest_service(
-            "/public_exposed_parameters",
-            crud(PublicExposedParameter::router(db)),
-        )
+        .nest_service("/public_exposed_parameters", crud(PublicExposedParameter::router(db)))
         .nest_service("/standard_curves", crud(StandardCurve::router(db)))
         .nest_service("/notes", crud(Note::router(db)))
         .nest_service("/constants", crud(Constant::router(db)))
@@ -54,11 +58,7 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .nest_service("/sync_services", crud(SyncService::router(db)))
         .nest_service("/sync_commands", crud(SyncCommand::router(db)))
         .nest_service("/sync_events", crud(SyncEvent::router(db)))
-        .nest_service(
-            "/sync_service_credentials",
-            crud(SyncServiceCredential::router(db)),
-        )
-        // Custom action routes under /actions/ to avoid conflict with nest_service catch-all
+        .nest_service("/sync_service_credentials", crud(SyncServiceCredential::router(db)))
         .route(
             "/actions/sensor_calibrations/{id}/recalculate",
             post(calibrations::recalculate_calibration),
@@ -71,33 +71,20 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
             "/actions/invalidate_public_config/{slug}",
             post(public_config::invalidate_public_config),
         )
-        .route(
-            "/actions/merge_site_parameters",
-            post(merge::merge_site_parameters_handler),
-        )
-        .route(
-            "/actions/merge_parameters",
-            post(merge::merge_parameters_handler),
-        )
-        .route(
-            "/alarms/active",
-            get(super::alarms::get_active_alarms),
-        )
-        .route(
-            "/alarms/summary",
-            get(super::alarms::get_alarm_summary),
-        )
-        .route("/search", get(super::service::search::search))
+        .route("/actions/merge_site_parameters", post(merge::merge_site_parameters_handler))
+        .route("/actions/merge_parameters", post(merge::merge_parameters_handler))
+        .route("/alarms/active", get(alarm_views::get_active_alarms))
+        .route("/alarms/summary", get(alarm_views::get_alarm_summary))
+        .route("/search", get(search::search))
         .route(
             "/actions/preview_derived",
-            post(super::service::actions::preview_derived),
+            post(crate::routes::private::admin::actions::preview_derived),
         )
         .route(
             "/actions/rollback_deployment",
-            post(super::service::actions::rollback_deployment),
+            post(crate::routes::private::admin::actions::rollback_deployment),
         );
 
-    // Keycloak user management proxy (only if admin client secret configured)
     if state.keycloak_admin.is_some() {
         router = router
             .nest("/users", users::router())
@@ -105,7 +92,6 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         tracing::info!("User management routes enabled");
     }
 
-    // Apply Keycloak auth layer if configured
     if let Some(instance) = state.keycloak_auth_instance.clone() {
         use axum_keycloak_auth::{PassthroughMode, layer::KeycloakAuthLayer};
         router = router.layer(

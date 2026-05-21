@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::entity::{projects, public_exposed_parameters, sites};
+use crate::routes::private::{projects, public_exposed_parameters, sites};
 
 /// Cache for public project configurations
 pub type PublicConfigCache = Cache<String, Arc<PublicProjectConfig>>;

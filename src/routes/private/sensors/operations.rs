@@ -8,7 +8,7 @@ use sea_orm::{
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::entity::{data_streams, sensor_calibrations, sensor_deployments, sensors};
+use crate::routes::private::{data_streams, sensor_calibrations, sensor_deployments, sensors};
 use super::model::Sensor;
 use crate::error::AppResult;
 

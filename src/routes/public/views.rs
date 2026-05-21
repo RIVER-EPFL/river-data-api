@@ -12,10 +12,10 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::site_parameters as site_parameters_entity;
+use crate::routes::private::site_parameters as site_parameters_entity;
 use crate::error::{AppError, AppResult};
-use crate::services::bulk::{self, StreamableAggregateParam, StreamableParam};
-use crate::services::public_api_config::{
+use crate::common::bulk::{self, StreamableAggregateParam, StreamableParam};
+use crate::routes::public::services::{
     ExposedParamConfig, PublicProjectConfig, PublicSiteConfig, get_public_config,
 };
 

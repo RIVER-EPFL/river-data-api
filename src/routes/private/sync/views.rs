@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::{data_streams, parameters, projects, site_parameters, sites};
+use crate::routes::private::{data_streams, parameters, projects, site_parameters, sites};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::operations::{create_sensor_for_stream, extract_vaisala_device_serial};
 
@@ -1163,17 +1163,17 @@ struct CreatePairingPlanRequest {
 async fn create_pairing_plan(
     State(state): State<AppState>,
     Json(req): Json<CreatePairingPlanRequest>,
-) -> AppResult<Json<crate::entity::pairing_plans::Model>> {
+) -> AppResult<Json<crate::routes::private::pairing_plans::Model>> {
     let plan = crate::routes::private::sync::services::create_plan(&state.db, &req.source_system).await?;
     Ok(Json(plan))
 }
 
 async fn list_pairing_plans(
     State(state): State<AppState>,
-) -> AppResult<Json<Vec<crate::entity::pairing_plans::Model>>> {
+) -> AppResult<Json<Vec<crate::routes::private::pairing_plans::Model>>> {
     use sea_orm::QueryOrder;
-    let plans = crate::entity::pairing_plans::Entity::find()
-        .order_by_desc(crate::entity::pairing_plans::Column::CreatedAt)
+    let plans = crate::routes::private::pairing_plans::Entity::find()
+        .order_by_desc(crate::routes::private::pairing_plans::Column::CreatedAt)
         .all(&state.db)
         .await?;
     Ok(Json(plans))
@@ -1182,8 +1182,8 @@ async fn list_pairing_plans(
 async fn get_pairing_plan(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<crate::entity::pairing_plans::Model>> {
-    let plan = crate::entity::pairing_plans::Entity::find_by_id(id)
+) -> AppResult<Json<crate::routes::private::pairing_plans::Model>> {
+    let plan = crate::routes::private::pairing_plans::Entity::find_by_id(id)
         .one(&state.db)
         .await?
         .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
@@ -1214,8 +1214,8 @@ async fn update_pairing_plan(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdatePairingPlanRequest>,
-) -> AppResult<Json<crate::entity::pairing_plans::Model>> {
-    let plan = crate::entity::pairing_plans::Entity::find_by_id(id)
+) -> AppResult<Json<crate::routes::private::pairing_plans::Model>> {
+    let plan = crate::routes::private::pairing_plans::Entity::find_by_id(id)
         .one(&state.db)
         .await?
         .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
@@ -1257,7 +1257,7 @@ async fn update_pairing_plan(
     let summary = serde_json::to_value(crate::routes::private::sync::services::compute_summary_pub(&entries))
         .unwrap_or_default();
 
-    let mut active: crate::entity::pairing_plans::ActiveModel = plan.into();
+    let mut active: crate::routes::private::pairing_plans::ActiveModel = plan.into();
     active.entries = Set(serde_json::to_value(&entries).unwrap_or_default());
     active.summary = Set(summary);
     let updated = active.update(&state.db).await?;
@@ -1317,7 +1317,7 @@ async fn plan_site_metadata(
 ) -> AppResult<Json<Vec<serde_json::Value>>> {
     use sea_orm::Statement;
 
-    let plan = crate::entity::pairing_plans::Entity::find_by_id(id)
+    let plan = crate::routes::private::pairing_plans::Entity::find_by_id(id)
         .one(&state.db)
         .await?
         .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;

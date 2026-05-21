@@ -1,12 +1,9 @@
-pub mod admin;
-pub mod alarms;
 pub mod config;
 pub mod private;
-pub mod projects;
 pub mod public;
 pub mod public_api;
 pub mod service;
-pub mod sites;
+pub mod admin;
 
 pub use crate::common::cache;
 
@@ -18,7 +15,7 @@ use tower::ServiceBuilder;
 use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 use uuid::Uuid;
 
-use crate::services::FallbackIpKeyExtractor;
+use crate::common::rate_limit::FallbackIpKeyExtractor;
 use tower_http::{
     compression::CompressionLayer,
     cors::CorsLayer,
@@ -30,7 +27,7 @@ use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
 use crate::common::AppState;
-use crate::entity::{projects as projects_entity, sites as sites_entity};
+use crate::routes::private::{projects as projects_entity, sites as sites_entity};
 use crate::error::{AppError, AppResult};
 
 // ============================================================================
@@ -229,31 +226,31 @@ pub fn enforce_time_range(
 #[openapi(
     paths(
         healthz,
-        projects::list_project_sites,
-        sites::list_site_parameters,
-        sites::get_site_detail,
-        sites::get_site_readings,
-        sites::get_site_aggregates,
-        sites::get_site_status_events,
-        alarms::get_site_alarms,
-        sites::get_site_annotations,
+        private::projects::views::list_project_sites,
+        private::sites::handlers::list_site_parameters,
+        private::sites::handlers::get_site_detail,
+        private::sites::readings::get_site_readings,
+        private::sites::aggregates::get_site_aggregates,
+        private::sites::status_events::get_site_status_events,
+        private::alarms::views::get_site_alarms,
+        private::sites::annotations::get_site_annotations,
     ),
     components(
         schemas(
-            projects::ProjectResponse,
-            sites::SiteResponse,
-            sites::SiteDetailResponse,
-            sites::SiteRef,
-            sites::ProjectRef,
-            sites::ParameterResponse,
-            sites::ReadingsResponse,
-            sites::ParameterData,
-            sites::AggregatesResponse,
-            sites::ParameterAggregateData,
-            sites::StatusEventsResponse,
-            sites::AnnotationResponse,
-            alarms::AlarmViolationsResponse,
-            alarms::ParameterViolationData,
+            private::projects::types::ProjectResponse,
+            private::sites::types::SiteResponse,
+            private::sites::types::SiteDetailResponse,
+            private::sites::types::SiteRef,
+            private::sites::types::ProjectRef,
+            private::sites::types::ParameterResponse,
+            private::sites::readings::ReadingsResponse,
+            private::sites::readings::ParameterData,
+            private::sites::aggregates::AggregatesResponse,
+            private::sites::aggregates::ParameterAggregateData,
+            private::sites::status_events::StatusEventsResponse,
+            private::sites::annotations::AnnotationResponse,
+            private::alarms::types::AlarmViolationsResponse,
+            private::alarms::types::ParameterViolationData,
         )
     ),
     tags(

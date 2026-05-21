@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::auth::Role;
 use crate::error::AppError;
-use crate::services::api_token::validate_bearer_token;
+use crate::routes::private::api_tokens::services::validate_bearer_token;
 
 // Type alias for the Keycloak auth status used throughout this module.
 type KcStatus = axum_keycloak_auth::KeycloakAuthStatus<
@@ -143,9 +143,9 @@ pub async fn service_auth_middleware(
     if let Some(raw) = sync_header
         && !raw.is_empty()
     {
-        let token_hash = crate::services::api_token::hash_token(raw);
+        let token_hash = crate::routes::private::api_tokens::services::hash_token(raw);
 
-        use crate::entity::sync_service_tokens;
+        use crate::routes::private::sync::tokens_model as sync_service_tokens;
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
         if let Ok(Some(token)) = sync_service_tokens::Entity::find()

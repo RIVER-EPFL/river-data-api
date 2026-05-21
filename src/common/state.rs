@@ -8,9 +8,9 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::config::Config;
-use crate::services::api_token::TokenCache;
+use crate::routes::private::api_tokens::services::TokenCache;
 use super::bulk::{BulkSemaphore, new_bulk_semaphore};
-use crate::services::public_api_config::{PublicConfigCache, new_public_config_cache};
+use crate::routes::public::services::{PublicConfigCache, new_public_config_cache};
 
 /// Cached Keycloak admin API credentials and token.
 #[derive(Clone)]
@@ -78,7 +78,7 @@ impl AppState {
             }
         });
 
-        let token_cache = crate::services::api_token::new_token_cache();
+        let token_cache = crate::routes::private::api_tokens::services::new_token_cache();
 
         Self {
             db,

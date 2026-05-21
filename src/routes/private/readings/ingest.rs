@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::entity::{data_streams, readings, status_events};
+use crate::routes::private::{data_streams, readings, status_events};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::operations::resolve_sensor_context;
 
