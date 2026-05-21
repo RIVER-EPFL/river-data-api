@@ -69,52 +69,45 @@ async fn readyz(
     }
 }
 
-/// Resolve a project by UUID or name (case-insensitive)
+/// Resolve any entity by UUID or case-insensitive name lookup.
+async fn resolve_by_id_or_name<E>(
+    db: &DatabaseConnection,
+    id_or_name: &str,
+    label: &str,
+) -> AppResult<E::Model>
+where
+    E: EntityTrait,
+    E::Model: Send,
+    <<E as EntityTrait>::PrimaryKey as sea_orm::PrimaryKeyTrait>::ValueType: From<Uuid>,
+{
+    if let Ok(uuid) = id_or_name.parse::<Uuid>() {
+        return E::find_by_id(uuid)
+            .one(db)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("{label} not found")));
+    }
+    E::find()
+        .filter(Condition::all().add(Expr::cust_with_values(
+            "LOWER(name) = LOWER($1)",
+            [id_or_name],
+        )))
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("{label} not found")))
+}
+
 pub async fn resolve_project(
     db: &DatabaseConnection,
     id_or_name: &str,
 ) -> AppResult<projects_entity::Model> {
-    // Try UUID first
-    if let Ok(uuid) = id_or_name.parse::<Uuid>() {
-        return projects_entity::Entity::find_by_id(uuid)
-            .one(db)
-            .await?
-            .ok_or_else(|| AppError::NotFound("Project not found".to_string()));
-    }
-
-    // Fall back to case-insensitive name lookup using LOWER()
-    projects_entity::Entity::find()
-        .filter(Condition::all().add(Expr::cust_with_values(
-            "LOWER(name) = LOWER($1)",
-            [id_or_name],
-        )))
-        .one(db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Project not found".to_string()))
+    resolve_by_id_or_name::<projects_entity::Entity>(db, id_or_name, "Project").await
 }
 
-/// Resolve a site by UUID or name (case-insensitive)
 pub async fn resolve_site(
     db: &DatabaseConnection,
     id_or_name: &str,
 ) -> AppResult<sites_entity::Model> {
-    // Try UUID first
-    if let Ok(uuid) = id_or_name.parse::<Uuid>() {
-        return sites_entity::Entity::find_by_id(uuid)
-            .one(db)
-            .await?
-            .ok_or_else(|| AppError::NotFound("Site not found".to_string()));
-    }
-
-    // Fall back to case-insensitive name lookup using LOWER()
-    sites_entity::Entity::find()
-        .filter(Condition::all().add(Expr::cust_with_values(
-            "LOWER(name) = LOWER($1)",
-            [id_or_name],
-        )))
-        .one(db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Site not found".to_string()))
+    resolve_by_id_or_name::<sites_entity::Entity>(db, id_or_name, "Site").await
 }
 
 /// Resolve a site by UUID or name, fetching the related project in the same query.
