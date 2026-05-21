@@ -2,6 +2,9 @@
 members = [".", "migration"]
 resolver = "2"
 
+[patch.crates-io]
+crudcrate = { path = "/home/ejthomas/projects/personal/crudcrate/crudcrate/crudcrate" }
+
 [package]
 name = "river-db"
 version = "0.2.0"
@@ -58,7 +61,7 @@ moka = { version = "0.12", features = ["future"] }
 axum-keycloak-auth = "0.8"
 
 # Admin CRUD
-crudcrate = { version = "0.7.1", features = ["postgresql", "derive"] }
+crudcrate = { version = "0.9", features = ["postgresql", "derive"] }
 
 # HTTP client (Keycloak admin proxy)
 reqwest = { version = "0.12", features = ["json"] }

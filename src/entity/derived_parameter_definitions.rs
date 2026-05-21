@@ -31,7 +31,7 @@ pub struct Model {
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     #[sea_orm(ignore)]
-    #[crudcrate(non_db_attr = true, exclude(create, update), join(one, all))]
+    #[crudcrate(non_db_attr = true, exclude(create, update), join(one, all, depth = 1))]
     pub sources: Vec<super::derived_parameter_sources::DerivedParameterSource>,
 }
 

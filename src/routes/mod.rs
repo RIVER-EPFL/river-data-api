@@ -410,8 +410,23 @@ pub fn build_router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz));
 
-    // OpenAPI documentation
-    let docs_routes = Router::new().merge(Scalar::with_url("/docs", ApiDoc::openapi()));
+    // OpenAPI documentation. Pin the Scalar JS version so a compromised
+    // `latest` on jsdelivr cannot inject script into the docs page.
+    // Keep this in sync with the version in routes/public_api/mod.rs.
+    const PINNED_SCALAR_HTML: &str = r#"<!doctype html>
+<html>
+<head>
+    <title>Scalar</title>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+</head>
+<body>
+<script id="api-reference" type="application/json">$spec</script>
+<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.57.2"></script>
+</body>
+</html>"#;
+    let docs_routes = Router::new()
+        .merge(Scalar::with_url("/docs", ApiDoc::openapi()).custom_html(PINNED_SCALAR_HTML));
 
     // Build CORS layer from config
     let cors = {

@@ -133,7 +133,7 @@ async fn serve_docs(
 </head>
 <body>
     <script id="api-reference" type="application/json">{spec_json}</script>
-    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.57.2"></script>
 </body>
 </html>"#,
         title = html_escape(&config.api_title),
