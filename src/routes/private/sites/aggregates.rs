@@ -16,7 +16,7 @@ use crate::common::middleware::ProjectScope;
 use crate::entity::{alarm_thresholds, site_parameters};
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, resolve_site_with_project, validate_time_range};
-use crate::services::bulk::{self, StreamableAggregateParam};
+use crate::common::bulk::{self, StreamableAggregateParam};
 
 use super::types::{ProjectRef, SiteRef};
 

@@ -32,24 +32,24 @@ pub struct Model {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     #[sea_orm(ignore)]
     #[crudcrate(non_db_attr = true, exclude(create, update), join(one, all, depth = 1))]
-    pub sources: Vec<crate::entity::derived_parameter_sources::DerivedParameterSource>,
+    pub sources: Vec<crate::routes::private::derived_parameters::source_model::DerivedParameterSource>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    #[sea_orm(has_many = "crate::entity::site_parameters::Entity")]
+    #[sea_orm(has_many = "crate::routes::private::site_parameters::Entity")]
     SiteParameters,
-    #[sea_orm(has_many = "crate::entity::derived_parameter_sources::Entity")]
+    #[sea_orm(has_many = "crate::routes::private::derived_parameters::source_model::Entity")]
     DerivedParameterSources,
 }
 
-impl Related<crate::entity::site_parameters::Entity> for Entity {
+impl Related<crate::routes::private::site_parameters::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SiteParameters.def()
     }
 }
 
-impl Related<crate::entity::derived_parameter_sources::Entity> for Entity {
+impl Related<crate::routes::private::derived_parameters::source_model::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::DerivedParameterSources.def()
     }

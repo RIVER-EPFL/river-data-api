@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
-use crate::routes::sites::{ProjectRef, SiteRef};
+use crate::routes::private::sites::types::{ProjectRef, SiteRef};
 
 /// Response for alarm violations endpoint
 #[derive(Debug, Serialize, ToSchema)]

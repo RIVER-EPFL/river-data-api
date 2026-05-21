@@ -2,7 +2,7 @@ use axum::{Json, extract::State};
 
 use crate::common::AppState;
 use crate::error::AppResult;
-use crate::services::merge::{
+use super::merge_services::{
     MergeParametersRequest, MergeParametersResponse, MergeSiteParametersRequest,
     MergeSiteParametersResponse, merge_parameters, merge_site_parameters,
 };

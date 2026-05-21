@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::error::AppResult;
-use crate::services::calibration::recalculate_for_calibration;
+use crate::routes::private::sensor_calibrations::services::recalculate_for_calibration;
 
 pub async fn recalculate_calibration(
     State(state): State<AppState>,

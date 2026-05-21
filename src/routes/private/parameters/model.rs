@@ -49,51 +49,51 @@ pub struct Model {
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    #[sea_orm(has_many = "crate::entity::sensors::Entity")]
+    #[sea_orm(has_many = "crate::routes::private::sensors::Entity")]
     Sensors,
-    #[sea_orm(has_many = "crate::entity::site_parameters::Entity")]
+    #[sea_orm(has_many = "crate::routes::private::site_parameters::Entity")]
     SiteParameters,
-    #[sea_orm(has_many = "crate::entity::alarm_thresholds::Entity")]
+    #[sea_orm(has_many = "crate::routes::private::alarm_thresholds::Entity")]
     AlarmThresholds,
-    #[sea_orm(has_many = "crate::entity::public_exposed_parameters::Entity")]
+    #[sea_orm(has_many = "crate::routes::private::public_exposed_parameters::Entity")]
     PublicExposedParameters,
-    #[sea_orm(has_many = "crate::entity::status_events::Entity")]
+    #[sea_orm(has_many = "crate::routes::private::status_events::Entity")]
     StatusEvents,
-    #[sea_orm(has_many = "crate::entity::derived_parameter_sources::Entity")]
+    #[sea_orm(has_many = "crate::routes::private::derived_parameters::source_model::Entity")]
     DerivedParameterSources,
 }
 
-impl Related<crate::entity::sensors::Entity> for Entity {
+impl Related<crate::routes::private::sensors::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Sensors.def()
     }
 }
 
-impl Related<crate::entity::site_parameters::Entity> for Entity {
+impl Related<crate::routes::private::site_parameters::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SiteParameters.def()
     }
 }
 
-impl Related<crate::entity::alarm_thresholds::Entity> for Entity {
+impl Related<crate::routes::private::alarm_thresholds::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::AlarmThresholds.def()
     }
 }
 
-impl Related<crate::entity::public_exposed_parameters::Entity> for Entity {
+impl Related<crate::routes::private::public_exposed_parameters::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::PublicExposedParameters.def()
     }
 }
 
-impl Related<crate::entity::status_events::Entity> for Entity {
+impl Related<crate::routes::private::status_events::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::StatusEvents.def()
     }
 }
 
-impl Related<crate::entity::derived_parameter_sources::Entity> for Entity {
+impl Related<crate::routes::private::derived_parameters::source_model::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::DerivedParameterSources.def()
     }

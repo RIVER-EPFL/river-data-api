@@ -41,35 +41,35 @@ pub struct Model {
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    #[sea_orm(has_many = "crate::entity::sync_commands::Entity")]
+    #[sea_orm(has_many = "crate::routes::private::sync::commands_model::Entity")]
     SyncCommands,
-    #[sea_orm(has_many = "crate::entity::sync_events::Entity")]
+    #[sea_orm(has_many = "crate::routes::private::sync::events_model::Entity")]
     SyncEvents,
-    #[sea_orm(has_many = "crate::entity::sync_service_credentials::Entity")]
+    #[sea_orm(has_many = "crate::routes::private::sync::credentials_model::Entity")]
     SyncServiceCredentials,
-    #[sea_orm(has_many = "crate::entity::sync_service_tokens::Entity")]
+    #[sea_orm(has_many = "crate::routes::private::sync::tokens_model::Entity")]
     SyncServiceTokens,
 }
 
-impl Related<crate::entity::sync_commands::Entity> for Entity {
+impl Related<crate::routes::private::sync::commands_model::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SyncCommands.def()
     }
 }
 
-impl Related<crate::entity::sync_events::Entity> for Entity {
+impl Related<crate::routes::private::sync::events_model::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SyncEvents.def()
     }
 }
 
-impl Related<crate::entity::sync_service_credentials::Entity> for Entity {
+impl Related<crate::routes::private::sync::credentials_model::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SyncServiceCredentials.def()
     }
 }
 
-impl Related<crate::entity::sync_service_tokens::Entity> for Entity {
+impl Related<crate::routes::private::sync::tokens_model::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SyncServiceTokens.def()
     }

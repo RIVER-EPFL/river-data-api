@@ -5,7 +5,7 @@ use axum::{
 
 use crate::common::AppState;
 use crate::error::AppResult;
-use crate::services::public_api_config::invalidate_config;
+use crate::routes::public::services::invalidate_config;
 
 pub async fn invalidate_public_config(
     State(state): State<AppState>,

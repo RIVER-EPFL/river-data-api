@@ -31,14 +31,14 @@ pub struct Model {
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
     #[sea_orm(
-        belongs_to = "crate::entity::sites::Entity",
+        belongs_to = "crate::routes::private::sites::Entity",
         from = "Column::SiteId",
-        to = "crate::entity::sites::Column::Id"
+        to = "crate::routes::private::sites::Column::Id"
     )]
     Site,
 }
 
-impl Related<crate::entity::sites::Entity> for Entity {
+impl Related<crate::routes::private::sites::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Site.def()
     }

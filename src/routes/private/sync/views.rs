@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::entity::{data_streams, parameters, projects, site_parameters, sites};
 use crate::error::{AppError, AppResult};
-use crate::services::operations::{create_sensor_for_stream, extract_vaisala_device_serial};
+use crate::routes::private::sensors::operations::{create_sensor_for_stream, extract_vaisala_device_serial};
 
 // ============================================================================
 // Router — library admin routes + local discovery/pairing routes
@@ -450,7 +450,7 @@ async fn apply_discovery(
     if resp.total_backfilled > 0 {
         let db_clone = db.clone();
         tokio::spawn(async move {
-            crate::services::sync_state::refresh_continuous_aggregates_full(&db_clone).await;
+            crate::common::sync_state::refresh_continuous_aggregates_full(&db_clone).await;
         });
     }
 
@@ -1128,7 +1128,7 @@ async fn bulk_pair(
     if paired > 0 {
         let db_clone = db.clone();
         tokio::spawn(async move {
-            crate::services::sync_state::refresh_continuous_aggregates_full(&db_clone).await;
+            crate::common::sync_state::refresh_continuous_aggregates_full(&db_clone).await;
         });
     }
 
@@ -1164,7 +1164,7 @@ async fn create_pairing_plan(
     State(state): State<AppState>,
     Json(req): Json<CreatePairingPlanRequest>,
 ) -> AppResult<Json<crate::entity::pairing_plans::Model>> {
-    let plan = crate::services::pairing::create_plan(&state.db, &req.source_system).await?;
+    let plan = crate::routes::private::sync::services::create_plan(&state.db, &req.source_system).await?;
     Ok(Json(plan))
 }
 
@@ -1224,7 +1224,7 @@ async fn update_pairing_plan(
         return Err(AppError::BadRequest("Can only edit draft plans".to_string()));
     }
 
-    let mut entries: Vec<crate::services::pairing::PlanEntry> =
+    let mut entries: Vec<crate::routes::private::sync::services::PlanEntry> =
         serde_json::from_value(plan.entries.clone())
             .map_err(|e| AppError::Internal(format!("Failed to parse entries: {e}")))?;
 
@@ -1254,7 +1254,7 @@ async fn update_pairing_plan(
         }
     }
 
-    let summary = serde_json::to_value(crate::services::pairing::compute_summary_pub(&entries))
+    let summary = serde_json::to_value(crate::routes::private::sync::services::compute_summary_pub(&entries))
         .unwrap_or_default();
 
     let mut active: crate::entity::pairing_plans::ActiveModel = plan.into();
@@ -1268,8 +1268,8 @@ async fn update_pairing_plan(
 async fn apply_pairing_plan(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<crate::services::pairing::ApplyResult>> {
-    let result = crate::services::pairing::apply_plan(&state.db, id).await?;
+) -> AppResult<Json<crate::routes::private::sync::services::ApplyResult>> {
+    let result = crate::routes::private::sync::services::apply_plan(&state.db, id).await?;
     Ok(Json(result))
 }
 
@@ -1277,7 +1277,7 @@ async fn revert_pairing_plan(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let reverted = crate::services::pairing::revert_plan(&state.db, id).await?;
+    let reverted = crate::routes::private::sync::services::revert_plan(&state.db, id).await?;
     Ok(Json(serde_json::json!({ "reverted": reverted })))
 }
 
@@ -1322,7 +1322,7 @@ async fn plan_site_metadata(
         .await?
         .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
 
-    let entries: Vec<crate::services::pairing::PlanEntry> =
+    let entries: Vec<crate::routes::private::sync::services::PlanEntry> =
         serde_json::from_value(plan.entries.clone())
             .map_err(|e| AppError::Internal(format!("Failed to parse entries: {e}")))?;
 

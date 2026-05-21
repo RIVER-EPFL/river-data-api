@@ -27,87 +27,87 @@ pub struct Model {
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
     #[sea_orm(
-        belongs_to = "crate::entity::data_streams::Entity",
+        belongs_to = "crate::routes::private::data_streams::Entity",
         from = "Column::StreamId",
-        to = "crate::entity::data_streams::Column::Id"
+        to = "crate::routes::private::data_streams::Column::Id"
     )]
     DataStream,
     #[sea_orm(
-        belongs_to = "crate::entity::sites::Entity",
+        belongs_to = "crate::routes::private::sites::Entity",
         from = "Column::SiteId",
-        to = "crate::entity::sites::Column::Id"
+        to = "crate::routes::private::sites::Column::Id"
     )]
     Site,
     #[sea_orm(
-        belongs_to = "crate::entity::parameters::Entity",
+        belongs_to = "crate::routes::private::parameters::Entity",
         from = "Column::ParameterId",
-        to = "crate::entity::parameters::Column::Id"
+        to = "crate::routes::private::parameters::Column::Id"
     )]
     Parameter,
     #[sea_orm(
-        belongs_to = "crate::entity::sensors::Entity",
+        belongs_to = "crate::routes::private::sensors::Entity",
         from = "Column::SensorId",
-        to = "crate::entity::sensors::Column::Id"
+        to = "crate::routes::private::sensors::Column::Id"
     )]
     Sensor,
     #[sea_orm(
-        belongs_to = "crate::entity::sensor_calibrations::Entity",
+        belongs_to = "crate::routes::private::sensor_calibrations::Entity",
         from = "Column::CalibrationId",
-        to = "crate::entity::sensor_calibrations::Column::Id"
+        to = "crate::routes::private::sensor_calibrations::Column::Id"
     )]
     SensorCalibration,
     #[sea_orm(
-        belongs_to = "crate::entity::sensor_deployments::Entity",
+        belongs_to = "crate::routes::private::sensor_deployments::Entity",
         from = "Column::DeploymentId",
-        to = "crate::entity::sensor_deployments::Column::Id"
+        to = "crate::routes::private::sensor_deployments::Column::Id"
     )]
     SensorDeployment,
     #[sea_orm(
-        belongs_to = "crate::entity::samples::Entity",
+        belongs_to = "crate::routes::private::samples::Entity",
         from = "Column::SampleId",
-        to = "crate::entity::samples::Column::Id",
+        to = "crate::routes::private::samples::Column::Id",
         on_delete = "SetNull"
     )]
     Sample,
 }
 
-impl Related<crate::entity::data_streams::Entity> for Entity {
+impl Related<crate::routes::private::data_streams::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::DataStream.def()
     }
 }
 
-impl Related<crate::entity::sites::Entity> for Entity {
+impl Related<crate::routes::private::sites::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Site.def()
     }
 }
 
-impl Related<crate::entity::parameters::Entity> for Entity {
+impl Related<crate::routes::private::parameters::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Parameter.def()
     }
 }
 
-impl Related<crate::entity::sensors::Entity> for Entity {
+impl Related<crate::routes::private::sensors::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Sensor.def()
     }
 }
 
-impl Related<crate::entity::sensor_calibrations::Entity> for Entity {
+impl Related<crate::routes::private::sensor_calibrations::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SensorCalibration.def()
     }
 }
 
-impl Related<crate::entity::sensor_deployments::Entity> for Entity {
+impl Related<crate::routes::private::sensor_deployments::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SensorDeployment.def()
     }
 }
 
-impl Related<crate::entity::samples::Entity> for Entity {
+impl Related<crate::routes::private::samples::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Sample.def()
     }

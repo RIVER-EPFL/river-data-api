@@ -49,44 +49,44 @@ pub struct Model {
     pub discovered_at: Option<chrono::DateTime<chrono::Utc>>,
     #[sea_orm(ignore)]
     #[crudcrate(non_db_attr = true, exclude(create, update), join(one, all, depth = 1))]
-    pub parameter: Vec<crate::entity::parameters::Parameter>,
+    pub parameter: Vec<crate::routes::private::parameters::Parameter>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
     #[sea_orm(
-        belongs_to = "crate::entity::sites::Entity",
+        belongs_to = "crate::routes::private::sites::Entity",
         from = "Column::SiteId",
-        to = "crate::entity::sites::Column::Id"
+        to = "crate::routes::private::sites::Column::Id"
     )]
     Site,
     #[sea_orm(
-        belongs_to = "crate::entity::parameters::Entity",
+        belongs_to = "crate::routes::private::parameters::Entity",
         from = "Column::ParameterId",
-        to = "crate::entity::parameters::Column::Id"
+        to = "crate::routes::private::parameters::Column::Id"
     )]
     Parameter,
     #[sea_orm(
-        belongs_to = "crate::entity::derived_parameter_definitions::Entity",
+        belongs_to = "crate::routes::private::derived_parameters::definition_model::Entity",
         from = "Column::DerivedDefinitionId",
-        to = "crate::entity::derived_parameter_definitions::Column::Id"
+        to = "crate::routes::private::derived_parameters::definition_model::Column::Id"
     )]
     DerivedParameterDefinition,
 }
 
-impl Related<crate::entity::sites::Entity> for Entity {
+impl Related<crate::routes::private::sites::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Site.def()
     }
 }
 
-impl Related<crate::entity::parameters::Entity> for Entity {
+impl Related<crate::routes::private::parameters::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Parameter.def()
     }
 }
 
-impl Related<crate::entity::derived_parameter_definitions::Entity> for Entity {
+impl Related<crate::routes::private::derived_parameters::definition_model::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::DerivedParameterDefinition.def()
     }

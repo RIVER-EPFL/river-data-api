@@ -18,7 +18,7 @@ use crate::common::middleware::ProjectScope;
 use crate::entity::{parameters, site_parameters};
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, enforce_time_range, resolve_site_with_project};
-use crate::services::bulk::{self, StreamableParam};
+use crate::common::bulk::{self, StreamableParam};
 
 use super::types::{ProjectRef, SiteRef};
 

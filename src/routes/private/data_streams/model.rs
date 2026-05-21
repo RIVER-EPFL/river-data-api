@@ -54,38 +54,38 @@ pub struct Model {
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
     #[sea_orm(
-        belongs_to = "crate::entity::site_parameters::Entity",
+        belongs_to = "crate::routes::private::site_parameters::Entity",
         from = "Column::SiteParameterId",
-        to = "crate::entity::site_parameters::Column::Id"
+        to = "crate::routes::private::site_parameters::Column::Id"
     )]
     SiteParameter,
     #[sea_orm(
-        belongs_to = "crate::entity::sensors::Entity",
+        belongs_to = "crate::routes::private::sensors::Entity",
         from = "Column::SensorId",
-        to = "crate::entity::sensors::Column::Id"
+        to = "crate::routes::private::sensors::Column::Id"
     )]
     Sensor,
     #[sea_orm(
-        belongs_to = "crate::entity::pairing_plans::Entity",
+        belongs_to = "crate::routes::private::pairing_plans::Entity",
         from = "Column::PairingPlanId",
-        to = "crate::entity::pairing_plans::Column::Id"
+        to = "crate::routes::private::pairing_plans::Column::Id"
     )]
     PairingPlan,
 }
 
-impl Related<crate::entity::site_parameters::Entity> for Entity {
+impl Related<crate::routes::private::site_parameters::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SiteParameter.def()
     }
 }
 
-impl Related<crate::entity::sensors::Entity> for Entity {
+impl Related<crate::routes::private::sensors::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Sensor.def()
     }
 }
 
-impl Related<crate::entity::pairing_plans::Entity> for Entity {
+impl Related<crate::routes::private::pairing_plans::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::PairingPlan.def()
     }

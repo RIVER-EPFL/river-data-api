@@ -9,7 +9,7 @@ use crate::common::middleware::ProjectScope;
 use crate::entity::sites;
 use crate::error::{AppError, AppResult};
 use crate::routes::resolve_project;
-use crate::routes::sites::SiteResponse;
+use crate::routes::private::sites::types::SiteResponse;
 
 /// List sites belonging to a project
 #[utoipa::path(

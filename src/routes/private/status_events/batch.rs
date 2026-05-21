@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::entity::status_events;
 use crate::error::AppResult;
-use crate::services::operations::get_or_create_api_stream;
+use crate::routes::private::data_streams::operations::get_or_create_api_stream;
 
 #[derive(Debug, Deserialize)]
 pub struct BatchStatusEventsRequest {

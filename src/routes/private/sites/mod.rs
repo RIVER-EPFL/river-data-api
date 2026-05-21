@@ -6,3 +6,4 @@ pub mod readings;
 pub mod router;
 pub mod status_events;
 pub mod types;
+pub use model::*;

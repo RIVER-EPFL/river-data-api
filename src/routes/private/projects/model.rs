@@ -44,19 +44,19 @@ pub struct Model {
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    #[sea_orm(has_many = "crate::entity::sites::Entity")]
+    #[sea_orm(has_many = "crate::routes::private::sites::Entity")]
     Sites,
-    #[sea_orm(has_many = "crate::entity::public_exposed_parameters::Entity")]
+    #[sea_orm(has_many = "crate::routes::private::public_exposed_parameters::Entity")]
     PublicExposedParameters,
 }
 
-impl Related<crate::entity::sites::Entity> for Entity {
+impl Related<crate::routes::private::sites::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Sites.def()
     }
 }
 
-impl Related<crate::entity::public_exposed_parameters::Entity> for Entity {
+impl Related<crate::routes::private::public_exposed_parameters::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::PublicExposedParameters.def()
     }

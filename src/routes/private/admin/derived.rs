@@ -58,7 +58,7 @@ pub async fn recompute_derived(
                                 };
                             let utc_time = time.with_timezone(&chrono::Utc);
                             if let Err(e) =
-                                crate::services::calibration::recalculate_derived_at_timestamp(
+                                crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
                                     &db, site_id, utc_time,
                                 )
                                 .await

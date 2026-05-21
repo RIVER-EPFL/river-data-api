@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::entity::readings;
 use crate::error::AppResult;
-use crate::services::operations::get_or_create_api_stream;
+use crate::routes::private::data_streams::operations::get_or_create_api_stream;
 
 #[derive(Debug, Deserialize)]
 pub struct BatchReadingsRequest {
@@ -142,8 +142,8 @@ pub async fn insert_batch_readings(
         let affected_site_ids: std::collections::HashSet<Uuid> =
             stream_cache.keys().map(|(site_id, _)| *site_id).collect();
         for site_id in &affected_site_ids {
-            crate::services::cache::invalidate_prefix(&state, &format!("readings:{site_id}")).await;
-            crate::services::cache::invalidate_prefix(&state, &format!("aggregates:{site_id}")).await;
+            crate::common::cache::invalidate_prefix(&state, &format!("readings:{site_id}")).await;
+            crate::common::cache::invalidate_prefix(&state, &format!("aggregates:{site_id}")).await;
         }
 
         // Auto-compute derived values for affected sites
@@ -152,7 +152,7 @@ pub async fn insert_batch_readings(
             for (site_id, timestamps) in site_timestamps_for_derived {
                 for time in timestamps {
                     if let Err(e) =
-                        crate::services::calibration::recalculate_derived_at_timestamp(
+                        crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
                             &db_clone, site_id, time,
                         )
                         .await

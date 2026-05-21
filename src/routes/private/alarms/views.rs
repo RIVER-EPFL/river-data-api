@@ -17,13 +17,13 @@ use crate::common::middleware::ProjectScope;
 use crate::entity::{alarm_thresholds, site_parameters};
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, resolve_site_with_project, validate_time_range};
-use crate::services::bulk;
+use crate::common::bulk;
 
 use super::types::{
     ActiveAlarm, ActiveAlarmsResponse, AlarmSeverityCounts, AlarmSiteSummary, AlarmSummaryResponse,
     AlarmThresholdInfo, AlarmViolationsResponse, ParameterViolationData, SiteAlarmsQuery,
 };
-use crate::routes::sites::{ProjectRef, SiteRef};
+use crate::routes::private::sites::types::{ProjectRef, SiteRef};
 
 /// Row from the violations query
 #[derive(Debug, FromQueryResult)]

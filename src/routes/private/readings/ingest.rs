@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::entity::{data_streams, readings, status_events};
 use crate::error::{AppError, AppResult};
-use crate::services::operations::resolve_sensor_context;
+use crate::routes::private::sensors::operations::resolve_sensor_context;
 
 // ============================================================================
 // Stream-based Readings Ingest
@@ -184,7 +184,7 @@ pub async fn ingest_readings(
             tokio::spawn(async move {
                 for time in unique_timestamps {
                     if let Err(e) =
-                        crate::services::calibration::recalculate_derived_at_timestamp(
+                        crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
                             &db_clone, sid, time,
                         )
                         .await

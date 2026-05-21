@@ -15,7 +15,7 @@ use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
 use crate::error::{AppError, AppResult};
 use crate::routes::{resolve_site, validate_optional_time_range};
-use crate::services::bulk;
+use crate::common::bulk;
 
 use super::types::SiteRef;
 
