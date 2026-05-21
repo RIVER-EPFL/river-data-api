@@ -262,6 +262,22 @@ pub struct ApplyResult {
     pub readings_backfilled: u64,
 }
 
+struct EntityCaches {
+    projects: HashMap<String, Uuid>,
+    sites: HashMap<String, Uuid>,
+    params: HashMap<String, Uuid>,
+    site_params: HashMap<(Uuid, Uuid), Uuid>,
+    param_names: HashMap<Uuid, String>,
+}
+
+struct ApplyCounters {
+    projects_created: u32,
+    sites_created: u32,
+    params_created: u32,
+    sp_created: u32,
+    streams_paired: u32,
+}
+
 /// Apply a pairing plan: create entities, pair streams, backfill readings.
 pub async fn apply_plan(
     db: &sea_orm::DatabaseConnection,
@@ -282,111 +298,172 @@ pub async fn apply_plan(
 
     let txn = db.begin().await?;
 
-    // Raise decompression limit for backfill
     txn.execute(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
     )).await?;
 
-    let mut project_map: HashMap<String, Uuid> = HashMap::new();
-    let mut site_map: HashMap<String, Uuid> = HashMap::new();
-    let mut param_map: HashMap<String, Uuid> = HashMap::new();
-    let mut sp_cache: HashMap<(Uuid, Uuid), Uuid> = HashMap::new();
-
-    let mut projects_created = 0u32;
-    let mut sites_created = 0u32;
-    let mut params_created = 0u32;
-    let mut sp_created = 0u32;
-    let mut streams_paired = 0u32;
-
-    // Pre-load param names for site_parameter creation
-    let param_name_lookup: HashMap<Uuid, String> = parameters::Entity::find()
+    let param_names: HashMap<Uuid, String> = parameters::Entity::find()
         .all(&txn).await?
         .into_iter().map(|p| (p.id, p.name)).collect();
 
-    // Process entries that have action = "pair"
-    let pair_entries: Vec<&PlanEntry> = entries.iter().filter(|e| e.action == "pair").collect();
+    let mut caches = EntityCaches {
+        projects: HashMap::new(),
+        sites: HashMap::new(),
+        params: HashMap::new(),
+        site_params: HashMap::new(),
+        param_names,
+    };
+    let mut counters = ApplyCounters {
+        projects_created: 0, sites_created: 0, params_created: 0,
+        sp_created: 0, streams_paired: 0,
+    };
 
-    for entry in &pair_entries {
-        // Resolve project
-        let project_id = resolve_or_create_project(
-            &txn, &entry.project, &mut project_map, &mut projects_created, &plan.source_system,
+    for entry in entries.iter().filter(|e| e.action == "pair") {
+        let (site_parameter_id, parameter_id) = resolve_plan_entry(
+            &txn, entry, &plan.source_system, &mut caches, &mut counters,
         ).await?;
-
-        // Resolve site
-        let site_id = resolve_or_create_site(
-            &txn, &entry.site, &mut site_map, &mut sites_created, project_id,
-        ).await?;
-
-        // Resolve parameter
-        let parameter_id = resolve_or_create_param(
-            &txn, &entry.parameter, &mut param_map, &mut params_created,
-        ).await?;
-
-        // Resolve site_parameter
-        let sp_key = (site_id, parameter_id);
-        let site_parameter_id = if let Some(&sp_id) = sp_cache.get(&sp_key) {
-            sp_id
-        } else {
-            let existing = site_parameters::Entity::find()
-                .filter(Condition::all()
-                    .add(site_parameters::Column::SiteId.eq(site_id))
-                    .add(site_parameters::Column::ParameterId.eq(parameter_id)))
-                .one(&txn).await?;
-            let id = if let Some(existing) = existing {
-                existing.id
-            } else {
-                let id = Uuid::new_v4();
-                let param_name_val = param_name_lookup.get(&parameter_id)
-                    .or_else(|| param_map.iter().find(|&(_, &v)| v == parameter_id).map(|(k, _)| k))
-                    .cloned()
-                    .unwrap_or_default();
-                site_parameters::ActiveModel {
-                    id: Set(id),
-                    site_id: Set(site_id),
-                    parameter_id: Set(parameter_id),
-                    name: Set(param_name_val),
-                    sensor_type: Set(String::new()),
-                    display_units: Set(None), units_name: Set(None),
-                    units_min: Set(None), units_max: Set(None),
-                    decimal_places: Set(None), channel_id: Set(None),
-                    sample_interval_sec: Set(None),
-                    is_active: Set(Some(true)),
-                    is_derived: Set(Some(false)),
-                    derived_definition_id: Set(None),
-                    variable_mappings: Set(None),
-                    created_at: Set(Some(Utc::now())),
-                    updated_at: Set(Some(Utc::now())),
-                    discovered_at: Set(Some(Utc::now())),
-                }.insert(&txn).await?;
-                sp_created += 1;
-                id
-            };
-            sp_cache.insert(sp_key, id);
-            id
-        };
-
-        // Pair the stream
-        let stream = data_streams::Entity::find_by_id(entry.stream_id)
-            .one(&txn).await?
-            .ok_or_else(|| AppError::NotFound(format!("Stream {} not found", entry.stream_id)))?;
-
-        // Create sensor if stream doesn't have one
-        if stream.sensor_id.is_none() {
-            let _ = create_sensor_for_stream(&txn, &stream, parameter_id, site_id).await;
-        }
-
-        let now = Utc::now();
-        let mut active: data_streams::ActiveModel = stream.into();
-        active.site_parameter_id = Set(Some(site_parameter_id));
-        active.pairing_plan_id = Set(Some(plan_id));
-        active.paired_at = Set(Some(now.into()));
-        active.updated_at = Set(now.into());
-        active.update(&txn).await?;
-        streams_paired += 1;
+        pair_entry_stream(&txn, entry, plan_id, site_parameter_id, parameter_id).await?;
+        counters.streams_paired += 1;
     }
 
-    // Batch backfill readings
+    let readings_backfilled = backfill_plan_readings(&txn, plan_id).await?;
+    finalize_plan(&txn, plan_id, &counters, readings_backfilled).await?;
+    txn.commit().await?;
+
+    let db_clone = db.clone();
+    tokio::spawn(async move {
+        crate::common::sync_state::refresh_continuous_aggregates_full(&db_clone).await;
+    });
+
+    let result = ApplyResult {
+        projects_created: counters.projects_created,
+        sites_created: counters.sites_created,
+        parameters_created: counters.params_created,
+        site_parameters_created: counters.sp_created,
+        streams_paired: counters.streams_paired,
+        readings_backfilled,
+    };
+
+    tracing::info!(
+        plan_id = %plan_id,
+        streams_paired = counters.streams_paired,
+        sites_created = counters.sites_created,
+        params_created = counters.params_created,
+        readings_backfilled,
+        "Pairing plan applied"
+    );
+
+    Ok(result)
+}
+
+/// Resolve or create all entities for one plan entry. Returns (site_parameter_id, parameter_id).
+async fn resolve_plan_entry<C: ConnectionTrait>(
+    txn: &C,
+    entry: &PlanEntry,
+    source_system: &str,
+    caches: &mut EntityCaches,
+    counters: &mut ApplyCounters,
+) -> AppResult<(Uuid, Uuid)> {
+    let project_id = resolve_or_create_project(
+        txn, &entry.project, &mut caches.projects, &mut counters.projects_created, source_system,
+    ).await?;
+    let site_id = resolve_or_create_site(
+        txn, &entry.site, &mut caches.sites, &mut counters.sites_created, project_id,
+    ).await?;
+    let parameter_id = resolve_or_create_param(
+        txn, &entry.parameter, &mut caches.params, &mut counters.params_created,
+    ).await?;
+    let site_parameter_id = resolve_or_create_site_param(
+        txn, site_id, parameter_id, &caches.param_names, &caches.params,
+        &mut caches.site_params, &mut counters.sp_created,
+    ).await?;
+    Ok((site_parameter_id, parameter_id))
+}
+
+async fn resolve_or_create_site_param<C: ConnectionTrait>(
+    txn: &C,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    param_names: &HashMap<Uuid, String>,
+    param_cache: &HashMap<String, Uuid>,
+    sp_cache: &mut HashMap<(Uuid, Uuid), Uuid>,
+    sp_created: &mut u32,
+) -> AppResult<Uuid> {
+    let key = (site_id, parameter_id);
+    if let Some(&id) = sp_cache.get(&key) {
+        return Ok(id);
+    }
+
+    let existing = site_parameters::Entity::find()
+        .filter(Condition::all()
+            .add(site_parameters::Column::SiteId.eq(site_id))
+            .add(site_parameters::Column::ParameterId.eq(parameter_id)))
+        .one(txn).await?;
+
+    let id = if let Some(existing) = existing {
+        existing.id
+    } else {
+        let id = Uuid::new_v4();
+        let param_name_val = param_names.get(&parameter_id)
+            .or_else(|| param_cache.iter().find(|&(_, &v)| v == parameter_id).map(|(k, _)| k))
+            .cloned()
+            .unwrap_or_default();
+        site_parameters::ActiveModel {
+            id: Set(id),
+            site_id: Set(site_id),
+            parameter_id: Set(parameter_id),
+            name: Set(param_name_val),
+            sensor_type: Set(String::new()),
+            display_units: Set(None), units_name: Set(None),
+            units_min: Set(None), units_max: Set(None),
+            decimal_places: Set(None), channel_id: Set(None),
+            sample_interval_sec: Set(None),
+            is_active: Set(Some(true)),
+            is_derived: Set(Some(false)),
+            derived_definition_id: Set(None),
+            variable_mappings: Set(None),
+            created_at: Set(Some(Utc::now())),
+            updated_at: Set(Some(Utc::now())),
+            discovered_at: Set(Some(Utc::now())),
+        }.insert(txn).await?;
+        *sp_created += 1;
+        id
+    };
+    sp_cache.insert(key, id);
+    Ok(id)
+}
+
+async fn pair_entry_stream<C: ConnectionTrait>(
+    txn: &C,
+    entry: &PlanEntry,
+    plan_id: Uuid,
+    site_parameter_id: Uuid,
+    parameter_id: Uuid,
+) -> AppResult<()> {
+    let stream = data_streams::Entity::find_by_id(entry.stream_id)
+        .one(txn).await?
+        .ok_or_else(|| AppError::NotFound(format!("Stream {} not found", entry.stream_id)))?;
+
+    if stream.sensor_id.is_none() {
+        let site_id = site_parameters::Entity::find_by_id(site_parameter_id)
+            .one(txn).await?
+            .map(|sp| sp.site_id)
+            .unwrap_or_default();
+        let _ = create_sensor_for_stream(txn, &stream, parameter_id, site_id).await;
+    }
+
+    let now = Utc::now();
+    let mut active: data_streams::ActiveModel = stream.into();
+    active.site_parameter_id = Set(Some(site_parameter_id));
+    active.pairing_plan_id = Set(Some(plan_id));
+    active.paired_at = Set(Some(now.into()));
+    active.updated_at = Set(now.into());
+    active.update(txn).await?;
+    Ok(())
+}
+
+async fn backfill_plan_readings<C: ConnectionTrait>(txn: &C, plan_id: Uuid) -> AppResult<u64> {
     let backfill_result = txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE readings r
@@ -398,9 +475,7 @@ pub async fn apply_plan(
             AND ds.pairing_plan_id = $1",
         [plan_id.into()],
     )).await?;
-    let readings_backfilled = backfill_result.rows_affected();
 
-    // Backfill status_events
     let _ = txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE status_events se
@@ -412,43 +487,33 @@ pub async fn apply_plan(
         [plan_id.into()],
     )).await;
 
-    // Update plan status
+    Ok(backfill_result.rows_affected())
+}
+
+async fn finalize_plan<C: ConnectionTrait>(
+    txn: &C,
+    plan_id: Uuid,
+    counters: &ApplyCounters,
+    readings_backfilled: u64,
+) -> AppResult<()> {
     let result = ApplyResult {
-        projects_created,
-        sites_created,
-        parameters_created: params_created,
-        site_parameters_created: sp_created,
-        streams_paired,
+        projects_created: counters.projects_created,
+        sites_created: counters.sites_created,
+        parameters_created: counters.params_created,
+        site_parameters_created: counters.sp_created,
+        streams_paired: counters.streams_paired,
         readings_backfilled,
     };
 
     let mut plan_active: pairing_plans::ActiveModel = pairing_plans::Entity::find_by_id(plan_id)
-        .one(&txn).await?
+        .one(txn).await?
         .ok_or_else(|| AppError::Internal("Plan disappeared during apply".to_string()))?
         .into();
     plan_active.status = Set("applied".to_string());
     plan_active.applied_at = Set(Some(Utc::now().into()));
     plan_active.apply_result = Set(Some(serde_json::to_value(&result).unwrap_or_default()));
-    plan_active.update(&txn).await?;
-
-    txn.commit().await?;
-
-    // Trigger aggregate refresh in background
-    let db_clone = db.clone();
-    tokio::spawn(async move {
-        crate::common::sync_state::refresh_continuous_aggregates_full(&db_clone).await;
-    });
-
-    tracing::info!(
-        plan_id = %plan_id,
-        streams_paired,
-        sites_created,
-        params_created,
-        readings_backfilled,
-        "Pairing plan applied"
-    );
-
-    Ok(result)
+    plan_active.update(txn).await?;
+    Ok(())
 }
 
 /// Revert a pairing plan: bulk unpair all streams that were paired by this plan.

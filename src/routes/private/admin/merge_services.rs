@@ -279,9 +279,31 @@ pub async fn merge_parameters(
     }
 
     let txn = db.begin().await.map_err(AppError::Database)?;
-    let pg = sea_orm::DatabaseBackend::Postgres;
+    validate_both_parameters_exist(&txn, source_id, target_id).await?;
 
-    // Validate both parameters exist
+    let (sites_merged, sites_reassigned, total_readings, total_streams) =
+        merge_site_parameters_per_site(&txn, source_id, target_id).await?;
+
+    reassign_parameter_references(&txn, source_id, target_id).await?;
+    delete_parameter(&txn, source_id).await?;
+
+    txn.commit().await.map_err(AppError::Database)?;
+
+    Ok(MergeParametersResponse {
+        sites_merged,
+        sites_reassigned,
+        readings_moved: total_readings,
+        streams_updated: total_streams,
+        source_deleted: true,
+    })
+}
+
+async fn validate_both_parameters_exist(
+    txn: &impl ConnectionTrait,
+    source_id: Uuid,
+    target_id: Uuid,
+) -> AppResult<()> {
+    let pg = sea_orm::DatabaseBackend::Postgres;
     let count: i64 = txn
         .query_one(Statement::from_sql_and_values(
             pg,
@@ -298,13 +320,17 @@ pub async fn merge_parameters(
             "One or both parameters not found".to_string(),
         ));
     }
+    Ok(())
+}
 
-    let mut sites_merged: u64 = 0;
-    let mut sites_reassigned: u64 = 0;
-    let mut total_readings: u64 = 0;
-    let mut total_streams: u64 = 0;
+/// For each site_parameter on source: merge into target's existing site_parameter or reassign.
+async fn merge_site_parameters_per_site(
+    txn: &impl ConnectionTrait,
+    source_id: Uuid,
+    target_id: Uuid,
+) -> AppResult<(u64, u64, u64, u64)> {
+    let pg = sea_orm::DatabaseBackend::Postgres;
 
-    // Find all site_parameters for the source parameter
     let source_sps = txn
         .query_all(Statement::from_sql_and_values(
             pg,
@@ -314,11 +340,15 @@ pub async fn merge_parameters(
         .await
         .map_err(AppError::Database)?;
 
+    let mut sites_merged: u64 = 0;
+    let mut sites_reassigned: u64 = 0;
+    let mut total_readings: u64 = 0;
+    let mut total_streams: u64 = 0;
+
     for row in &source_sps {
         let sp_id: Uuid = row.try_get("", "id").map_err(AppError::Database)?;
         let site_id: Uuid = row.try_get("", "site_id").map_err(AppError::Database)?;
 
-        // Check if target parameter already has a site_parameter at this site
         let target_sp = txn
             .query_one(Statement::from_sql_and_values(
                 pg,
@@ -329,110 +359,158 @@ pub async fn merge_parameters(
             .map_err(AppError::Database)?;
 
         if let Some(target_row) = target_sp {
-            // Conflict: both exist at this site — do per-site merge
-            let target_sp_id: Uuid =
-                target_row.try_get("", "id").map_err(AppError::Database)?;
-
-            // Move readings
-            let r = txn
-                .execute(Statement::from_sql_and_values(
-                    pg,
-                    "UPDATE readings SET parameter_id = $1 WHERE site_id = $2 AND parameter_id = $3",
-                    vec![target_id.into(), site_id.into(), source_id.into()],
-                ))
-                .await
-                .map_err(AppError::Database)?;
-            total_readings += r.rows_affected();
-
-            // Move status_events
-            txn.execute(Statement::from_sql_and_values(
-                pg,
-                "UPDATE status_events SET parameter_id = $1 WHERE site_id = $2 AND parameter_id = $3",
-                vec![target_id.into(), site_id.into(), source_id.into()],
-            ))
-            .await
-            .map_err(AppError::Database)?;
-
-            // Move data_streams from source SP to target SP
-            let s = txn
-                .execute(Statement::from_sql_and_values(
-                    pg,
-                    "UPDATE data_streams SET site_parameter_id = $1 WHERE site_parameter_id = $2",
-                    vec![target_sp_id.into(), sp_id.into()],
-                ))
-                .await
-                .map_err(AppError::Database)?;
-            total_streams += s.rows_affected();
-
-            // Delete alarm_thresholds for source at this site
-            txn.execute(Statement::from_sql_and_values(
-                pg,
-                "DELETE FROM alarm_thresholds WHERE parameter_id = $1 AND site_id = $2",
-                vec![source_id.into(), site_id.into()],
-            ))
-            .await
-            .map_err(AppError::Database)?;
-
-            // Delete leftover readings/status_events for source at this site
-            txn.execute(Statement::from_sql_and_values(
-                pg,
-                "DELETE FROM readings WHERE site_id = $1 AND parameter_id = $2",
-                vec![site_id.into(), source_id.into()],
-            ))
-            .await
-            .map_err(AppError::Database)?;
-            txn.execute(Statement::from_sql_and_values(
-                pg,
-                "DELETE FROM status_events WHERE site_id = $1 AND parameter_id = $2",
-                vec![site_id.into(), source_id.into()],
-            ))
-            .await
-            .map_err(AppError::Database)?;
-
-            // Delete the source site_parameter
-            txn.execute(Statement::from_sql_and_values(
-                pg,
-                "DELETE FROM site_parameters WHERE id = $1",
-                vec![sp_id.into()],
-            ))
-            .await
-            .map_err(AppError::Database)?;
-
+            let target_sp_id: Uuid = target_row.try_get("", "id").map_err(AppError::Database)?;
+            let (readings, streams) = merge_conflicting_site_param(
+                txn, sp_id, target_sp_id, site_id, source_id, target_id,
+            ).await?;
+            total_readings += readings;
+            total_streams += streams;
             sites_merged += 1;
         } else {
-            // No conflict: just reassign the site_parameter to target
-            txn.execute(Statement::from_sql_and_values(
-                pg,
-                "UPDATE site_parameters SET parameter_id = $1 WHERE id = $2",
-                vec![target_id.into(), sp_id.into()],
-            ))
-            .await
-            .map_err(AppError::Database)?;
-
-            // Also update denormalized parameter_id on readings
-            let r = txn
-                .execute(Statement::from_sql_and_values(
-                    pg,
-                    "UPDATE readings SET parameter_id = $1 WHERE site_id = $2 AND parameter_id = $3",
-                    vec![target_id.into(), site_id.into(), source_id.into()],
-                ))
-                .await
-                .map_err(AppError::Database)?;
-            total_readings += r.rows_affected();
-
-            txn.execute(Statement::from_sql_and_values(
-                pg,
-                "UPDATE status_events SET parameter_id = $1 WHERE site_id = $2 AND parameter_id = $3",
-                vec![target_id.into(), site_id.into(), source_id.into()],
-            ))
-            .await
-            .map_err(AppError::Database)?;
-
+            let readings = reassign_site_param(txn, sp_id, site_id, source_id, target_id).await?;
+            total_readings += readings;
             sites_reassigned += 1;
         }
     }
 
-    // Reassign sensors (handle UNIQUE(serial_number, parameter_id) by deleting conflicting source sensors)
+    Ok((sites_merged, sites_reassigned, total_readings, total_streams))
+}
+
+/// Both source and target have a site_parameter at this site -- absorb source into target.
+async fn merge_conflicting_site_param(
+    txn: &impl ConnectionTrait,
+    source_sp_id: Uuid,
+    target_sp_id: Uuid,
+    site_id: Uuid,
+    source_param_id: Uuid,
+    target_param_id: Uuid,
+) -> AppResult<(u64, u64)> {
+    let pg = sea_orm::DatabaseBackend::Postgres;
+
+    let r = txn
+        .execute(Statement::from_sql_and_values(
+            pg,
+            "UPDATE readings SET parameter_id = $1 WHERE site_id = $2 AND parameter_id = $3",
+            vec![target_param_id.into(), site_id.into(), source_param_id.into()],
+        ))
+        .await
+        .map_err(AppError::Database)?;
+    let readings_moved = r.rows_affected();
+
+    txn.execute(Statement::from_sql_and_values(
+        pg,
+        "UPDATE status_events SET parameter_id = $1 WHERE site_id = $2 AND parameter_id = $3",
+        vec![target_param_id.into(), site_id.into(), source_param_id.into()],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+
+    let s = txn
+        .execute(Statement::from_sql_and_values(
+            pg,
+            "UPDATE data_streams SET site_parameter_id = $1 WHERE site_parameter_id = $2",
+            vec![target_sp_id.into(), source_sp_id.into()],
+        ))
+        .await
+        .map_err(AppError::Database)?;
+    let streams_moved = s.rows_affected();
+
+    delete_site_param_remnants(txn, source_sp_id, site_id, source_param_id).await?;
+
+    Ok((readings_moved, streams_moved))
+}
+
+/// No conflict at this site -- just reassign the site_parameter's parameter_id.
+async fn reassign_site_param(
+    txn: &impl ConnectionTrait,
+    sp_id: Uuid,
+    site_id: Uuid,
+    source_param_id: Uuid,
+    target_param_id: Uuid,
+) -> AppResult<u64> {
+    let pg = sea_orm::DatabaseBackend::Postgres;
+
+    txn.execute(Statement::from_sql_and_values(
+        pg,
+        "UPDATE site_parameters SET parameter_id = $1 WHERE id = $2",
+        vec![target_param_id.into(), sp_id.into()],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+
+    let r = txn
+        .execute(Statement::from_sql_and_values(
+            pg,
+            "UPDATE readings SET parameter_id = $1 WHERE site_id = $2 AND parameter_id = $3",
+            vec![target_param_id.into(), site_id.into(), source_param_id.into()],
+        ))
+        .await
+        .map_err(AppError::Database)?;
+
+    txn.execute(Statement::from_sql_and_values(
+        pg,
+        "UPDATE status_events SET parameter_id = $1 WHERE site_id = $2 AND parameter_id = $3",
+        vec![target_param_id.into(), site_id.into(), source_param_id.into()],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+
+    Ok(r.rows_affected())
+}
+
+async fn delete_site_param_remnants(
+    txn: &impl ConnectionTrait,
+    sp_id: Uuid,
+    site_id: Uuid,
+    source_param_id: Uuid,
+) -> AppResult<()> {
+    let pg = sea_orm::DatabaseBackend::Postgres;
+
+    txn.execute(Statement::from_sql_and_values(
+        pg,
+        "DELETE FROM alarm_thresholds WHERE parameter_id = $1 AND site_id = $2",
+        vec![source_param_id.into(), site_id.into()],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+
+    txn.execute(Statement::from_sql_and_values(
+        pg,
+        "DELETE FROM readings WHERE site_id = $1 AND parameter_id = $2",
+        vec![site_id.into(), source_param_id.into()],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+
+    txn.execute(Statement::from_sql_and_values(
+        pg,
+        "DELETE FROM status_events WHERE site_id = $1 AND parameter_id = $2",
+        vec![site_id.into(), source_param_id.into()],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+
+    txn.execute(Statement::from_sql_and_values(
+        pg,
+        "DELETE FROM site_parameters WHERE id = $1",
+        vec![sp_id.into()],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+
+    Ok(())
+}
+
+/// Move sensors, derived sources, alarms, annotations, samples, standard curves, and
+/// public_exposed_parameters from source to target parameter.
+async fn reassign_parameter_references(
+    txn: &impl ConnectionTrait,
+    source_id: Uuid,
+    target_id: Uuid,
+) -> AppResult<()> {
+    let pg = sea_orm::DatabaseBackend::Postgres;
+
+    // Sensors: delete conflicts on UNIQUE(serial_number, parameter_id), then reassign
     txn.execute(Statement::from_sql_and_values(
         pg,
         r#"DELETE FROM sensors WHERE parameter_id = $1
@@ -449,7 +527,7 @@ pub async fn merge_parameters(
     .await
     .map_err(AppError::Database)?;
 
-    // Reassign derived_parameter_sources (delete if target already referenced)
+    // Derived parameter sources: delete conflicts, then reassign
     txn.execute(Statement::from_sql_and_values(
         pg,
         r#"DELETE FROM derived_parameter_sources WHERE parameter_id = $1
@@ -468,7 +546,6 @@ pub async fn merge_parameters(
     .await
     .map_err(AppError::Database)?;
 
-    // Delete global alarm_thresholds for source
     txn.execute(Statement::from_sql_and_values(
         pg,
         "DELETE FROM alarm_thresholds WHERE parameter_id = $1",
@@ -477,7 +554,6 @@ pub async fn merge_parameters(
     .await
     .map_err(AppError::Database)?;
 
-    // Reassign annotations
     txn.execute(Statement::from_sql_and_values(
         pg,
         "UPDATE annotations SET parameter_id = $1 WHERE parameter_id = $2",
@@ -486,7 +562,6 @@ pub async fn merge_parameters(
     .await
     .map_err(AppError::Database)?;
 
-    // Reassign samples
     txn.execute(Statement::from_sql_and_values(
         pg,
         "UPDATE samples SET parameter_id = $1 WHERE parameter_id = $2",
@@ -495,7 +570,6 @@ pub async fn merge_parameters(
     .await
     .map_err(AppError::Database)?;
 
-    // Reassign standard_curves
     txn.execute(Statement::from_sql_and_values(
         pg,
         "UPDATE standard_curves SET parameter_id = $1 WHERE parameter_id = $2",
@@ -504,7 +578,7 @@ pub async fn merge_parameters(
     .await
     .map_err(AppError::Database)?;
 
-    // Reassign public_exposed_parameters (delete conflicts)
+    // Public exposed parameters: delete conflicts, then reassign
     txn.execute(Statement::from_sql_and_values(
         pg,
         r#"DELETE FROM public_exposed_parameters WHERE parameter_id = $1
@@ -523,22 +597,16 @@ pub async fn merge_parameters(
     .await
     .map_err(AppError::Database)?;
 
-    // Delete the source parameter
+    Ok(())
+}
+
+async fn delete_parameter(txn: &impl ConnectionTrait, source_id: Uuid) -> AppResult<()> {
     txn.execute(Statement::from_sql_and_values(
-        pg,
+        sea_orm::DatabaseBackend::Postgres,
         "DELETE FROM parameters WHERE id = $1",
         vec![source_id.into()],
     ))
     .await
     .map_err(AppError::Database)?;
-
-    txn.commit().await.map_err(AppError::Database)?;
-
-    Ok(MergeParametersResponse {
-        sites_merged,
-        sites_reassigned,
-        readings_moved: total_readings,
-        streams_updated: total_streams,
-        source_deleted: true,
-    })
+    Ok(())
 }

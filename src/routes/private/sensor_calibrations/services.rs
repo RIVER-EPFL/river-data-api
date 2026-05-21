@@ -122,12 +122,19 @@ pub fn evaluate_formula(formula: &str, variables: &HashMap<String, f64>) -> Resu
         .map_err(|e| format!("Evaluation error: {e}"))
 }
 
-pub async fn recalculate_derived_at_timestamp(
+struct DerivedWork {
+    site_param_id: Uuid,
+    mappings: serde_json::Value,
+    formula: String,
+    derived_site_id: Uuid,
+    derived_parameter_id: Uuid,
+}
+
+async fn fetch_derived_work_items(
     db: &DatabaseConnection,
     site_id: Uuid,
-    time: chrono::DateTime<chrono::Utc>,
-) -> Result<(), sea_orm::DbErr> {
-    let derived_params = db
+) -> Result<Vec<DerivedWork>, sea_orm::DbErr> {
+    let rows = db
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT sp.id, sp.variable_mappings, d.formula, sp.site_id, sp.parameter_id
@@ -138,44 +145,26 @@ pub async fn recalculate_derived_at_timestamp(
         ))
         .await?;
 
-    if derived_params.is_empty() {
-        return Ok(());
-    }
-
-    struct DerivedWork {
-        site_param_id: Uuid,
-        mappings: serde_json::Value,
-        formula: String,
-        derived_site_id: Uuid,
-        derived_parameter_id: Uuid,
-    }
-
-    let mut work_items: Vec<DerivedWork> = Vec::new();
-    for row in &derived_params {
-        let site_param_id: Uuid = row.try_get("", "id")?;
-        let mappings: serde_json::Value = row.try_get("", "variable_mappings")?;
-        let formula: String = row.try_get("", "formula")?;
-        let derived_site_id: Uuid = row.try_get("", "site_id")?;
-        let derived_parameter_id: Uuid = row.try_get("", "parameter_id")?;
-        work_items.push(DerivedWork {
-            site_param_id,
-            mappings,
-            formula,
-            derived_site_id,
-            derived_parameter_id,
+    let mut items = Vec::with_capacity(rows.len());
+    for row in &rows {
+        items.push(DerivedWork {
+            site_param_id: row.try_get("", "id")?,
+            mappings: row.try_get("", "variable_mappings")?,
+            formula: row.try_get("", "formula")?,
+            derived_site_id: row.try_get("", "site_id")?,
+            derived_parameter_id: row.try_get("", "parameter_id")?,
         });
     }
+    Ok(items)
+}
 
+fn build_evaluation_order(work_items: &[DerivedWork]) -> Vec<usize> {
     let derived_param_ids: std::collections::HashSet<Uuid> =
         work_items.iter().map(|w| w.derived_parameter_id).collect();
 
     let mut deps: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
-    let mut sp_to_param: HashMap<Uuid, Uuid> = HashMap::new();
-
-    for item in &work_items {
-        sp_to_param.insert(item.site_param_id, item.derived_parameter_id);
+    for item in work_items {
         let mut item_deps = Vec::new();
-
         if let Some(mapping_obj) = item.mappings.as_object() {
             for (_var_name, source_val) in mapping_obj {
                 if let Some(source_id_str) = source_val.as_str()
@@ -215,11 +204,25 @@ pub async fn recalculate_derived_at_timestamp(
 
     if !remaining.is_empty() {
         tracing::warn!(
-            site_id = %site_id,
             remaining = remaining.len(),
             "Topological sort could not resolve all derived parameter dependencies"
         );
     }
+
+    ordered
+}
+
+pub async fn recalculate_derived_at_timestamp(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+    time: chrono::DateTime<chrono::Utc>,
+) -> Result<(), sea_orm::DbErr> {
+    let work_items = fetch_derived_work_items(db, site_id).await?;
+    if work_items.is_empty() {
+        return Ok(());
+    }
+
+    let ordered = build_evaluation_order(&work_items);
 
     for idx in ordered {
         let item = &work_items[idx];
