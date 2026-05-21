@@ -11,10 +11,6 @@ use crate::routes::private::{data_streams, parameters, pairing_plans, projects, 
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::operations::create_sensor_for_stream;
 
-// ============================================================================
-// Hierarchy Extraction
-// ============================================================================
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamHierarchy {
     pub project: String,
@@ -82,10 +78,6 @@ pub fn extract_hierarchy(stream: &data_streams::Model) -> StreamHierarchy {
     }
 }
 
-// ============================================================================
-// Plan Entry Types
-// ============================================================================
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanEntry {
     pub stream_id: Uuid,
@@ -138,10 +130,6 @@ pub struct PlanSummary {
     pub unique_parameters: usize,
 }
 
-// ============================================================================
-// Plan Creation
-// ============================================================================
-
 /// Create a pairing plan for all unpaired streams of a given source system.
 pub async fn create_plan(
     db: &impl ConnectionTrait,
@@ -181,27 +169,27 @@ pub async fn create_plan(
 
         // Match project
         let (proj_id, proj_create) = match_entity(&h.project, &existing_projects);
-        let project_confidence = if proj_id.is_some() { "exact" } else if !h.project.is_empty() { "none" } else { "none" };
+        let project_confidence = if proj_id.is_some() { "exact" } else { "none" };
 
         // Match site
         let (site_id, site_create) = match_entity(&h.site, &existing_sites);
-        let site_confidence = if site_id.is_some() { "exact" } else if !h.site.is_empty() { "none" } else { "none" };
+        let site_confidence = if site_id.is_some() { "exact" } else { "none" };
 
         // Match parameter
         let (param_id, param_create) = match_entity_display(&h.parameter, &existing_params);
-        let param_confidence = if param_id.is_some() { "exact" } else if !h.parameter.is_empty() { "none" } else { "none" };
+        let param_confidence = if param_id.is_some() { "exact" } else { "none" };
 
         // Check for parameter unit collision
         let mut warnings = Vec::new();
-        if let Some(pid) = param_id {
-            if let Some((_, _, existing_units)) = existing_params.iter().find(|(id, _, _)| *id == pid) {
-                if !existing_units.is_empty() && !h.units.is_empty() && existing_units.to_lowercase() != h.units.to_lowercase() {
-                    warnings.push(format!(
-                        "Parameter '{}' exists with units '{}' but this source uses '{}'",
-                        h.parameter, existing_units, h.units
-                    ));
-                }
-            }
+        if let Some(pid) = param_id
+            && let Some((_, _, existing_units)) = existing_params.iter().find(|(id, _, _)| *id == pid)
+            && !existing_units.is_empty() && !h.units.is_empty()
+            && existing_units.to_lowercase() != h.units.to_lowercase()
+        {
+            warnings.push(format!(
+                "Parameter '{}' exists with units '{}' but this source uses '{}'",
+                h.parameter, existing_units, h.units
+            ));
         }
 
         // Overall confidence: lowest of the three
@@ -263,10 +251,6 @@ pub async fn create_plan(
     let inserted = plan.insert(db).await?;
     Ok(inserted)
 }
-
-// ============================================================================
-// Plan Apply
-// ============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ApplyResult {
@@ -467,10 +451,6 @@ pub async fn apply_plan(
     Ok(result)
 }
 
-// ============================================================================
-// Plan Revert
-// ============================================================================
-
 /// Revert a pairing plan: bulk unpair all streams that were paired by this plan.
 pub async fn revert_plan(
     db: &sea_orm::DatabaseConnection,
@@ -536,10 +516,6 @@ pub async fn revert_plan(
     tracing::info!(plan_id = %plan_id, reverted, "Pairing plan reverted");
     Ok(reverted)
 }
-
-// ============================================================================
-// Helpers
-// ============================================================================
 
 pub fn compute_summary_pub(entries: &[PlanEntry]) -> PlanSummary {
     compute_summary(entries)

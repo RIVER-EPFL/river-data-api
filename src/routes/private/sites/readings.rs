@@ -22,6 +22,13 @@ use crate::common::bulk::{self, StreamableParam};
 
 use super::types::{ProjectRef, SiteRef};
 
+/// Per-parameter reading row with flag info: (time, value, is_flagged, flag_reason).
+type ReadingRowTuple = Vec<(DateTime<Utc>, f64, Option<bool>, Option<String>)>;
+/// Per-parameter severity: (time, severity).
+type SeverityVec = Vec<(DateTime<Utc>, Option<i16>)>;
+/// Per-parameter flag info: (time, is_flagged, flag_reason).
+type FlagVec = Vec<(DateTime<Utc>, Option<bool>, Option<String>)>;
+
 /// Minimal struct for efficient readings query
 #[derive(Debug, FromQueryResult)]
 struct ReadingRow {
@@ -359,7 +366,7 @@ pub async fn get_site_readings(
     // (different replicate_index). We use sequential indexing to preserve all rows
     // instead of the HashSet deduplication that would collapse them.
     if include_replicates {
-        let mut param_rows: HashMap<Uuid, Vec<(DateTime<Utc>, f64, Option<bool>, Option<String>)>> =
+        let mut param_rows: HashMap<Uuid, ReadingRowTuple> =
             HashMap::with_capacity(num_params);
 
         for row in &query_result {
@@ -447,9 +454,8 @@ pub async fn get_site_readings(
     let mut time_set: HashSet<DateTime<Utc>> = HashSet::with_capacity(estimated_times);
     let mut param_values: HashMap<Uuid, Vec<(DateTime<Utc>, f64)>> =
         HashMap::with_capacity(num_params);
-    let mut param_severities: HashMap<Uuid, Vec<(DateTime<Utc>, Option<i16>)>> = HashMap::new();
-    let mut param_flags: HashMap<Uuid, Vec<(DateTime<Utc>, Option<bool>, Option<String>)>> =
-        HashMap::new();
+    let mut param_severities: HashMap<Uuid, SeverityVec> = HashMap::new();
+    let mut param_flags: HashMap<Uuid, FlagVec> = HashMap::new();
 
     if include_alarms {
         for row in query_result {

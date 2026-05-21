@@ -202,37 +202,37 @@ fn extract_source_metadata(stream_metadata: &serde_json::Value) -> Option<serde_
     let device = stream_metadata.get("device")?;
     let mut meta = serde_json::Map::new();
 
-    if let Some(v) = device.get("logger_serial").and_then(|v| v.as_str()) {
-        if !v.is_empty() {
-            meta.insert(
-                "source_device_serial".to_string(),
-                serde_json::Value::String(v.to_string()),
-            );
-        }
+    if let Some(v) = device.get("logger_serial").and_then(|v| v.as_str())
+        && !v.is_empty()
+    {
+        meta.insert(
+            "source_device_serial".to_string(),
+            serde_json::Value::String(v.to_string()),
+        );
     }
-    if let Some(v) = device.get("probe_serial").and_then(|v| v.as_str()) {
-        if !v.is_empty() {
-            meta.insert(
-                "source_probe_serial".to_string(),
-                serde_json::Value::String(v.to_string()),
-            );
-        }
+    if let Some(v) = device.get("probe_serial").and_then(|v| v.as_str())
+        && !v.is_empty()
+    {
+        meta.insert(
+            "source_probe_serial".to_string(),
+            serde_json::Value::String(v.to_string()),
+        );
     }
-    if let Some(v) = device.get("logger_device").and_then(|v| v.as_str()) {
-        if !v.is_empty() {
-            meta.insert(
-                "source_device_model".to_string(),
-                serde_json::Value::String(v.to_string()),
-            );
-        }
+    if let Some(v) = device.get("logger_device").and_then(|v| v.as_str())
+        && !v.is_empty()
+    {
+        meta.insert(
+            "source_device_model".to_string(),
+            serde_json::Value::String(v.to_string()),
+        );
     }
-    if let Some(v) = device.get("device_class").and_then(|v| v.as_str()) {
-        if !v.is_empty() {
-            meta.insert(
-                "source_device_class".to_string(),
-                serde_json::Value::String(v.to_string()),
-            );
-        }
+    if let Some(v) = device.get("device_class").and_then(|v| v.as_str())
+        && !v.is_empty()
+    {
+        meta.insert(
+            "source_device_class".to_string(),
+            serde_json::Value::String(v.to_string()),
+        );
     }
 
     if meta.is_empty() {

@@ -9,9 +9,8 @@ use crate::routes::private::{data_streams, parameters, projects, site_parameters
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::operations::{create_sensor_for_stream, extract_vaisala_device_serial};
 
-// ============================================================================
-// Router — library admin routes + local discovery/pairing routes
-// ============================================================================
+/// Per-site info: (glacier_name, count, lat, lon, alt).
+type SiteInfoMap = std::collections::HashMap<String, (Option<String>, usize, Option<f64>, Option<f64>, Option<f64>)>;
 
 pub fn router() -> Router<AppState> {
     let (_service_routes, admin_routes) = river_data_core::server::routes::<AppState>();
@@ -28,10 +27,6 @@ pub fn router() -> Router<AppState> {
         .route("/pairing-plans/{id}/site-metadata", get(plan_site_metadata))
         .route("/unpaired-summary", get(unpaired_summary))
 }
-
-// ============================================================================
-// Stream Discovery & Auto-Pairing
-// ============================================================================
 
 #[derive(Serialize)]
 pub struct DiscoveryMatch {
@@ -217,12 +212,11 @@ async fn get_discovery(
                 vec![]
             };
 
-            let suggestion = if !site_within_project.is_empty() {
+            if !site_within_project.is_empty() {
                 match_confidence(&site_name, &site_within_project)
             } else {
                 match_confidence(&site_name, &site_candidates)
-            };
-            suggestion
+            }
         };
 
         // Match parameter
@@ -314,10 +308,6 @@ async fn get_discovery(
 
     Ok(Json(items))
 }
-
-// ============================================================================
-// Apply Discovery
-// ============================================================================
 
 #[derive(Deserialize)]
 pub struct ApplyDiscoveryRequest {
@@ -678,10 +668,6 @@ async fn process_action<C: ConnectionTrait>(
     })
 }
 
-// ============================================================================
-// Grouped Discovery + Bulk Pair
-// ============================================================================
-
 #[derive(Deserialize)]
 struct GroupedDiscoveryRequest {
     source_system: String,
@@ -740,8 +726,8 @@ async fn grouped_discovery(
 
     // Group by project (from source_path segment 1 or hierarchy metadata)
     let mut project_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    // Group by site (from source_path segment 3) → (glacier_name, count, lat, lon, alt)
-    let mut site_info: std::collections::HashMap<String, (Option<String>, usize, Option<f64>, Option<f64>, Option<f64>)> = std::collections::HashMap::new();
+    // Group by site (from source_path segment 3) -> (glacier_name, count, lat, lon, alt)
+    let mut site_info: SiteInfoMap = std::collections::HashMap::new();
     // Group by parameter (from source_name display name, extract the part after " - ")
     let mut param_info: std::collections::HashMap<String, (String, usize)> = std::collections::HashMap::new();
 
@@ -841,8 +827,6 @@ async fn grouped_discovery(
         parameters: grouped_params,
     }))
 }
-
-// ── Bulk Pair ──
 
 #[derive(Deserialize)]
 struct BulkPairRequest {
@@ -1151,10 +1135,6 @@ async fn bulk_pair(
     }))
 }
 
-// ============================================================================
-// Pairing Plans (Unified Workflow)
-// ============================================================================
-
 #[derive(Deserialize)]
 struct CreatePairingPlanRequest {
     source_system: String,
@@ -1281,10 +1261,6 @@ async fn revert_pairing_plan(
     Ok(Json(serde_json::json!({ "reverted": reverted })))
 }
 
-// ============================================================================
-// Unpaired Summary
-// ============================================================================
-
 async fn unpaired_summary(
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<serde_json::Value>>> {
@@ -1307,10 +1283,6 @@ async fn unpaired_summary(
     Ok(Json(result))
 }
 
-// ============================================================================
-// Plan Site Metadata
-// ============================================================================
-
 async fn plan_site_metadata(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -1331,10 +1303,8 @@ async fn plan_site_metadata(
         return Ok(Json(vec![]));
     }
 
-    let ids_str: Vec<String> = stream_ids.iter().map(|id| format!("'{id}'")).collect();
-    let ids_list = ids_str.join(",");
-
-    let sql = format!(
+    let rows = state.db.query_all(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
         "SELECT DISTINCT ON (metadata->'hierarchy'->>'site') \
             metadata->'hierarchy'->>'site' as site_name, \
             metadata->'coordinates'->>'latitude' as latitude, \
@@ -1349,13 +1319,12 @@ async fn plan_site_metadata(
             metadata->'device'->>'logger_serial' as device_serial, \
             metadata->>'channel_id' as channel_id, \
             metadata->>'sample_interval_sec' as sample_interval_sec \
-         FROM data_streams WHERE id IN ({ids_list}) \
-         ORDER BY metadata->'hierarchy'->>'site'"
-    );
-
-    let rows = state.db.query_all(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        sql,
+         FROM data_streams WHERE id = ANY($1) \
+         ORDER BY metadata->'hierarchy'->>'site'",
+        [sea_orm::Value::Array(
+            sea_orm::sea_query::ArrayType::Uuid,
+            Some(Box::new(stream_ids.into_iter().map(|id| sea_orm::Value::Uuid(Some(Box::new(id)))).collect())),
+        )],
     )).await?;
 
     let result: Vec<serde_json::Value> = rows.iter().map(|row| {

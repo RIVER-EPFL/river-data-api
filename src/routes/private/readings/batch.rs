@@ -61,9 +61,9 @@ pub async fn insert_batch_readings(
 
     for r in &payload.readings {
         let key = (r.site_id, r.parameter_id);
-        if !stream_cache.contains_key(&key) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = stream_cache.entry(key) {
             let stream_id = get_or_create_api_stream(&state.db, r.site_id, r.parameter_id).await?;
-            stream_cache.insert(key, stream_id);
+            entry.insert(stream_id);
         }
     }
 

@@ -152,20 +152,19 @@ pub async fn service_auth_middleware(
             .filter(sync_service_tokens::Column::TokenHash.eq(&token_hash))
             .one(&state.db)
             .await
+            && token.expires_at.with_timezone(&chrono::Utc) >= chrono::Utc::now()
         {
-            if token.expires_at.with_timezone(&chrono::Utc) >= chrono::Utc::now() {
-                request.extensions_mut().insert(AuthContext::ApiToken {
-                    token_id: token.service_id,
-                    permissions: TokenPermissions {
-                        read_metadata: true,
-                        read_data: true,
-                        write_metadata: true,
-                        write_data: true,
-                    },
-                    project_scope: None,
-                });
-                return next.run(request).await;
-            }
+            request.extensions_mut().insert(AuthContext::ApiToken {
+                token_id: token.service_id,
+                permissions: TokenPermissions {
+                    read_metadata: true,
+                    read_data: true,
+                    write_metadata: true,
+                    write_data: true,
+                },
+                project_scope: None,
+            });
+            return next.run(request).await;
         }
     }
 

@@ -53,11 +53,11 @@ pub async fn validate_bearer_token(
     // Check cache first
     if let Some(cached) = cache.get(&token_hash).await {
         // Re-check expiry on cached token
-        if let Some(expires_at) = cached.expires_at {
-            if expires_at.with_timezone(&Utc) < Utc::now() {
-                cache.invalidate(&token_hash).await;
-                return None;
-            }
+        if let Some(expires_at) = cached.expires_at
+            && expires_at.with_timezone(&Utc) < Utc::now()
+        {
+            cache.invalidate(&token_hash).await;
+            return None;
         }
 
         // Fire-and-forget: update last_used_at

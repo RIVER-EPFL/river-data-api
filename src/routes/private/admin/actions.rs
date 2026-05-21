@@ -8,10 +8,6 @@ use crate::error::{AppError, AppResult};
 use crate::routes::private::sensor_calibrations::services::{evaluate_formula, recalculate_derived_at_timestamp};
 use crate::common::sync_state as state;
 
-// ============================================================================
-// Refresh Aggregates
-// ============================================================================
-
 #[derive(Debug, Deserialize)]
 pub struct RefreshAggregatesRequest {
     #[serde(default)]
@@ -42,10 +38,6 @@ pub async fn refresh_aggregates(
 
     Ok(Json(serde_json::json!({ "status": "triggered" })))
 }
-
-// ============================================================================
-// Compute Derived
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct ComputeDerivedRequest {
@@ -104,10 +96,6 @@ pub async fn compute_derived(
         serde_json::json!({ "status": "triggered", "total_timestamps": total_timestamps }),
     ))
 }
-
-// ============================================================================
-// Rollback Deployment
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct RollbackDeploymentRequest {
@@ -220,10 +208,6 @@ pub async fn rollback_deployment(
         previous_deployment_id,
     }))
 }
-
-// ============================================================================
-// Preview Derived Formula
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct PreviewDerivedRequest {

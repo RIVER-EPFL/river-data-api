@@ -13,19 +13,11 @@ use crate::common::auth::Role;
 use crate::common::state::KeycloakAdmin;
 use crate::error::{AppError, AppResult};
 
-// ============================================================================
-// Query Parameters (React Admin format)
-// ============================================================================
-
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
     pub range: Option<String>,
     pub filter: Option<String>,
 }
-
-// ============================================================================
-// Request Bodies
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,10 +30,6 @@ pub struct CreateUserRequest {
     pub enabled: Option<bool>,
 }
 
-// ============================================================================
-// Keycloak Role Representation (subset)
-// ============================================================================
-
 #[derive(Debug, Deserialize, serde::Serialize)]
 struct KeycloakRole {
     id: String,
@@ -52,10 +40,6 @@ struct KeycloakRole {
 struct AssignRolesRequest {
     roles: Vec<String>,
 }
-
-// ============================================================================
-// Token Management
-// ============================================================================
 
 async fn get_admin_token(state: &AppState) -> AppResult<String> {
     let admin = state
@@ -149,10 +133,6 @@ fn simplify_user(u: &serde_json::Value) -> serde_json::Value {
         "createdTimestamp": u["createdTimestamp"],
     })
 }
-
-// ============================================================================
-// Handlers
-// ============================================================================
 
 async fn list_users(
     State(state): State<AppState>,
@@ -507,10 +487,6 @@ pub async fn list_roles(
     Ok(Json(roles))
 }
 
-// ============================================================================
-// Role Helpers
-// ============================================================================
-
 async fn fetch_role_users(
     client: &KeycloakAdmin,
     token: &str,
@@ -657,10 +633,6 @@ async fn set_user_roles(
 
     Ok(())
 }
-
-// ============================================================================
-// Router
-// ============================================================================
 
 pub fn router() -> Router<AppState> {
     Router::new()

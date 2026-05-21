@@ -47,14 +47,14 @@ async fn get_or_create_grab_stream(
         .await?
     {
         // Auto-pair existing unpaired stream
-        if stream.site_parameter_id.is_none() {
-            if let Some(sp_id) = site_parameter_id {
-                let mut active: data_streams::ActiveModel = stream.clone().into();
-                active.site_parameter_id = Set(Some(sp_id));
-                active.paired_at = Set(Some(chrono::Utc::now().into()));
-                active.updated_at = Set(chrono::Utc::now().into());
-                active.update(db).await?;
-            }
+        if stream.site_parameter_id.is_none()
+            && let Some(sp_id) = site_parameter_id
+        {
+            let mut active: data_streams::ActiveModel = stream.clone().into();
+            active.site_parameter_id = Set(Some(sp_id));
+            active.paired_at = Set(Some(chrono::Utc::now().into()));
+            active.updated_at = Set(chrono::Utc::now().into());
+            active.update(db).await?;
         }
         return Ok(stream.id);
     }
@@ -184,12 +184,12 @@ pub async fn insert_grab_samples(
     // Resolve stream_ids for each unique (site_id, parameter_id)
     let mut stream_cache: HashMap<Uuid, Uuid> = HashMap::new();
     for r in &payload.readings {
-        if !stream_cache.contains_key(&r.parameter_id) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = stream_cache.entry(r.parameter_id) {
             let sp_id = sp_lookup.get(&r.parameter_id).copied();
             let stream_id =
                 get_or_create_grab_stream(&state.db, payload.site_id, r.parameter_id, sp_id)
                     .await?;
-            stream_cache.insert(r.parameter_id, stream_id);
+            entry.insert(stream_id);
         }
     }
 

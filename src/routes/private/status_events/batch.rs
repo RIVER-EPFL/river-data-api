@@ -38,9 +38,9 @@ pub async fn insert_batch_status_events(
 
     for e in &payload.events {
         let key = (e.site_id, e.parameter_id);
-        if !stream_cache.contains_key(&key) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = stream_cache.entry(key) {
             let stream_id = get_or_create_api_stream(&state.db, e.site_id, e.parameter_id).await?;
-            stream_cache.insert(key, stream_id);
+            entry.insert(stream_id);
         }
     }
 

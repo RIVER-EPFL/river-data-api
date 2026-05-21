@@ -250,10 +250,6 @@ async fn delete_source(
     Ok(())
 }
 
-// ============================================================================
-// Parameter-level merge
-// ============================================================================
-
 #[derive(Debug, Deserialize)]
 pub struct MergeParametersRequest {
     pub source_parameter_id: Uuid,

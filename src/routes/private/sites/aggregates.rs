@@ -20,6 +20,9 @@ use crate::common::bulk::{self, StreamableAggregateParam};
 
 use super::types::{ProjectRef, SiteRef};
 
+/// Per-parameter aggregate data: (avg, min, max, count) keyed by timestamp.
+type ParamAggMap = HashMap<Uuid, HashMap<DateTime<Utc>, (Option<f64>, Option<f64>, Option<f64>, i64)>>;
+
 fn default_format() -> String {
     "json".to_string()
 }
@@ -319,10 +322,7 @@ pub async fn get_site_aggregates(
         .collect();
 
     let mut time_set: BTreeMap<DateTime<Utc>, usize> = BTreeMap::new();
-    let mut param_aggs: HashMap<
-        Uuid,
-        HashMap<DateTime<Utc>, (Option<f64>, Option<f64>, Option<f64>, i64)>,
-    > = HashMap::new();
+    let mut param_aggs: ParamAggMap = HashMap::new();
 
     for row in results {
         let time = row.bucket;

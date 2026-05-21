@@ -179,12 +179,12 @@ pub async fn recalculate_derived_at_timestamp(
         if let Some(mapping_obj) = item.mappings.as_object() {
             for (_var_name, source_val) in mapping_obj {
                 if let Some(source_id_str) = source_val.as_str()
-                    && let Ok(source_sp_id) = source_id_str.parse::<Uuid>() {
-                        if let Some(other) = work_items.iter().find(|w| w.site_param_id == source_sp_id)
-                            && derived_param_ids.contains(&other.derived_parameter_id) {
-                                item_deps.push(other.site_param_id);
-                            }
-                    }
+                    && let Ok(source_sp_id) = source_id_str.parse::<Uuid>()
+                    && let Some(other) = work_items.iter().find(|w| w.site_param_id == source_sp_id)
+                    && derived_param_ids.contains(&other.derived_parameter_id)
+                {
+                    item_deps.push(other.site_param_id);
+                }
             }
         }
         deps.insert(item.site_param_id, item_deps);
@@ -419,45 +419,51 @@ pub async fn spawn_reprocessing_job(
     trigger_type: &str,
     trigger_id: Option<Uuid>,
 ) -> Result<Uuid, sea_orm::DbErr> {
-    let job_id = Uuid::new_v4();
-    let trigger_id_sql = trigger_id
-        .map(|id| format!("'{id}'"))
-        .unwrap_or_else(|| "NULL".to_string());
+    use sea_orm::Value;
 
-    db.execute(Statement::from_string(
+    let job_id = Uuid::new_v4();
+    let trigger_id_value: Value = match trigger_id {
+        Some(id) => id.into(),
+        None => Value::String(None),
+    };
+
+    db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        format!(
-            "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status) \
-             VALUES ('{job_id}', '{sensor_id}', '{trigger_type}', {trigger_id_sql}, 'pending')"
-        ),
+        "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status) \
+         VALUES ($1, $2, $3, $4, 'pending')",
+        [job_id.into(), sensor_id.into(), trigger_type.into(), trigger_id_value],
     ))
     .await?;
 
     let db = db.clone();
     let trigger_type = trigger_type.to_string();
     tokio::spawn(async move {
-        let _ = db
-            .execute(Statement::from_string(
+        if let Err(e) = db
+            .execute(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                format!(
-                    "UPDATE reprocessing_jobs SET status = 'running' WHERE id = '{job_id}'"
-                ),
+                "UPDATE reprocessing_jobs SET status = 'running' WHERE id = $1",
+                [job_id.into()],
             ))
-            .await;
+            .await
+        {
+            tracing::warn!(error = %e, job_id = %job_id, "Failed to set reprocessing job to running");
+        }
 
         match reprocess_sensor_readings(&db, sensor_id).await {
             Ok(count) => {
-                let _ = db
-                    .execute(Statement::from_string(
+                if let Err(e) = db
+                    .execute(Statement::from_sql_and_values(
                         sea_orm::DatabaseBackend::Postgres,
-                        format!(
-                            "UPDATE reprocessing_jobs \
-                             SET status = 'completed', readings_updated = {count}, \
-                                 completed_at = NOW() \
-                             WHERE id = '{job_id}'"
-                        ),
+                        "UPDATE reprocessing_jobs \
+                         SET status = 'completed', readings_updated = $1, \
+                             completed_at = NOW() \
+                         WHERE id = $2",
+                        [(count as i64).into(), job_id.into()],
                     ))
-                    .await;
+                    .await
+                {
+                    tracing::warn!(error = %e, job_id = %job_id, "Failed to mark reprocessing job completed");
+                }
                 tracing::info!(
                     sensor_id = %sensor_id,
                     readings_updated = count,
@@ -466,18 +472,20 @@ pub async fn spawn_reprocessing_job(
                 );
             }
             Err(e) => {
-                let msg = e.to_string().replace('\'', "''");
-                let _ = db
-                    .execute(Statement::from_string(
+                let msg = e.to_string();
+                if let Err(db_err) = db
+                    .execute(Statement::from_sql_and_values(
                         sea_orm::DatabaseBackend::Postgres,
-                        format!(
-                            "UPDATE reprocessing_jobs \
-                             SET status = 'failed', error_message = '{msg}', \
-                                 completed_at = NOW() \
-                             WHERE id = '{job_id}'"
-                        ),
+                        "UPDATE reprocessing_jobs \
+                         SET status = 'failed', error_message = $1, \
+                             completed_at = NOW() \
+                         WHERE id = $2",
+                        [msg.as_str().into(), job_id.into()],
                     ))
-                    .await;
+                    .await
+                {
+                    tracing::warn!(error = %db_err, job_id = %job_id, "Failed to mark reprocessing job failed");
+                }
                 tracing::error!(
                     error = %e,
                     sensor_id = %sensor_id,

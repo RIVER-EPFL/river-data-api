@@ -12,13 +12,16 @@ use crate::routes::private::api_tokens::services::TokenCache;
 use super::bulk::{BulkSemaphore, new_bulk_semaphore};
 use crate::routes::public::services::{PublicConfigCache, new_public_config_cache};
 
+/// Cached admin token: (access_token, expiry).
+type AdminTokenCache = Arc<Mutex<Option<(String, DateTime<Utc>)>>>;
+
 /// Cached Keycloak admin API credentials and token.
 #[derive(Clone)]
 pub struct KeycloakAdmin {
     pub http_client: reqwest::Client,
     pub client_id: String,
     pub client_secret: String,
-    pub token_cache: Arc<Mutex<Option<(String, DateTime<Utc>)>>>,
+    pub token_cache: AdminTokenCache,
 }
 
 /// Cached response with metadata for freshness checking

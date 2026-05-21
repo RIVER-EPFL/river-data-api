@@ -30,10 +30,6 @@ use crate::common::AppState;
 use crate::routes::private::{projects as projects_entity, sites as sites_entity};
 use crate::error::{AppError, AppResult};
 
-// ============================================================================
-// Root Endpoints
-// ============================================================================
-
 /// Liveness probe — returns 200 if the process is running.
 #[utoipa::path(
     get,
@@ -72,10 +68,6 @@ async fn readyz(
         _ => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
-
-// ============================================================================
-// Resolution Helpers
-// ============================================================================
 
 /// Resolve a project by UUID or name (case-insensitive)
 pub async fn resolve_project(
@@ -152,10 +144,6 @@ pub async fn resolve_site_with_project(
         .ok_or_else(|| AppError::NotFound("Site not found".to_string()))
 }
 
-// ============================================================================
-// Time Range Validation
-// ============================================================================
-
 /// Validate that a required time range has end >= start.
 pub fn validate_time_range(
     start: chrono::DateTime<chrono::Utc>,
@@ -217,10 +205,6 @@ pub fn enforce_time_range(
 
     Ok((effective_start, end))
 }
-
-// ============================================================================
-// OpenAPI Documentation
-// ============================================================================
 
 #[derive(OpenApi)]
 #[openapi(
@@ -296,10 +280,6 @@ impl utoipa::Modify for SecurityAddon {
         );
     }
 }
-
-// ============================================================================
-// Router Builder
-// ============================================================================
 
 pub fn build_router(state: AppState) -> Router {
     let config = &state.config;

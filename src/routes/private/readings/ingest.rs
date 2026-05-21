@@ -9,10 +9,6 @@ use crate::routes::private::{data_streams, readings, status_events};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::operations::resolve_sensor_context;
 
-// ============================================================================
-// Stream-based Readings Ingest
-// ============================================================================
-
 #[derive(Debug, Deserialize)]
 pub struct IngestReadingsRequest {
     pub stream_id: Uuid,
@@ -174,31 +170,31 @@ pub async fn ingest_readings(
     }
 
     // Auto-compute derived parameters for newly ingested timestamps (batched)
-    if paired && inserted > 0 {
-        if let Some(sid) = site_id {
-            let db_clone = state.db.clone();
-            let mut unique_timestamps: Vec<chrono::DateTime<Utc>> =
-                payload.readings.iter().map(|r| r.time).collect();
-            unique_timestamps.sort();
-            unique_timestamps.dedup();
-            tokio::spawn(async move {
-                for time in unique_timestamps {
-                    if let Err(e) =
-                        crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
-                            &db_clone, sid, time,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            site_id = %sid,
-                            time = %time,
-                            "Failed to auto-compute derived values after ingest"
-                        );
-                    }
+    if paired && inserted > 0
+        && let Some(sid) = site_id
+    {
+        let db_clone = state.db.clone();
+        let mut unique_timestamps: Vec<chrono::DateTime<Utc>> =
+            payload.readings.iter().map(|r| r.time).collect();
+        unique_timestamps.sort();
+        unique_timestamps.dedup();
+        tokio::spawn(async move {
+            for time in unique_timestamps {
+                if let Err(e) =
+                    crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
+                        &db_clone, sid, time,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        site_id = %sid,
+                        time = %time,
+                        "Failed to auto-compute derived values after ingest"
+                    );
                 }
-            });
-        }
+            }
+        });
     }
 
     tracing::info!(total, inserted, stream_id = %payload.stream_id, paired, "Ingest complete");
@@ -208,10 +204,6 @@ pub async fn ingest_readings(
         paired,
     }))
 }
-
-// ============================================================================
-// Stream-based Status Events Ingest
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct IngestStatusEventsRequest {

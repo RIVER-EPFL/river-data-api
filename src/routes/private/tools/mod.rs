@@ -9,10 +9,6 @@ use crate::error::{AppError, AppResult};
 /// Cached gas constants — loaded from DB once, then reused for all pCO2 calculations.
 static GAS_CONSTANTS: OnceCell<river_data_core::toolbox::GasConstants> = OnceCell::const_new();
 
-// ============================================================================
-// Constant lookup helper
-// ============================================================================
-
 async fn get_constant(db: &DatabaseConnection, name: &str, default: f64) -> f64 {
     use crate::routes::private::constants;
     constants::Entity::find()
@@ -24,10 +20,6 @@ async fn get_constant(db: &DatabaseConnection, name: &str, default: f64) -> f64 
         .map(|c| c.value)
         .unwrap_or(default)
 }
-
-// ============================================================================
-// Common types
-// ============================================================================
 
 #[derive(Debug, Serialize)]
 pub struct ToolResult {
@@ -43,10 +35,6 @@ pub struct ToolParamInfo {
     pub label: &'static str,
     pub required: bool,
 }
-
-// ============================================================================
-// DOC Tool
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct DocRequest {
@@ -80,10 +68,6 @@ pub async fn calculate_doc(Json(payload): Json<DocRequest>) -> AppResult<Json<To
     }))
 }
 
-// ============================================================================
-// TSS / AFDM Tool
-// ============================================================================
-
 #[derive(Debug, Deserialize)]
 pub struct TssAfdmRequest {
     pub wgt_dried_g: f64,
@@ -115,10 +99,6 @@ pub async fn calculate_tss_afdm(
         inputs_ignored: vec![],
     }))
 }
-
-// ============================================================================
-// Chlorophyll Tool
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct ChlorophyllRequest {
@@ -178,10 +158,6 @@ pub async fn calculate_chlorophyll(
     }))
 }
 
-// ============================================================================
-// Nutrients Tool
-// ============================================================================
-
 #[derive(Debug, Deserialize)]
 pub struct NutrientsRequest {
     /// Multi-species mode: each key is a species name, value is replicates
@@ -225,10 +201,6 @@ pub async fn calculate_nutrients(
     }))
 }
 
-// ============================================================================
-// Ions (Charge Balance) Tool
-// ============================================================================
-
 #[derive(Debug, Deserialize)]
 pub struct IonsRequest {
     pub cations: Vec<IonEntry>,
@@ -267,10 +239,6 @@ pub async fn calculate_ions(Json(payload): Json<IonsRequest>) -> AppResult<Json<
     }))
 }
 
-// ============================================================================
-// Alkalinity Tool
-// ============================================================================
-
 #[derive(Debug, Deserialize)]
 pub struct AlkalinityRequest {
     pub sample_weight_g: f64,
@@ -303,10 +271,6 @@ pub async fn calculate_alkalinity(
         inputs_ignored: vec![],
     }))
 }
-
-// ============================================================================
-// pCO2 Tool
-// ============================================================================
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -392,19 +356,19 @@ pub async fn calculate_pco2(db: &DatabaseConnection, Json(payload): Json<Pco2Req
 
             let pco2 = match payload.variant {
                 Pco2Variant::Simple => {
-                    river_data_core::toolbox::pco2_from_co2aq(co2_aq, payload.water_temp_c, &constants)
+                    river_data_core::toolbox::pco2_from_co2aq(co2_aq, payload.water_temp_c, constants)
                 }
                 Pco2Variant::P1 => {
                     let bp = payload.pressure_hpa.ok_or_else(|| {
                         AppError::BadRequest("pressure_hpa required for P1 variant".to_string())
                     })?;
-                    river_data_core::toolbox::pco2_p1(co2_aq, payload.water_temp_c, bp, &constants)
+                    river_data_core::toolbox::pco2_p1(co2_aq, payload.water_temp_c, bp, constants)
                 }
                 Pco2Variant::P2 => {
                     let bp = payload.pressure_hpa.ok_or_else(|| {
                         AppError::BadRequest("pressure_hpa required for P2 variant".to_string())
                     })?;
-                    river_data_core::toolbox::pco2_p2(co2_aq, payload.water_temp_c, bp, &constants)
+                    river_data_core::toolbox::pco2_p2(co2_aq, payload.water_temp_c, bp, constants)
                 }
             };
 
@@ -466,7 +430,7 @@ pub async fn calculate_pco2(db: &DatabaseConnection, Json(payload): Json<Pco2Req
                     field_pressure_hpa,
                 };
 
-                let rep = river_data_core::toolbox::pco2_replicates(&input_a, &input_b, &constants);
+                let rep = river_data_core::toolbox::pco2_replicates(&input_a, &input_b, constants);
 
                 results.insert("CO2_HS_Um_A".into(), serde_json::json!(rep.a.co2_hs_umol));
                 results.insert("CO2_HS_Um_B".into(), serde_json::json!(rep.b.co2_hs_umol));
@@ -483,7 +447,7 @@ pub async fn calculate_pco2(db: &DatabaseConnection, Json(payload): Json<Pco2Req
                 results.insert("CH4_umol_L_avg".into(), serde_json::json!(rep.ch4_dissolved_umol_avg));
                 results.insert("CH4_umol_L_sd".into(), serde_json::json!(rep.ch4_dissolved_umol_sd));
             } else {
-                let r = river_data_core::toolbox::pco2_full_pipeline(&input_a, &constants);
+                let r = river_data_core::toolbox::pco2_full_pipeline(&input_a, constants);
 
                 results.insert("CO2_HS_Um_avg".into(), serde_json::json!(r.co2_hs_umol));
                 results.insert("pCO2_HS_uatm_avg".into(), serde_json::json!(r.pco2_uatm));
@@ -502,10 +466,6 @@ pub async fn calculate_pco2(db: &DatabaseConnection, Json(payload): Json<Pco2Req
         }
     }
 }
-
-// ============================================================================
-// DIC Tool
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct DicReplicateBInput {
@@ -598,10 +558,6 @@ pub async fn calculate_dic(db: &DatabaseConnection, Json(payload): Json<DicReque
     }
 }
 
-// ============================================================================
-// DOM (SUVA, ratios) Tool
-// ============================================================================
-
 #[derive(Debug, Deserialize)]
 pub struct DomRequest {
     pub a254: Option<f64>,
@@ -650,10 +606,6 @@ pub async fn calculate_dom(Json(payload): Json<DomRequest>) -> AppResult<Json<To
         inputs_ignored: vec![],
     }))
 }
-
-// ============================================================================
-// Field Data Tool
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct FieldDataRequest {
@@ -706,12 +658,12 @@ pub async fn calculate_field_data(
     }
 
     // Reach depth stats
-    if let Some(ref depths) = payload.reach_depths {
-        if !depths.is_empty() {
-            let (avg, sd) = river_data_core::toolbox::reach_depth_stats(depths);
-            results.insert("Reach_depth_avg_cm".into(), serde_json::json!(avg));
-            results.insert("Reach_depth_sd_cm".into(), serde_json::json!(sd));
-        }
+    if let Some(ref depths) = payload.reach_depths
+        && !depths.is_empty()
+    {
+        let (avg, sd) = river_data_core::toolbox::reach_depth_stats(depths);
+        results.insert("Reach_depth_avg_cm".into(), serde_json::json!(avg));
+        results.insert("Reach_depth_sd_cm".into(), serde_json::json!(sd));
     }
 
     Ok(Json(ToolResult {
@@ -721,10 +673,6 @@ pub async fn calculate_field_data(
         inputs_ignored: vec![],
     }))
 }
-
-// ============================================================================
-// CO2 Air Tool
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct Co2AirRequest {
@@ -753,10 +701,6 @@ pub async fn calculate_co2_air(
         inputs_ignored: vec![],
     }))
 }
-
-// ============================================================================
-// Isotopes Tool
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct IsotopesRequest {
@@ -787,10 +731,6 @@ pub async fn calculate_isotopes(
         inputs_ignored: vec![],
     }))
 }
-
-// ============================================================================
-// Benthic Tool
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct BenthicRequest {
@@ -835,10 +775,6 @@ pub async fn calculate_benthic(
         inputs_ignored: vec![],
     }))
 }
-
-// ============================================================================
-// Chlorophyll-Benthic Unified Tool (multi-replicate)
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct ChlaBenthicRequest {
@@ -902,10 +838,6 @@ pub async fn calculate_chla_benthic(
         inputs_ignored: vec![],
     }))
 }
-
-// ============================================================================
-// Tool list endpoint
-// ============================================================================
 
 #[derive(Debug, Serialize)]
 pub struct ToolInfo {

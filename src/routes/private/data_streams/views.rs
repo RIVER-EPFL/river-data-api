@@ -12,10 +12,6 @@ use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::operations::{close_sensor_deployment, create_sensor_for_stream};
 use crate::common::sync_state::refresh_continuous_aggregates_full;
 
-// ============================================================================
-// Stream Stats
-// ============================================================================
-
 #[derive(Debug, Serialize)]
 pub struct StreamStatsResponse {
     pub stream_id: Uuid,
@@ -71,10 +67,6 @@ pub async fn stream_stats(
         latest_value,
     }))
 }
-
-// ============================================================================
-// Stream Registration
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterStreamRequest {
@@ -178,10 +170,6 @@ pub async fn register_stream(
 
     Ok(Json(stream.into()))
 }
-
-// ============================================================================
-// Pair Stream
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct PairStreamRequest {
@@ -300,10 +288,6 @@ pub async fn pair_stream(
     }))
 }
 
-// ============================================================================
-// Unpair Stream
-// ============================================================================
-
 #[derive(Debug, Serialize)]
 pub struct UnpairStreamResponse {
     pub stream: StreamResponse,
@@ -330,11 +314,19 @@ pub async fn unpair_stream(
     }
 
     // Close sensor deployment if stream has a sensor
-    if let Some(sensor_id) = stream.sensor_id {
-        if let Some(sp_id) = stream.site_parameter_id {
-            if let Ok(Some(sp)) = site_parameters::Entity::find_by_id(sp_id).one(db).await {
-                let _ = close_sensor_deployment(db, sensor_id, sp.site_id).await;
-            }
+    if let Some(sensor_id) = stream.sensor_id
+        && let Some(sp_id) = stream.site_parameter_id
+        && let Ok(Some(sp)) = site_parameters::Entity::find_by_id(sp_id).one(db).await
+    {
+        let site_id = sp.site_id;
+        match close_sensor_deployment(db, sensor_id, site_id).await {
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                error = %e,
+                sensor_id = %sensor_id,
+                site_id = %site_id,
+                "Failed to close sensor deployment during unpair"
+            ),
         }
     }
 
