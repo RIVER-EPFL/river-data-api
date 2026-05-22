@@ -275,6 +275,74 @@ pub fn full_permissions() -> serde_json::Value {
     })
 }
 
+pub fn no_permissions() -> serde_json::Value {
+    serde_json::json!({
+        "read_metadata": false,
+        "read_data": false,
+        "write_metadata": false,
+        "write_data": false,
+    })
+}
+
+pub fn perms(read_metadata: bool, read_data: bool, write_metadata: bool, write_data: bool) -> serde_json::Value {
+    serde_json::json!({
+        "read_metadata": read_metadata,
+        "read_data": read_data,
+        "write_metadata": write_metadata,
+        "write_data": write_data,
+    })
+}
+
+pub async fn seed_token_full(db: &DatabaseConnection) -> String {
+    seed_api_token(db, full_permissions(), None).await
+}
+
+pub async fn seed_token_read_metadata_only(db: &DatabaseConnection) -> String {
+    seed_api_token(db, perms(true, false, false, false), None).await
+}
+
+pub async fn seed_token_read_data_only(db: &DatabaseConnection) -> String {
+    seed_api_token(db, perms(false, true, false, false), None).await
+}
+
+pub async fn seed_token_write_metadata_only(db: &DatabaseConnection) -> String {
+    seed_api_token(db, perms(false, false, true, false), None).await
+}
+
+pub async fn seed_token_write_data_only(db: &DatabaseConnection) -> String {
+    seed_api_token(db, perms(false, false, false, true), None).await
+}
+
+/// Seed a sync service session token with FULL permissions. Mirrors the production
+/// auth path where a sync service post-enrollment has unrestricted scope.
+/// Returns (raw_token, service_id).
+pub async fn seed_sync_session_token(db: &DatabaseConnection) -> (String, Uuid) {
+    use chrono::Duration;
+    let service_id = Uuid::new_v4();
+    let raw_token = format!("sync-session-{}", Uuid::new_v4());
+    let token_hash = hash_token(&raw_token);
+    let expires_at = (Utc::now() + Duration::hours(1)).to_rfc3339();
+
+    exec(
+        db,
+        &format!(
+            "INSERT INTO sync_services (id, service_type, instance_id, status, created_at, updated_at) \
+             VALUES ('{service_id}', 'test', 'test-instance', 'registered', now(), now())"
+        ),
+    )
+    .await;
+    exec(
+        db,
+        &format!(
+            "INSERT INTO sync_service_tokens (id, service_id, token_hash, expires_at, created_at) \
+             VALUES (gen_random_uuid(), '{service_id}', '{token_hash}', '{expires_at}', now())"
+        ),
+    )
+    .await;
+
+    (raw_token, service_id)
+}
+
 pub async fn seed_api_token(
     db: &DatabaseConnection,
     permissions: serde_json::Value,

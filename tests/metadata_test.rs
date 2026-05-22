@@ -21,7 +21,7 @@ async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
 }
 
 // =============================================================================
-// Projects: GET /api/service/projects — CrudCrate list
+// Projects: GET /api/v1/projects — CrudCrate list
 // =============================================================================
 
 #[tokio::test]
@@ -29,7 +29,7 @@ async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
 async fn test_list_projects() {
     let (_db, app, token) = setup().await;
 
-    let (status, body) = common::get_json_with_token(&app, "/api/service/projects", &token).await;
+    let (status, body) = common::get_json_with_token(&app, "/api/v1/projects", &token).await;
     assert_eq!(status, 200);
 
     let projects = body.as_array().expect("response should be an array");
@@ -42,7 +42,7 @@ async fn test_list_projects() {
 }
 
 // =============================================================================
-// Projects: GET /api/service/projects/{id} — CrudCrate get by UUID
+// Projects: GET /api/v1/projects/{id} — CrudCrate get by UUID
 // =============================================================================
 
 #[tokio::test]
@@ -50,7 +50,7 @@ async fn test_list_projects() {
 async fn test_get_project_by_uuid() {
     let (_db, app, token) = setup().await;
 
-    let uri = format!("/api/service/projects/{}", common::PROJECT_ID);
+    let uri = format!("/api/v1/projects/{}", common::PROJECT_ID);
     let (status, body) = common::get_json_with_token(&app, &uri, &token).await;
     assert_eq!(status, 200);
 
@@ -60,7 +60,7 @@ async fn test_get_project_by_uuid() {
 }
 
 // =============================================================================
-// Projects: GET /api/service/projects/{id}/sites
+// Projects: GET /api/v1/projects/{id}/sites
 // =============================================================================
 
 #[tokio::test]
@@ -68,7 +68,7 @@ async fn test_get_project_by_uuid() {
 async fn test_list_project_sites() {
     let (_db, app, token) = setup().await;
 
-    let uri = format!("/api/service/projects/{}/sites", common::PROJECT_ID);
+    let uri = format!("/api/v1/projects/{}/sites", common::PROJECT_ID);
     let (status, body) = common::get_json_with_token(&app, &uri, &token).await;
     assert_eq!(status, 200);
 
@@ -92,7 +92,7 @@ async fn test_list_project_sites() {
 }
 
 // =============================================================================
-// Projects: GET /api/service/projects/{bad_uuid} — 404
+// Projects: GET /api/v1/projects/{bad_uuid} — 404
 // =============================================================================
 
 #[tokio::test]
@@ -102,7 +102,7 @@ async fn test_get_project_not_found() {
 
     let (status, _body) = common::get_with_token(
         &app,
-        "/api/service/projects/00000000-0000-0000-0000-ffffffffffff",
+        "/api/v1/projects/00000000-0000-0000-0000-ffffffffffff",
         &token,
     )
     .await;
@@ -110,7 +110,7 @@ async fn test_get_project_not_found() {
 }
 
 // =============================================================================
-// Sites: GET /api/service/sites — CrudCrate list
+// Sites: GET /api/v1/sites — CrudCrate list
 // =============================================================================
 
 #[tokio::test]
@@ -118,7 +118,7 @@ async fn test_get_project_not_found() {
 async fn test_list_sites() {
     let (_db, app, token) = setup().await;
 
-    let (status, body) = common::get_json_with_token(&app, "/api/service/sites", &token).await;
+    let (status, body) = common::get_json_with_token(&app, "/api/v1/sites", &token).await;
     assert_eq!(status, 200);
 
     let sites = body.as_array().expect("response should be an array");
@@ -126,7 +126,7 @@ async fn test_list_sites() {
 }
 
 // =============================================================================
-// Sites: GET /api/service/sites/{id} — CrudCrate get by UUID
+// Sites: GET /api/v1/sites/{id} — CrudCrate get by UUID
 // =============================================================================
 
 #[tokio::test]
@@ -134,7 +134,7 @@ async fn test_list_sites() {
 async fn test_get_site_by_uuid() {
     let (_db, app, token) = setup().await;
 
-    let uri = format!("/api/service/sites/{}", common::SITE1_ID);
+    let uri = format!("/api/v1/sites/{}", common::SITE1_ID);
     let (status, body) = common::get_json_with_token(&app, &uri, &token).await;
     assert_eq!(status, 200);
 
@@ -145,7 +145,7 @@ async fn test_get_site_by_uuid() {
 }
 
 // =============================================================================
-// Sites: GET /api/service/sites/{id}/parameters
+// Sites: GET /api/v1/sites/{id}/parameters
 // =============================================================================
 
 #[tokio::test]
@@ -153,7 +153,7 @@ async fn test_get_site_by_uuid() {
 async fn test_list_site_parameters() {
     let (_db, app, token) = setup().await;
 
-    let uri = format!("/api/service/sites/{}/parameters", common::SITE1_ID);
+    let uri = format!("/api/v1/sites/{}/parameters", common::SITE1_ID);
     let (status, body) = common::get_json_with_token(&app, &uri, &token).await;
     assert_eq!(status, 200);
 
@@ -173,7 +173,7 @@ async fn test_list_site_parameters() {
 }
 
 // =============================================================================
-// Sites: GET /api/service/sites/{bad_uuid} — 404
+// Sites: GET /api/v1/sites/{bad_uuid} — 404
 // =============================================================================
 
 #[tokio::test]
@@ -183,7 +183,7 @@ async fn test_get_site_not_found() {
 
     let (status, _body) = common::get_with_token(
         &app,
-        "/api/service/sites/00000000-0000-0000-0000-ffffffffffff",
+        "/api/v1/sites/00000000-0000-0000-0000-ffffffffffff",
         &token,
     )
     .await;

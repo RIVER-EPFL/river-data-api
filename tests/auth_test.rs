@@ -30,7 +30,7 @@ async fn test_unauthenticated_get_returns_401() {
     let (_db, app) = setup().await;
 
     // No Authorization header at all
-    let (status, _body) = common::get(&app, "/api/service/projects").await;
+    let (status, _body) = common::get(&app, "/api/v1/projects").await;
     assert_eq!(status, 401, "unauthenticated GET to service tier should return 401");
 }
 
@@ -52,7 +52,7 @@ async fn test_expired_token_returns_401() {
     .await;
 
     let (status, _body) =
-        common::get_with_token(&app, "/api/service/projects", &expired_token).await;
+        common::get_with_token(&app, "/api/v1/projects", &expired_token).await;
     assert_eq!(status, 401, "expired token should return 401");
 }
 
@@ -68,7 +68,7 @@ async fn test_inactive_token_returns_401() {
     let inactive_token = common::seed_inactive_api_token(&db, common::full_permissions()).await;
 
     let (status, _body) =
-        common::get_with_token(&app, "/api/service/projects", &inactive_token).await;
+        common::get_with_token(&app, "/api/v1/projects", &inactive_token).await;
     assert_eq!(status, 401, "inactive token should return 401");
 }
 
@@ -95,7 +95,7 @@ async fn test_read_metadata_only_token() {
 
     // GET projects (read_metadata) → 200
     let (status, _body) =
-        common::get_with_token(&app, "/api/service/projects", &token).await;
+        common::get_with_token(&app, "/api/v1/projects", &token).await;
     assert_eq!(status, 200, "read_metadata token should access projects");
 
     // GET readings (read_data) → 403
@@ -103,7 +103,7 @@ async fn test_read_metadata_only_token() {
     let (status, _body) = common::get_with_token(
         &app,
         &format!(
-            "/api/service/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z"
+            "/api/v1/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z"
         ),
         &token,
     )
@@ -145,7 +145,7 @@ async fn test_project_scoped_token_cannot_access_other_project_site() {
     let (status, _body) = common::get_with_token(
         &app,
         &format!(
-            "/api/service/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z"
+            "/api/v1/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z"
         ),
         &token,
     )
@@ -164,7 +164,7 @@ async fn test_malformed_auth_header_returns_401() {
 
     // "NotBearer xyz" instead of "Bearer xyz"
     let (status, _body) =
-        common::get_with_auth_header(&app, "/api/service/projects", "NotBearer xyz").await;
+        common::get_with_auth_header(&app, "/api/v1/projects", "NotBearer xyz").await;
     assert_eq!(status, 401, "malformed auth header should return 401, not 500");
 }
 
@@ -178,6 +178,6 @@ async fn test_empty_bearer_token_returns_401() {
     let (_db, app) = setup().await;
 
     let (status, _body) =
-        common::get_with_auth_header(&app, "/api/service/projects", "Bearer ").await;
+        common::get_with_auth_header(&app, "/api/v1/projects", "Bearer ").await;
     assert_eq!(status, 401, "empty bearer token should return 401");
 }

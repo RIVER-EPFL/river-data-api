@@ -23,7 +23,7 @@ async fn test_register_stream() {
 
     let (status, json) = common::post_json_parse_with_token(
         &app,
-        "/api/service/streams/register",
+        "/api/v1/streams/register",
         &serde_json::json!({
             "source_system": "vaisala",
             "source_key": "9999",
@@ -50,7 +50,7 @@ async fn test_register_stream_upsert() {
     // First registration
     let (status, json1) = common::post_json_parse_with_token(
         &app,
-        "/api/service/streams/register",
+        "/api/v1/streams/register",
         &serde_json::json!({
             "source_system": "test-upsert",
             "source_key": "key-1",
@@ -65,7 +65,7 @@ async fn test_register_stream_upsert() {
     // Second registration with same source_system + source_key — should upsert
     let (status, json2) = common::post_json_parse_with_token(
         &app,
-        "/api/service/streams/register",
+        "/api/v1/streams/register",
         &serde_json::json!({
             "source_system": "test-upsert",
             "source_key": "key-1",
@@ -122,7 +122,7 @@ async fn test_pair_stream_backfills_readings() {
     // Pair the stream
     let (status, body) = common::post_json_with_token(
         &app,
-        &format!("/api/service/streams/{stream_id}/pair"),
+        &format!("/api/v1/streams/{stream_id}/pair"),
         &serde_json::json!({ "site_parameter_id": common::PARAM_S1_TEMP_ID }),
         &token,
     )
@@ -172,7 +172,7 @@ async fn test_pair_already_paired_stream_fails() {
 
     let (status, _) = common::post_json_with_token(
         &app,
-        &format!("/api/service/streams/{stream_id}/pair"),
+        &format!("/api/v1/streams/{stream_id}/pair"),
         &serde_json::json!({ "site_parameter_id": common::PARAM_S1_TEMP_ID }),
         &token,
     )
@@ -214,7 +214,7 @@ async fn test_unpair_stream_clears_readings() {
     // Unpair
     let (status, body) = common::post_json_with_token(
         &app,
-        &format!("/api/service/streams/{stream_id}/unpair"),
+        &format!("/api/v1/streams/{stream_id}/unpair"),
         &serde_json::json!({}),
         &token,
     )
@@ -247,7 +247,7 @@ async fn test_unpair_unpaired_stream_fails() {
 
     let (status, _) = common::post_json_with_token(
         &app,
-        &format!("/api/service/streams/{stream_id}/unpair"),
+        &format!("/api/v1/streams/{stream_id}/unpair"),
         &serde_json::json!({}),
         &token,
     )
@@ -284,7 +284,7 @@ async fn test_stream_stats() {
 
     let (status, json) = common::get_json_with_token(
         &app,
-        &format!("/api/service/streams/{stream_id}/stats"),
+        &format!("/api/v1/streams/{stream_id}/stats"),
         &token,
     )
     .await;
@@ -311,7 +311,7 @@ async fn test_stream_stats_empty() {
 
     let (status, json) = common::get_json_with_token(
         &app,
-        &format!("/api/service/streams/{stream_id}/stats"),
+        &format!("/api/v1/streams/{stream_id}/stats"),
         &token,
     )
     .await;
@@ -328,7 +328,7 @@ async fn test_stream_stats_not_found() {
 
     let (status, _) = common::get_with_token(
         &app,
-        "/api/service/streams/00000000-0000-4000-e000-999999999999/stats",
+        "/api/v1/streams/00000000-0000-4000-e000-999999999999/stats",
         &token,
     )
     .await;
@@ -355,7 +355,7 @@ async fn test_streams_require_write_metadata() {
 
     let (status, _) = common::post_json_with_token(
         &app,
-        "/api/service/streams/register",
+        "/api/v1/streams/register",
         &serde_json::json!({
             "source_system": "test",
             "source_key": "perm-check"

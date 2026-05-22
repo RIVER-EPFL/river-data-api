@@ -54,7 +54,7 @@ async fn test_global_plus_site_specific_threshold_no_duplicate_rows() {
     let (status, body) = common::get_json_with_token(
         &app,
         &format!(
-            "/api/service/sites/{site_id}/alarms?start=2025-01-15T08:00:00Z&end=2025-01-15T09:00:00Z"
+            "/api/v1/sites/{site_id}/alarms?start=2025-01-15T08:00:00Z&end=2025-01-15T09:00:00Z"
         ),
         &token,
     )
@@ -140,7 +140,7 @@ async fn test_all_null_thresholds_no_violations() {
     let (status, body) = common::get_json_with_token(
         &app,
         &format!(
-            "/api/service/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"
+            "/api/v1/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"
         ),
         &token,
     )

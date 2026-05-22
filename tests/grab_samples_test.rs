@@ -24,7 +24,7 @@ async fn test_insert_triplicate_grab_samples() {
     let time = "2025-06-15T10:00:00Z";
     let (status, body) = common::post_json_with_token(
         &app,
-        "/api/service/grab_samples",
+        "/api/v1/grab_samples",
         &serde_json::json!({
             "site_id": common::SITE1_ID,
             "created_by": "test-user",
@@ -103,7 +103,7 @@ async fn test_single_grab_sample_no_sample_row() {
 
     let (status, body) = common::post_json_with_token(
         &app,
-        "/api/service/grab_samples",
+        "/api/v1/grab_samples",
         &serde_json::json!({
             "site_id": common::SITE1_ID,
             "readings": [
@@ -149,7 +149,7 @@ async fn test_multi_parameter_grab_samples() {
     let time = "2025-06-15T12:00:00Z";
     let (status, body) = common::post_json_with_token(
         &app,
-        "/api/service/grab_samples",
+        "/api/v1/grab_samples",
         &serde_json::json!({
             "site_id": common::SITE1_ID,
             "readings": [
@@ -178,7 +178,7 @@ async fn test_grab_sample_creates_stream() {
 
     let (status, _) = common::post_json_with_token(
         &app,
-        "/api/service/grab_samples",
+        "/api/v1/grab_samples",
         &serde_json::json!({
             "site_id": common::SITE1_ID,
             "readings": [
@@ -220,7 +220,7 @@ async fn test_grab_sample_invalid_site() {
 
     let (status, _) = common::post_json_with_token(
         &app,
-        "/api/service/grab_samples",
+        "/api/v1/grab_samples",
         &serde_json::json!({
             "site_id": "00000000-0000-4000-a000-999999999999",
             "readings": [
@@ -245,7 +245,7 @@ async fn test_grab_sample_invalid_parameter() {
     // Site2 doesn't have DEPTH parameter
     let (status, _) = common::post_json_with_token(
         &app,
-        "/api/service/grab_samples",
+        "/api/v1/grab_samples",
         &serde_json::json!({
             "site_id": common::SITE2_ID,
             "readings": [
@@ -269,7 +269,7 @@ async fn test_grab_sample_empty_readings() {
 
     let (status, _) = common::post_json_with_token(
         &app,
-        "/api/service/grab_samples",
+        "/api/v1/grab_samples",
         &serde_json::json!({
             "site_id": common::SITE1_ID,
             "readings": []
@@ -300,7 +300,7 @@ async fn test_grab_samples_require_write_data() {
 
     let (status, _) = common::post_json_with_token(
         &app,
-        "/api/service/grab_samples",
+        "/api/v1/grab_samples",
         &serde_json::json!({
             "site_id": common::SITE1_ID,
             "readings": [

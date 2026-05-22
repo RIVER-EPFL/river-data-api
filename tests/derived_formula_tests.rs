@@ -85,7 +85,7 @@ async fn create_derived_param(
         "description": "Auto-created by test"
     });
     let (status, text) =
-        common::post_json_with_token(app, "/api/service/derived_parameters", &body, token).await;
+        common::post_json_with_token(app, "/api/v1/derived_parameters", &body, token).await;
     let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|_| {
         serde_json::json!({ "raw": text })
     });
@@ -94,7 +94,7 @@ async fn create_derived_param(
 
 /// Delete a derived parameter by id (best-effort cleanup).
 async fn cleanup_derived_param(app: &axum::Router, token: &str, id: &str) {
-    let uri = format!("/api/service/derived_parameters/{id}");
+    let uri = format!("/api/v1/derived_parameters/{id}");
     let _ = delete_with_token(app, &uri, token).await;
 }
 
@@ -234,7 +234,7 @@ async fn test_update_derived_parameter_formula() {
     let update_body = serde_json::json!({
         "formula": "Conductivity + Depth"
     });
-    let uri = format!("/api/service/derived_parameters/{id}");
+    let uri = format!("/api/v1/derived_parameters/{id}");
     let (put_status, put_text) = put_json_with_token(&app, &uri, &update_body, &token).await;
     let put_json: serde_json::Value = serde_json::from_str(&put_text).unwrap_or_else(|_| {
         serde_json::json!({ "raw": put_text })
@@ -287,7 +287,7 @@ async fn test_preview_derived_missing_site() {
     });
 
     let (status, _text) =
-        common::post_json_with_token(&app, "/api/service/actions/preview_derived", &body, &token)
+        common::post_json_with_token(&app, "/api/v1/actions/preview_derived", &body, &token)
             .await;
 
     // Should be a client error (404) not a server error (500)
@@ -318,7 +318,7 @@ async fn test_preview_derived_invalid_formula() {
     });
 
     let (status, _text) =
-        common::post_json_with_token(&app, "/api/service/actions/preview_derived", &body, &token)
+        common::post_json_with_token(&app, "/api/v1/actions/preview_derived", &body, &token)
             .await;
 
     assert_eq!(

@@ -366,17 +366,20 @@ pub fn build_router(state: AppState) -> Router {
     // Combine all API routes under /api/v1.
     // Body limits: api_router manages its own (10MB on batch readings, 1MB on actions);
     // public is unauthenticated; config gets 1MB limit.
-    // Note: nest() routes take priority over nest_service() wildcards, so sync control
-    // paths (/sync/enroll, /sync/heartbeat) are matched before the api_authed catch-all.
+    // Sync control paths (/sync/enroll, /sync/heartbeat, etc.) and the unified router's
+    // sync admin views (/sync/services, /sync/credentials, etc.) live on different
+    // method+path combinations, so .merge() composes them without conflict. Per-router
+    // middleware (dual auth vs sync session auth) is preserved by the merge.
     let api_routes = Router::new()
-        .nest_service("/", api_authed)
-        .nest("/", sync_control_routes)
-        .nest("/public", public_routes_final)
+        .merge(api_authed)
+        .merge(sync_control_routes.with_state(state.clone()))
+        .nest("/public", public_routes_final.with_state(state.clone()))
         .nest(
             "/config",
             Router::new()
                 .route("/keycloak", get(config::get_keycloak_config))
-                .layer(RequestBodyLimitLayer::new(1024 * 1024)),
+                .layer(RequestBodyLimitLayer::new(1024 * 1024))
+                .with_state(state.clone()),
         );
 
     // Health check routes (NO rate limiting)
@@ -447,9 +450,11 @@ pub fn build_router(state: AppState) -> Router {
     tracing::info!(timeout_seconds = config.request_timeout_seconds, "Request timeout configured");
 
     // Combine all routes. The API is versioned at /api/v1/; health and docs stay at root.
+    // All sub-routers have state already bound (Router<()>), so the top-level Router is
+    // also Router<()> — no trailing .with_state() needed.
     Router::new()
         .nest("/api/v1", api_routes)
-        .merge(health_routes)
+        .merge(health_routes.with_state(state.clone()))
         .merge(docs_routes)
         .layer(
             ServiceBuilder::new()
@@ -492,7 +497,6 @@ pub fn build_router(state: AppState) -> Router {
                 ),
         )
         .layer(axum::middleware::from_fn(request_id_middleware))
-        .with_state(state)
 }
 
 /// Middleware that generates a unique request ID for each request.
