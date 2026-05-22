@@ -223,90 +223,96 @@ pub async fn recalculate_derived_at_timestamp(
     }
 
     let ordered = build_evaluation_order(&work_items);
-
     for idx in ordered {
-        let item = &work_items[idx];
+        evaluate_and_upsert_derived(db, &work_items[idx], time).await?;
+    }
+    Ok(())
+}
 
-        let Some(mapping_obj) = item.mappings.as_object() else {
-            continue;
+async fn resolve_variables_for_derived(
+    db: &DatabaseConnection,
+    item: &DerivedWork,
+    time: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<HashMap<String, f64>>, sea_orm::DbErr> {
+    let Some(mapping_obj) = item.mappings.as_object() else {
+        return Ok(None);
+    };
+
+    let mut variables = HashMap::new();
+    for (var_name, source_param_id_val) in mapping_obj {
+        let Some(source_id_str) = source_param_id_val.as_str() else {
+            return Ok(None);
+        };
+        let Ok(source_sp_id) = source_id_str.parse::<Uuid>() else {
+            return Ok(None);
         };
 
-        let mut variables = HashMap::new();
-        let mut all_present = true;
-
-        for (var_name, source_param_id_val) in mapping_obj {
-            let Some(source_id_str) = source_param_id_val.as_str() else {
-                all_present = false;
-                break;
-            };
-            let Ok(source_sp_id) = source_id_str.parse::<Uuid>() else {
-                all_present = false;
-                break;
-            };
-
-            let value_row = db
-                .query_one(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    r"SELECT COALESCE(r.calibrated_value, r.raw_value) as val
-                      FROM readings r
-                      JOIN site_parameters sp ON sp.site_id = r.site_id AND sp.parameter_id = r.parameter_id
-                      WHERE sp.id = $1 AND r.time = $2",
-                    [source_sp_id.into(), time.into()],
-                ))
-                .await?;
-
-            if let Some(vr) = value_row {
-                let val: f64 = vr.try_get("", "val")?;
-                variables.insert(var_name.clone(), val);
-            } else {
-                all_present = false;
-                break;
-            }
-        }
-
-        if !all_present {
-            continue;
-        }
-
-        if let Ok(result) = evaluate_formula(&item.formula, &variables) {
-            if !result.is_finite() {
-                continue;
-            }
-
-            let stream_row = db
-                .query_one(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    r"SELECT id FROM data_streams WHERE site_parameter_id = $1 LIMIT 1",
-                    [item.site_param_id.into()],
-                ))
-                .await?;
-
-            let Some(stream_row) = stream_row else {
-                tracing::warn!(
-                    site_parameter_id = %item.site_param_id,
-                    "No data stream found for derived site_parameter, skipping"
-                );
-                continue;
-            };
-            let stream_id: Uuid = stream_row.try_get("", "id")?;
-
-            db.execute(Statement::from_sql_and_values(
+        let value_row = db
+            .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                r"INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, replicate_index)
-                  VALUES ($1, $2, $3, $4, $5, $5, 0)
-                  ON CONFLICT (stream_id, time, replicate_index) DO UPDATE SET calibrated_value = $5",
-                [
-                    stream_id.into(),
-                    item.derived_site_id.into(),
-                    item.derived_parameter_id.into(),
-                    time.into(),
-                    result.into(),
-                ],
+                r"SELECT COALESCE(r.calibrated_value, r.raw_value) as val
+                  FROM readings r
+                  JOIN site_parameters sp ON sp.site_id = r.site_id AND sp.parameter_id = r.parameter_id
+                  WHERE sp.id = $1 AND r.time = $2",
+                [source_sp_id.into(), time.into()],
             ))
             .await?;
-        }
+
+        match value_row {
+            Some(vr) => variables.insert(var_name.clone(), vr.try_get("", "val")?),
+            None => return Ok(None),
+        };
+    }
+    Ok(Some(variables))
+}
+
+async fn evaluate_and_upsert_derived(
+    db: &DatabaseConnection,
+    item: &DerivedWork,
+    time: chrono::DateTime<chrono::Utc>,
+) -> Result<(), sea_orm::DbErr> {
+    let Some(variables) = resolve_variables_for_derived(db, item, time).await? else {
+        return Ok(());
+    };
+
+    let Ok(result) = evaluate_formula(&item.formula, &variables) else {
+        return Ok(());
+    };
+    if !result.is_finite() {
+        return Ok(());
     }
 
+    let stream_row = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT id FROM data_streams WHERE site_parameter_id = $1 LIMIT 1",
+            [item.site_param_id.into()],
+        ))
+        .await?;
+
+    let Some(stream_row) = stream_row else {
+        tracing::warn!(
+            site_parameter_id = %item.site_param_id,
+            "No data stream found for derived site_parameter, skipping"
+        );
+        return Ok(());
+    };
+    let stream_id: Uuid = stream_row.try_get("", "id")?;
+
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, replicate_index)
+          VALUES ($1, $2, $3, $4, $5, $5, 0)
+          ON CONFLICT (stream_id, time, replicate_index) DO UPDATE SET calibrated_value = $5",
+        [
+            stream_id.into(),
+            item.derived_site_id.into(),
+            item.derived_parameter_id.into(),
+            time.into(),
+            result.into(),
+        ],
+    ))
+    .await?;
     Ok(())
 }
 
