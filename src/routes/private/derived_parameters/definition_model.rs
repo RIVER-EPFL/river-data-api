@@ -4,7 +4,7 @@ use sea_orm::entity::prelude::*;
 use super::operations::DerivedParameterDefinitionOperations;
 
 #[derive(
-    Clone, Debug, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
+    Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
 )]
 #[sea_orm(table_name = "derived_parameter_definitions")]
 #[crudcrate(
@@ -12,7 +12,8 @@ use super::operations::DerivedParameterDefinitionOperations;
     name_singular = "derived_parameter_definition",
     name_plural = "derived_parameter_definitions",
     generate_router,
-    operations = DerivedParameterDefinitionOperations
+    operations = DerivedParameterDefinitionOperations,
+    derive_partial_eq
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]

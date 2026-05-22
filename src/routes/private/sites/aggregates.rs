@@ -63,6 +63,8 @@ pub struct ParameterAggregateData {
     /// Maximum severity level per bucket (0=ok, 1=warning, 2=alarm). Only present when alarms=true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_severity: Option<Vec<Option<i16>>>,
+    /// Count of flagged readings per bucket (always present).
+    pub flagged_count: Vec<i64>,
 }
 
 impl StreamableAggregateParam for ParameterAggregateData {
@@ -91,6 +93,13 @@ struct AggregateRow {
     min_value: Option<f64>,
     max_value: Option<f64>,
     count: i64,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct FlaggedBucketRow {
+    bucket: DateTime<Utc>,
+    parameter_id: Uuid,
+    flagged_count: i64,
 }
 
 fn build_csv_response(
@@ -333,6 +342,58 @@ pub async fn get_site_aggregates(
         );
     }
 
+    let bucket_interval = match resolution.as_str() {
+        "hourly" => "1 hour",
+        "daily" => "1 day",
+        "weekly" => "7 days",
+        "monthly" => "1 month",
+        _ => unreachable!(),
+    };
+
+    let flagged_sql = format!(
+        r"
+        SELECT
+            time_bucket('{bucket_interval}'::interval, time) AS bucket,
+            parameter_id,
+            COUNT(*)::bigint AS flagged_count
+        FROM readings
+        WHERE site_id = $1
+          AND parameter_id IN ({})
+          AND time >= ${}
+          AND time <= ${}
+          AND is_flagged = TRUE
+          AND replicate_index = 0
+        GROUP BY bucket, parameter_id
+        ",
+        placeholders.join(","),
+        start_param,
+        end_param,
+    );
+
+    let mut flagged_values: Vec<sea_orm::Value> = param_values.clone();
+    flagged_values.push(query.start.into());
+    flagged_values.push(query.end.into());
+
+    let flagged_rows: Vec<FlaggedBucketRow> = state
+        .db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &flagged_sql,
+            flagged_values,
+        ))
+        .await?
+        .into_iter()
+        .filter_map(|row| FlaggedBucketRow::from_query_result(&row, "").ok())
+        .collect();
+
+    let mut flagged_by_param: HashMap<Uuid, HashMap<DateTime<Utc>, i64>> = HashMap::new();
+    for row in flagged_rows {
+        flagged_by_param
+            .entry(row.parameter_id)
+            .or_default()
+            .insert(row.bucket, row.flagged_count);
+    }
+
     let times: Vec<DateTime<Utc>> = time_set.keys().copied().collect();
 
     let param_data: Vec<ParameterAggregateData> = params_list
@@ -346,6 +407,8 @@ pub async fn get_site_aggregates(
             let mut min = Vec::with_capacity(times.len());
             let mut max = Vec::with_capacity(times.len());
             let mut count = Vec::with_capacity(times.len());
+            let mut flagged_count = Vec::with_capacity(times.len());
+            let flagged_map = flagged_by_param.get(&global_param_id);
             let mut severity_vec: Option<Vec<Option<i16>>> = if include_alarms {
                 Some(Vec::with_capacity(times.len()))
             } else {
@@ -353,6 +416,7 @@ pub async fn get_site_aggregates(
             };
 
             for t in &times {
+                flagged_count.push(flagged_map.and_then(|m| m.get(t).copied()).unwrap_or(0));
                 if let Some(aggs) = aggs_map.and_then(|m| m.get(t)) {
                     avg.push(aggs.0);
                     min.push(aggs.1);
@@ -404,6 +468,7 @@ pub async fn get_site_aggregates(
                 max,
                 count,
                 max_severity: severity_vec,
+                flagged_count,
             }
         })
         .collect();

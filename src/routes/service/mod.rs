@@ -96,6 +96,8 @@ pub fn service_router(state: &AppState) -> Router<()> {
         .route("/grab_samples", post(grab_samples::insert_grab_samples))
         .route("/readings/flag", patch(flags::flag_readings))
         .route("/readings/unflag", patch(flags::unflag_readings))
+        .route("/readings/flag_range", patch(flags::flag_range))
+        .route("/readings/unflag_range", patch(flags::unflag_range))
         .route("/actions/refresh_aggregates", post(actions::refresh_aggregates))
         .route("/actions/compute_derived", post(actions::compute_derived))
         .route("/actions/rollback_deployment", post(actions::rollback_deployment))

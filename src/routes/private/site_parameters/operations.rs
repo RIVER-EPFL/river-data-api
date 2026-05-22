@@ -1,15 +1,107 @@
 use async_trait::async_trait;
-use crudcrate::{ApiError, CRUDOperations};
-use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, ActiveModelTrait, Set, Statement};
+use crudcrate::{ApiError, CRUDOperations, CRUDResource};
+use sea_orm::{ColumnTrait, ConnectionTrait, Condition, DatabaseConnection, EntityTrait, Order, QueryFilter, QueryOrder, QuerySelect, ActiveModelTrait, Set, Statement};
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-use super::model::SiteParameter;
+use super::model::{Column, Entity, SiteParameter};
+
+async fn enrich(db: &DatabaseConnection, items: &mut [SiteParameter]) -> Result<(), ApiError> {
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let param_ids: HashSet<Uuid> = items.iter().map(|sp| sp.parameter_id).collect();
+    let def_ids: HashSet<Uuid> = items
+        .iter()
+        .filter_map(|sp| sp.derived_definition_id)
+        .collect();
+
+    if !param_ids.is_empty() {
+        let params = crate::routes::private::parameters::Entity::find()
+            .filter(crate::routes::private::parameters::Column::Id.is_in(param_ids))
+            .all(db)
+            .await
+            .map_err(ApiError::database)?;
+        let by_id: HashMap<Uuid, crate::routes::private::parameters::Parameter> = params
+            .into_iter()
+            .map(|m| (m.id, crate::routes::private::parameters::Parameter::from(m)))
+            .collect();
+        for sp in items.iter_mut() {
+            if let Some(p) = by_id.get(&sp.parameter_id) {
+                sp.parameter = vec![p.clone()];
+            }
+        }
+    }
+
+    if !def_ids.is_empty() {
+        let defs = crate::routes::private::derived_parameters::definition_model::Entity::find()
+            .filter(crate::routes::private::derived_parameters::definition_model::Column::Id.is_in(def_ids))
+            .all(db)
+            .await
+            .map_err(ApiError::database)?;
+        let by_id: HashMap<Uuid, crate::routes::private::derived_parameters::definition_model::DerivedParameterDefinition> = defs
+            .into_iter()
+            .map(|m| (m.id, crate::routes::private::derived_parameters::definition_model::DerivedParameterDefinition::from(m)))
+            .collect();
+        for sp in items.iter_mut() {
+            if let Some(def_id) = sp.derived_definition_id
+                && let Some(def) = by_id.get(&def_id)
+            {
+                sp.derived_definition = Some(def.clone());
+            }
+        }
+    }
+
+    Ok(())
+}
 
 pub struct SiteParameterOperations;
 
 #[async_trait]
 impl CRUDOperations for SiteParameterOperations {
     type Resource = SiteParameter;
+
+    async fn fetch_one(
+        &self,
+        db: &DatabaseConnection,
+        id: Uuid,
+    ) -> Result<SiteParameter, ApiError> {
+        let model = Entity::find_by_id(id)
+            .one(db)
+            .await
+            .map_err(ApiError::database)?
+            .ok_or_else(|| ApiError::not_found(SiteParameter::RESOURCE_NAME_SINGULAR, Some(id.to_string())))?;
+        let mut resource = SiteParameter::from(model);
+        let mut slice = std::slice::from_mut(&mut resource);
+        enrich(db, &mut slice).await?;
+        Ok(resource)
+    }
+
+    async fn fetch_all(
+        &self,
+        db: &DatabaseConnection,
+        condition: &Condition,
+        order_column: Column,
+        order_direction: Order,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Vec<<SiteParameter as CRUDResource>::ListModel>, ApiError> {
+        let models = Entity::find()
+            .filter(condition.clone())
+            .order_by(order_column, order_direction)
+            .offset(offset)
+            .limit(limit)
+            .all(db)
+            .await
+            .map_err(ApiError::database)?;
+        let mut resources: Vec<SiteParameter> = models.into_iter().map(SiteParameter::from).collect();
+        enrich(db, &mut resources).await?;
+        Ok(resources
+            .into_iter()
+            .map(<SiteParameter as CRUDResource>::ListModel::from)
+            .collect())
+    }
 
     async fn after_create(
         &self,

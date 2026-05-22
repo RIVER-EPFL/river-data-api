@@ -50,6 +50,9 @@ pub struct Model {
     #[sea_orm(ignore)]
     #[crudcrate(non_db_attr = true, exclude(create, update), join(one, all, depth = 1))]
     pub parameter: Vec<crate::routes::private::parameters::Parameter>,
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
+    pub derived_definition: Option<crate::routes::private::derived_parameters::definition_model::DerivedParameterDefinition>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

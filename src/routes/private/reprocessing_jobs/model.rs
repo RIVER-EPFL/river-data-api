@@ -17,7 +17,7 @@ pub struct Model {
     #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
     pub id: Uuid,
     #[crudcrate(filterable, exclude(update, create))]
-    pub sensor_id: Uuid,
+    pub sensor_id: Option<Uuid>,
     #[crudcrate(filterable, exclude(update, create))]
     pub trigger_type: String,
     #[crudcrate(filterable, exclude(update, create))]
@@ -26,6 +26,10 @@ pub struct Model {
     pub status: String,
     #[crudcrate(exclude(update, create))]
     pub readings_updated: Option<i32>,
+    #[crudcrate(exclude(update, create))]
+    pub progress: Option<i32>,
+    #[crudcrate(exclude(update, create))]
+    pub total: Option<i32>,
     #[crudcrate(exclude(update, create))]
     pub error_message: Option<String>,
     #[crudcrate(sortable, exclude(update, create))]

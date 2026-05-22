@@ -4,6 +4,7 @@ use crate::common::AppState;
 use crate::common::auth::Role;
 use crate::routes::private::{
     alarm_thresholds::AlarmThreshold,
+    annotations::Annotation,
     api_tokens::ApiToken,
     constants::Constant,
     data_streams::DataStream,
@@ -55,6 +56,7 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .nest_service("/public_exposed_parameters", crud(PublicExposedParameter::router(db)))
         .nest_service("/standard_curves", crud(StandardCurve::router(db)))
         .nest_service("/notes", crud(Note::router(db)))
+        .nest_service("/annotations", crud(Annotation::router(db)))
         .nest_service("/constants", crud(Constant::router(db)))
         .nest_service("/samples", crud(Sample::router(db)))
         .nest_service("/reprocessing_jobs", crud(ReprocessingJob::router(db)))
