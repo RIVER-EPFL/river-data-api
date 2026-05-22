@@ -2663,7 +2663,7 @@ dependencies = [
 
 [[package]]
 name = "river-data-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2677,6 +2677,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "utoipa",
  "uuid",
 ]
 

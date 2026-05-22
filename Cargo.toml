@@ -85,7 +85,7 @@ async-trait = "0.1"
 migration = { path = "migration" }
 
 # Core library (sync control plane + hydrochemistry toolbox)
-river-data-core = { version = "0.2.0", features = ["server", "toolbox"] }
+river-data-core = { version = "0.2.1", features = ["server", "toolbox"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
