@@ -183,3 +183,70 @@ async fn test_continuous_derived_recompute_after_ingest() {
         "first derived reading was lost after second ingest"
     );
 }
+
+/// Scenario: a source reading exists historically but no derived reading was
+/// computed for that timestamp. Triggering the manual recompute endpoint must
+/// backfill the missing derived value.
+#[tokio::test]
+#[serial]
+async fn test_recompute_endpoint_backfills_historical_gap() {
+    let (db, app, token) = setup().await;
+    let site_id = Uuid::parse_str(common::SITE1_ID).unwrap();
+
+    let derived_name = format!("dom_backfill_{}", Uuid::new_v4().simple());
+    let create_body = serde_json::json!({
+        "name": derived_name,
+        "display_name": "Backfill DO mg/L",
+        "units": "mg/L",
+        "formula": "Dissolved_O2 * 0.032",
+    });
+    let (status, def_json) = common::post_json_parse_with_token(
+        &app,
+        "/api/service/derived_parameters",
+        &create_body,
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status));
+    let derived_def_id = def_json["id"].as_str().unwrap().to_string();
+    let output_parameter_id = def_json["output_parameter_id"].as_str().unwrap().to_string();
+    let derived_param_uuid = Uuid::parse_str(&output_parameter_id).unwrap();
+
+    let seeded_source_time: DateTime<Utc> = "2025-01-15T00:00:00Z".parse().unwrap();
+    let pre = poll_for_derived(&db, site_id, derived_param_uuid, seeded_source_time, 1).await;
+    assert!(
+        pre.is_none(),
+        "expected no derived reading before assignment + recompute"
+    );
+
+    let assign_body = serde_json::json!({
+        "site_id": common::SITE1_ID,
+        "parameter_id": output_parameter_id,
+        "name": derived_name,
+        "sensor_type": "derived",
+        "is_derived": true,
+        "derived_definition_id": derived_def_id,
+        "display_units": "mg/L",
+    });
+    let (status, _) = common::post_json_with_token(
+        &app,
+        "/api/service/site_parameters",
+        &assign_body,
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status));
+
+    let uri = format!("/api/admin/actions/derived_parameters/{derived_def_id}/recompute");
+    let (status, _) = common::post_json_with_token(&app, &uri, &serde_json::json!({}), &token).await;
+    assert!(
+        (200..300).contains(&status),
+        "recompute endpoint should accept request"
+    );
+
+    let v = poll_for_derived(&db, site_id, derived_param_uuid, seeded_source_time, POLL_DEADLINE_SECS).await;
+    assert!(
+        v.is_some(),
+        "recompute should have backfilled a derived reading at {seeded_source_time}"
+    );
+}
