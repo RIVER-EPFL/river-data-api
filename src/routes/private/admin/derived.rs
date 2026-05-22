@@ -72,6 +72,7 @@ pub async fn recompute_derived(
                     .await;
 
                     let mut filled: i32 = 0;
+                    let mut min_filled: Option<chrono::DateTime<chrono::Utc>> = None;
                     for (i, row) in rows.iter().enumerate() {
                         let Ok(site_id) = row.try_get::<Uuid>("", "site_id") else { continue };
                         let Ok(time) = row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "time") else { continue };
@@ -81,7 +82,10 @@ pub async fn recompute_derived(
                         )
                         .await
                         {
-                            Ok(()) => filled += 1,
+                            Ok(()) => {
+                                filled += 1;
+                                min_filled = Some(min_filled.map_or(utc_time, |m| m.min(utc_time)));
+                            }
                             Err(e) => tracing::error!(error = %e, time = %time, "Failed to recompute derived value"),
                         }
                         if (i + 1) % 500 == 0 {
@@ -93,6 +97,11 @@ pub async fn recompute_derived(
                             )
                             .await;
                         }
+                    }
+
+                    if let Some(since) = min_filled {
+                        tracing::info!(%since, %job_id, "Refreshing continuous aggregates after derived recompute");
+                        crate::common::sync_state::refresh_continuous_aggregates(&db, Some(since)).await;
                     }
 
                     update_job(

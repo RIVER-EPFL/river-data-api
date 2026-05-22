@@ -10,6 +10,10 @@ const MAX_GAPS_PER_RUN: usize = 50_000;
 /// Catches gaps from crashes during ingest, sync cycles missed while the API
 /// was down, derived parameters assigned after historical source data already
 /// existed, and any other inconsistency between source and derived readings.
+///
+/// After filling gaps, refreshes continuous aggregates back to the earliest
+/// filled timestamp so the hourly/daily/weekly/monthly rollups reflect the
+/// newly written derived values.
 pub async fn run_once(db: &DatabaseConnection) -> Result<usize, sea_orm::DbErr> {
     let started = std::time::Instant::now();
     let rows = db
@@ -48,6 +52,7 @@ pub async fn run_once(db: &DatabaseConnection) -> Result<usize, sea_orm::DbErr> 
     tracing::info!(gaps = total, "Derived janitor: filling gaps");
 
     let mut filled = 0usize;
+    let mut min_filled: Option<chrono::DateTime<chrono::Utc>> = None;
     for (i, row) in rows.iter().enumerate() {
         let site_id: Uuid = row.try_get("", "site_id")?;
         let time: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
@@ -57,12 +62,20 @@ pub async fn run_once(db: &DatabaseConnection) -> Result<usize, sea_orm::DbErr> 
         )
         .await
         {
-            Ok(()) => filled += 1,
+            Ok(()) => {
+                filled += 1;
+                min_filled = Some(min_filled.map_or(utc_time, |m| m.min(utc_time)));
+            }
             Err(e) => tracing::warn!(error = %e, site_id = %site_id, time = %utc_time, "Janitor failed to fill derived gap"),
         }
         if (i + 1) % 1000 == 0 {
             tracing::info!("Derived janitor: filled {}/{}", i + 1, total);
         }
+    }
+
+    if let Some(since) = min_filled {
+        tracing::info!(%since, filled, "Derived janitor: refreshing continuous aggregates after backfill");
+        crate::common::sync_state::refresh_continuous_aggregates(db, Some(since)).await;
     }
 
     tracing::info!(
@@ -77,6 +90,16 @@ pub async fn run_once(db: &DatabaseConnection) -> Result<usize, sea_orm::DbErr> 
 
 /// Long-running task: run the janitor once on startup, then every `interval`.
 ///
+/// On every tick:
+///   1. `run_once` fills any missing derived readings (and refreshes aggregates
+///      scoped to the earliest backfilled timestamp).
+///   2. An incremental refresh of the last 24h hourly / 7d daily windows runs
+///      unconditionally, so aggregates stay in sync with regular ingestion
+///      even when no derived gaps were found.
+///   3. Once every ~24h, a full refresh of all continuous aggregates runs,
+///      catching any historical drift older than 7d without needing a manual
+///      `POST /actions/refresh_aggregates {full: true}`.
+///
 /// Spawned as `tokio::spawn(periodic(db, interval))` from main.rs.
 pub async fn periodic(db: DatabaseConnection, interval: Duration) {
     tracing::info!(
@@ -84,16 +107,33 @@ pub async fn periodic(db: DatabaseConnection, interval: Duration) {
         "Derived janitor: starting"
     );
 
-    if let Err(e) = run_once(&db).await {
-        tracing::warn!(error = %e, "Derived janitor: initial run failed");
-    }
+    const FULL_REFRESH_EVERY: Duration = Duration::from_secs(86_400);
+    let mut last_full_refresh: Option<std::time::Instant> = None;
+
+    let tick = async |db: &DatabaseConnection,
+                      last_full_refresh: &mut Option<std::time::Instant>| {
+        if let Err(e) = run_once(db).await {
+            tracing::warn!(error = %e, "Derived janitor: run failed");
+        }
+
+        let now = std::time::Instant::now();
+        let due_full = last_full_refresh
+            .is_none_or(|t| now.duration_since(t) >= FULL_REFRESH_EVERY);
+        if due_full {
+            tracing::info!("Derived janitor: running scheduled full continuous aggregate refresh");
+            crate::common::sync_state::refresh_continuous_aggregates_full(db).await;
+            *last_full_refresh = Some(now);
+        } else {
+            crate::common::sync_state::refresh_continuous_aggregates(db, None).await;
+        }
+    };
+
+    tick(&db, &mut last_full_refresh).await;
 
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        if let Err(e) = run_once(&db).await {
-            tracing::warn!(error = %e, "Derived janitor: periodic run failed");
-        }
+        tick(&db, &mut last_full_refresh).await;
     }
 }

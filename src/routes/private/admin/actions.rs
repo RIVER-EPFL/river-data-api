@@ -86,6 +86,19 @@ pub async fn compute_derived(
             }
 
             tracing::info!(computed, "Derived computation complete");
+
+            if computed > 0 {
+                let min_time = payload
+                    .site_timestamps
+                    .iter()
+                    .flat_map(|st| st.timestamps.iter())
+                    .min()
+                    .copied();
+                if let Some(since) = min_time {
+                    tracing::info!(%since, "Refreshing continuous aggregates after derived computation");
+                    state::refresh_continuous_aggregates(&db, Some(since)).await;
+                }
+            }
         }).await {
             Ok(()) => {}
             Err(_) => tracing::error!("Compute derived task timed out after 10 minutes"),
