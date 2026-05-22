@@ -20,6 +20,7 @@ use crate::routes::private::{
     pairing_plans::PairingPlan,
     parameters::Parameter,
     public_exposed_parameters::PublicExposedParameter,
+    reprocessing_jobs::ReprocessingJob,
     samples::Sample,
     sensor_calibrations::SensorCalibration,
     sensor_deployments::SensorDeployment,
@@ -57,6 +58,7 @@ pub fn service_router(state: &AppState) -> Router<()> {
         .nest("/annotations", with_crud_perms(Annotation::router(db)))
         .nest("/constants", with_crud_perms(Constant::router(db)))
         .nest("/samples", with_crud_perms(Sample::router(db)))
+        .nest("/reprocessing_jobs", with_crud_perms(ReprocessingJob::router(db)))
         .nest("/sync_services", with_crud_perms(SyncService::router(db)))
         .nest("/sync_commands", with_crud_perms(SyncCommand::router(db)))
         .nest("/sync_events", with_crud_perms(SyncEvent::router(db)))

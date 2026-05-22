@@ -633,13 +633,19 @@ async fn pair_and_backfill<C: ConnectionTrait>(
     )).await.map_err(|e| e.to_string())?;
     let backfilled = result.rows_affected();
 
-    let _ = db.execute(Statement::from_sql_and_values(
+    if let Err(e) = db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE status_events
           SET site_id = $1, parameter_id = $2, sensor_id = $4
           WHERE stream_id = $3 AND site_id IS NULL",
         [sp.site_id.into(), sp.parameter_id.into(), stream_id.into(), sensor_ctx.sensor_id.into()],
-    )).await;
+    )).await {
+        tracing::warn!(
+            error = %e,
+            stream_id = %stream_id,
+            "Failed to backfill status_events during stream pairing; readings were still paired",
+        );
+    }
 
     Ok((sensors_created, backfilled))
 }

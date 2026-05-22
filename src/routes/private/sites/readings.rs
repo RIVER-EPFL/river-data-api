@@ -108,6 +108,8 @@ pub struct SiteReadingsQuery {
     pub end: Option<DateTime<Utc>>,
     /// Filter by sensor types (comma-separated)
     pub sensor_types: Option<String>,
+    /// Filter to a specific subset of parameters (comma-separated UUIDs). If omitted, returns all parameters configured for the site.
+    pub parameter_ids: Option<String>,
     /// Response format: json (default), ndjson, csv
     #[serde(default = "default_format")]
     pub format: String,
@@ -190,6 +192,19 @@ pub async fn get_site_readings(
         if !type_list.is_empty() {
             param_query = param_query.filter(site_parameters::Column::SensorType.is_in(type_list));
         }
+    }
+
+    if let Some(ref ids) = query.parameter_ids {
+        let parsed: Vec<Uuid> = ids
+            .split(',')
+            .filter_map(|s| Uuid::parse_str(s.trim()).ok())
+            .collect();
+        if parsed.is_empty() {
+            return Err(AppError::BadRequest(
+                "parameter_ids was provided but no UUIDs could be parsed".to_string(),
+            ));
+        }
+        param_query = param_query.filter(site_parameters::Column::ParameterId.is_in(parsed));
     }
 
     // Get matching site_parameters (needed for cache key validation)

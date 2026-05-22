@@ -450,7 +450,15 @@ async fn pair_entry_stream<C: ConnectionTrait>(
             .one(txn).await?
             .map(|sp| sp.site_id)
             .unwrap_or_default();
-        let _ = create_sensor_for_stream(txn, &stream, parameter_id, site_id).await;
+        if let Err(e) = create_sensor_for_stream(txn, &stream, parameter_id, site_id).await {
+            tracing::warn!(
+                error = %e,
+                stream_id = %stream.id,
+                parameter_id = %parameter_id,
+                site_id = %site_id,
+                "Failed to auto-create sensor for stream during pairing; stream will still be paired",
+            );
+        }
     }
 
     let now = Utc::now();
@@ -476,7 +484,7 @@ async fn backfill_plan_readings<C: ConnectionTrait>(txn: &C, plan_id: Uuid) -> A
         [plan_id.into()],
     )).await?;
 
-    let _ = txn.execute(Statement::from_sql_and_values(
+    if let Err(e) = txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE status_events se
           SET site_id = sp.site_id, parameter_id = sp.parameter_id
@@ -485,7 +493,13 @@ async fn backfill_plan_readings<C: ConnectionTrait>(txn: &C, plan_id: Uuid) -> A
           WHERE se.stream_id = ds.id AND se.site_id IS NULL
             AND ds.pairing_plan_id = $1",
         [plan_id.into()],
-    )).await;
+    )).await {
+        tracing::warn!(
+            error = %e,
+            plan_id = %plan_id,
+            "Failed to backfill status_events site_id/parameter_id during plan apply; readings were still updated",
+        );
+    }
 
     Ok(backfill_result.rows_affected())
 }
@@ -547,14 +561,20 @@ pub async fn revert_plan(
         [plan_id.into()],
     )).await?;
 
-    // NULL out status_events
-    let _ = txn.execute(Statement::from_sql_and_values(
+    // NULL out status_events — best-effort: readings are already cleared above
+    if let Err(e) = txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE status_events se SET site_id = NULL, parameter_id = NULL
           FROM data_streams ds
           WHERE se.stream_id = ds.id AND ds.pairing_plan_id = $1",
         [plan_id.into()],
-    )).await;
+    )).await {
+        tracing::warn!(
+            error = %e,
+            plan_id = %plan_id,
+            "Failed to NULL status_events during plan revert; readings were already cleared",
+        );
+    }
 
     // Unpair the streams
     let result = txn.execute(Statement::from_sql_and_values(

@@ -19,9 +19,7 @@ use crate::routes::public::services::{
     ExposedParamConfig, PublicProjectConfig, PublicSiteConfig, get_public_config,
 };
 
-// ============================================================================
 // Time Format
-// ============================================================================
 
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
@@ -37,9 +35,7 @@ fn parse_time(s: &str) -> Result<DateTime<Utc>, AppError> {
         .map_err(|e| AppError::BadRequest(format!("Invalid datetime '{s}': {e}")))
 }
 
-// ============================================================================
 // Shared Types
-// ============================================================================
 
 fn default_format() -> String {
     "json".to_string()
@@ -60,9 +56,7 @@ pub struct ParameterInfo {
     pub description: Option<String>,
 }
 
-// ============================================================================
 // Resolution Helpers
-// ============================================================================
 
 /// Resolve a site within a public project by slug or UUID.
 fn resolve_site_from_config<'a>(
@@ -194,9 +188,7 @@ fn resolve_requested_param_names(
     Ok(requested)
 }
 
-// ============================================================================
 // GET /{project_slug}/sites -- List all sites
-// ============================================================================
 
 /// List available sites for a public project.
 #[utoipa::path(
@@ -229,9 +221,7 @@ pub async fn list_sites(
     Ok(Json(sites))
 }
 
-// ============================================================================
 // GET /{project_slug}/sites/{site_id} -- Site info
-// ============================================================================
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SiteDetailResponse {
@@ -334,9 +324,7 @@ pub async fn get_site(
     }))
 }
 
-// ============================================================================
 // GET /{project_slug}/sites/{site_id}/parameters -- Parameter listing
-// ============================================================================
 
 /// List available parameters for a site in a public project.
 #[utoipa::path(
@@ -371,9 +359,7 @@ pub async fn list_parameters(
     Ok(Json(params))
 }
 
-// ============================================================================
 // GET /{project_slug}/sites/{site_id}/readings -- Raw time-series
-// ============================================================================
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct ReadingsQuery {
@@ -534,9 +520,7 @@ pub async fn get_readings(
     }
 }
 
-// ============================================================================
 // GET /{project_slug}/sites/{site_id}/aggregates/{resolution} -- Aggregated
-// ============================================================================
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct AggregatesQuery {
@@ -857,9 +841,7 @@ pub async fn get_aggregates(
     }
 }
 
-// ============================================================================
 // Shared Helpers
-// ============================================================================
 
 /// Fetch raw readings for resolved parameters, build time axis and parameter arrays.
 async fn fetch_readings(
@@ -1011,9 +993,7 @@ async fn fetch_readings(
     Ok((times_formatted, output_params))
 }
 
-// ============================================================================
 // Streaming CSV/NDJSON Builders (delegated to bulk.rs)
-// ============================================================================
 
 fn build_csv_response(times: Vec<String>, parameters: &[ParameterData]) -> AppResult<Response> {
     bulk::build_csv_response_with_times(times, parameters)

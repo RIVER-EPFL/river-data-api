@@ -12,6 +12,7 @@ use crate::routes::private::{
     parameters::Parameter,
     projects::Project,
     public_exposed_parameters::PublicExposedParameter,
+    reprocessing_jobs::ReprocessingJob,
     samples::Sample,
     sensor_calibrations::SensorCalibration,
     sensor_deployments::SensorDeployment,
@@ -54,6 +55,7 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .nest_service("/notes", crud(Note::router(db)))
         .nest_service("/constants", crud(Constant::router(db)))
         .nest_service("/samples", crud(Sample::router(db)))
+        .nest_service("/reprocessing_jobs", crud(ReprocessingJob::router(db)))
         .nest_service("/data_streams", crud(DataStream::router(db)))
         .nest_service("/sync_services", crud(SyncService::router(db)))
         .nest_service("/sync_commands", crud(SyncCommand::router(db)))
