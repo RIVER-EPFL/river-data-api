@@ -2,20 +2,21 @@ use axum::{Json, extract::State};
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::routes::private::{data_streams, readings, samples, site_parameters, sites};
 use crate::error::{AppError, AppResult};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct GrabSampleRequest {
     pub site_id: Uuid,
     pub created_by: Option<String>,
     pub readings: Vec<GrabSampleReading>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct GrabSampleReading {
     pub parameter_id: Uuid,
     pub sensor_id: Option<Uuid>,
@@ -25,7 +26,7 @@ pub struct GrabSampleReading {
     pub replicate_index: Option<i16>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct GrabSampleResponse {
     pub inserted: usize,
     pub samples_created: usize,
@@ -143,6 +144,19 @@ async fn auto_create_samples(
     Ok(sample_map)
 }
 
+/// Insert field-collected grab sample readings (manual measurements with replicate sets).
+/// Each request creates one Sample aggregate per parameter and uses dedicated "grab_sample"
+/// streams. Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/grab_samples",
+    request_body = GrabSampleRequest,
+    responses(
+        (status = 200, description = "Counts of inserted readings and created Sample rows", body = GrabSampleResponse),
+        (status = 400, description = "Empty readings, parameter not configured for site, or other validation"),
+    ),
+    tag = "ingestion"
+)]
 pub async fn insert_grab_samples(
     State(state): State<AppState>,
     Json(payload): Json<GrabSampleRequest>,

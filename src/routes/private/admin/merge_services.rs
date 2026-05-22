@@ -1,16 +1,17 @@
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, TransactionTrait};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct MergeSiteParametersRequest {
     pub source_site_parameter_id: Uuid,
     pub target_site_parameter_id: Uuid,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct MergeSiteParametersResponse {
     pub merged_readings: u64,
     pub merged_status_events: u64,
@@ -250,13 +251,13 @@ async fn delete_source(
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct MergeParametersRequest {
     pub source_parameter_id: Uuid,
     pub target_parameter_id: Uuid,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct MergeParametersResponse {
     pub sites_merged: u64,
     pub sites_reassigned: u64,

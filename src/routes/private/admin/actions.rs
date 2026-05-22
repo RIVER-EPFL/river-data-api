@@ -1,6 +1,7 @@
 use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
@@ -8,12 +9,24 @@ use crate::error::{AppError, AppResult};
 use crate::routes::private::sensor_calibrations::services::{evaluate_formula, recalculate_derived_at_timestamp};
 use crate::common::sync_state as state;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct RefreshAggregatesRequest {
+    /// If true, refresh ALL continuous aggregates (slow). If false, incremental refresh.
     #[serde(default)]
     pub full: bool,
 }
 
+/// Fire-and-forget refresh of TimescaleDB continuous aggregates. Returns immediately;
+/// the refresh runs in a tokio task with a 10-minute timeout. Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/actions/refresh_aggregates",
+    request_body = RefreshAggregatesRequest,
+    responses(
+        (status = 200, description = "Refresh triggered (status field is always 'triggered')"),
+    ),
+    tag = "actions"
+)]
 pub async fn refresh_aggregates(
     State(app_state): State<AppState>,
     Json(payload): Json<RefreshAggregatesRequest>,
@@ -39,17 +52,29 @@ pub async fn refresh_aggregates(
     Ok(Json(serde_json::json!({ "status": "triggered" })))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ComputeDerivedRequest {
     pub site_timestamps: Vec<SiteTimestamps>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct SiteTimestamps {
     pub site_id: Uuid,
     pub timestamps: Vec<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Compute and upsert derived parameter values for the given (site, timestamp) pairs.
+/// Runs derived formula evaluation against source readings. Triggers an aggregate refresh
+/// on success. Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/actions/compute_derived",
+    request_body = ComputeDerivedRequest,
+    responses(
+        (status = 200, description = "Computation triggered; returns counts when complete"),
+    ),
+    tag = "actions"
+)]
 pub async fn compute_derived(
     State(app_state): State<AppState>,
     Json(payload): Json<ComputeDerivedRequest>,
@@ -110,18 +135,30 @@ pub async fn compute_derived(
     ))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct RollbackDeploymentRequest {
     pub deployment_id: Uuid,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct RollbackDeploymentResponse {
     pub status: String,
     pub readings_reassigned: u64,
     pub previous_deployment_id: Option<Uuid>,
 }
 
+/// Undo the most recent sensor deployment, reassigning its readings back to the previous
+/// deployment's site. Used after an accidentally-created deployment. Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/actions/rollback_deployment",
+    request_body = RollbackDeploymentRequest,
+    responses(
+        (status = 200, description = "Rollback complete with reassignment count", body = RollbackDeploymentResponse),
+        (status = 404, description = "Deployment not found"),
+    ),
+    tag = "actions"
+)]
 pub async fn rollback_deployment(
     State(app_state): State<AppState>,
     Json(payload): Json<RollbackDeploymentRequest>,
@@ -222,7 +259,7 @@ pub async fn rollback_deployment(
     }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct PreviewDerivedRequest {
     pub formula: String,
     pub site_id: Uuid,
@@ -230,7 +267,7 @@ pub struct PreviewDerivedRequest {
     pub end: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PreviewDerivedResponse {
     pub site: PreviewSite,
     pub times: Vec<chrono::DateTime<chrono::Utc>>,
@@ -238,20 +275,20 @@ pub struct PreviewDerivedResponse {
     pub derived: DerivedSeries,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PreviewSite {
     pub id: Uuid,
     pub name: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SourceParameterSeries {
     pub name: String,
     pub units: String,
     pub values: Vec<Option<f64>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct DerivedSeries {
     pub name: String,
     pub formula: String,
@@ -297,6 +334,20 @@ fn extract_variables(formula: &str) -> Vec<String> {
         .collect()
 }
 
+/// Preview a derived parameter formula against historical source readings at a given site,
+/// WITHOUT writing anything to the database. Used by the formula builder UI to validate
+/// formulas before saving. Requires `read_data`.
+#[utoipa::path(
+    post,
+    path = "/actions/preview_derived",
+    request_body = PreviewDerivedRequest,
+    responses(
+        (status = 200, description = "Computed values with per-timestamp errors", body = PreviewDerivedResponse),
+        (status = 400, description = "Invalid formula syntax or unknown variables"),
+        (status = 404, description = "Site not found"),
+    ),
+    tag = "actions"
+)]
 pub async fn preview_derived(
     State(app_state): State<AppState>,
     Json(payload): Json<PreviewDerivedRequest>,

@@ -2,34 +2,46 @@ use axum::{Json, extract::State};
 use chrono::{DateTime, Utc};
 use sea_orm::ConnectionTrait;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ReadingKey {
     pub site_id: Uuid,
     pub parameter_id: Uuid,
     pub time: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct FlagReadingsRequest {
     pub readings: Vec<ReadingKey>,
     pub reason: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UnflagReadingsRequest {
     pub readings: Vec<ReadingKey>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct FlagReadingsResponse {
     pub updated: u64,
 }
 
+/// Flag a set of individual readings by (site_id, parameter_id, time). Requires `write_data`.
+#[utoipa::path(
+    patch,
+    path = "/readings/flag",
+    request_body = FlagReadingsRequest,
+    responses(
+        (status = 200, description = "Number of readings updated", body = FlagReadingsResponse),
+        (status = 400, description = "Missing readings or reason"),
+    ),
+    tag = "ingestion"
+)]
 pub async fn flag_readings(
     State(state): State<AppState>,
     Json(payload): Json<FlagReadingsRequest>,
@@ -111,6 +123,17 @@ pub async fn flag_readings(
     }))
 }
 
+/// Unflag a set of previously-flagged readings. Requires `write_data`.
+#[utoipa::path(
+    patch,
+    path = "/readings/unflag",
+    request_body = UnflagReadingsRequest,
+    responses(
+        (status = 200, description = "Number of readings updated", body = FlagReadingsResponse),
+        (status = 400, description = "No readings specified"),
+    ),
+    tag = "ingestion"
+)]
 pub async fn unflag_readings(
     State(state): State<AppState>,
     Json(payload): Json<UnflagReadingsRequest>,
@@ -188,7 +211,7 @@ pub async fn unflag_readings(
     }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct FlagRangeRequest {
     pub site_id: Uuid,
     pub parameter_id: Uuid,
@@ -197,7 +220,7 @@ pub struct FlagRangeRequest {
     pub reason: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UnflagRangeRequest {
     pub site_id: Uuid,
     pub parameter_id: Uuid,
@@ -228,6 +251,18 @@ async fn refresh_aggregates_for_range(
     }
 }
 
+/// Flag every reading in a (site_id, parameter_id, time range). Requires `write_data`.
+/// Refreshes continuous aggregates for the affected window on success.
+#[utoipa::path(
+    patch,
+    path = "/readings/flag_range",
+    request_body = FlagRangeRequest,
+    responses(
+        (status = 200, description = "Number of readings updated", body = FlagReadingsResponse),
+        (status = 400, description = "Missing reason or end_time < start_time"),
+    ),
+    tag = "ingestion"
+)]
 pub async fn flag_range(
     State(state): State<AppState>,
     Json(payload): Json<FlagRangeRequest>,
@@ -271,6 +306,18 @@ pub async fn flag_range(
     Ok(Json(FlagReadingsResponse { updated: total_updated }))
 }
 
+/// Unflag every reading in a (site_id, parameter_id, time range). Requires `write_data`.
+/// Refreshes continuous aggregates for the affected window on success.
+#[utoipa::path(
+    patch,
+    path = "/readings/unflag_range",
+    request_body = UnflagRangeRequest,
+    responses(
+        (status = 200, description = "Number of readings updated", body = FlagReadingsResponse),
+        (status = 400, description = "end_time < start_time"),
+    ),
+    tag = "ingestion"
+)]
 pub async fn unflag_range(
     State(state): State<AppState>,
     Json(payload): Json<UnflagRangeRequest>,

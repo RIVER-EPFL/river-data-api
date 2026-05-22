@@ -2,6 +2,7 @@ use axum::{Json, extract::State};
 use sea_orm::{EntityTrait, Set};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
@@ -9,12 +10,12 @@ use crate::routes::private::status_events;
 use crate::error::AppResult;
 use crate::routes::private::data_streams::services::get_or_create_api_stream;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct BatchStatusEventsRequest {
     pub events: Vec<StatusEventInput>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct StatusEventInput {
     pub site_id: Uuid,
     pub parameter_id: Uuid,
@@ -23,13 +24,25 @@ pub struct StatusEventInput {
     pub sensor_id: Option<Uuid>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct BatchStatusEventsResponse {
     pub inserted: usize,
 }
 
 const BATCH_SIZE: usize = 1000;
 
+/// Batch insert non-numeric device status events (e.g. "low_battery", "offline").
+/// Auto-creates "api" streams as needed. 10MB body limit. Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/status_events/batch",
+    request_body = BatchStatusEventsRequest,
+    responses(
+        (status = 200, description = "Inserted count", body = BatchStatusEventsResponse),
+        (status = 413, description = "Body exceeds 10MB limit"),
+    ),
+    tag = "ingestion"
+)]
 pub async fn insert_batch_status_events(
     State(state): State<AppState>,
     Json(payload): Json<BatchStatusEventsRequest>,

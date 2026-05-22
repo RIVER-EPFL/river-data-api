@@ -7,6 +7,19 @@ use super::merge_services::{
     MergeSiteParametersResponse, merge_parameters, merge_site_parameters,
 };
 
+/// Merge two `site_parameters` — absorb `source` into `target`. Moves readings, status
+/// events, streams, and sensor deployments; deletes the source row. Idempotent on the
+/// `(stream_id, time, replicate_index)` PK. Requires `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/actions/merge_site_parameters",
+    request_body = MergeSiteParametersRequest,
+    responses(
+        (status = 200, description = "Counts of moved rows and source deletion status", body = MergeSiteParametersResponse),
+        (status = 404, description = "Source or target not found"),
+    ),
+    tag = "actions"
+)]
 pub async fn merge_site_parameters_handler(
     State(state): State<AppState>,
     Json(payload): Json<MergeSiteParametersRequest>,
@@ -29,6 +42,19 @@ pub async fn merge_site_parameters_handler(
     Ok(Json(result))
 }
 
+/// Merge two global parameters in the catalog — absorb `source` into `target`. Re-points
+/// every `site_parameter`, reading, status event, and stream from source to target. Use
+/// when two catalog entries describe the same physical parameter. Requires `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/actions/merge_parameters",
+    request_body = MergeParametersRequest,
+    responses(
+        (status = 200, description = "Counts of moved rows", body = MergeParametersResponse),
+        (status = 404, description = "Source or target parameter not found"),
+    ),
+    tag = "actions"
+)]
 pub async fn merge_parameters_handler(
     State(state): State<AppState>,
     Json(payload): Json<MergeParametersRequest>,

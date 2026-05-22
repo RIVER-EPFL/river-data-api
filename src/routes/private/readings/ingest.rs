@@ -2,6 +2,7 @@ use axum::{Json, extract::State};
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Set, Statement};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
@@ -9,13 +10,13 @@ use crate::routes::private::{data_streams, readings, status_events};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::operations::resolve_sensor_context;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct IngestReadingsRequest {
     pub stream_id: Uuid,
     pub readings: Vec<IngestReading>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct IngestReading {
     pub time: chrono::DateTime<Utc>,
     pub raw_value: f64,
@@ -26,7 +27,7 @@ pub struct IngestReading {
     pub deployment_id: Option<Uuid>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct IngestResponse {
     pub inserted: usize,
     pub stream_id: Uuid,
@@ -35,12 +36,20 @@ pub struct IngestResponse {
 
 const BATCH_SIZE: usize = 1000;
 
-/// `POST /api/service/ingest` — stream-based data ingestion.
-///
-/// 1. Always inserts into `readings` with `stream_id`.
-/// 2. If stream is paired → fills `site_id`, `parameter_id` from pairing, applies identity calibration.
-/// 3. If unpaired → inserts with `site_id = NULL`, `calibrated_value = raw_value`.
-/// 4. Updates `data_streams.last_data_time`.
+/// Stream-based data ingestion. Inserts readings keyed by `stream_id`. If the stream is
+/// paired to a `site_parameter`, readings are stamped with `site_id`/`parameter_id` and an
+/// identity calibration. Unpaired streams insert with `site_id = NULL` (and won't show up
+/// in continuous aggregates until paired). Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/ingest",
+    request_body = IngestReadingsRequest,
+    responses(
+        (status = 200, description = "Inserted count and pairing state", body = IngestResponse),
+        (status = 404, description = "Stream not found"),
+    ),
+    tag = "ingestion"
+)]
 pub async fn ingest_readings(
     State(state): State<AppState>,
     Json(payload): Json<IngestReadingsRequest>,
@@ -205,27 +214,38 @@ pub async fn ingest_readings(
     }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct IngestStatusEventsRequest {
     pub stream_id: Uuid,
     pub events: Vec<IngestStatusEvent>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct IngestStatusEvent {
     pub time: chrono::DateTime<Utc>,
     pub value: String,
     pub sensor_id: Option<Uuid>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct IngestStatusEventsResponse {
     pub inserted: usize,
     pub stream_id: Uuid,
     pub paired: bool,
 }
 
-/// `POST /api/service/ingest/status_events` — stream-based status event ingestion.
+/// Stream-based status event ingestion (non-numeric device states like "low_battery").
+/// Hypertable inserts keyed by stream_id. Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/ingest/status_events",
+    request_body = IngestStatusEventsRequest,
+    responses(
+        (status = 200, description = "Inserted count and pairing state", body = IngestStatusEventsResponse),
+        (status = 404, description = "Stream not found"),
+    ),
+    tag = "ingestion"
+)]
 pub async fn ingest_status_events(
     State(state): State<AppState>,
     Json(payload): Json<IngestStatusEventsRequest>,

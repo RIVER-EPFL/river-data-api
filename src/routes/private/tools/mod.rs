@@ -45,22 +45,23 @@ async fn load_gas_constants(db: &DatabaseConnection) -> river_data_core::toolbox
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ToolResult {
     pub tool: String,
+    #[schema(value_type = Object)]
     pub results: serde_json::Value,
     pub inputs_used: Vec<String>,
     pub inputs_ignored: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, utoipa::ToSchema)]
 pub struct ToolParamInfo {
     pub name: &'static str,
     pub label: &'static str,
     pub required: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ToolInfo {
     pub name: &'static str,
     pub description: &'static str,
@@ -96,10 +97,34 @@ fn registry() -> &'static [Box<dyn AnalyticalTool>] {
     ])
 }
 
+/// List all available analytical tools (DOC, DIC, pCO2, etc.) with their parameter schemas.
+/// Requires `read_data`.
+#[utoipa::path(
+    get,
+    path = "/tools",
+    responses(
+        (status = 200, description = "List of tool descriptors", body = [ToolInfo]),
+    ),
+    tag = "tools"
+)]
 pub async fn list_tools() -> Json<Vec<&'static ToolInfo>> {
     Json(registry().iter().map(|t| t.info()).collect())
 }
 
+/// Run an analytical tool calculation. Request body schema is per-tool (call `GET /tools`
+/// to discover required fields). Requires `read_data`.
+#[utoipa::path(
+    post,
+    path = "/tools/{tool_name}/calculate",
+    params(("tool_name" = String, Path, description = "Tool name (e.g. 'doc', 'dic', 'pco2')")),
+    request_body(content = Object, description = "Per-tool request body (see GET /tools for schemas)"),
+    responses(
+        (status = 200, description = "Calculation result with `inputs_used` / `inputs_ignored` accounting", body = ToolResult),
+        (status = 404, description = "Unknown tool name"),
+        (status = 400, description = "Invalid input for this tool"),
+    ),
+    tag = "tools"
+)]
 pub async fn calculate_tool(
     State(state): State<AppState>,
     Path(tool_name): Path<String>,

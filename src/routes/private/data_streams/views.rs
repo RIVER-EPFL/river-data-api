@@ -4,6 +4,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, Statement,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
@@ -12,7 +13,7 @@ use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::operations::{close_sensor_deployment, create_sensor_for_stream};
 use crate::common::sync_state::refresh_continuous_aggregates_full;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct StreamStatsResponse {
     pub stream_id: Uuid,
     pub reading_count: i64,
@@ -21,7 +22,18 @@ pub struct StreamStatsResponse {
     pub latest_value: Option<f64>,
 }
 
-/// `GET /api/service/streams/{id}/stats` — reading stats for a stream.
+/// Reading statistics for a single data stream: count, time range, latest value.
+/// Requires `read_metadata`.
+#[utoipa::path(
+    get,
+    path = "/streams/{id}/stats",
+    params(("id" = Uuid, Path, description = "Stream UUID")),
+    responses(
+        (status = 200, description = "Stream statistics", body = StreamStatsResponse),
+        (status = 404, description = "Stream not found"),
+    ),
+    tag = "streams"
+)]
 pub async fn stream_stats(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -68,13 +80,14 @@ pub async fn stream_stats(
     }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct RegisterStreamRequest {
     pub source_system: String,
     pub source_key: String,
     pub source_name: Option<String>,
     pub source_path: Option<String>,
     #[serde(default = "default_metadata")]
+    #[schema(value_type = Object)]
     pub metadata: serde_json::Value,
 }
 
@@ -82,13 +95,14 @@ fn default_metadata() -> serde_json::Value {
     serde_json::json!({})
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct StreamResponse {
     pub id: Uuid,
     pub source_system: String,
     pub source_key: String,
     pub source_name: Option<String>,
     pub source_path: Option<String>,
+    #[schema(value_type = Object)]
     pub metadata: serde_json::Value,
     pub site_parameter_id: Option<Uuid>,
     pub sensor_id: Option<Uuid>,
@@ -117,7 +131,17 @@ impl From<data_streams::Model> for StreamResponse {
     }
 }
 
-/// `POST /api/service/streams/register` — upsert on (source_system, source_key).
+/// Upsert a data stream by (source_system, source_key). Used by sync microservices on
+/// discovery to register streams before pairing. Requires `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/streams/register",
+    request_body = RegisterStreamRequest,
+    responses(
+        (status = 200, description = "Stream registered (created or updated)", body = StreamResponse),
+    ),
+    tag = "streams"
+)]
 pub async fn register_stream(
     State(state): State<AppState>,
     Json(payload): Json<RegisterStreamRequest>,
@@ -171,23 +195,32 @@ pub async fn register_stream(
     Ok(Json(stream.into()))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct PairStreamRequest {
     pub site_parameter_id: Uuid,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PairStreamResponse {
     pub stream: StreamResponse,
     pub backfilled: u64,
 }
 
-/// `POST /api/service/streams/{id}/pair` — pair a stream to a site_parameter.
-///
-/// 1. Sets `site_parameter_id` and `paired_at` on the stream.
-/// 2. Backfills existing readings: `UPDATE readings SET site_id=X, parameter_id=Y WHERE stream_id=Z AND site_id IS NULL`.
-/// 3. Applies identity calibration (`calibrated_value = raw_value`).
-/// 4. Triggers aggregate refresh.
+/// Pair a stream to a site_parameter. Sets `site_parameter_id`/`paired_at` on the stream,
+/// backfills existing unpaired readings with site_id/parameter_id, applies identity
+/// calibration, and triggers an aggregate refresh. Requires `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/pair",
+    params(("id" = Uuid, Path, description = "Stream UUID")),
+    request_body = PairStreamRequest,
+    responses(
+        (status = 200, description = "Stream paired, backfill count returned", body = PairStreamResponse),
+        (status = 404, description = "Stream not found"),
+        (status = 409, description = "Stream already paired"),
+    ),
+    tag = "streams"
+)]
 pub async fn pair_stream(
     State(state): State<AppState>,
     Path(stream_id): Path<Uuid>,
@@ -288,16 +321,25 @@ pub async fn pair_stream(
     }))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct UnpairStreamResponse {
     pub stream: StreamResponse,
     pub cleared: u64,
 }
 
-/// `POST /api/service/streams/{id}/unpair` — remove pairing from a stream.
-///
-/// Clears `site_parameter_id` and `paired_at`, and nulls out `site_id`/`parameter_id`
-/// on all readings for this stream.
+/// Remove pairing from a stream. Clears `site_parameter_id`/`paired_at` on the stream and
+/// nulls out `site_id`/`parameter_id` on all readings (effectively hiding them from
+/// continuous aggregates). Requires `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/unpair",
+    params(("id" = Uuid, Path, description = "Stream UUID")),
+    responses(
+        (status = 200, description = "Stream unpaired, cleared count returned", body = UnpairStreamResponse),
+        (status = 404, description = "Stream not found"),
+    ),
+    tag = "streams"
+)]
 pub async fn unpair_stream(
     State(state): State<AppState>,
     Path(stream_id): Path<Uuid>,

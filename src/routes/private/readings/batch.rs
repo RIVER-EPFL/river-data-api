@@ -2,6 +2,7 @@ use axum::{Json, extract::State};
 use sea_orm::{EntityTrait, Set};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
@@ -9,12 +10,12 @@ use crate::routes::private::readings;
 use crate::error::AppResult;
 use crate::routes::private::data_streams::services::get_or_create_api_stream;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct BatchReadingsRequest {
     pub readings: Vec<ReadingInput>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ReadingInput {
     pub site_id: Uuid,
     pub parameter_id: Uuid,
@@ -30,13 +31,26 @@ pub struct ReadingInput {
     pub sample_id: Option<Uuid>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct BatchReadingsResponse {
     pub inserted: usize,
 }
 
 const BATCH_SIZE: usize = 1000;
 
+/// Batch insert readings keyed by (site_id, parameter_id). Auto-creates "api" streams when
+/// a (site, parameter) pair has none. 10MB body limit. Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/readings/batch",
+    request_body = BatchReadingsRequest,
+    responses(
+        (status = 200, description = "Inserted count", body = BatchReadingsResponse),
+        (status = 400, description = "Timestamp outside [-10 years, +1 day] window"),
+        (status = 413, description = "Body exceeds 10MB limit"),
+    ),
+    tag = "ingestion"
+)]
 pub async fn insert_batch_readings(
     State(state): State<AppState>,
     Json(payload): Json<BatchReadingsRequest>,

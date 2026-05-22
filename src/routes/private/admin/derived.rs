@@ -26,6 +26,19 @@ async fn update_job(
     }
 }
 
+/// Recompute every derived value for a given derived parameter definition. Backfills via
+/// joining source readings; tracked as a `reprocessing_jobs` row. Refreshes continuous
+/// aggregates on completion. Requires `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/actions/derived_parameters/{id}/recompute",
+    params(("id" = Uuid, Path, description = "Derived parameter definition UUID")),
+    responses(
+        (status = 200, description = "Background recompute job triggered with job_id"),
+        (status = 404, description = "Derived parameter definition not found"),
+    ),
+    tag = "actions"
+)]
 pub async fn recompute_derived(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
