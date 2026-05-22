@@ -630,6 +630,9 @@ pub async fn get_alarm_summary(
 
     let total = rows.len();
 
+    let latest_by_site = fetch_latest_reading_times(&state.db, scope).await?;
+
+    let mut covered_sites: HashSet<Uuid> = site_map.keys().copied().collect();
     let mut by_site: Vec<AlarmSiteSummary> = site_map
         .into_iter()
         .map(|(site_id, (site_name, warnings, alarms))| AlarmSiteSummary {
@@ -637,8 +640,22 @@ pub async fn get_alarm_summary(
             site_name,
             warning_count: warnings,
             alarm_count: alarms,
+            latest_reading_time: latest_by_site.get(&site_id).map(|(_, t)| *t),
         })
         .collect();
+
+    for (site_id, (site_name, latest_time)) in &latest_by_site {
+        if covered_sites.insert(*site_id) {
+            by_site.push(AlarmSiteSummary {
+                site_id: *site_id,
+                site_name: site_name.clone(),
+                warning_count: 0,
+                alarm_count: 0,
+                latest_reading_time: Some(*latest_time),
+            });
+        }
+    }
+
     by_site.sort_by(|a, b| a.site_name.cmp(&b.site_name));
 
     Ok(Json(AlarmSummaryResponse {
@@ -649,4 +666,56 @@ pub async fn get_alarm_summary(
         },
         by_site,
     }))
+}
+
+/// Row from the latest reading time query
+#[derive(Debug, FromQueryResult)]
+struct LatestReadingTimeRow {
+    site_id: Uuid,
+    site_name: String,
+    latest_time: chrono::DateTime<chrono::FixedOffset>,
+}
+
+/// Fetch per-site latest reading time across all paired readings
+async fn fetch_latest_reading_times(
+    db: &sea_orm::DatabaseConnection,
+    scope: Option<Uuid>,
+) -> AppResult<HashMap<Uuid, (String, DateTime<Utc>)>> {
+    let project_filter = if scope.is_some() {
+        "WHERE s.project_id = $1"
+    } else {
+        ""
+    };
+
+    let sql = format!(
+        r"
+        SELECT s.id AS site_id, s.name AS site_name, MAX(r.time) AS latest_time
+        FROM sites s
+        JOIN readings r ON r.site_id = s.id
+        {project_filter}
+        GROUP BY s.id, s.name
+        "
+    );
+
+    let values: Vec<sea_orm::Value> = if let Some(project_id) = scope {
+        vec![project_id.into()]
+    } else {
+        vec![]
+    };
+
+    let rows: Vec<LatestReadingTimeRow> = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            values,
+        ))
+        .await?
+        .into_iter()
+        .filter_map(|row| LatestReadingTimeRow::from_query_result(&row, "").ok())
+        .collect();
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.site_id, (r.site_name, r.latest_time.with_timezone(&Utc))))
+        .collect())
 }

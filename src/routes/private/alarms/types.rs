@@ -101,6 +101,8 @@ pub struct AlarmSiteSummary {
     pub site_name: String,
     pub warning_count: usize,
     pub alarm_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_reading_time: Option<DateTime<Utc>>,
 }
 
 /// Response for alarm summary endpoint
