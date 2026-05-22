@@ -134,8 +134,17 @@ fn match_confidence(name: &str, candidates: &[(Uuid, String)]) -> DiscoverySugge
     }
 }
 
-/// `GET /api/admin/sync/discovery` — returns structured discovery report for unpaired streams.
-async fn get_discovery(
+/// Return a structured discovery report for unpaired streams, with name-match suggestions
+/// for project, site, parameter, and site_parameter resolution. Requires `read_metadata`.
+#[utoipa::path(
+    get,
+    path = "/sync/discovery",
+    responses(
+        (status = 200, description = "Array of discovery items with match suggestions", body = Object),
+    ),
+    tag = "sync"
+)]
+pub async fn get_discovery(
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<DiscoveryItem>>> {
     let db = &state.db;
@@ -424,7 +433,20 @@ struct ActionStats {
 ///
 /// Runs all actions within a single database transaction so that partial failures
 /// don't leave orphaned entities or inconsistent pairing state.
-async fn apply_discovery(
+/// Apply a discovery decision: create missing project/site/parameter/site_parameter rows,
+/// then pair the stream and backfill its readings. Used by the UI's pairing wizard.
+/// Requires `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/sync/apply-discovery",
+    request_body(content = Object, description = "Discovery actions to apply (per-stream)"),
+    responses(
+        (status = 200, description = "Pairing results per stream", body = Object),
+        (status = 400, description = "Invalid action payload"),
+    ),
+    tag = "sync"
+)]
+pub async fn apply_discovery(
     State(state): State<AppState>,
     Json(req): Json<ApplyDiscoveryRequest>,
 ) -> AppResult<Json<ApplyDiscoveryResponse>> {
@@ -704,12 +726,12 @@ async fn process_action<C: ConnectionTrait>(
 }
 
 #[derive(Deserialize)]
-struct GroupedDiscoveryRequest {
+pub struct GroupedDiscoveryRequest {
     source_system: String,
 }
 
 #[derive(Serialize)]
-struct GroupedDiscoveryResponse {
+pub struct GroupedDiscoveryResponse {
     source_system: String,
     total_streams: usize,
     projects: Vec<GroupedProject>,
@@ -745,7 +767,18 @@ struct GroupedParameter {
 }
 
 /// `POST /api/admin/sync/grouped-discovery` — server-side grouping of unpaired streams.
-async fn grouped_discovery(
+/// Like apply-discovery but groups streams by site for bulk creation. Returns counts
+/// of created/paired entities per group. Requires `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/sync/grouped-discovery",
+    request_body(content = Object, description = "Stream groupings with site-level decisions"),
+    responses(
+        (status = 200, description = "Per-group counts of created/paired entities", body = Object),
+    ),
+    tag = "sync"
+)]
+pub async fn grouped_discovery(
     State(state): State<AppState>,
     Json(req): Json<GroupedDiscoveryRequest>,
 ) -> AppResult<Json<GroupedDiscoveryResponse>> {
@@ -864,7 +897,7 @@ async fn grouped_discovery(
 }
 
 #[derive(Deserialize)]
-struct BulkPairRequest {
+pub struct BulkPairRequest {
     source_system: String,
     project_name: String,
     /// Sites to create or use. Each has name + optional existing_id.
@@ -874,7 +907,7 @@ struct BulkPairRequest {
 }
 
 #[derive(Deserialize)]
-struct BulkPairSite {
+pub struct BulkPairSite {
     name: String,
     existing_id: Option<Uuid>,
     latitude: Option<f64>,
@@ -883,7 +916,7 @@ struct BulkPairSite {
 }
 
 #[derive(Deserialize)]
-struct BulkPairParameter {
+pub struct BulkPairParameter {
     name: String,
     display_name: String,
     units: String,
@@ -891,7 +924,7 @@ struct BulkPairParameter {
 }
 
 #[derive(Serialize)]
-struct BulkPairResponse {
+pub struct BulkPairResponse {
     project_created: bool,
     sites_created: u32,
     parameters_created: u32,
@@ -900,7 +933,18 @@ struct BulkPairResponse {
 }
 
 /// `POST /api/admin/sync/bulk-pair` — creates entities and pairs all matching streams in one transaction.
-async fn bulk_pair(
+/// Bulk-pair multiple streams to existing site_parameters in a single transaction.
+/// Backfills readings for each paired stream. Requires `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/sync/bulk-pair",
+    request_body(content = Object, description = "List of (stream_id, site_parameter_id) pairings"),
+    responses(
+        (status = 200, description = "Pairing counts and backfill totals", body = Object),
+    ),
+    tag = "sync"
+)]
+pub async fn bulk_pair(
     State(state): State<AppState>,
     Json(req): Json<BulkPairRequest>,
 ) -> AppResult<Json<BulkPairResponse>> {
@@ -1171,11 +1215,22 @@ async fn bulk_pair(
 }
 
 #[derive(Deserialize)]
-struct CreatePairingPlanRequest {
+pub struct CreatePairingPlanRequest {
     source_system: String,
 }
 
-async fn create_pairing_plan(
+/// Create a draft pairing plan describing a batch of intended stream-to-site_parameter
+/// pairings. The plan is reviewable and applied separately. Requires `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/sync/pairing-plans",
+    request_body(content = Object),
+    responses(
+        (status = 200, description = "Created pairing plan", body = Object),
+    ),
+    tag = "sync"
+)]
+pub async fn create_pairing_plan(
     State(state): State<AppState>,
     Json(req): Json<CreatePairingPlanRequest>,
 ) -> AppResult<Json<crate::routes::private::pairing_plans::Model>> {
@@ -1183,7 +1238,16 @@ async fn create_pairing_plan(
     Ok(Json(plan))
 }
 
-async fn list_pairing_plans(
+/// List existing pairing plans by status (draft/applied/reverted). Requires `read_metadata`.
+#[utoipa::path(
+    get,
+    path = "/sync/pairing-plans",
+    responses(
+        (status = 200, description = "Array of pairing plans", body = Object),
+    ),
+    tag = "sync"
+)]
+pub async fn list_pairing_plans(
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<crate::routes::private::pairing_plans::Model>>> {
     use sea_orm::QueryOrder;
@@ -1194,7 +1258,18 @@ async fn list_pairing_plans(
     Ok(Json(plans))
 }
 
-async fn get_pairing_plan(
+/// Get a single pairing plan with its full pairing list. Requires `read_metadata`.
+#[utoipa::path(
+    get,
+    path = "/sync/pairing-plans/{id}",
+    params(("id" = Uuid, Path, description = "Pairing plan UUID")),
+    responses(
+        (status = 200, description = "Pairing plan with intended pairings", body = Object),
+        (status = 404, description = "Plan not found"),
+    ),
+    tag = "sync"
+)]
+pub async fn get_pairing_plan(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<crate::routes::private::pairing_plans::Model>> {
@@ -1206,7 +1281,7 @@ async fn get_pairing_plan(
 }
 
 #[derive(Deserialize)]
-struct UpdatePairingPlanRequest {
+pub struct UpdatePairingPlanRequest {
     updates: Vec<PlanEntryUpdate>,
 }
 
@@ -1225,7 +1300,20 @@ struct PlanEntryUpdate {
     parameter_units: Option<String>,
 }
 
-async fn update_pairing_plan(
+/// Edit a draft pairing plan (only `draft` status allows updates). Requires `write_metadata`.
+#[utoipa::path(
+    patch,
+    path = "/sync/pairing-plans/{id}",
+    params(("id" = Uuid, Path, description = "Pairing plan UUID")),
+    request_body(content = Object),
+    responses(
+        (status = 200, description = "Updated plan", body = Object),
+        (status = 404, description = "Plan not found"),
+        (status = 409, description = "Plan not in draft status"),
+    ),
+    tag = "sync"
+)]
+pub async fn update_pairing_plan(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdatePairingPlanRequest>,
@@ -1280,7 +1368,20 @@ async fn update_pairing_plan(
     Ok(Json(updated))
 }
 
-async fn apply_pairing_plan(
+/// Apply a pairing plan: execute all its pairings and backfills atomically. Marks the
+/// plan as `applied`. Requires `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/sync/pairing-plans/{id}/apply",
+    params(("id" = Uuid, Path, description = "Pairing plan UUID")),
+    responses(
+        (status = 200, description = "Plan applied with execution counts", body = Object),
+        (status = 404, description = "Plan not found"),
+        (status = 409, description = "Plan already applied or reverted"),
+    ),
+    tag = "sync"
+)]
+pub async fn apply_pairing_plan(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<crate::routes::private::sync::services::ApplyResult>> {
@@ -1288,7 +1389,20 @@ async fn apply_pairing_plan(
     Ok(Json(result))
 }
 
-async fn revert_pairing_plan(
+/// Revert an applied pairing plan: unpair every stream it touched, restoring the prior
+/// state. Marks the plan as `reverted`. Requires `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/sync/pairing-plans/{id}/revert",
+    params(("id" = Uuid, Path, description = "Pairing plan UUID")),
+    responses(
+        (status = 200, description = "Plan reverted with unpaired counts", body = Object),
+        (status = 404, description = "Plan not found"),
+        (status = 409, description = "Plan not in applied status"),
+    ),
+    tag = "sync"
+)]
+pub async fn revert_pairing_plan(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
@@ -1296,7 +1410,17 @@ async fn revert_pairing_plan(
     Ok(Json(serde_json::json!({ "reverted": reverted })))
 }
 
-async fn unpaired_summary(
+/// Aggregate summary of unpaired streams grouped by source system. Used by the dashboard
+/// to surface streams needing attention. Requires `read_metadata`.
+#[utoipa::path(
+    get,
+    path = "/sync/unpaired-summary",
+    responses(
+        (status = 200, description = "Counts of unpaired streams by source_system", body = Object),
+    ),
+    tag = "sync"
+)]
+pub async fn unpaired_summary(
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<serde_json::Value>>> {
     use sea_orm::{ConnectionTrait, Statement};
@@ -1318,7 +1442,19 @@ async fn unpaired_summary(
     Ok(Json(result))
 }
 
-async fn plan_site_metadata(
+/// Get site metadata enrichment for a pairing plan: latitudes, longitudes, glacier names,
+/// stream counts. Used by the pairing UI to display context. Requires `read_metadata`.
+#[utoipa::path(
+    get,
+    path = "/sync/pairing-plans/{id}/site-metadata",
+    params(("id" = Uuid, Path, description = "Pairing plan UUID")),
+    responses(
+        (status = 200, description = "Site metadata map keyed by site name", body = Object),
+        (status = 404, description = "Plan not found"),
+    ),
+    tag = "sync"
+)]
+pub async fn plan_site_metadata(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Vec<serde_json::Value>>> {

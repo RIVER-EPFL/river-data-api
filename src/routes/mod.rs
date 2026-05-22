@@ -235,6 +235,18 @@ pub fn enforce_time_range(
         private::admin::merge::merge_site_parameters_handler,
         private::admin::merge::merge_parameters_handler,
         private::admin::public_config::invalidate_public_config,
+        private::sync::views::get_discovery,
+        private::sync::views::apply_discovery,
+        private::sync::views::grouped_discovery,
+        private::sync::views::bulk_pair,
+        private::sync::views::create_pairing_plan,
+        private::sync::views::list_pairing_plans,
+        private::sync::views::get_pairing_plan,
+        private::sync::views::update_pairing_plan,
+        private::sync::views::apply_pairing_plan,
+        private::sync::views::revert_pairing_plan,
+        private::sync::views::unpaired_summary,
+        private::sync::views::plan_site_metadata,
     ),
     components(
         schemas(
@@ -314,6 +326,7 @@ pub fn enforce_time_range(
         (name = "streams", description = "Data stream registration and pairing"),
         (name = "tools", description = "Analytical calculators (DOC, DIC, pCO2, etc.)"),
         (name = "actions", description = "Operator actions: aggregate refresh, recalibration, merging, derived recomputation"),
+        (name = "sync", description = "Sync service control plane: discovery, pairing plans, service/credential management"),
     ),
     modifiers(&SecurityAddon),
     info(
