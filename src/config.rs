@@ -71,6 +71,11 @@ pub struct Config {
     pub public_max_readings_time_range_days: i64,
     pub public_max_aggregates_time_range_days: i64,
     pub default_readings_lookback_days: i64,
+
+    // Derived-parameter janitor
+    pub janitor_interval_seconds: u64,
+    pub janitor_full_refresh_seconds: u64,
+    pub janitor_retention_days: u32,
 }
 
 impl Config {
@@ -210,6 +215,20 @@ impl Config {
                 .unwrap_or_else(|_| "7".to_string())
                 .parse()
                 .unwrap_or(7),
+
+            // Derived-parameter janitor
+            janitor_interval_seconds: env::var("JANITOR_INTERVAL_SECONDS")
+                .unwrap_or_else(|_| "3600".to_string())
+                .parse()
+                .unwrap_or(3600),
+            janitor_full_refresh_seconds: env::var("JANITOR_FULL_REFRESH_SECONDS")
+                .unwrap_or_else(|_| "86400".to_string())
+                .parse()
+                .unwrap_or(86_400),
+            janitor_retention_days: env::var("JANITOR_RETENTION_DAYS")
+                .unwrap_or_else(|_| "180".to_string())
+                .parse()
+                .unwrap_or(180),
         })
     }
 

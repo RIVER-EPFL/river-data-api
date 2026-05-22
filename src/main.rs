@@ -88,13 +88,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = AppState::new(db.clone(), config.clone(), keycloak_instance);
 
-    let janitor_interval = Duration::from_secs(3600);
+    let janitor_interval = Duration::from_secs(config.janitor_interval_seconds);
+    let janitor_full_refresh = Duration::from_secs(config.janitor_full_refresh_seconds);
+    let janitor_retention_days = config.janitor_retention_days;
     tokio::spawn(river_db::routes::private::derived_parameters::janitor::periodic(
         db.clone(),
         janitor_interval,
+        janitor_full_refresh,
+        janitor_retention_days,
     ));
     tracing::info!(
         interval_secs = janitor_interval.as_secs(),
+        full_refresh_secs = janitor_full_refresh.as_secs(),
+        retention_days = janitor_retention_days,
         "Spawned derived consistency janitor"
     );
 

@@ -48,6 +48,9 @@ fn test_config() -> Config {
         public_max_readings_time_range_days: 30,
         public_max_aggregates_time_range_days: 180,
         default_readings_lookback_days: 7,
+        janitor_interval_seconds: 3600,
+        janitor_full_refresh_seconds: 86_400,
+        janitor_retention_days: 180,
     }
 }
 
