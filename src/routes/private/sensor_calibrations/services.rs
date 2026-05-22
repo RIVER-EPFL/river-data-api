@@ -124,7 +124,7 @@ pub fn evaluate_formula(formula: &str, variables: &HashMap<String, f64>) -> Resu
 
 struct DerivedWork {
     site_param_id: Uuid,
-    mappings: serde_json::Value,
+    derived_definition_id: Uuid,
     formula: String,
     derived_site_id: Uuid,
     derived_parameter_id: Uuid,
@@ -137,7 +137,7 @@ async fn fetch_derived_work_items(
     let rows = db
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT sp.id, sp.variable_mappings, d.formula, sp.site_id, sp.parameter_id
+            r"SELECT sp.id, sp.derived_definition_id, d.formula, sp.site_id, sp.parameter_id
               FROM site_parameters sp
               JOIN derived_parameter_definitions d ON sp.derived_definition_id = d.id
               WHERE sp.site_id = $1 AND sp.is_derived = true",
@@ -149,7 +149,7 @@ async fn fetch_derived_work_items(
     for row in &rows {
         items.push(DerivedWork {
             site_param_id: row.try_get("", "id")?,
-            mappings: row.try_get("", "variable_mappings")?,
+            derived_definition_id: row.try_get("", "derived_definition_id")?,
             formula: row.try_get("", "formula")?,
             derived_site_id: row.try_get("", "site_id")?,
             derived_parameter_id: row.try_get("", "parameter_id")?,
@@ -158,22 +158,24 @@ async fn fetch_derived_work_items(
     Ok(items)
 }
 
-fn build_evaluation_order(work_items: &[DerivedWork]) -> Vec<usize> {
+async fn build_evaluation_order(
+    db: &DatabaseConnection,
+    work_items: &[DerivedWork],
+) -> Result<Vec<usize>, sea_orm::DbErr> {
     let derived_param_ids: std::collections::HashSet<Uuid> =
         work_items.iter().map(|w| w.derived_parameter_id).collect();
 
     let mut deps: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
     for item in work_items {
+        let source_param_ids = source_parameter_ids_for_definition(db, item.derived_definition_id).await?;
         let mut item_deps = Vec::new();
-        if let Some(mapping_obj) = item.mappings.as_object() {
-            for (_var_name, source_val) in mapping_obj {
-                if let Some(source_id_str) = source_val.as_str()
-                    && let Ok(source_sp_id) = source_id_str.parse::<Uuid>()
-                    && let Some(other) = work_items.iter().find(|w| w.site_param_id == source_sp_id)
-                    && derived_param_ids.contains(&other.derived_parameter_id)
-                {
-                    item_deps.push(other.site_param_id);
-                }
+        for source_param_id in source_param_ids {
+            if derived_param_ids.contains(&source_param_id)
+                && let Some(other) = work_items
+                    .iter()
+                    .find(|w| w.derived_parameter_id == source_param_id)
+            {
+                item_deps.push(other.site_param_id);
             }
         }
         deps.insert(item.site_param_id, item_deps);
@@ -209,7 +211,90 @@ fn build_evaluation_order(work_items: &[DerivedWork]) -> Vec<usize> {
         );
     }
 
-    ordered
+    Ok(ordered)
+}
+
+async fn get_or_create_derived_stream(
+    db: &DatabaseConnection,
+    item: &DerivedWork,
+) -> Result<Uuid, sea_orm::DbErr> {
+    let existing = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT id FROM data_streams WHERE site_parameter_id = $1 LIMIT 1",
+            [item.site_param_id.into()],
+        ))
+        .await?;
+    if let Some(row) = existing {
+        return row.try_get::<Uuid>("", "id");
+    }
+
+    let def_row = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT name FROM derived_parameter_definitions WHERE id = $1",
+            [item.derived_definition_id.into()],
+        ))
+        .await?
+        .ok_or_else(|| {
+            sea_orm::DbErr::Custom(format!(
+                "derived_parameter_definition {} not found",
+                item.derived_definition_id
+            ))
+        })?;
+    let def_name: String = def_row.try_get("", "name")?;
+
+    let source_key = format!("{}_{}", def_name, item.derived_site_id);
+    let stream_id = Uuid::new_v4();
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"INSERT INTO data_streams
+            (id, source_system, source_key, source_name, site_parameter_id, is_active, discovered_at, paired_at)
+          VALUES ($1, 'derived', $2, $3, $4, true, NOW(), NOW())
+          ON CONFLICT (source_system, source_key) DO UPDATE
+            SET site_parameter_id = EXCLUDED.site_parameter_id
+          RETURNING id",
+        [
+            stream_id.into(),
+            source_key.into(),
+            def_name.into(),
+            item.site_param_id.into(),
+        ],
+    ))
+    .await?;
+
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT id FROM data_streams WHERE site_parameter_id = $1 LIMIT 1",
+            [item.site_param_id.into()],
+        ))
+        .await?
+        .ok_or_else(|| {
+            sea_orm::DbErr::Custom(
+                "Failed to retrieve derived data stream after upsert".to_string(),
+            )
+        })?;
+    row.try_get::<Uuid>("", "id")
+}
+
+async fn source_parameter_ids_for_definition(
+    db: &DatabaseConnection,
+    derived_definition_id: Uuid,
+) -> Result<Vec<Uuid>, sea_orm::DbErr> {
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT parameter_id FROM derived_parameter_sources
+              WHERE derived_definition_id = $1",
+            [derived_definition_id.into()],
+        ))
+        .await?;
+    let mut ids = Vec::with_capacity(rows.len());
+    for row in &rows {
+        ids.push(row.try_get::<Uuid>("", "parameter_id")?);
+    }
+    Ok(ids)
 }
 
 pub async fn recalculate_derived_at_timestamp(
@@ -222,7 +307,7 @@ pub async fn recalculate_derived_at_timestamp(
         return Ok(());
     }
 
-    let ordered = build_evaluation_order(&work_items);
+    let ordered = build_evaluation_order(db, &work_items).await?;
     for idx in ordered {
         evaluate_and_upsert_derived(db, &work_items[idx], time).await?;
     }
@@ -234,32 +319,39 @@ async fn resolve_variables_for_derived(
     item: &DerivedWork,
     time: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<HashMap<String, f64>>, sea_orm::DbErr> {
-    let Some(mapping_obj) = item.mappings.as_object() else {
+    let mapping_rows = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT variable_name, parameter_id
+              FROM derived_parameter_sources
+              WHERE derived_definition_id = $1",
+            [item.derived_definition_id.into()],
+        ))
+        .await?;
+
+    if mapping_rows.is_empty() {
         return Ok(None);
-    };
+    }
 
     let mut variables = HashMap::new();
-    for (var_name, source_param_id_val) in mapping_obj {
-        let Some(source_id_str) = source_param_id_val.as_str() else {
-            return Ok(None);
-        };
-        let Ok(source_sp_id) = source_id_str.parse::<Uuid>() else {
-            return Ok(None);
-        };
+    for row in &mapping_rows {
+        let var_name: String = row.try_get("", "variable_name")?;
+        let source_param_id: Uuid = row.try_get("", "parameter_id")?;
 
         let value_row = db
             .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r"SELECT COALESCE(r.calibrated_value, r.raw_value) as val
                   FROM readings r
-                  JOIN site_parameters sp ON sp.site_id = r.site_id AND sp.parameter_id = r.parameter_id
-                  WHERE sp.id = $1 AND r.time = $2",
-                [source_sp_id.into(), time.into()],
+                  WHERE r.site_id = $1 AND r.parameter_id = $2 AND r.time = $3
+                  ORDER BY r.replicate_index ASC
+                  LIMIT 1",
+                [item.derived_site_id.into(), source_param_id.into(), time.into()],
             ))
             .await?;
 
         match value_row {
-            Some(vr) => variables.insert(var_name.clone(), vr.try_get("", "val")?),
+            Some(vr) => variables.insert(var_name, vr.try_get("", "val")?),
             None => return Ok(None),
         };
     }
@@ -282,22 +374,7 @@ async fn evaluate_and_upsert_derived(
         return Ok(());
     }
 
-    let stream_row = db
-        .query_one(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT id FROM data_streams WHERE site_parameter_id = $1 LIMIT 1",
-            [item.site_param_id.into()],
-        ))
-        .await?;
-
-    let Some(stream_row) = stream_row else {
-        tracing::warn!(
-            site_parameter_id = %item.site_param_id,
-            "No data stream found for derived site_parameter, skipping"
-        );
-        return Ok(());
-    };
-    let stream_id: Uuid = stream_row.try_get("", "id")?;
+    let stream_id = get_or_create_derived_stream(db, item).await?;
 
     db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
