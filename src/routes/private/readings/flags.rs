@@ -101,6 +101,10 @@ pub async fn flag_readings(
         }
     }
 
+    if total_updated > 0 {
+        state.response_cache.invalidate_all();
+    }
+
     tracing::info!(updated = total_updated, reason = %payload.reason, "Flagged readings");
     Ok(Json(FlagReadingsResponse {
         updated: total_updated,
@@ -172,6 +176,10 @@ pub async fn unflag_readings(
                 }
             }
         }
+    }
+
+    if total_updated > 0 {
+        state.response_cache.invalidate_all();
     }
 
     tracing::info!(updated = total_updated, "Unflagged readings");

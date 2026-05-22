@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations};
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, ActiveModelTrait, Set};
+use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, ActiveModelTrait, Set, Statement};
 use uuid::Uuid;
 
 use super::model::SiteParameter;
@@ -16,7 +16,17 @@ impl CRUDOperations for SiteParameterOperations {
         db: &DatabaseConnection,
         entity: &mut SiteParameter,
     ) -> Result<(), ApiError> {
-        // Look up the parent parameter's default thresholds
+        if entity.is_active.is_none() {
+            db.execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE site_parameters SET is_active = true WHERE id = $1",
+                [entity.id.into()],
+            ))
+            .await
+            .map_err(ApiError::database)?;
+            entity.is_active = Some(true);
+        }
+
         let parameter = crate::routes::private::parameters::Entity::find_by_id(entity.parameter_id)
             .one(db)
             .await

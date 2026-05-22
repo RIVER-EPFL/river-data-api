@@ -8,6 +8,7 @@ use crate::routes::private::{
     constants::Constant,
     data_streams::DataStream,
     derived_parameters::definition_model::DerivedParameterDefinition,
+    derived_parameters::source_model::DerivedParameterSource,
     notes::Note,
     parameters::Parameter,
     projects::Project,
@@ -48,6 +49,7 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .nest_service("/sensor_calibrations", crud(SensorCalibration::router(db)))
         .nest_service("/sensor_deployments", crud(SensorDeployment::router(db)))
         .nest_service("/derived_parameters", crud(DerivedParameterDefinition::router(db)))
+        .nest_service("/derived_parameter_sources", crud(DerivedParameterSource::router(db)))
         .nest_service("/alarm_thresholds", crud(AlarmThreshold::router(db)))
         .nest_service("/tokens", crud(ApiToken::router(db)))
         .nest_service("/public_exposed_parameters", crud(PublicExposedParameter::router(db)))

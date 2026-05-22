@@ -86,10 +86,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Create application state
-    let state = AppState::new(db, config.clone(), keycloak_instance);
+    let state = AppState::new(db.clone(), config.clone(), keycloak_instance);
 
-    // Build router
+    let janitor_interval = Duration::from_secs(3600);
+    tokio::spawn(river_db::routes::private::derived_parameters::janitor::periodic(
+        db.clone(),
+        janitor_interval,
+    ));
+    tracing::info!(
+        interval_secs = janitor_interval.as_secs(),
+        "Spawned derived consistency janitor"
+    );
+
     let app = routes::build_router(state);
 
     // Start server with graceful shutdown
