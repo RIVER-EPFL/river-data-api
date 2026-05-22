@@ -7,19 +7,22 @@ use axum::{
 };
 use chrono::Utc;
 use serde::Deserialize;
+use utoipa::ToSchema;
 
 use crate::common::AppState;
 use crate::common::auth::Role;
 use crate::common::state::KeycloakAdmin;
 use crate::error::{AppError, AppResult};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct ListQuery {
+    /// React-admin style range, e.g. "[0,9]"
     pub range: Option<String>,
+    /// React-admin style filter, e.g. {"q":"john"}
     pub filter: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateUserRequest {
     pub username: String,
@@ -30,15 +33,15 @@ pub struct CreateUserRequest {
     pub enabled: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, serde::Serialize)]
-struct KeycloakRole {
-    id: String,
-    name: String,
+#[derive(Debug, Deserialize, serde::Serialize, ToSchema)]
+pub struct KeycloakRole {
+    pub id: String,
+    pub name: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct AssignRolesRequest {
-    roles: Vec<String>,
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AssignRolesRequest {
+    pub roles: Vec<String>,
 }
 
 async fn get_admin_token(state: &AppState) -> AppResult<String> {
@@ -134,7 +137,20 @@ fn simplify_user(u: &serde_json::Value) -> serde_json::Value {
     })
 }
 
-async fn list_users(
+/// List Keycloak users with the `riverdata-user` realm role, with optional filtering by
+/// search query (username, email, firstName, lastName) and admin flag. Proxies to Keycloak's
+/// admin API. Requires Keycloak Administrator role (`require_admin`).
+#[utoipa::path(
+    get,
+    path = "/users",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "User list with Content-Range header", body = Object),
+        (status = 503, description = "Keycloak admin client not configured"),
+    ),
+    tag = "admin"
+)]
+pub async fn list_users(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -230,7 +246,18 @@ async fn list_users(
     Ok((headers, Json(page)))
 }
 
-async fn get_user(
+/// Get a Keycloak user by ID with their realm roles attached. Requires `require_admin`.
+#[utoipa::path(
+    get,
+    path = "/users/{id}",
+    params(("id" = String, Path, description = "Keycloak user UUID")),
+    responses(
+        (status = 200, description = "User detail", body = Object),
+        (status = 404, description = "User not found"),
+    ),
+    tag = "admin"
+)]
+pub async fn get_user(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
@@ -270,7 +297,19 @@ async fn get_user(
     Ok(Json(result))
 }
 
-async fn create_user(
+/// Create a Keycloak user and automatically assign the `riverdata-user` realm role.
+/// Returns the new user's ID. Requires `require_admin`.
+#[utoipa::path(
+    post,
+    path = "/users",
+    request_body = CreateUserRequest,
+    responses(
+        (status = 201, description = "User created"),
+        (status = 409, description = "Username or email already exists"),
+    ),
+    tag = "admin"
+)]
+pub async fn create_user(
     State(state): State<AppState>,
     Json(req): Json<CreateUserRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -340,7 +379,19 @@ async fn create_user(
     Ok(Json(simplify_user(&user)))
 }
 
-async fn update_user(
+/// Update a Keycloak user (partial JSON merge). Requires `require_admin`.
+#[utoipa::path(
+    put,
+    path = "/users/{id}",
+    params(("id" = String, Path, description = "Keycloak user UUID")),
+    request_body(content = Object, description = "Partial user fields to update"),
+    responses(
+        (status = 200, description = "User updated"),
+        (status = 404, description = "User not found"),
+    ),
+    tag = "admin"
+)]
+pub async fn update_user(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<serde_json::Value>,
@@ -408,7 +459,18 @@ async fn update_user(
     Ok(Json(result))
 }
 
-async fn delete_user(
+/// Delete a Keycloak user. Requires `require_admin`.
+#[utoipa::path(
+    delete,
+    path = "/users/{id}",
+    params(("id" = String, Path, description = "Keycloak user UUID")),
+    responses(
+        (status = 200, description = "User deleted"),
+        (status = 404, description = "User not found"),
+    ),
+    tag = "admin"
+)]
+pub async fn delete_user(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
@@ -438,7 +500,19 @@ async fn delete_user(
     Ok(Json(serde_json::json!({ "id": id })))
 }
 
-async fn assign_roles(
+/// Set the realm roles for a user (overwrites; not additive). Requires `require_admin`.
+#[utoipa::path(
+    post,
+    path = "/users/{id}/roles",
+    params(("id" = String, Path, description = "Keycloak user UUID")),
+    request_body = AssignRolesRequest,
+    responses(
+        (status = 200, description = "Roles updated"),
+        (status = 404, description = "User not found"),
+    ),
+    tag = "admin"
+)]
+pub async fn assign_roles(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<AssignRolesRequest>,
@@ -452,6 +526,16 @@ async fn assign_roles(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
+/// List Keycloak realm roles (just `riverdata-admin` and `riverdata-user` in the default
+/// realm config). Used by the UI's role-assignment picker. Requires `require_admin`.
+#[utoipa::path(
+    get,
+    path = "/roles",
+    responses(
+        (status = 200, description = "Realm roles", body = [KeycloakRole]),
+    ),
+    tag = "admin"
+)]
 pub async fn list_roles(
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<serde_json::Value>>> {

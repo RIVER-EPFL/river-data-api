@@ -247,6 +247,13 @@ pub fn enforce_time_range(
         private::sync::views::revert_pairing_plan,
         private::sync::views::unpaired_summary,
         private::sync::views::plan_site_metadata,
+        private::admin::users::list_users,
+        private::admin::users::get_user,
+        private::admin::users::create_user,
+        private::admin::users::update_user,
+        private::admin::users::delete_user,
+        private::admin::users::assign_roles,
+        private::admin::users::list_roles,
     ),
     components(
         schemas(
@@ -314,6 +321,9 @@ pub fn enforce_time_range(
             private::admin::merge_services::MergeSiteParametersResponse,
             private::admin::merge_services::MergeParametersRequest,
             private::admin::merge_services::MergeParametersResponse,
+            private::admin::users::CreateUserRequest,
+            private::admin::users::AssignRolesRequest,
+            private::admin::users::KeycloakRole,
         )
     ),
     tags(
@@ -327,6 +337,7 @@ pub fn enforce_time_range(
         (name = "tools", description = "Analytical calculators (DOC, DIC, pCO2, etc.)"),
         (name = "actions", description = "Operator actions: aggregate refresh, recalibration, merging, derived recomputation"),
         (name = "sync", description = "Sync service control plane: discovery, pairing plans, service/credential management"),
+        (name = "admin", description = "Keycloak user/role management (require_admin — Keycloak admin role only, no token can pass)"),
     ),
     modifiers(&SecurityAddon),
     info(
