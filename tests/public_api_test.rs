@@ -1,4 +1,4 @@
-//! Tests for the public API tier (/api/public/).
+//! Tests for the public API tier (/api/v1/public/).
 //!
 //! Run with: cargo test --test public_api_test
 //! Requires: DATABASE_URL pointing to a TimescaleDB instance.
@@ -72,7 +72,7 @@ async fn setup_public() -> (sea_orm::DatabaseConnection, axum::Router) {
 async fn test_nonexistent_slug_returns_404() {
     let (_db, app) = setup_public().await;
 
-    let (status, _body) = common::get(&app, "/api/public/nonexistent-slug/sites").await;
+    let (status, _body) = common::get(&app, "/api/v1/public/nonexistent-slug/sites").await;
     assert_eq!(status, 404, "nonexistent project slug should return 404");
 }
 
@@ -95,7 +95,7 @@ async fn test_non_public_project_returns_404() {
     )
     .await;
 
-    let (status, _body) = common::get(&app, "/api/public/test-river/sites").await;
+    let (status, _body) = common::get(&app, "/api/v1/public/test-river/sites").await;
     assert_eq!(status, 404, "non-public project should return 404");
 }
 
@@ -108,7 +108,7 @@ async fn test_non_public_project_returns_404() {
 async fn test_public_list_sites() {
     let (_db, app) = setup_public().await;
 
-    let (status, body) = common::get_json(&app, "/api/public/test-river/sites").await;
+    let (status, body) = common::get_json(&app, "/api/v1/public/test-river/sites").await;
     assert_eq!(status, 200);
 
     let sites = body.as_array().expect("response should be an array");
@@ -127,7 +127,7 @@ async fn test_public_readings() {
 
     let (status, body) = common::get_json(
         &app,
-        "/api/public/test-river/sites/upstream/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z",
+        "/api/v1/public/test-river/sites/upstream/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z",
     )
     .await;
 
@@ -165,7 +165,7 @@ async fn test_public_readings_zero_conversion_factor() {
 
     let (status, body) = common::get_json(
         &app,
-        "/api/public/test-river/sites/upstream/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T01:00:00Z",
+        "/api/v1/public/test-river/sites/upstream/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T01:00:00Z",
     )
     .await;
 
@@ -226,7 +226,7 @@ async fn test_multi_exposure_same_parameter() {
 
     let (status, body) = common::get_json(
         &app,
-        "/api/public/test-river/sites/upstream/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T01:00:00Z",
+        "/api/v1/public/test-river/sites/upstream/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T01:00:00Z",
     )
     .await;
     assert_eq!(status, 200);
@@ -264,7 +264,7 @@ async fn test_multi_exposure_same_parameter() {
 async fn test_public_discovery() {
     let (_db, app) = setup_public().await;
 
-    let (status, body) = common::get_json(&app, "/api/public").await;
+    let (status, body) = common::get_json(&app, "/api/v1/public").await;
     assert_eq!(status, 200);
 
     let projects = body.as_array().expect("discovery should return an array");
@@ -285,7 +285,7 @@ async fn test_public_aggregates_with_conversion() {
 
     let (status, body) = common::get_json(
         &app,
-        "/api/public/test-river/sites/upstream/aggregates/hourly?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z",
+        "/api/v1/public/test-river/sites/upstream/aggregates/hourly?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z",
     )
     .await;
     assert_eq!(status, 200);
@@ -321,7 +321,7 @@ async fn test_public_readings_csv() {
 
     let (status, body) = common::get(
         &app,
-        "/api/public/test-river/sites/upstream/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T01:00:00Z&format=csv",
+        "/api/v1/public/test-river/sites/upstream/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T01:00:00Z&format=csv",
     )
     .await;
     assert_eq!(status, 200);
@@ -358,7 +358,7 @@ async fn test_public_docs_custom_title() {
     )
     .await;
 
-    let (status, body) = common::get(&app, "/api/public/test-river/docs").await;
+    let (status, body) = common::get(&app, "/api/v1/public/test-river/docs").await;
     assert_eq!(status, 200);
     assert!(body.contains("Mount Resilience Data"), "docs should include custom title");
 }
@@ -374,7 +374,7 @@ async fn test_public_parameter_filtering() {
 
     let (status, body) = common::get_json(
         &app,
-        "/api/public/test-river/sites/upstream/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T01:00:00Z&parameters=DOmgL",
+        "/api/v1/public/test-river/sites/upstream/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T01:00:00Z&parameters=DOmgL",
     )
     .await;
     assert_eq!(status, 200);
@@ -396,7 +396,7 @@ async fn test_public_site_detail() {
 
     let (status, body) = common::get_json(
         &app,
-        "/api/public/test-river/sites/upstream",
+        "/api/v1/public/test-river/sites/upstream",
     )
     .await;
     assert_eq!(status, 200);
@@ -420,7 +420,7 @@ async fn test_public_list_parameters() {
 
     let (status, body) = common::get_json(
         &app,
-        "/api/public/test-river/sites/upstream/parameters",
+        "/api/v1/public/test-river/sites/upstream/parameters",
     )
     .await;
     assert_eq!(status, 200);
