@@ -210,6 +210,7 @@ pub fn enforce_time_range(
         private::sites::status_events::get_site_status_events,
         private::alarms::views::get_site_alarms,
         private::sites::annotations::get_site_annotations,
+        private::search::search,
     ),
     components(
         schemas(
@@ -227,6 +228,12 @@ pub fn enforce_time_range(
             private::sites::annotations::AnnotationResponse,
             private::alarms::types::AlarmViolationsResponse,
             private::alarms::types::ParameterViolationData,
+            private::search::SearchResponse,
+            private::search::SearchResults,
+            private::search::SiteResult,
+            private::search::SensorResult,
+            private::search::ParameterResult,
+            private::search::ProjectResult,
         )
     ),
     tags(
@@ -234,6 +241,7 @@ pub fn enforce_time_range(
         (name = "projects", description = "Project management"),
         (name = "sites", description = "Site management and data"),
         (name = "alarms", description = "Threshold-based alarm violations"),
+        (name = "search", description = "Cross-entity search"),
     ),
     modifiers(&SecurityAddon),
     info(

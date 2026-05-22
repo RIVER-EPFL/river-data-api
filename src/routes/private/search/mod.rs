@@ -1,24 +1,27 @@
 use axum::{Json, extract::{Query, State}};
 use sea_orm::{DatabaseBackend, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct SearchParams {
+    /// Free-text query (minimum 2 characters). Matched case-insensitively against
+    /// site name, sensor serial/name, parameter name/display_name, and project name.
     pub q: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SearchResponse {
     pub query: String,
     pub results: SearchResults,
     pub total: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SearchResults {
     pub sites: Vec<SiteResult>,
     pub sensors: Vec<SensorResult>,
@@ -26,32 +29,44 @@ pub struct SearchResults {
     pub projects: Vec<ProjectResult>,
 }
 
-#[derive(Debug, Serialize, FromQueryResult)]
+#[derive(Debug, Serialize, FromQueryResult, ToSchema)]
 pub struct SiteResult {
     pub id: Uuid,
     pub name: String,
 }
 
-#[derive(Debug, Serialize, FromQueryResult)]
+#[derive(Debug, Serialize, FromQueryResult, ToSchema)]
 pub struct SensorResult {
     pub id: Uuid,
     pub serial_number: Option<String>,
     pub name: Option<String>,
 }
 
-#[derive(Debug, Serialize, FromQueryResult)]
+#[derive(Debug, Serialize, FromQueryResult, ToSchema)]
 pub struct ParameterResult {
     pub id: Uuid,
     pub name: String,
     pub display_name: String,
 }
 
-#[derive(Debug, Serialize, FromQueryResult)]
+#[derive(Debug, Serialize, FromQueryResult, ToSchema)]
 pub struct ProjectResult {
     pub id: Uuid,
     pub name: String,
 }
 
+/// Cross-entity full-text search. Matches against sites, sensors, parameters, and
+/// projects by name (case-insensitive substring). Requires `read_metadata`.
+#[utoipa::path(
+    get,
+    path = "/search",
+    params(SearchParams),
+    responses(
+        (status = 200, description = "Matching entities grouped by type", body = SearchResponse),
+        (status = 400, description = "Query shorter than 2 characters"),
+    ),
+    tag = "search"
+)]
 pub async fn search(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
