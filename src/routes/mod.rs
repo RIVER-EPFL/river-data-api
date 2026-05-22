@@ -3,7 +3,6 @@ pub mod private;
 pub mod public;
 pub mod public_api;
 pub mod service;
-pub mod admin;
 
 pub use crate::common::cache;
 
@@ -288,34 +287,33 @@ pub fn build_router(state: AppState) -> Router {
         );
     }
 
-    // Service tier router (replaces old /api/private/)
-    let service_routes_inner = service::service_router(&state);
+    // Unified /api/ router. Hosts everything previously split between /api/admin/
+    // and /api/service/. Per-route authorization lives in api_router itself via the
+    // require_* middleware; here we layer dual-auth and rate limiting on top.
+    let api_inner = service::api_router(&state);
 
     // Public API routes
     let public_routes = public_api::public_router();
 
-    // Admin routes (Keycloak-protected)
-    let admin_routes = admin::admin_router(&state);
-
-    // Apply optional rate limiting to service tier
-    let service_routes_rated = if config.disable_rate_limiting {
-        service_routes_inner
+    // Apply optional rate limiting
+    let api_rated = if config.disable_rate_limiting {
+        api_inner
     } else {
-        let service_limiter = GovernorConfigBuilder::default()
+        let api_limiter = GovernorConfigBuilder::default()
             .key_extractor(FallbackIpKeyExtractor)
             .per_second(config.rate_limit_data_per_second)
             .burst_size(config.rate_limit_data_burst)
             .finish()
-            .expect("Failed to create service rate limiter");
+            .expect("Failed to create api rate limiter");
 
-        service_routes_inner.layer(GovernorLayer {
-            config: Arc::new(service_limiter),
+        api_inner.layer(GovernorLayer {
+            config: Arc::new(api_limiter),
         })
     };
 
-    // Apply dual auth (Keycloak JWT OR API token) to service routes
-    let service_routes = {
-        let mut r = service_routes_rated.layer(middleware::from_fn_with_state(
+    // Apply dual auth (Keycloak JWT OR API token)
+    let api_authed = {
+        let mut r = api_rated.layer(middleware::from_fn_with_state(
             state.clone(),
             crate::common::middleware::service_auth_middleware,
         ));
@@ -331,7 +329,7 @@ pub fn build_router(state: AppState) -> Router {
                     .build(),
             );
         } else {
-            tracing::warn!("Service routes are not protected by Keycloak (API tokens still work)");
+            tracing::warn!("API routes are not protected by Keycloak (API tokens still work)");
         }
         r
     };
@@ -353,22 +351,19 @@ pub fn build_router(state: AppState) -> Router {
     };
 
     // Sync control routes — separate auth path (body-based creds + session tokens,
-    // NOT dual auth via service_auth_middleware)
+    // NOT dual auth via service_auth_middleware). These paths live under /sync/* but
+    // don't collide with sync admin views which use /sync/services, /sync/credentials etc.
     let sync_control_routes = service::sync_control_router(&state);
 
-    // Combine all API routes
-    // Body limits: service tier manages its own (10MB on batch readings),
-    // admin and config get 1MB limit.
-    // Note: nest() routes take priority over nest_service() wildcards,
-    // so sync control paths are matched before the service catch-all.
+    // Combine all API routes under /api/v1.
+    // Body limits: api_router manages its own (10MB on batch readings, 1MB on actions);
+    // public is unauthenticated; config gets 1MB limit.
+    // Note: nest() routes take priority over nest_service() wildcards, so sync control
+    // paths (/sync/enroll, /sync/heartbeat) are matched before the api_authed catch-all.
     let api_routes = Router::new()
-        .nest_service("/service", service_routes)
-        .nest("/service", sync_control_routes)
+        .nest_service("/", api_authed)
+        .nest("/", sync_control_routes)
         .nest("/public", public_routes_final)
-        .nest(
-            "/admin",
-            admin_routes.layer(RequestBodyLimitLayer::new(1024 * 1024)),
-        )
         .nest(
             "/config",
             Router::new()
@@ -443,9 +438,9 @@ pub fn build_router(state: AppState) -> Router {
     let timeout = Duration::from_secs(config.request_timeout_seconds);
     tracing::info!(timeout_seconds = config.request_timeout_seconds, "Request timeout configured");
 
-    // Combine all routes
+    // Combine all routes. The API is versioned at /api/v1/; health and docs stay at root.
     Router::new()
-        .nest("/api", api_routes)
+        .nest("/api/v1", api_routes)
         .merge(health_routes)
         .merge(docs_routes)
         .layer(

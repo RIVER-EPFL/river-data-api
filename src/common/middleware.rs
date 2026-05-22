@@ -32,14 +32,14 @@ pub enum AuthContext {
 }
 
 impl AuthContext {
-    fn has_role(&self, target: &Role) -> bool {
+    pub fn has_role(&self, target: &Role) -> bool {
         match self {
             AuthContext::Keycloak { roles } => roles.contains(target),
             AuthContext::ApiToken { .. } => false,
         }
     }
 
-    fn is_admin(&self) -> bool {
+    pub fn is_admin(&self) -> bool {
         self.has_role(&Role::Administrator)
     }
 }
@@ -275,6 +275,27 @@ pub async fn require_crud_permissions(request: Request, next: Next) -> Response 
         }
         None => AppError::Unauthorized("Authentication required".to_string()).into_response(),
     }
+}
+
+/// Shared check for "Keycloak user with a specific role". Returns the wrapped handler's
+/// response on success, or a 401/403 `AppError` response on failure. API tokens always fail.
+async fn check_keycloak_role(target: Role, request: Request, next: Next) -> Response {
+    match request.extensions().get::<AuthContext>() {
+        Some(AuthContext::Keycloak { roles }) if roles.contains(&target) => next.run(request).await,
+        Some(AuthContext::Keycloak { .. }) => {
+            AppError::Forbidden(format!("Requires {target} role")).into_response()
+        }
+        Some(AuthContext::ApiToken { .. }) => {
+            AppError::Forbidden("API tokens cannot access this endpoint".to_string()).into_response()
+        }
+        None => AppError::Unauthorized("Authentication required".to_string()).into_response(),
+    }
+}
+
+/// Require Keycloak `Administrator` role. NO API token can pass — defense in depth for
+/// user management, token mutation, and sync credential creation.
+pub async fn require_admin(request: Request, next: Next) -> Response {
+    check_keycloak_role(Role::Administrator, request, next).await
 }
 
 /// Extractor that yields the project scope from `AuthContext::ApiToken`, if any.

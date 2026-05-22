@@ -12,20 +12,49 @@ use crate::routes::private::sensors::operations::{create_sensor_for_stream, extr
 /// Per-site info: (glacier_name, count, lat, lon, alt).
 type SiteInfoMap = std::collections::HashMap<String, (Option<String>, usize, Option<f64>, Option<f64>, Option<f64>)>;
 
-pub fn router() -> Router<AppState> {
-    let (_service_routes, admin_routes) = river_data_core::server::routes::<AppState>();
+use axum::routing::patch;
+use river_data_core::server::handlers::admin as core_admin;
 
-    admin_routes
+/// Sync admin views are split by required authorization so the unified `/api/` router
+/// can layer the right middleware per group without route-level overrides.
+///
+/// Group membership:
+/// - `read_routes`: list/get operations, fine for any read_metadata caller.
+/// - `write_routes`: operator actions — issuing sync commands, pairing workflows.
+///   Same gate as other entity mutations (Keycloak admin or write_metadata token).
+/// - `admin_routes`: credential creation and revoke — these mint full-permission
+///   sync session tokens, so they're Keycloak-admin only (no API token can pass).
+pub fn read_routes() -> Router<AppState> {
+    Router::new()
+        .route("/services", get(core_admin::list_services::<AppState>))
+        .route("/services/{id}", get(core_admin::get_service::<AppState>))
+        .route("/commands", get(core_admin::list_commands::<AppState>))
+        .route("/events", get(core_admin::list_sync_events::<AppState>))
+        .route("/credentials", get(core_admin::list_credentials::<AppState>))
         .route("/discovery", get(get_discovery))
+        .route("/pairing-plans", get(list_pairing_plans))
+        .route("/pairing-plans/{id}", get(get_pairing_plan))
+        .route("/pairing-plans/{id}/site-metadata", get(plan_site_metadata))
+        .route("/unpaired-summary", get(unpaired_summary))
+}
+
+pub fn write_routes() -> Router<AppState> {
+    Router::new()
+        .route("/services/{id}/commands", post(core_admin::issue_command::<AppState>))
+        .route("/services/{id}/revoke", post(core_admin::revoke_service::<AppState>))
         .route("/apply-discovery", post(apply_discovery))
         .route("/grouped-discovery", post(grouped_discovery))
         .route("/bulk-pair", post(bulk_pair))
-        .route("/pairing-plans", get(list_pairing_plans).post(create_pairing_plan))
-        .route("/pairing-plans/{id}", get(get_pairing_plan).patch(update_pairing_plan))
+        .route("/pairing-plans", post(create_pairing_plan))
+        .route("/pairing-plans/{id}", patch(update_pairing_plan))
         .route("/pairing-plans/{id}/apply", post(apply_pairing_plan))
         .route("/pairing-plans/{id}/revert", post(revert_pairing_plan))
-        .route("/pairing-plans/{id}/site-metadata", get(plan_site_metadata))
-        .route("/unpaired-summary", get(unpaired_summary))
+}
+
+pub fn admin_routes() -> Router<AppState> {
+    Router::new()
+        .route("/credentials", post(core_admin::create_credential::<AppState>))
+        .route("/credentials/{id}/revoke", post(core_admin::revoke_credential::<AppState>))
 }
 
 #[derive(Serialize)]
