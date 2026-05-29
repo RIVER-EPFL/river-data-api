@@ -85,7 +85,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         admin::{actions, calibrations, derived, merge, public_config, users},
         alarms::views as alarm_views,
         data_streams::views as stream_views,
-        readings::{batch as readings_batch, flags, grab_samples, ingest},
+        readings::{batch as readings_batch, flags, grab_samples, import as readings_import, ingest},
         search,
         status_events::batch as status_events_batch,
         sync::views as sync_views,
@@ -108,6 +108,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route("/ingest", post(ingest::ingest_readings))
         .route("/ingest/status_events", post(ingest::ingest_status_events))
         .route("/readings/batch", post(readings_batch::insert_batch_readings))
+        .route("/readings/import_csv", post(readings_import::import_csv))
         .route("/status_events/batch", post(status_events_batch::insert_batch_status_events))
         .layer(RequestBodyLimitLayer::new(DATA_BODY_LIMIT))
         .route("/grab_samples", post(grab_samples::insert_grab_samples))
