@@ -412,7 +412,7 @@ async fn bug5_slope_zero_rejected_by_validation() {
 
     let (status, body) = common::post_json_with_token(
         &app,
-        "/api/v1/sensor_calibrations",
+        "/api/sensor_calibrations",
         &serde_json::json!({
             "sensor_id": sensor_id,
             "slope": 0.0,
@@ -466,7 +466,7 @@ async fn bug8_time_range_off_by_one() {
     let (status, _) = common::get_with_token(
         &app,
         &format!(
-            "/api/v1/sites/{}/readings?start=2025-01-01T00:00:00Z&end=2025-04-01T00:00:00Z",
+            "/api/sites/{}/readings?start=2025-01-01T00:00:00Z&end=2025-04-01T00:00:00Z",
             common::SITE1_ID
         ),
         &token,
@@ -478,7 +478,7 @@ async fn bug8_time_range_off_by_one() {
     let (status, body) = common::get_with_token(
         &app,
         &format!(
-            "/api/v1/sites/{}/readings?start=2025-01-01T00:00:00Z&end=2025-04-01T23:59:59Z",
+            "/api/sites/{}/readings?start=2025-01-01T00:00:00Z&end=2025-04-01T23:59:59Z",
             common::SITE1_ID
         ),
         &token,

@@ -488,7 +488,7 @@ pub fn build_router(state: AppState) -> Router {
     // don't collide with sync admin views which use /sync/services, /sync/credentials etc.
     let sync_control_routes = service::sync_control_router(&state);
 
-    // Combine all API routes under /api/v1.
+    // Combine all API routes under /api.
     // Body limits: api_router manages its own (10MB on batch readings, 1MB on actions);
     // public is unauthenticated; config gets 1MB limit.
     // Sync control paths (/sync/enroll, /sync/heartbeat, etc.) and the unified router's
@@ -574,11 +574,11 @@ pub fn build_router(state: AppState) -> Router {
     let timeout = Duration::from_secs(config.request_timeout_seconds);
     tracing::info!(timeout_seconds = config.request_timeout_seconds, "Request timeout configured");
 
-    // Combine all routes. The API is versioned at /api/v1/; health and docs stay at root.
+    // Combine all routes. The API is versioned at /api/; health and docs stay at root.
     // All sub-routers have state already bound (Router<()>), so the top-level Router is
     // also Router<()> — no trailing .with_state() needed.
     Router::new()
-        .nest("/api/v1", api_routes)
+        .nest("/api", api_routes)
         .merge(health_routes.with_state(state.clone()))
         .merge(docs_routes)
         .layer(

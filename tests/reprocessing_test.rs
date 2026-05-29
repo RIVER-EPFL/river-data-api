@@ -120,7 +120,7 @@ async fn recalibration_updates_all_readings() {
     let token = seed_api_token(&db, full_permissions(), None).await;
     let (status, body) = post_json_with_token(
         &app,
-        "/api/v1/sensor_calibrations",
+        "/api/sensor_calibrations",
         &serde_json::json!({
             "sensor_id": sensor.id,
             "slope": 2.0,
@@ -151,7 +151,7 @@ async fn recalibration_updates_all_readings() {
     let (status, json) = get_json_with_token(
         &app,
         &format!(
-            "/api/v1/sites/{}/readings?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z\
+            "/api/sites/{}/readings?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z\
              &sensor_types=DO_Temperature",
             SITE1_ID
         ),
@@ -230,7 +230,7 @@ async fn deployment_change_updates_site_and_deployment() {
     // End deployment A at 12:00
     let (status, _) = put_json_with_token(
         &app,
-        &format!("/api/v1/sensor_deployments/{dep_a}"),
+        &format!("/api/sensor_deployments/{dep_a}"),
         &serde_json::json!({ "deployed_until": "2025-01-01T12:00:00Z" }),
         &token,
     )
@@ -241,7 +241,7 @@ async fn deployment_change_updates_site_and_deployment() {
     // Create deployment B at site 2 from 12:00
     let (status, body) = post_json_with_token(
         &app,
-        "/api/v1/sensor_deployments",
+        "/api/sensor_deployments",
         &serde_json::json!({
             "sensor_id": sensor.id,
             "site_id": SITE2_ID,
@@ -362,7 +362,7 @@ async fn retroactive_calibration_date_change() {
     let token = seed_api_token(&db, full_permissions(), None).await;
     let (status, _) = put_json_with_token(
         &app,
-        &format!("/api/v1/sensor_calibrations/{real_cal}"),
+        &format!("/api/sensor_calibrations/{real_cal}"),
         &serde_json::json!({ "valid_from": "2025-01-12T00:00:00Z" }),
         &token,
     )
@@ -449,7 +449,7 @@ async fn lab_sensor_multiple_deployments_same_day() {
     // Create dep_b: SITE2 10:00-12:00
     let (status, body) = post_json_with_token(
         &app,
-        "/api/v1/sensor_deployments",
+        "/api/sensor_deployments",
         &serde_json::json!({
             "sensor_id": sensor.id,
             "site_id": SITE2_ID,
@@ -468,7 +468,7 @@ async fn lab_sensor_multiple_deployments_same_day() {
     // Create dep_c: SITE1 12:00-14:00
     let (status, body) = post_json_with_token(
         &app,
-        "/api/v1/sensor_deployments",
+        "/api/sensor_deployments",
         &serde_json::json!({
             "sensor_id": sensor.id,
             "site_id": SITE1_ID,
@@ -529,7 +529,7 @@ async fn calibration_time_windows_auto_bounded() {
     let token = seed_api_token(&db, full_permissions(), None).await;
     let (status, _) = post_json_with_token(
         &app,
-        "/api/v1/sensor_calibrations",
+        "/api/sensor_calibrations",
         &serde_json::json!({
             "sensor_id": sensor.id,
             "slope": 2.0,
@@ -633,7 +633,7 @@ async fn delete_intermediate_calibration_fallback() {
     let token = seed_api_token(&db, full_permissions(), None).await;
     let (status, _) = delete_with_token(
         &app,
-        &format!("/api/v1/sensor_calibrations/{cal_a}"),
+        &format!("/api/sensor_calibrations/{cal_a}"),
         &token,
     )
     .await;
@@ -708,7 +708,7 @@ async fn full_cascade_calibration_to_aggregates() {
     let token = seed_api_token(&db, full_permissions(), None).await;
     let (status, body) = post_json_with_token(
         &app,
-        "/api/v1/sensor_calibrations",
+        "/api/sensor_calibrations",
         &serde_json::json!({
             "sensor_id": sensor.id,
             "slope": 2.0,

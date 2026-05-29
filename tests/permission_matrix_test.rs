@@ -1,5 +1,5 @@
 //! Permission matrix: iterate every authorization boundary against every caller type
-//! and assert allow/deny. Proves the unified `/api/v1/` tier preserves the security model.
+//! and assert allow/deny. Proves the unified `/api/` tier preserves the security model.
 //!
 //! Caller types (in-process tests can mint API tokens; Keycloak admin path is covered by
 //! the opt-in `e2e_keycloak_test.rs` suite):
@@ -190,7 +190,7 @@ async fn permission_matrix_covers_every_boundary() {
         Probe {
             label: "search",
             method: "GET",
-            path: "/api/v1/search?q=Site".to_string(),
+            path: "/api/search?q=Site".to_string(),
             body: None,
             boundary: Boundary::ReadMeta,
             allow_non_200_when_authorized: false,
@@ -199,7 +199,7 @@ async fn permission_matrix_covers_every_boundary() {
         Probe {
             label: "alarms-summary",
             method: "GET",
-            path: "/api/v1/alarms/summary".to_string(),
+            path: "/api/alarms/summary".to_string(),
             body: None,
             boundary: Boundary::ReadData,
             allow_non_200_when_authorized: false,
@@ -207,7 +207,7 @@ async fn permission_matrix_covers_every_boundary() {
         Probe {
             label: "tools-list",
             method: "GET",
-            path: "/api/v1/tools".to_string(),
+            path: "/api/tools".to_string(),
             body: None,
             boundary: Boundary::ReadData,
             allow_non_200_when_authorized: false,
@@ -215,7 +215,7 @@ async fn permission_matrix_covers_every_boundary() {
         Probe {
             label: "site-readings",
             method: "GET",
-            path: format!("/api/v1/sites/{site_id}/readings?start={start}&end={end}"),
+            path: format!("/api/sites/{site_id}/readings?start={start}&end={end}"),
             body: None,
             boundary: Boundary::ReadData,
             allow_non_200_when_authorized: true,
@@ -224,7 +224,7 @@ async fn permission_matrix_covers_every_boundary() {
         Probe {
             label: "merge-site-parameters",
             method: "POST",
-            path: "/api/v1/actions/merge_site_parameters".to_string(),
+            path: "/api/actions/merge_site_parameters".to_string(),
             body: Some(serde_json::json!({})),
             boundary: Boundary::WriteMeta,
             allow_non_200_when_authorized: true,
@@ -232,7 +232,7 @@ async fn permission_matrix_covers_every_boundary() {
         Probe {
             label: "register-stream",
             method: "POST",
-            path: "/api/v1/streams/register".to_string(),
+            path: "/api/streams/register".to_string(),
             body: Some(serde_json::json!({})),
             boundary: Boundary::WriteMeta,
             allow_non_200_when_authorized: true,
@@ -241,7 +241,7 @@ async fn permission_matrix_covers_every_boundary() {
         Probe {
             label: "refresh-aggregates",
             method: "POST",
-            path: "/api/v1/actions/refresh_aggregates".to_string(),
+            path: "/api/actions/refresh_aggregates".to_string(),
             body: Some(serde_json::json!({})),
             boundary: Boundary::WriteData,
             allow_non_200_when_authorized: true,
@@ -249,7 +249,7 @@ async fn permission_matrix_covers_every_boundary() {
         Probe {
             label: "readings-batch",
             method: "POST",
-            path: "/api/v1/readings/batch".to_string(),
+            path: "/api/readings/batch".to_string(),
             body: Some(serde_json::json!([])),
             boundary: Boundary::WriteData,
             allow_non_200_when_authorized: true,
@@ -258,7 +258,7 @@ async fn permission_matrix_covers_every_boundary() {
         Probe {
             label: "tokens-create",
             method: "POST",
-            path: "/api/v1/tokens".to_string(),
+            path: "/api/tokens".to_string(),
             body: Some(serde_json::json!({
                 "name": "should-be-denied",
                 "permissions": {"read_metadata": true, "read_data": false, "write_metadata": false, "write_data": false}
@@ -269,7 +269,7 @@ async fn permission_matrix_covers_every_boundary() {
         Probe {
             label: "tokens-list",
             method: "GET",
-            path: "/api/v1/tokens".to_string(),
+            path: "/api/tokens".to_string(),
             body: None,
             boundary: Boundary::Admin,
             allow_non_200_when_authorized: true,
@@ -277,7 +277,7 @@ async fn permission_matrix_covers_every_boundary() {
         Probe {
             label: "sync-credentials-list",
             method: "GET",
-            path: "/api/v1/sync_service_credentials".to_string(),
+            path: "/api/sync_service_credentials".to_string(),
             body: None,
             boundary: Boundary::Admin,
             allow_non_200_when_authorized: true,
@@ -285,7 +285,7 @@ async fn permission_matrix_covers_every_boundary() {
         Probe {
             label: "sync-credentials-create-via-core",
             method: "POST",
-            path: "/api/v1/sync/credentials".to_string(),
+            path: "/api/sync/credentials".to_string(),
             body: Some(serde_json::json!({"name": "test"})),
             boundary: Boundary::Admin,
             allow_non_200_when_authorized: true,
@@ -315,9 +315,9 @@ async fn require_admin_blocks_full_permissions_token() {
     let tok_full = common::seed_token_full(&db).await;
 
     let admin_paths = [
-        ("GET", "/api/v1/tokens"),
-        ("GET", "/api/v1/sync_service_credentials"),
-        ("POST", "/api/v1/sync/credentials"),
+        ("GET", "/api/tokens"),
+        ("GET", "/api/sync_service_credentials"),
+        ("POST", "/api/sync/credentials"),
     ];
 
     for (method, path) in admin_paths {
@@ -350,15 +350,15 @@ async fn sync_session_token_full_permissions_but_not_admin() {
 
     let (tok_sync, _) = common::seed_sync_session_token(&db).await;
 
-    let (status, _) = common::get_with_token(&app, "/api/v1/search?q=site", &tok_sync).await;
+    let (status, _) = common::get_with_token(&app, "/api/search?q=site", &tok_sync).await;
     assert_eq!(status, 200, "sync session can hit read_metadata routes");
 
-    let (status, _) = common::get_with_token(&app, "/api/v1/tokens", &tok_sync).await;
+    let (status, _) = common::get_with_token(&app, "/api/tokens", &tok_sync).await;
     assert_eq!(status, 403, "sync session must NOT pass require_admin");
 
     let (status, _) = common::post_json_with_token(
         &app,
-        "/api/v1/sync/credentials",
+        "/api/sync/credentials",
         &serde_json::json!({"name": "should-be-denied"}),
         &tok_sync,
     )

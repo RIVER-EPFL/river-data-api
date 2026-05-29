@@ -36,7 +36,7 @@ fn assert_result_key_exists(json: &serde_json::Value, key: &str) {
 async fn test_list_tools() {
     let (app, token) = setup().await;
 
-    let (status, json) = common::get_json_with_token(&app, "/api/v1/tools", &token).await;
+    let (status, json) = common::get_json_with_token(&app, "/api/tools", &token).await;
     assert_eq!(status, 200);
 
     let tools = json.as_array().expect("tools should be an array");
@@ -64,7 +64,7 @@ async fn test_doc_with_replicates() {
 
     let (status, json) = common::post_json_parse_with_token(
         &app,
-        "/api/v1/tools/doc/calculate",
+        "/api/tools/doc/calculate",
         &serde_json::json!({
             "replicates": [185.2, 198.7, 191.4]
         }),
@@ -87,7 +87,7 @@ async fn test_doc_with_std_curve() {
 
     let (status, json) = common::post_json_parse_with_token(
         &app,
-        "/api/v1/tools/doc/calculate",
+        "/api/tools/doc/calculate",
         &serde_json::json!({
             "replicates": [0.45, 0.52, 0.48],
             "std_curve": { "slope": 412.5, "intercept": -3.2 }
@@ -111,7 +111,7 @@ async fn test_alkalinity() {
 
     let (status, json) = common::post_json_parse_with_token(
         &app,
-        "/api/v1/tools/alkalinity/calculate",
+        "/api/tools/alkalinity/calculate",
         &serde_json::json!({
             "sample_weight_g": 50.0,
             "acid_normality": 0.02,
@@ -139,7 +139,7 @@ async fn test_ion_charge_balance() {
 
     let (status, json) = common::post_json_parse_with_token(
         &app,
-        "/api/v1/tools/ions/calculate",
+        "/api/tools/ions/calculate",
         &serde_json::json!({
             "cations": [
                 { "name": "Ca", "concentration_mg_l": 25.66 },
@@ -177,7 +177,7 @@ async fn test_isotopes() {
 
     let (status, json) = common::post_json_parse_with_token(
         &app,
-        "/api/v1/tools/isotopes/calculate",
+        "/api/tools/isotopes/calculate",
         &serde_json::json!({
             "d_d": -102.5,
             "d18o": -13.98,
@@ -209,7 +209,7 @@ async fn test_field_data() {
 
     let (status, json) = common::post_json_parse_with_token(
         &app,
-        "/api/v1/tools/field_data/calculate",
+        "/api/tools/field_data/calculate",
         &serde_json::json!({
             "elevation_m": 1936.0,
             "temp_c": 6.7,
@@ -246,7 +246,7 @@ async fn test_pco2_simple() {
 
     let (status, json) = common::post_json_parse_with_token(
         &app,
-        "/api/v1/tools/pco2/calculate",
+        "/api/tools/pco2/calculate",
         &serde_json::json!({
             "co2_aq_umol": 15.0,
             "water_temp_c": 6.7,
@@ -271,7 +271,7 @@ async fn test_dic() {
 
     let (status, json) = common::post_json_parse_with_token(
         &app,
-        "/api/v1/tools/dic/calculate",
+        "/api/tools/dic/calculate",
         &serde_json::json!({
             "acid_sample_weight_g": 5.02,
             "acid_weight_g": 0.25,
@@ -301,7 +301,7 @@ async fn test_nutrients_multi_species() {
 
     let (status, json) = common::post_json_parse_with_token(
         &app,
-        "/api/v1/tools/nutrients/calculate",
+        "/api/tools/nutrients/calculate",
         &serde_json::json!({
             "species": {
                 "PO4": [0.008, 0.009, 0.007],
@@ -331,7 +331,7 @@ async fn test_tss_afdm() {
 
     let (status, json) = common::post_json_parse_with_token(
         &app,
-        "/api/v1/tools/tss_afdm/calculate",
+        "/api/tools/tss_afdm/calculate",
         &serde_json::json!({
             "wgt_dried_g": 0.1025,
             "wgt_prefilt_g": 0.1000,
@@ -361,7 +361,7 @@ async fn test_dom_indices() {
 
     let (status, json) = common::post_json_parse_with_token(
         &app,
-        "/api/v1/tools/dom/calculate",
+        "/api/tools/dom/calculate",
         &serde_json::json!({
             "a254": 0.085,
             "doc_avg_ppb": 192.0,
@@ -393,7 +393,7 @@ async fn test_co2_air() {
 
     let (status, json) = common::post_json_parse_with_token(
         &app,
-        "/api/v1/tools/co2_air/calculate",
+        "/api/tools/co2_air/calculate",
         &serde_json::json!({
             "co2_wet": 415.0,
             "ch4_wet": 1.95,
@@ -419,7 +419,7 @@ async fn test_chlorophyll_acid() {
 
     let (status, json) = common::post_json_parse_with_token(
         &app,
-        "/api/v1/tools/chlorophyll/calculate",
+        "/api/tools/chlorophyll/calculate",
         &serde_json::json!({
             "method": "acid",
             "fluorescence_before": 45.2,
@@ -446,7 +446,7 @@ async fn test_benthic() {
 
     let (status, json) = common::post_json_parse_with_token(
         &app,
-        "/api/v1/tools/benthic/calculate",
+        "/api/tools/benthic/calculate",
         &serde_json::json!({
             "diameters_cm": [8.5, 12.0, 6.3, 9.8, 7.2],
             "afdm_g_filter": 0.0035,
@@ -475,7 +475,7 @@ async fn test_unknown_tool() {
 
     let (status, _) = common::post_json_with_token(
         &app,
-        "/api/v1/tools/nonexistent/calculate",
+        "/api/tools/nonexistent/calculate",
         &serde_json::json!({}),
         &token,
     )
@@ -497,7 +497,7 @@ async fn test_tools_require_valid_token() {
 
     let (status, _) = common::post_json_with_token(
         &app,
-        "/api/v1/tools/doc/calculate",
+        "/api/tools/doc/calculate",
         &serde_json::json!({ "replicates": [100.0] }),
         "invalid-token",
     )

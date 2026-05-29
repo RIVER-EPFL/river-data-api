@@ -71,7 +71,7 @@ async fn test_continuous_derived_recompute_after_ingest() {
     });
     let (status, def_json) = common::post_json_parse_with_token(
         &app,
-        "/api/v1/derived_parameters",
+        "/api/derived_parameters",
         &create_body,
         &token,
     )
@@ -98,7 +98,7 @@ async fn test_continuous_derived_recompute_after_ingest() {
     });
     let (status, sp_text) = common::post_json_with_token(
         &app,
-        "/api/v1/site_parameters",
+        "/api/site_parameters",
         &assign_body,
         &token,
     )
@@ -121,7 +121,7 @@ async fn test_continuous_derived_recompute_after_ingest() {
     });
     let (status, text) = common::post_json_with_token(
         &app,
-        "/api/v1/readings/batch",
+        "/api/readings/batch",
         &ingest_body_1,
         &token,
     )
@@ -155,7 +155,7 @@ async fn test_continuous_derived_recompute_after_ingest() {
     });
     let (status, text) = common::post_json_with_token(
         &app,
-        "/api/v1/readings/batch",
+        "/api/readings/batch",
         &ingest_body_2,
         &token,
     )
@@ -202,7 +202,7 @@ async fn test_recompute_endpoint_backfills_historical_gap() {
     });
     let (status, def_json) = common::post_json_parse_with_token(
         &app,
-        "/api/v1/derived_parameters",
+        "/api/derived_parameters",
         &create_body,
         &token,
     )
@@ -230,14 +230,14 @@ async fn test_recompute_endpoint_backfills_historical_gap() {
     });
     let (status, _) = common::post_json_with_token(
         &app,
-        "/api/v1/site_parameters",
+        "/api/site_parameters",
         &assign_body,
         &token,
     )
     .await;
     assert!((200..300).contains(&status));
 
-    let uri = format!("/api/v1/actions/derived_parameters/{derived_def_id}/recompute");
+    let uri = format!("/api/actions/derived_parameters/{derived_def_id}/recompute");
     let (status, _) = common::post_json_with_token(&app, &uri, &serde_json::json!({}), &token).await;
     assert!(
         (200..300).contains(&status),

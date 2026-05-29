@@ -34,7 +34,7 @@ async fn malformed_authorization_headers_all_return_401() {
     ];
 
     for (label, header) in cases {
-        let (status, _body) = common::get_with_auth_header(&app, "/api/v1/projects", header).await;
+        let (status, _body) = common::get_with_auth_header(&app, "/api/projects", header).await;
         assert_eq!(status, 401, "[{label}] expected 401, got {status}");
     }
 }
@@ -47,9 +47,9 @@ async fn inactive_token_returns_401_even_for_endpoints_it_was_authorized_for() {
     let tok = common::seed_inactive_api_token(&db, common::full_permissions()).await;
 
     let endpoints = [
-        "/api/v1/projects",
-        "/api/v1/sites",
-        "/api/v1/search?q=test",
+        "/api/projects",
+        "/api/sites",
+        "/api/search?q=test",
     ];
     for path in endpoints {
         let (status, _) = common::get_with_token(&app, path, &tok).await;
@@ -71,9 +71,9 @@ async fn expired_token_returns_401_for_every_endpoint() {
     .await;
 
     let endpoints = [
-        "/api/v1/projects",
-        "/api/v1/search?q=foo",
-        "/api/v1/alarms/summary",
+        "/api/projects",
+        "/api/search?q=foo",
+        "/api/alarms/summary",
     ];
     for path in endpoints {
         let (status, _) = common::get_with_token(&app, path, &tok).await;
@@ -88,12 +88,12 @@ async fn permission_json_with_missing_fields_uses_serde_defaults() {
 
     // Empty `{}` — serde defaults: read_metadata=true, read_data=true, write_*=false.
     let tok_empty = common::seed_api_token(&db, serde_json::json!({}), None).await;
-    let (status, _) = common::get_with_token(&app, "/api/v1/projects", &tok_empty).await;
+    let (status, _) = common::get_with_token(&app, "/api/projects", &tok_empty).await;
     assert_eq!(status, 200, "empty permissions should default to read access, got {status}");
 
     let (write_status, _) = common::post_json_with_token(
         &app,
-        "/api/v1/streams/register",
+        "/api/streams/register",
         &serde_json::json!({}),
         &tok_empty,
     )
@@ -120,11 +120,11 @@ async fn permission_json_with_unknown_keys_is_tolerated() {
     )
     .await;
 
-    let (read_status, _) = common::get_with_token(&app, "/api/v1/projects", &tok).await;
+    let (read_status, _) = common::get_with_token(&app, "/api/projects", &tok).await;
     assert_eq!(read_status, 200, "read should succeed with known scopes");
 
     // The new unknown field must NOT escalate to admin access — proves the schema is closed.
-    let (admin_status, _) = common::get_with_token(&app, "/api/v1/tokens", &tok).await;
+    let (admin_status, _) = common::get_with_token(&app, "/api/tokens", &tok).await;
     assert_eq!(
         admin_status, 403,
         "an unknown 'future_admin_flag' field must not grant admin access"
@@ -149,7 +149,7 @@ async fn permission_json_null_uses_defaults() {
     )
     .await;
 
-    let (status, _) = common::get_with_token(&app, "/api/v1/projects", &raw).await;
+    let (status, _) = common::get_with_token(&app, "/api/projects", &raw).await;
     // The from_json fallback returns the default TokenPermissions — reads on, writes off.
     assert_eq!(status, 200, "null permissions should fall back to defaults, got {status}");
 }
@@ -161,7 +161,7 @@ async fn revoked_sync_session_token_rejected_on_next_use() {
 
     let (tok, _service_id) = common::seed_sync_session_token(&db).await;
 
-    let (ok_status, _) = common::get_with_token(&app, "/api/v1/search?q=site", &tok).await;
+    let (ok_status, _) = common::get_with_token(&app, "/api/search?q=site", &tok).await;
     assert_eq!(ok_status, 200, "fresh sync session token should work, got {ok_status}");
 
     // Manually expire by setting expires_at to the past — emulates revoke_credential.
@@ -171,7 +171,7 @@ async fn revoked_sync_session_token_rejected_on_next_use() {
     )
     .await;
 
-    let (rev_status, _) = common::get_with_token(&app, "/api/v1/search?q=site", &tok).await;
+    let (rev_status, _) = common::get_with_token(&app, "/api/search?q=site", &tok).await;
     assert_eq!(rev_status, 401, "expired sync session must be rejected, got {rev_status}");
 }
 
@@ -202,11 +202,11 @@ async fn require_admin_blocks_every_bypass_vector() {
     ];
 
     let admin_routes = [
-        ("GET", "/api/v1/tokens"),
-        ("POST", "/api/v1/tokens"),
-        ("GET", "/api/v1/sync_service_credentials"),
-        ("POST", "/api/v1/sync/credentials"),
-        ("POST", "/api/v1/sync/credentials/00000000-0000-0000-0000-000000000000/revoke"),
+        ("GET", "/api/tokens"),
+        ("POST", "/api/tokens"),
+        ("GET", "/api/sync_service_credentials"),
+        ("POST", "/api/sync/credentials"),
+        ("POST", "/api/sync/credentials/00000000-0000-0000-0000-000000000000/revoke"),
     ];
 
     for (label, tok) in &attempts {
@@ -235,9 +235,9 @@ async fn anonymous_returns_401_not_403_on_admin_routes() {
     // 403 = authenticated but forbidden. Mixing them up is a UX issue.
     let (_db, app) = setup().await;
 
-    let (status, _) = common::get(&app, "/api/v1/tokens").await;
+    let (status, _) = common::get(&app, "/api/tokens").await;
     assert_eq!(status, 401, "anonymous on admin route should be 401, got {status}");
 
-    let (status, _) = common::get(&app, "/api/v1/sync_service_credentials").await;
+    let (status, _) = common::get(&app, "/api/sync_service_credentials").await;
     assert_eq!(status, 401, "anonymous on admin route should be 401, got {status}");
 }

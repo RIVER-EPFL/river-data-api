@@ -56,7 +56,7 @@ async fn test_csv_value_with_comma_is_properly_quoted() {
     let (status, body) = common::get_with_token(
         &app,
         &format!(
-            "/api/v1/sites/{site_id}/status_events?start=2025-01-15T00:00:00Z&end=2025-01-16T00:00:00Z&format=csv"
+            "/api/sites/{site_id}/status_events?start=2025-01-15T00:00:00Z&end=2025-01-16T00:00:00Z&format=csv"
         ),
         &token,
     )
@@ -121,7 +121,7 @@ async fn test_status_events_empty_range() {
     let (status, body) = common::get_json_with_token(
         &app,
         &format!(
-            "/api/v1/sites/{site_id}/status_events?start=2020-01-01T00:00:00Z&end=2020-01-02T00:00:00Z"
+            "/api/sites/{site_id}/status_events?start=2020-01-01T00:00:00Z&end=2020-01-02T00:00:00Z"
         ),
         &token,
     )
@@ -158,7 +158,7 @@ async fn test_status_events_ndjson_format() {
     let (status, body) = common::get_with_token(
         &app,
         &format!(
-            "/api/v1/sites/{site_id}/status_events?start=2025-01-15T00:00:00Z&end=2025-01-16T00:00:00Z&format=ndjson"
+            "/api/sites/{site_id}/status_events?start=2025-01-15T00:00:00Z&end=2025-01-16T00:00:00Z&format=ndjson"
         ),
         &token,
     )

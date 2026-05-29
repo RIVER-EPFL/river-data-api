@@ -68,13 +68,13 @@ async fn keycloak_admin_can_reach_admin_routes() {
     let client = reqwest::Client::new();
     let jwt = get_keycloak_jwt(&client, "admin", "admin").await;
 
-    let status = api_get(&client, "/api/v1/tokens", Some(&jwt)).await;
+    let status = api_get(&client, "/api/tokens", Some(&jwt)).await;
     assert!(
         (200..=299).contains(&status),
-        "admin Keycloak JWT on /api/v1/tokens got {status} (expected 2xx)"
+        "admin Keycloak JWT on /api/tokens got {status} (expected 2xx)"
     );
 
-    let status = api_get(&client, "/api/v1/sync_service_credentials", Some(&jwt)).await;
+    let status = api_get(&client, "/api/sync_service_credentials", Some(&jwt)).await;
     assert!(
         (200..=299).contains(&status),
         "admin Keycloak JWT on /sync_service_credentials got {status}"
@@ -87,15 +87,15 @@ async fn keycloak_user_cannot_reach_admin_routes() {
     let client = reqwest::Client::new();
     let jwt = get_keycloak_jwt(&client, "user", "user").await;
 
-    let status = api_get(&client, "/api/v1/tokens", Some(&jwt)).await;
+    let status = api_get(&client, "/api/tokens", Some(&jwt)).await;
     assert_eq!(
         status, 403,
-        "non-admin Keycloak JWT on /api/v1/tokens got {status} (expected 403)"
+        "non-admin Keycloak JWT on /api/tokens got {status} (expected 403)"
     );
 
     let status = api_post(
         &client,
-        "/api/v1/sync/credentials",
+        "/api/sync/credentials",
         &serde_json::json!({"name": "blocked"}),
         Some(&jwt),
     )
@@ -112,13 +112,13 @@ async fn keycloak_user_can_read_metadata() {
     let client = reqwest::Client::new();
     let jwt = get_keycloak_jwt(&client, "user", "user").await;
 
-    let status = api_get(&client, "/api/v1/projects", Some(&jwt)).await;
+    let status = api_get(&client, "/api/projects", Some(&jwt)).await;
     assert!(
         (200..=299).contains(&status),
         "non-admin Keycloak JWT must still read metadata, got {status}"
     );
 
-    let status = api_get(&client, "/api/v1/search?q=site", Some(&jwt)).await;
+    let status = api_get(&client, "/api/search?q=site", Some(&jwt)).await;
     assert!(
         (200..=299).contains(&status),
         "non-admin Keycloak JWT must still search, got {status}"
@@ -129,7 +129,7 @@ async fn keycloak_user_can_read_metadata() {
 #[ignore]
 async fn anonymous_blocked_from_admin_routes_returns_401() {
     let client = reqwest::Client::new();
-    let status = api_get(&client, "/api/v1/tokens", None).await;
+    let status = api_get(&client, "/api/tokens", None).await;
     assert_eq!(status, 401, "anonymous on admin route should be 401, got {status}");
 }
 
@@ -137,7 +137,7 @@ async fn anonymous_blocked_from_admin_routes_returns_401() {
 #[ignore]
 async fn public_endpoints_work_without_keycloak() {
     let client = reqwest::Client::new();
-    let status = api_get(&client, "/api/v1/public", None).await;
+    let status = api_get(&client, "/api/public", None).await;
     assert!(
         (200..=299).contains(&status),
         "public discovery must work without auth, got {status}"
@@ -155,7 +155,7 @@ async fn keycloak_admin_can_post_sync_credentials() {
 
     let status = api_post(
         &client,
-        "/api/v1/sync/credentials",
+        "/api/sync/credentials",
         &serde_json::json!({"name": "e2e-test-cred"}),
         Some(&jwt),
     )

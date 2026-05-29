@@ -21,7 +21,7 @@ async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
 }
 
 // ============================================================================
-// Readings endpoint: GET /api/v1/sites/{site_id}/readings
+// Readings endpoint: GET /api/sites/{site_id}/readings
 // ============================================================================
 
 #[tokio::test]
@@ -33,7 +33,7 @@ async fn test_readings_basic_time_range() {
     let (status, body) = common::get_json_with_token(
         &app,
         &format!(
-            "/api/v1/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z"
+            "/api/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z"
         ),
         &token,
     )
@@ -96,7 +96,7 @@ async fn test_readings_sensor_types_filter() {
     let (status, body) = common::get_json_with_token(
         &app,
         &format!(
-            "/api/v1/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z&sensor_types=DO_Temperature,Turbidity"
+            "/api/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z&sensor_types=DO_Temperature,Turbidity"
         ),
         &token,
     )
@@ -122,7 +122,7 @@ async fn test_readings_with_alarms() {
     let (status, body) = common::get_json_with_token(
         &app,
         &format!(
-            "/api/v1/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z&alarms=true"
+            "/api/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z&alarms=true"
         ),
         &token,
     )
@@ -177,7 +177,7 @@ async fn test_readings_with_explicit_time_range() {
     // Provide explicit time range covering the seed data (default 7-day lookback would miss 2025-01-15)
     let (status, body) = common::get_json_with_token(
         &app,
-        &format!("/api/v1/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"),
+        &format!("/api/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"),
         &token,
     )
     .await;
@@ -201,7 +201,7 @@ async fn test_readings_nonexistent_site_returns_404() {
 
     let (status, _body) = common::get_with_token(
         &app,
-        "/api/v1/sites/00000000-0000-4000-a000-999999999999/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z",
+        "/api/sites/00000000-0000-4000-a000-999999999999/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z",
         &token,
     )
     .await;
@@ -219,7 +219,7 @@ async fn test_readings_invalid_time_range_returns_400() {
     let (status, _body) = common::get_with_token(
         &app,
         &format!(
-            "/api/v1/sites/{site_id}/readings?start=2025-01-16T00:00:00Z&end=2025-01-15T00:00:00Z"
+            "/api/sites/{site_id}/readings?start=2025-01-16T00:00:00Z&end=2025-01-15T00:00:00Z"
         ),
         &token,
     )
@@ -229,7 +229,7 @@ async fn test_readings_invalid_time_range_returns_400() {
 }
 
 // ============================================================================
-// Aggregates endpoint: GET /api/v1/sites/{site_id}/aggregates/{resolution}
+// Aggregates endpoint: GET /api/sites/{site_id}/aggregates/{resolution}
 // ============================================================================
 
 #[tokio::test]
@@ -241,7 +241,7 @@ async fn test_aggregates_hourly() {
     let (status, body) = common::get_json_with_token(
         &app,
         &format!(
-            "/api/v1/sites/{site_id}/aggregates/hourly?start=2025-01-15T00:00:00Z&end=2025-01-16T00:00:00Z"
+            "/api/sites/{site_id}/aggregates/hourly?start=2025-01-15T00:00:00Z&end=2025-01-16T00:00:00Z"
         ),
         &token,
     )
@@ -320,7 +320,7 @@ async fn test_aggregates_daily() {
     let (status, body) = common::get_json_with_token(
         &app,
         &format!(
-            "/api/v1/sites/{site_id}/aggregates/daily?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"
+            "/api/sites/{site_id}/aggregates/daily?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"
         ),
         &token,
     )
@@ -357,7 +357,7 @@ async fn test_aggregates_sensor_types_filter() {
     let (status, body) = common::get_json_with_token(
         &app,
         &format!(
-            "/api/v1/sites/{site_id}/aggregates/hourly?start=2025-01-15T00:00:00Z&end=2025-01-16T00:00:00Z&sensor_types=Conductivity"
+            "/api/sites/{site_id}/aggregates/hourly?start=2025-01-15T00:00:00Z&end=2025-01-16T00:00:00Z&sensor_types=Conductivity"
         ),
         &token,
     )
@@ -379,7 +379,7 @@ async fn test_aggregates_with_alarms() {
     let (status, body) = common::get_json_with_token(
         &app,
         &format!(
-            "/api/v1/sites/{site_id}/aggregates/hourly?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z&alarms=true"
+            "/api/sites/{site_id}/aggregates/hourly?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z&alarms=true"
         ),
         &token,
     )
@@ -434,7 +434,7 @@ async fn test_aggregates_invalid_resolution_returns_400() {
     let (status, _body) = common::get_with_token(
         &app,
         &format!(
-            "/api/v1/sites/{site_id}/aggregates/minutely?start=2025-01-15T00:00:00Z&end=2025-01-16T00:00:00Z"
+            "/api/sites/{site_id}/aggregates/minutely?start=2025-01-15T00:00:00Z&end=2025-01-16T00:00:00Z"
         ),
         &token,
     )
@@ -454,7 +454,7 @@ async fn test_aggregates_missing_params_returns_400() {
 
     let (status, _body) = common::get_with_token(
         &app,
-        &format!("/api/v1/sites/{site_id}/aggregates/hourly"),
+        &format!("/api/sites/{site_id}/aggregates/hourly"),
         &token,
     )
     .await;
@@ -466,7 +466,7 @@ async fn test_aggregates_missing_params_returns_400() {
 }
 
 // ============================================================================
-// Alarms endpoint: GET /api/v1/sites/{site_id}/alarms
+// Alarms endpoint: GET /api/sites/{site_id}/alarms
 // ============================================================================
 
 #[tokio::test]
@@ -478,7 +478,7 @@ async fn test_alarms_basic() {
     let (status, body) = common::get_json_with_token(
         &app,
         &format!(
-            "/api/v1/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"
+            "/api/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"
         ),
         &token,
     )
@@ -544,7 +544,7 @@ async fn test_alarms_severity_filter() {
     let (status, body) = common::get_json_with_token(
         &app,
         &format!(
-            "/api/v1/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z&severity=2"
+            "/api/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z&severity=2"
         ),
         &token,
     )
@@ -576,7 +576,7 @@ async fn test_alarms_sensor_types_filter() {
     let (status, body) = common::get_json_with_token(
         &app,
         &format!(
-            "/api/v1/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z&sensor_types=DO_Temperature"
+            "/api/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z&sensor_types=DO_Temperature"
         ),
         &token,
     )
@@ -601,7 +601,7 @@ async fn test_alarms_missing_params_returns_400() {
     let site_id = common::SITE1_ID;
 
     let (status, _body) =
-        common::get_with_token(&app, &format!("/api/v1/sites/{site_id}/alarms"), &token).await;
+        common::get_with_token(&app, &format!("/api/sites/{site_id}/alarms"), &token).await;
 
     assert_eq!(status, 400, "alarms without start/end should return 400");
 }

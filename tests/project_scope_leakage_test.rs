@@ -49,11 +49,11 @@ async fn scoped_token_blocked_from_other_projects_site_detail() {
 
     let tok = common::seed_api_token(&db, common::full_permissions(), Some(project_a)).await;
 
-    let (status_b, _) = common::get_with_token(&app, &format!("/api/v1/sites/{site_b}/detail"), &tok).await;
+    let (status_b, _) = common::get_with_token(&app, &format!("/api/sites/{site_b}/detail"), &tok).await;
     assert_eq!(status_b, 403, "scoped token must not reach a site outside its project");
 
     let site_a = common::fixtures::SITE1_ID;
-    let (status_a, _) = common::get_with_token(&app, &format!("/api/v1/sites/{site_a}/detail"), &tok).await;
+    let (status_a, _) = common::get_with_token(&app, &format!("/api/sites/{site_a}/detail"), &tok).await;
     assert_eq!(status_a, 200, "scoped token must still reach its own project's site");
 }
 
@@ -76,7 +76,7 @@ async fn scoped_token_blocked_from_other_projects_readings() {
 
     let (status, _) = common::get_with_token(
         &app,
-        &format!("/api/v1/sites/{SITE_B_ID}/readings?start={start}&end={end}"),
+        &format!("/api/sites/{SITE_B_ID}/readings?start={start}&end={end}"),
         &tok,
     )
     .await;
@@ -102,7 +102,7 @@ async fn scoped_token_blocked_from_other_projects_aggregates() {
 
     let (status, _) = common::get_with_token(
         &app,
-        &format!("/api/v1/sites/{SITE_B_ID}/aggregates/hourly?start={start}&end={end}"),
+        &format!("/api/sites/{SITE_B_ID}/aggregates/hourly?start={start}&end={end}"),
         &tok,
     )
     .await;
@@ -126,7 +126,7 @@ async fn scoped_token_blocked_from_other_projects_status_events() {
 
     let (status, body) = common::get_with_token(
         &app,
-        &format!("/api/v1/sites/{SITE_B_ID}/status_events?start={start}"),
+        &format!("/api/sites/{SITE_B_ID}/status_events?start={start}"),
         &tok,
     )
     .await;
@@ -148,8 +148,8 @@ async fn unscoped_token_can_reach_both_projects() {
     let tok = common::seed_api_token(&db, common::full_permissions(), None).await;
 
     let site_a = common::fixtures::SITE1_ID;
-    let (status_a, _) = common::get_with_token(&app, &format!("/api/v1/sites/{site_a}/detail"), &tok).await;
-    let (status_b, _) = common::get_with_token(&app, &format!("/api/v1/sites/{SITE_B_ID}/detail"), &tok).await;
+    let (status_a, _) = common::get_with_token(&app, &format!("/api/sites/{site_a}/detail"), &tok).await;
+    let (status_b, _) = common::get_with_token(&app, &format!("/api/sites/{SITE_B_ID}/detail"), &tok).await;
     assert_eq!(status_a, 200, "unscoped token reaches project A");
     assert_eq!(status_b, 200, "unscoped token reaches project B");
 }
@@ -170,7 +170,7 @@ async fn scoped_token_rejects_cross_project_uuid_in_path() {
     )
     .await;
 
-    let (status, _) = common::get_with_token(&app, "/api/v1/sites/ScopeSiteB/detail", &tok).await;
+    let (status, _) = common::get_with_token(&app, "/api/sites/ScopeSiteB/detail", &tok).await;
     let parsed: u16 = status.into();
     assert!(
         parsed == 403 || parsed == 404,
@@ -191,7 +191,7 @@ async fn scoped_token_passes_anonymous_public_api() {
     )
     .await;
 
-    let (status, _) = common::get(&app, "/api/v1/public").await;
+    let (status, _) = common::get(&app, "/api/public").await;
     assert_eq!(status, 200, "public discovery must work without auth");
     let _ = Uuid::nil(); // silence unused-import warning if scoped down later
 }

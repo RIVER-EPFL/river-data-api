@@ -177,7 +177,7 @@ impl AnalyticalTool for DocTool {
         static INFO: ToolInfo = ToolInfo {
             name: "doc",
             description: "Dissolved Organic Carbon (replicate avg/sd with optional standard curve)",
-            endpoint: "/api/service/tools/doc/calculate",
+            endpoint: "/api/tools/doc/calculate",
             params: &[
                 ToolParamInfo { name: "replicates", label: "Replicates (array)", required: true },
                 ToolParamInfo { name: "std_curve", label: "Standard Curve (slope/intercept)", required: false },
@@ -221,7 +221,7 @@ impl AnalyticalTool for TssAfdmTool {
         static INFO: ToolInfo = ToolInfo {
             name: "tss_afdm",
             description: "Total Suspended Solids & Ash-Free Dry Mass",
-            endpoint: "/api/service/tools/tss_afdm/calculate",
+            endpoint: "/api/tools/tss_afdm/calculate",
             params: &[
                 ToolParamInfo { name: "wgt_dried_g", label: "Dried Weight (g)", required: true },
                 ToolParamInfo { name: "wgt_prefilt_g", label: "Pre-filter Weight (g)", required: true },
@@ -281,7 +281,7 @@ impl AnalyticalTool for ChlorophyllTool {
         static INFO: ToolInfo = ToolInfo {
             name: "chlorophyll",
             description: "Chlorophyll-a (acid and no-acid methods)",
-            endpoint: "/api/service/tools/chlorophyll/calculate",
+            endpoint: "/api/tools/chlorophyll/calculate",
             params: &[
                 ToolParamInfo { name: "method", label: "Method (acid/no_acid)", required: true },
                 ToolParamInfo { name: "fluorescence_before", label: "Fluorescence Before", required: true },
@@ -352,7 +352,7 @@ impl AnalyticalTool for NutrientsTool {
         static INFO: ToolInfo = ToolInfo {
             name: "nutrients",
             description: "Nutrient replicates (PO4, NH4, NOx, NO2, TDP, TDN)",
-            endpoint: "/api/service/tools/nutrients/calculate",
+            endpoint: "/api/tools/nutrients/calculate",
             params: &[
                 ToolParamInfo { name: "species", label: "Species (multi-species map)", required: false },
                 ToolParamInfo { name: "replicates", label: "Replicates (single-species)", required: false },
@@ -415,7 +415,7 @@ impl AnalyticalTool for IonsTool {
         static INFO: ToolInfo = ToolInfo {
             name: "ions",
             description: "IC ion charge balance verification",
-            endpoint: "/api/service/tools/ions/calculate",
+            endpoint: "/api/tools/ions/calculate",
             params: &[
                 ToolParamInfo { name: "cations", label: "Cations (array)", required: true },
                 ToolParamInfo { name: "anions", label: "Anions (array)", required: true },
@@ -469,7 +469,7 @@ impl AnalyticalTool for AlkalinityTool {
         static INFO: ToolInfo = ToolInfo {
             name: "alkalinity",
             description: "Gran titration alkalinity (meq/L, mg/L CaCO3)",
-            endpoint: "/api/service/tools/alkalinity/calculate",
+            endpoint: "/api/tools/alkalinity/calculate",
             params: &[
                 ToolParamInfo { name: "sample_weight_g", label: "Sample Weight (g)", required: true },
                 ToolParamInfo { name: "acid_normality", label: "Acid Normality", required: true },
@@ -559,7 +559,7 @@ impl AnalyticalTool for Pco2Tool {
         static INFO: ToolInfo = ToolInfo {
             name: "pco2",
             description: "pCO2 from headspace CO2aq (simple, P1, P2 variants)",
-            endpoint: "/api/service/tools/pco2/calculate",
+            endpoint: "/api/tools/pco2/calculate",
             params: &[
                 ToolParamInfo { name: "mode", label: "Mode (simple/full_pipeline)", required: false },
                 ToolParamInfo { name: "variant", label: "Variant (simple/p1/p2)", required: false },
@@ -740,7 +740,7 @@ impl AnalyticalTool for DicTool {
         static INFO: ToolInfo = ToolInfo {
             name: "dic",
             description: "DIC concentration and d13C-DIC from acid digestion",
-            endpoint: "/api/service/tools/dic/calculate",
+            endpoint: "/api/tools/dic/calculate",
             params: &[
                 ToolParamInfo { name: "acid_sample_weight_g", label: "Acid Sample Weight (g)", required: true },
                 ToolParamInfo { name: "acid_weight_g", label: "Acid Weight (g)", required: true },
@@ -847,7 +847,7 @@ impl AnalyticalTool for DomTool {
         static INFO: ToolInfo = ToolInfo {
             name: "dom",
             description: "SUVA, absorbance ratios, spectral slopes",
-            endpoint: "/api/service/tools/dom/calculate",
+            endpoint: "/api/tools/dom/calculate",
             params: &[
                 ToolParamInfo { name: "a254", label: "Absorbance @254nm", required: false },
                 ToolParamInfo { name: "doc_avg_ppb", label: "DOC Avg (ppb)", required: false },
@@ -922,7 +922,7 @@ impl AnalyticalTool for FieldDataTool {
         static INFO: ToolInfo = ToolInfo {
             name: "field_data",
             description: "Barometric pressure from altitude, CO2 correction",
-            endpoint: "/api/service/tools/field_data/calculate",
+            endpoint: "/api/tools/field_data/calculate",
             params: &[
                 ToolParamInfo { name: "elevation_m", label: "Elevation (m)", required: false },
                 ToolParamInfo { name: "temp_c", label: "Temperature (°C)", required: false },
@@ -1005,7 +1005,7 @@ impl AnalyticalTool for Co2AirTool {
         static INFO: ToolInfo = ToolInfo {
             name: "co2_air",
             description: "CO2/CH4 dry concentrations from wet measurements",
-            endpoint: "/api/service/tools/co2_air/calculate",
+            endpoint: "/api/tools/co2_air/calculate",
             params: &[
                 ToolParamInfo { name: "co2_wet", label: "CO2 Wet (ppm)", required: false },
                 ToolParamInfo { name: "ch4_wet", label: "CH4 Wet (ppm)", required: false },
@@ -1052,7 +1052,7 @@ impl AnalyticalTool for IsotopesTool {
         static INFO: ToolInfo = ToolInfo {
             name: "isotopes",
             description: "Deuterium excess, 17O excess",
-            endpoint: "/api/service/tools/isotopes/calculate",
+            endpoint: "/api/tools/isotopes/calculate",
             params: &[
                 ToolParamInfo { name: "d_d", label: "dD (permil)", required: false },
                 ToolParamInfo { name: "d18o", label: "d18O (permil)", required: false },
@@ -1103,7 +1103,7 @@ impl AnalyticalTool for BenthicTool {
         static INFO: ToolInfo = ToolInfo {
             name: "benthic",
             description: "Rock surface area, per-m2 normalizations",
-            endpoint: "/api/service/tools/benthic/calculate",
+            endpoint: "/api/tools/benthic/calculate",
             params: &[
                 ToolParamInfo { name: "diameters_cm", label: "Rock Diameters (cm)", required: true },
                 ToolParamInfo { name: "afdm_g_filter", label: "AFDM per Filter (g)", required: false },
@@ -1178,7 +1178,7 @@ impl AnalyticalTool for ChlaBenthicTool {
         static INFO: ToolInfo = ToolInfo {
             name: "chla_benthic",
             description: "Unified Chlorophyll-Benthic multi-replicate (acid + no-acid Chl-a, AFDM, per-m2)",
-            endpoint: "/api/service/tools/chla_benthic/calculate",
+            endpoint: "/api/tools/chla_benthic/calculate",
             params: &[
                 ToolParamInfo { name: "acid_slope", label: "Acid Slope", required: true },
                 ToolParamInfo { name: "acid_intercept", label: "Acid Intercept", required: true },

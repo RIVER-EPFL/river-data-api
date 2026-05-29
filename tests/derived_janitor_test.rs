@@ -66,7 +66,7 @@ async fn test_janitor_fills_derived_gaps() {
     });
     let (status, def_json) = common::post_json_parse_with_token(
         &app,
-        "/api/v1/derived_parameters",
+        "/api/derived_parameters",
         &create_body,
         &token,
     )

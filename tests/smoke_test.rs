@@ -42,7 +42,7 @@ async fn test_infra_seed_and_healthz() {
     // Try a simple endpoint that doesn't use CrudCrate
     let (status, body) = common::get_with_token(
         &app,
-        &format!("/api/v1/sites/{}/parameters", common::SITE1_ID),
+        &format!("/api/sites/{}/parameters", common::SITE1_ID),
         &token,
     )
     .await;
@@ -51,7 +51,7 @@ async fn test_infra_seed_and_healthz() {
     // Try the site detail endpoint (custom handler, not CrudCrate)
     let (status, body) = common::get_with_token(
         &app,
-        &format!("/api/v1/sites/{}", common::SITE1_ID),
+        &format!("/api/sites/{}", common::SITE1_ID),
         &token,
     )
     .await;

@@ -4,7 +4,6 @@ resolver = "2"
 
 [patch.crates-io]
 crudcrate = { path = "/home/ejthomas/projects/personal/crudcrate/crudcrate/crudcrate" }
-river-data-core = { path = "/home/ejthomas/projects/RIVER/river-data/dev/river-data-core" }
 
 [package]
 name = "river-db"
