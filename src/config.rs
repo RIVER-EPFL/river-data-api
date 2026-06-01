@@ -200,9 +200,9 @@ impl Config {
                 .parse()
                 .unwrap_or(90),
             max_aggregates_time_range_days: env::var("MAX_AGGREGATES_TIME_RANGE_DAYS")
-                .unwrap_or_else(|_| "365".to_string())
+                .unwrap_or_else(|_| "1825".to_string())
                 .parse()
-                .unwrap_or(365),
+                .unwrap_or(1825),
             public_max_readings_time_range_days: env::var("PUBLIC_MAX_READINGS_TIME_RANGE_DAYS")
                 .unwrap_or_else(|_| "30".to_string())
                 .parse()

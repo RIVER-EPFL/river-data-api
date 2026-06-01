@@ -194,15 +194,6 @@ pub async fn get_site_aggregates(
 
     validate_time_range(query.start, query.end)?;
 
-    // Enforce max aggregate time range
-    let span = query.end - query.start;
-    if span.num_days() > state.config.max_aggregates_time_range_days {
-        return Err(AppError::BadRequest(format!(
-            "Time range exceeds maximum of {} days for aggregates",
-            state.config.max_aggregates_time_range_days
-        )));
-    }
-
     let format = bulk::determine_format(&query.format, &headers);
 
     let mut param_query = site_parameters::Entity::find()
