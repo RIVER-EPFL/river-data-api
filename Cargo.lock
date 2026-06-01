@@ -638,9 +638,9 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crudcrate"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e90521b6cf2e948e87a0821d19bb02e4ddfaa733384ee71a643b3dd59b2efc71"
+checksum = "8c0c0db2f6b18cda48917207cb34c739d6c16b36e3d6d27d7a75b5f2d33123c6"
 dependencies = [
  "async-trait",
  "axum",
@@ -656,9 +656,9 @@ dependencies = [
 
 [[package]]
 name = "crudcrate-derive"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03a8580f1063e87b2a7f32e258b1002f65998bd698ffbbc1087c189ce3437328"
+checksum = "91411e923bacd4afc6c445f6ae1715bece0ae25fc094480367574407e4f8b74f"
 dependencies = [
  "convert_case",
  "heck 0.5.0",
@@ -1877,7 +1877,7 @@ dependencies = [
 
 [[package]]
 name = "migration"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dotenvy",
  "sea-orm-migration",
@@ -2674,7 +2674,7 @@ dependencies = [
 
 [[package]]
 name = "river-db"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum",
