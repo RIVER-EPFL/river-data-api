@@ -598,6 +598,22 @@ async fn reassign_parameter_references(
     .await
     .map_err(AppError::Database)?;
 
+    // Merge aliases: target gets source's aliases + source's name as a new alias
+    txn.execute(Statement::from_sql_and_values(
+        pg,
+        r#"UPDATE parameters SET aliases = (
+            SELECT array_agg(DISTINCT a)
+            FROM unnest(
+                (SELECT aliases FROM parameters WHERE id = $1)
+                || (SELECT aliases FROM parameters WHERE id = $2)
+                || ARRAY[(SELECT name FROM parameters WHERE id = $2)]
+            ) AS a WHERE a IS NOT NULL AND a != ''
+        ) WHERE id = $1"#,
+        vec![target_id.into(), source_id.into()],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+
     Ok(())
 }
 
