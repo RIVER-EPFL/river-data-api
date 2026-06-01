@@ -103,6 +103,21 @@ impl CRUDOperations for SiteParameterOperations {
             .collect())
     }
 
+    async fn before_delete(
+        &self,
+        db: &DatabaseConnection,
+        id: Uuid,
+    ) -> Result<(), ApiError> {
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE data_streams SET site_parameter_id = NULL WHERE site_parameter_id = $1",
+            [id.into()],
+        ))
+        .await
+        .map_err(ApiError::database)?;
+        Ok(())
+    }
+
     async fn after_create(
         &self,
         db: &DatabaseConnection,
@@ -169,6 +184,93 @@ impl CRUDOperations for SiteParameterOperations {
         };
 
         threshold.insert(db).await.map_err(ApiError::database)?;
+
+        // Trigger immediate derived backfill when a derived site_parameter is assigned
+        if entity.is_derived == Some(true) {
+            if let Some(def_id) = entity.derived_definition_id {
+                let db = db.clone();
+                let site_id = entity.site_id;
+                let job_id = Uuid::new_v4();
+
+                db.execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status) \
+                     VALUES ($1, NULL, 'derived_assignment', $2, 'pending')",
+                    [job_id.into(), def_id.into()],
+                ))
+                .await
+                .map_err(ApiError::database)?;
+
+                tokio::spawn(async move {
+                    tracing::info!(%def_id, %site_id, %job_id, "Computing derived values after site assignment");
+
+                    let timestamps = db
+                        .query_all(Statement::from_sql_and_values(
+                            sea_orm::DatabaseBackend::Postgres,
+                            r"SELECT DISTINCT r.time
+                              FROM readings r
+                              JOIN derived_parameter_sources dps ON dps.parameter_id = r.parameter_id
+                              WHERE dps.derived_definition_id = $1 AND r.site_id = $2
+                              ORDER BY r.time",
+                            [def_id.into(), site_id.into()],
+                        ))
+                        .await;
+
+                    match timestamps {
+                        Ok(rows) => {
+                            let total = rows.len() as i32;
+                            let _ = db.execute(Statement::from_sql_and_values(
+                                sea_orm::DatabaseBackend::Postgres,
+                                "UPDATE reprocessing_jobs SET status = 'running', total = $1, progress = 0 WHERE id = $2",
+                                [total.into(), job_id.into()],
+                            )).await;
+
+                            let mut filled = 0i32;
+                            let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
+                            for (i, row) in rows.iter().enumerate() {
+                                let Ok(time) = row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "time") else { continue };
+                                let utc = time.with_timezone(&chrono::Utc);
+                                if crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
+                                    &db, site_id, utc,
+                                ).await.is_ok() {
+                                    filled += 1;
+                                    earliest = Some(earliest.map_or(utc, |e| e.min(utc)));
+                                }
+                                if (i + 1) % 500 == 0 {
+                                    let _ = db.execute(Statement::from_sql_and_values(
+                                        sea_orm::DatabaseBackend::Postgres,
+                                        "UPDATE reprocessing_jobs SET progress = $1 WHERE id = $2",
+                                        [(i as i32 + 1).into(), job_id.into()],
+                                    )).await;
+                                }
+                            }
+
+                            if let Some(since) = earliest {
+                                let _ = crate::common::sync_state::refresh_continuous_aggregates(
+                                    &db, Some(since),
+                                ).await;
+                            }
+
+                            let _ = db.execute(Statement::from_sql_and_values(
+                                sea_orm::DatabaseBackend::Postgres,
+                                "UPDATE reprocessing_jobs SET status = 'completed', progress = $1 WHERE id = $2",
+                                [filled.into(), job_id.into()],
+                            )).await;
+
+                            tracing::info!(%def_id, %site_id, filled, total, "Derived assignment backfill completed");
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, %def_id, %site_id, "Failed to query timestamps for derived backfill");
+                            let _ = db.execute(Statement::from_sql_and_values(
+                                sea_orm::DatabaseBackend::Postgres,
+                                "UPDATE reprocessing_jobs SET status = 'failed' WHERE id = $1",
+                                [job_id.into()],
+                            )).await;
+                        }
+                    }
+                });
+            }
+        }
 
         Ok(())
     }

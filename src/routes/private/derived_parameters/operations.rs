@@ -330,6 +330,30 @@ pub struct DerivedParameterDefinitionOperations;
 impl CRUDOperations for DerivedParameterDefinitionOperations {
     type Resource = DerivedParameterDefinition;
 
+    async fn before_delete(
+        &self,
+        db: &DatabaseConnection,
+        id: Uuid,
+    ) -> Result<(), ApiError> {
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "DELETE FROM derived_parameter_sources WHERE derived_definition_id = $1",
+            [id.into()],
+        ))
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to delete sources: {e}"), None))?;
+
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE site_parameters SET derived_definition_id = NULL WHERE derived_definition_id = $1",
+            [id.into()],
+        ))
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to unlink site_parameters: {e}"), None))?;
+
+        Ok(())
+    }
+
     async fn before_create(
         &self,
         db: &DatabaseConnection,
