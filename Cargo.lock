@@ -1877,7 +1877,7 @@ dependencies = [
 
 [[package]]
 name = "migration"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "dotenvy",
  "sea-orm-migration",
@@ -2652,9 +2652,9 @@ dependencies = [
 
 [[package]]
 name = "river-data-core"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34b94c15d7edf2490e2e3714e28df2e06a479a20917e8856c7f329462114b727"
+checksum = "715ba63a7c4ebd18394a3a7b058fe8b56654f51673b66a60fcafdb6e5b177518"
 dependencies = [
  "async-trait",
  "axum",
@@ -2674,7 +2674,7 @@ dependencies = [
 
 [[package]]
 name = "river-db"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "axum",
