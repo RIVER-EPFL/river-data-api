@@ -1298,6 +1298,8 @@ struct PlanEntryUpdate {
     parameter_name: Option<String>,
     #[serde(default)]
     parameter_units: Option<String>,
+    #[serde(default)]
+    parameter_id: Option<Uuid>,
 }
 
 /// Edit a draft pairing plan (only `draft` status allows updates). Requires `write_metadata`.
@@ -1353,6 +1355,10 @@ pub async fn update_pairing_plan(
             }
             if let Some(ref units) = update.parameter_units {
                 entry.parameter.units = units.clone();
+            }
+            if let Some(pid) = update.parameter_id {
+                entry.parameter.id = Some(pid);
+                entry.parameter.create = false;
             }
         }
     }

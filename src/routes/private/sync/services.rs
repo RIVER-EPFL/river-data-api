@@ -90,6 +90,8 @@ pub struct PlanEntry {
     pub confidence: String, // "exact" | "fuzzy" | "none"
     #[serde(default)]
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub original_parameter_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +117,10 @@ pub struct PlanParamRef {
     pub name: String,
     pub create: bool,
     pub units: String,
+    #[serde(default)]
+    pub group_key: Option<String>,
+    #[serde(default)]
+    pub original_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +134,84 @@ pub struct PlanSummary {
     pub unique_projects: usize,
     pub unique_sites: usize,
     pub unique_parameters: usize,
+}
+
+struct ParamGroupProposal {
+    proposed_name: String,
+    units: String,
+    original_names: Vec<String>,
+    entry_indices: Vec<usize>,
+}
+
+fn longest_common_suffix(names: &[&str]) -> String {
+    if names.is_empty() { return String::new(); }
+    if names.len() == 1 { return names[0].to_string(); }
+
+    let reversed: Vec<Vec<char>> = names.iter()
+        .map(|n| n.chars().rev().flat_map(|c| c.to_lowercase()).collect())
+        .collect();
+    let min_len = reversed.iter().map(|r| r.len()).min().unwrap_or(0);
+
+    let mut common_len = 0;
+    for i in 0..min_len {
+        let ch = reversed[0][i];
+        if reversed.iter().all(|r| r[i] == ch) {
+            common_len += 1;
+        } else {
+            break;
+        }
+    }
+
+    // Return the suffix from the first name (preserving its original case)
+    let first = names[0];
+    first[first.len() - common_len..].to_string()
+}
+
+fn group_streams_by_parameter(
+    entries: &[(usize, String, String)],
+) -> Vec<ParamGroupProposal> {
+    let mut by_units: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    for (idx, name, units) in entries {
+        by_units.entry(units.to_lowercase())
+            .or_default()
+            .push((*idx, name.clone()));
+    }
+
+    let mut proposals = Vec::new();
+    for (units, members) in &by_units {
+        if members.len() <= 1 {
+            let (idx, name) = &members[0];
+            proposals.push(ParamGroupProposal {
+                proposed_name: name.clone(),
+                units: units.clone(),
+                original_names: vec![name.clone()],
+                entry_indices: vec![*idx],
+            });
+            continue;
+        }
+
+        let names: Vec<&str> = members.iter().map(|(_, n)| n.as_str()).collect();
+        let suffix = longest_common_suffix(&names);
+
+        if suffix.len() >= 2 {
+            proposals.push(ParamGroupProposal {
+                proposed_name: suffix,
+                units: units.clone(),
+                original_names: names.iter().map(|n| n.to_string()).collect(),
+                entry_indices: members.iter().map(|(idx, _)| *idx).collect(),
+            });
+        } else {
+            for (idx, name) in members {
+                proposals.push(ParamGroupProposal {
+                    proposed_name: name.clone(),
+                    units: units.clone(),
+                    original_names: vec![name.clone()],
+                    entry_indices: vec![*idx],
+                });
+            }
+        }
+    }
+    proposals
 }
 
 /// Create a pairing plan for all unpaired streams of a given source system.
@@ -225,13 +309,36 @@ pub async fn create_plan(
             },
             parameter: PlanParamRef {
                 id: param_id,
-                name: h.parameter,
+                name: h.parameter.clone(),
                 create: param_create,
                 units: h.units,
+                group_key: None,
+                original_names: vec![],
             },
             confidence,
             warnings,
+            original_parameter_name: Some(h.parameter),
         });
+    }
+
+    // Group new-to-create parameters by units + common suffix
+    let to_group: Vec<(usize, String, String)> = entries.iter().enumerate()
+        .filter(|(_, e)| e.action == "pair" && e.parameter.create)
+        .map(|(i, e)| (i, e.parameter.name.clone(), e.parameter.units.clone()))
+        .collect();
+
+    if !to_group.is_empty() {
+        for group in group_streams_by_parameter(&to_group) {
+            if group.entry_indices.len() <= 1 {
+                continue;
+            }
+            let key = format!("{}::{}", group.units, group.proposed_name);
+            for &idx in &group.entry_indices {
+                entries[idx].parameter.name = group.proposed_name.clone();
+                entries[idx].parameter.group_key = Some(key.clone());
+                entries[idx].parameter.original_names = group.original_names.clone();
+            }
+        }
     }
 
     let summary = compute_summary(&entries);
@@ -801,7 +908,7 @@ async fn resolve_or_create_param(
         category: Set(category),
         data_type: Set("numeric".to_string()),
         description: Set(None),
-        aliases: Set(vec![]),
+        aliases: Set(param_ref.original_names.clone()),
         default_warning_min: Set(None), default_warning_max: Set(None),
         default_alarm_min: Set(None), default_alarm_max: Set(None),
         created_at: Set(Some(Utc::now())),
@@ -811,46 +918,6 @@ async fn resolve_or_create_param(
     Ok(id)
 }
 
-fn infer_category(name: &str) -> String {
-    let lower = name.to_lowercase();
-    if lower.contains("nitrat") || lower.contains("nitrit") || lower.contains("ammon")
-        || lower.contains("phosph") || lower.contains("nitrogen") || lower.contains("nutrient")
-    {
-        "Nutrients".to_string()
-    } else if lower.contains("peak ") || lower.contains("cdom") || lower.contains("fluor")
-        || lower.contains("humif") || lower.contains("bix") || lower.contains("hix")
-        || lower.contains("suva") || lower.contains("absorb") || lower.contains("e2/e3")
-        || lower.contains("e4/e6") || lower.contains("slope ratio") || lower.contains("spectral")
-    {
-        "DOM".to_string()
-    } else if lower.contains("calcium") || lower.contains("magnesium") || lower.contains("sodium")
-        || lower.contains("potassium") || lower.contains("chloride") || lower.contains("sulfate")
-        || lower.contains("fluoride") || lower.contains("bromide") || lower.contains("lithium")
-    {
-        "Ions".to_string()
-    } else if lower.contains("isotop") || lower.contains("δ") || lower.contains("d-excess")
-        || lower.contains("d18o") || lower.contains("d13c")
-    {
-        "Isotopes".to_string()
-    } else if lower.contains("co2") || lower.contains("pco2") || lower.contains("methane")
-        || lower.contains("ch4")
-    {
-        "pCO2".to_string()
-    } else if lower.contains("dissolved organic carbon") || lower.contains("doc") {
-        "DOC".to_string()
-    } else if lower.contains("dissolved inorganic carbon") || lower.contains("dic") {
-        "DIC".to_string()
-    } else if lower.contains("temperatur") || lower.contains("conductiv") || lower.contains("turbid")
-        || lower.contains("dissolved oxygen") || lower.contains("alkalin") || lower == "ph"
-    {
-        "Physicochemical".to_string()
-    } else if lower.contains("depth") || lower.contains("water level") {
-        "Hydrology".to_string()
-    } else if lower.contains("battery") || lower.contains("signal") || lower.contains("batt") {
-        "device_health".to_string()
-    } else if lower.contains("suspend") || lower.contains("tss") || lower.contains("afdm") {
-        "TSS".to_string()
-    } else {
-        "measurement".to_string()
-    }
+fn infer_category(_name: &str) -> String {
+    "measurement".to_string()
 }
