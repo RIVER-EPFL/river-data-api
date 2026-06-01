@@ -15,7 +15,7 @@ command = ["cargo", "test", "--color", "always"]
 need_stdout = true
 
 [jobs.test-integration]
-command = ["cargo", "test", "--tests", "--color", "always", "--", "--test-threads=1"]
+command = ["cargo", "nextest", "run", "--tests", "--color", "always", "--test-threads=1", "--hide-progress-bar", "--failure-output", "final", "--status-level", "fail"]
 need_stdout = true
 
 [jobs.test-unit]
@@ -27,6 +27,7 @@ command = ["cargo", "run", "--color", "always"]
 need_stdout = true
 allow_warnings = true
 background = true
+on_change_strategy = "kill_then_restart"
 
 [jobs.doc]
 command = ["cargo", "doc", "--no-deps", "--color", "always"]

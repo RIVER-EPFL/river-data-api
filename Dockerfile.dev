@@ -1,5 +1,6 @@
 FROM rust:1.95
-RUN cargo install bacon
+RUN rustup toolchain install nightly
+RUN cargo install bacon && cargo install --locked cargo-nextest
 WORKDIR /app
 # Only copy manifests for initial dependency fetch — source is volume-mounted at runtime
 COPY Cargo.toml Cargo.lock ./
