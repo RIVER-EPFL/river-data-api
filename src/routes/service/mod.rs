@@ -34,7 +34,8 @@ use crate::routes::private::{
 };
 
 const ACTION_BODY_LIMIT: usize = 1024 * 1024; // 1 MB — preserved from the former admin tier
-const DATA_BODY_LIMIT: usize = 10 * 1024 * 1024; // 10 MB — bulk ingestion only
+const DATA_BODY_LIMIT: usize = 10 * 1024 * 1024; // 10 MB — bulk ingestion
+const IMPORT_BODY_LIMIT: usize = 50 * 1024 * 1024; // 50 MB — CSV import
 
 /// The single `/api/` router. Mounted by the parent router which wraps it with
 /// dual-auth (`service_auth_middleware`), Keycloak JWT pass-through, and optional
@@ -108,9 +109,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route("/ingest", post(ingest::ingest_readings))
         .route("/ingest/status_events", post(ingest::ingest_status_events))
         .route("/readings/batch", post(readings_batch::insert_batch_readings))
-        .route("/readings/import_csv", post(readings_import::import_csv))
         .route("/status_events/batch", post(status_events_batch::insert_batch_status_events))
         .layer(RequestBodyLimitLayer::new(DATA_BODY_LIMIT))
+        .route("/readings/import_csv", post(readings_import::import_csv))
+        .layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT))
         .route("/grab_samples", post(grab_samples::insert_grab_samples))
         .route("/readings/flag", patch(flags::flag_readings))
         .route("/readings/unflag", patch(flags::unflag_readings))

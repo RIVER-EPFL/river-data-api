@@ -134,58 +134,65 @@ pub async fn import_csv(
     })?;
     let site_id = site.id;
 
-    // --- Resolution tables --------------------------------------------------------------------
-    // Catalog: lower(name) -> id, id -> name.
-    let catalog_rows = state
+    // --- Resolution tables (site_parameter-first) ---------------------------------------------
+
+    // Site parameters for this site: lower(sp.name) -> (parameter_id, sp_name).
+    // Also build alias map from the site's parameters only.
+    let sp_rows = state
         .db
-        .query_all(Statement::from_string(
+        .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, name FROM parameters".to_owned(),
+            "SELECT sp.name AS sp_name, sp.parameter_id, p.name AS param_name, p.aliases \
+             FROM site_parameters sp JOIN parameters p ON p.id = sp.parameter_id \
+             WHERE sp.site_id = $1",
+            [site_id.into()],
         ))
         .await?;
-    let mut catalog: HashMap<String, Uuid> = HashMap::new();
+
+    let mut site_param_map: HashMap<String, (Uuid, String)> = HashMap::new();
+    let mut site_alias_map: HashMap<String, (Uuid, String)> = HashMap::new();
     let mut param_names: HashMap<Uuid, String> = HashMap::new();
-    for row in &catalog_rows {
-        let Ok(pid) = row.try_get::<Uuid>("", "id") else { continue };
-        let name: String = row.try_get("", "name").unwrap_or_default();
-        catalog.insert(name.to_lowercase(), pid);
-        param_names.insert(pid, name);
+    let mut site_param_ids: HashSet<Uuid> = HashSet::new();
+
+    for row in &sp_rows {
+        let sp_name: String = row.try_get("", "sp_name").unwrap_or_default();
+        let Ok(pid) = row.try_get::<Uuid>("", "parameter_id") else { continue };
+        let param_name: String = row.try_get("", "param_name").unwrap_or_default();
+        let aliases: Vec<String> = row.try_get("", "aliases").unwrap_or_default();
+
+        site_param_map.insert(sp_name.to_lowercase(), (pid, sp_name.clone()));
+        site_param_map.insert(param_name.to_lowercase(), (pid, sp_name.clone()));
+        param_names.insert(pid, sp_name.clone());
+        site_param_ids.insert(pid);
+
+        for alias in &aliases {
+            site_alias_map.insert(alias.to_lowercase(), (pid, sp_name.clone()));
+        }
     }
 
-    // Aliases (the source-column → parameter map the sync services also use): lower(alias) -> id.
-    let alias_rows = state
-        .db
-        .query_all(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT p.id AS pid, lower(al) AS alias FROM parameters p, unnest(p.aliases) AS al"
-                .to_owned(),
-        ))
-        .await?;
-    let mut alias_map: HashMap<String, Uuid> = HashMap::new();
-    for row in &alias_rows {
-        let Ok(pid) = row.try_get::<Uuid>("", "pid") else { continue };
-        let Ok(alias) = row.try_get::<String>("", "alias") else { continue };
-        alias_map.insert(alias, pid);
-    }
-
-    // Public exposure for the project: lower(public_name) -> (id, factor, offset).
+    // Public exposure for the project: lower(public_name) -> (id, sp_name, factor, offset).
     let exposure_rows = state
         .db
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT public_name, parameter_id, COALESCE(conversion_factor, 1.0) AS factor, \
-             COALESCE(conversion_offset, 0.0) AS offset FROM public_exposed_parameters \
-             WHERE project_id = $1 AND public_name IS NOT NULL",
-            [project.id.into()],
+            "SELECT pep.public_name, pep.parameter_id, \
+             COALESCE(pep.conversion_factor, 1.0) AS factor, \
+             COALESCE(pep.conversion_offset, 0.0) AS offset, \
+             sp.name AS sp_name \
+             FROM public_exposed_parameters pep \
+             LEFT JOIN site_parameters sp ON sp.parameter_id = pep.parameter_id AND sp.site_id = $2 \
+             WHERE pep.project_id = $1 AND pep.public_name IS NOT NULL",
+            [project.id.into(), site_id.into()],
         ))
         .await?;
-    let mut exposure: HashMap<String, (Uuid, f64, f64)> = HashMap::new();
+    let mut exposure: HashMap<String, (Uuid, String, f64, f64)> = HashMap::new();
     for row in &exposure_rows {
         let name: String = row.try_get("", "public_name").unwrap_or_default();
         let Ok(pid) = row.try_get::<Uuid>("", "parameter_id") else { continue };
+        let sp_name: String = row.try_get("", "sp_name").unwrap_or(name.clone());
         let factor: f64 = row.try_get("", "factor").unwrap_or(1.0);
         let offset: f64 = row.try_get("", "offset").unwrap_or(0.0);
-        exposure.insert(name.to_lowercase(), (pid, factor, offset));
+        exposure.insert(name.to_lowercase(), (pid, sp_name, factor, offset));
     }
 
     // Derived-output parameters are computed, never ingested.
@@ -203,26 +210,31 @@ pub async fn import_csv(
         .filter_map(|r| r.try_get::<Uuid>("", "output_parameter_id").ok())
         .collect();
 
-    // Parameters actually assigned to this site (its "parameter list").
-    let site_param_rows = state
+    // Global catalog fallback: lower(name) -> id (for columns that don't match site params).
+    let catalog_rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT parameter_id FROM site_parameters WHERE site_id = $1",
-            [site_id.into()],
+            "SELECT id, name FROM parameters".to_owned(),
         ))
         .await?;
-    let site_param_ids: HashSet<Uuid> = site_param_rows
-        .iter()
-        .filter_map(|r| r.try_get::<Uuid>("", "parameter_id").ok())
-        .collect();
+    let mut catalog: HashMap<String, Uuid> = HashMap::new();
+    for row in &catalog_rows {
+        let Ok(pid) = row.try_get::<Uuid>("", "id") else { continue };
+        let name: String = row.try_get("", "name").unwrap_or_default();
+        catalog.insert(name.to_lowercase(), pid);
+        param_names.entry(pid).or_insert(name);
+    }
 
-    // Resolve an explicit-mapping target (parameter UUID or catalog name) to a parameter id.
-    let resolve_target = |target: &str| -> Option<Uuid> {
+    // Resolve an explicit-mapping target to a parameter id (site_param name, UUID, or catalog name).
+    let resolve_target = |target: &str| -> Option<(Uuid, String)> {
         if let Ok(uuid) = Uuid::parse_str(target) {
-            return param_names.contains_key(&uuid).then_some(uuid);
+            return param_names.get(&uuid).map(|n| (uuid, n.clone()));
         }
-        catalog.get(&target.to_lowercase()).copied()
+        let key = target.to_lowercase();
+        site_param_map.get(&key).cloned()
+            .or_else(|| site_alias_map.get(&key).cloned())
+            .or_else(|| catalog.get(&key).map(|&pid| (pid, param_names.get(&pid).cloned().unwrap_or_default())))
     };
 
     // --- Parse header and classify columns ----------------------------------------------------
@@ -253,8 +265,9 @@ pub async fn import_csv(
             continue;
         }
 
-        // Candidate (parameter_id, factor, offset): explicit mapping wins, then auto-resolution.
-        let candidate: Option<(Uuid, f64, f64)> =
+        // Candidate (parameter_id, display_name, factor, offset):
+        // Resolution: explicit mapping > site_param name > site aliases > exposure > catalog.
+        let candidate: Option<(Uuid, String, f64, f64)> =
             if let Some(entry) = req.mapping.as_ref().and_then(|m| m.get(header)) {
                 match entry {
                     None => {
@@ -262,7 +275,7 @@ pub async fn import_csv(
                         continue;
                     }
                     Some(target) => match resolve_target(target) {
-                        Some(pid) => Some((pid, 1.0, 0.0)),
+                        Some((pid, name)) => Some((pid, name, 1.0, 0.0)),
                         None => {
                             unmapped_columns.push(header.to_string());
                             warnings.push(format!(
@@ -274,25 +287,22 @@ pub async fn import_csv(
                 }
             } else {
                 let key = header.to_lowercase();
-                exposure
+                site_param_map
                     .get(&key)
-                    .copied()
-                    .or_else(|| alias_map.get(&key).map(|p| (*p, 1.0, 0.0)))
-                    .or_else(|| catalog.get(&key).map(|p| (*p, 1.0, 0.0)))
+                    .map(|(pid, name)| (*pid, name.clone(), 1.0, 0.0))
+                    .or_else(|| site_alias_map.get(&key).map(|(pid, name)| (*pid, name.clone(), 1.0, 0.0)))
+                    .or_else(|| exposure.get(&key).map(|(pid, name, f, o)| (*pid, name.clone(), *f, *o)))
+                    .or_else(|| catalog.get(&key).map(|pid| (*pid, param_names.get(pid).cloned().unwrap_or_default(), 1.0, 0.0)))
             };
 
         match candidate {
-            Some((pid, _, _)) if derived_outputs.contains(&pid) => {
-                // Derived output column: recomputed from its sources, not ingested.
+            Some((pid, _, _, _)) if derived_outputs.contains(&pid) => {
                 skipped_columns.push(header.to_string());
             }
-            Some((pid, factor, offset)) => {
-                let name = param_names
-                    .get(&pid)
-                    .cloned()
-                    .unwrap_or_else(|| header.to_string());
-                mapped_columns.insert(header.to_string(), name.clone());
+            Some((pid, resolved_name, factor, offset)) => {
+                mapped_columns.insert(header.to_string(), resolved_name);
                 if !site_param_ids.contains(&pid) {
+                    let name = param_names.get(&pid).cloned().unwrap_or_default();
                     warnings.push(format!(
                         "Column '{header}' maps to parameter '{name}', which is not assigned to site '{}' — it will be stored but not exposed until you add the site parameter",
                         site.name
