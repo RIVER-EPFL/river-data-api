@@ -31,6 +31,39 @@ pub async fn poll_job(app: &Router, token: &str, job_id: &str, max_secs: u64) ->
     }
 }
 
+/// Wait for all reprocessing jobs of a given `trigger_type` to reach a terminal state. Returns true
+/// if at least one job ran and none failed; false on failure or timeout. For background jobs whose
+/// id isn't returned by the triggering request (e.g. `derived_assignment`, which has a NULL sensor_id).
+pub async fn wait_for_jobs_by_trigger(db: &sea_orm::DatabaseConnection, trigger_type: &str, timeout_secs: u64) -> bool {
+    use sea_orm::{ConnectionTrait, Statement};
+    let start = Instant::now();
+    loop {
+        let row = db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT \
+                   COUNT(*) FILTER (WHERE status IN ('pending','running')) AS active, \
+                   COUNT(*) FILTER (WHERE status = 'failed') AS failed, \
+                   COUNT(*) AS total \
+                 FROM reprocessing_jobs WHERE trigger_type = $1",
+                [trigger_type.into()],
+            ))
+            .await
+            .expect("query reprocessing_jobs")
+            .expect("count row");
+        let active: i64 = row.try_get("", "active").unwrap();
+        let failed: i64 = row.try_get("", "failed").unwrap();
+        let total: i64 = row.try_get("", "total").unwrap();
+        if total > 0 && active == 0 {
+            return failed == 0;
+        }
+        if start.elapsed().as_secs() > timeout_secs {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// A numeric array from a readings (`values`) or aggregate (`avg`/`min`/`max`/`count`) response.
 /// `key` matches a parameter by `name`, `display_name`, or `parameter_id` — the authenticated
 /// readings group by the site_parameter name while the public API uses the global parameter name,
