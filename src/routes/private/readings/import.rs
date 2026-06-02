@@ -22,6 +22,7 @@ use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams::services::get_or_create_api_stream;
 use crate::routes::private::readings;
+use crate::routes::private::readings::batch::{ConflictMode, readings_on_conflict};
 use crate::routes::resolve_site_with_project;
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -34,9 +35,12 @@ pub struct ImportCsvRequest {
     /// `null` skips the column. Overrides automatic resolution.
     #[serde(default)]
     pub mapping: Option<HashMap<String, Option<String>>>,
-    /// When true, resolve and report the plan without writing anything.
+    /// When true, resolve and report the plan (and overlap diff) without writing anything.
     #[serde(default)]
     pub dry_run: bool,
+    /// Behaviour on (stream_id, time, replicate_index) collisions. Defaults to `skip`.
+    #[serde(default)]
+    pub conflict: ConflictMode,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -66,12 +70,32 @@ pub struct ImportCsvResponse {
     pub derived_timestamps: usize,
     /// Readings skipped because they already existed (idempotent re-import). 0 for `dry_run`.
     pub duplicates: usize,
+    /// Incoming readings whose (stream, time) already exists with the same stored value.
+    pub overlaps_identical: usize,
+    /// Incoming readings whose (stream, time) already exists with a different stored value.
+    /// In `overwrite` mode these are the rows that would be (or were) replaced.
+    pub overlaps_differing: usize,
+    /// Existing rows replaced because `conflict = overwrite`. Always 0 in `skip` mode or `dry_run`.
+    pub overwritten: usize,
+    /// Up to 20 differing overlaps, so the UI can preview what an overwrite would change.
+    pub overlap_sample: Vec<OverlapDiff>,
     /// Per-row problems (bad timestamp / non-numeric value): the offending row or cell is skipped
     /// and the rest import, so the operator can fix the source and re-import. Truncated for very
     /// large files (see `error_count`).
     pub errors: Vec<RowError>,
     /// Total number of row problems (may exceed `errors.len()` when the list is truncated).
     pub error_count: usize,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OverlapDiff {
+    pub time: chrono::DateTime<chrono::Utc>,
+    /// Parameter the differing value belongs to.
+    pub parameter_id: Uuid,
+    /// Currently stored value.
+    pub existing: f64,
+    /// Value from the imported CSV.
+    pub incoming: f64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -356,7 +380,11 @@ pub async fn import_csv(
         }
     }
 
-    // Dry run: report the plan without writing.
+    // Overlap diff: bucket incoming rows against what's already stored for this site, so the UI
+    // can preview what a re-import or overwrite would touch.
+    let overlap = compute_overlaps(&state.db, site_id, &rows).await?;
+
+    // Dry run: report the plan and overlap diff without writing.
     if req.dry_run {
         return Ok(Json(ImportCsvResponse {
             site_id,
@@ -373,6 +401,10 @@ pub async fn import_csv(
             derived_job_id: None,
             derived_timestamps: 0,
             duplicates: 0,
+            overlaps_identical: overlap.identical,
+            overlaps_differing: overlap.differing,
+            overwritten: 0,
+            overlap_sample: overlap.sample,
             errors,
             error_count,
         }));
@@ -414,22 +446,17 @@ pub async fn import_csv(
         })
         .collect();
 
-    let mut inserted_total = 0usize;
+    // In overwrite mode `rows_affected` counts inserts plus updates; the overlap diff already
+    // told us how many existing rows there are, so inserts = affected - overlapping rows.
+    let overlapping = overlap.identical + overlap.differing;
+    let mut affected_total = 0usize;
     for chunk in models.chunks(BATCH_SIZE) {
         match readings::Entity::insert_many(chunk.to_vec())
-            .on_conflict(
-                sea_orm::sea_query::OnConflict::columns([
-                    readings::Column::StreamId,
-                    readings::Column::Time,
-                    readings::Column::ReplicateIndex,
-                ])
-                .do_nothing()
-                .to_owned(),
-            )
+            .on_conflict(readings_on_conflict(req.conflict))
             .exec_without_returning(&state.db)
             .await
         {
-            Ok(affected) => inserted_total += affected as usize,
+            Ok(affected) => affected_total += affected as usize,
             Err(e) => {
                 let msg = e.to_string();
                 if !msg.contains("None of the records") {
@@ -440,7 +467,12 @@ pub async fn import_csv(
         }
     }
 
-    tracing::info!(site = %site.name, inserted_total, params = mappings.len(), "CSV import inserted readings");
+    let (inserted_total, overwritten) = match req.conflict {
+        ConflictMode::Skip => (affected_total, 0),
+        ConflictMode::Overwrite => (affected_total.saturating_sub(overlapping), overlap.differing),
+    };
+
+    tracing::info!(site = %site.name, inserted_total, overwritten, params = mappings.len(), "CSV import inserted readings");
 
     // Recompute derived parameters + refresh aggregates in the background as a tracked
     // reprocessing job, so the request returns immediately after the (fast) raw insert. Skip
@@ -451,7 +483,7 @@ pub async fn import_csv(
     distinct_ts.dedup();
     let derived_timestamps = distinct_ts.len();
 
-    let derived_job_id = if inserted_total > 0 {
+    let derived_job_id = if inserted_total > 0 || overwritten > 0 {
         let job_id = Uuid::new_v4();
         let total = i32::try_from(derived_timestamps).unwrap_or(i32::MAX);
         state
@@ -517,7 +549,7 @@ pub async fn import_csv(
         None
     };
 
-    // Readings we tried to insert but that already existed (skipped via ON CONFLICT).
+    // Readings we tried to insert but that already existed (skipped, or overwritten).
     let duplicates = rows.len().saturating_sub(inserted_total);
 
     Ok(Json(ImportCsvResponse {
@@ -535,7 +567,97 @@ pub async fn import_csv(
         derived_job_id,
         derived_timestamps,
         duplicates,
+        overlaps_identical: overlap.identical,
+        overlaps_differing: overlap.differing,
+        overwritten,
+        overlap_sample: overlap.sample,
         errors,
         error_count,
     }))
+}
+
+struct OverlapReport {
+    identical: usize,
+    differing: usize,
+    sample: Vec<OverlapDiff>,
+}
+
+/// Cap on differing-overlap rows returned for UI preview.
+const OVERLAP_SAMPLE_CAP: usize = 20;
+/// Tolerance for treating an incoming value as identical to the stored one.
+const OVERLAP_EPSILON: f64 = 1e-9;
+
+/// Bucket incoming `(parameter_id, time, stored_value)` rows against existing readings for the
+/// site into identical vs differing overlaps. Existing values are fetched in one batched query per
+/// chunk keyed by (parameter_id, time) at `replicate_index = 0`.
+async fn compute_overlaps(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    rows: &[(Uuid, chrono::DateTime<chrono::Utc>, f64)],
+) -> AppResult<OverlapReport> {
+    let mut identical = 0usize;
+    let mut differing = 0usize;
+    let mut sample = Vec::new();
+
+    if rows.is_empty() {
+        return Ok(OverlapReport { identical, differing, sample });
+    }
+
+    const CHUNK: usize = 1000;
+    for chunk in rows.chunks(CHUNK) {
+        let mut params: Vec<sea_orm::Value> = Vec::with_capacity(chunk.len() * 2);
+        let mut placeholders: Vec<String> = Vec::with_capacity(chunk.len());
+        for (pid, time, _) in chunk {
+            let base = params.len();
+            params.push((*pid).into());
+            params.push(sea_orm::prelude::DateTimeWithTimeZone::from(*time).into());
+            placeholders.push(format!("(${},${})", base + 1, base + 2));
+        }
+        params.push(site_id.into());
+        let site_idx = params.len();
+
+        let sql = format!(
+            "SELECT parameter_id, time, COALESCE(calibrated_value, raw_value) AS val \
+             FROM readings \
+             WHERE site_id = ${site_idx} AND replicate_index = 0 \
+             AND (parameter_id, time) IN ({})",
+            placeholders.join(",")
+        );
+
+        let existing_rows = db
+            .query_all(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                &sql,
+                params,
+            ))
+            .await?;
+
+        let mut existing: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), f64> = HashMap::new();
+        for row in &existing_rows {
+            let Ok(pid) = row.try_get::<Uuid>("", "parameter_id") else { continue };
+            let Ok(t) = row.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "time") else { continue };
+            let Ok(val) = row.try_get::<f64>("", "val") else { continue };
+            existing.insert((pid, t.with_timezone(&chrono::Utc)), val);
+        }
+
+        for (pid, time, incoming) in chunk {
+            if let Some(&stored) = existing.get(&(*pid, *time)) {
+                if (stored - incoming).abs() <= OVERLAP_EPSILON {
+                    identical += 1;
+                } else {
+                    differing += 1;
+                    if sample.len() < OVERLAP_SAMPLE_CAP {
+                        sample.push(OverlapDiff {
+                            time: *time,
+                            parameter_id: *pid,
+                            existing: stored,
+                            incoming: *incoming,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(OverlapReport { identical, differing, sample })
 }

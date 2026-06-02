@@ -1,5 +1,5 @@
 use axum::{Json, extract::State};
-use sea_orm::{EntityTrait, Set};
+use sea_orm::{ConnectionTrait, EntityTrait, Set};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
@@ -10,9 +10,23 @@ use crate::routes::private::readings;
 use crate::error::AppResult;
 use crate::routes::private::data_streams::services::get_or_create_api_stream;
 
+/// How to handle readings that collide with an existing (stream_id, time, replicate_index).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictMode {
+    /// Keep the existing row, drop the incoming one.
+    #[default]
+    Skip,
+    /// Replace the stored values with the incoming ones.
+    Overwrite,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct BatchReadingsRequest {
     pub readings: Vec<ReadingInput>,
+    /// Behaviour on (stream_id, time, replicate_index) collisions. Defaults to `skip`.
+    #[serde(default)]
+    pub conflict: ConflictMode,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -34,9 +48,33 @@ pub struct ReadingInput {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct BatchReadingsResponse {
     pub inserted: usize,
+    /// Existing rows replaced because `conflict = overwrite`. Always 0 in `skip` mode.
+    pub overwritten: usize,
 }
 
 const BATCH_SIZE: usize = 1000;
+
+/// Build the `ON CONFLICT` clause for the readings PK. In `skip` mode collisions are dropped;
+/// in `overwrite` mode the value columns are replaced from the incoming row.
+pub(crate) fn readings_on_conflict(mode: ConflictMode) -> sea_orm::sea_query::OnConflict {
+    let mut clause = sea_orm::sea_query::OnConflict::columns([
+        readings::Column::StreamId,
+        readings::Column::Time,
+        readings::Column::ReplicateIndex,
+    ]);
+    match mode {
+        ConflictMode::Skip => {
+            clause.do_nothing();
+        }
+        ConflictMode::Overwrite => {
+            clause.update_columns([
+                readings::Column::RawValue,
+                readings::Column::CalibratedValue,
+            ]);
+        }
+    }
+    clause.to_owned()
+}
 
 /// Batch insert readings keyed by (site_id, parameter_id). Auto-creates "api" streams when
 /// a (site, parameter) pair has none. 10MB body limit. Requires `write_data`.
@@ -121,22 +159,28 @@ pub async fn insert_batch_readings(
 
     let total = models.len();
     let mut inserted = 0usize;
+    let mut overwritten = 0usize;
+    let conflict = payload.conflict;
 
     for chunk in models.chunks(BATCH_SIZE) {
+        // In overwrite mode `rows_affected` counts both inserts and updates, so the count of
+        // keys already present (looked up before the write) tells us how many were replaced.
+        let pre_existing = if conflict == ConflictMode::Overwrite {
+            count_existing(&state.db, chunk).await?
+        } else {
+            0
+        };
+
         match readings::Entity::insert_many(chunk.to_vec())
-            .on_conflict(
-                sea_orm::sea_query::OnConflict::columns([
-                    readings::Column::StreamId,
-                    readings::Column::Time,
-                    readings::Column::ReplicateIndex,
-                ])
-                .do_nothing()
-                .to_owned(),
-            )
+            .on_conflict(readings_on_conflict(conflict))
             .exec_without_returning(&state.db)
             .await
         {
-            Ok(rows) => inserted += rows as usize,
+            Ok(rows) => {
+                let affected = rows as usize;
+                inserted += affected.saturating_sub(pre_existing);
+                overwritten += pre_existing;
+            }
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("None of the records") {
@@ -149,10 +193,11 @@ pub async fn insert_batch_readings(
         }
     }
 
-    tracing::info!(total, inserted, "Batch readings insert complete");
+    tracing::info!(total, inserted, overwritten, "Batch readings insert complete");
 
-    // Invalidate response cache and auto-compute derived parameters for all affected sites
-    if inserted > 0 {
+    // Invalidate response cache and auto-compute derived parameters for all affected sites.
+    // Cascade also runs when rows were overwritten, since their downstream values are now stale.
+    if inserted > 0 || overwritten > 0 {
         let affected_site_ids: std::collections::HashSet<Uuid> =
             stream_cache.keys().map(|(site_id, _)| *site_id).collect();
         for site_id in &affected_site_ids {
@@ -160,9 +205,36 @@ pub async fn insert_batch_readings(
             crate::common::cache::invalidate_prefix(&state, &format!("aggregates:{site_id}")).await;
         }
 
-        // Auto-compute derived values for affected sites
+        // Auto-compute derived values for affected sites and refresh aggregates, tracked as a job.
+        let total_ts: usize = site_timestamps_for_derived.values().map(Vec::len).sum();
+        let earliest = site_timestamps_for_derived
+            .values()
+            .flatten()
+            .min()
+            .copied();
+        let job_id = Uuid::new_v4();
+        let job_total = i32::try_from(total_ts).unwrap_or(i32::MAX);
+        state
+            .db
+            .execute(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status, total, progress) \
+                 VALUES ($1, NULL, 'batch_derived', NULL, 'pending', $2, 0)",
+                [job_id.into(), job_total.into()],
+            ))
+            .await?;
+
         let db_clone = state.db.clone();
         tokio::spawn(async move {
+            let _ = db_clone
+                .execute(sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "UPDATE reprocessing_jobs SET status = 'running' WHERE id = $1",
+                    [job_id.into()],
+                ))
+                .await;
+
+            let mut progress = 0i32;
             for (site_id, timestamps) in site_timestamps_for_derived {
                 for time in timestamps {
                     if let Err(e) =
@@ -178,10 +250,73 @@ pub async fn insert_batch_readings(
                             "Failed to auto-compute derived values after batch insert"
                         );
                     }
+                    progress += 1;
+                    if progress % 500 == 0 {
+                        let _ = db_clone
+                            .execute(sea_orm::Statement::from_sql_and_values(
+                                sea_orm::DatabaseBackend::Postgres,
+                                "UPDATE reprocessing_jobs SET progress = $1 WHERE id = $2",
+                                [progress.into(), job_id.into()],
+                            ))
+                            .await;
+                    }
                 }
             }
+
+            crate::common::sync_state::refresh_continuous_aggregates(&db_clone, earliest).await;
+
+            let _ = db_clone
+                .execute(sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "UPDATE reprocessing_jobs SET status = 'completed', progress = total, \
+                     completed_at = NOW() WHERE id = $1",
+                    [job_id.into()],
+                ))
+                .await;
         });
     }
 
-    Ok(Json(BatchReadingsResponse { inserted }))
+    Ok(Json(BatchReadingsResponse {
+        inserted,
+        overwritten,
+    }))
+}
+
+/// Count how many of the chunk's (stream_id, time, replicate_index) keys already exist, so the
+/// caller can split `rows_affected` into inserts vs overwrites in `overwrite` mode.
+async fn count_existing(
+    db: &sea_orm::DatabaseConnection,
+    chunk: &[readings::ActiveModel],
+) -> AppResult<usize> {
+    use sea_orm::{ColumnTrait, Condition, QueryFilter, QuerySelect, sea_query::Expr};
+
+    if chunk.is_empty() {
+        return Ok(0);
+    }
+
+    let mut condition = Condition::any();
+    for m in chunk {
+        let (sea_orm::ActiveValue::Set(stream_id), sea_orm::ActiveValue::Set(time), sea_orm::ActiveValue::Set(rep)) =
+            (m.stream_id.clone(), m.time.clone(), m.replicate_index.clone())
+        else {
+            continue;
+        };
+        condition = condition.add(
+            Condition::all()
+                .add(readings::Column::StreamId.eq(stream_id))
+                .add(readings::Column::Time.eq(time))
+                .add(readings::Column::ReplicateIndex.eq(rep)),
+        );
+    }
+
+    let count = readings::Entity::find()
+        .select_only()
+        .column_as(Expr::col(readings::Column::StreamId).count(), "n")
+        .filter(condition)
+        .into_tuple::<i64>()
+        .one(db)
+        .await?
+        .unwrap_or(0);
+
+    Ok(usize::try_from(count).unwrap_or(0))
 }

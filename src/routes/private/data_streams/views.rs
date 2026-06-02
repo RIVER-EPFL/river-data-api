@@ -301,11 +301,38 @@ pub async fn pair_stream(
     ))
     .await?;
 
-    // Trigger aggregate refresh in background
+    // Trigger aggregate refresh in background, tracked as a reprocessing job.
     if backfilled > 0 {
+        let job_id = Uuid::new_v4();
+        let backfilled_count = i32::try_from(backfilled).unwrap_or(i32::MAX);
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status, total, progress, readings_updated) \
+             VALUES ($1, NULL, 'pairing_backfill', $2, 'pending', 1, 0, $3)",
+            [job_id.into(), stream_id.into(), backfilled_count.into()],
+        ))
+        .await?;
+
         let db_clone = db.clone();
         tokio::spawn(async move {
+            let _ = db_clone
+                .execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "UPDATE reprocessing_jobs SET status = 'running' WHERE id = $1",
+                    [job_id.into()],
+                ))
+                .await;
+
             refresh_continuous_aggregates_full(&db_clone).await;
+
+            let _ = db_clone
+                .execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "UPDATE reprocessing_jobs SET status = 'completed', progress = total, \
+                     completed_at = NOW() WHERE id = $1",
+                    [job_id.into()],
+                ))
+                .await;
         });
     }
 

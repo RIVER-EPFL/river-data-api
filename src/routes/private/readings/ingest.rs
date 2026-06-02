@@ -178,16 +178,36 @@ pub async fn ingest_readings(
         }
     }
 
-    // Auto-compute derived parameters for newly ingested timestamps (batched)
+    // Auto-compute derived parameters for newly ingested timestamps (batched), tracked as a job.
     if paired && inserted > 0
         && let Some(sid) = site_id
     {
-        let db_clone = state.db.clone();
         let mut unique_timestamps: Vec<chrono::DateTime<Utc>> =
             payload.readings.iter().map(|r| r.time).collect();
         unique_timestamps.sort();
         unique_timestamps.dedup();
+
+        let job_id = Uuid::new_v4();
+        let job_total = i32::try_from(unique_timestamps.len()).unwrap_or(i32::MAX);
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status, total, progress) \
+             VALUES ($1, NULL, 'ingest_derived', NULL, 'pending', $2, 0)",
+            [job_id.into(), job_total.into()],
+        ))
+        .await?;
+
+        let db_clone = state.db.clone();
         tokio::spawn(async move {
+            let _ = db_clone
+                .execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "UPDATE reprocessing_jobs SET status = 'running' WHERE id = $1",
+                    [job_id.into()],
+                ))
+                .await;
+
+            let mut progress = 0i32;
             for time in unique_timestamps {
                 if let Err(e) =
                     crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
@@ -202,7 +222,26 @@ pub async fn ingest_readings(
                         "Failed to auto-compute derived values after ingest"
                     );
                 }
+                progress += 1;
+                if progress % 500 == 0 {
+                    let _ = db_clone
+                        .execute(Statement::from_sql_and_values(
+                            sea_orm::DatabaseBackend::Postgres,
+                            "UPDATE reprocessing_jobs SET progress = $1 WHERE id = $2",
+                            [progress.into(), job_id.into()],
+                        ))
+                        .await;
+                }
             }
+
+            let _ = db_clone
+                .execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "UPDATE reprocessing_jobs SET status = 'completed', progress = total, \
+                     completed_at = NOW() WHERE id = $1",
+                    [job_id.into()],
+                ))
+                .await;
         });
     }
 
