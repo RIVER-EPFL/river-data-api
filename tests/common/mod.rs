@@ -43,8 +43,6 @@ fn test_config() -> Config {
         db_max_connections: 25,
         db_min_connections: 1,
         request_timeout_seconds: 60,
-        max_readings_time_range_days: 90,
-        max_aggregates_time_range_days: 365,
         default_readings_lookback_days: 7,
         public_rate_limit_burst: 10,
         public_rate_limit_period_secs: 2,

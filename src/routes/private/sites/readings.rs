@@ -17,7 +17,7 @@ use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
 use crate::routes::private::{parameters, site_parameters};
 use crate::error::{AppError, AppResult};
-use crate::routes::{cache, enforce_time_range, resolve_site_with_project};
+use crate::routes::{cache, validate_optional_time_range, resolve_site_with_project};
 use crate::common::bulk::{self, StreamableParam};
 
 use super::types::{ProjectRef, SiteRef};
@@ -176,13 +176,11 @@ pub async fn get_site_readings(
         name: site.name.clone(),
     };
 
-    // Enforce time range limits
-    let (effective_start, effective_end) = enforce_time_range(
-        query.start,
-        query.end,
-        state.config.max_readings_time_range_days,
-        state.config.default_readings_lookback_days,
-    )?;
+    let effective_start = query.start.unwrap_or_else(|| {
+        chrono::Utc::now() - chrono::Duration::days(state.config.default_readings_lookback_days)
+    });
+    let effective_end = query.end;
+    validate_optional_time_range(Some(effective_start), effective_end)?;
 
     // Determine format from query or Accept header
     let format = bulk::determine_format(&query.format, &headers);

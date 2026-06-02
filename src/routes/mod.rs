@@ -160,43 +160,6 @@ pub fn validate_optional_time_range(
     Ok(())
 }
 
-/// Enforce a maximum time range span and require `start`.
-/// If `start` is None, defaults to `now - default_lookback_days`.
-/// Returns the effective (start, end) after applying defaults and validation.
-pub fn enforce_time_range(
-    start: Option<chrono::DateTime<chrono::Utc>>,
-    end: Option<chrono::DateTime<chrono::Utc>>,
-    max_days: i64,
-    default_lookback_days: i64,
-) -> AppResult<(chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>)> {
-    let effective_start = start.unwrap_or_else(|| {
-        chrono::Utc::now() - chrono::Duration::days(default_lookback_days)
-    });
-
-    if let Some(e) = end {
-        if e < effective_start {
-            return Err(AppError::BadRequest(
-                "end time must not be before start time".to_string(),
-            ));
-        }
-        let span = e - effective_start;
-        if span > chrono::Duration::days(max_days) {
-            return Err(AppError::BadRequest(format!(
-                "Time range exceeds maximum of {max_days} days"
-            )));
-        }
-    } else {
-        // No end specified — check span against now
-        let span = chrono::Utc::now() - effective_start;
-        if span > chrono::Duration::days(max_days) {
-            return Err(AppError::BadRequest(format!(
-                "Time range exceeds maximum of {max_days} days (provide a narrower start or add an end time)"
-            )));
-        }
-    }
-
-    Ok((effective_start, end))
-}
 
 #[derive(OpenApi)]
 #[openapi(

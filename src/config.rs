@@ -65,9 +65,7 @@ pub struct Config {
     // Request timeout (seconds)
     pub request_timeout_seconds: u64,
 
-    // Time range limits (days)
-    pub max_readings_time_range_days: i64,
-    pub max_aggregates_time_range_days: i64,
+    // Default lookback when no start time is provided (days)
     pub default_readings_lookback_days: i64,
 
     // Public API rate limit (token bucket: burst_size cells, refilled 1 per period)
@@ -196,15 +194,6 @@ impl Config {
                 .parse()
                 .unwrap_or(60),
 
-            // Time range limits
-            max_readings_time_range_days: env::var("MAX_READINGS_TIME_RANGE_DAYS")
-                .unwrap_or_else(|_| "90".to_string())
-                .parse()
-                .unwrap_or(90),
-            max_aggregates_time_range_days: env::var("MAX_AGGREGATES_TIME_RANGE_DAYS")
-                .unwrap_or_else(|_| "1825".to_string())
-                .parse()
-                .unwrap_or(1825),
             default_readings_lookback_days: env::var("DEFAULT_READINGS_LOOKBACK_DAYS")
                 .unwrap_or_else(|_| "7".to_string())
                 .parse()
