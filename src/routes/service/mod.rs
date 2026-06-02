@@ -1,4 +1,9 @@
-use axum::{Router, middleware, routing::{get, patch, post}};
+use axum::{
+    Router, middleware,
+    extract::{Request, State},
+    response::Response,
+    routing::{get, patch, post},
+};
 use tower_http::limit::RequestBodyLimitLayer;
 use utoipa_axum::router::OpenApiRouter;
 
@@ -36,6 +41,27 @@ const ACTION_BODY_LIMIT: usize = 1024 * 1024; // 1 MB — preserved from the for
 const DATA_BODY_LIMIT: usize = 10 * 1024 * 1024; // 10 MB — bulk ingestion
 const IMPORT_BODY_LIMIT: usize = 50 * 1024 * 1024; // 50 MB — CSV import
 
+/// Clear the public API config cache after a successful mutating request.
+///
+/// Layered onto the projects/sites/site_parameters CRUD routers — the entities the
+/// public config (`public_config_cache`) is built from. Deliberately coarse: it drops
+/// the whole cache rather than resolving the affected project slug, since the cache is
+/// a read-through convenience that rebuilds on the next public request, not a source of
+/// truth. GET/HEAD requests and failed mutations leave it untouched.
+async fn invalidate_public_config_on_mutation(
+    State(state): State<AppState>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    let is_mutation = !matches!(request.method().as_str(), "GET" | "HEAD" | "OPTIONS");
+    let response = next.run(request).await;
+    if is_mutation && response.status().is_success() {
+        state.public_config_cache.invalidate_all();
+        tracing::debug!("Public API config cache cleared after entity mutation");
+    }
+    response
+}
+
 /// The single `/api/` router. Mounted by the parent router which wraps it with
 /// dual-auth (`service_auth_middleware`), Keycloak JWT pass-through, and optional
 /// rate limiting. Per-route authorization is enforced inside this function via
@@ -53,12 +79,20 @@ pub fn api_router(state: &AppState) -> Router<()> {
         // can't enumerate credentials. See plan: defense in depth.
         r.layer(middleware::from_fn(require_admin))
     };
+    // Clear the public API config cache whenever a project/site/site_parameter is
+    // created, updated, or deleted. Coarse and best-effort — see the middleware doc.
+    let invalidate_public_config = |r: OpenApiRouter| -> OpenApiRouter {
+        r.layer(middleware::from_fn_with_state(
+            state.clone(),
+            invalidate_public_config_on_mutation,
+        ))
+    };
 
     let entity_router: Router<()> = OpenApiRouter::new()
-        .nest("/projects", crate::routes::private::projects::router::service_router(state))
-        .nest("/sites", crate::routes::private::sites::router::service_router(state))
+        .nest("/projects", invalidate_public_config(crate::routes::private::projects::router::service_router(state)))
+        .nest("/sites", invalidate_public_config(crate::routes::private::sites::router::service_router(state)))
         .nest("/parameters", with_crud_perms(Parameter::router(db)))
-        .nest("/site_parameters", with_crud_perms(SiteParameter::router(db)))
+        .nest("/site_parameters", invalidate_public_config(with_crud_perms(SiteParameter::router(db))))
         .nest("/sensors", with_crud_perms(Sensor::router(db)))
         .nest("/sensor_calibrations", with_crud_perms(SensorCalibration::router(db)))
         .nest("/sensor_deployments", with_crud_perms(SensorDeployment::router(db)))
