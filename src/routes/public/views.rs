@@ -43,7 +43,6 @@ fn default_format() -> String {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SiteRef {
     pub id: String,
-    pub uuid: String,
     pub name: String,
 }
 
@@ -180,7 +179,6 @@ pub async fn list_sites(
         .iter()
         .map(|s| SiteRef {
             id: s.slug.clone(),
-            uuid: s.site_id.to_string(),
             name: s.name.clone(),
         })
         .collect();
@@ -279,7 +277,6 @@ pub async fn get_site(
     Ok(Json(SiteDetailResponse {
         site: SiteRef {
             id: site.slug.clone(),
-            uuid: site.site_id.to_string(),
             name: site.name.clone(),
         },
         parameters: params,
@@ -439,7 +436,6 @@ pub async fn get_readings(
         let response = ReadingsResponse {
             site: SiteRef {
                 id: site.slug.clone(),
-                uuid: site.site_id.to_string(),
                 name: site.name.clone(),
             },
             start: None,
@@ -472,7 +468,6 @@ pub async fn get_readings(
             let response = ReadingsResponse {
                 site: SiteRef {
                     id: site.slug.clone(),
-                    uuid: site.site_id.to_string(),
                     name: site.name.clone(),
                 },
                 start: actual_start,
@@ -608,7 +603,6 @@ pub async fn get_aggregates(
         let response = AggregatesResponse {
             site: SiteRef {
                 id: site.slug.clone(),
-                uuid: site.site_id.to_string(),
                 name: site.name.clone(),
             },
             resolution,
@@ -638,7 +632,6 @@ pub async fn get_aggregates(
         let response = AggregatesResponse {
             site: SiteRef {
                 id: site.slug.clone(),
-                uuid: site.site_id.to_string(),
                 name: site.name.clone(),
             },
             resolution,
@@ -787,7 +780,6 @@ pub async fn get_aggregates(
             let response = AggregatesResponse {
                 site: SiteRef {
                     id: site.slug.clone(),
-                    uuid: site.site_id.to_string(),
                     name: site.name.clone(),
                 },
                 resolution,
