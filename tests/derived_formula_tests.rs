@@ -99,6 +99,64 @@ async fn cleanup_derived_param(app: &axum::Router, token: &str, id: &str) {
 }
 
 // =============================================================================
+// GET by id must populate `sources` via the join (regression guard for the
+// fk_column fix — the create response built sources in-memory, but the GET path
+// loads them through CrudCrate's join, which previously returned []).
+// =============================================================================
+
+#[tokio::test]
+#[serial]
+async fn test_get_derived_parameter_populates_sources() {
+    let (_db, app, token) = setup().await;
+    let name = format!("get_sources_{}", uuid::Uuid::new_v4());
+
+    let (status, created) =
+        create_derived_param(&app, &token, &name, "Turbidity + Dissolved_O2").await;
+    assert!(
+        (200..300).contains(&status),
+        "create failed {status}: {created}"
+    );
+    let id = created["id"].as_str().expect("created response should have id");
+
+    let (gstatus, gtext) =
+        common::get_with_token(&app, &format!("/api/derived_parameters/{id}"), &token).await;
+    assert_eq!(gstatus, 200, "GET by id failed: {gtext}");
+    let json: serde_json::Value = serde_json::from_str(&gtext).expect("valid json");
+    let sources = json["sources"]
+        .as_array()
+        .unwrap_or_else(|| panic!("sources should be a populated array on GET, got: {json}"));
+    assert_eq!(
+        sources.len(),
+        2,
+        "GET by id should populate 2 sources via the join, got: {sources:?}"
+    );
+
+    // The UI loads derived definitions via the LIST endpoint, so the join must
+    // populate there too (it uses the same fk_column config).
+    let (lstatus, ltext) =
+        common::get_with_token(&app, "/api/derived_parameters?page_size=200", &token).await;
+    assert_eq!(lstatus, 200, "list failed: {ltext}");
+    let list: serde_json::Value = serde_json::from_str(&ltext).expect("valid json");
+    let items = list.as_array().cloned().unwrap_or_else(|| {
+        list["data"].as_array().cloned().expect("list should be an array or {data: []}")
+    });
+    let created_in_list = items
+        .iter()
+        .find(|d| d["id"].as_str() == Some(id))
+        .unwrap_or_else(|| panic!("created def should be in the list response"));
+    let list_sources = created_in_list["sources"]
+        .as_array()
+        .unwrap_or_else(|| panic!("sources should be populated in the list response too"));
+    assert_eq!(
+        list_sources.len(),
+        2,
+        "list endpoint should populate 2 sources via the join, got: {list_sources:?}"
+    );
+
+    cleanup_derived_param(&app, &token, id).await;
+}
+
+// =============================================================================
 // 1. Create with valid formula — sources auto-populated
 // =============================================================================
 
