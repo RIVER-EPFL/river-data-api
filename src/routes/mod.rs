@@ -373,43 +373,24 @@ pub fn build_router(state: AppState) -> Router {
     let config = &state.config;
 
     if config.disable_rate_limiting {
-        tracing::warn!("Rate limiting DISABLED");
+        tracing::warn!("Rate limiting DISABLED (including public API)");
     } else {
         tracing::info!(
-            metadata_rate = %format!("{}/s burst {}", config.rate_limit_metadata_per_second, config.rate_limit_metadata_burst),
-            data_rate = %format!("{}/s burst {}", config.rate_limit_data_per_second, config.rate_limit_data_burst),
+            public_rate = %format!("burst {} / {}s refill", config.public_rate_limit_burst, config.public_rate_limit_period_secs),
             bulk_concurrent = config.bulk_concurrent_limit,
-            "Rate limiting configured"
+            "Public API rate limiting configured"
         );
     }
 
-    // Unified /api/ router. Hosts everything previously split between /api/admin/
-    // and /api/service/. Per-route authorization lives in api_router itself via the
-    // require_* middleware; here we layer dual-auth and rate limiting on top.
     let api_inner = service::api_router(&state);
 
     // Public API routes
     let public_routes = public_api::public_router();
 
-    // Apply optional rate limiting
-    let api_rated = if config.disable_rate_limiting {
-        api_inner
-    } else {
-        let api_limiter = GovernorConfigBuilder::default()
-            .key_extractor(FallbackIpKeyExtractor)
-            .per_second(config.rate_limit_data_per_second)
-            .burst_size(config.rate_limit_data_burst)
-            .finish()
-            .expect("Failed to create api rate limiter");
-
-        api_inner.layer(GovernorLayer {
-            config: Arc::new(api_limiter),
-        })
-    };
-
-    // Apply dual auth (Keycloak JWT OR API token)
+    // Apply dual auth (Keycloak JWT OR API token).
+    // No rate limiting on authenticated tier — auth is the gate.
     let api_authed = {
-        let mut r = api_rated.layer(middleware::from_fn_with_state(
+        let mut r = api_inner.layer(middleware::from_fn_with_state(
             state.clone(),
             crate::common::middleware::service_auth_middleware,
         ));

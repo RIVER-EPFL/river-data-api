@@ -33,10 +33,6 @@ fn test_config() -> Config {
         api_host: "127.0.0.1".to_string(),
         api_port: 0,
         disable_rate_limiting: true,
-        rate_limit_metadata_per_second: 1000,
-        rate_limit_metadata_burst: 1000,
-        rate_limit_data_per_second: 1000,
-        rate_limit_data_burst: 1000,
         bulk_concurrent_limit: 100,
         cache_ttl_seconds: 0,
         cache_max_bytes: 0,
@@ -70,10 +66,6 @@ pub fn build_test_app_with_cache(db: DatabaseConnection) -> axum::Router {
 pub fn build_test_app_with_rate_limiting(db: DatabaseConnection) -> axum::Router {
     let mut config = test_config();
     config.disable_rate_limiting = false;
-    config.rate_limit_metadata_per_second = 2;
-    config.rate_limit_metadata_burst = 3;
-    config.rate_limit_data_per_second = 2;
-    config.rate_limit_data_burst = 3;
     let state = AppState::new(db, config, None);
     river_db::routes::build_router(state)
 }
