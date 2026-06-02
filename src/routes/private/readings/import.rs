@@ -658,6 +658,12 @@ pub async fn import_csv(
         None
     };
 
+    let new_rows = rows.len().saturating_sub(overlapping);
+    let (inserted_total, duplicates, overwritten) = match req.conflict {
+        ConflictMode::Skip => (new_rows, overlapping, 0),
+        ConflictMode::Overwrite => (new_rows, overlap.identical, overlap.differing),
+    };
+
     Ok(Json(ImportCsvResponse {
         site_id,
         site_name: site.name,
@@ -668,15 +674,15 @@ pub async fn import_csv(
         unmapped_columns,
         warnings,
         row_count,
-        inserted_total: 0,
+        inserted_total,
         earliest,
         latest,
         derived_job_id,
         derived_timestamps,
-        duplicates: 0,
+        duplicates,
         overlaps_identical: overlap.identical,
         overlaps_differing: overlap.differing,
-        overwritten: 0,
+        overwritten,
         overlap_sample: overlap.sample,
         errors,
         error_count,

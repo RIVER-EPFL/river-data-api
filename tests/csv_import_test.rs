@@ -134,16 +134,12 @@ async fn test_csv_import_dry_run_then_write_skips_derived_and_recomputes() {
     assert_eq!(resp["inserted_total"].as_u64().unwrap(), 4);
     assert!(resp["derived_job_id"].is_string(), "expected a background derived job: {resp}");
 
-    // Raw values land immediately.
+    // Insert runs in a background job; poll until the reading appears.
     assert_eq!(
-        scalar(&db, common::GLOBAL_PARAM_DO_ID, "2025-02-01T00:00:00Z", "raw_value").await,
-        Some(250.0)
+        poll_scalar(&db, common::GLOBAL_PARAM_DO_ID, "2025-02-01T00:00:00Z", "raw_value", 10).await,
+        Some(250.0),
+        "background insert should write raw_value within 10s"
     );
-    // Derived recomputation runs via tokio::spawn inside the import handler.
-    // In test context the spawned task may not complete because the DB pool
-    // is shared with the test's own queries — this is a known test-infrastructure
-    // limitation, not a code bug. The e2e workflow test covers derived recomputation
-    // via a separate polling approach.
 
     // Idempotent re-import: nothing inserted, no background job started.
     let (_s, again) = import(
@@ -185,8 +181,9 @@ async fn test_csv_import_explicit_mapping_overrides_and_skips() {
     assert!(skipped.contains(&"junk".to_string()), "junk must be skipped: {resp}");
     assert_eq!(resp["inserted_total"].as_u64().unwrap(), 2);
     assert_eq!(
-        scalar(&db, common::GLOBAL_PARAM_DO_ID, "2025-02-02T00:00:00Z", "raw_value").await,
-        Some(250.0)
+        poll_scalar(&db, common::GLOBAL_PARAM_DO_ID, "2025-02-02T00:00:00Z", "raw_value", 10).await,
+        Some(250.0),
+        "background insert should write raw_value within 10s"
     );
 }
 
@@ -207,7 +204,7 @@ async fn test_csv_import_rejects_when_no_columns_resolve() {
 #[tokio::test]
 #[serial]
 async fn test_csv_import_collects_row_errors_and_counts_duplicates() {
-    let (_db, app, token) = setup().await;
+    let (db, app, token) = setup().await;
     // Row 2 good; row 3 has a bad DateTime; row 4 has a non-numeric Dissolved_O2 (its temperature
     // is still good). Headers match the catalog names directly.
     let csv = "DateTime,Dissolved_O2,DO_Temperature\n\
@@ -234,6 +231,12 @@ not-a-date,260,13.0\n\
         .join(" | ");
     assert!(msgs.contains("DateTime"), "should flag the bad timestamp: {msgs}");
     assert!(msgs.contains("abc"), "should flag the non-numeric value: {msgs}");
+
+    // Wait for the background insert to land before re-importing.
+    assert!(
+        poll_scalar(&db, common::GLOBAL_PARAM_DO_ID, "2025-04-01T00:00:00Z", "raw_value", 10).await.is_some(),
+        "background insert should write within 10s"
+    );
 
     // Re-import the same file: good rows are now duplicates (skipped, not errored); bad rows still error.
     let (_s, again) = import(
