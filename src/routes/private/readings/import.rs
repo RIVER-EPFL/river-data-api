@@ -450,7 +450,7 @@ pub async fn import_csv(
         ));
     }
 
-    // --- Insert raw readings ------------------------------------------------------------------
+    // --- Prepare insert models (synchronous, fast) ---------------------------------------------
     let mut stream_cache: HashMap<Uuid, Uuid> = HashMap::new();
     for m in &mappings {
         if let std::collections::hash_map::Entry::Vacant(e) = stream_cache.entry(m.parameter_id) {
@@ -480,60 +480,20 @@ pub async fn import_csv(
         })
         .collect();
 
-    // In overwrite mode `rows_affected` counts inserts plus updates; the overlap diff already
-    // told us how many existing rows there are, so inserts = affected - overlapping rows.
-    let overlapping = overlap.identical + overlap.differing;
-    let mut affected_total = 0usize;
-    for chunk in models.chunks(BATCH_SIZE) {
-        match readings::Entity::insert_many(chunk.to_vec())
-            .on_conflict(readings_on_conflict(req.conflict))
-            .exec_without_returning(&state.db)
-            .await
-        {
-            Ok(affected) => affected_total += affected as usize,
-            Err(e) => {
-                let msg = e.to_string();
-                if !msg.contains("None of the records") {
-                    tracing::warn!(error = %e, "Failed to insert imported readings chunk");
-                    return Err(AppError::Database(e));
-                }
-            }
-        }
-    }
-
-    let (inserted_total, overwritten) = match req.conflict {
-        ConflictMode::Skip => (affected_total, 0),
-        ConflictMode::Overwrite => (affected_total.saturating_sub(overlapping), overlap.differing),
-    };
-
-    tracing::info!(site = %site.name, inserted_total, overwritten, params = mappings.len(), "CSV import inserted readings");
-
-    // Emit DataIngested events per imported parameter
-    if inserted_total > 0 || overwritten > 0 {
-        for m in &mappings {
-            if let Some(&stream_id) = stream_cache.get(&m.parameter_id) {
-                let _ = state.events.send(AppEvent::DataIngested {
-                    site_id: Some(site_id),
-                    parameter_id: Some(m.parameter_id),
-                    stream_id,
-                    count: inserted_total + overwritten,
-                });
-            }
-        }
-    }
-
-    // Recompute derived parameters + refresh aggregates in the background as a tracked
-    // reprocessing job, so the request returns immediately after the (fast) raw insert. Skip
-    // entirely when nothing new was inserted (idempotent re-import).
     let mut distinct_ts: Vec<chrono::DateTime<chrono::Utc>> =
         rows.iter().map(|(_, t, _)| *t).collect();
     distinct_ts.sort_unstable();
     distinct_ts.dedup();
     let derived_timestamps = distinct_ts.len();
 
-    let derived_job_id = if inserted_total > 0 || overwritten > 0 {
+    let overlapping = overlap.identical + overlap.differing;
+    let overlap_differing = overlap.differing;
+    let has_work = rows.len() > overlapping || (overlap_differing > 0 && req.conflict == ConflictMode::Overwrite);
+
+    // --- Spawn background job for insert + derived recompute + aggregate refresh ---------------
+    let derived_job_id = if has_work {
         let job_id = Uuid::new_v4();
-        let total = i32::try_from(derived_timestamps).unwrap_or(i32::MAX);
+        let total = i32::try_from(models.len()).unwrap_or(i32::MAX);
         state
             .db
             .execute(Statement::from_sql_and_values(
@@ -549,6 +509,13 @@ pub async fn import_csv(
         let app = state.clone();
         let events = state.events.clone();
         let since = earliest;
+        let conflict = req.conflict;
+        let site_name = site.name.clone();
+        let param_streams: Vec<(Uuid, Uuid)> = mappings
+            .iter()
+            .filter_map(|m| stream_cache.get(&m.parameter_id).map(|&sid| (m.parameter_id, sid)))
+            .collect();
+
         tokio::spawn(async move {
             let _ = db
                 .execute(Statement::from_sql_and_values(
@@ -558,51 +525,131 @@ pub async fn import_csv(
                 ))
                 .await;
 
-            let mut filled = 0i32;
-            for (i, time) in distinct_ts.iter().enumerate() {
-                if crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
-                    &db, site_id, *time,
-                )
-                .await
-                .is_ok()
+            // Phase 1: insert readings
+            let mut affected_total = 0usize;
+            let mut inserted_so_far = 0usize;
+            for chunk in models.chunks(BATCH_SIZE) {
+                match readings::Entity::insert_many(chunk.to_vec())
+                    .on_conflict(readings_on_conflict(conflict))
+                    .exec_without_returning(&db)
+                    .await
                 {
-                    filled += 1;
+                    Ok(affected) => affected_total += affected as usize,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if !msg.contains("None of the records") {
+                            tracing::warn!(error = %e, "Failed to insert imported readings chunk");
+                            let _ = db
+                                .execute(Statement::from_sql_and_values(
+                                    sea_orm::DatabaseBackend::Postgres,
+                                    "UPDATE reprocessing_jobs SET status = 'failed', \
+                                     error_message = $1, completed_at = NOW() WHERE id = $2",
+                                    [msg.into(), job_id.into()],
+                                ))
+                                .await;
+                            let _ = events.send(AppEvent::JobCompleted {
+                                job_id,
+                                status: "failed".to_string(),
+                                readings_updated: None,
+                                error_message: Some(e.to_string()),
+                            });
+                            return;
+                        }
+                    }
                 }
-                if (i + 1) % 500 == 0 {
+                inserted_so_far += chunk.len();
+                if inserted_so_far % 5000 < BATCH_SIZE {
                     let _ = db
                         .execute(Statement::from_sql_and_values(
                             sea_orm::DatabaseBackend::Postgres,
                             "UPDATE reprocessing_jobs SET progress = $1 WHERE id = $2",
-                            [i32::try_from(i + 1).unwrap_or(i32::MAX).into(), job_id.into()],
+                            [i32::try_from(inserted_so_far).unwrap_or(i32::MAX).into(), job_id.into()],
                         ))
                         .await;
                     let _ = events.send(AppEvent::JobProgress {
                         job_id,
                         status: "running".to_string(),
-                        progress: Some(i32::try_from(i + 1).unwrap_or(i32::MAX)),
+                        progress: Some(i32::try_from(inserted_so_far).unwrap_or(i32::MAX)),
                         total: Some(total),
                     });
                 }
             }
 
-            if let Some(s) = since {
-                crate::common::sync_state::refresh_continuous_aggregates(&db, Some(s)).await;
+            let (inserted_total, overwritten) = match conflict {
+                ConflictMode::Skip => (affected_total, 0),
+                ConflictMode::Overwrite => (affected_total.saturating_sub(overlapping), overlap_differing),
+            };
+            tracing::info!(site = %site_name, inserted_total, overwritten, "CSV import inserted readings");
+
+            if inserted_total > 0 || overwritten > 0 {
+                for (parameter_id, stream_id) in &param_streams {
+                    let _ = events.send(AppEvent::DataIngested {
+                        site_id: Some(site_id),
+                        parameter_id: Some(*parameter_id),
+                        stream_id: *stream_id,
+                        count: inserted_total + overwritten,
+                    });
+                }
             }
-            crate::common::cache::invalidate_prefix(&app, &format!("readings:{site_id}")).await;
-            crate::common::cache::invalidate_prefix(&app, &format!("aggregates:{site_id}")).await;
+
+            // Phase 2: derived recompute
+            let mut filled = 0i32;
+            if inserted_total > 0 || overwritten > 0 {
+                let derived_total = i32::try_from(models.len() + distinct_ts.len()).unwrap_or(i32::MAX);
+                let _ = db
+                    .execute(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        "UPDATE reprocessing_jobs SET total = $1 WHERE id = $2",
+                        [derived_total.into(), job_id.into()],
+                    ))
+                    .await;
+
+                for (i, time) in distinct_ts.iter().enumerate() {
+                    if crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
+                        &db, site_id, *time,
+                    )
+                    .await
+                    .is_ok()
+                    {
+                        filled += 1;
+                    }
+                    if (i + 1) % 500 == 0 {
+                        let prog = i32::try_from(models.len() + i + 1).unwrap_or(i32::MAX);
+                        let _ = db
+                            .execute(Statement::from_sql_and_values(
+                                sea_orm::DatabaseBackend::Postgres,
+                                "UPDATE reprocessing_jobs SET progress = $1 WHERE id = $2",
+                                [prog.into(), job_id.into()],
+                            ))
+                            .await;
+                        let _ = events.send(AppEvent::JobProgress {
+                            job_id,
+                            status: "running".to_string(),
+                            progress: Some(prog),
+                            total: Some(derived_total),
+                        });
+                    }
+                }
+
+                if let Some(s) = since {
+                    crate::common::sync_state::refresh_continuous_aggregates(&db, Some(s)).await;
+                }
+                crate::common::cache::invalidate_prefix(&app, &format!("readings:{site_id}")).await;
+                crate::common::cache::invalidate_prefix(&app, &format!("aggregates:{site_id}")).await;
+            }
 
             let _ = db
                 .execute(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "UPDATE reprocessing_jobs SET status = 'completed', progress = total, \
                      readings_updated = $1, completed_at = NOW() WHERE id = $2",
-                    [filled.into(), job_id.into()],
+                    [i32::try_from(inserted_total + overwritten).unwrap_or(i32::MAX).into(), job_id.into()],
                 ))
                 .await;
             let _ = events.send(AppEvent::JobCompleted {
                 job_id,
                 status: "completed".to_string(),
-                readings_updated: Some(filled),
+                readings_updated: Some(i32::try_from(inserted_total + overwritten).unwrap_or(i32::MAX)),
                 error_message: None,
             });
         });
@@ -610,9 +657,6 @@ pub async fn import_csv(
     } else {
         None
     };
-
-    // Readings we tried to insert but that already existed (skipped, or overwritten).
-    let duplicates = rows.len().saturating_sub(inserted_total);
 
     Ok(Json(ImportCsvResponse {
         site_id,
@@ -624,15 +668,15 @@ pub async fn import_csv(
         unmapped_columns,
         warnings,
         row_count,
-        inserted_total,
+        inserted_total: 0,
         earliest,
         latest,
         derived_job_id,
         derived_timestamps,
-        duplicates,
+        duplicates: 0,
         overlaps_identical: overlap.identical,
         overlaps_differing: overlap.differing,
-        overwritten,
+        overwritten: 0,
         overlap_sample: overlap.sample,
         errors,
         error_count,
