@@ -39,7 +39,6 @@ async fn public_api_is_still_rate_limited() {
     common::cleanup_test_db(&db).await;
     common::seed_test_data(&db).await;
 
-    // Make the test project public so /api/public/ returns results
     common::exec(
         &db,
         &format!(
@@ -48,12 +47,34 @@ async fn public_api_is_still_rate_limited() {
         ),
     )
     .await;
+    common::exec(
+        &db,
+        &format!(
+            "UPDATE sites SET public_slug = 'upstream' WHERE id = '{}'",
+            common::SITE1_ID,
+        ),
+    )
+    .await;
+    common::exec(
+        &db,
+        &format!(
+            "UPDATE site_parameters SET is_public = true WHERE id = '{}'",
+            common::PARAM_S1_TEMP_ID,
+        ),
+    )
+    .await;
 
     let app = common::build_test_app_with_rate_limiting(db);
 
+    let url = "/api/public/test-river/sites/upstream/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z";
+
+    // Confirm the endpoint returns 200 before exhausting the burst
+    let (status, _) = common::get(&app, url).await;
+    assert_eq!(status, 200, "Public endpoint should return data");
+
     let mut status_codes = Vec::new();
     for _ in 0..15 {
-        let (status, _) = common::get(&app, "/api/public/").await;
+        let (status, _) = common::get(&app, url).await;
         status_codes.push(status);
     }
 
