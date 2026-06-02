@@ -1,5 +1,6 @@
 pub mod client;
 pub mod db;
+pub mod e2e;
 pub mod fixtures;
 pub mod seed;
 pub mod sensor_lifecycle;
