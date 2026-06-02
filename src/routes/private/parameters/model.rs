@@ -27,13 +27,13 @@ pub struct Model {
     pub name: String,
     #[crudcrate(fulltext, sortable)]
     pub display_name: String,
-    #[crudcrate(sortable)]
+    #[crudcrate(sortable, on_create = String::new())]
     pub default_units: String,
     #[sea_orm(column_type = "String(StringLen::N(32))")]
-    #[crudcrate(filterable, sortable)]
+    #[crudcrate(filterable, sortable, on_create = String::from("measurement"))]
     pub category: String,
     #[sea_orm(column_type = "String(StringLen::N(16))")]
-    #[crudcrate(filterable, sortable)]
+    #[crudcrate(filterable, sortable, on_create = String::from("numeric"))]
     pub data_type: String,
     #[crudcrate(sortable)]
     pub description: Option<String>,

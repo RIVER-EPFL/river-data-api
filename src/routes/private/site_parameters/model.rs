@@ -22,9 +22,9 @@ pub struct Model {
     pub site_id: Uuid,
     #[crudcrate(filterable)]
     pub parameter_id: Uuid,
-    #[crudcrate(filterable, fulltext, sortable)]
+    #[crudcrate(filterable, fulltext, sortable, on_create = String::new())]
     pub name: String,
-    #[crudcrate(filterable)]
+    #[crudcrate(filterable, on_create = String::new())]
     pub sensor_type: String,
     pub display_units: Option<String>,
     pub units_name: Option<String>,

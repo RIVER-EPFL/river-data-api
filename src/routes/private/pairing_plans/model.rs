@@ -25,7 +25,7 @@ pub struct Model {
     pub id: Uuid,
     #[crudcrate(filterable)]
     pub source_system: String,
-    #[crudcrate(filterable)]
+    #[crudcrate(filterable, on_create = String::from("draft"))]
     pub status: String,
     pub created_by: Option<String>,
     #[sea_orm(column_type = "JsonBinary")]

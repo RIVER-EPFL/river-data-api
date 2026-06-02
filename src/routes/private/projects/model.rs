@@ -32,7 +32,7 @@ pub struct Model {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     #[crudcrate(exclude(create, update))]
     pub discovered_at: Option<chrono::DateTime<chrono::Utc>>,
-    #[crudcrate(filterable)]
+    #[crudcrate(filterable, on_create = false)]
     pub is_public: bool,
     #[crudcrate(filterable)]
     pub public_slug: Option<String>,

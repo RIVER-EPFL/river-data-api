@@ -27,7 +27,7 @@ pub struct Model {
     pub project_scope: Option<Uuid>,
     #[sea_orm(column_type = "JsonBinary")]
     pub permissions: serde_json::Value,
-    #[crudcrate(filterable)]
+    #[crudcrate(filterable, on_create = true)]
     pub is_active: bool,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,

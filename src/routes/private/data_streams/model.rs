@@ -35,7 +35,7 @@ pub struct Model {
     pub site_parameter_id: Option<Uuid>,
     #[crudcrate(filterable)]
     pub sensor_id: Option<Uuid>,
-    #[crudcrate(filterable)]
+    #[crudcrate(filterable, on_create = true)]
     pub is_active: bool,
     #[crudcrate(sortable, exclude(create, update))]
     pub discovered_at: DateTimeWithTimeZone,

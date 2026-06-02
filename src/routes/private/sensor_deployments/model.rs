@@ -35,7 +35,7 @@ pub struct Model {
     pub deployed_from: chrono::DateTime<chrono::Utc>,
     #[crudcrate(sortable)]
     pub deployed_until: Option<chrono::DateTime<chrono::Utc>>,
-    #[crudcrate(filterable)]
+    #[crudcrate(filterable, on_create = String::from("permanent"))]
     pub deployment_type: String,
     pub notes: Option<String>,
     #[crudcrate(exclude(create, update))]
