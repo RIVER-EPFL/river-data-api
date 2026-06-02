@@ -5,18 +5,17 @@ use axum::{
 };
 use chrono::{DateTime, NaiveDateTime, Utc};
 use sea_orm::sea_query::{Alias, Expr, Order, PostgresQueryBuilder, Query as SeaQuery};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::routes::private::site_parameters as site_parameters_entity;
 use crate::error::{AppError, AppResult};
 use crate::common::bulk::{self, StreamableAggregateParam, StreamableParam};
 use crate::routes::public::services::{
-    ExposedParamConfig, PublicProjectConfig, PublicSiteConfig, get_public_config,
+    PublicProjectConfig, PublicSiteConfig, get_public_config,
 };
 
 // Time Format
@@ -79,81 +78,49 @@ fn resolve_site_from_config<'a>(
         .ok_or_else(|| AppError::NotFound(format!("Unknown site: {site_id}")))
 }
 
-/// Build the list of all public parameter names from config (base + derived).
+/// Build the list of all public parameter names from config.
 fn all_public_param_names(config: &PublicProjectConfig) -> Vec<String> {
-    config
+    let mut names: Vec<String> = config
         .exposed_params
         .iter()
-        .map(|ep| ep.public_name.clone())
-        .collect()
+        .map(|ep| ep.name.clone())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
-fn build_param_to_config_map(config: &PublicProjectConfig) -> HashMap<Uuid, Vec<&ExposedParamConfig>> {
-    let mut map: HashMap<Uuid, Vec<&ExposedParamConfig>> = HashMap::new();
-    for ep in &config.exposed_params {
-        map.entry(ep.parameter_id).or_default().push(ep);
-    }
-    map
-}
-
-/// Resolve which DB `site_parameters` at a site match the exposed config.
-/// Returns a list of (`site_id`, `parameter_id`, `public_name`, `public_units`, `is_derived`).
-async fn resolve_site_parameters(
-    db: &sea_orm::DatabaseConnection,
+/// Resolve public site_parameters at a site from the cached config.
+/// Returns one `ResolvedParam` per exposed param belonging to this site.
+fn resolve_site_parameters(
     site_id: Uuid,
     config: &PublicProjectConfig,
-) -> AppResult<Vec<ResolvedParam>> {
-    let param_to_config = build_param_to_config_map(config);
-    let param_ids: Vec<Uuid> = param_to_config.keys().copied().collect();
-
-    if param_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Find all site_parameters at this site whose parameter_id matches an exposed config
-    let params = site_parameters_entity::Entity::find()
-        .filter(site_parameters_entity::Column::SiteId.eq(site_id))
-        .filter(site_parameters_entity::Column::ParameterId.is_in(param_ids))
-        .all(db)
-        .await
-        .map_err(AppError::Database)?;
-
-    let mut resolved = Vec::new();
-    for sp in params {
-        let is_derived = sp.is_derived.unwrap_or(false);
-
-        if let Some(ep_configs) = param_to_config.get(&sp.parameter_id) {
-            for ep_config in ep_configs {
-                if !is_derived || ep_config.include_derived {
-                    resolved.push(ResolvedParam {
-                        site_id: sp.site_id,
-                        parameter_id: sp.parameter_id,
-                        public_name: ep_config.public_name.clone(),
-                        public_units: ep_config.public_units.clone(),
-                        conversion_factor: ep_config.conversion_factor,
-                        conversion_offset: ep_config.conversion_offset,
-                    });
-                }
-            }
-        }
-    }
-
-    resolved.sort_by(|a, b| a.public_name.cmp(&b.public_name));
-    Ok(resolved)
+) -> Vec<ResolvedParam> {
+    let mut resolved: Vec<ResolvedParam> = config
+        .exposed_params
+        .iter()
+        .filter(|ep| ep.site_id == site_id)
+        .map(|ep| ResolvedParam {
+            site_id: ep.site_id,
+            parameter_id: ep.parameter_id,
+            name: ep.name.clone(),
+            units: ep.units.clone(),
+        })
+        .collect();
+    resolved.sort_by(|a, b| a.name.cmp(&b.name));
+    resolved
 }
 
 #[derive(Debug, Clone)]
 struct ResolvedParam {
     site_id: Uuid,
     parameter_id: Uuid,
-    public_name: String,
-    public_units: String,
-    conversion_factor: f64,
-    conversion_offset: f64,
+    name: String,
+    units: String,
 }
 
 /// Parse the `parameters` query string and filter against the project's exposed params.
-/// Returns the list of requested public names.
+/// Returns the list of requested parameter names.
 fn resolve_requested_param_names(
     parameters: Option<&str>,
     config: &PublicProjectConfig,
@@ -259,18 +226,16 @@ pub async fn get_site(
     let config = get_public_config(&state.db, &state.public_config_cache, &project_slug).await?;
     let site = resolve_site_from_config(&config, &site_id)?;
 
-    let params: Vec<ParameterInfo> = config
-        .exposed_params
+    let resolved = resolve_site_parameters(site.site_id, &config);
+
+    let params: Vec<ParameterInfo> = resolved
         .iter()
-        .map(|ep| ParameterInfo {
-            name: ep.public_name.clone(),
-            units: ep.public_units.clone(),
-            description: ep.description.clone(),
+        .map(|rp| ParameterInfo {
+            name: rp.name.clone(),
+            units: rp.units.clone(),
+            description: None,
         })
         .collect();
-
-    // Query data range for exposed parameters at this site
-    let resolved = resolve_site_parameters(&state.db, site.site_id, &config).await?;
     let param_ids: Vec<Uuid> = resolved.iter().map(|rp| rp.parameter_id).collect();
 
     let (data_start, data_end, reading_count) = if param_ids.is_empty() {
@@ -344,15 +309,15 @@ pub async fn list_parameters(
     Path((project_slug, site_id)): Path<(String, String)>,
 ) -> AppResult<Json<Vec<ParameterInfo>>> {
     let config = get_public_config(&state.db, &state.public_config_cache, &project_slug).await?;
-    let _ = resolve_site_from_config(&config, &site_id)?;
+    let site = resolve_site_from_config(&config, &site_id)?;
 
-    let params: Vec<ParameterInfo> = config
-        .exposed_params
+    let resolved = resolve_site_parameters(site.site_id, &config);
+    let params: Vec<ParameterInfo> = resolved
         .iter()
-        .map(|ep| ParameterInfo {
-            name: ep.public_name.clone(),
-            units: ep.public_units.clone(),
-            description: ep.description.clone(),
+        .map(|rp| ParameterInfo {
+            name: rp.name.clone(),
+            units: rp.units.clone(),
+            description: None,
         })
         .collect();
 
@@ -485,13 +450,13 @@ pub async fn get_readings(
         return Ok(Json(response).into_response());
     }
 
-    // Resolve DB parameters matching the requested public names
-    let all_resolved = resolve_site_parameters(&state.db, site.site_id, &config).await?;
+    // Resolve DB parameters matching the requested names
+    let all_resolved = resolve_site_parameters(site.site_id, &config);
 
-    // Filter to only the requested public names
+    // Filter to only the requested names
     let resolved: Vec<&ResolvedParam> = all_resolved
         .iter()
-        .filter(|rp| requested_names.contains(&rp.public_name))
+        .filter(|rp| requested_names.contains(&rp.name))
         .collect();
 
     let (times_formatted, output_params) = fetch_readings(&state, &resolved, start, end).await?;
@@ -655,11 +620,11 @@ pub async fn get_aggregates(
         return Ok(Json(response).into_response());
     }
 
-    // Resolve DB parameters matching the requested public names
-    let all_resolved = resolve_site_parameters(&state.db, site.site_id, &config).await?;
+    // Resolve DB parameters matching the requested names
+    let all_resolved = resolve_site_parameters(site.site_id, &config);
     let resolved: Vec<&ResolvedParam> = all_resolved
         .iter()
-        .filter(|rp| requested_names.contains(&rp.public_name))
+        .filter(|rp| requested_names.contains(&rp.name))
         .collect();
 
     let param_ids: Vec<Uuid> = {
@@ -685,17 +650,12 @@ pub async fn get_aggregates(
         return Ok(Json(response).into_response());
     }
 
-    let mut id_to_publics: HashMap<Uuid, Vec<(&str, &str, f64, f64)>> = HashMap::new();
+    let mut id_to_publics: HashMap<Uuid, Vec<(&str, &str)>> = HashMap::new();
     for rp in &resolved {
         id_to_publics
             .entry(rp.parameter_id)
             .or_default()
-            .push((
-                rp.public_name.as_str(),
-                rp.public_units.as_str(),
-                rp.conversion_factor,
-                rp.conversion_offset,
-            ));
+            .push((rp.name.as_str(), rp.units.as_str()));
     }
 
     // Build parameterized query against continuous aggregate
@@ -758,13 +718,13 @@ pub async fn get_aggregates(
         }
         let param_uuid = row.param_id.parse::<Uuid>().ok();
         if let Some(configs) = param_uuid.and_then(|uuid| id_to_publics.get(&uuid)) {
-            for (name, _units, factor, offset) in configs {
+            for (name, _units) in configs {
                 param_aggs.entry(name.to_string()).or_default().push((
                     row.bucket,
                     AggValues {
-                        avg: row.avg_value.map(|v| v * factor + offset),
-                        min: row.min_value.map(|v| v * factor + offset),
-                        max: row.max_value.map(|v| v * factor + offset),
+                        avg: row.avg_value,
+                        min: row.min_value,
+                        max: row.max_value,
                         count: row.count,
                     },
                 ));
@@ -788,8 +748,8 @@ pub async fn get_aggregates(
     for name in &requested_names {
         let units = resolved
             .iter()
-            .find(|rp| &rp.public_name == name)
-            .map_or("", |rp| rp.public_units.as_str());
+            .find(|rp| &rp.name == name)
+            .map_or("", |rp| rp.units.as_str());
 
         let mut avg = vec![None; num_times];
         let mut min = vec![None; num_times];
@@ -861,17 +821,12 @@ async fn fetch_readings(
         return Ok((Vec::new(), Vec::new()));
     }
 
-    let mut id_to_publics: HashMap<Uuid, Vec<(&str, &str, f64, f64)>> = HashMap::new();
+    let mut id_to_publics: HashMap<Uuid, Vec<(&str, &str)>> = HashMap::new();
     for rp in resolved {
         id_to_publics
             .entry(rp.parameter_id)
             .or_default()
-            .push((
-                rp.public_name.as_str(),
-                rp.public_units.as_str(),
-                rp.conversion_factor,
-                rp.conversion_offset,
-            ));
+            .push((rp.name.as_str(), rp.units.as_str()));
     }
 
     // All resolved params come from the same site
@@ -927,7 +882,7 @@ async fn fetch_readings(
 
     let mut times_ordered: Vec<DateTime<Utc>> = Vec::new();
     let mut time_set: std::collections::HashSet<DateTime<Utc>> = std::collections::HashSet::new();
-    // Map from public_name -> Vec<(time, value)>
+    // Map from parameter name -> Vec<(time, value)>
     let mut param_values: HashMap<String, Vec<(DateTime<Utc>, f64)>> = HashMap::new();
 
     for row in &rows {
@@ -938,12 +893,11 @@ async fn fetch_readings(
 
         let param_uuid = row.param_id.parse::<Uuid>().ok();
         if let Some(configs) = param_uuid.and_then(|uuid| id_to_publics.get(&uuid)) {
-            for (name, _units, factor, offset) in configs {
-                let converted_value = row.value * factor + offset;
+            for (name, _units) in configs {
                 param_values
                     .entry(name.to_string())
                     .or_default()
-                    .push((time, converted_value));
+                    .push((time, row.value));
             }
         }
     }
@@ -958,12 +912,12 @@ async fn fetch_readings(
 
     let num_times = times_ordered.len();
 
-    // Build output in the order the resolved params appear (sorted by public name)
-    // Deduplicate public names (multiple DB params can map to same public name)
+    // Build output in the order the resolved params appear (sorted by name)
+    // Deduplicate names (multiple site_parameters can share a parameter)
     let mut seen_names: Vec<String> = Vec::new();
     for rp in resolved {
-        if !seen_names.contains(&rp.public_name) {
-            seen_names.push(rp.public_name.clone());
+        if !seen_names.contains(&rp.name) {
+            seen_names.push(rp.name.clone());
         }
     }
 
@@ -971,8 +925,8 @@ async fn fetch_readings(
     for public_name in &seen_names {
         let units = resolved
             .iter()
-            .find(|rp| &rp.public_name == public_name)
-            .map_or("", |rp| rp.public_units.as_str());
+            .find(|rp| &rp.name == public_name)
+            .map_or("", |rp| rp.units.as_str());
 
         let mut values = vec![None; num_times];
         if let Some(readings) = param_values.get(public_name.as_str()) {

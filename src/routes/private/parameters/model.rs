@@ -55,8 +55,6 @@ pub enum Relation {
     SiteParameters,
     #[sea_orm(has_many = "crate::routes::private::alarm_thresholds::Entity")]
     AlarmThresholds,
-    #[sea_orm(has_many = "crate::routes::private::public_exposed_parameters::Entity")]
-    PublicExposedParameters,
     #[sea_orm(has_many = "crate::routes::private::status_events::Entity")]
     StatusEvents,
     #[sea_orm(has_many = "crate::routes::private::derived_parameters::source_model::Entity")]
@@ -78,12 +76,6 @@ impl Related<crate::routes::private::site_parameters::Entity> for Entity {
 impl Related<crate::routes::private::alarm_thresholds::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::AlarmThresholds.def()
-    }
-}
-
-impl Related<crate::routes::private::public_exposed_parameters::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::PublicExposedParameters.def()
     }
 }
 

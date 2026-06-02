@@ -502,8 +502,8 @@ async fn delete_site_param_remnants(
     Ok(())
 }
 
-/// Move sensors, derived sources, alarms, annotations, samples, standard curves, and
-/// public_exposed_parameters from source to target parameter.
+/// Move sensors, derived sources, alarms, annotations, samples, and standard curves
+/// from source to target parameter.
 async fn reassign_parameter_references(
     txn: &impl ConnectionTrait,
     source_id: Uuid,
@@ -574,25 +574,6 @@ async fn reassign_parameter_references(
     txn.execute(Statement::from_sql_and_values(
         pg,
         "UPDATE standard_curves SET parameter_id = $1 WHERE parameter_id = $2",
-        vec![target_id.into(), source_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
-
-    // Public exposed parameters: delete conflicts, then reassign
-    txn.execute(Statement::from_sql_and_values(
-        pg,
-        r#"DELETE FROM public_exposed_parameters WHERE parameter_id = $1
-           AND project_id IN (
-               SELECT project_id FROM public_exposed_parameters WHERE parameter_id = $2
-           )"#,
-        vec![source_id.into(), target_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
-    txn.execute(Statement::from_sql_and_values(
-        pg,
-        "UPDATE public_exposed_parameters SET parameter_id = $1 WHERE parameter_id = $2",
         vec![target_id.into(), source_id.into()],
     ))
     .await

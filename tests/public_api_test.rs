@@ -21,7 +21,7 @@ async fn exec(db: &sea_orm::DatabaseConnection, sql: &str) {
     .unwrap_or_else(|e| panic!("SQL failed: {e}\nQuery: {sql}"));
 }
 
-/// Set up a public project with exposed parameters for public API testing.
+/// Set up a public project with one exposed parameter (DO_Temperature) for public API testing.
 async fn setup_public() -> (sea_orm::DatabaseConnection, axum::Router) {
     let db = common::setup_test_db().await;
     common::cleanup_test_db(&db).await;
@@ -47,14 +47,12 @@ async fn setup_public() -> (sea_orm::DatabaseConnection, axum::Router) {
     )
     .await;
 
-    // Expose the Temperature parameter publicly
+    // Expose the DO_Temperature site_parameter publicly
     exec(
         &db,
         &format!(
-            "INSERT INTO public_exposed_parameters (id, project_id, parameter_id, public_name, public_units, sort_order, conversion_factor, conversion_offset, include_derived) \
-             VALUES (gen_random_uuid(), '{}', '{}', 'Temperature', '°C', 1, 1.0, 0.0, false)",
-            common::PROJECT_ID,
-            common::GLOBAL_PARAM_TEMP_ID,
+            "UPDATE site_parameters SET is_public = true WHERE id = '{}'",
+            common::PARAM_S1_TEMP_ID,
         ),
     )
     .await;
@@ -63,8 +61,25 @@ async fn setup_public() -> (sea_orm::DatabaseConnection, axum::Router) {
     (db, app)
 }
 
+/// Set up a public project with two exposed parameters (DO_Temperature + Dissolved_O2).
+async fn setup_two_params() -> (sea_orm::DatabaseConnection, axum::Router) {
+    let (db, app) = setup_public().await;
+
+    // Also expose Dissolved_O2 at site 1
+    exec(
+        &db,
+        &format!(
+            "UPDATE site_parameters SET is_public = true WHERE id = '{}'",
+            common::PARAM_S1_DO_ID,
+        ),
+    )
+    .await;
+
+    (db, app)
+}
+
 // ============================================================================
-// Nonexistent slug → 404
+// Nonexistent slug -> 404
 // ============================================================================
 
 #[tokio::test]
@@ -77,7 +92,7 @@ async fn test_nonexistent_slug_returns_404() {
 }
 
 // ============================================================================
-// Non-public project → 404
+// Non-public project -> 404
 // ============================================================================
 
 #[tokio::test]
@@ -112,12 +127,11 @@ async fn test_public_list_sites() {
     assert_eq!(status, 200);
 
     let sites = body.as_array().expect("response should be an array");
-    // Only site 1 has a public_slug, but the endpoint may return all sites
     assert!(!sites.is_empty(), "should have at least one site");
 }
 
 // ============================================================================
-// Public readings
+// Public readings (single parameter)
 // ============================================================================
 
 #[tokio::test]
@@ -133,10 +147,9 @@ async fn test_public_readings() {
 
     assert_eq!(status, 200);
 
-    // Should have Temperature parameter exposed
     let params = body["parameters"].as_array().unwrap();
     assert_eq!(params.len(), 1, "should have 1 exposed parameter");
-    assert_eq!(params[0]["name"].as_str().unwrap(), "Temperature");
+    assert_eq!(params[0]["name"].as_str().unwrap(), "DO_Temperature");
     assert_eq!(params[0]["units"].as_str().unwrap(), "°C");
 
     let times = body["times"].as_array().unwrap();
@@ -144,85 +157,13 @@ async fn test_public_readings() {
 }
 
 // ============================================================================
-// Unit conversion with factor=0 (offset-only)
+// Public readings with two parameters
 // ============================================================================
 
 #[tokio::test]
 #[serial]
-async fn test_public_readings_zero_conversion_factor() {
-    let (db, app) = setup_public().await;
-
-    exec(
-        &db,
-        &format!(
-            "UPDATE public_exposed_parameters SET conversion_factor = 0, conversion_offset = 100 \
-             WHERE project_id = '{}' AND parameter_id = '{}'",
-            common::PROJECT_ID,
-            common::GLOBAL_PARAM_TEMP_ID,
-        ),
-    )
-    .await;
-
-    let (status, body) = common::get_json(
-        &app,
-        "/api/public/test-river/sites/upstream/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T01:00:00Z",
-    )
-    .await;
-
-    assert_eq!(status, 200);
-
-    let params = body["parameters"].as_array().unwrap();
-    assert_eq!(params.len(), 1);
-
-    let values = params[0]["values"].as_array().unwrap();
-    for (i, v) in values.iter().enumerate() {
-        if let Some(val) = v.as_f64() {
-            assert!(
-                (val - 100.0).abs() < 1e-10,
-                "with factor=0 and offset=100, all values should be 100.0, got {val} at index {i}"
-            );
-        }
-    }
-}
-
-// ============================================================================
-// Multi-exposure: same parameter exposed under two names (DOuM + DOmgL)
-// ============================================================================
-
-async fn setup_multi_exposure() -> (sea_orm::DatabaseConnection, axum::Router) {
-    let (db, app) = setup_public().await;
-
-    // Expose Dissolved_O2 as DOuM (identity)
-    exec(
-        &db,
-        &format!(
-            "INSERT INTO public_exposed_parameters (id, project_id, parameter_id, public_name, public_units, sort_order, conversion_factor, conversion_offset, include_derived) \
-             VALUES (gen_random_uuid(), '{}', '{}', 'DOuM', 'µM', 2, 1.0, 0.0, false)",
-            common::PROJECT_ID,
-            common::GLOBAL_PARAM_DO_ID,
-        ),
-    )
-    .await;
-
-    // Expose Dissolved_O2 again as DOmgL (factor=0.032)
-    exec(
-        &db,
-        &format!(
-            "INSERT INTO public_exposed_parameters (id, project_id, parameter_id, public_name, public_units, sort_order, conversion_factor, conversion_offset, include_derived) \
-             VALUES (gen_random_uuid(), '{}', '{}', 'DOmgL', 'mg/L', 3, 0.032, 0.0, false)",
-            common::PROJECT_ID,
-            common::GLOBAL_PARAM_DO_ID,
-        ),
-    )
-    .await;
-
-    (db, app)
-}
-
-#[tokio::test]
-#[serial]
-async fn test_multi_exposure_same_parameter() {
-    let (_db, app) = setup_multi_exposure().await;
+async fn test_public_readings_two_params() {
+    let (_db, app) = setup_two_params().await;
 
     let (status, body) = common::get_json(
         &app,
@@ -232,27 +173,18 @@ async fn test_multi_exposure_same_parameter() {
     assert_eq!(status, 200);
 
     let params = body["parameters"].as_array().unwrap();
-    assert_eq!(params.len(), 3, "should have Temperature, DOuM, DOmgL");
+    assert_eq!(params.len(), 2, "should have DO_Temperature and Dissolved_O2");
 
-    let doum = params.iter().find(|p| p["name"] == "DOuM").expect("DOuM missing");
-    let domgl = params.iter().find(|p| p["name"] == "DOmgL").expect("DOmgL missing");
+    let temp = params.iter().find(|p| p["name"] == "DO_Temperature").expect("DO_Temperature missing");
+    let do_param = params.iter().find(|p| p["name"] == "Dissolved_O2").expect("Dissolved_O2 missing");
 
-    assert_eq!(doum["units"], "µM");
-    assert_eq!(domgl["units"], "mg/L");
+    assert_eq!(temp["units"], "°C");
+    assert_eq!(do_param["units"], "µM");
 
-    let doum_values = doum["values"].as_array().unwrap();
-    let domgl_values = domgl["values"].as_array().unwrap();
-    assert_eq!(doum_values.len(), domgl_values.len());
-
-    for (i, (u, m)) in doum_values.iter().zip(domgl_values.iter()).enumerate() {
-        if let (Some(uv), Some(mv)) = (u.as_f64(), m.as_f64()) {
-            let expected = uv * 0.032;
-            assert!(
-                (mv - expected).abs() < 1e-6,
-                "DOmgL[{i}] = {mv} != DOuM[{i}] * 0.032 = {expected}"
-            );
-        }
-    }
+    let temp_values = temp["values"].as_array().unwrap();
+    let do_values = do_param["values"].as_array().unwrap();
+    assert_eq!(temp_values.len(), do_values.len());
+    assert!(!temp_values.is_empty(), "should have readings");
 }
 
 // ============================================================================
@@ -275,13 +207,13 @@ async fn test_public_discovery() {
 }
 
 // ============================================================================
-// Aggregates with conversion
+// Aggregates
 // ============================================================================
 
 #[tokio::test]
 #[serial]
-async fn test_public_aggregates_with_conversion() {
-    let (_db, app) = setup_multi_exposure().await;
+async fn test_public_aggregates() {
+    let (_db, app) = setup_two_params().await;
 
     let (status, body) = common::get_json(
         &app,
@@ -291,23 +223,15 @@ async fn test_public_aggregates_with_conversion() {
     assert_eq!(status, 200);
 
     let params = body["parameters"].as_array().unwrap();
-    assert_eq!(params.len(), 3, "aggregates should have Temperature, DOuM, DOmgL");
+    assert_eq!(params.len(), 2, "aggregates should have DO_Temperature and Dissolved_O2");
 
-    let doum = params.iter().find(|p| p["name"] == "DOuM").expect("DOuM aggregates missing");
-    let domgl = params.iter().find(|p| p["name"] == "DOmgL").expect("DOmgL aggregates missing");
+    let temp = params.iter().find(|p| p["name"] == "DO_Temperature").expect("DO_Temperature aggregates missing");
+    let do_param = params.iter().find(|p| p["name"] == "Dissolved_O2").expect("Dissolved_O2 aggregates missing");
 
-    let doum_avg = doum["avg"].as_array().unwrap();
-    let domgl_avg = domgl["avg"].as_array().unwrap();
-
-    for (i, (u, m)) in doum_avg.iter().zip(domgl_avg.iter()).enumerate() {
-        if let (Some(uv), Some(mv)) = (u.as_f64(), m.as_f64()) {
-            let expected = uv * 0.032;
-            assert!(
-                (mv - expected).abs() < 1e-6,
-                "DOmgL avg[{i}] = {mv} != DOuM avg[{i}] * 0.032 = {expected}"
-            );
-        }
-    }
+    let temp_avg = temp["avg"].as_array().unwrap();
+    let do_avg = do_param["avg"].as_array().unwrap();
+    assert!(!temp_avg.is_empty(), "should have hourly aggregates for temperature");
+    assert!(!do_avg.is_empty(), "should have hourly aggregates for dissolved oxygen");
 }
 
 // ============================================================================
@@ -317,7 +241,7 @@ async fn test_public_aggregates_with_conversion() {
 #[tokio::test]
 #[serial]
 async fn test_public_readings_csv() {
-    let (_db, app) = setup_multi_exposure().await;
+    let (_db, app) = setup_two_params().await;
 
     let (status, body) = common::get(
         &app,
@@ -331,9 +255,8 @@ async fn test_public_readings_csv() {
 
     let header = lines[0];
     assert!(header.starts_with("time"), "CSV header should start with time");
-    assert!(header.contains("DOuM"), "CSV header should include DOuM");
-    assert!(header.contains("DOmgL"), "CSV header should include DOmgL");
-    assert!(header.contains("Temperature"), "CSV header should include Temperature");
+    assert!(header.contains("DO_Temperature"), "CSV header should include DO_Temperature");
+    assert!(header.contains("Dissolved_O2"), "CSV header should include Dissolved_O2");
 
     assert!(lines.len() > 1, "CSV should have data rows");
 }
@@ -370,19 +293,19 @@ async fn test_public_docs_custom_title() {
 #[tokio::test]
 #[serial]
 async fn test_public_parameter_filtering() {
-    let (_db, app) = setup_multi_exposure().await;
+    let (_db, app) = setup_two_params().await;
 
     let (status, body) = common::get_json(
         &app,
-        "/api/public/test-river/sites/upstream/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T01:00:00Z&parameters=DOmgL",
+        "/api/public/test-river/sites/upstream/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T01:00:00Z&parameters=Dissolved_O2",
     )
     .await;
     assert_eq!(status, 200);
 
     let params = body["parameters"].as_array().unwrap();
-    assert_eq!(params.len(), 1, "should only have DOmgL");
-    assert_eq!(params[0]["name"], "DOmgL");
-    assert_eq!(params[0]["units"], "mg/L");
+    assert_eq!(params.len(), 1, "should only have Dissolved_O2");
+    assert_eq!(params[0]["name"], "Dissolved_O2");
+    assert_eq!(params[0]["units"], "µM");
 }
 
 // ============================================================================
@@ -392,7 +315,7 @@ async fn test_public_parameter_filtering() {
 #[tokio::test]
 #[serial]
 async fn test_public_site_detail() {
-    let (_db, app) = setup_multi_exposure().await;
+    let (_db, app) = setup_two_params().await;
 
     let (status, body) = common::get_json(
         &app,
@@ -402,7 +325,7 @@ async fn test_public_site_detail() {
     assert_eq!(status, 200);
 
     let params = body["parameters"].as_array().unwrap();
-    assert_eq!(params.len(), 3, "site detail should list all 3 exposed params");
+    assert_eq!(params.len(), 2, "site detail should list both exposed params");
 
     assert!(body["reading_count"].as_i64().unwrap() > 0, "should have readings");
     assert!(body["data_start"].is_string(), "should have data_start");
@@ -416,7 +339,7 @@ async fn test_public_site_detail() {
 #[tokio::test]
 #[serial]
 async fn test_public_list_parameters() {
-    let (_db, app) = setup_multi_exposure().await;
+    let (_db, app) = setup_two_params().await;
 
     let (status, body) = common::get_json(
         &app,
@@ -426,10 +349,9 @@ async fn test_public_list_parameters() {
     assert_eq!(status, 200);
 
     let params = body.as_array().unwrap();
-    assert_eq!(params.len(), 3);
+    assert_eq!(params.len(), 2);
 
     let names: Vec<&str> = params.iter().map(|p| p["name"].as_str().unwrap()).collect();
-    assert!(names.contains(&"Temperature"));
-    assert!(names.contains(&"DOuM"));
-    assert!(names.contains(&"DOmgL"));
+    assert!(names.contains(&"DO_Temperature"));
+    assert!(names.contains(&"Dissolved_O2"));
 }

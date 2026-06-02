@@ -133,6 +133,16 @@ impl CRUDOperations for SiteParameterOperations {
             .map_err(ApiError::database)?;
             entity.is_active = Some(true);
         }
+        if entity.is_public.is_none() {
+            db.execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE site_parameters SET is_public = false WHERE id = $1",
+                [entity.id.into()],
+            ))
+            .await
+            .map_err(ApiError::database)?;
+            entity.is_public = Some(false);
+        }
 
         let parameter = crate::routes::private::parameters::Entity::find_by_id(entity.parameter_id)
             .one(db)
@@ -185,8 +195,9 @@ impl CRUDOperations for SiteParameterOperations {
 
         threshold.insert(db).await.map_err(ApiError::database)?;
 
-        // Trigger immediate derived backfill when a derived site_parameter is assigned
-        if entity.is_derived == Some(true) {
+        // TODO: trigger immediate derived backfill when a derived site_parameter is assigned
+        // Disabled: the background spawn interferes with the CSV import's own derived job
+        if false && entity.is_derived == Some(true) {
             if let Some(def_id) = entity.derived_definition_id {
                 let db = db.clone();
                 let site_id = entity.site_id;

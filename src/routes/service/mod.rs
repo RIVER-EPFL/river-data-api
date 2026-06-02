@@ -19,7 +19,6 @@ use crate::routes::private::{
     notes::Note,
     pairing_plans::PairingPlan,
     parameters::Parameter,
-    public_exposed_parameters::PublicExposedParameter,
     reprocessing_jobs::ReprocessingJob,
     samples::Sample,
     sensor_calibrations::SensorCalibration,
@@ -68,7 +67,6 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .nest("/alarm_thresholds", with_crud_perms(AlarmThreshold::router(db)))
         .nest("/tokens", admin_only_crud(ApiToken::router(db)))
         .nest("/sync_service_credentials", admin_only_crud(SyncServiceCredential::router(db)))
-        .nest("/public_exposed_parameters", with_crud_perms(PublicExposedParameter::router(db)))
         .nest("/data_streams", with_crud_perms(DataStream::router(db)))
         .nest("/standard_curves", with_crud_perms(StandardCurve::router(db)))
         .nest("/notes", with_crud_perms(Note::router(db)))

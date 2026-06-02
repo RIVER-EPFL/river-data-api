@@ -259,39 +259,6 @@ async fn test_derived_sources_reassigned() {
     assert!(reassigned > 0, "derived source should point to target");
 }
 
-// Scenario: source has a public_exposed_parameter, target does not (for the same project).
-// Expected behaviour: exposure reassigned to target.
-#[tokio::test]
-#[serial]
-async fn test_public_exposed_merged() {
-    let (db, _, _) = setup().await;
-
-    common::exec(
-        &db,
-        &format!(
-            "INSERT INTO public_exposed_parameters (id, project_id, parameter_id, public_name, public_units, conversion_factor, conversion_offset, include_derived, sort_order)
-             VALUES (gen_random_uuid(), '{}', '{}', 'DOuM', 'uM', 1.0, 0.0, false, 0)",
-            common::PROJECT_ID,
-            common::GLOBAL_PARAM_DO_ID
-        ),
-    )
-    .await;
-
-    merge_parameters(&db, &merge_req(common::GLOBAL_PARAM_DO_ID, common::GLOBAL_PARAM_TEMP_ID))
-        .await
-        .expect("merge should succeed");
-
-    let on_target = count(
-        &db,
-        &format!(
-            "SELECT count(*) AS c FROM public_exposed_parameters WHERE parameter_id = '{}'",
-            common::GLOBAL_PARAM_TEMP_ID
-        ),
-    )
-    .await;
-    assert!(on_target > 0, "exposure should be on target");
-}
-
 // Scenario: source has aliases and a name; target has different aliases.
 // Expected behaviour: target ends up with the union of both alias sets plus source's name.
 #[tokio::test]

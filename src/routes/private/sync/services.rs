@@ -527,6 +527,7 @@ async fn resolve_or_create_site_param<C: ConnectionTrait>(
             decimal_places: Set(None), channel_id: Set(None),
             sample_interval_sec: Set(None),
             is_active: Set(Some(true)),
+            is_public: Set(Some(false)),
             is_derived: Set(Some(false)),
             derived_definition_id: Set(None),
             variable_mappings: Set(None),

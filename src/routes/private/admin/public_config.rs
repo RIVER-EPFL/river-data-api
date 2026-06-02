@@ -8,7 +8,7 @@ use crate::error::AppResult;
 use crate::routes::public::services::invalidate_config;
 
 /// Invalidate the in-memory cache for a public project's API config. Use after editing
-/// `public_exposed_parameters` to force a re-read on next public API request. Requires
+/// public visibility settings to force a re-read on next public API request. Requires
 /// `write_metadata`.
 #[utoipa::path(
     post,

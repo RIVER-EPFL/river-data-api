@@ -10,7 +10,6 @@ pub mod notes;
 pub mod pairing_plans;
 pub mod parameters;
 pub mod projects;
-pub mod public_exposed_parameters;
 pub mod readings;
 pub mod reprocessing_jobs;
 pub mod samples;

@@ -2,9 +2,9 @@
 //!
 //! Accepts the client's delivery format: a `DateTime` column plus one column per parameter
 //! (e.g. `DateTime,DOmgL,DOuM,WaterTempdegC`) for a single target site. Each column is resolved to
-//! a parameter via, in order: an explicit per-request `mapping`, the project's
-//! `public_exposed_parameters` (public name), the global `parameters.aliases`, then the catalog
-//! name. Columns that resolve to a derived-output parameter (e.g. `DOmgL`) are skipped — derived
+//! a parameter via, in order: an explicit per-request `mapping`, site_parameter names,
+//! site parameter aliases, then the global catalog name. Columns that resolve to a
+//! derived-output parameter (e.g. `DOmgL`) are skipped — derived
 //! values are recomputed from their sources, never ingested.
 //!
 //! `dry_run` returns the resolution plan (which columns map where, which are skipped/unmapped, plus
@@ -128,10 +128,7 @@ pub async fn import_csv(
     State(state): State<AppState>,
     Json(req): Json<ImportCsvRequest>,
 ) -> AppResult<Json<ImportCsvResponse>> {
-    let (site, project) = resolve_site_with_project(&state.db, &req.site).await?;
-    let project = project.ok_or_else(|| {
-        AppError::BadRequest(format!("Site '{}' is not linked to a project", site.name))
-    })?;
+    let (site, _project) = resolve_site_with_project(&state.db, &req.site).await?;
     let site_id = site.id;
 
     // --- Resolution tables (site_parameter-first) ---------------------------------------------
@@ -170,31 +167,6 @@ pub async fn import_csv(
         }
     }
 
-    // Public exposure for the project: lower(public_name) -> (id, sp_name, factor, offset).
-    let exposure_rows = state
-        .db
-        .query_all(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT pep.public_name, pep.parameter_id, \
-             COALESCE(pep.conversion_factor, 1.0) AS factor, \
-             COALESCE(pep.conversion_offset, 0.0) AS offset, \
-             sp.name AS sp_name \
-             FROM public_exposed_parameters pep \
-             LEFT JOIN site_parameters sp ON sp.parameter_id = pep.parameter_id AND sp.site_id = $2 \
-             WHERE pep.project_id = $1 AND pep.public_name IS NOT NULL",
-            [project.id.into(), site_id.into()],
-        ))
-        .await?;
-    let mut exposure: HashMap<String, (Uuid, String, f64, f64)> = HashMap::new();
-    for row in &exposure_rows {
-        let name: String = row.try_get("", "public_name").unwrap_or_default();
-        let Ok(pid) = row.try_get::<Uuid>("", "parameter_id") else { continue };
-        let sp_name: String = row.try_get("", "sp_name").unwrap_or(name.clone());
-        let factor: f64 = row.try_get("", "factor").unwrap_or(1.0);
-        let offset: f64 = row.try_get("", "offset").unwrap_or(0.0);
-        exposure.insert(name.to_lowercase(), (pid, sp_name, factor, offset));
-    }
-
     // Derived-output parameters are computed, never ingested.
     let derived_rows = state
         .db
@@ -210,19 +182,23 @@ pub async fn import_csv(
         .filter_map(|r| r.try_get::<Uuid>("", "output_parameter_id").ok())
         .collect();
 
-    // Global catalog fallback: lower(name) -> id (for columns that don't match site params).
+    // Global catalog fallback: lower(name) -> id, lower(alias) -> id.
     let catalog_rows = state
         .db
         .query_all(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, name FROM parameters".to_owned(),
+            "SELECT id, name, aliases FROM parameters".to_owned(),
         ))
         .await?;
     let mut catalog: HashMap<String, Uuid> = HashMap::new();
     for row in &catalog_rows {
         let Ok(pid) = row.try_get::<Uuid>("", "id") else { continue };
         let name: String = row.try_get("", "name").unwrap_or_default();
+        let aliases: Vec<String> = row.try_get("", "aliases").unwrap_or_default();
         catalog.insert(name.to_lowercase(), pid);
+        for alias in &aliases {
+            catalog.insert(alias.to_lowercase(), pid);
+        }
         param_names.entry(pid).or_insert(name);
     }
 
@@ -291,7 +267,6 @@ pub async fn import_csv(
                     .get(&key)
                     .map(|(pid, name)| (*pid, name.clone(), 1.0, 0.0))
                     .or_else(|| site_alias_map.get(&key).map(|(pid, name)| (*pid, name.clone(), 1.0, 0.0)))
-                    .or_else(|| exposure.get(&key).map(|(pid, name, f, o)| (*pid, name.clone(), *f, *o)))
                     .or_else(|| catalog.get(&key).map(|pid| (*pid, param_names.get(pid).cloned().unwrap_or_default(), 1.0, 0.0)))
             };
 

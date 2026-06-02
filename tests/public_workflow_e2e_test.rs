@@ -141,7 +141,7 @@ async fn test_full_public_data_workflow() {
         "/api/parameters",
         &serde_json::json!({
             "name": "dissolved_oxygen", "display_name": "Dissolved Oxygen",
-            "default_units": "µM", "category": "measurement", "data_type": "numeric", "aliases": [],
+            "default_units": "µM", "category": "measurement", "data_type": "numeric", "aliases": ["DOuM"],
         }),
         &token,
     )
@@ -152,7 +152,7 @@ async fn test_full_public_data_workflow() {
         "/api/parameters",
         &serde_json::json!({
             "name": "temperature", "display_name": "Water Temperature",
-            "default_units": "°C", "category": "measurement", "data_type": "numeric", "aliases": [],
+            "default_units": "°C", "category": "measurement", "data_type": "numeric", "aliases": ["WaterTempdegC"],
         }),
         &token,
     )
@@ -227,25 +227,17 @@ async fn test_full_public_data_workflow() {
     .await;
     assert!((200..300).contains(&status), "assign derived ({status}): {sp}");
 
-    // 8. Expose the two raw parameters plus the derived one publicly, under the client's names.
-    for (pid, public_name, units, derived) in [
-        (&do_param_id, "DOuM", "µM", false),
-        (&temp_param_id, "WaterTempdegC", "°C", false),
-        (&derived_param_id, "DOmgL", "mg/L", true),
-    ] {
-        let (status, pe) = common::post_json_with_token(
-            &app,
-            "/api/public_exposed_parameters",
-            &serde_json::json!({
-                "project_id": project_id, "parameter_id": pid,
-                "public_name": public_name, "public_units": units,
-                "conversion_factor": 1.0, "conversion_offset": 0.0, "include_derived": derived,
-                "sort_order": 0,
-            }),
-            &token,
-        )
-        .await;
-        assert!((200..300).contains(&status), "expose {public_name} ({status}): {pe}");
+    // 8. Mark the site_parameters as public.
+    {
+        use sea_orm::{ConnectionTrait, Statement};
+        db.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "UPDATE site_parameters SET is_public = true WHERE site_id = '{site_id}'"
+            ),
+        ))
+        .await
+        .expect("mark site_parameters public");
     }
 
     // 9. Ingest historical data via the CSV import endpoint (client wide-CSV format).
@@ -281,6 +273,7 @@ async fn test_full_public_data_workflow() {
     assert!(sites.as_array().unwrap().iter().any(|s| s["uuid"] == site_id), "sites: {sites}");
 
     // 11. Public readings reproduce the real raw data exactly AND the recomputed derived value.
+    // Parameter names now come from parameters.name: "dissolved_oxygen", "temperature", "DOmgL".
     let to_iso = |s: &str| s.replace(' ', "T") + "Z";
     let readings_uri = format!(
         "/api/public/e2e_river/sites/{site_id}/readings?start={}&end={}",
@@ -289,13 +282,13 @@ async fn test_full_public_data_workflow() {
     );
     let (status, readings) = common::get_json(&app, &readings_uri).await;
     assert_eq!(status, 200, "public readings ({status}): {readings}");
-    let got_doum = values_for(&readings, "DOuM");
-    let got_temp = values_for(&readings, "WaterTempdegC");
+    let got_doum = values_for(&readings, "dissolved_oxygen");
+    let got_temp = values_for(&readings, "temperature");
     let got_domgl = values_for(&readings, "DOmgL");
     assert_eq!(got_doum.len(), rows.len(), "expected {} readings, got {}", rows.len(), got_doum.len());
     for (i, (_, doum, temp)) in rows.iter().enumerate() {
-        assert!((got_doum[i] - doum).abs() < 1e-6, "DOuM[{i}]: {} != {doum}", got_doum[i]);
-        assert!((got_temp[i] - temp).abs() < 1e-6, "WaterTempdegC[{i}]: {} != {temp}", got_temp[i]);
+        assert!((got_doum[i] - doum).abs() < 1e-6, "dissolved_oxygen[{i}]: {} != {doum}", got_doum[i]);
+        assert!((got_temp[i] - temp).abs() < 1e-6, "temperature[{i}]: {} != {temp}", got_temp[i]);
         assert!((got_domgl[i] - doum * 0.032).abs() < 1e-6, "DOmgL[{i}]: {} != {doum}*0.032", got_domgl[i]);
     }
 
@@ -307,15 +300,15 @@ async fn test_full_public_data_workflow() {
     );
     let (status, agg) = common::get_json(&app, &agg_uri).await;
     assert_eq!(status, 200, "public aggregates ({status}): {agg}");
-    let do_avg = field_for(&agg, "DOuM", "avg");
+    let do_avg = field_for(&agg, "dissolved_oxygen", "avg");
     assert!(
         do_avg.first().is_some_and(|v| (v - expected_mean).abs() < 1e-6),
-        "hourly DOuM mean should be {expected_mean}, got {do_avg:?}"
+        "hourly dissolved_oxygen mean should be {expected_mean}, got {do_avg:?}"
     );
     let domgl_avg = field_for(&agg, "DOmgL", "avg");
     assert!(
         domgl_avg.first().is_some_and(|v| (v - expected_mean * 0.032).abs() < 1e-6),
-        "hourly DOmgL mean should be {} (mean × 0.032), got {domgl_avg:?}",
+        "hourly DOmgL mean should be {} (mean * 0.032), got {domgl_avg:?}",
         expected_mean * 0.032
     );
 }

@@ -35,6 +35,8 @@ pub struct Model {
     pub sample_interval_sec: Option<i32>,
     #[crudcrate(filterable)]
     pub is_active: Option<bool>,
+    #[crudcrate(filterable, exclude(create))]
+    pub is_public: Option<bool>,
     #[crudcrate(filterable)]
     pub is_derived: Option<bool>,
     #[crudcrate(filterable)]

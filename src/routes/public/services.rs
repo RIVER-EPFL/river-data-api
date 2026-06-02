@@ -1,10 +1,10 @@
 use moka::future::Cache;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
+use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::routes::private::{projects, public_exposed_parameters, sites};
+use crate::routes::private::{projects, sites};
 
 /// Cache for public project configurations
 pub type PublicConfigCache = Cache<String, Arc<PublicProjectConfig>>;
@@ -32,14 +32,10 @@ pub struct PublicSiteConfig {
 
 #[derive(Debug, Clone)]
 pub struct ExposedParamConfig {
-    pub public_name: String,
-    pub public_units: String,
     pub parameter_id: Uuid,
-    pub description: Option<String>,
-    pub sort_order: i32,
-    pub conversion_factor: f64,
-    pub conversion_offset: f64,
-    pub include_derived: bool,
+    pub name: String,
+    pub units: String,
+    pub site_id: Uuid,
 }
 
 /// Create a new public config cache with a 5-minute TTL.
@@ -118,27 +114,55 @@ async fn load_public_config(
         })
         .collect();
 
-    // Load exposed parameters
-    let exposed = public_exposed_parameters::Entity::find()
-        .filter(public_exposed_parameters::Column::ProjectId.eq(project.id))
-        .order_by_asc(public_exposed_parameters::Column::SortOrder)
-        .all(db)
-        .await
-        .map_err(crate::error::AppError::Database)?;
+    // Load public site_parameters joined with parameters for name/units
+    #[derive(Debug, FromQueryResult)]
+    struct ExposedRow {
+        parameter_id: Uuid,
+        site_id: Uuid,
+        param_name: String,
+        default_units: String,
+    }
 
-    let exposed_configs: Vec<ExposedParamConfig> = exposed
-        .into_iter()
-        .map(|e| ExposedParamConfig {
-            public_name: e.public_name,
-            public_units: e.public_units,
-            parameter_id: e.parameter_id,
-            description: e.description,
-            sort_order: e.sort_order,
-            conversion_factor: e.conversion_factor.unwrap_or(1.0),
-            conversion_offset: e.conversion_offset.unwrap_or(0.0),
-            include_derived: e.include_derived,
-        })
-        .collect();
+    let site_ids: Vec<Uuid> = site_configs.iter().map(|s| s.site_id).collect();
+
+    let exposed_configs: Vec<ExposedParamConfig> = if site_ids.is_empty() {
+        Vec::new()
+    } else {
+        let mut placeholders = Vec::new();
+        let mut values: Vec<sea_orm::Value> = Vec::new();
+        for (i, id) in site_ids.iter().enumerate() {
+            placeholders.push(format!("${}", i + 1));
+            values.push((*id).into());
+        }
+        let sql = format!(
+            "SELECT sp.parameter_id, sp.site_id, p.name AS param_name, p.default_units \
+             FROM site_parameters sp \
+             JOIN parameters p ON p.id = sp.parameter_id \
+             WHERE sp.is_public = true AND sp.site_id IN ({}) \
+             ORDER BY p.name",
+            placeholders.join(", ")
+        );
+        let stmt = sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            values,
+        );
+        let rows: Vec<ExposedRow> = db
+            .query_all(stmt)
+            .await
+            .map_err(crate::error::AppError::Database)?
+            .into_iter()
+            .filter_map(|row| ExposedRow::from_query_result(&row, "").ok())
+            .collect();
+        rows.into_iter()
+            .map(|r| ExposedParamConfig {
+                parameter_id: r.parameter_id,
+                name: r.param_name,
+                units: r.default_units,
+                site_id: r.site_id,
+            })
+            .collect()
+    };
 
     Ok(PublicProjectConfig {
         project_id: project.id,
