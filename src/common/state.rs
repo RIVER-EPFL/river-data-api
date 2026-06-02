@@ -7,6 +7,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, broadcast};
 
+/// Cached CSV text for the import staging flow. Keyed by session UUID.
+pub type ImportStagingCache = Cache<String, Arc<String>>;
+
 use crate::config::Config;
 use crate::routes::private::api_tokens::services::TokenCache;
 use super::bulk::{BulkSemaphore, new_bulk_semaphore};
@@ -67,6 +70,7 @@ pub struct AppState {
     pub keycloak_admin: Option<KeycloakAdmin>,
     pub token_cache: TokenCache,
     pub events: EventSender,
+    pub import_staging: ImportStagingCache,
 }
 
 impl AppState {
@@ -107,6 +111,14 @@ impl AppState {
         let (events, _) = broadcast::channel(256);
         let _ = GLOBAL_EVENT_SENDER.set(events.clone());
 
+        let import_staging: ImportStagingCache = Cache::builder()
+            .weigher(|_key: &String, value: &Arc<String>| -> u32 {
+                value.len().try_into().unwrap_or(u32::MAX)
+            })
+            .max_capacity(500 * 1024 * 1024) // 500 MB
+            .time_to_live(Duration::from_secs(600)) // 10 minutes
+            .build();
+
         Self {
             db,
             config: Arc::new(config),
@@ -117,6 +129,7 @@ impl AppState {
             keycloak_admin,
             token_cache,
             events,
+            import_staging,
         }
     }
 }

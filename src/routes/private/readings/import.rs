@@ -15,6 +15,7 @@ use axum::{Json, extract::State};
 use sea_orm::{ConnectionTrait, EntityTrait, Set, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -30,7 +31,13 @@ pub struct ImportCsvRequest {
     /// Target site, by UUID or case-insensitive name.
     pub site: String,
     /// Wide CSV text: a `DateTime` column plus one column per parameter.
-    pub csv: String,
+    /// Optional when `session_id` references a previously uploaded CSV.
+    #[serde(default)]
+    pub csv: Option<String>,
+    /// Reference to a staged CSV from a prior dry_run. When present without `csv`, the server
+    /// retrieves the cached CSV text instead of requiring a re-upload.
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
     /// Optional explicit column → parameter mapping. The value is a parameter name or UUID;
     /// `null` skips the column. Overrides automatic resolution.
     #[serde(default)]
@@ -41,6 +48,10 @@ pub struct ImportCsvRequest {
     /// Behaviour on (stream_id, time, replicate_index) collisions. Defaults to `skip`.
     #[serde(default)]
     pub conflict: ConflictMode,
+    /// Timezone offset (hours) of the source timestamps relative to UTC. The server subtracts
+    /// this offset to convert to UTC, e.g. `2.0` for CEST (UTC+02:00).
+    #[serde(default)]
+    pub tz_offset_hours: Option<f64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -48,6 +59,9 @@ pub struct ImportCsvResponse {
     pub site_id: Uuid,
     pub site_name: String,
     pub dry_run: bool,
+    /// Staging session ID. Returned on every request; pass it back on subsequent requests
+    /// (re-analyze, import) to avoid re-uploading the CSV.
+    pub session_id: Option<Uuid>,
     /// Header → resolved catalog parameter name, for columns that will be ingested.
     pub mapped_columns: HashMap<String, String>,
     /// Columns intentionally not ingested: derived outputs (recomputed) or explicitly skipped.
@@ -118,13 +132,13 @@ struct ColumnMapping {
     conversion_offset: f64,
 }
 
-fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+fn parse_datetime(s: &str, tz_offset: chrono::Duration) -> Option<chrono::DateTime<chrono::Utc>> {
     let s = s.trim();
     if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-        return Some(ndt.and_utc());
+        return Some(ndt.and_utc() - tz_offset);
     }
     if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M") {
-        return Some(ndt.and_utc());
+        return Some(ndt.and_utc() - tz_offset);
     }
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&chrono::Utc));
@@ -144,7 +158,7 @@ fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         (status = 200, description = "Import summary or dry-run plan", body = ImportCsvResponse),
         (status = 400, description = "Unparseable CSV, missing DateTime column, or no resolvable parameter columns"),
         (status = 404, description = "Site not found"),
-        (status = 413, description = "Body exceeds 10MB limit"),
+        (status = 413, description = "Body exceeds 50MB limit"),
     ),
     tag = "ingestion"
 )]
@@ -152,6 +166,25 @@ pub async fn import_csv(
     State(state): State<AppState>,
     Json(req): Json<ImportCsvRequest>,
 ) -> AppResult<Json<ImportCsvResponse>> {
+    // --- Resolve CSV text: from request body or staging cache ---------------------------------
+    let (csv_text, session_id) = if let Some(csv) = req.csv.as_deref() {
+        let sid = Uuid::new_v4();
+        let arc = Arc::new(csv.to_owned());
+        state.import_staging.insert(sid.to_string(), arc.clone()).await;
+        (arc, sid)
+    } else if let Some(sid) = req.session_id {
+        let cached = state.import_staging.get(&sid.to_string()).await.ok_or_else(|| {
+            AppError::BadRequest("Staging session expired or not found — re-upload the file".into())
+        })?;
+        (cached, sid)
+    } else {
+        return Err(AppError::BadRequest("Provide either csv or session_id".into()));
+    };
+
+    let tz_offset = chrono::Duration::milliseconds(
+        (req.tz_offset_hours.unwrap_or(0.0) * 3_600_000.0) as i64,
+    );
+
     let (site, _project) = resolve_site_with_project(&state.db, &req.site).await?;
     let site_id = site.id;
 
@@ -242,7 +275,7 @@ pub async fn import_csv(
         .has_headers(true)
         .trim(csv::Trim::All)
         .flexible(true)
-        .from_reader(req.csv.as_bytes());
+        .from_reader(csv_text.as_bytes());
 
     let headers = reader
         .headers()
@@ -347,7 +380,7 @@ pub async fn import_csv(
             }
         };
         let dt_cell = record.get(datetime_idx).unwrap_or("");
-        let Some(time) = parse_datetime(dt_cell) else {
+        let Some(time) = parse_datetime(dt_cell, tz_offset) else {
             record_error(line, format!("Unparseable DateTime '{dt_cell}'"), &mut errors, &mut error_count);
             continue;
         };
@@ -382,7 +415,7 @@ pub async fn import_csv(
 
     // Overlap diff: bucket incoming rows against what's already stored for this site, so the UI
     // can preview what a re-import or overwrite would touch.
-    let overlap = compute_overlaps(&state.db, site_id, &rows).await?;
+    let overlap = compute_overlaps(&state.db, site_id, &rows, earliest, latest).await?;
 
     // Dry run: report the plan and overlap diff without writing.
     if req.dry_run {
@@ -390,6 +423,7 @@ pub async fn import_csv(
             site_id,
             site_name: site.name,
             dry_run: true,
+            session_id: Some(session_id),
             mapped_columns,
             skipped_columns,
             unmapped_columns,
@@ -584,6 +618,7 @@ pub async fn import_csv(
         site_id,
         site_name: site.name,
         dry_run: false,
+        session_id: Some(session_id),
         mapped_columns,
         skipped_columns,
         unmapped_columns,
@@ -616,72 +651,67 @@ const OVERLAP_SAMPLE_CAP: usize = 20;
 const OVERLAP_EPSILON: f64 = 1e-9;
 
 /// Bucket incoming `(parameter_id, time, stored_value)` rows against existing readings for the
-/// site into identical vs differing overlaps. Existing values are fetched in one batched query per
-/// chunk keyed by (parameter_id, time) at `replicate_index = 0`.
+/// site into identical vs differing overlaps. Fetches all existing readings in the time range for
+/// the relevant parameters in a single query, then compares in memory.
 async fn compute_overlaps(
     db: &sea_orm::DatabaseConnection,
     site_id: Uuid,
     rows: &[(Uuid, chrono::DateTime<chrono::Utc>, f64)],
+    earliest: Option<chrono::DateTime<chrono::Utc>>,
+    latest: Option<chrono::DateTime<chrono::Utc>>,
 ) -> AppResult<OverlapReport> {
     let mut identical = 0usize;
     let mut differing = 0usize;
     let mut sample = Vec::new();
 
+    let (Some(t_min), Some(t_max)) = (earliest, latest) else {
+        return Ok(OverlapReport { identical, differing, sample });
+    };
     if rows.is_empty() {
         return Ok(OverlapReport { identical, differing, sample });
     }
 
-    const CHUNK: usize = 1000;
-    for chunk in rows.chunks(CHUNK) {
-        let mut params: Vec<sea_orm::Value> = Vec::with_capacity(chunk.len() * 2);
-        let mut placeholders: Vec<String> = Vec::with_capacity(chunk.len());
-        for (pid, time, _) in chunk {
-            let base = params.len();
-            params.push((*pid).into());
-            params.push(sea_orm::prelude::DateTimeWithTimeZone::from(*time).into());
-            placeholders.push(format!("(${},${})", base + 1, base + 2));
-        }
-        params.push(site_id.into());
-        let site_idx = params.len();
+    let param_ids: Vec<Uuid> = rows.iter().map(|(pid, _, _)| *pid).collect::<HashSet<_>>().into_iter().collect();
 
-        let sql = format!(
+    let existing_rows = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
             "SELECT parameter_id, time, COALESCE(calibrated_value, raw_value) AS val \
              FROM readings \
-             WHERE site_id = ${site_idx} AND replicate_index = 0 \
-             AND (parameter_id, time) IN ({})",
-            placeholders.join(",")
-        );
+             WHERE site_id = $1 AND replicate_index = 0 \
+             AND parameter_id = ANY($2) \
+             AND time >= $3 AND time <= $4",
+            [
+                site_id.into(),
+                param_ids.into(),
+                sea_orm::prelude::DateTimeWithTimeZone::from(t_min).into(),
+                sea_orm::prelude::DateTimeWithTimeZone::from(t_max).into(),
+            ],
+        ))
+        .await?;
 
-        let existing_rows = db
-            .query_all(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                &sql,
-                params,
-            ))
-            .await?;
+    let mut existing: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), f64> =
+        HashMap::with_capacity(existing_rows.len());
+    for row in &existing_rows {
+        let Ok(pid) = row.try_get::<Uuid>("", "parameter_id") else { continue };
+        let Ok(t) = row.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "time") else { continue };
+        let Ok(val) = row.try_get::<f64>("", "val") else { continue };
+        existing.insert((pid, t.with_timezone(&chrono::Utc)), val);
+    }
 
-        let mut existing: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), f64> = HashMap::new();
-        for row in &existing_rows {
-            let Ok(pid) = row.try_get::<Uuid>("", "parameter_id") else { continue };
-            let Ok(t) = row.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "time") else { continue };
-            let Ok(val) = row.try_get::<f64>("", "val") else { continue };
-            existing.insert((pid, t.with_timezone(&chrono::Utc)), val);
-        }
-
-        for (pid, time, incoming) in chunk {
-            if let Some(&stored) = existing.get(&(*pid, *time)) {
-                if (stored - incoming).abs() <= OVERLAP_EPSILON {
-                    identical += 1;
-                } else {
-                    differing += 1;
-                    if sample.len() < OVERLAP_SAMPLE_CAP {
-                        sample.push(OverlapDiff {
-                            time: *time,
-                            parameter_id: *pid,
-                            existing: stored,
-                            incoming: *incoming,
-                        });
-                    }
+    for (pid, time, incoming) in rows {
+        if let Some(&stored) = existing.get(&(*pid, *time)) {
+            if (stored - incoming).abs() <= OVERLAP_EPSILON {
+                identical += 1;
+            } else {
+                differing += 1;
+                if sample.len() < OVERLAP_SAMPLE_CAP {
+                    sample.push(OverlapDiff {
+                        time: *time,
+                        parameter_id: *pid,
+                        existing: stored,
+                        incoming: *incoming,
+                    });
                 }
             }
         }
