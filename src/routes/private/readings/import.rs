@@ -141,7 +141,7 @@ fn parse_datetime(s: &str, tz_offset: chrono::Duration) -> Option<chrono::DateTi
         return Some(ndt.and_utc() - tz_offset);
     }
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&chrono::Utc));
+        return Some(dt.with_timezone(&chrono::Utc) - tz_offset);
     }
     None
 }
