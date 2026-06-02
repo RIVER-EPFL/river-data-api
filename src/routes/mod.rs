@@ -471,10 +471,13 @@ pub fn build_router(state: AppState) -> Router {
     let public_routes_final = if config.disable_rate_limiting {
         public_routes
     } else {
+        // Modest, deliberately separate from the authenticated /api tier: a token
+        // bucket of `burst` cells refilled 1 per `period` (default 10 burst, 1/2s ⇒
+        // ~30/min). Public data is cache-backed, so this caps abuse without hurting use.
         let public_limiter = GovernorConfigBuilder::default()
             .key_extractor(FallbackIpKeyExtractor)
-            .per_second(config.rate_limit_data_per_second)
-            .burst_size(config.rate_limit_data_burst)
+            .period(Duration::from_secs(config.public_rate_limit_period_secs))
+            .burst_size(config.public_rate_limit_burst)
             .finish()
             .expect("Failed to create public rate limiter");
 

@@ -12,6 +12,7 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::cache;
 use crate::error::{AppError, AppResult};
 use crate::common::bulk::{self, StreamableAggregateParam, StreamableParam};
 use crate::routes::public::services::{
@@ -348,7 +349,7 @@ pub struct ReadingsResponse {
     pub parameters: Vec<ParameterData>,
 }
 
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ParameterData {
     pub name: String,
     pub units: String,
@@ -398,86 +399,75 @@ pub async fn get_readings(
     let start_parsed = query.start.as_deref().map(parse_time).transpose()?;
     let end_parsed = query.end.as_deref().map(parse_time).transpose()?;
 
-    // Enforce public API time range limits
-    let max_days = state.config.public_max_readings_time_range_days;
+    // No start ⇒ default to a recent window rather than all history (the implicit
+    // guard against unbounded pulls). No wall-clock cap: the rate limiter + cache bound cost.
     let default_lookback = state.config.default_readings_lookback_days;
-    let effective_start = start_parsed.unwrap_or_else(|| {
-        chrono::Utc::now() - chrono::Duration::days(default_lookback)
-    });
+    let effective_start = start_parsed
+        .unwrap_or_else(|| chrono::Utc::now() - chrono::Duration::days(default_lookback));
 
-    if let Some(e) = end_parsed {
-        if e < effective_start {
-            return Err(AppError::BadRequest(
-                "end time must not be before start time".to_string(),
-            ));
-        }
-        let span = e - effective_start;
-        if span.num_days() > max_days {
-            return Err(AppError::BadRequest(format!(
-                "Time range exceeds maximum of {max_days} days for public readings"
-            )));
-        }
-    } else {
-        let span = chrono::Utc::now() - effective_start;
-        if span.num_days() > max_days {
-            return Err(AppError::BadRequest(format!(
-                "Time range exceeds maximum of {max_days} days for public readings"
-            )));
-        }
+    if let Some(e) = end_parsed
+        && e < effective_start
+    {
+        return Err(AppError::BadRequest(
+            "end time must not be before start time".to_string(),
+        ));
     }
 
     let start = Some(effective_start);
     let end = end_parsed;
+    let format = query.format.to_lowercase();
 
     let requested_names = resolve_requested_param_names(query.parameters.as_deref(), &config)?;
 
     if requested_names.is_empty() {
-        // No exposed params configured: return empty response
-        let response = ReadingsResponse {
-            site: SiteRef {
-                id: site.slug.clone(),
-                name: site.name.clone(),
-            },
-            start: None,
-            end: None,
-            times: Vec::new(),
-            parameters: Vec::new(),
-        };
-        return Ok(Json(response).into_response());
+        return readings_response_from_data(site, Vec::new(), Vec::new(), &format, false);
     }
 
     // Resolve DB parameters matching the requested names
     let all_resolved = resolve_site_parameters(site.site_id, &config);
-
-    // Filter to only the requested names
     let resolved: Vec<&ResolvedParam> = all_resolved
         .iter()
         .filter(|rp| requested_names.contains(&rp.name))
         .collect();
+    let param_ids: Vec<Uuid> = {
+        let mut ids: Vec<Uuid> = resolved.iter().map(|rp| rp.parameter_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+
+    // Serve from the response cache when possible (any format), so repeat queries
+    // don't re-hit the DB. Key on the data inputs, not the output format.
+    let mut names_key = requested_names.clone();
+    names_key.sort();
+    let cache_key = cache::cache_key(
+        "pub_readings",
+        &[
+            &project_slug,
+            &site.slug,
+            &names_key.join(","),
+            &effective_start.to_rfc3339(),
+            &end.map(|e| e.to_rfc3339()).unwrap_or_default(),
+        ],
+    );
+
+    if let Some(bytes) = cache::get_cached(&state, &cache_key, &param_ids, end).await
+        && let Ok(cached) = serde_json::from_slice::<CachedReadings>(&bytes)
+    {
+        return readings_response_from_data(site, cached.times, cached.parameters, &format, true);
+    }
 
     let (times_formatted, output_params) = fetch_readings(&state, &resolved, start, end).await?;
 
-    let actual_start = times_formatted.first().cloned();
-    let actual_end = times_formatted.last().cloned();
-
-    let format = query.format.to_lowercase();
-    match format.as_str() {
-        "csv" => build_csv_response(times_formatted, &output_params),
-        "ndjson" => build_ndjson_response(times_formatted, &output_params),
-        _ => {
-            let response = ReadingsResponse {
-                site: SiteRef {
-                    id: site.slug.clone(),
-                    name: site.name.clone(),
-                },
-                start: actual_start,
-                end: actual_end,
-                times: times_formatted,
-                parameters: output_params,
-            };
-            Ok(Json(response).into_response())
-        }
+    let max_time = times_formatted.last().and_then(|s| parse_time(s).ok());
+    if let Ok(bytes) = serde_json::to_vec(&CachedReadings {
+        times: times_formatted.clone(),
+        parameters: output_params.clone(),
+    }) {
+        cache::store_cached(&state, cache_key, bytes, max_time).await;
     }
+
+    readings_response_from_data(site, times_formatted, output_params, &format, false)
 }
 
 // GET /{project_slug}/sites/{site_id}/aggregates/{resolution} -- Aggregated
@@ -506,7 +496,7 @@ pub struct AggregatesResponse {
     pub parameters: Vec<ParameterAggregateData>,
 }
 
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ParameterAggregateData {
     pub name: String,
     pub units: String,
@@ -588,15 +578,6 @@ pub async fn get_aggregates(
         ));
     }
 
-    // Enforce public API time range limits for aggregates
-    let max_days = state.config.public_max_aggregates_time_range_days;
-    let span = end - start;
-    if span.num_days() > max_days {
-        return Err(AppError::BadRequest(format!(
-            "Time range exceeds maximum of {max_days} days for public aggregates"
-        )));
-    }
-
     let requested_names = resolve_requested_param_names(query.parameters.as_deref(), &config)?;
 
     if requested_names.is_empty() {
@@ -641,6 +622,36 @@ pub async fn get_aggregates(
             parameters: Vec::new(),
         };
         return Ok(Json(response).into_response());
+    }
+
+    // Serve cached aggregate data when possible (bounded query ⇒ TTL-cached).
+    let mut names_key = requested_names.clone();
+    names_key.sort();
+    let cache_key = cache::cache_key(
+        "pub_aggregates",
+        &[
+            &project_slug,
+            &site.slug,
+            &resolution,
+            &names_key.join(","),
+            &start.to_rfc3339(),
+            &end.to_rfc3339(),
+        ],
+    );
+
+    if let Some(bytes) = cache::get_cached(&state, &cache_key, &param_ids, Some(end)).await
+        && let Ok(cached) = serde_json::from_slice::<CachedAggregates>(&bytes)
+    {
+        return aggregates_response_from_data(
+            site,
+            &resolution,
+            format_time(start),
+            format_time(end),
+            cached.times,
+            cached.parameters,
+            &query.format.to_lowercase(),
+            true,
+        );
     }
 
     let mut id_to_publics: HashMap<Uuid, Vec<(&str, &str)>> = HashMap::new();
@@ -772,23 +783,101 @@ pub async fn get_aggregates(
 
     let times_formatted: Vec<String> = times_ordered.iter().map(|t| format_time(*t)).collect();
 
-    let format = query.format.to_lowercase();
-    match format.as_str() {
-        "csv" => build_aggregates_csv(times_formatted, &output_params),
-        "ndjson" => build_aggregates_ndjson(times_formatted, &output_params),
+    let max_time = times_ordered.last().copied();
+    if let Ok(bytes) = serde_json::to_vec(&CachedAggregates {
+        times: times_formatted.clone(),
+        parameters: output_params.clone(),
+    }) {
+        cache::store_cached(&state, cache_key, bytes, max_time).await;
+    }
+
+    aggregates_response_from_data(
+        site,
+        &resolution,
+        format_time(start),
+        format_time(end),
+        times_formatted,
+        output_params,
+        &query.format.to_lowercase(),
+        false,
+    )
+}
+
+// Response Cache Payloads + Format Helpers
+
+// We cache the fetched data (times + parameters) so every output format is served
+// without re-querying the database on repeat requests.
+#[derive(Serialize, Deserialize)]
+struct CachedReadings {
+    times: Vec<String>,
+    parameters: Vec<ParameterData>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedAggregates {
+    times: Vec<String>,
+    parameters: Vec<ParameterAggregateData>,
+}
+
+fn readings_response_from_data(
+    site: &PublicSiteConfig,
+    times: Vec<String>,
+    parameters: Vec<ParameterData>,
+    format: &str,
+    cache_hit: bool,
+) -> AppResult<Response> {
+    match format {
+        "csv" => build_csv_response(times, &parameters),
+        "ndjson" => build_ndjson_response(times, &parameters),
+        _ => {
+            let start = times.first().cloned();
+            let end = times.last().cloned();
+            let response = ReadingsResponse {
+                site: SiteRef {
+                    id: site.slug.clone(),
+                    name: site.name.clone(),
+                },
+                start,
+                end,
+                times,
+                parameters,
+            };
+            let bytes =
+                serde_json::to_vec(&response).map_err(|e| AppError::Internal(e.to_string()))?;
+            cache::json_response(bytes, cache_hit)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn aggregates_response_from_data(
+    site: &PublicSiteConfig,
+    resolution: &str,
+    start: String,
+    end: String,
+    times: Vec<String>,
+    parameters: Vec<ParameterAggregateData>,
+    format: &str,
+    cache_hit: bool,
+) -> AppResult<Response> {
+    match format {
+        "csv" => build_aggregates_csv(times, &parameters),
+        "ndjson" => build_aggregates_ndjson(times, &parameters),
         _ => {
             let response = AggregatesResponse {
                 site: SiteRef {
                     id: site.slug.clone(),
                     name: site.name.clone(),
                 },
-                resolution,
-                start: format_time(start),
-                end: format_time(end),
-                times: times_formatted,
-                parameters: output_params,
+                resolution: resolution.to_string(),
+                start,
+                end,
+                times,
+                parameters,
             };
-            Ok(Json(response).into_response())
+            let bytes =
+                serde_json::to_vec(&response).map_err(|e| AppError::Internal(e.to_string()))?;
+            cache::json_response(bytes, cache_hit)
         }
     }
 }

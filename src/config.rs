@@ -68,9 +68,11 @@ pub struct Config {
     // Time range limits (days)
     pub max_readings_time_range_days: i64,
     pub max_aggregates_time_range_days: i64,
-    pub public_max_readings_time_range_days: i64,
-    pub public_max_aggregates_time_range_days: i64,
     pub default_readings_lookback_days: i64,
+
+    // Public API rate limit (token bucket: burst_size cells, refilled 1 per period)
+    pub public_rate_limit_burst: u32,
+    pub public_rate_limit_period_secs: u64,
 
     // Derived-parameter janitor
     pub janitor_interval_seconds: u64,
@@ -203,18 +205,21 @@ impl Config {
                 .unwrap_or_else(|_| "1825".to_string())
                 .parse()
                 .unwrap_or(1825),
-            public_max_readings_time_range_days: env::var("PUBLIC_MAX_READINGS_TIME_RANGE_DAYS")
-                .unwrap_or_else(|_| "30".to_string())
-                .parse()
-                .unwrap_or(30),
-            public_max_aggregates_time_range_days: env::var("PUBLIC_MAX_AGGREGATES_TIME_RANGE_DAYS")
-                .unwrap_or_else(|_| "180".to_string())
-                .parse()
-                .unwrap_or(180),
             default_readings_lookback_days: env::var("DEFAULT_READINGS_LOOKBACK_DAYS")
                 .unwrap_or_else(|_| "7".to_string())
                 .parse()
                 .unwrap_or(7),
+
+            // Public API rate limit — modest by design; responses are cache-backed.
+            // Defaults: burst 10, 1 token per 2s ⇒ ~30/min sustained.
+            public_rate_limit_burst: env::var("PUBLIC_RATE_LIMIT_BURST")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()
+                .unwrap_or(10),
+            public_rate_limit_period_secs: env::var("PUBLIC_RATE_LIMIT_PERIOD_SECS")
+                .unwrap_or_else(|_| "2".to_string())
+                .parse()
+                .unwrap_or(2),
 
             // Derived-parameter janitor
             janitor_interval_seconds: env::var("JANITOR_INTERVAL_SECONDS")
