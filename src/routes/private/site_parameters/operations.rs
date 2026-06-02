@@ -5,6 +5,9 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use super::model::{Column, Entity, SiteParameter};
+use crate::routes::private::sensor_calibrations::services::{
+    recalculate_derived_at_timestamp, spawn_tracked_job,
+};
 
 async fn enrich(db: &DatabaseConnection, items: &mut [SiteParameter]) -> Result<(), ApiError> {
     if items.is_empty() {
@@ -153,6 +156,19 @@ impl CRUDOperations for SiteParameterOperations {
             return Ok(());
         };
 
+        // Backfill a human-readable name from the parameter when the client omitted it.
+        // `name` is fulltext/sortable, so it must not be left empty.
+        if entity.name.trim().is_empty() {
+            db.execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE site_parameters SET name = $1 WHERE id = $2",
+                [parameter.display_name.clone().into(), entity.id.into()],
+            ))
+            .await
+            .map_err(ApiError::database)?;
+            entity.name = parameter.display_name.clone();
+        }
+
         // Only create if at least one default threshold is set
         if parameter.default_warning_min.is_none()
             && parameter.default_warning_max.is_none()
@@ -195,91 +211,85 @@ impl CRUDOperations for SiteParameterOperations {
 
         threshold.insert(db).await.map_err(ApiError::database)?;
 
-        // TODO: trigger immediate derived backfill when a derived site_parameter is assigned
-        // Disabled: the background spawn interferes with the CSV import's own derived job
-        if false && entity.is_derived == Some(true) {
-            if let Some(def_id) = entity.derived_definition_id {
-                let db = db.clone();
-                let site_id = entity.site_id;
-                let job_id = Uuid::new_v4();
+        // Backfill derived values for the readings already present at this site when a
+        // derived site_parameter is assigned. Tracked via spawn_tracked_job. A guard skips
+        // the spawn if an overlapping backfill is already in flight (this definition's own
+        // assignment/recompute, or a CSV import / pairing backfill that will produce the
+        // same derived rows) so we don't double-run the same work.
+        if entity.is_derived == Some(true)
+            && let Some(def_id) = entity.derived_definition_id
+            && let Some(events) = crate::common::global_event_sender()
+        {
+            let site_id = entity.site_id;
 
-                db.execute(Statement::from_sql_and_values(
+            let in_flight = db
+                .query_one(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
-                    "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status) \
-                     VALUES ($1, NULL, 'derived_assignment', $2, 'pending')",
-                    [job_id.into(), def_id.into()],
+                    r"SELECT 1
+                      FROM reprocessing_jobs
+                      WHERE status IN ('pending', 'running')
+                        AND (
+                          (trigger_type IN ('derived_assignment', 'derived_recompute') AND trigger_id = $1)
+                          OR trigger_type IN ('csv_import', 'pairing_backfill')
+                        )
+                      LIMIT 1",
+                    [def_id.into()],
                 ))
                 .await
                 .map_err(ApiError::database)?;
 
-                tokio::spawn(async move {
-                    tracing::info!(%def_id, %site_id, %job_id, "Computing derived values after site assignment");
+            if in_flight.is_some() {
+                tracing::info!(
+                    %def_id, %site_id,
+                    "Skipping derived assignment backfill: an overlapping reprocessing job is in flight"
+                );
+            } else {
+                spawn_tracked_job(
+                    db,
+                    None,
+                    "derived_assignment",
+                    Some(def_id),
+                    events,
+                    move |db| async move {
+                        tracing::info!(%def_id, %site_id, "Computing derived values after site assignment");
 
-                    let timestamps = db
-                        .query_all(Statement::from_sql_and_values(
-                            sea_orm::DatabaseBackend::Postgres,
-                            r"SELECT DISTINCT r.time
-                              FROM readings r
-                              JOIN derived_parameter_sources dps ON dps.parameter_id = r.parameter_id
-                              WHERE dps.derived_definition_id = $1 AND r.site_id = $2
-                              ORDER BY r.time",
-                            [def_id.into(), site_id.into()],
-                        ))
-                        .await;
-
-                    match timestamps {
-                        Ok(rows) => {
-                            let total = rows.len() as i32;
-                            let _ = db.execute(Statement::from_sql_and_values(
+                        let rows = db
+                            .query_all(Statement::from_sql_and_values(
                                 sea_orm::DatabaseBackend::Postgres,
-                                "UPDATE reprocessing_jobs SET status = 'running', total = $1, progress = 0 WHERE id = $2",
-                                [total.into(), job_id.into()],
-                            )).await;
+                                r"SELECT DISTINCT r.time
+                                  FROM readings r
+                                  JOIN derived_parameter_sources dps ON dps.parameter_id = r.parameter_id
+                                  WHERE dps.derived_definition_id = $1 AND r.site_id = $2
+                                  ORDER BY r.time",
+                                [def_id.into(), site_id.into()],
+                            ))
+                            .await?;
 
-                            let mut filled = 0i32;
-                            let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
-                            for (i, row) in rows.iter().enumerate() {
-                                let Ok(time) = row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "time") else { continue };
-                                let utc = time.with_timezone(&chrono::Utc);
-                                if crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
-                                    &db, site_id, utc,
-                                ).await.is_ok() {
-                                    filled += 1;
-                                    earliest = Some(earliest.map_or(utc, |e| e.min(utc)));
-                                }
-                                if (i + 1) % 500 == 0 {
-                                    let _ = db.execute(Statement::from_sql_and_values(
-                                        sea_orm::DatabaseBackend::Postgres,
-                                        "UPDATE reprocessing_jobs SET progress = $1 WHERE id = $2",
-                                        [(i as i32 + 1).into(), job_id.into()],
-                                    )).await;
-                                }
+                        let mut filled = 0i64;
+                        let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
+                        for row in &rows {
+                            let Ok(time) =
+                                row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "time")
+                            else {
+                                continue;
+                            };
+                            let utc = time.with_timezone(&chrono::Utc);
+                            if recalculate_derived_at_timestamp(&db, site_id, utc).await.is_ok() {
+                                filled += 1;
+                                earliest = Some(earliest.map_or(utc, |e| e.min(utc)));
                             }
-
-                            if let Some(since) = earliest {
-                                let _ = crate::common::sync_state::refresh_continuous_aggregates(
-                                    &db, Some(since),
-                                ).await;
-                            }
-
-                            let _ = db.execute(Statement::from_sql_and_values(
-                                sea_orm::DatabaseBackend::Postgres,
-                                "UPDATE reprocessing_jobs SET status = 'completed', progress = $1 WHERE id = $2",
-                                [filled.into(), job_id.into()],
-                            )).await;
-
-                            tracing::info!(%def_id, %site_id, filled, total, "Derived assignment backfill completed");
                         }
-                        Err(e) => {
-                            tracing::error!(error = %e, %def_id, %site_id, "Failed to query timestamps for derived backfill");
-                            let _ = db.execute(Statement::from_sql_and_values(
-                                sea_orm::DatabaseBackend::Postgres,
-                                "UPDATE reprocessing_jobs SET status = 'failed' WHERE id = $1",
-                                [job_id.into()],
-                            )).await;
+
+                        if let Some(since) = earliest {
+                            crate::common::sync_state::refresh_continuous_aggregates(&db, Some(since)).await;
                         }
-                    }
-                });
+
+                        tracing::info!(%def_id, %site_id, filled, "Derived assignment backfill completed");
+                        Ok(filled)
+                    },
+                )
+                .await
+                .map_err(ApiError::database)?;
             }
         }
 

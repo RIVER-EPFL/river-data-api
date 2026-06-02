@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use std::collections::HashMap;
+use std::future::Future;
 use uuid::Uuid;
 
 #[must_use]
@@ -499,26 +500,41 @@ pub async fn reprocess_sensor_readings(
     Ok(readings_updated)
 }
 
-pub async fn spawn_reprocessing_job(
+/// Generic tracked-job lifecycle. Inserts a `reprocessing_jobs` row (`status = 'pending'`),
+/// emits `JobCreated`, then spawns a background task that flips the row to `running`
+/// (emitting `JobProgress`), runs `work`, and finally records `completed`
+/// (`readings_updated` = returned count) or `failed` (`error_message`) — emitting
+/// `JobCompleted` in both cases. `sensor_id` and `trigger_id` are both nullable; the
+/// `INSERT` writes SQL NULL when absent. Returns the job id immediately.
+pub async fn spawn_tracked_job<F, Fut>(
     db: &DatabaseConnection,
-    sensor_id: Uuid,
+    sensor_id: Option<Uuid>,
     trigger_type: &str,
     trigger_id: Option<Uuid>,
     events: crate::common::EventSender,
-) -> Result<Uuid, sea_orm::DbErr> {
+    work: F,
+) -> Result<Uuid, sea_orm::DbErr>
+where
+    F: FnOnce(DatabaseConnection) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<i64, sea_orm::DbErr>> + Send,
+{
     use sea_orm::Value;
 
     let job_id = Uuid::new_v4();
+    let sensor_id_value: Value = match sensor_id {
+        Some(id) => id.into(),
+        None => Value::Uuid(None),
+    };
     let trigger_id_value: Value = match trigger_id {
         Some(id) => id.into(),
-        None => Value::String(None),
+        None => Value::Uuid(None),
     };
 
     db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status) \
          VALUES ($1, $2, $3, $4, 'pending')",
-        [job_id.into(), sensor_id.into(), trigger_type.into(), trigger_id_value],
+        [job_id.into(), sensor_id_value, trigger_type.into(), trigger_id_value],
     ))
     .await?;
 
@@ -546,7 +562,7 @@ pub async fn spawn_reprocessing_job(
             total: None,
         });
 
-        match reprocess_sensor_readings(&db, sensor_id).await {
+        match work(db.clone()).await {
             Ok(count) => {
                 if let Err(e) = db
                     .execute(Statement::from_sql_and_values(
@@ -555,7 +571,7 @@ pub async fn spawn_reprocessing_job(
                          SET status = 'completed', readings_updated = $1, \
                              completed_at = NOW() \
                          WHERE id = $2",
-                        [(count as i64).into(), job_id.into()],
+                        [count.into(), job_id.into()],
                     ))
                     .await
                 {
@@ -568,10 +584,9 @@ pub async fn spawn_reprocessing_job(
                     error_message: None,
                 });
                 tracing::info!(
-                    sensor_id = %sensor_id,
                     readings_updated = count,
                     trigger = %trigger_type,
-                    "Reprocessing completed"
+                    "Tracked job completed"
                 );
             }
             Err(e) => {
@@ -597,13 +612,33 @@ pub async fn spawn_reprocessing_job(
                 });
                 tracing::error!(
                     error = %e,
-                    sensor_id = %sensor_id,
                     trigger = %trigger_type,
-                    "Reprocessing failed"
+                    "Tracked job failed"
                 );
             }
         }
     });
 
     Ok(job_id)
+}
+
+/// Thin wrapper over [`spawn_tracked_job`] whose work re-derives FK columns and
+/// `calibrated_value` for every reading owned by `sensor_id`. Signature unchanged so the
+/// calibration/deployment CrudCrate hooks keep compiling against it.
+pub async fn spawn_reprocessing_job(
+    db: &DatabaseConnection,
+    sensor_id: Uuid,
+    trigger_type: &str,
+    trigger_id: Option<Uuid>,
+    events: crate::common::EventSender,
+) -> Result<Uuid, sea_orm::DbErr> {
+    spawn_tracked_job(
+        db,
+        Some(sensor_id),
+        trigger_type,
+        trigger_id,
+        events,
+        move |db| async move { reprocess_sensor_readings(&db, sensor_id).await.map(|c| c as i64) },
+    )
+    .await
 }

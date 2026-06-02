@@ -6,7 +6,9 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
-use crate::routes::private::sensor_calibrations::services::{evaluate_formula, recalculate_derived_at_timestamp};
+use crate::routes::private::sensor_calibrations::services::{
+    evaluate_formula, recalculate_derived_at_timestamp, reprocess_sensor_readings, spawn_tracked_job,
+};
 use crate::common::sync_state as state;
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -16,14 +18,15 @@ pub struct RefreshAggregatesRequest {
     pub full: bool,
 }
 
-/// Fire-and-forget refresh of TimescaleDB continuous aggregates. Returns immediately;
-/// the refresh runs in a tokio task with a 10-minute timeout. Requires `write_data`.
+/// Refresh of TimescaleDB continuous aggregates, tracked as a `reprocessing_jobs` row.
+/// Returns immediately with the job id; the refresh runs in a background task with a
+/// 10-minute timeout (a timeout marks the job `failed`). Requires `write_data`.
 #[utoipa::path(
     post,
     path = "/actions/refresh_aggregates",
     request_body = RefreshAggregatesRequest,
     responses(
-        (status = 200, description = "Refresh triggered (status field is always 'triggered')"),
+        (status = 200, description = "Refresh triggered; returns job_id and status 'pending'"),
     ),
     tag = "actions"
 )]
@@ -31,25 +34,42 @@ pub async fn refresh_aggregates(
     State(app_state): State<AppState>,
     Json(payload): Json<RefreshAggregatesRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let db = app_state.db.clone();
     let full = payload.full;
+    let trigger_type = if full {
+        "refresh_aggregates_full"
+    } else {
+        "refresh_aggregates"
+    };
 
-    tokio::spawn(async move {
-        match tokio::time::timeout(std::time::Duration::from_secs(600), async {
-            if full {
-                tracing::info!("Triggered full aggregate refresh via service API");
-                state::refresh_continuous_aggregates_full(&db).await;
-            } else {
-                tracing::info!("Triggered incremental aggregate refresh via service API");
-                state::refresh_continuous_aggregates(&db, None).await;
+    let job_id = spawn_tracked_job(
+        &app_state.db,
+        None,
+        trigger_type,
+        None,
+        app_state.events.clone(),
+        move |db| async move {
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(600), async {
+                if full {
+                    tracing::info!("Triggered full aggregate refresh via service API");
+                    state::refresh_continuous_aggregates_full(&db).await;
+                } else {
+                    tracing::info!("Triggered incremental aggregate refresh via service API");
+                    state::refresh_continuous_aggregates(&db, None).await;
+                }
+            })
+            .await;
+            match outcome {
+                Ok(()) => Ok(0),
+                Err(_) => Err(sea_orm::DbErr::Custom(
+                    "Aggregate refresh task timed out after 10 minutes".to_string(),
+                )),
             }
-        }).await {
-            Ok(()) => {}
-            Err(_) => tracing::error!("Aggregate refresh task timed out after 10 minutes"),
-        }
-    });
+        },
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    Ok(Json(serde_json::json!({ "status": "triggered" })))
+    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "pending" })))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -63,15 +83,16 @@ pub struct SiteTimestamps {
     pub timestamps: Vec<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Compute and upsert derived parameter values for the given (site, timestamp) pairs.
-/// Runs derived formula evaluation against source readings. Triggers an aggregate refresh
-/// on success. Requires `write_data`.
+/// Compute and upsert derived parameter values for the given (site, timestamp) pairs,
+/// tracked as a `reprocessing_jobs` row (`readings_updated` = computed count). Runs derived
+/// formula evaluation against source readings, then refreshes aggregates. Returns the job id
+/// immediately. Requires `write_data`.
 #[utoipa::path(
     post,
     path = "/actions/compute_derived",
     request_body = ComputeDerivedRequest,
     responses(
-        (status = 200, description = "Computation triggered; returns counts when complete"),
+        (status = 200, description = "Computation triggered; returns job_id, status 'pending', total_timestamps"),
     ),
     tag = "actions"
 )]
@@ -79,23 +100,26 @@ pub async fn compute_derived(
     State(app_state): State<AppState>,
     Json(payload): Json<ComputeDerivedRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let db = app_state.db.clone();
-
     let total_timestamps: usize = payload
         .site_timestamps
         .iter()
         .map(|st| st.timestamps.len())
         .sum();
 
-    tokio::spawn(async move {
-        match tokio::time::timeout(std::time::Duration::from_secs(600), async {
+    let job_id = spawn_tracked_job(
+        &app_state.db,
+        None,
+        "compute_derived",
+        None,
+        app_state.events.clone(),
+        move |db| async move {
             tracing::info!(
                 sites = payload.site_timestamps.len(),
                 timestamps = total_timestamps,
                 "Computing derived values via service API"
             );
 
-            let mut computed = 0u64;
+            let mut computed = 0i64;
             for st in &payload.site_timestamps {
                 for time in &st.timestamps {
                     match recalculate_derived_at_timestamp(&db, st.site_id, *time).await {
@@ -124,15 +148,55 @@ pub async fn compute_derived(
                     state::refresh_continuous_aggregates(&db, Some(since)).await;
                 }
             }
-        }).await {
-            Ok(()) => {}
-            Err(_) => tracing::error!("Compute derived task timed out after 10 minutes"),
-        }
-    });
 
-    Ok(Json(
-        serde_json::json!({ "status": "triggered", "total_timestamps": total_timestamps }),
-    ))
+            Ok(computed)
+        },
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "job_id": job_id,
+        "status": "pending",
+        "total_timestamps": total_timestamps,
+    })))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ReprocessSensorRequest {
+    pub sensor_id: Uuid,
+}
+
+/// Re-derive `calibration_id`, `deployment_id`/`site_id`, and `calibrated_value` for every
+/// reading owned by a sensor from its calibration and deployment windows, cascade to derived
+/// parameters, and refresh aggregates. Tracked as a `reprocessing_jobs` row; returns the job
+/// id immediately. Requires `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/actions/reprocess",
+    request_body = ReprocessSensorRequest,
+    responses(
+        (status = 200, description = "Reprocessing triggered; returns job_id and status 'pending'"),
+    ),
+    tag = "actions"
+)]
+pub async fn reprocess_sensor(
+    State(app_state): State<AppState>,
+    Json(payload): Json<ReprocessSensorRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let sensor_id = payload.sensor_id;
+    let job_id = spawn_tracked_job(
+        &app_state.db,
+        Some(sensor_id),
+        "manual_reprocess",
+        None,
+        app_state.events.clone(),
+        move |db| async move { reprocess_sensor_readings(&db, sensor_id).await.map(|c| c as i64) },
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "pending" })))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

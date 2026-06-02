@@ -179,6 +179,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
             "/actions/sensor_calibrations/{id}/recalculate",
             post(calibrations::recalculate_calibration),
         )
+        .route("/actions/reprocess", post(actions::reprocess_sensor))
         .route(
             "/actions/derived_parameters/{id}/recompute",
             post(derived::recompute_derived),
