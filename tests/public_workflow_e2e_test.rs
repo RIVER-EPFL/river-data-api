@@ -270,7 +270,7 @@ async fn test_full_public_data_workflow() {
     );
     let (status, sites) = common::get_json(&app, "/api/public/e2e_river/sites").await;
     assert_eq!(status, 200);
-    assert!(sites.as_array().unwrap().iter().any(|s| s["uuid"] == site_id), "sites: {sites}");
+    assert!(sites.as_array().unwrap().iter().any(|s| s["id"] == "e2e_station"), "sites: {sites}");
 
     // 11. Public readings reproduce the real raw data exactly AND the recomputed derived value.
     // Parameter names now come from parameters.name: "dissolved_oxygen", "temperature", "DOmgL".
