@@ -1,9 +1,12 @@
+use std::collections::HashMap;
+
 use axum::{
     Json,
     extract::{Path, State},
 };
 use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement};
+use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
@@ -12,6 +15,48 @@ use crate::error::{AppError, AppResult};
 use crate::routes::{resolve_site, resolve_site_with_project};
 
 use super::types::{ParameterResponse, ProjectRef, SiteDetailResponse};
+
+#[derive(Debug, FromQueryResult)]
+struct ParameterExtentRow {
+    parameter_id: Uuid,
+    min_time: Option<DateTime<Utc>>,
+    max_time: Option<DateTime<Utc>>,
+    count: i64,
+}
+
+struct ParameterExtent {
+    data_start: Option<DateTime<Utc>>,
+    data_end: Option<DateTime<Utc>>,
+    reading_count: i64,
+}
+
+async fn parameter_extents(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+) -> AppResult<HashMap<Uuid, ParameterExtent>> {
+    let stmt = Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT parameter_id, MIN(time) AS min_time, MAX(time) AS max_time, COUNT(*) AS count \
+         FROM readings WHERE site_id = $1 GROUP BY parameter_id",
+        [site_id.into()],
+    );
+
+    let rows = ParameterExtentRow::find_by_statement(stmt).all(db).await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.parameter_id,
+                ParameterExtent {
+                    data_start: r.min_time,
+                    data_end: r.max_time,
+                    reading_count: r.count,
+                },
+            )
+        })
+        .collect())
+}
 
 /// List parameters for a site
 #[utoipa::path(
@@ -49,10 +94,13 @@ pub async fn list_site_parameters(
         .all(&state.db)
         .await?;
 
+    let extents = parameter_extents(&state.db, site.id).await?;
+
     let response: Vec<ParameterResponse> = params_list
         .into_iter()
         .map(|p| {
             let sensor_type = if p.sensor_type.is_empty() { p.name.clone() } else { p.sensor_type };
+            let extent = extents.get(&p.parameter_id);
             ParameterResponse {
                 id: p.id,
                 name: p.name,
@@ -60,6 +108,9 @@ pub async fn list_site_parameters(
                 display_units: p.display_units,
                 sample_interval_sec: p.sample_interval_sec,
                 is_active: p.is_active,
+                data_start: extent.and_then(|e| e.data_start),
+                data_end: extent.and_then(|e| e.data_end),
+                reading_count: extent.map(|e| e.reading_count),
             }
         })
         .collect();
@@ -111,10 +162,13 @@ pub async fn get_site_detail(
         .all(&state.db)
         .await?;
 
+    let extents = parameter_extents(&state.db, site.id).await?;
+
     let parameters: Vec<ParameterResponse> = params_list
         .into_iter()
         .map(|p| {
             let sensor_type = if p.sensor_type.is_empty() { p.name.clone() } else { p.sensor_type };
+            let extent = extents.get(&p.parameter_id);
             ParameterResponse {
                 id: p.id,
                 name: p.name,
@@ -122,6 +176,9 @@ pub async fn get_site_detail(
                 display_units: p.display_units,
                 sample_interval_sec: p.sample_interval_sec,
                 is_active: p.is_active,
+                data_start: extent.and_then(|e| e.data_start),
+                data_end: extent.and_then(|e| e.data_end),
+                reading_count: extent.map(|e| e.reading_count),
             }
         })
         .collect();

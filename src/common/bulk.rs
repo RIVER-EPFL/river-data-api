@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
+use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 
@@ -58,12 +59,18 @@ pub fn acquire_bulk_permit(
 /// Parameter data needed for CSV/NDJSON streaming (simple value-per-param).
 pub trait StreamableParam: Send + Sync {
     fn name(&self) -> &str;
+    fn parameter_id(&self) -> Option<Uuid> {
+        None
+    }
     fn value_at(&self, index: usize) -> Option<f64>;
 }
 
 /// Aggregate parameter data needed for CSV/NDJSON streaming (avg/min/max/count).
 pub trait StreamableAggregateParam: Send + Sync {
     fn name(&self) -> &str;
+    fn parameter_id(&self) -> Option<Uuid> {
+        None
+    }
     fn avg_at(&self, index: usize) -> Option<f64>;
     fn min_at(&self, index: usize) -> Option<f64>;
     fn max_at(&self, index: usize) -> Option<f64>;
@@ -95,11 +102,18 @@ pub fn build_csv_response_with_times(
     let params: Vec<_> = params.to_vec();
 
     tokio::spawn(async move {
+        let include_pid = params.iter().any(|p| p.parameter_id().is_some());
+
         // Header row
         let mut header = "time".to_string();
         for param in &params {
             header.push(',');
             header.push_str(param.name());
+        }
+        if include_pid {
+            for param in &params {
+                header.push_str(&format!(",{}_parameter_id", param.name()));
+            }
         }
         header.push('\n');
         let _ = tx.send(Ok(header)).await;
@@ -111,6 +125,14 @@ pub fn build_csv_response_with_times(
                 row.push(',');
                 if let Some(v) = param.value_at(i) {
                     row.push_str(&v.to_string());
+                }
+            }
+            if include_pid {
+                for param in &params {
+                    row.push(',');
+                    if let Some(pid) = param.parameter_id() {
+                        row.push_str(&pid.to_string());
+                    }
                 }
             }
             row.push('\n');
@@ -161,6 +183,12 @@ pub fn build_ndjson_response_with_times(
                         None => serde_json::Value::Null,
                     },
                 );
+                if let Some(pid) = param.parameter_id() {
+                    obj.insert(
+                        format!("{}_parameter_id", param.name()),
+                        serde_json::json!(pid.to_string()),
+                    );
+                }
             }
 
             let line = format!("{}\n", serde_json::Value::Object(obj));
@@ -201,6 +229,8 @@ pub fn build_aggregates_csv_response_with_times(
     let params: Vec<_> = params.to_vec();
 
     tokio::spawn(async move {
+        let include_pid = params.iter().any(|p| p.parameter_id().is_some());
+
         // Header row
         let mut header = "time".to_string();
         for param in &params {
@@ -211,6 +241,11 @@ pub fn build_aggregates_csv_response_with_times(
                 param.name(),
                 param.name()
             ));
+        }
+        if include_pid {
+            for param in &params {
+                header.push_str(&format!(",{}_parameter_id", param.name()));
+            }
         }
         header.push('\n');
         let _ = tx.send(Ok(header)).await;
@@ -234,6 +269,14 @@ pub fn build_aggregates_csv_response_with_times(
                 row.push(',');
                 if let Some(c) = param.count_at(i) {
                     row.push_str(&c.to_string());
+                }
+            }
+            if include_pid {
+                for param in &params {
+                    row.push(',');
+                    if let Some(pid) = param.parameter_id() {
+                        row.push_str(&pid.to_string());
+                    }
                 }
             }
             row.push('\n');
@@ -294,6 +337,12 @@ pub fn build_aggregates_ndjson_response_with_times(
                     max.map_or(serde_json::Value::Null, |v| serde_json::json!(v)),
                 );
                 obj.insert(format!("{}_count", param.name()), serde_json::json!(count));
+                if let Some(pid) = param.parameter_id() {
+                    obj.insert(
+                        format!("{}_parameter_id", param.name()),
+                        serde_json::json!(pid.to_string()),
+                    );
+                }
             }
 
             let line = format!("{}\n", serde_json::Value::Object(obj));

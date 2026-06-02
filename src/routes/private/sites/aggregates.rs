@@ -48,6 +48,8 @@ pub struct AggregatesResponse {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ParameterAggregateData {
     pub id: Uuid,
+    /// Global parameter id (the catalog parameter this site_parameter references)
+    pub parameter_id: Uuid,
     pub name: String,
     #[serde(rename = "type")]
     pub sensor_type: String,
@@ -70,6 +72,9 @@ pub struct ParameterAggregateData {
 impl StreamableAggregateParam for ParameterAggregateData {
     fn name(&self) -> &str {
         &self.name
+    }
+    fn parameter_id(&self) -> Option<Uuid> {
+        Some(self.parameter_id)
     }
     fn avg_at(&self, index: usize) -> Option<f64> {
         self.avg.get(index).and_then(|v| *v)
@@ -451,6 +456,7 @@ pub async fn get_site_aggregates(
 
             ParameterAggregateData {
                 id: param.id,
+                parameter_id: param.parameter_id,
                 name: param.name.clone(),
                 sensor_type: if param.sensor_type.is_empty() { param.name.clone() } else { param.sensor_type.clone() },
                 units: param.display_units.clone(),

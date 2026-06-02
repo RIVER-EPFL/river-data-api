@@ -72,6 +72,8 @@ pub struct ReadingsResponse {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ParameterData {
     pub id: Uuid,
+    /// Global parameter id (the catalog parameter this site_parameter references)
+    pub parameter_id: Uuid,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
@@ -94,6 +96,9 @@ pub struct ParameterData {
 impl StreamableParam for ParameterData {
     fn name(&self) -> &str {
         &self.name
+    }
+    fn parameter_id(&self) -> Option<Uuid> {
+        Some(self.parameter_id)
     }
     fn value_at(&self, index: usize) -> Option<f64> {
         self.values.get(index).and_then(|v| *v)
@@ -434,6 +439,7 @@ pub async fn get_site_readings(
 
                 ParameterData {
                     id: sp.id,
+                    parameter_id: sp.parameter_id,
                     name: sp.name.clone(),
                     display_name: display_name_map.get(&sp.parameter_id).cloned(),
                     sensor_type: if sp.sensor_type.is_empty() { sp.name.clone() } else { sp.sensor_type.clone() },
@@ -572,6 +578,7 @@ pub async fn get_site_readings(
 
             ParameterData {
                 id: sp.id,
+                parameter_id: sp.parameter_id,
                 name: sp.name.clone(),
                 display_name: display_name_map.get(&sp.parameter_id).cloned(),
                 sensor_type: if sp.sensor_type.is_empty() { sp.name.clone() } else { sp.sensor_type.clone() },

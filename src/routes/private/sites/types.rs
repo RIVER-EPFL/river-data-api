@@ -36,6 +36,12 @@ pub struct ParameterResponse {
     pub display_units: Option<String>,
     pub sample_interval_sec: Option<i32>,
     pub is_active: Option<bool>,
+    /// Earliest reading timestamp for this parameter at the site
+    pub data_start: Option<DateTime<Utc>>,
+    /// Latest reading timestamp for this parameter at the site
+    pub data_end: Option<DateTime<Utc>>,
+    /// Number of readings for this parameter at the site
+    pub reading_count: Option<i64>,
 }
 
 /// Detailed site response with project info, parameters, and data range
