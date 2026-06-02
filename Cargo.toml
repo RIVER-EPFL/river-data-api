@@ -27,7 +27,7 @@ sea-orm-timescale = "0.2.0"
 
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 # Serialization
 chrono = { version = "0.4", features = ["serde"] }

@@ -160,6 +160,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route("/actions/preview_derived", post(actions::preview_derived))
         .route("/alarms/active", get(alarm_views::get_active_alarms))
         .route("/alarms/summary", get(alarm_views::get_alarm_summary))
+        .route("/events", get(crate::routes::private::events::event_stream))
         .route("/tools", get(tools::list_tools))
         .route("/tools/{tool_name}/calculate", post(tools::calculate_tool))
         .layer(middleware::from_fn(require_read_data))

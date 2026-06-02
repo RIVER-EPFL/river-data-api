@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::common::AppState;
+use crate::common::{AppEvent, AppState};
 use crate::routes::private::readings;
 use crate::error::AppResult;
 use crate::routes::private::data_streams::services::get_or_create_api_stream;
@@ -195,6 +195,18 @@ pub async fn insert_batch_readings(
 
     tracing::info!(total, inserted, overwritten, "Batch readings insert complete");
 
+    // Emit DataIngested events per unique (site_id, parameter_id) pair
+    if inserted > 0 || overwritten > 0 {
+        for ((site_id, parameter_id), &stream_id) in &stream_cache {
+            let _ = state.events.send(AppEvent::DataIngested {
+                site_id: Some(*site_id),
+                parameter_id: Some(*parameter_id),
+                stream_id,
+                count: inserted + overwritten,
+            });
+        }
+    }
+
     // Invalidate response cache and auto-compute derived parameters for all affected sites.
     // Cascade also runs when rows were overwritten, since their downstream values are now stale.
     if inserted > 0 || overwritten > 0 {
@@ -223,8 +235,10 @@ pub async fn insert_batch_readings(
                 [job_id.into(), job_total.into()],
             ))
             .await?;
+        let _ = state.events.send(AppEvent::JobCreated { job_id });
 
         let db_clone = state.db.clone();
+        let events = state.events.clone();
         tokio::spawn(async move {
             let _ = db_clone
                 .execute(sea_orm::Statement::from_sql_and_values(
@@ -259,6 +273,12 @@ pub async fn insert_batch_readings(
                                 [progress.into(), job_id.into()],
                             ))
                             .await;
+                        let _ = events.send(AppEvent::JobProgress {
+                            job_id,
+                            status: "running".to_string(),
+                            progress: Some(progress),
+                            total: Some(job_total),
+                        });
                     }
                 }
             }
@@ -273,6 +293,12 @@ pub async fn insert_batch_readings(
                     [job_id.into()],
                 ))
                 .await;
+            let _ = events.send(AppEvent::JobCompleted {
+                job_id,
+                status: "completed".to_string(),
+                readings_updated: None,
+                error_message: None,
+            });
         });
     }
 

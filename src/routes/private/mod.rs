@@ -6,6 +6,7 @@ pub mod api_tokens;
 pub mod constants;
 pub mod data_streams;
 pub mod derived_parameters;
+pub mod events;
 pub mod notes;
 pub mod pairing_plans;
 pub mod parameters;

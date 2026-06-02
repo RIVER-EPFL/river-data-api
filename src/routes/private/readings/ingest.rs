@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::common::AppState;
+use crate::common::{AppEvent, AppState};
 use crate::routes::private::{data_streams, readings, status_events};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::operations::resolve_sensor_context;
@@ -161,6 +161,16 @@ pub async fn ingest_readings(
         }
     }
 
+    // Emit ingestion event
+    if inserted > 0 {
+        let _ = state.events.send(AppEvent::DataIngested {
+            site_id,
+            parameter_id,
+            stream_id: payload.stream_id,
+            count: inserted,
+        });
+    }
+
     // Update last_data_time on the stream
     if let Some(max_time) = payload.readings.iter().map(|r| r.time).max() {
         let should_update = stream
@@ -196,8 +206,10 @@ pub async fn ingest_readings(
             [job_id.into(), job_total.into()],
         ))
         .await?;
+        let _ = state.events.send(AppEvent::JobCreated { job_id });
 
         let db_clone = state.db.clone();
+        let events = state.events.clone();
         tokio::spawn(async move {
             let _ = db_clone
                 .execute(Statement::from_sql_and_values(
@@ -231,6 +243,12 @@ pub async fn ingest_readings(
                             [progress.into(), job_id.into()],
                         ))
                         .await;
+                    let _ = events.send(AppEvent::JobProgress {
+                        job_id,
+                        status: "running".to_string(),
+                        progress: Some(progress),
+                        total: Some(job_total),
+                    });
                 }
             }
 
@@ -242,6 +260,12 @@ pub async fn ingest_readings(
                     [job_id.into()],
                 ))
                 .await;
+            let _ = events.send(AppEvent::JobCompleted {
+                job_id,
+                status: "completed".to_string(),
+                readings_updated: None,
+                error_message: None,
+            });
         });
     }
 

@@ -5,7 +5,7 @@ use axum::{
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
-use crate::common::AppState;
+use crate::common::{AppEvent, AppState};
 use crate::error::AppResult;
 
 async fn update_job(
@@ -52,7 +52,9 @@ pub async fn recompute_derived(
         [job_id.into(), id.into()],
     ))
     .await?;
+    let _ = state.events.send(AppEvent::JobCreated { job_id });
 
+    let events = state.events.clone();
     tokio::spawn(async move {
         match tokio::time::timeout(std::time::Duration::from_secs(600), async {
             tracing::info!(derived_id = %id, %job_id, "Recomputing derived parameter");
@@ -109,6 +111,12 @@ pub async fn recompute_derived(
                                 vec![(i as i32 + 1).into(), job_id.into()],
                             )
                             .await;
+                            let _ = events.send(AppEvent::JobProgress {
+                                job_id,
+                                status: "running".to_string(),
+                                progress: Some(i as i32 + 1),
+                                total: Some(total),
+                            });
                         }
                     }
 
@@ -126,6 +134,12 @@ pub async fn recompute_derived(
                         vec![filled.into(), job_id.into()],
                     )
                     .await;
+                    let _ = events.send(AppEvent::JobCompleted {
+                        job_id,
+                        status: "completed".to_string(),
+                        readings_updated: Some(filled),
+                        error_message: None,
+                    });
                     tracing::info!(derived_id = %id, %job_id, total, filled, "Derived parameter recomputation complete");
                 }
                 Err(e) => {
@@ -138,6 +152,12 @@ pub async fn recompute_derived(
                         vec![msg.as_str().into(), job_id.into()],
                     )
                     .await;
+                    let _ = events.send(AppEvent::JobCompleted {
+                        job_id,
+                        status: "failed".to_string(),
+                        readings_updated: None,
+                        error_message: Some(msg),
+                    });
                 }
             }
         }).await {
@@ -151,6 +171,12 @@ pub async fn recompute_derived(
                     vec![job_id.into()],
                 )
                 .await;
+                let _ = events.send(AppEvent::JobCompleted {
+                    job_id,
+                    status: "failed".to_string(),
+                    readings_updated: None,
+                    error_message: Some("Timed out after 10 minutes".to_string()),
+                });
             }
         }
     });

@@ -3,14 +3,35 @@ use chrono::{DateTime, Utc};
 use moka::future::Cache;
 use river_data_core::server::SyncState;
 use sea_orm::DatabaseConnection;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 
 use crate::config::Config;
 use crate::routes::private::api_tokens::services::TokenCache;
 use super::bulk::{BulkSemaphore, new_bulk_semaphore};
 use crate::routes::public::services::{PublicConfigCache, new_public_config_cache};
+
+/// Server-sent event pushed to connected clients via the `/api/events` SSE stream.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AppEvent {
+    JobCreated { job_id: uuid::Uuid },
+    JobProgress { job_id: uuid::Uuid, status: String, progress: Option<i32>, total: Option<i32> },
+    JobCompleted { job_id: uuid::Uuid, status: String, readings_updated: Option<i32>, error_message: Option<String> },
+    DataIngested { site_id: Option<uuid::Uuid>, parameter_id: Option<uuid::Uuid>, stream_id: uuid::Uuid, count: usize },
+}
+
+pub type EventSender = broadcast::Sender<AppEvent>;
+
+/// Global handle so CrudCrate operation hooks (which only receive `&self` + `db`)
+/// can emit events without modifying the CrudCrate trait signatures.
+static GLOBAL_EVENT_SENDER: OnceLock<EventSender> = OnceLock::new();
+
+/// Returns a clone of the global event sender, if initialised.
+pub fn global_event_sender() -> Option<EventSender> {
+    GLOBAL_EVENT_SENDER.get().cloned()
+}
 
 /// Cached admin token: (access_token, expiry).
 type AdminTokenCache = Arc<Mutex<Option<(String, DateTime<Utc>)>>>;
@@ -45,6 +66,7 @@ pub struct AppState {
     pub bulk_semaphore: BulkSemaphore,
     pub keycloak_admin: Option<KeycloakAdmin>,
     pub token_cache: TokenCache,
+    pub events: EventSender,
 }
 
 impl AppState {
@@ -82,6 +104,8 @@ impl AppState {
         });
 
         let token_cache = crate::routes::private::api_tokens::services::new_token_cache();
+        let (events, _) = broadcast::channel(256);
+        let _ = GLOBAL_EVENT_SENDER.set(events.clone());
 
         Self {
             db,
@@ -92,6 +116,7 @@ impl AppState {
             bulk_semaphore,
             keycloak_admin,
             token_cache,
+            events,
         }
     }
 }

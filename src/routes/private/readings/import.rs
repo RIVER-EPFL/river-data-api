@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::common::AppState;
+use crate::common::{AppEvent, AppState};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams::services::get_or_create_api_stream;
 use crate::routes::private::readings;
@@ -474,6 +474,20 @@ pub async fn import_csv(
 
     tracing::info!(site = %site.name, inserted_total, overwritten, params = mappings.len(), "CSV import inserted readings");
 
+    // Emit DataIngested events per imported parameter
+    if inserted_total > 0 || overwritten > 0 {
+        for m in &mappings {
+            if let Some(&stream_id) = stream_cache.get(&m.parameter_id) {
+                let _ = state.events.send(AppEvent::DataIngested {
+                    site_id: Some(site_id),
+                    parameter_id: Some(m.parameter_id),
+                    stream_id,
+                    count: inserted_total + overwritten,
+                });
+            }
+        }
+    }
+
     // Recompute derived parameters + refresh aggregates in the background as a tracked
     // reprocessing job, so the request returns immediately after the (fast) raw insert. Skip
     // entirely when nothing new was inserted (idempotent re-import).
@@ -495,9 +509,11 @@ pub async fn import_csv(
                 [job_id.into(), total.into()],
             ))
             .await?;
+        let _ = state.events.send(AppEvent::JobCreated { job_id });
 
         let db = state.db.clone();
         let app = state.clone();
+        let events = state.events.clone();
         let since = earliest;
         tokio::spawn(async move {
             let _ = db
@@ -526,6 +542,12 @@ pub async fn import_csv(
                             [i32::try_from(i + 1).unwrap_or(i32::MAX).into(), job_id.into()],
                         ))
                         .await;
+                    let _ = events.send(AppEvent::JobProgress {
+                        job_id,
+                        status: "running".to_string(),
+                        progress: Some(i32::try_from(i + 1).unwrap_or(i32::MAX)),
+                        total: Some(total),
+                    });
                 }
             }
 
@@ -543,6 +565,12 @@ pub async fn import_csv(
                     [filled.into(), job_id.into()],
                 ))
                 .await;
+            let _ = events.send(AppEvent::JobCompleted {
+                job_id,
+                status: "completed".to_string(),
+                readings_updated: Some(filled),
+                error_message: None,
+            });
         });
         Some(job_id)
     } else {

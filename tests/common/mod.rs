@@ -4,7 +4,7 @@ pub mod fixtures;
 pub mod seed;
 pub mod sensor_lifecycle;
 
-use river_db::common::AppState;
+use river_db::common::{AppState, EventSender};
 use river_db::config::Config;
 use sea_orm::DatabaseConnection;
 
@@ -18,6 +18,13 @@ pub fn build_test_app(db: DatabaseConnection) -> axum::Router {
     let config = test_config();
     let state = AppState::new(db, config, None);
     river_db::routes::build_router(state)
+}
+
+pub fn build_test_app_with_events(db: DatabaseConnection) -> (axum::Router, EventSender) {
+    let config = test_config();
+    let state = AppState::new(db, config, None);
+    let events = state.events.clone();
+    (river_db::routes::build_router(state), events)
 }
 
 fn test_config() -> Config {

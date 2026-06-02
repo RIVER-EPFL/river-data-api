@@ -4,6 +4,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
 use super::model::SensorDeployment;
+use crate::common::global_event_sender;
 use crate::routes::private::sensor_calibrations::services::spawn_reprocessing_job;
 
 pub struct SensorDeploymentOperations;
@@ -44,9 +45,11 @@ impl CRUDOperations for SensorDeploymentOperations {
         db: &DatabaseConnection,
         entity: &mut SensorDeployment,
     ) -> Result<(), ApiError> {
-        spawn_reprocessing_job(db, entity.sensor_id, "deployment_create", Some(entity.id))
-            .await
-            .map_err(ApiError::database)?;
+        if let Some(events) = global_event_sender() {
+            spawn_reprocessing_job(db, entity.sensor_id, "deployment_create", Some(entity.id), events)
+                .await
+                .map_err(ApiError::database)?;
+        }
 
         Ok(())
     }
@@ -56,9 +59,11 @@ impl CRUDOperations for SensorDeploymentOperations {
         db: &DatabaseConnection,
         entity: &mut SensorDeployment,
     ) -> Result<(), ApiError> {
-        spawn_reprocessing_job(db, entity.sensor_id, "deployment_update", Some(entity.id))
-            .await
-            .map_err(ApiError::database)?;
+        if let Some(events) = global_event_sender() {
+            spawn_reprocessing_job(db, entity.sensor_id, "deployment_update", Some(entity.id), events)
+                .await
+                .map_err(ApiError::database)?;
+        }
 
         Ok(())
     }
@@ -95,9 +100,11 @@ impl CRUDOperations for SensorDeploymentOperations {
         .await
         .map_err(ApiError::database)?;
 
-        spawn_reprocessing_job(db, sensor_id, "deployment_delete", Some(id))
-            .await
-            .map_err(ApiError::database)?;
+        if let Some(events) = global_event_sender() {
+            spawn_reprocessing_job(db, sensor_id, "deployment_delete", Some(id), events)
+                .await
+                .map_err(ApiError::database)?;
+        }
 
         Ok(id)
     }

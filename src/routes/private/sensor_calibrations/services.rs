@@ -504,6 +504,7 @@ pub async fn spawn_reprocessing_job(
     sensor_id: Uuid,
     trigger_type: &str,
     trigger_id: Option<Uuid>,
+    events: crate::common::EventSender,
 ) -> Result<Uuid, sea_orm::DbErr> {
     use sea_orm::Value;
 
@@ -521,8 +522,11 @@ pub async fn spawn_reprocessing_job(
     ))
     .await?;
 
+    let _ = events.send(crate::common::AppEvent::JobCreated { job_id });
+
     let db = db.clone();
     let trigger_type = trigger_type.to_string();
+    let events = events.clone();
     tokio::spawn(async move {
         if let Err(e) = db
             .execute(Statement::from_sql_and_values(
@@ -534,6 +538,13 @@ pub async fn spawn_reprocessing_job(
         {
             tracing::warn!(error = %e, job_id = %job_id, "Failed to set reprocessing job to running");
         }
+
+        let _ = events.send(crate::common::AppEvent::JobProgress {
+            job_id,
+            status: "running".into(),
+            progress: Some(0),
+            total: None,
+        });
 
         match reprocess_sensor_readings(&db, sensor_id).await {
             Ok(count) => {
@@ -550,6 +561,12 @@ pub async fn spawn_reprocessing_job(
                 {
                     tracing::warn!(error = %e, job_id = %job_id, "Failed to mark reprocessing job completed");
                 }
+                let _ = events.send(crate::common::AppEvent::JobCompleted {
+                    job_id,
+                    status: "completed".into(),
+                    readings_updated: Some(count as i32),
+                    error_message: None,
+                });
                 tracing::info!(
                     sensor_id = %sensor_id,
                     readings_updated = count,
@@ -572,6 +589,12 @@ pub async fn spawn_reprocessing_job(
                 {
                     tracing::warn!(error = %db_err, job_id = %job_id, "Failed to mark reprocessing job failed");
                 }
+                let _ = events.send(crate::common::AppEvent::JobCompleted {
+                    job_id,
+                    status: "failed".into(),
+                    readings_updated: None,
+                    error_message: Some(msg.clone()),
+                });
                 tracing::error!(
                     error = %e,
                     sensor_id = %sensor_id,
