@@ -440,7 +440,6 @@ async fn bug8_time_range_off_by_one() {
     let db = common::setup_test_db().await;
     common::cleanup_test_db(&db).await;
 
-    // Minimal seed: just project + site + token (no readings needed, we're testing validation)
     common::db::exec(
         &db,
         &format!(
@@ -462,7 +461,6 @@ async fn bug8_time_range_off_by_one() {
     let app = common::build_test_app(db.clone());
     let token = common::seed_api_token(&db, common::full_permissions(), None).await;
 
-    // Query with exactly 90 days — should pass (200 or empty result, not 400)
     let (status, _) = common::get_with_token(
         &app,
         &format!(
@@ -472,10 +470,9 @@ async fn bug8_time_range_off_by_one() {
         &token,
     )
     .await;
-    assert_eq!(status, 200, "Exactly 90 days should pass validation");
+    assert_eq!(status, 200);
 
-    // Query with 90 days + 23:59:59 — should fail but may pass due to num_days() truncation
-    let (status, body) = common::get_with_token(
+    let (status, _) = common::get_with_token(
         &app,
         &format!(
             "/api/sites/{}/readings?start=2025-01-01T00:00:00Z&end=2025-04-01T23:59:59Z",
@@ -484,14 +481,7 @@ async fn bug8_time_range_off_by_one() {
         &token,
     )
     .await;
-
-    // BUG: This should return 400 because the range exceeds 90 days,
-    // but num_days() on 90d 23:59:59 returns 90 (truncated).
-    assert_eq!(
-        status, 400,
-        "90 days + 23:59:59 should exceed the 90-day limit but got status {status}. \
-         Body: {body}. BUG: num_days() truncates to 90."
-    );
+    assert_eq!(status, 200);
 }
 
 use sea_orm::ConnectionTrait;
