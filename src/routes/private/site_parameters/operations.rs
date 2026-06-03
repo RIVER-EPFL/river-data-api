@@ -169,47 +169,45 @@ impl CRUDOperations for SiteParameterOperations {
             entity.name = parameter.display_name.clone();
         }
 
-        // Only create if at least one default threshold is set
-        if parameter.default_warning_min.is_none()
-            && parameter.default_warning_max.is_none()
-            && parameter.default_alarm_min.is_none()
-            && parameter.default_alarm_max.is_none()
-        {
-            return Ok(());
+        // Auto-create an alarm threshold from the parameter's defaults, when any are set and
+        // none exists yet for this parameter + site. Derived output parameters carry no default
+        // thresholds, so this is simply skipped for them — the derived backfill below still runs.
+        let has_default_threshold = parameter.default_warning_min.is_some()
+            || parameter.default_warning_max.is_some()
+            || parameter.default_alarm_min.is_some()
+            || parameter.default_alarm_max.is_some();
+
+        if has_default_threshold {
+            let existing = crate::routes::private::alarm_thresholds::Entity::find()
+                .filter(crate::routes::private::alarm_thresholds::Column::ParameterId.eq(entity.parameter_id))
+                .filter(crate::routes::private::alarm_thresholds::Column::SiteId.eq(entity.site_id))
+                .one(db)
+                .await
+                .map_err(ApiError::database)?;
+
+            if existing.is_none() {
+                let threshold = crate::routes::private::alarm_thresholds::ActiveModel {
+                    id: Set(Uuid::new_v4()),
+                    parameter_id: Set(entity.parameter_id),
+                    site_id: Set(Some(entity.site_id)),
+                    alarm_type: Set("range".to_string()),
+                    warning_min: Set(parameter.default_warning_min),
+                    warning_max: Set(parameter.default_warning_max),
+                    alarm_min: Set(parameter.default_alarm_min),
+                    alarm_max: Set(parameter.default_alarm_max),
+                    description: Set(Some(format!(
+                        "Auto-created from {} defaults",
+                        parameter.name
+                    ))),
+                    string_alarm_values: Set(None),
+                    string_warning_values: Set(None),
+                    created_at: Set(None),
+                    updated_at: Set(None),
+                };
+
+                threshold.insert(db).await.map_err(ApiError::database)?;
+            }
         }
-
-        // Skip if an alarm_threshold already exists for this parameter + site
-        let existing = crate::routes::private::alarm_thresholds::Entity::find()
-            .filter(crate::routes::private::alarm_thresholds::Column::ParameterId.eq(entity.parameter_id))
-            .filter(crate::routes::private::alarm_thresholds::Column::SiteId.eq(entity.site_id))
-            .one(db)
-            .await
-            .map_err(ApiError::database)?;
-
-        if existing.is_some() {
-            return Ok(());
-        }
-
-        let threshold = crate::routes::private::alarm_thresholds::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            parameter_id: Set(entity.parameter_id),
-            site_id: Set(Some(entity.site_id)),
-            alarm_type: Set("range".to_string()),
-            warning_min: Set(parameter.default_warning_min),
-            warning_max: Set(parameter.default_warning_max),
-            alarm_min: Set(parameter.default_alarm_min),
-            alarm_max: Set(parameter.default_alarm_max),
-            description: Set(Some(format!(
-                "Auto-created from {} defaults",
-                parameter.name
-            ))),
-            string_alarm_values: Set(None),
-            string_warning_values: Set(None),
-            created_at: Set(None),
-            updated_at: Set(None),
-        };
-
-        threshold.insert(db).await.map_err(ApiError::database)?;
 
         // Backfill derived values for the readings already present at this site when a
         // derived site_parameter is assigned. Tracked via spawn_tracked_job. A guard skips

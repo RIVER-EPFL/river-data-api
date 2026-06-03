@@ -1,15 +1,8 @@
 //! End-to-end derived-parameter lifecycle: define a derived parameter, confirm the `sources` join
-//! populates (the WS1c fk_column fix), assign it to a site, and (aspirational) verify the assignment
-//! backfills historical derived readings and exposes them publicly.
-//!
-//! GAP found by this test: the derived-assignment backfill never runs. `after_create` in
-//! `site_parameters/operations.rs` returns early at the "no default thresholds" guard (lines 172-179)
-//! before reaching the derived-backfill block (line 219+), and a derived output parameter has no
-//! default thresholds — so the tracked `derived_assignment` job is never spawned. The backfill test
-//! is `#[ignore]`d until the ordering is fixed (move the backfill before that early return).
+//! populates (the WS1c fk_column fix), assign it to a site, and verify the assignment backfills
+//! historical derived readings and exposes them publicly.
 //!
 //! Run: cargo test --test e2e_derived_lifecycle_test -- --test-threads=1
-//! Include the blocked test: cargo test --test e2e_derived_lifecycle_test -- --ignored --test-threads=1
 
 mod common;
 
@@ -74,12 +67,10 @@ async fn derived_definition_populates_sources_and_assigns() {
     assert!((200..300).contains(&status), "assign derived ({status}): {sp}");
 }
 
-/// Aspirational: assigning a derived parameter should backfill historical derived readings
-/// (= source × factor) and expose them publicly. BLOCKED — see the file header gap note.
+/// Assigning a derived parameter backfills historical derived readings (= source × factor) and
+/// exposes them publicly once the project + site_parameter are made public.
 #[tokio::test]
 #[serial]
-#[ignore = "BLOCKED: derived_assignment backfill never spawns — after_create returns at the \
-            no-default-thresholds guard before the backfill block (site_parameters/operations.rs:172-219)"]
 async fn derived_assignment_backfills_and_publishes() {
     let db = common::setup_test_db().await;
     common::cleanup_test_db(&db).await;
@@ -132,6 +123,13 @@ async fn derived_assignment_backfills_and_publishes() {
     db.execute(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!("UPDATE projects SET is_public = true, public_slug = 'e2e_derived' WHERE id = '{}'", common::PROJECT_ID),
+    ))
+    .await
+    .unwrap();
+    // A site is only included in the public config when it has a public_slug (services.rs load_public_config).
+    db.execute(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!("UPDATE sites SET public_slug = 'e2e_derived_site1' WHERE id = '{}'", common::SITE1_ID),
     ))
     .await
     .unwrap();
