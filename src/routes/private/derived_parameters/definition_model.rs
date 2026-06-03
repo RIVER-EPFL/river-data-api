@@ -21,9 +21,9 @@ pub struct Model {
     pub id: Uuid,
     #[sea_orm(unique)]
     #[crudcrate(filterable, fulltext, sortable)]
-    pub name: String,
+    pub code: String,
     #[crudcrate(fulltext)]
-    pub display_name: String,
+    pub name: String,
     pub units: String,
     pub formula: String,
     pub description: Option<String>,

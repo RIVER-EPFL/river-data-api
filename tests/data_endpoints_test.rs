@@ -605,3 +605,43 @@ async fn test_alarms_missing_params_returns_400() {
 
     assert_eq!(status, 400, "alarms without start/end should return 400");
 }
+
+// Scenario: a site_parameter is given a label that differs from its parameter's short code.
+// Expected behaviour: the readings CSV column header uses the parameter `code`, not the
+// site_parameter label.
+#[tokio::test]
+#[serial]
+async fn test_readings_csv_header_uses_parameter_code() {
+    let (db, app, token) = setup().await;
+    let site_id = common::SITE1_ID;
+
+    // Relabel the temperature site_parameter so its name no longer matches the parameter code.
+    common::exec(
+        &db,
+        &format!(
+            "UPDATE site_parameters SET name = 'Custom Temp Label' WHERE id = '{}'",
+            common::PARAM_S1_TEMP_ID
+        ),
+    )
+    .await;
+
+    let (status, csv) = common::get_csv_with_token(
+        &app,
+        &format!(
+            "/api/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z&sensor_types=DO_Temperature"
+        ),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "readings csv ({status}): {csv}");
+
+    let header = csv.lines().next().expect("CSV should have a header line");
+    assert!(
+        header.contains("DO_Temperature"),
+        "CSV header should use the parameter code: {header}"
+    );
+    assert!(
+        !header.contains("Custom Temp Label"),
+        "CSV header must not use the site_parameter label: {header}"
+    );
+}

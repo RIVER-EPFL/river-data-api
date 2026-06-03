@@ -77,8 +77,8 @@ async fn test_derived_parameter_skips_infinity() {
     exec(
         &db,
         &format!(
-            "INSERT INTO parameters (id, name, display_name, default_units, category, data_type) \
-             VALUES ('{derived_param_id}', 'TempOverDO', 'Temp / DO', 'ratio', 'measurement', 'numeric')"
+            "INSERT INTO parameters (id, code, name, default_units, category) \
+             VALUES ('{derived_param_id}', 'TempOverDO', 'Temp / DO', 'ratio', 'measurement')"
         ),
     )
     .await;
@@ -87,7 +87,7 @@ async fn test_derived_parameter_skips_infinity() {
     exec(
         &db,
         &format!(
-            "INSERT INTO derived_parameter_definitions (id, name, display_name, units, formula) \
+            "INSERT INTO derived_parameter_definitions (id, code, name, units, formula) \
              VALUES ('{derived_def_id}', 'TempOverDO', 'Temp / DO', 'ratio', 'temp / do_val')"
         ),
     )

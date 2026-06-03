@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::common::{AppEvent, AppState};
 use crate::routes::private::{data_streams, readings, status_events};
 use crate::error::{AppError, AppResult};
-use crate::routes::private::sensors::operations::resolve_sensor_context;
+use crate::routes::private::sensors::operations::resolve_windows_for_times;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct IngestReadingsRequest {
@@ -97,37 +97,43 @@ pub async fn ingest_readings(
 
     let paired = site_id.is_some();
 
-    // Resolve sensor context from stream's linked sensor (if any)
-    let sensor_ctx = if paired {
-        if let Some(sid) = site_id {
-            resolve_sensor_context(db, &stream, sid).await
-        } else {
-            None
-        }
+    // Window-aware attribution: resolve calibration/deployment/site per reading TIME from the
+    // sensor's windows, agreeing with reprocess_sensor_readings. The stream's frozen sensor_id is the
+    // owner; cal/deployment/site come from whichever window covers each timestamp. `calibrated_value`
+    // is written as identity (raw) here; reprocess (fired by calibration edits) refines it.
+    let resolved = if let Some(stream_sensor) = stream.sensor_id {
+        let times: Vec<chrono::DateTime<Utc>> = payload.readings.iter().map(|r| r.time).collect();
+        resolve_windows_for_times(db, stream_sensor, None, &times)
+            .await
+            .unwrap_or_default()
     } else {
-        None
+        std::collections::HashMap::new()
     };
 
     // Build reading models
     let models: Vec<readings::ActiveModel> = payload
         .readings
         .iter()
-        .map(|r| readings::ActiveModel {
-            stream_id: Set(payload.stream_id),
-            time: Set(r.time.into()),
-            replicate_index: Set(r.replicate_index),
-            site_id: Set(site_id),
-            parameter_id: Set(parameter_id),
-            raw_value: Set(r.raw_value),
-            calibrated_value: Set(Some(r.raw_value)), // identity calibration
-            sensor_id: Set(r.sensor_id.or(sensor_ctx.as_ref().map(|c| c.sensor_id))),
-            calibration_id: Set(r.calibration_id.or(sensor_ctx.as_ref().map(|c| c.calibration_id))),
-            deployment_id: Set(r.deployment_id.or(sensor_ctx.as_ref().map(|c| c.deployment_id))),
-            logged: Set(Some(true)),
-            measurement_type: Set(Some("continuous".to_string())),
-            is_flagged: Set(Some(false)),
-            flag_reason: Set(None),
-            sample_id: Set(None),
+        .map(|r| {
+            let slot = resolved.get(&r.time);
+            readings::ActiveModel {
+                stream_id: Set(payload.stream_id),
+                time: Set(r.time.into()),
+                replicate_index: Set(r.replicate_index),
+                // Deployment-derived site when a deployment covers the time; else the pairing site.
+                site_id: Set(slot.and_then(|s| s.site_id).or(site_id)),
+                parameter_id: Set(parameter_id),
+                raw_value: Set(r.raw_value),
+                calibrated_value: Set(Some(r.raw_value)),
+                sensor_id: Set(r.sensor_id.or(stream.sensor_id)),
+                calibration_id: Set(r.calibration_id.or_else(|| slot.and_then(|s| s.calibration_id))),
+                deployment_id: Set(r.deployment_id.or_else(|| slot.and_then(|s| s.deployment_id))),
+                logged: Set(Some(true)),
+                measurement_type: Set(Some("continuous".to_string())),
+                is_flagged: Set(Some(false)),
+                flag_reason: Set(None),
+                sample_id: Set(None),
+            }
         })
         .collect();
 

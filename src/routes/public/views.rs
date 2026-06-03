@@ -49,6 +49,9 @@ pub struct SiteRef {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ParameterInfo {
+    /// Stable parameter code (catalog `code`, e.g. "DOmgL").
+    pub code: String,
+    /// Human-readable parameter name (e.g. "Dissolved Oxygen").
     pub name: String,
     pub units: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -83,7 +86,7 @@ fn all_public_param_names(config: &PublicProjectConfig) -> Vec<String> {
     let mut names: Vec<String> = config
         .exposed_params
         .iter()
-        .map(|ep| ep.name.clone())
+        .map(|ep| ep.code.clone())
         .collect();
     names.sort_unstable();
     names.dedup();
@@ -103,11 +106,12 @@ fn resolve_site_parameters(
         .map(|ep| ResolvedParam {
             site_id: ep.site_id,
             parameter_id: ep.parameter_id,
+            code: ep.code.clone(),
             name: ep.name.clone(),
             units: ep.units.clone(),
         })
         .collect();
-    resolved.sort_by(|a, b| a.name.cmp(&b.name));
+    resolved.sort_by(|a, b| a.code.cmp(&b.code));
     resolved
 }
 
@@ -115,12 +119,15 @@ fn resolve_site_parameters(
 struct ResolvedParam {
     site_id: Uuid,
     parameter_id: Uuid,
+    code: String,
     name: String,
     units: String,
 }
 
-/// Parse the `parameters` query string and filter against the project's exposed params.
-/// Returns the list of requested parameter names.
+/// Parse the `parameters` query string and resolve each requested entry against the
+/// project's exposed parameter codes. Matching is case-insensitive (forgiving for
+/// hand-typed queries), but each match is normalized back to the canonical stored
+/// `code` so downstream filtering and cache keys stay exact and stable.
 fn resolve_requested_param_names(
     parameters: Option<&str>,
     config: &PublicProjectConfig,
@@ -132,22 +139,23 @@ fn resolve_requested_param_names(
     }
 
     let requested: Vec<String> = if let Some(params_str) = parameters {
-        let names: Vec<String> = params_str
+        let mut resolved = Vec::new();
+        for raw in params_str
             .split(',')
-            .map(|s| s.trim().to_string())
+            .map(str::trim)
             .filter(|s| !s.is_empty())
-            .collect();
-
-        // Validate that all requested names are in the exposed set
-        for name in &names {
-            if !all_names.iter().any(|n| n == name) {
-                return Err(AppError::BadRequest(format!(
-                    "Unknown parameter: {name}. Available: {}",
-                    all_names.join(", ")
-                )));
+        {
+            match all_names.iter().find(|n| n.eq_ignore_ascii_case(raw)) {
+                Some(canonical) => resolved.push(canonical.clone()),
+                None => {
+                    return Err(AppError::BadRequest(format!(
+                        "Unknown parameter: {raw}. Available: {}",
+                        all_names.join(", ")
+                    )));
+                }
             }
         }
-        names
+        resolved
     } else {
         all_names
     };
@@ -230,6 +238,7 @@ pub async fn get_site(
     let params: Vec<ParameterInfo> = resolved
         .iter()
         .map(|rp| ParameterInfo {
+            code: rp.code.clone(),
             name: rp.name.clone(),
             units: rp.units.clone(),
             description: None,
@@ -313,6 +322,7 @@ pub async fn list_parameters(
     let params: Vec<ParameterInfo> = resolved
         .iter()
         .map(|rp| ParameterInfo {
+            code: rp.code.clone(),
             name: rp.name.clone(),
             units: rp.units.clone(),
             description: None,
@@ -351,6 +361,8 @@ pub struct ReadingsResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ParameterData {
+    /// Stable parameter code (catalog `code`) — also the CSV/NDJSON column key.
+    pub code: String,
     pub name: String,
     pub units: String,
     /// One value per entry in `times`. Null where no reading exists.
@@ -358,8 +370,8 @@ pub struct ParameterData {
 }
 
 impl StreamableParam for ParameterData {
-    fn name(&self) -> &str {
-        &self.name
+    fn column_key(&self) -> &str {
+        &self.code
     }
     fn value_at(&self, index: usize) -> Option<f64> {
         self.values.get(index).and_then(|v| *v)
@@ -427,7 +439,7 @@ pub async fn get_readings(
     let all_resolved = resolve_site_parameters(site.site_id, &config);
     let resolved: Vec<&ResolvedParam> = all_resolved
         .iter()
-        .filter(|rp| requested_names.contains(&rp.name))
+        .filter(|rp| requested_names.contains(&rp.code))
         .collect();
     let param_ids: Vec<Uuid> = {
         let mut ids: Vec<Uuid> = resolved.iter().map(|rp| rp.parameter_id).collect();
@@ -498,6 +510,8 @@ pub struct AggregatesResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ParameterAggregateData {
+    /// Stable parameter code (catalog `code`) — also the CSV/NDJSON column key.
+    pub code: String,
     pub name: String,
     pub units: String,
     pub avg: Vec<Option<f64>>,
@@ -507,8 +521,8 @@ pub struct ParameterAggregateData {
 }
 
 impl StreamableAggregateParam for ParameterAggregateData {
-    fn name(&self) -> &str {
-        &self.name
+    fn column_key(&self) -> &str {
+        &self.code
     }
     fn avg_at(&self, index: usize) -> Option<f64> {
         self.avg.get(index).and_then(|v| *v)
@@ -599,7 +613,7 @@ pub async fn get_aggregates(
     let all_resolved = resolve_site_parameters(site.site_id, &config);
     let resolved: Vec<&ResolvedParam> = all_resolved
         .iter()
-        .filter(|rp| requested_names.contains(&rp.name))
+        .filter(|rp| requested_names.contains(&rp.code))
         .collect();
 
     let param_ids: Vec<Uuid> = {
@@ -659,41 +673,49 @@ pub async fn get_aggregates(
         id_to_publics
             .entry(rp.parameter_id)
             .or_default()
-            .push((rp.name.as_str(), rp.units.as_str()));
+            .push((rp.code.as_str(), rp.units.as_str()));
     }
 
-    // Build parameterized query against continuous aggregate
-    let view = Alias::new(view_name);
-    let a = Alias::new("a");
-    let p = Alias::new("p");
+    // The CAGG is grouped by (bucket, site_id, parameter_id, sensor_id) since
+    // m20260603_000007. The public API has no sensor concept, so collapse the sensor dimension:
+    // count-weighted avg = SUM(sum_value)/SUM(count), MIN/MAX, SUM(count). Output shape and
+    // ordering (param_id as TEXT, ordered by parameter code) are preserved.
+    // $1 = site_id, $2.. = parameter_ids, then start, end.
+    let id_placeholders: Vec<String> = param_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("${}", i + 2))
+        .collect();
+    let start_idx = param_ids.len() + 2;
+    let end_idx = start_idx + 1;
+    let sql = format!(
+        r"
+        SELECT
+            p.id::text AS param_id,
+            a.bucket AS bucket,
+            CASE WHEN SUM(a.count) > 0 THEN SUM(a.sum_value) / SUM(a.count) ELSE NULL END AS avg_value,
+            MIN(a.min_value) AS min_value,
+            MAX(a.max_value) AS max_value,
+            SUM(a.count)::bigint AS count
+        FROM {view_name} a
+        JOIN parameters p ON a.parameter_id = p.id
+        WHERE a.site_id = $1
+          AND p.id IN ({})
+          AND a.bucket >= ${}
+          AND a.bucket <= ${}
+        GROUP BY a.bucket, p.id, p.code
+        ORDER BY a.bucket ASC, p.code ASC
+        ",
+        id_placeholders.join(","),
+        start_idx,
+        end_idx,
+    );
+    let mut values: Vec<sea_orm::Value> = vec![site.site_id.into()];
+    values.extend(param_ids.iter().map(|id| (*id).into()));
+    values.push(start.into());
+    values.push(end.into());
 
-    let (sql, values) = SeaQuery::select()
-        .expr_as(
-            Expr::col((p.clone(), Alias::new("id"))).cast_as(Alias::new("TEXT")),
-            Alias::new("param_id"),
-        )
-        .column((a.clone(), Alias::new("bucket")))
-        .column((a.clone(), Alias::new("avg_value")))
-        .column((a.clone(), Alias::new("min_value")))
-        .column((a.clone(), Alias::new("max_value")))
-        .column((a.clone(), Alias::new("count")))
-        .from_as(view, a.clone())
-        .join_as(
-            sea_orm::sea_query::JoinType::Join,
-            Alias::new("parameters"),
-            p.clone(),
-            Expr::col((a.clone(), Alias::new("parameter_id")))
-                .equals((p.clone(), Alias::new("id"))),
-        )
-        .and_where(Expr::col((a.clone(), Alias::new("site_id"))).eq(site.site_id))
-        .and_where(Expr::col((p.clone(), Alias::new("id"))).is_in(param_ids.clone()))
-        .and_where(Expr::col((a.clone(), Alias::new("bucket"))).gte(start))
-        .and_where(Expr::col((a.clone(), Alias::new("bucket"))).lte(end))
-        .order_by((a.clone(), Alias::new("bucket")), Order::Asc)
-        .order_by((p.clone(), Alias::new("name")), Order::Asc)
-        .build(PostgresQueryBuilder);
-
-    let stmt = Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values.0);
+    let stmt = Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, &sql, values);
 
     let rows: Vec<AggregateRow> = state
         .db
@@ -749,18 +771,17 @@ pub async fn get_aggregates(
     // Build output parameters in the order of requested names
     let mut output_params: Vec<ParameterAggregateData> = Vec::new();
 
-    for name in &requested_names {
-        let units = resolved
-            .iter()
-            .find(|rp| &rp.name == name)
-            .map_or("", |rp| rp.units.as_str());
+    for code in &requested_names {
+        let matched = resolved.iter().find(|rp| &rp.code == code);
+        let name = matched.map_or("", |rp| rp.name.as_str());
+        let units = matched.map_or("", |rp| rp.units.as_str());
 
         let mut avg = vec![None; num_times];
         let mut min = vec![None; num_times];
         let mut max = vec![None; num_times];
         let mut count = vec![0i64; num_times];
 
-        if let Some(aggs) = param_aggs.get(name.as_str()) {
+        if let Some(aggs) = param_aggs.get(code.as_str()) {
             for (bucket, agg) in aggs {
                 if let Some(&idx) = time_index.get(bucket) {
                     avg[idx] = agg.avg;
@@ -772,7 +793,8 @@ pub async fn get_aggregates(
         }
 
         output_params.push(ParameterAggregateData {
-            name: name.clone(),
+            code: code.clone(),
+            name: name.to_string(),
             units: units.to_string(),
             avg,
             min,
@@ -907,7 +929,7 @@ async fn fetch_readings(
         id_to_publics
             .entry(rp.parameter_id)
             .or_default()
-            .push((rp.name.as_str(), rp.units.as_str()));
+            .push((rp.code.as_str(), rp.units.as_str()));
     }
 
     // All resolved params come from the same site
@@ -941,7 +963,7 @@ async fn fetch_readings(
         .and_where(Expr::col((r.clone(), Alias::new("site_id"))).eq(site_id))
         .and_where(Expr::col((p.clone(), Alias::new("id"))).is_in(param_ids.clone()))
         .order_by((r.clone(), Alias::new("time")), Order::Asc)
-        .order_by((p.clone(), Alias::new("name")), Order::Asc);
+        .order_by((p.clone(), Alias::new("code")), Order::Asc);
 
     if let Some(s) = start {
         query.and_where(Expr::col((r.clone(), Alias::new("time"))).gte(s));
@@ -993,24 +1015,23 @@ async fn fetch_readings(
 
     let num_times = times_ordered.len();
 
-    // Build output in the order the resolved params appear (sorted by name)
-    // Deduplicate names (multiple site_parameters can share a parameter)
-    let mut seen_names: Vec<String> = Vec::new();
+    // Build output in the order the resolved params appear (sorted by code).
+    // Deduplicate codes (multiple site_parameters can share a parameter).
+    let mut seen_codes: Vec<String> = Vec::new();
     for rp in resolved {
-        if !seen_names.contains(&rp.name) {
-            seen_names.push(rp.name.clone());
+        if !seen_codes.contains(&rp.code) {
+            seen_codes.push(rp.code.clone());
         }
     }
 
     let mut output_params: Vec<ParameterData> = Vec::new();
-    for public_name in &seen_names {
-        let units = resolved
-            .iter()
-            .find(|rp| &rp.name == public_name)
-            .map_or("", |rp| rp.units.as_str());
+    for code in &seen_codes {
+        let matched = resolved.iter().find(|rp| &rp.code == code);
+        let name = matched.map_or("", |rp| rp.name.as_str());
+        let units = matched.map_or("", |rp| rp.units.as_str());
 
         let mut values = vec![None; num_times];
-        if let Some(readings) = param_values.get(public_name.as_str()) {
+        if let Some(readings) = param_values.get(code.as_str()) {
             for (time, value) in readings {
                 if let Some(&idx) = time_index.get(time) {
                     values[idx] = Some(*value);
@@ -1018,7 +1039,8 @@ async fn fetch_readings(
             }
         }
         output_params.push(ParameterData {
-            name: public_name.clone(),
+            code: code.clone(),
+            name: name.to_string(),
             units: units.to_string(),
             values,
         });

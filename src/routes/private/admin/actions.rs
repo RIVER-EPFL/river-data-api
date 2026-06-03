@@ -7,7 +7,8 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensor_calibrations::services::{
-    evaluate_formula, recalculate_derived_at_timestamp, reprocess_sensor_readings, spawn_tracked_job,
+    evaluate_formula, recalculate_derived_at_timestamp, recompute_deployed_until,
+    reprocess_sensor_readings, spawn_tracked_job,
 };
 use crate::common::sync_state as state;
 
@@ -262,41 +263,19 @@ pub async fn rollback_deployment(
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
     let previous_deployment_id: Option<Uuid> = previous.as_ref().and_then(|r| r.try_get("", "id").ok());
-    let previous_site_id: Option<Uuid> = previous.as_ref().and_then(|r| r.try_get("", "site_id").ok());
 
-    // 3. Re-open the previous deployment
-    if let Some(prev_id) = previous_deployment_id {
-        db.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE sensor_deployments SET deployed_until = NULL WHERE id = $1",
-            [prev_id.into()],
-        ))
-        .await
-        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-    }
-
-    // 4. Reassign readings from the rolled-back deployment
-    let reassign_result = if let (Some(prev_id), Some(prev_site)) = (previous_deployment_id, previous_site_id) {
-        db.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings SET deployment_id = $1, site_id = $2 WHERE deployment_id = $3",
-            [prev_id.into(), prev_site.into(), payload.deployment_id.into()],
-        ))
-        .await
-        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
-    } else {
-        db.execute(Statement::from_sql_and_values(
+    // 3. Clear readings' FK to the rolled-back deployment (readings.deployment_id has no ON DELETE
+    //    action, so the row can't be removed while referenced), then delete the deployment.
+    let cleared = db
+        .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE readings SET deployment_id = NULL WHERE deployment_id = $1",
             [payload.deployment_id.into()],
         ))
         .await
-        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
-    };
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    let readings_reassigned = cleared.rows_affected();
 
-    let readings_reassigned = reassign_result.rows_affected();
-
-    // 5. Delete the rolled-back deployment
     db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"DELETE FROM sensor_deployments WHERE id = $1",
@@ -305,6 +284,18 @@ pub async fn rollback_deployment(
     .await
     .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
+    // 4. Re-chain the timeline (the previous deployment reopens as the current one) and re-derive
+    //    every reading for the sensor by window. The rolled-back deployment's readings re-attribute
+    //    to whichever deployment now covers their time, or to no site if a gap remains. Re-chaining
+    //    only ever shortens windows, so it can't violate the slot-exclusion constraint. Reprocess
+    //    also refreshes the continuous aggregates.
+    recompute_deployed_until(db, sensor_id)
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    reprocess_sensor_readings(db, sensor_id)
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+
     tracing::info!(
         deployment_id = %payload.deployment_id,
         sensor_id = %sensor_id,
@@ -312,12 +303,6 @@ pub async fn rollback_deployment(
         previous = ?previous_deployment_id,
         "Rolled back deployment"
     );
-
-    // 6. Background aggregate refresh
-    let db_clone = db.clone();
-    tokio::spawn(async move {
-        state::refresh_continuous_aggregates(&db_clone, None).await;
-    });
 
     Ok(Json(RollbackDeploymentResponse {
         status: "rolled_back".to_string(),

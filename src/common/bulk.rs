@@ -58,7 +58,7 @@ pub fn acquire_bulk_permit(
 
 /// Parameter data needed for CSV/NDJSON streaming (simple value-per-param).
 pub trait StreamableParam: Send + Sync {
-    fn name(&self) -> &str;
+    fn column_key(&self) -> &str;
     fn parameter_id(&self) -> Option<Uuid> {
         None
     }
@@ -75,7 +75,7 @@ pub trait StreamableParam: Send + Sync {
 
 /// Aggregate parameter data needed for CSV/NDJSON streaming (avg/min/max/count).
 pub trait StreamableAggregateParam: Send + Sync {
-    fn name(&self) -> &str;
+    fn column_key(&self) -> &str;
     fn parameter_id(&self) -> Option<Uuid> {
         None
     }
@@ -117,16 +117,16 @@ pub fn build_csv_response_with_times(
         let mut header = "time".to_string();
         for param in &params {
             header.push(',');
-            header.push_str(param.name());
+            header.push_str(param.column_key());
         }
         if include_pid {
             for param in &params {
-                header.push_str(&format!(",{}_parameter_id", param.name()));
+                header.push_str(&format!(",{}_parameter_id", param.column_key()));
             }
         }
         if include_mtype {
             for param in &params {
-                header.push_str(&format!(",{}_measurement_type", param.name()));
+                header.push_str(&format!(",{}_measurement_type", param.column_key()));
             }
         }
         header.push('\n');
@@ -199,7 +199,7 @@ pub fn build_ndjson_response_with_times(
             for param in &params {
                 let value = param.value_at(i);
                 obj.insert(
-                    param.name().to_string(),
+                    param.column_key().to_string(),
                     match value {
                         Some(v) => serde_json::json!(v),
                         None => serde_json::Value::Null,
@@ -207,13 +207,13 @@ pub fn build_ndjson_response_with_times(
                 );
                 if let Some(pid) = param.parameter_id() {
                     obj.insert(
-                        format!("{}_parameter_id", param.name()),
+                        format!("{}_parameter_id", param.column_key()),
                         serde_json::json!(pid.to_string()),
                     );
                 }
                 if param.has_measurement_types() {
                     obj.insert(
-                        format!("{}_measurement_type", param.name()),
+                        format!("{}_measurement_type", param.column_key()),
                         match param.measurement_type_at(i) {
                             Some(mt) => serde_json::json!(mt),
                             None => serde_json::Value::Null,
@@ -267,15 +267,15 @@ pub fn build_aggregates_csv_response_with_times(
         for param in &params {
             header.push_str(&format!(
                 ",{}_avg,{}_min,{}_max,{}_count",
-                param.name(),
-                param.name(),
-                param.name(),
-                param.name()
+                param.column_key(),
+                param.column_key(),
+                param.column_key(),
+                param.column_key()
             ));
         }
         if include_pid {
             for param in &params {
-                header.push_str(&format!(",{}_parameter_id", param.name()));
+                header.push_str(&format!(",{}_parameter_id", param.column_key()));
             }
         }
         header.push('\n');
@@ -356,21 +356,21 @@ pub fn build_aggregates_ndjson_response_with_times(
                 let count = param.count_at(i).unwrap_or(0);
 
                 obj.insert(
-                    format!("{}_avg", param.name()),
+                    format!("{}_avg", param.column_key()),
                     avg.map_or(serde_json::Value::Null, |v| serde_json::json!(v)),
                 );
                 obj.insert(
-                    format!("{}_min", param.name()),
+                    format!("{}_min", param.column_key()),
                     min.map_or(serde_json::Value::Null, |v| serde_json::json!(v)),
                 );
                 obj.insert(
-                    format!("{}_max", param.name()),
+                    format!("{}_max", param.column_key()),
                     max.map_or(serde_json::Value::Null, |v| serde_json::json!(v)),
                 );
-                obj.insert(format!("{}_count", param.name()), serde_json::json!(count));
+                obj.insert(format!("{}_count", param.column_key()), serde_json::json!(count));
                 if let Some(pid) = param.parameter_id() {
                     obj.insert(
-                        format!("{}_parameter_id", param.name()),
+                        format!("{}_parameter_id", param.column_key()),
                         serde_json::json!(pid.to_string()),
                     );
                 }

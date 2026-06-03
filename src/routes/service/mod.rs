@@ -130,10 +130,42 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .layer(middleware::from_fn(require_read_metadata))
         .with_state(state.clone());
 
+    // Plain-handler sensor/calibration read views (not CrudCrate routes) for the plot overlays.
+    let sensor_view_read_routes = Router::new()
+        .route(
+            "/sensors/{id}/readings",
+            get(crate::routes::private::sensors::readings::get_sensor_readings),
+        )
+        .route(
+            "/sensors/{id}/deployment_bands",
+            get(crate::routes::private::sensors::readings::get_sensor_deployment_bands),
+        )
+        .route(
+            "/sensor_calibrations/{id}/window",
+            get(crate::routes::private::sensor_calibrations::window::get_calibration_window),
+        )
+        .layer(middleware::from_fn(require_read_data))
+        .with_state(state.clone());
+
     let stream_write_routes = Router::new()
         .route("/streams/register", post(stream_views::register_stream))
+        .route("/streams/{id}/import", post(stream_views::import_stream))
         .route("/streams/{id}/pair", post(stream_views::pair_stream))
         .route("/streams/{id}/unpair", post(stream_views::unpair_stream))
+        .layer(middleware::from_fn(require_write_metadata))
+        .with_state(state.clone());
+
+    use crate::routes::private::sensors::adopt as sensor_adopt;
+    let sensor_adopt_read = Router::new()
+        .route(
+            "/sensors/{sensor_id}/adopt_suggestions",
+            get(sensor_adopt::adopt_suggestions),
+        )
+        .layer(middleware::from_fn(require_read_metadata))
+        .with_state(state.clone());
+    let sensor_adopt_write = Router::new()
+        .route("/sensors/{sensor_id}/adopt", post(sensor_adopt::adopt_sensor))
+        .route("/actions/swap", post(sensor_adopt::swap_sensors))
         .layer(middleware::from_fn(require_write_metadata))
         .with_state(state.clone());
 
@@ -235,7 +267,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
     let mut router = Router::new()
         .merge(entity_router)
         .merge(stream_read_routes)
+        .merge(sensor_view_read_routes)
         .merge(stream_write_routes)
+        .merge(sensor_adopt_read)
+        .merge(sensor_adopt_write)
         .merge(metadata_read_routes)
         .merge(data_write_routes)
         .merge(data_read_routes)

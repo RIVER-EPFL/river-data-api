@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
-use crate::routes::private::site_parameters;
+use crate::routes::private::{parameters, site_parameters};
 use crate::error::{AppError, AppResult};
 use crate::routes::{resolve_site, resolve_site_with_project};
 
@@ -58,6 +58,76 @@ async fn parameter_extents(
         .collect())
 }
 
+struct GlobalParam {
+    code: String,
+    name: String,
+    default_units: String,
+}
+
+/// Fetch the global catalog rows (code, name, default_units) for a set of parameter ids.
+async fn global_param_map(
+    db: &sea_orm::DatabaseConnection,
+    param_ids: &[Uuid],
+) -> AppResult<HashMap<Uuid, GlobalParam>> {
+    let rows = parameters::Entity::find()
+        .filter(parameters::Column::Id.is_in(param_ids.iter().copied()))
+        .all(db)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|p| {
+            (
+                p.id,
+                GlobalParam {
+                    code: p.code,
+                    name: p.name,
+                    default_units: p.default_units,
+                },
+            )
+        })
+        .collect())
+}
+
+/// Build a `ParameterResponse` from a site_parameter, enriched with the global catalog
+/// (code/name/units) and the per-parameter reading extent.
+fn build_parameter_response(
+    p: site_parameters::Model,
+    globals: &HashMap<Uuid, GlobalParam>,
+    extents: &HashMap<Uuid, ParameterExtent>,
+) -> ParameterResponse {
+    let global = globals.get(&p.parameter_id);
+    let code = global.map(|g| g.code.clone()).unwrap_or_default();
+    let name = global
+        .map(|g| g.name.clone())
+        .unwrap_or_else(|| p.name.clone());
+    let units = p.display_units.clone().or_else(|| {
+        global
+            .map(|g| g.default_units.clone())
+            .filter(|u| !u.is_empty())
+    });
+    let sensor_type = if p.sensor_type.is_empty() {
+        p.name.clone()
+    } else {
+        p.sensor_type.clone()
+    };
+    let extent = extents.get(&p.parameter_id);
+    ParameterResponse {
+        id: p.id,
+        parameter_id: p.parameter_id,
+        code,
+        name,
+        units,
+        is_derived: p.is_derived.unwrap_or(false),
+        sensor_type,
+        display_units: p.display_units,
+        sample_interval_sec: p.sample_interval_sec,
+        is_active: p.is_active,
+        data_start: extent.and_then(|e| e.data_start),
+        data_end: extent.and_then(|e| e.data_end),
+        reading_count: extent.map(|e| e.reading_count),
+    }
+}
+
 /// List parameters for a site
 #[utoipa::path(
     get,
@@ -94,25 +164,13 @@ pub async fn list_site_parameters(
         .all(&state.db)
         .await?;
 
+    let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.parameter_id).collect();
+    let globals = global_param_map(&state.db, &param_ids).await?;
     let extents = parameter_extents(&state.db, site.id).await?;
 
     let response: Vec<ParameterResponse> = params_list
         .into_iter()
-        .map(|p| {
-            let sensor_type = if p.sensor_type.is_empty() { p.name.clone() } else { p.sensor_type };
-            let extent = extents.get(&p.parameter_id);
-            ParameterResponse {
-                id: p.id,
-                name: p.name,
-                sensor_type,
-                display_units: p.display_units,
-                sample_interval_sec: p.sample_interval_sec,
-                is_active: p.is_active,
-                data_start: extent.and_then(|e| e.data_start),
-                data_end: extent.and_then(|e| e.data_end),
-                reading_count: extent.map(|e| e.reading_count),
-            }
-        })
+        .map(|p| build_parameter_response(p, &globals, &extents))
         .collect();
 
     Ok(Json(response))
@@ -162,25 +220,13 @@ pub async fn get_site_detail(
         .all(&state.db)
         .await?;
 
+    let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.parameter_id).collect();
+    let globals = global_param_map(&state.db, &param_ids).await?;
     let extents = parameter_extents(&state.db, site.id).await?;
 
     let parameters: Vec<ParameterResponse> = params_list
         .into_iter()
-        .map(|p| {
-            let sensor_type = if p.sensor_type.is_empty() { p.name.clone() } else { p.sensor_type };
-            let extent = extents.get(&p.parameter_id);
-            ParameterResponse {
-                id: p.id,
-                name: p.name,
-                sensor_type,
-                display_units: p.display_units,
-                sample_interval_sec: p.sample_interval_sec,
-                is_active: p.is_active,
-                data_start: extent.and_then(|e| e.data_start),
-                data_end: extent.and_then(|e| e.data_end),
-                reading_count: extent.map(|e| e.reading_count),
-            }
-        })
+        .map(|p| build_parameter_response(p, &globals, &extents))
         .collect();
 
     // Query data range from readings

@@ -160,11 +160,11 @@ async fn test_list_site_parameters() {
     let params = body.as_array().expect("response should be an array");
     assert_eq!(params.len(), 5, "site 1 has 5 active parameters");
 
-    // Verify ordered by name
-    let names: Vec<&str> = params.iter().map(|p| p["name"].as_str().unwrap()).collect();
-    let mut sorted = names.clone();
+    // Verify ordered by code
+    let codes: Vec<&str> = params.iter().map(|p| p["code"].as_str().unwrap()).collect();
+    let mut sorted = codes.clone();
     sorted.sort();
-    assert_eq!(names, sorted);
+    assert_eq!(codes, sorted);
 
     // All should be active
     for param in params {

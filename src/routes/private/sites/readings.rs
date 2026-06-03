@@ -76,6 +76,8 @@ pub struct ParameterData {
     pub id: Uuid,
     /// Global parameter id (the catalog parameter this site_parameter references)
     pub parameter_id: Uuid,
+    /// Stable parameter code (catalog `code`) — used as the CSV/NDJSON column key
+    pub code: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
@@ -99,8 +101,8 @@ pub struct ParameterData {
 }
 
 impl StreamableParam for ParameterData {
-    fn name(&self) -> &str {
-        &self.name
+    fn column_key(&self) -> &str {
+        &self.code
     }
     fn parameter_id(&self) -> Option<Uuid> {
         Some(self.parameter_id)
@@ -239,16 +241,19 @@ pub async fn get_site_readings(
     let _param_info_map: HashMap<Uuid, &site_parameters::Model> =
         params_list.iter().map(|p| (p.parameter_id, p)).collect();
 
-    // Fetch global parameter display_names
+    // Fetch global parameter friendly names + stable codes
     let global_params = parameters::Entity::find()
         .filter(parameters::Column::Id.is_in(param_ids.clone()))
         .all(&state.db)
         .await?;
-    let display_name_map: HashMap<Uuid, String> = global_params
-        .into_iter()
-        .filter(|p| !p.display_name.is_empty())
-        .map(|p| (p.id, p.display_name))
-        .collect();
+    let mut name_map: HashMap<Uuid, String> = HashMap::new();
+    let mut code_map: HashMap<Uuid, String> = HashMap::new();
+    for p in global_params {
+        code_map.insert(p.id, p.code);
+        if !p.name.is_empty() {
+            name_map.insert(p.id, p.name);
+        }
+    }
 
     let include_alarms = query.alarms.unwrap_or(false);
     let include_flagged = query.include_flagged.unwrap_or(true);
@@ -464,8 +469,9 @@ pub async fn get_site_readings(
                 ParameterData {
                     id: sp.id,
                     parameter_id: sp.parameter_id,
+                    code: code_map.get(&sp.parameter_id).cloned().unwrap_or_default(),
                     name: sp.name.clone(),
-                    display_name: display_name_map.get(&sp.parameter_id).cloned(),
+                    display_name: name_map.get(&sp.parameter_id).cloned(),
                     sensor_type: if sp.sensor_type.is_empty() { sp.name.clone() } else { sp.sensor_type.clone() },
                     units: sp.display_units.clone(),
                     values,
@@ -632,8 +638,9 @@ pub async fn get_site_readings(
             ParameterData {
                 id: sp.id,
                 parameter_id: sp.parameter_id,
+                code: code_map.get(&sp.parameter_id).cloned().unwrap_or_default(),
                 name: sp.name.clone(),
-                display_name: display_name_map.get(&sp.parameter_id).cloned(),
+                display_name: name_map.get(&sp.parameter_id).cloned(),
                 sensor_type: if sp.sensor_type.is_empty() { sp.name.clone() } else { sp.sensor_type.clone() },
                 units: sp.display_units.clone(),
                 values,

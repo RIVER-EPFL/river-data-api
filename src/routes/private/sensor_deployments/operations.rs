@@ -5,7 +5,9 @@ use uuid::Uuid;
 
 use super::model::SensorDeployment;
 use crate::common::global_event_sender;
-use crate::routes::private::sensor_calibrations::services::spawn_reprocessing_job;
+use crate::routes::private::sensor_calibrations::services::{
+    recompute_deployed_until, spawn_reprocessing_job,
+};
 
 pub struct SensorDeploymentOperations;
 
@@ -37,6 +39,38 @@ impl CRUDOperations for SensorDeploymentOperations {
             );
         }
 
+        // One sensor per (site, parameter) at a time is hard-enforced by the
+        // `excl_deployment_site_param_slot` constraint. Pre-check for a different sensor already in
+        // this slot over an overlapping window so the operator gets a clear 400 ("recall it first")
+        // instead of a raw constraint violation; the constraint remains the atomic backstop.
+        let conflict = db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r"SELECT 1 FROM sensor_deployments d
+                  WHERE d.site_id = $1
+                    AND d.parameter_id = (SELECT parameter_id FROM sensors WHERE id = $2)
+                    AND d.sensor_id <> $2
+                    AND tstzrange(d.deployed_from, COALESCE(d.deployed_until, 'infinity'::timestamptz), '[)')
+                        && tstzrange($3, COALESCE($4, 'infinity'::timestamptz), '[)')
+                  LIMIT 1",
+                [
+                    data.site_id.into(),
+                    data.sensor_id.into(),
+                    data.deployed_from.into(),
+                    data.deployed_until.into(),
+                ],
+            ))
+            .await
+            .map_err(ApiError::database)?;
+
+        if conflict.is_some() {
+            return Err(ApiError::bad_request(
+                "Another sensor is already deployed to this site for this parameter over an \
+                 overlapping period. Recall it first, then deploy."
+                    .to_string(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -45,6 +79,10 @@ impl CRUDOperations for SensorDeploymentOperations {
         db: &DatabaseConnection,
         entity: &mut SensorDeployment,
     ) -> Result<(), ApiError> {
+        recompute_deployed_until(db, entity.sensor_id)
+            .await
+            .map_err(ApiError::database)?;
+
         if let Some(events) = global_event_sender() {
             spawn_reprocessing_job(db, entity.sensor_id, "deployment_create", Some(entity.id), events)
                 .await
@@ -59,6 +97,10 @@ impl CRUDOperations for SensorDeploymentOperations {
         db: &DatabaseConnection,
         entity: &mut SensorDeployment,
     ) -> Result<(), ApiError> {
+        recompute_deployed_until(db, entity.sensor_id)
+            .await
+            .map_err(ApiError::database)?;
+
         if let Some(events) = global_event_sender() {
             spawn_reprocessing_job(db, entity.sensor_id, "deployment_update", Some(entity.id), events)
                 .await
@@ -92,6 +134,16 @@ impl CRUDOperations for SensorDeploymentOperations {
             .try_get("", "sensor_id")
             .map_err(ApiError::database)?;
 
+        // readings.deployment_id has no ON DELETE action — clear references first, then delete.
+        // The reprocess below re-derives deployment_id/site_id for these readings by window.
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE readings SET deployment_id = NULL WHERE deployment_id = $1",
+            [id.into()],
+        ))
+        .await
+        .map_err(ApiError::database)?;
+
         db.execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "DELETE FROM sensor_deployments WHERE id = $1",
@@ -99,6 +151,10 @@ impl CRUDOperations for SensorDeploymentOperations {
         ))
         .await
         .map_err(ApiError::database)?;
+
+        recompute_deployed_until(db, sensor_id)
+            .await
+            .map_err(ApiError::database)?;
 
         if let Some(events) = global_event_sender() {
             spawn_reprocessing_job(db, sensor_id, "deployment_delete", Some(id), events)

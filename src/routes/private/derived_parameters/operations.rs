@@ -73,7 +73,7 @@ async fn resolve_variables(
         let row = db
             .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                r"SELECT id FROM parameters WHERE name = $1 LIMIT 1",
+                r"SELECT id FROM parameters WHERE code = $1 LIMIT 1",
                 [var_name.clone().into()],
             ))
             .await
@@ -104,7 +104,7 @@ async fn find_derived_definition_for_param(
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT dpd.id FROM derived_parameter_definitions dpd
-              JOIN parameters p ON p.name = dpd.name
+              JOIN parameters p ON p.code = dpd.code
               WHERE p.id = $1",
             [parameter_id.into()],
         ))
@@ -185,7 +185,7 @@ async fn validate_dependency_chain(
             let cycle_row = db
                 .query_one(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
-                    r"SELECT 1 FROM parameters WHERE name = $1 AND id = $2",
+                    r"SELECT 1 FROM parameters WHERE code = $1 AND id = $2",
                     [definition_name.into(), (*parameter_id).into()],
                 ))
                 .await
@@ -246,11 +246,11 @@ async fn ensure_output_parameter(
         // Keep the parameter row in sync
         db.execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE parameters SET display_name = $2, default_units = $3, description = $4
+            r"UPDATE parameters SET name = $2, default_units = $3, description = $4
               WHERE id = $1",
             [
                 existing_id.into(),
-                entity.display_name.clone().into(),
+                entity.name.clone().into(),
                 entity.units.clone().into(),
                 entity.description.clone().unwrap_or_default().into(),
             ],
@@ -264,8 +264,8 @@ async fn ensure_output_parameter(
     let existing = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT id FROM parameters WHERE LOWER(name) = LOWER($1) LIMIT 1",
-            [entity.name.clone().into()],
+            r"SELECT id FROM parameters WHERE LOWER(code) = LOWER($1) LIMIT 1",
+            [entity.code.clone().into()],
         ))
         .await
         .map_err(|e| ApiError::internal(format!("Failed to lookup output parameter: {e}"), None))?;
@@ -276,11 +276,11 @@ async fn ensure_output_parameter(
             .map_err(|e| ApiError::internal(format!("Failed to read parameter id: {e}"), None))?;
         db.execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE parameters SET display_name = $2, default_units = $3, description = $4
+            r"UPDATE parameters SET name = $2, default_units = $3, description = $4
               WHERE id = $1",
             [
                 id.into(),
-                entity.display_name.clone().into(),
+                entity.name.clone().into(),
                 entity.units.clone().into(),
                 entity.description.clone().unwrap_or_default().into(),
             ],
@@ -292,12 +292,12 @@ async fn ensure_output_parameter(
         let row = db
             .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                r"INSERT INTO parameters (id, name, display_name, default_units, category, data_type, description)
-                  VALUES (gen_random_uuid(), $1, $2, $3, 'derived', 'float', $4)
+                r"INSERT INTO parameters (id, code, name, default_units, category, description)
+                  VALUES (gen_random_uuid(), $1, $2, $3, 'measurement', $4)
                   RETURNING id",
                 [
+                    entity.code.clone().into(),
                     entity.name.clone().into(),
-                    entity.display_name.clone().into(),
                     entity.units.clone().into(),
                     entity.description.clone().unwrap_or_default().into(),
                 ],
@@ -361,7 +361,7 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
     ) -> Result<(), ApiError> {
         validate_formula(&data.formula)?;
         let resolved = resolve_variables(db, &data.formula).await?;
-        validate_dependency_chain(db, &data.name, &resolved).await?;
+        validate_dependency_chain(db, &data.code, &resolved).await?;
         Ok(())
     }
 
@@ -418,7 +418,7 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
         entity: &mut DerivedParameterDefinition,
     ) -> Result<(), ApiError> {
         let resolved = resolve_variables(db, &entity.formula).await?;
-        validate_dependency_chain(db, &entity.name, &resolved).await?;
+        validate_dependency_chain(db, &entity.code, &resolved).await?;
         sync_sources(db, entity.id, &resolved).await?;
 
         // Keep the output parameter in sync

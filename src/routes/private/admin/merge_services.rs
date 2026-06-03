@@ -587,7 +587,7 @@ async fn reassign_parameter_references(
             FROM unnest(
                 (SELECT aliases FROM parameters WHERE id = $1)
                 || (SELECT aliases FROM parameters WHERE id = $2)
-                || ARRAY[(SELECT name FROM parameters WHERE id = $2)]
+                || ARRAY[(SELECT code FROM parameters WHERE id = $2)]
             ) AS a WHERE a IS NOT NULL AND a != ''
         ) WHERE id = $1"#,
         vec![target_id.into(), source_id.into()],

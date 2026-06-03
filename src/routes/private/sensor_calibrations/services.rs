@@ -446,6 +446,39 @@ pub async fn recompute_valid_until(
     Ok(())
 }
 
+/// Twin of [`recompute_valid_until`] for the deployment timeline: chain each of a sensor's
+/// deployments' `deployed_until` down to the next deployment's `deployed_from`. Unlike calibrations
+/// — which absorb gaps (`valid_until = LEAD(valid_from)`) so coverage is continuous — deployments
+/// may legitimately have gaps (a sensor sitting in the lab between field campaigns), so this only
+/// ever *shortens* a window to remove overlap (`LEAST` keeps an existing earlier bound) and never
+/// extends one. Shortening can't create an overlap, so the result always satisfies the per-(site,
+/// parameter) exclusion constraint.
+pub async fn recompute_deployed_until(
+    db: &DatabaseConnection,
+    sensor_id: Uuid,
+) -> Result<(), sea_orm::DbErr> {
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"WITH ordered AS (
+            SELECT id,
+                   LEAST(
+                       COALESCE(deployed_until, 'infinity'::timestamptz),
+                       COALESCE(LEAD(deployed_from) OVER (ORDER BY deployed_from), 'infinity'::timestamptz)
+                   ) AS new_until
+            FROM sensor_deployments
+            WHERE sensor_id = $1
+        )
+        UPDATE sensor_deployments d
+        SET deployed_until = NULLIF(ordered.new_until, 'infinity'::timestamptz)
+        FROM ordered
+        WHERE d.id = ordered.id AND d.sensor_id = $1
+          AND COALESCE(d.deployed_until, 'infinity'::timestamptz) <> ordered.new_until",
+        [sensor_id.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
 pub async fn reprocess_sensor_readings(
     db: &DatabaseConnection,
     sensor_id: Uuid,
@@ -484,6 +517,28 @@ pub async fn reprocess_sensor_readings(
         WHERE r.sensor_id = $1
           AND r.time >= dw.deployed_from
           AND r.time < dw.deployed_until",
+        [sensor_id.into()],
+    ))
+    .await?;
+
+    // Recall: a reading that falls in a gap between/after the sensor's deployments (the sensor was
+    // pulled out — e.g. sitting in the lab) belongs to no site. Clear its site/deployment so it
+    // drops out of the continuous aggregates. Guarded to `time >= the sensor's first deployment` so
+    // readings that predate any deployment keep the site_id the stream pairing gave them (auto-created
+    // deployments start at pairing time, not data start — without this guard a reprocess would
+    // un-attribute all historical data).
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"UPDATE readings r
+          SET site_id = NULL, deployment_id = NULL
+          WHERE r.sensor_id = $1
+            AND r.time >= (SELECT MIN(deployed_from) FROM sensor_deployments WHERE sensor_id = $1)
+            AND NOT EXISTS (
+                SELECT 1 FROM sensor_deployments d
+                WHERE d.sensor_id = $1
+                  AND r.time >= d.deployed_from
+                  AND r.time < COALESCE(d.deployed_until, 'infinity'::timestamptz)
+            )",
         [sensor_id.into()],
     ))
     .await?;
@@ -528,6 +583,111 @@ pub async fn reprocess_sensor_readings(
     }
 
     Ok(readings_updated)
+}
+
+/// Per-(site, parameter) twin of [`reprocess_sensor_readings`]. Where the per-sensor reprocess
+/// re-derives FK columns for rows it already owns (`r.sensor_id = $sensor`), this re-derives the
+/// OWNER too: for every reading at `(site_id, parameter_id)`, it sets `sensor_id`/`deployment_id`/
+/// `calibration_id`/`calibrated_value` from whichever deployment+calibration window covers the
+/// reading time. This is what makes a sensor SWAP (B replaces A at one feed) re-attribute A's
+/// post-swap readings to B. The `excl_deployment_site_param_slot` constraint guarantees at most one
+/// covering deployment per time, so the owner is unambiguous and the join is single-valued.
+///
+/// Like the per-sensor engine, the recall NULL-clear is guarded to `time >= the slot's first
+/// deployment` so pre-deployment history keeps its pairing site_id.
+pub async fn reprocess_site_parameter_readings(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+    parameter_id: Uuid,
+) -> Result<usize, sea_orm::DbErr> {
+    // 1. Re-own + re-stamp deployment/site from the (site, parameter) deployment timeline.
+    let dep_result = db
+        .execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE readings r
+              SET sensor_id = dw.sensor_id,
+                  deployment_id = dw.id,
+                  site_id = dw.site_id
+              FROM (
+                  SELECT id, sensor_id, site_id, deployed_from,
+                         COALESCE(deployed_until, 'infinity'::timestamptz) AS deployed_until
+                  FROM sensor_deployments
+                  WHERE site_id = $1 AND parameter_id = $2
+              ) dw
+              WHERE r.parameter_id = $2
+                AND (r.site_id = $1 OR r.sensor_id = dw.sensor_id)
+                AND r.time >= dw.deployed_from
+                AND r.time < dw.deployed_until",
+            [site_id.into(), parameter_id.into()],
+        ))
+        .await?;
+    let updated = dep_result.rows_affected() as usize;
+
+    // 2. Re-derive calibrated_value/calibration_id for the (now correct) owner per cal window.
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"UPDATE readings r
+          SET calibration_id = cw.id,
+              calibrated_value = cw.slope * r.raw_value + cw.intercept
+          FROM sensor_calibrations cw
+          WHERE r.site_id = $1 AND r.parameter_id = $2
+            AND cw.sensor_id = r.sensor_id
+            AND r.time >= cw.valid_from
+            AND r.time < COALESCE(cw.valid_until, 'infinity'::timestamptz)",
+        [site_id.into(), parameter_id.into()],
+    ))
+    .await?;
+
+    // 3. Recall NULL-clear: a reading in a deployment gap drops out of the site (guarded to
+    //    time >= the slot's first deployment so pre-deployment history is kept).
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"UPDATE readings r
+          SET site_id = NULL, deployment_id = NULL
+          WHERE r.site_id = $1 AND r.parameter_id = $2
+            AND r.time >= (SELECT MIN(deployed_from) FROM sensor_deployments
+                           WHERE site_id = $1 AND parameter_id = $2)
+            AND NOT EXISTS (
+                SELECT 1 FROM sensor_deployments d
+                WHERE d.site_id = $1 AND d.parameter_id = $2
+                  AND r.time >= d.deployed_from
+                  AND r.time < COALESCE(d.deployed_until, 'infinity'::timestamptz)
+            )",
+        [site_id.into(), parameter_id.into()],
+    ))
+    .await?;
+
+    // 4. Cascade derived + refresh aggregates over the affected range (same tail as per-sensor).
+    let affected = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT DISTINCT site_id, time FROM readings
+              WHERE site_id = $1 AND parameter_id = $2",
+            [site_id.into(), parameter_id.into()],
+        ))
+        .await?;
+    for row in &affected {
+        let sid: Uuid = row.try_get("", "site_id")?;
+        let time: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
+        let utc = time.with_timezone(&Utc);
+        if let Err(e) = recalculate_derived_at_timestamp(db, sid, utc).await {
+            tracing::warn!(error = %e, site_id = %sid, time = %utc,
+                "Failed to cascade (site,parameter) reprocess to derived parameter");
+        }
+    }
+    let range = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT MIN(time) AS min_time FROM readings WHERE site_id = $1 AND parameter_id = $2",
+            [site_id.into(), parameter_id.into()],
+        ))
+        .await?;
+    if let Some(r) = range
+        && let Ok(since) = r.try_get::<DateTime<Utc>>("", "min_time")
+    {
+        crate::common::sync_state::refresh_continuous_aggregates(db, Some(since)).await;
+    }
+    Ok(updated)
 }
 
 /// Generic tracked-job lifecycle with the process-wide retry policy (see [`set_job_retry_policy`]).

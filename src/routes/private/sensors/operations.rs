@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::routes::private::{data_streams, sensor_calibrations, sensor_deployments, sensors};
 use super::model::Sensor;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 
 pub struct SensorOperations;
 
@@ -194,7 +194,10 @@ impl CRUDOperations for SensorOperations {
 pub struct SensorContext {
     pub sensor_id: Uuid,
     pub calibration_id: Uuid,
-    pub deployment_id: Uuid,
+    /// `None` when the sensor is not deployed to the target site at this time — the slot may be
+    /// occupied by another sensor, or the sensor isn't adopted yet. Readings still carry
+    /// `sensor_id`/`calibration_id`; only the deployment FK is absent.
+    pub deployment_id: Option<Uuid>,
 }
 
 /// Extract Vaisala device metadata from stream metadata for storage on the sensor.
@@ -242,6 +245,99 @@ fn extract_source_metadata(stream_metadata: &serde_json::Value) -> Option<serde_
     }
 }
 
+/// Find an existing sensor by its natural key `(serial_number, parameter_id)`.
+/// Returns `None` when no serial is available (we never dedupe serial-less sensors).
+async fn find_sensor_by_serial_param<C: ConnectionTrait>(
+    db: &C,
+    serial: Option<&str>,
+    parameter_id: Uuid,
+) -> AppResult<Option<sensors::Model>> {
+    let Some(serial) = serial else {
+        return Ok(None);
+    };
+    let existing = sensors::Entity::find()
+        .filter(
+            Condition::all()
+                .add(sensors::Column::SerialNumber.eq(serial))
+                .add(sensors::Column::ParameterId.eq(parameter_id)),
+        )
+        .one(db)
+        .await?;
+    Ok(existing)
+}
+
+/// Link a data stream to a sensor (`data_streams.sensor_id`) as the pairing hint.
+async fn link_stream_to_sensor<C: ConnectionTrait>(
+    db: &C,
+    stream: &data_streams::Model,
+    sensor_id: Uuid,
+) -> AppResult<()> {
+    if stream.sensor_id == Some(sensor_id) {
+        return Ok(());
+    }
+    let mut stream_active: data_streams::ActiveModel = stream.clone().into();
+    stream_active.sensor_id = Set(Some(sensor_id));
+    stream_active.updated_at = Set(Utc::now().into());
+    stream_active.update(db).await?;
+    Ok(())
+}
+
+/// Insert a new sensor for `(serial, parameter)`, or return the existing one if a sensor with that
+/// natural key already exists. Race-safe: the `ON CONFLICT … DO NOTHING` targets the partial unique
+/// index `idx_sensors_serial_parameter (serial_number, parameter_id) WHERE serial_number IS NOT NULL`,
+/// so concurrent pairings of the same device converge on one row WITHOUT raising a unique violation.
+/// That matters because some callers run inside a transaction (sync plan/discovery apply): a raised
+/// violation there would poison the whole transaction, not just this insert. A serial-less sensor has
+/// no dedupe key (the predicate excludes it), so it always inserts and the new id comes back via
+/// `RETURNING`. The conflict branch re-selects the winner.
+async fn insert_or_get_sensor<C: ConnectionTrait>(
+    db: &C,
+    serial: Option<&str>,
+    parameter_id: Uuid,
+    name: &str,
+    metadata: Option<serde_json::Value>,
+) -> AppResult<Uuid> {
+    let serial_val: sea_orm::Value = match serial {
+        Some(s) => s.to_string().into(),
+        None => sea_orm::Value::String(None),
+    };
+    let metadata_val: sea_orm::Value = match &metadata {
+        Some(v) => serde_json::to_string(v)
+            .unwrap_or_else(|_| "null".to_string())
+            .into(),
+        None => sea_orm::Value::String(None),
+    };
+
+    let inserted = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r#"INSERT INTO sensors
+                   (id, serial_number, name, parameter_id, is_active, is_lab_instrument, metadata, created_at)
+               VALUES (gen_random_uuid(), $1, $2, $3, true, false, $4::jsonb, now())
+               ON CONFLICT (serial_number, parameter_id) WHERE serial_number IS NOT NULL
+               DO NOTHING
+               RETURNING id"#,
+            [serial_val, name.into(), parameter_id.into(), metadata_val],
+        ))
+        .await?;
+
+    if let Some(row) = inserted {
+        let id: Uuid = row.try_get("", "id")?;
+        return Ok(id);
+    }
+
+    // Conflict on (serial, parameter): a sensor already exists (possibly a concurrent winner) — reuse it.
+    let existing = find_sensor_by_serial_param(db, serial, parameter_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::Internal(
+                "sensor upsert conflicted but the existing (serial, parameter) row was not found"
+                    .to_string(),
+            )
+        })?;
+    Ok(existing.id)
+}
+
 /// Create or reuse a sensor for a data stream being paired.
 ///
 /// If the stream already has a `sensor_id`, reuses that sensor (ensures deployment exists for the target site).
@@ -253,65 +349,48 @@ pub async fn create_sensor_for_stream<C: ConnectionTrait>(
     parameter_id: Uuid,
     site_id: Uuid,
 ) -> AppResult<SensorContext> {
+    let ctx = import_sensor_for_stream(db, stream, parameter_id).await?;
+    // Ensure active deployment exists for this sensor+site (None if the slot is occupied).
+    let deployment_id = find_or_create_deployment(db, ctx.sensor_id, site_id).await?;
+    Ok(SensorContext {
+        deployment_id,
+        ..ctx
+    })
+}
+
+/// Import-only: create or reuse a sensor for a stream and resolve its latest calibration, WITHOUT
+/// deploying it to a site. The "imported, not adopted" state — readings get `sensor_id`/
+/// `calibration_id` (so calibration math applies) but no `deployment_id`/`site_id` until an explicit
+/// adopt. Idempotent: reuses the stream's linked sensor, else the existing `(serial, parameter)`
+/// sensor, else inserts one (race-safe via `insert_or_get_sensor`). Updates `data_streams.sensor_id`.
+pub async fn import_sensor_for_stream<C: ConnectionTrait>(
+    db: &C,
+    stream: &data_streams::Model,
+    parameter_id: Uuid,
+) -> AppResult<SensorContext> {
+    let serial = extract_vaisala_device_serial(&stream.metadata);
+
     let (sensor_id, calibration_id) = if let Some(existing_sensor_id) = stream.sensor_id {
-        // Reuse existing sensor — find its latest calibration
         let cal_id = get_latest_calibration(db, existing_sensor_id).await?;
         (existing_sensor_id, cal_id)
     } else {
-        // Create new sensor
         let sensor_name = stream
             .source_name
             .clone()
             .unwrap_or_else(|| format!("Stream {}", stream.source_key));
-
         let metadata = extract_source_metadata(&stream.metadata);
-
-        let sensor = sensors::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            serial_number: Set(None),
-            name: Set(Some(sensor_name)),
-            parameter_id: Set(parameter_id),
-            manufacturer: Set(None),
-            model: Set(None),
-            is_active: Set(Some(true)),
-            is_lab_instrument: Set(Some(false)),
-            notes: Set(None),
-            metadata: Set(metadata),
-            created_at: Set(Some(Utc::now())),
-        };
-        let sensor = sensor.insert(db).await?;
-        let sensor_id = sensor.id;
-
-        // Create identity calibration
-        let cal = sensor_calibrations::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            sensor_id: Set(sensor_id),
-            slope: Set(1.0),
-            intercept: Set(0.0),
-            valid_from: Set(Utc::now()),
-            performed_by: Set(Some("system".to_string())),
-            notes: Set(Some("Identity calibration (auto-created)".to_string())),
-            valid_until: Set(None),
-            created_at: Set(Some(Utc::now())),
-        };
-        let cal = cal.insert(db).await?;
-
-        // Link stream to sensor
-        let mut stream_active: data_streams::ActiveModel = stream.clone().into();
-        stream_active.sensor_id = Set(Some(sensor_id));
-        stream_active.updated_at = Set(Utc::now().into());
-        stream_active.update(db).await?;
-
-        (sensor_id, cal.id)
+        let sensor_id =
+            insert_or_get_sensor(db, serial.as_deref(), parameter_id, &sensor_name, metadata)
+                .await?;
+        let cal_id = get_latest_calibration(db, sensor_id).await?;
+        link_stream_to_sensor(db, stream, sensor_id).await?;
+        (sensor_id, cal_id)
     };
-
-    // Ensure active deployment exists for this sensor+site
-    let deployment_id = find_or_create_deployment(db, sensor_id, site_id).await?;
 
     Ok(SensorContext {
         sensor_id,
         calibration_id,
-        deployment_id,
+        deployment_id: None,
     })
 }
 
@@ -346,12 +425,21 @@ async fn get_latest_calibration<C: ConnectionTrait>(
     }
 }
 
-/// Find an active deployment for sensor+site, or create one.
+/// Find this sensor's open deployment at the site, or auto-create one — but only if the
+/// `(site, parameter)` slot is free. Returns `None` when the slot is already occupied by another
+/// sensor (the swap case), leaving the deployment to an explicit adopt.
+///
+/// One sensor per `(site, parameter)` is hard-enforced by the `excl_deployment_site_param_slot`
+/// exclusion constraint. A blind insert onto an occupied slot would raise an exclusion violation —
+/// which, in the sync apply path (this runs inside `create_sensor_for_stream` within a transaction),
+/// would poison the whole pairing transaction. The conditional insert below skips cleanly when the
+/// slot is occupied (the common swap case) instead of raising; the constraint remains the atomic
+/// backstop for the rare concurrent-double-deploy race.
 async fn find_or_create_deployment<C: ConnectionTrait>(
     db: &C,
     sensor_id: Uuid,
     site_id: Uuid,
-) -> AppResult<Uuid> {
+) -> AppResult<Option<Uuid>> {
     let existing = sensor_deployments::Entity::find()
         .filter(
             Condition::all()
@@ -363,21 +451,38 @@ async fn find_or_create_deployment<C: ConnectionTrait>(
         .await?;
 
     if let Some(dep) = existing {
-        return Ok(dep.id);
+        return Ok(Some(dep.id));
     }
 
-    let dep = sensor_deployments::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        sensor_id: Set(sensor_id),
-        site_id: Set(site_id),
-        deployed_from: Set(Utc::now()),
-        deployed_until: Set(None),
-        deployment_type: Set("permanent".to_string()),
-        notes: Set(Some("Auto-created during stream pairing".to_string())),
-        created_at: Set(Some(Utc::now())),
-    };
-    let dep = dep.insert(db).await?;
-    Ok(dep.id)
+    // Insert an open deployment only when no other deployment occupies the (site, parameter) slot at
+    // now(). `parameter_id` is filled by the BEFORE INSERT trigger from the sensor.
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"INSERT INTO sensor_deployments
+                  (id, sensor_id, site_id, deployed_from, deployment_type, notes)
+              SELECT gen_random_uuid(), $1, $2, NOW(), 'permanent', 'Auto-created during stream pairing'
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM sensor_deployments d
+                  WHERE d.site_id = $2
+                    AND d.parameter_id = (SELECT parameter_id FROM sensors WHERE id = $1)
+                    AND COALESCE(d.deployed_until, 'infinity'::timestamptz) > NOW()
+              )
+              RETURNING id",
+            [sensor_id.into(), site_id.into()],
+        ))
+        .await?;
+
+    match row {
+        Some(r) => Ok(Some(r.try_get("", "id")?)),
+        None => {
+            tracing::info!(
+                %sensor_id, %site_id,
+                "Deployment slot already occupied by another sensor; skipping auto-deploy (explicit adopt required)"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Close the active deployment for a sensor at a site.
@@ -397,34 +502,88 @@ pub async fn close_sensor_deployment(
     Ok(())
 }
 
-/// Resolve sensor context for a stream (for ingestion).
-/// Returns None if the stream has no sensor_id or if context can't be resolved.
-pub async fn resolve_sensor_context(
-    db: &DatabaseConnection,
-    stream: &data_streams::Model,
-    site_id: Uuid,
-) -> Option<SensorContext> {
-    let sensor_id = stream.sensor_id?;
+/// One resolved attribution slot for a reading time.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedSlot {
+    pub calibration_id: Option<Uuid>,
+    pub deployment_id: Option<Uuid>,
+    pub site_id: Option<Uuid>,
+}
 
-    let cal_id = get_latest_calibration(db, sensor_id).await.ok()?;
+/// Resolve attribution for a batch of reading times for one sensor, by window — the same half-open
+/// `[from, COALESCE(until,'infinity'))` semantics `reprocess_sensor_readings` uses, so every write
+/// path agrees with reprocess. Two indexed range scans regardless of batch size.
+///
+/// `expected_site`: when `Some`, only a deployment at that site can attribute a time (used by grabs,
+/// which are site-fixed by the request); when `None`, whichever deployment covers the time wins
+/// (matches reprocess, used by continuous ingest).
+pub async fn resolve_windows_for_times<C: ConnectionTrait>(
+    db: &C,
+    sensor_id: Uuid,
+    expected_site: Option<Uuid>,
+    times: &[chrono::DateTime<Utc>],
+) -> AppResult<std::collections::HashMap<chrono::DateTime<Utc>, ResolvedSlot>> {
+    use std::collections::HashMap;
+    let mut out: HashMap<chrono::DateTime<Utc>, ResolvedSlot> = HashMap::new();
+    if times.is_empty() {
+        return Ok(out);
+    }
 
-    // Find active deployment for this sensor+site
-    let dep = sensor_deployments::Entity::find()
-        .filter(
-            Condition::all()
-                .add(sensor_deployments::Column::SensorId.eq(sensor_id))
-                .add(sensor_deployments::Column::SiteId.eq(site_id))
-                .add(sensor_deployments::Column::DeployedUntil.is_null()),
-        )
-        .one(db)
-        .await
-        .ok()??;
+    let cal_rows = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT id, valid_from, COALESCE(valid_until, 'infinity'::timestamptz) AS valid_until
+              FROM sensor_calibrations WHERE sensor_id = $1 ORDER BY valid_from",
+            [sensor_id.into()],
+        ))
+        .await?;
+    let cals: Vec<(Uuid, chrono::DateTime<Utc>, chrono::DateTime<Utc>)> = cal_rows
+        .iter()
+        .map(|r| -> AppResult<_> {
+            let id: Uuid = r.try_get("", "id")?;
+            let from: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "valid_from")?;
+            let until: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "valid_until")?;
+            Ok((id, from.with_timezone(&Utc), until.with_timezone(&Utc)))
+        })
+        .collect::<AppResult<_>>()?;
 
-    Some(SensorContext {
-        sensor_id,
-        calibration_id: cal_id,
-        deployment_id: dep.id,
-    })
+    let dep_rows = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT id, site_id, deployed_from, COALESCE(deployed_until, 'infinity'::timestamptz) AS deployed_until
+              FROM sensor_deployments WHERE sensor_id = $1 ORDER BY deployed_from",
+            [sensor_id.into()],
+        ))
+        .await?;
+    let deps: Vec<(Uuid, Uuid, chrono::DateTime<Utc>, chrono::DateTime<Utc>)> = dep_rows
+        .iter()
+        .map(|r| -> AppResult<_> {
+            let id: Uuid = r.try_get("", "id")?;
+            let site_id: Uuid = r.try_get("", "site_id")?;
+            let from: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "deployed_from")?;
+            let until: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "deployed_until")?;
+            Ok((id, site_id, from.with_timezone(&Utc), until.with_timezone(&Utc)))
+        })
+        .collect::<AppResult<_>>()?;
+
+    for &t in times {
+        let calibration_id = cals
+            .iter()
+            .find(|(_, from, until)| t >= *from && t < *until)
+            .map(|(id, _, _)| *id);
+        let dep = deps.iter().find(|(_, site_id, from, until)| {
+            t >= *from && t < *until && expected_site.is_none_or(|s| *site_id == s)
+        });
+        out.insert(
+            t,
+            ResolvedSlot {
+                calibration_id,
+                deployment_id: dep.map(|(id, _, _, _)| *id),
+                site_id: dep.map(|(_, site_id, _, _)| *site_id),
+            },
+        );
+    }
+    Ok(out)
 }
 
 /// Extract the Vaisala device serial from stream metadata (for discovery response).

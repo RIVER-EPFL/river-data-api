@@ -53,26 +53,27 @@ fn parsed_csv() -> Vec<(String, f64, f64)> {
         .collect()
 }
 
-/// Extract a numeric array (`field`) for a named parameter. Readings use `values`; aggregates
-/// expose `avg`/`min`/`max`/`count`.
-fn field_for(resp: &serde_json::Value, name: &str, field: &str) -> Vec<f64> {
+/// Extract a numeric array (`field`) for a parameter identified by its short `code`. Public
+/// parameters expose `code` (short code) and `name` (human label); the assertions key off `code`.
+/// Readings use `values`; aggregates expose `avg`/`min`/`max`/`count`.
+fn field_for(resp: &serde_json::Value, code: &str, field: &str) -> Vec<f64> {
     let params = resp["parameters"]
         .as_array()
         .unwrap_or_else(|| panic!("no 'parameters' array in response: {resp}"));
     let p = params
         .iter()
-        .find(|p| p["name"] == name)
-        .unwrap_or_else(|| panic!("parameter {name} missing in {resp}"));
+        .find(|p| p["code"] == code)
+        .unwrap_or_else(|| panic!("parameter {code} missing in {resp}"));
     p[field]
         .as_array()
-        .unwrap_or_else(|| panic!("'{field}' not an array for {name}: param={p}"))
+        .unwrap_or_else(|| panic!("'{field}' not an array for {code}: param={p}"))
         .iter()
         .map(|v| v.as_f64().unwrap_or(f64::NAN))
         .collect()
 }
 
-fn values_for(resp: &serde_json::Value, name: &str) -> Vec<f64> {
-    field_for(resp, name, "values")
+fn values_for(resp: &serde_json::Value, code: &str) -> Vec<f64> {
+    field_for(resp, code, "values")
 }
 
 fn id_of(json: &serde_json::Value) -> String {
@@ -140,8 +141,8 @@ async fn test_full_public_data_workflow() {
         &app,
         "/api/parameters",
         &serde_json::json!({
-            "name": "dissolved_oxygen", "display_name": "Dissolved Oxygen",
-            "default_units": "µM", "category": "measurement", "data_type": "numeric", "aliases": ["DOuM"],
+            "code": "dissolved_oxygen", "name": "Dissolved Oxygen",
+            "default_units": "µM", "category": "measurement", "aliases": ["DOuM"],
         }),
         &token,
     )
@@ -151,8 +152,8 @@ async fn test_full_public_data_workflow() {
         &app,
         "/api/parameters",
         &serde_json::json!({
-            "name": "temperature", "display_name": "Water Temperature",
-            "default_units": "°C", "category": "measurement", "data_type": "numeric", "aliases": ["WaterTempdegC"],
+            "code": "temperature", "name": "Water Temperature",
+            "default_units": "°C", "category": "measurement", "aliases": ["WaterTempdegC"],
         }),
         &token,
     )
@@ -203,7 +204,7 @@ async fn test_full_public_data_workflow() {
         &app,
         "/api/derived_parameters",
         &serde_json::json!({
-            "name": "DOmgL", "display_name": "Dissolved Oxygen mg/L",
+            "code": "DOmgL", "name": "Dissolved Oxygen mg/L",
             "units": "mg/L", "formula": "dissolved_oxygen * 0.032",
         }),
         &token,
@@ -273,7 +274,7 @@ async fn test_full_public_data_workflow() {
     assert!(sites.as_array().unwrap().iter().any(|s| s["id"] == "e2e_station"), "sites: {sites}");
 
     // 11. Public readings reproduce the real raw data exactly AND the recomputed derived value.
-    // Parameter names now come from parameters.name: "dissolved_oxygen", "temperature", "DOmgL".
+    // Public parameters are keyed by their short `code`: "dissolved_oxygen", "temperature", "DOmgL".
     let to_iso = |s: &str| s.replace(' ', "T") + "Z";
     let readings_uri = format!(
         "/api/public/e2e_river/sites/{site_id}/readings?start={}&end={}",

@@ -34,7 +34,7 @@ async fn configure_derived_and_exposure(
         app,
         "/api/derived_parameters",
         &serde_json::json!({
-            "name": derived_name, "display_name": "DO mg/L", "units": "mg/L",
+            "code": derived_name, "name": "DO mg/L", "units": "mg/L",
             "formula": "Dissolved_O2 * 0.032",
         }),
         token,

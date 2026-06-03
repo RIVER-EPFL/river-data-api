@@ -196,7 +196,7 @@ pub async fn import_csv(
         .db
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT sp.name AS sp_name, sp.parameter_id, p.name AS param_name, p.aliases \
+            "SELECT sp.name AS sp_name, sp.parameter_id, p.code AS param_name, p.aliases \
              FROM site_parameters sp JOIN parameters p ON p.id = sp.parameter_id \
              WHERE sp.site_id = $1",
             [site_id.into()],
@@ -244,13 +244,13 @@ pub async fn import_csv(
         .db
         .query_all(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, name, aliases FROM parameters".to_owned(),
+            "SELECT id, code, aliases FROM parameters".to_owned(),
         ))
         .await?;
     let mut catalog: HashMap<String, Uuid> = HashMap::new();
     for row in &catalog_rows {
         let Ok(pid) = row.try_get::<Uuid>("", "id") else { continue };
-        let name: String = row.try_get("", "name").unwrap_or_default();
+        let name: String = row.try_get("", "code").unwrap_or_default();
         let aliases: Vec<String> = row.try_get("", "aliases").unwrap_or_default();
         catalog.insert(name.to_lowercase(), pid);
         for alias in &aliases {

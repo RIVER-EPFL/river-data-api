@@ -227,7 +227,7 @@ async fn test_derived_sources_reassigned() {
     common::exec(
         &db,
         &format!(
-            "INSERT INTO derived_parameter_definitions (id, name, display_name, units, formula)
+            "INSERT INTO derived_parameter_definitions (id, code, name, units, formula)
              VALUES (gen_random_uuid(), 'test_derived', 'Test', 'mg/L', 'dissolved_oxygen * 0.032')
              ON CONFLICT DO NOTHING"
         ),
@@ -238,7 +238,7 @@ async fn test_derived_sources_reassigned() {
         &format!(
             "INSERT INTO derived_parameter_sources (derived_definition_id, parameter_id, variable_name)
              SELECT id, '{}', 'dissolved_oxygen'
-             FROM derived_parameter_definitions WHERE name = 'test_derived'",
+             FROM derived_parameter_definitions WHERE code = 'test_derived'",
             common::GLOBAL_PARAM_DO_ID
         ),
     )
@@ -283,17 +283,17 @@ async fn test_aliases_absorbed() {
     )
     .await;
 
-    let source_name: String = {
+    let source_code: String = {
         use sea_orm::{ConnectionTrait, Statement};
         db.query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT name FROM parameters WHERE id = $1",
+            "SELECT code FROM parameters WHERE id = $1",
             [uuid::Uuid::parse_str(common::GLOBAL_PARAM_DO_ID).unwrap().into()],
         ))
         .await
         .unwrap()
         .unwrap()
-        .try_get("", "name")
+        .try_get("", "code")
         .unwrap()
     };
 
@@ -311,8 +311,8 @@ async fn test_aliases_absorbed() {
         "should keep target alias: {target_aliases:?}"
     );
     assert!(
-        target_aliases.contains(&source_name),
-        "should contain source name '{source_name}': {target_aliases:?}"
+        target_aliases.contains(&source_code),
+        "should contain source code '{source_code}': {target_aliases:?}"
     );
 }
 

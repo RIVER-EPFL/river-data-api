@@ -385,9 +385,9 @@ pub struct CreateSiteAction {
 
 #[derive(Deserialize)]
 pub struct CreateParameterAction {
-    pub name: String,
+    pub code: String,
     #[serde(default = "default_display_name")]
-    pub display_name: String,
+    pub name: String,
     #[serde(default)]
     pub default_units: String,
     #[serde(default = "default_category")]
@@ -571,19 +571,18 @@ async fn resolve_or_create_parameter<C: ConnectionTrait>(
     }
     let cp = create.ok_or("No parameter specified")?;
     let existing = parameters::Entity::find()
-        .filter(Expr::cust_with_values("LOWER(name) = $1", [cp.name.to_lowercase()]))
+        .filter(Expr::cust_with_values("LOWER(code) = $1", [cp.code.to_lowercase()]))
         .one(db).await.map_err(|e| e.to_string())?;
     if let Some(existing) = existing {
         return Ok((existing.id, false));
     }
-    let display_name = if cp.display_name.is_empty() { cp.name.clone() } else { cp.display_name.clone() };
+    let name = if cp.name.is_empty() { cp.code.clone() } else { cp.name.clone() };
     let p = parameters::ActiveModel {
         id: Set(Uuid::new_v4()),
-        name: Set(cp.name.clone()),
-        display_name: Set(display_name),
+        code: Set(cp.code.clone()),
+        name: Set(name),
         default_units: Set(cp.default_units.clone()),
         category: Set(cp.category.clone()),
-        data_type: Set("numeric".to_string()),
         description: Set(None),
         aliases: Set(vec![]),
         default_warning_min: Set(None), default_warning_max: Set(None),
@@ -760,8 +759,8 @@ struct GroupedSite {
 
 #[derive(Serialize)]
 struct GroupedParameter {
+    code: String,
     name: String,
-    display_name: String,
     units: String,
     stream_count: usize,
     existing_id: Option<Uuid>,
@@ -851,7 +850,7 @@ pub async fn grouped_discovery(
         .into_iter().map(|s| (s.id, s.name.to_lowercase())).collect();
     let existing_params: Vec<(Uuid, String, String)> = parameters::Entity::find()
         .all(db).await?
-        .into_iter().map(|p| (p.id, p.name.to_lowercase(), p.display_name)).collect();
+        .into_iter().map(|p| (p.id, p.code.to_lowercase(), p.name)).collect();
 
     let grouped_projects: Vec<GroupedProject> = project_counts.into_iter()
         .map(|(name, count)| {
@@ -873,20 +872,20 @@ pub async fn grouped_discovery(
     grouped_sites.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mut grouped_params: Vec<GroupedParameter> = param_info.into_iter()
-        .map(|(display_name, (units, count))| {
+        .map(|(label, (units, count))| {
             let existing_id = existing_params.iter()
-                .find(|(_, n, _)| *n == display_name.to_lowercase())
+                .find(|(_, c, _)| *c == label.to_lowercase())
                 .map(|(id, _, _)| *id);
             GroupedParameter {
-                name: display_name.clone(),
-                display_name,
+                code: label.clone(),
+                name: label,
                 units,
                 stream_count: count,
                 existing_id,
             }
         })
         .collect();
-    grouped_params.sort_by(|a, b| a.name.cmp(&b.name));
+    grouped_params.sort_by(|a, b| a.code.cmp(&b.code));
 
     Ok(Json(GroupedDiscoveryResponse {
         source_system: req.source_system,
@@ -903,7 +902,7 @@ pub struct BulkPairRequest {
     project_name: String,
     /// Sites to create or use. Each has name + optional existing_id.
     sites: Vec<BulkPairSite>,
-    /// Parameters to create or use. Each has name, display_name, units + optional existing_id.
+    /// Parameters to create or use. Each has code, name, units + optional existing_id.
     parameters: Vec<BulkPairParameter>,
 }
 
@@ -918,8 +917,8 @@ pub struct BulkPairSite {
 
 #[derive(Deserialize)]
 pub struct BulkPairParameter {
+    code: String,
     name: String,
-    display_name: String,
     units: String,
     existing_id: Option<Uuid>,
 }
@@ -1023,7 +1022,7 @@ pub async fn bulk_pair(
             eid
         } else {
             let existing = parameters::Entity::find()
-                .filter(Expr::cust_with_values("LOWER(name) = $1", [p.name.to_lowercase()]))
+                .filter(Expr::cust_with_values("LOWER(code) = $1", [p.code.to_lowercase()]))
                 .one(&txn).await?;
             if let Some(existing) = existing {
                 existing.id
@@ -1031,11 +1030,10 @@ pub async fn bulk_pair(
                 let id = Uuid::new_v4();
                 parameters::ActiveModel {
                     id: Set(id),
+                    code: Set(p.code.clone()),
                     name: Set(p.name.clone()),
-                    display_name: Set(p.display_name.clone()),
                     default_units: Set(p.units.clone()),
                     category: Set("measurement".to_string()),
-                    data_type: Set("numeric".to_string()),
                     description: Set(None),
                     aliases: Set(vec![]),
                     default_warning_min: Set(None), default_warning_max: Set(None),
@@ -1046,7 +1044,7 @@ pub async fn bulk_pair(
                 id
             }
         };
-        param_map.insert(p.name.to_lowercase(), id);
+        param_map.insert(p.code.to_lowercase(), id);
     }
 
     // 4. Fetch unpaired streams, build site_parameter mappings, then batch-pair

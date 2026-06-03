@@ -149,7 +149,7 @@ async fn test_public_readings() {
 
     let params = body["parameters"].as_array().unwrap();
     assert_eq!(params.len(), 1, "should have 1 exposed parameter");
-    assert_eq!(params[0]["name"].as_str().unwrap(), "DO_Temperature");
+    assert_eq!(params[0]["code"].as_str().unwrap(), "DO_Temperature");
     assert_eq!(params[0]["units"].as_str().unwrap(), "°C");
 
     let times = body["times"].as_array().unwrap();
@@ -175,8 +175,8 @@ async fn test_public_readings_two_params() {
     let params = body["parameters"].as_array().unwrap();
     assert_eq!(params.len(), 2, "should have DO_Temperature and Dissolved_O2");
 
-    let temp = params.iter().find(|p| p["name"] == "DO_Temperature").expect("DO_Temperature missing");
-    let do_param = params.iter().find(|p| p["name"] == "Dissolved_O2").expect("Dissolved_O2 missing");
+    let temp = params.iter().find(|p| p["code"] == "DO_Temperature").expect("DO_Temperature missing");
+    let do_param = params.iter().find(|p| p["code"] == "Dissolved_O2").expect("Dissolved_O2 missing");
 
     assert_eq!(temp["units"], "°C");
     assert_eq!(do_param["units"], "µM");
@@ -225,8 +225,8 @@ async fn test_public_aggregates() {
     let params = body["parameters"].as_array().unwrap();
     assert_eq!(params.len(), 2, "aggregates should have DO_Temperature and Dissolved_O2");
 
-    let temp = params.iter().find(|p| p["name"] == "DO_Temperature").expect("DO_Temperature aggregates missing");
-    let do_param = params.iter().find(|p| p["name"] == "Dissolved_O2").expect("Dissolved_O2 aggregates missing");
+    let temp = params.iter().find(|p| p["code"] == "DO_Temperature").expect("DO_Temperature aggregates missing");
+    let do_param = params.iter().find(|p| p["code"] == "Dissolved_O2").expect("Dissolved_O2 aggregates missing");
 
     let temp_avg = temp["avg"].as_array().unwrap();
     let do_avg = do_param["avg"].as_array().unwrap();
@@ -304,7 +304,7 @@ async fn test_public_parameter_filtering() {
 
     let params = body["parameters"].as_array().unwrap();
     assert_eq!(params.len(), 1, "should only have Dissolved_O2");
-    assert_eq!(params[0]["name"], "Dissolved_O2");
+    assert_eq!(params[0]["code"], "Dissolved_O2");
     assert_eq!(params[0]["units"], "µM");
 }
 
@@ -351,7 +351,7 @@ async fn test_public_list_parameters() {
     let params = body.as_array().unwrap();
     assert_eq!(params.len(), 2);
 
-    let names: Vec<&str> = params.iter().map(|p| p["name"].as_str().unwrap()).collect();
-    assert!(names.contains(&"DO_Temperature"));
-    assert!(names.contains(&"Dissolved_O2"));
+    let codes: Vec<&str> = params.iter().map(|p| p["code"].as_str().unwrap()).collect();
+    assert!(codes.contains(&"DO_Temperature"));
+    assert!(codes.contains(&"Dissolved_O2"));
 }

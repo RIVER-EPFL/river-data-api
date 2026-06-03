@@ -33,6 +33,7 @@ pub struct PublicSiteConfig {
 #[derive(Debug, Clone)]
 pub struct ExposedParamConfig {
     pub parameter_id: Uuid,
+    pub code: String,
     pub name: String,
     pub units: String,
     pub site_id: Uuid,
@@ -119,6 +120,7 @@ async fn load_public_config(
     struct ExposedRow {
         parameter_id: Uuid,
         site_id: Uuid,
+        param_code: String,
         param_name: String,
         default_units: String,
     }
@@ -135,11 +137,11 @@ async fn load_public_config(
             values.push((*id).into());
         }
         let sql = format!(
-            "SELECT sp.parameter_id, sp.site_id, p.name AS param_name, p.default_units \
+            "SELECT sp.parameter_id, sp.site_id, p.code AS param_code, p.name AS param_name, p.default_units \
              FROM site_parameters sp \
              JOIN parameters p ON p.id = sp.parameter_id \
              WHERE sp.is_public = true AND sp.site_id IN ({}) \
-             ORDER BY p.name",
+             ORDER BY p.code",
             placeholders.join(", ")
         );
         let stmt = sea_orm::Statement::from_sql_and_values(
@@ -157,6 +159,7 @@ async fn load_public_config(
         rows.into_iter()
             .map(|r| ExposedParamConfig {
                 parameter_id: r.parameter_id,
+                code: r.param_code,
                 name: r.param_name,
                 units: r.default_units,
                 site_id: r.site_id,
@@ -176,7 +179,7 @@ async fn load_public_config(
             .unwrap_or_else(|| "Public sensor data API.".to_string()),
         api_version: project
             .public_api_version
-            .unwrap_or_else(|| "1.0.0".to_string()),
+            .unwrap_or_else(|| "2.0.0".to_string()),
         contact_email: project.public_contact_email,
         sites: site_configs,
         exposed_params: exposed_configs,

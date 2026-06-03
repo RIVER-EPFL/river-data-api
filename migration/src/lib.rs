@@ -13,6 +13,11 @@ mod m20260522_000001_reprocessing_jobs_optional_sensor;
 mod m20260601_000001_simplify_public_exposure;
 mod m20260603_000001_alarm_events;
 mod m20260603_000002_job_retry_count;
+mod m20260603_000003_parameter_nomenclature;
+mod m20260603_000004_drop_alarm_type;
+mod m20260603_000005_capture_sensor_serial;
+mod m20260603_000006_deployment_twin;
+mod m20260603_000007_sensor_dimension_aggregates;
 
 pub struct Migrator;
 
@@ -33,6 +38,11 @@ impl MigratorTrait for Migrator {
             Box::new(m20260601_000001_simplify_public_exposure::Migration),
             Box::new(m20260603_000001_alarm_events::Migration),
             Box::new(m20260603_000002_job_retry_count::Migration),
+            Box::new(m20260603_000003_parameter_nomenclature::Migration),
+            Box::new(m20260603_000004_drop_alarm_type::Migration),
+            Box::new(m20260603_000005_capture_sensor_serial::Migration),
+            Box::new(m20260603_000006_deployment_twin::Migration),
+            Box::new(m20260603_000007_sensor_dimension_aggregates::Migration),
         ]
     }
 }

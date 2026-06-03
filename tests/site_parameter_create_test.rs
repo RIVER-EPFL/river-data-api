@@ -1,9 +1,9 @@
 //! Regression tests for the site_parameter create-friction fix.
 //!
 //! Assigning a parameter to a site should require only `{site_id, parameter_id}`:
-//! `name` is backfilled from the parameter's display name and `sensor_type`
-//! defaults to an empty string (the API falls back to the parameter name for
-//! display). Run with: cargo test --test site_parameter_create_test
+//! `name` is backfilled from the parameter's human label (`parameters.name`) and
+//! `sensor_type` defaults to an empty string (the API falls back to the parameter
+//! code for display). Run with: cargo test --test site_parameter_create_test
 
 mod common;
 
@@ -44,7 +44,7 @@ async fn create_site_parameter_with_only_site_and_parameter() {
     let got: serde_json::Value = serde_json::from_str(&gtext).expect("valid json");
     assert_eq!(
         got["name"], "Water Depth",
-        "name should be backfilled from the parameter's display_name: {got}"
+        "name should be backfilled from the parameter's human label (parameters.name): {got}"
     );
     assert_eq!(
         got["sensor_type"], "",

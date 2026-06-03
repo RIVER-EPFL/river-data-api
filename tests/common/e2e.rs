@@ -65,15 +65,16 @@ pub async fn wait_for_jobs_by_trigger(db: &sea_orm::DatabaseConnection, trigger_
 }
 
 /// A numeric array from a readings (`values`) or aggregate (`avg`/`min`/`max`/`count`) response.
-/// `key` matches a parameter by `name`, `display_name`, or `parameter_id` — the authenticated
-/// readings group by the site_parameter name while the public API uses the global parameter name,
-/// so matching on `parameter_id` is the stable choice across both.
+/// `key` matches a parameter by `code`, `name`, `display_name`, or `parameter_id` — the
+/// authenticated readings group by the site_parameter name while the public API exposes `code`
+/// (short code) and `name` (human label), so matching on `parameter_id` or `code` is the stable
+/// choice across both.
 pub fn field_for(resp: &serde_json::Value, key: &str, field: &str) -> Vec<f64> {
     resp["parameters"]
         .as_array()
         .unwrap_or_else(|| panic!("no 'parameters' array in response: {resp}"))
         .iter()
-        .find(|p| p["name"] == key || p["display_name"] == key || p["parameter_id"] == key)
+        .find(|p| p["code"] == key || p["name"] == key || p["display_name"] == key || p["parameter_id"] == key)
         .unwrap_or_else(|| panic!("parameter {key} missing in {resp}"))[field]
         .as_array()
         .unwrap_or_else(|| panic!("'{field}' not an array for {key}"))
@@ -112,12 +113,12 @@ pub async fn create_site(app: &Router, token: &str, project_id: &str, name: &str
     .await
 }
 
-pub async fn create_parameter(app: &Router, token: &str, name: &str, display_name: &str, units: &str) -> String {
+pub async fn create_parameter(app: &Router, token: &str, code: &str, name: &str, units: &str) -> String {
     create(
         app,
         token,
         "/api/parameters",
-        json!({ "name": name, "display_name": display_name, "default_units": units, "category": "measurement", "data_type": "numeric", "aliases": [] }),
+        json!({ "code": code, "name": name, "default_units": units, "category": "measurement", "aliases": [] }),
     )
     .await
 }

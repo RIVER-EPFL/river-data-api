@@ -220,6 +220,30 @@ pub async fn insert_grab_samples(
 
     let samples_created = sample_map.len();
 
+    // Window-aware attribution for grabs that name a sensor: resolve calibration/deployment from the
+    // sensor's windows at the grab time (site-fixed to payload.site_id), instead of writing NULL.
+    // Grabs without a sensor_id keep NULL cal/deployment (manual lab values with no instrument).
+    let grab_slots = {
+        use crate::routes::private::sensors::operations::{resolve_windows_for_times, ResolvedSlot};
+        let mut times_by_sensor: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = HashMap::new();
+        for r in &payload.readings {
+            if let Some(sid) = r.sensor_id {
+                times_by_sensor.entry(sid).or_default().push(r.time);
+            }
+        }
+        let mut slots: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), ResolvedSlot> = HashMap::new();
+        for (sid, times) in &times_by_sensor {
+            let resolved =
+                resolve_windows_for_times(&state.db, *sid, Some(payload.site_id), times)
+                    .await
+                    .unwrap_or_default();
+            for (t, slot) in resolved {
+                slots.insert((*sid, t), slot);
+            }
+        }
+        slots
+    };
+
     // Track replicate_index per (parameter_id, time) group for auto-assignment
     let mut index_counters: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), i16> = HashMap::new();
 
@@ -252,8 +276,8 @@ pub async fn insert_grab_samples(
                 raw_value: Set(r.value),
                 calibrated_value: Set(None),
                 sensor_id: Set(r.sensor_id),
-                calibration_id: Set(None),
-                deployment_id: Set(None),
+                calibration_id: Set(r.sensor_id.and_then(|sid| grab_slots.get(&(sid, r.time)).and_then(|s| s.calibration_id))),
+                deployment_id: Set(r.sensor_id.and_then(|sid| grab_slots.get(&(sid, r.time)).and_then(|s| s.deployment_id))),
                 logged: Set(Some(true)),
                 measurement_type: Set(Some("spot".to_string())),
                 is_flagged: Set(Some(false)),

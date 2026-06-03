@@ -42,8 +42,8 @@ async fn bug1_flagged_readings_still_in_aggregates() {
     common::db::exec(
         &db,
         &format!(
-            "INSERT INTO parameters (id, name, display_name, default_units, category, data_type) \
-             VALUES ('{gid}', 'Temperature', 'Temperature', '°C', 'measurement', 'numeric')",
+            "INSERT INTO parameters (id, code, name, default_units, category) \
+             VALUES ('{gid}', 'Temperature', 'Temperature', '°C', 'measurement')",
             gid = common::GLOBAL_PARAM_TEMP_ID
         ),
     )
@@ -196,9 +196,9 @@ async fn bug3_merge_drops_conflicting_readings() {
     common::db::exec(
         &db,
         &format!(
-            "INSERT INTO parameters (id, name, display_name, default_units, category, data_type) VALUES \
-             ('{p1}', 'Temp_A', 'Temp A', '°C', 'measurement', 'numeric'), \
-             ('{p2}', 'Temp_B', 'Temp B', '°C', 'measurement', 'numeric')",
+            "INSERT INTO parameters (id, code, name, default_units, category) VALUES \
+             ('{p1}', 'Temp_A', 'Temp A', '°C', 'measurement'), \
+             ('{p2}', 'Temp_B', 'Temp B', '°C', 'measurement')",
             p1 = common::GLOBAL_PARAM_TEMP_ID,
             p2 = common::GLOBAL_PARAM_DO_ID
         ),
@@ -389,8 +389,8 @@ async fn bug5_slope_zero_rejected_by_validation() {
     common::db::exec(
         &db,
         &format!(
-            "INSERT INTO parameters (id, name, display_name, default_units, category, data_type) \
-             VALUES ('{gid}', 'Temperature', 'Temperature', '°C', 'measurement', 'numeric')",
+            "INSERT INTO parameters (id, code, name, default_units, category) \
+             VALUES ('{gid}', 'Temperature', 'Temperature', '°C', 'measurement')",
             gid = common::GLOBAL_PARAM_TEMP_ID
         ),
     )

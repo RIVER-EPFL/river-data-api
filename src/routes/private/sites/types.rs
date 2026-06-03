@@ -30,8 +30,18 @@ pub struct SiteResponse {
 /// Parameter information embedded in site responses
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ParameterResponse {
+    /// Site-parameter id
     pub id: Uuid,
+    /// Global catalog parameter id
+    pub parameter_id: Uuid,
+    /// Stable parameter code (catalog `code`, e.g. "DOmgL")
+    pub code: String,
+    /// Human-readable parameter name (catalog `name`, e.g. "Dissolved Oxygen")
     pub name: String,
+    /// Resolved units: site override (`display_units`) falling back to the catalog `default_units`
+    pub units: Option<String>,
+    /// Whether this is a derived (computed) parameter at this site
+    pub is_derived: bool,
     pub sensor_type: String,
     pub display_units: Option<String>,
     pub sample_interval_sec: Option<i32>,

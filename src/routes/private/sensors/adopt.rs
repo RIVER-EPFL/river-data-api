@@ -1,0 +1,463 @@
+use axum::{
+    Json,
+    extract::{Path, State},
+};
+use chrono::{DateTime, Utc};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, Set,
+    Statement, TransactionTrait,
+};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+use uuid::Uuid;
+
+use crate::common::AppState;
+use crate::error::{AppError, AppResult};
+use crate::routes::private::sensor_calibrations::services::{
+    recompute_deployed_until, reprocess_sensor_readings, reprocess_site_parameter_readings,
+    spawn_tracked_job,
+};
+use crate::routes::private::{parameters, site_parameters};
+
+fn default_true() -> bool {
+    true
+}
+
+/// Resolve the `(site, parameter)` site_parameter, creating it when missing (if allowed). Mirrors
+/// the sync path's helper so an adopted sensor's data lands under the same junction config.
+async fn resolve_or_create_site_parameter<C: ConnectionTrait>(
+    db: &C,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    create: bool,
+) -> AppResult<(Uuid, bool)> {
+    let existing = site_parameters::Entity::find()
+        .filter(
+            Condition::all()
+                .add(site_parameters::Column::SiteId.eq(site_id))
+                .add(site_parameters::Column::ParameterId.eq(parameter_id)),
+        )
+        .one(db)
+        .await?;
+    if let Some(existing) = existing {
+        return Ok((existing.id, false));
+    }
+    if !create {
+        return Err(AppError::BadRequest(
+            "No site_parameter exists for this (site, parameter); pass create_site_parameter=true"
+                .to_string(),
+        ));
+    }
+    let param = parameters::Entity::find_by_id(parameter_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Parameter not found".to_string()))?;
+    let sp = site_parameters::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        site_id: Set(site_id),
+        parameter_id: Set(parameter_id),
+        name: Set(param.name),
+        sensor_type: Set(String::new()),
+        display_units: Set(None),
+        units_name: Set(None),
+        units_min: Set(None),
+        units_max: Set(None),
+        decimal_places: Set(None),
+        channel_id: Set(None),
+        sample_interval_sec: Set(None),
+        is_active: Set(Some(true)),
+        is_public: Set(Some(false)),
+        is_derived: Set(Some(false)),
+        derived_definition_id: Set(None),
+        variable_mappings: Set(None),
+        created_at: Set(Some(Utc::now())),
+        updated_at: Set(Some(Utc::now())),
+        discovered_at: Set(Some(Utc::now())),
+    };
+    let inserted = sp.insert(db).await?;
+    Ok((inserted.id, true))
+}
+
+fn is_slot_conflict(err: &sea_orm::DbErr) -> bool {
+    let msg = err.to_string();
+    msg.contains("excl_deployment_site_param_slot") || msg.contains("23P01")
+}
+
+// ---------------------------------------------------------------------------
+// Adopt
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AdoptRequest {
+    pub site_id: Uuid,
+    /// Half-open window start. Defaults to now().
+    #[serde(default)]
+    pub deployed_from: Option<DateTime<Utc>>,
+    /// Optional window end (recall). NULL = open-ended.
+    #[serde(default)]
+    pub deployed_until: Option<DateTime<Utc>>,
+    /// Auto-create the (site, parameter) site_parameter if missing. Default true.
+    #[serde(default = "default_true")]
+    pub create_site_parameter: bool,
+    #[serde(default)]
+    pub deployment_type: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AdoptResponse {
+    pub deployment_id: Uuid,
+    pub sensor_id: Uuid,
+    pub site_id: Uuid,
+    pub parameter_id: Uuid,
+    pub site_parameter_id: Uuid,
+    pub site_parameter_created: bool,
+    pub deployed_from: DateTime<Utc>,
+    pub deployed_until: Option<DateTime<Utc>>,
+    pub job_id: Uuid,
+}
+
+async fn sensor_parameter<C: ConnectionTrait>(db: &C, sensor_id: Uuid) -> AppResult<Uuid> {
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT parameter_id FROM sensors WHERE id = $1",
+            [sensor_id.into()],
+        ))
+        .await?
+        .ok_or_else(|| AppError::NotFound("Sensor not found".to_string()))?;
+    row.try_get("", "parameter_id")
+        .map_err(|e| AppError::Internal(e.to_string()))
+}
+
+/// Adopt (deploy) a sensor to a site slot for a window. Auto-creates the site_parameter if missing,
+/// then re-derives the sensor's readings by window (tracked job). Requires `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/sensors/{sensor_id}/adopt",
+    params(("sensor_id" = Uuid, Path, description = "Sensor UUID")),
+    request_body = AdoptRequest,
+    responses(
+        (status = 200, description = "Sensor adopted; returns deployment + tracked job id", body = AdoptResponse),
+        (status = 404, description = "Sensor or site not found"),
+        (status = 409, description = "Slot occupied by another sensor over an overlapping window"),
+    ),
+    tag = "sensors"
+)]
+pub async fn adopt_sensor(
+    State(app_state): State<AppState>,
+    Path(sensor_id): Path<Uuid>,
+    Json(payload): Json<AdoptRequest>,
+) -> AppResult<Json<AdoptResponse>> {
+    let db = &app_state.db;
+    let parameter_id = sensor_parameter(db, sensor_id).await?;
+
+    let site_exists = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT 1 FROM sites WHERE id = $1",
+            [payload.site_id.into()],
+        ))
+        .await?;
+    if site_exists.is_none() {
+        return Err(AppError::NotFound("Site not found".to_string()));
+    }
+
+    let deployed_from = payload.deployed_from.unwrap_or_else(Utc::now);
+    if let Some(until) = payload.deployed_until
+        && until <= deployed_from
+    {
+        return Err(AppError::BadRequest(
+            "deployed_until must be after deployed_from".to_string(),
+        ));
+    }
+
+    let txn = db.begin().await?;
+    let (site_parameter_id, site_parameter_created) =
+        resolve_or_create_site_parameter(&txn, payload.site_id, parameter_id, payload.create_site_parameter)
+            .await?;
+
+    // Auto-recall this sensor's currently-open deployment at the new start (twin of the
+    // sensor_deployments before_create hook).
+    txn.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"UPDATE sensor_deployments SET deployed_until = $1
+          WHERE sensor_id = $2 AND deployed_until IS NULL",
+        [deployed_from.into(), sensor_id.into()],
+    ))
+    .await?;
+
+    // Insert the deployment. parameter_id is filled by the BEFORE INSERT trigger; the
+    // excl_deployment_site_param_slot constraint is the atomic cross-sensor guard.
+    let dep_id = Uuid::new_v4();
+    let dep_type = payload
+        .deployment_type
+        .clone()
+        .unwrap_or_else(|| "permanent".to_string());
+    let notes = payload
+        .notes
+        .clone()
+        .unwrap_or_else(|| "Adopted via /sensors/{id}/adopt".to_string());
+    let until_val: sea_orm::Value = payload.deployed_until.into();
+    let insert = txn
+        .execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"INSERT INTO sensor_deployments
+                  (id, sensor_id, site_id, deployed_from, deployed_until, deployment_type, notes)
+              VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            [
+                dep_id.into(),
+                sensor_id.into(),
+                payload.site_id.into(),
+                deployed_from.into(),
+                until_val,
+                dep_type.into(),
+                notes.into(),
+            ],
+        ))
+        .await;
+    if let Err(e) = insert {
+        txn.rollback().await.ok();
+        if is_slot_conflict(&e) {
+            return Err(AppError::Conflict(
+                "Another sensor is deployed to this site for this parameter over an overlapping \
+                 period. Recall it first."
+                    .to_string(),
+            ));
+        }
+        return Err(AppError::Database(e));
+    }
+    txn.commit().await?;
+
+    // Re-chain the timeline, backfill parameter_id (reprocess sets site_id/deployment_id but not
+    // parameter_id — aggregates group by parameter), then reprocess by window via a tracked job.
+    recompute_deployed_until(db, sensor_id).await?;
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "UPDATE readings SET parameter_id = $1 WHERE sensor_id = $2 AND parameter_id IS NULL",
+        [parameter_id.into(), sensor_id.into()],
+    ))
+    .await?;
+
+    let job_id = spawn_tracked_job(
+        db,
+        Some(sensor_id),
+        "manual_adopt",
+        Some(dep_id),
+        app_state.events.clone(),
+        move |db| async move { reprocess_sensor_readings(&db, sensor_id).await.map(|c| c as i64) },
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(AdoptResponse {
+        deployment_id: dep_id,
+        sensor_id,
+        site_id: payload.site_id,
+        parameter_id,
+        site_parameter_id,
+        site_parameter_created,
+        deployed_from,
+        deployed_until: payload.deployed_until,
+        job_id,
+    }))
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AdoptSuggestion {
+    pub now: DateTime<Utc>,
+    pub end_of_last_deployment: Option<DateTime<Utc>>,
+    pub first_reading: Option<DateTime<Utc>>,
+}
+
+/// Suggested deploy dates for a sensor: now, the end of its last deployment, and its first reading.
+#[utoipa::path(
+    get,
+    path = "/sensors/{sensor_id}/adopt_suggestions",
+    params(("sensor_id" = Uuid, Path, description = "Sensor UUID")),
+    responses((status = 200, description = "Suggested dates", body = AdoptSuggestion)),
+    tag = "sensors"
+)]
+pub async fn adopt_suggestions(
+    State(app_state): State<AppState>,
+    Path(sensor_id): Path<Uuid>,
+) -> AppResult<Json<AdoptSuggestion>> {
+    let db = &app_state.db;
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT
+                (SELECT MAX(COALESCE(deployed_until, deployed_from)) FROM sensor_deployments WHERE sensor_id = $1) AS end_last,
+                (SELECT MIN(time) FROM readings WHERE sensor_id = $1) AS first_reading",
+            [sensor_id.into()],
+        ))
+        .await?;
+    let (end_of_last_deployment, first_reading) = match row {
+        Some(r) => (
+            r.try_get::<DateTime<chrono::FixedOffset>>("", "end_last")
+                .ok()
+                .map(|t| t.with_timezone(&Utc)),
+            r.try_get::<DateTime<chrono::FixedOffset>>("", "first_reading")
+                .ok()
+                .map(|t| t.with_timezone(&Utc)),
+        ),
+        None => (None, None),
+    };
+    Ok(Json(AdoptSuggestion {
+        now: Utc::now(),
+        end_of_last_deployment,
+        first_reading,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Swap (end A, start B)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SwapRequest {
+    pub outgoing_sensor_id: Uuid,
+    pub incoming_sensor_id: Uuid,
+    pub site_id: Uuid,
+    /// Instant of the swap. Defaults to now(). A ends at T, B starts at T (half-open => no overlap).
+    #[serde(default)]
+    pub at: Option<DateTime<Utc>>,
+    #[serde(default = "default_true")]
+    pub create_site_parameter: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SwapResponse {
+    pub ended_deployment_id: Option<Uuid>,
+    pub started_deployment_id: Uuid,
+    pub site_id: Uuid,
+    pub parameter_id: Uuid,
+    pub at: DateTime<Utc>,
+    pub outgoing_job_id: Option<Uuid>,
+    pub incoming_job_id: Uuid,
+}
+
+/// Swap one sensor for another in a (site, parameter) slot: end the outgoing sensor's deployment and
+/// start the incoming sensor's at the same instant, in one transaction. Requires `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/actions/swap",
+    request_body = SwapRequest,
+    responses(
+        (status = 200, description = "Swap complete; returns deployments + tracked jobs", body = SwapResponse),
+        (status = 400, description = "Sensors measure different parameters"),
+        (status = 409, description = "Slot conflict"),
+    ),
+    tag = "sensors"
+)]
+pub async fn swap_sensors(
+    State(app_state): State<AppState>,
+    Json(payload): Json<SwapRequest>,
+) -> AppResult<Json<SwapResponse>> {
+    let db = &app_state.db;
+    let out_param = sensor_parameter(db, payload.outgoing_sensor_id).await?;
+    let in_param = sensor_parameter(db, payload.incoming_sensor_id).await?;
+    if out_param != in_param {
+        return Err(AppError::BadRequest(
+            "Both sensors must measure the same parameter to share a slot".to_string(),
+        ));
+    }
+    let parameter_id = in_param;
+    let at = payload.at.unwrap_or_else(Utc::now);
+
+    let txn = db.begin().await?;
+    let (site_parameter_id, _created) = resolve_or_create_site_parameter(
+        &txn,
+        payload.site_id,
+        parameter_id,
+        payload.create_site_parameter,
+    )
+    .await?;
+
+    // End the outgoing sensor's open deployment at the slot.
+    let ended = txn
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE sensor_deployments SET deployed_until = $1
+              WHERE sensor_id = $2 AND site_id = $3 AND deployed_until IS NULL
+              RETURNING id",
+            [at.into(), payload.outgoing_sensor_id.into(), payload.site_id.into()],
+        ))
+        .await?;
+    let ended_deployment_id: Option<Uuid> = ended.and_then(|r| r.try_get("", "id").ok());
+
+    // Start the incoming sensor at the same instant; half-open windows mean no overlap.
+    let started_id = Uuid::new_v4();
+    let insert = txn
+        .execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"INSERT INTO sensor_deployments
+                  (id, sensor_id, site_id, deployed_from, deployment_type, notes)
+              VALUES ($1, $2, $3, $4, 'permanent', 'Swapped in via /actions/swap')",
+            [
+                started_id.into(),
+                payload.incoming_sensor_id.into(),
+                payload.site_id.into(),
+                at.into(),
+            ],
+        ))
+        .await;
+    if let Err(e) = insert {
+        txn.rollback().await.ok();
+        if is_slot_conflict(&e) {
+            return Err(AppError::Conflict(
+                "Slot still occupied at the swap instant; recall the incumbent first.".to_string(),
+            ));
+        }
+        return Err(AppError::Database(e));
+    }
+    txn.commit().await?;
+
+    recompute_deployed_until(db, payload.outgoing_sensor_id).await?;
+    recompute_deployed_until(db, payload.incoming_sensor_id).await?;
+
+    // Relink the feed to the incoming sensor so FUTURE ingest stamps B (the stream's frozen sensor_id
+    // is only a hint; the deployment timeline is authoritative for attribution).
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "UPDATE data_streams SET sensor_id = $1, updated_at = now() WHERE site_parameter_id = $2",
+        [payload.incoming_sensor_id.into(), site_parameter_id.into()],
+    ))
+    .await?;
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "UPDATE readings SET parameter_id = $1 WHERE sensor_id = $2 AND parameter_id IS NULL",
+        [parameter_id.into(), payload.incoming_sensor_id.into()],
+    ))
+    .await?;
+
+    // Per-(site,parameter) handover reprocess: re-owns existing readings to whichever sensor's
+    // deployment window covers each time — so the outgoing sensor's post-swap readings re-attribute
+    // to the incoming sensor (a per-sensor reprocess can't, since those rows still carry sensor A).
+    let site_id = payload.site_id;
+    let job_id = spawn_tracked_job(
+        db,
+        None,
+        "sensor_swap",
+        Some(site_parameter_id),
+        app_state.events.clone(),
+        move |db| async move {
+            reprocess_site_parameter_readings(&db, site_id, parameter_id)
+                .await
+                .map(|c| c as i64)
+        },
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(SwapResponse {
+        ended_deployment_id,
+        started_deployment_id: started_id,
+        site_id: payload.site_id,
+        parameter_id,
+        at,
+        outgoing_job_id: None,
+        incoming_job_id: job_id,
+    }))
+}

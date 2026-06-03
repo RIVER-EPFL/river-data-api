@@ -196,6 +196,76 @@ pub async fn register_stream(
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+pub struct ImportStreamRequest {
+    /// The parameter this stream's sensor measures. Keys the sensor by (serial, parameter).
+    pub parameter_id: Uuid,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ImportStreamResponse {
+    pub stream: StreamResponse,
+    pub sensor_id: Uuid,
+    pub attributed: u64,
+}
+
+/// Import a stream's sensor into inventory WITHOUT deploying it to a site. Creates/reuses the sensor
+/// by (serial, parameter), links it to the stream, and stamps `sensor_id`/`calibration_id` on the
+/// stream's site-less readings (calibration math applies; the readings stay un-attributed to any
+/// site until an explicit adopt). Idempotent: re-import reuses the same sensor and only fills
+/// readings missing this attribution. Requires `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/import",
+    params(("id" = Uuid, Path, description = "Stream UUID")),
+    request_body = ImportStreamRequest,
+    responses(
+        (status = 200, description = "Sensor imported; attribution count returned", body = ImportStreamResponse),
+        (status = 404, description = "Stream not found"),
+    ),
+    tag = "streams"
+)]
+pub async fn import_stream(
+    State(state): State<AppState>,
+    Path(stream_id): Path<Uuid>,
+    Json(payload): Json<ImportStreamRequest>,
+) -> AppResult<Json<ImportStreamResponse>> {
+    use crate::routes::private::sensors::operations::import_sensor_for_stream;
+    let db = &state.db;
+
+    let stream = data_streams::Entity::find_by_id(stream_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
+
+    let ctx = import_sensor_for_stream(db, &stream, payload.parameter_id).await?;
+
+    // Stamp sensor/calibration on site-less readings only; do NOT touch
+    // site_id/parameter_id/deployment_id (those are set at adopt). Idempotent.
+    let result = db
+        .execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE readings
+              SET sensor_id = $2, calibration_id = $3,
+                  calibrated_value = COALESCE(calibrated_value, raw_value)
+              WHERE stream_id = $1 AND sensor_id IS NULL",
+            [stream_id.into(), ctx.sensor_id.into(), ctx.calibration_id.into()],
+        ))
+        .await?;
+    let attributed = result.rows_affected();
+
+    let updated = data_streams::Entity::find_by_id(stream_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::Internal("Failed to fetch updated stream".to_string()))?;
+
+    Ok(Json(ImportStreamResponse {
+        stream: updated.into(),
+        sensor_id: ctx.sensor_id,
+        attributed,
+    }))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct PairStreamRequest {
     pub site_parameter_id: Uuid,
 }

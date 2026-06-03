@@ -24,17 +24,14 @@ pub struct Model {
     pub id: Uuid,
     #[sea_orm(unique)]
     #[crudcrate(filterable, fulltext, sortable)]
-    pub name: String,
+    pub code: String,
     #[crudcrate(fulltext, sortable)]
-    pub display_name: String,
+    pub name: String,
     #[crudcrate(sortable, on_create = String::new())]
     pub default_units: String,
     #[sea_orm(column_type = "String(StringLen::N(32))")]
     #[crudcrate(filterable, sortable, on_create = String::from("measurement"))]
     pub category: String,
-    #[sea_orm(column_type = "String(StringLen::N(16))")]
-    #[crudcrate(filterable, sortable, on_create = String::from("numeric"))]
-    pub data_type: String,
     #[crudcrate(sortable)]
     pub description: Option<String>,
     #[crudcrate(filterable)]

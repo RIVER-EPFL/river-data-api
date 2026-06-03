@@ -65,8 +65,8 @@ async fn delete_derived_definition_with_sources() {
         &app,
         "/api/derived_parameters",
         &serde_json::json!({
-            "name": def_name,
-            "display_name": "Delete Test",
+            "code": def_name,
+            "name": "Delete Test",
             "units": "mg/L",
             "formula": "Dissolved_O2 * 0.032",
         }),

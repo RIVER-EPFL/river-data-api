@@ -45,8 +45,8 @@ pub struct SensorResult {
 #[derive(Debug, Serialize, FromQueryResult, ToSchema)]
 pub struct ParameterResult {
     pub id: Uuid,
+    pub code: String,
     pub name: String,
-    pub display_name: String,
 }
 
 #[derive(Debug, Serialize, FromQueryResult, ToSchema)]
@@ -102,7 +102,7 @@ pub async fn search(
         .all(&state.db),
         ParameterResult::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT id, name, display_name FROM parameters WHERE name ILIKE $1 OR display_name ILIKE $1 ORDER BY name LIMIT 10",
+            "SELECT id, code, name FROM parameters WHERE code ILIKE $1 OR name ILIKE $1 ORDER BY code LIMIT 10",
             [pattern.clone().into()],
         ))
         .all(&state.db),

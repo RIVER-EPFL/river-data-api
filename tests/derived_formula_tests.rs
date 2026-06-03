@@ -78,8 +78,8 @@ async fn create_derived_param(
     formula: &str,
 ) -> (u16, serde_json::Value) {
     let body = serde_json::json!({
-        "name": name,
-        "display_name": format!("Test {name}"),
+        "code": name,
+        "name": format!("Test {name}"),
         "units": "test_units",
         "formula": formula,
         "description": "Auto-created by test"

@@ -59,8 +59,8 @@ async fn test_janitor_fills_derived_gaps() {
 
     let derived_name = format!("janitor_test_{}", Uuid::new_v4().simple());
     let create_body = serde_json::json!({
-        "name": derived_name,
-        "display_name": "Janitor test mg/L",
+        "code": derived_name,
+        "name": "Janitor test mg/L",
         "units": "mg/L",
         "formula": "Dissolved_O2 * 0.032",
     });

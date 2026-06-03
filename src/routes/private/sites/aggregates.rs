@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
-use crate::routes::private::{alarm_thresholds, site_parameters};
+use crate::routes::private::{alarm_thresholds, parameters, site_parameters};
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, resolve_site_with_project, validate_time_range};
 use crate::common::bulk::{self, StreamableAggregateParam};
@@ -50,6 +50,8 @@ pub struct ParameterAggregateData {
     pub id: Uuid,
     /// Global parameter id (the catalog parameter this site_parameter references)
     pub parameter_id: Uuid,
+    /// Stable parameter code (catalog `code`) — used as the CSV/NDJSON column key
+    pub code: String,
     pub name: String,
     #[serde(rename = "type")]
     pub sensor_type: String,
@@ -70,8 +72,8 @@ pub struct ParameterAggregateData {
 }
 
 impl StreamableAggregateParam for ParameterAggregateData {
-    fn name(&self) -> &str {
-        &self.name
+    fn column_key(&self) -> &str {
+        &self.code
     }
     fn parameter_id(&self) -> Option<Uuid> {
         Some(self.parameter_id)
@@ -216,6 +218,15 @@ pub async fn get_site_aggregates(
     // Global parameter IDs from site_parameters (readings/aggregates use global parameter_id)
     let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.parameter_id).collect();
 
+    // Stable parameter codes (catalog `code`) for export column keys.
+    let code_map: HashMap<Uuid, String> = parameters::Entity::find()
+        .filter(parameters::Column::Id.is_in(param_ids.clone()))
+        .all(&state.db)
+        .await?
+        .into_iter()
+        .map(|p| (p.id, p.code))
+        .collect();
+
     let include_alarms = query.alarms.unwrap_or(false);
 
     let cache_key = cache::cache_key(
@@ -289,20 +300,26 @@ pub async fn get_site_aggregates(
     let start_param = param_ids.len() + 2;
     let end_param = start_param + 1;
 
+    // The CAGG is grouped by (bucket, site_id, parameter_id, sensor_id) since
+    // m20260603_000007, so one (site, parameter) slot yields multiple rows per bucket (one per
+    // sensor, plus the NULL-sensor group). Collapse the sensor dimension here so the default site
+    // read is unchanged: count = SUM(count), avg = count-weighted SUM(sum_value)/SUM(count),
+    // min = MIN(min_value), max = MAX(max_value).
     let sql = format!(
         r"
         SELECT
             bucket,
             parameter_id,
-            avg_value,
-            min_value,
-            max_value,
-            count
+            CASE WHEN SUM(count) > 0 THEN SUM(sum_value) / SUM(count) ELSE NULL END AS avg_value,
+            MIN(min_value) AS min_value,
+            MAX(max_value) AS max_value,
+            SUM(count)::bigint AS count
         FROM {view_name}
         WHERE site_id = $1
           AND parameter_id IN ({})
           AND bucket >= ${}
           AND bucket <= ${}
+        GROUP BY bucket, parameter_id
         ORDER BY bucket ASC, parameter_id ASC
         ",
         placeholders.join(","),
@@ -457,6 +474,7 @@ pub async fn get_site_aggregates(
             ParameterAggregateData {
                 id: param.id,
                 parameter_id: param.parameter_id,
+                code: code_map.get(&param.parameter_id).cloned().unwrap_or_default(),
                 name: param.name.clone(),
                 sensor_type: if param.sensor_type.is_empty() { param.name.clone() } else { param.sensor_type.clone() },
                 units: param.display_units.clone(),

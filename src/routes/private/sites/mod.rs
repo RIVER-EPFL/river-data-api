@@ -4,6 +4,7 @@ pub mod handlers;
 pub mod model;
 pub mod readings;
 pub mod router;
+pub mod sensor_identity;
 pub mod sensor_vs_grab;
 pub mod status_events;
 pub mod types;

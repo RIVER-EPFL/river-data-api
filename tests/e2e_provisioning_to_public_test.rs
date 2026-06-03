@@ -119,7 +119,7 @@ async fn provision_pair_ingest_and_expose_publicly() {
     );
     let (status, pub_readings) = common::get_json(&app, &pub_uri).await;
     assert_eq!(status, 200, "public readings ({status}): {pub_readings}");
-    // Public readings key parameters by the global parameter name (not site_parameter / id).
+    // Public readings key parameters by the global parameter short code (not site_parameter / id).
     let pub_got = e2e::values_for(&pub_readings, "e2e_depth");
     assert_eq!(pub_got.len(), 6, "public should expose 6 readings: {pub_readings}");
 

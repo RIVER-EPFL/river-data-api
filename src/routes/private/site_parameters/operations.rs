@@ -162,11 +162,11 @@ impl CRUDOperations for SiteParameterOperations {
             db.execute(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "UPDATE site_parameters SET name = $1 WHERE id = $2",
-                [parameter.display_name.clone().into(), entity.id.into()],
+                [parameter.name.clone().into(), entity.id.into()],
             ))
             .await
             .map_err(ApiError::database)?;
-            entity.name = parameter.display_name.clone();
+            entity.name = parameter.name.clone();
         }
 
         // Auto-create an alarm threshold from the parameter's defaults, when any are set and
@@ -190,7 +190,6 @@ impl CRUDOperations for SiteParameterOperations {
                     id: Set(Uuid::new_v4()),
                     parameter_id: Set(entity.parameter_id),
                     site_id: Set(Some(entity.site_id)),
-                    alarm_type: Set("range".to_string()),
                     warning_min: Set(parameter.default_warning_min),
                     warning_max: Set(parameter.default_warning_max),
                     alarm_min: Set(parameter.default_alarm_min),
@@ -199,8 +198,6 @@ impl CRUDOperations for SiteParameterOperations {
                         "Auto-created from {} defaults",
                         parameter.name
                     ))),
-                    string_alarm_values: Set(None),
-                    string_warning_values: Set(None),
                     created_at: Set(None),
                     updated_at: Set(None),
                 };

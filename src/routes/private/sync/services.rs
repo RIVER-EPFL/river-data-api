@@ -884,7 +884,7 @@ async fn resolve_or_create_param(
     }
     // 1. Exact name match (case-insensitive)
     let existing = parameters::Entity::find()
-        .filter(Expr::cust_with_values("LOWER(name) = $1", [key.clone()]))
+        .filter(Expr::cust_with_values("LOWER(code) = $1", [key.clone()]))
         .one(txn).await?;
     if let Some(existing) = existing {
         cache.insert(key, existing.id);
@@ -903,11 +903,10 @@ async fn resolve_or_create_param(
     let id = Uuid::new_v4();
     parameters::ActiveModel {
         id: Set(id),
+        code: Set(param_ref.name.clone()),
         name: Set(param_ref.name.clone()),
-        display_name: Set(param_ref.name.clone()),
         default_units: Set(param_ref.units.clone()),
         category: Set(category),
-        data_type: Set("numeric".to_string()),
         description: Set(None),
         aliases: Set(param_ref.original_names.clone()),
         default_warning_min: Set(None), default_warning_max: Set(None),

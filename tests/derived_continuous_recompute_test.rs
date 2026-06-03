@@ -63,8 +63,8 @@ async fn test_continuous_derived_recompute_after_ingest() {
 
     let derived_name = format!("dom_test_{}", Uuid::new_v4().simple());
     let create_body = serde_json::json!({
-        "name": derived_name,
-        "display_name": "Test DO mg/L",
+        "code": derived_name,
+        "name": "Test DO mg/L",
         "units": "mg/L",
         "formula": "Dissolved_O2 * 0.032",
         "description": "Continuous recompute test fixture",
@@ -195,8 +195,8 @@ async fn test_recompute_endpoint_backfills_historical_gap() {
 
     let derived_name = format!("dom_backfill_{}", Uuid::new_v4().simple());
     let create_body = serde_json::json!({
-        "name": derived_name,
-        "display_name": "Backfill DO mg/L",
+        "code": derived_name,
+        "name": "Backfill DO mg/L",
         "units": "mg/L",
         "formula": "Dissolved_O2 * 0.032",
     });

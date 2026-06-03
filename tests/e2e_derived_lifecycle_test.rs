@@ -16,7 +16,7 @@ async fn create_derived(app: &axum::Router, token: &str) -> (String, String) {
         app,
         "/api/derived_parameters",
         &serde_json::json!({
-            "name": "DOmgL_e2e", "display_name": "DO mg/L (e2e)", "units": "mg/L",
+            "code": "DOmgL_e2e", "name": "DO mg/L (e2e)", "units": "mg/L",
             "formula": "Dissolved_O2 * 0.032",
         }),
         token,
