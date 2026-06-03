@@ -74,6 +74,121 @@ impl CRUDOperations for SensorDeploymentOperations {
         Ok(())
     }
 
+    // Mirror of `before_create` for edits: a PATCH that moves a deployment's window/site into
+    // another sensor's slot would otherwise hit `excl_deployment_site_param_slot` as a raw 500.
+    // Pre-check (excluding the row being edited) so the operator gets a clear 400, and auto-recall
+    // the sensor's other open deployments when this edit keeps/makes it open. The recall and the
+    // CrudCrate-applied UPDATE are separate statements (hooks don't share the update's txn), so the
+    // EXCLUDE constraint remains the atomic backstop and `after_update`'s recompute re-chains the
+    // sensor's own timeline.
+    async fn before_update(
+        &self,
+        db: &DatabaseConnection,
+        id: Uuid,
+        data: &<SensorDeployment as CRUDResource>::UpdateModel,
+    ) -> Result<(), ApiError> {
+        // Only the slot-defining fields can create an overlap. If none were patched (e.g. notes or
+        // deployment_type only), there's nothing to re-enforce.
+        if data.site_id.is_none()
+            && data.sensor_id.is_none()
+            && data.deployed_from.is_none()
+            && data.deployed_until.is_none()
+        {
+            return Ok(());
+        }
+
+        let Some(existing) = db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT sensor_id, site_id, deployed_from, deployed_until \
+                 FROM sensor_deployments WHERE id = $1",
+                [id.into()],
+            ))
+            .await
+            .map_err(ApiError::database)?
+        else {
+            return Ok(()); // unknown id — let CrudCrate's update produce the 404
+        };
+
+        let cur_sensor: Uuid = existing.try_get("", "sensor_id").map_err(ApiError::database)?;
+        let cur_site: Uuid = existing.try_get("", "site_id").map_err(ApiError::database)?;
+        let cur_from: chrono::DateTime<chrono::FixedOffset> =
+            existing.try_get("", "deployed_from").map_err(ApiError::database)?;
+        let cur_until: Option<chrono::DateTime<chrono::FixedOffset>> =
+            existing.try_get("", "deployed_until").map_err(ApiError::database)?;
+
+        // Merge the double-option patch over the existing row (outer None = field absent).
+        let new_sensor = match data.sensor_id {
+            Some(Some(v)) => v,
+            _ => cur_sensor,
+        };
+        let new_site = match data.site_id {
+            Some(Some(v)) => v,
+            _ => cur_site,
+        };
+        let new_from: chrono::DateTime<chrono::Utc> = match data.deployed_from {
+            Some(Some(v)) => v,
+            _ => cur_from.with_timezone(&chrono::Utc),
+        };
+        let new_until: Option<chrono::DateTime<chrono::Utc>> = match data.deployed_until {
+            Some(inner) => inner,
+            None => cur_until.map(|t| t.with_timezone(&chrono::Utc)),
+        };
+
+        let conflict = db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r"SELECT 1 FROM sensor_deployments d
+                  WHERE d.site_id = $1
+                    AND d.parameter_id = (SELECT parameter_id FROM sensors WHERE id = $2)
+                    AND d.sensor_id <> $2
+                    AND d.id <> $3
+                    AND tstzrange(d.deployed_from, COALESCE(d.deployed_until, 'infinity'::timestamptz), '[)')
+                        && tstzrange($4, COALESCE($5, 'infinity'::timestamptz), '[)')
+                  LIMIT 1",
+                [
+                    new_site.into(),
+                    new_sensor.into(),
+                    id.into(),
+                    new_from.into(),
+                    new_until.into(),
+                ],
+            ))
+            .await
+            .map_err(ApiError::database)?;
+
+        if conflict.is_some() {
+            return Err(ApiError::bad_request(
+                "Another sensor is already deployed to this site for this parameter over an \
+                 overlapping period. Recall it first, then move this deployment."
+                    .to_string(),
+            ));
+        }
+
+        // If the edit keeps/makes this deployment open-ended, close the sensor's other open
+        // deployments at the new start (twin of the before_create recall, excluding self).
+        if new_until.is_none() {
+            let recalled = db
+                .execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    r"UPDATE sensor_deployments SET deployed_until = $1
+                      WHERE sensor_id = $2 AND deployed_until IS NULL AND id <> $3",
+                    [new_from.into(), new_sensor.into(), id.into()],
+                ))
+                .await
+                .map_err(ApiError::database)?;
+            if recalled.rows_affected() > 0 {
+                tracing::info!(
+                    sensor_id = %new_sensor,
+                    recalled = recalled.rows_affected(),
+                    "Auto-recalled active deployment(s) on deployment edit"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     async fn after_create(
         &self,
         db: &DatabaseConnection,

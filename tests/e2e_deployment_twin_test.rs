@@ -167,3 +167,62 @@ async fn recall_unattributes_post_recall_readings() {
         }
     }
 }
+
+#[tokio::test]
+#[serial]
+async fn patch_into_occupied_slot_is_a_clean_client_error() {
+    let db = common::setup_test_db().await;
+    common::cleanup_test_db(&db).await;
+    sl::seed_base_entities(&db).await;
+    let token = common::seed_api_token(&db, common::full_permissions(), None).await;
+    let app = common::build_test_app(db.clone());
+
+    let sensor_a = sl::create_sensor(&db, "patch-a", common::GLOBAL_PARAM_TEMP_ID).await;
+    let sensor_b = sl::create_sensor(&db, "patch-b", common::GLOBAL_PARAM_TEMP_ID).await;
+
+    // A holds (site 1, Temperature); B holds (site 2, Temperature) — different slots, both allowed.
+    let _dep_a =
+        e2e::create_deployment(&app, &token, &sensor_a.id.to_string(), common::SITE1_ID, "2025-06-01T00:00:00Z").await;
+    let dep_b =
+        e2e::create_deployment(&app, &token, &sensor_b.id.to_string(), common::SITE2_ID, "2025-06-01T00:00:00Z").await;
+
+    // Moving B into A's slot via PATCH must surface the `before_update` pre-check as a clean 400 —
+    // not the raw `excl_deployment_site_param_slot` 500 the path produced before the hook existed.
+    let (status, body) = common::put_json_with_token(
+        &app,
+        &format!("/api/sensor_deployments/{dep_b}"),
+        &serde_json::json!({ "site_id": common::SITE1_ID }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 400, "moving into an occupied slot must be a clean 400, got {status}: {body}");
+}
+
+#[tokio::test]
+#[serial]
+async fn patch_window_extension_is_not_a_self_conflict() {
+    let db = common::setup_test_db().await;
+    common::cleanup_test_db(&db).await;
+    sl::seed_base_entities(&db).await;
+    let token = common::seed_api_token(&db, common::full_permissions(), None).await;
+    let app = common::build_test_app(db.clone());
+
+    let sensor = sl::create_sensor(&db, "solo", common::GLOBAL_PARAM_TEMP_ID).await;
+    let dep =
+        e2e::create_deployment(&app, &token, &sensor.id.to_string(), common::SITE1_ID, "2025-06-01T06:00:00Z").await;
+
+    // Pulling the only deployment's start earlier must not conflict with itself (self-exclusion).
+    let (status, body) = common::put_json_with_token(
+        &app,
+        &format!("/api/sensor_deployments/{dep}"),
+        &serde_json::json!({ "deployed_from": "2025-06-01T00:00:00Z" }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "extending own window must succeed ({status}): {body}");
+    assert_eq!(
+        deployed_until(&db, &dep).await,
+        None,
+        "the deployment stays open after extending its start"
+    );
+}
