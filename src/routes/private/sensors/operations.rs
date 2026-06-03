@@ -529,50 +529,56 @@ pub async fn resolve_windows_for_times<C: ConnectionTrait>(
         return Ok(out);
     }
 
+    // Read the raw nullable bounds (NULL = open / unbounded). Do NOT COALESCE to 'infinity' in SQL
+    // and read it into a non-nullable DateTime — chrono/sqlx cannot represent infinity and would
+    // panic for the (common) open calibration/deployment.
     let cal_rows = db
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT id, valid_from, COALESCE(valid_until, 'infinity'::timestamptz) AS valid_until
+            r"SELECT id, valid_from, valid_until
               FROM sensor_calibrations WHERE sensor_id = $1 ORDER BY valid_from",
             [sensor_id.into()],
         ))
         .await?;
-    let cals: Vec<(Uuid, chrono::DateTime<Utc>, chrono::DateTime<Utc>)> = cal_rows
+    let cals: Vec<(Uuid, chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>)> = cal_rows
         .iter()
         .map(|r| -> AppResult<_> {
             let id: Uuid = r.try_get("", "id")?;
             let from: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "valid_from")?;
-            let until: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "valid_until")?;
-            Ok((id, from.with_timezone(&Utc), until.with_timezone(&Utc)))
+            let until: Option<chrono::DateTime<chrono::FixedOffset>> =
+                r.try_get("", "valid_until")?;
+            Ok((id, from.with_timezone(&Utc), until.map(|u| u.with_timezone(&Utc))))
         })
         .collect::<AppResult<_>>()?;
 
     let dep_rows = db
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT id, site_id, deployed_from, COALESCE(deployed_until, 'infinity'::timestamptz) AS deployed_until
+            r"SELECT id, site_id, deployed_from, deployed_until
               FROM sensor_deployments WHERE sensor_id = $1 ORDER BY deployed_from",
             [sensor_id.into()],
         ))
         .await?;
-    let deps: Vec<(Uuid, Uuid, chrono::DateTime<Utc>, chrono::DateTime<Utc>)> = dep_rows
+    let deps: Vec<(Uuid, Uuid, chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>)> = dep_rows
         .iter()
         .map(|r| -> AppResult<_> {
             let id: Uuid = r.try_get("", "id")?;
             let site_id: Uuid = r.try_get("", "site_id")?;
             let from: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "deployed_from")?;
-            let until: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "deployed_until")?;
-            Ok((id, site_id, from.with_timezone(&Utc), until.with_timezone(&Utc)))
+            let until: Option<chrono::DateTime<chrono::FixedOffset>> =
+                r.try_get("", "deployed_until")?;
+            Ok((id, site_id, from.with_timezone(&Utc), until.map(|u| u.with_timezone(&Utc))))
         })
         .collect::<AppResult<_>>()?;
 
     for &t in times {
+        // A NULL upper bound is open-ended (covers everything from `from` onward).
         let calibration_id = cals
             .iter()
-            .find(|(_, from, until)| t >= *from && t < *until)
+            .find(|(_, from, until)| t >= *from && until.is_none_or(|u| t < u))
             .map(|(id, _, _)| *id);
         let dep = deps.iter().find(|(_, site_id, from, until)| {
-            t >= *from && t < *until && expected_site.is_none_or(|s| *site_id == s)
+            t >= *from && until.is_none_or(|u| t < u) && expected_site.is_none_or(|s| *site_id == s)
         });
         out.insert(
             t,
