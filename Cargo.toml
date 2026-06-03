@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "river-db"
-version = "0.3.6"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.95"
 authors = ["RIVER Team"]
