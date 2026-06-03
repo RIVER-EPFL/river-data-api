@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, TransactionTrait};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::OnceLock;
@@ -70,9 +70,17 @@ pub async fn recalculate_for_calibration(
         ))
         .await?;
 
+    // The calibrated_value rewrite runs in a txn with TimescaleDB's per-statement decompression cap
+    // lifted (see `reprocess_sensor_readings`); the derived cascade below runs after commit.
+    let txn = db.begin().await?;
+    txn.execute(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
+    ))
+    .await?;
     let rows_affected = if let Some(ref next) = next_cal {
         let next_from: chrono::DateTime<chrono::FixedOffset> = next.try_get("", "valid_from")?;
-        db.execute(Statement::from_sql_and_values(
+        txn.execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE readings SET calibrated_value = $1 * raw_value + $2
               WHERE sensor_id = $3 AND time >= $4 AND time < $5",
@@ -87,7 +95,7 @@ pub async fn recalculate_for_calibration(
         .await?
         .rows_affected()
     } else {
-        db.execute(Statement::from_sql_and_values(
+        txn.execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE readings SET calibrated_value = $1 * raw_value + $2
               WHERE sensor_id = $3 AND time >= $4",
@@ -101,6 +109,7 @@ pub async fn recalculate_for_calibration(
         .await?
         .rows_affected()
     };
+    txn.commit().await?;
 
     if rows_affected > 0 {
         let affected_rows = if let Some(ref next) = next_cal {
@@ -453,8 +462,8 @@ pub async fn recompute_valid_until(
 /// ever *shortens* a window to remove overlap (`LEAST` keeps an existing earlier bound) and never
 /// extends one. Shortening can't create an overlap, so the result always satisfies the per-(site,
 /// parameter) exclusion constraint.
-pub async fn recompute_deployed_until(
-    db: &DatabaseConnection,
+pub async fn recompute_deployed_until<C: ConnectionTrait>(
+    db: &C,
     sensor_id: Uuid,
 ) -> Result<(), sea_orm::DbErr> {
     db.execute(Statement::from_sql_and_values(
@@ -483,7 +492,19 @@ pub async fn reprocess_sensor_readings(
     db: &DatabaseConnection,
     sensor_id: Uuid,
 ) -> Result<usize, sea_orm::DbErr> {
-    let cal_result = db
+    // The bulk re-derivation runs in one transaction with TimescaleDB's per-statement decompression
+    // cap lifted (default 100k tuples). A deep-historical reprocess rewrites rows in compressed
+    // (>30-day) chunks and would otherwise abort the job; SET LOCAL resets on commit and is a no-op
+    // on uncompressed data. The read-back, derived cascade, and continuous-aggregate refresh run
+    // AFTER commit — a CAGG refresh cannot run inside a transaction.
+    let txn = db.begin().await?;
+    txn.execute(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
+    ))
+    .await?;
+
+    let cal_result = txn
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE readings r
@@ -503,7 +524,7 @@ pub async fn reprocess_sensor_readings(
         .await?;
     let readings_updated = cal_result.rows_affected() as usize;
 
-    db.execute(Statement::from_sql_and_values(
+    txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE readings r
         SET deployment_id = dw.id,
@@ -527,7 +548,7 @@ pub async fn reprocess_sensor_readings(
     // readings that predate any deployment keep the site_id the stream pairing gave them (auto-created
     // deployments start at pairing time, not data start — without this guard a reprocess would
     // un-attribute all historical data).
-    db.execute(Statement::from_sql_and_values(
+    txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE readings r
           SET site_id = NULL, deployment_id = NULL
@@ -542,6 +563,8 @@ pub async fn reprocess_sensor_readings(
         [sensor_id.into()],
     ))
     .await?;
+
+    txn.commit().await?;
 
     let affected = db
         .query_all(Statement::from_sql_and_values(
@@ -600,8 +623,17 @@ pub async fn reprocess_site_parameter_readings(
     site_id: Uuid,
     parameter_id: Uuid,
 ) -> Result<usize, sea_orm::DbErr> {
+    // Steps 1-3 run in one transaction with TimescaleDB's per-statement decompression cap lifted
+    // (see `reprocess_sensor_readings`); the derived cascade + aggregate refresh follow after commit.
+    let txn = db.begin().await?;
+    txn.execute(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
+    ))
+    .await?;
+
     // 1. Re-own + re-stamp deployment/site from the (site, parameter) deployment timeline.
-    let dep_result = db
+    let dep_result = txn
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE readings r
@@ -624,7 +656,7 @@ pub async fn reprocess_site_parameter_readings(
     let updated = dep_result.rows_affected() as usize;
 
     // 2. Re-derive calibrated_value/calibration_id for the (now correct) owner per cal window.
-    db.execute(Statement::from_sql_and_values(
+    txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE readings r
           SET calibration_id = cw.id,
@@ -640,7 +672,7 @@ pub async fn reprocess_site_parameter_readings(
 
     // 3. Recall NULL-clear: a reading in a deployment gap drops out of the site (guarded to
     //    time >= the slot's first deployment so pre-deployment history is kept).
-    db.execute(Statement::from_sql_and_values(
+    txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE readings r
           SET site_id = NULL, deployment_id = NULL
@@ -656,6 +688,8 @@ pub async fn reprocess_site_parameter_readings(
         [site_id.into(), parameter_id.into()],
     ))
     .await?;
+
+    txn.commit().await?;
 
     // 4. Cascade derived + refresh aggregates over the affected range (same tail as per-sensor).
     let affected = db
