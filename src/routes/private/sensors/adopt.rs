@@ -174,6 +174,13 @@ pub async fn adopt_sensor(
     }
 
     let txn = db.begin().await?;
+    // Lift the decompression cap for the readings parameter_id backfill below (no-op on uncompressed
+    // data; resets on commit). Applies to the whole transaction.
+    txn.execute(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
+    ))
+    .await?;
     let (site_parameter_id, site_parameter_created) =
         resolve_or_create_site_parameter(&txn, payload.site_id, parameter_id, payload.create_site_parameter)
             .await?;
@@ -228,17 +235,18 @@ pub async fn adopt_sensor(
         }
         return Err(AppError::Database(e));
     }
-    txn.commit().await?;
-
-    // Re-chain the timeline, backfill parameter_id (reprocess sets site_id/deployment_id but not
-    // parameter_id — aggregates group by parameter), then reprocess by window via a tracked job.
-    recompute_deployed_until(db, sensor_id).await?;
-    db.execute(Statement::from_sql_and_values(
+    // Re-chain the timeline and backfill parameter_id (reprocess sets site_id/deployment_id but not
+    // parameter_id — aggregates group by parameter) inside the same transaction as the deployment
+    // insert, so a failure can't leave a half-applied adopt. The reprocess itself is a post-commit
+    // tracked job (heavy, async, retryable).
+    recompute_deployed_until(&txn, sensor_id).await?;
+    txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "UPDATE readings SET parameter_id = $1 WHERE sensor_id = $2 AND parameter_id IS NULL",
         [parameter_id.into(), sensor_id.into()],
     ))
     .await?;
+    txn.commit().await?;
 
     let job_id = spawn_tracked_job(
         db,
@@ -367,12 +375,28 @@ pub async fn swap_sensors(
     let at = payload.at.unwrap_or_else(Utc::now);
 
     let txn = db.begin().await?;
+    // Lift the decompression cap for the readings parameter_id backfill below (resets on commit).
+    txn.execute(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
+    ))
+    .await?;
     let (site_parameter_id, _created) = resolve_or_create_site_parameter(
         &txn,
         payload.site_id,
         parameter_id,
         payload.create_site_parameter,
     )
+    .await?;
+
+    // Recall the INCOMING sensor's open deployment(s) anywhere else at the swap instant, so it can't
+    // end up double-open across two slots (twin of the outgoing recall + the adopt before_create hook).
+    txn.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"UPDATE sensor_deployments SET deployed_until = $1
+          WHERE sensor_id = $2 AND deployed_until IS NULL",
+        [at.into(), payload.incoming_sensor_id.into()],
+    ))
     .await?;
 
     // End the outgoing sensor's open deployment at the slot.
@@ -412,25 +436,25 @@ pub async fn swap_sensors(
         }
         return Err(AppError::Database(e));
     }
-    txn.commit().await?;
-
-    recompute_deployed_until(db, payload.outgoing_sensor_id).await?;
-    recompute_deployed_until(db, payload.incoming_sensor_id).await?;
-
-    // Relink the feed to the incoming sensor so FUTURE ingest stamps B (the stream's frozen sensor_id
-    // is only a hint; the deployment timeline is authoritative for attribution).
-    db.execute(Statement::from_sql_and_values(
+    // Re-chain both sensors' timelines, relink the feed to the incoming sensor (so FUTURE ingest
+    // stamps B — the stream's frozen sensor_id is only a hint; the deployment timeline is
+    // authoritative), and backfill parameter_id, all inside the swap transaction so a failure can't
+    // leave a half-applied swap. The handover reprocess is a post-commit tracked job.
+    recompute_deployed_until(&txn, payload.outgoing_sensor_id).await?;
+    recompute_deployed_until(&txn, payload.incoming_sensor_id).await?;
+    txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "UPDATE data_streams SET sensor_id = $1, updated_at = now() WHERE site_parameter_id = $2",
         [payload.incoming_sensor_id.into(), site_parameter_id.into()],
     ))
     .await?;
-    db.execute(Statement::from_sql_and_values(
+    txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "UPDATE readings SET parameter_id = $1 WHERE sensor_id = $2 AND parameter_id IS NULL",
         [parameter_id.into(), payload.incoming_sensor_id.into()],
     ))
     .await?;
+    txn.commit().await?;
 
     // Per-(site,parameter) handover reprocess: re-owns existing readings to whichever sensor's
     // deployment window covers each time — so the outgoing sensor's post-swap readings re-attribute
