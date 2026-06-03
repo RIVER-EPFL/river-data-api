@@ -50,6 +50,10 @@ pub struct ParameterAggregateData {
     pub id: Uuid,
     /// Global parameter id (the catalog parameter this site_parameter references)
     pub parameter_id: Uuid,
+    /// Owning sensor for this series. Only present when `split_by_sensor=true` (null = the
+    /// unattributed/legacy group). Absent in the default collapsed response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sensor_id: Option<Uuid>,
     /// Stable parameter code (catalog `code`) — used as the CSV/NDJSON column key
     pub code: String,
     pub name: String,
@@ -109,6 +113,25 @@ struct FlaggedBucketRow {
     flagged_count: i64,
 }
 
+#[derive(Debug, FromQueryResult)]
+struct SensorAggregateRow {
+    bucket: DateTime<Utc>,
+    parameter_id: Uuid,
+    sensor_id: Option<Uuid>,
+    avg_value: Option<f64>,
+    min_value: Option<f64>,
+    max_value: Option<f64>,
+    count: i64,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct FlaggedSensorRow {
+    bucket: DateTime<Utc>,
+    parameter_id: Uuid,
+    sensor_id: Option<Uuid>,
+    flagged_count: i64,
+}
+
 fn build_csv_response(
     _resolution: &str,
     times: &[DateTime<Utc>],
@@ -137,6 +160,9 @@ pub struct SiteAggregatesQuery {
     pub format: String,
     /// Include alarm severity data (threshold violations)
     pub alarms: Option<bool>,
+    /// Return one series per sensor instead of collapsing the sensor dimension. JSON only; each
+    /// returned parameter entry carries its `sensor_id` (null = the unattributed group).
+    pub split_by_sensor: Option<bool>,
 }
 
 /// Get aggregates for a specific site
@@ -262,6 +288,26 @@ pub async fn get_site_aggregates(
             parameters: vec![],
         })
         .into_response());
+    }
+
+    // Opt-in per-sensor split: an isolated JSON-only path that returns one series per
+    // (parameter, sensor) instead of collapsing the sensor dimension. Kept separate so the default
+    // (cached, CSV/NDJSON-capable) path is unchanged. CSV/NDJSON ignore the flag (sensors would
+    // collide on the column key); the public API is sensor-agnostic by design and has no equivalent.
+    if query.split_by_sensor.unwrap_or(false) && format == "json" {
+        return aggregates_split_by_sensor(
+            &state,
+            site_ref,
+            project_ref,
+            &resolution,
+            view_name,
+            &param_ids,
+            &code_map,
+            &params_list,
+            query.start,
+            query.end,
+        )
+        .await;
     }
 
     // Fetch thresholds when alarms are requested (small query, ~22 rows max)
@@ -474,6 +520,7 @@ pub async fn get_site_aggregates(
             ParameterAggregateData {
                 id: param.id,
                 parameter_id: param.parameter_id,
+                sensor_id: None,
                 code: code_map.get(&param.parameter_id).cloned().unwrap_or_default(),
                 name: param.name.clone(),
                 sensor_type: if param.sensor_type.is_empty() { param.name.clone() } else { param.sensor_type.clone() },
@@ -506,4 +553,195 @@ pub async fn get_site_aggregates(
             cache::cache_and_respond(&state, cache_key, &response, max_time).await
         }
     }
+}
+
+/// Per-sensor aggregate read (the `split_by_sensor=true` JSON path). Returns one
+/// `ParameterAggregateData` per `(parameter, sensor)` present in the sensor-dimension CAGG, each
+/// carrying its `sensor_id` (null = the unattributed group). Uncached and JSON-only by design — an
+/// opt-in analytical view for overlay plots, kept isolated from the default collapsed path.
+#[allow(clippy::too_many_arguments)]
+async fn aggregates_split_by_sensor(
+    state: &AppState,
+    site_ref: SiteRef,
+    project_ref: Option<ProjectRef>,
+    resolution: &str,
+    view_name: &str,
+    param_ids: &[Uuid],
+    code_map: &HashMap<Uuid, String>,
+    params_list: &[site_parameters::Model],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> AppResult<Response> {
+    let placeholders: Vec<String> = param_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("${}", i + 2))
+        .collect();
+    let start_param = param_ids.len() + 2;
+    let end_param = start_param + 1;
+
+    let mut base_values: Vec<sea_orm::Value> = vec![site_ref.id.into()];
+    base_values.extend(param_ids.iter().map(|id| (*id).into()));
+
+    let sql = format!(
+        r"
+        SELECT
+            bucket,
+            parameter_id,
+            sensor_id,
+            CASE WHEN SUM(count) > 0 THEN SUM(sum_value) / SUM(count) ELSE NULL END AS avg_value,
+            MIN(min_value) AS min_value,
+            MAX(max_value) AS max_value,
+            SUM(count)::bigint AS count
+        FROM {view_name}
+        WHERE site_id = $1
+          AND parameter_id IN ({})
+          AND bucket >= ${}
+          AND bucket <= ${}
+        GROUP BY bucket, parameter_id, sensor_id
+        ORDER BY bucket ASC, parameter_id ASC, sensor_id ASC
+        ",
+        placeholders.join(","),
+        start_param,
+        end_param,
+    );
+    let mut values = base_values.clone();
+    values.push(start.into());
+    values.push(end.into());
+
+    let rows: Vec<SensorAggregateRow> = state
+        .db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            values,
+        ))
+        .await?
+        .into_iter()
+        .filter_map(|r| SensorAggregateRow::from_query_result(&r, "").ok())
+        .collect();
+
+    let bucket_interval = match resolution {
+        "daily" => "1 day",
+        "weekly" => "7 days",
+        "monthly" => "1 month",
+        _ => "1 hour",
+    };
+    let flagged_sql = format!(
+        r"
+        SELECT
+            time_bucket('{bucket_interval}'::interval, time) AS bucket,
+            parameter_id,
+            sensor_id,
+            COUNT(*)::bigint AS flagged_count
+        FROM readings
+        WHERE site_id = $1
+          AND parameter_id IN ({})
+          AND time >= ${}
+          AND time <= ${}
+          AND is_flagged = TRUE
+          AND replicate_index = 0
+        GROUP BY bucket, parameter_id, sensor_id
+        ",
+        placeholders.join(","),
+        start_param,
+        end_param,
+    );
+    let mut flagged_values = base_values;
+    flagged_values.push(start.into());
+    flagged_values.push(end.into());
+    let flagged_rows: Vec<FlaggedSensorRow> = state
+        .db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &flagged_sql,
+            flagged_values,
+        ))
+        .await?
+        .into_iter()
+        .filter_map(|r| FlaggedSensorRow::from_query_result(&r, "").ok())
+        .collect();
+
+    type AggTuple = (Option<f64>, Option<f64>, Option<f64>, i64);
+    let mut series: BTreeMap<(Uuid, Option<Uuid>), HashMap<DateTime<Utc>, AggTuple>> =
+        BTreeMap::new();
+    let mut flagged: HashMap<(Uuid, Option<Uuid>), HashMap<DateTime<Utc>, i64>> = HashMap::new();
+    let mut time_set: std::collections::BTreeSet<DateTime<Utc>> = std::collections::BTreeSet::new();
+
+    for r in rows {
+        time_set.insert(r.bucket);
+        series
+            .entry((r.parameter_id, r.sensor_id))
+            .or_default()
+            .insert(r.bucket, (r.avg_value, r.min_value, r.max_value, r.count));
+    }
+    for r in flagged_rows {
+        flagged
+            .entry((r.parameter_id, r.sensor_id))
+            .or_default()
+            .insert(r.bucket, r.flagged_count);
+    }
+
+    let times: Vec<DateTime<Utc>> = time_set.into_iter().collect();
+    let param_by_id: HashMap<Uuid, &site_parameters::Model> =
+        params_list.iter().map(|p| (p.parameter_id, p)).collect();
+
+    let mut parameters = Vec::with_capacity(series.len());
+    for ((parameter_id, sensor_id), aggs) in series {
+        let p = param_by_id.get(&parameter_id);
+        let flagged_map = flagged.get(&(parameter_id, sensor_id));
+        let mut avg = Vec::with_capacity(times.len());
+        let mut min = Vec::with_capacity(times.len());
+        let mut max = Vec::with_capacity(times.len());
+        let mut count = Vec::with_capacity(times.len());
+        let mut flagged_count = Vec::with_capacity(times.len());
+        for t in &times {
+            flagged_count.push(flagged_map.and_then(|m| m.get(t).copied()).unwrap_or(0));
+            if let Some(a) = aggs.get(t) {
+                avg.push(a.0);
+                min.push(a.1);
+                max.push(a.2);
+                count.push(a.3);
+            } else {
+                avg.push(None);
+                min.push(None);
+                max.push(None);
+                count.push(0);
+            }
+        }
+        parameters.push(ParameterAggregateData {
+            id: p.map_or(parameter_id, |p| p.id),
+            parameter_id,
+            sensor_id,
+            code: code_map.get(&parameter_id).cloned().unwrap_or_default(),
+            name: p.map(|p| p.name.clone()).unwrap_or_default(),
+            sensor_type: p
+                .map(|p| {
+                    if p.sensor_type.is_empty() {
+                        p.name.clone()
+                    } else {
+                        p.sensor_type.clone()
+                    }
+                })
+                .unwrap_or_default(),
+            units: p.and_then(|p| p.display_units.clone()),
+            avg,
+            min,
+            max,
+            count,
+            max_severity: None,
+            flagged_count,
+        });
+    }
+
+    Ok(Json(AggregatesResponse {
+        project: project_ref,
+        site: site_ref,
+        resolution: resolution.to_string(),
+        start,
+        end,
+        times,
+        parameters,
+    })
+    .into_response())
 }
