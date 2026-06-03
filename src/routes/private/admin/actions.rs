@@ -8,7 +8,7 @@ use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensor_calibrations::services::{
     evaluate_formula, recalculate_derived_at_timestamp, recompute_deployed_until,
-    reprocess_sensor_readings, spawn_tracked_job,
+    reprocess_site_parameter_readings, reprocess_sensor_readings, spawn_tracked_job,
 };
 use crate::common::sync_state as state;
 
@@ -203,6 +203,86 @@ pub async fn reprocess_sensor(
     Ok(Json(serde_json::json!({ "job_id": job_id, "status": "pending" })))
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReprocessAllResponse {
+    pub job_id: Uuid,
+    pub status: String,
+    /// Number of (site, parameter) slots queued for re-derivation.
+    pub slots: usize,
+}
+
+/// Re-derive `sensor_id`/`deployment_id`/`site_id`/`calibrated_value` for ALL historical readings
+/// from the current deployment + calibration timelines, across every `(site, parameter)` slot that
+/// has a deployment. Use after correcting deployment/calibration windows in bulk (the backdate of
+/// historical attribution). Each slot is reprocessed via the decompression-safe
+/// `reprocess_site_parameter_readings`; runs as one tracked job. Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/actions/reprocess_all",
+    responses(
+        (status = 200, description = "Backdate reprocessing triggered; returns job_id and slot count", body = ReprocessAllResponse),
+    ),
+    tag = "actions"
+)]
+pub async fn reprocess_all(
+    State(app_state): State<AppState>,
+) -> AppResult<Json<ReprocessAllResponse>> {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let db = &app_state.db;
+    let slot_rows = db
+        .query_all(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT DISTINCT site_id, parameter_id FROM sensor_deployments".to_owned(),
+        ))
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    let slots: Vec<(Uuid, Uuid)> = slot_rows
+        .into_iter()
+        .filter_map(|r| {
+            let s: Uuid = r.try_get("", "site_id").ok()?;
+            let p: Uuid = r.try_get("", "parameter_id").ok()?;
+            Some((s, p))
+        })
+        .collect();
+    let slot_count = slots.len();
+
+    let job_id = spawn_tracked_job(
+        db,
+        None,
+        "reprocess_all",
+        None,
+        app_state.events.clone(),
+        move |db| {
+            let slots = slots.clone();
+            async move {
+                let mut total = 0i64;
+                for (site_id, parameter_id) in slots {
+                    match reprocess_site_parameter_readings(&db, site_id, parameter_id).await {
+                        Ok(n) => total += n as i64,
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            site_id = %site_id,
+                            parameter_id = %parameter_id,
+                            "reprocess_all: slot reprocess failed"
+                        ),
+                    }
+                }
+                tracing::info!(readings_updated = total, "reprocess_all complete");
+                Ok(total)
+            }
+        },
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(ReprocessAllResponse {
+        job_id,
+        status: "pending".to_string(),
+        slots: slot_count,
+    }))
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RollbackDeploymentRequest {
     pub deployment_id: Uuid,
@@ -239,7 +319,8 @@ pub async fn rollback_deployment(
     let target = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT id, sensor_id, site_id, deployed_from FROM sensor_deployments WHERE id = $1",
+            r"SELECT id, sensor_id, site_id, deployed_from, deployed_until
+              FROM sensor_deployments WHERE id = $1",
             [payload.deployment_id.into()],
         ))
         .await
@@ -249,6 +330,10 @@ pub async fn rollback_deployment(
     let sensor_id: Uuid = target.try_get("", "sensor_id").map_err(|e| AppError::Internal(format!("{e}")))?;
     let target_deployed_from: chrono::DateTime<chrono::FixedOffset> =
         target.try_get("", "deployed_from").map_err(|e| AppError::Internal(format!("{e}")))?;
+    // The boundary the rolled-back deployment vacates — the previous deployment re-extends to here
+    // (NULL = the target was open-ended, so the previous reopens open-ended too).
+    let target_deployed_until: Option<chrono::DateTime<chrono::FixedOffset>> =
+        target.try_get("", "deployed_until").map_err(|e| AppError::Internal(format!("{e}")))?;
 
     // 2. Find the previous deployment for the same sensor
     let previous = db
@@ -284,11 +369,26 @@ pub async fn rollback_deployment(
     .await
     .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
-    // 4. Re-chain the timeline (the previous deployment reopens as the current one) and re-derive
-    //    every reading for the sensor by window. The rolled-back deployment's readings re-attribute
-    //    to whichever deployment now covers their time, or to no site if a gap remains. Re-chaining
-    //    only ever shortens windows, so it can't violate the slot-exclusion constraint. Reprocess
-    //    also refreshes the continuous aggregates.
+    // 4. Reopen the previous deployment to absorb the vacated window. `recompute_deployed_until` only
+    //    ever SHORTENS (LEAST), so without this the previous deployment — which was auto-closed when
+    //    the rolled-back one was created — stays closed and the readings would un-attribute (site_id
+    //    NULL) instead of reverting to the previous site. Reopening to the target's own
+    //    `deployed_until` reclaims exactly the window the target held (NULL = open-ended), which can't
+    //    overlap anything the slot constraint already excluded.
+    if let Some(prev_id) = previous_deployment_id {
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE sensor_deployments SET deployed_until = $1 WHERE id = $2",
+            [target_deployed_until.into(), prev_id.into()],
+        ))
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    }
+
+    // 5. Re-chain the remaining timeline and re-derive every reading for the sensor by window. The
+    //    rolled-back deployment's readings now fall in the reopened previous deployment's window (or
+    //    in a gap → no site, if there was no previous). Re-chaining only ever shortens, so it can't
+    //    violate the slot-exclusion constraint. Reprocess also refreshes the continuous aggregates.
     recompute_deployed_until(db, sensor_id)
         .await
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
