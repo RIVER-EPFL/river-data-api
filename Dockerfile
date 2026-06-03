@@ -1,5 +1,9 @@
 # Stage 1: Chef (base with dependencies)
 FROM rust:1.95-slim AS chef
+# openssl-sys (via reqwest/sqlx native-tls) needs pkg-config + the OpenSSL dev headers; the slim
+# image ships neither.
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 RUN cargo install cargo-chef
 WORKDIR /app
 
@@ -17,7 +21,8 @@ RUN cargo build --release
 
 # Stage 4: Runtime (minimal image)
 FROM debian:bookworm-slim AS runtime
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+# libssl3 = the OpenSSL runtime the dynamically-linked binary needs; ca-certificates for TLS trust.
+RUN apt-get update && apt-get install -y ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/river-db /usr/local/bin/
 EXPOSE 3000
 ENTRYPOINT ["/usr/local/bin/river-db"]
