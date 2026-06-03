@@ -438,8 +438,42 @@ pub async fn apply_plan(
     finalize_plan(&txn, plan_id, &counters, readings_backfilled).await?;
     txn.commit().await?;
 
+    // Re-derive the paired readings by the deployment + calibration windows for each touched
+    // (site, parameter) slot, then a full refresh as a safety net. `backfill_plan_readings` only
+    // stamps site_id/parameter_id; the window-aware engine (same one ingest/reprocess use) assigns
+    // sensor_id/deployment_id/calibration_id and the per-window calibrated_value, while its recall
+    // guard leaves pre-deployment history attributed by the pairing. Runs post-commit because the
+    // reprocess opens its own transaction and refreshes continuous aggregates (which can't run
+    // inside one).
+    let slot_rows = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT DISTINCT sp.site_id, sp.parameter_id
+              FROM data_streams ds JOIN site_parameters sp ON ds.site_parameter_id = sp.id
+              WHERE ds.pairing_plan_id = $1",
+            [plan_id.into()],
+        ))
+        .await
+        .unwrap_or_default();
+    let slots: Vec<(Uuid, Uuid)> = slot_rows
+        .into_iter()
+        .filter_map(|r| {
+            let s: Uuid = r.try_get("", "site_id").ok()?;
+            let p: Uuid = r.try_get("", "parameter_id").ok()?;
+            Some((s, p))
+        })
+        .collect();
     let db_clone = db.clone();
     tokio::spawn(async move {
+        for (site_id, parameter_id) in slots {
+            if let Err(e) = crate::routes::private::sensor_calibrations::services::reprocess_site_parameter_readings(
+                &db_clone, site_id, parameter_id,
+            )
+            .await
+            {
+                tracing::warn!(error = %e, %site_id, %parameter_id, "apply_plan: slot reprocess failed");
+            }
+        }
         crate::common::sync_state::refresh_continuous_aggregates_full(&db_clone).await;
     });
 
