@@ -31,9 +31,14 @@ pub struct Model {
     pub sensor_id: Uuid,
     #[crudcrate(filterable)]
     pub site_id: Uuid,
+    /// Denormalized from the sensor's (immutable) parameter by the `set_deployment_parameter_id`
+    /// trigger. Read-only over the API (`exclude(create, update)`); serialized so the UI can resolve
+    /// the slot incumbent for adopt/swap.
+    #[crudcrate(filterable, exclude(create, update))]
+    pub parameter_id: Uuid,
     #[crudcrate(sortable)]
     pub deployed_from: chrono::DateTime<chrono::Utc>,
-    #[crudcrate(sortable)]
+    #[crudcrate(filterable, sortable)]
     pub deployed_until: Option<chrono::DateTime<chrono::Utc>>,
     #[crudcrate(filterable, on_create = String::from("permanent"))]
     pub deployment_type: String,
