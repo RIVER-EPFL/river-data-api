@@ -22,8 +22,8 @@ use crate::common::bulk::{self, StreamableParam};
 
 use super::types::{ProjectRef, SiteRef};
 
-/// Per-parameter reading row with flag info: (time, value, is_flagged, flag_reason).
-type ReadingRowTuple = Vec<(DateTime<Utc>, f64, Option<bool>, Option<String>)>;
+/// Per-parameter reading row: (time, value, is_flagged, flag_reason, measurement_type).
+type ReadingRowTuple = Vec<(DateTime<Utc>, f64, Option<bool>, Option<String>, Option<String>)>;
 /// Per-parameter severity: (time, severity).
 type SeverityVec = Vec<(DateTime<Utc>, Option<i16>)>;
 /// Per-parameter flag info: (time, is_flagged, flag_reason).
@@ -37,6 +37,7 @@ struct ReadingRow {
     value: f64,
     is_flagged: Option<bool>,
     flag_reason: Option<String>,
+    measurement_type: Option<String>,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -47,6 +48,7 @@ struct ReadingRowWithSeverity {
     severity: Option<i16>,
     is_flagged: Option<bool>,
     flag_reason: Option<String>,
+    measurement_type: Option<String>,
 }
 
 fn default_format() -> String {
@@ -91,6 +93,9 @@ pub struct ParameterData {
     /// Reasons for flagging (same length as times). Only present when `include_flagged=true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flag_reasons: Option<Vec<Option<String>>>,
+    /// Per-point measurement type (continuous/spot/derived). Only present when `include_measurement_type=true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measurement_types: Option<Vec<Option<String>>>,
 }
 
 impl StreamableParam for ParameterData {
@@ -102,6 +107,15 @@ impl StreamableParam for ParameterData {
     }
     fn value_at(&self, index: usize) -> Option<f64> {
         self.values.get(index).and_then(|v| *v)
+    }
+    fn measurement_type_at(&self, index: usize) -> Option<&str> {
+        self.measurement_types
+            .as_ref()
+            .and_then(|v| v.get(index))
+            .and_then(|o| o.as_deref())
+    }
+    fn has_measurement_types(&self) -> bool {
+        self.measurement_types.is_some()
     }
 }
 
@@ -128,6 +142,8 @@ pub struct SiteReadingsQuery {
     pub include_replicates: Option<bool>,
     /// Filter by sample ID to retrieve replicates for a specific sample.
     pub sample_id: Option<Uuid>,
+    /// Include a per-point measurement_type indicator (continuous/spot/derived) on each parameter.
+    pub include_measurement_type: Option<bool>,
 }
 
 /// Get readings for a specific site
@@ -237,6 +253,7 @@ pub async fn get_site_readings(
     let include_alarms = query.alarms.unwrap_or(false);
     let include_flagged = query.include_flagged.unwrap_or(true);
     let include_replicates = query.include_replicates.unwrap_or(false) || query.sample_id.is_some();
+    let include_measurement_type = query.include_measurement_type.unwrap_or(false);
 
     let measurement_type_filter = query.measurement_type.as_deref().unwrap_or("");
 
@@ -254,6 +271,7 @@ pub async fn get_site_readings(
             if include_flagged { "flagged" } else { "no_flagged" },
             if include_replicates { "replicates" } else { "" },
             &query.sample_id.map(|id| id.to_string()).unwrap_or_default(),
+            if include_measurement_type { "mtype" } else { "" },
         ],
     );
 
@@ -300,9 +318,9 @@ pub async fn get_site_readings(
                      (t.warning_max IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) > t.warning_max) THEN 1
                 ELSE 0
             END::smallint as severity,
-            r.is_flagged, r.flag_reason"
+            r.is_flagged, r.flag_reason, r.measurement_type"
     } else {
-        "r.parameter_id, r.time, COALESCE(r.calibrated_value, r.raw_value) AS value, r.is_flagged, r.flag_reason"
+        "r.parameter_id, r.time, COALESCE(r.calibrated_value, r.raw_value) AS value, r.is_flagged, r.flag_reason, r.measurement_type"
     };
 
     let from_clause = if include_alarms {
@@ -393,7 +411,7 @@ pub async fn get_site_readings(
                 param_rows
                     .entry(r.parameter_id)
                     .or_insert_with(|| Vec::with_capacity(estimated_times))
-                    .push((time, r.value, r.is_flagged, r.flag_reason));
+                    .push((time, r.value, r.is_flagged, r.flag_reason, r.measurement_type));
             }
         }
 
@@ -420,9 +438,14 @@ pub async fn get_site_readings(
                 } else {
                     None
                 };
+                let mut measurement_types_vec: Option<Vec<Option<String>>> = if include_measurement_type {
+                    Some(vec![None; len])
+                } else {
+                    None
+                };
 
                 if let Some(rows) = rows {
-                    for (i, (_, value, is_flag, reason)) in rows.iter().enumerate() {
+                    for (i, (_, value, is_flag, reason, mtype)) in rows.iter().enumerate() {
                         if i < len {
                             values[i] = Some(*value);
                             if let Some(ref mut fv) = flagged_vec {
@@ -430,6 +453,9 @@ pub async fn get_site_readings(
                             }
                             if let Some(ref mut rv) = flag_reasons_vec {
                                 rv[i] = reason.clone();
+                            }
+                            if let Some(ref mut mtv) = measurement_types_vec {
+                                mtv[i] = mtype.clone();
                             }
                         }
                     }
@@ -446,6 +472,7 @@ pub async fn get_site_readings(
                     severities: None,
                     flagged: flagged_vec,
                     flag_reasons: flag_reasons_vec,
+                    measurement_types: measurement_types_vec,
                 }
             })
             .collect();
@@ -475,6 +502,7 @@ pub async fn get_site_readings(
         HashMap::with_capacity(num_params);
     let mut param_severities: HashMap<Uuid, SeverityVec> = HashMap::new();
     let mut param_flags: HashMap<Uuid, FlagVec> = HashMap::new();
+    let mut param_meas_types: HashMap<Uuid, Vec<(DateTime<Utc>, Option<String>)>> = HashMap::new();
 
     if include_alarms {
         for row in query_result {
@@ -495,6 +523,12 @@ pub async fn get_site_readings(
                         .or_default()
                         .push((time, r.is_flagged, r.flag_reason));
                 }
+                if include_measurement_type {
+                    param_meas_types
+                        .entry(r.parameter_id)
+                        .or_default()
+                        .push((time, r.measurement_type));
+                }
             }
         }
     } else {
@@ -511,6 +545,12 @@ pub async fn get_site_readings(
                         .entry(r.parameter_id)
                         .or_default()
                         .push((time, r.is_flagged, r.flag_reason));
+                }
+                if include_measurement_type {
+                    param_meas_types
+                        .entry(r.parameter_id)
+                        .or_default()
+                        .push((time, r.measurement_type));
                 }
             }
         }
@@ -538,6 +578,11 @@ pub async fn get_site_readings(
                 None
             };
             let mut flag_reasons_vec: Option<Vec<Option<String>>> = if include_flagged {
+                Some(vec![None; times.len()])
+            } else {
+                None
+            };
+            let mut measurement_types_vec: Option<Vec<Option<String>>> = if include_measurement_type {
                 Some(vec![None; times.len()])
             } else {
                 None
@@ -574,6 +619,16 @@ pub async fn get_site_readings(
                 }
             }
 
+            if let Some(ref mut mtv) = measurement_types_vec
+                && let Some(mtypes) = param_meas_types.get(&global_param_id)
+            {
+                for (time, mtype) in mtypes {
+                    if let Some(&idx) = time_index.get(time) {
+                        mtv[idx] = mtype.clone();
+                    }
+                }
+            }
+
             ParameterData {
                 id: sp.id,
                 parameter_id: sp.parameter_id,
@@ -585,6 +640,7 @@ pub async fn get_site_readings(
                 severities: severities_vec,
                 flagged: flagged_vec,
                 flag_reasons: flag_reasons_vec,
+                measurement_types: measurement_types_vec,
             }
         })
         .collect();

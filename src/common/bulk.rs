@@ -63,6 +63,14 @@ pub trait StreamableParam: Send + Sync {
         None
     }
     fn value_at(&self, index: usize) -> Option<f64>;
+    /// Per-point measurement type (`continuous`/`spot`/`derived`), when the caller opted in.
+    fn measurement_type_at(&self, _index: usize) -> Option<&str> {
+        None
+    }
+    /// Whether this param carries per-point measurement types (controls the export column).
+    fn has_measurement_types(&self) -> bool {
+        false
+    }
 }
 
 /// Aggregate parameter data needed for CSV/NDJSON streaming (avg/min/max/count).
@@ -103,6 +111,7 @@ pub fn build_csv_response_with_times(
 
     tokio::spawn(async move {
         let include_pid = params.iter().any(|p| p.parameter_id().is_some());
+        let include_mtype = params.iter().any(|p| p.has_measurement_types());
 
         // Header row
         let mut header = "time".to_string();
@@ -113,6 +122,11 @@ pub fn build_csv_response_with_times(
         if include_pid {
             for param in &params {
                 header.push_str(&format!(",{}_parameter_id", param.name()));
+            }
+        }
+        if include_mtype {
+            for param in &params {
+                header.push_str(&format!(",{}_measurement_type", param.name()));
             }
         }
         header.push('\n');
@@ -132,6 +146,14 @@ pub fn build_csv_response_with_times(
                     row.push(',');
                     if let Some(pid) = param.parameter_id() {
                         row.push_str(&pid.to_string());
+                    }
+                }
+            }
+            if include_mtype {
+                for param in &params {
+                    row.push(',');
+                    if let Some(mt) = param.measurement_type_at(i) {
+                        row.push_str(mt);
                     }
                 }
             }
@@ -187,6 +209,15 @@ pub fn build_ndjson_response_with_times(
                     obj.insert(
                         format!("{}_parameter_id", param.name()),
                         serde_json::json!(pid.to_string()),
+                    );
+                }
+                if param.has_measurement_types() {
+                    obj.insert(
+                        format!("{}_measurement_type", param.name()),
+                        match param.measurement_type_at(i) {
+                            Some(mt) => serde_json::json!(mt),
+                            None => serde_json::Value::Null,
+                        },
                     );
                 }
             }
