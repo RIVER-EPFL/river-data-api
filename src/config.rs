@@ -75,6 +75,10 @@ pub struct Config {
 
     // Alarm sweeper: how often to reconcile persisted alarm_events against current breaches
     pub alarm_sweep_interval_seconds: u64,
+
+    // Tracked-job retry policy (calibration/deployment/derived reprocessing, aggregate refresh, ...)
+    pub job_max_retries: u32,
+    pub job_retry_backoff_seconds: u64,
 }
 
 impl Config {
@@ -205,6 +209,15 @@ impl Config {
                 .unwrap_or(180),
 
             alarm_sweep_interval_seconds: env::var("ALARM_SWEEP_INTERVAL_SECONDS")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()
+                .unwrap_or(60),
+
+            job_max_retries: env::var("JOB_MAX_RETRIES")
+                .unwrap_or_else(|_| "3".to_string())
+                .parse()
+                .unwrap_or(3),
+            job_retry_backoff_seconds: env::var("JOB_RETRY_BACKOFF_SECONDS")
                 .unwrap_or_else(|_| "60".to_string())
                 .parse()
                 .unwrap_or(60),

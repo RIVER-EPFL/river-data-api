@@ -296,7 +296,7 @@ pub async fn wait_for_reprocessing(
             .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT COUNT(*) AS cnt FROM reprocessing_jobs \
-                 WHERE sensor_id = $1 AND status IN ('pending', 'running')",
+                 WHERE sensor_id = $1 AND status IN ('pending', 'running', 'retrying')",
                 [sensor_id.into()],
             ))
             .await

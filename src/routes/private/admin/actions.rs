@@ -72,12 +72,12 @@ pub async fn refresh_aggregates(
     Ok(Json(serde_json::json!({ "job_id": job_id, "status": "pending" })))
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct ComputeDerivedRequest {
     pub site_timestamps: Vec<SiteTimestamps>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct SiteTimestamps {
     pub site_id: Uuid,
     pub timestamps: Vec<chrono::DateTime<chrono::Utc>>,
@@ -112,7 +112,9 @@ pub async fn compute_derived(
         "compute_derived",
         None,
         app_state.events.clone(),
-        move |db| async move {
+        move |db| {
+            let payload = payload.clone();
+            async move {
             tracing::info!(
                 sites = payload.site_timestamps.len(),
                 timestamps = total_timestamps,
@@ -150,6 +152,7 @@ pub async fn compute_derived(
             }
 
             Ok(computed)
+            }
         },
     )
     .await

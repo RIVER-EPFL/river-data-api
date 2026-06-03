@@ -32,6 +32,8 @@ pub struct Model {
     pub total: Option<i32>,
     #[crudcrate(exclude(update, create))]
     pub error_message: Option<String>,
+    #[crudcrate(exclude(update, create))]
+    pub retry_count: i32,
     #[crudcrate(sortable, exclude(update, create))]
     pub created_at: DateTimeWithTimeZone,
     #[crudcrate(sortable, exclude(update, create))]

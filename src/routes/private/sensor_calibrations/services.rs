@@ -2,7 +2,37 @@ use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::OnceLock;
+use std::time::Duration;
 use uuid::Uuid;
+
+/// Retry policy for tracked jobs. Set once at startup from `Config`; code paths that don't run
+/// `main.rs` (integration tests) see the default — no retries — so their behavior is unchanged.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    pub max_retries: u32,
+    pub backoff_base: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 0,
+            backoff_base: Duration::from_secs(60),
+        }
+    }
+}
+
+static JOB_RETRY_POLICY: OnceLock<RetryPolicy> = OnceLock::new();
+
+/// Initialise the global tracked-job retry policy (call once at startup, from `main.rs`).
+pub fn set_job_retry_policy(policy: RetryPolicy) {
+    let _ = JOB_RETRY_POLICY.set(policy);
+}
+
+fn job_retry_policy() -> RetryPolicy {
+    JOB_RETRY_POLICY.get().copied().unwrap_or_default()
+}
 
 #[must_use]
 pub fn apply_calibration(raw: f64, slope: f64, intercept: f64) -> f64 {
@@ -500,12 +530,10 @@ pub async fn reprocess_sensor_readings(
     Ok(readings_updated)
 }
 
-/// Generic tracked-job lifecycle. Inserts a `reprocessing_jobs` row (`status = 'pending'`),
-/// emits `JobCreated`, then spawns a background task that flips the row to `running`
-/// (emitting `JobProgress`), runs `work`, and finally records `completed`
-/// (`readings_updated` = returned count) or `failed` (`error_message`) — emitting
-/// `JobCompleted` in both cases. `sensor_id` and `trigger_id` are both nullable; the
-/// `INSERT` writes SQL NULL when absent. Returns the job id immediately.
+/// Generic tracked-job lifecycle with the process-wide retry policy (see [`set_job_retry_policy`]).
+/// Inserts a `reprocessing_jobs` row (`status = 'pending'`), emits `JobCreated`, then spawns a
+/// background task that runs `work` and records `completed`/`failed`. `work` is a factory (`Fn`)
+/// because it may be invoked more than once when retries are enabled.
 pub async fn spawn_tracked_job<F, Fut>(
     db: &DatabaseConnection,
     sensor_id: Option<Uuid>,
@@ -515,7 +543,40 @@ pub async fn spawn_tracked_job<F, Fut>(
     work: F,
 ) -> Result<Uuid, sea_orm::DbErr>
 where
-    F: FnOnce(DatabaseConnection) -> Fut + Send + 'static,
+    F: Fn(DatabaseConnection) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<i64, sea_orm::DbErr>> + Send,
+{
+    let policy = job_retry_policy();
+    spawn_tracked_job_with_retry(
+        db,
+        sensor_id,
+        trigger_type,
+        trigger_id,
+        events,
+        policy.max_retries,
+        policy.backoff_base,
+        work,
+    )
+    .await
+}
+
+/// Like [`spawn_tracked_job`] but with an explicit retry policy. On a failed attempt the row is set
+/// to `retrying` (bumping `retry_count`) and `make_work` is re-invoked after an exponential backoff
+/// (`backoff_base * 2^(attempt-1)`); only after `max_retries` exhausted is the job marked `failed`.
+/// `make_work` must be `Fn` (callable once per attempt). `sensor_id`/`trigger_id` are nullable.
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_tracked_job_with_retry<F, Fut>(
+    db: &DatabaseConnection,
+    sensor_id: Option<Uuid>,
+    trigger_type: &str,
+    trigger_id: Option<Uuid>,
+    events: crate::common::EventSender,
+    max_retries: u32,
+    backoff_base: Duration,
+    make_work: F,
+) -> Result<Uuid, sea_orm::DbErr>
+where
+    F: Fn(DatabaseConnection) -> Fut + Send + 'static,
     Fut: Future<Output = Result<i64, sea_orm::DbErr>> + Send,
 {
     use sea_orm::Value;
@@ -562,7 +623,49 @@ where
             total: None,
         });
 
-        match work(db.clone()).await {
+        let mut attempt = 0u32;
+        let outcome = loop {
+            match make_work(db.clone()).await {
+                Ok(count) => break Ok(count),
+                Err(e) if attempt < max_retries => {
+                    attempt += 1;
+                    let msg = e.to_string();
+                    let delay = backoff_base.saturating_mul(2u32.saturating_pow(attempt - 1));
+                    tracing::warn!(
+                        error = %e,
+                        attempt,
+                        max_retries,
+                        trigger = %trigger_type,
+                        delay_ms = delay.as_millis() as u64,
+                        "Tracked job attempt failed; retrying"
+                    );
+                    let _ = db
+                        .execute(Statement::from_sql_and_values(
+                            sea_orm::DatabaseBackend::Postgres,
+                            "UPDATE reprocessing_jobs SET status = 'retrying', error_message = $1, retry_count = $2 WHERE id = $3",
+                            [msg.as_str().into(), (attempt as i32).into(), job_id.into()],
+                        ))
+                        .await;
+                    let _ = events.send(crate::common::AppEvent::JobProgress {
+                        job_id,
+                        status: "retrying".into(),
+                        progress: Some(attempt as i32),
+                        total: Some(max_retries as i32),
+                    });
+                    tokio::time::sleep(delay).await;
+                    let _ = db
+                        .execute(Statement::from_sql_and_values(
+                            sea_orm::DatabaseBackend::Postgres,
+                            "UPDATE reprocessing_jobs SET status = 'running' WHERE id = $1",
+                            [job_id.into()],
+                        ))
+                        .await;
+                }
+                Err(e) => break Err(e),
+            }
+        };
+
+        match outcome {
             Ok(count) => {
                 if let Err(e) = db
                     .execute(Statement::from_sql_and_values(

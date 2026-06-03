@@ -12,6 +12,7 @@ mod m20260511_000001_add_parameter_aliases;
 mod m20260522_000001_reprocessing_jobs_optional_sensor;
 mod m20260601_000001_simplify_public_exposure;
 mod m20260603_000001_alarm_events;
+mod m20260603_000002_job_retry_count;
 
 pub struct Migrator;
 
@@ -31,6 +32,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260522_000001_reprocessing_jobs_optional_sensor::Migration),
             Box::new(m20260601_000001_simplify_public_exposure::Migration),
             Box::new(m20260603_000001_alarm_events::Migration),
+            Box::new(m20260603_000002_job_retry_count::Migration),
         ]
     }
 }

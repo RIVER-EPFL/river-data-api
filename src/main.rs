@@ -88,6 +88,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = AppState::new(db.clone(), config.clone(), keycloak_instance);
 
+    river_db::routes::private::sensor_calibrations::services::set_job_retry_policy(
+        river_db::routes::private::sensor_calibrations::services::RetryPolicy {
+            max_retries: config.job_max_retries,
+            backoff_base: Duration::from_secs(config.job_retry_backoff_seconds),
+        },
+    );
+
     let janitor_interval = Duration::from_secs(config.janitor_interval_seconds);
     let janitor_full_refresh = Duration::from_secs(config.janitor_full_refresh_seconds);
     let janitor_retention_days = config.janitor_retention_days;
