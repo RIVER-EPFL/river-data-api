@@ -1,6 +1,6 @@
 //! End-to-end data-quality configuration: set an alarm threshold, annotate a time range, and add a
-//! station note (US-3.1, US-4.1, US-4.3). Plus an aspirational, currently-blocked stateful
-//! alarm acknowledge/auto-resolve flow (US-3.2).
+//! station note (US-3.1, US-4.1, US-4.3). Plus the stateful alarm acknowledge / auto-resolve flow
+//! (US-3.2) driven through the persisted `alarm_events` + sweeper.
 //!
 //! Run: cargo test --test e2e_data_quality_test -- --test-threads=1
 
@@ -8,6 +8,8 @@ mod common;
 
 use common::e2e;
 use common::sensor_lifecycle as sl;
+use river_db::routes::private::alarms;
+use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
 
 #[tokio::test]
@@ -76,29 +78,102 @@ async fn configure_threshold_annotate_and_note() {
     assert!(notes_list.iter().any(|n| n["id"].as_str() == Some(note_id.as_str())), "note should list");
 }
 
-/// Aspirational (US-3.2): acknowledging an alarm and having it auto-resolve when readings return to
-/// range. BLOCKED — alarms are computed on-the-fly (stateless); there is no `alarm_events` table,
-/// no `POST /api/alarms/{id}/acknowledge`, and no resolve/re-raise state machine (see CLAUDE.md
-/// "Deferred"). Encoded so the workflow exists once that feature is built.
+/// US-3.2: an out-of-range reading opens a persisted alarm event (sweeper), the event can be
+/// acknowledged while still firing, and a later in-range reading auto-resolves it. The sweeper never
+/// runs under `build_test_app`, so the test drives `evaluate_alarm_events` directly for determinism.
 #[tokio::test]
 #[serial]
-#[ignore = "BLOCKED: alarms are stateless — no alarm_events table / acknowledge endpoint (CLAUDE.md Deferred)"]
 async fn alarm_acknowledge_and_autoresolve() {
     let db = common::setup_test_db().await;
     common::cleanup_test_db(&db).await;
-    common::seed_test_data(&db).await;
+    common::seed_test_data(&db).await; // thresholds + in-range readings for SITE1/Turbidity (OK band 0..100)
     let token = common::seed_api_token(&db, common::full_permissions(), None).await;
     let app = common::build_test_app(db.clone());
 
-    // Intended: ingest an out-of-range reading → it appears in /api/alarms/active → acknowledge it
-    // (POST /api/alarms/{id}/acknowledge) → it shows acknowledged → a later in-range reading
-    // auto-resolves it. No acknowledge endpoint exists yet.
-    let (status, _ack) = common::post_json_with_token(
+    let site1 = common::SITE1_ID;
+    let turb = common::GLOBAL_PARAM_TURB_ID;
+
+    // Reuse a seeded stream for SITE1/Turbidity to inject readings at later-than-seed timestamps so
+    // they become the latest reading the sweeper evaluates.
+    let stream_id: uuid::Uuid = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT stream_id FROM readings WHERE site_id='{site1}' AND parameter_id='{turb}' LIMIT 1"),
+        ))
+        .await
+        .unwrap()
+        .expect("a seeded turbidity stream")
+        .try_get("", "stream_id")
+        .unwrap();
+
+    let inject = |time: &str, value: f64| {
+        let sql = format!(
+            "INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, replicate_index) \
+             VALUES ('{stream_id}', '{site1}', '{turb}', '{time}', {value}, 0) ON CONFLICT DO NOTHING"
+        );
+        db.execute(Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql))
+    };
+
+    // Out-of-range turbidity (> alarm_max 500) at the latest time → a breach.
+    inject("2025-02-01T00:00:00Z", 9999.0).await.unwrap();
+
+    let stats = alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    assert!(stats.opened >= 1, "the breach should open an alarm event: {stats:?}");
+
+    // It appears in /alarms/active with a stable event_id, severity 2, unacknowledged.
+    let find_turb = |active: &serde_json::Value| -> Option<serde_json::Value> {
+        active["alarms"].as_array()?.iter()
+            .find(|a| a["site_id"].as_str() == Some(site1) && a["parameter_id"].as_str() == Some(turb))
+            .cloned()
+    };
+    let (status, active) = common::get_json_with_token(&app, "/api/alarms/active", &token).await;
+    assert_eq!(status, 200, "alarms/active ({status}): {active}");
+    let alarm = find_turb(&active).expect("turbidity breach in active feed");
+    assert_eq!(alarm["severity"].as_i64(), Some(2), "out-of-range turbidity is an alarm: {alarm}");
+    assert_eq!(alarm["acknowledged"], serde_json::json!(false), "not acknowledged yet: {alarm}");
+    let event_id = alarm["event_id"].as_str().expect("event_id present once swept").to_string();
+
+    // Acknowledge it — still firing, now flagged acknowledged.
+    let (status, ack) = common::post_json_with_token(
         &app,
-        "/api/alarms/acknowledge",
-        &serde_json::json!({ "site_id": common::SITE1_ID, "parameter_id": common::GLOBAL_PARAM_TURB_ID }),
+        &format!("/api/alarms/{event_id}/acknowledge"),
+        &serde_json::json!({}),
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "acknowledge endpoint should exist and succeed (got {status})");
+    assert!((200..300).contains(&status), "acknowledge ({status}): {ack}");
+
+    let (_status, active) = common::get_json_with_token(&app, "/api/alarms/active", &token).await;
+    let alarm = find_turb(&active).expect("still firing after acknowledge");
+    assert_eq!(alarm["acknowledged"], serde_json::json!(true), "now acknowledged: {alarm}");
+
+    // Acknowledging again is idempotent (200), not a 409.
+    let (status, _again) = common::post_json_with_token(
+        &app,
+        &format!("/api/alarms/{event_id}/acknowledge"),
+        &serde_json::json!({}),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "re-acknowledge should be idempotent (got {status})");
+
+    // A later in-range reading clears the breach; the next sweep auto-resolves the event.
+    inject("2025-02-01T01:00:00Z", 50.0).await.unwrap();
+    let stats = alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    assert!(stats.resolved >= 1, "returning in-range should resolve the event: {stats:?}");
+
+    let (_status, active) = common::get_json_with_token(&app, "/api/alarms/active", &token).await;
+    assert!(find_turb(&active).is_none(), "resolved alarm should drop out of the active feed: {active}");
+
+    let resolved: bool = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT resolved_at IS NOT NULL AS done FROM alarm_events WHERE id='{event_id}'"),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "done")
+        .unwrap();
+    assert!(resolved, "the alarm event should be marked resolved");
 }

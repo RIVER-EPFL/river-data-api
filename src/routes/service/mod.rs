@@ -153,6 +153,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route("/actions/refresh_aggregates", post(actions::refresh_aggregates))
         .route("/actions/compute_derived", post(actions::compute_derived))
         .route("/actions/rollback_deployment", post(actions::rollback_deployment))
+        .route("/alarms/{event_id}/acknowledge", post(alarm_views::acknowledge_alarm))
         .layer(middleware::from_fn(require_write_data))
         .with_state(state.clone());
 

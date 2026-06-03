@@ -53,6 +53,7 @@ fn test_config() -> Config {
         janitor_interval_seconds: 3600,
         janitor_full_refresh_seconds: 86_400,
         janitor_retention_days: 180,
+        alarm_sweep_interval_seconds: 60,
     }
 }
 

@@ -22,7 +22,11 @@ type KcStatus = axum_keycloak_auth::KeycloakAuthStatus<
 #[derive(Debug, Clone)]
 pub enum AuthContext {
     /// Authenticated via Keycloak JWT (admin UI, browser sessions).
-    Keycloak { roles: Vec<Role> },
+    Keycloak {
+        roles: Vec<Role>,
+        /// Best-effort user identity (email, else preferred_username) for audit fields.
+        email: Option<String>,
+    },
     /// Authenticated via API token (external scripts, curl).
     ApiToken {
         token_id: Uuid,
@@ -34,7 +38,7 @@ pub enum AuthContext {
 impl AuthContext {
     pub fn has_role(&self, target: &Role) -> bool {
         match self {
-            AuthContext::Keycloak { roles } => roles.contains(target),
+            AuthContext::Keycloak { roles, .. } => roles.contains(target),
             AuthContext::ApiToken { .. } => false,
         }
     }
@@ -100,9 +104,18 @@ pub async fn service_auth_middleware(
                     .iter()
                     .map(|kr| kr.role().clone())
                     .collect();
+                let email = {
+                    let e = token.extra.email.email.trim();
+                    if !e.is_empty() {
+                        Some(e.to_string())
+                    } else {
+                        let u = token.extra.profile.preferred_username.trim();
+                        (!u.is_empty()).then(|| u.to_string())
+                    }
+                };
                 request
                     .extensions_mut()
-                    .insert(AuthContext::Keycloak { roles });
+                    .insert(AuthContext::Keycloak { roles, email });
                 return next.run(request).await;
             }
             axum_keycloak_auth::KeycloakAuthStatus::Failure(_) => {
@@ -281,7 +294,7 @@ pub async fn require_crud_permissions(request: Request, next: Next) -> Response 
 /// response on success, or a 401/403 `AppError` response on failure. API tokens always fail.
 async fn check_keycloak_role(target: Role, request: Request, next: Next) -> Response {
     match request.extensions().get::<AuthContext>() {
-        Some(AuthContext::Keycloak { roles }) if roles.contains(&target) => next.run(request).await,
+        Some(AuthContext::Keycloak { roles, .. }) if roles.contains(&target) => next.run(request).await,
         Some(AuthContext::Keycloak { .. }) => {
             AppError::Forbidden(format!("Requires {target} role")).into_response()
         }

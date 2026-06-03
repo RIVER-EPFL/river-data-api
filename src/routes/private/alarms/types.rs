@@ -78,6 +78,27 @@ pub struct ActiveAlarm {
     pub severity: i16,
     /// Timestamp of the latest violating reading
     pub since: DateTime<Utc>,
+    /// Persisted alarm-event id (present once the sweeper has recorded this breach).
+    /// Acknowledge via `POST /api/alarms/{event_id}/acknowledge`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<Uuid>,
+    /// True when the open event has been acknowledged.
+    pub acknowledged: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acknowledged_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acknowledged_by: Option<String>,
+    /// Highest severity seen while this event has been open (1=warning, 2=alarm).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_severity: Option<i16>,
+}
+
+/// Returned by `POST /api/alarms/{event_id}/acknowledge`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AcknowledgedAlarmResponse {
+    pub event_id: Uuid,
+    pub acknowledged_at: DateTime<Utc>,
+    pub acknowledged_by: String,
 }
 
 /// Response for active alarms endpoint

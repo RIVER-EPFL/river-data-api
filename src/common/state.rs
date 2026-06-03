@@ -23,6 +23,7 @@ pub enum AppEvent {
     JobProgress { job_id: uuid::Uuid, status: String, progress: Option<i32>, total: Option<i32> },
     JobCompleted { job_id: uuid::Uuid, status: String, readings_updated: Option<i32>, error_message: Option<String> },
     DataIngested { site_id: Option<uuid::Uuid>, parameter_id: Option<uuid::Uuid>, stream_id: uuid::Uuid, count: usize },
+    AlarmStateChanged { opened: usize, resolved: usize },
 }
 
 pub type EventSender = broadcast::Sender<AppEvent>;

@@ -21,6 +21,7 @@ pub async fn event_stream(
                     crate::common::AppEvent::JobProgress { .. } => "job_progress",
                     crate::common::AppEvent::JobCompleted { .. } => "job_completed",
                     crate::common::AppEvent::DataIngested { .. } => "data_ingested",
+                    crate::common::AppEvent::AlarmStateChanged { .. } => "alarm_state_changed",
                 };
                 Some(Ok(Event::default().event(event_type).data(json)))
             }

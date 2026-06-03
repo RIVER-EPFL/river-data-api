@@ -30,6 +30,9 @@ pub enum AppError {
 
     #[error("Forbidden: {0}")]
     Forbidden(String),
+
+    #[error("Conflict: {0}")]
+    Conflict(String),
 }
 
 impl IntoResponse for AppError {
@@ -61,6 +64,7 @@ impl IntoResponse for AppError {
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             Self::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
             Self::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
+            Self::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
         };
 
         let body = Json(json!({

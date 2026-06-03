@@ -104,6 +104,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Spawned derived consistency janitor"
     );
 
+    let alarm_sweep_interval = Duration::from_secs(config.alarm_sweep_interval_seconds);
+    tokio::spawn(river_db::routes::private::alarms::sweeper::periodic(
+        db.clone(),
+        alarm_sweep_interval,
+        state.events.clone(),
+    ));
+    tracing::info!(
+        interval_secs = alarm_sweep_interval.as_secs(),
+        "Spawned alarm sweeper"
+    );
+
     let app = routes::build_router(state);
 
     // Start server with graceful shutdown

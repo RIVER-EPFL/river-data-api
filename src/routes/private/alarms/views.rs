@@ -13,15 +13,16 @@ use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::common::middleware::ProjectScope;
+use crate::common::middleware::{AuthContext, ProjectScope};
 use crate::routes::private::{alarm_thresholds, site_parameters};
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, resolve_site_with_project, validate_time_range};
 use crate::common::bulk;
 
 use super::types::{
-    ActiveAlarm, ActiveAlarmsResponse, AlarmSeverityCounts, AlarmSiteSummary, AlarmSummaryResponse,
-    AlarmThresholdInfo, AlarmViolationsResponse, ParameterViolationData, SiteAlarmsQuery,
+    AcknowledgedAlarmResponse, ActiveAlarm, ActiveAlarmsResponse, AlarmSeverityCounts,
+    AlarmSiteSummary, AlarmSummaryResponse, AlarmThresholdInfo, AlarmViolationsResponse,
+    ParameterViolationData, SiteAlarmsQuery,
 };
 use crate::routes::private::sites::types::{ProjectRef, SiteRef};
 
@@ -441,22 +442,23 @@ pub async fn get_site_alarms(
 
 /// Row from the active alarms query
 #[derive(Debug, FromQueryResult)]
-struct ActiveAlarmRow {
-    site_id: Uuid,
-    site_name: String,
-    parameter_id: Uuid,
-    parameter_name: String,
-    current_value: f64,
-    time: chrono::DateTime<chrono::FixedOffset>,
-    warning_min: Option<f64>,
-    warning_max: Option<f64>,
-    alarm_min: Option<f64>,
-    alarm_max: Option<f64>,
-    severity: i16,
+pub(crate) struct ActiveAlarmRow {
+    pub(crate) site_id: Uuid,
+    pub(crate) site_name: String,
+    pub(crate) parameter_id: Uuid,
+    pub(crate) parameter_name: String,
+    pub(crate) current_value: f64,
+    pub(crate) time: chrono::DateTime<chrono::FixedOffset>,
+    pub(crate) warning_min: Option<f64>,
+    pub(crate) warning_max: Option<f64>,
+    pub(crate) alarm_min: Option<f64>,
+    pub(crate) alarm_max: Option<f64>,
+    pub(crate) severity: i16,
 }
 
-/// Fetch active alarm violations across all sites
-async fn fetch_active_alarm_rows(
+/// Fetch active alarm violations across all sites. The sweeper reuses this as the "current breach
+/// set" so the persisted events never diverge from what `/alarms/active` would compute.
+pub(crate) async fn fetch_active_alarm_rows(
     db: &sea_orm::DatabaseConnection,
     scope: Option<Uuid>,
 ) -> AppResult<Vec<ActiveAlarmRow>> {
@@ -550,10 +552,55 @@ async fn fetch_active_alarm_rows(
     Ok(rows)
 }
 
+/// Open persisted alarm event, keyed by (site, parameter) for annotating the live feed.
+#[derive(Debug, FromQueryResult)]
+struct OpenEventRow {
+    site_id: Uuid,
+    parameter_id: Uuid,
+    id: Uuid,
+    acknowledged_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    acknowledged_by: Option<String>,
+    max_severity: i16,
+}
+
+/// Fetch the currently-open alarm events as a map keyed by (site_id, parameter_id). Used to attach
+/// `event_id` + acknowledgement state to the (stateless) current-breach feed.
+async fn fetch_open_events(
+    db: &sea_orm::DatabaseConnection,
+    scope: Option<Uuid>,
+) -> AppResult<HashMap<(Uuid, Uuid), OpenEventRow>> {
+    let project_filter = if scope.is_some() {
+        "AND s.project_id = $1"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT ae.site_id, ae.parameter_id, ae.id, ae.acknowledged_at, ae.acknowledged_by, ae.max_severity \
+         FROM alarm_events ae JOIN sites s ON s.id = ae.site_id \
+         WHERE ae.resolved_at IS NULL {project_filter}"
+    );
+    let values: Vec<sea_orm::Value> = if let Some(p) = scope { vec![p.into()] } else { vec![] };
+    let mut map = HashMap::new();
+    for row in db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            values,
+        ))
+        .await?
+    {
+        if let Ok(r) = OpenEventRow::from_query_result(&row, "") {
+            map.insert((r.site_id, r.parameter_id), r);
+        }
+    }
+    Ok(map)
+}
+
 /// Get currently active alarm violations across all sites
 ///
-/// For each alarm threshold, checks the latest reading to see if it
-/// violates warning or alarm limits. Returns all current violations.
+/// For each alarm threshold, checks the latest reading to see if it violates warning or alarm
+/// limits. Each current violation is annotated with its persisted `alarm_event` (id + acknowledgement
+/// state) so the UI can acknowledge it; the breach set itself stays driven by the latest readings.
 #[utoipa::path(
     get,
     path = "/alarms/active",
@@ -567,28 +614,120 @@ pub async fn get_active_alarms(
     ProjectScope(scope): ProjectScope,
 ) -> AppResult<Json<ActiveAlarmsResponse>> {
     let rows = fetch_active_alarm_rows(&state.db, scope).await?;
+    let open = fetch_open_events(&state.db, scope).await?;
 
     let alarms: Vec<ActiveAlarm> = rows
         .into_iter()
-        .map(|row| ActiveAlarm {
-            site_id: row.site_id,
-            site_name: row.site_name,
-            parameter_id: row.parameter_id,
-            parameter_name: row.parameter_name,
-            current_value: row.current_value,
-            threshold: AlarmThresholdInfo {
-                warning_min: row.warning_min,
-                warning_max: row.warning_max,
-                alarm_min: row.alarm_min,
-                alarm_max: row.alarm_max,
-            },
-            severity: row.severity,
-            since: row.time.with_timezone(&Utc),
+        .map(|row| {
+            let ev = open.get(&(row.site_id, row.parameter_id));
+            ActiveAlarm {
+                site_id: row.site_id,
+                site_name: row.site_name,
+                parameter_id: row.parameter_id,
+                parameter_name: row.parameter_name,
+                current_value: row.current_value,
+                threshold: AlarmThresholdInfo {
+                    warning_min: row.warning_min,
+                    warning_max: row.warning_max,
+                    alarm_min: row.alarm_min,
+                    alarm_max: row.alarm_max,
+                },
+                severity: row.severity,
+                since: row.time.with_timezone(&Utc),
+                event_id: ev.map(|e| e.id),
+                acknowledged: ev.is_some_and(|e| e.acknowledged_at.is_some()),
+                acknowledged_at: ev.and_then(|e| e.acknowledged_at.map(|t| t.with_timezone(&Utc))),
+                acknowledged_by: ev.and_then(|e| e.acknowledged_by.clone()),
+                max_severity: ev.map(|e| e.max_severity),
+            }
         })
         .collect();
 
     let total = alarms.len();
     Ok(Json(ActiveAlarmsResponse { alarms, total }))
+}
+
+/// Best-effort actor identity for the `acknowledged_by` audit field.
+fn actor_label(auth: &AuthContext) -> String {
+    match auth {
+        AuthContext::Keycloak { email: Some(e), .. } => e.clone(),
+        AuthContext::Keycloak { .. } => "keycloak".to_string(),
+        AuthContext::ApiToken { token_id, .. } => format!("token:{token_id}"),
+    }
+}
+
+/// Acknowledge an open alarm event
+///
+/// Marks the open `alarm_event` as acknowledged by the calling user/token. Acknowledging does not
+/// resolve the alarm — it stays active (flagged `acknowledged: true`) until the reading returns to
+/// range. Returns 404 if the event does not exist, 409 if it is already resolved.
+#[utoipa::path(
+    post,
+    path = "/alarms/{event_id}/acknowledge",
+    params(("event_id" = String, Path, description = "Alarm event id")),
+    responses(
+        (status = 200, description = "Alarm acknowledged", body = AcknowledgedAlarmResponse),
+        (status = 404, description = "Alarm event not found"),
+        (status = 409, description = "Alarm already resolved"),
+    ),
+    tag = "alarms"
+)]
+pub async fn acknowledge_alarm(
+    State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<AuthContext>,
+    Path(event_id): Path<Uuid>,
+) -> AppResult<Json<AcknowledgedAlarmResponse>> {
+    #[derive(Debug, FromQueryResult)]
+    struct EventState {
+        resolved_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+        acknowledged_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+        acknowledged_by: Option<String>,
+    }
+
+    let existing = state
+        .db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT resolved_at, acknowledged_at, acknowledged_by FROM alarm_events WHERE id = $1",
+            [event_id.into()],
+        ))
+        .await?
+        .and_then(|r| EventState::from_query_result(&r, "").ok());
+
+    let Some(ev) = existing else {
+        return Err(AppError::NotFound(format!("Alarm event {event_id} not found")));
+    };
+    if ev.resolved_at.is_some() {
+        return Err(AppError::Conflict("Alarm already resolved".to_string()));
+    }
+    // Idempotent: an already-acknowledged open event returns its existing acknowledgement.
+    if let (Some(at), Some(by)) = (ev.acknowledged_at, ev.acknowledged_by) {
+        return Ok(Json(AcknowledgedAlarmResponse {
+            event_id,
+            acknowledged_at: at.with_timezone(&Utc),
+            acknowledged_by: by,
+        }));
+    }
+
+    let actor = actor_label(&auth);
+    let row = state
+        .db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE alarm_events SET acknowledged_at = NOW(), acknowledged_by = $2, updated_at = NOW() \
+             WHERE id = $1 AND resolved_at IS NULL RETURNING acknowledged_at",
+            [event_id.into(), actor.clone().into()],
+        ))
+        .await?;
+    let acknowledged_at: chrono::DateTime<chrono::FixedOffset> = row
+        .and_then(|r| r.try_get("", "acknowledged_at").ok())
+        .ok_or_else(|| AppError::Conflict("Alarm already resolved".to_string()))?;
+
+    Ok(Json(AcknowledgedAlarmResponse {
+        event_id,
+        acknowledged_at: acknowledged_at.with_timezone(&Utc),
+        acknowledged_by: actor,
+    }))
 }
 
 /// Get a summary of active alarm violations

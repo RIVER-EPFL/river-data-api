@@ -72,6 +72,9 @@ pub struct Config {
     pub janitor_interval_seconds: u64,
     pub janitor_full_refresh_seconds: u64,
     pub janitor_retention_days: u32,
+
+    // Alarm sweeper: how often to reconcile persisted alarm_events against current breaches
+    pub alarm_sweep_interval_seconds: u64,
 }
 
 impl Config {
@@ -200,6 +203,11 @@ impl Config {
                 .unwrap_or_else(|_| "180".to_string())
                 .parse()
                 .unwrap_or(180),
+
+            alarm_sweep_interval_seconds: env::var("ALARM_SWEEP_INTERVAL_SECONDS")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()
+                .unwrap_or(60),
         })
     }
 
