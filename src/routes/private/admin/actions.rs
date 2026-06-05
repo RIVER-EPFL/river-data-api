@@ -8,7 +8,8 @@ use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensor_calibrations::services::{
     evaluate_formula, recalculate_derived_at_timestamp, recompute_deployed_until,
-    reprocess_site_parameter_readings, reprocess_sensor_readings, spawn_tracked_job,
+    recompute_valid_until, reprocess_site_parameter_readings, reprocess_sensor_readings,
+    spawn_tracked_job,
 };
 use crate::common::sync_state as state;
 
@@ -951,6 +952,254 @@ pub async fn backfill_attribution(
         job_id,
         status: "pending".to_string(),
         deployments_updated,
+        estimated_readings,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Calibration backfill
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, ToSchema, Clone)]
+pub struct CalibrationBackfillCandidate {
+    pub sensor_id: Uuid,
+    pub uncalibrated_count: i64,
+    pub target_from: chrono::DateTime<chrono::Utc>,
+    pub earliest_calibration_from: Option<chrono::DateTime<chrono::Utc>>,
+    pub is_identity: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CalibrationBackfillCandidatesResponse {
+    pub candidates: Vec<CalibrationBackfillCandidate>,
+    pub total_candidates: usize,
+    pub total_uncalibrated: i64,
+}
+
+async fn fetch_calibration_candidates(
+    db: &sea_orm::DatabaseConnection,
+) -> AppResult<Vec<CalibrationBackfillCandidate>> {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let rows = db
+        .query_all(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT r.sensor_id, COUNT(*) AS uncalibrated_count, MIN(r.time) AS target_from
+              FROM readings r
+              WHERE r.sensor_id IS NOT NULL AND r.calibration_id IS NULL
+              GROUP BY r.sensor_id
+              HAVING COUNT(*) > 0
+              ORDER BY COUNT(*) DESC"
+                .to_owned(),
+        ))
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+
+    let mut candidates = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let sensor_id: Uuid = row.try_get("", "sensor_id")?;
+        let uncalibrated_count: i64 = row.try_get("", "uncalibrated_count")?;
+        let target_from: chrono::DateTime<chrono::FixedOffset> =
+            row.try_get("", "target_from")?;
+
+        let cal_row = db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r"SELECT valid_from, slope, intercept
+                  FROM sensor_calibrations
+                  WHERE sensor_id = $1
+                  ORDER BY valid_from ASC
+                  LIMIT 1",
+                [sensor_id.into()],
+            ))
+            .await
+            .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+
+        let (earliest_calibration_from, is_identity) = if let Some(cr) = cal_row {
+            let vf: chrono::DateTime<chrono::FixedOffset> = cr.try_get("", "valid_from")?;
+            let slope: f64 = cr.try_get("", "slope")?;
+            let intercept: f64 = cr.try_get("", "intercept")?;
+            (
+                Some(vf.with_timezone(&chrono::Utc)),
+                (slope - 1.0).abs() < f64::EPSILON && intercept.abs() < f64::EPSILON,
+            )
+        } else {
+            (None, false)
+        };
+
+        candidates.push(CalibrationBackfillCandidate {
+            sensor_id,
+            uncalibrated_count,
+            target_from: target_from.with_timezone(&chrono::Utc),
+            earliest_calibration_from,
+            is_identity,
+        });
+    }
+
+    Ok(candidates)
+}
+
+/// List sensors with uncalibrated readings. Requires `read_metadata`.
+#[utoipa::path(
+    get,
+    path = "/actions/calibration_candidates",
+    responses((status = 200, description = "Calibration backfill candidates", body = CalibrationBackfillCandidatesResponse)),
+    tag = "actions"
+)]
+pub async fn calibration_candidates(
+    State(app_state): State<AppState>,
+) -> AppResult<Json<CalibrationBackfillCandidatesResponse>> {
+    let candidates = fetch_calibration_candidates(&app_state.db).await?;
+    let total_uncalibrated: i64 = candidates.iter().map(|c| c.uncalibrated_count).sum();
+    Ok(Json(CalibrationBackfillCandidatesResponse {
+        total_candidates: candidates.len(),
+        total_uncalibrated,
+        candidates,
+    }))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct BackfillCalibrationsRequest {
+    #[serde(default)]
+    pub all: bool,
+    pub sensor_id: Option<Uuid>,
+    #[serde(default)]
+    pub sensor_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BackfillCalibrationsResponse {
+    pub job_id: Uuid,
+    pub status: String,
+    pub sensors_updated: usize,
+    pub estimated_readings: i64,
+}
+
+/// Ensure calibration coverage for sensors with uncalibrated readings, then reprocess. Creates an
+/// identity calibration (slope=1, intercept=0) for gaps before the first real calibration, or
+/// backdates an existing identity calibration. Runs as one tracked job. Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/actions/backfill_calibrations",
+    request_body = BackfillCalibrationsRequest,
+    responses((status = 200, description = "Calibration backfill triggered", body = BackfillCalibrationsResponse)),
+    tag = "actions"
+)]
+pub async fn backfill_calibrations(
+    State(app_state): State<AppState>,
+    Json(payload): Json<BackfillCalibrationsRequest>,
+) -> AppResult<Json<BackfillCalibrationsResponse>> {
+    use sea_orm::{ConnectionTrait, Statement};
+    let db = &app_state.db;
+
+    let all_candidates = fetch_calibration_candidates(db).await?;
+    let id_filter: HashSet<Uuid> = payload.sensor_ids.iter().copied().collect();
+    let selected: Vec<CalibrationBackfillCandidate> = all_candidates
+        .into_iter()
+        .filter(|c| {
+            if !id_filter.is_empty() {
+                id_filter.contains(&c.sensor_id)
+            } else if let Some(sid) = payload.sensor_id {
+                c.sensor_id == sid
+            } else {
+                payload.all
+            }
+        })
+        .collect();
+
+    if selected.is_empty() {
+        return Err(AppError::BadRequest(
+            "No matching calibration backfill candidates (pass all=true, a sensor_id, or sensor_ids)".to_string(),
+        ));
+    }
+
+    let estimated_readings: i64 = selected.iter().map(|c| c.uncalibrated_count).sum();
+    let mut sensor_ids_touched: Vec<Uuid> = Vec::new();
+
+    for c in &selected {
+        match (c.earliest_calibration_from, c.is_identity) {
+            // No calibrations at all — create identity starting at earliest reading
+            (None, _) => {
+                let cal_id = Uuid::new_v4();
+                db.execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    r"INSERT INTO sensor_calibrations
+                          (id, sensor_id, slope, intercept, valid_from, performed_by, notes, created_at)
+                      VALUES ($1, $2, 1.0, 0.0, $3, 'system', 'Identity calibration (backfill)', NOW())",
+                    [cal_id.into(), c.sensor_id.into(), c.target_from.into()],
+                ))
+                .await
+                .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+            }
+            // Earliest calibration is identity — backdate it
+            (Some(_), true) => {
+                db.execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    r"UPDATE sensor_calibrations
+                      SET valid_from = $1
+                      WHERE sensor_id = $2
+                        AND slope = 1.0 AND intercept = 0.0
+                        AND valid_from = (
+                            SELECT MIN(valid_from) FROM sensor_calibrations WHERE sensor_id = $2
+                        )",
+                    [c.target_from.into(), c.sensor_id.into()],
+                ))
+                .await
+                .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+            }
+            // Earliest calibration is real — insert identity before it
+            (Some(_), false) => {
+                let cal_id = Uuid::new_v4();
+                db.execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    r"INSERT INTO sensor_calibrations
+                          (id, sensor_id, slope, intercept, valid_from, performed_by, notes, created_at)
+                      VALUES ($1, $2, 1.0, 0.0, $3, 'system', 'Identity calibration (backfill)', NOW())",
+                    [cal_id.into(), c.sensor_id.into(), c.target_from.into()],
+                ))
+                .await
+                .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+            }
+        }
+
+        recompute_valid_until(db, c.sensor_id)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        sensor_ids_touched.push(c.sensor_id);
+    }
+
+    let sensors_updated = sensor_ids_touched.len();
+    let job_id = spawn_tracked_job(
+        db,
+        None,
+        "backfill_calibrations",
+        None,
+        app_state.events.clone(),
+        move |db| {
+            let sensors = sensor_ids_touched.clone();
+            async move {
+                let mut total = 0i64;
+                for sensor_id in sensors {
+                    match reprocess_sensor_readings(&db, sensor_id).await {
+                        Ok(n) => total += n as i64,
+                        Err(e) => tracing::warn!(
+                            error = %e, sensor_id = %sensor_id,
+                            "backfill_calibrations: sensor reprocess failed"
+                        ),
+                    }
+                }
+                tracing::info!(readings_updated = total, "backfill_calibrations complete");
+                Ok(total)
+            }
+        },
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(BackfillCalibrationsResponse {
+        job_id,
+        status: "pending".to_string(),
+        sensors_updated,
         estimated_readings,
     }))
 }

@@ -395,6 +395,8 @@ pub async fn import_sensor_for_stream<C: ConnectionTrait>(
 }
 
 /// Find the latest calibration for a sensor, or create an identity calibration if none exists.
+/// When creating, `valid_from` is set to the sensor's earliest reading time (if readings exist)
+/// so historical data is covered. Falls back to `NOW()` when no readings exist yet.
 async fn get_latest_calibration<C: ConnectionTrait>(
     db: &C,
     sensor_id: Uuid,
@@ -408,13 +410,27 @@ async fn get_latest_calibration<C: ConnectionTrait>(
     if let Some(cal) = cal {
         Ok(cal.id)
     } else {
-        // Create identity calibration
+        let earliest = db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT MIN(time) AS earliest FROM readings WHERE sensor_id = $1",
+                [sensor_id.into()],
+            ))
+            .await?;
+        let valid_from = earliest
+            .and_then(|r| {
+                r.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "earliest")
+                    .ok()
+            })
+            .map(|t| t.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
+
         let cal = sensor_calibrations::ActiveModel {
             id: Set(Uuid::new_v4()),
             sensor_id: Set(sensor_id),
             slope: Set(1.0),
             intercept: Set(0.0),
-            valid_from: Set(Utc::now()),
+            valid_from: Set(valid_from),
             performed_by: Set(Some("system".to_string())),
             notes: Set(Some("Identity calibration (auto-created)".to_string())),
             valid_until: Set(None),

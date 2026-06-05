@@ -488,10 +488,116 @@ pub async fn recompute_deployed_until<C: ConnectionTrait>(
     Ok(())
 }
 
+/// If readings exist before the sensor's first calibration, create or extend an identity
+/// calibration (slope=1, intercept=0) to cover them. Never modifies existing non-identity
+/// calibrations — the identity only fills the uncovered region before the first real calibration.
+async fn ensure_calibration_coverage(
+    db: &DatabaseConnection,
+    sensor_id: Uuid,
+) -> Result<(), sea_orm::DbErr> {
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT COUNT(*) AS cnt, MIN(r.time) AS earliest
+              FROM readings r
+              WHERE r.sensor_id = $1
+                AND r.calibration_id IS NULL
+                AND r.time < COALESCE(
+                    (SELECT MIN(valid_from) FROM sensor_calibrations WHERE sensor_id = $1),
+                    'infinity'::timestamptz
+                )",
+            [sensor_id.into()],
+        ))
+        .await?;
+
+    let (cnt, earliest): (i64, Option<DateTime<Utc>>) = match row {
+        Some(ref r) => {
+            let c: i64 = r.try_get("", "cnt").unwrap_or(0);
+            let e = r
+                .try_get::<chrono::DateTime<chrono::FixedOffset>>("", "earliest")
+                .ok()
+                .map(|t| t.with_timezone(&Utc));
+            (c, e)
+        }
+        None => (0, None),
+    };
+
+    if cnt == 0 {
+        return Ok(());
+    }
+    let earliest = match earliest {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+
+    let first_cal = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT id, slope, intercept, valid_from
+              FROM sensor_calibrations
+              WHERE sensor_id = $1
+              ORDER BY valid_from ASC
+              LIMIT 1",
+            [sensor_id.into()],
+        ))
+        .await?;
+
+    match first_cal {
+        None => {
+            db.execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r"INSERT INTO sensor_calibrations
+                      (id, sensor_id, slope, intercept, valid_from, performed_by, notes, created_at)
+                  VALUES (gen_random_uuid(), $1, 1.0, 0.0, $2, 'system', 'Identity calibration (auto-created)', NOW())",
+                [sensor_id.into(), earliest.into()],
+            ))
+            .await?;
+        }
+        Some(ref cal) => {
+            let slope: f64 = cal.try_get("", "slope").unwrap_or(1.0);
+            let intercept: f64 = cal.try_get("", "intercept").unwrap_or(0.0);
+            let cal_id: Uuid = cal.try_get("", "id")?;
+            let is_identity =
+                (slope - 1.0).abs() < f64::EPSILON && intercept.abs() < f64::EPSILON;
+
+            if is_identity {
+                db.execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "UPDATE sensor_calibrations SET valid_from = $1 WHERE id = $2",
+                    [earliest.into(), cal_id.into()],
+                ))
+                .await?;
+            } else {
+                db.execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    r"INSERT INTO sensor_calibrations
+                          (id, sensor_id, slope, intercept, valid_from, performed_by, notes, created_at)
+                      VALUES (gen_random_uuid(), $1, 1.0, 0.0, $2, 'system', 'Identity calibration (auto-created)', NOW())",
+                    [sensor_id.into(), earliest.into()],
+                ))
+                .await?;
+            }
+        }
+    }
+
+    recompute_valid_until(db, sensor_id).await?;
+    tracing::info!(
+        sensor_id = %sensor_id,
+        uncalibrated = cnt,
+        extended_to = %earliest,
+        "auto-extended calibration coverage"
+    );
+    Ok(())
+}
+
 pub async fn reprocess_sensor_readings(
     db: &DatabaseConnection,
     sensor_id: Uuid,
 ) -> Result<usize, sea_orm::DbErr> {
+    // Ensure calibration windows cover all readings before the main re-derivation.
+    // Creates or extends an identity calibration for any pre-first-calibration gap.
+    ensure_calibration_coverage(db, sensor_id).await?;
+
     // The bulk re-derivation runs in one transaction with TimescaleDB's per-statement decompression
     // cap lifted (default 100k tuples). A deep-historical reprocess rewrites rows in compressed
     // (>30-day) chunks and would otherwise abort the job; SET LOCAL resets on commit and is a no-op
