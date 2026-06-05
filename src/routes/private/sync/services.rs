@@ -866,6 +866,19 @@ async fn resolve_or_create_site(
     project_id: Uuid,
 ) -> AppResult<Uuid> {
     if let Some(id) = site_ref.id {
+        // The site was matched at plan-creation time. Still backfill coordinates from the stream
+        // metadata if the site lacks them — otherwise a site discovered before its coordinates were
+        // known never picks them up (the common case, since match_entity sets the id).
+        if site_ref.latitude.is_some()
+            && let Some(existing) = sites::Entity::find_by_id(id).one(txn).await?
+            && existing.latitude.is_none()
+        {
+            let mut update: sites::ActiveModel = existing.into();
+            update.latitude = Set(site_ref.latitude);
+            update.longitude = Set(site_ref.longitude);
+            update.altitude_m = Set(site_ref.altitude_m);
+            update.update(txn).await?;
+        }
         return Ok(id);
     }
     let key = site_ref.name.to_lowercase();
