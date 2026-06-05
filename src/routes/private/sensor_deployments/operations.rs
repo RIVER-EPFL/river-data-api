@@ -4,12 +4,55 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
 use super::model::SensorDeployment;
-use crate::common::global_event_sender;
+use crate::common::{EventSender, global_event_sender};
 use crate::routes::private::sensor_calibrations::services::{
-    recompute_deployed_until, spawn_reprocessing_job,
+    recompute_deployed_until, reprocess_sensor_readings, reprocess_site_parameter_readings,
+    spawn_tracked_job,
 };
 
 pub struct SensorDeploymentOperations;
+
+/// Spawn a tracked reprocess for a deployment change. Runs the **slot-scoped** reprocess first
+/// (`reprocess_site_parameter_readings`) so a backdated/edited window re-attributes the affected
+/// (site, parameter) by deployment timeline — stamping `sensor_id` onto previously unattributed
+/// (NULL-sensor) history — then a per-sensor pass to reconcile the sensor's own rows at any vacated
+/// slot. `parameter_id` is resolved from the sensor (a deployment is always for the sensor's parameter).
+async fn spawn_slot_reprocess(
+    db: &DatabaseConnection,
+    sensor_id: Uuid,
+    site_id: Uuid,
+    trigger_type: &str,
+    trigger_id: Uuid,
+    events: EventSender,
+) -> Result<(), sea_orm::DbErr> {
+    let param: Option<Uuid> = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT parameter_id FROM sensors WHERE id = $1",
+            [sensor_id.into()],
+        ))
+        .await?
+        .and_then(|r| r.try_get::<Uuid>("", "parameter_id").ok());
+
+    spawn_tracked_job(
+        db,
+        Some(sensor_id),
+        trigger_type,
+        Some(trigger_id),
+        events,
+        move |db| async move {
+            let n = if let Some(parameter_id) = param {
+                reprocess_site_parameter_readings(&db, site_id, parameter_id).await? as i64
+            } else {
+                0
+            };
+            reprocess_sensor_readings(&db, sensor_id).await?;
+            Ok(n)
+        },
+    )
+    .await?;
+    Ok(())
+}
 
 #[async_trait]
 impl CRUDOperations for SensorDeploymentOperations {
@@ -199,7 +242,7 @@ impl CRUDOperations for SensorDeploymentOperations {
             .map_err(ApiError::database)?;
 
         if let Some(events) = global_event_sender() {
-            spawn_reprocessing_job(db, entity.sensor_id, "deployment_create", Some(entity.id), events)
+            spawn_slot_reprocess(db, entity.sensor_id, entity.site_id, "deployment_create", entity.id, events)
                 .await
                 .map_err(ApiError::database)?;
         }
@@ -217,7 +260,7 @@ impl CRUDOperations for SensorDeploymentOperations {
             .map_err(ApiError::database)?;
 
         if let Some(events) = global_event_sender() {
-            spawn_reprocessing_job(db, entity.sensor_id, "deployment_update", Some(entity.id), events)
+            spawn_slot_reprocess(db, entity.sensor_id, entity.site_id, "deployment_update", entity.id, events)
                 .await
                 .map_err(ApiError::database)?;
         }
@@ -233,7 +276,7 @@ impl CRUDOperations for SensorDeploymentOperations {
         let row = db
             .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                "SELECT sensor_id FROM sensor_deployments WHERE id = $1",
+                "SELECT sensor_id, site_id FROM sensor_deployments WHERE id = $1",
                 [id.into()],
             ))
             .await
@@ -247,6 +290,9 @@ impl CRUDOperations for SensorDeploymentOperations {
         };
         let sensor_id: Uuid = row
             .try_get("", "sensor_id")
+            .map_err(ApiError::database)?;
+        let site_id: Uuid = row
+            .try_get("", "site_id")
             .map_err(ApiError::database)?;
 
         // readings.deployment_id has no ON DELETE action — clear references first, then delete.
@@ -272,7 +318,7 @@ impl CRUDOperations for SensorDeploymentOperations {
             .map_err(ApiError::database)?;
 
         if let Some(events) = global_event_sender() {
-            spawn_reprocessing_job(db, sensor_id, "deployment_delete", Some(id), events)
+            spawn_slot_reprocess(db, sensor_id, site_id, "deployment_delete", id, events)
                 .await
                 .map_err(ApiError::database)?;
         }

@@ -54,9 +54,15 @@ pub struct SensorReadingsResponse {
     pub calibrated_min: Vec<Option<f64>>,
     pub calibrated_max: Vec<Option<f64>>,
     pub site_ids: Vec<Option<Uuid>>,
-    /// Earliest/latest reading time for this sensor (full extent, independent of the query window).
+    /// Earliest/latest reading time **attributed to this sensor** (full extent, independent of the
+    /// query window).
     pub data_start: Option<DateTime<Utc>>,
     pub data_end: Option<DateTime<Utc>>,
+    /// Earliest reading at the sensor's current (open) deployment slot — same site + parameter,
+    /// regardless of `sensor_id`. This is the true backdate target: history before `data_start`
+    /// that is not yet attributed to the sensor but would be claimed by backdating `deployed_from`.
+    /// Null when the sensor has no open deployment.
+    pub slot_data_start: Option<DateTime<Utc>>,
 }
 
 /// Per-sensor time series (raw + calibrated), for the sensor detail plot. Requires `read_data`.
@@ -119,6 +125,24 @@ pub async fn get_sensor_readings(
     let data_end = extent
         .as_ref()
         .and_then(|r| r.try_get::<DateTime<chrono::FixedOffset>>("", "data_end").ok())
+        .map(|t| t.with_timezone(&Utc));
+
+    // Earliest reading at the sensor's OPEN deployment slot (same site + parameter, any sensor_id) —
+    // the true backdate target. Unattributed history (sensor_id NULL) is invisible to `data_start`
+    // but lives here, and backdating `deployed_from` to it lets the slot reprocess claim it.
+    let slot_data_start = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT MIN(r.time) AS slot_start
+              FROM readings r
+              JOIN sensor_deployments d
+                ON d.sensor_id = $1 AND d.deployed_until IS NULL
+              WHERE r.site_id = d.site_id AND r.parameter_id = d.parameter_id
+                AND r.replicate_index = 0",
+            [sensor_id.into()],
+        ))
+        .await?
+        .and_then(|r| r.try_get::<DateTime<chrono::FixedOffset>>("", "slot_start").ok())
         .map(|t| t.with_timezone(&Utc));
 
     // Build the query. Aggregated resolutions time-bucket the readings (avg + min/max of raw and
@@ -201,6 +225,7 @@ pub async fn get_sensor_readings(
         site_ids,
         data_start,
         data_end,
+        slot_data_start,
     }))
 }
 

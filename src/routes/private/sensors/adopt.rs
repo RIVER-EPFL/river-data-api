@@ -248,13 +248,21 @@ pub async fn adopt_sensor(
     .await?;
     txn.commit().await?;
 
+    // Slot-scoped reprocess re-attributes the (site, parameter) by deployment window — so a backdated
+    // deployed_from stamps the sensor onto previously unattributed (sensor_id NULL) history. The
+    // per-sensor pass then reconciles the sensor's own rows at any vacated slot.
+    let adopt_site_id = payload.site_id;
     let job_id = spawn_tracked_job(
         db,
         Some(sensor_id),
         "manual_adopt",
         Some(dep_id),
         app_state.events.clone(),
-        move |db| async move { reprocess_sensor_readings(&db, sensor_id).await.map(|c| c as i64) },
+        move |db| async move {
+            let n = reprocess_site_parameter_readings(&db, adopt_site_id, parameter_id).await? as i64;
+            reprocess_sensor_readings(&db, sensor_id).await?;
+            Ok(n)
+        },
     )
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
