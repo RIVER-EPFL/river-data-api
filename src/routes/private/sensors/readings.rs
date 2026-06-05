@@ -19,20 +19,44 @@ pub struct SensorReadingsQuery {
     pub end: Option<DateTime<Utc>>,
     /// Include the per-point raw (uncalibrated) value array. Default true.
     pub include_raw: Option<bool>,
+    /// Downsampling resolution: `raw` (default, per-point), or `hourly`/`daily`/`weekly`/`monthly`
+    /// time-bucketed averages with min/max envelopes. Mirrors the site plot's resolution selector.
+    pub resolution: Option<String>,
+}
+
+/// Map a resolution keyword to a `time_bucket` interval. `None`/`raw` → no bucketing.
+fn resolution_interval(res: &str) -> Option<&'static str> {
+    match res {
+        "hourly" => Some("1 hour"),
+        "daily" => Some("1 day"),
+        "weekly" => Some("7 days"),
+        "monthly" => Some("1 month"),
+        _ => None,
+    }
 }
 
 /// Columnar raw + calibrated series for one sensor (the sensor's single global parameter),
 /// aligned to `times`. `site_ids[i]` is the site the reading was attributed to (null when the
-/// sensor was undeployed at that time).
+/// sensor was undeployed at that time). In an aggregated `resolution`, `raw`/`calibrated` are the
+/// per-bucket averages and the `*_min`/`*_max` envelopes are populated (empty in `raw` mode).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SensorReadingsResponse {
     pub sensor_id: Uuid,
     pub parameter_id: Option<Uuid>,
     pub units: Option<String>,
+    /// Resolution actually applied (`raw`, `hourly`, `daily`, `weekly`, `monthly`).
+    pub resolution: String,
     pub times: Vec<DateTime<Utc>>,
     pub raw: Vec<Option<f64>>,
     pub calibrated: Vec<Option<f64>>,
+    pub raw_min: Vec<Option<f64>>,
+    pub raw_max: Vec<Option<f64>>,
+    pub calibrated_min: Vec<Option<f64>>,
+    pub calibrated_max: Vec<Option<f64>>,
     pub site_ids: Vec<Option<Uuid>>,
+    /// Earliest/latest reading time for this sensor (full extent, independent of the query window).
+    pub data_start: Option<DateTime<Utc>>,
+    pub data_end: Option<DateTime<Utc>>,
 }
 
 /// Per-sensor time series (raw + calibrated), for the sensor detail plot. Requires `read_data`.
@@ -44,7 +68,8 @@ pub struct SensorReadingsResponse {
         SensorReadingsQuery
     ),
     responses(
-        (status = 200, description = "Sensor readings", body = SensorReadingsResponse),
+        (status = 200, description = "Sensor readings (per-point, or time-bucketed when resolution is set)", body = SensorReadingsResponse),
+        (status = 400, description = "Invalid resolution"),
         (status = 404, description = "Sensor not found"),
     ),
     tag = "sensors"
@@ -70,12 +95,52 @@ pub async fn get_sensor_readings(
     let parameter_id: Option<Uuid> = meta.try_get("", "parameter_id").ok();
     let units: Option<String> = meta.try_get("", "default_units").ok();
 
-    let mut sql = String::from(
-        r"SELECT time, raw_value, calibrated_value, site_id
-          FROM readings
-          WHERE sensor_id = $1 AND replicate_index = 0",
-    );
+    let resolution = query.resolution.as_deref().unwrap_or("raw");
+    let bucket = resolution_interval(resolution);
+    if query.resolution.as_deref().is_some_and(|r| r != "raw" && bucket.is_none()) {
+        return Err(AppError::BadRequest(format!(
+            "Invalid resolution '{resolution}' (expected raw|hourly|daily|weekly|monthly)"
+        )));
+    }
+
+    // Full reading extent for this sensor (drives the UI slider bounds, independent of the window).
+    let extent = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT MIN(time) AS data_start, MAX(time) AS data_end
+              FROM readings WHERE sensor_id = $1 AND replicate_index = 0",
+            [sensor_id.into()],
+        ))
+        .await?;
+    let data_start = extent
+        .as_ref()
+        .and_then(|r| r.try_get::<DateTime<chrono::FixedOffset>>("", "data_start").ok())
+        .map(|t| t.with_timezone(&Utc));
+    let data_end = extent
+        .as_ref()
+        .and_then(|r| r.try_get::<DateTime<chrono::FixedOffset>>("", "data_end").ok())
+        .map(|t| t.with_timezone(&Utc));
+
+    // Build the query. Aggregated resolutions time-bucket the readings (avg + min/max of raw and
+    // calibrated), excluding flagged points to match continuous-aggregate semantics; raw mode
+    // returns per-point values including flagged.
     let mut values: Vec<sea_orm::Value> = vec![sensor_id.into()];
+    let mut sql = if let Some(interval) = bucket {
+        format!(
+            r"SELECT time_bucket('{interval}'::interval, time) AS time,
+                     avg(raw_value) AS raw_value, min(raw_value) AS raw_min, max(raw_value) AS raw_max,
+                     avg(calibrated_value) AS calibrated_value, min(calibrated_value) AS cal_min, max(calibrated_value) AS cal_max,
+                     last(site_id, time) AS site_id
+              FROM readings
+              WHERE sensor_id = $1 AND replicate_index = 0 AND is_flagged IS NOT TRUE"
+        )
+    } else {
+        String::from(
+            r"SELECT time, raw_value, calibrated_value, site_id
+              FROM readings
+              WHERE sensor_id = $1 AND replicate_index = 0",
+        )
+    };
     if let Some(start) = query.start {
         values.push(start.into());
         sql.push_str(&format!(" AND time >= ${}", values.len()));
@@ -84,7 +149,11 @@ pub async fn get_sensor_readings(
         values.push(end.into());
         sql.push_str(&format!(" AND time <= ${}", values.len()));
     }
-    sql.push_str(" ORDER BY time ASC");
+    if bucket.is_some() {
+        sql.push_str(" GROUP BY 1 ORDER BY 1 ASC");
+    } else {
+        sql.push_str(" ORDER BY time ASC");
+    }
 
     let rows = db
         .query_all(Statement::from_sql_and_values(
@@ -94,9 +163,14 @@ pub async fn get_sensor_readings(
         ))
         .await?;
 
+    let aggregated = bucket.is_some();
     let mut times = Vec::with_capacity(rows.len());
     let mut raw = Vec::with_capacity(rows.len());
     let mut calibrated = Vec::with_capacity(rows.len());
+    let mut raw_min = Vec::with_capacity(if aggregated { rows.len() } else { 0 });
+    let mut raw_max = Vec::with_capacity(if aggregated { rows.len() } else { 0 });
+    let mut calibrated_min = Vec::with_capacity(if aggregated { rows.len() } else { 0 });
+    let mut calibrated_max = Vec::with_capacity(if aggregated { rows.len() } else { 0 });
     let mut site_ids = Vec::with_capacity(rows.len());
     for row in &rows {
         let t: DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
@@ -104,16 +178,29 @@ pub async fn get_sensor_readings(
         raw.push(if include_raw { row.try_get::<f64>("", "raw_value").ok() } else { None });
         calibrated.push(row.try_get::<f64>("", "calibrated_value").ok());
         site_ids.push(row.try_get::<Uuid>("", "site_id").ok());
+        if aggregated {
+            raw_min.push(row.try_get::<f64>("", "raw_min").ok());
+            raw_max.push(row.try_get::<f64>("", "raw_max").ok());
+            calibrated_min.push(row.try_get::<f64>("", "cal_min").ok());
+            calibrated_max.push(row.try_get::<f64>("", "cal_max").ok());
+        }
     }
 
     Ok(Json(SensorReadingsResponse {
         sensor_id,
         parameter_id,
         units,
+        resolution: if aggregated { resolution.to_string() } else { "raw".to_string() },
         times,
         raw,
         calibrated,
+        raw_min,
+        raw_max,
+        calibrated_min,
+        calibrated_max,
         site_ids,
+        data_start,
+        data_end,
     }))
 }
 
