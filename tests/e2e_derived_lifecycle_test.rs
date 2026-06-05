@@ -122,23 +122,21 @@ async fn derived_assignment_backfills_and_publishes() {
 
     db.execute(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
-        format!("UPDATE projects SET is_public = true, public_slug = 'e2e_derived' WHERE id = '{}'", common::PROJECT_ID),
+        format!("UPDATE projects SET is_public = true, public_code = 'e2e_derived' WHERE id = '{}'", common::PROJECT_ID),
     ))
     .await
     .unwrap();
-    // A site is only included in the public config when it has a public_slug (services.rs load_public_config).
+    // A site is only included in the public config when it has a public_code (services.rs load_public_config).
     db.execute(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
-        format!("UPDATE sites SET public_slug = 'e2e_derived_site1' WHERE id = '{}'", common::SITE1_ID),
+        format!("UPDATE sites SET public_code = 'e2e_derived_site1' WHERE id = '{}'", common::SITE1_ID),
     ))
     .await
     .unwrap();
     e2e::set_site_parameter_public(&db, &sp_id).await;
 
-    let pub_uri = format!(
-        "/api/public/e2e_derived/sites/{}/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T01:00:00Z",
-        common::SITE1_ID
-    );
+    let pub_uri =
+        "/api/public/e2e_derived/sites/e2e_derived_site1/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T01:00:00Z";
     let (status, pub_readings) = common::get_json(&app, &pub_uri).await;
     assert_eq!(status, 200, "public readings ({status}): {pub_readings}");
     assert!(!e2e::values_for(&pub_readings, "DOmgL_e2e").is_empty(), "derived exposed publicly");

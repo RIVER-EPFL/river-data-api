@@ -12,8 +12,8 @@ use crate::routes::public::services::invalidate_config;
 /// `write_metadata`.
 #[utoipa::path(
     post,
-    path = "/actions/invalidate_public_config/{slug}",
-    params(("slug" = String, Path, description = "Public project slug")),
+    path = "/actions/invalidate_public_config/{code}",
+    params(("code" = String, Path, description = "Public project code")),
     responses(
         (status = 200, description = "Cache invalidated"),
     ),
@@ -21,10 +21,10 @@ use crate::routes::public::services::invalidate_config;
 )]
 pub async fn invalidate_public_config(
     State(state): State<AppState>,
-    Path(slug): Path<String>,
+    Path(code): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
-    invalidate_config(&state.public_config_cache, &slug).await;
+    invalidate_config(&state.public_config_cache, &code).await;
     Ok(Json(
-        serde_json::json!({ "status": "invalidated", "slug": slug }),
+        serde_json::json!({ "status": "invalidated", "code": code }),
     ))
 }

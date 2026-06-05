@@ -845,7 +845,7 @@ async fn resolve_or_create_project<C: ConnectionTrait>(
         description: Set(None),
         data_source: Set(Some(source_system.to_string())),
         is_public: Set(false),
-        public_slug: Set(None),
+        public_code: Set(None),
         public_api_title: Set(None),
         public_api_description: Set(None),
         public_api_version: Set(None),
@@ -907,7 +907,7 @@ async fn resolve_or_create_site(
         latitude: Set(site_ref.latitude),
         longitude: Set(site_ref.longitude),
         altitude_m: Set(site_ref.altitude_m),
-        public_slug: Set(None),
+        public_code: Set(None),
         created_at: Set(Some(Utc::now())),
         discovered_at: Set(Some(Utc::now())),
     }.insert(txn).await?;

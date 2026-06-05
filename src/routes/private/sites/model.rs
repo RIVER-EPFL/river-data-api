@@ -30,7 +30,7 @@ pub struct Model {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     #[crudcrate(exclude(create, update))]
     pub discovered_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub public_slug: Option<String>,
+    pub public_code: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

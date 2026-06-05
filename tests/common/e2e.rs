@@ -93,22 +93,22 @@ async fn create(app: &Router, token: &str, path: &str, body: serde_json::Value) 
     id_of(&json)
 }
 
-pub async fn create_project(app: &Router, token: &str, name: &str, slug: &str, public: bool) -> String {
+pub async fn create_project(app: &Router, token: &str, name: &str, code: &str, public: bool) -> String {
     create(
         app,
         token,
         "/api/projects",
-        json!({ "name": name, "description": "e2e", "is_public": public, "public_slug": slug }),
+        json!({ "name": name, "description": "e2e", "is_public": public, "public_code": code }),
     )
     .await
 }
 
-pub async fn create_site(app: &Router, token: &str, project_id: &str, name: &str, slug: &str) -> String {
+pub async fn create_site(app: &Router, token: &str, project_id: &str, name: &str, code: &str) -> String {
     create(
         app,
         token,
         "/api/sites",
-        json!({ "name": name, "project_id": project_id, "latitude": 46.0, "longitude": 7.0, "public_slug": slug }),
+        json!({ "name": name, "project_id": project_id, "latitude": 46.0, "longitude": 7.0, "public_code": code }),
     )
     .await
 }

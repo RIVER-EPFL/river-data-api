@@ -45,7 +45,7 @@ const IMPORT_BODY_LIMIT: usize = 50 * 1024 * 1024; // 50 MB — CSV import
 ///
 /// Layered onto the projects/sites/site_parameters CRUD routers — the entities the
 /// public config (`public_config_cache`) is built from. Deliberately coarse: it drops
-/// the whole cache rather than resolving the affected project slug, since the cache is
+/// the whole cache rather than resolving the affected project code, since the cache is
 /// a read-through convenience that rebuilds on the next public request, not a source of
 /// truth. GET/HEAD requests and failed mutations leave it untouched.
 async fn invalidate_public_config_on_mutation(
@@ -222,7 +222,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
             post(derived::recompute_derived),
         )
         .route(
-            "/actions/invalidate_public_config/{slug}",
+            "/actions/invalidate_public_config/{code}",
             post(public_config::invalidate_public_config),
         )
         .route(

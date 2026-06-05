@@ -5,7 +5,7 @@ use utoipa::OpenApi;
 
 use crate::common::AppState;
 use crate::error::AppResult;
-use crate::routes::public::services::list_public_slugs;
+use crate::routes::public::services::list_public_codes;
 
 // OpenAPI doc template for public APIs
 #[derive(OpenApi)]
@@ -35,42 +35,42 @@ use crate::routes::public::services::list_public_slugs;
 pub struct PublicApiDoc;
 
 /// Router for all public API integrations.
-/// Routes: /`api/public/{project_slug}/sites`/...
+/// Routes: /`api/public/{project_code}/sites`/...
 pub fn public_router() -> Router<AppState> {
     Router::new()
         .route("/", get(discovery))
-        .route("/{project_slug}/sites", get(handlers::list_sites))
-        .route("/{project_slug}/sites/{site_id}", get(handlers::get_site))
+        .route("/{project_code}/sites", get(handlers::list_sites))
+        .route("/{project_code}/sites/{site_code}", get(handlers::get_site))
         .route(
-            "/{project_slug}/sites/{site_id}/parameters",
+            "/{project_code}/sites/{site_code}/parameters",
             get(handlers::list_parameters),
         )
         .route(
-            "/{project_slug}/sites/{site_id}/readings",
+            "/{project_code}/sites/{site_code}/readings",
             get(handlers::get_readings),
         )
         .route(
-            "/{project_slug}/sites/{site_id}/aggregates/{resolution}",
+            "/{project_code}/sites/{site_code}/aggregates/{resolution}",
             get(handlers::get_aggregates),
         )
-        .route("/{project_slug}/docs", get(serve_docs))
+        .route("/{project_code}/docs", get(serve_docs))
 }
 
 #[derive(serde::Serialize)]
 struct DiscoveryEntry {
-    slug: String,
+    code: String,
     docs_url: String,
     sites_url: String,
 }
 
 async fn discovery(State(state): State<AppState>) -> AppResult<Json<Vec<DiscoveryEntry>>> {
-    let slugs = list_public_slugs(&state.db).await?;
-    let entries = slugs
+    let codes = list_public_codes(&state.db).await?;
+    let entries = codes
         .into_iter()
-        .map(|slug| DiscoveryEntry {
-            docs_url: format!("/api/public/{slug}/docs"),
-            sites_url: format!("/api/public/{slug}/sites"),
-            slug,
+        .map(|code| DiscoveryEntry {
+            docs_url: format!("/api/public/{code}/docs"),
+            sites_url: format!("/api/public/{code}/sites"),
+            code,
         })
         .collect();
     Ok(Json(entries))
@@ -78,11 +78,11 @@ async fn discovery(State(state): State<AppState>) -> AppResult<Json<Vec<Discover
 
 async fn serve_docs(
     axum::extract::State(state): axum::extract::State<AppState>,
-    axum::extract::Path(project_slug): axum::extract::Path<String>,
+    axum::extract::Path(project_code): axum::extract::Path<String>,
 ) -> Result<axum::response::Html<String>, crate::error::AppError> {
     use crate::routes::public::services::get_public_config;
 
-    let config = get_public_config(&state.db, &state.public_config_cache, &project_slug).await?;
+    let config = get_public_config(&state.db, &state.public_config_cache, &project_code).await?;
 
     let mut spec = PublicApiDoc::openapi();
     spec.info.title = config.api_title.clone();
@@ -98,11 +98,11 @@ async fn serve_docs(
 
     // Set server URL so Scalar "Try It" points to the correct base path
     spec.servers = Some(vec![utoipa::openapi::server::Server::new(format!(
-        "/api/public/{project_slug}"
+        "/api/public/{project_code}"
     ))]);
 
-    // Rewrite paths: strip the /api/public/{project_slug} prefix since server URL handles it
-    let prefix = "/api/public/{project_slug}";
+    // Rewrite paths: strip the /api/public/{project_code} prefix since server URL handles it
+    let prefix = "/api/public/{project_code}";
     let old_paths: std::collections::BTreeMap<String, _> = std::mem::take(&mut spec.paths.paths);
     for (path_key, path_item) in old_paths {
         let new_key = if path_key.starts_with(prefix) {

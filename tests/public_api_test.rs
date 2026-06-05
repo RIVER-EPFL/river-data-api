@@ -27,21 +27,19 @@ async fn setup_public() -> (sea_orm::DatabaseConnection, axum::Router) {
     common::cleanup_test_db(&db).await;
     common::seed_test_data(&db).await;
 
-    // Make the test project public with a slug
     exec(
         &db,
         &format!(
-            "UPDATE projects SET is_public = true, public_slug = 'test-river' WHERE id = '{}'",
+            "UPDATE projects SET is_public = true, public_code = 'test-river' WHERE id = '{}'",
             common::PROJECT_ID
         ),
     )
     .await;
 
-    // Give site 1 a public slug
     exec(
         &db,
         &format!(
-            "UPDATE sites SET public_slug = 'upstream' WHERE id = '{}'",
+            "UPDATE sites SET public_code = 'upstream' WHERE id = '{}'",
             common::SITE1_ID,
         ),
     )
@@ -79,16 +77,16 @@ async fn setup_two_params() -> (sea_orm::DatabaseConnection, axum::Router) {
 }
 
 // ============================================================================
-// Nonexistent slug -> 404
+// Nonexistent code -> 404
 // ============================================================================
 
 #[tokio::test]
 #[serial]
-async fn test_nonexistent_slug_returns_404() {
+async fn test_nonexistent_code_returns_404() {
     let (_db, app) = setup_public().await;
 
-    let (status, _body) = common::get(&app, "/api/public/nonexistent-slug/sites").await;
-    assert_eq!(status, 404, "nonexistent project slug should return 404");
+    let (status, _body) = common::get(&app, "/api/public/nonexistent-code/sites").await;
+    assert_eq!(status, 404, "nonexistent project code should return 404");
 }
 
 // ============================================================================
@@ -201,7 +199,7 @@ async fn test_public_discovery() {
 
     let projects = body.as_array().expect("discovery should return an array");
     assert_eq!(projects.len(), 1);
-    assert_eq!(projects[0]["slug"], "test-river");
+    assert_eq!(projects[0]["code"], "test-river");
     assert!(projects[0]["docs_url"].as_str().unwrap().contains("/docs"));
     assert!(projects[0]["sites_url"].as_str().unwrap().contains("/sites"));
 }

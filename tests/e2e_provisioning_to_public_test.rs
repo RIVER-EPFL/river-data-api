@@ -114,9 +114,9 @@ async fn provision_pair_ingest_and_expose_publicly() {
     // 7. Expose publicly and verify the public JSON + CSV surfaces reproduce the data.
     e2e::set_site_parameter_public(&db, &sp_id).await;
 
-    let pub_uri = format!(
-        "/api/public/e2e_prov/sites/{site_id}/readings?start=2025-06-01T00:00:00Z&end=2025-06-01T00:59:00Z"
-    );
+    let pub_uri =
+        "/api/public/e2e_prov/sites/prov_station/readings?start=2025-06-01T00:00:00Z&end=2025-06-01T00:59:00Z"
+            .to_string();
     let (status, pub_readings) = common::get_json(&app, &pub_uri).await;
     assert_eq!(status, 200, "public readings ({status}): {pub_readings}");
     // Public readings key parameters by the global parameter short code (not site_parameter / id).

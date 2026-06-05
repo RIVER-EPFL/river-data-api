@@ -110,7 +110,7 @@ async fn test_full_public_data_workflow() {
             "name": "E2E River",
             "description": "End-to-end workflow project",
             "is_public": true,
-            "public_slug": "e2e_river",
+            "public_code": "e2e_river",
             "public_api_title": "E2E River Public API",
         }),
         &token,
@@ -128,7 +128,7 @@ async fn test_full_public_data_workflow() {
             "project_id": project_id,
             "latitude": 46.1,
             "longitude": 7.2,
-            "public_slug": "e2e_station",
+            "public_code": "e2e_station",
         }),
         &token,
     )
@@ -266,18 +266,18 @@ async fn test_full_public_data_workflow() {
     let (status, discovery) = common::get_json(&app, "/api/public").await;
     assert_eq!(status, 200);
     assert!(
-        discovery.as_array().unwrap().iter().any(|p| p["slug"] == "e2e_river"),
+        discovery.as_array().unwrap().iter().any(|p| p["code"] == "e2e_river"),
         "discovery should list e2e_river: {discovery}"
     );
     let (status, sites) = common::get_json(&app, "/api/public/e2e_river/sites").await;
     assert_eq!(status, 200);
-    assert!(sites.as_array().unwrap().iter().any(|s| s["id"] == "e2e_station"), "sites: {sites}");
+    assert!(sites.as_array().unwrap().iter().any(|s| s["code"] == "e2e_station"), "sites: {sites}");
 
     // 11. Public readings reproduce the real raw data exactly AND the recomputed derived value.
     // Public parameters are keyed by their short `code`: "dissolved_oxygen", "temperature", "DOmgL".
     let to_iso = |s: &str| s.replace(' ', "T") + "Z";
     let readings_uri = format!(
-        "/api/public/e2e_river/sites/{site_id}/readings?start={}&end={}",
+        "/api/public/e2e_river/sites/e2e_station/readings?start={}&end={}",
         to_iso(&rows.first().unwrap().0),
         to_iso(&rows.last().unwrap().0),
     );
@@ -296,9 +296,8 @@ async fn test_full_public_data_workflow() {
     // 12. Hourly aggregate over the first hour equals the mean of that hour's real readings.
     let hour0: Vec<f64> = rows.iter().filter(|(dt, _, _)| &dt[11..13] == "00").map(|(_, d, _)| *d).collect();
     let expected_mean = hour0.iter().sum::<f64>() / hour0.len() as f64;
-    let agg_uri = format!(
-        "/api/public/e2e_river/sites/{site_id}/aggregates/hourly?start=2026-03-01T00:00:00Z&end=2026-03-01T00:59:00Z"
-    );
+    let agg_uri =
+        "/api/public/e2e_river/sites/e2e_station/aggregates/hourly?start=2026-03-01T00:00:00Z&end=2026-03-01T00:59:00Z";
     let (status, agg) = common::get_json(&app, &agg_uri).await;
     assert_eq!(status, 200, "public aggregates ({status}): {agg}");
     let do_avg = field_for(&agg, "dissolved_oxygen", "avg");

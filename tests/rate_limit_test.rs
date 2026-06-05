@@ -42,7 +42,7 @@ async fn public_api_is_still_rate_limited() {
     common::exec(
         &db,
         &format!(
-            "UPDATE projects SET is_public = true, public_slug = 'test-river' WHERE id = '{}'",
+            "UPDATE projects SET is_public = true, public_code = 'test-river' WHERE id = '{}'",
             common::PROJECT_ID
         ),
     )
@@ -50,7 +50,7 @@ async fn public_api_is_still_rate_limited() {
     common::exec(
         &db,
         &format!(
-            "UPDATE sites SET public_slug = 'upstream' WHERE id = '{}'",
+            "UPDATE sites SET public_code = 'upstream' WHERE id = '{}'",
             common::SITE1_ID,
         ),
     )

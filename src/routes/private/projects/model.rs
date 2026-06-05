@@ -35,7 +35,7 @@ pub struct Model {
     #[crudcrate(filterable, on_create = false)]
     pub is_public: bool,
     #[crudcrate(filterable)]
-    pub public_slug: Option<String>,
+    pub public_code: Option<String>,
     pub public_api_title: Option<String>,
     pub public_api_description: Option<String>,
     pub public_api_version: Option<String>,

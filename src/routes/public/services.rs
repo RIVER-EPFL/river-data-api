@@ -14,7 +14,7 @@ pub type PublicConfigCache = Cache<String, Arc<PublicProjectConfig>>;
 pub struct PublicProjectConfig {
     pub project_id: Uuid,
     pub project_name: String,
-    pub slug: String,
+    pub code: String,
     pub api_title: String,
     pub api_description: String,
     pub api_version: String,
@@ -27,7 +27,7 @@ pub struct PublicProjectConfig {
 pub struct PublicSiteConfig {
     pub site_id: Uuid,
     pub name: String,
-    pub slug: String,
+    pub code: String,
 }
 
 #[derive(Debug, Clone)]
@@ -48,24 +48,24 @@ pub fn new_public_config_cache() -> PublicConfigCache {
         .build()
 }
 
-/// Load or return cached public project config by slug.
+/// Load or return cached public project config by code.
 pub async fn get_public_config(
     db: &DatabaseConnection,
     cache: &PublicConfigCache,
-    slug: &str,
+    code: &str,
 ) -> Result<Arc<PublicProjectConfig>, crate::error::AppError> {
-    if let Some(config) = cache.get(slug).await {
+    if let Some(config) = cache.get(code).await {
         return Ok(config);
     }
 
-    let config = load_public_config(db, slug).await?;
+    let config = load_public_config(db, code).await?;
     let config = Arc::new(config);
-    cache.insert(slug.to_string(), config.clone()).await;
+    cache.insert(code.to_string(), config.clone()).await;
     Ok(config)
 }
 
-/// List all public project slugs (for discovery).
-pub async fn list_public_slugs(
+/// List all public project codes (for discovery).
+pub async fn list_public_codes(
     db: &DatabaseConnection,
 ) -> Result<Vec<String>, crate::error::AppError> {
     let projects = projects::Entity::find()
@@ -74,32 +74,31 @@ pub async fn list_public_slugs(
         .await
         .map_err(crate::error::AppError::Database)?;
 
-    Ok(projects.into_iter().filter_map(|p| p.public_slug).collect())
+    Ok(projects.into_iter().filter_map(|p| p.public_code).collect())
 }
 
-/// Invalidate a cached config by slug.
-pub async fn invalidate_config(cache: &PublicConfigCache, slug: &str) {
-    cache.invalidate(slug).await;
+/// Invalidate a cached config by code.
+pub async fn invalidate_config(cache: &PublicConfigCache, code: &str) {
+    cache.invalidate(code).await;
 }
 
 async fn load_public_config(
     db: &DatabaseConnection,
-    slug: &str,
+    code: &str,
 ) -> Result<PublicProjectConfig, crate::error::AppError> {
     let project = projects::Entity::find()
         .filter(projects::Column::IsPublic.eq(true))
-        .filter(projects::Column::PublicSlug.eq(slug))
+        .filter(projects::Column::PublicCode.eq(code))
         .one(db)
         .await
         .map_err(crate::error::AppError::Database)?
         .ok_or_else(|| {
-            crate::error::AppError::NotFound(format!("Public project not found: {slug}"))
+            crate::error::AppError::NotFound(format!("Public project not found: {code}"))
         })?;
 
-    // Load sites with public_slug set, belonging to this project
     let db_sites = sites::Entity::find()
         .filter(sites::Column::ProjectId.eq(project.id))
-        .filter(sites::Column::PublicSlug.is_not_null())
+        .filter(sites::Column::PublicCode.is_not_null())
         .all(db)
         .await
         .map_err(crate::error::AppError::Database)?;
@@ -107,10 +106,10 @@ async fn load_public_config(
     let site_configs: Vec<PublicSiteConfig> = db_sites
         .into_iter()
         .filter_map(|s| {
-            s.public_slug.map(|slug| PublicSiteConfig {
+            s.public_code.map(|code| PublicSiteConfig {
                 site_id: s.id,
                 name: s.name,
-                slug,
+                code,
             })
         })
         .collect();
@@ -170,7 +169,7 @@ async fn load_public_config(
     Ok(PublicProjectConfig {
         project_id: project.id,
         project_name: project.name,
-        slug: slug.to_string(),
+        code: code.to_string(),
         api_title: project
             .public_api_title
             .unwrap_or_else(|| "Public API".to_string()),

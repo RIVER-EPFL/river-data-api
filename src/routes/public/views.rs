@@ -43,7 +43,7 @@ fn default_format() -> String {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SiteRef {
-    pub id: String,
+    pub code: String,
     pub name: String,
 }
 
@@ -60,25 +60,15 @@ pub struct ParameterInfo {
 
 // Resolution Helpers
 
-/// Resolve a site within a public project by slug or UUID.
 fn resolve_site_from_config<'a>(
     config: &'a PublicProjectConfig,
-    site_id: &str,
+    site_code: &str,
 ) -> AppResult<&'a PublicSiteConfig> {
-    // Try UUID first
-    if let Ok(uuid) = site_id.parse::<Uuid>() {
-        return config
-            .sites
-            .iter()
-            .find(|s| s.site_id == uuid)
-            .ok_or_else(|| AppError::NotFound(format!("Site not found: {site_id}")));
-    }
-    // Try slug (case-insensitive)
     config
         .sites
         .iter()
-        .find(|s| s.slug.eq_ignore_ascii_case(site_id))
-        .ok_or_else(|| AppError::NotFound(format!("Unknown site: {site_id}")))
+        .find(|s| s.code.eq_ignore_ascii_case(site_code))
+        .ok_or_else(|| AppError::NotFound(format!("Unknown site: {site_code}")))
 }
 
 /// Build the list of all public parameter names from config.
@@ -163,14 +153,14 @@ fn resolve_requested_param_names(
     Ok(requested)
 }
 
-// GET /{project_slug}/sites -- List all sites
+// GET /{project_code}/sites -- List all sites
 
 /// List available sites for a public project.
 #[utoipa::path(
     get,
-    path = "/api/public/{project_slug}/sites",
+    path = "/api/public/{project_code}/sites",
     params(
-        ("project_slug" = String, Path, description = "Public project slug"),
+        ("project_code" = String, Path, description = "Public project code"),
     ),
     responses(
         (status = 200, body = Vec<SiteRef>),
@@ -179,15 +169,15 @@ fn resolve_requested_param_names(
 )]
 pub async fn list_sites(
     State(state): State<AppState>,
-    Path(project_slug): Path<String>,
+    Path(project_code): Path<String>,
 ) -> AppResult<Json<Vec<SiteRef>>> {
-    let config = get_public_config(&state.db, &state.public_config_cache, &project_slug).await?;
+    let config = get_public_config(&state.db, &state.public_config_cache, &project_code).await?;
 
     let sites: Vec<SiteRef> = config
         .sites
         .iter()
         .map(|s| SiteRef {
-            id: s.slug.clone(),
+            code: s.code.clone(),
             name: s.name.clone(),
         })
         .collect();
@@ -195,7 +185,7 @@ pub async fn list_sites(
     Ok(Json(sites))
 }
 
-// GET /{project_slug}/sites/{site_id} -- Site info
+// GET /{project_code}/sites/{site_code} -- Site info
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SiteDetailResponse {
@@ -216,10 +206,10 @@ struct DataRangeRow {
 /// Site overview with available parameters and data range.
 #[utoipa::path(
     get,
-    path = "/api/public/{project_slug}/sites/{site_id}",
+    path = "/api/public/{project_code}/sites/{site_code}",
     params(
-        ("project_slug" = String, Path, description = "Public project slug"),
-        ("site_id" = String, Path, description = "Site slug or UUID"),
+        ("project_code" = String, Path, description = "Public project code"),
+        ("site_code" = String, Path, description = "Site code"),
     ),
     responses(
         (status = 200, body = SiteDetailResponse),
@@ -228,10 +218,10 @@ struct DataRangeRow {
 )]
 pub async fn get_site(
     State(state): State<AppState>,
-    Path((project_slug, site_id)): Path<(String, String)>,
+    Path((project_code, site_code)): Path<(String, String)>,
 ) -> AppResult<Json<SiteDetailResponse>> {
-    let config = get_public_config(&state.db, &state.public_config_cache, &project_slug).await?;
-    let site = resolve_site_from_config(&config, &site_id)?;
+    let config = get_public_config(&state.db, &state.public_config_cache, &project_code).await?;
+    let site = resolve_site_from_config(&config, &site_code)?;
 
     let resolved = resolve_site_parameters(site.site_id, &config);
 
@@ -286,7 +276,7 @@ pub async fn get_site(
 
     Ok(Json(SiteDetailResponse {
         site: SiteRef {
-            id: site.slug.clone(),
+            code: site.code.clone(),
             name: site.name.clone(),
         },
         parameters: params,
@@ -296,15 +286,15 @@ pub async fn get_site(
     }))
 }
 
-// GET /{project_slug}/sites/{site_id}/parameters -- Parameter listing
+// GET /{project_code}/sites/{site_code}/parameters -- Parameter listing
 
 /// List available parameters for a site in a public project.
 #[utoipa::path(
     get,
-    path = "/api/public/{project_slug}/sites/{site_id}/parameters",
+    path = "/api/public/{project_code}/sites/{site_code}/parameters",
     params(
-        ("project_slug" = String, Path, description = "Public project slug"),
-        ("site_id" = String, Path, description = "Site slug or UUID"),
+        ("project_code" = String, Path, description = "Public project code"),
+        ("site_code" = String, Path, description = "Site code"),
     ),
     responses(
         (status = 200, body = Vec<ParameterInfo>),
@@ -313,10 +303,10 @@ pub async fn get_site(
 )]
 pub async fn list_parameters(
     State(state): State<AppState>,
-    Path((project_slug, site_id)): Path<(String, String)>,
+    Path((project_code, site_code)): Path<(String, String)>,
 ) -> AppResult<Json<Vec<ParameterInfo>>> {
-    let config = get_public_config(&state.db, &state.public_config_cache, &project_slug).await?;
-    let site = resolve_site_from_config(&config, &site_id)?;
+    let config = get_public_config(&state.db, &state.public_config_cache, &project_code).await?;
+    let site = resolve_site_from_config(&config, &site_code)?;
 
     let resolved = resolve_site_parameters(site.site_id, &config);
     let params: Vec<ParameterInfo> = resolved
@@ -332,7 +322,7 @@ pub async fn list_parameters(
     Ok(Json(params))
 }
 
-// GET /{project_slug}/sites/{site_id}/readings -- Raw time-series
+// GET /{project_code}/sites/{site_code}/readings -- Raw time-series
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct ReadingsQuery {
@@ -388,10 +378,10 @@ struct ReadingRow {
 /// Raw time-series readings for a public project site.
 #[utoipa::path(
     get,
-    path = "/api/public/{project_slug}/sites/{site_id}/readings",
+    path = "/api/public/{project_code}/sites/{site_code}/readings",
     params(
-        ("project_slug" = String, Path, description = "Public project slug"),
-        ("site_id" = String, Path, description = "Site slug or UUID"),
+        ("project_code" = String, Path, description = "Public project code"),
+        ("site_code" = String, Path, description = "Site code"),
         ReadingsQuery,
     ),
     responses(
@@ -402,11 +392,11 @@ struct ReadingRow {
 )]
 pub async fn get_readings(
     State(state): State<AppState>,
-    Path((project_slug, site_id)): Path<(String, String)>,
+    Path((project_code, site_code)): Path<(String, String)>,
     Query(query): Query<ReadingsQuery>,
 ) -> AppResult<Response> {
-    let config = get_public_config(&state.db, &state.public_config_cache, &project_slug).await?;
-    let site = resolve_site_from_config(&config, &site_id)?;
+    let config = get_public_config(&state.db, &state.public_config_cache, &project_code).await?;
+    let site = resolve_site_from_config(&config, &site_code)?;
 
     let start_parsed = query.start.as_deref().map(parse_time).transpose()?;
     let end_parsed = query.end.as_deref().map(parse_time).transpose()?;
@@ -455,8 +445,8 @@ pub async fn get_readings(
     let cache_key = cache::cache_key(
         "pub_readings",
         &[
-            &project_slug,
-            &site.slug,
+            &project_code,
+            &site.code,
             &names_key.join(","),
             &effective_start.to_rfc3339(),
             &end.map(|e| e.to_rfc3339()).unwrap_or_default(),
@@ -482,7 +472,7 @@ pub async fn get_readings(
     readings_response_from_data(site, times_formatted, output_params, &format, false)
 }
 
-// GET /{project_slug}/sites/{site_id}/aggregates/{resolution} -- Aggregated
+// GET /{project_code}/sites/{site_code}/aggregates/{resolution} -- Aggregated
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct AggregatesQuery {
@@ -551,10 +541,10 @@ struct AggregateRow {
 /// Aggregated time-series (hourly, daily, weekly, monthly) for a public project site.
 #[utoipa::path(
     get,
-    path = "/api/public/{project_slug}/sites/{site_id}/aggregates/{resolution}",
+    path = "/api/public/{project_code}/sites/{site_code}/aggregates/{resolution}",
     params(
-        ("project_slug" = String, Path, description = "Public project slug"),
-        ("site_id" = String, Path, description = "Site slug or UUID"),
+        ("project_code" = String, Path, description = "Public project code"),
+        ("site_code" = String, Path, description = "Site code"),
         ("resolution" = String, Path, description = "hourly, daily, weekly, or monthly"),
         AggregatesQuery,
     ),
@@ -566,11 +556,11 @@ struct AggregateRow {
 )]
 pub async fn get_aggregates(
     State(state): State<AppState>,
-    Path((project_slug, site_id, resolution)): Path<(String, String, String)>,
+    Path((project_code, site_code, resolution)): Path<(String, String, String)>,
     Query(query): Query<AggregatesQuery>,
 ) -> AppResult<Response> {
-    let config = get_public_config(&state.db, &state.public_config_cache, &project_slug).await?;
-    let site = resolve_site_from_config(&config, &site_id)?;
+    let config = get_public_config(&state.db, &state.public_config_cache, &project_code).await?;
+    let site = resolve_site_from_config(&config, &site_code)?;
 
     let view_name = match resolution.as_str() {
         "hourly" => "readings_hourly",
@@ -597,7 +587,7 @@ pub async fn get_aggregates(
     if requested_names.is_empty() {
         let response = AggregatesResponse {
             site: SiteRef {
-                id: site.slug.clone(),
+                code: site.code.clone(),
                 name: site.name.clone(),
             },
             resolution,
@@ -626,7 +616,7 @@ pub async fn get_aggregates(
     if param_ids.is_empty() {
         let response = AggregatesResponse {
             site: SiteRef {
-                id: site.slug.clone(),
+                code: site.code.clone(),
                 name: site.name.clone(),
             },
             resolution,
@@ -644,8 +634,8 @@ pub async fn get_aggregates(
     let cache_key = cache::cache_key(
         "pub_aggregates",
         &[
-            &project_slug,
-            &site.slug,
+            &project_code,
+            &site.code,
             &resolution,
             &names_key.join(","),
             &start.to_rfc3339(),
@@ -856,7 +846,7 @@ fn readings_response_from_data(
             let end = times.last().cloned();
             let response = ReadingsResponse {
                 site: SiteRef {
-                    id: site.slug.clone(),
+                    code: site.code.clone(),
                     name: site.name.clone(),
                 },
                 start,
@@ -888,7 +878,7 @@ fn aggregates_response_from_data(
         _ => {
             let response = AggregatesResponse {
                 site: SiteRef {
-                    id: site.slug.clone(),
+                    code: site.code.clone(),
                     name: site.name.clone(),
                 },
                 resolution: resolution.to_string(),

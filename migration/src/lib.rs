@@ -18,6 +18,7 @@ mod m20260603_000004_drop_alarm_type;
 mod m20260603_000005_capture_sensor_serial;
 mod m20260603_000006_deployment_twin;
 mod m20260603_000007_sensor_dimension_aggregates;
+mod m20260605_000001_public_slug_to_code;
 
 pub struct Migrator;
 
@@ -43,6 +44,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260603_000005_capture_sensor_serial::Migration),
             Box::new(m20260603_000006_deployment_twin::Migration),
             Box::new(m20260603_000007_sensor_dimension_aggregates::Migration),
+            Box::new(m20260605_000001_public_slug_to_code::Migration),
         ]
     }
 }
