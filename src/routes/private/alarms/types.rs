@@ -124,6 +124,15 @@ pub struct AlarmSiteSummary {
     pub alarm_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_reading_time: Option<DateTime<Utc>>,
+    /// Most recent `last_seen_at` of an alarm event whose peak severity was a warning
+    /// (`max_severity = 1`). Events that escalated to an alarm contribute to `last_alarm_at`
+    /// instead, so the two timestamps are disjoint by peak severity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_warning_at: Option<DateTime<Utc>>,
+    /// Most recent `last_seen_at` of an alarm event that reached alarm severity
+    /// (`max_severity = 2`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_alarm_at: Option<DateTime<Utc>>,
 }
 
 /// Response for alarm summary endpoint
@@ -132,4 +141,50 @@ pub struct AlarmSummaryResponse {
     pub total: usize,
     pub by_severity: AlarmSeverityCounts,
     pub by_site: Vec<AlarmSiteSummary>,
+}
+
+/// Query parameters for the persisted alarm-events feed
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct AlarmEventsQuery {
+    /// Filter to a single site
+    pub site_id: Option<Uuid>,
+    /// Filter on `max_severity` (1=warning, 2=alarm), exact match
+    pub severity: Option<i16>,
+    /// Lifecycle filter: `open` | `resolved` | `all` (default `all`)
+    pub status: Option<String>,
+    /// Max rows to return (default 200, capped at 1000)
+    pub limit: Option<u64>,
+}
+
+/// A single persisted alarm event
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AlarmEventResponse {
+    pub id: Uuid,
+    pub site_id: Uuid,
+    pub site_name: String,
+    pub parameter_id: Uuid,
+    pub parameter_name: String,
+    /// Current severity (1=warning, 2=alarm)
+    pub severity: i16,
+    /// Highest severity seen while the event has been open (1=warning, 2=alarm)
+    pub max_severity: i16,
+    pub started_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub value_at_start: f64,
+    pub last_value: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_value: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acknowledged_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acknowledged_by: Option<String>,
+}
+
+/// Response for the alarm-events feed
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AlarmEventsResponse {
+    pub events: Vec<AlarmEventResponse>,
+    pub total: usize,
 }

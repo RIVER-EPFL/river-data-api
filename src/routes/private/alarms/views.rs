@@ -20,9 +20,10 @@ use crate::routes::{cache, resolve_site_with_project, validate_time_range};
 use crate::common::bulk;
 
 use super::types::{
-    AcknowledgedAlarmResponse, ActiveAlarm, ActiveAlarmsResponse, AlarmSeverityCounts,
-    AlarmSiteSummary, AlarmSummaryResponse, AlarmThresholdInfo, AlarmViolationsResponse,
-    ParameterViolationData, SiteAlarmsQuery,
+    AcknowledgedAlarmResponse, ActiveAlarm, ActiveAlarmsResponse, AlarmEventResponse,
+    AlarmEventsQuery, AlarmEventsResponse, AlarmSeverityCounts, AlarmSiteSummary,
+    AlarmSummaryResponse, AlarmThresholdInfo, AlarmViolationsResponse, ParameterViolationData,
+    SiteAlarmsQuery,
 };
 use crate::routes::private::sites::types::{ProjectRef, SiteRef};
 
@@ -770,27 +771,42 @@ pub async fn get_alarm_summary(
     let total = rows.len();
 
     let latest_by_site = fetch_latest_reading_times(&state.db, scope).await?;
+    let event_times_by_site = fetch_last_alarm_warning_times(&state.db, scope).await?;
 
     let mut covered_sites: HashSet<Uuid> = site_map.keys().copied().collect();
     let mut by_site: Vec<AlarmSiteSummary> = site_map
         .into_iter()
-        .map(|(site_id, (site_name, warnings, alarms))| AlarmSiteSummary {
-            site_id,
-            site_name,
-            warning_count: warnings,
-            alarm_count: alarms,
-            latest_reading_time: latest_by_site.get(&site_id).map(|(_, t)| *t),
+        .map(|(site_id, (site_name, warnings, alarms))| {
+            let (last_warning_at, last_alarm_at) = event_times_by_site
+                .get(&site_id)
+                .copied()
+                .unwrap_or((None, None));
+            AlarmSiteSummary {
+                site_id,
+                site_name,
+                warning_count: warnings,
+                alarm_count: alarms,
+                latest_reading_time: latest_by_site.get(&site_id).map(|(_, t)| *t),
+                last_warning_at,
+                last_alarm_at,
+            }
         })
         .collect();
 
     for (site_id, (site_name, latest_time)) in &latest_by_site {
         if covered_sites.insert(*site_id) {
+            let (last_warning_at, last_alarm_at) = event_times_by_site
+                .get(site_id)
+                .copied()
+                .unwrap_or((None, None));
             by_site.push(AlarmSiteSummary {
                 site_id: *site_id,
                 site_name: site_name.clone(),
                 warning_count: 0,
                 alarm_count: 0,
                 latest_reading_time: Some(*latest_time),
+                last_warning_at,
+                last_alarm_at,
             });
         }
     }
@@ -857,4 +873,205 @@ async fn fetch_latest_reading_times(
         .into_iter()
         .map(|r| (r.site_id, (r.site_name, r.latest_time.with_timezone(&Utc))))
         .collect())
+}
+
+/// Row from the per-site last warning/alarm event query
+#[derive(Debug, FromQueryResult)]
+struct LastAlarmWarningRow {
+    site_id: Uuid,
+    last_warning_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    last_alarm_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+}
+
+/// Fetch per-site last persisted warning (max_severity = 1) and alarm (max_severity = 2) timestamps
+/// from `alarm_events`, keyed by site_id as `(last_warning_at, last_alarm_at)`.
+async fn fetch_last_alarm_warning_times(
+    db: &sea_orm::DatabaseConnection,
+    scope: Option<Uuid>,
+) -> AppResult<HashMap<Uuid, (Option<DateTime<Utc>>, Option<DateTime<Utc>>)>> {
+    let project_filter = if scope.is_some() {
+        "WHERE s.project_id = $1"
+    } else {
+        ""
+    };
+
+    let sql = format!(
+        r"
+        SELECT s.id AS site_id,
+               MAX(ae.last_seen_at) FILTER (WHERE ae.max_severity = 1) AS last_warning_at,
+               MAX(ae.last_seen_at) FILTER (WHERE ae.max_severity = 2) AS last_alarm_at
+        FROM alarm_events ae
+        JOIN sites s ON s.id = ae.site_id
+        {project_filter}
+        GROUP BY s.id
+        "
+    );
+
+    let values: Vec<sea_orm::Value> = if let Some(project_id) = scope {
+        vec![project_id.into()]
+    } else {
+        vec![]
+    };
+
+    let rows: Vec<LastAlarmWarningRow> = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            values,
+        ))
+        .await?
+        .into_iter()
+        .filter_map(|row| LastAlarmWarningRow::from_query_result(&row, "").ok())
+        .collect();
+
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.site_id,
+                (
+                    r.last_warning_at.map(|t| t.with_timezone(&Utc)),
+                    r.last_alarm_at.map(|t| t.with_timezone(&Utc)),
+                ),
+            )
+        })
+        .collect())
+}
+
+/// Row from the persisted alarm-events feed query
+#[derive(Debug, FromQueryResult)]
+struct AlarmEventRow {
+    id: Uuid,
+    site_id: Uuid,
+    site_name: String,
+    parameter_id: Uuid,
+    parameter_name: String,
+    severity: i16,
+    max_severity: i16,
+    started_at: chrono::DateTime<chrono::FixedOffset>,
+    last_seen_at: chrono::DateTime<chrono::FixedOffset>,
+    value_at_start: f64,
+    last_value: f64,
+    resolved_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    resolved_value: Option<f64>,
+    acknowledged_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    acknowledged_by: Option<String>,
+}
+
+/// List persisted alarm events
+///
+/// Returns rows from `alarm_events` (the stateful breach history), filterable by site, severity
+/// (`max_severity`), and lifecycle status (`open`/`resolved`/`all`). Ordered most-recently-seen first.
+#[utoipa::path(
+    get,
+    path = "/alarms/events",
+    params(AlarmEventsQuery),
+    responses(
+        (status = 200, description = "Persisted alarm events", body = AlarmEventsResponse),
+    ),
+    tag = "alarms"
+)]
+pub async fn get_alarm_events(
+    State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+    Query(query): Query<AlarmEventsQuery>,
+) -> AppResult<Json<AlarmEventsResponse>> {
+    let limit = query.limit.unwrap_or(200).min(1000);
+
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    let mut conditions: Vec<String> = Vec::new();
+
+    if let Some(project_id) = scope {
+        values.push(project_id.into());
+        conditions.push(format!("s.project_id = ${}", values.len()));
+    }
+    if let Some(site_id) = query.site_id {
+        values.push(site_id.into());
+        conditions.push(format!("ae.site_id = ${}", values.len()));
+    }
+    if let Some(severity) = query.severity {
+        values.push(severity.into());
+        conditions.push(format!("ae.max_severity = ${}", values.len()));
+    }
+    match query.status.as_deref() {
+        Some("open") => conditions.push("ae.resolved_at IS NULL".to_string()),
+        Some("resolved") => conditions.push("ae.resolved_at IS NOT NULL".to_string()),
+        _ => {}
+    }
+
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    };
+
+    let sql = format!(
+        r"
+        SELECT ae.id, ae.site_id, s.name AS site_name, ae.parameter_id,
+               COALESCE(sp.name, p.name) AS parameter_name,
+               ae.severity, ae.max_severity, ae.started_at, ae.last_seen_at,
+               ae.value_at_start, ae.last_value, ae.resolved_at, ae.resolved_value,
+               ae.acknowledged_at, ae.acknowledged_by
+        FROM alarm_events ae
+        JOIN sites s ON s.id = ae.site_id
+        JOIN parameters p ON p.id = ae.parameter_id
+        LEFT JOIN site_parameters sp ON sp.site_id = ae.site_id AND sp.parameter_id = ae.parameter_id
+        {where_clause}
+        ORDER BY ae.last_seen_at DESC
+        LIMIT {limit}
+        "
+    );
+
+    // Count all matching events (before LIMIT) so `total` reflects the full match set, not the
+    // truncated page. Only the alarm_events + sites join is needed — no filter touches sp/p.
+    let count_sql = format!(
+        r"
+        SELECT COUNT(*) AS cnt
+        FROM alarm_events ae
+        JOIN sites s ON s.id = ae.site_id
+        {where_clause}
+        "
+    );
+    let total: usize = state
+        .db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &count_sql,
+            values.clone(),
+        ))
+        .await?
+        .and_then(|row| row.try_get::<i64>("", "cnt").ok())
+        .unwrap_or(0)
+        .max(0) as usize;
+
+    let events: Vec<AlarmEventResponse> = state
+        .db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            values,
+        ))
+        .await?
+        .into_iter()
+        .filter_map(|row| AlarmEventRow::from_query_result(&row, "").ok())
+        .map(|r| AlarmEventResponse {
+            id: r.id,
+            site_id: r.site_id,
+            site_name: r.site_name,
+            parameter_id: r.parameter_id,
+            parameter_name: r.parameter_name,
+            severity: r.severity,
+            max_severity: r.max_severity,
+            started_at: r.started_at.with_timezone(&Utc),
+            last_seen_at: r.last_seen_at.with_timezone(&Utc),
+            value_at_start: r.value_at_start,
+            last_value: r.last_value,
+            resolved_at: r.resolved_at.map(|t| t.with_timezone(&Utc)),
+            resolved_value: r.resolved_value,
+            acknowledged_at: r.acknowledged_at.map(|t| t.with_timezone(&Utc)),
+            acknowledged_by: r.acknowledged_by,
+        })
+        .collect();
+
+    Ok(Json(AlarmEventsResponse { events, total }))
 }
