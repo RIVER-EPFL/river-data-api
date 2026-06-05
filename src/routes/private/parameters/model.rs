@@ -1,6 +1,8 @@
 use crudcrate::{CRUDResource, EntityToModels};
 use sea_orm::entity::prelude::*;
 
+use super::operations::ParameterOperations;
+
 #[derive(
     Clone,
     Debug,
@@ -16,7 +18,8 @@ use sea_orm::entity::prelude::*;
     name_singular = "parameter",
     name_plural = "parameters",
     generate_router,
-    derive_partial_eq
+    derive_partial_eq,
+    operations = ParameterOperations
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]

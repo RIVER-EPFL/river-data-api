@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::{AuthContext, ProjectScope};
-use crate::routes::private::{alarm_thresholds, site_parameters};
+use crate::routes::private::site_parameters;
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, resolve_site_with_project, validate_time_range};
 use crate::common::bulk;
@@ -212,32 +212,10 @@ pub async fn get_site_alarms(
         .into_response());
     }
 
-    // Get thresholds for these parameters (using global parameter_ids)
     let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.parameter_id).collect();
-    let thresholds = alarm_thresholds::Entity::find()
-        .filter(alarm_thresholds::Column::ParameterId.is_in(param_ids.clone()))
-        .filter(
-            sea_orm::Condition::any()
-                .add(alarm_thresholds::Column::SiteId.eq(site.id))
-                .add(alarm_thresholds::Column::SiteId.is_null()),
-        )
-        .all(&state.db)
-        .await?;
-
-    // Prefer site-specific thresholds over global ones
-    let mut threshold_map: HashMap<Uuid, alarm_thresholds::Model> = HashMap::new();
-    for t in thresholds {
-        let existing = threshold_map.get(&t.parameter_id);
-        if existing.is_none() || t.site_id.is_some() {
-            threshold_map.insert(t.parameter_id, t);
-        }
-    }
-
-    let selected_threshold_ids: Vec<Uuid> = threshold_map.values().map(|t| t.id).collect();
 
     let params_with_thresholds: Vec<ParameterWithThreshold> = params_list
         .iter()
-        .filter(|p| threshold_map.contains_key(&p.parameter_id))
         .map(|p| ParameterWithThreshold {
             id: p.parameter_id,
             name: p.name.clone(),
@@ -245,18 +223,6 @@ pub async fn get_site_alarms(
             display_units: p.display_units.clone(),
         })
         .collect();
-
-    if params_with_thresholds.is_empty() {
-        return Ok(Json(AlarmViolationsResponse {
-            project: project_ref,
-            site: site_ref,
-            start: None,
-            end: None,
-            times: vec![],
-            parameters: vec![],
-        })
-        .into_response());
-    }
 
     let cache_key = cache::cache_key(
         "alarms",
@@ -279,22 +245,16 @@ pub async fn get_site_alarms(
 
     let _permit = bulk::acquire_bulk_permit(&format, &state.bulk_semaphore)?;
 
+    // $1 = site_id, $2..=$N+1 = parameter_ids, $N+2 = start, $N+3 = end
     let alarm_param_ids: Vec<uuid::Uuid> = params_with_thresholds.iter().map(|p| p.id).collect();
-    // $1 = site_id, $2..=$N+1 = parameter_ids
     let placeholders: Vec<String> = alarm_param_ids
         .iter()
         .enumerate()
         .map(|(i, _)| format!("${}", i + 2))
         .collect();
-    // $N+2..=$N+M+1 = threshold_ids
-    let threshold_offset = alarm_param_ids.len() + 2;
-    let threshold_placeholders: Vec<String> = selected_threshold_ids
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("${}", threshold_offset + i))
-        .collect();
-    let start_param = threshold_offset + selected_threshold_ids.len();
+    let start_param = alarm_param_ids.len() + 2;
     let end_param = start_param + 1;
+    let param_list = placeholders.join(",");
 
     let min_severity = query.severity.unwrap_or(1);
 
@@ -320,6 +280,25 @@ pub async fn get_site_alarms(
 
     let sql = format!(
         r"
+        WITH resolved_thresholds AS (
+            SELECT DISTINCT ON (parameter_id)
+                parameter_id, warning_min, warning_max, alarm_min, alarm_max
+            FROM (
+                SELECT t.parameter_id, t.warning_min, t.warning_max, t.alarm_min, t.alarm_max,
+                       CASE WHEN t.site_id = $1 THEN 1 WHEN t.site_id IS NULL THEN 2 END AS priority
+                FROM alarm_thresholds t
+                WHERE t.parameter_id IN ({param_list})
+                  AND (t.site_id = $1 OR t.site_id IS NULL)
+                UNION ALL
+                SELECT p.id, p.default_warning_min, p.default_warning_max,
+                       p.default_alarm_min, p.default_alarm_max, 3
+                FROM parameters p
+                WHERE p.id IN ({param_list})
+                  AND (p.default_warning_min IS NOT NULL OR p.default_warning_max IS NOT NULL
+                       OR p.default_alarm_min IS NOT NULL OR p.default_alarm_max IS NOT NULL)
+            ) sources
+            ORDER BY parameter_id, priority
+        )
         SELECT
             r.parameter_id,
             r.time,
@@ -332,24 +311,17 @@ pub async fn get_site_alarms(
                 ELSE 0
             END::smallint as severity
         FROM readings r
-        JOIN alarm_thresholds t ON r.parameter_id = t.parameter_id AND t.id IN ({})
+        JOIN resolved_thresholds t ON r.parameter_id = t.parameter_id
         WHERE r.site_id = $1
-          AND r.parameter_id IN ({})
-          AND r.time >= ${}
-          AND r.time <= ${}
-          AND {}
+          AND r.time >= ${start_param}
+          AND r.time <= ${end_param}
+          AND {violation_condition}
         ORDER BY r.time, r.parameter_id
-        ",
-        threshold_placeholders.join(","),
-        placeholders.join(","),
-        start_param,
-        end_param,
-        violation_condition
+        "
     );
 
     let mut values: Vec<sea_orm::Value> = vec![site.id.into()];
     values.extend(alarm_param_ids.iter().map(|id| (*id).into()));
-    values.extend(selected_threshold_ids.iter().map(|id| (*id).into()));
     values.push(query.start.into());
     values.push(query.end.into());
 
@@ -471,21 +443,35 @@ pub(crate) async fn fetch_active_alarm_rows(
 
     let sql = format!(
         r"
-        WITH ranked_thresholds AS (
-            SELECT DISTINCT ON (t.parameter_id, sp.site_id)
-                sp.site_id,
-                t.parameter_id,
-                sp.name AS parameter_name,
-                t.warning_min,
-                t.warning_max,
-                t.alarm_min,
-                t.alarm_max
+        WITH threshold_sources AS (
+            SELECT t.parameter_id, t.site_id,
+                   t.warning_min, t.warning_max, t.alarm_min, t.alarm_max,
+                   CASE WHEN t.site_id IS NOT NULL THEN 1 ELSE 2 END AS priority
             FROM alarm_thresholds t
+            UNION ALL
+            SELECT p.id, NULL::uuid,
+                   p.default_warning_min, p.default_warning_max,
+                   p.default_alarm_min, p.default_alarm_max,
+                   3
+            FROM parameters p
+            WHERE p.default_warning_min IS NOT NULL
+               OR p.default_warning_max IS NOT NULL
+               OR p.default_alarm_min IS NOT NULL
+               OR p.default_alarm_max IS NOT NULL
+        ),
+        ranked_thresholds AS (
+            SELECT DISTINCT ON (ts.parameter_id, sp.site_id)
+                sp.site_id,
+                ts.parameter_id,
+                sp.name AS parameter_name,
+                ts.warning_min, ts.warning_max,
+                ts.alarm_min, ts.alarm_max
+            FROM threshold_sources ts
             JOIN site_parameters sp
-                ON sp.parameter_id = t.parameter_id
+                ON sp.parameter_id = ts.parameter_id
                 AND sp.is_active = true
-            WHERE t.site_id = sp.site_id OR t.site_id IS NULL
-            ORDER BY t.parameter_id, sp.site_id, t.site_id NULLS LAST
+            WHERE ts.site_id = sp.site_id OR ts.site_id IS NULL
+            ORDER BY ts.parameter_id, sp.site_id, ts.priority
         ),
         latest_readings AS (
             SELECT DISTINCT ON (r.site_id, r.parameter_id)
