@@ -456,9 +456,65 @@ pub async fn seed_sync_credentials(
     exec(
         db,
         &format!(
-            "INSERT INTO sync_service_credentials (id, client_id, client_secret_hash, service_type, is_active) \
-             VALUES (gen_random_uuid(), '{client_id}', '{secret_hash}', '{service_type}', true)"
+            "INSERT INTO sync_service_credentials (id, client_id, client_secret_hash, service_type) \
+             VALUES (gen_random_uuid(), '{client_id}', '{secret_hash}', '{service_type}')"
         ),
     )
     .await;
+}
+
+/// Seed an unpaired data stream carrying a `metadata.hierarchy` (so `extract_hierarchy`/`create_plan`
+/// resolve project/site/parameter), plus `source_path`/`source_name` for `grouped_discovery`, and
+/// `n_readings` unpaired readings (`site_id`/`parameter_id` NULL) for apply-backfill to claim.
+/// `coords` is `(latitude, longitude, altitude_m)`.
+#[allow(clippy::too_many_arguments)]
+pub async fn seed_unpaired_stream_with_hierarchy(
+    db: &DatabaseConnection,
+    stream_id: &str,
+    source_system: &str,
+    source_key: &str,
+    project: &str,
+    site: &str,
+    parameter: &str,
+    units: &str,
+    coords: Option<(f64, f64, f64)>,
+    n_readings: usize,
+) {
+    let coords_json = match coords {
+        Some((lat, lon, alt)) => format!(
+            ", \"coordinates\": {{\"latitude\": {lat}, \"longitude\": {lon}, \"altitude_m\": {alt}}}"
+        ),
+        None => String::new(),
+    };
+    let metadata = format!(
+        "{{\"hierarchy\": {{\"project\": \"{project}\", \"site\": \"{site}\", \"parameter\": \"{parameter}\"}}, \"units\": \"{units}\"{coords_json}}}"
+    );
+    let source_path = format!("{source_system}/{project}/{site}/{parameter}");
+    let source_name = format!("{site} - {parameter}");
+    exec(
+        db,
+        &format!(
+            "INSERT INTO data_streams (id, source_system, source_key, source_name, source_path, metadata, is_active) \
+             VALUES ('{stream_id}', '{source_system}', '{source_key}', '{source_name}', '{source_path}', '{metadata}'::jsonb, true)"
+        ),
+    )
+    .await;
+
+    if n_readings > 0 {
+        let base = Utc::now() - Duration::days(2);
+        let values: Vec<String> = (0..n_readings)
+            .map(|i| {
+                let t = (base + Duration::minutes((i as i64) * 10)).to_rfc3339();
+                format!("('{stream_id}', '{t}', {})", 10.0 + i as f64)
+            })
+            .collect();
+        exec(
+            db,
+            &format!(
+                "INSERT INTO readings (stream_id, time, raw_value) VALUES {} ON CONFLICT DO NOTHING",
+                values.join(", ")
+            ),
+        )
+        .await;
+    }
 }
