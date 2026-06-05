@@ -6,12 +6,37 @@
 
 mod common;
 
+use common::e2e;
 use common::sensor_lifecycle::*;
 use common::*;
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serial_test::serial;
 use std::time::Duration;
 
 const WAIT: Duration = Duration::from_secs(30);
+
+async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
+    let row = db
+        .query_one(Statement::from_string(DatabaseBackend::Postgres, sql.to_string()))
+        .await
+        .expect("query")
+        .expect("row");
+    row.try_get::<i64>("", "c").expect("c")
+}
+
+async fn deployed_until(db: &DatabaseConnection, id: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let row = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("SELECT deployed_until FROM sensor_deployments WHERE id = '{id}'"),
+        ))
+        .await
+        .ok()
+        .flatten()?;
+    row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "deployed_until")
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
 
 /// §3 — calibration windows are gap-absorbing: a window runs to the NEXT calibration's `valid_from`,
 /// so a reading between two calibrations resolves to the EARLIER one, never the later or the prior.
@@ -96,4 +121,159 @@ async fn recall_keeps_pre_first_deployment_readings_attributed() {
     assert_eq!(rows[0].site_id, Some(site1), "01-05 predates first deployment → keeps pairing's site_id");
     assert_eq!(rows[1].site_id, Some(site1), "01-11 inside the (now-closed) window → still SITE1");
     assert_eq!(rows[2].site_id, None, "01-15 in the post-recall gap → un-attributed");
+}
+
+/// §3 — deployment windows are gap-preserving: `recompute_deployed_until` only ever SHORTENS
+/// (`LEAST(existing, LEAD(deployed_from))`), never extends. Trying to push a window past the next
+/// deployment's start is re-clamped, so deployments never overlap.
+#[tokio::test]
+#[serial]
+async fn deployment_recompute_only_shortens_never_extends() {
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+
+    let sensor = create_sensor(&db, "Probe-shorten", GLOBAL_PARAM_TEMP_ID).await;
+    let app = build_test_app(db.clone());
+    let token = seed_api_token(&db, full_permissions(), None).await;
+
+    // Deploy A at SITE1, then B at SITE2 two hours later (auto-recall closes A at B's start).
+    let sid = sensor.id.to_string();
+    let dep_a = e2e::create_deployment(&app, &token, &sid, SITE1_ID, "2025-03-01T00:00:00Z").await;
+    let _dep_b = e2e::create_deployment(&app, &token, &sid, SITE2_ID, "2025-03-01T02:00:00Z").await;
+    assert!(wait_for_reprocessing(&db, sensor.id, WAIT).await, "reprocess after second deploy");
+    assert_eq!(
+        deployed_until(&db, &dep_a).await,
+        Some(dt("2025-03-01T02:00:00Z")),
+        "A auto-closed at B's start"
+    );
+
+    // Attempt to EXTEND A past B's start. Different sites, so no slot conflict — but recompute must
+    // re-clamp A back to B's start rather than letting it overlap.
+    let (status, body) = put_json_with_token(
+        &app,
+        &format!("/api/sensor_deployments/{dep_a}"),
+        &serde_json::json!({"deployed_until": "2025-03-01T05:00:00Z"}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "extend attempt ({status}): {body}");
+    assert!(wait_for_reprocessing(&db, sensor.id, WAIT).await, "reprocess after extend attempt");
+    assert_eq!(
+        deployed_until(&db, &dep_a).await,
+        Some(dt("2025-03-01T02:00:00Z")),
+        "recompute re-clamped A to B's start — never extended"
+    );
+}
+
+/// §4/§5 — pairing a stream whose `(site, parameter)` slot is already held by another sensor must
+/// not raise: auto-deploy is skipped (`find_or_create_deployment` returns None) and the readings
+/// carry `sensor_id`/`calibration_id` but no `deployment_id` until an explicit adopt.
+#[tokio::test]
+#[serial]
+async fn auto_deploy_skipped_when_slot_occupied() {
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+
+    // Sensor A holds the (SITE1, TEMP) slot with an open deployment.
+    let sensor_a = create_sensor(&db, "Incumbent-A", GLOBAL_PARAM_TEMP_ID).await;
+    deploy_sensor(&db, sensor_a.id, SITE1_ID, dt("2025-01-01T00:00:00Z")).await;
+
+    // A second, unpaired stream (NULL serial → a distinct sensor B is created on pair) with readings.
+    let stream = create_unpaired_stream(&db, "occupied-slot").await;
+    insert_unpaired_readings(
+        &db, stream,
+        &[(dt("2025-02-01T00:00:00Z"), 10.0), (dt("2025-02-01T00:10:00Z"), 11.0)],
+    )
+    .await;
+
+    let app = build_test_app(db.clone());
+    let token = seed_api_token(&db, full_permissions(), None).await;
+
+    // Pairing to the occupied slot must succeed (no 5xx), but skip auto-deploy.
+    let (status, body) = post_json_with_token(
+        &app,
+        &format!("/api/streams/{stream}/pair"),
+        &serde_json::json!({"site_parameter_id": PARAM_S1_TEMP_ID}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "pair into occupied slot ({status}): {body}");
+
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM readings \
+                 WHERE stream_id = '{stream}' AND sensor_id IS NOT NULL AND deployment_id IS NULL"
+            ),
+        )
+        .await,
+        2,
+        "readings carry a sensor + calibration but no deployment (slot was occupied)"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM readings r JOIN sensors s ON r.sensor_id = s.id \
+                 WHERE r.stream_id = '{stream}' AND s.id <> '{}'",
+                sensor_a.id
+            ),
+        )
+        .await,
+        2,
+        "the stream got its own (distinct) sensor B, not the incumbent A"
+    );
+}
+
+/// §6 — reprocess re-derives attribution from the timelines. Starting from readings whose
+/// `calibration_id`/`deployment_id`/`calibrated_value` have been wiped, a manual reprocess restores
+/// all of them by time window.
+#[tokio::test]
+#[serial]
+async fn reprocess_restores_nulled_attribution_fks() {
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+
+    let sensor = create_sensor(&db, "Probe-nulled", GLOBAL_PARAM_TEMP_ID).await;
+    let dep = deploy_sensor(&db, sensor.id, SITE1_ID, dt("2025-01-01T00:00:00Z")).await;
+    let stream = create_paired_stream(&db, "nulled-fks", PARAM_S1_TEMP_ID).await;
+    insert_readings(
+        &db, stream, SITE1_ID, GLOBAL_PARAM_TEMP_ID,
+        sensor.id, sensor.identity_calibration_id, dep, 1.0, 0.0,
+        &[(dt("2025-01-05T00:00:00Z"), 10.0)],
+    )
+    .await;
+
+    // Corrupt the materialized attribution: wipe the FKs and the calibrated value.
+    exec(
+        &db,
+        &format!(
+            "UPDATE readings SET calibration_id = NULL, deployment_id = NULL, calibrated_value = 999 \
+             WHERE stream_id = '{stream}'"
+        ),
+    )
+    .await;
+
+    let app = build_test_app(db.clone());
+    let token = seed_api_token(&db, full_permissions(), None).await;
+    let (status, body) = post_json_with_token(
+        &app,
+        "/api/actions/reprocess",
+        &serde_json::json!({"sensor_id": sensor.id}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "reprocess ({status}): {body}");
+    assert!(wait_for_reprocessing(&db, sensor.id, WAIT).await, "reprocess completes");
+
+    let rows = get_readings(&db, stream).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].calibration_id, Some(sensor.identity_calibration_id), "calibration_id restored");
+    assert_eq!(rows[0].deployment_id, Some(dep), "deployment_id restored");
+    assert_eq!(rows[0].calibrated_value, Some(10.0), "calibrated_value re-derived (1*10), not 999");
+    assert_eq!(rows[0].site_id, Some(SITE1_ID.parse::<uuid::Uuid>().unwrap()), "site_id intact");
 }
