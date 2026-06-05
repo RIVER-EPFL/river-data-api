@@ -78,6 +78,9 @@ pub struct ActiveAlarm {
     pub severity: i16,
     /// Timestamp of the latest violating reading
     pub since: DateTime<Utc>,
+    /// When the breach started (from the persisted alarm event).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
     /// Persisted alarm-event id (present once the sweeper has recorded this breach).
     /// Acknowledge via `POST /api/alarms/{event_id}/acknowledge`.
     #[serde(skip_serializing_if = "Option::is_none")]

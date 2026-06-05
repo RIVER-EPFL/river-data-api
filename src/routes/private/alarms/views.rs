@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::header::{self, HeaderMap, HeaderValue},
+    http::{StatusCode, header::{self, HeaderMap, HeaderValue}},
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
@@ -559,6 +559,7 @@ struct OpenEventRow {
     site_id: Uuid,
     parameter_id: Uuid,
     id: Uuid,
+    started_at: chrono::DateTime<chrono::FixedOffset>,
     acknowledged_at: Option<chrono::DateTime<chrono::FixedOffset>>,
     acknowledged_by: Option<String>,
     max_severity: i16,
@@ -576,7 +577,7 @@ async fn fetch_open_events(
         ""
     };
     let sql = format!(
-        "SELECT ae.site_id, ae.parameter_id, ae.id, ae.acknowledged_at, ae.acknowledged_by, ae.max_severity \
+        "SELECT ae.site_id, ae.parameter_id, ae.id, ae.started_at, ae.acknowledged_at, ae.acknowledged_by, ae.max_severity \
          FROM alarm_events ae JOIN sites s ON s.id = ae.site_id \
          WHERE ae.resolved_at IS NULL {project_filter}"
     );
@@ -635,6 +636,7 @@ pub async fn get_active_alarms(
                 },
                 severity: row.severity,
                 since: row.time.with_timezone(&Utc),
+                started_at: ev.map(|e| e.started_at.with_timezone(&Utc)),
                 event_id: ev.map(|e| e.id),
                 acknowledged: ev.is_some_and(|e| e.acknowledged_at.is_some()),
                 acknowledged_at: ev.and_then(|e| e.acknowledged_at.map(|t| t.with_timezone(&Utc))),
@@ -729,6 +731,61 @@ pub async fn acknowledge_alarm(
         acknowledged_at: acknowledged_at.with_timezone(&Utc),
         acknowledged_by: actor,
     }))
+}
+
+/// Remove acknowledgement from an open alarm event
+///
+/// Clears `acknowledged_at` and `acknowledged_by`, re-raising the alarm in the UI notification
+/// badge. Returns 404 if the event does not exist, 409 if already resolved. Idempotent — returns
+/// 204 even if already unacknowledged.
+#[utoipa::path(
+    delete,
+    path = "/alarms/{event_id}/acknowledge",
+    params(("event_id" = String, Path, description = "Alarm event id")),
+    responses(
+        (status = 204, description = "Acknowledgement removed"),
+        (status = 404, description = "Alarm event not found"),
+        (status = 409, description = "Alarm already resolved"),
+    ),
+    tag = "alarms"
+)]
+pub async fn unacknowledge_alarm(
+    State(state): State<AppState>,
+    Path(event_id): Path<Uuid>,
+) -> AppResult<StatusCode> {
+    #[derive(Debug, FromQueryResult)]
+    struct EventCheck {
+        resolved_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    }
+
+    let existing = state
+        .db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT resolved_at FROM alarm_events WHERE id = $1",
+            [event_id.into()],
+        ))
+        .await?
+        .and_then(|r| EventCheck::from_query_result(&r, "").ok());
+
+    let Some(ev) = existing else {
+        return Err(AppError::NotFound(format!("Alarm event {event_id} not found")));
+    };
+    if ev.resolved_at.is_some() {
+        return Err(AppError::Conflict("Alarm already resolved".to_string()));
+    }
+
+    state
+        .db
+        .execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE alarm_events SET acknowledged_at = NULL, acknowledged_by = NULL, updated_at = NOW() \
+             WHERE id = $1 AND resolved_at IS NULL",
+            [event_id.into()],
+        ))
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Get a summary of active alarm violations
