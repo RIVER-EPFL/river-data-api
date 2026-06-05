@@ -8,7 +8,9 @@ use uuid::Uuid;
 use crate::common::{AppEvent, AppState};
 use crate::routes::private::{data_streams, readings, status_events};
 use crate::error::{AppError, AppResult};
-use crate::routes::private::sensors::operations::resolve_windows_for_times;
+use crate::routes::private::sensors::operations::{
+    resolve_slot_owner_for_times, resolve_windows_for_times,
+};
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct IngestReadingsRequest {
@@ -110,12 +112,26 @@ pub async fn ingest_readings(
         std::collections::HashMap::new()
     };
 
+    // Fallback when the stream carries no frozen sensor: attribute by the (site, parameter)
+    // deployment timeline so readings still land owned when a deployment covers their time.
+    let slot_owner = match (stream.sensor_id, site_id, parameter_id) {
+        (None, Some(s), Some(p)) => {
+            let times: Vec<chrono::DateTime<Utc>> =
+                payload.readings.iter().map(|r| r.time).collect();
+            resolve_slot_owner_for_times(db, s, p, &times)
+                .await
+                .unwrap_or_default()
+        }
+        _ => std::collections::HashMap::new(),
+    };
+
     // Build reading models
     let models: Vec<readings::ActiveModel> = payload
         .readings
         .iter()
         .map(|r| {
             let slot = resolved.get(&r.time);
+            let owner = slot_owner.get(&r.time);
             readings::ActiveModel {
                 stream_id: Set(payload.stream_id),
                 time: Set(r.time.into()),
@@ -125,9 +141,15 @@ pub async fn ingest_readings(
                 parameter_id: Set(parameter_id),
                 raw_value: Set(r.raw_value),
                 calibrated_value: Set(Some(r.raw_value)),
-                sensor_id: Set(r.sensor_id.or(stream.sensor_id)),
-                calibration_id: Set(r.calibration_id.or_else(|| slot.and_then(|s| s.calibration_id))),
-                deployment_id: Set(r.deployment_id.or_else(|| slot.and_then(|s| s.deployment_id))),
+                sensor_id: Set(r.sensor_id.or(stream.sensor_id).or_else(|| owner.and_then(|o| o.sensor_id))),
+                calibration_id: Set(r
+                    .calibration_id
+                    .or_else(|| slot.and_then(|s| s.calibration_id))
+                    .or_else(|| owner.and_then(|o| o.calibration_id))),
+                deployment_id: Set(r
+                    .deployment_id
+                    .or_else(|| slot.and_then(|s| s.deployment_id))
+                    .or_else(|| owner.and_then(|o| o.deployment_id))),
                 logged: Set(Some(true)),
                 measurement_type: Set(Some("continuous".to_string())),
                 is_flagged: Set(Some(false)),

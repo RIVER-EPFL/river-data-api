@@ -252,6 +252,63 @@ pub async fn insert_readings(
     }
 }
 
+/// Insert orphan readings: paired to a (site, parameter) but with NO sensor/calibration/deployment
+/// (the historical-import state that needs backfill). `calibrated_value = raw` (identity).
+pub async fn insert_orphan_readings(
+    db: &DatabaseConnection,
+    stream_id: Uuid,
+    site_id: &str,
+    parameter_id: &str,
+    readings: &[(DateTime<Utc>, f64)],
+) {
+    for (time, raw) in readings {
+        exec(
+            db,
+            &format!(
+                "INSERT INTO readings \
+                 (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, replicate_index) \
+                 VALUES ('{stream_id}', '{site_id}', '{parameter_id}', '{}', {raw}, {raw}, 0) \
+                 ON CONFLICT DO NOTHING",
+                time.to_rfc3339()
+            ),
+        )
+        .await;
+    }
+}
+
+/// Insert fully-unpaired readings (no site/parameter/sensor) on a stream — the pre-pairing state.
+pub async fn insert_unpaired_readings(
+    db: &DatabaseConnection,
+    stream_id: Uuid,
+    readings: &[(DateTime<Utc>, f64)],
+) {
+    for (time, raw) in readings {
+        exec(
+            db,
+            &format!(
+                "INSERT INTO readings (stream_id, time, raw_value, calibrated_value, replicate_index) \
+                 VALUES ('{stream_id}', '{}', {raw}, {raw}, 0) ON CONFLICT DO NOTHING",
+                time.to_rfc3339()
+            ),
+        )
+        .await;
+    }
+}
+
+/// Create an UNPAIRED data stream (no site_parameter). Returns the stream ID.
+pub async fn create_unpaired_stream(db: &DatabaseConnection, source_key: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    exec(
+        db,
+        &format!(
+            "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active) \
+             VALUES ('{id}', 'test', '{source_key}', 'Test {source_key}', true)"
+        ),
+    )
+    .await;
+    id
+}
+
 /// Query all readings for a stream, ordered by time.
 pub async fn get_readings(db: &DatabaseConnection, stream_id: Uuid) -> Vec<ReadingRow> {
     let rows = db

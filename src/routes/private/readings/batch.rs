@@ -9,6 +9,7 @@ use crate::common::{AppEvent, AppState};
 use crate::routes::private::readings;
 use crate::error::AppResult;
 use crate::routes::private::data_streams::services::get_or_create_api_stream;
+use crate::routes::private::sensors::operations::{ResolvedOwner, resolve_slot_owner_for_times};
 
 /// How to handle readings that collide with an existing (stream_id, time, replicate_index).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, ToSchema)]
@@ -132,11 +133,36 @@ pub async fn insert_batch_readings(
         map
     };
 
+    // For rows that don't carry an explicit sensor, resolve it from the deployment window covering
+    // the time so batch-inserted data lands attributed. Explicit payload values always win.
+    let mut owner_map: HashMap<(Uuid, Uuid, chrono::DateTime<chrono::Utc>), ResolvedOwner> =
+        HashMap::new();
+    {
+        let mut times_by_slot: HashMap<(Uuid, Uuid), Vec<chrono::DateTime<chrono::Utc>>> =
+            HashMap::new();
+        for r in &payload.readings {
+            if r.sensor_id.is_none() {
+                times_by_slot.entry((r.site_id, r.parameter_id)).or_default().push(r.time);
+            }
+        }
+        for ((site, param), ts) in &times_by_slot {
+            let resolved = resolve_slot_owner_for_times(&state.db, *site, *param, ts).await?;
+            for (t, owner) in resolved {
+                owner_map.insert((*site, *param, t), owner);
+            }
+        }
+    }
+
     let models: Vec<readings::ActiveModel> = payload
         .readings
         .into_iter()
         .map(|r| {
             let stream_id = stream_cache[&(r.site_id, r.parameter_id)];
+            let owner = if r.sensor_id.is_none() {
+                owner_map.get(&(r.site_id, r.parameter_id, r.time)).cloned().unwrap_or_default()
+            } else {
+                ResolvedOwner::default()
+            };
             readings::ActiveModel {
                 stream_id: Set(stream_id),
                 site_id: Set(Some(r.site_id)),
@@ -145,9 +171,9 @@ pub async fn insert_batch_readings(
                 replicate_index: Set(r.replicate_index.unwrap_or(0)),
                 raw_value: Set(r.raw_value),
                 calibrated_value: Set(r.calibrated_value),
-                sensor_id: Set(r.sensor_id),
-                calibration_id: Set(r.calibration_id),
-                deployment_id: Set(r.deployment_id),
+                sensor_id: Set(r.sensor_id.or(owner.sensor_id)),
+                calibration_id: Set(r.calibration_id.or(owner.calibration_id)),
+                deployment_id: Set(r.deployment_id.or(owner.deployment_id)),
                 logged: Set(Some(true)),
                 measurement_type: Set(Some("continuous".to_string())),
                 is_flagged: Set(Some(false)),

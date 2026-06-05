@@ -712,3 +712,245 @@ pub async fn preview_derived(
         },
     }))
 }
+
+// ---------------------------------------------------------------------------
+// Bulk historical attribution (backfill)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, ToSchema, Clone)]
+pub struct BackfillCandidate {
+    pub deployment_id: Uuid,
+    pub sensor_id: Uuid,
+    pub site_id: Uuid,
+    pub parameter_id: Uuid,
+    /// The deployment's current start.
+    pub deployed_from: chrono::DateTime<chrono::Utc>,
+    /// Earliest claimable unattributed reading — the date `deployed_from` would move back to.
+    pub target_from: chrono::DateTime<chrono::Utc>,
+    /// Number of unattributed readings (`sensor_id IS NULL`) in `[target_from, deployed_from)`.
+    pub claimable_count: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BackfillSiteSummary {
+    pub site_id: Uuid,
+    pub deployments: i64,
+    pub claimable_count: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BackfillCandidatesResponse {
+    pub candidates: Vec<BackfillCandidate>,
+    pub by_site: Vec<BackfillSiteSummary>,
+    pub total_candidates: usize,
+    pub total_claimable: i64,
+}
+
+/// Open deployments that have claimable pre-start history: readings at the same `(site, parameter)`
+/// with `sensor_id IS NULL` before `deployed_from`, bounded below by any prior deployment's end so
+/// backdating can't overlap it. `target_from` is the earliest such reading.
+async fn fetch_backfill_candidates(
+    db: &sea_orm::DatabaseConnection,
+) -> AppResult<Vec<BackfillCandidate>> {
+    use sea_orm::{ConnectionTrait, Statement};
+    let rows = db
+        .query_all(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT d.id AS deployment_id, d.sensor_id, d.site_id, d.parameter_id,
+                     d.deployed_from, c.target_from, c.claimable_count
+              FROM sensor_deployments d
+              CROSS JOIN LATERAL (
+                  SELECT MAX(p.deployed_until) AS prior_end
+                  FROM sensor_deployments p
+                  WHERE p.site_id = d.site_id AND p.parameter_id = d.parameter_id
+                    AND p.id <> d.id AND p.deployed_until IS NOT NULL
+                    AND p.deployed_until <= d.deployed_from
+              ) pe
+              CROSS JOIN LATERAL (
+                  SELECT MIN(r.time) AS target_from, COUNT(*) AS claimable_count
+                  FROM readings r
+                  WHERE r.site_id = d.site_id AND r.parameter_id = d.parameter_id
+                    AND r.sensor_id IS NULL AND r.time < d.deployed_from
+                    AND (pe.prior_end IS NULL OR r.time >= pe.prior_end)
+              ) c
+              WHERE d.deployed_until IS NULL AND c.claimable_count > 0
+              ORDER BY c.claimable_count DESC"
+                .to_owned(),
+        ))
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+
+    rows.iter()
+        .map(|r| -> AppResult<BackfillCandidate> {
+            let deployed_from: chrono::DateTime<chrono::FixedOffset> =
+                r.try_get("", "deployed_from")?;
+            let target_from: chrono::DateTime<chrono::FixedOffset> =
+                r.try_get("", "target_from")?;
+            Ok(BackfillCandidate {
+                deployment_id: r.try_get("", "deployment_id")?,
+                sensor_id: r.try_get("", "sensor_id")?,
+                site_id: r.try_get("", "site_id")?,
+                parameter_id: r.try_get("", "parameter_id")?,
+                deployed_from: deployed_from.with_timezone(&chrono::Utc),
+                target_from: target_from.with_timezone(&chrono::Utc),
+                claimable_count: r.try_get("", "claimable_count")?,
+            })
+        })
+        .collect()
+}
+
+/// List open deployments with claimable pre-deployment history, rolled up per site. Requires
+/// `read_metadata`.
+#[utoipa::path(
+    get,
+    path = "/actions/backfill_candidates",
+    responses((status = 200, description = "Backfill candidates", body = BackfillCandidatesResponse)),
+    tag = "actions"
+)]
+pub async fn backfill_candidates(
+    State(app_state): State<AppState>,
+) -> AppResult<Json<BackfillCandidatesResponse>> {
+    let candidates = fetch_backfill_candidates(&app_state.db).await?;
+
+    let mut by_site_map: HashMap<Uuid, (i64, i64)> = HashMap::new();
+    let mut total_claimable = 0i64;
+    for c in &candidates {
+        let e = by_site_map.entry(c.site_id).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += c.claimable_count;
+        total_claimable += c.claimable_count;
+    }
+    let by_site = by_site_map
+        .into_iter()
+        .map(|(site_id, (deployments, claimable_count))| BackfillSiteSummary {
+            site_id,
+            deployments,
+            claimable_count,
+        })
+        .collect();
+
+    Ok(Json(BackfillCandidatesResponse {
+        total_candidates: candidates.len(),
+        total_claimable,
+        by_site,
+        candidates,
+    }))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct BackfillAttributionRequest {
+    /// Backfill every candidate.
+    #[serde(default)]
+    pub all: bool,
+    /// Restrict to candidates at this site.
+    pub site_id: Option<Uuid>,
+    /// Restrict to these specific deployments.
+    #[serde(default)]
+    pub deployment_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BackfillAttributionResponse {
+    pub job_id: Uuid,
+    pub status: String,
+    pub deployments_updated: usize,
+    pub estimated_readings: i64,
+}
+
+/// Backdate the selected open deployments to their earliest claimable reading (bounded by any prior
+/// deployment), then window-reprocess the affected slots so the previously-unattributed readings are
+/// stamped with `sensor_id`/`deployment_id`/`calibration_id`. Runs as one tracked job. Requires
+/// `write_data`.
+#[utoipa::path(
+    post,
+    path = "/actions/backfill_attribution",
+    request_body = BackfillAttributionRequest,
+    responses((status = 200, description = "Backfill triggered", body = BackfillAttributionResponse)),
+    tag = "actions"
+)]
+pub async fn backfill_attribution(
+    State(app_state): State<AppState>,
+    Json(payload): Json<BackfillAttributionRequest>,
+) -> AppResult<Json<BackfillAttributionResponse>> {
+    use sea_orm::{ConnectionTrait, Statement};
+    let db = &app_state.db;
+
+    let all_candidates = fetch_backfill_candidates(db).await?;
+    let dep_filter: HashSet<Uuid> = payload.deployment_ids.iter().copied().collect();
+    let selected: Vec<BackfillCandidate> = all_candidates
+        .into_iter()
+        .filter(|c| {
+            if !dep_filter.is_empty() {
+                dep_filter.contains(&c.deployment_id)
+            } else if let Some(site) = payload.site_id {
+                c.site_id == site
+            } else {
+                payload.all
+            }
+        })
+        .collect();
+
+    if selected.is_empty() {
+        return Err(AppError::BadRequest(
+            "No matching backfill candidates (pass all=true, a site_id, or deployment_ids)".to_string(),
+        ));
+    }
+
+    // Backdate each selected deployment to its target_from (>= prior end, so no slot overlap), then
+    // re-chain that sensor's deployed_until. Collect the distinct slots + sensors touched.
+    let estimated_readings: i64 = selected.iter().map(|c| c.claimable_count).sum();
+    let mut slots: HashSet<(Uuid, Uuid)> = HashSet::new();
+    let mut sensors: HashSet<Uuid> = HashSet::new();
+    for c in &selected {
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE sensor_deployments SET deployed_from = $1 WHERE id = $2",
+            [c.target_from.into(), c.deployment_id.into()],
+        ))
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+        slots.insert((c.site_id, c.parameter_id));
+        sensors.insert(c.sensor_id);
+    }
+    for sensor_id in &sensors {
+        recompute_deployed_until(db, *sensor_id)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+    }
+
+    let deployments_updated = selected.len();
+    let slot_vec: Vec<(Uuid, Uuid)> = slots.into_iter().collect();
+    let job_id = spawn_tracked_job(
+        db,
+        None,
+        "backfill_attribution",
+        None,
+        app_state.events.clone(),
+        move |db| {
+            let slots = slot_vec.clone();
+            async move {
+                let mut total = 0i64;
+                for (site_id, parameter_id) in slots {
+                    match reprocess_site_parameter_readings(&db, site_id, parameter_id).await {
+                        Ok(n) => total += n as i64,
+                        Err(e) => tracing::warn!(
+                            error = %e, site_id = %site_id, parameter_id = %parameter_id,
+                            "backfill_attribution: slot reprocess failed"
+                        ),
+                    }
+                }
+                tracing::info!(readings_updated = total, "backfill_attribution complete");
+                Ok(total)
+            }
+        },
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(BackfillAttributionResponse {
+        job_id,
+        status: "pending".to_string(),
+        deployments_updated,
+        estimated_readings,
+    }))
+}

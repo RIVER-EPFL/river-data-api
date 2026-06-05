@@ -23,6 +23,7 @@ use crate::common::{AppEvent, AppState};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams::services::get_or_create_api_stream;
 use crate::routes::private::readings;
+use crate::routes::private::sensors::operations::{ResolvedOwner, resolve_slot_owner_for_times};
 use crate::routes::private::readings::batch::{ConflictMode, readings_on_conflict};
 use crate::routes::resolve_site_with_project;
 
@@ -459,24 +460,44 @@ pub async fn import_csv(
         }
     }
 
+    // Attribute each row to the sensor whose deployment window covers its time, so imported readings
+    // that fall inside an existing deployment land attributed instead of NULL (the historical-orphan
+    // source). Rows outside every deployment window resolve to all-None and need a later backdate.
+    let mut owner_map: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), ResolvedOwner> = HashMap::new();
+    {
+        let mut times_by_param: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = HashMap::new();
+        for (pid, t, _) in &rows {
+            times_by_param.entry(*pid).or_default().push(*t);
+        }
+        for (pid, ts) in &times_by_param {
+            let resolved = resolve_slot_owner_for_times(&state.db, site_id, *pid, ts).await?;
+            for (t, owner) in resolved {
+                owner_map.insert((*pid, t), owner);
+            }
+        }
+    }
+
     let models: Vec<readings::ActiveModel> = rows
         .iter()
-        .map(|(parameter_id, time, value)| readings::ActiveModel {
-            stream_id: Set(stream_cache[parameter_id]),
-            site_id: Set(Some(site_id)),
-            parameter_id: Set(Some(*parameter_id)),
-            time: Set((*time).into()),
-            replicate_index: Set(0),
-            raw_value: Set(*value),
-            calibrated_value: Set(Some(*value)),
-            sensor_id: Set(None),
-            calibration_id: Set(None),
-            deployment_id: Set(None),
-            logged: Set(Some(false)),
-            measurement_type: Set(Some("continuous".to_string())),
-            is_flagged: Set(Some(false)),
-            flag_reason: Set(None),
-            sample_id: Set(None),
+        .map(|(parameter_id, time, value)| {
+            let owner = owner_map.get(&(*parameter_id, *time)).cloned().unwrap_or_default();
+            readings::ActiveModel {
+                stream_id: Set(stream_cache[parameter_id]),
+                site_id: Set(Some(site_id)),
+                parameter_id: Set(Some(*parameter_id)),
+                time: Set((*time).into()),
+                replicate_index: Set(0),
+                raw_value: Set(*value),
+                calibrated_value: Set(Some(*value)),
+                sensor_id: Set(owner.sensor_id),
+                calibration_id: Set(owner.calibration_id),
+                deployment_id: Set(owner.deployment_id),
+                logged: Set(Some(false)),
+                measurement_type: Set(Some("continuous".to_string())),
+                is_flagged: Set(Some(false)),
+                flag_reason: Set(None),
+                sample_id: Set(None),
+            }
         })
         .collect();
 

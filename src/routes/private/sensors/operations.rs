@@ -592,6 +592,115 @@ pub async fn resolve_windows_for_times<C: ConnectionTrait>(
     Ok(out)
 }
 
+/// `(id, sensor_id, from, until)` for a deployment or calibration window row.
+type SlotWindowRow = (Uuid, Uuid, chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>);
+
+/// Owner (sensor + deployment + active calibration) resolved for a reading time at a slot.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedOwner {
+    pub sensor_id: Option<Uuid>,
+    pub deployment_id: Option<Uuid>,
+    pub calibration_id: Option<Uuid>,
+}
+
+/// Reverse of [`resolve_windows_for_times`]: for a `(site, parameter)` slot, resolve which sensor —
+/// and its deployment + active calibration — covers each time, by the same half-open
+/// `[from, COALESCE(until,'infinity'))` windows. Used by the write paths (import/batch/ingest) to
+/// attribute a reading at write time whenever a deployment already covers its time, so new data lands
+/// attributed instead of NULL. Single-valued: the `excl_deployment_site_param_slot` constraint
+/// guarantees at most one deployment per `(site, parameter)` at any instant. Times outside every
+/// deployment window resolve to `ResolvedOwner::default()` (all `None`) — they need a backdate.
+pub async fn resolve_slot_owner_for_times<C: ConnectionTrait>(
+    db: &C,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    times: &[chrono::DateTime<Utc>],
+) -> AppResult<std::collections::HashMap<chrono::DateTime<Utc>, ResolvedOwner>> {
+    use std::collections::HashMap;
+    let mut out: HashMap<chrono::DateTime<Utc>, ResolvedOwner> = HashMap::new();
+    if times.is_empty() {
+        return Ok(out);
+    }
+
+    let dep_rows = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT id, sensor_id, deployed_from, deployed_until
+              FROM sensor_deployments WHERE site_id = $1 AND parameter_id = $2 ORDER BY deployed_from",
+            [site_id.into(), parameter_id.into()],
+        ))
+        .await?;
+    let deps: Vec<SlotWindowRow> = dep_rows
+        .iter()
+        .map(|r| -> AppResult<_> {
+            let id: Uuid = r.try_get("", "id")?;
+            let sensor_id: Uuid = r.try_get("", "sensor_id")?;
+            let from: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "deployed_from")?;
+            let until: Option<chrono::DateTime<chrono::FixedOffset>> =
+                r.try_get("", "deployed_until")?;
+            Ok((id, sensor_id, from.with_timezone(&Utc), until.map(|u| u.with_timezone(&Utc))))
+        })
+        .collect::<AppResult<_>>()?;
+    if deps.is_empty() {
+        for &t in times {
+            out.insert(t, ResolvedOwner::default());
+        }
+        return Ok(out);
+    }
+
+    // Calibrations for the sensors that have deployments at this slot.
+    let cal_rows = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT id, sensor_id, valid_from, valid_until
+              FROM sensor_calibrations
+              WHERE sensor_id IN (
+                  SELECT DISTINCT sensor_id FROM sensor_deployments
+                  WHERE site_id = $1 AND parameter_id = $2
+              )
+              ORDER BY valid_from",
+            [site_id.into(), parameter_id.into()],
+        ))
+        .await?;
+    let cals: Vec<SlotWindowRow> = cal_rows
+        .iter()
+        .map(|r| -> AppResult<_> {
+            let id: Uuid = r.try_get("", "id")?;
+            let sensor_id: Uuid = r.try_get("", "sensor_id")?;
+            let from: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "valid_from")?;
+            let until: Option<chrono::DateTime<chrono::FixedOffset>> =
+                r.try_get("", "valid_until")?;
+            Ok((id, sensor_id, from.with_timezone(&Utc), until.map(|u| u.with_timezone(&Utc))))
+        })
+        .collect::<AppResult<_>>()?;
+
+    for &t in times {
+        let dep = deps
+            .iter()
+            .find(|(_, _, from, until)| t >= *from && until.is_none_or(|u| t < u));
+        let (deployment_id, sensor_id) = match dep {
+            Some((id, sid, _, _)) => (Some(*id), Some(*sid)),
+            None => (None, None),
+        };
+        let calibration_id = sensor_id.and_then(|sid| {
+            cals.iter()
+                .find(|(_, csid, from, until)| {
+                    *csid == sid && t >= *from && until.is_none_or(|u| t < u)
+                })
+                .map(|(id, _, _, _)| *id)
+        });
+        out.insert(
+            t,
+            ResolvedOwner {
+                sensor_id,
+                deployment_id,
+                calibration_id,
+            },
+        );
+    }
+    Ok(out)
+}
+
 /// Extract the Vaisala device serial from stream metadata (for discovery response).
 pub fn extract_vaisala_device_serial(metadata: &serde_json::Value) -> Option<String> {
     metadata

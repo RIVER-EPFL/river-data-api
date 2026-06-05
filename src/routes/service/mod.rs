@@ -186,6 +186,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route("/actions/compute_derived", post(actions::compute_derived))
         .route("/actions/rollback_deployment", post(actions::rollback_deployment))
         .route("/actions/reprocess_all", post(actions::reprocess_all))
+        .route("/actions/backfill_attribution", post(actions::backfill_attribution))
         .route("/alarms/{event_id}/acknowledge", post(alarm_views::acknowledge_alarm))
         .layer(middleware::from_fn(require_write_data))
         .with_state(state.clone());
@@ -202,6 +203,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
 
     let metadata_read_routes = Router::new()
         .route("/search", get(search::search))
+        .route("/actions/backfill_candidates", get(actions::backfill_candidates))
         .layer(middleware::from_fn(require_read_metadata))
         .with_state(state.clone());
 
