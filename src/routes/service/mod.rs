@@ -212,6 +212,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route("/actions/compute_derived", post(actions::compute_derived))
         .route("/actions/rollback_deployment", post(actions::rollback_deployment))
         .route("/actions/reprocess_all", post(actions::reprocess_all))
+        .route("/actions/rebuild_alarm_events", post(actions::rebuild_alarm_events))
         .route("/actions/backfill_attribution", post(actions::backfill_attribution))
         .route("/actions/backfill_calibrations", post(actions::backfill_calibrations))
         .route("/alarms/{event_id}/acknowledge", post(alarm_views::acknowledge_alarm).delete(alarm_views::unacknowledge_alarm))

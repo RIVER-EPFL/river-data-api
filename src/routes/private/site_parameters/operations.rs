@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
-use sea_orm::{ColumnTrait, ConnectionTrait, Condition, DatabaseConnection, EntityTrait, Order, QueryFilter, QueryOrder, QuerySelect, ActiveModelTrait, Set, Statement};
+use sea_orm::{ColumnTrait, ConnectionTrait, Condition, DatabaseConnection, EntityTrait, Order, QueryFilter, QueryOrder, QuerySelect, Statement};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
@@ -169,42 +169,11 @@ impl CRUDOperations for SiteParameterOperations {
             entity.name = parameter.name.clone();
         }
 
-        // Auto-create an alarm threshold from the parameter's defaults, when any are set and
-        // none exists yet for this parameter + site. Derived output parameters carry no default
-        // thresholds, so this is simply skipped for them — the derived backfill below still runs.
-        let has_default_threshold = parameter.default_warning_min.is_some()
-            || parameter.default_warning_max.is_some()
-            || parameter.default_alarm_min.is_some()
-            || parameter.default_alarm_max.is_some();
-
-        if has_default_threshold {
-            let existing = crate::routes::private::alarm_thresholds::Entity::find()
-                .filter(crate::routes::private::alarm_thresholds::Column::ParameterId.eq(entity.parameter_id))
-                .filter(crate::routes::private::alarm_thresholds::Column::SiteId.eq(entity.site_id))
-                .one(db)
-                .await
-                .map_err(ApiError::database)?;
-
-            if existing.is_none() {
-                let threshold = crate::routes::private::alarm_thresholds::ActiveModel {
-                    id: Set(Uuid::new_v4()),
-                    parameter_id: Set(entity.parameter_id),
-                    site_id: Set(Some(entity.site_id)),
-                    warning_min: Set(parameter.default_warning_min),
-                    warning_max: Set(parameter.default_warning_max),
-                    alarm_min: Set(parameter.default_alarm_min),
-                    alarm_max: Set(parameter.default_alarm_max),
-                    description: Set(Some(format!(
-                        "Auto-created from {} defaults",
-                        parameter.name
-                    ))),
-                    created_at: Set(None),
-                    updated_at: Set(None),
-                };
-
-                threshold.insert(db).await.map_err(ApiError::database)?;
-            }
-        }
+        // NOTE: alarm thresholds are intentionally NOT auto-created from parameter defaults.
+        // Alarm evaluation already falls back to the parameter's `default_*` columns when no
+        // `alarm_thresholds` row exists, so a default-valued row is redundant — and worse, a
+        // site-specific copy would silently shadow a global threshold an operator set. A
+        // site-specific row is created only when a user explicitly overrides via the editor.
 
         // Backfill derived values for the readings already present at this site when a
         // derived site_parameter is assigned. Tracked via spawn_tracked_job. A guard skips

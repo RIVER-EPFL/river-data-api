@@ -285,6 +285,71 @@ pub async fn reprocess_all(
     }))
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+pub struct RebuildAlarmEventsRequest {
+    /// Restrict to one site (default: every active site).
+    #[serde(default)]
+    pub site_id: Option<Uuid>,
+    /// Restrict to one parameter (default: every parameter at the targeted sites).
+    #[serde(default)]
+    pub parameter_id: Option<Uuid>,
+    /// Window start (ISO 8601). Defaults per-slot to the slot's earliest reading.
+    #[serde(default)]
+    pub start: Option<chrono::DateTime<chrono::Utc>>,
+    /// Window end (ISO 8601). Defaults per-slot to the slot's latest reading.
+    #[serde(default)]
+    pub end: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Reconstruct persisted alarm events from the actual readings, for the targeted slots and window.
+/// Walks the readings, collapses consecutive out-of-range readings into resolved breach episodes,
+/// and writes them to `alarm_events` (idempotently). This is the on-demand twin of the automatic
+/// backfill that fires after a CSV import / batch ingest; the live 60s sweeper still owns currently
+/// open breaches. Tracked as a `reprocessing_jobs` row (`trigger_type = 'alarm_backfill'`); returns
+/// the job id immediately. Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/actions/rebuild_alarm_events",
+    request_body = RebuildAlarmEventsRequest,
+    responses(
+        (status = 200, description = "Rebuild triggered; returns job_id and status 'pending'"),
+    ),
+    tag = "actions"
+)]
+pub async fn rebuild_alarm_events(
+    State(app_state): State<AppState>,
+    Json(payload): Json<RebuildAlarmEventsRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let RebuildAlarmEventsRequest {
+        site_id,
+        parameter_id,
+        start,
+        end,
+    } = payload;
+
+    let job_id = spawn_tracked_job(
+        &app_state.db,
+        None,
+        "alarm_backfill",
+        None,
+        app_state.events.clone(),
+        move |db| async move {
+            crate::routes::private::alarms::episodes::rebuild_alarm_events(
+                &db,
+                site_id,
+                parameter_id,
+                start,
+                end,
+            )
+            .await
+        },
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "pending" })))
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RollbackDeploymentRequest {
     pub deployment_id: Uuid,

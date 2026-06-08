@@ -260,23 +260,21 @@ pub async fn get_site_alarms(
 
     let val_expr = "COALESCE(r.calibrated_value, r.raw_value)";
 
-    let violation_condition = if min_severity >= 2 {
-        format!(
-            "(
-            (t.alarm_min IS NOT NULL AND {val_expr} < t.alarm_min) OR
-            (t.alarm_max IS NOT NULL AND {val_expr} > t.alarm_max)
-        )"
-        )
-    } else {
-        format!(
-            "(
-            (t.alarm_min IS NOT NULL AND {val_expr} < t.alarm_min) OR
-            (t.alarm_max IS NOT NULL AND {val_expr} > t.alarm_max) OR
-            (t.warning_min IS NOT NULL AND {val_expr} < t.warning_min) OR
-            (t.warning_max IS NOT NULL AND {val_expr} > t.warning_max)
-        )"
-        )
-    };
+    let violation_condition = super::thresholds::violation_condition(
+        val_expr,
+        "t.warning_min",
+        "t.warning_max",
+        "t.alarm_min",
+        "t.alarm_max",
+        min_severity,
+    );
+    let sev_case = super::thresholds::severity_case(
+        val_expr,
+        "t.warning_min",
+        "t.warning_max",
+        "t.alarm_min",
+        "t.alarm_max",
+    );
 
     let sql = format!(
         r"
@@ -303,13 +301,7 @@ pub async fn get_site_alarms(
             r.parameter_id,
             r.time,
             COALESCE(r.calibrated_value, r.raw_value) AS value,
-            CASE
-                WHEN (t.alarm_min IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) < t.alarm_min) OR
-                     (t.alarm_max IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) > t.alarm_max) THEN 2
-                WHEN (t.warning_min IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) < t.warning_min) OR
-                     (t.warning_max IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) > t.warning_max) THEN 1
-                ELSE 0
-            END::smallint as severity
+            ({sev_case})::smallint as severity
         FROM readings r
         JOIN resolved_thresholds t ON r.parameter_id = t.parameter_id
         WHERE r.site_id = $1
@@ -441,6 +433,22 @@ pub(crate) async fn fetch_active_alarm_rows(
         ""
     };
 
+    let sev_case = super::thresholds::severity_case(
+        "lr.value",
+        "rt.warning_min",
+        "rt.warning_max",
+        "rt.alarm_min",
+        "rt.alarm_max",
+    );
+    let violation = super::thresholds::violation_condition(
+        "lr.value",
+        "rt.warning_min",
+        "rt.warning_max",
+        "rt.alarm_min",
+        "rt.alarm_max",
+        1,
+    );
+
     let sql = format!(
         r"
         WITH threshold_sources AS (
@@ -496,24 +504,13 @@ pub(crate) async fn fetch_active_alarm_rows(
             rt.warning_max,
             rt.alarm_min,
             rt.alarm_max,
-            CASE
-                WHEN (rt.alarm_min IS NOT NULL AND lr.value < rt.alarm_min) OR
-                     (rt.alarm_max IS NOT NULL AND lr.value > rt.alarm_max) THEN 2::smallint
-                WHEN (rt.warning_min IS NOT NULL AND lr.value < rt.warning_min) OR
-                     (rt.warning_max IS NOT NULL AND lr.value > rt.warning_max) THEN 1::smallint
-                ELSE 0::smallint
-            END AS severity
+            ({sev_case})::smallint AS severity
         FROM latest_readings lr
         JOIN ranked_thresholds rt
             ON rt.site_id = lr.site_id
             AND rt.parameter_id = lr.parameter_id
         JOIN sites s ON s.id = lr.site_id
-        WHERE (
-            (rt.alarm_min IS NOT NULL AND lr.value < rt.alarm_min) OR
-            (rt.alarm_max IS NOT NULL AND lr.value > rt.alarm_max) OR
-            (rt.warning_min IS NOT NULL AND lr.value < rt.warning_min) OR
-            (rt.warning_max IS NOT NULL AND lr.value > rt.warning_max)
-        )
+        WHERE {violation}
         {project_filter}
         ORDER BY severity DESC, s.name, rt.parameter_name
         "
@@ -1036,6 +1033,18 @@ pub async fn get_alarm_events(
         values.push(severity.into());
         conditions.push(format!("ae.max_severity = ${}", values.len()));
     }
+    if let Some(parameter_id) = query.parameter_id {
+        values.push(parameter_id.into());
+        conditions.push(format!("ae.parameter_id = ${}", values.len()));
+    }
+    if let Some(start) = query.start {
+        values.push(start.into());
+        conditions.push(format!("ae.last_seen_at >= ${}", values.len()));
+    }
+    if let Some(end) = query.end {
+        values.push(end.into());
+        conditions.push(format!("ae.started_at <= ${}", values.len()));
+    }
     match query.status.as_deref() {
         Some("open") => conditions.push("ae.resolved_at IS NULL".to_string()),
         Some("resolved") => conditions.push("ae.resolved_at IS NOT NULL".to_string()),
@@ -1047,6 +1056,8 @@ pub async fn get_alarm_events(
     } else {
         format!("WHERE {}", conditions.join(" AND "))
     };
+
+    let offset = query.offset.unwrap_or(0);
 
     let sql = format!(
         r"
@@ -1061,7 +1072,7 @@ pub async fn get_alarm_events(
         LEFT JOIN site_parameters sp ON sp.site_id = ae.site_id AND sp.parameter_id = ae.parameter_id
         {where_clause}
         ORDER BY ae.last_seen_at DESC
-        LIMIT {limit}
+        LIMIT {limit} OFFSET {offset}
         "
     );
 

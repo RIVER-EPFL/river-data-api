@@ -535,6 +535,7 @@ pub async fn import_csv(
         let app = state.clone();
         let events = state.events.clone();
         let since = earliest;
+        let latest_for_alarm = latest;
         let conflict = req.conflict;
         let site_name = site.name.clone();
         let param_streams: Vec<(Uuid, Uuid)> = mappings
@@ -662,6 +663,42 @@ pub async fn import_csv(
                 }
                 crate::common::cache::invalidate_prefix(&app, &format!("readings:{site_id}")).await;
                 crate::common::cache::invalidate_prefix(&app, &format!("aggregates:{site_id}")).await;
+
+                // Rebuild persisted alarm events for the imported window so out-of-range CSV rows
+                // become breach episodes (the live sweeper only ever inspects the latest reading).
+                // Separate tracked `alarm_backfill` job so it shows up alongside the manual rebuild.
+                if let (Some(alarm_start), Some(alarm_end)) = (since, latest_for_alarm) {
+                    let alarm_params: Vec<Uuid> =
+                        param_streams.iter().map(|(pid, _)| *pid).collect();
+                    let _ = crate::routes::private::sensor_calibrations::services::spawn_tracked_job(
+                        &db,
+                        None,
+                        "alarm_backfill",
+                        None,
+                        events.clone(),
+                        move |inner_db| {
+                            let alarm_params = alarm_params.clone();
+                            async move {
+                                let mut total = 0i64;
+                                for pid in alarm_params {
+                                    match crate::routes::private::alarms::episodes::evaluate_alarm_episodes(
+                                        &inner_db, site_id, pid, alarm_start, alarm_end,
+                                    )
+                                    .await
+                                    {
+                                        Ok(n) => total += n,
+                                        Err(e) => tracing::warn!(
+                                            error = %e, %site_id, parameter_id = %pid,
+                                            "alarm backfill slot failed"
+                                        ),
+                                    }
+                                }
+                                Ok(total)
+                            }
+                        },
+                    )
+                    .await;
+                }
             }
 
             let _ = db

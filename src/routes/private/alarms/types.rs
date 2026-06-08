@@ -155,8 +155,15 @@ pub struct AlarmEventsQuery {
     pub severity: Option<i16>,
     /// Lifecycle filter: `open` | `resolved` | `all` (default `all`)
     pub status: Option<String>,
+    /// Only events whose active span overlaps [start, end] (ISO 8601)
+    pub start: Option<chrono::DateTime<chrono::Utc>>,
+    pub end: Option<chrono::DateTime<chrono::Utc>>,
+    /// Filter to a single parameter
+    pub parameter_id: Option<uuid::Uuid>,
     /// Max rows to return (default 200, capped at 1000)
     pub limit: Option<u64>,
+    /// Pagination offset (default 0)
+    pub offset: Option<u64>,
 }
 
 /// A single persisted alarm event
