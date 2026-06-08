@@ -6,6 +6,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::routes::private::{data_streams, readings, samples, site_parameters, sites};
 use crate::error::{AppError, AppResult};
 
@@ -159,11 +160,15 @@ async fn auto_create_samples(
 )]
 pub async fn insert_grab_samples(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(payload): Json<GrabSampleRequest>,
 ) -> AppResult<Json<GrabSampleResponse>> {
     if payload.readings.is_empty() {
         return Err(AppError::BadRequest("No readings provided".to_string()));
     }
+
+    // A project-scoped token may only write to a site within its project.
+    enforce_project_scope_for_sites(&state.db, scope, &[payload.site_id]).await?;
 
     // Validate site exists
     let site = sites::Entity::find_by_id(payload.site_id)

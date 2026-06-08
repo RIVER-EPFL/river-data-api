@@ -12,6 +12,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::middleware::{ProjectScope, sensor_in_scope};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensor_calibrations::services::{
     recompute_deployed_until, reprocess_sensor_readings, reprocess_site_parameter_readings,
@@ -297,9 +298,14 @@ pub struct AdoptSuggestion {
 )]
 pub async fn adopt_suggestions(
     State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Path(sensor_id): Path<Uuid>,
 ) -> AppResult<Json<AdoptSuggestion>> {
     let db = &app_state.db;
+    // A project-scoped key only sees adopt suggestions for a sensor deployed within its project.
+    if !sensor_in_scope(db, scope, sensor_id).await? {
+        return Err(AppError::NotFound("Sensor not found".to_string()));
+    }
     let row = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,

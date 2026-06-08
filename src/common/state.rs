@@ -15,6 +15,22 @@ use crate::routes::private::api_tokens::services::TokenCache;
 use super::bulk::{BulkSemaphore, new_bulk_semaphore};
 use crate::routes::public::services::{PublicConfigCache, new_public_config_cache};
 
+/// Per-token request limiters, keyed by token id. Each entry holds the configured
+/// `rate_limit_per_second` (so a changed limit rebuilds the limiter) and a direct governor
+/// limiter. Tokens with no configured limit never enter this cache (they are unlimited). Bounded
+/// by capacity + idle eviction so it can't grow without limit.
+pub type TokenRateLimiters =
+    Cache<uuid::Uuid, (i32, Arc<governor::DefaultDirectRateLimiter>)>;
+
+/// Build an empty per-token rate-limiter registry (max 10k live keys, evicted after 1h idle).
+#[must_use]
+pub fn new_token_rate_limiters() -> TokenRateLimiters {
+    Cache::builder()
+        .max_capacity(10_000)
+        .time_to_idle(Duration::from_secs(3600))
+        .build()
+}
+
 /// Server-sent event pushed to connected clients via the `/api/events` SSE stream.
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -70,6 +86,7 @@ pub struct AppState {
     pub bulk_semaphore: BulkSemaphore,
     pub keycloak_admin: Option<KeycloakAdmin>,
     pub token_cache: TokenCache,
+    pub token_rate_limiters: TokenRateLimiters,
     pub events: EventSender,
     pub import_staging: ImportStagingCache,
 }
@@ -108,7 +125,10 @@ impl AppState {
             }
         });
 
-        let token_cache = crate::routes::private::api_tokens::services::new_token_cache();
+        let token_cache = crate::routes::private::api_tokens::services::new_token_cache(
+            config.token_cache_ttl_seconds,
+        );
+        let token_rate_limiters = new_token_rate_limiters();
         let (events, _) = broadcast::channel(256);
         let _ = GLOBAL_EVENT_SENDER.set(events.clone());
 
@@ -129,6 +149,7 @@ impl AppState {
             bulk_semaphore,
             keycloak_admin,
             token_cache,
+            token_rate_limiters,
             events,
             import_staging,
         }

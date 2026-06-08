@@ -9,13 +9,15 @@ use utoipa_axum::router::OpenApiRouter;
 
 use crate::common::AppState;
 use crate::common::middleware::{
-    require_admin, require_crud_permissions, require_read_data, require_read_metadata,
-    require_write_data, require_write_metadata,
+    bust_token_cache_on_mutation, deny_scoped_token, enforce_token_scope_on_crud, require_admin,
+    require_crud_permissions, require_read_data, require_read_metadata, require_write_data,
+    require_write_metadata,
 };
 use crate::common::rate_limit::FallbackIpKeyExtractor;
 use crate::routes::private::{
     alarm_thresholds::AlarmThreshold,
     annotations::Annotation,
+    api_token_audit_log::ApiTokenAuditLog,
     api_tokens::ApiToken,
     constants::Constant,
     data_streams::DataStream,
@@ -99,8 +101,16 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .nest("/derived_parameters", with_crud_perms(DerivedParameterDefinition::router(db)))
         .nest("/derived_parameter_sources", with_crud_perms(DerivedParameterSource::router(db)))
         .nest("/alarm_thresholds", with_crud_perms(AlarmThreshold::router(db)))
-        .nest("/tokens", admin_only_crud(ApiToken::router(db)))
+        .nest(
+            "/tokens",
+            admin_only_crud(ApiToken::router(db)).layer(middleware::from_fn_with_state(
+                state.clone(),
+                bust_token_cache_on_mutation,
+            )),
+        )
         .nest("/sync_service_credentials", admin_only_crud(SyncServiceCredential::router(db)))
+        // Read-only forensic audit trail of API-token use. Admin-only (no token can read it).
+        .nest("/api_token_audit_logs", admin_only_crud(ApiTokenAuditLog::router(db)))
         .nest("/data_streams", with_crud_perms(DataStream::router(db)))
         .nest("/standard_curves", with_crud_perms(StandardCurve::router(db)))
         .nest("/notes", with_crud_perms(Note::router(db)))
@@ -112,6 +122,12 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .nest("/sync_commands", with_crud_perms(SyncCommand::router(db)))
         .nest("/sync_events", with_crud_perms(SyncEvent::router(db)))
         .nest("/pairing_plans", with_crud_perms(PairingPlan::router(db)))
+        // Project-scoped API tokens may only mutate project-bound entities within their project
+        // (fails closed on the global catalog). No-op for Keycloak users and unscoped tokens.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_token_scope_on_crud,
+        ))
         .into();
 
     use crate::routes::private::{
@@ -152,6 +168,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route("/streams/{id}/import", post(stream_views::import_stream))
         .route("/streams/{id}/pair", post(stream_views::pair_stream))
         .route("/streams/{id}/unpair", post(stream_views::unpair_stream))
+        .layer(middleware::from_fn(deny_scoped_token))
         .layer(middleware::from_fn(require_write_metadata))
         .with_state(state.clone());
 
@@ -166,10 +183,13 @@ pub fn api_router(state: &AppState) -> Router<()> {
     let sensor_adopt_write = Router::new()
         .route("/sensors/{sensor_id}/adopt", post(sensor_adopt::adopt_sensor))
         .route("/actions/swap", post(sensor_adopt::swap_sensors))
+        .layer(middleware::from_fn(deny_scoped_token))
         .layer(middleware::from_fn(require_write_metadata))
         .with_state(state.clone());
 
-    let data_write_routes = Router::new()
+    // Data push paths. Each handler self-enforces project scope (a scoped token may only write
+    // within its project), so these stay reachable by per-client logger keys.
+    let data_push_routes = Router::new()
         .route("/ingest", post(ingest::ingest_readings))
         .route("/ingest/status_events", post(ingest::ingest_status_events))
         .route("/readings/batch", post(readings_batch::insert_batch_readings))
@@ -182,6 +202,12 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route("/readings/unflag", patch(flags::unflag_readings))
         .route("/readings/flag_range", patch(flags::flag_range))
         .route("/readings/unflag_range", patch(flags::unflag_range))
+        .layer(middleware::from_fn(require_write_data))
+        .with_state(state.clone());
+
+    // Operator / global data actions that span projects or have no per-project target. Denied to
+    // project-scoped tokens (a logger key has no reason to trigger a global reprocess/refresh).
+    let data_action_routes = Router::new()
         .route("/actions/refresh_aggregates", post(actions::refresh_aggregates))
         .route("/actions/compute_derived", post(actions::compute_derived))
         .route("/actions/rollback_deployment", post(actions::rollback_deployment))
@@ -189,6 +215,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route("/actions/backfill_attribution", post(actions::backfill_attribution))
         .route("/actions/backfill_calibrations", post(actions::backfill_calibrations))
         .route("/alarms/{event_id}/acknowledge", post(alarm_views::acknowledge_alarm).delete(alarm_views::unacknowledge_alarm))
+        .layer(middleware::from_fn(deny_scoped_token))
         .layer(middleware::from_fn(require_write_data))
         .with_state(state.clone());
 
@@ -236,6 +263,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
             post(merge::merge_parameters_handler),
         )
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
+        .layer(middleware::from_fn(deny_scoped_token))
         .layer(middleware::from_fn(require_write_metadata))
         .with_state(state.clone());
 
@@ -250,6 +278,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
     let sync_admin_write = Router::new()
         .nest("/sync", sync_views::write_routes())
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
+        .layer(middleware::from_fn(deny_scoped_token))
         .layer(middleware::from_fn(require_write_metadata))
         .with_state(state.clone());
 
@@ -270,15 +299,34 @@ pub fn api_router(state: &AppState) -> Router<()> {
             .with_state(state.clone())
     });
 
+    // Token lifecycle actions (revoke/rotate). Admin-only, like all token management.
+    let token_admin_routes = Router::new()
+        .route(
+            "/tokens/{id}/revoke",
+            post(crate::routes::private::api_tokens::views::revoke_token),
+        )
+        .route(
+            "/tokens/{id}/rotate",
+            post(crate::routes::private::api_tokens::views::rotate_token),
+        )
+        .route(
+            "/tokens/{id}/usage",
+            get(crate::routes::private::api_tokens::views::token_usage),
+        )
+        .layer(middleware::from_fn(require_admin))
+        .with_state(state.clone());
+
     let mut router = Router::new()
         .merge(entity_router)
+        .merge(token_admin_routes)
         .merge(stream_read_routes)
         .merge(sensor_view_read_routes)
         .merge(stream_write_routes)
         .merge(sensor_adopt_read)
         .merge(sensor_adopt_write)
         .merge(metadata_read_routes)
-        .merge(data_write_routes)
+        .merge(data_push_routes)
+        .merge(data_action_routes)
         .merge(data_read_routes)
         .merge(operator_action_routes)
         .merge(sync_admin_read)

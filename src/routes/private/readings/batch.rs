@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::common::{AppEvent, AppState};
 use crate::routes::private::readings;
 use crate::error::AppResult;
@@ -92,8 +93,13 @@ pub(crate) fn readings_on_conflict(mode: ConflictMode) -> sea_orm::sea_query::On
 )]
 pub async fn insert_batch_readings(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(payload): Json<BatchReadingsRequest>,
 ) -> AppResult<Json<BatchReadingsResponse>> {
+    // A project-scoped token may only write to sites within its project.
+    let target_sites: Vec<Uuid> = payload.readings.iter().map(|r| r.site_id).collect();
+    enforce_project_scope_for_sites(&state.db, scope, &target_sites).await?;
+
     // Validate timestamps are within reasonable bounds
     let now = chrono::Utc::now();
     let min_time = now - chrono::Duration::days(365 * 10); // 10 years ago

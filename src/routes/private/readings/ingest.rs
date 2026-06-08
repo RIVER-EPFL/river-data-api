@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::common::{AppEvent, AppState};
 use crate::routes::private::{data_streams, readings, status_events};
 use crate::error::{AppError, AppResult};
@@ -54,6 +55,7 @@ const BATCH_SIZE: usize = 1000;
 )]
 pub async fn ingest_readings(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(payload): Json<IngestReadingsRequest>,
 ) -> AppResult<Json<IngestResponse>> {
     if payload.readings.is_empty() {
@@ -98,6 +100,10 @@ pub async fn ingest_readings(
     };
 
     let paired = site_id.is_some();
+
+    // A project-scoped token may only ingest into a stream paired to a site within its project.
+    // An unpaired stream has no project, so a scoped token is rejected outright.
+    enforce_ingest_scope(&state.db, scope, site_id).await?;
 
     // Window-aware attribution: resolve calibration/deployment/site per reading TIME from the
     // sensor's windows, agreeing with reprocess_sensor_readings. The stream's frozen sensor_id is the
@@ -339,6 +345,7 @@ pub struct IngestStatusEventsResponse {
 )]
 pub async fn ingest_status_events(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(payload): Json<IngestStatusEventsRequest>,
 ) -> AppResult<Json<IngestStatusEventsResponse>> {
     if payload.events.is_empty() {
@@ -381,6 +388,8 @@ pub async fn ingest_status_events(
     };
 
     let paired = site_id.is_some();
+
+    enforce_ingest_scope(&state.db, scope, site_id).await?;
 
     let models: Vec<status_events::ActiveModel> = payload
         .events
@@ -430,4 +439,26 @@ pub async fn ingest_status_events(
         stream_id: payload.stream_id,
         paired,
     }))
+}
+
+/// Project-scope check for stream-based ingest. A scoped token may only write to a stream paired
+/// to a site within its project; an unpaired stream (no resolved site) is rejected outright so a
+/// scoped key cannot create unattributed, project-less data.
+async fn enforce_ingest_scope(
+    db: &sea_orm::DatabaseConnection,
+    scope: Option<Uuid>,
+    site_id: Option<Uuid>,
+) -> AppResult<()> {
+    if scope.is_none() {
+        return Ok(());
+    }
+    match site_id {
+        Some(sid) => enforce_project_scope_for_sites(db, scope, &[sid]).await?,
+        None => {
+            return Err(AppError::Forbidden(
+                "Project-scoped token cannot ingest into an unpaired stream".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }

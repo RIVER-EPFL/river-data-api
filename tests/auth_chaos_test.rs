@@ -137,14 +137,15 @@ async fn permission_json_null_uses_defaults() {
     let (db, app) = setup().await;
 
     // Insert directly with null permissions JSON to bypass the helper.
-    use river_db::routes::private::api_tokens::services::hash_token;
-    let raw = format!("test-null-{}", uuid::Uuid::new_v4());
-    let hash = hash_token(&raw);
+    use river_db::routes::private::api_tokens::services::mint_api_token;
+    let minted = mint_api_token();
+    let raw = minted.raw_token;
     common::db::exec(
         &db,
         &format!(
-            "INSERT INTO api_tokens (id, name, token_hash, permissions, is_active) \
-             VALUES (gen_random_uuid(), 'null-perms', '{hash}', 'null'::jsonb, true)"
+            "INSERT INTO api_tokens (id, name, token_hash, token_prefix, permissions, is_active) \
+             VALUES (gen_random_uuid(), 'null-perms', '{}', '{}', 'null'::jsonb, true)",
+            minted.token_hash, minted.token_prefix
         ),
     )
     .await;

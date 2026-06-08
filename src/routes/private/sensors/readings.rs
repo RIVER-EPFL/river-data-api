@@ -9,6 +9,7 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::middleware::{ProjectScope, sensor_in_scope};
 use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -82,6 +83,7 @@ pub struct SensorReadingsResponse {
 )]
 pub async fn get_sensor_readings(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Path(sensor_id): Path<Uuid>,
     Query(query): Query<SensorReadingsQuery>,
 ) -> AppResult<Json<SensorReadingsResponse>> {
@@ -101,6 +103,28 @@ pub async fn get_sensor_readings(
     let parameter_id: Option<Uuid> = meta.try_get("", "parameter_id").ok();
     let units: Option<String> = meta.try_get("", "default_units").ok();
 
+    // A project-scoped key may only read a sensor that has been deployed within its project, and
+    // even then only sees the readings attributed to in-project sites. A sensor never deployed in
+    // the project is reported as not-found (no cross-project existence disclosure).
+    if !sensor_in_scope(db, scope, sensor_id).await? {
+        return Err(AppError::NotFound("Sensor not found".to_string()));
+    }
+    // Appends `AND <col> IN (<scope project's sites>)` (and binds the project id) when scoped; a
+    // no-op for unscoped principals. Applied to every readings query below so the temporal extent
+    // and per-point series are both confined to the project.
+    let scope_filter = |values: &mut Vec<sea_orm::Value>, col: &str| -> String {
+        match scope {
+            Some(p) => {
+                values.push(p.into());
+                format!(
+                    " AND {col} IN (SELECT id FROM sites WHERE project_id = ${})",
+                    values.len()
+                )
+            }
+            None => String::new(),
+        }
+    };
+
     let resolution = query.resolution.as_deref().unwrap_or("raw");
     let bucket = resolution_interval(resolution);
     if query.resolution.as_deref().is_some_and(|r| r != "raw" && bucket.is_none()) {
@@ -110,12 +134,16 @@ pub async fn get_sensor_readings(
     }
 
     // Full reading extent for this sensor (drives the UI slider bounds, independent of the window).
+    let mut extent_vals: Vec<sea_orm::Value> = vec![sensor_id.into()];
+    let extent_scope = scope_filter(&mut extent_vals, "site_id");
     let extent = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT MIN(time) AS data_start, MAX(time) AS data_end
-              FROM readings WHERE sensor_id = $1 AND replicate_index = 0",
-            [sensor_id.into()],
+            &format!(
+                r"SELECT MIN(time) AS data_start, MAX(time) AS data_end
+                  FROM readings WHERE sensor_id = $1 AND replicate_index = 0{extent_scope}"
+            ),
+            extent_vals,
         ))
         .await?;
     let data_start = extent
@@ -130,16 +158,20 @@ pub async fn get_sensor_readings(
     // Earliest reading at the sensor's OPEN deployment slot (same site + parameter, any sensor_id) —
     // the true backdate target. Unattributed history (sensor_id NULL) is invisible to `data_start`
     // but lives here, and backdating `deployed_from` to it lets the slot reprocess claim it.
+    let mut slot_vals: Vec<sea_orm::Value> = vec![sensor_id.into()];
+    let slot_scope = scope_filter(&mut slot_vals, "r.site_id");
     let slot_data_start = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT MIN(r.time) AS slot_start
-              FROM readings r
-              JOIN sensor_deployments d
-                ON d.sensor_id = $1 AND d.deployed_until IS NULL
-              WHERE r.site_id = d.site_id AND r.parameter_id = d.parameter_id
-                AND r.replicate_index = 0",
-            [sensor_id.into()],
+            &format!(
+                r"SELECT MIN(r.time) AS slot_start
+                  FROM readings r
+                  JOIN sensor_deployments d
+                    ON d.sensor_id = $1 AND d.deployed_until IS NULL
+                  WHERE r.site_id = d.site_id AND r.parameter_id = d.parameter_id
+                    AND r.replicate_index = 0{slot_scope}"
+            ),
+            slot_vals,
         ))
         .await?
         .and_then(|r| r.try_get::<DateTime<chrono::FixedOffset>>("", "slot_start").ok())
@@ -165,6 +197,7 @@ pub async fn get_sensor_readings(
               WHERE sensor_id = $1 AND replicate_index = 0",
         )
     };
+    sql.push_str(&scope_filter(&mut values, "site_id"));
     if let Some(start) = query.start {
         values.push(start.into());
         sql.push_str(&format!(" AND time >= ${}", values.len()));
@@ -268,10 +301,17 @@ pub struct SensorDeploymentBandsResponse {
 )]
 pub async fn get_sensor_deployment_bands(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Path(sensor_id): Path<Uuid>,
     Query(query): Query<SensorBandsQuery>,
 ) -> AppResult<Json<SensorDeploymentBandsResponse>> {
     let db = &state.db;
+
+    // A project-scoped key only sees a sensor deployed within its project, and only the bands at
+    // in-project sites (a field sensor can move between projects).
+    if !sensor_in_scope(db, scope, sensor_id).await? {
+        return Err(AppError::NotFound("Sensor not found".to_string()));
+    }
 
     let mut sql = String::from(
         r"SELECT d.id AS deployment_id, d.site_id, s.name AS site_name,
@@ -281,6 +321,10 @@ pub async fn get_sensor_deployment_bands(
           WHERE d.sensor_id = $1",
     );
     let mut values: Vec<sea_orm::Value> = vec![sensor_id.into()];
+    if let Some(project) = scope {
+        values.push(project.into());
+        sql.push_str(&format!(" AND s.project_id = ${}", values.len()));
+    }
     if let Some(end) = query.end {
         values.push(end.into());
         sql.push_str(&format!(" AND d.deployed_from < ${}", values.len()));

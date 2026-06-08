@@ -9,6 +9,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::middleware::{ProjectScope, sensor_in_scope};
 use crate::error::{AppError, AppResult};
 
 /// One reading the calibration's `[valid_from, valid_until)` window resolves.
@@ -50,6 +51,7 @@ const MAX_POINTS: i64 = 2000;
 )]
 pub async fn get_calibration_window(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Path(calibration_id): Path<Uuid>,
 ) -> AppResult<Json<CalibrationWindowResponse>> {
     let db = &state.db;
@@ -67,6 +69,25 @@ pub async fn get_calibration_window(
         .ok_or_else(|| AppError::NotFound("Calibration not found".to_string()))?;
 
     let sensor_id: Uuid = cal.try_get("", "sensor_id")?;
+
+    // A project-scoped key may only inspect a calibration whose sensor is deployed within its
+    // project, and only sees the window's in-project readings.
+    if !sensor_in_scope(db, scope, sensor_id).await? {
+        return Err(AppError::NotFound("Calibration not found".to_string()));
+    }
+    // Appends `AND site_id IN (<scope project's sites>)` (binding the project id) when scoped.
+    let scope_clause = |values: &mut Vec<sea_orm::Value>| -> String {
+        match scope {
+            Some(p) => {
+                values.push(p.into());
+                format!(
+                    " AND site_id IN (SELECT id FROM sites WHERE project_id = ${})",
+                    values.len()
+                )
+            }
+            None => String::new(),
+        }
+    };
     let parameter_id: Option<Uuid> = cal.try_get("", "parameter_id").ok();
     let slope: f64 = cal.try_get("", "slope")?;
     let intercept: f64 = cal.try_get("", "intercept")?;
@@ -80,29 +101,39 @@ pub async fn get_calibration_window(
     };
 
     // The window is [valid_from, COALESCE(valid_until, 'infinity')).
+    let mut count_vals: Vec<sea_orm::Value> = vec![sensor_id.into(), vf.clone(), vu.clone()];
+    let count_scope = scope_clause(&mut count_vals);
     let count_row = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT COUNT(*) AS c FROM readings
-              WHERE sensor_id = $1 AND replicate_index = 0
-                AND time >= $2
-                AND time < COALESCE($3, 'infinity'::timestamptz)",
-            [sensor_id.into(), vf.clone(), vu.clone()],
+            &format!(
+                r"SELECT COUNT(*) AS c FROM readings
+                  WHERE sensor_id = $1 AND replicate_index = 0
+                    AND time >= $2
+                    AND time < COALESCE($3, 'infinity'::timestamptz){count_scope}"
+            ),
+            count_vals,
         ))
         .await?;
     let point_count: i64 = count_row.and_then(|r| r.try_get("", "c").ok()).unwrap_or(0);
 
+    let mut point_vals: Vec<sea_orm::Value> = vec![sensor_id.into(), vf, vu];
+    let point_scope = scope_clause(&mut point_vals);
+    point_vals.push(MAX_POINTS.into());
+    let limit_idx = point_vals.len();
     let rows = db
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT time, raw_value, calibrated_value, COALESCE(is_flagged, false) AS is_flagged
-              FROM readings
-              WHERE sensor_id = $1 AND replicate_index = 0
-                AND time >= $2
-                AND time < COALESCE($3, 'infinity'::timestamptz)
-              ORDER BY time DESC
-              LIMIT $4",
-            [sensor_id.into(), vf, vu, MAX_POINTS.into()],
+            &format!(
+                r"SELECT time, raw_value, calibrated_value, COALESCE(is_flagged, false) AS is_flagged
+                  FROM readings
+                  WHERE sensor_id = $1 AND replicate_index = 0
+                    AND time >= $2
+                    AND time < COALESCE($3, 'infinity'::timestamptz){point_scope}
+                  ORDER BY time DESC
+                  LIMIT ${limit_idx}"
+            ),
+            point_vals,
         ))
         .await?;
 

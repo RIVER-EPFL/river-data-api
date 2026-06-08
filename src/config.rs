@@ -37,6 +37,9 @@ pub struct Config {
 
     // Caching
     pub cache_ttl_seconds: u64,
+    // API-token validation cache TTL (seconds). Short so revocations/expiries take effect quickly;
+    // revoke/rotate also bust the cache explicitly.
+    pub token_cache_ttl_seconds: u64,
     pub cache_max_bytes: u64,
 
     // Application metadata
@@ -67,6 +70,17 @@ pub struct Config {
     // Public API rate limit (token bucket: burst_size cells, refilled 1 per period)
     pub public_rate_limit_burst: u32,
     pub public_rate_limit_period_secs: u64,
+
+    // Authenticated-tier per-IP rate limit, in true requests/second (+ burst). Generous by design —
+    // auth is still the primary gate; this only bounds an auth-failure / argon2 flood from a single
+    // client IP, and real loggers push infrequent large batches well under it. Honors
+    // DISABLE_RATE_LIMITING.
+    pub auth_rate_limit_per_second: u64,
+    pub auth_rate_limit_burst: u32,
+
+    // Forensic audit log of API-token use (token_id/method/path/status per request). On by default
+    // for the public-facing key surface; best-effort and fire-and-forget so it never blocks a request.
+    pub audit_api_token_use: bool,
 
     // Derived-parameter janitor
     pub janitor_interval_seconds: u64,
@@ -128,6 +142,10 @@ impl Config {
                 .unwrap_or_else(|_| "300".to_string())
                 .parse()
                 .unwrap_or(300), // 5 minutes default
+            token_cache_ttl_seconds: env::var("TOKEN_CACHE_TTL_SECONDS")
+                .unwrap_or_else(|_| "15".to_string())
+                .parse()
+                .unwrap_or(15), // 15s default — fast revocation, low DB load
             cache_max_bytes: env::var("CACHE_MAX_BYTES")
                 .unwrap_or_else(|_| "209715200".to_string())
                 .parse()
@@ -193,6 +211,20 @@ impl Config {
                 .unwrap_or_else(|_| "2".to_string())
                 .parse()
                 .unwrap_or(2),
+
+            auth_rate_limit_per_second: env::var("AUTH_RATE_LIMIT_PER_SECOND")
+                .unwrap_or_else(|_| "100".to_string())
+                .parse()
+                .unwrap_or(100),
+            auth_rate_limit_burst: env::var("AUTH_RATE_LIMIT_BURST")
+                .unwrap_or_else(|_| "200".to_string())
+                .parse()
+                .unwrap_or(200),
+
+            audit_api_token_use: env::var("AUDIT_API_TOKEN_USE")
+                .unwrap_or_else(|_| "true".to_string())
+                .parse()
+                .unwrap_or(true),
 
             // Derived-parameter janitor
             janitor_interval_seconds: env::var("JANITOR_INTERVAL_SECONDS")

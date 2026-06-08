@@ -19,6 +19,7 @@ use std::sync::Arc;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::common::{AppEvent, AppState};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams::services::get_or_create_api_stream;
@@ -165,6 +166,7 @@ fn parse_datetime(s: &str, tz_offset: chrono::Duration) -> Option<chrono::DateTi
 )]
 pub async fn import_csv(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(req): Json<ImportCsvRequest>,
 ) -> AppResult<Json<ImportCsvResponse>> {
     // --- Resolve CSV text: from request body or staging cache ---------------------------------
@@ -188,6 +190,9 @@ pub async fn import_csv(
 
     let (site, _project) = resolve_site_with_project(&state.db, &req.site).await?;
     let site_id = site.id;
+
+    // A project-scoped token may only import into a site within its project.
+    enforce_project_scope_for_sites(&state.db, scope, &[site_id]).await?;
 
     // --- Resolution tables (site_parameter-first) ---------------------------------------------
 

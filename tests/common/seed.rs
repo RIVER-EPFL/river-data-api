@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use super::db::exec;
 use super::fixtures::*;
-use river_db::routes::private::api_tokens::services::hash_token;
+use river_db::routes::private::api_tokens::services::{hash_token, mint_api_token};
 
 // ============================================================================
 // Full seed orchestrator
@@ -348,21 +348,45 @@ pub async fn seed_api_token(
     permissions: serde_json::Value,
     project_scope: Option<&str>,
 ) -> String {
-    let raw_token = format!("test-token-{}", Uuid::new_v4());
-    let token_hash = hash_token(&raw_token);
+    let minted = mint_api_token();
     let scope_sql = project_scope.map_or("NULL".to_string(), |s| format!("'{s}'"));
     let perm_json = serde_json::to_string(&permissions).unwrap();
 
     exec(
         db,
         &format!(
-            "INSERT INTO api_tokens (id, name, token_hash, project_scope, permissions, is_active) \
-             VALUES (gen_random_uuid(), 'test-token', '{token_hash}', {scope_sql}, '{perm_json}'::jsonb, true)"
+            "INSERT INTO api_tokens (id, name, token_hash, token_prefix, project_scope, permissions, is_active) \
+             VALUES (gen_random_uuid(), 'test-token', '{}', '{}', {scope_sql}, '{perm_json}'::jsonb, true)",
+            minted.token_hash, minted.token_prefix
         ),
     )
     .await;
 
-    raw_token
+    minted.raw_token
+}
+
+/// Seed an active token carrying a per-token rate limit (requests/second).
+pub async fn seed_api_token_with_rate_limit(
+    db: &DatabaseConnection,
+    permissions: serde_json::Value,
+    project_scope: Option<&str>,
+    rate_limit_per_second: i32,
+) -> String {
+    let minted = mint_api_token();
+    let scope_sql = project_scope.map_or("NULL".to_string(), |s| format!("'{s}'"));
+    let perm_json = serde_json::to_string(&permissions).unwrap();
+
+    exec(
+        db,
+        &format!(
+            "INSERT INTO api_tokens (id, name, token_hash, token_prefix, project_scope, permissions, is_active, rate_limit_per_second) \
+             VALUES (gen_random_uuid(), 'test-token-rl', '{}', '{}', {scope_sql}, '{perm_json}'::jsonb, true, {rate_limit_per_second})",
+            minted.token_hash, minted.token_prefix
+        ),
+    )
+    .await;
+
+    minted.raw_token
 }
 
 pub async fn seed_api_token_with_expiry(
@@ -371,8 +395,7 @@ pub async fn seed_api_token_with_expiry(
     project_scope: Option<&str>,
     expires_at: chrono::DateTime<Utc>,
 ) -> String {
-    let raw_token = format!("test-token-{}", Uuid::new_v4());
-    let token_hash = hash_token(&raw_token);
+    let minted = mint_api_token();
     let scope_sql = project_scope.map_or("NULL".to_string(), |s| format!("'{s}'"));
     let perm_json = serde_json::to_string(&permissions).unwrap();
     let expires_str = expires_at.to_rfc3339();
@@ -380,33 +403,34 @@ pub async fn seed_api_token_with_expiry(
     exec(
         db,
         &format!(
-            "INSERT INTO api_tokens (id, name, token_hash, project_scope, permissions, is_active, expires_at) \
-             VALUES (gen_random_uuid(), 'test-token', '{token_hash}', {scope_sql}, '{perm_json}'::jsonb, true, '{expires_str}')"
+            "INSERT INTO api_tokens (id, name, token_hash, token_prefix, project_scope, permissions, is_active, expires_at) \
+             VALUES (gen_random_uuid(), 'test-token', '{}', '{}', {scope_sql}, '{perm_json}'::jsonb, true, '{expires_str}')",
+            minted.token_hash, minted.token_prefix
         ),
     )
     .await;
 
-    raw_token
+    minted.raw_token
 }
 
 pub async fn seed_inactive_api_token(
     db: &DatabaseConnection,
     permissions: serde_json::Value,
 ) -> String {
-    let raw_token = format!("test-token-{}", Uuid::new_v4());
-    let token_hash = hash_token(&raw_token);
+    let minted = mint_api_token();
     let perm_json = serde_json::to_string(&permissions).unwrap();
 
     exec(
         db,
         &format!(
-            "INSERT INTO api_tokens (id, name, token_hash, permissions, is_active) \
-             VALUES (gen_random_uuid(), 'test-token-inactive', '{token_hash}', '{perm_json}'::jsonb, false)"
+            "INSERT INTO api_tokens (id, name, token_hash, token_prefix, permissions, is_active) \
+             VALUES (gen_random_uuid(), 'test-token-inactive', '{}', '{}', '{perm_json}'::jsonb, false)",
+            minted.token_hash, minted.token_prefix
         ),
     )
     .await;
 
-    raw_token
+    minted.raw_token
 }
 
 // ============================================================================

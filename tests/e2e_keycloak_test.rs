@@ -1,170 +1,162 @@
-//! End-to-end tests against the running docker compose stack with Keycloak.
+//! Keycloak auth tests — the in-process app validating REAL JWTs from the **dev Keycloak**.
 //!
-//! These tests are `#[ignore]` by default — they require:
-//!   docker compose --profile auth up -d   # in river-data-ui/
+//! These reuse the dev Keycloak (realm `river-data`; users `admin/admin` + `user/user`) for token
+//! issuance and JWKS validation, while running the API in-process against the **test DB**. They
+//! cover the Keycloak side of the capability model that the default `keycloak_auth_instance: None`
+//! harness can't: `require_admin` accepts a real `riverdata-admin` JWT, a `riverdata-user` is denied
+//! admin + `write_metadata` but allowed `write_data`, anonymous is 401, and the public tier is open.
 //!
-//! Run with:
-//!   cargo test --test e2e_keycloak_test -- --ignored --test-threads=1
-//!
-//! Why we need these: in-process tests can only verify that API tokens get rejected
-//! by `require_admin`. They can't verify the Keycloak acceptance path because the
-//! test harness passes `keycloak_auth_instance: None`. These tests confirm that a real
-//! Keycloak `riverdata-admin` JWT does in fact reach admin endpoints, and a regular
-//! `riverdata-user` JWT does not.
+//! They auto-skip when Keycloak is unreachable, so the default `cargo test` stays green without it.
+//! Run with the dev stack up (Keycloak on :8180):
+//!   DATABASE_URL=… cargo test --test e2e_keycloak_test -- --test-threads=1
+//! Override the Keycloak URL with `TEST_KEYCLOAK_URL` (the watcher container uses
+//! `http://river-db-keycloak:8080/`).
 
-use serde_json::Value;
+mod common;
 
-const KEYCLOAK_TOKEN_URL: &str =
-    "http://localhost:8089/realms/river-data/protocol/openid-connect/token";
-const API_BASE: &str = "http://localhost:3005";
+use common::fixtures::{GLOBAL_PARAM_TEMP_ID, SITE1_ID};
+use common::keycloak::{build_test_app_with_keycloak, get_keycloak_jwt, keycloak_reachable};
+use serial_test::serial;
 
-async fn get_keycloak_jwt(client: &reqwest::Client, username: &str, password: &str) -> String {
-    let resp = client
-        .post(KEYCLOAK_TOKEN_URL)
-        .form(&[
-            ("grant_type", "password"),
-            ("client_id", "river-data-ui-local"),
-            ("username", username),
-            ("password", password),
-        ])
-        .send()
-        .await
-        .expect("Keycloak unreachable (did you `docker compose --profile auth up -d`?)");
-    let status = resp.status();
-    let body: Value = resp.json().await.expect("Keycloak returned non-JSON");
-    assert!(status.is_success(), "Keycloak token request failed: {body}");
-    body["access_token"]
-        .as_str()
-        .expect("no access_token in Keycloak response")
-        .to_string()
+/// Skip-guard: prints and returns when Keycloak isn't reachable. libtest has no runtime-skip, so a
+/// skipped test reports as `passed`; the `eprintln!` makes that visible.
+macro_rules! require_keycloak {
+    () => {
+        if !keycloak_reachable().await {
+            eprintln!(
+                "SKIP: keycloak unreachable (start the dev stack, or set TEST_KEYCLOAK_URL)"
+            );
+            return;
+        }
+    };
 }
 
-async fn api_get(client: &reqwest::Client, path: &str, token: Option<&str>) -> u16 {
-    let url = format!("{API_BASE}{path}");
-    let mut req = client.get(&url);
-    if let Some(t) = token {
-        req = req.bearer_auth(t);
-    }
-    req.send().await.expect("API unreachable").status().as_u16()
+async fn seeded_app() -> (sea_orm::DatabaseConnection, axum::Router) {
+    let db = common::setup_test_db().await;
+    common::cleanup_test_db(&db).await;
+    common::seed_test_data(&db).await;
+    let app = build_test_app_with_keycloak(db.clone()).await;
+    (db, app)
 }
 
-async fn api_post(
-    client: &reqwest::Client,
-    path: &str,
-    body: &Value,
-    token: Option<&str>,
-) -> u16 {
-    let url = format!("{API_BASE}{path}");
-    let mut req = client.post(&url).json(body);
-    if let Some(t) = token {
-        req = req.bearer_auth(t);
-    }
-    req.send().await.expect("API unreachable").status().as_u16()
+fn now_rfc3339() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 #[tokio::test]
-#[ignore]
+#[serial]
 async fn keycloak_admin_can_reach_admin_routes() {
-    let client = reqwest::Client::new();
-    let jwt = get_keycloak_jwt(&client, "admin", "admin").await;
+    require_keycloak!();
+    let (_db, app) = seeded_app().await;
+    let jwt = get_keycloak_jwt("admin", "admin").await;
 
-    let status = api_get(&client, "/api/tokens", Some(&jwt)).await;
-    assert!(
-        (200..=299).contains(&status),
-        "admin Keycloak JWT on /api/tokens got {status} (expected 2xx)"
-    );
-
-    let status = api_get(&client, "/api/sync_service_credentials", Some(&jwt)).await;
-    assert!(
-        (200..=299).contains(&status),
-        "admin Keycloak JWT on /sync_service_credentials got {status}"
-    );
+    let (s, _) = common::get_with_token(&app, "/api/tokens", &jwt).await;
+    assert_eq!(s, 200, "admin JWT must reach /api/tokens");
+    let (s, _) = common::get_with_token(&app, "/api/sync_service_credentials", &jwt).await;
+    assert_eq!(s, 200, "admin JWT must reach /api/sync_service_credentials");
+    // The new admin-only forensic audit log is reachable for a real admin JWT.
+    let (s, _) = common::get_with_token(&app, "/api/api_token_audit_logs", &jwt).await;
+    assert_eq!(s, 200, "admin JWT must reach the audit log");
 }
 
 #[tokio::test]
-#[ignore]
+#[serial]
 async fn keycloak_user_cannot_reach_admin_routes() {
-    let client = reqwest::Client::new();
-    let jwt = get_keycloak_jwt(&client, "user", "user").await;
+    require_keycloak!();
+    let (_db, app) = seeded_app().await;
+    let jwt = get_keycloak_jwt("user", "user").await;
 
-    let status = api_get(&client, "/api/tokens", Some(&jwt)).await;
-    assert_eq!(
-        status, 403,
-        "non-admin Keycloak JWT on /api/tokens got {status} (expected 403)"
-    );
-
-    let status = api_post(
-        &client,
+    let (s, _) = common::get_with_token(&app, "/api/tokens", &jwt).await;
+    assert_eq!(s, 403, "non-admin JWT on /api/tokens must be 403");
+    let (s, _) = common::post_json_with_token(
+        &app,
         "/api/sync/credentials",
         &serde_json::json!({"name": "blocked"}),
-        Some(&jwt),
+        &jwt,
     )
     .await;
-    assert_eq!(
-        status, 403,
-        "non-admin Keycloak JWT on POST /sync/credentials got {status} (expected 403)"
-    );
+    assert_eq!(s, 403, "non-admin JWT on POST /sync/credentials must be 403");
+    let (s, _) = common::get_with_token(&app, "/api/api_token_audit_logs", &jwt).await;
+    assert_eq!(s, 403, "non-admin JWT must not read the audit log");
 }
 
 #[tokio::test]
-#[ignore]
+#[serial]
 async fn keycloak_user_can_read_metadata() {
-    let client = reqwest::Client::new();
-    let jwt = get_keycloak_jwt(&client, "user", "user").await;
+    require_keycloak!();
+    let (_db, app) = seeded_app().await;
+    let jwt = get_keycloak_jwt("user", "user").await;
 
-    let status = api_get(&client, "/api/projects", Some(&jwt)).await;
-    assert!(
-        (200..=299).contains(&status),
-        "non-admin Keycloak JWT must still read metadata, got {status}"
-    );
-
-    let status = api_get(&client, "/api/search?q=site", Some(&jwt)).await;
-    assert!(
-        (200..=299).contains(&status),
-        "non-admin Keycloak JWT must still search, got {status}"
-    );
+    let (s, _) = common::get_with_token(&app, "/api/projects", &jwt).await;
+    assert_eq!(s, 200, "non-admin JWT must read metadata");
+    let (s, _) = common::get_with_token(&app, "/api/search?q=Station", &jwt).await;
+    assert_eq!(s, 200, "non-admin JWT must search");
 }
 
 #[tokio::test]
-#[ignore]
+#[serial]
+async fn keycloak_capability_mapping_user_vs_admin() {
+    require_keycloak!();
+    let (_db, app) = seeded_app().await;
+    let user = get_keycloak_jwt("user", "user").await;
+    let admin = get_keycloak_jwt("admin", "admin").await;
+
+    // write_metadata is Keycloak-Administrator-only: a non-admin user is denied a CRUD mutation...
+    let param = serde_json::json!({
+        "code": "kc_new", "name": "KC New", "default_units": "x",
+        "category": "measurement", "aliases": []
+    });
+    let (s, _) = common::post_json_with_token(&app, "/api/parameters", &param, &user).await;
+    assert_eq!(s, 403, "a non-admin Keycloak user must be denied write_metadata");
+    // ...but the admin is allowed (auth passes; a 2xx confirms the create).
+    let (s, body) = common::post_json_with_token(&app, "/api/parameters", &param, &admin).await;
+    assert!((200..300).contains(&s), "admin must be allowed write_metadata: {body}");
+
+    // write_data is granted to ANY authenticated Keycloak user.
+    let t = now_rfc3339();
+    let batch = serde_json::json!({
+        "readings": [{ "site_id": SITE1_ID, "parameter_id": GLOBAL_PARAM_TEMP_ID, "time": t, "raw_value": 1.0 }]
+    });
+    let (s, body) = common::post_json_with_token(&app, "/api/readings/batch", &batch, &user).await;
+    assert_eq!(s, 200, "any Keycloak user has write_data: {body}");
+}
+
+#[tokio::test]
+#[serial]
 async fn anonymous_blocked_from_admin_routes_returns_401() {
-    let client = reqwest::Client::new();
-    let status = api_get(&client, "/api/tokens", None).await;
-    assert_eq!(status, 401, "anonymous on admin route should be 401, got {status}");
+    require_keycloak!();
+    let (_db, app) = seeded_app().await;
+    let (s, _) = common::get(&app, "/api/tokens").await;
+    assert_eq!(s, 401, "anonymous on an admin route must be 401");
 }
 
 #[tokio::test]
-#[ignore]
+#[serial]
 async fn public_endpoints_work_without_keycloak() {
-    let client = reqwest::Client::new();
-    let status = api_get(&client, "/api/public", None).await;
-    assert!(
-        (200..=299).contains(&status),
-        "public discovery must work without auth, got {status}"
-    );
+    require_keycloak!();
+    let (_db, app) = seeded_app().await;
+    let (s, _) = common::get(&app, "/api/public").await;
+    assert!((200..300).contains(&s), "public discovery must work without auth");
 }
 
 #[tokio::test]
-#[ignore]
+#[serial]
 async fn keycloak_admin_can_post_sync_credentials() {
-    // The hardest path to test in-process: a real Keycloak admin JWT is the ONLY thing
-    // that should pass require_admin on POST /sync/credentials. In-process tests prove
-    // the deny side (no token can pass); this proves the allow side.
-    let client = reqwest::Client::new();
-    let jwt = get_keycloak_jwt(&client, "admin", "admin").await;
+    require_keycloak!();
+    let (_db, app) = seeded_app().await;
+    let jwt = get_keycloak_jwt("admin", "admin").await;
 
-    let status = api_post(
-        &client,
+    // The allow side of `require_admin`: a real admin JWT must PASS the gate. The handler's business
+    // outcome (created / conflict / validation) is incidental — assert only that auth was accepted.
+    let (s, body) = common::post_json_with_token(
+        &app,
         "/api/sync/credentials",
-        &serde_json::json!({"name": "e2e-test-cred"}),
-        Some(&jwt),
+        &serde_json::json!({"name": "e2e-test-cred", "service_type": "vaisala"}),
+        &jwt,
     )
     .await;
-    // 200/201 = created; the e2e test isn't responsible for cleanup, so we accept any
-    // 2xx outcome and rely on the test DB being recycled by `docker compose --profile test`.
-    // 409 (conflict on duplicate name) is also acceptable on re-runs.
     assert!(
-        (200..=299).contains(&status) || status == 409,
-        "admin JWT POST /sync/credentials got {status} (expected 2xx or 409)"
+        s != 401 && s != 403,
+        "admin JWT must pass require_admin on POST /sync/credentials, got {s}: {body}"
     );
 }

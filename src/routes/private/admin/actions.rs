@@ -5,6 +5,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::middleware::{DenyScoped, ProjectScope, enforce_project_scope_for_sites};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensor_calibrations::services::{
     evaluate_formula, recalculate_derived_at_timestamp, recompute_deployed_until,
@@ -503,9 +504,13 @@ fn extract_variables(formula: &str) -> Vec<String> {
 )]
 pub async fn preview_derived(
     State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(payload): Json<PreviewDerivedRequest>,
 ) -> AppResult<Json<PreviewDerivedResponse>> {
     use sea_orm::{ConnectionTrait, Statement};
+
+    // A project-scoped key may only preview a derived computation against a site in its project.
+    enforce_project_scope_for_sites(&app_state.db, scope, &[payload.site_id]).await?;
 
     // Validate formula
     if payload.formula.len() > 1000 {
@@ -810,6 +815,7 @@ async fn fetch_backfill_candidates(
 )]
 pub async fn backfill_candidates(
     State(app_state): State<AppState>,
+    _: DenyScoped,
 ) -> AppResult<Json<BackfillCandidatesResponse>> {
     let candidates = fetch_backfill_candidates(&app_state.db).await?;
 
@@ -1048,6 +1054,7 @@ async fn fetch_calibration_candidates(
 )]
 pub async fn calibration_candidates(
     State(app_state): State<AppState>,
+    _: DenyScoped,
 ) -> AppResult<Json<CalibrationBackfillCandidatesResponse>> {
     let candidates = fetch_calibration_candidates(&app_state.db).await?;
     let total_uncalibrated: i64 = candidates.iter().map(|c| c.uncalibrated_count).sum();

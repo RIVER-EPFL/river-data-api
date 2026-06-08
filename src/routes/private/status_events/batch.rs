@@ -6,6 +6,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::routes::private::status_events;
 use crate::error::AppResult;
 use crate::routes::private::data_streams::services::get_or_create_api_stream;
@@ -45,8 +46,12 @@ const BATCH_SIZE: usize = 1000;
 )]
 pub async fn insert_batch_status_events(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(payload): Json<BatchStatusEventsRequest>,
 ) -> AppResult<Json<BatchStatusEventsResponse>> {
+    let target_sites: Vec<Uuid> = payload.events.iter().map(|e| e.site_id).collect();
+    enforce_project_scope_for_sites(&state.db, scope, &target_sites).await?;
+
     let mut stream_cache: HashMap<(Uuid, Uuid), Uuid> = HashMap::new();
 
     for e in &payload.events {

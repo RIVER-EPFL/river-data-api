@@ -434,8 +434,10 @@ pub fn build_router(state: AppState) -> Router {
     // Public API routes
     let public_routes = public_api::public_router();
 
-    // Apply dual auth (Keycloak JWT OR API token).
-    // No rate limiting on authenticated tier — auth is the gate.
+    // Apply dual auth (Keycloak JWT OR API token). Auth is the primary gate; a generous per-client-IP
+    // limiter sits in front of it so an unauthenticated flood (e.g. of invalid tokens, each costing an
+    // argon2 verification) is bounded per source IP without throttling real loggers, which push large
+    // batches infrequently and stay well under the limit.
     let api_authed = {
         let mut r = api_inner.layer(middleware::from_fn_with_state(
             state.clone(),
@@ -454,6 +456,22 @@ pub fn build_router(state: AppState) -> Router {
             );
         } else {
             tracing::warn!("API routes are not protected by Keycloak (API tokens still work)");
+        }
+        if !config.disable_rate_limiting {
+            // `auth_rate_limit_per_second` is a true requests/second rate; tower_governor replenishes
+            // one cell per `period`, so convert: period = 1s / rate (a sub-second interval). Layered
+            // last → outermost, so the IP check runs before Keycloak/token validation.
+            let rate = config.auth_rate_limit_per_second.max(1);
+            let period_nanos = (1_000_000_000u64 / rate).max(1);
+            let auth_limiter = GovernorConfigBuilder::default()
+                .key_extractor(FallbackIpKeyExtractor)
+                .period(Duration::from_nanos(period_nanos))
+                .burst_size(config.auth_rate_limit_burst)
+                .finish()
+                .expect("Failed to create authenticated-tier rate limiter");
+            r = r.layer(GovernorLayer {
+                config: Arc::new(auth_limiter),
+            });
         }
         r
     };

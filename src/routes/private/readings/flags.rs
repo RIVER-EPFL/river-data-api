@@ -6,6 +6,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -44,6 +45,7 @@ pub struct FlagReadingsResponse {
 )]
 pub async fn flag_readings(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(payload): Json<FlagReadingsRequest>,
 ) -> AppResult<Json<FlagReadingsResponse>> {
     if payload.readings.is_empty() {
@@ -52,6 +54,9 @@ pub async fn flag_readings(
     if payload.reason.trim().is_empty() {
         return Err(AppError::BadRequest("Reason is required".to_string()));
     }
+
+    let target_sites: Vec<Uuid> = payload.readings.iter().map(|r| r.site_id).collect();
+    enforce_project_scope_for_sites(&state.db, scope, &target_sites).await?;
 
     let mut total_updated = 0u64;
 
@@ -136,11 +141,15 @@ pub async fn flag_readings(
 )]
 pub async fn unflag_readings(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(payload): Json<UnflagReadingsRequest>,
 ) -> AppResult<Json<FlagReadingsResponse>> {
     if payload.readings.is_empty() {
         return Err(AppError::BadRequest("No readings specified".to_string()));
     }
+
+    let target_sites: Vec<Uuid> = payload.readings.iter().map(|r| r.site_id).collect();
+    enforce_project_scope_for_sites(&state.db, scope, &target_sites).await?;
 
     let mut total_updated = 0u64;
 
@@ -265,6 +274,7 @@ async fn refresh_aggregates_for_range(
 )]
 pub async fn flag_range(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(payload): Json<FlagRangeRequest>,
 ) -> AppResult<Json<FlagReadingsResponse>> {
     if payload.reason.trim().is_empty() {
@@ -273,6 +283,7 @@ pub async fn flag_range(
     if payload.end_time < payload.start_time {
         return Err(AppError::BadRequest("end_time must be >= start_time".to_string()));
     }
+    enforce_project_scope_for_sites(&state.db, scope, &[payload.site_id]).await?;
 
     let result = state
         .db
@@ -320,11 +331,13 @@ pub async fn flag_range(
 )]
 pub async fn unflag_range(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(payload): Json<UnflagRangeRequest>,
 ) -> AppResult<Json<FlagReadingsResponse>> {
     if payload.end_time < payload.start_time {
         return Err(AppError::BadRequest("end_time must be >= start_time".to_string()));
     }
+    enforce_project_scope_for_sites(&state.db, scope, &[payload.site_id]).await?;
 
     let result = state
         .db

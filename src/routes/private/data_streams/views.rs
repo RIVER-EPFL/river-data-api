@@ -8,6 +8,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::middleware::ProjectScope;
 use crate::routes::private::{data_streams, site_parameters};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::operations::{close_sensor_deployment, create_sensor_for_stream};
@@ -39,13 +40,38 @@ pub struct StreamStatsResponse {
 )]
 pub async fn stream_stats(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<StreamStatsResponse>> {
     // Verify stream exists
-    data_streams::Entity::find_by_id(id)
+    let stream = data_streams::Entity::find_by_id(id)
         .one(&state.db)
         .await?
         .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
+
+    // A project-scoped key may only inspect a stream paired into its own project. An unpaired or
+    // cross-project stream is reported as not-found (rather than 403) so a scoped key can't even
+    // confirm the existence of another project's streams.
+    if let Some(project) = scope {
+        let in_scope = match stream.site_parameter_id {
+            Some(sp_id) => {
+                state
+                    .db
+                    .query_one(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        "SELECT s.project_id FROM site_parameters sp JOIN sites s ON s.id = sp.site_id WHERE sp.id = $1",
+                        [sp_id.into()],
+                    ))
+                    .await?
+                    .and_then(|r| r.try_get::<Uuid>("", "project_id").ok())
+                    == Some(project)
+            }
+            None => false,
+        };
+        if !in_scope {
+            return Err(AppError::NotFound("Stream not found".to_string()));
+        }
+    }
 
     let row = state.db
         .query_one(Statement::from_sql_and_values(

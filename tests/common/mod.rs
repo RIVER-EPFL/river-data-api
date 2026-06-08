@@ -2,6 +2,7 @@ pub mod client;
 pub mod db;
 pub mod e2e;
 pub mod fixtures;
+pub mod keycloak;
 pub mod seed;
 pub mod sensor_lifecycle;
 
@@ -21,6 +22,15 @@ pub fn build_test_app(db: DatabaseConnection) -> axum::Router {
     river_db::routes::build_router(state)
 }
 
+/// Build an `AppState` (and a router that shares it) so tests can both drive HTTP requests and
+/// call admin-only handlers (e.g. token revoke/rotate) directly against the same caches.
+pub fn build_test_app_with_state(db: DatabaseConnection) -> (axum::Router, AppState) {
+    let config = test_config();
+    let state = AppState::new(db, config, None);
+    let app = river_db::routes::build_router(state.clone());
+    (app, state)
+}
+
 pub fn build_test_app_with_events(db: DatabaseConnection) -> (axum::Router, EventSender) {
     let config = test_config();
     let state = AppState::new(db, config, None);
@@ -36,6 +46,7 @@ fn test_config() -> Config {
         disable_rate_limiting: true,
         bulk_concurrent_limit: 100,
         cache_ttl_seconds: 0,
+        token_cache_ttl_seconds: 1,
         cache_max_bytes: 0,
         deployment: river_db::config::Deployment::Local,
         keycloak_url: None,
@@ -50,6 +61,13 @@ fn test_config() -> Config {
         default_readings_lookback_days: 7,
         public_rate_limit_burst: 10,
         public_rate_limit_period_secs: 2,
+        // High enough that the authenticated-tier IP limiter never trips in tests (the public-tier
+        // limiter is what rate_limit_test exercises); most tests also disable rate limiting entirely.
+        auth_rate_limit_per_second: 100_000,
+        auth_rate_limit_burst: 100_000,
+        // Off by default in tests (keeps token-authed test requests from writing audit rows); the
+        // dedicated audit test flips it on against a fresh AppState.
+        audit_api_token_use: false,
         janitor_interval_seconds: 3600,
         janitor_full_refresh_seconds: 86_400,
         janitor_retention_days: 180,
@@ -72,4 +90,13 @@ pub fn build_test_app_with_rate_limiting(db: DatabaseConnection) -> axum::Router
     config.disable_rate_limiting = false;
     let state = AppState::new(db, config, None);
     river_db::routes::build_router(state)
+}
+
+/// App + shared state with API-token-use auditing enabled (off by default in tests).
+pub fn build_test_app_with_audit(db: DatabaseConnection) -> (axum::Router, AppState) {
+    let mut config = test_config();
+    config.audit_api_token_use = true;
+    let state = AppState::new(db, config, None);
+    let app = river_db::routes::build_router(state.clone());
+    (app, state)
 }

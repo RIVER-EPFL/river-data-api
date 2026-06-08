@@ -5,6 +5,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::middleware::ProjectScope;
 use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
@@ -69,6 +70,7 @@ pub struct ProjectResult {
 )]
 pub async fn search(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Query(params): Query<SearchParams>,
 ) -> AppResult<Json<SearchResponse>> {
     let query = params.q.trim();
@@ -87,17 +89,45 @@ pub async fn search(
 
     let pattern = format!("%{query}%");
 
+    // A project-scoped key sees only its own project, that project's sites, and sensors deployed
+    // there. The global measurement catalog (`parameters`) is shared reference data, not project
+    // data, so it stays visible to everyone. Unscoped principals (Keycloak users, unscoped tokens)
+    // search across all projects unchanged.
+    let (sites_sql, sensors_sql, projects_sql) = if scope.is_some() {
+        (
+            "SELECT id, name FROM sites WHERE name ILIKE $1 AND project_id = $2 ORDER BY name LIMIT 10",
+            "SELECT id, serial_number, name FROM sensors \
+             WHERE (serial_number ILIKE $1 OR name ILIKE $1) \
+               AND EXISTS (SELECT 1 FROM sensor_deployments d JOIN sites s ON s.id = d.site_id \
+                           WHERE d.sensor_id = sensors.id AND s.project_id = $2) \
+             ORDER BY serial_number LIMIT 10",
+            "SELECT id, name FROM projects WHERE name ILIKE $1 AND id = $2 ORDER BY name LIMIT 10",
+        )
+    } else {
+        (
+            "SELECT id, name FROM sites WHERE name ILIKE $1 ORDER BY name LIMIT 10",
+            "SELECT id, serial_number, name FROM sensors WHERE serial_number ILIKE $1 OR name ILIKE $1 ORDER BY serial_number LIMIT 10",
+            "SELECT id, name FROM projects WHERE name ILIKE $1 ORDER BY name LIMIT 10",
+        )
+    };
+    let scoped_vals = || -> Vec<sea_orm::Value> {
+        match scope {
+            Some(p) => vec![pattern.clone().into(), p.into()],
+            None => vec![pattern.clone().into()],
+        }
+    };
+
     let (sites, sensors, parameters, projects) = tokio::try_join!(
         SiteResult::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT id, name FROM sites WHERE name ILIKE $1 ORDER BY name LIMIT 10",
-            [pattern.clone().into()],
+            sites_sql,
+            scoped_vals(),
         ))
         .all(&state.db),
         SensorResult::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT id, serial_number, name FROM sensors WHERE serial_number ILIKE $1 OR name ILIKE $1 ORDER BY serial_number LIMIT 10",
-            [pattern.clone().into()],
+            sensors_sql,
+            scoped_vals(),
         ))
         .all(&state.db),
         ParameterResult::find_by_statement(Statement::from_sql_and_values(
@@ -108,8 +138,8 @@ pub async fn search(
         .all(&state.db),
         ProjectResult::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT id, name FROM projects WHERE name ILIKE $1 ORDER BY name LIMIT 10",
-            [pattern.clone().into()],
+            projects_sql,
+            scoped_vals(),
         ))
         .all(&state.db),
     )?;
