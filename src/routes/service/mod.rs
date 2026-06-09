@@ -324,6 +324,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
             "/tokens/{id}/usage",
             get(crate::routes::private::api_tokens::views::token_usage),
         )
+        .route(
+            "/api_token_audit_logs/distinct/status_codes",
+            get(crate::routes::private::api_token_audit_log::views::distinct_status_codes),
+        )
         .layer(middleware::from_fn(require_admin))
         .with_state(state.clone());
 
