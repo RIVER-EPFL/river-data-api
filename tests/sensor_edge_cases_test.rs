@@ -191,7 +191,7 @@ async fn auto_deploy_skipped_when_slot_occupied() {
     let app = build_test_app(db.clone());
     let token = seed_api_token(&db, full_permissions(), None).await;
 
-    // Pairing to the occupied slot must succeed (no 5xx), but skip auto-deploy.
+    // Pairing to the occupied slot must succeed (no 5xx), but skip auto-deploy for sensor B.
     let (status, body) = post_json_with_token(
         &app,
         &format!("/api/streams/{stream}/pair"),
@@ -201,31 +201,42 @@ async fn auto_deploy_skipped_when_slot_occupied() {
     .await;
     assert_eq!(status, 200, "pair into occupied slot ({status}): {body}");
 
+    // The pair handler spawns a pairing_backfill reprocess job that re-derives attribution by
+    // deployment windows. Sensor A's open deployment covers the reading timestamps, so the
+    // reprocess re-owns them to A.
+    assert!(
+        e2e::wait_for_jobs_by_trigger(&db, "pairing_backfill", 30).await,
+        "pairing_backfill job completes"
+    );
+
+    // After reprocess: readings are attributed to sensor A (the incumbent whose deployment covers
+    // the timestamps), not sensor B (which was created for the stream but never deployed).
     assert_eq!(
         count(
             &db,
             &format!(
                 "SELECT count(*) AS c FROM readings \
-                 WHERE stream_id = '{stream}' AND sensor_id IS NOT NULL AND deployment_id IS NULL"
-            ),
-        )
-        .await,
-        2,
-        "readings carry a sensor + calibration but no deployment (slot was occupied)"
-    );
-    assert_eq!(
-        count(
-            &db,
-            &format!(
-                "SELECT count(*) AS c FROM readings r JOIN sensors s ON r.sensor_id = s.id \
-                 WHERE r.stream_id = '{stream}' AND s.id <> '{}'",
+                 WHERE stream_id = '{stream}' AND sensor_id = '{}' AND deployment_id IS NOT NULL",
                 sensor_a.id
             ),
         )
         .await,
         2,
-        "the stream got its own (distinct) sensor B, not the incumbent A"
+        "readings re-attributed to the incumbent sensor A with its deployment"
     );
+
+    // Sensor B was created for the stream (linked via data_streams.sensor_id) but has no
+    // deployment — the slot was occupied. It stays available for an explicit adopt later.
+    let stream_sensor = count(
+        &db,
+        &format!(
+            "SELECT count(*) AS c FROM data_streams \
+             WHERE id = '{stream}' AND sensor_id IS NOT NULL AND sensor_id <> '{}'",
+            sensor_a.id
+        ),
+    )
+    .await;
+    assert_eq!(stream_sensor, 1, "stream is linked to a distinct sensor B (not A)");
 }
 
 /// §6 — reprocess re-derives attribution from the timelines. Starting from readings whose
