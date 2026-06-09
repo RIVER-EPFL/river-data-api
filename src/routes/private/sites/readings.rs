@@ -313,25 +313,38 @@ pub async fn get_site_readings(
         .collect();
     values.extend(param_ids.iter().map(|id| (*id).into()));
 
-    let select_clause = if include_alarms {
-        r"r.parameter_id, r.time, COALESCE(r.calibrated_value, r.raw_value) AS value,
-            CASE
-                WHEN t.parameter_id IS NULL THEN NULL
-                WHEN (t.alarm_min IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) < t.alarm_min) OR
-                     (t.alarm_max IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) > t.alarm_max) THEN 2
-                WHEN (t.warning_min IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) < t.warning_min) OR
-                     (t.warning_max IS NOT NULL AND COALESCE(r.calibrated_value, r.raw_value) > t.warning_max) THEN 1
-                ELSE 0
-            END::smallint as severity,
-            r.is_flagged, r.flag_reason, r.measurement_type"
+    let select_clause: String = if include_alarms {
+        // Severity from the one shared ladder (alarms engine). NULL when the slot has no threshold
+        // at any tier (no `t` row); otherwise the ladder treats all-NULL bounds as 0 (disabled).
+        let sev = crate::routes::private::alarms::thresholds::severity_case(
+            "COALESCE(r.calibrated_value, r.raw_value)",
+            "t.warning_min",
+            "t.warning_max",
+            "t.alarm_min",
+            "t.alarm_max",
+        );
+        format!(
+            "r.parameter_id, r.time, COALESCE(r.calibrated_value, r.raw_value) AS value, \
+             CASE WHEN t.parameter_id IS NULL THEN NULL ELSE ({sev})::smallint END as severity, \
+             r.is_flagged, r.flag_reason, r.measurement_type"
+        )
     } else {
-        "r.parameter_id, r.time, COALESCE(r.calibrated_value, r.raw_value) AS value, r.is_flagged, r.flag_reason, r.measurement_type"
+        "r.parameter_id, r.time, COALESCE(r.calibrated_value, r.raw_value) AS value, r.is_flagged, r.flag_reason, r.measurement_type".to_string()
     };
 
-    let from_clause = if include_alarms {
-        "readings r LEFT JOIN alarm_thresholds t ON r.parameter_id = t.parameter_id AND (t.site_id = r.site_id OR t.site_id IS NULL)"
+    let from_clause: String = if include_alarms {
+        // Resolve the 3-tier threshold per slot via the single engine definition (site → global →
+        // parameter default), scoped to this site, and LEFT JOIN it — so a parameter with only
+        // defaults still gets a severity (the old direct join to alarm_thresholds did not).
+        let cte = crate::routes::private::alarms::thresholds::resolve_thresholds_sql(
+            Some(site.id),
+            Some(param_ids.clone()),
+        );
+        format!(
+            "readings r LEFT JOIN ({cte}) t ON t.parameter_id = r.parameter_id AND t.site_id = r.site_id"
+        )
     } else {
-        "readings r"
+        "readings r".to_string()
     };
 
     let next_param = param_ids.len() + 2;

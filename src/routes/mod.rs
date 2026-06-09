@@ -173,6 +173,7 @@ pub fn validate_optional_time_range(
         private::sites::status_events::get_site_status_events,
         private::alarms::views::get_site_alarms,
         private::alarms::views::get_alarm_events,
+        private::alarms::views::get_thresholds,
         private::alarms::views::acknowledge_alarm,
         private::alarms::views::unacknowledge_alarm,
         private::sites::annotations::get_site_annotations,

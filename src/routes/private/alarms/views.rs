@@ -245,19 +245,9 @@ pub async fn get_site_alarms(
 
     let _permit = bulk::acquire_bulk_permit(&format, &state.bulk_semaphore)?;
 
-    // $1 = site_id, $2..=$N+1 = parameter_ids, $N+2 = start, $N+3 = end
     let alarm_param_ids: Vec<uuid::Uuid> = params_with_thresholds.iter().map(|p| p.id).collect();
-    let placeholders: Vec<String> = alarm_param_ids
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("${}", i + 2))
-        .collect();
-    let start_param = alarm_param_ids.len() + 2;
-    let end_param = start_param + 1;
-    let param_list = placeholders.join(",");
 
     let min_severity = query.severity.unwrap_or(1);
-
     let val_expr = "COALESCE(r.calibrated_value, r.raw_value)";
 
     let violation_condition = super::thresholds::violation_condition(
@@ -276,27 +266,15 @@ pub async fn get_site_alarms(
         "t.alarm_max",
     );
 
+    // The single resolution definition (site → global → parameter default), scoped to this site and
+    // spliced as the threshold CTE. Param ids are inlined in the rendered CTE, so the outer query
+    // only binds $1 = site_id, $2 = start, $3 = end.
+    let resolved_cte =
+        super::thresholds::resolve_thresholds_sql(Some(site.id), Some(alarm_param_ids));
+
     let sql = format!(
         r"
-        WITH resolved_thresholds AS (
-            SELECT DISTINCT ON (parameter_id)
-                parameter_id, warning_min, warning_max, alarm_min, alarm_max
-            FROM (
-                SELECT t.parameter_id, t.warning_min, t.warning_max, t.alarm_min, t.alarm_max,
-                       CASE WHEN t.site_id = $1 THEN 1 WHEN t.site_id IS NULL THEN 2 END AS priority
-                FROM alarm_thresholds t
-                WHERE t.parameter_id IN ({param_list})
-                  AND (t.site_id = $1 OR t.site_id IS NULL)
-                UNION ALL
-                SELECT p.id, p.default_warning_min, p.default_warning_max,
-                       p.default_alarm_min, p.default_alarm_max, 3
-                FROM parameters p
-                WHERE p.id IN ({param_list})
-                  AND (p.default_warning_min IS NOT NULL OR p.default_warning_max IS NOT NULL
-                       OR p.default_alarm_min IS NOT NULL OR p.default_alarm_max IS NOT NULL)
-            ) sources
-            ORDER BY parameter_id, priority
-        )
+        WITH resolved_thresholds AS ({resolved_cte})
         SELECT
             r.parameter_id,
             r.time,
@@ -305,17 +283,14 @@ pub async fn get_site_alarms(
         FROM readings r
         JOIN resolved_thresholds t ON r.parameter_id = t.parameter_id
         WHERE r.site_id = $1
-          AND r.time >= ${start_param}
-          AND r.time <= ${end_param}
+          AND r.time >= $2
+          AND r.time <= $3
           AND {violation_condition}
         ORDER BY r.time, r.parameter_id
         "
     );
 
-    let mut values: Vec<sea_orm::Value> = vec![site.id.into()];
-    values.extend(alarm_param_ids.iter().map(|id| (*id).into()));
-    values.push(query.start.into());
-    values.push(query.end.into());
+    let values: Vec<sea_orm::Value> = vec![site.id.into(), query.start.into(), query.end.into()];
 
     let violations: Vec<ViolationRow> = state
         .db
@@ -449,38 +424,12 @@ pub(crate) async fn fetch_active_alarm_rows(
         1,
     );
 
+    // The single resolution definition across all active slots (no scope), spliced as the CTE.
+    let resolved_cte = super::thresholds::resolve_thresholds_sql(None, None);
+
     let sql = format!(
         r"
-        WITH threshold_sources AS (
-            SELECT t.parameter_id, t.site_id,
-                   t.warning_min, t.warning_max, t.alarm_min, t.alarm_max,
-                   CASE WHEN t.site_id IS NOT NULL THEN 1 ELSE 2 END AS priority
-            FROM alarm_thresholds t
-            UNION ALL
-            SELECT p.id, NULL::uuid,
-                   p.default_warning_min, p.default_warning_max,
-                   p.default_alarm_min, p.default_alarm_max,
-                   3
-            FROM parameters p
-            WHERE p.default_warning_min IS NOT NULL
-               OR p.default_warning_max IS NOT NULL
-               OR p.default_alarm_min IS NOT NULL
-               OR p.default_alarm_max IS NOT NULL
-        ),
-        ranked_thresholds AS (
-            SELECT DISTINCT ON (ts.parameter_id, sp.site_id)
-                sp.site_id,
-                ts.parameter_id,
-                sp.name AS parameter_name,
-                ts.warning_min, ts.warning_max,
-                ts.alarm_min, ts.alarm_max
-            FROM threshold_sources ts
-            JOIN site_parameters sp
-                ON sp.parameter_id = ts.parameter_id
-                AND sp.is_active = true
-            WHERE ts.site_id = sp.site_id OR ts.site_id IS NULL
-            ORDER BY ts.parameter_id, sp.site_id, ts.priority
-        ),
+        WITH resolved_thresholds AS ({resolved_cte}),
         latest_readings AS (
             SELECT DISTINCT ON (r.site_id, r.parameter_id)
                 r.site_id,
@@ -488,7 +437,7 @@ pub(crate) async fn fetch_active_alarm_rows(
                 r.time,
                 COALESCE(r.calibrated_value, r.raw_value) AS value
             FROM readings r
-            JOIN ranked_thresholds rt
+            JOIN resolved_thresholds rt
                 ON rt.site_id = r.site_id
                 AND rt.parameter_id = r.parameter_id
             ORDER BY r.site_id, r.parameter_id, r.time DESC
@@ -497,7 +446,7 @@ pub(crate) async fn fetch_active_alarm_rows(
             lr.site_id,
             s.name AS site_name,
             lr.parameter_id,
-            rt.parameter_name,
+            sp.name AS parameter_name,
             lr.value AS current_value,
             lr.time,
             rt.warning_min,
@@ -506,13 +455,17 @@ pub(crate) async fn fetch_active_alarm_rows(
             rt.alarm_max,
             ({sev_case})::smallint AS severity
         FROM latest_readings lr
-        JOIN ranked_thresholds rt
+        JOIN resolved_thresholds rt
             ON rt.site_id = lr.site_id
             AND rt.parameter_id = lr.parameter_id
         JOIN sites s ON s.id = lr.site_id
+        JOIN site_parameters sp
+            ON sp.site_id = lr.site_id
+            AND sp.parameter_id = lr.parameter_id
+            AND sp.is_active = true
         WHERE {violation}
         {project_filter}
-        ORDER BY severity DESC, s.name, rt.parameter_name
+        ORDER BY severity DESC, s.name, parameter_name
         "
     );
 
@@ -1071,7 +1024,7 @@ pub async fn get_alarm_events(
         JOIN parameters p ON p.id = ae.parameter_id
         LEFT JOIN site_parameters sp ON sp.site_id = ae.site_id AND sp.parameter_id = ae.parameter_id
         {where_clause}
-        ORDER BY ae.last_seen_at DESC
+        ORDER BY (ae.resolved_at IS NULL) DESC, ae.last_seen_at DESC
         LIMIT {limit} OFFSET {offset}
         "
     );
@@ -1128,4 +1081,78 @@ pub async fn get_alarm_events(
         .collect();
 
     Ok(Json(AlarmEventsResponse { events, total }))
+}
+
+/// Query for the resolved-thresholds feed.
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+pub struct ThresholdsQuery {
+    pub site_id: Option<Uuid>,
+    pub parameter_id: Option<Uuid>,
+}
+
+/// One resolved threshold plus the slot's latest reading value, for the UI thresholds table.
+#[derive(FromQueryResult, serde::Serialize, utoipa::ToSchema)]
+pub struct ThresholdWithValue {
+    pub site_id: Uuid,
+    pub parameter_id: Uuid,
+    pub warning_min: Option<f64>,
+    pub warning_max: Option<f64>,
+    pub alarm_min: Option<f64>,
+    pub alarm_max: Option<f64>,
+    pub source: String,
+    /// Latest reading (last 30 days) for this slot, or null if none — display only.
+    pub current_value: Option<f64>,
+}
+
+/// Resolved thresholds, one row per active `(site, parameter)` slot, each carrying its latest value.
+///
+/// The single source of truth for the 3-tier resolution (site row → global row → parameter
+/// default), built by `engine::resolve_thresholds_query`. The UI consumes this instead of
+/// re-deriving the tiers client-side. Optional `site_id` / `parameter_id` scope.
+#[utoipa::path(
+    get,
+    path = "/alarms/thresholds",
+    params(ThresholdsQuery),
+    responses((status = 200, description = "Resolved thresholds + current value per (site, parameter)")),
+    tag = "alarms"
+)]
+pub async fn get_thresholds(
+    State(state): State<AppState>,
+    Query(query): Query<ThresholdsQuery>,
+) -> AppResult<Json<Vec<ThresholdWithValue>>> {
+    let resolved_cte = super::thresholds::resolve_thresholds_sql(
+        query.site_id,
+        query.parameter_id.map(|p| vec![p]),
+    );
+
+    // Attach the latest reading per slot so the table can show a current value beside each threshold.
+    // Bounded to the last 30 days so TimescaleDB chunk-excludes to recent chunks (fast even for the
+    // unscoped/global view); a slot with no recent reading gets a NULL current value.
+    let sql = format!(
+        "WITH resolved AS ({resolved_cte}), \
+         latest AS ( \
+            SELECT DISTINCT ON (site_id, parameter_id) site_id, parameter_id, \
+                   COALESCE(calibrated_value, raw_value) AS current_value \
+            FROM readings \
+            WHERE replicate_index = 0 AND site_id IS NOT NULL AND time > now() - interval '30 days' \
+            ORDER BY site_id, parameter_id, time DESC \
+         ) \
+         SELECT r.site_id, r.parameter_id, r.warning_min, r.warning_max, r.alarm_min, r.alarm_max, \
+                r.source, l.current_value \
+         FROM resolved r \
+         LEFT JOIN latest l ON l.site_id = r.site_id AND l.parameter_id = r.parameter_id"
+    );
+
+    let rows = state
+        .db
+        .query_all(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+        ))
+        .await?
+        .into_iter()
+        .filter_map(|r| ThresholdWithValue::from_query_result(&r, "").ok())
+        .collect();
+
+    Ok(Json(rows))
 }

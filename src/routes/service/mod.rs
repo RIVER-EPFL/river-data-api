@@ -225,6 +225,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route("/alarms/active", get(alarm_views::get_active_alarms))
         .route("/alarms/summary", get(alarm_views::get_alarm_summary))
         .route("/alarms/events", get(alarm_views::get_alarm_events))
+        .route("/alarms/thresholds", get(alarm_views::get_thresholds))
         .route("/events", get(crate::routes::private::events::event_stream))
         .route("/tools", get(tools::list_tools))
         .route("/tools/{tool_name}/calculate", post(tools::calculate_tool))

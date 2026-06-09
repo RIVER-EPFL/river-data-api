@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
-use crate::routes::private::{alarm_thresholds, parameters, site_parameters};
+use crate::routes::private::{parameters, site_parameters};
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, resolve_site_with_project, validate_time_range};
 use crate::common::bulk::{self, StreamableAggregateParam};
@@ -310,24 +310,33 @@ pub async fn get_site_aggregates(
         .await;
     }
 
-    // Fetch thresholds when alarms are requested (small query, ~22 rows max)
-    // Prefer site-specific thresholds over global ones
-    let threshold_map: HashMap<Uuid, alarm_thresholds::Model> = if include_alarms {
-        let all_thresholds = alarm_thresholds::Entity::find()
-            .filter(alarm_thresholds::Column::ParameterId.is_in(param_ids.clone()))
-            .filter(
-                sea_orm::Condition::any()
-                    .add(alarm_thresholds::Column::SiteId.eq(site.id))
-                    .add(alarm_thresholds::Column::SiteId.is_null()),
-            )
-            .all(&state.db)
-            .await?;
-        let mut map: HashMap<Uuid, alarm_thresholds::Model> = HashMap::new();
-        for t in all_thresholds {
-            let existing = map.get(&t.parameter_id);
-            // Insert if no existing entry, or if this one is site-specific (preferred)
-            if existing.is_none() || t.site_id.is_some() {
-                map.insert(t.parameter_id, t);
+    // Resolve thresholds via the single engine definition (site → global → parameter default),
+    // scoped to this site. Replaces the old ORM fetch that ignored the parameter-default tier.
+    use crate::routes::private::alarms::thresholds as alarm_engine;
+    let threshold_map: HashMap<Uuid, alarm_engine::ResolvedThreshold> = if include_alarms {
+        let (sql, values) =
+            alarm_engine::resolve_thresholds_query(Some(site.id), Some(param_ids.clone()))
+                .build(sea_orm::sea_query::PostgresQueryBuilder);
+        let mut map = HashMap::new();
+        for row in state
+            .db
+            .query_all(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                sql,
+                values.0,
+            ))
+            .await?
+        {
+            if let Ok(tr) = alarm_engine::ThresholdRow::from_query_result(&row, "") {
+                map.insert(
+                    tr.parameter_id,
+                    alarm_engine::ResolvedThreshold {
+                        warning_min: tr.warning_min,
+                        warning_max: tr.warning_max,
+                        alarm_min: tr.alarm_min,
+                        alarm_max: tr.alarm_max,
+                    },
+                );
             }
         }
         map
@@ -483,28 +492,9 @@ pub async fn get_site_aggregates(
                     count.push(aggs.3);
 
                     if let Some(ref mut sev_vec) = severity_vec {
-                        sev_vec.push(match threshold {
-                            Some(th) => {
-                                let min_val = aggs.1;
-                                let max_val = aggs.2;
-                                if (th.alarm_min.is_some()
-                                    && min_val.is_some_and(|v| v < th.alarm_min.unwrap()))
-                                    || (th.alarm_max.is_some()
-                                        && max_val.is_some_and(|v| v > th.alarm_max.unwrap()))
-                                {
-                                    Some(2i16)
-                                } else if (th.warning_min.is_some()
-                                    && min_val.is_some_and(|v| v < th.warning_min.unwrap()))
-                                    || (th.warning_max.is_some()
-                                        && max_val.is_some_and(|v| v > th.warning_max.unwrap()))
-                                {
-                                    Some(1i16)
-                                } else {
-                                    Some(0i16)
-                                }
-                            }
-                            None => None,
-                        });
+                        sev_vec.push(
+                            threshold.map(|th| alarm_engine::severity_of_range(aggs.1, aggs.2, th)),
+                        );
                     }
                 } else {
                     avg.push(None);
