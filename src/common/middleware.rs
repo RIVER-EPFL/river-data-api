@@ -297,6 +297,19 @@ pub async fn require_crud_permissions(request: Request, next: Next) -> Response 
     require_capability(cap, request, next).await
 }
 
+/// Method-aware `CrudCrate` gate for entities whose rows are time-series **data**, not catalog
+/// metadata: GET/HEAD need `read_data` (a metadata-only key must not read them), mutations need
+/// `write_metadata` (editing an annotation/sample record is entity management, distinct from the
+/// `write_data` ingestion path). Used for `annotations` and `samples`.
+pub async fn require_crud_data_read_permissions(request: Request, next: Next) -> Response {
+    let cap = if matches!(*request.method(), Method::GET | Method::HEAD) {
+        Capability::ReadData
+    } else {
+        Capability::WriteMetadata
+    };
+    require_capability(cap, request, next).await
+}
+
 /// Requires the `Admin` capability — the Keycloak Administrator role only. NO API token can pass
 /// (tokens never hold `Admin`): defense in depth for user management, token mutation, and sync
 /// credential creation.
@@ -692,4 +705,95 @@ pub async fn sensor_in_scope(
     Ok(row
         .and_then(|r| r.try_get::<bool>("", "in_scope").ok())
         .unwrap_or(false))
+}
+
+/// Subquery selecting the ids of the sites in a scoped principal's project. Used to confine child
+/// entities whose own scoping column is `site_id` (`notes`, `annotations`, …) without an extra
+/// round-trip — it inlines as a SQL sub-select in the read filter.
+fn scoped_site_ids_query(scope: Uuid) -> sea_orm::sea_query::SelectStatement {
+    use crate::routes::private::sites;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
+    sites::Entity::find()
+        .select_only()
+        .column(sites::Column::Id)
+        .filter(sites::Column::ProjectId.eq(scope))
+        .into_query()
+}
+
+/// Subquery selecting the site_parameter ids within a scoped principal's project. Used to confine
+/// `data_streams`, whose scoping column is `site_parameter_id`.
+fn scoped_site_parameter_ids_query(scope: Uuid) -> sea_orm::sea_query::SelectStatement {
+    use crate::routes::private::site_parameters;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
+    site_parameters::Entity::find()
+        .select_only()
+        .column(site_parameters::Column::Id)
+        .filter(site_parameters::Column::SiteId.in_subquery(scoped_site_ids_query(scope)))
+        .into_query()
+}
+
+/// Row-filter confining a CRUD entity's *read* (list / get-by-id) to a scoped principal's project,
+/// or `None` for global-catalog, operational, and admin-only entities (a scoped token reading
+/// shared definitions like `parameters`/`constants` is intended). Built as a subquery so it adds no
+/// round-trip and references only the entity's own columns; rows whose scoping column is NULL
+/// (unpaired streams, site-less global thresholds) fall out by construction, which matches the
+/// write-side confinement.
+fn crud_read_scope_condition(entity: &str, scope: Uuid) -> Option<sea_orm::Condition> {
+    use crate::routes::private::{
+        alarm_thresholds, annotations, data_streams, notes, projects, samples, sensor_deployments,
+        site_parameters, sites,
+    };
+    use sea_orm::{ColumnTrait, Condition};
+    let expr = match entity {
+        "projects" => projects::Column::Id.eq(scope),
+        "sites" => sites::Column::ProjectId.eq(scope),
+        "site_parameters" => {
+            site_parameters::Column::SiteId.in_subquery(scoped_site_ids_query(scope))
+        }
+        "notes" => notes::Column::SiteId.in_subquery(scoped_site_ids_query(scope)),
+        "annotations" => annotations::Column::SiteId.in_subquery(scoped_site_ids_query(scope)),
+        "sensor_deployments" => {
+            sensor_deployments::Column::SiteId.in_subquery(scoped_site_ids_query(scope))
+        }
+        "alarm_thresholds" => {
+            alarm_thresholds::Column::SiteId.in_subquery(scoped_site_ids_query(scope))
+        }
+        "samples" => samples::Column::SiteId.in_subquery(scoped_site_ids_query(scope)),
+        "data_streams" => {
+            data_streams::Column::SiteParameterId.in_subquery(scoped_site_parameter_ids_query(scope))
+        }
+        _ => return None,
+    };
+    Some(Condition::all().add(expr))
+}
+
+/// Read-side project-scope confinement for the CRUD entity routers. For a project-scoped principal
+/// (an API token bound to one project today; a future per-project Keycloak user via the same
+/// `project_scope()`), injects a CrudCrate [`crudcrate::ScopeCondition`] so the generated handlers
+/// filter list results to that project and turn a cross-project get-by-id into a 404. No-op for
+/// unscoped principals, for write methods (mutations are confined by [`enforce_token_scope_on_crud`]),
+/// and for global/operational entities. The injected condition is per-entity and only consumed by
+/// the generated CrudCrate list/get handlers — custom sub-routes (e.g. `/sites/{id}/readings`) don't
+/// read the extension and keep their own manual scope checks.
+pub async fn inject_read_scope(request: Request, next: Next) -> Response {
+    let Some(scope) = request
+        .extensions()
+        .get::<AuthContext>()
+        .and_then(AuthContext::project_scope)
+    else {
+        return next.run(request).await;
+    };
+    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+        return next.run(request).await;
+    }
+    if let Some((entity, _id)) = parse_crud_target(request.uri().path())
+        && let Some(condition) = crud_read_scope_condition(entity, scope)
+    {
+        let mut request = request;
+        request
+            .extensions_mut()
+            .insert(crudcrate::ScopeCondition::new(condition));
+        return next.run(request).await;
+    }
+    next.run(request).await
 }

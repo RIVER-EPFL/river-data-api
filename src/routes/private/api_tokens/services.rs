@@ -14,8 +14,10 @@ use super::model;
 /// busts the whole cache explicitly (see `invalidate_token_cache`).
 pub type TokenCache = Cache<String, model::Model>;
 
-/// Default TTL for the token validation cache when none is configured.
-pub const DEFAULT_TOKEN_CACHE_TTL_SECONDS: u64 = 15;
+/// Default TTL for the token validation cache when none is configured. Short by design: expiry is
+/// re-checked on every cache hit and revoke/rotate bust the whole cache, so a small TTL keeps the
+/// window for any out-of-band `is_active` flip tight at negligible DB cost.
+pub const DEFAULT_TOKEN_CACHE_TTL_SECONDS: u64 = 5;
 
 /// Create a new token validation cache with the given TTL (seconds).
 #[must_use]
@@ -52,6 +54,16 @@ pub fn hash_token(raw_token: &str) -> String {
 /// The public prefix of every API token string: `rvd_<prefix>_<secret>`.
 const API_TOKEN_PREFIX: &str = "rvd_";
 
+/// Hex length of the non-secret lookup prefix produced by [`mint_api_token`] (8 bytes → 16 chars).
+const PREFIX_HEX_LEN: usize = 16;
+/// Hex length of the secret produced by [`mint_api_token`] (32 bytes → 64 chars).
+const SECRET_HEX_LEN: usize = 64;
+
+/// Whether every byte of `s` is a lowercase hex digit. Mirrors [`random_hex`]'s `{:02x}` output.
+fn is_lower_hex(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// A freshly minted API token. `raw_token` is shown to the operator exactly once; only
 /// `token_prefix` (indexed lookup key, non-secret) and `token_hash` (argon2id of the secret)
 /// are persisted.
@@ -86,7 +98,16 @@ pub fn mint_api_token() -> MintedToken {
 pub fn split_api_token(raw_token: &str) -> Option<(&str, &str)> {
     let rest = raw_token.strip_prefix(API_TOKEN_PREFIX)?;
     let (prefix, secret) = rest.split_once('_')?;
-    if prefix.is_empty() || secret.is_empty() {
+    // Reject anything not shaped exactly like a minted token: 16-hex prefix, 64-hex secret. This
+    // rejects malformed `rvd_…` junk before it can reach the indexed prefix lookup, so a flood of
+    // well-prefixed-but-bogus bearer values can't drive DB work (the per-IP limiter runs ahead of
+    // this; the length/hex gate is the second line). A wrong-but-well-formed secret still verifies
+    // against argon2 — only the at-rest hash can reject that.
+    if prefix.len() != PREFIX_HEX_LEN
+        || secret.len() != SECRET_HEX_LEN
+        || !is_lower_hex(prefix)
+        || !is_lower_hex(secret)
+    {
         return None;
     }
     Some((prefix, secret))

@@ -52,6 +52,23 @@ pub async fn get_json_with_token(
     (status, json)
 }
 
+/// Unauthenticated POST — used to assert the public tier refuses writes.
+pub async fn post_json(app: &Router, uri: &str, body: &serde_json::Value) -> (u16, String) {
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(body).unwrap()))
+        .unwrap();
+
+    let response = app.clone().oneshot(req).await.unwrap();
+    let status = response.status().as_u16();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&body).to_string();
+
+    (status, text)
+}
+
 pub async fn post_json_with_token(
     app: &Router,
     uri: &str,

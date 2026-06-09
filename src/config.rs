@@ -143,9 +143,10 @@ impl Config {
                 .parse()
                 .unwrap_or(300), // 5 minutes default
             token_cache_ttl_seconds: env::var("TOKEN_CACHE_TTL_SECONDS")
-                .unwrap_or_else(|_| "15".to_string())
+                .unwrap_or_else(|_| "5".to_string())
                 .parse()
-                .unwrap_or(15), // 15s default — fast revocation, low DB load
+                .unwrap_or(5), // 5s default — tight revocation/expiry window, negligible DB load
+                               // (expiry is re-checked every request; revoke/rotate bust the cache)
             cache_max_bytes: env::var("CACHE_MAX_BYTES")
                 .unwrap_or_else(|_| "209715200".to_string())
                 .parse()

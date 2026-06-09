@@ -9,9 +9,9 @@ use utoipa_axum::router::OpenApiRouter;
 
 use crate::common::AppState;
 use crate::common::middleware::{
-    bust_token_cache_on_mutation, deny_scoped_token, enforce_token_scope_on_crud, require_admin,
-    require_crud_permissions, require_read_data, require_read_metadata, require_write_data,
-    require_write_metadata,
+    bust_token_cache_on_mutation, deny_scoped_token, enforce_token_scope_on_crud, inject_read_scope,
+    require_admin, require_crud_data_read_permissions, require_crud_permissions, require_read_data,
+    require_read_metadata, require_write_data, require_write_metadata,
 };
 use crate::common::rate_limit::FallbackIpKeyExtractor;
 use crate::routes::private::{
@@ -74,6 +74,11 @@ pub fn api_router(state: &AppState) -> Router<()> {
     let with_crud_perms = |r: OpenApiRouter| -> OpenApiRouter {
         r.layer(middleware::from_fn(require_crud_permissions))
     };
+    // Like `with_crud_perms` but reads need `read_data` (not `read_metadata`) — for CRUD entities
+    // whose rows are time-series data (annotations, samples), so a metadata-only key can't read them.
+    let with_crud_data_read_perms = |r: OpenApiRouter| -> OpenApiRouter {
+        r.layer(middleware::from_fn(require_crud_data_read_permissions))
+    };
     let admin_only_crud = |r: OpenApiRouter| -> OpenApiRouter {
         // CrudCrate exposes a single router for all 5 methods. For entities that mint
         // privileged credentials (API tokens, sync service credentials) we keep the
@@ -114,9 +119,9 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .nest("/data_streams", with_crud_perms(DataStream::router(db)))
         .nest("/standard_curves", with_crud_perms(StandardCurve::router(db)))
         .nest("/notes", with_crud_perms(Note::router(db)))
-        .nest("/annotations", with_crud_perms(Annotation::router(db)))
+        .nest("/annotations", with_crud_data_read_perms(Annotation::router(db)))
         .nest("/constants", with_crud_perms(Constant::router(db)))
-        .nest("/samples", with_crud_perms(Sample::router(db)))
+        .nest("/samples", with_crud_data_read_perms(Sample::router(db)))
         .nest("/reprocessing_jobs", with_crud_perms(ReprocessingJob::router(db)))
         .nest("/sync_services", with_crud_perms(SyncService::router(db)))
         .nest("/sync_commands", with_crud_perms(SyncCommand::router(db)))
@@ -128,6 +133,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
             state.clone(),
             enforce_token_scope_on_crud,
         ))
+        // Read mirror of the above: confine list/get reads for project-bound entities to the
+        // scoped token's project (CrudCrate `ScopeCondition`). No-op for unscoped callers and for
+        // global/operational entities. Disjoint from the write guard above (it handles mutations).
+        .layer(middleware::from_fn(inject_read_scope))
         .into();
 
     use crate::routes::private::{
