@@ -720,6 +720,18 @@ fn scoped_site_ids_query(scope: Uuid) -> sea_orm::sea_query::SelectStatement {
         .into_query()
 }
 
+/// Subquery selecting sensor ids that have at least one deployment at a site in the scoped project.
+/// Used to confine `sensors` and `sensor_calibrations`.
+fn scoped_sensor_ids_query(scope: Uuid) -> sea_orm::sea_query::SelectStatement {
+    use crate::routes::private::sensor_deployments;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
+    sensor_deployments::Entity::find()
+        .select_only()
+        .column(sensor_deployments::Column::SensorId)
+        .filter(sensor_deployments::Column::SiteId.in_subquery(scoped_site_ids_query(scope)))
+        .into_query()
+}
+
 /// Subquery selecting the site_parameter ids within a scoped principal's project. Used to confine
 /// `data_streams`, whose scoping column is `site_parameter_id`.
 fn scoped_site_parameter_ids_query(scope: Uuid) -> sea_orm::sea_query::SelectStatement {
@@ -740,8 +752,8 @@ fn scoped_site_parameter_ids_query(scope: Uuid) -> sea_orm::sea_query::SelectSta
 /// write-side confinement.
 fn crud_read_scope_condition(entity: &str, scope: Uuid) -> Option<sea_orm::Condition> {
     use crate::routes::private::{
-        alarm_thresholds, annotations, data_streams, notes, projects, samples, sensor_deployments,
-        site_parameters, sites,
+        alarm_thresholds, annotations, data_streams, notes, projects, reprocessing_jobs, samples,
+        sensor_calibrations, sensor_deployments, sensors, site_parameters, sites,
     };
     use sea_orm::{ColumnTrait, Condition};
     let expr = match entity {
@@ -760,7 +772,15 @@ fn crud_read_scope_condition(entity: &str, scope: Uuid) -> Option<sea_orm::Condi
         }
         "samples" => samples::Column::SiteId.in_subquery(scoped_site_ids_query(scope)),
         "data_streams" => {
-            data_streams::Column::SiteParameterId.in_subquery(scoped_site_parameter_ids_query(scope))
+            data_streams::Column::SiteParameterId
+                .in_subquery(scoped_site_parameter_ids_query(scope))
+        }
+        "sensors" => sensors::Column::Id.in_subquery(scoped_sensor_ids_query(scope)),
+        "sensor_calibrations" => {
+            sensor_calibrations::Column::SensorId.in_subquery(scoped_sensor_ids_query(scope))
+        }
+        "reprocessing_jobs" => {
+            reprocessing_jobs::Column::SensorId.in_subquery(scoped_sensor_ids_query(scope))
         }
         _ => return None,
     };

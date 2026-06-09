@@ -123,10 +123,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .nest("/constants", with_crud_perms(Constant::router(db)))
         .nest("/samples", with_crud_data_read_perms(Sample::router(db)))
         .nest("/reprocessing_jobs", with_crud_perms(ReprocessingJob::router(db)))
-        .nest("/sync_services", with_crud_perms(SyncService::router(db)))
-        .nest("/sync_commands", with_crud_perms(SyncCommand::router(db)))
-        .nest("/sync_events", with_crud_perms(SyncEvent::router(db)))
-        .nest("/pairing_plans", with_crud_perms(PairingPlan::router(db)))
+        .nest("/sync_services", admin_only_crud(SyncService::router(db)))
+        .nest("/sync_commands", admin_only_crud(SyncCommand::router(db)))
+        .nest("/sync_events", admin_only_crud(SyncEvent::router(db)))
+        .nest("/pairing_plans", admin_only_crud(PairingPlan::router(db)))
         // Project-scoped API tokens may only mutate project-bound entities within their project
         // (fails closed on the global catalog). No-op for Keycloak users and unscoped tokens.
         .layer(middleware::from_fn_with_state(

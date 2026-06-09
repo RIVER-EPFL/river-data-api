@@ -541,8 +541,25 @@ pub fn build_router(state: AppState) -> Router {
 <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.57.2"></script>
 </body>
 </html>"#;
-    let docs_routes = Router::new()
-        .merge(Scalar::with_url("/docs", ApiDoc::openapi()).custom_html(PINNED_SCALAR_HTML));
+    let mut docs_routes = Router::new()
+        .merge(Scalar::with_url("/docs", ApiDoc::openapi()).custom_html(PINNED_SCALAR_HTML))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::common::middleware::service_auth_middleware,
+        ));
+    if let Some(instance) = state.keycloak_auth_instance.clone() {
+        use axum_keycloak_auth::{PassthroughMode, layer::KeycloakAuthLayer};
+        docs_routes = docs_routes.layer(
+            KeycloakAuthLayer::<crate::common::auth::Role>::builder()
+                .instance(instance)
+                .passthrough_mode(PassthroughMode::Pass)
+                .persist_raw_claims(false)
+                .expected_audiences(vec![String::from("account")])
+                .required_roles(vec![crate::common::auth::Role::User])
+                .build(),
+        );
+    }
+    let docs_routes = docs_routes.with_state(state.clone());
 
     // Build CORS layer from config
     let cors = {

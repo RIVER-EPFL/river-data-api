@@ -22,7 +22,9 @@ const SAMPLE_B_ID: &str = "00000000-0000-4000-b000-000000000203";
 const DEPLOY_B_ID: &str = "00000000-0000-4000-b000-000000000204";
 const THRESH_B_ID: &str = "00000000-0000-4000-b000-000000000205";
 const STREAM_B_ID: &str = "00000000-0000-4000-b000-000000000206";
-const SENSOR_ID: &str = "00000000-0000-4000-b000-0000000000ff";
+const SENSOR_B_ID: &str = "00000000-0000-4000-b000-0000000000ff";
+const CALIB_B_ID: &str = "00000000-0000-4000-b000-000000000301";
+const REPROC_B_ID: &str = "00000000-0000-4000-b000-000000000302";
 // A project-A note, to prove the scoped key still reaches its own project.
 const NOTE_A_ID: &str = "00000000-0000-4000-a000-000000000901";
 
@@ -39,8 +41,10 @@ async fn setup() -> (sea_orm::DatabaseConnection, axum::Router) {
         format!("INSERT INTO notes (id, site_id, text) VALUES ('{NOTE_A_ID}', '{SITE1_ID}', 'noteA')"),
         format!("INSERT INTO annotations (id, site_id, parameter_id, start_time, end_time, text, category) VALUES ('{ANNO_B_ID}', '{SITE_B_ID}', '{GLOBAL_PARAM_TEMP_ID}', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', 'annoB', 'note')"),
         format!("INSERT INTO samples (id, site_id, parameter_id, collected_at, n) VALUES ('{SAMPLE_B_ID}', '{SITE_B_ID}', '{GLOBAL_PARAM_TEMP_ID}', '2026-01-01T00:00:00Z', 1)"),
-        format!("INSERT INTO sensors (id, parameter_id) VALUES ('{SENSOR_ID}', '{GLOBAL_PARAM_TEMP_ID}')"),
-        format!("INSERT INTO sensor_deployments (id, sensor_id, site_id, deployed_from, deployment_type) VALUES ('{DEPLOY_B_ID}', '{SENSOR_ID}', '{SITE_B_ID}', '2026-01-01T00:00:00Z', 'permanent')"),
+        format!("INSERT INTO sensors (id, parameter_id) VALUES ('{SENSOR_B_ID}', '{GLOBAL_PARAM_TEMP_ID}')"),
+        format!("INSERT INTO sensor_deployments (id, sensor_id, site_id, deployed_from, deployment_type) VALUES ('{DEPLOY_B_ID}', '{SENSOR_B_ID}', '{SITE_B_ID}', '2026-01-01T00:00:00Z', 'permanent')"),
+        format!("INSERT INTO sensor_calibrations (id, sensor_id, slope, intercept, valid_from) VALUES ('{CALIB_B_ID}', '{SENSOR_B_ID}', 1.0, 0.0, '2026-01-01T00:00:00Z')"),
+        format!("INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, status) VALUES ('{REPROC_B_ID}', '{SENSOR_B_ID}', 'calibration', 'completed')"),
         format!("INSERT INTO alarm_thresholds (id, parameter_id, site_id, warning_min) VALUES ('{THRESH_B_ID}', '{GLOBAL_PARAM_TEMP_ID}', '{SITE_B_ID}', 1.0)"),
         format!("INSERT INTO data_streams (id, source_system, source_key, site_parameter_id, is_active) VALUES ('{STREAM_B_ID}', 'test-b', 'b-stream-1', '{SP_B_ID}', true)"),
     ] {
@@ -85,6 +89,9 @@ async fn scoped_key_confined_on_crud_reads() {
         ("/api/sensor_deployments", DEPLOY_B_ID),
         ("/api/alarm_thresholds", THRESH_B_ID),
         ("/api/data_streams", STREAM_B_ID),
+        ("/api/sensors", SENSOR_B_ID),
+        ("/api/sensor_calibrations", CALIB_B_ID),
+        ("/api/reprocessing_jobs", REPROC_B_ID),
     ];
 
     for (path, b_id) in cases {
@@ -135,6 +142,25 @@ async fn scoped_key_still_sees_own_project() {
     // Its own project is the only one listed.
     let project_ids = list_ids(&app, "/api/projects", &scoped).await;
     assert_eq!(project_ids, vec![PROJECT_ID.to_string()], "only own project listed");
+}
+
+/// Sync infrastructure entities (sync_services, sync_commands, sync_events, pairing_plans) are
+/// admin-only — no API token (scoped or unscoped) can list them.
+#[tokio::test]
+#[serial]
+async fn admin_only_entities_reject_api_tokens() {
+    let (db, app) = setup().await;
+    let unscoped = common::seed_api_token(&db, common::full_permissions(), None).await;
+
+    for path in [
+        "/api/sync_services",
+        "/api/sync_commands",
+        "/api/sync_events",
+        "/api/pairing_plans",
+    ] {
+        let (s, _) = common::get_with_token(&app, path, &unscoped).await;
+        assert_eq!(s, 401, "{path} should be admin-only (401 for API token), got {s}");
+    }
 }
 
 /// A batch that mixes an in-scope and an out-of-scope site in one payload is rejected wholesale —
