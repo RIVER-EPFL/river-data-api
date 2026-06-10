@@ -518,39 +518,38 @@ pub async fn import_csv(
 
     // --- Spawn background job for insert + derived recompute + aggregate refresh ---------------
     let derived_job_id = if has_work {
-        let job_id = Uuid::new_v4();
         let total = i32::try_from(models.len()).unwrap_or(i32::MAX);
-        state
-            .db
-            .execute(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status, total, progress) \
-                 VALUES ($1, NULL, 'csv_import', NULL, 'pending', $2, 0)",
-                [job_id.into(), total.into()],
-            ))
-            .await?;
-        let _ = state.events.send(AppEvent::JobCreated { job_id });
-
-        let db = state.db.clone();
         let app = state.clone();
-        let events = state.events.clone();
         let since = earliest;
         let latest_for_alarm = latest;
         let conflict = req.conflict;
         let site_name = site.name.clone();
-        let param_streams: Vec<(Uuid, Uuid)> = mappings
-            .iter()
-            .filter_map(|m| stream_cache.get(&m.parameter_id).map(|&sid| (m.parameter_id, sid)))
-            .collect();
+        // Arc the large per-import payloads so each job invocation (retry-safe `Fn`) clones cheaply.
+        let param_streams: std::sync::Arc<Vec<(Uuid, Uuid)>> = std::sync::Arc::new(
+            mappings
+                .iter()
+                .filter_map(|m| stream_cache.get(&m.parameter_id).map(|&sid| (m.parameter_id, sid)))
+                .collect(),
+        );
+        let models = std::sync::Arc::new(models);
+        let distinct_ts = std::sync::Arc::new(distinct_ts);
 
-        tokio::spawn(async move {
-            let _ = db
-                .execute(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "UPDATE reprocessing_jobs SET status = 'running' WHERE id = $1",
-                    [job_id.into()],
-                ))
-                .await;
+        let job_id = crate::routes::private::reprocessing_jobs::lifecycle::spawn_tracked_job_ctx(
+            &state.db,
+            None,
+            "csv_import",
+            None,
+            state.events.clone(),
+            move |ctx| {
+                let app = app.clone();
+                let events = app.events.clone();
+                let site_name = site_name.clone();
+                let param_streams = param_streams.clone();
+                let models = models.clone();
+                let distinct_ts = distinct_ts.clone();
+                async move {
+                    let db = ctx.db().clone();
+                    ctx.set_progress(0, Some(total)).await;
 
             // Phase 1: insert readings
             let mut affected_total = 0usize;
@@ -566,39 +565,17 @@ pub async fn import_csv(
                         let msg = e.to_string();
                         if !msg.contains("None of the records") {
                             tracing::warn!(error = %e, "Failed to insert imported readings chunk");
-                            let _ = db
-                                .execute(Statement::from_sql_and_values(
-                                    sea_orm::DatabaseBackend::Postgres,
-                                    "UPDATE reprocessing_jobs SET status = 'failed', \
-                                     error_message = $1, completed_at = NOW() WHERE id = $2",
-                                    [msg.into(), job_id.into()],
-                                ))
-                                .await;
-                            let _ = events.send(AppEvent::JobCompleted {
-                                job_id,
-                                status: "failed".to_string(),
-                                readings_updated: None,
-                                error_message: Some(e.to_string()),
-                            });
-                            return;
+                            return Err(e);
                         }
                     }
                 }
                 inserted_so_far += chunk.len();
                 if inserted_so_far % 5000 < BATCH_SIZE {
-                    let _ = db
-                        .execute(Statement::from_sql_and_values(
-                            sea_orm::DatabaseBackend::Postgres,
-                            "UPDATE reprocessing_jobs SET progress = $1 WHERE id = $2",
-                            [i32::try_from(inserted_so_far).unwrap_or(i32::MAX).into(), job_id.into()],
-                        ))
-                        .await;
-                    let _ = events.send(AppEvent::JobProgress {
-                        job_id,
-                        status: "running".to_string(),
-                        progress: Some(i32::try_from(inserted_so_far).unwrap_or(i32::MAX)),
-                        total: Some(total),
-                    });
+                    ctx.set_progress(
+                        i32::try_from(inserted_so_far).unwrap_or(i32::MAX),
+                        Some(total),
+                    )
+                    .await;
                 }
             }
 
@@ -609,7 +586,7 @@ pub async fn import_csv(
             tracing::info!(site = %site_name, inserted_total, overwritten, "CSV import inserted readings");
 
             if inserted_total > 0 || overwritten > 0 {
-                for (parameter_id, stream_id) in &param_streams {
+                for (parameter_id, stream_id) in param_streams.iter() {
                     let _ = events.send(AppEvent::DataIngested {
                         site_id: Some(site_id),
                         parameter_id: Some(*parameter_id),
@@ -620,41 +597,22 @@ pub async fn import_csv(
             }
 
             // Phase 2: derived recompute
-            let mut filled = 0i32;
             if inserted_total > 0 || overwritten > 0 {
                 let derived_total = i32::try_from(models.len() + distinct_ts.len()).unwrap_or(i32::MAX);
-                let _ = db
-                    .execute(Statement::from_sql_and_values(
-                        sea_orm::DatabaseBackend::Postgres,
-                        "UPDATE reprocessing_jobs SET total = $1 WHERE id = $2",
-                        [derived_total.into(), job_id.into()],
-                    ))
-                    .await;
+                ctx.set_progress(
+                    i32::try_from(models.len()).unwrap_or(i32::MAX),
+                    Some(derived_total),
+                )
+                .await;
 
                 for (i, time) in distinct_ts.iter().enumerate() {
-                    if crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
+                    let _ = crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
                         &db, site_id, *time,
                     )
-                    .await
-                    .is_ok()
-                    {
-                        filled += 1;
-                    }
+                    .await;
                     if (i + 1) % 500 == 0 {
                         let prog = i32::try_from(models.len() + i + 1).unwrap_or(i32::MAX);
-                        let _ = db
-                            .execute(Statement::from_sql_and_values(
-                                sea_orm::DatabaseBackend::Postgres,
-                                "UPDATE reprocessing_jobs SET progress = $1 WHERE id = $2",
-                                [prog.into(), job_id.into()],
-                            ))
-                            .await;
-                        let _ = events.send(AppEvent::JobProgress {
-                            job_id,
-                            status: "running".to_string(),
-                            progress: Some(prog),
-                            total: Some(derived_total),
-                        });
+                        ctx.set_progress(prog, Some(derived_total)).await;
                     }
                 }
 
@@ -711,21 +669,13 @@ pub async fn import_csv(
                 .await;
             }
 
-            let _ = db
-                .execute(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "UPDATE reprocessing_jobs SET status = 'completed', progress = total, \
-                     readings_updated = $1, completed_at = NOW() WHERE id = $2",
-                    [i32::try_from(inserted_total + overwritten).unwrap_or(i32::MAX).into(), job_id.into()],
-                ))
-                .await;
-            let _ = events.send(AppEvent::JobCompleted {
-                job_id,
-                status: "completed".to_string(),
-                readings_updated: Some(i32::try_from(inserted_total + overwritten).unwrap_or(i32::MAX)),
-                error_message: None,
-            });
-        });
+                    Ok(i64::from(
+                        i32::try_from(inserted_total + overwritten).unwrap_or(i32::MAX),
+                    ))
+                }
+            },
+        )
+        .await?;
         Some(job_id)
     } else {
         None
