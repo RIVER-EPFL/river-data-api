@@ -350,6 +350,39 @@ pub async fn rebuild_alarm_events(
     Ok(Json(serde_json::json!({ "job_id": job_id, "status": "pending" })))
 }
 
+/// Force a full open-alarm reconcile right now, instead of waiting for the periodic backstop
+/// sweep. Runs the same single tick the sweeper runs (open new breaches, refresh still-breaching,
+/// auto-resolve returned-to-range) across every active slot, synchronously — the post-LATERAL
+/// breach query is O(active slots), so this returns in well under a second. Operator escape hatch
+/// for "I changed something and want the alarm state correct immediately". Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/actions/reconcile_alarms",
+    responses(
+        (status = 200, description = "Reconcile complete; counts of opened/updated/resolved events"),
+    ),
+    tag = "actions"
+)]
+pub async fn reconcile_alarms(
+    State(app_state): State<AppState>,
+) -> AppResult<Json<serde_json::Value>> {
+    let stats =
+        crate::routes::private::alarms::sweeper::evaluate_alarm_events(&app_state.db).await?;
+
+    if stats.opened > 0 || stats.resolved > 0 {
+        let _ = app_state.events.send(crate::common::AppEvent::AlarmStateChanged {
+            opened: stats.opened,
+            resolved: stats.resolved,
+        });
+    }
+
+    Ok(Json(serde_json::json!({
+        "opened": stats.opened,
+        "updated": stats.updated,
+        "resolved": stats.resolved,
+    })))
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RollbackDeploymentRequest {
     pub deployment_id: Uuid,

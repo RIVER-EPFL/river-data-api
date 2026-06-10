@@ -87,7 +87,9 @@ pub struct Config {
     pub janitor_full_refresh_seconds: u64,
     pub janitor_retention_days: u32,
 
-    // Alarm sweeper: how often to reconcile persisted alarm_events against current breaches
+    // Alarm sweeper: how often to reconcile persisted alarm_events against current breaches.
+    // The sweep is only the backstop — ingest, config changes, and job completions reconcile
+    // event-driven (~1s), so this just bounds how long a missed trigger can stay stale.
     pub alarm_sweep_interval_seconds: u64,
 
     // Tracked-job retry policy (calibration/deployment/derived reprocessing, aggregate refresh, ...)
@@ -242,9 +244,9 @@ impl Config {
                 .unwrap_or(180),
 
             alarm_sweep_interval_seconds: env::var("ALARM_SWEEP_INTERVAL_SECONDS")
-                .unwrap_or_else(|_| "60".to_string())
+                .unwrap_or_else(|_| "300".to_string())
                 .parse()
-                .unwrap_or(60),
+                .unwrap_or(300),
 
             job_max_retries: env::var("JOB_MAX_RETRIES")
                 .unwrap_or_else(|_| "3".to_string())

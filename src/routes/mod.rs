@@ -210,6 +210,7 @@ pub fn validate_optional_time_range(
         private::admin::actions::reprocess_sensor,
         private::admin::actions::reprocess_all,
         private::admin::actions::rebuild_alarm_events,
+        private::admin::actions::reconcile_alarms,
         private::admin::actions::rollback_deployment,
         private::admin::actions::calibration_candidates,
         private::admin::actions::backfill_calibrations,
