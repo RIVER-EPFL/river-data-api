@@ -233,6 +233,7 @@ pub fn validate_optional_time_range(
         private::sync::views::unpaired_summary,
         private::sync::views::plan_site_metadata,
         private::admin::users::list_users,
+        private::admin::users::search_users,
         private::admin::users::get_user,
         private::admin::users::create_user,
         private::admin::users::update_user,

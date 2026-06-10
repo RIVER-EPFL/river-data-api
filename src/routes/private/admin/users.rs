@@ -182,10 +182,27 @@ pub async fn list_users(
         v.get("admin").and_then(|a| a.as_bool())
     });
 
-    // Fetch only users with the riverdata-user role (not the entire realm)
+    // Fetch only users holding a riverdata role (not the entire realm — it is LDAP-federated
+    // and contains every EPFL account). Union both roles so admin-only users appear too.
     let user_role = Role::User.to_string();
     let admin_role = Role::Administrator.to_string();
-    let kc_users = fetch_role_users(client, &token, &base, &user_role).await;
+    let (role_users, role_admins) = futures::future::try_join(
+        fetch_role_users(client, &token, &base, &user_role),
+        fetch_role_users(client, &token, &base, &admin_role),
+    )
+    .await?;
+    let mut kc_users = role_users;
+    let mut seen: std::collections::HashSet<String> = kc_users
+        .iter()
+        .filter_map(|u| u["id"].as_str().map(String::from))
+        .collect();
+    for u in role_admins {
+        if let Some(id) = u["id"].as_str()
+            && seen.insert(id.to_string())
+        {
+            kc_users.push(u);
+        }
+    }
 
     // Fetch roles for each user concurrently
     let role_futures: Vec<_> = kc_users
@@ -244,6 +261,83 @@ pub async fn list_users(
     );
 
     Ok((headers, Json(page)))
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct SearchQuery {
+    /// Search string matched by Keycloak against username, email, first and last name.
+    pub q: String,
+}
+
+/// Search the realm's user directory (LDAP-federated in production, so this reaches every
+/// EPFL account). Each result carries its current realm roles so callers can tell who already
+/// has river-data access. Used by the UI's add-user flow. Requires `require_admin`.
+#[utoipa::path(
+    get,
+    path = "/users/search",
+    params(SearchQuery),
+    responses(
+        (status = 200, description = "Matching users with their realm roles", body = Object),
+        (status = 503, description = "Keycloak admin client not configured"),
+    ),
+    tag = "admin"
+)]
+pub async fn search_users(
+    State(state): State<AppState>,
+    Query(query): Query<SearchQuery>,
+) -> AppResult<Json<Vec<serde_json::Value>>> {
+    let token = get_admin_token(&state).await?;
+    let client = admin_client(&state)?;
+    let base = admin_base_url(&state)?;
+
+    let resp = client
+        .http_client
+        .get(format!("{base}/users"))
+        .bearer_auth(&token)
+        .query(&[
+            ("search", query.q.as_str()),
+            ("max", "20"),
+            ("briefRepresentation", "true"),
+        ])
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Keycloak request failed: {e}")))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!(
+            "Keycloak user search failed ({status}): {body}"
+        )));
+    }
+
+    let kc_users: Vec<serde_json::Value> = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to parse user search: {e}")))?;
+
+    let role_futures: Vec<_> = kc_users
+        .iter()
+        .map(|u| {
+            let user_id = u["id"].as_str().unwrap_or_default().to_string();
+            let token = token.clone();
+            let base = base.clone();
+            async move { fetch_user_roles(client, &token, &base, &user_id).await }
+        })
+        .collect();
+    let all_roles = futures::future::join_all(role_futures).await;
+
+    let users: Vec<serde_json::Value> = kc_users
+        .iter()
+        .zip(all_roles)
+        .map(|(u, roles)| {
+            let mut user = simplify_user(u);
+            user["roles"] = serde_json::json!(roles);
+            user
+        })
+        .collect();
+
+    Ok(Json(users))
 }
 
 /// Get a Keycloak user by ID with their realm roles attached. Requires `require_admin`.
@@ -576,7 +670,7 @@ async fn fetch_role_users(
     token: &str,
     base: &str,
     role_name: &str,
-) -> Vec<serde_json::Value> {
+) -> AppResult<Vec<serde_json::Value>> {
     let url = format!("{base}/roles/{role_name}/users");
     tracing::debug!("Fetching role users from: {url}");
     let resp = client
@@ -585,25 +679,27 @@ async fn fetch_role_users(
         .bearer_auth(token)
         .query(&[("first", "0"), ("max", "1000")])
         .send()
-        .await;
-
-    match resp {
-        Ok(r) if r.status().is_success() => {
-            let users: Vec<serde_json::Value> = r.json().await.unwrap_or_default();
-            tracing::debug!("Got {} users with role {role_name}", users.len());
-            users
-        }
-        Ok(r) => {
-            let status = r.status();
-            let body = r.text().await.unwrap_or_default();
-            tracing::warn!("Keycloak role users request failed ({status}): {body}");
-            vec![]
-        }
-        Err(e) => {
+        .await
+        .map_err(|e| {
             tracing::warn!("Keycloak role users request error: {e}");
-            vec![]
-        }
+            AppError::Internal(format!("Keycloak role users request failed: {e}"))
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        tracing::warn!("Keycloak role users request failed ({status}): {body}");
+        return Err(AppError::Internal(format!(
+            "Keycloak role users request failed ({status}): {body}"
+        )));
     }
+
+    let users: Vec<serde_json::Value> = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to parse role users: {e}")))?;
+    tracing::debug!("Got {} users with role {role_name}", users.len());
+    Ok(users)
 }
 
 async fn fetch_user_roles(
@@ -721,6 +817,7 @@ async fn set_user_roles(
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_users).post(create_user))
+        .route("/search", get(search_users))
         .route("/{id}", get(get_user).put(update_user).delete(delete_user))
         .route("/{id}/roles", axum::routing::post(assign_roles))
 }

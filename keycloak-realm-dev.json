@@ -70,6 +70,14 @@
         }
       ],
       "realmRoles": ["riverdata-user"]
+    },
+    {
+      "username": "service-account-river-data-api",
+      "enabled": true,
+      "serviceAccountClientId": "river-data-api-local",
+      "clientRoles": {
+        "realm-management": ["manage-users", "view-users", "query-users", "view-realm"]
+      }
     }
   ]
 }

@@ -9,3 +9,4 @@ mod common;
 mod merge_conflict_handling;
 mod merge_parameters;
 mod reprocess_all_backdate;
+mod users;

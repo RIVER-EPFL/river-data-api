@@ -37,6 +37,33 @@ pub fn keycloak_client_id() -> String {
     std::env::var("TEST_KEYCLOAK_CLIENT_ID").unwrap_or_else(|_| "river-data-ui-local".to_string())
 }
 
+/// Service-account client for the Keycloak admin proxy (`/users`, `/roles`). Defaults match the
+/// dev realm import (`keycloak-realm-dev.json`): a confidential client whose service account holds
+/// the `realm-management` roles (`manage-users`, `view-users`, `query-users`, `view-realm`).
+#[must_use]
+pub fn keycloak_admin_client_id() -> String {
+    std::env::var("TEST_KEYCLOAK_ADMIN_CLIENT_ID")
+        .unwrap_or_else(|_| "river-data-api-local".to_string())
+}
+
+#[must_use]
+pub fn keycloak_admin_client_secret() -> String {
+    std::env::var("TEST_KEYCLOAK_ADMIN_CLIENT_SECRET")
+        .unwrap_or_else(|_| "river-data-api-local-secret".to_string())
+}
+
+/// A test `Config` with the Keycloak admin proxy pointed at an in-test mock server (no auth
+/// instance, no real Keycloak). For driving the admin proxy handlers' failure paths directly.
+#[must_use]
+pub fn test_config_with_mock_keycloak(mock_url: &str) -> river_db::config::Config {
+    let mut config = super::test_config();
+    config.keycloak_url = Some(mock_url.to_string());
+    config.keycloak_realm = Some("mock".to_string());
+    config.keycloak_admin_client_id = Some("mock-client".to_string());
+    config.keycloak_admin_client_secret = Some("mock-secret".to_string());
+    config
+}
+
 /// Whether the configured Keycloak's OIDC discovery is reachable (2s timeout). Tests skip when false.
 pub async fn keycloak_reachable() -> bool {
     let url = format!(
@@ -86,12 +113,29 @@ pub async fn get_keycloak_jwt(username: &str, password: &str) -> String {
 /// (axum-keycloak-auth 0.8.3) if a request arrives before discovery has started, which a no-token
 /// request can otherwise race.
 pub async fn build_test_app_with_keycloak(db: DatabaseConnection) -> axum::Router {
+    build_test_app_with_keycloak_inner(db, false).await
+}
+
+/// Like [`build_test_app_with_keycloak`], additionally configuring the Keycloak **admin proxy**
+/// (service-account client credentials), so the conditional `/users` + `/roles` routes are mounted.
+pub async fn build_test_app_with_keycloak_admin(db: DatabaseConnection) -> axum::Router {
+    build_test_app_with_keycloak_inner(db, true).await
+}
+
+async fn build_test_app_with_keycloak_inner(
+    db: DatabaseConnection,
+    with_admin_proxy: bool,
+) -> axum::Router {
     let base = keycloak_base_url();
     let realm = keycloak_realm();
     let mut config = super::test_config();
     config.keycloak_url = Some(base.clone());
     config.keycloak_realm = Some(realm.clone());
     config.keycloak_client_id = Some(keycloak_client_id());
+    if with_admin_proxy {
+        config.keycloak_admin_client_id = Some(keycloak_admin_client_id());
+        config.keycloak_admin_client_secret = Some(keycloak_admin_client_secret());
+    }
 
     let instance = Arc::new(KeycloakAuthInstance::new(
         KeycloakConfig::builder()

@@ -382,6 +382,229 @@ async fn replicate_zero_decides_breach_state() {
     );
 }
 
+/// Re-activating a site_parameter brings its slot back into evaluation: the still-breaching
+/// reading re-opens as a fresh event (the resolved one is history), instantly.
+#[tokio::test]
+#[serial]
+async fn site_parameter_reactivation_reopens_alarm() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+    let stream = turb_stream(&db).await;
+
+    inject(&db, stream, "2025-02-01T00:00:00Z", BREACH).await;
+    alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    assert_eq!(open_turb_event_count(&db).await, 1);
+
+    let toggle = |active: bool| {
+        let app = &app;
+        let token = &token;
+        async move {
+            crate::common::put_json_with_token(
+                app,
+                &format!("/api/site_parameters/{}", crate::common::PARAM_S1_TURB_ID),
+                &serde_json::json!({ "is_active": active }),
+                token,
+            )
+            .await
+        }
+    };
+
+    let (status, body) = toggle(false).await;
+    assert_eq!(status, 200, "deactivate: {body}");
+    assert_eq!(open_turb_event_count(&db).await, 0, "deactivation resolves without a sweep");
+
+    let (status, body) = toggle(true).await;
+    assert_eq!(status, 200, "reactivate: {body}");
+    assert_eq!(open_turb_event_count(&db).await, 1, "reactivation re-opens without a sweep");
+    assert_eq!(
+        turb_event_count(&db, false).await,
+        2,
+        "the re-open is a fresh event; the resolved one is preserved"
+    );
+}
+
+/// `DELETE /alarm_thresholds/batch` re-checks breach state like single delete does.
+#[tokio::test]
+#[serial]
+async fn threshold_batch_delete_reconciles_without_new_reading() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+    let stream = turb_stream(&db).await;
+
+    inject(&db, stream, "2025-02-01T00:00:00Z", BREACH).await;
+
+    let (status, created) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/alarm_thresholds",
+        &serde_json::json!({
+            "parameter_id": crate::common::GLOBAL_PARAM_TURB_ID,
+            "site_id": crate::common::SITE1_ID,
+            "warning_max": 99999.0,
+            "alarm_max": 99999.0,
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 201, "threshold create: {created}");
+    let override_id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(open_turb_event_count(&db).await, 0, "wide override suppresses the breach");
+
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let req = axum::http::Request::builder()
+        .method("DELETE")
+        .uri("/api/alarm_thresholds/batch")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::to_string(&serde_json::json!([override_id])).unwrap(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    let status = response.status().as_u16();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        (200..300).contains(&status),
+        "batch delete ({status}): {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        1,
+        "batch delete falls back to the global threshold and opens without a sweep"
+    );
+}
+
+async fn open_event_count(db: &sea_orm::DatabaseConnection, parameter_id: &str) -> i64 {
+    db.query_one(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            "SELECT COUNT(*) AS c FROM alarm_events \
+             WHERE site_id='{}' AND parameter_id='{parameter_id}' AND resolved_at IS NULL",
+            crate::common::SITE1_ID,
+        ),
+    ))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get::<i64>("", "c")
+    .unwrap()
+}
+
+/// Merging site_parameters reconciles both sides in the same request: the absorbed slot's open
+/// event resolves (the slot is gone) and the target slot opens for the moved breaching reading
+/// (merge moves readings between parameters within the site; 600 breaches the temperature
+/// thresholds too).
+#[tokio::test]
+#[serial]
+async fn merge_reconciles_source_and_target_slots() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+    let stream = turb_stream(&db).await;
+
+    inject(&db, stream, "2025-02-01T00:00:00Z", BREACH).await;
+    alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    assert_eq!(open_turb_event_count(&db).await, 1);
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/actions/merge_site_parameters",
+        &serde_json::json!({
+            "source_site_parameter_id": crate::common::PARAM_S1_TURB_ID,
+            "target_site_parameter_id": crate::common::PARAM_S1_TEMP_ID,
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "merge: {body}");
+
+    assert_eq!(
+        open_event_count(&db, crate::common::GLOBAL_PARAM_TURB_ID).await,
+        0,
+        "the absorbed slot's event resolves without a sweep"
+    );
+    assert_eq!(
+        open_event_count(&db, crate::common::GLOBAL_PARAM_TEMP_ID).await,
+        1,
+        "the moved breaching reading opens at the target without a sweep"
+    );
+}
+
+/// Every tracked job reconciles alarms on completion: a job that rewrites the breaching value back
+/// into range resolves the open event with no sweep and no further API call.
+#[tokio::test]
+#[serial]
+async fn tracked_job_completion_reconciles_alarms() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let (_app, events) = crate::common::build_test_app_with_events(db.clone());
+    let stream = turb_stream(&db).await;
+
+    inject(&db, stream, "2025-02-01T00:00:00Z", BREACH).await;
+    alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    assert_eq!(open_turb_event_count(&db).await, 1);
+
+    let site = crate::common::SITE1_ID;
+    let param = crate::common::GLOBAL_PARAM_TURB_ID;
+    let job_id = river_db::routes::private::sensor_calibrations::services::spawn_tracked_job(
+        &db,
+        None,
+        "manual_reprocess",
+        None,
+        events,
+        move |db| async move {
+            db.execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "UPDATE readings SET raw_value = {IN_RANGE} \
+                     WHERE site_id='{site}' AND parameter_id='{param}' AND raw_value={BREACH}"
+                ),
+            ))
+            .await?;
+            Ok(1)
+        },
+    )
+    .await
+    .unwrap();
+
+    // The completion reconcile runs inside the spawned job task; poll the alarm state itself
+    // (the job row flips to 'completed' just before the reconcile, so job status alone races).
+    let mut reconciled = false;
+    for _ in 0..50 {
+        if open_turb_event_count(&db).await == 0 {
+            reconciled = true;
+            break;
+        }
+        let status: String = db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("SELECT status FROM reprocessing_jobs WHERE id='{job_id}'"),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "status")
+            .unwrap();
+        assert_ne!(status, "failed", "job must not fail");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        reconciled,
+        "job completion did not reconcile the alarm within 5s"
+    );
+}
+
 /// `POST /actions/reconcile_alarms` runs a full reconcile on demand and reports what changed.
 #[tokio::test]
 #[serial]
