@@ -130,6 +130,7 @@ async fn test_status_events_empty_range() {
 
     let events = body["events"].as_array().unwrap();
     assert!(events.is_empty(), "should return empty events array");
+    assert_eq!(body["total"], 0);
 }
 
 // ============================================================================

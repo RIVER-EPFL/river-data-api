@@ -7,3 +7,4 @@
 mod common;
 
 mod csv_quoting_and_formats;
+mod pagination;

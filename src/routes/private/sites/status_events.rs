@@ -41,6 +41,13 @@ pub struct StatusEventsQuery {
     /// Response format: json (default), ndjson, csv
     #[serde(default = "default_format")]
     pub format: String,
+    /// Max events to return (JSON only, capped at 1000). If omitted, returns all
+    /// matching events. CSV/NDJSON always export the full range.
+    pub limit: Option<u64>,
+    /// Pagination offset (JSON only, default 0).
+    pub offset: Option<u64>,
+    /// Sort by time: `asc` (default) or `desc`.
+    pub order: Option<String>,
 }
 
 /// A single status event in the JSON response
@@ -59,6 +66,8 @@ pub struct StatusEventsResponse {
     pub site: SiteRef,
     /// Array of status events
     pub events: Vec<StatusEventData>,
+    /// Total events matching the time range (ignores limit/offset)
+    pub total: u64,
 }
 
 /// Get status events for a specific site
@@ -141,8 +150,46 @@ pub async fn get_site_status_events(
     };
     let _ = next_param; // suppress unused warning
 
+    let dir = if query.order.as_deref() == Some("desc") {
+        "DESC"
+    } else {
+        "ASC"
+    };
+
+    // Pagination applies to JSON only; CSV/NDJSON remain full-range exports.
+    let pagination = match (format.as_str(), query.limit) {
+        ("json", Some(limit)) => {
+            let limit = limit.min(1000);
+            let offset = query.offset.unwrap_or(0);
+            format!(" LIMIT {limit} OFFSET {offset}")
+        }
+        _ => String::new(),
+    };
+
+    // Count the full match set only when a LIMIT truncates the result; otherwise
+    // the row count already is the total.
+    let counted_total: Option<u64> = if pagination.is_empty() {
+        None
+    } else {
+        let count_sql = format!(
+            "SELECT COUNT(*) AS cnt FROM status_events WHERE site_id = $1{time_conditions}"
+        );
+        let total = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                &count_sql,
+                values.clone(),
+            ))
+            .await?
+            .and_then(|row| row.try_get::<i64>("", "cnt").ok())
+            .unwrap_or(0)
+            .max(0) as u64;
+        Some(total)
+    };
+
     let sql = format!(
-        "SELECT parameter_id, time, value, sensor_id FROM status_events WHERE site_id = $1{time_conditions} ORDER BY time"
+        "SELECT parameter_id, time, value, sensor_id FROM status_events WHERE site_id = $1{time_conditions} ORDER BY time {dir}{pagination}"
     );
 
     let query_result = state
@@ -170,9 +217,11 @@ pub async fn get_site_status_events(
         "csv" => build_status_events_csv(&events),
         "ndjson" => build_status_events_ndjson(&events),
         _ => {
+            let total = counted_total.unwrap_or(events.len() as u64);
             let response = StatusEventsResponse {
                 site: site_ref,
                 events,
+                total,
             };
             Ok(Json(response).into_response())
         }
