@@ -243,6 +243,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
 
     let metadata_read_routes = Router::new()
         .route("/search", get(search::search))
+        .route("/version", get(crate::routes::version::get_version))
         .route("/actions/backfill_candidates", get(actions::backfill_candidates))
         .route("/actions/calibration_candidates", get(actions::calibration_candidates))
         .layer(middleware::from_fn(require_read_metadata))

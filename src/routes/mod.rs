@@ -1,4 +1,5 @@
 pub mod config;
+pub mod version;
 pub mod private;
 pub mod public;
 pub mod public_api;
@@ -165,6 +166,7 @@ pub fn validate_optional_time_range(
 #[openapi(
     paths(
         healthz,
+        version::get_version,
         private::projects::views::list_project_sites,
         private::sites::handlers::list_site_parameters,
         private::sites::handlers::get_site_detail,
@@ -381,10 +383,12 @@ pub fn validate_optional_time_range(
         (name = "admin", description = "Keycloak user/role management (require_admin — Keycloak admin role only, no token can pass)"),
     ),
     modifiers(&SecurityAddon),
+    // `version` is overwritten at serve time from CARGO_PKG_VERSION (see build_router); the literal
+    // here is just a placeholder the derive macro requires.
     info(
         title = "River Data API",
         description = "Time-series sensor data API",
-        version = "0.2.0"
+        version = "0.0.0"
     )
 )]
 struct ApiDoc;
@@ -541,25 +545,17 @@ pub fn build_router(state: AppState) -> Router {
 <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.57.2"></script>
 </body>
 </html>"#;
-    let mut docs_routes = Router::new()
-        .merge(Scalar::with_url("/docs", ApiDoc::openapi()).custom_html(PINNED_SCALAR_HTML))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            crate::common::middleware::service_auth_middleware,
-        ));
-    if let Some(instance) = state.keycloak_auth_instance.clone() {
-        use axum_keycloak_auth::{PassthroughMode, layer::KeycloakAuthLayer};
-        docs_routes = docs_routes.layer(
-            KeycloakAuthLayer::<crate::common::auth::Role>::builder()
-                .instance(instance)
-                .passthrough_mode(PassthroughMode::Pass)
-                .persist_raw_claims(false)
-                .expected_audiences(vec![String::from("account")])
-                .required_roles(vec![crate::common::auth::Role::User])
-                .build(),
-        );
-    }
-    let docs_routes = docs_routes.with_state(state.clone());
+    // Report the crate's actual version in the served OpenAPI doc rather than a hand-maintained
+    // literal (which had gone stale at 0.2.0 while the crate was 0.4.2).
+    let mut openapi = ApiDoc::openapi();
+    openapi.info.version = env!("CARGO_PKG_VERSION").to_string();
+    // `/docs` is intentionally unauthenticated. The ingress routes only `/api` externally and keeps
+    // root paths (`/docs`, `/healthz`) cluster-internal, so the Scalar UI + spec are never publicly
+    // reachable. Leaving it auth-free also stops the auth-wrapped fallback from answering unmatched
+    // root routes with 401 instead of 404.
+    let docs_routes = Router::new()
+        .merge(Scalar::with_url("/docs", openapi).custom_html(PINNED_SCALAR_HTML))
+        .with_state(state.clone());
 
     // Build CORS layer from config
     let cors = {

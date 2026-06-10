@@ -17,6 +17,11 @@ FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
+# Build/version metadata baked into the binary, surfaced by GET /api/version. Set late (after the
+# cached dep cook) so changing them only re-runs the final crate build, not the dependency layers.
+ARG BUILD_VERSION=dev
+ARG BUILD_TIME=unknown
+ENV BUILD_VERSION=$BUILD_VERSION BUILD_TIME=$BUILD_TIME
 RUN cargo build --release
 
 # Stage 4: Runtime (minimal image)
