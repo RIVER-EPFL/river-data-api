@@ -260,6 +260,7 @@ pub async fn ingest_readings(
         unique_timestamps.sort();
         unique_timestamps.dedup();
         let job_total = i32::try_from(unique_timestamps.len()).unwrap_or(i32::MAX);
+        let source_stream = payload.stream_id;
 
         crate::routes::private::reprocessing_jobs::lifecycle::spawn_tracked_job_ctx(
             db,
@@ -270,6 +271,13 @@ pub async fn ingest_readings(
             move |ctx| {
                 let timestamps = unique_timestamps.clone();
                 async move {
+                    ctx.set_site(sid).await;
+                    ctx.set_detail(serde_json::json!({
+                        "scope": { "site_id": sid },
+                        "source": { "stream_id": source_stream },
+                        "counts": { "timestamps": job_total },
+                    }))
+                    .await;
                     ctx.set_progress(0, Some(job_total)).await;
                     let mut progress = 0i32;
                     for time in timestamps {

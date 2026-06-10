@@ -817,13 +817,39 @@ pub async fn spawn_reprocessing_job(
     trigger_id: Option<Uuid>,
     events: crate::common::EventSender,
 ) -> Result<Uuid, sea_orm::DbErr> {
-    spawn_tracked_job(
+    spawn_tracked_job_ctx(
         db,
         Some(sensor_id),
         trigger_type,
         trigger_id,
         events,
-        move |db| async move { reprocess_sensor_readings(&db, sensor_id).await.map(|c| c as i64) },
+        move |ctx| async move {
+            ctx.info(&format!("Reprocessing readings for sensor {sensor_id}"))
+                .await;
+            let count = reprocess_sensor_readings(ctx.db(), sensor_id).await?;
+            // Scope the job to the sensor's site(s) and record what it touched, so the timeline
+            // shows which sensor/site and how many readings were re-derived.
+            if let Ok(Some(row)) = ctx
+                .db()
+                .query_one(sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT DISTINCT site_id FROM readings WHERE sensor_id = $1 AND site_id IS NOT NULL LIMIT 1",
+                    [sensor_id.into()],
+                ))
+                .await
+            {
+                if let Ok(site_id) = row.try_get::<Uuid>("", "site_id") {
+                    ctx.set_site(site_id).await;
+                }
+            }
+            ctx.set_detail(serde_json::json!({
+                "scope": { "sensor_id": sensor_id },
+                "counts": { "readings_updated": count },
+            }))
+            .await;
+            ctx.info(&format!("Re-derived {count} readings")).await;
+            Ok(count as i64)
+        },
     )
     .await
 }

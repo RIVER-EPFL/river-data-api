@@ -108,6 +108,13 @@ pub async fn run_once(db: &DatabaseConnection) -> Result<usize, sea_orm::DbErr> 
                 crate::common::sync_state::refresh_continuous_aggregates(ctx.db(), Some(since)).await;
             }
             ctx.set_progress(total, Some(total)).await;
+            ctx.set_detail(serde_json::json!({
+                "counts": { "gaps_found": total, "filled": filled },
+                "time_range": { "earliest_filled": min_filled },
+                "capped_at_limit": total as usize >= MAX_GAPS_PER_RUN,
+            }))
+            .await;
+            ctx.info(&format!("Filled {filled} of {total} derived gaps")).await;
             tracing::info!(
                 filled,
                 total,
