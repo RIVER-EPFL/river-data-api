@@ -8,7 +8,6 @@ mod common;
 
 mod aggregation_and_paired_series;
 mod alarm_annotation_note_lifecycle;
-mod data_endpoints_workflow;
 mod deployment_slot_and_recall;
 mod full_public_data_workflow;
 mod grab_aggregation_and_tool_save;

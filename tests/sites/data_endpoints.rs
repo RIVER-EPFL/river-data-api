@@ -1,6 +1,6 @@
 //! End-to-end tests for data endpoints: readings, aggregates, alarms.
 //!
-//! Run with: cargo test --test e2e
+//! Run with: cargo test --test sites
 //! Requires: DATABASE_URL pointing to a TimescaleDB instance.
 
 

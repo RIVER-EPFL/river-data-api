@@ -1,7 +1,7 @@
 //! `split_by_sensor=true` returns one aggregate series per sensor (using the sensor-dimension
 //! continuous aggregate), while the default collapses the sensor dimension into a single series.
 //!
-//! Run: cargo test --test readings -- --test-threads=1
+//! Run: cargo test --test sites -- --test-threads=1
 
 
 use crate::common::sensor_lifecycle as sl;

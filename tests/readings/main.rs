@@ -6,8 +6,6 @@
 #[allow(dead_code, unused_imports)]
 mod common;
 
-mod aggregate_flag_and_range_correctness;
-mod aggregate_sensor_split;
 mod csv_import_column_resolution;
 mod grab_samples_insertion;
 mod ingest_dedup_and_visibility;
