@@ -259,4 +259,30 @@ impl CRUDOperations for SiteParameterOperations {
 
         Ok(())
     }
+
+    // Breach evaluation only considers slots whose site_parameter is active, so toggling
+    // `is_active` (or removing the slot) can open or resolve alarms with no new reading.
+    // Reconcile immediately instead of waiting for the backstop sweep.
+    async fn after_update(
+        &self,
+        db: &DatabaseConnection,
+        _entity: &mut SiteParameter,
+    ) -> Result<(), ApiError> {
+        crate::routes::private::alarms::sweeper::reconcile_all_from_hook(db).await;
+        Ok(())
+    }
+
+    async fn after_delete(&self, db: &DatabaseConnection, _id: Uuid) -> Result<(), ApiError> {
+        crate::routes::private::alarms::sweeper::reconcile_all_from_hook(db).await;
+        Ok(())
+    }
+
+    async fn after_delete_many(
+        &self,
+        db: &DatabaseConnection,
+        _ids: &[Uuid],
+    ) -> Result<(), ApiError> {
+        crate::routes::private::alarms::sweeper::reconcile_all_from_hook(db).await;
+        Ok(())
+    }
 }

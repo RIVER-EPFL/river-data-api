@@ -457,6 +457,11 @@ pub(crate) async fn fetch_active_alarm_rows(
     // Loose index scan: one `ORDER BY time DESC LIMIT 1` per active slot via
     // `idx_readings_site_param_time`, instead of a `DISTINCT ON` over the whole hypertable. Cost is
     // O(active slots), independent of history depth.
+    //
+    // `replicate_index = 0` keeps the "latest value" deterministic when grab replicates share a
+    // timestamp, matching episodes and the continuous aggregates. Flagged readings deliberately
+    // still drive alarms (divergent from aggregates/samples, which exclude them): an out-of-range
+    // value should keep alerting even after someone flags it.
     let sql = format!(
         r"
         WITH resolved_thresholds AS ({resolved_cte})
@@ -482,6 +487,7 @@ pub(crate) async fn fetch_active_alarm_rows(
             SELECT COALESCE(r.calibrated_value, r.raw_value) AS value, r.time
             FROM readings r
             WHERE r.site_id = rt.site_id AND r.parameter_id = rt.parameter_id
+              AND r.replicate_index = 0
             ORDER BY r.time DESC
             LIMIT 1
         ) lr

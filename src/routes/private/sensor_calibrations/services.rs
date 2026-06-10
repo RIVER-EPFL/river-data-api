@@ -980,6 +980,12 @@ where
                 {
                     tracing::warn!(error = %e, job_id = %job_id, "Failed to mark reprocessing job completed");
                 }
+                // Most tracked jobs rewrite reading values or attribution (recalibration,
+                // reprocess, pairing/derived backfill, adopt/swap), any of which can change breach
+                // state. Reconcile unconditionally: it is idempotent, O(active slots), spawns no
+                // jobs (no recursion), and is merely redundant for jobs that don't touch values.
+                crate::routes::private::alarms::sweeper::reconcile_all_and_notify(&db, &events)
+                    .await;
                 let _ = events.send(crate::common::AppEvent::JobCompleted {
                     job_id,
                     status: "completed".into(),

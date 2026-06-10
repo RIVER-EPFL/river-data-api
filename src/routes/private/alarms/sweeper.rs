@@ -88,6 +88,21 @@ pub async fn reconcile_all_and_notify(db: &DatabaseConnection, events: &EventSen
     }
 }
 
+/// [`reconcile_all_and_notify`] for contexts that only hold a `&DatabaseConnection` (CrudCrate
+/// operation hooks). Uses the process-global event sender; a missing sender (some unit tests) just
+/// skips the SSE. Never returns an error — a failed reconcile must not fail the CRUD operation
+/// that triggered it.
+pub async fn reconcile_all_from_hook(db: &DatabaseConnection) {
+    match crate::common::global_event_sender() {
+        Some(events) => reconcile_all_and_notify(db, &events).await,
+        None => {
+            if let Err(e) = evaluate_alarm_events(db).await {
+                tracing::warn!(error = %e, "global alarm reconcile failed");
+            }
+        }
+    }
+}
+
 /// One reconciliation tick. `slots = None` reconciles every active slot (backstop); `slots = Some`
 /// restricts every step to those slots. Idempotent: the partial unique index on open events makes
 /// open-or-update a no-op when nothing changed.
@@ -209,6 +224,7 @@ async fn reconcile(
              updated_at = NOW(), \
              resolved_value = (SELECT COALESCE(r.calibrated_value, r.raw_value) FROM readings r \
                                WHERE r.site_id = ae.site_id AND r.parameter_id = ae.parameter_id \
+                                 AND r.replicate_index = 0 \
                                ORDER BY r.time DESC LIMIT 1) \
          WHERE ae.resolved_at IS NULL{scope_clause}{not_in_clause}"
     );

@@ -249,6 +249,20 @@ pub async fn insert_grab_samples(
         slots
     };
 
+    // Per-parameter time windows for the alarm episode reconstruction below (computed up front
+    // because the readings vec is consumed building the insert models).
+    let mut alarm_windows: HashMap<Uuid, (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> =
+        HashMap::new();
+    for r in &payload.readings {
+        alarm_windows
+            .entry(r.parameter_id)
+            .and_modify(|(lo, hi)| {
+                *lo = (*lo).min(r.time);
+                *hi = (*hi).max(r.time);
+            })
+            .or_insert((r.time, r.time));
+    }
+
     // Track replicate_index per (parameter_id, time) group for auto-assignment
     let mut index_counters: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), i16> = HashMap::new();
 
@@ -320,7 +334,10 @@ pub async fn insert_grab_samples(
 
     txn.commit().await?;
 
-    // Event-driven open-alarm reconcile for the sampled slots (error-safe; backstop covers it).
+    // Event-driven open-alarm reconcile for the sampled slots (error-safe; backstop covers it),
+    // plus historical episode reconstruction per slot so back-dated grabs land in alarm_events
+    // like the batch/import paths. Inline rather than a tracked job to avoid one
+    // reprocessing_jobs row per field campaign entry.
     if inserted > 0 {
         let alarm_slots: Vec<(Uuid, Uuid)> = stream_cache
             .keys()
@@ -332,6 +349,20 @@ pub async fn insert_grab_samples(
             &alarm_slots,
         )
         .await;
+
+        for (pid, (lo, hi)) in alarm_windows {
+            if let Err(e) = crate::routes::private::alarms::episodes::evaluate_alarm_episodes(
+                &state.db,
+                payload.site_id,
+                pid,
+                lo,
+                hi,
+            )
+            .await
+            {
+                tracing::warn!(error = %e, site_id = %payload.site_id, parameter_id = %pid, "alarm episode reconstruction failed");
+            }
+        }
     }
 
     tracing::info!(total, inserted, samples_created, site = %site.name, "Grab samples inserted");

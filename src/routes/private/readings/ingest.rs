@@ -204,7 +204,10 @@ pub async fn ingest_readings(
             count: inserted,
         });
 
-        // Event-driven open-alarm reconcile for this slot (error-safe; backstop still covers it).
+        // Event-driven open-alarm reconcile for this slot (error-safe; backstop still covers it),
+        // plus historical episode reconstruction over the ingested window so back-dated breaches
+        // land in alarm_events like the batch/import paths. Inline rather than a tracked job:
+        // single ingest fires every sync cycle per stream and would spam reprocessing_jobs.
         if let (Some(s), Some(p)) = (site_id, parameter_id) {
             crate::routes::private::alarms::sweeper::reconcile_and_notify(
                 &state.db,
@@ -212,6 +215,16 @@ pub async fn ingest_readings(
                 &[(s, p)],
             )
             .await;
+
+            let times = payload.readings.iter().map(|r| r.time);
+            if let (Some(lo), Some(hi)) = (times.clone().min(), times.max())
+                && let Err(e) = crate::routes::private::alarms::episodes::evaluate_alarm_episodes(
+                    &state.db, s, p, lo, hi,
+                )
+                .await
+            {
+                tracing::warn!(error = %e, site_id = %s, parameter_id = %p, "alarm episode reconstruction failed");
+            }
         }
     }
 

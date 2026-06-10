@@ -39,6 +39,11 @@ pub async fn merge_site_parameters_handler(
         "Site parameter merge complete"
     );
 
+    // A merge moves readings between slots and deletes a site_parameter, either of which can
+    // open or resolve alarms. Error-safe; the backstop sweep covers any failure.
+    crate::routes::private::alarms::sweeper::reconcile_all_and_notify(&state.db, &state.events)
+        .await;
+
     Ok(Json(result))
 }
 
@@ -74,6 +79,9 @@ pub async fn merge_parameters_handler(
         streams_updated = result.streams_updated,
         "Parameter merge complete"
     );
+
+    crate::routes::private::alarms::sweeper::reconcile_all_and_notify(&state.db, &state.events)
+        .await;
 
     Ok(Json(result))
 }

@@ -1,6 +1,8 @@
 use crudcrate::{CRUDResource, EntityToModels};
 use sea_orm::entity::prelude::*;
 
+use super::operations::AlarmThresholdOperations;
+
 #[derive(
     Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
 )]
@@ -9,7 +11,8 @@ use sea_orm::entity::prelude::*;
     api_struct = "AlarmThreshold",
     name_singular = "alarm_threshold",
     name_plural = "alarm_thresholds",
-    generate_router
+    generate_router,
+    operations = AlarmThresholdOperations
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
