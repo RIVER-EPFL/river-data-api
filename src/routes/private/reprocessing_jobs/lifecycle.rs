@@ -10,7 +10,9 @@
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use std::future::Future;
+use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -63,13 +65,15 @@ pub async fn reconcile_interrupted_jobs(db: &DatabaseConnection) -> Result<u64, 
 }
 
 /// Handle passed to a tracked job's work closure. Owns a DB connection, the job id, and the event
-/// sender so work can report incremental progress that the UI sees live. Cheap to clone (the retry
-/// loop hands a fresh clone to each attempt).
+/// sender so work can report incremental progress, structured `detail`, and a timeline of log lines
+/// that the UI sees live. Cheap to clone (the retry loop hands a fresh clone to each attempt); the
+/// log `seq` counter is shared across clones so ordering is monotonic across retries.
 #[derive(Clone)]
 pub struct JobContext {
     db: DatabaseConnection,
     job_id: Uuid,
     events: crate::common::EventSender,
+    seq: Arc<AtomicI64>,
 }
 
 impl JobContext {
@@ -83,6 +87,76 @@ impl JobContext {
     #[must_use]
     pub fn job_id(&self) -> Uuid {
         self.job_id
+    }
+
+    /// Append a line to the job's timeline (`reprocessing_job_logs`). `warn`/`error` lines are also
+    /// streamed over SSE as `JobLog`; the full ordered timeline is fetched on demand from
+    /// `GET /api/jobs/{id}/logs`. Best-effort — a logging failure must never fail the job.
+    pub async fn log(&self, level: &str, message: &str, context: serde_json::Value) {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "INSERT INTO reprocessing_job_logs (job_id, seq, level, message, context) \
+                 VALUES ($1, $2, $3, $4, $5::jsonb)",
+                [
+                    self.job_id.into(),
+                    seq.into(),
+                    level.into(),
+                    message.into(),
+                    context.to_string().into(),
+                ],
+            ))
+            .await
+        {
+            tracing::warn!(error = %e, job_id = %self.job_id, "Failed to append job log line");
+        }
+        if level == "warn" || level == "error" {
+            let _ = self.events.send(crate::common::AppEvent::JobLog {
+                job_id: self.job_id,
+                seq,
+                level: level.into(),
+                message: message.into(),
+                context,
+            });
+        }
+    }
+
+    /// Convenience: an `info` timeline line with no structured context.
+    pub async fn info(&self, message: &str) {
+        self.log("info", message, serde_json::json!({})).await;
+    }
+
+    /// Replace the job's structured `detail` summary (scope, time range, counts, provenance).
+    /// Best-effort.
+    pub async fn set_detail(&self, detail: serde_json::Value) {
+        if let Err(e) = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE reprocessing_jobs SET detail = $1::jsonb WHERE id = $2",
+                [detail.to_string().into(), self.job_id.into()],
+            ))
+            .await
+        {
+            tracing::warn!(error = %e, job_id = %self.job_id, "Failed to set job detail");
+        }
+    }
+
+    /// Set the job's `site_id` scope column (promoted from `detail` for list filtering).
+    pub async fn set_site(&self, site_id: Uuid) {
+        if let Err(e) = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE reprocessing_jobs SET site_id = $1 WHERE id = $2",
+                [site_id.into(), self.job_id.into()],
+            ))
+            .await
+        {
+            tracing::warn!(error = %e, job_id = %self.job_id, "Failed to set job site_id");
+        }
     }
 
     /// Atomically persist `progress` (and `total` when provided) onto the row **and** emit the
@@ -149,9 +223,15 @@ where
 
     db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status) \
-         VALUES ($1, $2, $3, $4, 'pending')",
-        [job_id.into(), sensor_id_value, trigger_type.into(), trigger_id_value],
+        "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status, category) \
+         VALUES ($1, $2, $3, $4, 'pending', $5)",
+        [
+            job_id.into(),
+            sensor_id_value,
+            trigger_type.into(),
+            trigger_id_value,
+            super::registry::category_for(trigger_type).into(),
+        ],
     ))
     .await?;
 
@@ -183,6 +263,7 @@ where
             db: db.clone(),
             job_id,
             events: events.clone(),
+            seq: Arc::new(AtomicI64::new(0)),
         };
 
         let mut attempt = 0u32;
@@ -354,9 +435,15 @@ where
     // Runs inline and starts immediately, so insert straight as `running` (no queued `pending`).
     db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status) \
-         VALUES ($1, $2, $3, $4, 'running')",
-        [job_id.into(), sensor_id_value, trigger_type.into(), trigger_id_value],
+        "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status, category) \
+         VALUES ($1, $2, $3, $4, 'running', $5)",
+        [
+            job_id.into(),
+            sensor_id_value,
+            trigger_type.into(),
+            trigger_id_value,
+            super::registry::category_for(trigger_type).into(),
+        ],
     ))
     .await?;
     let _ = events.send(crate::common::AppEvent::JobCreated { job_id });
@@ -371,6 +458,7 @@ where
         db: db.clone(),
         job_id,
         events: events.clone(),
+        seq: Arc::new(AtomicI64::new(0)),
     };
 
     match work(ctx).await {

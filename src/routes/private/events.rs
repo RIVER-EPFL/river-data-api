@@ -57,6 +57,7 @@ pub async fn event_stream(
                 crate::common::AppEvent::JobCreated { .. } => "job_created",
                 crate::common::AppEvent::JobProgress { .. } => "job_progress",
                 crate::common::AppEvent::JobCompleted { .. } => "job_completed",
+                crate::common::AppEvent::JobLog { .. } => "job_log",
                 crate::common::AppEvent::DataIngested { .. } => "data_ingested",
                 crate::common::AppEvent::AlarmStateChanged { .. } => "alarm_state_changed",
             };

@@ -38,6 +38,7 @@ pub enum AppEvent {
     JobCreated { job_id: uuid::Uuid },
     JobProgress { job_id: uuid::Uuid, status: String, progress: Option<i32>, total: Option<i32> },
     JobCompleted { job_id: uuid::Uuid, status: String, readings_updated: Option<i32>, error_message: Option<String> },
+    JobLog { job_id: uuid::Uuid, seq: i64, level: String, message: String, context: serde_json::Value },
     DataIngested { site_id: Option<uuid::Uuid>, parameter_id: Option<uuid::Uuid>, stream_id: uuid::Uuid, count: usize },
     AlarmStateChanged { opened: usize, resolved: usize },
 }

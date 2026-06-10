@@ -34,6 +34,18 @@ pub struct Model {
     pub error_message: Option<String>,
     #[crudcrate(exclude(update, create))]
     pub retry_count: i32,
+    /// Classification driving UI grouping/filtering: operator | metadata | maintenance.
+    #[crudcrate(filterable, exclude(update, create))]
+    pub category: String,
+    /// Scope promoted from `detail` so the jobs list can filter by site.
+    #[crudcrate(filterable, exclude(update, create))]
+    pub site_id: Option<Uuid>,
+    /// Originating job for a cascade (e.g. a derived recompute spawned by a reprocess).
+    #[crudcrate(filterable, exclude(update, create))]
+    pub parent_job_id: Option<Uuid>,
+    /// Structured per-job summary + provenance (scope, time range, counts, source, samples).
+    #[crudcrate(exclude(update, create))]
+    pub detail: serde_json::Value,
     #[crudcrate(sortable, exclude(update, create))]
     pub created_at: DateTimeWithTimeZone,
     #[crudcrate(sortable, exclude(update, create))]

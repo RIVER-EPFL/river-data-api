@@ -237,6 +237,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route("/alarms/events", get(alarm_views::get_alarm_events))
         .route("/alarms/thresholds", get(alarm_views::get_thresholds))
         .route("/events", get(crate::routes::private::events::event_stream))
+        .route(
+            "/reprocessing_jobs/{id}/logs",
+            get(crate::routes::private::reprocessing_jobs::routes::get_job_logs),
+        )
         .route("/tools", get(tools::list_tools))
         .route("/tools/{tool_name}/calculate", post(tools::calculate_tool))
         .layer(middleware::from_fn(require_read_data))
