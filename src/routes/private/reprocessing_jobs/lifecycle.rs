@@ -42,6 +42,26 @@ fn job_retry_policy() -> RetryPolicy {
     JOB_RETRY_POLICY.get().copied().unwrap_or_default()
 }
 
+/// Reconcile tracked jobs left mid-flight by a previous process. A job still in
+/// `pending`/`running`/`retrying` at startup can only be the corpse of a background task that died
+/// with the last process (the spawned task does not survive a restart), so mark it `interrupted` —
+/// a terminal status the UI shows as stopped and that is safe to rerun. Returns the count swept.
+///
+/// Must run once at startup **after** migrations and **before** anything can create a new job (the
+/// janitor spawn, the HTTP server), so it can't sweep a job that legitimately just started.
+pub async fn reconcile_interrupted_jobs(db: &DatabaseConnection) -> Result<u64, sea_orm::DbErr> {
+    let res = db
+        .execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE reprocessing_jobs \
+             SET status = 'interrupted', completed_at = NOW(), \
+                 error_message = 'Interrupted by API restart' \
+             WHERE status IN ('pending', 'running', 'retrying')",
+        ))
+        .await?;
+    Ok(res.rows_affected())
+}
+
 /// Handle passed to a tracked job's work closure. Owns a DB connection, the job id, and the event
 /// sender so work can report incremental progress that the UI sees live. Cheap to clone (the retry
 /// loop hands a fresh clone to each attempt).

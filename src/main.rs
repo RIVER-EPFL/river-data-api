@@ -66,6 +66,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     migration::Migrator::up(&db, None).await?;
     tracing::info!("Migrations completed");
 
+    // Reconcile any tracked jobs left mid-flight by a previous process (their background tasks died
+    // with that process). Must run after migrations and before the janitor spawn / HTTP server, so
+    // it can't sweep a job that legitimately just started.
+    match river_db::routes::private::reprocessing_jobs::lifecycle::reconcile_interrupted_jobs(&db)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(count = n, "Marked orphaned reprocessing jobs as interrupted"),
+        Err(e) => tracing::error!(error = %e, "Failed to reconcile interrupted reprocessing jobs"),
+    }
+
     // Initialize Keycloak authentication (optional in dev, required in prod)
     let keycloak_instance = if let (Some(url), Some(realm)) = (&config.keycloak_url, &config.keycloak_realm) {
         tracing::info!(url = %url, realm = %realm, "Initializing Keycloak authentication");
