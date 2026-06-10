@@ -23,19 +23,6 @@ pub async fn site_has_active_derived(
     Ok(row.is_some())
 }
 
-async fn update_job(db: &DatabaseConnection, job_id: Uuid, sql: &str, values: Vec<sea_orm::Value>) {
-    if let Err(e) = db
-        .execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-            values,
-        ))
-        .await
-    {
-        tracing::warn!(error = %e, %job_id, "Derived janitor: failed to update reprocessing_jobs row");
-    }
-}
-
 /// Find (site_id, time) pairs where a source reading exists but no corresponding
 /// derived reading was ever written. Recompute each.
 ///
@@ -43,136 +30,97 @@ async fn update_job(db: &DatabaseConnection, job_id: Uuid, sql: &str, values: Ve
 /// was down, derived parameters assigned after historical source data already
 /// existed, and any other inconsistency between source and derived readings.
 ///
-/// Each call persists a `reprocessing_jobs` row with `trigger_type='janitor_run'`
-/// so operators can see janitor activity on the `/jobs` UI page. After filling
-/// any gaps, refreshes continuous aggregates back to the earliest filled
-/// timestamp so the hourly/daily/weekly/monthly rollups reflect the newly
-/// written derived values.
+/// Runs through the shared synchronous tracked-job lifecycle ([`run_tracked_job`]) so it persists a
+/// `reprocessing_jobs` row with `trigger_type='janitor_run'` and reports live progress like every
+/// other job. After filling any gaps, refreshes continuous aggregates back to the earliest filled
+/// timestamp so the hourly/daily/weekly/monthly rollups reflect the newly written derived values.
 pub async fn run_once(db: &DatabaseConnection) -> Result<usize, sea_orm::DbErr> {
     let started = std::time::Instant::now();
-    let job_id = Uuid::new_v4();
-    db.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, status) \
-         VALUES ($1, NULL, 'janitor_run', 'running')",
-        [job_id.into()],
-    ))
+    // Same global-sender pattern as the CrudCrate hooks: real SSE stream in prod, a detached
+    // throwaway channel under tests where no AppState was constructed.
+    let events = crate::common::global_event_sender()
+        .unwrap_or_else(|| tokio::sync::broadcast::channel(1).0);
+
+    let filled = crate::routes::private::reprocessing_jobs::lifecycle::run_tracked_job(
+        db,
+        None,
+        "janitor_run",
+        None,
+        events,
+        |ctx| async move {
+            let rows = ctx
+                .db()
+                .query_all(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    r"SELECT DISTINCT r.site_id, r.time
+                      FROM readings r
+                      JOIN site_parameters sp
+                        ON sp.site_id = r.site_id
+                       AND sp.is_derived = true
+                       AND COALESCE(sp.is_active, true) = true
+                      JOIN derived_parameter_sources dps
+                        ON dps.derived_definition_id = sp.derived_definition_id
+                       AND dps.parameter_id = r.parameter_id
+                      WHERE NOT EXISTS (
+                          SELECT 1 FROM readings r2
+                          WHERE r2.site_id = r.site_id
+                            AND r2.parameter_id = sp.parameter_id
+                            AND r2.time = r.time
+                      )
+                      ORDER BY r.site_id, r.time
+                      LIMIT $1",
+                    [(MAX_GAPS_PER_RUN as i64).into()],
+                ))
+                .await?;
+
+            let total = i32::try_from(rows.len()).unwrap_or(i32::MAX);
+            ctx.set_progress(0, Some(total)).await;
+            if rows.is_empty() {
+                tracing::info!("Derived janitor: no gaps found");
+                return Ok(0);
+            }
+            tracing::info!(gaps = total, "Derived janitor: filling gaps");
+
+            let mut filled: i64 = 0;
+            let mut min_filled: Option<chrono::DateTime<chrono::Utc>> = None;
+            for (i, row) in rows.iter().enumerate() {
+                let site_id: Uuid = row.try_get("", "site_id")?;
+                let time: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
+                let utc_time = time.with_timezone(&chrono::Utc);
+                match crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
+                    ctx.db(), site_id, utc_time,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        filled += 1;
+                        min_filled = Some(min_filled.map_or(utc_time, |m| m.min(utc_time)));
+                    }
+                    Err(e) => tracing::warn!(error = %e, site_id = %site_id, time = %utc_time, "Janitor failed to fill derived gap"),
+                }
+                if (i + 1) % 1000 == 0 {
+                    ctx.set_progress(i as i32 + 1, Some(total)).await;
+                }
+            }
+
+            if let Some(since) = min_filled {
+                tracing::info!(%since, filled, "Derived janitor: refreshing continuous aggregates after backfill");
+                crate::common::sync_state::refresh_continuous_aggregates(ctx.db(), Some(since)).await;
+            }
+            ctx.set_progress(total, Some(total)).await;
+            tracing::info!(
+                filled,
+                total,
+                capped_at_limit = total as usize >= MAX_GAPS_PER_RUN,
+                "Derived janitor: gap fill complete"
+            );
+            Ok(filled)
+        },
+    )
     .await?;
 
-    let rows = match db
-        .query_all(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT DISTINCT r.site_id, r.time
-              FROM readings r
-              JOIN site_parameters sp
-                ON sp.site_id = r.site_id
-               AND sp.is_derived = true
-               AND COALESCE(sp.is_active, true) = true
-              JOIN derived_parameter_sources dps
-                ON dps.derived_definition_id = sp.derived_definition_id
-               AND dps.parameter_id = r.parameter_id
-              WHERE NOT EXISTS (
-                  SELECT 1 FROM readings r2
-                  WHERE r2.site_id = r.site_id
-                    AND r2.parameter_id = sp.parameter_id
-                    AND r2.time = r.time
-              )
-              ORDER BY r.site_id, r.time
-              LIMIT $1",
-            [(MAX_GAPS_PER_RUN as i64).into()],
-        ))
-        .await
-    {
-        Ok(rows) => rows,
-        Err(e) => {
-            let msg = e.to_string();
-            update_job(
-                db,
-                job_id,
-                "UPDATE reprocessing_jobs SET status = 'failed', error_message = $1, completed_at = NOW() WHERE id = $2",
-                vec![msg.as_str().into(), job_id.into()],
-            )
-            .await;
-            return Err(e);
-        }
-    };
-
-    let total = rows.len() as i32;
-    update_job(
-        db,
-        job_id,
-        "UPDATE reprocessing_jobs SET total = $1, progress = 0 WHERE id = $2",
-        vec![total.into(), job_id.into()],
-    )
-    .await;
-
-    if rows.is_empty() {
-        update_job(
-            db,
-            job_id,
-            "UPDATE reprocessing_jobs SET status = 'completed', readings_updated = 0, completed_at = NOW() WHERE id = $1",
-            vec![job_id.into()],
-        )
-        .await;
-        tracing::info!(
-            %job_id,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "Derived janitor: no gaps found"
-        );
-        return Ok(0);
-    }
-
-    tracing::info!(%job_id, gaps = total, "Derived janitor: filling gaps");
-
-    let mut filled: i32 = 0;
-    let mut min_filled: Option<chrono::DateTime<chrono::Utc>> = None;
-    for (i, row) in rows.iter().enumerate() {
-        let site_id: Uuid = row.try_get("", "site_id")?;
-        let time: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
-        let utc_time = time.with_timezone(&chrono::Utc);
-        match crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
-            db, site_id, utc_time,
-        )
-        .await
-        {
-            Ok(()) => {
-                filled += 1;
-                min_filled = Some(min_filled.map_or(utc_time, |m| m.min(utc_time)));
-            }
-            Err(e) => tracing::warn!(error = %e, site_id = %site_id, time = %utc_time, "Janitor failed to fill derived gap"),
-        }
-        if (i + 1) % 1000 == 0 {
-            tracing::info!(%job_id, "Derived janitor: filled {}/{}", i + 1, total);
-            update_job(
-                db,
-                job_id,
-                "UPDATE reprocessing_jobs SET progress = $1 WHERE id = $2",
-                vec![(i as i32 + 1).into(), job_id.into()],
-            )
-            .await;
-        }
-    }
-
-    if let Some(since) = min_filled {
-        tracing::info!(%job_id, %since, filled, "Derived janitor: refreshing continuous aggregates after backfill");
-        crate::common::sync_state::refresh_continuous_aggregates(db, Some(since)).await;
-    }
-
-    update_job(
-        db,
-        job_id,
-        "UPDATE reprocessing_jobs \
-         SET status = 'completed', progress = total, readings_updated = $1, completed_at = NOW() \
-         WHERE id = $2",
-        vec![filled.into(), job_id.into()],
-    )
-    .await;
-
     tracing::info!(
-        %job_id,
         filled,
-        total,
-        capped_at_limit = total as usize >= MAX_GAPS_PER_RUN,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "Derived janitor: complete"
     );

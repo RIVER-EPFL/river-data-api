@@ -301,6 +301,104 @@ where
     .await
 }
 
+/// Synchronous sibling of [`spawn_tracked_job_ctx`] for jobs that must run **inline** and hand their
+/// result back to the caller (e.g. the periodic derived janitor, whose periodic loop awaits the
+/// filled count before deciding follow-up work). Runs the full lifecycle — inserts the row as
+/// `running`, emits `JobCreated`/`JobProgress`, runs `work` to completion, records
+/// `completed`/`failed`, and on success runs the same post-success alarm reconcile as the spawned
+/// path — but in the current task, with no retry. Returns the work's count (or its error).
+pub async fn run_tracked_job<F, Fut>(
+    db: &DatabaseConnection,
+    sensor_id: Option<Uuid>,
+    trigger_type: &str,
+    trigger_id: Option<Uuid>,
+    events: crate::common::EventSender,
+    work: F,
+) -> Result<i64, sea_orm::DbErr>
+where
+    F: FnOnce(JobContext) -> Fut,
+    Fut: Future<Output = Result<i64, sea_orm::DbErr>>,
+{
+    use sea_orm::Value;
+
+    let job_id = Uuid::new_v4();
+    let sensor_id_value: Value = match sensor_id {
+        Some(id) => id.into(),
+        None => Value::Uuid(None),
+    };
+    let trigger_id_value: Value = match trigger_id {
+        Some(id) => id.into(),
+        None => Value::Uuid(None),
+    };
+
+    // Runs inline and starts immediately, so insert straight as `running` (no queued `pending`).
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status) \
+         VALUES ($1, $2, $3, $4, 'running')",
+        [job_id.into(), sensor_id_value, trigger_type.into(), trigger_id_value],
+    ))
+    .await?;
+    let _ = events.send(crate::common::AppEvent::JobCreated { job_id });
+    let _ = events.send(crate::common::AppEvent::JobProgress {
+        job_id,
+        status: "running".into(),
+        progress: Some(0),
+        total: None,
+    });
+
+    let ctx = JobContext {
+        db: db.clone(),
+        job_id,
+        events: events.clone(),
+    };
+
+    match work(ctx).await {
+        Ok(count) => {
+            if let Err(e) = db
+                .execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "UPDATE reprocessing_jobs SET status = 'completed', readings_updated = $1, \
+                     completed_at = NOW() WHERE id = $2",
+                    [count.into(), job_id.into()],
+                ))
+                .await
+            {
+                tracing::warn!(error = %e, job_id = %job_id, "Failed to mark tracked job completed");
+            }
+            crate::routes::private::alarms::sweeper::reconcile_all_and_notify(db, &events).await;
+            let _ = events.send(crate::common::AppEvent::JobCompleted {
+                job_id,
+                status: "completed".into(),
+                readings_updated: Some(count as i32),
+                error_message: None,
+            });
+            Ok(count)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if let Err(db_err) = db
+                .execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "UPDATE reprocessing_jobs SET status = 'failed', error_message = $1, \
+                     completed_at = NOW() WHERE id = $2",
+                    [msg.as_str().into(), job_id.into()],
+                ))
+                .await
+            {
+                tracing::warn!(error = %db_err, job_id = %job_id, "Failed to mark tracked job failed");
+            }
+            let _ = events.send(crate::common::AppEvent::JobCompleted {
+                job_id,
+                status: "failed".into(),
+                readings_updated: None,
+                error_message: Some(msg),
+            });
+            Err(e)
+        }
+    }
+}
+
 /// Convenience adapter for jobs that only need a `DatabaseConnection` (no progress reporting), using
 /// the process-wide retry policy.
 pub async fn spawn_tracked_job<F, Fut>(
