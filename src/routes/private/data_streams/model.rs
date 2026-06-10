@@ -23,11 +23,13 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
     pub id: Uuid,
-    #[crudcrate(filterable)]
+    #[crudcrate(filterable, sortable)]
     pub source_system: String,
-    #[crudcrate(filterable)]
+    #[crudcrate(filterable, fulltext, sortable)]
     pub source_key: String,
+    #[crudcrate(fulltext, sortable)]
     pub source_name: Option<String>,
+    #[crudcrate(fulltext)]
     pub source_path: Option<String>,
     #[sea_orm(column_type = "JsonBinary")]
     pub metadata: serde_json::Value,
