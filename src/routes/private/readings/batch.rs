@@ -322,6 +322,11 @@ pub async fn insert_batch_readings(
 
             crate::common::sync_state::refresh_continuous_aggregates(&db_clone, earliest).await;
 
+            // Derived recompute can change derived-parameter values; reconcile all slots (cheap) so
+            // derived breaches surface without waiting for the backstop. Error-safe.
+            crate::routes::private::alarms::sweeper::reconcile_all_and_notify(&db_clone, &events)
+                .await;
+
             let _ = db_clone
                 .execute(sea_orm::Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
@@ -372,6 +377,18 @@ pub async fn insert_batch_readings(
             )
             .await;
         }
+
+        // Live open-alarm reconcile for the just-ingested slots (event-driven freshness). The
+        // periodic backstop still reconciles everything; this just updates persisted alarms + SSE
+        // within ~1s of the write instead of waiting for the next sweep. Error-safe — the helper
+        // logs and swallows failures, so it can never break ingestion.
+        let alarm_slots: Vec<(Uuid, Uuid)> = stream_cache.keys().copied().collect();
+        crate::routes::private::alarms::sweeper::reconcile_and_notify(
+            &state.db,
+            &state.events,
+            &alarm_slots,
+        )
+        .await;
     }
 
     Ok(Json(BatchReadingsResponse {

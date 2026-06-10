@@ -320,6 +320,20 @@ pub async fn insert_grab_samples(
 
     txn.commit().await?;
 
+    // Event-driven open-alarm reconcile for the sampled slots (error-safe; backstop covers it).
+    if inserted > 0 {
+        let alarm_slots: Vec<(Uuid, Uuid)> = stream_cache
+            .keys()
+            .map(|pid| (payload.site_id, *pid))
+            .collect();
+        crate::routes::private::alarms::sweeper::reconcile_and_notify(
+            &state.db,
+            &state.events,
+            &alarm_slots,
+        )
+        .await;
+    }
+
     tracing::info!(total, inserted, samples_created, site = %site.name, "Grab samples inserted");
     Ok(Json(GrabSampleResponse {
         inserted,

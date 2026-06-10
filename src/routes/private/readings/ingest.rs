@@ -203,6 +203,16 @@ pub async fn ingest_readings(
             stream_id: payload.stream_id,
             count: inserted,
         });
+
+        // Event-driven open-alarm reconcile for this slot (error-safe; backstop still covers it).
+        if let (Some(s), Some(p)) = (site_id, parameter_id) {
+            crate::routes::private::alarms::sweeper::reconcile_and_notify(
+                &state.db,
+                &state.events,
+                &[(s, p)],
+            )
+            .await;
+        }
     }
 
     // Update last_data_time on the stream
@@ -285,6 +295,11 @@ pub async fn ingest_readings(
                     });
                 }
             }
+
+            // Derived recompute can change derived-parameter values; reconcile all slots (cheap) so
+            // derived breaches surface without waiting for the backstop. Error-safe.
+            crate::routes::private::alarms::sweeper::reconcile_all_and_notify(&db_clone, &events)
+                .await;
 
             let _ = db_clone
                 .execute(Statement::from_sql_and_values(

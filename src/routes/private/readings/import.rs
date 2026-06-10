@@ -699,6 +699,16 @@ pub async fn import_csv(
                     )
                     .await;
                 }
+
+                // Live open-alarm reconcile for the imported slots (error-safe; backstop covers it).
+                let alarm_slots: Vec<(Uuid, Uuid)> =
+                    param_streams.iter().map(|(pid, _)| (site_id, *pid)).collect();
+                crate::routes::private::alarms::sweeper::reconcile_and_notify(
+                    &db,
+                    &events,
+                    &alarm_slots,
+                )
+                .await;
             }
 
             let _ = db

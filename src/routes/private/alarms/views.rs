@@ -401,12 +401,12 @@ pub(crate) struct ActiveAlarmRow {
 pub(crate) async fn fetch_active_alarm_rows(
     db: &sea_orm::DatabaseConnection,
     scope: Option<Uuid>,
+    slots: Option<&[(Uuid, Uuid)]>,
 ) -> AppResult<Vec<ActiveAlarmRow>> {
-    let project_filter = if scope.is_some() {
-        "AND s.project_id = $1"
-    } else {
-        ""
-    };
+    // Empty slot list means "evaluate nothing" — short-circuit before building an invalid `IN ()`.
+    if matches!(slots, Some(s) if s.is_empty()) {
+        return Ok(Vec::new());
+    }
 
     let sev_case = super::thresholds::severity_case(
         "lr.value",
@@ -427,25 +427,43 @@ pub(crate) async fn fetch_active_alarm_rows(
     // The single resolution definition across all active slots (no scope), spliced as the CTE.
     let resolved_cte = super::thresholds::resolve_thresholds_sql(None, None);
 
+    // Bind params are appended in order: optional project scope, then optional (site, parameter)
+    // slot pairs. `next` tracks the next `$N` placeholder.
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    let mut next = 1usize;
+
+    let project_filter = if let Some(project_id) = scope {
+        values.push(project_id.into());
+        let clause = format!("AND s.project_id = ${next}");
+        next += 1;
+        clause
+    } else {
+        String::new()
+    };
+
+    let slot_filter = if let Some(slots) = slots {
+        let mut pairs = Vec::with_capacity(slots.len());
+        for (site_id, parameter_id) in slots {
+            pairs.push(format!("(${},${})", next, next + 1));
+            values.push((*site_id).into());
+            values.push((*parameter_id).into());
+            next += 2;
+        }
+        format!("AND (rt.site_id, rt.parameter_id) IN ({})", pairs.join(","))
+    } else {
+        String::new()
+    };
+
+    // Loose index scan: one `ORDER BY time DESC LIMIT 1` per active slot via
+    // `idx_readings_site_param_time`, instead of a `DISTINCT ON` over the whole hypertable. Cost is
+    // O(active slots), independent of history depth.
     let sql = format!(
         r"
-        WITH resolved_thresholds AS ({resolved_cte}),
-        latest_readings AS (
-            SELECT DISTINCT ON (r.site_id, r.parameter_id)
-                r.site_id,
-                r.parameter_id,
-                r.time,
-                COALESCE(r.calibrated_value, r.raw_value) AS value
-            FROM readings r
-            JOIN resolved_thresholds rt
-                ON rt.site_id = r.site_id
-                AND rt.parameter_id = r.parameter_id
-            ORDER BY r.site_id, r.parameter_id, r.time DESC
-        )
+        WITH resolved_thresholds AS ({resolved_cte})
         SELECT
-            lr.site_id,
+            rt.site_id,
             s.name AS site_name,
-            lr.parameter_id,
+            rt.parameter_id,
             sp.name AS parameter_name,
             lr.value AS current_value,
             lr.time,
@@ -454,26 +472,25 @@ pub(crate) async fn fetch_active_alarm_rows(
             rt.alarm_min,
             rt.alarm_max,
             ({sev_case})::smallint AS severity
-        FROM latest_readings lr
-        JOIN resolved_thresholds rt
-            ON rt.site_id = lr.site_id
-            AND rt.parameter_id = lr.parameter_id
-        JOIN sites s ON s.id = lr.site_id
+        FROM resolved_thresholds rt
+        JOIN sites s ON s.id = rt.site_id
         JOIN site_parameters sp
-            ON sp.site_id = lr.site_id
-            AND sp.parameter_id = lr.parameter_id
+            ON sp.site_id = rt.site_id
+            AND sp.parameter_id = rt.parameter_id
             AND sp.is_active = true
+        CROSS JOIN LATERAL (
+            SELECT COALESCE(r.calibrated_value, r.raw_value) AS value, r.time
+            FROM readings r
+            WHERE r.site_id = rt.site_id AND r.parameter_id = rt.parameter_id
+            ORDER BY r.time DESC
+            LIMIT 1
+        ) lr
         WHERE {violation}
         {project_filter}
+        {slot_filter}
         ORDER BY severity DESC, s.name, parameter_name
         "
     );
-
-    let values: Vec<sea_orm::Value> = if let Some(project_id) = scope {
-        vec![project_id.into()]
-    } else {
-        vec![]
-    };
 
     let rows: Vec<ActiveAlarmRow> = db
         .query_all(Statement::from_sql_and_values(
@@ -551,7 +568,7 @@ pub async fn get_active_alarms(
     State(state): State<AppState>,
     ProjectScope(scope): ProjectScope,
 ) -> AppResult<Json<ActiveAlarmsResponse>> {
-    let rows = fetch_active_alarm_rows(&state.db, scope).await?;
+    let rows = fetch_active_alarm_rows(&state.db, scope, None).await?;
     let open = fetch_open_events(&state.db, scope).await?;
 
     let alarms: Vec<ActiveAlarm> = rows
@@ -739,7 +756,7 @@ pub async fn get_alarm_summary(
     State(state): State<AppState>,
     ProjectScope(scope): ProjectScope,
 ) -> AppResult<Json<AlarmSummaryResponse>> {
-    let rows = fetch_active_alarm_rows(&state.db, scope).await?;
+    let rows = fetch_active_alarm_rows(&state.db, scope, None).await?;
 
     let mut warning_count = 0usize;
     let mut alarm_count = 0usize;
