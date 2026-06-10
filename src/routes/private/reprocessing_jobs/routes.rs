@@ -65,6 +65,46 @@ pub async fn get_job_logs(
 }
 
 #[derive(Debug, Serialize)]
+pub struct CancelResponse {
+    pub status: String,
+}
+
+/// `POST /api/reprocessing_jobs/{id}/cancel` — cooperatively cancel a running job. The job stops at
+/// its next batch checkpoint and is recorded `cancelled`. 409 if the type isn't cancellable or the
+/// job isn't currently running in this process; 404 if the id is unknown. Requires `write_metadata`.
+pub async fn cancel_job(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<CancelResponse>> {
+    let row = state
+        .db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT trigger_type, status FROM reprocessing_jobs WHERE id = $1",
+            [id.into()],
+        ))
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("job {id} not found")))?;
+
+    let trigger_type: String = row.try_get("", "trigger_type")?;
+    if !super::registry::is_cancellable(&trigger_type) {
+        return Err(AppError::Conflict(format!(
+            "jobs of type '{trigger_type}' cannot be cancelled once running"
+        )));
+    }
+
+    if super::lifecycle::request_cancel(id) {
+        Ok(Json(CancelResponse {
+            status: "cancelling".to_string(),
+        }))
+    } else {
+        Err(AppError::Conflict(
+            "job is not currently running".to_string(),
+        ))
+    }
+}
+
+#[derive(Debug, Serialize)]
 pub struct RerunResponse {
     pub job_id: Uuid,
     pub status: String,

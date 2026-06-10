@@ -9,12 +9,49 @@
 //! progress use [`spawn_tracked_job_ctx`]. Domain glue (e.g. `spawn_reprocessing_job`) wraps these.
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 use uuid::Uuid;
+
+/// In-process registry of cancel flags for running jobs. A cooperative cancel sets the flag; the
+/// job's loop checks [`JobContext::is_cancelled`] at its batch checkpoints and bails. Lives in the
+/// process (single-replica, like the moka caches); flags are registered when a job starts and
+/// removed when it reaches a terminal state.
+fn cancel_registry() -> MutexGuard<'static, HashMap<Uuid, Arc<AtomicBool>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<Uuid, Arc<AtomicBool>>>> = OnceLock::new();
+    REGISTRY
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn register_cancel(job_id: Uuid) -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    cancel_registry().insert(job_id, flag.clone());
+    flag
+}
+
+fn deregister_cancel(job_id: Uuid) {
+    cancel_registry().remove(&job_id);
+}
+
+/// Request cancellation of a running job. Returns `true` if a running job was signalled, `false` if
+/// no such job is in flight in this process (already finished, or never registered).
+#[must_use]
+pub fn request_cancel(job_id: Uuid) -> bool {
+    match cancel_registry().get(&job_id) {
+        Some(flag) => {
+            flag.store(true, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
 
 /// Retry policy for tracked jobs. Set once at startup from `Config`; code paths that don't run
 /// `main.rs` (integration tests) see the default — no retries — so their behavior is unchanged.
@@ -74,6 +111,7 @@ pub struct JobContext {
     job_id: Uuid,
     events: crate::common::EventSender,
     seq: Arc<AtomicI64>,
+    cancel: Arc<AtomicBool>,
 }
 
 impl JobContext {
@@ -87,6 +125,13 @@ impl JobContext {
     #[must_use]
     pub fn job_id(&self) -> Uuid {
         self.job_id
+    }
+
+    /// Whether cancellation has been requested. Loop-based work checks this at its batch
+    /// checkpoints and returns early; the lifecycle then records the job as `cancelled`.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
     }
 
     /// Append a line to the job's timeline (`reprocessing_job_logs`). `warn`/`error` lines are also
@@ -264,13 +309,15 @@ where
             job_id,
             events: events.clone(),
             seq: Arc::new(AtomicI64::new(0)),
+            cancel: register_cancel(job_id),
         };
 
         let mut attempt = 0u32;
         let outcome = loop {
             match make_work(ctx.clone()).await {
                 Ok(count) => break Ok(count),
-                Err(e) if attempt < max_retries => {
+                // Don't retry a job that was cancelled mid-attempt.
+                Err(e) if attempt < max_retries && !ctx.is_cancelled() => {
                     attempt += 1;
                     let msg = e.to_string();
                     let delay = backoff_base.saturating_mul(2u32.saturating_pow(attempt - 1));
@@ -310,18 +357,21 @@ where
 
         match outcome {
             Ok(count) => {
+                // A job that observed the cancel flag and returned early is `cancelled`, not
+                // `completed`. Its partial result is consistent (every op is idempotent) and the
+                // janitor finishes anything left.
+                let final_status = if ctx.is_cancelled() { "cancelled" } else { "completed" };
                 if let Err(e) = db
                     .execute(Statement::from_sql_and_values(
                         sea_orm::DatabaseBackend::Postgres,
                         "UPDATE reprocessing_jobs \
-                         SET status = 'completed', readings_updated = $1, \
-                             completed_at = NOW() \
-                         WHERE id = $2",
-                        [count.into(), job_id.into()],
+                         SET status = $1, readings_updated = $2, completed_at = NOW() \
+                         WHERE id = $3",
+                        [final_status.into(), count.into(), job_id.into()],
                     ))
                     .await
                 {
-                    tracing::warn!(error = %e, job_id = %job_id, "Failed to mark reprocessing job completed");
+                    tracing::warn!(error = %e, job_id = %job_id, "Failed to mark reprocessing job terminal");
                 }
                 // Most tracked jobs rewrite reading values or attribution (recalibration,
                 // reprocess, pairing/derived backfill, adopt/swap), any of which can change breach
@@ -331,14 +381,15 @@ where
                     .await;
                 let _ = events.send(crate::common::AppEvent::JobCompleted {
                     job_id,
-                    status: "completed".into(),
+                    status: final_status.into(),
                     readings_updated: Some(count as i32),
                     error_message: None,
                 });
                 tracing::info!(
                     readings_updated = count,
                     trigger = %trigger_type,
-                    "Tracked job completed"
+                    status = final_status,
+                    "Tracked job finished"
                 );
             }
             Err(e) => {
@@ -369,6 +420,7 @@ where
                 );
             }
         }
+        deregister_cancel(job_id);
     });
 
     Ok(job_id)
@@ -454,30 +506,37 @@ where
         total: None,
     });
 
+    let cancel = register_cancel(job_id);
     let ctx = JobContext {
         db: db.clone(),
         job_id,
         events: events.clone(),
         seq: Arc::new(AtomicI64::new(0)),
+        cancel: cancel.clone(),
     };
 
-    match work(ctx).await {
+    let result = match work(ctx).await {
         Ok(count) => {
+            let final_status = if cancel.load(Ordering::Relaxed) {
+                "cancelled"
+            } else {
+                "completed"
+            };
             if let Err(e) = db
                 .execute(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
-                    "UPDATE reprocessing_jobs SET status = 'completed', readings_updated = $1, \
-                     completed_at = NOW() WHERE id = $2",
-                    [count.into(), job_id.into()],
+                    "UPDATE reprocessing_jobs SET status = $1, readings_updated = $2, \
+                     completed_at = NOW() WHERE id = $3",
+                    [final_status.into(), count.into(), job_id.into()],
                 ))
                 .await
             {
-                tracing::warn!(error = %e, job_id = %job_id, "Failed to mark tracked job completed");
+                tracing::warn!(error = %e, job_id = %job_id, "Failed to mark tracked job terminal");
             }
             crate::routes::private::alarms::sweeper::reconcile_all_and_notify(db, &events).await;
             let _ = events.send(crate::common::AppEvent::JobCompleted {
                 job_id,
-                status: "completed".into(),
+                status: final_status.into(),
                 readings_updated: Some(count as i32),
                 error_message: None,
             });
@@ -504,7 +563,9 @@ where
             });
             Err(e)
         }
-    }
+    };
+    deregister_cancel(job_id);
+    result
 }
 
 /// Convenience adapter for jobs that only need a `DatabaseConnection` (no progress reporting), using

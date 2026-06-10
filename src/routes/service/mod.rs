@@ -283,6 +283,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
             "/reprocessing_jobs/{id}/rerun",
             post(crate::routes::private::reprocessing_jobs::routes::rerun_job),
         )
+        .route(
+            "/reprocessing_jobs/{id}/cancel",
+            post(crate::routes::private::reprocessing_jobs::routes::cancel_job),
+        )
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(middleware::from_fn(deny_scoped_token))
         .layer(middleware::from_fn(require_write_metadata))

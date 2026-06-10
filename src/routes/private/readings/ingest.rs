@@ -281,6 +281,9 @@ pub async fn ingest_readings(
                     ctx.set_progress(0, Some(job_total)).await;
                     let mut progress = 0i32;
                     for time in timestamps {
+                        if ctx.is_cancelled() {
+                            break;
+                        }
                         if let Err(e) =
                             crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
                                 ctx.db(), sid, time,

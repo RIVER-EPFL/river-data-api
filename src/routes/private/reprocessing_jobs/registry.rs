@@ -59,3 +59,18 @@ pub fn is_rerunnable(trigger_type: &str) -> bool {
             | "derived_recompute"
     )
 }
+
+/// Whether a running job of this `trigger_type` can be cooperatively cancelled — i.e. it iterates a
+/// loop and checks `JobContext::is_cancelled` at its batch checkpoints. Single-statement jobs
+/// (aggregate refresh, pairing backfill) have no checkpoint and report 409 on a cancel attempt.
+#[must_use]
+pub fn is_cancellable(trigger_type: &str) -> bool {
+    matches!(
+        trigger_type,
+        "ingest_derived"
+            | "batch_derived"
+            | "derived_recompute"
+            | "csv_import"
+            | "janitor_run"
+    )
+}

@@ -70,6 +70,9 @@ pub async fn spawn_recompute_derived(
                 let mut filled: i32 = 0;
                 let mut min_filled: Option<chrono::DateTime<chrono::Utc>> = None;
                 for (i, row) in rows.iter().enumerate() {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
                     let Ok(site_id) = row.try_get::<Uuid>("", "site_id") else {
                         continue;
                     };

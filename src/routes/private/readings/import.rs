@@ -606,6 +606,9 @@ pub async fn import_csv(
                 .await;
 
                 for (i, time) in distinct_ts.iter().enumerate() {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
                     let _ = crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
                         &db, site_id, *time,
                     )

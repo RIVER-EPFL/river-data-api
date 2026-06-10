@@ -84,6 +84,9 @@ pub async fn run_once(db: &DatabaseConnection) -> Result<usize, sea_orm::DbErr> 
             let mut filled: i64 = 0;
             let mut min_filled: Option<chrono::DateTime<chrono::Utc>> = None;
             for (i, row) in rows.iter().enumerate() {
+                if ctx.is_cancelled() {
+                    break;
+                }
                 let site_id: Uuid = row.try_get("", "site_id")?;
                 let time: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
                 let utc_time = time.with_timezone(&chrono::Utc);

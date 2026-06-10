@@ -287,8 +287,11 @@ pub async fn insert_batch_readings(
                     async move {
                         ctx.set_progress(0, Some(job_total)).await;
                         let mut progress = 0i32;
-                        for (site_id, timestamps) in derived_sites {
+                        'outer: for (site_id, timestamps) in derived_sites {
                             for time in timestamps {
+                                if ctx.is_cancelled() {
+                                    break 'outer;
+                                }
                                 if let Err(e) =
                                     crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
                                         ctx.db(), site_id, time,
