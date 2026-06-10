@@ -85,7 +85,14 @@ pub struct Config {
     // Derived-parameter janitor
     pub janitor_interval_seconds: u64,
     pub janitor_full_refresh_seconds: u64,
+    /// Retention for `operator`/`metadata` tracked jobs (audit value). 0 disables.
     pub janitor_retention_days: u32,
+    /// Retention for high-volume `maintenance` tracked jobs (janitor/ingest/refresh/alarm backfill).
+    /// Much shorter than operator/metadata. 0 disables age-based pruning. See also the count cap.
+    pub job_maintenance_retention_days: u32,
+    /// Hard cap on retained `maintenance` job rows regardless of age — a burst can't blow storage
+    /// between daily prunes. 0 disables the cap.
+    pub job_maintenance_max_rows: u64,
 
     // Alarm sweeper: how often to reconcile persisted alarm_events against current breaches.
     // The sweep is only the backstop — ingest, config changes, and job completions reconcile
@@ -242,6 +249,14 @@ impl Config {
                 .unwrap_or_else(|_| "180".to_string())
                 .parse()
                 .unwrap_or(180),
+            job_maintenance_retention_days: env::var("JOB_MAINTENANCE_RETENTION_DAYS")
+                .unwrap_or_else(|_| "14".to_string())
+                .parse()
+                .unwrap_or(14),
+            job_maintenance_max_rows: env::var("JOB_MAINTENANCE_MAX_ROWS")
+                .unwrap_or_else(|_| "50000".to_string())
+                .parse()
+                .unwrap_or(50_000),
 
             alarm_sweep_interval_seconds: env::var("ALARM_SWEEP_INTERVAL_SECONDS")
                 .unwrap_or_else(|_| "300".to_string())

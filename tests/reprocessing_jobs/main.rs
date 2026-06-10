@@ -8,5 +8,6 @@ mod common;
 
 mod job_logs_and_detail;
 mod job_tracking_on_actions;
+mod retention;
 mod retry_backoff;
 mod startup_sweep;

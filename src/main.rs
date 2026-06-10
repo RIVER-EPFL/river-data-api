@@ -108,17 +108,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let janitor_interval = Duration::from_secs(config.janitor_interval_seconds);
     let janitor_full_refresh = Duration::from_secs(config.janitor_full_refresh_seconds);
-    let janitor_retention_days = config.janitor_retention_days;
     tokio::spawn(river_db::routes::private::derived_parameters::janitor::periodic(
         db.clone(),
         janitor_interval,
         janitor_full_refresh,
-        janitor_retention_days,
+        config.job_maintenance_retention_days,
+        config.janitor_retention_days,
+        config.job_maintenance_max_rows,
     ));
     tracing::info!(
         interval_secs = janitor_interval.as_secs(),
         full_refresh_secs = janitor_full_refresh.as_secs(),
-        retention_days = janitor_retention_days,
+        maintenance_retention_days = config.job_maintenance_retention_days,
+        operator_retention_days = config.janitor_retention_days,
         "Spawned derived consistency janitor"
     );
 

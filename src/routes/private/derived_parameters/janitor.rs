@@ -127,19 +127,61 @@ pub async fn run_once(db: &DatabaseConnection) -> Result<usize, sea_orm::DbErr> 
     Ok(filled as usize)
 }
 
-/// Delete old janitor-run rows from `reprocessing_jobs`. Only `janitor_run` rows
-/// are pruned — calibration/deployment/derived-recompute rows are operator
-/// history and preserved indefinitely.
-async fn prune_janitor_rows(db: &DatabaseConnection, retention_days: u32) {
-    if retention_days == 0 {
-        return;
+/// Tiered retention for `reprocessing_jobs` (logs cascade-delete with their job). Three layers:
+///   1. `maintenance` rows (high-volume janitor/ingest/refresh/alarm-backfill) age out fast.
+///   2. `operator`/`metadata` rows (audit value) age out slowly.
+///   3. A hard count cap on `maintenance` rows so an ingestion burst can't blow storage between the
+///      daily prunes. Each window/cap of 0 disables that layer.
+///
+/// Returns the total rows deleted (across all layers).
+pub async fn prune_tracked_jobs(
+    db: &DatabaseConnection,
+    maintenance_days: u32,
+    operator_days: u32,
+    maintenance_max_rows: u64,
+) -> u64 {
+    let mut deleted = 0u64;
+
+    if maintenance_days > 0 {
+        deleted += run_delete(
+            db,
+            format!(
+                "DELETE FROM reprocessing_jobs \
+                 WHERE category = 'maintenance' AND created_at < NOW() - INTERVAL '{maintenance_days} days'"
+            ),
+            "maintenance age",
+        )
+        .await;
     }
-    let cutoff_expr = format!("INTERVAL '{retention_days} days'");
-    let sql = format!(
-        "DELETE FROM reprocessing_jobs \
-         WHERE trigger_type = 'janitor_run' \
-           AND created_at < NOW() - {cutoff_expr}"
-    );
+    if operator_days > 0 {
+        deleted += run_delete(
+            db,
+            format!(
+                "DELETE FROM reprocessing_jobs \
+                 WHERE category IN ('operator', 'metadata') AND created_at < NOW() - INTERVAL '{operator_days} days'"
+            ),
+            "operator/metadata age",
+        )
+        .await;
+    }
+    if maintenance_max_rows > 0 {
+        // Keep the most-recent N maintenance rows; delete the older overflow.
+        let sql = format!(
+            "DELETE FROM reprocessing_jobs WHERE id IN ( \
+                SELECT id FROM reprocessing_jobs WHERE category = 'maintenance' \
+                ORDER BY created_at DESC OFFSET {maintenance_max_rows} \
+            )"
+        );
+        deleted += run_delete(db, sql, "maintenance count cap").await;
+    }
+
+    if deleted > 0 {
+        tracing::info!(deleted, "Tracked-job retention: pruned old job rows");
+    }
+    deleted
+}
+
+async fn run_delete(db: &DatabaseConnection, sql: String, label: &str) -> u64 {
     match db
         .execute(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -147,12 +189,11 @@ async fn prune_janitor_rows(db: &DatabaseConnection, retention_days: u32) {
         ))
         .await
     {
-        Ok(res) => tracing::info!(
-            deleted = res.rows_affected(),
-            retention_days,
-            "Derived janitor: pruned old janitor_run rows"
-        ),
-        Err(e) => tracing::warn!(error = %e, "Derived janitor: failed to prune janitor_run rows"),
+        Ok(res) => res.rows_affected(),
+        Err(e) => {
+            tracing::warn!(error = %e, label, "Tracked-job retention: prune layer failed");
+            0
+        }
     }
 }
 
@@ -168,22 +209,24 @@ async fn prune_janitor_rows(db: &DatabaseConnection, retention_days: u32) {
 ///   3. Once every `full_refresh_interval`, a full refresh of all continuous
 ///      aggregates runs, catching any historical drift older than 7d without
 ///      needing a manual `POST /actions/refresh_aggregates {full: true}`.
-///   4. Once every ~24h, old `janitor_run` rows older than `retention_days`
-///      are pruned. Set `retention_days = 0` to disable.
+///   4. Once every ~24h, [`prune_tracked_jobs`] enforces tiered job-row retention
+///      (maintenance rows age out fast, operator/metadata slowly, plus a maintenance count cap).
 ///
-/// Spawned from main.rs with durations sourced from `Config`
-/// (`JANITOR_INTERVAL_SECONDS`, `JANITOR_FULL_REFRESH_SECONDS`,
-/// `JANITOR_RETENTION_DAYS`).
+/// Spawned from main.rs with durations/retention sourced from `Config`.
 pub async fn periodic(
     db: DatabaseConnection,
     interval: Duration,
     full_refresh_interval: Duration,
-    retention_days: u32,
+    maintenance_retention_days: u32,
+    operator_retention_days: u32,
+    maintenance_max_rows: u64,
 ) {
     tracing::info!(
         interval_secs = interval.as_secs(),
         full_refresh_secs = full_refresh_interval.as_secs(),
-        retention_days,
+        maintenance_retention_days,
+        operator_retention_days,
+        maintenance_max_rows,
         "Derived janitor: starting"
     );
 
@@ -210,7 +253,13 @@ pub async fn periodic(
 
         let due_prune = last_prune.is_none_or(|t| now.duration_since(t) >= PRUNE_EVERY);
         if due_prune {
-            prune_janitor_rows(db, retention_days).await;
+            prune_tracked_jobs(
+                db,
+                maintenance_retention_days,
+                operator_retention_days,
+                maintenance_max_rows,
+            )
+            .await;
             *last_prune = Some(now);
         }
     };

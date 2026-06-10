@@ -71,6 +71,8 @@ fn test_config() -> Config {
         janitor_interval_seconds: 3600,
         janitor_full_refresh_seconds: 86_400,
         janitor_retention_days: 180,
+        job_maintenance_retention_days: 14,
+        job_maintenance_max_rows: 50_000,
         alarm_sweep_interval_seconds: 60,
         job_max_retries: 3,
         job_retry_backoff_seconds: 60,
