@@ -279,6 +279,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
             "/actions/merge_parameters",
             post(merge::merge_parameters_handler),
         )
+        .route(
+            "/reprocessing_jobs/{id}/rerun",
+            post(crate::routes::private::reprocessing_jobs::routes::rerun_job),
+        )
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(middleware::from_fn(deny_scoped_token))
         .layer(middleware::from_fn(require_write_metadata))

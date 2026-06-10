@@ -31,3 +31,31 @@ pub fn category_for(trigger_type: &str) -> &'static str {
         _ => CATEGORY_OPERATOR,
     }
 }
+
+/// Whether a finished job of this `trigger_type` can be re-run by replaying it from the ids stored
+/// on its row (sensor reprocess, aggregate refresh, derived recompute). Keyed on trigger_type, not
+/// status — `interrupted`/`failed`/`completed`/`cancelled` jobs are all rerunnable if the type is.
+///
+/// Excluded for now: the timestamp-driven derived jobs (`ingest_derived`/`batch_derived`/
+/// `compute_derived`) — faithful replay needs their persisted timestamps (a follow-up); the janitor
+/// already backfills any missed derived values. `csv_import` can never replay (source expires).
+#[must_use]
+pub fn is_rerunnable(trigger_type: &str) -> bool {
+    matches!(
+        trigger_type,
+        "manual_reprocess"
+            | "calibration_create"
+            | "calibration_update"
+            | "calibration_delete"
+            | "calibration_recalculate"
+            | "deployment_create"
+            | "deployment_update"
+            | "deployment_delete"
+            | "deployment_edit"
+            | "manual_adopt"
+            | "sensor_swap"
+            | "refresh_aggregates"
+            | "refresh_aggregates_full"
+            | "derived_recompute"
+    )
+}

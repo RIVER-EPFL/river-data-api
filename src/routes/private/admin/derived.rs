@@ -25,12 +25,23 @@ pub async fn recompute_derived(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let job_id = crate::routes::private::reprocessing_jobs::lifecycle::spawn_tracked_job_ctx(
-        &state.db,
+    let job_id = spawn_recompute_derived(&state.db, state.events.clone(), id).await?;
+    Ok(Json(serde_json::json!({ "status": "triggered", "job_id": job_id })))
+}
+
+/// Spawn a tracked `derived_recompute` job for one derived parameter definition. Shared by the
+/// recompute action handler and the job-rerun dispatcher.
+pub async fn spawn_recompute_derived(
+    db: &sea_orm::DatabaseConnection,
+    events: crate::common::EventSender,
+    id: Uuid,
+) -> Result<Uuid, sea_orm::DbErr> {
+    crate::routes::private::reprocessing_jobs::lifecycle::spawn_tracked_job_ctx(
+        db,
         None,
         "derived_recompute",
         Some(id),
-        state.events.clone(),
+        events,
         move |ctx| async move {
             // Bound the recompute so a stuck job can't run forever; a timeout marks it failed.
             let work = async {
@@ -100,7 +111,5 @@ pub async fn recompute_derived(
             }
         },
     )
-    .await?;
-
-    Ok(Json(serde_json::json!({ "status": "triggered", "job_id": job_id })))
+    .await
 }
