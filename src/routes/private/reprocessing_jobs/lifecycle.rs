@@ -1,7 +1,12 @@
 //! The single tracked-job lifecycle: insert a `reprocessing_jobs` row, emit SSE events, run the
 //! work closure (with retry + backoff), and record the terminal status. Every background job in the
 //! API flows through here so that observability, retry, and (eventually) cancellation/rerun are
-//! defined once. Domain glue (e.g. `spawn_reprocessing_job` for sensor reprocessing) wraps these.
+//! defined once.
+//!
+//! The core takes a [`JobContext`] closure so work can report incremental progress
+//! ([`JobContext::set_progress`]). Simple jobs that don't need progress use the `db`-closure
+//! adapters ([`spawn_tracked_job`] / [`spawn_tracked_job_with_retry`]); loop-based jobs that report
+//! progress use [`spawn_tracked_job_ctx`]. Domain glue (e.g. `spawn_reprocessing_job`) wraps these.
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use std::future::Future;
@@ -37,42 +42,66 @@ fn job_retry_policy() -> RetryPolicy {
     JOB_RETRY_POLICY.get().copied().unwrap_or_default()
 }
 
-/// Spawn a tracked job using the global retry policy. Inserts a `reprocessing_jobs` row
-/// (`status = 'pending'`), emits `JobCreated`, then runs `work` in a background task that flips the
-/// row through `running` → `completed`/`failed`, emitting `JobProgress`/`JobCompleted`. Returns the
-/// job id immediately. `sensor_id`/`trigger_id` are nullable.
-pub async fn spawn_tracked_job<F, Fut>(
-    db: &DatabaseConnection,
-    sensor_id: Option<Uuid>,
-    trigger_type: &str,
-    trigger_id: Option<Uuid>,
+/// Handle passed to a tracked job's work closure. Owns a DB connection, the job id, and the event
+/// sender so work can report incremental progress that the UI sees live. Cheap to clone (the retry
+/// loop hands a fresh clone to each attempt).
+#[derive(Clone)]
+pub struct JobContext {
+    db: DatabaseConnection,
+    job_id: Uuid,
     events: crate::common::EventSender,
-    work: F,
-) -> Result<Uuid, sea_orm::DbErr>
-where
-    F: Fn(DatabaseConnection) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<i64, sea_orm::DbErr>> + Send,
-{
-    let policy = job_retry_policy();
-    spawn_tracked_job_with_retry(
-        db,
-        sensor_id,
-        trigger_type,
-        trigger_id,
-        events,
-        policy.max_retries,
-        policy.backoff_base,
-        work,
-    )
-    .await
 }
 
-/// Like [`spawn_tracked_job`] but with an explicit retry policy. On a failed attempt the row is set
-/// to `retrying` (bumping `retry_count`) and `make_work` is re-invoked after an exponential backoff
-/// (`backoff_base * 2^(attempt-1)`); only after `max_retries` exhausted is the job marked `failed`.
-/// `make_work` must be `Fn` (callable once per attempt). `sensor_id`/`trigger_id` are nullable.
+impl JobContext {
+    /// The DB connection the job should use.
+    #[must_use]
+    pub fn db(&self) -> &DatabaseConnection {
+        &self.db
+    }
+
+    /// This job's id.
+    #[must_use]
+    pub fn job_id(&self) -> Uuid {
+        self.job_id
+    }
+
+    /// Atomically persist `progress` (and `total` when provided) onto the row **and** emit the
+    /// matching `JobProgress` event, so the stored row and the live SSE stream never disagree and a
+    /// crash leaves a truthful last-known checkpoint. Best-effort: a failed write is logged, never
+    /// fatal to the job.
+    pub async fn set_progress(&self, progress: i32, total: Option<i32>) {
+        let stmt = match total {
+            Some(t) => Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE reprocessing_jobs SET progress = $1, total = $2 WHERE id = $3",
+                [progress.into(), t.into(), self.job_id.into()],
+            ),
+            None => Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE reprocessing_jobs SET progress = $1 WHERE id = $2",
+                [progress.into(), self.job_id.into()],
+            ),
+        };
+        if let Err(e) = self.db.execute(stmt).await {
+            tracing::warn!(error = %e, job_id = %self.job_id, "Failed to update job progress");
+        }
+        let _ = self.events.send(crate::common::AppEvent::JobProgress {
+            job_id: self.job_id,
+            status: "running".into(),
+            progress: Some(progress),
+            total,
+        });
+    }
+}
+
+/// Core tracked-job lifecycle (JobContext closure + explicit retry policy). Inserts a
+/// `reprocessing_jobs` row (`status = 'pending'`), emits `JobCreated`, then runs `make_work` in a
+/// background task that flips the row through `running` → `completed`/`failed`. On a failed attempt
+/// the row is set to `retrying` (bumping `retry_count`) and `make_work` is re-invoked after an
+/// exponential backoff; only after `max_retries` exhausted is it marked `failed`. `make_work` must
+/// be `Fn` (callable once per attempt). Returns the job id immediately.
 #[allow(clippy::too_many_arguments)]
-pub async fn spawn_tracked_job_with_retry<F, Fut>(
+pub async fn spawn_tracked_job_ctx_with_retry<F, Fut>(
     db: &DatabaseConnection,
     sensor_id: Option<Uuid>,
     trigger_type: &str,
@@ -83,7 +112,7 @@ pub async fn spawn_tracked_job_with_retry<F, Fut>(
     make_work: F,
 ) -> Result<Uuid, sea_orm::DbErr>
 where
-    F: Fn(DatabaseConnection) -> Fut + Send + 'static,
+    F: Fn(JobContext) -> Fut + Send + 'static,
     Fut: Future<Output = Result<i64, sea_orm::DbErr>> + Send,
 {
     use sea_orm::Value;
@@ -130,9 +159,15 @@ where
             total: None,
         });
 
+        let ctx = JobContext {
+            db: db.clone(),
+            job_id,
+            events: events.clone(),
+        };
+
         let mut attempt = 0u32;
         let outcome = loop {
-            match make_work(db.clone()).await {
+            match make_work(ctx.clone()).await {
                 Ok(count) => break Ok(count),
                 Err(e) if attempt < max_retries => {
                     attempt += 1;
@@ -236,4 +271,81 @@ where
     });
 
     Ok(job_id)
+}
+
+/// [`spawn_tracked_job_ctx_with_retry`] using the process-wide retry policy. Use this for
+/// loop-based jobs that report progress via [`JobContext::set_progress`].
+pub async fn spawn_tracked_job_ctx<F, Fut>(
+    db: &DatabaseConnection,
+    sensor_id: Option<Uuid>,
+    trigger_type: &str,
+    trigger_id: Option<Uuid>,
+    events: crate::common::EventSender,
+    make_work: F,
+) -> Result<Uuid, sea_orm::DbErr>
+where
+    F: Fn(JobContext) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<i64, sea_orm::DbErr>> + Send,
+{
+    let policy = job_retry_policy();
+    spawn_tracked_job_ctx_with_retry(
+        db,
+        sensor_id,
+        trigger_type,
+        trigger_id,
+        events,
+        policy.max_retries,
+        policy.backoff_base,
+        make_work,
+    )
+    .await
+}
+
+/// Convenience adapter for jobs that only need a `DatabaseConnection` (no progress reporting), using
+/// the process-wide retry policy.
+pub async fn spawn_tracked_job<F, Fut>(
+    db: &DatabaseConnection,
+    sensor_id: Option<Uuid>,
+    trigger_type: &str,
+    trigger_id: Option<Uuid>,
+    events: crate::common::EventSender,
+    work: F,
+) -> Result<Uuid, sea_orm::DbErr>
+where
+    F: Fn(DatabaseConnection) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<i64, sea_orm::DbErr>> + Send,
+{
+    spawn_tracked_job_ctx(db, sensor_id, trigger_type, trigger_id, events, move |ctx| {
+        work(ctx.db().clone())
+    })
+    .await
+}
+
+/// `db`-closure adapter for [`spawn_tracked_job_ctx_with_retry`] with an explicit retry policy.
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_tracked_job_with_retry<F, Fut>(
+    db: &DatabaseConnection,
+    sensor_id: Option<Uuid>,
+    trigger_type: &str,
+    trigger_id: Option<Uuid>,
+    events: crate::common::EventSender,
+    max_retries: u32,
+    backoff_base: Duration,
+    make_work: F,
+) -> Result<Uuid, sea_orm::DbErr>
+where
+    F: Fn(DatabaseConnection) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<i64, sea_orm::DbErr>> + Send,
+{
+    spawn_tracked_job_ctx_with_retry(
+        db,
+        sensor_id,
+        trigger_type,
+        trigger_id,
+        events,
+        max_retries,
+        backoff_base,
+        move |ctx| make_work(ctx.db().clone()),
+    )
+    .await
 }

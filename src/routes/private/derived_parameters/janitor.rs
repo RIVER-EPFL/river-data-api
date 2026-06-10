@@ -4,6 +4,25 @@ use uuid::Uuid;
 
 const MAX_GAPS_PER_RUN: usize = 50_000;
 
+/// Whether a site has any active derived `site_parameter`. The spawn-guard for the ingest/batch
+/// derived-compute jobs: when false, a derived recompute at that site would do nothing, so the job
+/// is skipped entirely (the dominant source of empty `ingest_derived` jobs). Anything genuinely
+/// needed is still caught by the periodic janitor gap scan.
+pub async fn site_has_active_derived(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+) -> Result<bool, sea_orm::DbErr> {
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT 1 FROM site_parameters \
+             WHERE site_id = $1 AND is_derived = true AND COALESCE(is_active, true) = true LIMIT 1",
+            [site_id.into()],
+        ))
+        .await?;
+    Ok(row.is_some())
+}
+
 async fn update_job(db: &DatabaseConnection, job_id: Uuid, sql: &str, values: Vec<sea_orm::Value>) {
     if let Err(e) = db
         .execute(Statement::from_sql_and_values(

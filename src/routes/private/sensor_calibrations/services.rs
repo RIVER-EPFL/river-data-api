@@ -7,7 +7,8 @@ use uuid::Uuid;
 // Re-exported here so existing `sensor_calibrations::services::{spawn_tracked_job, ...}` call sites
 // and tests keep compiling against the same path.
 pub use crate::routes::private::reprocessing_jobs::lifecycle::{
-    RetryPolicy, set_job_retry_policy, spawn_tracked_job, spawn_tracked_job_with_retry,
+    JobContext, RetryPolicy, set_job_retry_policy, spawn_tracked_job, spawn_tracked_job_ctx,
+    spawn_tracked_job_with_retry,
 };
 
 #[must_use]

@@ -246,89 +246,52 @@ pub async fn ingest_readings(
     }
 
     // Auto-compute derived parameters for newly ingested timestamps (batched), tracked as a job.
-    if paired && inserted > 0
+    // Spawn-guard: skip entirely when the site has no active derived parameter — the job would
+    // compute nothing, and this is the dominant source of empty `ingest_derived` jobs.
+    if paired
+        && inserted > 0
         && let Some(sid) = site_id
+        && crate::routes::private::derived_parameters::janitor::site_has_active_derived(db, sid)
+            .await
+            .unwrap_or(true)
     {
         let mut unique_timestamps: Vec<chrono::DateTime<Utc>> =
             payload.readings.iter().map(|r| r.time).collect();
         unique_timestamps.sort();
         unique_timestamps.dedup();
-
-        let job_id = Uuid::new_v4();
         let job_total = i32::try_from(unique_timestamps.len()).unwrap_or(i32::MAX);
-        db.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status, total, progress) \
-             VALUES ($1, NULL, 'ingest_derived', NULL, 'pending', $2, 0)",
-            [job_id.into(), job_total.into()],
-        ))
+
+        crate::routes::private::reprocessing_jobs::lifecycle::spawn_tracked_job_ctx(
+            db,
+            None,
+            "ingest_derived",
+            None,
+            state.events.clone(),
+            move |ctx| {
+                let timestamps = unique_timestamps.clone();
+                async move {
+                    ctx.set_progress(0, Some(job_total)).await;
+                    let mut progress = 0i32;
+                    for time in timestamps {
+                        if let Err(e) =
+                            crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
+                                ctx.db(), sid, time,
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, site_id = %sid, time = %time, "Failed to auto-compute derived values after ingest");
+                        }
+                        progress += 1;
+                        if progress % 500 == 0 {
+                            ctx.set_progress(progress, Some(job_total)).await;
+                        }
+                    }
+                    ctx.set_progress(progress, Some(job_total)).await;
+                    Ok(i64::from(progress))
+                }
+            },
+        )
         .await?;
-        let _ = state.events.send(AppEvent::JobCreated { job_id });
-
-        let db_clone = state.db.clone();
-        let events = state.events.clone();
-        tokio::spawn(async move {
-            let _ = db_clone
-                .execute(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "UPDATE reprocessing_jobs SET status = 'running' WHERE id = $1",
-                    [job_id.into()],
-                ))
-                .await;
-
-            let mut progress = 0i32;
-            for time in unique_timestamps {
-                if let Err(e) =
-                    crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
-                        &db_clone, sid, time,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        site_id = %sid,
-                        time = %time,
-                        "Failed to auto-compute derived values after ingest"
-                    );
-                }
-                progress += 1;
-                if progress % 500 == 0 {
-                    let _ = db_clone
-                        .execute(Statement::from_sql_and_values(
-                            sea_orm::DatabaseBackend::Postgres,
-                            "UPDATE reprocessing_jobs SET progress = $1 WHERE id = $2",
-                            [progress.into(), job_id.into()],
-                        ))
-                        .await;
-                    let _ = events.send(AppEvent::JobProgress {
-                        job_id,
-                        status: "running".to_string(),
-                        progress: Some(progress),
-                        total: Some(job_total),
-                    });
-                }
-            }
-
-            // Derived recompute can change derived-parameter values; reconcile all slots (cheap) so
-            // derived breaches surface without waiting for the backstop. Error-safe.
-            crate::routes::private::alarms::sweeper::reconcile_all_and_notify(&db_clone, &events)
-                .await;
-
-            let _ = db_clone
-                .execute(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "UPDATE reprocessing_jobs SET status = 'completed', progress = total, \
-                     completed_at = NOW() WHERE id = $1",
-                    [job_id.into()],
-                ))
-                .await;
-            let _ = events.send(AppEvent::JobCompleted {
-                job_id,
-                status: "completed".to_string(),
-                readings_updated: None,
-                error_message: None,
-            });
-        });
     }
 
     tracing::info!(total, inserted, stream_id = %payload.stream_id, paired, "Ingest complete");

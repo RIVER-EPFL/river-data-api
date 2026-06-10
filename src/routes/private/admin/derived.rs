@@ -2,29 +2,11 @@ use axum::{
     Json,
     extract::{Path, State},
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, Statement};
 use uuid::Uuid;
 
-use crate::common::{AppEvent, AppState};
+use crate::common::AppState;
 use crate::error::AppResult;
-
-async fn update_job(
-    db: &DatabaseConnection,
-    job_id: Uuid,
-    sql: &str,
-    values: Vec<sea_orm::Value>,
-) {
-    if let Err(e) = db
-        .execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-            values,
-        ))
-        .await
-    {
-        tracing::warn!(error = %e, %job_id, "Failed to update reprocessing job");
-    }
-}
 
 /// Recompute every derived value for a given derived parameter definition. Backfills via
 /// joining source readings; tracked as a `reprocessing_jobs` row. Refreshes continuous
@@ -43,142 +25,82 @@ pub async fn recompute_derived(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let db = state.db.clone();
-    let job_id = Uuid::new_v4();
-    db.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status) \
-         VALUES ($1, NULL, 'derived_recompute', $2, 'pending')",
-        [job_id.into(), id.into()],
-    ))
+    let job_id = crate::routes::private::reprocessing_jobs::lifecycle::spawn_tracked_job_ctx(
+        &state.db,
+        None,
+        "derived_recompute",
+        Some(id),
+        state.events.clone(),
+        move |ctx| async move {
+            // Bound the recompute so a stuck job can't run forever; a timeout marks it failed.
+            let work = async {
+                tracing::info!(derived_id = %id, job_id = %ctx.job_id(), "Recomputing derived parameter");
+                let rows = ctx
+                    .db()
+                    .query_all(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        r"SELECT DISTINCT r.site_id, r.time
+                          FROM readings r
+                          JOIN site_parameters sp
+                            ON sp.site_id = r.site_id
+                           AND sp.is_derived = true
+                           AND sp.derived_definition_id = $1
+                          JOIN derived_parameter_sources dps
+                            ON dps.derived_definition_id = sp.derived_definition_id
+                           AND dps.parameter_id = r.parameter_id
+                          ORDER BY r.site_id, r.time",
+                        [id.into()],
+                    ))
+                    .await?;
+
+                let total = i32::try_from(rows.len()).unwrap_or(i32::MAX);
+                ctx.set_progress(0, Some(total)).await;
+
+                let mut filled: i32 = 0;
+                let mut min_filled: Option<chrono::DateTime<chrono::Utc>> = None;
+                for (i, row) in rows.iter().enumerate() {
+                    let Ok(site_id) = row.try_get::<Uuid>("", "site_id") else {
+                        continue;
+                    };
+                    let Ok(time) = row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "time")
+                    else {
+                        continue;
+                    };
+                    let utc_time = time.with_timezone(&chrono::Utc);
+                    match crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
+                        ctx.db(), site_id, utc_time,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            filled += 1;
+                            min_filled = Some(min_filled.map_or(utc_time, |m| m.min(utc_time)));
+                        }
+                        Err(e) => tracing::error!(error = %e, time = %time, "Failed to recompute derived value"),
+                    }
+                    if (i + 1) % 500 == 0 {
+                        ctx.set_progress(i as i32 + 1, Some(total)).await;
+                    }
+                }
+
+                if let Some(since) = min_filled {
+                    tracing::info!(%since, "Refreshing continuous aggregates after derived recompute");
+                    crate::common::sync_state::refresh_continuous_aggregates(ctx.db(), Some(since)).await;
+                }
+                ctx.set_progress(total, Some(total)).await;
+                tracing::info!(derived_id = %id, total, filled, "Derived parameter recomputation complete");
+                Ok::<i64, sea_orm::DbErr>(i64::from(filled))
+            };
+
+            match tokio::time::timeout(std::time::Duration::from_secs(600), work).await {
+                Ok(res) => res,
+                Err(_) => Err(sea_orm::DbErr::Custom(
+                    "Timed out after 10 minutes".to_string(),
+                )),
+            }
+        },
+    )
     .await?;
-    let _ = state.events.send(AppEvent::JobCreated { job_id });
 
-    let events = state.events.clone();
-    tokio::spawn(async move {
-        match tokio::time::timeout(std::time::Duration::from_secs(600), async {
-            tracing::info!(derived_id = %id, %job_id, "Recomputing derived parameter");
-            let timestamps = db
-                .query_all(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    r"SELECT DISTINCT r.site_id, r.time
-                      FROM readings r
-                      JOIN site_parameters sp
-                        ON sp.site_id = r.site_id
-                       AND sp.is_derived = true
-                       AND sp.derived_definition_id = $1
-                      JOIN derived_parameter_sources dps
-                        ON dps.derived_definition_id = sp.derived_definition_id
-                       AND dps.parameter_id = r.parameter_id
-                      ORDER BY r.site_id, r.time",
-                    [id.into()],
-                ))
-                .await;
-
-            match timestamps {
-                Ok(rows) => {
-                    let total = rows.len() as i32;
-                    update_job(
-                        &db,
-                        job_id,
-                        "UPDATE reprocessing_jobs SET status = 'running', total = $1, progress = 0 WHERE id = $2",
-                        vec![total.into(), job_id.into()],
-                    )
-                    .await;
-
-                    let mut filled: i32 = 0;
-                    let mut min_filled: Option<chrono::DateTime<chrono::Utc>> = None;
-                    for (i, row) in rows.iter().enumerate() {
-                        let Ok(site_id) = row.try_get::<Uuid>("", "site_id") else { continue };
-                        let Ok(time) = row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "time") else { continue };
-                        let utc_time = time.with_timezone(&chrono::Utc);
-                        match crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
-                            &db, site_id, utc_time,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                filled += 1;
-                                min_filled = Some(min_filled.map_or(utc_time, |m| m.min(utc_time)));
-                            }
-                            Err(e) => tracing::error!(error = %e, time = %time, "Failed to recompute derived value"),
-                        }
-                        if (i + 1) % 500 == 0 {
-                            update_job(
-                                &db,
-                                job_id,
-                                "UPDATE reprocessing_jobs SET progress = $1 WHERE id = $2",
-                                vec![(i as i32 + 1).into(), job_id.into()],
-                            )
-                            .await;
-                            let _ = events.send(AppEvent::JobProgress {
-                                job_id,
-                                status: "running".to_string(),
-                                progress: Some(i as i32 + 1),
-                                total: Some(total),
-                            });
-                        }
-                    }
-
-                    if let Some(since) = min_filled {
-                        tracing::info!(%since, %job_id, "Refreshing continuous aggregates after derived recompute");
-                        crate::common::sync_state::refresh_continuous_aggregates(&db, Some(since)).await;
-                    }
-
-                    update_job(
-                        &db,
-                        job_id,
-                        "UPDATE reprocessing_jobs \
-                         SET status = 'completed', progress = total, readings_updated = $1, completed_at = NOW() \
-                         WHERE id = $2",
-                        vec![filled.into(), job_id.into()],
-                    )
-                    .await;
-                    let _ = events.send(AppEvent::JobCompleted {
-                        job_id,
-                        status: "completed".to_string(),
-                        readings_updated: Some(filled),
-                        error_message: None,
-                    });
-                    tracing::info!(derived_id = %id, %job_id, total, filled, "Derived parameter recomputation complete");
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    tracing::error!(error = %e, %job_id, "Failed to query timestamps for recomputation");
-                    update_job(
-                        &db,
-                        job_id,
-                        "UPDATE reprocessing_jobs SET status = 'failed', error_message = $1, completed_at = NOW() WHERE id = $2",
-                        vec![msg.as_str().into(), job_id.into()],
-                    )
-                    .await;
-                    let _ = events.send(AppEvent::JobCompleted {
-                        job_id,
-                        status: "failed".to_string(),
-                        readings_updated: None,
-                        error_message: Some(msg),
-                    });
-                }
-            }
-        }).await {
-            Ok(()) => {}
-            Err(_) => {
-                tracing::error!(derived_id = %id, %job_id, "Recompute derived task timed out after 10 minutes");
-                update_job(
-                    &db,
-                    job_id,
-                    "UPDATE reprocessing_jobs SET status = 'failed', error_message = 'Timed out after 10 minutes', completed_at = NOW() WHERE id = $1",
-                    vec![job_id.into()],
-                )
-                .await;
-                let _ = events.send(AppEvent::JobCompleted {
-                    job_id,
-                    status: "failed".to_string(),
-                    readings_updated: None,
-                    error_message: Some("Timed out after 10 minutes".to_string()),
-                });
-            }
-        }
-    });
     Ok(Json(serde_json::json!({ "status": "triggered", "job_id": job_id })))
 }

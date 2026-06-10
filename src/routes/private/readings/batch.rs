@@ -1,5 +1,5 @@
 use axum::{Json, extract::State};
-use sea_orm::{ConnectionTrait, EntityTrait, Set};
+use sea_orm::{EntityTrait, Set};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
@@ -249,8 +249,6 @@ pub async fn insert_batch_readings(
             crate::common::cache::invalidate_prefix(&state, &format!("aggregates:{site_id}")).await;
         }
 
-        // Auto-compute derived values for affected sites and refresh aggregates, tracked as a job.
-        let total_ts: usize = site_timestamps_for_derived.values().map(Vec::len).sum();
         let earliest = site_timestamps_for_derived
             .values()
             .flatten()
@@ -261,87 +259,58 @@ pub async fn insert_batch_readings(
             .flatten()
             .max()
             .copied();
-        let job_id = Uuid::new_v4();
-        let job_total = i32::try_from(total_ts).unwrap_or(i32::MAX);
-        state
-            .db
-            .execute(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status, total, progress) \
-                 VALUES ($1, NULL, 'batch_derived', NULL, 'pending', $2, 0)",
-                [job_id.into(), job_total.into()],
-            ))
-            .await?;
-        let _ = state.events.send(AppEvent::JobCreated { job_id });
 
-        let db_clone = state.db.clone();
-        let events = state.events.clone();
-        tokio::spawn(async move {
-            let _ = db_clone
-                .execute(sea_orm::Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "UPDATE reprocessing_jobs SET status = 'running' WHERE id = $1",
-                    [job_id.into()],
-                ))
-                .await;
-
-            let mut progress = 0i32;
-            for (site_id, timestamps) in site_timestamps_for_derived {
-                for time in timestamps {
-                    if let Err(e) =
-                        crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
-                            &db_clone, site_id, time,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            site_id = %site_id,
-                            time = %time,
-                            "Failed to auto-compute derived values after batch insert"
-                        );
-                    }
-                    progress += 1;
-                    if progress % 500 == 0 {
-                        let _ = db_clone
-                            .execute(sea_orm::Statement::from_sql_and_values(
-                                sea_orm::DatabaseBackend::Postgres,
-                                "UPDATE reprocessing_jobs SET progress = $1 WHERE id = $2",
-                                [progress.into(), job_id.into()],
-                            ))
-                            .await;
-                        let _ = events.send(AppEvent::JobProgress {
-                            job_id,
-                            status: "running".to_string(),
-                            progress: Some(progress),
-                            total: Some(job_total),
-                        });
-                    }
-                }
+        // Auto-compute derived values for affected sites, tracked as a job. Spawn-guard: keep only
+        // sites with an active derived parameter — others would compute nothing.
+        let mut derived_sites: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = HashMap::new();
+        for (site_id, timestamps) in &site_timestamps_for_derived {
+            if crate::routes::private::derived_parameters::janitor::site_has_active_derived(
+                &state.db, *site_id,
+            )
+            .await
+            .unwrap_or(true)
+            {
+                derived_sites.insert(*site_id, timestamps.clone());
             }
-
-            crate::common::sync_state::refresh_continuous_aggregates(&db_clone, earliest).await;
-
-            // Derived recompute can change derived-parameter values; reconcile all slots (cheap) so
-            // derived breaches surface without waiting for the backstop. Error-safe.
-            crate::routes::private::alarms::sweeper::reconcile_all_and_notify(&db_clone, &events)
-                .await;
-
-            let _ = db_clone
-                .execute(sea_orm::Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "UPDATE reprocessing_jobs SET status = 'completed', progress = total, \
-                     completed_at = NOW() WHERE id = $1",
-                    [job_id.into()],
-                ))
-                .await;
-            let _ = events.send(AppEvent::JobCompleted {
-                job_id,
-                status: "completed".to_string(),
-                readings_updated: None,
-                error_message: None,
-            });
-        });
+        }
+        if !derived_sites.is_empty() {
+            let job_total =
+                i32::try_from(derived_sites.values().map(Vec::len).sum::<usize>()).unwrap_or(i32::MAX);
+            crate::routes::private::reprocessing_jobs::lifecycle::spawn_tracked_job_ctx(
+                &state.db,
+                None,
+                "batch_derived",
+                None,
+                state.events.clone(),
+                move |ctx| {
+                    let derived_sites = derived_sites.clone();
+                    async move {
+                        ctx.set_progress(0, Some(job_total)).await;
+                        let mut progress = 0i32;
+                        for (site_id, timestamps) in derived_sites {
+                            for time in timestamps {
+                                if let Err(e) =
+                                    crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
+                                        ctx.db(), site_id, time,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(error = %e, site_id = %site_id, time = %time, "Failed to auto-compute derived values after batch insert");
+                                }
+                                progress += 1;
+                                if progress % 500 == 0 {
+                                    ctx.set_progress(progress, Some(job_total)).await;
+                                }
+                            }
+                        }
+                        crate::common::sync_state::refresh_continuous_aggregates(ctx.db(), earliest).await;
+                        ctx.set_progress(progress, Some(job_total)).await;
+                        Ok(i64::from(progress))
+                    }
+                },
+            )
+            .await?;
+        }
 
         // Rebuild persisted alarm events from the just-ingested readings: out-of-range historical
         // values become breach episodes (the 60s sweeper only ever inspects the latest reading).
