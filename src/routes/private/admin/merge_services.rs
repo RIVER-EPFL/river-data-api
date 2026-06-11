@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct MergeSiteParametersRequest {
     pub source_site_parameter_id: Uuid,
     pub target_site_parameter_id: Uuid,
@@ -251,7 +251,7 @@ async fn delete_source(
     Ok(())
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct MergeParametersRequest {
     pub source_parameter_id: Uuid,
     pub target_parameter_id: Uuid,

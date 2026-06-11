@@ -8,5 +8,6 @@ mod common;
 
 mod merge_conflict_handling;
 mod merge_parameters;
+mod merge_site_parameters_job;
 mod reprocess_all_backdate;
 mod users;

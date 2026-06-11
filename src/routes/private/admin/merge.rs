@@ -23,28 +23,31 @@ use super::merge_services::{
 pub async fn merge_site_parameters_handler(
     State(state): State<AppState>,
     Json(payload): Json<MergeSiteParametersRequest>,
-) -> AppResult<Json<MergeSiteParametersResponse>> {
-    tracing::info!(
-        source = %payload.source_site_parameter_id,
-        target = %payload.target_site_parameter_id,
-        "Merging site_parameters"
-    );
-
-    let result = merge_site_parameters(&state.db, &payload).await?;
-
-    tracing::info!(
-        merged_readings = result.merged_readings,
-        merged_status_events = result.merged_status_events,
-        streams_updated = result.streams_updated,
-        "Site parameter merge complete"
-    );
-
-    // A merge moves readings between slots and deletes a site_parameter, either of which can
-    // open or resolve alarms. Error-safe; the backstop sweep covers any failure.
-    crate::routes::private::alarms::sweeper::reconcile_all_and_notify(&state.db, &state.events)
-        .await;
-
-    Ok(Json(result))
+) -> AppResult<Json<serde_json::Value>> {
+    // Background the multi-table move as a tracked job; the job's `detail` carries the counts the
+    // UI used to read synchronously. Alarm reconcile runs on job completion (central lifecycle).
+    let trigger_id = payload.source_site_parameter_id;
+    let job_id = crate::routes::private::reprocessing_jobs::lifecycle::spawn_tracked_job_ctx(
+        &state.db,
+        None,
+        "merge_site_parameters",
+        Some(trigger_id),
+        state.events.clone(),
+        move |ctx| {
+            let payload = payload.clone();
+            async move {
+                match merge_site_parameters(ctx.db(), &payload).await {
+                    Ok(result) => {
+                        ctx.set_detail(serde_json::json!({ "counts": result })).await;
+                        Ok(i64::try_from(result.merged_readings).unwrap_or(i64::MAX))
+                    }
+                    Err(e) => Err(sea_orm::DbErr::Custom(e.to_string())),
+                }
+            }
+        },
+    )
+    .await?;
+    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "pending" })))
 }
 
 /// Merge two global parameters in the catalog — absorb `source` into `target`. Re-points
@@ -63,25 +66,27 @@ pub async fn merge_site_parameters_handler(
 pub async fn merge_parameters_handler(
     State(state): State<AppState>,
     Json(payload): Json<MergeParametersRequest>,
-) -> AppResult<Json<MergeParametersResponse>> {
-    tracing::info!(
-        source = %payload.source_parameter_id,
-        target = %payload.target_parameter_id,
-        "Merging parameters"
-    );
-
-    let result = merge_parameters(&state.db, &payload).await?;
-
-    tracing::info!(
-        sites_merged = result.sites_merged,
-        sites_reassigned = result.sites_reassigned,
-        readings_moved = result.readings_moved,
-        streams_updated = result.streams_updated,
-        "Parameter merge complete"
-    );
-
-    crate::routes::private::alarms::sweeper::reconcile_all_and_notify(&state.db, &state.events)
-        .await;
-
-    Ok(Json(result))
+) -> AppResult<Json<serde_json::Value>> {
+    let trigger_id = payload.source_parameter_id;
+    let job_id = crate::routes::private::reprocessing_jobs::lifecycle::spawn_tracked_job_ctx(
+        &state.db,
+        None,
+        "merge_parameters",
+        Some(trigger_id),
+        state.events.clone(),
+        move |ctx| {
+            let payload = payload.clone();
+            async move {
+                match merge_parameters(ctx.db(), &payload).await {
+                    Ok(result) => {
+                        ctx.set_detail(serde_json::json!({ "counts": result })).await;
+                        Ok(i64::try_from(result.readings_moved).unwrap_or(i64::MAX))
+                    }
+                    Err(e) => Err(sea_orm::DbErr::Custom(e.to_string())),
+                }
+            }
+        },
+    )
+    .await?;
+    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "pending" })))
 }
