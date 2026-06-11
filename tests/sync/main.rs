@@ -7,3 +7,4 @@
 mod common;
 
 mod control_plane;
+mod pairing_plan_apply;

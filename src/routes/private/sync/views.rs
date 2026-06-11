@@ -1390,9 +1390,56 @@ pub async fn update_pairing_plan(
 pub async fn apply_pairing_plan(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<crate::routes::private::sync::services::ApplyResult>> {
-    let result = crate::routes::private::sync::services::apply_plan(&state.db, id).await?;
-    Ok(Json(result))
+) -> AppResult<Json<serde_json::Value>> {
+    // Validate synchronously for immediate feedback, then background the heavy entity-resolution +
+    // readings backfill as a tracked job so the request doesn't block. The job's `detail` carries
+    // the execution counts the UI used to read from the response.
+    let status = plan_status(&state.db, id).await?;
+    if status != "draft" {
+        return Err(AppError::BadRequest(format!(
+            "Plan is '{status}', can only apply 'draft' plans"
+        )));
+    }
+    let job_id = crate::routes::private::reprocessing_jobs::lifecycle::spawn_tracked_job_ctx(
+        &state.db,
+        None,
+        "plan_apply",
+        Some(id),
+        state.events.clone(),
+        move |ctx| async move {
+            match crate::routes::private::sync::services::apply_plan(ctx.db(), id).await {
+                Ok(result) => {
+                    ctx.set_detail(serde_json::json!({
+                        "scope": { "plan_id": id },
+                        "counts": result,
+                    }))
+                    .await;
+                    ctx.info(&format!(
+                        "Applied plan: {} streams paired, {} readings backfilled",
+                        result.streams_paired, result.readings_backfilled
+                    ))
+                    .await;
+                    Ok(i64::try_from(result.readings_backfilled).unwrap_or(i64::MAX))
+                }
+                Err(e) => Err(sea_orm::DbErr::Custom(e.to_string())),
+            }
+        },
+    )
+    .await?;
+    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "pending" })))
+}
+
+/// Fetch a pairing plan's status, or 404 if unknown.
+async fn plan_status(db: &sea_orm::DatabaseConnection, id: Uuid) -> AppResult<String> {
+    let row = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT status FROM pairing_plans WHERE id = $1",
+            [id.into()],
+        ))
+        .await?
+        .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
+    Ok(row.try_get::<String>("", "status")?)
 }
 
 /// Revert an applied pairing plan: unpair every stream it touched, restoring the prior
@@ -1412,8 +1459,35 @@ pub async fn revert_pairing_plan(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let reverted = crate::routes::private::sync::services::revert_plan(&state.db, id).await?;
-    Ok(Json(serde_json::json!({ "reverted": reverted })))
+    let status = plan_status(&state.db, id).await?;
+    if status != "applied" {
+        return Err(AppError::BadRequest(format!(
+            "Plan is '{status}', can only revert 'applied' plans"
+        )));
+    }
+    let job_id = crate::routes::private::reprocessing_jobs::lifecycle::spawn_tracked_job_ctx(
+        &state.db,
+        None,
+        "plan_revert",
+        Some(id),
+        state.events.clone(),
+        move |ctx| async move {
+            match crate::routes::private::sync::services::revert_plan(ctx.db(), id).await {
+                Ok(reverted) => {
+                    ctx.set_detail(serde_json::json!({
+                        "scope": { "plan_id": id },
+                        "counts": { "reverted": reverted },
+                    }))
+                    .await;
+                    ctx.info(&format!("Reverted plan: {reverted} streams unpaired")).await;
+                    Ok(i64::from(reverted))
+                }
+                Err(e) => Err(sea_orm::DbErr::Custom(e.to_string())),
+            }
+        },
+    )
+    .await?;
+    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "pending" })))
 }
 
 /// Aggregate summary of unpaired streams grouped by source system. Used by the dashboard
