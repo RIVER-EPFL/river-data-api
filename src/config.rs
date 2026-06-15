@@ -22,6 +22,28 @@ impl std::str::FromStr for Deployment {
     }
 }
 
+/// Email delivery backend. SMTP submits via `lettre`; Graph posts to Microsoft Graph `sendMail`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EmailBackend {
+    #[default]
+    Disabled,
+    Smtp,
+    Graph,
+}
+
+impl std::str::FromStr for EmailBackend {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "smtp" => Ok(Self::Smtp),
+            "graph" => Ok(Self::Graph),
+            "disabled" | "none" | "" => Ok(Self::Disabled),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     // Database
@@ -102,6 +124,36 @@ pub struct Config {
     // Tracked-job retry policy (calibration/deployment/derived reprocessing, aggregate refresh, ...)
     pub job_max_retries: u32,
     pub job_retry_backoff_seconds: u64,
+
+    // Notifications (Telegram bot + email). Every channel is optional — an unset token or a
+    // disabled/incomplete email backend is simply skipped, so the API runs identically without them.
+    pub telegram_bot_token: Option<String>,
+    pub email_backend: EmailBackend,
+    // SMTP submission (lettre) — used when email_backend = Smtp.
+    pub smtp_host: Option<String>,
+    pub smtp_port: u16,
+    pub smtp_username: Option<String>,
+    pub smtp_password: Option<String>,
+    pub smtp_from: Option<String>,
+    // Microsoft Graph sendMail — used when email_backend = Graph.
+    pub graph_tenant_id: Option<String>,
+    pub graph_client_id: Option<String>,
+    pub graph_client_secret: Option<String>,
+    pub graph_sender: Option<String>,
+    // Where alarm emails are delivered (e.g. an EPFL group distribution address). The list server
+    // handles per-recipient fan-out, so this is a single address.
+    pub alert_email_to: Option<String>,
+    // Dispatcher poll cadence (the broadcast wakeup is primary; this bounds a missed event) and the
+    // identity reconciliation sweep cadence (anti-backdoor).
+    pub notify_poll_interval_seconds: u64,
+    pub identity_reconcile_interval_seconds: u64,
+    // Battery depletion forecast: cutoff voltage and the days-to-cutoff threshold that raises an alert.
+    pub battery_cutoff_volts: f64,
+    pub battery_forecast_alert_days: i64,
+    // When true, grab samples submitted via the bot are flagged for review on insert.
+    pub telegram_grab_flag_for_review: bool,
+    // Dashboard base URL used to build deep links in notification messages.
+    pub dashboard_base_url: Option<String>,
 }
 
 impl Config {
@@ -271,6 +323,46 @@ impl Config {
                 .unwrap_or_else(|_| "60".to_string())
                 .parse()
                 .unwrap_or(60),
+
+            telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN").ok().filter(|s| !s.is_empty()),
+            email_backend: env::var("EMAIL_BACKEND")
+                .unwrap_or_default()
+                .parse()
+                .unwrap_or(EmailBackend::Disabled),
+            smtp_host: env::var("SMTP_HOST").ok().filter(|s| !s.is_empty()),
+            smtp_port: env::var("SMTP_PORT")
+                .unwrap_or_else(|_| "587".to_string())
+                .parse()
+                .unwrap_or(587),
+            smtp_username: env::var("SMTP_USERNAME").ok().filter(|s| !s.is_empty()),
+            smtp_password: env::var("SMTP_PASSWORD").ok().filter(|s| !s.is_empty()),
+            smtp_from: env::var("SMTP_FROM").ok().filter(|s| !s.is_empty()),
+            graph_tenant_id: env::var("GRAPH_TENANT_ID").ok().filter(|s| !s.is_empty()),
+            graph_client_id: env::var("GRAPH_CLIENT_ID").ok().filter(|s| !s.is_empty()),
+            graph_client_secret: env::var("GRAPH_CLIENT_SECRET").ok().filter(|s| !s.is_empty()),
+            graph_sender: env::var("GRAPH_SENDER").ok().filter(|s| !s.is_empty()),
+            alert_email_to: env::var("ALERT_EMAIL_TO").ok().filter(|s| !s.is_empty()),
+            notify_poll_interval_seconds: env::var("NOTIFY_POLL_INTERVAL_SECONDS")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()
+                .unwrap_or(60),
+            identity_reconcile_interval_seconds: env::var("IDENTITY_RECONCILE_INTERVAL_SECONDS")
+                .unwrap_or_else(|_| "300".to_string())
+                .parse()
+                .unwrap_or(300),
+            battery_cutoff_volts: env::var("BATTERY_CUTOFF_VOLTS")
+                .unwrap_or_else(|_| "10.5".to_string())
+                .parse()
+                .unwrap_or(10.5),
+            battery_forecast_alert_days: env::var("BATTERY_FORECAST_ALERT_DAYS")
+                .unwrap_or_else(|_| "14".to_string())
+                .parse()
+                .unwrap_or(14),
+            telegram_grab_flag_for_review: env::var("TELEGRAM_GRAB_FLAG_FOR_REVIEW")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
+            dashboard_base_url: env::var("DASHBOARD_BASE_URL").ok().filter(|s| !s.is_empty()),
         })
     }
 
