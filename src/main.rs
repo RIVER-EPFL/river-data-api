@@ -135,6 +135,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Spawned alarm sweeper"
     );
 
+    tokio::spawn(river_db::routes::private::notifications::dispatcher::periodic(
+        db.clone(),
+        state.config.clone(),
+        state.events.clone(),
+    ));
+    tracing::info!("Spawned notification dispatcher");
+
     let app = routes::build_router(state);
 
     // Start server with graceful shutdown
