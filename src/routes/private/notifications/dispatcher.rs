@@ -58,7 +58,7 @@ pub async fn periodic(db: DatabaseConnection, config: Arc<Config>, events: Event
     );
 
     let mut rx = events.subscribe();
-    run_cycle(&db, &channels, &config).await;
+    dispatch_once(&db, &channels, &config).await;
 
     let mut ticker = tokio::time::interval(Duration::from_secs(config.notify_poll_interval_seconds));
     ticker.tick().await;
@@ -73,12 +73,14 @@ pub async fn periodic(db: DatabaseConnection, config: Arc<Config>, events: Event
             },
         };
         if should_run {
-            run_cycle(&db, &channels, &config).await;
+            dispatch_once(&db, &channels, &config).await;
         }
     }
 }
 
-async fn run_cycle(
+/// One drain of the outbox (open + resolve passes). Exposed `pub` so integration tests can drive it
+/// deterministically with injected channels instead of waiting on the interval.
+pub async fn dispatch_once(
     db: &DatabaseConnection,
     channels: &[Box<dyn NotificationChannel>],
     config: &Config,
