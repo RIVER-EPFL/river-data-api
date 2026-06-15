@@ -26,7 +26,8 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
          pairing_plans, data_streams, \
          reprocessing_jobs, \
          annotations, notes, \
-         alarm_thresholds, api_tokens, \
+         alarm_thresholds, alarm_events, api_tokens, \
+         telegram_identities, notification_mutes, notification_log, \
          sensor_calibrations, sensor_deployments, sensors, \
          derived_parameter_sources, derived_parameter_definitions, \
          standard_curves, constants, \

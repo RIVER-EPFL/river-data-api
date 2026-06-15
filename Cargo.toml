@@ -97,3 +97,5 @@ serial_test = "3"
 tower = { version = "0.5", features = ["util"] }
 hyper = "1"
 http-body-util = "0.1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros"] }
