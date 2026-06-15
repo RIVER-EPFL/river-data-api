@@ -30,8 +30,12 @@ async fn merge_site_parameters_then_flag_and_query_alarms() {
     )
     .await;
     assert!((200..300).contains(&status), "merge ({status}): {merge}");
-    assert_eq!(merge["source_deleted"], true, "source site_parameter deleted: {merge}");
-    assert!(merge["merged_readings"].as_i64().unwrap() > 0, "some readings reassigned: {merge}");
+    let job_id = merge["job_id"].as_str().expect("merge response carries job_id").to_string();
+    assert_eq!(
+        crate::common::e2e::poll_job(&app, &token, &job_id, 30).await,
+        "completed",
+        "merge job completes"
+    );
 
     // Source site_parameter is gone; its readings now carry the target's parameter_id.
     let (status, _gone) =

@@ -143,75 +143,31 @@ struct ParamGroupProposal {
     entry_indices: Vec<usize>,
 }
 
-fn longest_common_suffix(names: &[&str]) -> String {
-    if names.is_empty() { return String::new(); }
-    if names.len() == 1 { return names[0].to_string(); }
-
-    let reversed: Vec<Vec<char>> = names.iter()
-        .map(|n| n.chars().rev().flat_map(|c| c.to_lowercase()).collect())
-        .collect();
-    let min_len = reversed.iter().map(|r| r.len()).min().unwrap_or(0);
-
-    let mut common_len = 0;
-    for i in 0..min_len {
-        let ch = reversed[0][i];
-        if reversed.iter().all(|r| r[i] == ch) {
-            common_len += 1;
-        } else {
-            break;
-        }
-    }
-
-    // Return the suffix from the first name (preserving its original case)
-    let first = names[0];
-    first[first.len() - common_len..].to_string()
-}
-
 fn group_streams_by_parameter(
     entries: &[(usize, String, String)],
 ) -> Vec<ParamGroupProposal> {
-    let mut by_units: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    // Distinct quantities can share a units suffix (e.g. "Nitrate [µg/L]" vs
+    // "Ammonia [µg/L]"), so only entries whose names are identical group together.
+    let mut by_key: HashMap<(String, String), Vec<(usize, String)>> = HashMap::new();
     for (idx, name, units) in entries {
-        by_units.entry(units.to_lowercase())
+        by_key.entry((units.to_lowercase(), name.to_lowercase()))
             .or_default()
             .push((*idx, name.clone()));
     }
 
-    let mut proposals = Vec::new();
-    for (units, members) in &by_units {
-        if members.len() <= 1 {
-            let (idx, name) = &members[0];
-            proposals.push(ParamGroupProposal {
-                proposed_name: name.clone(),
-                units: units.clone(),
-                original_names: vec![name.clone()],
-                entry_indices: vec![*idx],
-            });
-            continue;
-        }
-
-        let names: Vec<&str> = members.iter().map(|(_, n)| n.as_str()).collect();
-        let suffix = longest_common_suffix(&names);
-
-        if suffix.len() >= 2 {
-            proposals.push(ParamGroupProposal {
-                proposed_name: suffix,
-                units: units.clone(),
-                original_names: names.iter().map(|n| n.to_string()).collect(),
+    by_key.into_iter()
+        .map(|((units, _), members)| {
+            let mut original_names: Vec<String> = members.iter().map(|(_, n)| n.clone()).collect();
+            original_names.sort();
+            original_names.dedup();
+            ParamGroupProposal {
+                proposed_name: members[0].1.clone(),
+                units,
+                original_names,
                 entry_indices: members.iter().map(|(idx, _)| *idx).collect(),
-            });
-        } else {
-            for (idx, name) in members {
-                proposals.push(ParamGroupProposal {
-                    proposed_name: name.clone(),
-                    units: units.clone(),
-                    original_names: vec![name.clone()],
-                    entry_indices: vec![*idx],
-                });
             }
-        }
-    }
-    proposals
+        })
+        .collect()
 }
 
 /// Create a pairing plan for all unpaired streams of a given source system.
@@ -321,7 +277,7 @@ pub async fn create_plan(
         });
     }
 
-    // Group new-to-create parameters by units + common suffix
+    // Group new-to-create parameters with identical names (per units) across sites
     let to_group: Vec<(usize, String, String)> = entries.iter().enumerate()
         .filter(|(_, e)| e.action == "pair" && e.parameter.create)
         .map(|(i, e)| (i, e.parameter.name.clone(), e.parameter.units.clone()))

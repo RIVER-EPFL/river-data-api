@@ -343,12 +343,12 @@ async fn test_not_found_rejection() {
     assert!(result.is_err(), "should reject nonexistent source");
 }
 
-// Scenario: call merge via HTTP endpoint.
-// Expected behaviour: 200 with response shape, source actually deleted.
+// Scenario: call merge via HTTP endpoint, which runs as a tracked merge_parameters job.
+// Expected behaviour: 200 with a job_id, job completes, source actually deleted.
 #[tokio::test]
 #[serial]
 async fn test_http_round_trip() {
-    let (_db, app, token) = setup().await;
+    let (db, app, token) = setup().await;
 
     let body = serde_json::json!({
         "source_parameter_id": crate::common::GLOBAL_PARAM_DO_ID,
@@ -364,8 +364,8 @@ async fn test_http_round_trip() {
     .await;
 
     assert_eq!(status, 200, "merge via HTTP: {resp}");
-    assert!(resp["source_deleted"].as_bool().unwrap(), "source_deleted should be true");
-    assert!(resp["readings_moved"].as_u64().unwrap() > 0, "should move readings");
+    let job_id = resp["job_id"].as_str().expect("response carries job_id").to_string();
+    assert_eq!(crate::merge_site_parameters_job::wait_terminal(&db, &job_id).await, "completed");
 
     let (get_status, _) = crate::common::get_with_token(
         &app,

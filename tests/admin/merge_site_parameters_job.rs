@@ -9,7 +9,7 @@ use serial_test::serial;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-async fn wait_terminal(db: &sea_orm::DatabaseConnection, job_id: &str) -> String {
+pub async fn wait_terminal(db: &sea_orm::DatabaseConnection, job_id: &str) -> String {
     let id = Uuid::parse_str(job_id).unwrap();
     let start = Instant::now();
     loop {

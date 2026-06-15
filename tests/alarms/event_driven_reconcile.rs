@@ -498,10 +498,10 @@ async fn open_event_count(db: &sea_orm::DatabaseConnection, parameter_id: &str) 
     .unwrap()
 }
 
-/// Merging site_parameters reconciles both sides in the same request: the absorbed slot's open
-/// event resolves (the slot is gone) and the target slot opens for the moved breaching reading
-/// (merge moves readings between parameters within the site; 600 breaches the temperature
-/// thresholds too).
+/// Merging site_parameters reconciles both sides when the merge job completes: the absorbed
+/// slot's open event resolves (the slot is gone) and the target slot opens for the moved
+/// breaching reading (merge moves readings between parameters within the site; 600 breaches
+/// the temperature thresholds too).
 #[tokio::test]
 #[serial]
 async fn merge_reconciles_source_and_target_slots() {
@@ -527,6 +527,15 @@ async fn merge_reconciles_source_and_target_slots() {
     )
     .await;
     assert_eq!(status, 200, "merge: {body}");
+    let job_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["job_id"]
+        .as_str()
+        .expect("merge response carries job_id")
+        .to_string();
+    assert_eq!(
+        crate::common::e2e::poll_job(&app, &token, &job_id, 30).await,
+        "completed",
+        "merge job completes"
+    );
 
     assert_eq!(
         open_event_count(&db, crate::common::GLOBAL_PARAM_TURB_ID).await,
