@@ -120,6 +120,7 @@ async fn route(
         "thresholds" => commands::thresholds(&state.db, args).await,
         "server" => commands::server(&state.db).await,
         "battery" => commands::battery(&state.db, args, cutoff).await,
+        "grab" => commands::grab(state, args, username, chat_id).await,
         "mute" | "unmute" | "muted" => {
             if role.allows_admin() {
                 let by = username

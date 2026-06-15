@@ -3,9 +3,17 @@
 //! Everything is answered from the database directly (the bot runs in-process), so there are no HTTP
 //! self-calls. Site and parameter arguments are matched case-insensitively by name/code.
 
+use axum::Json;
+use axum::extract::State;
 use chrono::{Duration, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
+
+use crate::common::AppState;
+use crate::common::middleware::ProjectScope;
+use crate::routes::private::readings::grab_samples::{
+    GrabSampleReading, GrabSampleRequest, insert_grab_samples,
+};
 
 use super::messages::severity_label;
 
@@ -20,6 +28,7 @@ pub fn help() -> String {
      /thresholds [site] — configured thresholds\n\
      /server — sync service status\n\
      /battery [site] — voltage and depletion forecast\n\
+     /grab <site> <param> <value> [more] — submit a grab sample\n\
      /mute <site> <param> [days] — suppress alerts\n\
      /unmute <site> <param>\n\
      /muted — active mutes\n\
@@ -566,6 +575,86 @@ pub async fn start(
         Ok(None) => "Invalid or expired code.".to_string(),
         // Most likely the chat is already linked to another identity (unique constraint).
         Err(_) => "This chat is already linked, or the code is invalid.".to_string(),
+    }
+}
+
+/// `/grab <site> <param> <value> [more values…]` — submit a grab sample (and its replicates) from
+/// the field. Reuses the full grab-sample insert path (stream creation, sample aggregation, alarm
+/// reconciliation). When `TELEGRAM_GRAB_FLAG_FOR_REVIEW` is set, the readings are flagged on insert
+/// so they're held out of aggregates until a curator reviews them.
+pub async fn grab(state: &AppState, args: &str, username: Option<&str>, chat_id: i64) -> String {
+    let toks: Vec<&str> = args.split_whitespace().collect();
+    if toks.len() < 3 {
+        return "Usage: /grab <site> <param> <value> [more values…]".to_string();
+    }
+    let (site_arg, param_arg) = (toks[0], toks[1]);
+    let mut values = Vec::with_capacity(toks.len() - 2);
+    for t in &toks[2..] {
+        match t.parse::<f64>() {
+            Ok(v) => values.push(v),
+            Err(_) => return format!("\"{t}\" is not a number."),
+        }
+    }
+
+    let (site_id, site_name) = match resolve_site(&state.db, site_arg).await {
+        Ok(SiteMatch::One(id, name)) => (id, name),
+        Ok(SiteMatch::NotFound) => return format!("No site matches \"{site_arg}\"."),
+        Ok(SiteMatch::Ambiguous(names)) => return ambiguous_reply("sites", &names),
+        Err(e) => return db_error(&e),
+    };
+    let (param_id, param_name) = match resolve_parameter(&state.db, param_arg).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(msg)) => return msg,
+        Err(e) => return db_error(&e),
+    };
+
+    let now = Utc::now();
+    let created_by = username.map_or_else(|| format!("telegram:{chat_id}"), |u| format!("telegram:{u}"));
+    let readings = values
+        .iter()
+        .map(|&value| GrabSampleReading {
+            parameter_id: param_id,
+            sensor_id: None,
+            value,
+            time: now,
+            replicate_index: None,
+        })
+        .collect();
+    let req = GrabSampleRequest {
+        site_id,
+        created_by: Some(created_by),
+        readings,
+    };
+
+    match insert_grab_samples(State(state.clone()), ProjectScope(None), Json(req)).await {
+        Ok(Json(resp)) => {
+            let mut reply =
+                format!("✅ Recorded {} value(s) for {site_name} / {param_name}.", resp.inserted);
+            if state.config.telegram_grab_flag_for_review {
+                flag_for_review(&state.db, site_id, param_id, now).await;
+                reply.push_str(" Flagged for review.");
+            }
+            reply
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "bot grab insert failed");
+            format!("Couldn't record that — is {param_name} configured at {site_name}?")
+        }
+    }
+}
+
+async fn flag_for_review(db: &DatabaseConnection, site_id: Uuid, param_id: Uuid, time: chrono::DateTime<chrono::Utc>) {
+    let res = db
+        .execute(Statement::from_sql_and_values(
+            PG,
+            "UPDATE readings SET is_flagged = TRUE, \
+                 flag_reason = 'field submission – pending review' \
+             WHERE site_id = $1 AND parameter_id = $2 AND time = $3",
+            [site_id.into(), param_id.into(), time.into()],
+        ))
+        .await;
+    if let Err(e) = res {
+        tracing::warn!(error = %e, "failed to flag grab sample for review");
     }
 }
 
