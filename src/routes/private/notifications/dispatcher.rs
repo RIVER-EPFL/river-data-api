@@ -91,6 +91,10 @@ pub async fn dispatch_once(
     if let Err(e) = process_pending(db, channels, config, false).await {
         tracing::warn!(error = %e, "notification dispatcher: resolve pass failed");
     }
+    // Signal triggers only run when a channel is configured (they do heavier detection queries).
+    if !channels.is_empty() {
+        super::triggers::run(db, channels, config).await;
+    }
 }
 
 async fn process_pending(
@@ -196,7 +200,7 @@ async fn fetch_active_mutes(db: &DatabaseConnection) -> Result<HashSet<(Uuid, Uu
 /// Deliver to every channel, log each attempt, and decide whether to stamp the outbox: stamp when
 /// nothing was attempted (no channels/recipients) or at least one delivery succeeded; otherwise leave
 /// it for the next tick to retry.
-async fn deliver(
+pub(super) async fn deliver(
     db: &DatabaseConnection,
     channels: &[Box<dyn NotificationChannel>],
     msg: &OutgoingMessage,

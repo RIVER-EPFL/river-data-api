@@ -99,10 +99,8 @@ async fn opened_alarm_is_notified_and_stamped() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     dispatcher::dispatch_once(&db, &channels(&sent, false), state.config.as_ref()).await;
 
-    let msgs = sent.lock().unwrap();
-    assert_eq!(msgs.len(), 1, "one batched opened message");
-    assert_eq!(msgs[0].kind, "alarm_opened");
-    drop(msgs);
+    let opened = sent.lock().unwrap().iter().filter(|m| m.kind == "alarm_opened").count();
+    assert_eq!(opened, 1, "one batched opened message");
     assert_eq!(
         count(&db, "notified_at IS NULL AND resolved_at IS NULL").await,
         0,
@@ -134,7 +132,10 @@ async fn muted_alarm_is_suppressed_but_stamped() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     dispatcher::dispatch_once(&db, &channels(&sent, false), state.config.as_ref()).await;
 
-    assert!(sent.lock().unwrap().is_empty(), "a muted slot sends nothing");
+    assert!(
+        sent.lock().unwrap().iter().all(|m| m.kind != "alarm_opened"),
+        "a muted slot sends no alarm notification"
+    );
     assert_eq!(
         count(&db, "notified_at IS NULL AND resolved_at IS NULL").await,
         0,
@@ -155,7 +156,8 @@ async fn failed_delivery_is_not_stamped_and_retries() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     dispatcher::dispatch_once(&db, &channels(&sent, true), state.config.as_ref()).await;
 
-    assert_eq!(sent.lock().unwrap().len(), 1, "delivery was attempted");
+    let attempted = sent.lock().unwrap().iter().filter(|m| m.kind == "alarm_opened").count();
+    assert_eq!(attempted, 1, "the alarm delivery was attempted");
     assert_eq!(
         count(&db, "notified_at IS NULL AND resolved_at IS NULL").await,
         1,
@@ -184,10 +186,8 @@ async fn resolved_alarm_sends_resolution_notice() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     dispatcher::dispatch_once(&db, &channels(&sent, false), state.config.as_ref()).await;
 
-    let msgs = sent.lock().unwrap();
-    assert_eq!(msgs.len(), 1, "one batched resolved message");
-    assert_eq!(msgs[0].kind, "alarm_resolved");
-    drop(msgs);
+    let resolved = sent.lock().unwrap().iter().filter(|m| m.kind == "alarm_resolved").count();
+    assert_eq!(resolved, 1, "one batched resolved message");
     assert_eq!(
         count(&db, "resolved_at IS NOT NULL AND resolution_notified_at IS NULL").await,
         0,

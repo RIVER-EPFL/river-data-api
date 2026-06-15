@@ -9,3 +9,4 @@ mod anti_backdoor_test;
 mod dispatcher_test;
 mod grab_test;
 mod link_flow_test;
+mod triggers_test;

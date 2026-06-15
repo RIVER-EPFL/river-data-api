@@ -150,6 +150,8 @@ pub struct Config {
     // Battery depletion forecast: cutoff voltage and the days-to-cutoff threshold that raises an alert.
     pub battery_cutoff_volts: f64,
     pub battery_forecast_alert_days: i64,
+    // A paired slot with no reading newer than this many hours raises a stale-data alert.
+    pub stale_data_threshold_hours: i64,
     // When true, grab samples submitted via the bot are flagged for review on insert.
     pub telegram_grab_flag_for_review: bool,
     // Dashboard base URL used to build deep links in notification messages.
@@ -358,6 +360,10 @@ impl Config {
                 .unwrap_or_else(|_| "14".to_string())
                 .parse()
                 .unwrap_or(14),
+            stale_data_threshold_hours: env::var("STALE_DATA_THRESHOLD_HOURS")
+                .unwrap_or_else(|_| "6".to_string())
+                .parse()
+                .unwrap_or(6),
             telegram_grab_flag_for_review: env::var("TELEGRAM_GRAB_FLAG_FOR_REVIEW")
                 .unwrap_or_else(|_| "false".to_string())
                 .parse()

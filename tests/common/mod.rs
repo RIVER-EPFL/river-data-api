@@ -92,6 +92,7 @@ fn test_config() -> Config {
         identity_reconcile_interval_seconds: 300,
         battery_cutoff_volts: 10.5,
         battery_forecast_alert_days: 14,
+        stale_data_threshold_hours: 6,
         telegram_grab_flag_for_review: false,
         dashboard_base_url: None,
     }
