@@ -12,6 +12,7 @@ pub type ImportStagingCache = Cache<String, Arc<String>>;
 
 use crate::config::Config;
 use crate::routes::private::api_tokens::services::TokenCache;
+use crate::routes::private::notifications::authz::Authorizer;
 use super::bulk::{BulkSemaphore, new_bulk_semaphore};
 use crate::routes::public::services::{PublicConfigCache, new_public_config_cache};
 
@@ -90,6 +91,9 @@ pub struct AppState {
     pub token_rate_limiters: TokenRateLimiters,
     pub events: EventSender,
     pub import_staging: ImportStagingCache,
+    /// Live role resolver for Telegram chats (anti-backdoor). Shared so the user-management revoke
+    /// path can invalidate a sub's cached role immediately.
+    pub authorizer: Arc<Authorizer>,
 }
 
 impl AppState {
@@ -153,6 +157,7 @@ impl AppState {
             token_rate_limiters,
             events,
             import_staging,
+            authorizer: Arc::new(Authorizer::new()),
         }
     }
 }

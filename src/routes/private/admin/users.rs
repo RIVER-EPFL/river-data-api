@@ -44,7 +44,7 @@ pub struct AssignRolesRequest {
     pub roles: Vec<String>,
 }
 
-async fn get_admin_token(state: &AppState) -> AppResult<String> {
+pub(crate) async fn get_admin_token(state: &AppState) -> AppResult<String> {
     let admin = state
         .keycloak_admin
         .as_ref()
@@ -109,7 +109,7 @@ async fn get_admin_token(state: &AppState) -> AppResult<String> {
     Ok(token)
 }
 
-fn admin_base_url(state: &AppState) -> AppResult<String> {
+pub(crate) fn admin_base_url(state: &AppState) -> AppResult<String> {
     Ok(format!(
         "{}/admin/realms/{}",
         state.config.keycloak_url.as_ref()
@@ -119,7 +119,7 @@ fn admin_base_url(state: &AppState) -> AppResult<String> {
     ))
 }
 
-fn admin_client(state: &AppState) -> AppResult<&KeycloakAdmin> {
+pub(crate) fn admin_client(state: &AppState) -> AppResult<&KeycloakAdmin> {
     state.keycloak_admin.as_ref()
         .ok_or_else(|| AppError::ServiceUnavailable("Keycloak not configured".to_string()))
 }
