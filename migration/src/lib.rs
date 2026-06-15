@@ -24,6 +24,7 @@ mod m20260608_000001_api_token_audit_log;
 mod m20260608_000002_alarm_events_history_index;
 mod m20260610_000001_reprocessing_jobs_status_index;
 mod m20260610_000002_job_detail_and_logs;
+mod m20260615_000001_notifications;
 
 pub struct Migrator;
 
@@ -55,6 +56,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260608_000002_alarm_events_history_index::Migration),
             Box::new(m20260610_000001_reprocessing_jobs_status_index::Migration),
             Box::new(m20260610_000002_job_detail_and_logs::Migration),
+            Box::new(m20260615_000001_notifications::Migration),
         ]
     }
 }
