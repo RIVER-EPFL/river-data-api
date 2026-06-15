@@ -7,6 +7,8 @@
 use sea_orm::DatabaseConnection;
 
 pub mod authz;
+pub mod bot;
+pub mod commands;
 pub mod dispatcher;
 pub mod email;
 pub mod identities_model;

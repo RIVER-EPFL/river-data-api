@@ -11,6 +11,15 @@ use super::{DeliveryResult, NotificationChannel, OutgoingMessage};
 
 const API_BASE: &str = "https://api.telegram.org";
 
+/// A parsed inbound update (only the fields the bot uses).
+#[derive(Debug, Clone)]
+pub struct Update {
+    pub update_id: i64,
+    pub chat_id: Option<i64>,
+    pub username: Option<String>,
+    pub text: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct TelegramClient {
     http: reqwest::Client,
@@ -25,6 +34,41 @@ impl TelegramClient {
             .build()
             .unwrap_or_default();
         Self { http, token }
+    }
+
+    /// Long-poll for updates since `offset`. Uses a request timeout above the long-poll timeout so
+    /// the held-open connection isn't cut early.
+    pub async fn get_updates(&self, offset: i64, timeout_secs: u32) -> Result<Vec<Update>, String> {
+        let url = format!("{API_BASE}/bot{}/getUpdates", self.token);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[
+                ("offset", offset.to_string()),
+                ("timeout", timeout_secs.to_string()),
+            ])
+            .timeout(Duration::from_secs(u64::from(timeout_secs) + 10))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("telegram getUpdates {}", resp.status()));
+        }
+        let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let results = json["result"].as_array().cloned().unwrap_or_default();
+        let updates = results
+            .iter()
+            .map(|r| {
+                let msg = &r["message"];
+                Update {
+                    update_id: r["update_id"].as_i64().unwrap_or(0),
+                    chat_id: msg["chat"]["id"].as_i64(),
+                    username: msg["from"]["username"].as_str().map(String::from),
+                    text: msg["text"].as_str().map(String::from),
+                }
+            })
+            .collect();
+        Ok(updates)
     }
 
     /// Send a plain-text message to one chat. Returns the Telegram error description on failure.

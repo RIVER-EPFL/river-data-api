@@ -142,6 +142,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     tracing::info!("Spawned notification dispatcher");
 
+    if state.config.telegram_bot_token.is_some() {
+        tokio::spawn(river_db::routes::private::notifications::bot::run(state.clone()));
+        tracing::info!("Spawned Telegram bot poller");
+    }
+
     let app = routes::build_router(state);
 
     // Start server with graceful shutdown
