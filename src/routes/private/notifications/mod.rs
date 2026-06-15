@@ -15,7 +15,9 @@ pub mod identities_model;
 pub mod log_model;
 pub mod messages;
 pub mod mutes_model;
+pub mod reconcile;
 pub mod telegram;
+pub mod views;
 
 pub use identities_model::TelegramIdentity;
 pub use log_model::NotificationLog;

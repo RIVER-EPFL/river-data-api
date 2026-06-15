@@ -147,6 +147,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Spawned Telegram bot poller");
     }
 
+    let reconcile_interval = Duration::from_secs(config.identity_reconcile_interval_seconds);
+    tokio::spawn(river_db::routes::private::notifications::reconcile::periodic(
+        state.clone(),
+        reconcile_interval,
+    ));
+    tracing::info!(
+        interval_secs = reconcile_interval.as_secs(),
+        "Spawned Telegram identity reconciliation"
+    );
+
     let app = routes::build_router(state);
 
     // Start server with graceful shutdown

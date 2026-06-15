@@ -6,6 +6,7 @@ use axum::{
     routing::get,
 };
 use chrono::Utc;
+use sea_orm::{ConnectionTrait, Statement};
 use serde::Deserialize;
 use utoipa::ToSchema;
 
@@ -13,6 +14,34 @@ use crate::common::AppState;
 use crate::common::auth::Role;
 use crate::common::state::KeycloakAdmin;
 use crate::error::{AppError, AppResult};
+
+fn has_riverdata_role(roles: &[String]) -> bool {
+    roles
+        .iter()
+        .any(|r| r == &Role::User.to_string() || r == &Role::Administrator.to_string())
+}
+
+/// Anti-backdoor hook: a user's bot access must not outlive their system access. On any change to a
+/// user's roles / enabled flag / existence, drop their cached role so the bot re-resolves on the next
+/// command, and — when they no longer have access — deactivate their linked Telegram chats outright
+/// rather than waiting for the reconciliation sweep. Best-effort: never fails the user-management op.
+async fn revoke_telegram_access(state: &AppState, sub: &str, still_has_access: bool) {
+    state.authorizer.invalidate(sub).await;
+    if !still_has_access {
+        let res = state
+            .db
+            .execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE telegram_identities SET is_active = FALSE, updated_at = NOW() \
+                 WHERE linked_keycloak_sub = $1",
+                [sub.into()],
+            ))
+            .await;
+        if let Err(e) = res {
+            tracing::warn!(error = %e, "failed to deactivate telegram identities on access change");
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct ListQuery {
@@ -548,6 +577,9 @@ pub async fn update_user(
         fetch_user_roles(client, &token, &base, &id).await
     };
 
+    let enabled = current["enabled"].as_bool().unwrap_or(true);
+    revoke_telegram_access(&state, &id, enabled && has_riverdata_role(&roles)).await;
+
     let mut result = simplify_user(&current);
     result["roles"] = serde_json::json!(roles);
     Ok(Json(result))
@@ -591,6 +623,8 @@ pub async fn delete_user(
         )));
     }
 
+    revoke_telegram_access(&state, &id, false).await;
+
     Ok(Json(serde_json::json!({ "id": id })))
 }
 
@@ -616,6 +650,8 @@ pub async fn assign_roles(
     let base = admin_base_url(&state)?;
 
     set_user_roles(client, &token, &base, &id, &req.roles).await?;
+
+    revoke_telegram_access(&state, &id, has_riverdata_role(&req.roles)).await;
 
     Ok(Json(serde_json::json!({ "success": true })))
 }

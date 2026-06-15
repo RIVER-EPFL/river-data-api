@@ -328,6 +328,15 @@ pub fn api_router(state: &AppState) -> Router<()> {
             .with_state(state.clone())
     });
 
+    // Telegram identity link-code minting. Admin-only — it grants a chat the linked user's role.
+    let telegram_admin_routes = Router::new()
+        .route(
+            "/telegram_identities/link_code",
+            post(crate::routes::private::notifications::views::generate_link_code),
+        )
+        .layer(middleware::from_fn(require_admin))
+        .with_state(state.clone());
+
     // Token lifecycle actions (revoke/rotate). Admin-only, like all token management.
     let token_admin_routes = Router::new()
         .route(
@@ -352,6 +361,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
     let mut router = Router::new()
         .merge(entity_router)
         .merge(token_admin_routes)
+        .merge(telegram_admin_routes)
         .merge(stream_read_routes)
         .merge(sensor_view_read_routes)
         .merge(stream_write_routes)
