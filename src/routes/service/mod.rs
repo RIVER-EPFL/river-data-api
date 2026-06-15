@@ -24,6 +24,7 @@ use crate::routes::private::{
     derived_parameters::definition_model::DerivedParameterDefinition,
     derived_parameters::source_model::DerivedParameterSource,
     notes::Note,
+    notifications::{NotificationLog, NotificationMute, TelegramIdentity},
     pairing_plans::PairingPlan,
     parameters::Parameter,
     reprocessing_jobs::ReprocessingJob,
@@ -119,6 +120,9 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .nest("/data_streams", with_crud_perms(DataStream::router(db)))
         .nest("/standard_curves", with_crud_perms(StandardCurve::router(db)))
         .nest("/notes", with_crud_perms(Note::router(db)))
+        .nest("/telegram_identities", admin_only_crud(TelegramIdentity::router(db)))
+        .nest("/notification_mutes", with_crud_perms(NotificationMute::router(db)))
+        .nest("/notification_logs", admin_only_crud(NotificationLog::router(db)))
         .nest("/annotations", with_crud_data_read_perms(Annotation::router(db)))
         .nest("/constants", with_crud_perms(Constant::router(db)))
         .nest("/samples", with_crud_data_read_perms(Sample::router(db)))
