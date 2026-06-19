@@ -5,9 +5,6 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use super::model::{Column, Entity, SiteParameter};
-use crate::routes::private::sensor_calibrations::services::{
-    recalculate_derived_at_timestamp, spawn_tracked_job,
-};
 
 async fn enrich(db: &DatabaseConnection, items: &mut [SiteParameter]) -> Result<(), ApiError> {
     if items.is_empty() {
@@ -176,13 +173,12 @@ impl CRUDOperations for SiteParameterOperations {
         // site-specific row is created only when a user explicitly overrides via the editor.
 
         // Backfill derived values for the readings already present at this site when a
-        // derived site_parameter is assigned. Tracked via spawn_tracked_job. A guard skips
-        // the spawn if an overlapping backfill is already in flight (this definition's own
-        // assignment/recompute, or a CSV import / pairing backfill that will produce the
-        // same derived rows) so we don't double-run the same work.
+        // derived site_parameter is assigned. Enqueued as a durable `derived_assignment` job on
+        // the claim-based worker pool. A guard skips the enqueue if an overlapping backfill is
+        // already in flight (this definition's own assignment/recompute, or a CSV import / pairing
+        // backfill that will produce the same derived rows) so we don't double-run the same work.
         if entity.is_derived == Some(true)
             && let Some(def_id) = entity.derived_definition_id
-            && let Some(events) = crate::common::global_event_sender()
         {
             let site_id = entity.site_id;
 
@@ -191,7 +187,7 @@ impl CRUDOperations for SiteParameterOperations {
                     sea_orm::DatabaseBackend::Postgres,
                     r"SELECT 1
                       FROM reprocessing_jobs
-                      WHERE status IN ('pending', 'running')
+                      WHERE status IN ('queued', 'pending', 'running', 'retrying')
                         AND (
                           (trigger_type IN ('derived_assignment', 'derived_recompute') AND trigger_id = $1)
                           OR trigger_type IN ('csv_import', 'pairing_backfill')
@@ -208,49 +204,13 @@ impl CRUDOperations for SiteParameterOperations {
                     "Skipping derived assignment backfill: an overlapping reprocessing job is in flight"
                 );
             } else {
-                spawn_tracked_job(
+                crate::routes::private::reprocessing_jobs::worker::enqueue(
                     db,
-                    None,
                     "derived_assignment",
+                    None,
                     Some(def_id),
-                    events,
-                    move |db| async move {
-                        tracing::info!(%def_id, %site_id, "Computing derived values after site assignment");
-
-                        let rows = db
-                            .query_all(Statement::from_sql_and_values(
-                                sea_orm::DatabaseBackend::Postgres,
-                                r"SELECT DISTINCT r.time
-                                  FROM readings r
-                                  JOIN derived_parameter_sources dps ON dps.parameter_id = r.parameter_id
-                                  WHERE dps.derived_definition_id = $1 AND r.site_id = $2
-                                  ORDER BY r.time",
-                                [def_id.into(), site_id.into()],
-                            ))
-                            .await?;
-
-                        let mut filled = 0i64;
-                        let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
-                        for row in &rows {
-                            let Ok(time) =
-                                row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "time")
-                            else {
-                                continue;
-                            };
-                            let utc = time.with_timezone(&chrono::Utc);
-                            if recalculate_derived_at_timestamp(&db, site_id, utc).await.is_ok() {
-                                filled += 1;
-                                earliest = Some(earliest.map_or(utc, |e| e.min(utc)));
-                            }
-                        }
-
-                        if let Some(since) = earliest {
-                            crate::common::sync_state::refresh_continuous_aggregates(&db, Some(since)).await;
-                        }
-
-                        tracing::info!(%def_id, %site_id, filled, "Derived assignment backfill completed");
-                        Ok(filled)
-                    },
+                    &serde_json::json!({ "derived_definition_id": def_id, "site_id": site_id }),
+                    None,
                 )
                 .await
                 .map_err(ApiError::database)?;
