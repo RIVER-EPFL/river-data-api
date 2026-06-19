@@ -55,6 +55,19 @@ pub fn global_event_sender() -> Option<EventSender> {
     GLOBAL_EVENT_SENDER.get().cloned()
 }
 
+/// Global handle to the running `AppState` so worker-run scheduled Jobs (which receive only a
+/// `JobContext` carrying `db`/`events`/`params`) can reach config and shared in-process services —
+/// most importantly the live `Authorizer` cache the identity-reconcile job re-resolves against.
+/// Same single-replica, set-once contract as [`GLOBAL_EVENT_SENDER`]: the first `AppState::new` wins
+/// (later ones in tests are ignored), so this is the real serving state in `main.rs`.
+static GLOBAL_APP_STATE: OnceLock<AppState> = OnceLock::new();
+
+/// Returns a clone of the global `AppState`, if initialised. `None` in contexts that never built one.
+#[must_use]
+pub fn global_app_state() -> Option<AppState> {
+    GLOBAL_APP_STATE.get().cloned()
+}
+
 /// Cached admin token: (access_token, expiry).
 type AdminTokenCache = Arc<Mutex<Option<(String, DateTime<Utc>)>>>;
 
@@ -145,7 +158,7 @@ impl AppState {
             .time_to_live(Duration::from_secs(600)) // 10 minutes
             .build();
 
-        Self {
+        let state = Self {
             db,
             config: Arc::new(config),
             response_cache: cache,
@@ -158,7 +171,11 @@ impl AppState {
             events,
             import_staging,
             authorizer: Arc::new(Authorizer::new()),
-        }
+        };
+        // Publish the serving state so worker-run scheduled Jobs can reach config + the shared
+        // Authorizer. Set-once: the first construction (the real one in `main.rs`) wins.
+        let _ = GLOBAL_APP_STATE.set(state.clone());
+        state
     }
 }
 

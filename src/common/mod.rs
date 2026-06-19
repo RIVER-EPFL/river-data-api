@@ -6,4 +6,6 @@ pub mod rate_limit;
 pub mod state;
 pub mod sync_state;
 
-pub use state::{AppEvent, AppState, CachedResponse, EventSender, global_event_sender};
+pub use state::{
+    AppEvent, AppState, CachedResponse, EventSender, global_app_state, global_event_sender,
+};
