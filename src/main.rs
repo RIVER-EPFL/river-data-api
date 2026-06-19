@@ -61,9 +61,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     tracing::info!("Statement timeout set to 30s");
 
-    // Run migrations
+    // Run migrations under a cross-replica advisory lock. With 2-3 replicas booting together,
+    // concurrent Migrator::up can deadlock on ALTER / non-CONCURRENT CREATE INDEX. A dedicated
+    // single-connection handle holds a session lock for the whole run — lock and unlock land on the
+    // same connection so it can't leak — serialising migrations across replicas; once one replica has
+    // applied them the others no-op. (Timescale hypertable/CAGG DDL can't run inside one txn, so a
+    // transaction-scoped lock isn't an option.)
     tracing::info!("Running migrations...");
-    migration::Migrator::up(&db, None).await?;
+    let mut lock_opts = ConnectOptions::new(&config.database_url);
+    lock_opts
+        .max_connections(1)
+        .min_connections(1)
+        .connect_timeout(Duration::from_secs(5))
+        .sqlx_logging(false);
+    let lock_db = Database::connect(lock_opts).await?;
+    lock_db
+        .execute_unprepared("SELECT pg_advisory_lock(8526340921)")
+        .await?;
+    let migrate_result = migration::Migrator::up(&db, None).await;
+    let _ = lock_db
+        .execute_unprepared("SELECT pg_advisory_unlock(8526340921)")
+        .await;
+    lock_db.close().await?;
+    migrate_result?;
     tracing::info!("Migrations completed");
 
     // Reconcile any tracked jobs left mid-flight by a previous process (their background tasks died
