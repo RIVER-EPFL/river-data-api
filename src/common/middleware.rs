@@ -24,8 +24,13 @@ pub enum AuthContext {
     /// Authenticated via Keycloak JWT (admin UI, browser sessions).
     Keycloak {
         roles: Vec<Role>,
+        /// The Keycloak `sub` (stable user id). Self-service notification endpoints bind strictly to
+        /// this so a caller can only ever manage their own identity.
+        sub: String,
         /// Best-effort user identity (email, else preferred_username) for audit fields.
         email: Option<String>,
+        /// Whether a verified email claim is present (false when `email` is a username fallback).
+        email_verified: bool,
         /// Project confinement for a non-admin Keycloak user. `None` = global/cross-project
         /// access — the current behaviour for every Keycloak user. The field exists so the
         /// coming role-based RBAC (a user pidgeoned to one project) reuses the exact same
@@ -52,6 +57,28 @@ impl AuthContext {
 
     pub fn is_admin(&self) -> bool {
         self.has_role(&Role::Administrator)
+    }
+
+    /// The Keycloak `sub` of the caller, if authenticated via Keycloak JWT. `None` for API tokens —
+    /// self-service notification endpoints require a real user identity.
+    pub fn keycloak_sub(&self) -> Option<&str> {
+        match self {
+            AuthContext::Keycloak { sub, .. } => Some(sub.as_str()),
+            AuthContext::ApiToken { .. } => None,
+        }
+    }
+
+    /// The caller's email claim (Keycloak only), if present.
+    pub fn email(&self) -> Option<&str> {
+        match self {
+            AuthContext::Keycloak { email, .. } => email.as_deref(),
+            AuthContext::ApiToken { .. } => None,
+        }
+    }
+
+    /// Whether the caller has a verified email claim.
+    pub fn email_verified(&self) -> bool {
+        matches!(self, AuthContext::Keycloak { email_verified: true, .. })
     }
 
     /// Project scope this identity is confined to, if any. `None` = global/cross-project access.
@@ -145,18 +172,24 @@ pub async fn service_auth_middleware(
                     .iter()
                     .map(|kr| kr.role().clone())
                     .collect();
-                let email = {
-                    let e = token.extra.email.email.trim();
-                    if !e.is_empty() {
-                        Some(e.to_string())
-                    } else {
-                        let u = token.extra.profile.preferred_username.trim();
-                        (!u.is_empty()).then(|| u.to_string())
-                    }
+                let raw_email = token.extra.email.email.trim();
+                // `email_verified` is only meaningful when a real email claim is present; the audit
+                // `email` falls back to preferred_username, which is never a verified address.
+                let email_verified = !raw_email.is_empty() && token.extra.email.email_verified;
+                let email = if raw_email.is_empty() {
+                    let u = token.extra.profile.preferred_username.trim();
+                    (!u.is_empty()).then(|| u.to_string())
+                } else {
+                    Some(raw_email.to_string())
                 };
-                request
-                    .extensions_mut()
-                    .insert(AuthContext::Keycloak { roles, email, scope: None });
+                let sub = token.subject.clone();
+                request.extensions_mut().insert(AuthContext::Keycloak {
+                    roles,
+                    sub,
+                    email,
+                    email_verified,
+                    scope: None,
+                });
                 return next.run(request).await;
             }
             axum_keycloak_auth::KeycloakAuthStatus::Failure(_) => {

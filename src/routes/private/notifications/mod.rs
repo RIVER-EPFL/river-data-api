@@ -6,6 +6,7 @@
 
 use sea_orm::DatabaseConnection;
 
+pub mod access;
 pub mod authz;
 pub mod bot;
 pub mod commands;
@@ -13,6 +14,7 @@ pub mod dispatcher;
 pub mod email;
 pub mod identities_model;
 pub mod log_model;
+pub mod me;
 pub mod messages;
 pub mod mutes_model;
 pub mod reconcile;

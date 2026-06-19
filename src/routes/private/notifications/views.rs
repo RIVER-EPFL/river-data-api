@@ -26,7 +26,7 @@ pub struct LinkCodeResponse {
 }
 
 /// Avoids visually ambiguous characters (no l/1/i/o/0) so codes are easy to relay.
-fn generate_code() -> String {
+pub(super) fn generate_code() -> String {
     const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
     let mut rng = rand::rng();
     (0..8)

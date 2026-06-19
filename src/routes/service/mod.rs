@@ -2,7 +2,7 @@ use axum::{
     Router, middleware,
     extract::{Request, State},
     response::Response,
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post, put},
 };
 use tower_http::limit::RequestBodyLimitLayer;
 use utoipa_axum::router::OpenApiRouter;
@@ -337,6 +337,22 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .layer(middleware::from_fn(require_admin))
         .with_state(state.clone());
 
+    // Self-service notification preferences. Any Keycloak user manages their OWN settings (the handler
+    // binds to the caller's JWT sub; API tokens are refused in-handler since they have no user sub).
+    let notifications_me_routes = {
+        use crate::routes::private::notifications::me;
+        Router::new()
+            .route(
+                "/notifications/me",
+                get(me::get_my_notifications).patch(me::update_my_notifications),
+            )
+            .route("/notifications/me/subscriptions", put(me::set_my_subscriptions))
+            .route("/notifications/me/link_code", post(me::mint_my_link_code))
+            .route("/notifications/me/telegram", delete(me::unlink_my_telegram))
+            .layer(middleware::from_fn(require_read_data))
+            .with_state(state.clone())
+    };
+
     // Token lifecycle actions (revoke/rotate). Admin-only, like all token management.
     let token_admin_routes = Router::new()
         .route(
@@ -362,6 +378,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .merge(entity_router)
         .merge(token_admin_routes)
         .merge(telegram_admin_routes)
+        .merge(notifications_me_routes)
         .merge(stream_read_routes)
         .merge(sensor_view_read_routes)
         .merge(stream_write_routes)
