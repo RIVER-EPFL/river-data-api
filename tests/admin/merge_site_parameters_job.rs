@@ -23,7 +23,7 @@ pub async fn wait_terminal(db: &sea_orm::DatabaseConnection, job_id: &str) -> St
             .unwrap()
             .unwrap();
         let status: String = row.try_get("", "status").unwrap();
-        if !matches!(status.as_str(), "pending" | "running" | "retrying") {
+        if !matches!(status.as_str(), "queued" | "pending" | "running" | "retrying") {
             return status;
         }
         assert!(start.elapsed() < Duration::from_secs(15), "merge job did not settle");

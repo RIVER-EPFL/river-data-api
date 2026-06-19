@@ -38,7 +38,7 @@ async fn wait_for_terminal(db: &sea_orm::DatabaseConnection, job_id: &str) -> St
             .unwrap()
             .expect("job row exists");
         let status: String = row.try_get("", "status").unwrap();
-        if status != "pending" && status != "running" && status != "retrying" {
+        if status != "queued" && status != "pending" && status != "running" && status != "retrying" {
             return status;
         }
         if start.elapsed() > WAIT_TIMEOUT {
