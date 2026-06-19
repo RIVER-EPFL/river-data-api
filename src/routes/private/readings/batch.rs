@@ -293,37 +293,25 @@ pub async fn insert_batch_readings(
 
         // Rebuild persisted alarm events from the just-ingested readings: out-of-range historical
         // values become breach episodes (the 60s sweeper only ever inspects the latest reading).
-        // Tracked as an `alarm_backfill` job, scoped to exactly the ingested slots and window.
+        // Enqueued as an `alarm_backfill` worker job, scoped to exactly the ingested slots and window.
         if let (Some(alarm_start), Some(alarm_end)) = (earliest, latest) {
-            let alarm_slots: Vec<(Uuid, Uuid)> = stream_cache.keys().copied().collect();
-            let _ = crate::routes::private::sensor_calibrations::services::spawn_tracked_job(
+            let slots: Vec<serde_json::Value> = stream_cache
+                .keys()
+                .map(|(site_id, parameter_id)| serde_json::json!([site_id, parameter_id]))
+                .collect();
+            crate::routes::private::reprocessing_jobs::worker::enqueue(
                 &state.db,
-                None,
                 "alarm_backfill",
                 None,
-                state.events.clone(),
-                move |db| {
-                    let alarm_slots = alarm_slots.clone();
-                    async move {
-                        let mut total = 0i64;
-                        for (site_id, parameter_id) in alarm_slots {
-                            match crate::routes::private::alarms::episodes::evaluate_alarm_episodes(
-                                &db, site_id, parameter_id, alarm_start, alarm_end,
-                            )
-                            .await
-                            {
-                                Ok(n) => total += n,
-                                Err(e) => tracing::warn!(
-                                    error = %e, %site_id, %parameter_id,
-                                    "alarm backfill slot failed"
-                                ),
-                            }
-                        }
-                        Ok(total)
-                    }
-                },
+                None,
+                &serde_json::json!({
+                    "slots": slots,
+                    "start": alarm_start.to_rfc3339(),
+                    "end": alarm_end.to_rfc3339(),
+                }),
+                None,
             )
-            .await;
+            .await?;
         }
 
         // Live open-alarm reconcile for the just-ingested slots (event-driven freshness). The

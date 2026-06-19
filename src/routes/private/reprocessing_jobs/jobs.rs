@@ -593,10 +593,15 @@ impl Job for ReprocessAll {
     }
 }
 
-/// Reconstruct persisted alarm events from the actual readings for the targeted slots and window.
-/// All four scoping inputs are optional (`site_id`/`parameter_id`/`start`/`end`); absent inputs
-/// widen the scope. Idempotent — re-derives the same episodes. Backs the `rebuild_alarm_events`
-/// operator action.
+/// Reconstruct persisted alarm events from the actual readings. Two scoping shapes:
+///
+/// - `slots` present (array of `[site_id, parameter_id]`): loop `evaluate_alarm_episodes` over each
+///   pair with the shared `start`/`end` window — the per-slot shape the inline batch/CSV ingest
+///   spawns used.
+/// - `slots` absent: the single/widened `rebuild_alarm_events` path scoped by the optional
+///   `site_id`/`parameter_id`/`start`/`end` (the `rebuild_alarm_events` operator action).
+///
+/// Idempotent either way — re-derives the same episodes.
 pub struct AlarmBackfill;
 
 #[async_trait]
@@ -607,10 +612,46 @@ impl Job for AlarmBackfill {
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         let params = ctx.params();
-        let site_id = optional_uuid(params, "site_id");
-        let parameter_id = optional_uuid(params, "parameter_id");
         let start = optional_datetime(params, "start");
         let end = optional_datetime(params, "end");
+        let slots = uuid_pair_array(params, "slots");
+
+        if !slots.is_empty() {
+            let (Some(start), Some(end)) = (start, end) else {
+                return Err(DbErr::Custom(
+                    "alarm_backfill with slots requires start and end".into(),
+                ));
+            };
+            let mut total = 0i64;
+            for (site_id, parameter_id) in &slots {
+                match crate::routes::private::alarms::episodes::evaluate_alarm_episodes(
+                    ctx.db(),
+                    *site_id,
+                    *parameter_id,
+                    start,
+                    end,
+                )
+                .await
+                {
+                    Ok(n) => total += n,
+                    Err(e) => tracing::warn!(
+                        error = %e, site_id = %site_id, parameter_id = %parameter_id,
+                        "alarm backfill slot failed"
+                    ),
+                }
+            }
+            if let Some((site_id, _)) = slots.first() {
+                ctx.set_site(*site_id).await;
+            }
+            ctx.set_detail(serde_json::json!({
+                "counts": { "events_written": total, "slots": slots.len() },
+            }))
+            .await;
+            return Ok(total);
+        }
+
+        let site_id = optional_uuid(params, "site_id");
+        let parameter_id = optional_uuid(params, "parameter_id");
         let count = crate::routes::private::alarms::episodes::rebuild_alarm_events(
             ctx.db(),
             site_id,
