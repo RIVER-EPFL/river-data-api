@@ -81,17 +81,37 @@ pub(crate) fn job_retry_policy() -> RetryPolicy {
     JOB_RETRY_POLICY.get().copied().unwrap_or_default()
 }
 
+/// Stable identity for THIS replica, stamped as `owner` on inline-spawned jobs. The startup sweep is
+/// scoped to it so a booting replica only reconciles rows it (the same pod) created — never a peer's
+/// live inline job. In k8s this is the pod name (`HOSTNAME`): unique per replica, stable across a
+/// container restart so a crashed-and-restarted pod still recovers its own orphans; a different pod
+/// (rolling deploy) gets a different id and leaves prior orphans for the leased worker pool. Falls
+/// back to the pid when HOSTNAME is unset (local runs).
+#[must_use]
+pub fn process_owner() -> &'static str {
+    static OWNER: OnceLock<String> = OnceLock::new();
+    OWNER.get_or_init(|| {
+        std::env::var("HOSTNAME")
+            .ok()
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| format!("pid-{}", std::process::id()))
+    })
+}
+
 /// Sweep inline jobs stranded mid-flight by a dead process to `interrupted` at startup. Only
-/// lease-less rows qualify — worker-pool jobs carry a lease and are recovered by the reaper, not this
-/// sweep, so a restart can't strand or double-claim them. Runs after migrations, before serving.
+/// lease-less rows owned by THIS replica qualify — worker-pool jobs carry a lease (recovered by the
+/// reaper) and a peer's live inline jobs carry a different `owner`, so a restart can't strand or
+/// double-claim them. Runs after migrations, before serving.
 pub async fn reconcile_interrupted_jobs(db: &DatabaseConnection) -> Result<u64, sea_orm::DbErr> {
     let res = db
-        .execute(Statement::from_string(
+        .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE reprocessing_jobs \
              SET status = 'interrupted', completed_at = NOW(), \
                  error_message = 'Interrupted by API restart' \
-             WHERE status IN ('pending', 'running', 'retrying') AND lease_expires_at IS NULL",
+             WHERE status IN ('pending', 'running', 'retrying') AND lease_expires_at IS NULL \
+               AND owner = $1",
+            [process_owner().into()],
         ))
         .await?;
     Ok(res.rows_affected())
@@ -292,14 +312,15 @@ where
 
     db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status, category) \
-         VALUES ($1, $2, $3, $4, 'pending', $5)",
+        "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status, category, owner) \
+         VALUES ($1, $2, $3, $4, 'pending', $5, $6)",
         [
             job_id.into(),
             sensor_id_value,
             trigger_type.into(),
             trigger_id_value,
             super::registry::category_for(trigger_type).into(),
+            process_owner().into(),
         ],
     ))
     .await?;
@@ -512,14 +533,15 @@ where
     // Runs inline and starts immediately, so insert straight as `running` (no queued `pending`).
     db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status, category) \
-         VALUES ($1, $2, $3, $4, 'running', $5)",
+        "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, trigger_id, status, category, owner) \
+         VALUES ($1, $2, $3, $4, 'running', $5, $6)",
         [
             job_id.into(),
             sensor_id_value,
             trigger_type.into(),
             trigger_id_value,
             super::registry::category_for(trigger_type).into(),
+            process_owner().into(),
         ],
     ))
     .await?;
