@@ -17,6 +17,27 @@ pub enum OverlapPolicy {
     AllowConcurrent,
 }
 
+impl OverlapPolicy {
+    /// The stable string persisted to `schedules.overlap_policy`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SkipIfRunning => "skip_if_running",
+            Self::AllowConcurrent => "allow_concurrent",
+        }
+    }
+
+    /// Parse the persisted string, falling back to the default for an unknown/missing value so a
+    /// hand-edited row can never make the scheduler panic.
+    #[must_use]
+    pub fn from_str_or_default(s: Option<&str>) -> Self {
+        match s {
+            Some("allow_concurrent") => Self::AllowConcurrent,
+            _ => Self::SkipIfRunning,
+        }
+    }
+}
+
 /// What to do about runs missed while the scheduler was down (a deploy/restart gap).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CatchupPolicy {
@@ -25,6 +46,26 @@ pub enum CatchupPolicy {
     RunOnce,
     /// Skip entirely; wait for the next scheduled slot.
     Skip,
+}
+
+impl CatchupPolicy {
+    /// The stable string persisted to `schedules.catchup_policy`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RunOnce => "run_once",
+            Self::Skip => "skip",
+        }
+    }
+
+    /// Parse the persisted string, falling back to the default for an unknown/missing value.
+    #[must_use]
+    pub fn from_str_or_default(s: Option<&str>) -> Self {
+        match s {
+            Some("skip") => Self::Skip,
+            _ => Self::RunOnce,
+        }
+    }
 }
 
 /// A recurring Service's cadence + policies. The persisted form (a `schedules` row) carries these
