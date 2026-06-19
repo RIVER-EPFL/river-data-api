@@ -132,42 +132,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    let janitor_interval = Duration::from_secs(config.janitor_interval_seconds);
-    let janitor_full_refresh = Duration::from_secs(config.janitor_full_refresh_seconds);
-    tokio::spawn(river_db::routes::private::derived_parameters::janitor::periodic(
-        db.clone(),
-        janitor_interval,
-        janitor_full_refresh,
-        config.job_maintenance_retention_days,
-        config.janitor_retention_days,
-        config.job_maintenance_max_rows,
-    ));
-    tracing::info!(
-        interval_secs = janitor_interval.as_secs(),
-        full_refresh_secs = janitor_full_refresh.as_secs(),
-        maintenance_retention_days = config.job_maintenance_retention_days,
-        operator_retention_days = config.janitor_retention_days,
-        "Spawned derived consistency janitor"
-    );
-
-    let alarm_sweep_interval = Duration::from_secs(config.alarm_sweep_interval_seconds);
-    tokio::spawn(river_db::routes::private::alarms::sweeper::periodic(
-        db.clone(),
-        alarm_sweep_interval,
-        state.events.clone(),
-    ));
-    tracing::info!(
-        interval_secs = alarm_sweep_interval.as_secs(),
-        "Spawned alarm sweeper"
-    );
-
-    tokio::spawn(river_db::routes::private::notifications::dispatcher::periodic(
-        db.clone(),
-        state.config.clone(),
-        state.events.clone(),
-    ));
-    tracing::info!("Spawned notification dispatcher");
-
+    // The Telegram bot long-polls a global feed (not a competing-consumer queue), so it stays a
+    // dedicated single-replica task — it is NOT a scheduled Service.
     if state.config.telegram_bot_token.is_some() {
         if state.config.enable_telegram_bot {
             tokio::spawn(river_db::routes::private::notifications::bot::run(state.clone()));
@@ -177,28 +143,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let reconcile_interval = Duration::from_secs(config.identity_reconcile_interval_seconds);
-    tokio::spawn(river_db::routes::private::notifications::reconcile::periodic(
-        state.clone(),
-        reconcile_interval,
-    ));
-    tracing::info!(
-        interval_secs = reconcile_interval.as_secs(),
-        "Spawned Telegram identity reconciliation"
+    // The five former background loops (derived janitor, alarm sweeper, notification dispatcher,
+    // identity reconciliation, channel health) are now recurring Services run through the DB-backed
+    // scheduler: each fires as a Job claimed by exactly one replica per scheduled tick, so they no
+    // longer double-fire at 2-3 k8s replicas. The registry carries their cadence from Config; the
+    // scheduler seeds a `schedules` row per Service on first start and ticks them thereafter.
+    let mut registry = river_db::routes::private::reprocessing_jobs::job::build_registry();
+    river_db::routes::private::reprocessing_jobs::job::register_scheduled_services(
+        &mut registry,
+        &config,
     );
+    let registry = std::sync::Arc::new(registry);
 
-    tokio::spawn(river_db::routes::private::notifications::health::periodic(
-        db.clone(),
-        state.config.clone(),
-    ));
-    tracing::info!("Spawned notification channel health probe");
+    if let Err(e) = river_db::routes::private::reprocessing_jobs::scheduler::seed_default_schedules(
+        &db, &registry,
+    )
+    .await
+    {
+        tracing::error!(error = %e, "Failed to seed default schedules");
+    } else {
+        tracing::info!("Seeded recurring-service schedules");
+    }
 
-    let registry = std::sync::Arc::new(
-        river_db::routes::private::reprocessing_jobs::job::build_registry(),
-    );
     tokio::spawn({
         let db = db.clone();
         let events = state.events.clone();
+        let registry = registry.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         async move {
             river_db::routes::private::reprocessing_jobs::worker::run(db, events, registry, async move {
@@ -208,6 +178,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     tracing::info!("Spawned job worker");
+
+    tokio::spawn({
+        let db = db.clone();
+        let registry = registry.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
+        async move {
+            river_db::routes::private::reprocessing_jobs::scheduler::run(db, registry, async move {
+                let _ = shutdown_rx.changed().await;
+            })
+            .await;
+        }
+    });
+    tracing::info!("Spawned recurring-service scheduler");
+
+    // Preserve the low-latency reaction the dispatcher and sweeper had to live alarm-state changes:
+    // the scheduled cadence is only the fallback. On every `AlarmStateChanged` broadcast (raised by
+    // event-driven reconciles on ingest / config change / job completion), immediately enqueue an
+    // alarm sweep and a notification drain. Both enqueues are dedupe-keyed on a coarse time bucket so
+    // a burst of broadcasts collapses to at most one queued job of each kind, and `enqueue` is
+    // `ON CONFLICT DO NOTHING` so exactly one replica wins.
+    tokio::spawn({
+        let db = db.clone();
+        let mut rx = state.events.subscribe();
+        let mut shutdown_rx = shutdown_rx.clone();
+        async move {
+            use river_db::common::AppEvent;
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => return,
+                    ev = rx.recv() => match ev {
+                        Ok(AppEvent::AlarmStateChanged { .. }) => {
+                            // 5s bucket: collapse a flurry of broadcasts into one immediate run while
+                            // still firing promptly. The scheduled tick is the ongoing backstop.
+                            let bucket = chrono::Utc::now().timestamp() / 5;
+                            for job in ["alarm_sweep", "dispatch_notifications"] {
+                                let key = format!("{job}:wake:{bucket}");
+                                if let Err(e) = river_db::routes::private::reprocessing_jobs::worker::enqueue(
+                                    &db, job, None, None, &serde_json::json!({ "trigger": "alarm_state_changed" }), Some(&key),
+                                ).await {
+                                    tracing::warn!(error = %e, job, "failed to enqueue on alarm-state broadcast");
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(RecvError::Lagged(_)) => {}
+                        Err(RecvError::Closed) => return,
+                    },
+                }
+            }
+        }
+    });
+    tracing::info!("Spawned alarm-state broadcast bridge");
 
     let app = routes::build_router(state);
 
