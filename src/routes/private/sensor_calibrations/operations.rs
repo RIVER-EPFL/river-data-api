@@ -4,8 +4,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
 use super::model::SensorCalibration;
-use super::services::{recompute_valid_until, spawn_reprocessing_job};
-use crate::common::global_event_sender;
+use super::services::recompute_valid_until;
 
 pub struct SensorCalibrationOperations;
 
@@ -49,11 +48,16 @@ impl CRUDOperations for SensorCalibrationOperations {
             .await
             .map_err(ApiError::database)?;
 
-        if let Some(events) = global_event_sender() {
-            spawn_reprocessing_job(db, entity.sensor_id, "calibration_create", Some(entity.id), events)
-                .await
-                .map_err(ApiError::database)?;
-        }
+        crate::routes::private::reprocessing_jobs::worker::enqueue(
+            db,
+            "calibration_create",
+            Some(entity.sensor_id),
+            Some(entity.id),
+            &serde_json::json!({ "sensor_id": entity.sensor_id }),
+            None,
+        )
+        .await
+        .map_err(ApiError::database)?;
 
         Ok(())
     }
@@ -67,11 +71,16 @@ impl CRUDOperations for SensorCalibrationOperations {
             .await
             .map_err(ApiError::database)?;
 
-        if let Some(events) = global_event_sender() {
-            spawn_reprocessing_job(db, entity.sensor_id, "calibration_update", Some(entity.id), events)
-                .await
-                .map_err(ApiError::database)?;
-        }
+        crate::routes::private::reprocessing_jobs::worker::enqueue(
+            db,
+            "calibration_update",
+            Some(entity.sensor_id),
+            Some(entity.id),
+            &serde_json::json!({ "sensor_id": entity.sensor_id }),
+            None,
+        )
+        .await
+        .map_err(ApiError::database)?;
 
         Ok(())
     }
@@ -120,11 +129,16 @@ impl CRUDOperations for SensorCalibrationOperations {
             .await
             .map_err(ApiError::database)?;
 
-        if let Some(events) = global_event_sender() {
-            spawn_reprocessing_job(db, sensor_id, "calibration_delete", Some(id), events)
-                .await
-                .map_err(ApiError::database)?;
-        }
+        crate::routes::private::reprocessing_jobs::worker::enqueue(
+            db,
+            "calibration_delete",
+            Some(sensor_id),
+            Some(id),
+            &serde_json::json!({ "sensor_id": sensor_id }),
+            None,
+        )
+        .await
+        .map_err(ApiError::database)?;
 
         Ok(id)
     }

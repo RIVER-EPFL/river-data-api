@@ -117,7 +117,14 @@ impl JobRegistry {
 #[must_use]
 pub fn build_registry() -> JobRegistry {
     let mut registry = JobRegistry::new();
-    registry.register(Arc::new(super::jobs::ReprocessSensor::new("manual_reprocess")));
+    for trigger in [
+        "manual_reprocess",
+        "calibration_create",
+        "calibration_update",
+        "calibration_delete",
+    ] {
+        registry.register(Arc::new(super::jobs::ReprocessSensor::new(trigger)));
+    }
     registry
 }
 

@@ -191,18 +191,18 @@ pub async fn reprocess_sensor(
     Json(payload): Json<ReprocessSensorRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     let sensor_id = payload.sensor_id;
-    let job_id = spawn_tracked_job(
+    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
         &app_state.db,
-        Some(sensor_id),
         "manual_reprocess",
+        Some(sensor_id),
         None,
-        app_state.events.clone(),
-        move |db| async move { reprocess_sensor_readings(&db, sensor_id).await.map(|c| c as i64) },
+        &serde_json::json!({ "sensor_id": sensor_id }),
+        None,
     )
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "pending" })))
+    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "queued" })))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
