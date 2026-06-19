@@ -259,48 +259,19 @@ pub async fn ingest_readings(
             payload.readings.iter().map(|r| r.time).collect();
         unique_timestamps.sort();
         unique_timestamps.dedup();
-        let job_total = i32::try_from(unique_timestamps.len()).unwrap_or(i32::MAX);
         let source_stream = payload.stream_id;
 
-        crate::routes::private::reprocessing_jobs::lifecycle::spawn_tracked_job_ctx(
+        crate::routes::private::reprocessing_jobs::worker::enqueue(
             db,
-            None,
             "ingest_derived",
             None,
-            state.events.clone(),
-            move |ctx| {
-                let timestamps = unique_timestamps.clone();
-                async move {
-                    ctx.set_site(sid).await;
-                    ctx.set_detail(serde_json::json!({
-                        "scope": { "site_id": sid },
-                        "source": { "stream_id": source_stream },
-                        "counts": { "timestamps": job_total },
-                    }))
-                    .await;
-                    ctx.set_progress(0, Some(job_total)).await;
-                    let mut progress = 0i32;
-                    for time in timestamps {
-                        if ctx.is_cancelled() {
-                            break;
-                        }
-                        if let Err(e) =
-                            crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
-                                ctx.db(), sid, time,
-                            )
-                            .await
-                        {
-                            tracing::warn!(error = %e, site_id = %sid, time = %time, "Failed to auto-compute derived values after ingest");
-                        }
-                        progress += 1;
-                        if progress % 500 == 0 {
-                            ctx.set_progress(progress, Some(job_total)).await;
-                        }
-                    }
-                    ctx.set_progress(progress, Some(job_total)).await;
-                    Ok(i64::from(progress))
-                }
-            },
+            None,
+            &serde_json::json!({
+                "site_id": sid,
+                "stream_id": source_stream,
+                "timestamps": unique_timestamps,
+            }),
+            None,
         )
         .await?;
     }
