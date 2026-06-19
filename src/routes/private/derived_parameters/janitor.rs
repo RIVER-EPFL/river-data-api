@@ -157,7 +157,8 @@ pub async fn prune_tracked_jobs(
             db,
             format!(
                 "DELETE FROM reprocessing_jobs \
-                 WHERE category = 'maintenance' AND created_at < NOW() - INTERVAL '{maintenance_days} days'"
+                 WHERE category = 'maintenance' AND created_at < NOW() - INTERVAL '{maintenance_days} days' \
+                   AND status NOT IN ('queued', 'running', 'retrying')"
             ),
             "maintenance age",
         )
@@ -168,7 +169,8 @@ pub async fn prune_tracked_jobs(
             db,
             format!(
                 "DELETE FROM reprocessing_jobs \
-                 WHERE category IN ('operator', 'metadata') AND created_at < NOW() - INTERVAL '{operator_days} days'"
+                 WHERE category IN ('operator', 'metadata') AND created_at < NOW() - INTERVAL '{operator_days} days' \
+                   AND status NOT IN ('queued', 'running', 'retrying')"
             ),
             "operator/metadata age",
         )
@@ -178,7 +180,8 @@ pub async fn prune_tracked_jobs(
         // Keep the most-recent N maintenance rows; delete the older overflow.
         let sql = format!(
             "DELETE FROM reprocessing_jobs WHERE id IN ( \
-                SELECT id FROM reprocessing_jobs WHERE category = 'maintenance' \
+                SELECT id FROM reprocessing_jobs \
+                WHERE category = 'maintenance' AND status NOT IN ('queued', 'running', 'retrying') \
                 ORDER BY created_at DESC OFFSET {maintenance_max_rows} \
             )"
         );
