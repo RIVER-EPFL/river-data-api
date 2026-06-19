@@ -811,9 +811,40 @@ impl Job for JanitorRun {
         Some(Schedule::every_secs(self.interval_seconds.max(1) as i64))
     }
 
+    // The one concrete tunable: `retention_days` overrides the operator-retention window for the
+    // tracked-job prune. Other Services keep the default accept-anything `validate` (no tunables yet)
+    // and follow this same pattern when they grow one.
+    fn validate(&self, tunables: &serde_json::Value) -> Result<(), String> {
+        if tunables.is_null() {
+            return Ok(());
+        }
+        let Some(obj) = tunables.as_object() else {
+            return Err("tunables must be a JSON object".to_string());
+        };
+        if let Some(v) = obj.get("retention_days") {
+            let ok = v.as_u64().is_some_and(|n| n >= 1);
+            if !ok {
+                return Err("retention_days must be a positive integer".to_string());
+            }
+        }
+        Ok(())
+    }
+
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         use crate::routes::private::derived_parameters::janitor;
         let db = ctx.db();
+
+        // A scheduled run carries the schedule's tunables snapshot under `params.tunables`
+        // (see `scheduler::enqueue_due`); an on-demand `run_now` carries the same key. Fall back to
+        // the config-derived default when absent or out of range.
+        let operator_retention_days = ctx
+            .params()
+            .get("tunables")
+            .and_then(|t| t.get("retention_days"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(self.operator_retention_days);
 
         // 1. Fill derived gaps (this itself opens its own tracked `janitor_run` row + refreshes
         //    aggregates back to the earliest filled timestamp).
@@ -842,7 +873,7 @@ impl Job for JanitorRun {
         let pruned = janitor::prune_tracked_jobs(
             db,
             self.maintenance_retention_days,
-            self.operator_retention_days,
+            operator_retention_days,
             self.maintenance_max_rows,
         )
         .await;

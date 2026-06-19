@@ -67,6 +67,10 @@ struct DueSchedule {
     scheduled_at: DateTime<Utc>,
     interval_seconds: i64,
     overlap: OverlapPolicy,
+    /// The operator-edited tunables snapshot, carried onto the enqueued job's params. Jobs read it
+    /// from `ctx.params()["tunables"]`; it is fixed at enqueue time, so a mid-run edit to the
+    /// schedule does NOT affect a job already queued/running (intentional — a run uses one snapshot).
+    tunables: serde_json::Value,
 }
 
 /// One scheduler pass: claim due rows, advance their grid, and enqueue each (honoring overlap).
@@ -95,7 +99,7 @@ async fn claim_one_due(db: &DatabaseConnection) -> Result<Option<DueSchedule>, s
     let row = txn
         .query_one(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, job_name, next_run_at, interval_seconds, overlap_policy \
+            "SELECT id, job_name, next_run_at, interval_seconds, overlap_policy, tunables \
              FROM schedules \
              WHERE enabled AND next_run_at IS NOT NULL AND next_run_at <= now() \
              ORDER BY next_run_at \
@@ -116,6 +120,10 @@ async fn claim_one_due(db: &DatabaseConnection) -> Result<Option<DueSchedule>, s
     let interval_seconds: i64 = row.try_get::<i64>("", "interval_seconds").unwrap_or(0).max(1);
     let overlap =
         OverlapPolicy::from_str_or_default(row.try_get::<Option<String>>("", "overlap_policy")?.as_deref());
+    // `tunables` is `NOT NULL DEFAULT '{}'`; default to an empty object if a hand-edited row is null.
+    let tunables: serde_json::Value = row
+        .try_get::<Option<serde_json::Value>>("", "tunables")?
+        .unwrap_or_else(|| serde_json::json!({}));
 
     // Advance the grid off the SCHEDULED time, not `now()`, so cadence never drifts by a run's own
     // latency and a downtime gap snaps forward to the next future slot (discarding the backlog).
@@ -137,6 +145,7 @@ async fn claim_one_due(db: &DatabaseConnection) -> Result<Option<DueSchedule>, s
         scheduled_at,
         interval_seconds,
         overlap,
+        tunables,
     }))
 }
 
@@ -170,7 +179,11 @@ async fn enqueue_due(
         &due.job_name,
         None,
         None,
-        &serde_json::json!({ "scheduled_at": due.scheduled_at, "interval_seconds": due.interval_seconds }),
+        &serde_json::json!({
+            "scheduled_at": due.scheduled_at,
+            "interval_seconds": due.interval_seconds,
+            "tunables": due.tunables,
+        }),
         Some(&dedupe_key),
     )
     .await?;
