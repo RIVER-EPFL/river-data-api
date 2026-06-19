@@ -20,11 +20,12 @@ use crate::config::Config;
 use super::email::{self, EmailChannel};
 use super::messages::{self, PendingEvent};
 use super::telegram::{TelegramChannel, TelegramClient};
-use super::{NotificationChannel, OutgoingMessage};
+use super::{NotificationChannel, OutgoingMessage, Slot};
 
 struct Row {
     id: Uuid,
     slot: (Uuid, Uuid),
+    project_id: Uuid,
     event: PendingEvent,
 }
 
@@ -118,27 +119,33 @@ async fn process_pending(
     let muted_ids: Vec<Uuid> = muted.iter().map(|r| r.id).collect();
     stamp(db, column, &muted_ids).await?;
 
-    if !to_notify.is_empty() {
-        let events: Vec<PendingEvent> = to_notify.iter().map(|r| r.event.clone()).collect();
-        let base = config.dashboard_base_url.as_deref();
-        let msg = if opened {
+    // One message per event so each carries its own slot — fan-out is per-subscriber by scope, which
+    // a single batched message spanning multiple slots couldn't express.
+    let base = config.dashboard_base_url.as_deref();
+    let mut to_stamp: Vec<Uuid> = Vec::new();
+    for r in &to_notify {
+        let events = [r.event.clone()];
+        let mut msg = if opened {
             messages::render_opened(&events, base)
         } else {
             messages::render_resolved(&events, base)
         };
-        let single = if to_notify.len() == 1 { Some(to_notify[0].id) } else { None };
-        let should_stamp = deliver(db, channels, &msg, single).await;
-        if should_stamp {
-            let ids: Vec<Uuid> = to_notify.iter().map(|r| r.id).collect();
-            stamp(db, column, &ids).await?;
+        msg.slot = Some(Slot {
+            project_id: Some(r.project_id),
+            site_id: r.slot.0,
+            parameter_id: r.slot.1,
+        });
+        if deliver(db, channels, &msg, Some(r.id)).await {
+            to_stamp.push(r.id);
         }
     }
+    stamp(db, column, &to_stamp).await?;
     Ok(())
 }
 
 async fn fetch_pending(db: &DatabaseConnection, opened: bool) -> Result<Vec<Row>, DbErr> {
     let sql = if opened {
-        "SELECT ae.id, ae.site_id, ae.parameter_id, s.name AS site_name, \
+        "SELECT ae.id, ae.site_id, ae.parameter_id, s.project_id AS project_id, s.name AS site_name, \
                 p.name AS parameter_name, p.default_units AS units, \
                 ae.severity AS severity, ae.last_value AS value \
          FROM alarm_events ae \
@@ -147,7 +154,7 @@ async fn fetch_pending(db: &DatabaseConnection, opened: bool) -> Result<Vec<Row>
          WHERE ae.notified_at IS NULL AND ae.resolved_at IS NULL \
          ORDER BY ae.started_at"
     } else {
-        "SELECT ae.id, ae.site_id, ae.parameter_id, s.name AS site_name, \
+        "SELECT ae.id, ae.site_id, ae.parameter_id, s.project_id AS project_id, s.name AS site_name, \
                 p.name AS parameter_name, p.default_units AS units, \
                 ae.max_severity AS severity, COALESCE(ae.resolved_value, ae.last_value) AS value \
          FROM alarm_events ae \
@@ -167,6 +174,7 @@ async fn fetch_pending(db: &DatabaseConnection, opened: bool) -> Result<Vec<Row>
         out.push(Row {
             id,
             slot: (site_id, parameter_id),
+            project_id: row.try_get("", "project_id")?,
             event: PendingEvent {
                 site_name: row.try_get("", "site_name")?,
                 parameter_name: row.try_get("", "parameter_name")?,

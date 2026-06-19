@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 
-use super::{DeliveryResult, NotificationChannel, OutgoingMessage};
+use super::access::{accessible_project_ids, project_allowed};
+use super::{DeliveryResult, NotificationChannel, OutgoingMessage, Slot};
 
 const API_BASE: &str = "https://api.telegram.org";
 
@@ -103,23 +104,60 @@ impl TelegramChannel {
     }
 }
 
-async fn alert_chat_ids(db: &DatabaseConnection) -> Result<Vec<i64>, String> {
-    let rows = db
-        .query_all(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT telegram_chat_id FROM telegram_identities \
-             WHERE is_active AND receive_alerts AND telegram_chat_id IS NOT NULL"
-                .to_string(),
-        ))
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut ids = Vec::with_capacity(rows.len());
-    for row in rows {
-        if let Ok(id) = row.try_get::<i64>("", "telegram_chat_id") {
-            ids.push(id);
+/// `(linked_keycloak_sub, chat_id)` for every linked, active, telegram-enabled chat that is
+/// subscribed to `slot`. A chat with no subscriber/subscription row defaults to enabled + subscribed
+/// (so chats linked before opting in still receive alerts). `slot = None` → every enabled chat (a
+/// system-wide alert). Subscription precedence: parameter override > site override > project override
+/// > default on.
+pub async fn slot_recipients(
+    db: &DatabaseConnection,
+    slot: &Option<Slot>,
+) -> Result<Vec<(String, i64)>, String> {
+    let rows = match slot {
+        Some(s) => {
+            db.query_all(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT ti.linked_keycloak_sub AS sub, ti.telegram_chat_id AS chat_id \
+                 FROM telegram_identities ti \
+                 LEFT JOIN notification_subscribers ns ON ns.keycloak_sub = ti.linked_keycloak_sub \
+                 WHERE ti.is_active AND ti.telegram_chat_id IS NOT NULL \
+                   AND COALESCE(ns.is_active, true) AND COALESCE(ns.telegram_enabled, true) \
+                   AND COALESCE(( \
+                     SELECT subq.enabled FROM notification_subscriptions subq \
+                     WHERE subq.keycloak_sub = ti.linked_keycloak_sub \
+                       AND ( (subq.site_id = $1 AND subq.parameter_id = $2) \
+                          OR (subq.site_id = $1 AND subq.parameter_id IS NULL) \
+                          OR ($3::uuid IS NOT NULL AND subq.project_id = $3 \
+                              AND subq.site_id IS NULL AND subq.parameter_id IS NULL) ) \
+                     ORDER BY (subq.parameter_id IS NOT NULL) DESC, (subq.site_id IS NOT NULL) DESC \
+                     LIMIT 1 \
+                   ), true)",
+                [s.site_id.into(), s.parameter_id.into(), s.project_id.into()],
+            ))
+            .await
+        }
+        None => {
+            db.query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT ti.linked_keycloak_sub AS sub, ti.telegram_chat_id AS chat_id \
+                 FROM telegram_identities ti \
+                 LEFT JOIN notification_subscribers ns ON ns.keycloak_sub = ti.linked_keycloak_sub \
+                 WHERE ti.is_active AND ti.telegram_chat_id IS NOT NULL \
+                   AND COALESCE(ns.is_active, true) AND COALESCE(ns.telegram_enabled, true)"
+                    .to_string(),
+            ))
+            .await
         }
     }
-    Ok(ids)
+    .map_err(|e| e.to_string())?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let sub: String = row.try_get("", "sub").map_err(|e| e.to_string())?;
+        let chat_id: i64 = row.try_get("", "chat_id").map_err(|e| e.to_string())?;
+        out.push((sub, chat_id));
+    }
+    Ok(out)
 }
 
 #[async_trait::async_trait]
@@ -129,15 +167,24 @@ impl NotificationChannel for TelegramChannel {
     }
 
     async fn deliver(&self, db: &DatabaseConnection, msg: &OutgoingMessage) -> Vec<DeliveryResult> {
-        let chat_ids = match alert_chat_ids(db).await {
-            Ok(ids) => ids,
+        let recipients = match slot_recipients(db, &msg.slot).await {
+            Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, "telegram: failed to load recipients");
                 return Vec::new();
             }
         };
-        let mut results = Vec::with_capacity(chat_ids.len());
-        for chat_id in chat_ids {
+        // Project-access guard (no-op until project access is role-scoped — see access.rs). Routing
+        // fan-out through the same seam as subscription writes keeps the leak guard in one place.
+        let project = msg.slot.as_ref().and_then(|s| s.project_id);
+
+        let mut results = Vec::with_capacity(recipients.len());
+        for (sub, chat_id) in recipients {
+            if let Some(p) = project {
+                if !project_allowed(&accessible_project_ids(db, &sub).await, p) {
+                    continue;
+                }
+            }
             let outcome = self.client.send_message(chat_id, &msg.body).await;
             results.push(DeliveryResult {
                 recipient: chat_id.to_string(),

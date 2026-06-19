@@ -52,6 +52,7 @@ pub fn render_opened(events: &[PendingEvent], dashboard_base: Option<&str>) -> O
         kind: "alarm_opened",
         subject,
         body,
+        slot: None,
     }
 }
 
@@ -69,6 +70,7 @@ pub fn render_resolved(events: &[PendingEvent], dashboard_base: Option<&str>) ->
         kind: "alarm_resolved",
         subject,
         body,
+        slot: None,
     }
 }
 

@@ -8,6 +8,7 @@ mod common;
 mod anti_backdoor_test;
 mod capabilities_test;
 mod dispatcher_test;
+mod fanout_test;
 mod grab_test;
 mod link_flow_test;
 mod me_test;

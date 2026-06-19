@@ -5,6 +5,7 @@
 //! to linked identities whose Keycloak role is resolved live (`authz`), never from a cached value.
 
 use sea_orm::DatabaseConnection;
+use uuid::Uuid;
 
 pub mod access;
 pub mod authz;
@@ -26,12 +27,25 @@ pub use identities_model::TelegramIdentity;
 pub use log_model::NotificationLog;
 pub use mutes_model::NotificationMute;
 
+/// The (project, site, parameter) an alert belongs to. Used to fan out only to subscribers who opted
+/// in to that scope. `None` on a message means system-wide (e.g. a sync-service failure) — every
+/// enabled recipient gets it. `project_id` is `None` when the trigger didn't resolve it (site- and
+/// parameter-level subscription overrides still apply; only project-level overrides are skipped).
+#[derive(Clone, Debug)]
+pub struct Slot {
+    pub project_id: Option<Uuid>,
+    pub site_id: Uuid,
+    pub parameter_id: Uuid,
+}
+
 /// A rendered notification ready to deliver. `kind` matches `notification_log.kind`.
 #[derive(Clone, Debug)]
 pub struct OutgoingMessage {
     pub kind: &'static str,
     pub subject: String,
     pub body: String,
+    /// The alert's scope, for per-subscriber fan-out. `None` = system-wide.
+    pub slot: Option<Slot>,
 }
 
 /// Outcome of one delivery to one recipient, recorded in `notification_log`.

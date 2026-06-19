@@ -8,7 +8,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, Statement};
 use crate::config::Config;
 
 use super::dispatcher::deliver;
-use super::{NotificationChannel, OutgoingMessage};
+use super::{NotificationChannel, OutgoingMessage, Slot};
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
 const BATTERY_RENOTIFY_DAYS: i64 = 7;
@@ -110,6 +110,7 @@ async fn stale_data(
                     "⏳ No data from {site_name} / {param_name} for ~{}h.",
                     age.num_hours()
                 ),
+                slot: Some(Slot { project_id: None, site_id, parameter_id }),
             };
             if deliver(db, channels, &msg, None).await {
                 state_upsert(db, "stale_data", &key, "firing").await?;
@@ -119,6 +120,7 @@ async fn stale_data(
                 kind: "stale_data",
                 subject: format!("River Data: data resumed from {site_name}"),
                 body: format!("✅ Data flowing again from {site_name} / {param_name}."),
+                slot: Some(Slot { project_id: None, site_id, parameter_id }),
             };
             if deliver(db, channels, &msg, None).await {
                 state_clear(db, "stale_data", &key).await?;
@@ -196,6 +198,7 @@ async fn battery_forecast(
             body: format!(
                 "🔋 {site_name}: {latest:.2}V, trend {slope:+.3}V/day — ~{days:.0}d to {cutoff:.1}V."
             ),
+            slot: Some(Slot { project_id: None, site_id, parameter_id: battery_param }),
         };
         if deliver(db, channels, &msg, None).await {
             state_upsert(db, "battery_forecast", &key, "firing").await?;
@@ -242,6 +245,8 @@ async fn sync_failures(
             kind: "sync_failure",
             subject: format!("River Data: sync failures on {service_type}"),
             body: format!("⚠️ {n} sync failure(s) on {service_type}/{instance} since the last alert."),
+            // System-wide infrastructure alert — no per-site scope, every enabled recipient gets it.
+            slot: None,
         };
         if deliver(db, channels, &msg, None).await {
             state_upsert(db, "sync_failure", &key, "firing").await?;
