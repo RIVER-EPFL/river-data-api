@@ -77,6 +77,7 @@ fn test_config() -> Config {
         job_max_retries: 3,
         job_retry_backoff_seconds: 60,
         telegram_bot_token: None,
+        telegram_bot_username: None,
         email_backend: river_db::config::EmailBackend::Disabled,
         smtp_host: None,
         smtp_port: 587,

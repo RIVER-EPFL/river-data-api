@@ -523,6 +523,7 @@ pub fn build_router(state: AppState) -> Router {
             "/config",
             Router::new()
                 .route("/keycloak", get(config::get_keycloak_config))
+                .route("/notifications", get(config::get_notifications_config))
                 .layer(RequestBodyLimitLayer::new(1024 * 1024))
                 .with_state(state.clone()),
         );

@@ -128,6 +128,9 @@ pub struct Config {
     // Notifications (Telegram bot + email). Every channel is optional — an unset token or a
     // disabled/incomplete email backend is simply skipped, so the API runs identically without them.
     pub telegram_bot_token: Option<String>,
+    // Public bot username (no @, e.g. `riverdata_bot`). Optional — only used to build the
+    // `t.me/<bot>?start=<code>` self-service deep link; not a secret.
+    pub telegram_bot_username: Option<String>,
     pub email_backend: EmailBackend,
     // SMTP submission (lettre) — used when email_backend = Smtp.
     pub smtp_host: Option<String>,
@@ -159,6 +162,39 @@ pub struct Config {
 }
 
 impl Config {
+    /// Whether the Telegram channel is configured (a bot token is present). Pure check — no I/O.
+    #[must_use]
+    pub fn telegram_configured(&self) -> bool {
+        self.telegram_bot_token.is_some()
+    }
+
+    /// Whether the email transport is fully configured for the selected backend. Mirrors the gating
+    /// in `notifications::email::build_mailer` without constructing a transport or logging, so it is
+    /// safe to call on the public capabilities endpoint.
+    #[must_use]
+    pub fn email_configured(&self) -> bool {
+        match self.email_backend {
+            EmailBackend::Disabled => false,
+            EmailBackend::Smtp => self.smtp_host.is_some() && self.smtp_from.is_some(),
+            EmailBackend::Graph => {
+                self.graph_tenant_id.is_some()
+                    && self.graph_client_id.is_some()
+                    && self.graph_client_secret.is_some()
+                    && self.graph_sender.is_some()
+            }
+        }
+    }
+
+    /// The email backend as the lowercase string the frontend expects (`smtp`/`graph`/`disabled`).
+    #[must_use]
+    pub fn email_backend_str(&self) -> &'static str {
+        match self.email_backend {
+            EmailBackend::Disabled => "disabled",
+            EmailBackend::Smtp => "smtp",
+            EmailBackend::Graph => "graph",
+        }
+    }
+
     /// Load configuration from environment variables.
     ///
     /// # Errors
@@ -327,6 +363,10 @@ impl Config {
                 .unwrap_or(60),
 
             telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN").ok().filter(|s| !s.is_empty()),
+            telegram_bot_username: env::var("TELEGRAM_BOT_USERNAME")
+                .ok()
+                .map(|s| s.trim().trim_start_matches('@').to_string())
+                .filter(|s| !s.is_empty()),
             email_backend: env::var("EMAIL_BACKEND")
                 .unwrap_or_default()
                 .parse()
