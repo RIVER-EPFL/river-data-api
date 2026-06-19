@@ -12,6 +12,7 @@ mod job_tracking_on_actions;
 mod rerun;
 mod retention;
 mod retry_backoff;
+mod schedule_routes;
 mod scheduler;
 mod startup_sweep;
 mod worker_pool;
