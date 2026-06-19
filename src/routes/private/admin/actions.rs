@@ -8,8 +8,8 @@ use crate::common::AppState;
 use crate::common::middleware::{DenyScoped, ProjectScope, enforce_project_scope_for_sites};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensor_calibrations::services::{
-    evaluate_formula, recompute_deployed_until, recompute_valid_until,
-    reprocess_site_parameter_readings, reprocess_sensor_readings, spawn_tracked_job,
+    evaluate_formula, recompute_deployed_until, recompute_valid_until, reprocess_sensor_readings,
+    spawn_tracked_job,
 };
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -189,48 +189,30 @@ pub async fn reprocess_all(
         ))
         .await
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-    let slots: Vec<(Uuid, Uuid)> = slot_rows
+    // Count the slots only to report it back synchronously; the job re-reads `sensor_deployments`
+    // itself, so a rerun reflects the current topology.
+    let slot_count = slot_rows
         .into_iter()
-        .filter_map(|r| {
-            let s: Uuid = r.try_get("", "site_id").ok()?;
-            let p: Uuid = r.try_get("", "parameter_id").ok()?;
-            Some((s, p))
+        .filter(|r| {
+            r.try_get::<Uuid>("", "site_id").is_ok() && r.try_get::<Uuid>("", "parameter_id").is_ok()
         })
-        .collect();
-    let slot_count = slots.len();
+        .count();
 
-    let job_id = spawn_tracked_job(
+    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
         db,
-        None,
         "reprocess_all",
         None,
-        app_state.events.clone(),
-        move |db| {
-            let slots = slots.clone();
-            async move {
-                let mut total = 0i64;
-                for (site_id, parameter_id) in slots {
-                    match reprocess_site_parameter_readings(&db, site_id, parameter_id).await {
-                        Ok(n) => total += n as i64,
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            site_id = %site_id,
-                            parameter_id = %parameter_id,
-                            "reprocess_all: slot reprocess failed"
-                        ),
-                    }
-                }
-                tracing::info!(readings_updated = total, "reprocess_all complete");
-                Ok(total)
-            }
-        },
+        None,
+        &serde_json::json!({}),
+        None,
     )
     .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
+    .map_err(|e| AppError::Internal(e.to_string()))?
+    .ok_or_else(|| AppError::Internal("failed to enqueue reprocess_all job".to_string()))?;
 
     Ok(Json(ReprocessAllResponse {
         job_id,
-        status: "pending".to_string(),
+        status: "queued".to_string(),
         slots: slot_count,
     }))
 }
@@ -277,27 +259,23 @@ pub async fn rebuild_alarm_events(
         end,
     } = payload;
 
-    let job_id = spawn_tracked_job(
+    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
         &app_state.db,
-        None,
         "alarm_backfill",
         None,
-        app_state.events.clone(),
-        move |db| async move {
-            crate::routes::private::alarms::episodes::rebuild_alarm_events(
-                &db,
-                site_id,
-                parameter_id,
-                start,
-                end,
-            )
-            .await
-        },
+        None,
+        &serde_json::json!({
+            "site_id": site_id,
+            "parameter_id": parameter_id,
+            "start": start,
+            "end": end,
+        }),
+        None,
     )
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "pending" })))
+    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "queued" })))
 }
 
 /// Force a full open-alarm reconcile right now, instead of waiting for the periodic backstop
@@ -957,9 +935,12 @@ pub async fn backfill_attribution(
     let mut slots: HashSet<(Uuid, Uuid)> = HashSet::new();
     let mut sensors: HashSet<Uuid> = HashSet::new();
     for c in &selected {
+        // Idempotent backdate: only move `deployed_from` earlier. After the first apply the row sits
+        // at `target_from`, so a client retry replayed against another replica matches no rows
+        // (`deployed_from > target_from` is false) and can't double-apply or re-widen the window.
         db.execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "UPDATE sensor_deployments SET deployed_from = $1 WHERE id = $2",
+            "UPDATE sensor_deployments SET deployed_from = $1 WHERE id = $2 AND deployed_from > $1",
             [c.target_from.into(), c.deployment_id.into()],
         ))
         .await
@@ -974,37 +955,22 @@ pub async fn backfill_attribution(
     }
 
     let deployments_updated = selected.len();
-    let slot_vec: Vec<(Uuid, Uuid)> = slots.into_iter().collect();
-    let job_id = spawn_tracked_job(
+    let slots_param: Vec<[Uuid; 2]> = slots.into_iter().map(|(s, p)| [s, p]).collect();
+    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
         db,
-        None,
         "backfill_attribution",
         None,
-        app_state.events.clone(),
-        move |db| {
-            let slots = slot_vec.clone();
-            async move {
-                let mut total = 0i64;
-                for (site_id, parameter_id) in slots {
-                    match reprocess_site_parameter_readings(&db, site_id, parameter_id).await {
-                        Ok(n) => total += n as i64,
-                        Err(e) => tracing::warn!(
-                            error = %e, site_id = %site_id, parameter_id = %parameter_id,
-                            "backfill_attribution: slot reprocess failed"
-                        ),
-                    }
-                }
-                tracing::info!(readings_updated = total, "backfill_attribution complete");
-                Ok(total)
-            }
-        },
+        None,
+        &serde_json::json!({ "slots": slots_param }),
+        None,
     )
     .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
+    .map_err(|e| AppError::Internal(e.to_string()))?
+    .ok_or_else(|| AppError::Internal("failed to enqueue backfill_attribution job".to_string()))?;
 
     Ok(Json(BackfillAttributionResponse {
         job_id,
-        status: "pending".to_string(),
+        status: "queued".to_string(),
         deployments_updated,
         estimated_readings,
     }))
@@ -1173,20 +1139,28 @@ pub async fn backfill_calibrations(
 
     for c in &selected {
         match (c.earliest_calibration_from, c.is_identity) {
-            // No calibrations at all — create identity starting at earliest reading
-            (None, _) => {
+            // No calibrations at all — create identity starting at earliest reading. The guarded
+            // INSERT (NOT EXISTS) makes a client retry to another replica a no-op: there is no unique
+            // constraint to lean on `ON CONFLICT`, so the existence check on
+            // (sensor_id, identity coeffs, valid_from) prevents a duplicate identity row.
+            (None, _) | (Some(_), false) => {
                 let cal_id = Uuid::new_v4();
                 db.execute(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     r"INSERT INTO sensor_calibrations
                           (id, sensor_id, slope, intercept, valid_from, performed_by, notes, created_at)
-                      VALUES ($1, $2, 1.0, 0.0, $3, 'system', 'Identity calibration (backfill)', NOW())",
+                      SELECT $1, $2, 1.0, 0.0, $3, 'system', 'Identity calibration (backfill)', NOW()
+                      WHERE NOT EXISTS (
+                          SELECT 1 FROM sensor_calibrations
+                          WHERE sensor_id = $2 AND slope = 1.0 AND intercept = 0.0 AND valid_from = $3
+                      )",
                     [cal_id.into(), c.sensor_id.into(), c.target_from.into()],
                 ))
                 .await
                 .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
             }
-            // Earliest calibration is identity — backdate it
+            // Earliest calibration is identity — backdate it. `valid_from > $1` makes the move
+            // idempotent: once it sits at `target_from`, a retry matches no rows.
             (Some(_), true) => {
                 db.execute(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
@@ -1194,23 +1168,11 @@ pub async fn backfill_calibrations(
                       SET valid_from = $1
                       WHERE sensor_id = $2
                         AND slope = 1.0 AND intercept = 0.0
+                        AND valid_from > $1
                         AND valid_from = (
                             SELECT MIN(valid_from) FROM sensor_calibrations WHERE sensor_id = $2
                         )",
                     [c.target_from.into(), c.sensor_id.into()],
-                ))
-                .await
-                .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-            }
-            // Earliest calibration is real — insert identity before it
-            (Some(_), false) => {
-                let cal_id = Uuid::new_v4();
-                db.execute(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    r"INSERT INTO sensor_calibrations
-                          (id, sensor_id, slope, intercept, valid_from, performed_by, notes, created_at)
-                      VALUES ($1, $2, 1.0, 0.0, $3, 'system', 'Identity calibration (backfill)', NOW())",
-                    [cal_id.into(), c.sensor_id.into(), c.target_from.into()],
                 ))
                 .await
                 .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
@@ -1224,36 +1186,21 @@ pub async fn backfill_calibrations(
     }
 
     let sensors_updated = sensor_ids_touched.len();
-    let job_id = spawn_tracked_job(
+    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
         db,
-        None,
         "backfill_calibrations",
         None,
-        app_state.events.clone(),
-        move |db| {
-            let sensors = sensor_ids_touched.clone();
-            async move {
-                let mut total = 0i64;
-                for sensor_id in sensors {
-                    match reprocess_sensor_readings(&db, sensor_id).await {
-                        Ok(n) => total += n as i64,
-                        Err(e) => tracing::warn!(
-                            error = %e, sensor_id = %sensor_id,
-                            "backfill_calibrations: sensor reprocess failed"
-                        ),
-                    }
-                }
-                tracing::info!(readings_updated = total, "backfill_calibrations complete");
-                Ok(total)
-            }
-        },
+        None,
+        &serde_json::json!({ "sensors": sensor_ids_touched }),
+        None,
     )
     .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
+    .map_err(|e| AppError::Internal(e.to_string()))?
+    .ok_or_else(|| AppError::Internal("failed to enqueue backfill_calibrations job".to_string()))?;
 
     Ok(Json(BackfillCalibrationsResponse {
         job_id,
-        status: "pending".to_string(),
+        status: "queued".to_string(),
         sensors_updated,
         estimated_readings,
     }))
