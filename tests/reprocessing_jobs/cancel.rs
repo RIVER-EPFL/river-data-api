@@ -1,5 +1,6 @@
 //! Cooperative cancellation: a running cancellable job observes the cancel flag at its loop
-//! checkpoint and finishes as `cancelled`. Non-cancellable types and non-running jobs report 409.
+//! checkpoint and finishes as `cancelled`. The cancel endpoint sets a durable flag so a job owned by
+//! any replica stops; non-cancellable types and terminal jobs report 409.
 //!
 //! Run: cargo test --test reprocessing_jobs -- --test-threads=1
 
@@ -97,24 +98,55 @@ async fn cancel_endpoint_rejects_non_cancellable_and_unknown() {
     .await;
     assert_eq!(status, 409, "refresh_aggregates is not cancellable");
 
-    // Cancellable type but not actually running in-process -> 409.
-    let stale = Uuid::new_v4();
+    // Cancellable running job: accepted regardless of which replica owns it -> 200, flag set.
+    let running = Uuid::new_v4();
     crate::common::exec(
         &db,
         &format!(
             "INSERT INTO reprocessing_jobs (id, trigger_type, status, category) \
-             VALUES ('{stale}', 'csv_import', 'running', 'operator')"
+             VALUES ('{running}', 'csv_import', 'running', 'operator')"
         ),
     )
     .await;
     let (status, _t) = crate::common::post_json_with_token(
         &app,
-        &format!("/api/reprocessing_jobs/{stale}/cancel"),
+        &format!("/api/reprocessing_jobs/{running}/cancel"),
         &serde_json::json!({}),
         &token,
     )
     .await;
-    assert_eq!(status, 409, "no live token for this job");
+    assert_eq!(status, 200, "a running cancellable job accepts a cross-replica cancel");
+    let flagged: bool = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT cancel_requested FROM reprocessing_jobs WHERE id = $1",
+            [running.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "cancel_requested")
+        .unwrap();
+    assert!(flagged, "cancel_requested is set for the owning replica's heartbeat to observe");
+
+    // A terminal job is not in a cancellable state -> 409.
+    let done = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO reprocessing_jobs (id, trigger_type, status, category) \
+             VALUES ('{done}', 'csv_import', 'completed', 'operator')"
+        ),
+    )
+    .await;
+    let (status, _t) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/reprocessing_jobs/{done}/cancel"),
+        &serde_json::json!({}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 409, "a completed job cannot be cancelled");
 
     // Unknown id -> 404.
     let (status, _t) = crate::common::post_json_with_token(

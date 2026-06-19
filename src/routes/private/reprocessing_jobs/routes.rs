@@ -69,9 +69,12 @@ pub struct CancelResponse {
     pub status: String,
 }
 
-/// `POST /api/reprocessing_jobs/{id}/cancel` — cooperatively cancel a running job. The job stops at
-/// its next batch checkpoint and is recorded `cancelled`. 409 if the type isn't cancellable or the
-/// job isn't currently running in this process; 404 if the id is unknown. Requires `write_metadata`.
+/// `POST /api/reprocessing_jobs/{id}/cancel` — cooperatively cancel a job. A `queued` job (not yet
+/// claimed) is cancelled outright; a `running` worker-pool job is signalled via the `cancel_requested`
+/// column, which the owning replica's heartbeat observes and the job honors at its next checkpoint.
+/// `request_cancel` stays as a same-replica fast path for inline jobs. 409 if the type isn't
+/// cancellable or the job isn't in a cancellable state; 404 if the id is unknown. Requires
+/// `write_metadata`.
 pub async fn cancel_job(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -93,13 +96,32 @@ pub async fn cancel_job(
         )));
     }
 
-    if super::lifecycle::request_cancel(id) {
+    // Set the durable flag so the owning replica — which may not be this one — stops the job at its
+    // next checkpoint; a still-queued job is cancelled outright since nothing is running it yet.
+    let flagged = state
+        .db
+        .execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE reprocessing_jobs \
+             SET cancel_requested = true, \
+                 status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END, \
+                 completed_at = CASE WHEN status = 'queued' THEN NOW() ELSE completed_at END \
+             WHERE id = $1 AND status IN ('queued', 'pending', 'running', 'retrying')",
+            [id.into()],
+        ))
+        .await?
+        .rows_affected();
+
+    // Same-replica fast path for inline jobs (no lease/heartbeat to observe the flag).
+    let signalled_locally = super::lifecycle::request_cancel(id);
+
+    if flagged > 0 || signalled_locally {
         Ok(Json(CancelResponse {
             status: "cancelling".to_string(),
         }))
     } else {
         Err(AppError::Conflict(
-            "job is not currently running".to_string(),
+            "job is not in a cancellable state".to_string(),
         ))
     }
 }
@@ -143,7 +165,7 @@ pub async fn rerun_job(
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT 1 FROM reprocessing_jobs \
-             WHERE status IN ('pending', 'running', 'retrying') \
+             WHERE status IN ('queued', 'pending', 'running', 'retrying') \
                AND trigger_type = $1 \
                AND sensor_id IS NOT DISTINCT FROM $2 \
                AND trigger_id IS NOT DISTINCT FROM $3 \
