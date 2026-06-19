@@ -46,6 +46,50 @@ fn parse_timestamps(value: Option<&serde_json::Value>) -> Vec<chrono::DateTime<c
         .unwrap_or_default()
 }
 
+/// Parse an array of UUID strings under `key` (missing/empty → empty vec). Non-UUID elements are
+/// skipped — the persisted params are produced by our own handlers, so this is defensive only.
+fn uuid_array(params: &serde_json::Value, key: &str) -> Vec<Uuid> {
+    params
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse an array of `[site_id, parameter_id]` UUID pairs under `key`. Each element is a two-string
+/// array; malformed elements are skipped.
+fn uuid_pair_array(params: &serde_json::Value, key: &str) -> Vec<(Uuid, Uuid)> {
+    params
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    let pair = v.as_array()?;
+                    let a = pair.first()?.as_str().and_then(|s| Uuid::parse_str(s).ok())?;
+                    let b = pair.get(1)?.as_str().and_then(|s| Uuid::parse_str(s).ok())?;
+                    Some((a, b))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse an optional RFC-3339 timestamp under `key`.
+fn optional_datetime(
+    params: &serde_json::Value,
+    key: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    params
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
 /// Re-derive FK columns and `calibrated_value` for one sensor's readings. Backs the sensor-scoped
 /// reprocess triggers (manual reprocess, calibration changes).
 pub struct ReprocessSensor {
@@ -457,5 +501,266 @@ impl Job for IngestDerived {
         }
         ctx.set_progress(progress, Some(total)).await;
         Ok(i64::from(progress))
+    }
+}
+
+/// Backdate every `(site, parameter)` slot that has a deployment, re-deriving its readings from the
+/// current deployment + calibration timelines. The slot set is recomputed inside the job from
+/// `sensor_deployments`, so a rerun always reflects the current deployment topology. Backs the
+/// `reprocess_all` operator action. A failed slot logs and continues — a partial backdate is more
+/// useful than aborting the whole batch on one bad slot.
+pub struct ReprocessAll;
+
+#[async_trait]
+impl Job for ReprocessAll {
+    fn name(&self) -> &'static str {
+        "reprocess_all"
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let slot_rows = ctx
+            .db()
+            .query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT DISTINCT site_id, parameter_id FROM sensor_deployments".to_owned(),
+            ))
+            .await?;
+        let slots: Vec<(Uuid, Uuid)> = slot_rows
+            .into_iter()
+            .filter_map(|r| {
+                let s: Uuid = r.try_get("", "site_id").ok()?;
+                let p: Uuid = r.try_get("", "parameter_id").ok()?;
+                Some((s, p))
+            })
+            .collect();
+        let slot_count = slots.len();
+        ctx.info(&format!("Backdating {slot_count} slot(s)")).await;
+
+        let mut total = 0i64;
+        for (site_id, parameter_id) in slots {
+            match reprocess_site_parameter_readings(ctx.db(), site_id, parameter_id).await {
+                Ok(n) => total += n as i64,
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    site_id = %site_id,
+                    parameter_id = %parameter_id,
+                    "reprocess_all: slot reprocess failed"
+                ),
+            }
+        }
+        ctx.set_detail(serde_json::json!({
+            "counts": { "slots": slot_count, "readings_updated": total },
+        }))
+        .await;
+        tracing::info!(readings_updated = total, "reprocess_all complete");
+        Ok(total)
+    }
+}
+
+/// Reconstruct persisted alarm events from the actual readings for the targeted slots and window.
+/// All four scoping inputs are optional (`site_id`/`parameter_id`/`start`/`end`); absent inputs
+/// widen the scope. Idempotent — re-derives the same episodes. Backs the `rebuild_alarm_events`
+/// operator action.
+pub struct AlarmBackfill;
+
+#[async_trait]
+impl Job for AlarmBackfill {
+    fn name(&self) -> &'static str {
+        "alarm_backfill"
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let params = ctx.params();
+        let site_id = optional_uuid(params, "site_id");
+        let parameter_id = optional_uuid(params, "parameter_id");
+        let start = optional_datetime(params, "start");
+        let end = optional_datetime(params, "end");
+        let count = crate::routes::private::alarms::episodes::rebuild_alarm_events(
+            ctx.db(),
+            site_id,
+            parameter_id,
+            start,
+            end,
+        )
+        .await?;
+        if let Some(site_id) = site_id {
+            ctx.set_site(site_id).await;
+        }
+        ctx.set_detail(serde_json::json!({
+            "counts": { "events_written": count },
+        }))
+        .await;
+        Ok(count)
+    }
+}
+
+/// Window-reprocess the slots whose open deployments the handler just backdated, so the
+/// previously-unattributed readings are stamped with `sensor_id`/`deployment_id`/`calibration_id`.
+/// The slot set is carried in `params.slots` (the handler owns the pre-mutation that picked them).
+/// Backs the `backfill_attribution` operator action. A failed slot logs and continues.
+pub struct BackfillAttribution;
+
+#[async_trait]
+impl Job for BackfillAttribution {
+    fn name(&self) -> &'static str {
+        "backfill_attribution"
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let slots = uuid_pair_array(ctx.params(), "slots");
+        let mut total = 0i64;
+        for (site_id, parameter_id) in slots {
+            match reprocess_site_parameter_readings(ctx.db(), site_id, parameter_id).await {
+                Ok(n) => total += n as i64,
+                Err(e) => tracing::warn!(
+                    error = %e, site_id = %site_id, parameter_id = %parameter_id,
+                    "backfill_attribution: slot reprocess failed"
+                ),
+            }
+        }
+        ctx.set_detail(serde_json::json!({
+            "counts": { "readings_updated": total },
+        }))
+        .await;
+        tracing::info!(readings_updated = total, "backfill_attribution complete");
+        Ok(total)
+    }
+}
+
+/// Re-derive `calibrated_value`/`calibration_id` for the sensors whose identity calibrations the
+/// handler just created/backdated. The sensor set is carried in `params.sensors`. Backs the
+/// `backfill_calibrations` operator action. A failed sensor logs and continues.
+pub struct BackfillCalibrations;
+
+#[async_trait]
+impl Job for BackfillCalibrations {
+    fn name(&self) -> &'static str {
+        "backfill_calibrations"
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let sensors = uuid_array(ctx.params(), "sensors");
+        let mut total = 0i64;
+        for sensor_id in sensors {
+            match reprocess_sensor_readings(ctx.db(), sensor_id).await {
+                Ok(n) => total += n as i64,
+                Err(e) => tracing::warn!(
+                    error = %e, sensor_id = %sensor_id,
+                    "backfill_calibrations: sensor reprocess failed"
+                ),
+            }
+        }
+        ctx.set_detail(serde_json::json!({
+            "counts": { "readings_updated": total },
+        }))
+        .await;
+        tracing::info!(readings_updated = total, "backfill_calibrations complete");
+        Ok(total)
+    }
+}
+
+/// Absorb one `site_parameter` into another — moves readings, status events, streams, and
+/// deployments, then deletes the source. Idempotent on the readings PK and a no-op DELETE of an
+/// absent source, so a rerun is safe. Backs the `merge_site_parameters` operator action.
+pub struct MergeSiteParameters;
+
+#[async_trait]
+impl Job for MergeSiteParameters {
+    fn name(&self) -> &'static str {
+        "merge_site_parameters"
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let req = crate::routes::private::admin::merge_services::MergeSiteParametersRequest {
+            source_site_parameter_id: required_uuid(ctx.params(), "source_site_parameter_id")?,
+            target_site_parameter_id: required_uuid(ctx.params(), "target_site_parameter_id")?,
+        };
+        let result =
+            crate::routes::private::admin::merge_services::merge_site_parameters(ctx.db(), &req)
+                .await
+                .map_err(|e| DbErr::Custom(e.to_string()))?;
+        ctx.set_detail(serde_json::json!({ "counts": result })).await;
+        Ok(i64::try_from(result.merged_readings).unwrap_or(i64::MAX))
+    }
+}
+
+/// Absorb one global parameter into another — re-points every `site_parameter`, reading, status
+/// event, and stream from source to target, then deletes the source. Idempotent enough to rerun.
+/// Backs the `merge_parameters` operator action.
+pub struct MergeParameters;
+
+#[async_trait]
+impl Job for MergeParameters {
+    fn name(&self) -> &'static str {
+        "merge_parameters"
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let req = crate::routes::private::admin::merge_services::MergeParametersRequest {
+            source_parameter_id: required_uuid(ctx.params(), "source_parameter_id")?,
+            target_parameter_id: required_uuid(ctx.params(), "target_parameter_id")?,
+        };
+        let result =
+            crate::routes::private::admin::merge_services::merge_parameters(ctx.db(), &req)
+                .await
+                .map_err(|e| DbErr::Custom(e.to_string()))?;
+        ctx.set_detail(serde_json::json!({ "counts": result })).await;
+        Ok(i64::try_from(result.readings_moved).unwrap_or(i64::MAX))
+    }
+}
+
+/// Apply a pairing plan: resolve entities, execute pairings, backfill readings, mark the plan
+/// `applied`. The status transition is guarded (only a `draft` plan applies), so a rerun of an
+/// already-applied plan is a no-op. Backs the `apply_pairing_plan` operator action.
+pub struct PlanApply;
+
+#[async_trait]
+impl Job for PlanApply {
+    fn name(&self) -> &'static str {
+        "plan_apply"
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let plan_id = required_uuid(ctx.params(), "plan_id")?;
+        let result = crate::routes::private::sync::services::apply_plan(ctx.db(), plan_id)
+            .await
+            .map_err(|e| DbErr::Custom(e.to_string()))?;
+        ctx.set_detail(serde_json::json!({
+            "scope": { "plan_id": plan_id },
+            "counts": result,
+        }))
+        .await;
+        ctx.info(&format!(
+            "Applied plan: {} streams paired, {} readings backfilled",
+            result.streams_paired, result.readings_backfilled
+        ))
+        .await;
+        Ok(i64::try_from(result.readings_backfilled).unwrap_or(i64::MAX))
+    }
+}
+
+/// Revert an applied pairing plan: unpair every stream it touched, restoring the prior state, and
+/// mark the plan `reverted`. The status transition is guarded (only an `applied` plan reverts), so
+/// a rerun is a no-op. Backs the `revert_pairing_plan` operator action.
+pub struct PlanRevert;
+
+#[async_trait]
+impl Job for PlanRevert {
+    fn name(&self) -> &'static str {
+        "plan_revert"
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let plan_id = required_uuid(ctx.params(), "plan_id")?;
+        let reverted = crate::routes::private::sync::services::revert_plan(ctx.db(), plan_id)
+            .await
+            .map_err(|e| DbErr::Custom(e.to_string()))?;
+        ctx.set_detail(serde_json::json!({
+            "scope": { "plan_id": plan_id },
+            "counts": { "reverted": reverted },
+        }))
+        .await;
+        ctx.info(&format!("Reverted plan: {reverted} streams unpaired")).await;
+        Ok(i64::from(reverted))
     }
 }

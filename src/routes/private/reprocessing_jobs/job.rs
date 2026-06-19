@@ -139,6 +139,14 @@ pub fn build_registry() -> JobRegistry {
     for trigger in ["compute_derived", "batch_derived"] {
         registry.register(Arc::new(super::jobs::SiteTimestampsDerived::new(trigger)));
     }
+    registry.register(Arc::new(super::jobs::ReprocessAll));
+    registry.register(Arc::new(super::jobs::AlarmBackfill));
+    registry.register(Arc::new(super::jobs::BackfillAttribution));
+    registry.register(Arc::new(super::jobs::BackfillCalibrations));
+    registry.register(Arc::new(super::jobs::MergeSiteParameters));
+    registry.register(Arc::new(super::jobs::MergeParameters));
+    registry.register(Arc::new(super::jobs::PlanApply));
+    registry.register(Arc::new(super::jobs::PlanRevert));
     registry
 }
 
