@@ -133,6 +133,12 @@ pub fn build_registry() -> JobRegistry {
     for trigger in ["deployment_create", "deployment_update", "deployment_delete"] {
         registry.register(Arc::new(super::jobs::ReprocessDeployment::new(trigger)));
     }
+    registry.register(Arc::new(super::jobs::DerivedRecompute));
+    registry.register(Arc::new(super::jobs::DerivedAssignment));
+    registry.register(Arc::new(super::jobs::IngestDerived));
+    for trigger in ["compute_derived", "batch_derived"] {
+        registry.register(Arc::new(super::jobs::SiteTimestampsDerived::new(trigger)));
+    }
     registry
 }
 
