@@ -29,6 +29,7 @@ mod m20260615_000002_notification_state;
 mod m20260620_000001_notification_subscriptions;
 mod m20260620_000002_notification_health;
 mod m20260621_000001_job_worker_pool;
+mod m20260622_000001_schedules;
 
 pub struct Migrator;
 
@@ -65,6 +66,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260620_000001_notification_subscriptions::Migration),
             Box::new(m20260620_000002_notification_health::Migration),
             Box::new(m20260621_000001_job_worker_pool::Migration),
+            Box::new(m20260622_000001_schedules::Migration),
         ]
     }
 }
