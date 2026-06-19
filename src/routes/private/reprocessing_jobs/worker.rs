@@ -68,6 +68,7 @@ struct Claimed {
     id: Uuid,
     trigger_type: String,
     lease_epoch: i64,
+    params: serde_json::Value,
 }
 
 /// Claim one due `queued` row or one expired-lease `running` row (the reaper arm), stamping this
@@ -94,7 +95,7 @@ async fn claim_one(
                  lease_expires_at = now() + (interval '1 second' * $2) \
              FROM claimable c \
              WHERE j.id = c.id \
-             RETURNING j.id, j.trigger_type, j.lease_epoch",
+             RETURNING j.id, j.trigger_type, j.lease_epoch, j.params",
             [worker_id.into(), LEASE_SECONDS.into()],
         ))
         .await?;
@@ -104,6 +105,7 @@ async fn claim_one(
             id: r.try_get("", "id")?,
             trigger_type: r.try_get("", "trigger_type")?,
             lease_epoch: r.try_get("", "lease_epoch")?,
+            params: r.try_get("", "params")?,
         })),
         None => Ok(None),
     }
@@ -236,7 +238,7 @@ async fn execute(
         return Ok(());
     };
 
-    let (ctx, cancel) = JobContext::for_worker(db.clone(), claimed.id, events.clone());
+    let (ctx, cancel) = JobContext::for_worker(db.clone(), claimed.id, events.clone(), claimed.params.clone());
     let hb = tokio::spawn(heartbeat(
         db.clone(),
         claimed.id,

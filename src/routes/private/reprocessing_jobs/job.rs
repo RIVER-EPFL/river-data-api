@@ -116,7 +116,9 @@ impl JobRegistry {
 /// they are ported off the inline lifecycle.
 #[must_use]
 pub fn build_registry() -> JobRegistry {
-    JobRegistry::new()
+    let mut registry = JobRegistry::new();
+    registry.register(Arc::new(super::jobs::ReprocessSensor::new("manual_reprocess")));
+    registry
 }
 
 #[cfg(test)]

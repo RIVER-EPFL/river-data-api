@@ -212,3 +212,62 @@ async fn failure_records_error_and_releases_lease() {
     assert_eq!(row.retry_count, 1);
     assert!(matches!(row.status.as_str(), "failed" | "pending"));
 }
+
+#[tokio::test]
+#[serial]
+async fn worker_runs_registered_reprocess_job() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let ev = events();
+    let registry = river_db::routes::private::reprocessing_jobs::job::build_registry();
+    let wid = worker::worker_id();
+
+    let sensor_id = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO sensors (id, name, parameter_id, is_active) \
+             VALUES ('{sensor_id}', 'Worker-Probe', '{}', true)",
+            crate::common::GLOBAL_PARAM_TEMP_ID
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO sensor_calibrations (id, sensor_id, slope, intercept, valid_from, notes) \
+             VALUES ('{}', '{sensor_id}', 1.0, 0.0, '2000-01-01T00:00:00Z', 'identity')",
+            Uuid::new_v4()
+        ),
+    )
+    .await;
+
+    let id = worker::enqueue(
+        &db,
+        "manual_reprocess",
+        Some(sensor_id),
+        None,
+        &serde_json::json!({ "sensor_id": sensor_id }),
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    worker::drain(&db, &ev, &registry, &wid).await.unwrap();
+
+    let row = job_row(&db, id).await;
+    assert_eq!(row.status, "completed", "the registered ReprocessSensor job runs end to end");
+    let detail: serde_json::Value = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT detail FROM reprocessing_jobs WHERE id = '{id}'"),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "detail")
+        .unwrap();
+    assert_eq!(detail["scope"]["sensor_id"], serde_json::json!(sensor_id));
+}

@@ -108,6 +108,7 @@ pub struct JobContext {
     events: crate::common::EventSender,
     seq: Arc<AtomicI64>,
     cancel: Arc<AtomicBool>,
+    params: serde_json::Value,
 }
 
 impl JobContext {
@@ -118,6 +119,7 @@ impl JobContext {
         db: DatabaseConnection,
         job_id: Uuid,
         events: crate::common::EventSender,
+        params: serde_json::Value,
     ) -> (Self, Arc<AtomicBool>) {
         let cancel = Arc::new(AtomicBool::new(false));
         let ctx = Self {
@@ -126,8 +128,15 @@ impl JobContext {
             events,
             seq: Arc::new(AtomicI64::new(0)),
             cancel: cancel.clone(),
+            params,
         };
         (ctx, cancel)
+    }
+
+    /// The job's persisted inputs — what a worker-run job reads to do its work.
+    #[must_use]
+    pub fn params(&self) -> &serde_json::Value {
+        &self.params
     }
 
     /// The DB connection the job should use.
@@ -325,6 +334,7 @@ where
             events: events.clone(),
             seq: Arc::new(AtomicI64::new(0)),
             cancel: register_cancel(job_id),
+            params: serde_json::json!({}),
         };
 
         let mut attempt = 0u32;
@@ -528,6 +538,7 @@ where
         events: events.clone(),
         seq: Arc::new(AtomicI64::new(0)),
         cancel: cancel.clone(),
+        params: serde_json::json!({}),
     };
 
     let result = match work(ctx).await {

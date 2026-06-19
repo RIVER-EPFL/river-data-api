@@ -1,4 +1,5 @@
 pub mod job;
+pub mod jobs;
 pub mod lifecycle;
 pub mod model;
 pub mod registry;
