@@ -131,6 +131,10 @@ pub struct Config {
     // Public bot username (no @, e.g. `riverdata_bot`). Optional — only used to build the
     // `t.me/<bot>?start=<code>` self-service deep link; not a secret.
     pub telegram_bot_username: Option<String>,
+    // Whether THIS replica runs the Telegram bot poller. The bot long-polls getUpdates (a global
+    // feed, not a competing-consumer queue), so at >1 replica it must run on exactly one — set false
+    // on every replica except the single bot replica. Default true (single-replica behaviour).
+    pub enable_telegram_bot: bool,
     pub email_backend: EmailBackend,
     // SMTP submission (lettre) — used when email_backend = Smtp.
     pub smtp_host: Option<String>,
@@ -370,6 +374,10 @@ impl Config {
                 .ok()
                 .map(|s| s.trim().trim_start_matches('@').to_string())
                 .filter(|s| !s.is_empty()),
+            enable_telegram_bot: env::var("ENABLE_TELEGRAM_BOT")
+                .unwrap_or_else(|_| "true".to_string())
+                .parse()
+                .unwrap_or(true),
             email_backend: env::var("EMAIL_BACKEND")
                 .unwrap_or_default()
                 .parse()

@@ -169,8 +169,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Spawned notification dispatcher");
 
     if state.config.telegram_bot_token.is_some() {
-        tokio::spawn(river_db::routes::private::notifications::bot::run(state.clone()));
-        tracing::info!("Spawned Telegram bot poller");
+        if state.config.enable_telegram_bot {
+            tokio::spawn(river_db::routes::private::notifications::bot::run(state.clone()));
+            tracing::info!("Spawned Telegram bot poller");
+        } else {
+            tracing::info!("Telegram bot poller disabled on this replica (ENABLE_TELEGRAM_BOT=false)");
+        }
     }
 
     let reconcile_interval = Duration::from_secs(config.identity_reconcile_interval_seconds);
