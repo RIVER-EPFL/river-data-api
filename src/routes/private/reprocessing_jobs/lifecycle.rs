@@ -77,7 +77,7 @@ pub fn set_job_retry_policy(policy: RetryPolicy) {
     let _ = JOB_RETRY_POLICY.set(policy);
 }
 
-fn job_retry_policy() -> RetryPolicy {
+pub(crate) fn job_retry_policy() -> RetryPolicy {
     JOB_RETRY_POLICY.get().copied().unwrap_or_default()
 }
 
@@ -115,6 +115,25 @@ pub struct JobContext {
 }
 
 impl JobContext {
+    /// Build a context for a job claimed by the worker pool. Returns the context plus the in-process
+    /// cancel flag the worker's heartbeat flips when it sees `cancel_requested` on the row (or when
+    /// the lease is lost), so a cooperatively-cancellable job stops at its next checkpoint.
+    pub(crate) fn for_worker(
+        db: DatabaseConnection,
+        job_id: Uuid,
+        events: crate::common::EventSender,
+    ) -> (Self, Arc<AtomicBool>) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let ctx = Self {
+            db,
+            job_id,
+            events,
+            seq: Arc::new(AtomicI64::new(0)),
+            cancel: cancel.clone(),
+        };
+        (ctx, cancel)
+    }
+
     /// The DB connection the job should use.
     #[must_use]
     pub fn db(&self) -> &DatabaseConnection {

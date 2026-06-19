@@ -4,4 +4,5 @@ pub mod model;
 pub mod registry;
 pub mod routes;
 pub mod schedule;
+pub mod worker;
 pub use model::*;

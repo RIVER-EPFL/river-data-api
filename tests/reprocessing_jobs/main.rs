@@ -13,3 +13,4 @@ mod rerun;
 mod retention;
 mod retry_backoff;
 mod startup_sweep;
+mod worker_pool;
