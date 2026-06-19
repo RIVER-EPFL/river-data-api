@@ -37,42 +37,24 @@ pub async fn refresh_aggregates(
     State(app_state): State<AppState>,
     Json(payload): Json<RefreshAggregatesRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let full = payload.full;
-    let trigger_type = if full {
+    let trigger_type = if payload.full {
         "refresh_aggregates_full"
     } else {
         "refresh_aggregates"
     };
 
-    let job_id = spawn_tracked_job(
+    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
         &app_state.db,
-        None,
         trigger_type,
         None,
-        app_state.events.clone(),
-        move |db| async move {
-            let outcome = tokio::time::timeout(std::time::Duration::from_secs(600), async {
-                if full {
-                    tracing::info!("Triggered full aggregate refresh via service API");
-                    state::refresh_continuous_aggregates_full(&db).await;
-                } else {
-                    tracing::info!("Triggered incremental aggregate refresh via service API");
-                    state::refresh_continuous_aggregates(&db, None).await;
-                }
-            })
-            .await;
-            match outcome {
-                Ok(()) => Ok(0),
-                Err(_) => Err(sea_orm::DbErr::Custom(
-                    "Aggregate refresh task timed out after 10 minutes".to_string(),
-                )),
-            }
-        },
+        None,
+        &serde_json::json!({ "full": payload.full }),
+        None,
     )
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "pending" })))
+    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "queued" })))
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]

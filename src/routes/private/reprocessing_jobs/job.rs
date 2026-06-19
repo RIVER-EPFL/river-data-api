@@ -125,6 +125,8 @@ pub fn build_registry() -> JobRegistry {
     ] {
         registry.register(Arc::new(super::jobs::ReprocessSensor::new(trigger)));
     }
+    registry.register(Arc::new(super::jobs::RefreshAggregates::incremental()));
+    registry.register(Arc::new(super::jobs::RefreshAggregates::full()));
     registry
 }
 

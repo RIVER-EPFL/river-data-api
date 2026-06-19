@@ -1,12 +1,15 @@
 //! Concrete `Job` implementations — the worker-run handler for each `trigger_type`. Each reads its
 //! inputs from `ctx.params()` and calls the same service function the inline trigger used.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use sea_orm::{ConnectionTrait, DbErr, Statement};
 use uuid::Uuid;
 
 use super::job::Job;
 use super::lifecycle::JobContext;
+use crate::common::sync_state;
 use crate::routes::private::sensor_calibrations::services::reprocess_sensor_readings;
 
 fn required_uuid(params: &serde_json::Value, key: &str) -> Result<Uuid, DbErr> {
@@ -59,5 +62,44 @@ impl Job for ReprocessSensor {
         }))
         .await;
         Ok(count as i64)
+    }
+}
+
+/// Refresh continuous aggregates — incremental (recent window) or full. Single bounded statement.
+pub struct RefreshAggregates {
+    name: &'static str,
+    full: bool,
+}
+
+impl RefreshAggregates {
+    #[must_use]
+    pub fn incremental() -> Self {
+        Self { name: "refresh_aggregates", full: false }
+    }
+
+    #[must_use]
+    pub fn full() -> Self {
+        Self { name: "refresh_aggregates_full", full: true }
+    }
+}
+
+#[async_trait]
+impl Job for RefreshAggregates {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let outcome = tokio::time::timeout(Duration::from_secs(600), async {
+            if self.full {
+                sync_state::refresh_continuous_aggregates_full(ctx.db()).await;
+            } else {
+                sync_state::refresh_continuous_aggregates(ctx.db(), None).await;
+            }
+        })
+        .await;
+        outcome
+            .map(|()| 0)
+            .map_err(|_| DbErr::Custom("Aggregate refresh timed out after 10 minutes".into()))
     }
 }
