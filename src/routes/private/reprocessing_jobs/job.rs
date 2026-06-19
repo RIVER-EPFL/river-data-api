@@ -112,6 +112,13 @@ impl JobRegistry {
     }
 }
 
+/// Build the registry of every worker-run job kind. Called once at startup; jobs register here as
+/// they are ported off the inline lifecycle.
+#[must_use]
+pub fn build_registry() -> JobRegistry {
+    JobRegistry::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::lifecycle::JobContext;

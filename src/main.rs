@@ -99,6 +99,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = AppState::new(db.clone(), config.clone(), keycloak_instance);
 
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+
     river_db::routes::private::sensor_calibrations::services::set_job_retry_policy(
         river_db::routes::private::sensor_calibrations::services::RetryPolicy {
             max_retries: config.job_max_retries,
@@ -163,14 +169,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     tracing::info!("Spawned notification channel health probe");
 
+    let registry = std::sync::Arc::new(
+        river_db::routes::private::reprocessing_jobs::job::build_registry(),
+    );
+    tokio::spawn({
+        let db = db.clone();
+        let events = state.events.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
+        async move {
+            river_db::routes::private::reprocessing_jobs::worker::run(db, events, registry, async move {
+                let _ = shutdown_rx.changed().await;
+            })
+            .await;
+        }
+    });
+    tracing::info!("Spawned job worker");
+
     let app = routes::build_router(state);
 
     // Start server with graceful shutdown
     let addr = config.bind_address();
     tracing::info!(address = %addr, "Starting server");
     let listener = TcpListener::bind(&addr).await?;
+    let mut server_shutdown = shutdown_rx.clone();
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            let _ = server_shutdown.changed().await;
+        })
         .await?;
 
     tracing::info!("Server shut down gracefully");

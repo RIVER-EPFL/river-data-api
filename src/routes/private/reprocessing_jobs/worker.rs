@@ -290,6 +290,17 @@ pub async fn run_one(
     }
 }
 
+/// Run claimable jobs until the queue drains. Lets a test pump the worker after enqueuing.
+pub async fn drain(
+    db: &DatabaseConnection,
+    events: &crate::common::EventSender,
+    registry: &JobRegistry,
+    worker_id: &str,
+) -> Result<(), sea_orm::DbErr> {
+    while run_one(db, events, registry, worker_id).await? {}
+    Ok(())
+}
+
 /// This replica's worker loop: drain claimable work, then idle-poll. Runs until `shutdown` resolves,
 /// at which point it stops claiming and returns so in-flight work finishes within the k8s grace
 /// window (anything killed is recovered by lease expiry).
