@@ -1400,33 +1400,16 @@ pub async fn apply_pairing_plan(
             "Plan is '{status}', can only apply 'draft' plans"
         )));
     }
-    let job_id = crate::routes::private::reprocessing_jobs::lifecycle::spawn_tracked_job_ctx(
+    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
         &state.db,
-        None,
         "plan_apply",
+        None,
         Some(id),
-        state.events.clone(),
-        move |ctx| async move {
-            match crate::routes::private::sync::services::apply_plan(ctx.db(), id).await {
-                Ok(result) => {
-                    ctx.set_detail(serde_json::json!({
-                        "scope": { "plan_id": id },
-                        "counts": result,
-                    }))
-                    .await;
-                    ctx.info(&format!(
-                        "Applied plan: {} streams paired, {} readings backfilled",
-                        result.streams_paired, result.readings_backfilled
-                    ))
-                    .await;
-                    Ok(i64::try_from(result.readings_backfilled).unwrap_or(i64::MAX))
-                }
-                Err(e) => Err(sea_orm::DbErr::Custom(e.to_string())),
-            }
-        },
+        &serde_json::json!({ "plan_id": id }),
+        None,
     )
     .await?;
-    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "pending" })))
+    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "queued" })))
 }
 
 /// Fetch a pairing plan's status, or 404 if unknown.
@@ -1465,29 +1448,16 @@ pub async fn revert_pairing_plan(
             "Plan is '{status}', can only revert 'applied' plans"
         )));
     }
-    let job_id = crate::routes::private::reprocessing_jobs::lifecycle::spawn_tracked_job_ctx(
+    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
         &state.db,
-        None,
         "plan_revert",
+        None,
         Some(id),
-        state.events.clone(),
-        move |ctx| async move {
-            match crate::routes::private::sync::services::revert_plan(ctx.db(), id).await {
-                Ok(reverted) => {
-                    ctx.set_detail(serde_json::json!({
-                        "scope": { "plan_id": id },
-                        "counts": { "reverted": reverted },
-                    }))
-                    .await;
-                    ctx.info(&format!("Reverted plan: {reverted} streams unpaired")).await;
-                    Ok(i64::from(reverted))
-                }
-                Err(e) => Err(sea_orm::DbErr::Custom(e.to_string())),
-            }
-        },
+        &serde_json::json!({ "plan_id": id }),
+        None,
     )
     .await?;
-    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "pending" })))
+    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "queued" })))
 }
 
 /// Aggregate summary of unpaired streams grouped by source system. Used by the dashboard
