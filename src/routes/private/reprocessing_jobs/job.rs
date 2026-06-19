@@ -112,8 +112,10 @@ impl JobRegistry {
     }
 }
 
-/// Build the registry of every worker-run job kind. Called once at startup; jobs register here as
-/// they are ported off the inline lifecycle.
+/// Build the registry of every on-demand worker-run job kind. Called once at startup; jobs register
+/// here as they are ported off the inline lifecycle. The recurring Services (which carry a
+/// `default_schedule` derived from `Config`) are added separately via
+/// [`register_scheduled_services`] so this stays zero-arg for the worker-pool tests.
 #[must_use]
 pub fn build_registry() -> JobRegistry {
     let mut registry = JobRegistry::new();
@@ -148,6 +150,18 @@ pub fn build_registry() -> JobRegistry {
     registry.register(Arc::new(super::jobs::PlanApply));
     registry.register(Arc::new(super::jobs::PlanRevert));
     registry
+}
+
+/// Register the recurring Services (the former `main.rs` background loops) onto an existing registry,
+/// each carrying its cadence from `Config`. Kept separate from [`build_registry`] so the cadence
+/// dependency lives only on the `main.rs` startup path; the scheduler then seeds `schedules` rows
+/// from `registry.default_schedules()`.
+pub fn register_scheduled_services(registry: &mut JobRegistry, config: &crate::config::Config) {
+    registry.register(Arc::new(super::jobs::JanitorRun::from_config(config)));
+    registry.register(Arc::new(super::jobs::AlarmSweep::from_config(config)));
+    registry.register(Arc::new(super::jobs::IdentityReconcile::from_config(config)));
+    registry.register(Arc::new(super::jobs::NotifyHealth::from_config(config)));
+    registry.register(Arc::new(super::jobs::DispatchNotifications::from_config(config)));
 }
 
 #[cfg(test)]

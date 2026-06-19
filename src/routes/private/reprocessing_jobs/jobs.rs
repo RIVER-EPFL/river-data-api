@@ -9,7 +9,9 @@ use uuid::Uuid;
 
 use super::job::Job;
 use super::lifecycle::JobContext;
+use super::schedule::Schedule;
 use crate::common::sync_state;
+use crate::config::Config;
 use crate::routes::private::sensor_calibrations::services::{
     recalculate_derived_at_timestamp, reprocess_sensor_readings, reprocess_site_parameter_readings,
 };
@@ -405,6 +407,40 @@ impl SiteTimestampsDerived {
     }
 }
 
+// ── Recurring Services (Wave 2) ──────────────────────────────────────────────────────────────────
+//
+// The background loops formerly spawned in `main.rs` are now `Job` impls the DB-backed scheduler
+// enqueues on cadence (so exactly one replica fires each tick). Each `run` calls the SAME loop body
+// the periodic task called, once. Each `default_schedule` returns the cadence from `Config` so the
+// scheduler can seed a `schedules` row on first start; the seconds are captured at registry-build
+// time. Services that need config / shared in-process services beyond `db`+`params` read the
+// process-global `AppState` (`crate::common::global_app_state`) — the same set-once handle pattern
+// the CrudCrate hooks use for the event sender.
+
+/// Fill missing derived readings, refresh continuous aggregates, and prune old tracked-job rows —
+/// the derived-consistency janitor. Wraps [`janitor::run_once`] plus the per-tick full/incremental
+/// refresh and periodic retention the old `janitor::periodic` loop did.
+pub struct JanitorRun {
+    interval_seconds: u64,
+    full_refresh_seconds: u64,
+    maintenance_retention_days: u32,
+    operator_retention_days: u32,
+    maintenance_max_rows: u64,
+}
+
+impl JanitorRun {
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            interval_seconds: config.janitor_interval_seconds,
+            full_refresh_seconds: config.janitor_full_refresh_seconds,
+            maintenance_retention_days: config.job_maintenance_retention_days,
+            operator_retention_days: config.janitor_retention_days,
+            maintenance_max_rows: config.job_maintenance_max_rows,
+        }
+    }
+}
+
 #[async_trait]
 impl Job for SiteTimestampsDerived {
     fn name(&self) -> &'static str {
@@ -762,5 +798,208 @@ impl Job for PlanRevert {
         .await;
         ctx.info(&format!("Reverted plan: {reverted} streams unpaired")).await;
         Ok(i64::from(reverted))
+    }
+}
+
+#[async_trait]
+impl Job for JanitorRun {
+    fn name(&self) -> &'static str {
+        "janitor_service"
+    }
+
+    fn default_schedule(&self) -> Option<Schedule> {
+        Some(Schedule::every_secs(self.interval_seconds.max(1) as i64))
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        use crate::routes::private::derived_parameters::janitor;
+        let db = ctx.db();
+
+        // 1. Fill derived gaps (this itself opens its own tracked `janitor_run` row + refreshes
+        //    aggregates back to the earliest filled timestamp).
+        if let Err(e) = janitor::run_once(db).await {
+            tracing::warn!(error = %e, "Derived janitor: run failed");
+        }
+
+        // 2. The old loop ran a full continuous-aggregate refresh once every `full_refresh_seconds`
+        //    and an incremental one otherwise. Without per-replica loop state to track "last full",
+        //    derive it from the wall clock: do the full refresh on the tick whose scheduled epoch
+        //    falls in the first `interval` window of each `full_refresh` period.
+        let do_full = if self.full_refresh_seconds == 0 {
+            false
+        } else {
+            let now = chrono::Utc::now().timestamp().max(0) as u64;
+            (now % self.full_refresh_seconds) < self.interval_seconds.max(1)
+        };
+        if do_full {
+            tracing::info!("Derived janitor: running scheduled full continuous aggregate refresh");
+            sync_state::refresh_continuous_aggregates_full(db).await;
+        } else {
+            sync_state::refresh_continuous_aggregates(db, None).await;
+        }
+
+        // 3. Tiered tracked-job retention (cheap deletes; idempotent to run every tick).
+        let pruned = janitor::prune_tracked_jobs(
+            db,
+            self.maintenance_retention_days,
+            self.operator_retention_days,
+            self.maintenance_max_rows,
+        )
+        .await;
+        Ok(pruned as i64)
+    }
+}
+
+/// Reconcile persisted `alarm_events` against the current breach set (open/update/resolve), then
+/// emit an `AlarmStateChanged` SSE on change — the alarm-sweeper backstop. Wraps
+/// [`sweeper::evaluate_alarm_events`] + the same SSE the old `sweeper::periodic` emitted.
+pub struct AlarmSweep {
+    interval_seconds: u64,
+}
+
+impl AlarmSweep {
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        Self { interval_seconds: config.alarm_sweep_interval_seconds }
+    }
+}
+
+#[async_trait]
+impl Job for AlarmSweep {
+    fn name(&self) -> &'static str {
+        "alarm_sweep"
+    }
+
+    fn default_schedule(&self) -> Option<Schedule> {
+        Some(Schedule::every_secs(self.interval_seconds.max(1) as i64))
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        use crate::routes::private::alarms::sweeper;
+        match sweeper::evaluate_alarm_events(ctx.db()).await {
+            Ok(stats) => {
+                if (stats.opened > 0 || stats.resolved > 0)
+                    && let Some(events) = crate::common::global_event_sender()
+                {
+                    let _ = events.send(crate::common::AppEvent::AlarmStateChanged {
+                        opened: stats.opened,
+                        resolved: stats.resolved,
+                    });
+                }
+                Ok((stats.opened + stats.resolved) as i64)
+            }
+            Err(e) => Err(DbErr::Custom(format!("alarm sweep failed: {e}"))),
+        }
+    }
+}
+
+/// Re-resolve every active linked Telegram identity against Keycloak and deactivate any whose user
+/// is gone/disabled/role-revoked — the anti-backdoor identity reconciliation. Wraps
+/// [`reconcile::sweep`]. Needs the live `AppState` (Keycloak admin proxy + the shared `Authorizer`
+/// cache), read from the process global; a no-op when no `AppState` was built (some test contexts).
+pub struct IdentityReconcile {
+    interval_seconds: u64,
+}
+
+impl IdentityReconcile {
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        Self { interval_seconds: config.identity_reconcile_interval_seconds }
+    }
+}
+
+#[async_trait]
+impl Job for IdentityReconcile {
+    fn name(&self) -> &'static str {
+        "identity_reconcile"
+    }
+
+    fn default_schedule(&self) -> Option<Schedule> {
+        Some(Schedule::every_secs(self.interval_seconds.max(1) as i64))
+    }
+
+    async fn run(&self, _ctx: JobContext) -> Result<i64, DbErr> {
+        let Some(state) = crate::common::global_app_state() else {
+            tracing::debug!("identity_reconcile: no AppState in process; skipping");
+            return Ok(0);
+        };
+        match crate::routes::private::notifications::reconcile::sweep(&state).await {
+            Ok(0) => Ok(0),
+            Ok(n) => {
+                tracing::warn!(count = n, "Identity reconciliation: deactivated revoked links");
+                Ok(n as i64)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Probe each configured notification channel (Telegram `getMe` / SMTP / Graph token) and upsert
+/// `notification_channel_health` — the channel health heartbeat. Wraps [`health::probe_once`].
+pub struct NotifyHealth {
+    interval_seconds: u64,
+}
+
+impl NotifyHealth {
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        Self { interval_seconds: config.notify_health_interval_seconds.max(30) }
+    }
+}
+
+#[async_trait]
+impl Job for NotifyHealth {
+    fn name(&self) -> &'static str {
+        "notify_health"
+    }
+
+    fn default_schedule(&self) -> Option<Schedule> {
+        Some(Schedule::every_secs(self.interval_seconds.max(1) as i64))
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let Some(state) = crate::common::global_app_state() else {
+            tracing::debug!("notify_health: no AppState in process; skipping");
+            return Ok(0);
+        };
+        crate::routes::private::notifications::health::probe_once(ctx.db(), &state.config).await;
+        Ok(0)
+    }
+}
+
+/// Drain the `alarm_events` notification outbox (open + resolve passes) and run the signal triggers —
+/// the notification dispatcher. Wraps [`dispatcher::dispatch_once`]. The `AlarmStateChanged`
+/// broadcast still wakes an immediate enqueue in `main.rs` for low latency; this schedule is the
+/// fallback cadence.
+pub struct DispatchNotifications {
+    interval_seconds: u64,
+}
+
+impl DispatchNotifications {
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        Self { interval_seconds: config.notify_poll_interval_seconds }
+    }
+}
+
+#[async_trait]
+impl Job for DispatchNotifications {
+    fn name(&self) -> &'static str {
+        "dispatch_notifications"
+    }
+
+    fn default_schedule(&self) -> Option<Schedule> {
+        Some(Schedule::every_secs(self.interval_seconds.max(1) as i64))
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        use crate::routes::private::notifications::dispatcher;
+        let Some(state) = crate::common::global_app_state() else {
+            tracing::debug!("dispatch_notifications: no AppState in process; skipping");
+            return Ok(0);
+        };
+        let channels = dispatcher::build_channels(&state.config);
+        dispatcher::dispatch_once(ctx.db(), &channels, &state.config).await;
+        Ok(0)
     }
 }

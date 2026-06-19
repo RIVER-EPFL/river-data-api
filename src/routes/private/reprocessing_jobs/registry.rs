@@ -15,6 +15,11 @@ pub const CATEGORY_MAINTENANCE: &str = "maintenance";
 pub fn category_for(trigger_type: &str) -> &'static str {
     match trigger_type {
         "janitor_run"
+        | "janitor_service"
+        | "alarm_sweep"
+        | "identity_reconcile"
+        | "notify_health"
+        | "dispatch_notifications"
         | "ingest_derived"
         | "batch_derived"
         | "refresh_aggregates"
