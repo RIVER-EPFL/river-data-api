@@ -198,10 +198,10 @@ impl NotificationChannel for TelegramChannel {
 
         let mut results = Vec::with_capacity(recipients.len());
         for (sub, chat_id) in recipients {
-            if let Some(p) = project {
-                if !project_allowed(&accessible_project_ids(db, &sub).await, p) {
-                    continue;
-                }
+            if let Some(p) = project
+                && !project_allowed(&accessible_project_ids(db, &sub).await, p)
+            {
+                continue;
             }
             let outcome = self.client.send_message(chat_id, &msg.body).await;
             results.push(DeliveryResult {

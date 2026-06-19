@@ -240,12 +240,12 @@ pub async fn set_my_subscriptions(
     if accessible.is_some() {
         for s in &req.subscriptions {
             let project = resolve_project(&state, s).await?;
-            if let Some(p) = project {
-                if !project_allowed(&accessible, p) {
-                    return Err(AppError::Forbidden(
-                        "subscription references a project you cannot access".to_string(),
-                    ));
-                }
+            if let Some(p) = project
+                && !project_allowed(&accessible, p)
+            {
+                return Err(AppError::Forbidden(
+                    "subscription references a project you cannot access".to_string(),
+                ));
             }
         }
     }
