@@ -19,12 +19,9 @@ pub struct Model {
     // every command — never cached here as authority. See notifications::authz.
     #[crudcrate(filterable)]
     pub linked_keycloak_sub: String,
-    pub email: Option<String>,
-    pub display_name: Option<String>,
     // NULL until the user claims the row with /start <code>.
     #[crudcrate(filterable)]
     pub telegram_chat_id: Option<i64>,
-    pub telegram_username: Option<String>,
     #[crudcrate(on_create = true)]
     pub receive_alerts: bool,
     #[crudcrate(filterable, on_create = true)]

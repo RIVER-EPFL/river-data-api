@@ -17,8 +17,6 @@ const LINK_CODE_TTL_MINUTES: i64 = 60;
 pub struct GenerateLinkCodeRequest {
     /// Keycloak user `sub` this chat will speak for. The bot's role checks resolve against it.
     pub keycloak_sub: String,
-    pub email: Option<String>,
-    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -71,13 +69,11 @@ pub async fn generate_link_code(
         .query_one(Statement::from_sql_and_values(
             PG,
             "INSERT INTO telegram_identities \
-                (linked_keycloak_sub, email, display_name, link_code, link_code_expires_at, is_active) \
-             VALUES ($1, $2, $3, $4, NOW() + ($5 || ' minutes')::interval, TRUE) \
+                (linked_keycloak_sub, link_code, link_code_expires_at, is_active) \
+             VALUES ($1, $2, NOW() + ($3 || ' minutes')::interval, TRUE) \
              RETURNING link_code_expires_at",
             [
                 req.keycloak_sub.into(),
-                req.email.into(),
-                req.display_name.into(),
                 code.clone().into(),
                 LINK_CODE_TTL_MINUTES.to_string().into(),
             ],

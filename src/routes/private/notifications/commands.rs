@@ -550,22 +550,22 @@ pub async fn muted(db: &DatabaseConnection) -> String {
 pub async fn start(
     db: &DatabaseConnection,
     chat_id: i64,
-    username: Option<&str>,
+    _username: Option<&str>,
     code: &str,
 ) -> String {
     if code.is_empty() {
-        return "Send /start <code> with the link code an administrator gave you.".to_string();
+        return "Send /start <code> with the link code from your account settings.".to_string();
     }
     let res = db
         .query_one(Statement::from_sql_and_values(
             PG,
             "UPDATE telegram_identities \
-             SET telegram_chat_id = $1, telegram_username = $2, link_code = NULL, \
+             SET telegram_chat_id = $1, link_code = NULL, \
                  link_code_expires_at = NULL, is_active = TRUE, last_verified_at = NOW(), \
                  updated_at = NOW() \
-             WHERE link_code = $3 AND link_code_expires_at > NOW() AND telegram_chat_id IS NULL \
+             WHERE link_code = $2 AND link_code_expires_at > NOW() AND telegram_chat_id IS NULL \
              RETURNING id",
-            [chat_id.into(), username.into(), code.into()],
+            [chat_id.into(), code.into()],
         ))
         .await;
     match res {
