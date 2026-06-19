@@ -165,6 +165,13 @@ impl JobContext {
         &self.db
     }
 
+    /// The SSE event sender, for jobs that emit domain events (e.g. `DataIngested`) beyond the
+    /// lifecycle's own progress/completion events.
+    #[must_use]
+    pub fn events(&self) -> &crate::common::EventSender {
+        &self.events
+    }
+
     /// This job's id.
     #[must_use]
     pub fn job_id(&self) -> Uuid {

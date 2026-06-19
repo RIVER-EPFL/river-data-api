@@ -31,6 +31,7 @@ mod m20260620_000002_notification_health;
 mod m20260621_000001_job_worker_pool;
 mod m20260622_000001_schedules;
 mod m20260623_000001_schedule_audit;
+mod m20260623_000002_csv_import_staging;
 
 pub struct Migrator;
 
@@ -69,6 +70,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260621_000001_job_worker_pool::Migration),
             Box::new(m20260622_000001_schedules::Migration),
             Box::new(m20260623_000001_schedule_audit::Migration),
+            Box::new(m20260623_000002_csv_import_staging::Migration),
         ]
     }
 }

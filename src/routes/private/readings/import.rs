@@ -12,20 +12,19 @@
 //! align this file" before the operator confirms.
 
 use axum::{Json, extract::State};
-use sea_orm::{ConnectionTrait, EntityTrait, Set, Statement};
+use sea_orm::{ConnectionTrait, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
-use crate::common::{AppEvent, AppState};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams::services::get_or_create_api_stream;
-use crate::routes::private::readings;
+use crate::routes::private::readings::batch::ConflictMode;
 use crate::routes::private::sensors::operations::{ResolvedOwner, resolve_slot_owner_for_times};
-use crate::routes::private::readings::batch::{ConflictMode, readings_on_conflict};
 use crate::routes::resolve_site_with_project;
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -121,7 +120,7 @@ pub struct RowError {
     pub message: String,
 }
 
-const BATCH_SIZE: usize = 1000;
+pub(crate) const BATCH_SIZE: usize = 1000;
 /// Cap on the returned error list to keep responses bounded; `error_count` reports the true total.
 const MAX_ERRORS: usize = 500;
 
@@ -482,26 +481,19 @@ pub async fn import_csv(
         }
     }
 
-    let models: Vec<readings::ActiveModel> = rows
+    let staged: Vec<StagedRow> = rows
         .iter()
         .map(|(parameter_id, time, value)| {
             let owner = owner_map.get(&(*parameter_id, *time)).cloned().unwrap_or_default();
-            readings::ActiveModel {
-                stream_id: Set(stream_cache[parameter_id]),
-                site_id: Set(Some(site_id)),
-                parameter_id: Set(Some(*parameter_id)),
-                time: Set((*time).into()),
-                replicate_index: Set(0),
-                raw_value: Set(*value),
-                calibrated_value: Set(Some(*value)),
-                sensor_id: Set(owner.sensor_id),
-                calibration_id: Set(owner.calibration_id),
-                deployment_id: Set(owner.deployment_id),
-                logged: Set(Some(false)),
-                measurement_type: Set(Some("continuous".to_string())),
-                is_flagged: Set(Some(false)),
-                flag_reason: Set(None),
-                sample_id: Set(None),
+            StagedRow {
+                stream_id: stream_cache[parameter_id],
+                site_id,
+                parameter_id: *parameter_id,
+                time: *time,
+                raw_value: *value,
+                sensor_id: owner.sensor_id,
+                calibration_id: owner.calibration_id,
+                deployment_id: owner.deployment_id,
             }
         })
         .collect();
@@ -516,170 +508,46 @@ pub async fn import_csv(
     let overlap_differing = overlap.differing;
     let has_work = rows.len() > overlapping || (overlap_differing > 0 && req.conflict == ConflictMode::Overwrite);
 
-    // --- Spawn background job for insert + derived recompute + aggregate refresh ---------------
+    // --- Stage the parsed readings and enqueue the worker job ---------------------------------
+    // The readings are externalised to `csv_import_staging` so any replica can run the import (the
+    // parsed `Vec` no longer lives only in this handler's memory). The job reads them back by token.
     let derived_job_id = if has_work {
-        let total = i32::try_from(models.len()).unwrap_or(i32::MAX);
-        let app = state.clone();
-        let since = earliest;
-        let latest_for_alarm = latest;
-        let conflict = req.conflict;
-        let site_name = site.name.clone();
-        // Arc the large per-import payloads so each job invocation (retry-safe `Fn`) clones cheaply.
-        let param_streams: std::sync::Arc<Vec<(Uuid, Uuid)>> = std::sync::Arc::new(
-            mappings
-                .iter()
-                .filter_map(|m| stream_cache.get(&m.parameter_id).map(|&sid| (m.parameter_id, sid)))
-                .collect(),
-        );
-        let models = std::sync::Arc::new(models);
-        let distinct_ts = std::sync::Arc::new(distinct_ts);
+        let import_token = Uuid::new_v4();
+        stage_import_rows(&state.db, import_token, &staged).await?;
 
-        let job_id = crate::routes::private::reprocessing_jobs::lifecycle::spawn_tracked_job_ctx(
+        let param_streams: Vec<serde_json::Value> = mappings
+            .iter()
+            .filter_map(|m| {
+                stream_cache
+                    .get(&m.parameter_id)
+                    .map(|&sid| serde_json::json!([m.parameter_id, sid]))
+            })
+            .collect();
+
+        let params = serde_json::json!({
+            "import_token": import_token,
+            "site_id": site_id,
+            "site_name": site.name,
+            "conflict": match req.conflict {
+                ConflictMode::Skip => "skip",
+                ConflictMode::Overwrite => "overwrite",
+            },
+            "since": earliest.map(|t| t.to_rfc3339()),
+            "latest": latest.map(|t| t.to_rfc3339()),
+            "overlapping": overlapping,
+            "overlap_differing": overlap_differing,
+            "param_streams": param_streams,
+        });
+
+        crate::routes::private::reprocessing_jobs::worker::enqueue(
             &state.db,
-            None,
             "csv_import",
             None,
-            state.events.clone(),
-            move |ctx| {
-                let app = app.clone();
-                let events = app.events.clone();
-                let site_name = site_name.clone();
-                let param_streams = param_streams.clone();
-                let models = models.clone();
-                let distinct_ts = distinct_ts.clone();
-                async move {
-                    let db = ctx.db().clone();
-                    ctx.set_progress(0, Some(total)).await;
-
-            // Phase 1: insert readings
-            let mut affected_total = 0usize;
-            let mut inserted_so_far = 0usize;
-            for chunk in models.chunks(BATCH_SIZE) {
-                match readings::Entity::insert_many(chunk.to_vec())
-                    .on_conflict(readings_on_conflict(conflict))
-                    .exec_without_returning(&db)
-                    .await
-                {
-                    Ok(affected) => affected_total += affected as usize,
-                    Err(e) => {
-                        let msg = e.to_string();
-                        if !msg.contains("None of the records") {
-                            tracing::warn!(error = %e, "Failed to insert imported readings chunk");
-                            return Err(e);
-                        }
-                    }
-                }
-                inserted_so_far += chunk.len();
-                if inserted_so_far % 5000 < BATCH_SIZE {
-                    ctx.set_progress(
-                        i32::try_from(inserted_so_far).unwrap_or(i32::MAX),
-                        Some(total),
-                    )
-                    .await;
-                }
-            }
-
-            let (inserted_total, overwritten) = match conflict {
-                ConflictMode::Skip => (affected_total, 0),
-                ConflictMode::Overwrite => (affected_total.saturating_sub(overlapping), overlap_differing),
-            };
-            tracing::info!(site = %site_name, inserted_total, overwritten, "CSV import inserted readings");
-
-            if inserted_total > 0 || overwritten > 0 {
-                for (parameter_id, stream_id) in param_streams.iter() {
-                    let _ = events.send(AppEvent::DataIngested {
-                        site_id: Some(site_id),
-                        parameter_id: Some(*parameter_id),
-                        stream_id: *stream_id,
-                        count: inserted_total + overwritten,
-                    });
-                }
-            }
-
-            // Phase 2: derived recompute
-            if inserted_total > 0 || overwritten > 0 {
-                let derived_total = i32::try_from(models.len() + distinct_ts.len()).unwrap_or(i32::MAX);
-                ctx.set_progress(
-                    i32::try_from(models.len()).unwrap_or(i32::MAX),
-                    Some(derived_total),
-                )
-                .await;
-
-                for (i, time) in distinct_ts.iter().enumerate() {
-                    if ctx.is_cancelled() {
-                        break;
-                    }
-                    let _ = crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
-                        &db, site_id, *time,
-                    )
-                    .await;
-                    if (i + 1) % 500 == 0 {
-                        let prog = i32::try_from(models.len() + i + 1).unwrap_or(i32::MAX);
-                        ctx.set_progress(prog, Some(derived_total)).await;
-                    }
-                }
-
-                if let Some(s) = since {
-                    crate::common::sync_state::refresh_continuous_aggregates(&db, Some(s)).await;
-                }
-                crate::common::cache::invalidate_prefix(&app, &format!("readings:{site_id}")).await;
-                crate::common::cache::invalidate_prefix(&app, &format!("aggregates:{site_id}")).await;
-
-                // Rebuild persisted alarm events for the imported window so out-of-range CSV rows
-                // become breach episodes (the live sweeper only ever inspects the latest reading).
-                // Separate tracked `alarm_backfill` job so it shows up alongside the manual rebuild.
-                if let (Some(alarm_start), Some(alarm_end)) = (since, latest_for_alarm) {
-                    let alarm_params: Vec<Uuid> =
-                        param_streams.iter().map(|(pid, _)| *pid).collect();
-                    let _ = crate::routes::private::sensor_calibrations::services::spawn_tracked_job(
-                        &db,
-                        None,
-                        "alarm_backfill",
-                        None,
-                        events.clone(),
-                        move |inner_db| {
-                            let alarm_params = alarm_params.clone();
-                            async move {
-                                let mut total = 0i64;
-                                for pid in alarm_params {
-                                    match crate::routes::private::alarms::episodes::evaluate_alarm_episodes(
-                                        &inner_db, site_id, pid, alarm_start, alarm_end,
-                                    )
-                                    .await
-                                    {
-                                        Ok(n) => total += n,
-                                        Err(e) => tracing::warn!(
-                                            error = %e, %site_id, parameter_id = %pid,
-                                            "alarm backfill slot failed"
-                                        ),
-                                    }
-                                }
-                                Ok(total)
-                            }
-                        },
-                    )
-                    .await;
-                }
-
-                // Live open-alarm reconcile for the imported slots (error-safe; backstop covers it).
-                let alarm_slots: Vec<(Uuid, Uuid)> =
-                    param_streams.iter().map(|(pid, _)| (site_id, *pid)).collect();
-                crate::routes::private::alarms::sweeper::reconcile_and_notify(
-                    &db,
-                    &events,
-                    &alarm_slots,
-                )
-                .await;
-            }
-
-                    Ok(i64::from(
-                        i32::try_from(inserted_total + overwritten).unwrap_or(i32::MAX),
-                    ))
-                }
-            },
+            None,
+            &params,
+            None,
         )
-        .await?;
-        Some(job_id)
+        .await?
     } else {
         None
     };
@@ -713,6 +581,71 @@ pub async fn import_csv(
         errors,
         error_count,
     }))
+}
+
+/// One parsed CSV reading staged for the worker job. Carries only the variable per-row fields; the
+/// `csv_import` job re-applies the readings constants (replicate_index=0, logged=false,
+/// measurement_type='continuous', is_flagged=false) when it reads these back.
+struct StagedRow {
+    stream_id: Uuid,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    time: chrono::DateTime<chrono::Utc>,
+    raw_value: f64,
+    sensor_id: Option<Uuid>,
+    calibration_id: Option<Uuid>,
+    deployment_id: Option<Uuid>,
+}
+
+/// Bulk-insert the parsed rows into `csv_import_staging` under `import_token`, chunked so the
+/// parameter count per statement stays bounded. The worker job reads them back by token.
+async fn stage_import_rows(
+    db: &sea_orm::DatabaseConnection,
+    import_token: Uuid,
+    rows: &[StagedRow],
+) -> AppResult<()> {
+    for chunk in rows.chunks(BATCH_SIZE) {
+        let mut sql = String::from(
+            "INSERT INTO csv_import_staging \
+             (import_token, stream_id, site_id, parameter_id, time, raw_value, \
+              sensor_id, calibration_id, deployment_id) VALUES ",
+        );
+        let mut values: Vec<sea_orm::Value> = Vec::with_capacity(chunk.len() * 9);
+        for (i, r) in chunk.iter().enumerate() {
+            let base = i * 9;
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&format!(
+                "(${},${},${},${},${},${},${},${},${})",
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 7,
+                base + 8,
+                base + 9,
+            ));
+            values.push(import_token.into());
+            values.push(r.stream_id.into());
+            values.push(r.site_id.into());
+            values.push(r.parameter_id.into());
+            values.push(sea_orm::prelude::DateTimeWithTimeZone::from(r.time).into());
+            values.push(r.raw_value.into());
+            values.push(r.sensor_id.into());
+            values.push(r.calibration_id.into());
+            values.push(r.deployment_id.into());
+        }
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await?;
+    }
+    Ok(())
 }
 
 struct OverlapReport {
