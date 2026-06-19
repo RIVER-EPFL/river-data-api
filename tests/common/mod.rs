@@ -16,9 +16,28 @@ pub use db::*;
 pub use fixtures::*;
 pub use seed::*;
 
+/// Spawn a background job worker for the test, mirroring prod so flipped (`queued`) jobs run to
+/// completion under POST-and-poll tests. Aborted when the test's runtime drops.
+fn spawn_test_worker(state: &AppState) {
+    let db = state.db.clone();
+    let events = state.events.clone();
+    let registry =
+        std::sync::Arc::new(river_db::routes::private::reprocessing_jobs::job::build_registry());
+    tokio::spawn(async move {
+        river_db::routes::private::reprocessing_jobs::worker::run(
+            db,
+            events,
+            registry,
+            std::future::pending::<()>(),
+        )
+        .await;
+    });
+}
+
 pub fn build_test_app(db: DatabaseConnection) -> axum::Router {
     let config = test_config();
     let state = AppState::new(db, config, None);
+    spawn_test_worker(&state);
     river_db::routes::build_router(state)
 }
 
@@ -27,6 +46,7 @@ pub fn build_test_app(db: DatabaseConnection) -> axum::Router {
 pub fn build_test_app_with_state(db: DatabaseConnection) -> (axum::Router, AppState) {
     let config = test_config();
     let state = AppState::new(db, config, None);
+    spawn_test_worker(&state);
     let app = river_db::routes::build_router(state.clone());
     (app, state)
 }
@@ -34,6 +54,7 @@ pub fn build_test_app_with_state(db: DatabaseConnection) -> (axum::Router, AppSt
 pub fn build_test_app_with_events(db: DatabaseConnection) -> (axum::Router, EventSender) {
     let config = test_config();
     let state = AppState::new(db, config, None);
+    spawn_test_worker(&state);
     let events = state.events.clone();
     (river_db::routes::build_router(state), events)
 }
@@ -105,6 +126,7 @@ pub fn build_test_app_with_cache(db: DatabaseConnection) -> axum::Router {
     config.cache_ttl_seconds = 300;
     config.cache_max_bytes = 10_000_000;
     let state = AppState::new(db, config, None);
+    spawn_test_worker(&state);
     river_db::routes::build_router(state)
 }
 
@@ -112,6 +134,7 @@ pub fn build_test_app_with_rate_limiting(db: DatabaseConnection) -> axum::Router
     let mut config = test_config();
     config.disable_rate_limiting = false;
     let state = AppState::new(db, config, None);
+    spawn_test_worker(&state);
     river_db::routes::build_router(state)
 }
 
@@ -120,6 +143,7 @@ pub fn build_test_app_with_audit(db: DatabaseConnection) -> (axum::Router, AppSt
     let mut config = test_config();
     config.audit_api_token_use = true;
     let state = AppState::new(db, config, None);
+    spawn_test_worker(&state);
     let app = river_db::routes::build_router(state.clone());
     (app, state)
 }
