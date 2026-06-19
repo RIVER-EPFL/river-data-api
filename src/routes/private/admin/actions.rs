@@ -8,11 +8,9 @@ use crate::common::AppState;
 use crate::common::middleware::{DenyScoped, ProjectScope, enforce_project_scope_for_sites};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensor_calibrations::services::{
-    evaluate_formula, recalculate_derived_at_timestamp, recompute_deployed_until,
-    recompute_valid_until, reprocess_site_parameter_readings, reprocess_sensor_readings,
-    spawn_tracked_job,
+    evaluate_formula, recompute_deployed_until, recompute_valid_until,
+    reprocess_site_parameter_readings, reprocess_sensor_readings, spawn_tracked_job,
 };
-use crate::common::sync_state as state;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RefreshAggregatesRequest {
@@ -91,61 +89,31 @@ pub async fn compute_derived(
         .map(|st| st.timestamps.len())
         .sum();
 
-    let job_id = spawn_tracked_job(
+    let site_timestamps: Vec<serde_json::Value> = payload
+        .site_timestamps
+        .iter()
+        .map(|st| {
+            serde_json::json!({
+                "site_id": st.site_id,
+                "timestamps": st.timestamps,
+            })
+        })
+        .collect();
+
+    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
         &app_state.db,
-        None,
         "compute_derived",
         None,
-        app_state.events.clone(),
-        move |db| {
-            let payload = payload.clone();
-            async move {
-            tracing::info!(
-                sites = payload.site_timestamps.len(),
-                timestamps = total_timestamps,
-                "Computing derived values via service API"
-            );
-
-            let mut computed = 0i64;
-            for st in &payload.site_timestamps {
-                for time in &st.timestamps {
-                    match recalculate_derived_at_timestamp(&db, st.site_id, *time).await {
-                        Ok(()) => computed += 1,
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            site_id = %st.site_id,
-                            time = %time,
-                            "Failed to compute derived values"
-                        ),
-                    }
-                }
-            }
-
-            tracing::info!(computed, "Derived computation complete");
-
-            if computed > 0 {
-                let min_time = payload
-                    .site_timestamps
-                    .iter()
-                    .flat_map(|st| st.timestamps.iter())
-                    .min()
-                    .copied();
-                if let Some(since) = min_time {
-                    tracing::info!(%since, "Refreshing continuous aggregates after derived computation");
-                    state::refresh_continuous_aggregates(&db, Some(since)).await;
-                }
-            }
-
-            Ok(computed)
-            }
-        },
+        None,
+        &serde_json::json!({ "site_timestamps": site_timestamps }),
+        None,
     )
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "job_id": job_id,
-        "status": "pending",
+        "status": "queued",
         "total_timestamps": total_timestamps,
     })))
 }
