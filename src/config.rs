@@ -150,6 +150,9 @@ pub struct Config {
     // identity reconciliation sweep cadence (anti-backdoor).
     pub notify_poll_interval_seconds: u64,
     pub identity_reconcile_interval_seconds: u64,
+    // How often the background health probe checks each configured channel (getMe / SMTP NOOP /
+    // Graph token) and upserts notification_channel_health.
+    pub notify_health_interval_seconds: u64,
     // Battery depletion forecast: cutoff voltage and the days-to-cutoff threshold that raises an alert.
     pub battery_cutoff_volts: f64,
     pub battery_forecast_alert_days: i64,
@@ -389,6 +392,10 @@ impl Config {
                 .parse()
                 .unwrap_or(60),
             identity_reconcile_interval_seconds: env::var("IDENTITY_RECONCILE_INTERVAL_SECONDS")
+                .unwrap_or_else(|_| "300".to_string())
+                .parse()
+                .unwrap_or(300),
+            notify_health_interval_seconds: env::var("NOTIFY_HEALTH_INTERVAL_SECONDS")
                 .unwrap_or_else(|_| "300".to_string())
                 .parse()
                 .unwrap_or(300),

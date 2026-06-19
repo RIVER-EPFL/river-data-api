@@ -157,6 +157,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Spawned Telegram identity reconciliation"
     );
 
+    tokio::spawn(river_db::routes::private::notifications::health::periodic(
+        db.clone(),
+        state.config.clone(),
+    ));
+    tracing::info!("Spawned notification channel health probe");
+
     let app = routes::build_router(state);
 
     // Start server with graceful shutdown

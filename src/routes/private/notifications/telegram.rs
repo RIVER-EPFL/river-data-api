@@ -72,6 +72,20 @@ impl TelegramClient {
         Ok(updates)
     }
 
+    /// Liveness + token validity check. `getMe` returns the bot's identity when the token is valid.
+    pub async fn get_me(&self) -> Result<String, String> {
+        let url = format!("{API_BASE}/bot{}/getMe", self.token);
+        let resp = self.http.get(&url).send().await.map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("telegram getMe {status}: {body}"));
+        }
+        let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let username = json["result"]["username"].as_str().unwrap_or("?");
+        Ok(format!("bot @{username} reachable"))
+    }
+
     /// Send a plain-text message to one chat. Returns the Telegram error description on failure.
     pub async fn send_message(&self, chat_id: i64, text: &str) -> Result<(), String> {
         let url = format!("{API_BASE}/bot{}/sendMessage", self.token);
@@ -164,6 +178,10 @@ pub async fn slot_recipients(
 impl NotificationChannel for TelegramChannel {
     fn name(&self) -> &'static str {
         "telegram"
+    }
+
+    async fn check_health(&self) -> Result<String, String> {
+        self.client.get_me().await
     }
 
     async fn deliver(&self, db: &DatabaseConnection, msg: &OutgoingMessage) -> Vec<DeliveryResult> {

@@ -91,6 +91,7 @@ fn test_config() -> Config {
         alert_email_to: None,
         notify_poll_interval_seconds: 60,
         identity_reconcile_interval_seconds: 300,
+        notify_health_interval_seconds: 300,
         battery_cutoff_volts: 10.5,
         battery_forecast_alert_days: 14,
         stale_data_threshold_hours: 6,

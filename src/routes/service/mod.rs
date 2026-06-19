@@ -337,6 +337,18 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .layer(middleware::from_fn(require_admin))
         .with_state(state.clone());
 
+    // Admin notification oversight: per-channel health probe, one-off test send, subscriber roster.
+    let notifications_admin_routes = {
+        use crate::routes::private::notifications::{health, views as notif_views};
+        Router::new()
+            .route("/notifications/health", get(health::get_health))
+            .route("/notifications/health/refresh", post(health::refresh_health))
+            .route("/notifications/test-send", post(notif_views::test_send))
+            .route("/notifications/subscribers", get(notif_views::list_subscribers))
+            .layer(middleware::from_fn(require_admin))
+            .with_state(state.clone())
+    };
+
     // Self-service notification preferences. Any Keycloak user manages their OWN settings (the handler
     // binds to the caller's JWT sub; API tokens are refused in-handler since they have no user sub).
     let notifications_me_routes = {
@@ -378,6 +390,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .merge(entity_router)
         .merge(token_admin_routes)
         .merge(telegram_admin_routes)
+        .merge(notifications_admin_routes)
         .merge(notifications_me_routes)
         .merge(stream_read_routes)
         .merge(sensor_view_read_routes)

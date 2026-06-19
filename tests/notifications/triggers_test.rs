@@ -21,6 +21,10 @@ impl NotificationChannel for MockChannel {
         "mock"
     }
 
+    async fn check_health(&self) -> Result<String, String> {
+        Ok("mock healthy".to_string())
+    }
+
     async fn deliver(&self, _db: &DatabaseConnection, msg: &OutgoingMessage) -> Vec<DeliveryResult> {
         self.sent.lock().unwrap().push(msg.clone());
         vec![DeliveryResult {

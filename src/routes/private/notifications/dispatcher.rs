@@ -31,7 +31,7 @@ struct Row {
 
 /// Build the enabled channels from config. Empty when nothing is configured (the API runs fine
 /// without notifications — the dispatcher then just stamps the outbox and sends nothing).
-fn build_channels(config: &Config) -> Vec<Box<dyn NotificationChannel>> {
+pub(super) fn build_channels(config: &Config) -> Vec<Box<dyn NotificationChannel>> {
     let mut channels: Vec<Box<dyn NotificationChannel>> = Vec::new();
     if let Some(token) = &config.telegram_bot_token {
         channels.push(Box::new(TelegramChannel::new(TelegramClient::new(token.clone()))));
@@ -232,7 +232,7 @@ pub(super) async fn deliver(
     attempted == 0 || any_success
 }
 
-async fn log_delivery(
+pub(super) async fn log_delivery(
     db: &DatabaseConnection,
     alarm_event_id: Option<Uuid>,
     kind: &str,

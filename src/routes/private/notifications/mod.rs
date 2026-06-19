@@ -13,6 +13,7 @@ pub mod bot;
 pub mod commands;
 pub mod dispatcher;
 pub mod email;
+pub mod health;
 pub mod identities_model;
 pub mod log_model;
 pub mod me;
@@ -60,4 +61,7 @@ pub struct DeliveryResult {
 pub trait NotificationChannel: Send + Sync {
     fn name(&self) -> &'static str;
     async fn deliver(&self, db: &DatabaseConnection, msg: &OutgoingMessage) -> Vec<DeliveryResult>;
+    /// Live reachability probe (no message sent): `getMe` for Telegram, an SMTP connection test or a
+    /// Graph token fetch for email. `Ok(detail)` is healthy; `Err(detail)` carries the failure reason.
+    async fn check_health(&self) -> Result<String, String>;
 }

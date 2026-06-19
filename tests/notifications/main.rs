@@ -5,6 +5,7 @@
 #[allow(dead_code, unused_imports)]
 mod common;
 
+mod admin_test;
 mod anti_backdoor_test;
 mod capabilities_test;
 mod dispatcher_test;

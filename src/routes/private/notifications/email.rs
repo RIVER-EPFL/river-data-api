@@ -16,6 +16,8 @@ use super::{DeliveryResult, NotificationChannel, OutgoingMessage};
 #[async_trait::async_trait]
 pub trait Mailer: Send + Sync {
     async fn send(&self, to: &str, subject: &str, body: &str) -> Result<(), String>;
+    /// Reachability probe with no message sent: an SMTP connection test, or a Graph token fetch.
+    async fn check_health(&self) -> Result<String, String>;
 }
 
 /// SMTP submission via lettre. Port 25 uses a plaintext relay (e.g. an on-campus mail gateway);
@@ -64,6 +66,14 @@ impl Mailer for SmtpMailer {
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+
+    async fn check_health(&self) -> Result<String, String> {
+        match self.transport.test_connection().await {
+            Ok(true) => Ok("SMTP connection OK".to_string()),
+            Ok(false) => Err("SMTP server did not accept the connection".to_string()),
+            Err(e) => Err(e.to_string()),
+        }
     }
 }
 
@@ -164,6 +174,10 @@ impl Mailer for GraphMailer {
             Err(format!("graph sendMail {status}: {body}"))
         }
     }
+
+    async fn check_health(&self) -> Result<String, String> {
+        self.access_token().await.map(|_| "Graph token acquired".to_string())
+    }
 }
 
 /// Build the configured mailer, or `None` if email is disabled / not fully configured (logs why).
@@ -229,6 +243,10 @@ impl EmailChannel {
 impl NotificationChannel for EmailChannel {
     fn name(&self) -> &'static str {
         "email"
+    }
+
+    async fn check_health(&self) -> Result<String, String> {
+        self.mailer.check_health().await
     }
 
     async fn deliver(&self, _db: &DatabaseConnection, msg: &OutgoingMessage) -> Vec<DeliveryResult> {
