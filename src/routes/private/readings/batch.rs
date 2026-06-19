@@ -274,43 +274,19 @@ pub async fn insert_batch_readings(
             }
         }
         if !derived_sites.is_empty() {
-            let job_total =
-                i32::try_from(derived_sites.values().map(Vec::len).sum::<usize>()).unwrap_or(i32::MAX);
-            crate::routes::private::reprocessing_jobs::lifecycle::spawn_tracked_job_ctx(
+            let site_timestamps: Vec<serde_json::Value> = derived_sites
+                .iter()
+                .map(|(site_id, timestamps)| {
+                    serde_json::json!({ "site_id": site_id, "timestamps": timestamps })
+                })
+                .collect();
+            crate::routes::private::reprocessing_jobs::worker::enqueue(
                 &state.db,
-                None,
                 "batch_derived",
                 None,
-                state.events.clone(),
-                move |ctx| {
-                    let derived_sites = derived_sites.clone();
-                    async move {
-                        ctx.set_progress(0, Some(job_total)).await;
-                        let mut progress = 0i32;
-                        'outer: for (site_id, timestamps) in derived_sites {
-                            for time in timestamps {
-                                if ctx.is_cancelled() {
-                                    break 'outer;
-                                }
-                                if let Err(e) =
-                                    crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
-                                        ctx.db(), site_id, time,
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(error = %e, site_id = %site_id, time = %time, "Failed to auto-compute derived values after batch insert");
-                                }
-                                progress += 1;
-                                if progress % 500 == 0 {
-                                    ctx.set_progress(progress, Some(job_total)).await;
-                                }
-                            }
-                        }
-                        crate::common::sync_state::refresh_continuous_aggregates(ctx.db(), earliest).await;
-                        ctx.set_progress(progress, Some(job_total)).await;
-                        Ok(i64::from(progress))
-                    }
-                },
+                None,
+                &serde_json::json!({ "site_timestamps": site_timestamps }),
+                None,
             )
             .await?;
         }
