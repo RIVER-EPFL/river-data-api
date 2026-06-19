@@ -12,9 +12,6 @@ use crate::common::middleware::ProjectScope;
 use crate::routes::private::{data_streams, site_parameters};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::operations::{close_sensor_deployment, create_sensor_for_stream};
-use crate::routes::private::sensor_calibrations::services::{
-    reprocess_site_parameter_readings, spawn_tracked_job,
-};
 use crate::common::sync_state::refresh_continuous_aggregates_full;
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -408,17 +405,13 @@ pub async fn pair_stream(
     if backfilled > 0 {
         let slot_site = sp.site_id;
         let slot_param = sp.parameter_id;
-        spawn_tracked_job(
+        crate::routes::private::reprocessing_jobs::worker::enqueue(
             db,
-            None,
             "pairing_backfill",
+            None,
             Some(stream_id),
-            state.events.clone(),
-            move |db| async move {
-                reprocess_site_parameter_readings(&db, slot_site, slot_param)
-                    .await
-                    .map(|c| c as i64)
-            },
+            &serde_json::json!({ "site_id": slot_site, "parameter_id": slot_param }),
+            None,
         )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;

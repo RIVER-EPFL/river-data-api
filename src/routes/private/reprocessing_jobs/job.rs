@@ -127,6 +127,12 @@ pub fn build_registry() -> JobRegistry {
     }
     registry.register(Arc::new(super::jobs::RefreshAggregates::incremental()));
     registry.register(Arc::new(super::jobs::RefreshAggregates::full()));
+    for trigger in ["sensor_swap", "pairing_backfill", "manual_adopt"] {
+        registry.register(Arc::new(super::jobs::ReprocessSlot::new(trigger)));
+    }
+    for trigger in ["deployment_create", "deployment_update", "deployment_delete"] {
+        registry.register(Arc::new(super::jobs::ReprocessDeployment::new(trigger)));
+    }
     registry
 }
 

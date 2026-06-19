@@ -4,11 +4,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
 use super::model::SensorDeployment;
-use crate::common::{EventSender, global_event_sender};
-use crate::routes::private::sensor_calibrations::services::{
-    recompute_deployed_until, reprocess_sensor_readings, reprocess_site_parameter_readings,
-    spawn_tracked_job,
-};
+use crate::routes::private::sensor_calibrations::services::recompute_deployed_until;
 
 pub struct SensorDeploymentOperations;
 
@@ -23,32 +19,14 @@ async fn spawn_slot_reprocess(
     site_id: Uuid,
     trigger_type: &str,
     trigger_id: Uuid,
-    events: EventSender,
 ) -> Result<(), sea_orm::DbErr> {
-    let param: Option<Uuid> = db
-        .query_one(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT parameter_id FROM sensors WHERE id = $1",
-            [sensor_id.into()],
-        ))
-        .await?
-        .and_then(|r| r.try_get::<Uuid>("", "parameter_id").ok());
-
-    spawn_tracked_job(
+    crate::routes::private::reprocessing_jobs::worker::enqueue(
         db,
-        Some(sensor_id),
         trigger_type,
+        Some(sensor_id),
         Some(trigger_id),
-        events,
-        move |db| async move {
-            let n = if let Some(parameter_id) = param {
-                reprocess_site_parameter_readings(&db, site_id, parameter_id).await? as i64
-            } else {
-                0
-            };
-            reprocess_sensor_readings(&db, sensor_id).await?;
-            Ok(n)
-        },
+        &serde_json::json!({ "sensor_id": sensor_id, "site_id": site_id }),
+        None,
     )
     .await?;
     Ok(())
@@ -241,11 +219,9 @@ impl CRUDOperations for SensorDeploymentOperations {
             .await
             .map_err(ApiError::database)?;
 
-        if let Some(events) = global_event_sender() {
-            spawn_slot_reprocess(db, entity.sensor_id, entity.site_id, "deployment_create", entity.id, events)
-                .await
-                .map_err(ApiError::database)?;
-        }
+        spawn_slot_reprocess(db, entity.sensor_id, entity.site_id, "deployment_create", entity.id)
+            .await
+            .map_err(ApiError::database)?;
 
         Ok(())
     }
@@ -259,11 +235,9 @@ impl CRUDOperations for SensorDeploymentOperations {
             .await
             .map_err(ApiError::database)?;
 
-        if let Some(events) = global_event_sender() {
-            spawn_slot_reprocess(db, entity.sensor_id, entity.site_id, "deployment_update", entity.id, events)
-                .await
-                .map_err(ApiError::database)?;
-        }
+        spawn_slot_reprocess(db, entity.sensor_id, entity.site_id, "deployment_update", entity.id)
+            .await
+            .map_err(ApiError::database)?;
 
         Ok(())
     }
@@ -317,11 +291,9 @@ impl CRUDOperations for SensorDeploymentOperations {
             .await
             .map_err(ApiError::database)?;
 
-        if let Some(events) = global_event_sender() {
-            spawn_slot_reprocess(db, sensor_id, site_id, "deployment_delete", id, events)
-                .await
-                .map_err(ApiError::database)?;
-        }
+        spawn_slot_reprocess(db, sensor_id, site_id, "deployment_delete", id)
+            .await
+            .map_err(ApiError::database)?;
 
         Ok(id)
     }

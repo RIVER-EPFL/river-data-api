@@ -14,10 +14,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, sensor_in_scope};
 use crate::error::{AppError, AppResult};
-use crate::routes::private::sensor_calibrations::services::{
-    recompute_deployed_until, reprocess_sensor_readings, reprocess_site_parameter_readings,
-    spawn_tracked_job,
-};
+use crate::routes::private::sensor_calibrations::services::recompute_deployed_until;
 use crate::routes::private::{parameters, site_parameters};
 
 fn default_true() -> bool {
@@ -253,20 +250,21 @@ pub async fn adopt_sensor(
     // deployed_from stamps the sensor onto previously unattributed (sensor_id NULL) history. The
     // per-sensor pass then reconciles the sensor's own rows at any vacated slot.
     let adopt_site_id = payload.site_id;
-    let job_id = spawn_tracked_job(
+    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
         db,
-        Some(sensor_id),
         "manual_adopt",
+        Some(sensor_id),
         Some(dep_id),
-        app_state.events.clone(),
-        move |db| async move {
-            let n = reprocess_site_parameter_readings(&db, adopt_site_id, parameter_id).await? as i64;
-            reprocess_sensor_readings(&db, sensor_id).await?;
-            Ok(n)
-        },
+        &serde_json::json!({
+            "site_id": adopt_site_id,
+            "parameter_id": parameter_id,
+            "sensor_id": sensor_id,
+        }),
+        None,
     )
     .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
+    .map_err(|e| AppError::Internal(e.to_string()))?
+    .ok_or_else(|| AppError::Internal("failed to enqueue adopt job".to_string()))?;
 
     Ok(Json(AdoptResponse {
         deployment_id: dep_id,
@@ -474,20 +472,17 @@ pub async fn swap_sensors(
     // deployment window covers each time — so the outgoing sensor's post-swap readings re-attribute
     // to the incoming sensor (a per-sensor reprocess can't, since those rows still carry sensor A).
     let site_id = payload.site_id;
-    let job_id = spawn_tracked_job(
+    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
         db,
-        None,
         "sensor_swap",
+        None,
         Some(site_parameter_id),
-        app_state.events.clone(),
-        move |db| async move {
-            reprocess_site_parameter_readings(&db, site_id, parameter_id)
-                .await
-                .map(|c| c as i64)
-        },
+        &serde_json::json!({ "site_id": site_id, "parameter_id": parameter_id }),
+        None,
     )
     .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
+    .map_err(|e| AppError::Internal(e.to_string()))?
+    .ok_or_else(|| AppError::Internal("failed to enqueue swap job".to_string()))?;
 
     Ok(Json(SwapResponse {
         ended_deployment_id,

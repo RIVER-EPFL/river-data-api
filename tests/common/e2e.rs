@@ -42,7 +42,7 @@ pub async fn wait_for_jobs_by_trigger(db: &sea_orm::DatabaseConnection, trigger_
             .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT \
-                   COUNT(*) FILTER (WHERE status IN ('pending','running')) AS active, \
+                   COUNT(*) FILTER (WHERE status IN ('queued','pending','running')) AS active, \
                    COUNT(*) FILTER (WHERE status = 'failed') AS failed, \
                    COUNT(*) AS total \
                  FROM reprocessing_jobs WHERE trigger_type = $1",
