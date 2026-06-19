@@ -260,6 +260,13 @@ async fn execute(
             let readings = i32::try_from(count).unwrap_or(i32::MAX);
             let owned = commit_terminal(db, &claimed, worker_id, status, Some(readings), None).await?;
             if owned {
+                // Mirror the inline lifecycle's post-success reconcile. Most tracked jobs rewrite
+                // reading values or attribution (recalibration, reprocess, pairing/derived backfill,
+                // merge, adopt/swap), any of which can change breach state. Reconcile unconditionally:
+                // it is idempotent, O(active slots), spawns no jobs (no recursion), and is merely
+                // redundant for jobs that don't touch values. Guarded on `owned` so only the winning
+                // worker runs it.
+                crate::routes::private::alarms::sweeper::reconcile_all_and_notify(db, events).await;
                 let _ = events.send(crate::common::AppEvent::JobCompleted {
                     job_id: claimed.id,
                     status: status.to_string(),
