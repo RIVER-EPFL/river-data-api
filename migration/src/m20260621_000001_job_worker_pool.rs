@@ -34,10 +34,10 @@ impl MigrationTrait for Migration {
         )
         .await?;
 
-        // Claim path: pending rows that have come due (`next_attempt_at <= now()`).
+        // Claim path: queued rows that have come due (`next_attempt_at <= now()`).
         db.execute_unprepared(
             "CREATE INDEX IF NOT EXISTS idx_reprocessing_jobs_claimable \
-             ON reprocessing_jobs (next_attempt_at) WHERE status = 'pending'",
+             ON reprocessing_jobs (next_attempt_at) WHERE status = 'queued'",
         )
         .await?;
 

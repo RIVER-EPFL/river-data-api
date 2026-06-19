@@ -1,15 +1,6 @@
-//! The claim-based multi-replica worker pool (ADR 0001).
-//!
-//! Each API replica runs one [`run`] loop. It claims a due (or reapable) `reprocessing_jobs` row with
-//! a single `SELECT … FOR UPDATE SKIP LOCKED` + `UPDATE` — so two replicas never take the same row —
-//! takes a lease it heartbeats while running, dispatches to the [`Job`](super::job::Job) registered
-//! for the row's `trigger_type`, and commits the terminal status **ownership-guarded** (`WHERE owner
-//! = me AND lease_epoch = mine`) so a job reaped out from under a stalled worker can't clobber the new
-//! owner's result. A dead or CPU-throttled worker's lease simply expires and any replica reclaims the
-//! row — the same claim query is the reaper.
-//!
-//! Idempotency + the ownership-guarded commit are what make the rare stalled-worker overlap harmless;
-//! the lease timeout only governs how fast recovery happens, never correctness.
+//! Claim-based multi-replica worker pool: each replica claims a `queued` (or reapable) job with
+//! `SELECT … FOR UPDATE SKIP LOCKED`, leases it, and commits ownership-guarded so a reaped stalled
+//! worker can't clobber the new owner. Idempotency makes the rare overlap harmless. See ADR 0001.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -36,10 +27,9 @@ pub fn worker_id() -> String {
     format!("worker-{}-{}", std::process::id(), &uuid[..8])
 }
 
-/// Enqueue a job as a `pending` row for the worker pool to claim. When `dedupe_key` is set the
-/// enqueue is idempotent via the partial unique index — a second enqueue with the same key inserts
-/// nothing and returns `None` (this is how the scheduler keeps two replicas racing a tick from
-/// double-firing one scheduled run). Returns `Some(id)` for the row this call inserted.
+/// Enqueue a `queued` job for the worker pool. A set `dedupe_key` makes the enqueue idempotent (a
+/// duplicate inserts nothing and returns `None`), which keeps two replicas racing a scheduler tick
+/// from double-firing one run.
 pub async fn enqueue(
     db: &DatabaseConnection,
     trigger_type: &str,
@@ -56,7 +46,7 @@ pub async fn enqueue(
             "INSERT INTO reprocessing_jobs \
                  (id, trigger_type, sensor_id, trigger_id, status, category, params, dedupe_key, \
                   next_attempt_at) \
-             VALUES ($1, $2, $3, $4, 'pending', $5, $6::jsonb, $7, now()) \
+             VALUES ($1, $2, $3, $4, 'queued', $5, $6::jsonb, $7, now()) \
              ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING \
              RETURNING id",
             [
@@ -80,9 +70,8 @@ struct Claimed {
     lease_epoch: i64,
 }
 
-/// Atomically claim one due `pending` row **or** one expired-lease `running` row (the reaper arm),
-/// stamping this worker's ownership and a fresh lease + bumped epoch. `SKIP LOCKED` guarantees two
-/// concurrent workers never take the same row. Returns `None` when nothing is claimable.
+/// Claim one due `queued` row or one expired-lease `running` row (the reaper arm), stamping this
+/// worker's ownership and a fresh lease. `SKIP LOCKED` keeps two workers from taking the same row.
 async fn claim_one(
     db: &DatabaseConnection,
     worker_id: &str,
@@ -92,7 +81,7 @@ async fn claim_one(
             sea_orm::DatabaseBackend::Postgres,
             "WITH claimable AS ( \
                  SELECT id FROM reprocessing_jobs \
-                 WHERE (status = 'pending' AND next_attempt_at <= now()) \
+                 WHERE (status = 'queued' AND next_attempt_at <= now()) \
                     OR (status = 'running' AND lease_expires_at < now()) \
                  ORDER BY next_attempt_at \
                  FOR UPDATE SKIP LOCKED \
@@ -210,7 +199,7 @@ async fn reschedule_or_fail(
     db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "UPDATE reprocessing_jobs \
-         SET status = CASE WHEN retry_count < $1 THEN 'pending' ELSE 'failed' END, \
+         SET status = CASE WHEN retry_count < $1 THEN 'queued' ELSE 'failed' END, \
              retry_count = retry_count + 1, \
              error_message = $2, \
              next_attempt_at = CASE WHEN retry_count < $1 \
