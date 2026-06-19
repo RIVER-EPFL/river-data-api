@@ -198,3 +198,33 @@ async fn resolved_alarm_sends_resolution_notice() {
         "resolution_notified_at stamped"
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn concurrent_dispatchers_send_each_event_once() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    insert_open_event(&db).await;
+
+    // Two replicas drain the same outbox at once; the FOR UPDATE SKIP LOCKED claim must let only one
+    // send. A shared sink counts every send across both.
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let ch_a = channels(&sent, false);
+    let ch_b = channels(&sent, false);
+    let cfg = state.config.clone();
+    tokio::join!(
+        dispatcher::dispatch_once(&db, &ch_a, cfg.as_ref()),
+        dispatcher::dispatch_once(&db, &ch_b, cfg.as_ref()),
+    );
+
+    let opened = sent.lock().unwrap().iter().filter(|m| m.kind == "alarm_opened").count();
+    assert_eq!(opened, 1, "exactly one replica sends the alarm — no duplicate alerts");
+    assert_eq!(
+        count(&db, "notified_at IS NULL AND resolved_at IS NULL").await,
+        0,
+        "the event is stamped exactly once"
+    );
+}

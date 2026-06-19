@@ -115,15 +115,20 @@ async fn process_pending(
 
     let column = if opened { "notified_at" } else { "resolution_notified_at" };
 
-    // Suppressed by a mute: stamp so we neither send now nor re-pick later.
+    // Suppressed by a mute: stamp so neither this replica nor a peer sends or re-picks it.
     let muted_ids: Vec<Uuid> = muted.iter().map(|r| r.id).collect();
     stamp(db, column, &muted_ids).await?;
 
     // One message per event so each carries its own slot — fan-out is per-subscriber by scope, which
-    // a single batched message spanning multiple slots couldn't express.
+    // a single batched message spanning multiple slots couldn't express. Each event is CLAIMED with an
+    // atomic stamp before the send, so at 2-3 replicas exactly one replica owns it; a transient send
+    // failure releases the claim so the next tick retries (at-least-once). The claim is one autocommit
+    // UPDATE — no DB connection is held across the external send.
     let base = config.dashboard_base_url.as_deref();
-    let mut to_stamp: Vec<Uuid> = Vec::new();
     for r in &to_notify {
+        if !claim_event(db, column, r.id).await? {
+            continue; // a peer replica already claimed this event
+        }
         let events = [r.event.clone()];
         let mut msg = if opened {
             messages::render_opened(&events, base)
@@ -135,11 +140,10 @@ async fn process_pending(
             site_id: r.slot.0,
             parameter_id: r.slot.1,
         });
-        if deliver(db, channels, &msg, Some(r.id)).await {
-            to_stamp.push(r.id);
+        if !deliver(db, channels, &msg, Some(r.id)).await {
+            release_claim(db, column, r.id).await?;
         }
     }
-    stamp(db, column, &to_stamp).await?;
     Ok(())
 }
 
@@ -272,6 +276,28 @@ async fn stamp(db: &DatabaseConnection, column: &str, ids: &[Uuid]) -> Result<()
     );
     let values: Vec<sea_orm::Value> = ids.iter().map(|id| (*id).into()).collect();
     db.execute(Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, &sql, values))
+        .await?;
+    Ok(())
+}
+
+/// Atomically claim one outbox event by stamping its sent-marker column iff still NULL. The single
+/// replica whose UPDATE flips it from NULL wins (gets a RETURNING row) and sends; a peer that lost the
+/// race gets no row and skips. `column` is an internal literal, never user input.
+async fn claim_event(db: &DatabaseConnection, column: &str, id: Uuid) -> Result<bool, DbErr> {
+    let sql = format!(
+        "UPDATE alarm_events SET {column} = NOW(), updated_at = NOW() \
+         WHERE id = $1 AND {column} IS NULL RETURNING id"
+    );
+    let row = db
+        .query_one(Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, &sql, [id.into()]))
+        .await?;
+    Ok(row.is_some())
+}
+
+/// Release a claim after an all-channel send failure so the next tick retries it (at-least-once).
+async fn release_claim(db: &DatabaseConnection, column: &str, id: Uuid) -> Result<(), DbErr> {
+    let sql = format!("UPDATE alarm_events SET {column} = NULL WHERE id = $1");
+    db.execute(Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, &sql, [id.into()]))
         .await?;
     Ok(())
 }
