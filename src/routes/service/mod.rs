@@ -255,6 +255,18 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route("/version", get(crate::routes::version::get_version))
         .route("/actions/backfill_candidates", get(actions::backfill_candidates))
         .route("/actions/calibration_candidates", get(actions::calibration_candidates))
+        .route(
+            "/schedules",
+            get(crate::routes::private::reprocessing_jobs::schedule_routes::list_schedules),
+        )
+        .route(
+            "/schedules/{job_name}",
+            get(crate::routes::private::reprocessing_jobs::schedule_routes::get_schedule),
+        )
+        .route(
+            "/schedules/{job_name}/audit",
+            get(crate::routes::private::reprocessing_jobs::schedule_routes::get_schedule_audit),
+        )
         .layer(middleware::from_fn(require_read_metadata))
         .with_state(state.clone());
 
@@ -290,6 +302,14 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route(
             "/reprocessing_jobs/{id}/cancel",
             post(crate::routes::private::reprocessing_jobs::routes::cancel_job),
+        )
+        .route(
+            "/schedules/{job_name}",
+            patch(crate::routes::private::reprocessing_jobs::schedule_routes::update_schedule),
+        )
+        .route(
+            "/schedules/{job_name}/run_now",
+            post(crate::routes::private::reprocessing_jobs::schedule_routes::run_now),
         )
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(middleware::from_fn(deny_scoped_token))
