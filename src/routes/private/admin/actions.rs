@@ -9,7 +9,6 @@ use crate::common::middleware::{DenyScoped, ProjectScope, enforce_project_scope_
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensor_calibrations::services::{
     evaluate_formula, recompute_deployed_until, recompute_valid_until, reprocess_sensor_readings,
-    spawn_tracked_job,
 };
 
 #[derive(Debug, Deserialize, ToSchema)]
