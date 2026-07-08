@@ -124,6 +124,7 @@ pub fn build_registry() -> JobRegistry {
         "calibration_create",
         "calibration_update",
         "calibration_delete",
+        "calibration_recalculate",
     ] {
         registry.register(Arc::new(super::jobs::ReprocessSensor::new(trigger)));
     }

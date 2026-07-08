@@ -143,7 +143,7 @@ pub async fn rerun_job(
         .db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT trigger_type, sensor_id, trigger_id FROM reprocessing_jobs WHERE id = $1",
+            "SELECT trigger_type, sensor_id, trigger_id, params FROM reprocessing_jobs WHERE id = $1",
             [id.into()],
         ))
         .await?
@@ -152,6 +152,7 @@ pub async fn rerun_job(
     let trigger_type: String = row.try_get("", "trigger_type")?;
     let sensor_id: Option<Uuid> = row.try_get("", "sensor_id")?;
     let trigger_id: Option<Uuid> = row.try_get("", "trigger_id")?;
+    let params: serde_json::Value = row.try_get("", "params").unwrap_or(serde_json::Value::Null);
 
     if !super::registry::is_rerunnable(&trigger_type) {
         return Err(AppError::Conflict(format!(
@@ -183,74 +184,15 @@ pub async fn rerun_job(
         ));
     }
 
-    let new_id = dispatch_rerun(&state, &trigger_type, sensor_id, trigger_id)
+    // Replay the original job from its persisted params: the row already carries the exact
+    // `trigger_type`/`sensor_id`/`trigger_id`/`params` the first run used, so first-run and rerun
+    // share the single leased `enqueue` path (no separate reconstruction, no inline spawn).
+    let new_id = super::worker::enqueue(&state.db, &trigger_type, sensor_id, trigger_id, &params, None)
         .await?
-        .ok_or_else(|| {
-            AppError::Conflict("job is missing the data needed to rerun".to_string())
-        })?;
+        .ok_or_else(|| AppError::Conflict("an equivalent job is already in flight".to_string()))?;
 
     Ok(Json(RerunResponse {
         job_id: new_id,
-        status: "pending".to_string(),
+        status: "queued".to_string(),
     }))
-}
-
-/// Reconstruct and spawn a fresh job equivalent to a rerunnable one, from its stored ids. Returns
-/// `None` when a required id is absent (e.g. a sensor job with no `sensor_id`).
-async fn dispatch_rerun(
-    state: &AppState,
-    trigger_type: &str,
-    sensor_id: Option<Uuid>,
-    trigger_id: Option<Uuid>,
-) -> Result<Option<Uuid>, sea_orm::DbErr> {
-    use crate::routes::private::sensor_calibrations::services::spawn_reprocessing_job;
-
-    let job = match trigger_type {
-        "refresh_aggregates" => spawn_refresh_job(state, false).await?,
-        "refresh_aggregates_full" => spawn_refresh_job(state, true).await?,
-        "derived_recompute" => match trigger_id {
-            Some(def) => {
-                crate::routes::private::admin::derived::spawn_recompute_derived(
-                    &state.db,
-                    state.events.clone(),
-                    def,
-                )
-                .await?
-            }
-            None => return Ok(None),
-        },
-        // Everything else rerunnable is a sensor reprocess keyed by sensor_id.
-        _ => match sensor_id {
-            Some(sid) => {
-                spawn_reprocessing_job(&state.db, sid, trigger_type, trigger_id, state.events.clone())
-                    .await?
-            }
-            None => return Ok(None),
-        },
-    };
-    Ok(Some(job))
-}
-
-async fn spawn_refresh_job(state: &AppState, full: bool) -> Result<Uuid, sea_orm::DbErr> {
-    let trigger_type = if full {
-        "refresh_aggregates_full"
-    } else {
-        "refresh_aggregates"
-    };
-    crate::routes::private::reprocessing_jobs::lifecycle::spawn_tracked_job(
-        &state.db,
-        None,
-        trigger_type,
-        None,
-        state.events.clone(),
-        move |db| async move {
-            if full {
-                crate::common::sync_state::refresh_continuous_aggregates_full(&db).await;
-            } else {
-                crate::common::sync_state::refresh_continuous_aggregates(&db, None).await;
-            }
-            Ok(0)
-        },
-    )
-    .await
 }

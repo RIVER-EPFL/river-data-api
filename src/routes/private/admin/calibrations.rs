@@ -5,12 +5,11 @@ use axum::{
 use sea_orm::{ConnectionTrait, Statement};
 use uuid::Uuid;
 
-use crate::common::{AppState, global_event_sender};
+use crate::common::AppState;
 use crate::error::AppResult;
-use crate::routes::private::sensor_calibrations::services::spawn_reprocessing_job;
 
 /// Reprocess readings for the sensor owning a specific calibration.
-/// Spawns a tracked background job and returns immediately.
+/// Enqueues a tracked worker job and returns immediately.
 #[utoipa::path(
     post,
     path = "/actions/sensor_calibrations/{id}/recalculate",
@@ -44,18 +43,17 @@ pub async fn recalculate_calibration(
         .try_get("", "sensor_id")
         .map_err(|e| crate::error::AppError::Internal(e.to_string()))?;
 
-    let events = global_event_sender()
-        .ok_or_else(|| crate::error::AppError::Internal("Event sender not available".into()))?;
-
-    let job_id = spawn_reprocessing_job(
+    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
         &state.db,
-        sensor_id,
         "calibration_recalculate",
+        Some(sensor_id),
         Some(id),
-        events,
+        &serde_json::json!({ "sensor_id": sensor_id }),
+        None,
     )
     .await
-    .map_err(|e| crate::error::AppError::Internal(e.to_string()))?;
+    .map_err(|e| crate::error::AppError::Internal(e.to_string()))?
+    .ok_or_else(|| crate::error::AppError::Internal("enqueue returned no id".into()))?;
 
     Ok(Json(serde_json::json!({ "job_id": job_id })))
 }
