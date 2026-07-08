@@ -3,10 +3,10 @@
 //! entity-resolution rules (reuse existing site by case-insensitive name, reuse parameter via alias,
 //! coordinate backfill). A single full-permission API token drives every route.
 //!
-//! Apply spawns a post-commit reprocess + aggregate refresh; assertions here only touch the
-//! synchronously-committed facts (pairing, backfilled site_id/parameter_id, plan status,
-//! ApplyResult). Revert refreshes aggregates synchronously, so its assertions are immediately
-//! consistent.
+//! Apply and revert run as tracked `plan_apply`/`plan_revert` jobs: the endpoint returns a `job_id`
+//! and the pairing, backfill, and plan status transition happen in the job. `run_plan_action` posts
+//! the action, waits for the job to reach `completed`, and returns its `detail.counts` — so count
+//! assertions read the job detail and DB-fact assertions run only after the job has finished.
 //!
 //! Run: cargo test --test e2e -- --test-threads=1
 
@@ -30,6 +30,37 @@ fn find_entry<'a>(plan: &'a serde_json::Value, stream_id: &str) -> &'a serde_jso
         .iter()
         .find(|e| e["stream_id"] == serde_json::json!(stream_id))
         .unwrap_or_else(|| panic!("entry for stream {stream_id} missing: {plan}"))
+}
+
+/// Post `apply`/`revert` on a plan (both run as tracked `plan_apply`/`plan_revert` jobs), wait for
+/// the job to reach `completed`, and return its `detail.counts` object. The heavy work — pairing,
+/// backfill, and the plan status transition — happens in the job, so DB-fact assertions run only
+/// after this returns.
+async fn run_plan_action(
+    app: &axum::Router,
+    token: &str,
+    plan_id: &str,
+    action: &str,
+) -> serde_json::Value {
+    let (status, res) = crate::common::post_json_parse_with_token(
+        app,
+        &format!("/api/sync/pairing-plans/{plan_id}/{action}"),
+        &serde_json::json!({}),
+        token,
+    )
+    .await;
+    assert_eq!(status, 200, "{action} ({status}): {res}");
+    let job_id = res["job_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{action} returns a job_id: {res}"));
+    assert_eq!(
+        crate::common::e2e::poll_job(app, token, job_id, 30).await,
+        "completed",
+        "{action} job completes",
+    );
+    let (_, job) =
+        crate::common::get_json_with_token(app, &format!("/api/reprocessing_jobs/{job_id}"), token).await;
+    job["detail"]["counts"].clone()
 }
 
 #[tokio::test]
@@ -141,17 +172,14 @@ async fn create_inspect_update_apply_revert_full_lifecycle() {
     assert_eq!(e["parameter"]["id"], serde_json::json!(cond_param), "mapped to existing param");
     assert_eq!(e["parameter"]["create"], false);
 
-    // apply
-    let (status, res) = crate::common::post_json_parse_with_token(
-        &app, &format!("/api/sync/pairing-plans/{plan_id}/apply"), &serde_json::json!({}), &token,
-    ).await;
-    assert_eq!(status, 200, "apply ({status}): {res}");
-    assert_eq!(res["streams_paired"], 4);
-    assert_eq!(res["sites_created"], 2);
-    assert_eq!(res["projects_created"], 1);
-    assert_eq!(res["parameters_created"], 1, "only Temperature is new; Conductivity reused: {res}");
-    assert_eq!(res["site_parameters_created"], 4);
-    assert_eq!(res["readings_backfilled"], 12);
+    // apply (runs as a plan_apply job)
+    let counts = run_plan_action(&app, &token, &plan_id, "apply").await;
+    assert_eq!(counts["streams_paired"], 4);
+    assert_eq!(counts["sites_created"], 2);
+    assert_eq!(counts["projects_created"], 1);
+    assert_eq!(counts["parameters_created"], 1, "only Temperature is new; Conductivity reused: {counts}");
+    assert_eq!(counts["site_parameters_created"], 4);
+    assert_eq!(counts["readings_backfilled"], 12);
 
     assert_eq!(
         count(&db, &format!(
@@ -179,12 +207,9 @@ async fn create_inspect_update_apply_revert_full_lifecycle() {
     ).await;
     assert_eq!(status, 400, "cannot re-apply an applied plan");
 
-    // revert
-    let (status, body) = crate::common::post_json_parse_with_token(
-        &app, &format!("/api/sync/pairing-plans/{plan_id}/revert"), &serde_json::json!({}), &token,
-    ).await;
-    assert_eq!(status, 200, "revert ({status}): {body}");
-    assert_eq!(body["reverted"], 4);
+    // revert (runs as a plan_revert job)
+    let counts = run_plan_action(&app, &token, &plan_id, "revert").await;
+    assert_eq!(counts["reverted"], 4);
     assert_eq!(
         count(&db, &format!(
             "SELECT count(*) AS c FROM readings r JOIN data_streams ds ON r.stream_id = ds.id \
@@ -234,12 +259,9 @@ async fn apply_reuses_existing_site_by_case_insensitive_name() {
     assert_eq!(status, 200, "create ({status}): {plan}");
     let plan_id = plan["id"].as_str().unwrap().to_string();
 
-    let (status, res) = crate::common::post_json_parse_with_token(
-        &app, &format!("/api/sync/pairing-plans/{plan_id}/apply"), &serde_json::json!({}), &token,
-    ).await;
-    assert_eq!(status, 200, "apply ({status}): {res}");
-    assert_eq!(res["sites_created"], 0, "existing site reused by case-insensitive name");
-    assert_eq!(res["projects_created"], 0, "existing project reused");
+    let counts = run_plan_action(&app, &token, &plan_id, "apply").await;
+    assert_eq!(counts["sites_created"], 0, "existing site reused by case-insensitive name");
+    assert_eq!(counts["projects_created"], 0, "existing project reused");
 
     assert_eq!(
         count(&db, &format!(
@@ -274,11 +296,8 @@ async fn apply_reuses_existing_parameter_via_alias() {
     assert_eq!(status, 200, "create ({status}): {plan}");
     let plan_id = plan["id"].as_str().unwrap().to_string();
 
-    let (status, res) = crate::common::post_json_parse_with_token(
-        &app, &format!("/api/sync/pairing-plans/{plan_id}/apply"), &serde_json::json!({}), &token,
-    ).await;
-    assert_eq!(status, 200, "apply ({status}): {res}");
-    assert_eq!(res["parameters_created"], 0, "parameter reused via alias match");
+    let counts = run_plan_action(&app, &token, &plan_id, "apply").await;
+    assert_eq!(counts["parameters_created"], 0, "parameter reused via alias match");
     assert_eq!(
         count(&db, &format!(
             "SELECT count(*) AS c FROM data_streams ds JOIN site_parameters sp ON ds.site_parameter_id = sp.id \
@@ -306,10 +325,7 @@ async fn apply_creates_new_site_with_metadata_coordinates() {
     ).await;
     assert_eq!(status, 200, "create ({status}): {plan}");
     let plan_id = plan["id"].as_str().unwrap().to_string();
-    let (status, res) = crate::common::post_json_parse_with_token(
-        &app, &format!("/api/sync/pairing-plans/{plan_id}/apply"), &serde_json::json!({}), &token,
-    ).await;
-    assert_eq!(status, 200, "apply ({status}): {res}");
+    run_plan_action(&app, &token, &plan_id, "apply").await;
 
     assert_eq!(
         count(&db, "SELECT count(*) AS c FROM sites WHERE LOWER(name) = 'newsite' AND latitude = 46.25 AND altitude_m = 2100.0").await,
@@ -341,10 +357,7 @@ async fn apply_backfills_coordinates_onto_existing_site_lacking_them() {
     ).await;
     assert_eq!(status, 200, "create ({status}): {plan}");
     let plan_id = plan["id"].as_str().unwrap().to_string();
-    let (status, res) = crate::common::post_json_parse_with_token(
-        &app, &format!("/api/sync/pairing-plans/{plan_id}/apply"), &serde_json::json!({}), &token,
-    ).await;
-    assert_eq!(status, 200, "apply ({status}): {res}");
+    run_plan_action(&app, &token, &plan_id, "apply").await;
 
     assert_eq!(
         count(&db, &format!(
