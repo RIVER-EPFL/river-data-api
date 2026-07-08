@@ -71,10 +71,9 @@ pub struct CancelResponse {
 
 /// `POST /api/reprocessing_jobs/{id}/cancel` — cooperatively cancel a job. A `queued` job (not yet
 /// claimed) is cancelled outright; a `running` worker-pool job is signalled via the `cancel_requested`
-/// column, which the owning replica's heartbeat observes and the job honors at its next checkpoint.
-/// `request_cancel` stays as a same-replica fast path for inline jobs. 409 if the type isn't
-/// cancellable or the job isn't in a cancellable state; 404 if the id is unknown. Requires
-/// `write_metadata`.
+/// column, which the owning replica's heartbeat observes (possibly on a different replica) and the job
+/// honors at its next checkpoint. 409 if the type isn't cancellable or the job isn't in a cancellable
+/// state; 404 if the id is unknown. Requires `write_metadata`.
 pub async fn cancel_job(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -112,10 +111,7 @@ pub async fn cancel_job(
         .await?
         .rows_affected();
 
-    // Same-replica fast path for inline jobs (no lease/heartbeat to observe the flag).
-    let signalled_locally = super::lifecycle::request_cancel(id);
-
-    if flagged > 0 || signalled_locally {
+    if flagged > 0 {
         Ok(Json(CancelResponse {
             status: "cancelling".to_string(),
         }))

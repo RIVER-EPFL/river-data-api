@@ -40,19 +40,6 @@ fn deregister_cancel(job_id: Uuid) {
     cancel_registry().remove(&job_id);
 }
 
-/// Request cancellation of a running job. Returns `true` if a running job was signalled, `false` if
-/// no such job is in flight in this process (already finished, or never registered).
-#[must_use]
-pub fn request_cancel(job_id: Uuid) -> bool {
-    match cancel_registry().get(&job_id) {
-        Some(flag) => {
-            flag.store(true, Ordering::Relaxed);
-            true
-        }
-        None => false,
-    }
-}
-
 /// Retry policy for tracked jobs. Set once at startup from `Config`; code paths that don't run
 /// `main.rs` (integration tests) see the default — no retries — so their behavior is unchanged.
 #[derive(Debug, Clone, Copy)]
@@ -96,25 +83,6 @@ pub fn process_owner() -> &'static str {
             .filter(|h| !h.is_empty())
             .unwrap_or_else(|| format!("pid-{}", std::process::id()))
     })
-}
-
-/// Sweep inline jobs stranded mid-flight by a dead process to `interrupted` at startup. Only
-/// lease-less rows owned by THIS replica qualify — worker-pool jobs carry a lease (recovered by the
-/// reaper) and a peer's live inline jobs carry a different `owner`, so a restart can't strand or
-/// double-claim them. Runs after migrations, before serving.
-pub async fn reconcile_interrupted_jobs(db: &DatabaseConnection) -> Result<u64, sea_orm::DbErr> {
-    let res = db
-        .execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE reprocessing_jobs \
-             SET status = 'interrupted', completed_at = NOW(), \
-                 error_message = 'Interrupted by API restart' \
-             WHERE status IN ('pending', 'running', 'retrying') AND lease_expires_at IS NULL \
-               AND owner = $1",
-            [process_owner().into()],
-        ))
-        .await?;
-    Ok(res.rows_affected())
 }
 
 /// Handle passed to a tracked job's work closure. Owns a DB connection, the job id, and the event
@@ -560,7 +528,9 @@ where
         total: None,
     });
 
-    let cancel = register_cancel(job_id);
+    // A synchronous inline op (only the janitor uses this path) — not externally cancellable, so it
+    // carries a private flag rather than registering in a process-wide map.
+    let cancel = Arc::new(AtomicBool::new(false));
     let ctx = JobContext {
         db: db.clone(),
         job_id,
@@ -570,7 +540,7 @@ where
         params: serde_json::json!({}),
     };
 
-    let result = match work(ctx).await {
+    match work(ctx).await {
         Ok(count) => {
             let final_status = if cancel.load(Ordering::Relaxed) {
                 "cancelled"
@@ -618,9 +588,7 @@ where
             });
             Err(e)
         }
-    };
-    deregister_cancel(job_id);
-    result
+    }
 }
 
 /// Convenience adapter for jobs that only need a `DatabaseConnection` (no progress reporting), using
