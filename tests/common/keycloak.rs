@@ -77,6 +77,151 @@ pub async fn keycloak_reachable() -> bool {
     matches!(client.get(&url).send().await, Ok(r) if r.status().is_success())
 }
 
+/// Obtain a service-account admin token for the dev Keycloak's admin REST API (client credentials
+/// grant with the same confidential client the app's admin proxy uses).
+async fn get_keycloak_admin_token() -> String {
+    let url = format!(
+        "{}realms/{}/protocol/openid-connect/token",
+        keycloak_base_url(),
+        keycloak_realm()
+    );
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .form(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", &keycloak_admin_client_id()),
+            ("client_secret", &keycloak_admin_client_secret()),
+        ])
+        .send()
+        .await
+        .expect("Keycloak unreachable");
+    let body: serde_json::Value = resp.json().await.expect("Keycloak returned non-JSON");
+    body["access_token"]
+        .as_str()
+        .expect("no access_token in Keycloak admin response")
+        .to_string()
+}
+
+/// Idempotently ensure a realm user exists with the given password and EXACTLY the given
+/// `riverdata-*` realm roles (any other riverdata mappings are removed; unrelated realm roles are
+/// left alone). Lets tests provision fixture identities — e.g. a role-less user for the access
+/// gate — without a realm re-import (Keycloak's `--import-realm` skips existing realms).
+pub async fn ensure_realm_user(username: &str, password: &str, river_roles: &[&str]) {
+    let admin_token = get_keycloak_admin_token().await;
+    let base = format!("{}admin/realms/{}", keycloak_base_url(), keycloak_realm());
+    let client = reqwest::Client::new();
+
+    // A complete representation: missing profile fields or pending required actions make the
+    // password grant fail with "Account is not fully set up".
+    let representation = serde_json::json!({
+        "username": username,
+        "enabled": true,
+        "emailVerified": true,
+        "email": format!("{username}@test.local"),
+        "firstName": "Test",
+        "lastName": username,
+        "requiredActions": [],
+        "credentials": [{"type": "password", "value": password, "temporary": false}],
+    });
+    let create = client
+        .post(format!("{base}/users"))
+        .bearer_auth(&admin_token)
+        .json(&representation)
+        .send()
+        .await
+        .expect("Keycloak unreachable");
+    assert!(
+        create.status().is_success() || create.status() == reqwest::StatusCode::CONFLICT,
+        "user create failed: {}",
+        create.status()
+    );
+
+    let found: serde_json::Value = client
+        .get(format!("{base}/users?username={username}&exact=true"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("Keycloak unreachable")
+        .json()
+        .await
+        .expect("non-JSON user search");
+    let user_id = found[0]["id"].as_str().expect("user not found after create").to_string();
+
+    // Existing user: converge on the fixture representation (clears stale required actions) and
+    // make sure the password matches.
+    client
+        .put(format!("{base}/users/{user_id}"))
+        .bearer_auth(&admin_token)
+        .json(&representation)
+        .send()
+        .await
+        .expect("Keycloak unreachable");
+    client
+        .put(format!("{base}/users/{user_id}/reset-password"))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({"type": "password", "value": password, "temporary": false}))
+        .send()
+        .await
+        .expect("Keycloak unreachable");
+
+    let current: serde_json::Value = client
+        .get(format!("{base}/users/{user_id}/role-mappings/realm"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("Keycloak unreachable")
+        .json()
+        .await
+        .expect("non-JSON role mappings");
+    let stale: Vec<serde_json::Value> = current
+        .as_array()
+        .map(|roles| {
+            roles
+                .iter()
+                .filter(|r| {
+                    r["name"].as_str().is_some_and(|n| {
+                        n.starts_with("riverdata-") && !river_roles.contains(&n)
+                    })
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    if !stale.is_empty() {
+        client
+            .delete(format!("{base}/users/{user_id}/role-mappings/realm"))
+            .bearer_auth(&admin_token)
+            .json(&stale)
+            .send()
+            .await
+            .expect("Keycloak unreachable");
+    }
+
+    let mut to_add = Vec::new();
+    for role in river_roles {
+        let rep: serde_json::Value = client
+            .get(format!("{base}/roles/{role}"))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .expect("Keycloak unreachable")
+            .json()
+            .await
+            .expect("non-JSON role");
+        assert!(rep["id"].is_string(), "realm role {role} not found");
+        to_add.push(rep);
+    }
+    if !to_add.is_empty() {
+        client
+            .post(format!("{base}/users/{user_id}/role-mappings/realm"))
+            .bearer_auth(&admin_token)
+            .json(&to_add)
+            .send()
+            .await
+            .expect("Keycloak unreachable");
+    }
+}
+
 /// Obtain a real JWT via the resource-owner password grant against the configured Keycloak.
 pub async fn get_keycloak_jwt(username: &str, password: &str) -> String {
     let url = format!(

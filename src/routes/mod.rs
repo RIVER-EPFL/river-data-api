@@ -454,12 +454,15 @@ pub fn build_router(state: AppState) -> Router {
         if let Some(instance) = state.keycloak_auth_instance.clone() {
             use axum_keycloak_auth::{PassthroughMode, layer::KeycloakAuthLayer};
             r = r.layer(
+                // No `required_roles` here: the access gate lives in `service_auth_middleware`,
+                // which rejects role-less logins with a distinct 403 (`no_river_role`) instead of
+                // silently failing JWT validation and misreporting them as 401 via token auth.
+                // This also admits future role holders (e.g. admins without `riverdata-user`).
                 KeycloakAuthLayer::<crate::common::auth::Role>::builder()
                     .instance(instance)
                     .passthrough_mode(PassthroughMode::Pass)
                     .persist_raw_claims(false)
                     .expected_audiences(vec![String::from("account")])
-                    .required_roles(vec![crate::common::auth::Role::User])
                     .build(),
             );
         } else {

@@ -6,6 +6,7 @@
 #[allow(dead_code, unused_imports)]
 mod common;
 
+mod access_gate;
 mod keycloak_jwt_capability;
 mod malformed_and_revoked_rejection;
 mod middleware_and_permissions;

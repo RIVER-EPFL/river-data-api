@@ -92,13 +92,18 @@ impl AuthContext {
     }
 
     /// Whether this identity is granted a capability. The single source of truth for the
-    /// Keycloak-role-vs-token-permission policy: every authenticated Keycloak user may read and
-    /// write data, the Administrator role additionally writes metadata and holds `Admin`; an API
-    /// token is limited to whichever of its four permission bits are set and never holds `Admin`
-    /// (so a token can't reach token-minting / user-admin routes — defense in depth).
+    /// Keycloak-role-vs-token-permission policy: a Keycloak user must hold a `riverdata-*` role
+    /// to be granted ANYTHING (the realm is EPFL-federated — authentication alone is not
+    /// membership); members may read and write data, the Administrator role additionally writes
+    /// metadata and holds `Admin`; an API token is limited to whichever of its four permission
+    /// bits are set and never holds `Admin` (so a token can't reach token-minting / user-admin
+    /// routes — defense in depth).
     pub fn allows(&self, cap: Capability) -> bool {
         match self {
             AuthContext::Keycloak { roles, .. } => {
+                if !roles.iter().any(Role::grants_access) {
+                    return false;
+                }
                 let is_admin = roles.contains(&Role::Administrator);
                 match cap {
                     Capability::ReadMetadata | Capability::ReadData | Capability::WriteData => true,
@@ -172,6 +177,13 @@ pub async fn service_auth_middleware(
                     .iter()
                     .map(|kr| kr.role().clone())
                     .collect();
+                // Access gate: a valid EPFL login is not membership. Reject role-less users here
+                // with a distinct body (the UI keys on it) instead of falling through to token
+                // auth, which would misreport an authenticated-but-unauthorized user as 401.
+                if !roles.iter().any(Role::grants_access) {
+                    tracing::info!(sub = %token.subject, "Keycloak login without a riverdata role rejected");
+                    return AppError::Forbidden("no_river_role".to_string()).into_response();
+                }
                 let raw_email = token.extra.email.email.trim();
                 // `email_verified` is only meaningful when a real email claim is present; the audit
                 // `email` falls back to preferred_username, which is never a verified address.

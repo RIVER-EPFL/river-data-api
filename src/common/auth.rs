@@ -5,6 +5,18 @@ pub enum Role {
     Unknown(String),
 }
 
+impl Role {
+    /// Whether this realm role grants access to the application at all. The RIVER realm is
+    /// EPFL-federated and auto-assigns `default-roles-river` to every EPFL login, so
+    /// authentication alone proves nothing — only the explicit `riverdata-*` roles admit a user.
+    /// Unrelated realm roles (`admin`, `offline_access`, `uma_authorization`, …) land in
+    /// `Unknown` and are ignored.
+    #[must_use]
+    pub fn grants_access(&self) -> bool {
+        matches!(self, Role::Administrator | Role::User)
+    }
+}
+
 /// A single authorization capability. Both Keycloak roles and API-token permissions resolve into a
 /// set of these (see `AuthContext::allows`), so every route gate is expressed once as "requires
 /// capability X" instead of each middleware re-deriving the Keycloak-vs-token policy by hand. This
