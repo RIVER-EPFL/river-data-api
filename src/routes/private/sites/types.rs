@@ -21,6 +21,7 @@ pub struct SiteRef {
 pub struct SiteResponse {
     pub id: Uuid,
     pub project_id: Option<Uuid>,
+    pub subproject_id: Option<Uuid>,
     pub name: String,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,

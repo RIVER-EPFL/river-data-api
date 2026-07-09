@@ -49,6 +49,7 @@ pub async fn list_project_sites(
         .map(|s| SiteResponse {
             id: s.id,
             project_id: s.project_id,
+            subproject_id: s.subproject_id,
             name: s.name,
             latitude: s.latitude,
             longitude: s.longitude,

@@ -859,6 +859,7 @@ async fn resolve_or_create_site(
     sites::ActiveModel {
         id: Set(id),
         project_id: Set(Some(project_id)),
+        subproject_id: sea_orm::ActiveValue::NotSet,
         name: Set(site_ref.name.clone()),
         latitude: Set(site_ref.latitude),
         longitude: Set(site_ref.longitude),

@@ -536,6 +536,7 @@ async fn resolve_scope_project(
         };
         let sql = match entity {
             "sites" => "SELECT project_id FROM sites WHERE id = $1",
+            "subprojects" => "SELECT project_id FROM subprojects WHERE id = $1",
             "site_parameters" => {
                 "SELECT s.project_id FROM site_parameters sp JOIN sites s ON s.id = sp.site_id WHERE sp.id = $1"
             }
@@ -576,6 +577,10 @@ async fn resolve_scope_project(
     match entity {
         "sites" => fk("project_id").map_or_else(
             || ScopeOutcome::Deny("Site create must specify project_id".to_string()),
+            ScopeOutcome::Project,
+        ),
+        "subprojects" => fk("project_id").map_or_else(
+            || ScopeOutcome::Deny("Subproject create must specify project_id".to_string()),
             ScopeOutcome::Project,
         ),
         "site_parameters" | "notes" | "annotations" | "sensor_deployments" => match fk("site_id") {
@@ -768,12 +773,13 @@ fn crud_read_scope_condition(entity: &str, projects: &[Uuid]) -> Option<sea_orm:
     use crate::routes::private::{
         alarm_thresholds, annotations, data_streams, notes, projects as projects_entity,
         reprocessing_jobs, samples, sensor_calibrations, sensor_deployments, sensors,
-        site_parameters, sites,
+        site_parameters, sites, subprojects,
     };
     use sea_orm::{ColumnTrait, Condition};
     let ids = || projects.iter().copied();
     let expr = match entity {
         "projects" => projects_entity::Column::Id.is_in(ids()),
+        "subprojects" => subprojects::Column::ProjectId.is_in(ids()),
         "sites" => sites::Column::ProjectId.is_in(ids()),
         "site_parameters" => {
             site_parameters::Column::SiteId.in_subquery(scoped_site_ids_query(projects))

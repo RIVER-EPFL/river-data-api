@@ -35,6 +35,7 @@ use crate::routes::private::{
     sensors::Sensor,
     site_parameters::SiteParameter,
     standard_curves::StandardCurve,
+    subprojects::Subproject,
     sync::commands_model::SyncCommand,
     sync::credentials_model::SyncServiceCredential,
     sync::events_model::SyncEvent,
@@ -164,6 +165,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .nest("/api_token_audit_logs", admin_only_crud(ApiTokenAuditLog::router(db)))
         .nest("/data_streams", admin_write_crud(DataStream::router(db)))
         .nest("/standard_curves", field_crud(StandardCurve::router(db)))
+        .nest("/subprojects", invalidate_public_config(field_crud(Subproject::router(db))))
         .nest("/notes", field_crud(Note::router(db)))
         .nest("/telegram_identities", admin_only_crud(TelegramIdentity::router(db)))
         .nest("/notification_mutes", catalog_crud(NotificationMute::router(db)))

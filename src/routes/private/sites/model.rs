@@ -17,6 +17,10 @@ pub struct Model {
     pub id: Uuid,
     #[crudcrate(filterable, sortable)]
     pub project_id: Option<Uuid>,
+    // Optional on the wire, mandatory in practice: a DB trigger derives the project's default
+    // subproject when a site is created/moved without one, and keeps `project_id` in sync with it.
+    #[crudcrate(filterable, sortable)]
+    pub subproject_id: Option<Uuid>,
     #[sea_orm(unique)]
     #[crudcrate(filterable, fulltext, sortable)]
     pub name: String,
@@ -41,6 +45,12 @@ pub enum Relation {
         to = "crate::routes::private::projects::Column::Id"
     )]
     Project,
+    #[sea_orm(
+        belongs_to = "crate::routes::private::subprojects::Entity",
+        from = "Column::SubprojectId",
+        to = "crate::routes::private::subprojects::Column::Id"
+    )]
+    Subproject,
     #[sea_orm(has_many = "crate::routes::private::site_parameters::Entity")]
     SiteParameters,
     #[sea_orm(has_many = "crate::routes::private::sensor_deployments::Entity")]
@@ -52,6 +62,12 @@ pub enum Relation {
 impl Related<crate::routes::private::projects::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Project.def()
+    }
+}
+
+impl Related<crate::routes::private::subprojects::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Subproject.def()
     }
 }
 

@@ -33,7 +33,7 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
          derived_parameter_sources, derived_parameter_definitions, \
          standard_curves, constants, \
          user_project_grants, \
-         site_parameters, parameters, sites, projects CASCADE",
+         site_parameters, parameters, sites, subprojects, projects CASCADE",
     ];
 
     for sql in &stmts {

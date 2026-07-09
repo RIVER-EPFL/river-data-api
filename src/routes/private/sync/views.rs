@@ -551,6 +551,8 @@ async fn resolve_or_create_site<C: ConnectionTrait>(
     let s = sites::ActiveModel {
         id: Set(Uuid::new_v4()),
         project_id: Set(Some(project_id)),
+        // Left unset: the sites trigger assigns the project's default subproject.
+        subproject_id: sea_orm::ActiveValue::NotSet,
         name: Set(cs.name.clone()),
         latitude: Set(None), longitude: Set(None), altitude_m: Set(None),
         public_code: Set(None),
@@ -1001,6 +1003,7 @@ pub async fn bulk_pair(
                 sites::ActiveModel {
                     id: Set(id),
                     project_id: Set(Some(project_id)),
+                    subproject_id: sea_orm::ActiveValue::NotSet,
                     name: Set(s.name.clone()),
                     latitude: Set(s.latitude), longitude: Set(s.longitude), altitude_m: Set(s.altitude_m),
                     public_code: Set(None),

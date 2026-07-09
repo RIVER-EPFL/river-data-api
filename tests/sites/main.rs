@@ -9,3 +9,4 @@ mod common;
 mod aggregate_and_readings_query_correctness;
 mod aggregate_sensor_split;
 mod data_endpoints;
+mod subprojects;
