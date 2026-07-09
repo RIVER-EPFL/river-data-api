@@ -35,6 +35,7 @@ mod m20260623_000002_csv_import_staging;
 mod m20260709_000001_user_project_grants;
 mod m20260710_000001_subprojects;
 mod m20260711_000001_unified_curve_columns;
+mod m20260711_000002_aggregates_exclude_grabs;
 
 pub struct Migrator;
 
@@ -77,6 +78,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260709_000001_user_project_grants::Migration),
             Box::new(m20260710_000001_subprojects::Migration),
             Box::new(m20260711_000001_unified_curve_columns::Migration),
+            Box::new(m20260711_000002_aggregates_exclude_grabs::Migration),
         ]
     }
 }
