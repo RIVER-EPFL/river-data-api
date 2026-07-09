@@ -448,12 +448,11 @@ pub async fn deny_scoped_token(request: Request, next: Next) -> Response {
 /// (confined to their granted project set). Unrestricted principals (administrators, unscoped/sync
 /// tokens) pass through untouched (and pay no body-buffering cost).
 ///
-/// The global catalog (`parameters`, `sensors`, `constants`, `standard_curves`, …) has no owning
-/// project. A **scoped API token** is denied it (fail closed — a per-client key can never mutate
-/// shared metadata). A **Keycloak member** is allowed through: their capability gate already decides
-/// whether they may write it (e.g. catalog writes are Administrator-only, so a non-admin member
-/// never reaches those routes anyway), and global entities like `standard_curves` are legitimately
-/// managed by members.
+/// The global catalog (`parameters`, `sensors`, `constants`, …) has no owning project. A **scoped
+/// API token** is denied it (fail closed — a per-client key can never mutate shared metadata). A
+/// **Keycloak member** is allowed through: their capability gate already decides whether they may
+/// write it (e.g. catalog writes are Administrator-only, so a non-admin member never reaches those
+/// routes anyway), and global catalog entities are legitimately managed by members.
 pub async fn enforce_scope_on_crud(
     state: axum::extract::State<AppState>,
     request: Request,

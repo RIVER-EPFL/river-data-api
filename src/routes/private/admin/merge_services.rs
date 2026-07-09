@@ -502,9 +502,9 @@ async fn delete_site_param_remnants(
     Ok(())
 }
 
-/// Move deployments, calibrations, derived sources, alarms, annotations, samples, and standard
-/// curves from source to target parameter. (Sensors no longer carry a parameter — it lives on the
-/// deployment / calibration.)
+/// Move deployments, calibrations, derived sources, alarms, annotations, and samples from source to
+/// target parameter. (Sensors no longer carry a parameter — it lives on the deployment /
+/// calibration.)
 async fn reassign_parameter_references(
     txn: &impl ConnectionTrait,
     source_id: Uuid,
@@ -567,14 +567,6 @@ async fn reassign_parameter_references(
     txn.execute(Statement::from_sql_and_values(
         pg,
         "UPDATE samples SET parameter_id = $1 WHERE parameter_id = $2",
-        vec![target_id.into(), source_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
-
-    txn.execute(Statement::from_sql_and_values(
-        pg,
-        "UPDATE standard_curves SET parameter_id = $1 WHERE parameter_id = $2",
         vec![target_id.into(), source_id.into()],
     ))
     .await

@@ -31,7 +31,7 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
          notification_subscribers, notification_subscriptions, notification_channel_health, \
          sensor_calibrations, sensor_deployments, sensors, \
          derived_parameter_sources, derived_parameter_definitions, \
-         standard_curves, constants, \
+         constants, \
          user_project_grants, \
          site_parameters, parameters, sites, subprojects, projects CASCADE",
     ];

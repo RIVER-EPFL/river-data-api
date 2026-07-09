@@ -38,6 +38,7 @@ mod m20260711_000001_unified_curve_columns;
 mod m20260711_000002_aggregates_exclude_grabs;
 mod m20260711_000003_decouple_sensor_parameter;
 mod m20260711_000004_inherit_calibration_parameter;
+mod m20260711_000005_drop_standard_curves;
 
 pub struct Migrator;
 
@@ -83,6 +84,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260711_000002_aggregates_exclude_grabs::Migration),
             Box::new(m20260711_000003_decouple_sensor_parameter::Migration),
             Box::new(m20260711_000004_inherit_calibration_parameter::Migration),
+            Box::new(m20260711_000005_drop_standard_curves::Migration),
         ]
     }
 }

@@ -23,7 +23,6 @@ pub mod sensor_deployments;
 pub mod sensors;
 pub mod site_parameters;
 pub mod sites;
-pub mod standard_curves;
 pub mod status_events;
 pub mod subprojects;
 pub mod sync;
