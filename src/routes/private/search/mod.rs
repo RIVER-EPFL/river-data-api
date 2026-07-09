@@ -93,15 +93,15 @@ pub async fn search(
     // there. The global measurement catalog (`parameters`) is shared reference data, not project
     // data, so it stays visible to everyone. Unscoped principals (Keycloak users, unscoped tokens)
     // search across all projects unchanged.
-    let (sites_sql, sensors_sql, projects_sql) = if scope.is_some() {
+    let (sites_sql, sensors_sql, projects_sql) = if scope.is_restricted() {
         (
-            "SELECT id, name FROM sites WHERE name ILIKE $1 AND project_id = $2 ORDER BY name LIMIT 10",
+            "SELECT id, name FROM sites WHERE name ILIKE $1 AND project_id = ANY($2) ORDER BY name LIMIT 10",
             "SELECT id, serial_number, name FROM sensors \
              WHERE (serial_number ILIKE $1 OR name ILIKE $1) \
                AND EXISTS (SELECT 1 FROM sensor_deployments d JOIN sites s ON s.id = d.site_id \
-                           WHERE d.sensor_id = sensors.id AND s.project_id = $2) \
+                           WHERE d.sensor_id = sensors.id AND s.project_id = ANY($2)) \
              ORDER BY serial_number LIMIT 10",
-            "SELECT id, name FROM projects WHERE name ILIKE $1 AND id = $2 ORDER BY name LIMIT 10",
+            "SELECT id, name FROM projects WHERE name ILIKE $1 AND id = ANY($2) ORDER BY name LIMIT 10",
         )
     } else {
         (
@@ -111,8 +111,8 @@ pub async fn search(
         )
     };
     let scoped_vals = || -> Vec<sea_orm::Value> {
-        match scope {
-            Some(p) => vec![pattern.clone().into(), p.into()],
+        match scope.sql_project_array() {
+            Some(projects) => vec![pattern.clone().into(), projects],
             None => vec![pattern.clone().into()],
         }
     };

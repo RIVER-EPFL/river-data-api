@@ -21,9 +21,9 @@ pub async fn event_stream(
     // suppressed for scoped keys. Unscoped principals (Keycloak users, unscoped tokens) get the full
     // operator firehose. The snapshot is connection-lifetime: a site added mid-connection appears on
     // reconnect, which is acceptable for a live event feed.
-    let scope_sites: Option<Arc<HashSet<Uuid>>> = if scope.is_some() {
+    let scope_sites: Option<Arc<HashSet<Uuid>>> = if scope.is_restricted() {
         Some(Arc::new(
-            scope_site_ids(&state.db, scope)
+            scope_site_ids(&state.db, &scope)
                 .await
                 .ok()
                 .flatten()

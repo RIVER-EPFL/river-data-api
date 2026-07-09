@@ -8,6 +8,7 @@ pub mod constants;
 pub mod data_streams;
 pub mod derived_parameters;
 pub mod events;
+pub mod me;
 pub mod notes;
 pub mod notifications;
 pub mod pairing_plans;

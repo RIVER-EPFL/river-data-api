@@ -49,23 +49,20 @@ pub async fn stream_stats(
     // A project-scoped key may only inspect a stream paired into its own project. An unpaired or
     // cross-project stream is reported as not-found (rather than 403) so a scoped key can't even
     // confirm the existence of another project's streams.
-    if let Some(project) = scope {
-        let in_scope = match stream.site_parameter_id {
-            Some(sp_id) => {
-                state
-                    .db
-                    .query_one(Statement::from_sql_and_values(
-                        sea_orm::DatabaseBackend::Postgres,
-                        "SELECT s.project_id FROM site_parameters sp JOIN sites s ON s.id = sp.site_id WHERE sp.id = $1",
-                        [sp_id.into()],
-                    ))
-                    .await?
-                    .and_then(|r| r.try_get::<Uuid>("", "project_id").ok())
-                    == Some(project)
-            }
-            None => false,
+    if scope.is_restricted() {
+        let stream_project = match stream.site_parameter_id {
+            Some(sp_id) => state
+                .db
+                .query_one(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT s.project_id FROM site_parameters sp JOIN sites s ON s.id = sp.site_id WHERE sp.id = $1",
+                    [sp_id.into()],
+                ))
+                .await?
+                .and_then(|r| r.try_get::<Uuid>("", "project_id").ok()),
+            None => None,
         };
-        if !in_scope {
+        if !scope.allows_project_opt(stream_project) {
             return Err(AppError::NotFound("Stream not found".to_string()));
         }
     }

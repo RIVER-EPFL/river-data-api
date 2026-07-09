@@ -14,10 +14,82 @@
 //! Administrator-only for humans) the route keeps its historical token bit via an explicit
 //! [`TokenAccess`] override, so sync-service tokens are unaffected by the human-side RBAC.
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use axum::{extract::Request, middleware::Next, response::{IntoResponse, Response}};
 use serde::Deserialize;
+use uuid::Uuid;
 
 use crate::error::AppError;
+
+/// The set of projects an identity may see and act in. `Unrestricted` = global access (Keycloak
+/// administrators, unscoped API tokens, sync session tokens); `Projects` = confined to a set (a
+/// project-scoped API token carries exactly one; a non-admin Keycloak user carries their grant
+/// set). One type serves both identities so scope filtering is written once. An empty `Projects`
+/// set (a member with no grants) correctly filters everything out — fail closed.
+#[derive(Clone, Debug)]
+pub enum AccessScope {
+    Unrestricted,
+    Projects(Arc<HashSet<Uuid>>),
+}
+
+impl AccessScope {
+    /// A single-project scope (a scoped API token).
+    #[must_use]
+    pub fn one(project: Uuid) -> Self {
+        AccessScope::Projects(Arc::new(HashSet::from([project])))
+    }
+
+    /// Whether this scope confines to a project set (vs. unrestricted).
+    #[must_use]
+    pub fn is_restricted(&self) -> bool {
+        matches!(self, AccessScope::Projects(_))
+    }
+
+    /// Whether a given project is in scope.
+    #[must_use]
+    pub fn allows_project(&self, project: Uuid) -> bool {
+        match self {
+            AccessScope::Unrestricted => true,
+            AccessScope::Projects(set) => set.contains(&project),
+        }
+    }
+
+    /// The confined project ids, or `None` when unrestricted (no filtering).
+    #[must_use]
+    pub fn project_ids(&self) -> Option<Vec<Uuid>> {
+        match self {
+            AccessScope::Unrestricted => None,
+            AccessScope::Projects(set) => Some(set.iter().copied().collect()),
+        }
+    }
+
+    /// Like [`AccessScope::allows_project`] but for an entity whose project may be absent (a site
+    /// with a NULL `project_id`). A restricted principal is denied a project-less resource; an
+    /// unrestricted one sees everything.
+    #[must_use]
+    pub fn allows_project_opt(&self, project: Option<Uuid>) -> bool {
+        match self {
+            AccessScope::Unrestricted => true,
+            AccessScope::Projects(set) => project.is_some_and(|p| set.contains(&p)),
+        }
+    }
+
+    /// The confined project ids as a bindable Postgres `uuid[]` value for a raw `= ANY($n)` filter,
+    /// or `None` when unrestricted (the caller then omits the filter). An empty set binds as an
+    /// empty array, which `= ANY` treats as matching nothing — fail closed.
+    #[must_use]
+    pub fn sql_project_array(&self) -> Option<sea_orm::Value> {
+        use sea_orm::sea_query::ArrayType;
+        self.project_ids().map(|ids| {
+            sea_orm::Value::Array(
+                ArrayType::Uuid,
+                Some(Box::new(ids.into_iter().map(sea_orm::Value::from).collect())),
+            )
+        })
+    }
+}
 
 /// Keycloak realm roles, ordered by access level. `riverdata-user` is a deprecated alias for
 /// [`Role::River`] (kept until the realm role is renamed); unrelated realm roles (`admin`,

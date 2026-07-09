@@ -32,11 +32,9 @@ pub async fn list_project_sites(
     let project = resolve_project(&state.db, &project_id).await?;
 
     // Enforce project scope
-    if let Some(scope_project) = scope
-        && project.id != scope_project
-    {
+    if !scope.allows_project(project.id) {
         return Err(AppError::Forbidden(
-            "Token is scoped to a different project".to_string(),
+            "That project is outside your access".to_string(),
         ));
     }
 

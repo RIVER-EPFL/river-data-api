@@ -1,5 +1,6 @@
 pub mod authz;
 pub mod bulk;
+pub mod grants;
 pub mod cache;
 pub mod middleware;
 pub mod rate_limit;

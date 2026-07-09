@@ -72,16 +72,16 @@ pub async fn get_calibration_window(
 
     // A project-scoped key may only inspect a calibration whose sensor is deployed within its
     // project, and only sees the window's in-project readings.
-    if !sensor_in_scope(db, scope, sensor_id).await? {
+    if !sensor_in_scope(db, &scope, sensor_id).await? {
         return Err(AppError::NotFound("Calibration not found".to_string()));
     }
     // Appends `AND site_id IN (<scope project's sites>)` (binding the project id) when scoped.
     let scope_clause = |values: &mut Vec<sea_orm::Value>| -> String {
-        match scope {
-            Some(p) => {
-                values.push(p.into());
+        match scope.sql_project_array() {
+            Some(projects) => {
+                values.push(projects);
                 format!(
-                    " AND site_id IN (SELECT id FROM sites WHERE project_id = ${})",
+                    " AND site_id IN (SELECT id FROM sites WHERE project_id = ANY(${}))",
                     values.len()
                 )
             }

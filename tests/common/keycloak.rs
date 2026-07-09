@@ -199,17 +199,7 @@ pub async fn ensure_realm_user(username: &str, password: &str, river_roles: &[&s
 
     let mut to_add = Vec::new();
     for role in river_roles {
-        let rep: serde_json::Value = client
-            .get(format!("{base}/roles/{role}"))
-            .bearer_auth(&admin_token)
-            .send()
-            .await
-            .expect("Keycloak unreachable")
-            .json()
-            .await
-            .expect("non-JSON role");
-        assert!(rep["id"].is_string(), "realm role {role} not found");
-        to_add.push(rep);
+        to_add.push(ensure_realm_role(&client, &admin_token, &base, role).await);
     }
     if !to_add.is_empty() {
         client
@@ -220,6 +210,75 @@ pub async fn ensure_realm_user(username: &str, password: &str, river_roles: &[&s
             .await
             .expect("Keycloak unreachable");
     }
+}
+
+/// Idempotently ensure a realm role exists, returning its full representation. The new `riverdata-*`
+/// levels may not yet exist in the live dev realm (they're created out of band at ship time); tests
+/// create them on demand so they don't depend on realm-import ordering.
+async fn ensure_realm_role(
+    client: &reqwest::Client,
+    admin_token: &str,
+    base: &str,
+    role: &str,
+) -> serde_json::Value {
+    let get = || async {
+        client
+            .get(format!("{base}/roles/{role}"))
+            .bearer_auth(admin_token)
+            .send()
+            .await
+            .expect("Keycloak unreachable")
+    };
+    let existing = get().await;
+    if existing.status().is_success() {
+        return existing.json().await.expect("non-JSON role");
+    }
+    let created = client
+        .post(format!("{base}/roles"))
+        .bearer_auth(admin_token)
+        .json(&serde_json::json!({ "name": role }))
+        .send()
+        .await
+        .expect("Keycloak unreachable");
+    assert!(
+        created.status().is_success() || created.status() == reqwest::StatusCode::CONFLICT,
+        "realm role {role} create failed: {}",
+        created.status()
+    );
+    let rep: serde_json::Value = get().await.json().await.expect("non-JSON role");
+    assert!(rep["id"].is_string(), "realm role {role} missing after create");
+    rep
+}
+
+/// The Keycloak `sub` (== realm user id) for a username, via the admin API. Project grants are keyed
+/// by `sub`, so tests seed grants against this. Panics if the user doesn't exist.
+pub async fn keycloak_user_id(username: &str) -> String {
+    let admin_token = get_keycloak_admin_token().await;
+    let base = format!("{}admin/realms/{}", keycloak_base_url(), keycloak_realm());
+    let found: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/users?username={username}&exact=true"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("Keycloak unreachable")
+        .json()
+        .await
+        .expect("non-JSON user search");
+    found[0]["id"].as_str().expect("user not found").to_string()
+}
+
+/// Seed a project visibility grant directly (bypassing the admin endpoint) so capability tests can
+/// isolate the role→capability axis from the grant axis. Idempotent.
+pub async fn grant_project(db: &DatabaseConnection, sub: &str, project_id: &str) {
+    use sea_orm::{ConnectionTrait, Statement};
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO user_project_grants (user_sub, project_id, granted_by) VALUES ($1, $2::uuid, 'test') \
+         ON CONFLICT (user_sub, project_id) DO NOTHING",
+        [sub.into(), project_id.into()],
+    ))
+    .await
+    .expect("grant insert failed");
 }
 
 /// Obtain a real JWT via the resource-owner password grant against the configured Keycloak.

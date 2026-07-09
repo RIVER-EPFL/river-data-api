@@ -301,7 +301,7 @@ pub async fn adopt_suggestions(
 ) -> AppResult<Json<AdoptSuggestion>> {
     let db = &app_state.db;
     // A project-scoped key only sees adopt suggestions for a sensor deployed within its project.
-    if !sensor_in_scope(db, scope, sensor_id).await? {
+    if !sensor_in_scope(db, &scope, sensor_id).await? {
         return Err(AppError::NotFound("Sensor not found".to_string()));
     }
     let row = db

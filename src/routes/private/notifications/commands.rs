@@ -626,7 +626,15 @@ pub async fn grab(state: &AppState, args: &str, username: Option<&str>, chat_id:
         readings,
     };
 
-    match insert_grab_samples(State(state.clone()), ProjectScope(None), Json(req)).await {
+    // The Telegram user's authority was already resolved live (anti-backdoor); grab-sample writes
+    // from a linked chat run unrestricted here, matching the pre-grants behaviour.
+    match insert_grab_samples(
+        State(state.clone()),
+        ProjectScope(crate::common::authz::AccessScope::Unrestricted),
+        Json(req),
+    )
+    .await
+    {
         Ok(Json(resp)) => {
             let mut reply =
                 format!("✅ Recorded {} value(s) for {site_name} / {param_name}.", resp.inserted);

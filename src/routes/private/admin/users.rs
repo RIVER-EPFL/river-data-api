@@ -25,6 +25,9 @@ fn has_riverdata_role(roles: &[String]) -> bool {
 /// rather than waiting for the reconciliation sweep. Best-effort: never fails the user-management op.
 async fn revoke_telegram_access(state: &AppState, sub: &str, still_has_access: bool) {
     state.authorizer.invalidate(sub).await;
+    // A user's project visibility must re-resolve the moment their access changes (role edit,
+    // disable, delete). Cheap, and it means a disabled user's cached grants can't linger.
+    state.grants_cache.invalidate(sub).await;
     if !still_has_access {
         let res = state
             .db
@@ -852,10 +855,87 @@ async fn set_user_roles(
     Ok(())
 }
 
+/// Replace the project visibility grants for a user (`user_project_grants`). Body is the full new
+/// set — this overwrites, not appends — mirroring `assign_roles`. Requires `require_admin`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetGrantsRequest {
+    /// The complete set of project ids the user may see. An empty array revokes all access.
+    pub project_ids: Vec<uuid::Uuid>,
+}
+
+/// List the projects a user is granted, with names. Administrators are unrestricted (they are never
+/// granted rows); this reflects only the stored grant set. Requires `require_admin`.
+pub async fn list_user_grants(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Vec<crate::routes::private::me::GrantedProject>>> {
+    let rows = state
+        .db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT p.id, p.name FROM user_project_grants g \
+             JOIN projects p ON p.id = g.project_id \
+             WHERE g.user_sub = $1 ORDER BY p.name",
+            [id.into()],
+        ))
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let grants = rows
+        .iter()
+        .filter_map(|r| {
+            Some(crate::routes::private::me::GrantedProject {
+                project_id: r.try_get::<uuid::Uuid>("", "id").ok()?,
+                name: r.try_get::<String>("", "name").ok()?,
+            })
+        })
+        .collect();
+    Ok(Json(grants))
+}
+
+/// Replace a user's project grants transactionally and bust their grants cache so the change takes
+/// effect within one request. Requires `require_admin`.
+pub async fn set_user_grants(
+    State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
+    Path(id): Path<String>,
+    Json(req): Json<SetGrantsRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    use sea_orm::TransactionTrait;
+    let granted_by = auth.keycloak_sub().unwrap_or("").to_string();
+    let txn = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    txn.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "DELETE FROM user_project_grants WHERE user_sub = $1",
+        [id.clone().into()],
+    ))
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+    for project_id in &req.project_ids {
+        txn.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO user_project_grants (user_sub, project_id, granted_by) VALUES ($1, $2, $3) \
+             ON CONFLICT (user_sub, project_id) DO NOTHING",
+            [id.clone().into(), (*project_id).into(), granted_by.clone().into()],
+        ))
+        .await
+        .map_err(|e| AppError::BadRequest(format!("grant insert failed (unknown project?): {e}")))?;
+    }
+    txn.commit().await.map_err(|e| AppError::Internal(e.to_string()))?;
+
+    state.grants_cache.invalidate(&id).await;
+
+    Ok(Json(serde_json::json!({ "success": true, "count": req.project_ids.len() })))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_users).post(create_user))
         .route("/search", get(search_users))
         .route("/{id}", get(get_user).put(update_user).delete(delete_user))
         .route("/{id}/roles", axum::routing::post(assign_roles))
+        .route("/{id}/grants", get(list_user_grants).put(set_user_grants))
 }

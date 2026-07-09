@@ -191,7 +191,7 @@ pub async fn import_csv(
     let site_id = site.id;
 
     // A project-scoped token may only import into a site within its project.
-    enforce_project_scope_for_sites(&state.db, scope, &[site_id]).await?;
+    enforce_project_scope_for_sites(&state.db, &scope, &[site_id]).await?;
 
     // --- Resolution tables (site_parameter-first) ---------------------------------------------
 

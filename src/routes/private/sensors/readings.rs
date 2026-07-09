@@ -106,18 +106,18 @@ pub async fn get_sensor_readings(
     // A project-scoped key may only read a sensor that has been deployed within its project, and
     // even then only sees the readings attributed to in-project sites. A sensor never deployed in
     // the project is reported as not-found (no cross-project existence disclosure).
-    if !sensor_in_scope(db, scope, sensor_id).await? {
+    if !sensor_in_scope(db, &scope, sensor_id).await? {
         return Err(AppError::NotFound("Sensor not found".to_string()));
     }
     // Appends `AND <col> IN (<scope project's sites>)` (and binds the project id) when scoped; a
     // no-op for unscoped principals. Applied to every readings query below so the temporal extent
     // and per-point series are both confined to the project.
     let scope_filter = |values: &mut Vec<sea_orm::Value>, col: &str| -> String {
-        match scope {
-            Some(p) => {
-                values.push(p.into());
+        match scope.sql_project_array() {
+            Some(projects) => {
+                values.push(projects);
                 format!(
-                    " AND {col} IN (SELECT id FROM sites WHERE project_id = ${})",
+                    " AND {col} IN (SELECT id FROM sites WHERE project_id = ANY(${}))",
                     values.len()
                 )
             }
@@ -309,7 +309,7 @@ pub async fn get_sensor_deployment_bands(
 
     // A project-scoped key only sees a sensor deployed within its project, and only the bands at
     // in-project sites (a field sensor can move between projects).
-    if !sensor_in_scope(db, scope, sensor_id).await? {
+    if !sensor_in_scope(db, &scope, sensor_id).await? {
         return Err(AppError::NotFound("Sensor not found".to_string()));
     }
 
@@ -321,9 +321,9 @@ pub async fn get_sensor_deployment_bands(
           WHERE d.sensor_id = $1",
     );
     let mut values: Vec<sea_orm::Value> = vec![sensor_id.into()];
-    if let Some(project) = scope {
-        values.push(project.into());
-        sql.push_str(&format!(" AND s.project_id = ${}", values.len()));
+    if let Some(projects) = scope.sql_project_array() {
+        values.push(projects);
+        sql.push_str(&format!(" AND s.project_id = ANY(${})", values.len()));
     }
     if let Some(end) = query.end {
         values.push(end.into());

@@ -4,10 +4,13 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::common::authz::{self, Capability, Role, TokenAccess};
+use crate::common::authz::{self, AccessScope, Capability, Role, TokenAccess};
 // Re-exported so `common::middleware::TokenPermissions` keeps resolving for existing call sites;
 // the definition now lives with the rest of the policy in `authz`.
 pub use crate::common::authz::TokenPermissions;
@@ -33,11 +36,11 @@ pub enum AuthContext {
         email: Option<String>,
         /// Whether a verified email claim is present (false when `email` is a username fallback).
         email_verified: bool,
-        /// Project confinement for a non-admin Keycloak user. `None` = global/cross-project
-        /// access — the current behaviour for every Keycloak user. The field exists so the
-        /// coming role-based RBAC (a user pidgeoned to one project) reuses the exact same
-        /// scope-filtering plumbing as project-scoped API tokens; it stays `None` until then.
-        scope: Option<Uuid>,
+        /// The projects this user is granted (from `user_project_grants`). Empty for a member with
+        /// no grants (they see nothing — fail closed); ignored for administrators, who are
+        /// unrestricted. Non-admin members flow through the same scope-filtering plumbing as
+        /// project-scoped API tokens, generalized from one project to this set.
+        grants: Arc<HashSet<Uuid>>,
     },
     /// Authenticated via API token (external scripts, curl).
     ApiToken {
@@ -83,15 +86,24 @@ impl AuthContext {
         matches!(self, AuthContext::Keycloak { email_verified: true, .. })
     }
 
-    /// Project scope this identity is confined to, if any. `None` = global/cross-project access.
-    /// Sourced identically for every auth variant so scope-filtering is an identity-level concept,
-    /// not a token-only one — future Keycloak per-project users flow through the same path.
-    pub fn project_scope(&self) -> Option<Uuid> {
+    /// The projects this identity may see and act in. Sourced identically for every auth variant so
+    /// scope-filtering is an identity-level concept: an unscoped token / sync token / Keycloak
+    /// administrator is `Unrestricted`; a scoped token is confined to its one project; a non-admin
+    /// Keycloak member is confined to their grant set.
+    pub fn access_scope(&self) -> AccessScope {
         match self {
-            AuthContext::ApiToken { project_scope, .. } => *project_scope,
-            AuthContext::Keycloak { scope, .. } => *scope,
+            AuthContext::ApiToken { project_scope: Some(p), .. } => AccessScope::one(*p),
+            AuthContext::ApiToken { project_scope: None, .. } => AccessScope::Unrestricted,
+            AuthContext::Keycloak { roles, grants, .. } => {
+                if roles.contains(&Role::Administrator) {
+                    AccessScope::Unrestricted
+                } else {
+                    AccessScope::Projects(grants.clone())
+                }
+            }
         }
     }
+
 
     /// Whether this identity is granted a capability under the default token rule. Delegates to
     /// the policy in [`crate::common::authz`]: a Keycloak user's highest role level must hold the
@@ -145,12 +157,19 @@ pub async fn service_auth_middleware(
                     Some(raw_email.to_string())
                 };
                 let sub = token.subject.clone();
+                // Administrators are unrestricted, so skip the grant query entirely; every other
+                // member is confined to their granted project set (loaded through a short-TTL cache).
+                let grants = if roles.contains(&Role::Administrator) {
+                    Arc::new(HashSet::new())
+                } else {
+                    crate::common::grants::load_grants(&state.db, &state.grants_cache, &sub).await
+                };
                 request.extensions_mut().insert(AuthContext::Keycloak {
                     roles,
                     sub,
                     email,
                     email_verified,
-                    scope: None,
+                    grants,
                 });
                 return next.run(request).await;
             }
@@ -317,7 +336,7 @@ pub fn require_crud(
 /// Returns `None` for Keycloak users or unscoped API tokens.
 /// Handlers use this to filter queries by project when a token is scoped.
 #[derive(Debug, Clone)]
-pub struct ProjectScope(pub Option<Uuid>);
+pub struct ProjectScope(pub AccessScope);
 
 impl<S: Send + Sync> FromRequestParts<S> for ProjectScope {
     type Rejection = std::convert::Infallible;
@@ -326,7 +345,7 @@ impl<S: Send + Sync> FromRequestParts<S> for ProjectScope {
         let scope = parts
             .extensions
             .get::<AuthContext>()
-            .and_then(AuthContext::project_scope);
+            .map_or(AccessScope::Unrestricted, AuthContext::access_scope);
         Ok(ProjectScope(scope))
     }
 }
@@ -343,12 +362,13 @@ impl<S: Send + Sync> FromRequestParts<S> for DenyScoped {
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let scoped = parts
-            .extensions
-            .get::<AuthContext>()
-            .and_then(AuthContext::project_scope)
-            .is_some();
-        if scoped {
+        // Deny scoped API tokens only — a granted Keycloak member is confined by their grant set,
+        // not blocked outright from operator actions their capability admits.
+        let scoped_token = matches!(
+            parts.extensions.get::<AuthContext>(),
+            Some(AuthContext::ApiToken { project_scope: Some(_), .. })
+        );
+        if scoped_token {
             return Err(AppError::Forbidden(
                 "Project-scoped tokens cannot call operator or cross-project actions".to_string(),
             )
@@ -422,25 +442,31 @@ pub async fn deny_scoped_token(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
-/// Mutating-CRUD project-scope guard for API tokens, layered on the entity router. For a
-/// project-scoped token performing a create/update/delete, resolves the target row's owning
-/// project and rejects anything outside the token's scope. **Fails closed**: any entity whose
-/// owning project can't be resolved — including the global catalog (`parameters`, `sensors`,
-/// `constants`, `standard_curves`, …) — is denied, so a per-client key can never mutate shared or
-/// cross-project metadata. Keycloak users and unscoped API tokens pass through untouched (and pay
-/// no body-buffering cost, since they return before the body is read).
-pub async fn enforce_token_scope_on_crud(
+/// Mutating-CRUD scope guard, layered on the entity router. For a restricted principal performing a
+/// create/update/delete, resolves the target row's owning project and rejects anything outside the
+/// principal's scope. Applies to both a project-scoped API token and a non-admin Keycloak member
+/// (confined to their granted project set). Unrestricted principals (administrators, unscoped/sync
+/// tokens) pass through untouched (and pay no body-buffering cost).
+///
+/// The global catalog (`parameters`, `sensors`, `constants`, `standard_curves`, …) has no owning
+/// project. A **scoped API token** is denied it (fail closed — a per-client key can never mutate
+/// shared metadata). A **Keycloak member** is allowed through: their capability gate already decides
+/// whether they may write it (e.g. catalog writes are Administrator-only, so a non-admin member
+/// never reaches those routes anyway), and global entities like `standard_curves` are legitimately
+/// managed by members.
+pub async fn enforce_scope_on_crud(
     state: axum::extract::State<AppState>,
     request: Request,
     next: Next,
 ) -> Response {
-    let scope = match request.extensions().get::<AuthContext>() {
-        Some(AuthContext::ApiToken {
-            project_scope: Some(p),
-            ..
-        }) => *p,
-        _ => return next.run(request).await,
+    let (scope, is_token) = match request.extensions().get::<AuthContext>() {
+        Some(ctx @ AuthContext::ApiToken { .. }) => (ctx.access_scope(), true),
+        Some(ctx @ AuthContext::Keycloak { .. }) => (ctx.access_scope(), false),
+        None => return next.run(request).await,
     };
+    if !scope.is_restricted() {
+        return next.run(request).await;
+    }
 
     if matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
         return next.run(request).await;
@@ -448,10 +474,8 @@ pub async fn enforce_token_scope_on_crud(
 
     let path = request.uri().path().to_string();
     let Some((entity, id)) = parse_crud_target(&path) else {
-        return AppError::Forbidden(
-            "Project-scoped token cannot perform this operation".to_string(),
-        )
-        .into_response();
+        return AppError::Forbidden("You cannot perform this operation".to_string())
+            .into_response();
     };
     let entity = entity.to_string();
     let id = id.map(str::to_string);
@@ -467,12 +491,18 @@ pub async fn enforce_token_scope_on_crud(
     let json: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
 
     match resolve_scope_project(&state.db, &entity, id.as_deref(), json.as_ref()).await {
-        ScopeOutcome::Project(project) if project == scope => {}
+        ScopeOutcome::Project(project) if scope.allows_project(project) => {}
         ScopeOutcome::Project(_) => {
-            return AppError::Forbidden("Token is scoped to a different project".to_string())
+            return AppError::Forbidden("That resource is outside your project access".to_string())
                 .into_response();
         }
-        ScopeOutcome::Deny(msg) => return AppError::Forbidden(msg).into_response(),
+        // A global/unresolvable entity: fail closed for tokens, allow for members (their capability
+        // gate already governs whether they may write shared metadata).
+        ScopeOutcome::Deny(msg) => {
+            if is_token {
+                return AppError::Forbidden(msg).into_response();
+            }
+        }
     }
 
     let request = Request::from_parts(parts, axum::body::Body::from(bytes));
@@ -603,16 +633,17 @@ async fn project_from_query(
     }
 }
 
-/// Reject the request if a project-scoped API token is writing to any site outside its project.
-/// No-op for unscoped callers (Keycloak users and unscoped API tokens both pass `scope = None`).
-/// `site_ids` are the distinct sites the request would touch; an unknown site is also rejected.
+/// Reject the request if a restricted principal is writing to any site outside its scope. No-op for
+/// unrestricted callers (administrators, unscoped/sync tokens). `site_ids` are the distinct sites
+/// the request would touch; an unknown site is also rejected. Applies uniformly to a project-scoped
+/// API token and to a non-admin Keycloak member (whose scope is their granted project set).
 pub async fn enforce_project_scope_for_sites(
     db: &sea_orm::DatabaseConnection,
-    scope: Option<Uuid>,
+    scope: &AccessScope,
     site_ids: &[Uuid],
 ) -> Result<(), AppError> {
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-    let Some(scope_project) = scope else {
+    let AccessScope::Projects(_) = scope else {
         return Ok(());
     };
     let mut seen = std::collections::HashSet::new();
@@ -633,176 +664,165 @@ pub async fn enforce_project_scope_for_sites(
                 .try_get::<Option<Uuid>>("", "project_id")
                 .ok()
                 .flatten()
-                .is_some_and(|pid| pid == scope_project),
+                .is_some_and(|pid| scope.allows_project(pid)),
             None => false,
         };
         if !in_scope {
             return Err(AppError::Forbidden(
-                "Token is scoped to a different project".to_string(),
+                "Site is outside your project access".to_string(),
             ));
         }
     }
     Ok(())
 }
 
-/// Read-side scope filter: the site ids belonging to a scoped principal's project, or `None` when
-/// the principal is unscoped (global access — no filtering). This is the read mirror of
-/// `enforce_project_scope_for_sites`: handlers that return rows keyed by `site_id` pass the returned
-/// list as `site_id = ANY($n)` so a project-scoped key sees only its project's data and inventory.
-/// An empty `Some(vec![])` (a scope whose project has no sites) correctly filters everything out.
+/// Read-side scope filter: the site ids belonging to a restricted principal's project set, or `None`
+/// when unrestricted (no filtering). Handlers that return rows keyed by `site_id` pass the returned
+/// list as `site_id = ANY($n)`. An empty `Some(vec![])` (a member whose granted projects have no
+/// sites, or a member with no grants) correctly filters everything out.
 pub async fn scope_site_ids(
     db: &sea_orm::DatabaseConnection,
-    scope: Option<Uuid>,
+    scope: &AccessScope,
 ) -> Result<Option<Vec<Uuid>>, AppError> {
-    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-    let Some(project) = scope else {
+    use crate::routes::private::sites;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+    let Some(project_ids) = scope.project_ids() else {
         return Ok(None);
     };
-    let rows = db
-        .query_all(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            "SELECT id FROM sites WHERE project_id = $1",
-            [project.into()],
-        ))
+    let ids = sites::Entity::find()
+        .select_only()
+        .column(sites::Column::Id)
+        .filter(sites::Column::ProjectId.is_in(project_ids))
+        .into_tuple::<Uuid>()
+        .all(db)
         .await
         .map_err(AppError::Database)?;
-    let ids = rows
-        .iter()
-        .filter_map(|r| r.try_get::<Uuid>("", "id").ok())
-        .collect();
     Ok(Some(ids))
 }
 
-/// Whether a sensor is visible to a scoped principal: `true` if unscoped, otherwise `true` only when
-/// the sensor has at least one deployment to a site within the scoped project. Single-resource
-/// sensor read endpoints use this to 404 a cross-project sensor (rather than confirm its existence)
-/// before filtering its per-site rows to the project.
+/// Whether a sensor is visible to a restricted principal: `true` if unrestricted, otherwise `true`
+/// only when the sensor has at least one deployment to a site within the scoped project set.
+/// Single-resource sensor read endpoints use this to 404 a cross-scope sensor.
 pub async fn sensor_in_scope(
     db: &sea_orm::DatabaseConnection,
-    scope: Option<Uuid>,
+    scope: &AccessScope,
     sensor_id: Uuid,
 ) -> Result<bool, AppError> {
-    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-    let Some(project) = scope else {
+    use crate::routes::private::sensor_deployments;
+    use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+    let Some(project_ids) = scope.project_ids() else {
         return Ok(true);
     };
-    let row = db
-        .query_one(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            "SELECT EXISTS (\
-               SELECT 1 FROM sensor_deployments d JOIN sites s ON s.id = d.site_id \
-               WHERE d.sensor_id = $1 AND s.project_id = $2\
-             ) AS in_scope",
-            [sensor_id.into(), project.into()],
-        ))
+    let count = sensor_deployments::Entity::find()
+        .filter(sensor_deployments::Column::SensorId.eq(sensor_id))
+        .filter(sensor_deployments::Column::SiteId.in_subquery(scoped_site_ids_query(&project_ids)))
+        .count(db)
         .await
         .map_err(AppError::Database)?;
-    Ok(row
-        .and_then(|r| r.try_get::<bool>("", "in_scope").ok())
-        .unwrap_or(false))
+    Ok(count > 0)
 }
 
-/// Subquery selecting the ids of the sites in a scoped principal's project. Used to confine child
-/// entities whose own scoping column is `site_id` (`notes`, `annotations`, …) without an extra
+/// Subquery selecting the ids of the sites in a restricted principal's project set. Used to confine
+/// child entities whose own scoping column is `site_id` (`notes`, `annotations`, …) without an extra
 /// round-trip — it inlines as a SQL sub-select in the read filter.
-fn scoped_site_ids_query(scope: Uuid) -> sea_orm::sea_query::SelectStatement {
+fn scoped_site_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::SelectStatement {
     use crate::routes::private::sites;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
     sites::Entity::find()
         .select_only()
         .column(sites::Column::Id)
-        .filter(sites::Column::ProjectId.eq(scope))
+        .filter(sites::Column::ProjectId.is_in(projects.iter().copied()))
         .into_query()
 }
 
-/// Subquery selecting sensor ids that have at least one deployment at a site in the scoped project.
+/// Subquery selecting sensor ids that have at least one deployment at a site in the scoped set.
 /// Used to confine `sensors` and `sensor_calibrations`.
-fn scoped_sensor_ids_query(scope: Uuid) -> sea_orm::sea_query::SelectStatement {
+fn scoped_sensor_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::SelectStatement {
     use crate::routes::private::sensor_deployments;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
     sensor_deployments::Entity::find()
         .select_only()
         .column(sensor_deployments::Column::SensorId)
-        .filter(sensor_deployments::Column::SiteId.in_subquery(scoped_site_ids_query(scope)))
+        .filter(sensor_deployments::Column::SiteId.in_subquery(scoped_site_ids_query(projects)))
         .into_query()
 }
 
-/// Subquery selecting the site_parameter ids within a scoped principal's project. Used to confine
-/// `data_streams`, whose scoping column is `site_parameter_id`.
-fn scoped_site_parameter_ids_query(scope: Uuid) -> sea_orm::sea_query::SelectStatement {
+/// Subquery selecting the site_parameter ids within a restricted principal's project set. Used to
+/// confine `data_streams`, whose scoping column is `site_parameter_id`.
+fn scoped_site_parameter_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::SelectStatement {
     use crate::routes::private::site_parameters;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
     site_parameters::Entity::find()
         .select_only()
         .column(site_parameters::Column::Id)
-        .filter(site_parameters::Column::SiteId.in_subquery(scoped_site_ids_query(scope)))
+        .filter(site_parameters::Column::SiteId.in_subquery(scoped_site_ids_query(projects)))
         .into_query()
 }
 
-/// Row-filter confining a CRUD entity's *read* (list / get-by-id) to a scoped principal's project,
-/// or `None` for global-catalog, operational, and admin-only entities (a scoped token reading
-/// shared definitions like `parameters`/`constants` is intended). Built as a subquery so it adds no
+/// Row-filter confining a CRUD entity's *read* (list / get-by-id) to a restricted principal's
+/// project set, or `None` for global-catalog, operational, and admin-only entities (reading shared
+/// definitions like `parameters`/`constants` is intended). Built as a subquery so it adds no
 /// round-trip and references only the entity's own columns; rows whose scoping column is NULL
-/// (unpaired streams, site-less global thresholds) fall out by construction, which matches the
-/// write-side confinement.
-fn crud_read_scope_condition(entity: &str, scope: Uuid) -> Option<sea_orm::Condition> {
+/// (unpaired streams, site-less global thresholds) fall out by construction.
+fn crud_read_scope_condition(entity: &str, projects: &[Uuid]) -> Option<sea_orm::Condition> {
     use crate::routes::private::{
-        alarm_thresholds, annotations, data_streams, notes, projects, reprocessing_jobs, samples,
-        sensor_calibrations, sensor_deployments, sensors, site_parameters, sites,
+        alarm_thresholds, annotations, data_streams, notes, projects as projects_entity,
+        reprocessing_jobs, samples, sensor_calibrations, sensor_deployments, sensors,
+        site_parameters, sites,
     };
     use sea_orm::{ColumnTrait, Condition};
+    let ids = || projects.iter().copied();
     let expr = match entity {
-        "projects" => projects::Column::Id.eq(scope),
-        "sites" => sites::Column::ProjectId.eq(scope),
+        "projects" => projects_entity::Column::Id.is_in(ids()),
+        "sites" => sites::Column::ProjectId.is_in(ids()),
         "site_parameters" => {
-            site_parameters::Column::SiteId.in_subquery(scoped_site_ids_query(scope))
+            site_parameters::Column::SiteId.in_subquery(scoped_site_ids_query(projects))
         }
-        "notes" => notes::Column::SiteId.in_subquery(scoped_site_ids_query(scope)),
-        "annotations" => annotations::Column::SiteId.in_subquery(scoped_site_ids_query(scope)),
+        "notes" => notes::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
+        "annotations" => annotations::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
         "sensor_deployments" => {
-            sensor_deployments::Column::SiteId.in_subquery(scoped_site_ids_query(scope))
+            sensor_deployments::Column::SiteId.in_subquery(scoped_site_ids_query(projects))
         }
         "alarm_thresholds" => {
-            alarm_thresholds::Column::SiteId.in_subquery(scoped_site_ids_query(scope))
+            alarm_thresholds::Column::SiteId.in_subquery(scoped_site_ids_query(projects))
         }
-        "samples" => samples::Column::SiteId.in_subquery(scoped_site_ids_query(scope)),
+        "samples" => samples::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
         "data_streams" => {
             data_streams::Column::SiteParameterId
-                .in_subquery(scoped_site_parameter_ids_query(scope))
+                .in_subquery(scoped_site_parameter_ids_query(projects))
         }
-        "sensors" => sensors::Column::Id.in_subquery(scoped_sensor_ids_query(scope)),
+        "sensors" => sensors::Column::Id.in_subquery(scoped_sensor_ids_query(projects)),
         "sensor_calibrations" => {
-            sensor_calibrations::Column::SensorId.in_subquery(scoped_sensor_ids_query(scope))
+            sensor_calibrations::Column::SensorId.in_subquery(scoped_sensor_ids_query(projects))
         }
         "reprocessing_jobs" => {
-            reprocessing_jobs::Column::SensorId.in_subquery(scoped_sensor_ids_query(scope))
+            reprocessing_jobs::Column::SensorId.in_subquery(scoped_sensor_ids_query(projects))
         }
         _ => return None,
     };
     Some(Condition::all().add(expr))
 }
 
-/// Read-side project-scope confinement for the CRUD entity routers. For a project-scoped principal
-/// (an API token bound to one project today; a future per-project Keycloak user via the same
-/// `project_scope()`), injects a CrudCrate [`crudcrate::ScopeCondition`] so the generated handlers
-/// filter list results to that project and turn a cross-project get-by-id into a 404. No-op for
-/// unscoped principals, for write methods (mutations are confined by [`enforce_token_scope_on_crud`]),
-/// and for global/operational entities. The injected condition is per-entity and only consumed by
-/// the generated CrudCrate list/get handlers — custom sub-routes (e.g. `/sites/{id}/readings`) don't
-/// read the extension and keep their own manual scope checks.
+/// Read-side project-scope confinement for the CRUD entity routers. For a restricted principal (a
+/// scoped API token, or a non-admin Keycloak member confined to their grant set) injects a CrudCrate
+/// [`crudcrate::ScopeCondition`] so the generated handlers filter list results to that project set
+/// and turn an out-of-scope get-by-id into a 404. No-op for unrestricted principals, for write
+/// methods (mutations are confined by [`enforce_scope_on_crud`]), and for global/operational
+/// entities. Custom sub-routes (e.g. `/sites/{id}/readings`) don't read the extension and keep their
+/// own manual scope checks.
 pub async fn inject_read_scope(request: Request, next: Next) -> Response {
-    let Some(scope) = request
+    let scope = request
         .extensions()
         .get::<AuthContext>()
-        .and_then(AuthContext::project_scope)
-    else {
+        .map_or(AccessScope::Unrestricted, AuthContext::access_scope);
+    let Some(project_ids) = scope.project_ids() else {
         return next.run(request).await;
     };
     if !matches!(*request.method(), Method::GET | Method::HEAD) {
         return next.run(request).await;
     }
     if let Some((entity, _id)) = parse_crud_target(request.uri().path())
-        && let Some(condition) = crud_read_scope_condition(entity, scope)
+        && let Some(condition) = crud_read_scope_condition(entity, &project_ids)
     {
         let mut request = request;
         request

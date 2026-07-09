@@ -103,7 +103,7 @@ pub async fn ingest_readings(
 
     // A project-scoped token may only ingest into a stream paired to a site within its project.
     // An unpaired stream has no project, so a scoped token is rejected outright.
-    enforce_ingest_scope(&state.db, scope, site_id).await?;
+    enforce_ingest_scope(&state.db, &scope, site_id).await?;
 
     // Window-aware attribution: resolve calibration/deployment/site per reading TIME from the
     // sensor's windows, agreeing with reprocess_sensor_readings. The stream's frozen sensor_id is the
@@ -362,7 +362,7 @@ pub async fn ingest_status_events(
 
     let paired = site_id.is_some();
 
-    enforce_ingest_scope(&state.db, scope, site_id).await?;
+    enforce_ingest_scope(&state.db, &scope, site_id).await?;
 
     let models: Vec<status_events::ActiveModel> = payload
         .events
@@ -419,10 +419,10 @@ pub async fn ingest_status_events(
 /// scoped key cannot create unattributed, project-less data.
 async fn enforce_ingest_scope(
     db: &sea_orm::DatabaseConnection,
-    scope: Option<Uuid>,
+    scope: &crate::common::authz::AccessScope,
     site_id: Option<Uuid>,
 ) -> AppResult<()> {
-    if scope.is_none() {
+    if !scope.is_restricted() {
         return Ok(());
     }
     match site_id {

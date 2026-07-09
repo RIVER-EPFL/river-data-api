@@ -50,7 +50,7 @@ pub async fn insert_batch_status_events(
     Json(payload): Json<BatchStatusEventsRequest>,
 ) -> AppResult<Json<BatchStatusEventsResponse>> {
     let target_sites: Vec<Uuid> = payload.events.iter().map(|e| e.site_id).collect();
-    enforce_project_scope_for_sites(&state.db, scope, &target_sites).await?;
+    enforce_project_scope_for_sites(&state.db, &scope, &target_sites).await?;
 
     let mut stream_cache: HashMap<(Uuid, Uuid), Uuid> = HashMap::new();
 

@@ -13,8 +13,11 @@
 //! `http://river-db-keycloak:8080/`).
 
 
-use crate::common::fixtures::{GLOBAL_PARAM_TEMP_ID, SITE1_ID};
-use crate::common::keycloak::{build_test_app_with_keycloak, get_keycloak_jwt, keycloak_reachable};
+use crate::common::fixtures::{GLOBAL_PARAM_TEMP_ID, PROJECT_ID, SITE1_ID};
+use crate::common::keycloak::{
+    build_test_app_with_keycloak, get_keycloak_jwt, grant_project, keycloak_reachable,
+    keycloak_user_id,
+};
 use serial_test::serial;
 
 /// Skip-guard: prints and returns when Keycloak isn't reachable. libtest has no runtime-skip, so a
@@ -99,6 +102,9 @@ async fn keycloak_capability_mapping_user_vs_admin() {
     let (_db, app) = seeded_app().await;
     let user = get_keycloak_jwt("user", "user").await;
     let admin = get_keycloak_jwt("admin", "admin").await;
+    // Grant `user` the seed project up front (before its first request, so the grants cache loads the
+    // granted set, not an empty one). Capability denials below are independent of the grant.
+    grant_project(&_db, &keycloak_user_id("user").await, PROJECT_ID).await;
 
     // write_metadata is Keycloak-Administrator-only: a non-admin user is denied a CRUD mutation...
     let param = serde_json::json!({
@@ -111,13 +117,13 @@ async fn keycloak_capability_mapping_user_vs_admin() {
     let (s, body) = crate::common::post_json_with_token(&app, "/api/parameters", &param, &admin).await;
     assert!((200..300).contains(&s), "admin must be allowed write_metadata: {body}");
 
-    // write_data is granted to ANY authenticated Keycloak user.
+    // write_data is a River capability, reachable inside the granted project (granted up front).
     let t = now_rfc3339();
     let batch = serde_json::json!({
         "readings": [{ "site_id": SITE1_ID, "parameter_id": GLOBAL_PARAM_TEMP_ID, "time": t, "raw_value": 1.0 }]
     });
     let (s, body) = crate::common::post_json_with_token(&app, "/api/readings/batch", &batch, &user).await;
-    assert_eq!(s, 200, "any Keycloak user has write_data: {body}");
+    assert_eq!(s, 200, "a granted River user has write_data: {body}");
 }
 
 #[tokio::test]

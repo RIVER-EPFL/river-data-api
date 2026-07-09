@@ -121,9 +121,7 @@ pub async fn get_sensor_vs_grab(
 ) -> AppResult<Response> {
     let (site, _project) = resolve_site_with_project(&state.db, &site_id).await?;
 
-    if let Some(scope_project) = scope
-        && site.project_id != Some(scope_project)
-    {
+    if !scope.allows_project_opt(site.project_id) {
         return Err(AppError::Forbidden(
             "Token is scoped to a different project".to_string(),
         ));

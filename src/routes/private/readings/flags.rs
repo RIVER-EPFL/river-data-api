@@ -56,7 +56,7 @@ pub async fn flag_readings(
     }
 
     let target_sites: Vec<Uuid> = payload.readings.iter().map(|r| r.site_id).collect();
-    enforce_project_scope_for_sites(&state.db, scope, &target_sites).await?;
+    enforce_project_scope_for_sites(&state.db, &scope, &target_sites).await?;
 
     let mut total_updated = 0u64;
 
@@ -149,7 +149,7 @@ pub async fn unflag_readings(
     }
 
     let target_sites: Vec<Uuid> = payload.readings.iter().map(|r| r.site_id).collect();
-    enforce_project_scope_for_sites(&state.db, scope, &target_sites).await?;
+    enforce_project_scope_for_sites(&state.db, &scope, &target_sites).await?;
 
     let mut total_updated = 0u64;
 
@@ -283,7 +283,7 @@ pub async fn flag_range(
     if payload.end_time < payload.start_time {
         return Err(AppError::BadRequest("end_time must be >= start_time".to_string()));
     }
-    enforce_project_scope_for_sites(&state.db, scope, &[payload.site_id]).await?;
+    enforce_project_scope_for_sites(&state.db, &scope, &[payload.site_id]).await?;
 
     let result = state
         .db
@@ -337,7 +337,7 @@ pub async fn unflag_range(
     if payload.end_time < payload.start_time {
         return Err(AppError::BadRequest("end_time must be >= start_time".to_string()));
     }
-    enforce_project_scope_for_sites(&state.db, scope, &[payload.site_id]).await?;
+    enforce_project_scope_for_sites(&state.db, &scope, &[payload.site_id]).await?;
 
     let result = state
         .db

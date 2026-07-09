@@ -114,7 +114,8 @@ async fn reconcile(
         return Ok(SweepStats::default());
     }
 
-    let breaches = fetch_active_alarm_rows(db, None, slots).await?;
+    let breaches =
+        fetch_active_alarm_rows(db, &crate::common::authz::AccessScope::Unrestricted, slots).await?;
 
     // Pairs that already have an open event (within scope), so we can count opened vs updated.
     let (open_keys_sql, open_keys_values): (String, Vec<sea_orm::Value>) = match slots {

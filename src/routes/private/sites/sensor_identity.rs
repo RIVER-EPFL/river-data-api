@@ -86,9 +86,7 @@ pub async fn get_site_sensor_identity(
 ) -> AppResult<Json<SensorIdentityResponse>> {
     let db = &state.db;
     let site = resolve_site(db, &site_id).await?;
-    if let Some(scope_project) = scope
-        && site.project_id != Some(scope_project)
-    {
+    if !scope.allows_project_opt(site.project_id) {
         return Err(AppError::Forbidden(
             "Token is scoped to a different project".to_string(),
         ));

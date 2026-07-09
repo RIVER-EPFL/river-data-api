@@ -149,9 +149,7 @@ pub async fn list_site_parameters(
     let site = resolve_site(&state.db, &site_id).await?;
 
     // Enforce project scope
-    if let Some(scope_project) = scope
-        && site.project_id != Some(scope_project)
-    {
+    if !scope.allows_project_opt(site.project_id) {
         return Err(AppError::Forbidden(
             "Token is scoped to a different project".to_string(),
         ));
@@ -204,9 +202,7 @@ pub async fn get_site_detail(
     let (site, project) = resolve_site_with_project(&state.db, &site_id).await?;
 
     // Enforce project scope
-    if let Some(scope_project) = scope
-        && site.project_id != Some(scope_project)
-    {
+    if !scope.allows_project_opt(site.project_id) {
         return Err(AppError::Forbidden(
             "Token is scoped to a different project".to_string(),
         ));

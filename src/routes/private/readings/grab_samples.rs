@@ -168,7 +168,7 @@ pub async fn insert_grab_samples(
     }
 
     // A project-scoped token may only write to a site within its project.
-    enforce_project_scope_for_sites(&state.db, scope, &[payload.site_id]).await?;
+    enforce_project_scope_for_sites(&state.db, &scope, &[payload.site_id]).await?;
 
     // Validate site exists
     let site = sites::Entity::find_by_id(payload.site_id)

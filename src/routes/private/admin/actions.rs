@@ -535,7 +535,7 @@ pub async fn preview_derived(
     use sea_orm::{ConnectionTrait, Statement};
 
     // A project-scoped key may only preview a derived computation against a site in its project.
-    enforce_project_scope_for_sites(&app_state.db, scope, &[payload.site_id]).await?;
+    enforce_project_scope_for_sites(&app_state.db, &scope, &[payload.site_id]).await?;
 
     // Validate formula
     if payload.formula.len() > 1000 {

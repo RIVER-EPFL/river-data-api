@@ -104,6 +104,46 @@
       ]
     },
     {
+      "username": "intern1",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "intern1@local.dev",
+      "firstName": "Test",
+      "lastName": "Intern",
+      "credentials": [{ "type": "password", "value": "intern1", "temporary": false }],
+      "realmRoles": ["riverdata-intern"]
+    },
+    {
+      "username": "river1",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "river1@local.dev",
+      "firstName": "Test",
+      "lastName": "River",
+      "credentials": [{ "type": "password", "value": "river1", "temporary": false }],
+      "realmRoles": ["riverdata-river"]
+    },
+    {
+      "username": "manager1",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "manager1@local.dev",
+      "firstName": "Test",
+      "lastName": "Manager",
+      "credentials": [{ "type": "password", "value": "manager1", "temporary": false }],
+      "realmRoles": ["riverdata-manager"]
+    },
+    {
+      "username": "norole",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "norole@local.dev",
+      "firstName": "No",
+      "lastName": "Role",
+      "credentials": [{ "type": "password", "value": "norole", "temporary": false }],
+      "realmRoles": []
+    },
+    {
       "username": "service-account-river-data-api",
       "enabled": true,
       "serviceAccountClientId": "river-data-api-local",

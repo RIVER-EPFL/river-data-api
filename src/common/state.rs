@@ -101,6 +101,8 @@ pub struct AppState {
     pub bulk_semaphore: BulkSemaphore,
     pub keycloak_admin: Option<KeycloakAdmin>,
     pub token_cache: TokenCache,
+    /// Per-user project grants (`sub → granted project ids`), short-TTL. Busted on grant mutation.
+    pub grants_cache: crate::common::grants::GrantsCache,
     pub token_rate_limiters: TokenRateLimiters,
     pub events: EventSender,
     pub import_staging: ImportStagingCache,
@@ -146,6 +148,8 @@ impl AppState {
         let token_cache = crate::routes::private::api_tokens::services::new_token_cache(
             config.token_cache_ttl_seconds,
         );
+        let grants_cache =
+            crate::common::grants::new_grants_cache(config.grants_cache_ttl_seconds);
         let token_rate_limiters = new_token_rate_limiters();
         let (events, _) = broadcast::channel(256);
         let _ = GLOBAL_EVENT_SENDER.set(events.clone());
@@ -167,6 +171,7 @@ impl AppState {
             bulk_semaphore,
             keycloak_admin,
             token_cache,
+            grants_cache,
             token_rate_limiters,
             events,
             import_staging,

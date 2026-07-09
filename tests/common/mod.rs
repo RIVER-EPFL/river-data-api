@@ -68,6 +68,7 @@ fn test_config() -> Config {
         bulk_concurrent_limit: 100,
         cache_ttl_seconds: 0,
         token_cache_ttl_seconds: 1,
+        grants_cache_ttl_seconds: 1,
         cache_max_bytes: 0,
         deployment: river_db::config::Deployment::Local,
         keycloak_url: None,

@@ -161,11 +161,9 @@ pub async fn get_site_alarms(
     let (site, project) = resolve_site_with_project(&state.db, &site_id).await?;
 
     // Enforce project scope
-    if let Some(scope_project) = scope
-        && site.project_id != Some(scope_project)
-    {
+    if !scope.allows_project_opt(site.project_id) {
         return Err(AppError::Forbidden(
-            "Token is scoped to a different project".to_string(),
+            "That site is outside your project access".to_string(),
         ));
     }
 
@@ -400,7 +398,7 @@ pub(crate) struct ActiveAlarmRow {
 /// set" so the persisted events never diverge from what `/alarms/active` would compute.
 pub(crate) async fn fetch_active_alarm_rows(
     db: &sea_orm::DatabaseConnection,
-    scope: Option<Uuid>,
+    scope: &crate::common::authz::AccessScope,
     slots: Option<&[(Uuid, Uuid)]>,
 ) -> AppResult<Vec<ActiveAlarmRow>> {
     // Empty slot list means "evaluate nothing" — short-circuit before building an invalid `IN ()`.
@@ -432,9 +430,9 @@ pub(crate) async fn fetch_active_alarm_rows(
     let mut values: Vec<sea_orm::Value> = Vec::new();
     let mut next = 1usize;
 
-    let project_filter = if let Some(project_id) = scope {
-        values.push(project_id.into());
-        let clause = format!("AND s.project_id = ${next}");
+    let project_filter = if let Some(projects) = scope.sql_project_array() {
+        values.push(projects);
+        let clause = format!("AND s.project_id = ANY(${next})");
         next += 1;
         clause
     } else {
@@ -528,10 +526,10 @@ struct OpenEventRow {
 /// `event_id` + acknowledgement state to the (stateless) current-breach feed.
 async fn fetch_open_events(
     db: &sea_orm::DatabaseConnection,
-    scope: Option<Uuid>,
+    scope: &crate::common::authz::AccessScope,
 ) -> AppResult<HashMap<(Uuid, Uuid), OpenEventRow>> {
-    let project_filter = if scope.is_some() {
-        "AND s.project_id = $1"
+    let project_filter = if scope.is_restricted() {
+        "AND s.project_id = ANY($1)"
     } else {
         ""
     };
@@ -540,7 +538,7 @@ async fn fetch_open_events(
          FROM alarm_events ae JOIN sites s ON s.id = ae.site_id \
          WHERE ae.resolved_at IS NULL {project_filter}"
     );
-    let values: Vec<sea_orm::Value> = if let Some(p) = scope { vec![p.into()] } else { vec![] };
+    let values: Vec<sea_orm::Value> = scope.sql_project_array().map(|p| vec![p]).unwrap_or_default();
     let mut map = HashMap::new();
     for row in db
         .query_all(Statement::from_sql_and_values(
@@ -574,8 +572,8 @@ pub async fn get_active_alarms(
     State(state): State<AppState>,
     ProjectScope(scope): ProjectScope,
 ) -> AppResult<Json<ActiveAlarmsResponse>> {
-    let rows = fetch_active_alarm_rows(&state.db, scope, None).await?;
-    let open = fetch_open_events(&state.db, scope).await?;
+    let rows = fetch_active_alarm_rows(&state.db, &scope, None).await?;
+    let open = fetch_open_events(&state.db, &scope).await?;
 
     let alarms: Vec<ActiveAlarm> = rows
         .into_iter()
@@ -762,7 +760,7 @@ pub async fn get_alarm_summary(
     State(state): State<AppState>,
     ProjectScope(scope): ProjectScope,
 ) -> AppResult<Json<AlarmSummaryResponse>> {
-    let rows = fetch_active_alarm_rows(&state.db, scope, None).await?;
+    let rows = fetch_active_alarm_rows(&state.db, &scope, None).await?;
 
     let mut warning_count = 0usize;
     let mut alarm_count = 0usize;
@@ -786,8 +784,8 @@ pub async fn get_alarm_summary(
 
     let total = rows.len();
 
-    let latest_by_site = fetch_latest_reading_times(&state.db, scope).await?;
-    let event_times_by_site = fetch_last_alarm_warning_times(&state.db, scope).await?;
+    let latest_by_site = fetch_latest_reading_times(&state.db, &scope).await?;
+    let event_times_by_site = fetch_last_alarm_warning_times(&state.db, &scope).await?;
 
     let mut covered_sites: HashSet<Uuid> = site_map.keys().copied().collect();
     let mut by_site: Vec<AlarmSiteSummary> = site_map
@@ -850,10 +848,10 @@ struct LatestReadingTimeRow {
 /// Fetch per-site latest reading time across all paired readings
 async fn fetch_latest_reading_times(
     db: &sea_orm::DatabaseConnection,
-    scope: Option<Uuid>,
+    scope: &crate::common::authz::AccessScope,
 ) -> AppResult<HashMap<Uuid, (String, DateTime<Utc>)>> {
-    let project_filter = if scope.is_some() {
-        "WHERE s.project_id = $1"
+    let project_filter = if scope.is_restricted() {
+        "WHERE s.project_id = ANY($1)"
     } else {
         ""
     };
@@ -868,11 +866,7 @@ async fn fetch_latest_reading_times(
         "
     );
 
-    let values: Vec<sea_orm::Value> = if let Some(project_id) = scope {
-        vec![project_id.into()]
-    } else {
-        vec![]
-    };
+    let values: Vec<sea_orm::Value> = scope.sql_project_array().map(|p| vec![p]).unwrap_or_default();
 
     let rows: Vec<LatestReadingTimeRow> = db
         .query_all(Statement::from_sql_and_values(
@@ -903,10 +897,10 @@ struct LastAlarmWarningRow {
 /// from `alarm_events`, keyed by site_id as `(last_warning_at, last_alarm_at)`.
 async fn fetch_last_alarm_warning_times(
     db: &sea_orm::DatabaseConnection,
-    scope: Option<Uuid>,
+    scope: &crate::common::authz::AccessScope,
 ) -> AppResult<HashMap<Uuid, (Option<DateTime<Utc>>, Option<DateTime<Utc>>)>> {
-    let project_filter = if scope.is_some() {
-        "WHERE s.project_id = $1"
+    let project_filter = if scope.is_restricted() {
+        "WHERE s.project_id = ANY($1)"
     } else {
         ""
     };
@@ -923,11 +917,7 @@ async fn fetch_last_alarm_warning_times(
         "
     );
 
-    let values: Vec<sea_orm::Value> = if let Some(project_id) = scope {
-        vec![project_id.into()]
-    } else {
-        vec![]
-    };
+    let values: Vec<sea_orm::Value> = scope.sql_project_array().map(|p| vec![p]).unwrap_or_default();
 
     let rows: Vec<LastAlarmWarningRow> = db
         .query_all(Statement::from_sql_and_values(
@@ -997,9 +987,9 @@ pub async fn get_alarm_events(
     let mut values: Vec<sea_orm::Value> = Vec::new();
     let mut conditions: Vec<String> = Vec::new();
 
-    if let Some(project_id) = scope {
-        values.push(project_id.into());
-        conditions.push(format!("s.project_id = ${}", values.len()));
+    if let Some(projects) = scope.sql_project_array() {
+        values.push(projects);
+        conditions.push(format!("s.project_id = ANY(${})", values.len()));
     }
     if let Some(site_id) = query.site_id {
         values.push(site_id.into());

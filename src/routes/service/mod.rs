@@ -10,7 +10,7 @@ use utoipa_axum::router::OpenApiRouter;
 use crate::common::AppState;
 use crate::common::authz::{Capability, TokenAccess, TokenBit};
 use crate::common::middleware::{
-    bust_token_cache_on_mutation, deny_scoped_token, enforce_token_scope_on_crud, inject_read_scope,
+    bust_token_cache_on_mutation, deny_scoped_token, enforce_scope_on_crud, inject_read_scope,
     require_admin, require_admin_or_token_write_metadata, require_crud, require_manage_sensors,
     require_read_data, require_read_metadata, require_write_data,
 };
@@ -141,13 +141,16 @@ pub fn api_router(state: &AppState) -> Router<()> {
     let entity_router: Router<()> = OpenApiRouter::new()
         .nest("/projects", invalidate_public_config(crate::routes::private::projects::router::service_router(state)))
         .nest("/sites", invalidate_public_config(crate::routes::private::sites::router::service_router(state)))
-        .nest("/parameters", catalog_crud(Parameter::router(db)))
-        .nest("/site_parameters", invalidate_public_config(field_crud(SiteParameter::router(db))))
+        // Global catalog (the shared parameter list, constants, derived definitions) is
+        // Administrator-managed: onboarding a new global parameter is an admin act. Managers
+        // instead ASSIGN parameters to sites (site_parameters) and manage per-site alarm thresholds.
+        .nest("/parameters", admin_write_crud(Parameter::router(db)))
+        .nest("/site_parameters", invalidate_public_config(catalog_crud(SiteParameter::router(db))))
         .nest("/sensors", admin_write_crud(Sensor::router(db)))
         .nest("/sensor_calibrations", sensor_crud(SensorCalibration::router(db)))
         .nest("/sensor_deployments", sensor_crud(SensorDeployment::router(db)))
-        .nest("/derived_parameters", catalog_crud(DerivedParameterDefinition::router(db)))
-        .nest("/derived_parameter_sources", catalog_crud(DerivedParameterSource::router(db)))
+        .nest("/derived_parameters", admin_write_crud(DerivedParameterDefinition::router(db)))
+        .nest("/derived_parameter_sources", admin_write_crud(DerivedParameterSource::router(db)))
         .nest("/alarm_thresholds", catalog_crud(AlarmThreshold::router(db)))
         .nest(
             "/tokens",
@@ -177,7 +180,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         // (fails closed on the global catalog). No-op for Keycloak users and unscoped tokens.
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            enforce_token_scope_on_crud,
+            enforce_scope_on_crud,
         ))
         // Read mirror of the above: confine list/get reads for project-bound entities to the
         // scoped token's project (CrudCrate `ScopeCondition`). No-op for unscoped callers and for
@@ -432,6 +435,13 @@ pub fn api_router(state: &AppState) -> Router<()> {
             .with_state(state.clone())
     };
 
+    // The caller's own identity, level, and project visibility. No extra capability gate — the
+    // access gate in `service_auth_middleware` already guarantees a river role; the handler refuses
+    // API tokens (no user sub) itself.
+    let me_route = Router::new()
+        .route("/me", get(crate::routes::private::me::get_me))
+        .with_state(state.clone());
+
     // Token lifecycle actions (revoke/rotate). Admin-only, like all token management.
     let token_admin_routes = Router::new()
         .route(
@@ -459,6 +469,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .merge(telegram_admin_routes)
         .merge(notifications_admin_routes)
         .merge(notifications_me_routes)
+        .merge(me_route)
         .merge(stream_read_routes)
         .merge(sensor_view_read_routes)
         .merge(stream_write_routes)

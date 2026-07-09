@@ -62,6 +62,7 @@ pub struct Config {
     // API-token validation cache TTL (seconds). Short so revocations/expiries take effect quickly;
     // revoke/rotate also bust the cache explicitly.
     pub token_cache_ttl_seconds: u64,
+    pub grants_cache_ttl_seconds: u64,
     pub cache_max_bytes: u64,
 
     // Application metadata
@@ -253,6 +254,10 @@ impl Config {
                 .parse()
                 .unwrap_or(5), // 5s default — tight revocation/expiry window, negligible DB load
                                // (expiry is re-checked every request; revoke/rotate bust the cache)
+            grants_cache_ttl_seconds: env::var("GRANTS_CACHE_TTL_SECONDS")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()
+                .unwrap_or(30), // per-user project grants; grant mutations bust the cache directly
             cache_max_bytes: env::var("CACHE_MAX_BYTES")
                 .unwrap_or_else(|_| "209715200".to_string())
                 .parse()

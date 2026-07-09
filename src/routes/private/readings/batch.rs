@@ -98,7 +98,7 @@ pub async fn insert_batch_readings(
 ) -> AppResult<Json<BatchReadingsResponse>> {
     // A project-scoped token may only write to sites within its project.
     let target_sites: Vec<Uuid> = payload.readings.iter().map(|r| r.site_id).collect();
-    enforce_project_scope_for_sites(&state.db, scope, &target_sites).await?;
+    enforce_project_scope_for_sites(&state.db, &scope, &target_sites).await?;
 
     // Validate timestamps are within reasonable bounds
     let now = chrono::Utc::now();
