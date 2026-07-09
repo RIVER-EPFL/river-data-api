@@ -7,4 +7,5 @@
 mod common;
 
 mod formula_evaluation;
+mod instant_curve;
 mod reprocessing;

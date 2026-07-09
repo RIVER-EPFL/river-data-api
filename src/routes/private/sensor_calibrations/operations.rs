@@ -44,6 +44,12 @@ impl CRUDOperations for SensorCalibrationOperations {
         db: &DatabaseConnection,
         entity: &mut SensorCalibration,
     ) -> Result<(), ApiError> {
+        // Instant (lab grab) curves take no part in windowed chaining and drive no reprocessing:
+        // they apply only to the single grab reading that names them.
+        if entity.mode != "windowed" {
+            return Ok(());
+        }
+
         recompute_valid_until(db, entity.sensor_id)
             .await
             .map_err(ApiError::database)?;
@@ -67,6 +73,10 @@ impl CRUDOperations for SensorCalibrationOperations {
         db: &DatabaseConnection,
         entity: &mut SensorCalibration,
     ) -> Result<(), ApiError> {
+        if entity.mode != "windowed" {
+            return Ok(());
+        }
+
         recompute_valid_until(db, entity.sensor_id)
             .await
             .map_err(ApiError::database)?;

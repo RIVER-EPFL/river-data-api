@@ -39,6 +39,7 @@ mod m20260711_000002_aggregates_exclude_grabs;
 mod m20260711_000003_decouple_sensor_parameter;
 mod m20260711_000004_inherit_calibration_parameter;
 mod m20260711_000005_drop_standard_curves;
+mod m20260711_000006_inherit_windowed_only;
 
 pub struct Migrator;
 
@@ -85,6 +86,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260711_000003_decouple_sensor_parameter::Migration),
             Box::new(m20260711_000004_inherit_calibration_parameter::Migration),
             Box::new(m20260711_000005_drop_standard_curves::Migration),
+            Box::new(m20260711_000006_inherit_windowed_only::Migration),
         ]
     }
 }
