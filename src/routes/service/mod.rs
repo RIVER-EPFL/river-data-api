@@ -8,10 +8,11 @@ use tower_http::limit::RequestBodyLimitLayer;
 use utoipa_axum::router::OpenApiRouter;
 
 use crate::common::AppState;
+use crate::common::authz::{Capability, TokenAccess, TokenBit};
 use crate::common::middleware::{
     bust_token_cache_on_mutation, deny_scoped_token, enforce_token_scope_on_crud, inject_read_scope,
-    require_admin, require_crud_data_read_permissions, require_crud_permissions, require_read_data,
-    require_read_metadata, require_write_data, require_write_metadata,
+    require_admin, require_admin_or_token_write_metadata, require_crud, require_manage_sensors,
+    require_read_data, require_read_metadata, require_write_data,
 };
 use crate::common::rate_limit::FallbackIpKeyExtractor;
 use crate::routes::private::{
@@ -72,13 +73,54 @@ async fn invalidate_public_config_on_mutation(
 pub fn api_router(state: &AppState) -> Router<()> {
     let db = &state.db;
 
-    let with_crud_perms = |r: OpenApiRouter| -> OpenApiRouter {
-        r.layer(middleware::from_fn(require_crud_permissions))
+    // Per-entity CRUD gates: GET/HEAD need the read capability, mutations the write capability.
+    // The token side stays frozen at the historical `write_metadata` bit (via `TokenAccess::Same`
+    // for the split write capabilities, or an explicit `Bit` where the human side is admin-only)
+    // so API tokens and sync-service session tokens are unaffected by the human-role RBAC.
+    //
+    // Field metadata (sites, site_parameters, standard curves, notes): RIVER members may write.
+    let field_crud = |r: OpenApiRouter| -> OpenApiRouter {
+        r.layer(middleware::from_fn(require_crud(
+            Capability::ReadMetadata,
+            Capability::WriteFieldMetadata,
+            TokenAccess::Same,
+        )))
     };
-    // Like `with_crud_perms` but reads need `read_data` (not `read_metadata`) — for CRUD entities
-    // whose rows are time-series data (annotations, samples), so a metadata-only key can't read them.
-    let with_crud_data_read_perms = |r: OpenApiRouter| -> OpenApiRouter {
-        r.layer(middleware::from_fn(require_crud_data_read_permissions))
+    // Field metadata whose rows are time-series data (annotations, samples): reads need read_data.
+    let field_data_crud = |r: OpenApiRouter| -> OpenApiRouter {
+        r.layer(middleware::from_fn(require_crud(
+            Capability::ReadData,
+            Capability::WriteFieldMetadata,
+            TokenAccess::Same,
+        )))
+    };
+    // Sensor movement (calibrations, deployments): MANAGER members may write.
+    let sensor_crud = |r: OpenApiRouter| -> OpenApiRouter {
+        r.layer(middleware::from_fn(require_crud(
+            Capability::ReadMetadata,
+            Capability::ManageSensors,
+            TokenAccess::Same,
+        )))
+    };
+    // Global catalog (parameters, derived definitions/sources, alarm thresholds, constants,
+    // notification mutes): MANAGER members may write.
+    let catalog_crud = |r: OpenApiRouter| -> OpenApiRouter {
+        r.layer(middleware::from_fn(require_crud(
+            Capability::ReadMetadata,
+            Capability::WriteCatalog,
+            TokenAccess::Same,
+        )))
+    };
+    // Admin-managed inventory/system entities (sensor onboarding, data streams, reprocessing
+    // jobs): human writes are Administrator-only, but the historical write_metadata token bit is
+    // preserved so sync-service session tokens (which register streams and auto-create sensors)
+    // keep working.
+    let admin_write_crud = |r: OpenApiRouter| -> OpenApiRouter {
+        r.layer(middleware::from_fn(require_crud(
+            Capability::ReadMetadata,
+            Capability::Admin,
+            TokenAccess::Bit(TokenBit::WriteMetadata),
+        )))
     };
     let admin_only_crud = |r: OpenApiRouter| -> OpenApiRouter {
         // CrudCrate exposes a single router for all 5 methods. For entities that mint
@@ -99,14 +141,14 @@ pub fn api_router(state: &AppState) -> Router<()> {
     let entity_router: Router<()> = OpenApiRouter::new()
         .nest("/projects", invalidate_public_config(crate::routes::private::projects::router::service_router(state)))
         .nest("/sites", invalidate_public_config(crate::routes::private::sites::router::service_router(state)))
-        .nest("/parameters", with_crud_perms(Parameter::router(db)))
-        .nest("/site_parameters", invalidate_public_config(with_crud_perms(SiteParameter::router(db))))
-        .nest("/sensors", with_crud_perms(Sensor::router(db)))
-        .nest("/sensor_calibrations", with_crud_perms(SensorCalibration::router(db)))
-        .nest("/sensor_deployments", with_crud_perms(SensorDeployment::router(db)))
-        .nest("/derived_parameters", with_crud_perms(DerivedParameterDefinition::router(db)))
-        .nest("/derived_parameter_sources", with_crud_perms(DerivedParameterSource::router(db)))
-        .nest("/alarm_thresholds", with_crud_perms(AlarmThreshold::router(db)))
+        .nest("/parameters", catalog_crud(Parameter::router(db)))
+        .nest("/site_parameters", invalidate_public_config(field_crud(SiteParameter::router(db))))
+        .nest("/sensors", admin_write_crud(Sensor::router(db)))
+        .nest("/sensor_calibrations", sensor_crud(SensorCalibration::router(db)))
+        .nest("/sensor_deployments", sensor_crud(SensorDeployment::router(db)))
+        .nest("/derived_parameters", catalog_crud(DerivedParameterDefinition::router(db)))
+        .nest("/derived_parameter_sources", catalog_crud(DerivedParameterSource::router(db)))
+        .nest("/alarm_thresholds", catalog_crud(AlarmThreshold::router(db)))
         .nest(
             "/tokens",
             admin_only_crud(ApiToken::router(db)).layer(middleware::from_fn_with_state(
@@ -117,16 +159,16 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .nest("/sync_service_credentials", admin_only_crud(SyncServiceCredential::router(db)))
         // Read-only forensic audit trail of API-token use. Admin-only (no token can read it).
         .nest("/api_token_audit_logs", admin_only_crud(ApiTokenAuditLog::router(db)))
-        .nest("/data_streams", with_crud_perms(DataStream::router(db)))
-        .nest("/standard_curves", with_crud_perms(StandardCurve::router(db)))
-        .nest("/notes", with_crud_perms(Note::router(db)))
+        .nest("/data_streams", admin_write_crud(DataStream::router(db)))
+        .nest("/standard_curves", field_crud(StandardCurve::router(db)))
+        .nest("/notes", field_crud(Note::router(db)))
         .nest("/telegram_identities", admin_only_crud(TelegramIdentity::router(db)))
-        .nest("/notification_mutes", with_crud_perms(NotificationMute::router(db)))
+        .nest("/notification_mutes", catalog_crud(NotificationMute::router(db)))
         .nest("/notification_logs", admin_only_crud(NotificationLog::router(db)))
-        .nest("/annotations", with_crud_data_read_perms(Annotation::router(db)))
-        .nest("/constants", with_crud_perms(Constant::router(db)))
-        .nest("/samples", with_crud_data_read_perms(Sample::router(db)))
-        .nest("/reprocessing_jobs", with_crud_perms(ReprocessingJob::router(db)))
+        .nest("/annotations", field_data_crud(Annotation::router(db)))
+        .nest("/constants", catalog_crud(Constant::router(db)))
+        .nest("/samples", field_data_crud(Sample::router(db)))
+        .nest("/reprocessing_jobs", admin_write_crud(ReprocessingJob::router(db)))
         .nest("/sync_services", admin_only_crud(SyncService::router(db)))
         .nest("/sync_commands", admin_only_crud(SyncCommand::router(db)))
         .nest("/sync_events", admin_only_crud(SyncEvent::router(db)))
@@ -182,7 +224,9 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route("/streams/{id}/pair", post(stream_views::pair_stream))
         .route("/streams/{id}/unpair", post(stream_views::unpair_stream))
         .layer(middleware::from_fn(deny_scoped_token))
-        .layer(middleware::from_fn(require_write_metadata))
+        // Stream registration/pairing is an Administrator action for humans; the write_metadata
+        // token bit is preserved so sync-service session tokens keep registering streams.
+        .layer(middleware::from_fn(require_admin_or_token_write_metadata))
         .with_state(state.clone());
 
     use crate::routes::private::sensors::adopt as sensor_adopt;
@@ -197,7 +241,8 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route("/sensors/{sensor_id}/adopt", post(sensor_adopt::adopt_sensor))
         .route("/actions/swap", post(sensor_adopt::swap_sensors))
         .layer(middleware::from_fn(deny_scoped_token))
-        .layer(middleware::from_fn(require_write_metadata))
+        // Deploying/swapping a sensor at a slot is sensor movement: MANAGER (write_metadata token).
+        .layer(middleware::from_fn(require_manage_sensors))
         .with_state(state.clone());
 
     // Data push paths. Each handler self-enforces project scope (a scoped token may only write
@@ -270,9 +315,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .layer(middleware::from_fn(require_read_metadata))
         .with_state(state.clone());
 
-    // Operator actions previously on /api/admin/. require_write_metadata already
-    // enforces "Keycloak admin OR API token with write_metadata" — appropriate for
-    // automation scripts driving calibration/recompute/merge workflows.
+    // Operator actions previously on /api/admin/: calibration recalc, sensor reprocess, derived
+    // recompute, merges, job rerun/cancel, schedule control. MANAGER for humans (operators run
+    // these); the write_metadata token bit is preserved for automation scripts. Scoped tokens are
+    // denied (a logger key has no reason to trigger a global reprocess/merge).
     let operator_action_routes = Router::new()
         .route(
             "/actions/sensor_calibrations/{id}/recalculate",
@@ -313,7 +359,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         )
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(middleware::from_fn(deny_scoped_token))
-        .layer(middleware::from_fn(require_write_metadata))
+        .layer(middleware::from_fn(require_manage_sensors))
         .with_state(state.clone());
 
     // Sync admin views split by required permission. Credential creation/revoke is
@@ -328,7 +374,8 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .nest("/sync", sync_views::write_routes())
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(middleware::from_fn(deny_scoped_token))
-        .layer(middleware::from_fn(require_write_metadata))
+        // Human management of sync services is Administrator-only; write_metadata token preserved.
+        .layer(middleware::from_fn(require_admin_or_token_write_metadata))
         .with_state(state.clone());
 
     let sync_admin_admin = Router::new()

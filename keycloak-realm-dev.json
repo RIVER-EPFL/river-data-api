@@ -11,6 +11,18 @@
       {
         "name": "riverdata-user",
         "description": "River Data standard user with read access"
+      },
+      {
+        "name": "riverdata-intern",
+        "description": "River Data intern: read-only access"
+      },
+      {
+        "name": "riverdata-river",
+        "description": "River Data staff: write data and field metadata"
+      },
+      {
+        "name": "riverdata-manager",
+        "description": "River Data manager: manage sensors and the catalog"
       }
     ]
   },
@@ -20,11 +32,21 @@
       "enabled": true,
       "publicClient": true,
       "directAccessGrantsEnabled": true,
-      "redirectUris": ["http://localhost:*", "http://localhost:3005/*"],
-      "webOrigins": ["*"],
+      "redirectUris": [
+        "http://localhost:*",
+        "http://localhost:3005/*"
+      ],
+      "webOrigins": [
+        "*"
+      ],
       "protocol": "openid-connect",
       "standardFlowEnabled": true,
-      "defaultClientScopes": ["openid", "profile", "email", "roles"],
+      "defaultClientScopes": [
+        "openid",
+        "profile",
+        "email",
+        "roles"
+      ],
       "attributes": {}
     },
     {
@@ -36,7 +58,12 @@
       "serviceAccountsEnabled": true,
       "protocol": "openid-connect",
       "standardFlowEnabled": false,
-      "defaultClientScopes": ["openid", "profile", "email", "roles"],
+      "defaultClientScopes": [
+        "openid",
+        "profile",
+        "email",
+        "roles"
+      ],
       "attributes": {}
     }
   ],
@@ -54,7 +81,10 @@
           "temporary": false
         }
       ],
-      "realmRoles": ["riverdata-admin", "riverdata-user"]
+      "realmRoles": [
+        "riverdata-admin",
+        "riverdata-user"
+      ]
     },
     {
       "username": "user",
@@ -69,14 +99,21 @@
           "temporary": false
         }
       ],
-      "realmRoles": ["riverdata-user"]
+      "realmRoles": [
+        "riverdata-user"
+      ]
     },
     {
       "username": "service-account-river-data-api",
       "enabled": true,
       "serviceAccountClientId": "river-data-api-local",
       "clientRoles": {
-        "realm-management": ["manage-users", "view-users", "query-users", "view-realm"]
+        "realm-management": [
+          "manage-users",
+          "view-users",
+          "query-users",
+          "view-realm"
+        ]
       }
     }
   ]

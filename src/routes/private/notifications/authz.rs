@@ -12,7 +12,7 @@ use std::time::Duration;
 use moka::future::Cache;
 
 use crate::common::AppState;
-use crate::common::auth::Role;
+use crate::common::authz::Role;
 use crate::routes::private::admin::users;
 
 /// The live authority for a linked chat. `Revoked` means the link must be deactivated.
@@ -111,13 +111,15 @@ async fn resolve_live(state: &AppState, sub: &str) -> Option<RoleResolution> {
         return None;
     }
     let roles: Vec<serde_json::Value> = roles_resp.json().await.ok()?;
-    let has = |role: &Role| {
-        let name = role.to_string();
-        roles.iter().any(|r| r["name"].as_str() == Some(name.as_str()))
-    };
-    if has(&Role::Administrator) {
+    let role_names: Vec<Role> = roles
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .map(|n| Role::from(n.to_string()))
+        .collect();
+    if role_names.contains(&Role::Administrator) {
         Some(RoleResolution::Admin)
-    } else if has(&Role::User) {
+    } else if role_names.iter().any(Role::grants_access) {
+        // Any current riverdata level (intern/river/manager) is a delivery-authorized user.
         Some(RoleResolution::User)
     } else {
         Some(RoleResolution::Revoked)

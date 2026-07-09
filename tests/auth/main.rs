@@ -7,6 +7,7 @@
 mod common;
 
 mod access_gate;
+mod capability_levels;
 mod keycloak_jwt_capability;
 mod malformed_and_revoked_rejection;
 mod middleware_and_permissions;

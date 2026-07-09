@@ -458,7 +458,7 @@ pub fn build_router(state: AppState) -> Router {
                 // which rejects role-less logins with a distinct 403 (`no_river_role`) instead of
                 // silently failing JWT validation and misreporting them as 401 via token auth.
                 // This also admits future role holders (e.g. admins without `riverdata-user`).
-                KeycloakAuthLayer::<crate::common::auth::Role>::builder()
+                KeycloakAuthLayer::<crate::common::authz::Role>::builder()
                     .instance(instance)
                     .passthrough_mode(PassthroughMode::Pass)
                     .persist_raw_claims(false)

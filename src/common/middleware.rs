@@ -4,11 +4,13 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::common::auth::{Capability, Role};
+use crate::common::authz::{self, Capability, Role, TokenAccess};
+// Re-exported so `common::middleware::TokenPermissions` keeps resolving for existing call sites;
+// the definition now lives with the rest of the policy in `authz`.
+pub use crate::common::authz::TokenPermissions;
 use crate::error::AppError;
 use crate::routes::private::api_tokens::services::validate_bearer_token;
 
@@ -91,70 +93,18 @@ impl AuthContext {
         }
     }
 
-    /// Whether this identity is granted a capability. The single source of truth for the
-    /// Keycloak-role-vs-token-permission policy: a Keycloak user must hold a `riverdata-*` role
-    /// to be granted ANYTHING (the realm is EPFL-federated — authentication alone is not
-    /// membership); members may read and write data, the Administrator role additionally writes
-    /// metadata and holds `Admin`; an API token is limited to whichever of its four permission
-    /// bits are set and never holds `Admin` (so a token can't reach token-minting / user-admin
-    /// routes — defense in depth).
+    /// Whether this identity is granted a capability under the default token rule. Delegates to
+    /// the policy in [`crate::common::authz`]: a Keycloak user's highest role level must hold the
+    /// capability (level 0 — no `riverdata-*` role — holds nothing, since the EPFL-federated realm
+    /// makes authentication distinct from membership); an API token is limited to whichever of its
+    /// four permission bits map to the capability and never holds `Admin`.
     pub fn allows(&self, cap: Capability) -> bool {
         match self {
-            AuthContext::Keycloak { roles, .. } => {
-                if !roles.iter().any(Role::grants_access) {
-                    return false;
-                }
-                let is_admin = roles.contains(&Role::Administrator);
-                match cap {
-                    Capability::ReadMetadata | Capability::ReadData | Capability::WriteData => true,
-                    Capability::WriteMetadata | Capability::Admin => is_admin,
-                }
+            AuthContext::Keycloak { roles, .. } => authz::keycloak_allows(roles, cap),
+            AuthContext::ApiToken { permissions, .. } => {
+                authz::token_allows(permissions, cap, TokenAccess::Same)
             }
-            AuthContext::ApiToken { permissions, .. } => match cap {
-                Capability::ReadMetadata => permissions.read_metadata,
-                Capability::ReadData => permissions.read_data,
-                Capability::WriteMetadata => permissions.write_metadata,
-                Capability::WriteData => permissions.write_data,
-                Capability::Admin => false,
-            },
         }
-    }
-}
-
-/// Structured permissions for API tokens.
-/// Deserialized from the JSONB `permissions` column with serde defaults.
-#[derive(Debug, Clone, Deserialize)]
-pub struct TokenPermissions {
-    #[serde(default = "default_true")]
-    pub read_metadata: bool,
-    #[serde(default = "default_true")]
-    pub read_data: bool,
-    #[serde(default)]
-    pub write_metadata: bool,
-    #[serde(default)]
-    pub write_data: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-impl Default for TokenPermissions {
-    fn default() -> Self {
-        Self {
-            read_metadata: true,
-            read_data: true,
-            write_metadata: false,
-            write_data: false,
-        }
-    }
-}
-
-impl TokenPermissions {
-    /// Parse from a `serde_json::Value`, falling back to defaults on any error.
-    #[must_use] 
-    pub fn from_json(value: &serde_json::Value) -> Self {
-        serde_json::from_value(value.clone()).unwrap_or_default()
     }
 }
 
@@ -300,66 +250,66 @@ pub async fn service_auth_middleware(
     AppError::Unauthorized("Valid Keycloak JWT or API token required".to_string()).into_response()
 }
 
-/// Shared capability gate: 401 if unauthenticated, 403 if the identity lacks `cap`, else proceed.
-/// This is the single place the Keycloak-role-vs-token-permission policy is enforced (via
-/// `AuthContext::allows`); the named `require_*` middlewares below are thin wrappers so route wiring
-/// still reads as `require_read_data` etc. while the policy lives in exactly one function.
-async fn require_capability(cap: Capability, request: Request, next: Next) -> Response {
-    match request.extensions().get::<AuthContext>() {
-        Some(ctx) if ctx.allows(cap) => next.run(request).await,
-        Some(_) => AppError::Forbidden(format!("Requires {cap} capability")).into_response(),
-        None => AppError::Unauthorized("Authentication required".to_string()).into_response(),
-    }
-}
-
-/// Requires the `read_metadata` capability (granted to any authenticated principal with that bit).
+/// Requires the `read_metadata` capability (any member; token with read_metadata).
 pub async fn require_read_metadata(request: Request, next: Next) -> Response {
-    require_capability(Capability::ReadMetadata, request, next).await
+    authz::check(Capability::ReadMetadata, TokenAccess::Same, request, next).await
 }
 
 /// Requires the `read_data` capability.
 pub async fn require_read_data(request: Request, next: Next) -> Response {
-    require_capability(Capability::ReadData, request, next).await
+    authz::check(Capability::ReadData, TokenAccess::Same, request, next).await
 }
 
-/// Requires the `write_metadata` capability (Keycloak Administrator, or a token with write_metadata).
-pub async fn require_write_metadata(request: Request, next: Next) -> Response {
-    require_capability(Capability::WriteMetadata, request, next).await
-}
-
-/// Requires the `write_data` capability.
+/// Requires the `write_data` capability (RIVER member; token with write_data).
 pub async fn require_write_data(request: Request, next: Next) -> Response {
-    require_capability(Capability::WriteData, request, next).await
+    authz::check(Capability::WriteData, TokenAccess::Same, request, next).await
 }
 
-/// Method-aware `CrudCrate` gate: GET/HEAD need `read_metadata`, mutations need `write_metadata`.
-pub async fn require_crud_permissions(request: Request, next: Next) -> Response {
-    let cap = if matches!(*request.method(), Method::GET | Method::HEAD) {
-        Capability::ReadMetadata
-    } else {
-        Capability::WriteMetadata
-    };
-    require_capability(cap, request, next).await
+/// Requires the `write_field_metadata` capability (RIVER member; token with write_metadata).
+pub async fn require_write_field_metadata(request: Request, next: Next) -> Response {
+    authz::check(Capability::WriteFieldMetadata, TokenAccess::Same, request, next).await
 }
 
-/// Method-aware `CrudCrate` gate for entities whose rows are time-series **data**, not catalog
-/// metadata: GET/HEAD need `read_data` (a metadata-only key must not read them), mutations need
-/// `write_metadata` (editing an annotation/sample record is entity management, distinct from the
-/// `write_data` ingestion path). Used for `annotations` and `samples`.
-pub async fn require_crud_data_read_permissions(request: Request, next: Next) -> Response {
-    let cap = if matches!(*request.method(), Method::GET | Method::HEAD) {
-        Capability::ReadData
-    } else {
-        Capability::WriteMetadata
-    };
-    require_capability(cap, request, next).await
+/// Requires the `manage_sensors` capability (MANAGER member; token with write_metadata).
+pub async fn require_manage_sensors(request: Request, next: Next) -> Response {
+    authz::check(Capability::ManageSensors, TokenAccess::Same, request, next).await
+}
+
+/// Requires the `write_catalog` capability (MANAGER member; token with write_metadata).
+pub async fn require_write_catalog(request: Request, next: Next) -> Response {
+    authz::check(Capability::WriteCatalog, TokenAccess::Same, request, next).await
 }
 
 /// Requires the `Admin` capability — the Keycloak Administrator role only. NO API token can pass
 /// (tokens never hold `Admin`): defense in depth for user management, token mutation, and sync
 /// credential creation.
 pub async fn require_admin(request: Request, next: Next) -> Response {
-    require_capability(Capability::Admin, request, next).await
+    authz::check(Capability::Admin, TokenAccess::Deny, request, next).await
+}
+
+/// Keycloak Administrator OR an API token carrying `write_metadata`. For routes that are
+/// human-Administrator-only (streams register/pair, sensor onboarding, jobs) yet are legitimately
+/// driven by sync-service session tokens, which hold `write_metadata`. Keeps the human RBAC strict
+/// without breaking the microservices.
+pub async fn require_admin_or_token_write_metadata(request: Request, next: Next) -> Response {
+    authz::check(
+        Capability::Admin,
+        TokenAccess::Bit(authz::TokenBit::WriteMetadata),
+        request,
+        next,
+    )
+    .await
+}
+
+/// Method-aware `CrudCrate` gate: GET/HEAD need `read`, mutations need `write` (with `write_token`
+/// governing the token side of mutations). Returned as a closure so the per-entity capabilities
+/// are captured at wiring time in `service/mod.rs`.
+pub fn require_crud(
+    read: Capability,
+    write: Capability,
+    write_token: TokenAccess,
+) -> impl Fn(Request, Next) -> futures::future::BoxFuture<'static, Response> + Clone {
+    move |request, next| Box::pin(authz::check_crud(read, write, write_token, request, next))
 }
 
 /// Extractor that yields the project scope from `AuthContext::ApiToken`, if any.

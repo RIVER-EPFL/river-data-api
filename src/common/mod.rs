@@ -1,4 +1,4 @@
-pub mod auth;
+pub mod authz;
 pub mod bulk;
 pub mod cache;
 pub mod middleware;

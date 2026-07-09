@@ -2,12 +2,17 @@ use axum::middleware;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::common::AppState;
-use crate::common::middleware::{require_crud_permissions, require_read_data, require_read_metadata};
+use crate::common::authz::{Capability, TokenAccess};
+use crate::common::middleware::{require_crud, require_read_data, require_read_metadata};
 use crate::routes::private::sites::Site;
 
 pub fn service_router(state: &AppState) -> OpenApiRouter {
-    let crud = Site::router(&state.db)
-        .layer(middleware::from_fn(require_crud_permissions));
+    // Sites are field metadata: RIVER members (and write_metadata tokens) may create/edit them.
+    let crud = Site::router(&state.db).layer(middleware::from_fn(require_crud(
+        Capability::ReadMetadata,
+        Capability::WriteFieldMetadata,
+        TokenAccess::Same,
+    )));
 
     let data = OpenApiRouter::new()
         .routes(routes!(super::readings::get_site_readings))

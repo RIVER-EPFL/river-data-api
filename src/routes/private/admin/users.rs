@@ -11,14 +11,12 @@ use serde::Deserialize;
 use utoipa::ToSchema;
 
 use crate::common::AppState;
-use crate::common::auth::Role;
+use crate::common::authz::{RIVER_ROLE_NAMES, Role};
 use crate::common::state::KeycloakAdmin;
 use crate::error::{AppError, AppResult};
 
 fn has_riverdata_role(roles: &[String]) -> bool {
-    roles
-        .iter()
-        .any(|r| r == &Role::User.to_string() || r == &Role::Administrator.to_string())
+    roles.iter().any(|r| RIVER_ROLE_NAMES.contains(&r.as_str()))
 }
 
 /// Anti-backdoor hook: a user's bot access must not outlive their system access. On any change to a
@@ -212,24 +210,25 @@ pub async fn list_users(
     });
 
     // Fetch only users holding a riverdata role (not the entire realm — it is LDAP-federated
-    // and contains every EPFL account). Union both roles so admin-only users appear too.
-    let user_role = Role::User.to_string();
+    // and contains every EPFL account). Union members of every level so admin-only users appear
+    // too. A missing role (a level not yet created in Keycloak) yields no members via
+    // `fetch_role_users`; any real failure (forbidden, server error) still propagates.
     let admin_role = Role::Administrator.to_string();
-    let (role_users, role_admins) = futures::future::try_join(
-        fetch_role_users(client, &token, &base, &user_role),
-        fetch_role_users(client, &token, &base, &admin_role),
+    let role_member_lists = futures::future::join_all(
+        RIVER_ROLE_NAMES
+            .iter()
+            .map(|role| fetch_role_users(client, &token, &base, role)),
     )
-    .await?;
-    let mut kc_users = role_users;
-    let mut seen: std::collections::HashSet<String> = kc_users
-        .iter()
-        .filter_map(|u| u["id"].as_str().map(String::from))
-        .collect();
-    for u in role_admins {
-        if let Some(id) = u["id"].as_str()
-            && seen.insert(id.to_string())
-        {
-            kc_users.push(u);
+    .await;
+    let mut kc_users: Vec<serde_json::Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for members in role_member_lists {
+        for u in members? {
+            if let Some(id) = u["id"].as_str()
+                && seen.insert(id.to_string())
+            {
+                kc_users.push(u);
+            }
         }
     }
 
@@ -687,14 +686,12 @@ pub async fn list_roles(
         vec![]
     };
 
-    // Filter out Keycloak internal roles
+    // Expose only the riverdata access levels (canonical names, not the deprecated `riverdata-user`
+    // alias). Unrelated realm roles — Keycloak internals and the bare `admin` role, which is NOT a
+    // river access role — are hidden so the UI role picker can only assign real levels.
     let roles: Vec<serde_json::Value> = roles
         .into_iter()
-        .filter(|r| {
-            !r.name.starts_with("default-roles-")
-                && r.name != "uma_authorization"
-                && r.name != "offline_access"
-        })
+        .filter(|r| r.name != "riverdata-user" && RIVER_ROLE_NAMES.contains(&r.name.as_str()))
         .map(|r| serde_json::json!({ "id": r.id, "name": r.name }))
         .collect();
 
@@ -721,6 +718,11 @@ async fn fetch_role_users(
             AppError::Internal(format!("Keycloak role users request failed: {e}"))
         })?;
 
+    // A role that doesn't exist yet (the new intern/river/manager levels before they are created
+    // in Keycloak) is not an error — it simply has no members. Any other failure propagates.
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(Vec::new());
+    }
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
