@@ -7,7 +7,9 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
-use crate::routes::private::{data_streams, readings, samples, site_parameters, sites};
+use crate::routes::private::{
+    data_streams, readings, samples, sensor_calibrations, site_parameters, sites,
+};
 use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -25,6 +27,12 @@ pub struct GrabSampleReading {
     pub time: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub replicate_index: Option<i16>,
+    /// Instant standard curve (a `sensor_calibrations` row) chosen for this reading. When set, the
+    /// server stores `raw_value = value`, `calibrated_value = slope * value + intercept`, and stamps
+    /// `calibration_id` for publication provenance. When absent, `value` is stored raw and the
+    /// calibration is window-resolved from the sensor (if any).
+    #[serde(default)]
+    pub calibration_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -263,6 +271,34 @@ pub async fn insert_grab_samples(
             .or_insert((r.time, r.time));
     }
 
+    // Resolve any explicitly chosen instant standard curves up front (slope/intercept per id) so the
+    // correction is applied server-side. An unknown curve id is a 400 rather than a silent miss.
+    let curve_ids: Vec<Uuid> = payload
+        .readings
+        .iter()
+        .filter_map(|r| r.calibration_id)
+        .collect();
+    let curves: HashMap<Uuid, (f64, f64)> = if curve_ids.is_empty() {
+        HashMap::new()
+    } else {
+        sensor_calibrations::Entity::find()
+            .filter(sensor_calibrations::Column::Id.is_in(curve_ids))
+            .all(&state.db)
+            .await?
+            .into_iter()
+            .map(|c| (c.id, (c.slope, c.intercept)))
+            .collect()
+    };
+    for r in &payload.readings {
+        if let Some(cid) = r.calibration_id
+            && !curves.contains_key(&cid)
+        {
+            return Err(AppError::BadRequest(format!(
+                "Standard curve {cid} not found"
+            )));
+        }
+    }
+
     // Track replicate_index per (parameter_id, time) group for auto-assignment
     let mut index_counters: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), i16> = HashMap::new();
 
@@ -286,6 +322,18 @@ pub async fn insert_grab_samples(
                 0
             };
 
+            // An explicit instant curve wins: store raw + corrected + the curve id. Otherwise keep the
+            // raw value and let the sensor's window resolution attribute the calibration (if any).
+            let (calibrated_value, calibration_id) = if let Some(cid) = r.calibration_id {
+                let (slope, intercept) = curves[&cid];
+                (Some(slope * r.value + intercept), Some(cid))
+            } else {
+                let cid = r
+                    .sensor_id
+                    .and_then(|sid| grab_slots.get(&(sid, r.time)).and_then(|s| s.calibration_id));
+                (None, cid)
+            };
+
             readings::ActiveModel {
                 stream_id: Set(stream_id),
                 site_id: Set(Some(payload.site_id)),
@@ -293,9 +341,9 @@ pub async fn insert_grab_samples(
                 time: Set(r.time.into()),
                 replicate_index: Set(replicate_index),
                 raw_value: Set(r.value),
-                calibrated_value: Set(None),
+                calibrated_value: Set(calibrated_value),
                 sensor_id: Set(r.sensor_id),
-                calibration_id: Set(r.sensor_id.and_then(|sid| grab_slots.get(&(sid, r.time)).and_then(|s| s.calibration_id))),
+                calibration_id: Set(calibration_id),
                 deployment_id: Set(r.sensor_id.and_then(|sid| grab_slots.get(&(sid, r.time)).and_then(|s| s.deployment_id))),
                 logged: Set(Some(true)),
                 measurement_type: Set(Some("spot".to_string())),

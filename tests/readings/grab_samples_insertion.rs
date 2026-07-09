@@ -1,6 +1,7 @@
 
 use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
+use uuid::Uuid;
 
 async fn setup() -> (axum::Router, String, sea_orm::DatabaseConnection) {
     let db = crate::common::setup_test_db().await;
@@ -310,4 +311,95 @@ async fn test_grab_samples_require_write_data() {
     )
     .await;
     assert_eq!(status, 403, "grab_samples should require write_data permission");
+}
+
+// ============================================================================
+// Instant standard curve applied server-side: raw kept, corrected + provenance stored
+// ============================================================================
+
+#[tokio::test]
+#[serial]
+async fn test_grab_applies_instant_curve_server_side() {
+    let (app, token, db) = setup().await;
+
+    let sensor_id = "00000000-0000-4000-c000-0000000000a1";
+    let curve_id = "00000000-0000-4000-c000-0000000000b1";
+    db.execute(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "INSERT INTO sensors (id, name, parameter_id, is_active, is_lab_instrument, created_at)
+             VALUES ('{sensor_id}', 'Microplate reader', '{}', true, true, now())",
+            crate::common::GLOBAL_PARAM_TEMP_ID
+        ),
+    ))
+    .await
+    .unwrap();
+    db.execute(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "INSERT INTO sensor_calibrations (id, sensor_id, slope, intercept, valid_from, mode, name)
+             VALUES ('{curve_id}', '{sensor_id}', 2.0, 1.0, now(), 'instant', 'Plate A')"
+        ),
+    ))
+    .await
+    .unwrap();
+
+    let time = "2025-07-01T09:00:00Z";
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID,
+            "readings": [
+                { "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID, "sensor_id": sensor_id,
+                  "calibration_id": curve_id, "value": 10.0, "time": time }
+            ]
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "grab with curve should succeed: {body}");
+
+    let row = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT raw_value, calibrated_value, calibration_id, measurement_type FROM readings \
+                 WHERE site_id = '{}' AND parameter_id = '{}' AND time = '{time}'",
+                crate::common::SITE1_ID,
+                crate::common::GLOBAL_PARAM_TEMP_ID
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let raw: f64 = row.try_get("", "raw_value").unwrap();
+    let calibrated: f64 = row.try_get("", "calibrated_value").unwrap();
+    let stored_curve: Uuid = row.try_get("", "calibration_id").unwrap();
+    let mtype: String = row.try_get("", "measurement_type").unwrap();
+    assert_eq!(raw, 10.0, "raw value is the measured value");
+    assert_eq!(calibrated, 21.0, "2.0 * 10.0 + 1.0");
+    assert_eq!(stored_curve.to_string(), curve_id, "applied curve stamped for provenance");
+    assert_eq!(mtype, "spot");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_grab_rejects_unknown_curve() {
+    let (app, token, _db) = setup().await;
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID,
+            "readings": [
+                { "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID,
+                  "calibration_id": "00000000-0000-4000-c000-0000000000ff",
+                  "value": 10.0, "time": "2025-07-01T10:00:00Z" }
+            ]
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 400, "unknown curve id should be a 400: {body}");
 }

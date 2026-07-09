@@ -618,6 +618,7 @@ pub async fn grab(state: &AppState, args: &str, username: Option<&str>, chat_id:
             value,
             time: now,
             replicate_index: None,
+            calibration_id: None,
         })
         .collect();
     let req = GrabSampleRequest {
