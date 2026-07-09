@@ -138,8 +138,8 @@ async fn deployment_recompute_only_shortens_never_extends() {
 
     // Deploy A at SITE1, then B at SITE2 two hours later (auto-recall closes A at B's start).
     let sid = sensor.id.to_string();
-    let dep_a = e2e::create_deployment(&app, &token, &sid, SITE1_ID, "2025-03-01T00:00:00Z").await;
-    let _dep_b = e2e::create_deployment(&app, &token, &sid, SITE2_ID, "2025-03-01T02:00:00Z").await;
+    let dep_a = e2e::create_deployment(&app, &token, &sid, SITE1_ID, GLOBAL_PARAM_TEMP_ID, "2025-03-01T00:00:00Z").await;
+    let _dep_b = e2e::create_deployment(&app, &token, &sid, SITE2_ID, GLOBAL_PARAM_TEMP_ID, "2025-03-01T02:00:00Z").await;
     assert!(wait_for_reprocessing(&db, sensor.id, WAIT).await, "reprocess after second deploy");
     assert_eq!(
         deployed_until(&db, &dep_a).await,

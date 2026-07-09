@@ -242,9 +242,8 @@ async fn slope_zero_rejected_by_validation() {
     crate::common::db::exec(
         &db,
         &format!(
-            "INSERT INTO sensors (id, serial_number, parameter_id, manufacturer, model) \
-             VALUES ('{sensor_id}', 'TEST-001', '{pid}', 'TestCo', 'T1')",
-            pid = crate::common::GLOBAL_PARAM_TEMP_ID
+            "INSERT INTO sensors (id, serial_number, manufacturer, model) \
+             VALUES ('{sensor_id}', 'TEST-001', 'TestCo', 'T1')"
         ),
     )
     .await;

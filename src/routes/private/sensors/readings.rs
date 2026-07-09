@@ -90,18 +90,33 @@ pub async fn get_sensor_readings(
     let db = &state.db;
     let include_raw = query.include_raw.unwrap_or(true);
 
+    // A sensor has no intrinsic parameter; take the parameter (and its units) from the sensor's
+    // most recent deployment. Multi-parameter instruments resolve to their latest bound parameter
+    // here — the detail plot is single-series and the readings query below is not parameter-scoped.
+    let sensor_exists = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT 1 FROM sensors WHERE id = $1",
+            [sensor_id.into()],
+        ))
+        .await?;
+    if sensor_exists.is_none() {
+        return Err(AppError::NotFound("Sensor not found".to_string()));
+    }
     let meta = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT s.parameter_id, p.default_units
-              FROM sensors s LEFT JOIN parameters p ON p.id = s.parameter_id
-              WHERE s.id = $1",
+            r"SELECT d.parameter_id, p.default_units
+              FROM sensor_deployments d
+              JOIN parameters p ON p.id = d.parameter_id
+              WHERE d.sensor_id = $1
+              ORDER BY d.deployed_from DESC
+              LIMIT 1",
             [sensor_id.into()],
         ))
-        .await?
-        .ok_or_else(|| AppError::NotFound("Sensor not found".to_string()))?;
-    let parameter_id: Option<Uuid> = meta.try_get("", "parameter_id").ok();
-    let units: Option<String> = meta.try_get("", "default_units").ok();
+        .await?;
+    let parameter_id: Option<Uuid> = meta.as_ref().and_then(|m| m.try_get("", "parameter_id").ok());
+    let units: Option<String> = meta.as_ref().and_then(|m| m.try_get("", "default_units").ok());
 
     // A project-scoped key may only read a sensor that has been deployed within its project, and
     // even then only sees the readings attributed to in-project sites. A sensor never deployed in

@@ -88,6 +88,10 @@ fn is_slot_conflict(err: &sea_orm::DbErr) -> bool {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct AdoptRequest {
     pub site_id: Uuid,
+    /// The parameter this deployment binds the sensor to. Optional: derived from the sensor's
+    /// existing single parameter when omitted; required when the sensor covers several.
+    #[serde(default)]
+    pub parameter_id: Option<Uuid>,
     /// Half-open window start. Defaults to now().
     #[serde(default)]
     pub deployed_from: Option<DateTime<Utc>>,
@@ -116,17 +120,81 @@ pub struct AdoptResponse {
     pub job_id: Uuid,
 }
 
-async fn sensor_parameter<C: ConnectionTrait>(db: &C, sensor_id: Uuid) -> AppResult<Uuid> {
+/// Resolve the parameter to bind an adopt to. A sensor has no intrinsic parameter, so use the
+/// explicit `override_param` when given; otherwise derive it from the sensor's existing deployment /
+/// calibration parameters (unambiguous only when the sensor covers exactly one parameter).
+async fn resolve_sensor_parameter<C: ConnectionTrait>(
+    db: &C,
+    sensor_id: Uuid,
+    override_param: Option<Uuid>,
+) -> AppResult<Uuid> {
+    if let Some(p) = override_param {
+        return Ok(p);
+    }
+    let sensor_exists = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT 1 FROM sensors WHERE id = $1",
+            [sensor_id.into()],
+        ))
+        .await?;
+    if sensor_exists.is_none() {
+        return Err(AppError::NotFound("Sensor not found".to_string()));
+    }
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT DISTINCT parameter_id FROM (
+                  SELECT parameter_id FROM sensor_deployments WHERE sensor_id = $1
+                  UNION ALL
+                  SELECT parameter_id FROM sensor_calibrations WHERE sensor_id = $1
+              ) x WHERE parameter_id IS NOT NULL",
+            [sensor_id.into()],
+        ))
+        .await?;
+    let params: Vec<Uuid> = rows
+        .iter()
+        .filter_map(|r| r.try_get("", "parameter_id").ok())
+        .collect();
+    match params.as_slice() {
+        [one] => Ok(*one),
+        [] => Err(AppError::BadRequest(
+            "This sensor has no parameter yet; pass parameter_id".to_string(),
+        )),
+        _ => Err(AppError::BadRequest(
+            "This sensor measures multiple parameters; pass parameter_id to pick the slot"
+                .to_string(),
+        )),
+    }
+}
+
+/// Resolve the (site, parameter) slot a swap targets: the parameter the outgoing sensor is deployed
+/// for at the site, unless overridden.
+async fn resolve_swap_parameter<C: ConnectionTrait>(
+    db: &C,
+    outgoing_sensor_id: Uuid,
+    site_id: Uuid,
+    override_param: Option<Uuid>,
+) -> AppResult<Uuid> {
+    if let Some(p) = override_param {
+        return Ok(p);
+    }
     let row = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT parameter_id FROM sensors WHERE id = $1",
-            [sensor_id.into()],
+            r"SELECT parameter_id FROM sensor_deployments
+              WHERE sensor_id = $1 AND site_id = $2
+              ORDER BY (deployed_until IS NULL) DESC, deployed_from DESC
+              LIMIT 1",
+            [outgoing_sensor_id.into(), site_id.into()],
         ))
-        .await?
-        .ok_or_else(|| AppError::NotFound("Sensor not found".to_string()))?;
-    row.try_get("", "parameter_id")
-        .map_err(|e| AppError::Internal(e.to_string()))
+        .await?;
+    row.and_then(|r| r.try_get("", "parameter_id").ok())
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "Outgoing sensor is not deployed at this site; pass parameter_id".to_string(),
+            )
+        })
 }
 
 /// Adopt (deploy) a sensor to a site slot for a window. Auto-creates the site_parameter if missing,
@@ -149,7 +217,7 @@ pub async fn adopt_sensor(
     Json(payload): Json<AdoptRequest>,
 ) -> AppResult<Json<AdoptResponse>> {
     let db = &app_state.db;
-    let parameter_id = sensor_parameter(db, sensor_id).await?;
+    let parameter_id = resolve_sensor_parameter(db, sensor_id, payload.parameter_id).await?;
 
     let site_exists = db
         .query_one(Statement::from_sql_and_values(
@@ -193,8 +261,8 @@ pub async fn adopt_sensor(
     ))
     .await?;
 
-    // Insert the deployment. parameter_id is filled by the BEFORE INSERT trigger; the
-    // excl_deployment_site_param_slot constraint is the atomic cross-sensor guard.
+    // Insert the deployment, authoring parameter_id (the derive-from-sensor trigger was dropped);
+    // the excl_deployment_site_param_slot constraint is the atomic cross-sensor guard.
     let dep_id = Uuid::new_v4();
     let dep_type = payload
         .deployment_type
@@ -209,8 +277,8 @@ pub async fn adopt_sensor(
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"INSERT INTO sensor_deployments
-                  (id, sensor_id, site_id, deployed_from, deployed_until, deployment_type, notes)
-              VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                  (id, sensor_id, site_id, parameter_id, deployed_from, deployed_until, deployment_type, notes)
+              VALUES ($1, $2, $3, $8, $4, $5, $6, $7)",
             [
                 dep_id.into(),
                 sensor_id.into(),
@@ -219,6 +287,7 @@ pub async fn adopt_sensor(
                 until_val,
                 dep_type.into(),
                 notes.into(),
+                parameter_id.into(),
             ],
         ))
         .await;
@@ -340,6 +409,10 @@ pub struct SwapRequest {
     pub outgoing_sensor_id: Uuid,
     pub incoming_sensor_id: Uuid,
     pub site_id: Uuid,
+    /// The (site, parameter) slot to swap. Optional: derived from the outgoing sensor's deployment at
+    /// the site when omitted.
+    #[serde(default)]
+    pub parameter_id: Option<Uuid>,
     /// Instant of the swap. Defaults to now(). A ends at T, B starts at T (half-open => no overlap).
     #[serde(default)]
     pub at: Option<DateTime<Utc>>,
@@ -376,14 +449,13 @@ pub async fn swap_sensors(
     Json(payload): Json<SwapRequest>,
 ) -> AppResult<Json<SwapResponse>> {
     let db = &app_state.db;
-    let out_param = sensor_parameter(db, payload.outgoing_sensor_id).await?;
-    let in_param = sensor_parameter(db, payload.incoming_sensor_id).await?;
-    if out_param != in_param {
-        return Err(AppError::BadRequest(
-            "Both sensors must measure the same parameter to share a slot".to_string(),
-        ));
-    }
-    let parameter_id = in_param;
+    let parameter_id = resolve_swap_parameter(
+        db,
+        payload.outgoing_sensor_id,
+        payload.site_id,
+        payload.parameter_id,
+    )
+    .await?;
     let at = payload.at.unwrap_or_else(Utc::now);
 
     let txn = db.begin().await?;
@@ -429,13 +501,14 @@ pub async fn swap_sensors(
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"INSERT INTO sensor_deployments
-                  (id, sensor_id, site_id, deployed_from, deployment_type, notes)
-              VALUES ($1, $2, $3, $4, 'permanent', 'Swapped in via /actions/swap')",
+                  (id, sensor_id, site_id, parameter_id, deployed_from, deployment_type, notes)
+              VALUES ($1, $2, $3, $5, $4, 'permanent', 'Swapped in via /actions/swap')",
             [
                 started_id.into(),
                 payload.incoming_sensor_id.into(),
                 payload.site_id.into(),
                 at.into(),
+                parameter_id.into(),
             ],
         ))
         .await;

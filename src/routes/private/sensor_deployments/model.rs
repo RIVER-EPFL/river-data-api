@@ -31,10 +31,11 @@ pub struct Model {
     pub sensor_id: Uuid,
     #[crudcrate(filterable)]
     pub site_id: Uuid,
-    /// Denormalized from the sensor's (immutable) parameter by the `set_deployment_parameter_id`
-    /// trigger. Read-only over the API (`exclude(create, update)`); serialized so the UI can resolve
-    /// the slot incumbent for adopt/swap.
-    #[crudcrate(filterable, exclude(create, update))]
+    /// The parameter this deployment binds the sensor to at the site. Authored at create time (a
+    /// multi-parameter instrument gets one deployment per parameter); immutable afterwards
+    /// (`exclude(update)`). The `excl_deployment_site_param_slot` constraint enforces one sensor per
+    /// (site, parameter, time).
+    #[crudcrate(filterable, exclude(update))]
     pub parameter_id: Uuid,
     #[crudcrate(sortable)]
     pub deployed_from: chrono::DateTime<chrono::Utc>,

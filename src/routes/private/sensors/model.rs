@@ -28,8 +28,6 @@ pub struct Model {
     #[crudcrate(fulltext, sortable)]
     pub name: Option<String>,
     #[crudcrate(filterable)]
-    pub parameter_id: Uuid,
-    #[crudcrate(filterable)]
     pub manufacturer: Option<String>,
     #[crudcrate(filterable)]
     pub model: Option<String>,
@@ -67,24 +65,12 @@ pub struct Model {
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    #[sea_orm(
-        belongs_to = "crate::routes::private::parameters::Entity",
-        from = "Column::ParameterId",
-        to = "crate::routes::private::parameters::Column::Id"
-    )]
-    Parameter,
     #[sea_orm(has_many = "crate::routes::private::sensor_calibrations::Entity")]
     SensorCalibrations,
     #[sea_orm(has_many = "crate::routes::private::sensor_deployments::Entity")]
     SensorDeployments,
     #[sea_orm(has_many = "crate::routes::private::readings::Entity")]
     Readings,
-}
-
-impl Related<crate::routes::private::parameters::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::Parameter.def()
-    }
 }
 
 impl Related<crate::routes::private::sensor_calibrations::Entity> for Entity {

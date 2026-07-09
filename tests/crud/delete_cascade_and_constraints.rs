@@ -108,9 +108,8 @@ async fn delete_sensor_with_calibrations() {
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO sensors (id, serial_number, name, manufacturer, model, parameter_id) \
-             VALUES ('{sensor_id}', 'DEL-TEST-001', 'Delete Test', 'Test', 'T1', '{}')",
-            crate::common::GLOBAL_PARAM_TEMP_ID
+            "INSERT INTO sensors (id, serial_number, name, manufacturer, model) \
+             VALUES ('{sensor_id}', 'DEL-TEST-001', 'Delete Test', 'Test', 'T1')"
         ),
     )
     .await;

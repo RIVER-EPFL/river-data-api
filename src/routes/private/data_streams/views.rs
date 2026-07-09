@@ -220,8 +220,10 @@ pub async fn register_stream(
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ImportStreamRequest {
-    /// The parameter this stream's sensor measures. Keys the sensor by (serial, parameter).
-    pub parameter_id: Uuid,
+    /// Legacy field, ignored: a sensor is imported parameter-free (parameter is bound at
+    /// deploy/grab time). Retained so existing callers keep deserializing.
+    #[serde(default)]
+    pub parameter_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -250,7 +252,7 @@ pub struct ImportStreamResponse {
 pub async fn import_stream(
     State(state): State<AppState>,
     Path(stream_id): Path<Uuid>,
-    Json(payload): Json<ImportStreamRequest>,
+    Json(_payload): Json<ImportStreamRequest>,
 ) -> AppResult<Json<ImportStreamResponse>> {
     use crate::routes::private::sensors::operations::import_sensor_for_stream;
     let db = &state.db;
@@ -260,7 +262,8 @@ pub async fn import_stream(
         .await?
         .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
 
-    let ctx = import_sensor_for_stream(db, &stream, payload.parameter_id).await?;
+    // Import is parameter-free: a sensor is a device, its parameter is bound at deploy/grab time.
+    let ctx = import_sensor_for_stream(db, &stream).await?;
 
     // Stamp sensor/calibration on site-less readings only; do NOT touch
     // site_id/parameter_id/deployment_id (those are set at adopt). Idempotent.

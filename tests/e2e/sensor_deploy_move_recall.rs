@@ -54,7 +54,7 @@ async fn deploy_move_recall_reprocess_over_http() {
     // MOVE to site 2 at 00:30 via the API. The before_create hook closes the open site-1 deployment
     // at the new deployed_from; after_create spawns a tracked reprocessing job.
     let sensor_id = sensor.id.to_string();
-    let _dep_b = e2e::create_deployment(&app, &token, &sensor_id, crate::common::SITE2_ID, "2025-06-01T00:30:00Z").await;
+    let _dep_b = e2e::create_deployment(&app, &token, &sensor_id, crate::common::SITE2_ID, crate::common::GLOBAL_PARAM_TEMP_ID, "2025-06-01T00:30:00Z").await;
     assert!(
         sl::wait_for_reprocessing(&db, sensor.id, Duration::from_secs(30)).await,
         "reprocessing after move should complete"

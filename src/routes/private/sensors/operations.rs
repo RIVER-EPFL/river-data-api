@@ -245,22 +245,18 @@ fn extract_source_metadata(stream_metadata: &serde_json::Value) -> Option<serde_
     }
 }
 
-/// Find an existing sensor by its natural key `(serial_number, parameter_id)`.
+/// Find an existing sensor by its natural key `serial_number`. A serial identifies one physical
+/// instrument (a device measures many parameters through one serial), so dedup is serial-only.
 /// Returns `None` when no serial is available (we never dedupe serial-less sensors).
-async fn find_sensor_by_serial_param<C: ConnectionTrait>(
+async fn find_sensor_by_serial<C: ConnectionTrait>(
     db: &C,
     serial: Option<&str>,
-    parameter_id: Uuid,
 ) -> AppResult<Option<sensors::Model>> {
     let Some(serial) = serial else {
         return Ok(None);
     };
     let existing = sensors::Entity::find()
-        .filter(
-            Condition::all()
-                .add(sensors::Column::SerialNumber.eq(serial))
-                .add(sensors::Column::ParameterId.eq(parameter_id)),
-        )
+        .filter(sensors::Column::SerialNumber.eq(serial))
         .one(db)
         .await?;
     Ok(existing)
@@ -282,18 +278,17 @@ async fn link_stream_to_sensor<C: ConnectionTrait>(
     Ok(())
 }
 
-/// Insert a new sensor for `(serial, parameter)`, or return the existing one if a sensor with that
-/// natural key already exists. Race-safe: the `ON CONFLICT … DO NOTHING` targets the partial unique
-/// index `idx_sensors_serial_parameter (serial_number, parameter_id) WHERE serial_number IS NOT NULL`,
-/// so concurrent pairings of the same device converge on one row WITHOUT raising a unique violation.
-/// That matters because some callers run inside a transaction (sync plan/discovery apply): a raised
-/// violation there would poison the whole transaction, not just this insert. A serial-less sensor has
-/// no dedupe key (the predicate excludes it), so it always inserts and the new id comes back via
-/// `RETURNING`. The conflict branch re-selects the winner.
+/// Insert a new sensor for `serial`, or return the existing one if a sensor with that serial already
+/// exists. Race-safe: the `ON CONFLICT … DO NOTHING` targets the partial unique index
+/// `idx_sensors_serial_unique (serial_number) WHERE serial_number IS NOT NULL`, so concurrent pairings
+/// of the same device converge on one row WITHOUT raising a unique violation. That matters because
+/// some callers run inside a transaction (sync plan/discovery apply): a raised violation there would
+/// poison the whole transaction, not just this insert. A serial-less sensor has no dedupe key (the
+/// predicate excludes it), so it always inserts and the new id comes back via `RETURNING`. The
+/// conflict branch re-selects the winner.
 async fn insert_or_get_sensor<C: ConnectionTrait>(
     db: &C,
     serial: Option<&str>,
-    parameter_id: Uuid,
     name: &str,
     metadata: Option<serde_json::Value>,
 ) -> AppResult<Uuid> {
@@ -312,12 +307,12 @@ async fn insert_or_get_sensor<C: ConnectionTrait>(
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r#"INSERT INTO sensors
-                   (id, serial_number, name, parameter_id, is_active, is_lab_instrument, metadata, created_at)
-               VALUES (gen_random_uuid(), $1, $2, $3, true, false, $4::jsonb, now())
-               ON CONFLICT (serial_number, parameter_id) WHERE serial_number IS NOT NULL
+                   (id, serial_number, name, is_active, is_lab_instrument, metadata, created_at)
+               VALUES (gen_random_uuid(), $1, $2, true, false, $3::jsonb, now())
+               ON CONFLICT (serial_number) WHERE serial_number IS NOT NULL
                DO NOTHING
                RETURNING id"#,
-            [serial_val, name.into(), parameter_id.into(), metadata_val],
+            [serial_val, name.into(), metadata_val],
         ))
         .await?;
 
@@ -326,13 +321,12 @@ async fn insert_or_get_sensor<C: ConnectionTrait>(
         return Ok(id);
     }
 
-    // Conflict on (serial, parameter): a sensor already exists (possibly a concurrent winner) — reuse it.
-    let existing = find_sensor_by_serial_param(db, serial, parameter_id)
+    // Conflict on serial: a sensor already exists (possibly a concurrent winner) — reuse it.
+    let existing = find_sensor_by_serial(db, serial)
         .await?
         .ok_or_else(|| {
             AppError::Internal(
-                "sensor upsert conflicted but the existing (serial, parameter) row was not found"
-                    .to_string(),
+                "sensor upsert conflicted but the existing serial row was not found".to_string(),
             )
         })?;
     Ok(existing.id)
@@ -349,9 +343,9 @@ pub async fn create_sensor_for_stream<C: ConnectionTrait>(
     parameter_id: Uuid,
     site_id: Uuid,
 ) -> AppResult<SensorContext> {
-    let ctx = import_sensor_for_stream(db, stream, parameter_id).await?;
-    // Ensure active deployment exists for this sensor+site (None if the slot is occupied).
-    let deployment_id = find_or_create_deployment(db, ctx.sensor_id, site_id).await?;
+    let ctx = import_sensor_for_stream(db, stream).await?;
+    // Ensure active deployment exists for this sensor+site+parameter (None if the slot is occupied).
+    let deployment_id = find_or_create_deployment(db, ctx.sensor_id, site_id, parameter_id).await?;
     Ok(SensorContext {
         deployment_id,
         ..ctx
@@ -361,12 +355,11 @@ pub async fn create_sensor_for_stream<C: ConnectionTrait>(
 /// Import-only: create or reuse a sensor for a stream and resolve its latest calibration, WITHOUT
 /// deploying it to a site. The "imported, not adopted" state — readings get `sensor_id`/
 /// `calibration_id` (so calibration math applies) but no `deployment_id`/`site_id` until an explicit
-/// adopt. Idempotent: reuses the stream's linked sensor, else the existing `(serial, parameter)`
-/// sensor, else inserts one (race-safe via `insert_or_get_sensor`). Updates `data_streams.sensor_id`.
+/// adopt. Idempotent: reuses the stream's linked sensor, else the existing `serial` sensor, else
+/// inserts one (race-safe via `insert_or_get_sensor`). Updates `data_streams.sensor_id`.
 pub async fn import_sensor_for_stream<C: ConnectionTrait>(
     db: &C,
     stream: &data_streams::Model,
-    parameter_id: Uuid,
 ) -> AppResult<SensorContext> {
     let serial = extract_vaisala_device_serial(&stream.metadata);
 
@@ -380,8 +373,7 @@ pub async fn import_sensor_for_stream<C: ConnectionTrait>(
             .unwrap_or_else(|| format!("Stream {}", stream.source_key));
         let metadata = extract_source_metadata(&stream.metadata);
         let sensor_id =
-            insert_or_get_sensor(db, serial.as_deref(), parameter_id, &sensor_name, metadata)
-                .await?;
+            insert_or_get_sensor(db, serial.as_deref(), &sensor_name, metadata).await?;
         let cal_id = get_latest_calibration(db, sensor_id).await?;
         link_stream_to_sensor(db, stream, sensor_id).await?;
         (sensor_id, cal_id)
@@ -459,12 +451,14 @@ async fn find_or_create_deployment<C: ConnectionTrait>(
     db: &C,
     sensor_id: Uuid,
     site_id: Uuid,
+    parameter_id: Uuid,
 ) -> AppResult<Option<Uuid>> {
     let existing = sensor_deployments::Entity::find()
         .filter(
             Condition::all()
                 .add(sensor_deployments::Column::SensorId.eq(sensor_id))
                 .add(sensor_deployments::Column::SiteId.eq(site_id))
+                .add(sensor_deployments::Column::ParameterId.eq(parameter_id))
                 .add(sensor_deployments::Column::DeployedUntil.is_null()),
         )
         .one(db)
@@ -475,21 +469,21 @@ async fn find_or_create_deployment<C: ConnectionTrait>(
     }
 
     // Insert an open deployment only when no other deployment occupies the (site, parameter) slot at
-    // now(). `parameter_id` is filled by the BEFORE INSERT trigger from the sensor.
+    // now(). `parameter_id` is authored here (the derive-from-sensor trigger was dropped).
     let row = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"INSERT INTO sensor_deployments
-                  (id, sensor_id, site_id, deployed_from, deployment_type, notes)
-              SELECT gen_random_uuid(), $1, $2, NOW(), 'permanent', 'Auto-created during stream pairing'
+                  (id, sensor_id, site_id, parameter_id, deployed_from, deployment_type, notes)
+              SELECT gen_random_uuid(), $1, $2, $3, NOW(), 'permanent', 'Auto-created during stream pairing'
               WHERE NOT EXISTS (
                   SELECT 1 FROM sensor_deployments d
                   WHERE d.site_id = $2
-                    AND d.parameter_id = (SELECT parameter_id FROM sensors WHERE id = $1)
+                    AND d.parameter_id = $3
                     AND COALESCE(d.deployed_until, 'infinity'::timestamptz) > NOW()
               )
               RETURNING id",
-            [sensor_id.into(), site_id.into()],
+            [sensor_id.into(), site_id.into(), parameter_id.into()],
         ))
         .await?;
 

@@ -148,11 +148,13 @@ pub async fn get_site_sensor_identity(
 
     // Calibration markers: calibrations (overlapping the window) of the sensors deployed at this
     // site over the window, grouped by the sensor's parameter.
+    // Markers use the calibration's own parameter (the sensor no longer carries one); only windowed
+    // calibrations with a resolved parameter are plottable markers (instant grab curves and
+    // not-yet-attributed identity calibrations are excluded).
     let mut cal_sql = String::from(
-        r"SELECT c.id AS calibration_id, c.sensor_id, sn.parameter_id,
+        r"SELECT c.id AS calibration_id, c.sensor_id, c.parameter_id,
                  c.slope, c.intercept, c.valid_from, c.valid_until
           FROM sensor_calibrations c
-          JOIN sensors sn ON sn.id = c.sensor_id
           WHERE c.sensor_id IN (
               SELECT DISTINCT d.sensor_id FROM sensor_deployments d
               WHERE d.site_id = $1
@@ -171,9 +173,11 @@ pub async fn get_site_sensor_identity(
     }
     cal_sql.push_str(
         r" )
+            AND c.parameter_id IS NOT NULL
+            AND c.mode = 'windowed'
             AND c.valid_from < $2
             AND COALESCE(c.valid_until, 'infinity'::timestamptz) > $3
-          ORDER BY sn.parameter_id, c.valid_from",
+          ORDER BY c.parameter_id, c.valid_from",
     );
 
     let cal_rows = db

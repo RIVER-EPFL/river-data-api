@@ -50,7 +50,7 @@ fn sample_parameter(code: &str) -> serde_json::Value {
     })
 }
 fn sample_deployment() -> serde_json::Value {
-    serde_json::json!({ "sensor_id": GLOBAL_PARAM_TEMP_ID, "site_id": SITE1_ID })
+    serde_json::json!({ "sensor_id": GLOBAL_PARAM_TEMP_ID, "site_id": SITE1_ID, "parameter_id": GLOBAL_PARAM_TEMP_ID })
 }
 fn sample_site_parameter() -> serde_json::Value {
     serde_json::json!({ "site_id": SITE1_ID, "parameter_id": GLOBAL_PARAM_TEMP_ID })

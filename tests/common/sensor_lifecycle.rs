@@ -103,8 +103,10 @@ pub async fn seed_base_entities(db: &DatabaseConnection) {
 // Sensor lifecycle
 // ============================================================================
 
-/// Create a sensor linked to a global parameter, with an identity calibration
-/// (slope=1, intercept=0, valid_from=2000-01-01).
+/// Create a sensor (parameter-free device) with an identity calibration (slope=1, intercept=0,
+/// valid_from=2000-01-01) bound to `parameter_id`. The parameter lives on the calibration and
+/// deployment now, not the sensor; `deploy_sensor`/`add_calibration` derive it from this identity
+/// calibration so the sensor's whole windowed timeline shares one parameter.
 pub async fn create_sensor(
     db: &DatabaseConnection,
     name: &str,
@@ -115,18 +117,17 @@ pub async fn create_sensor(
 
     exec(
         db,
-        &format!(
-            "INSERT INTO sensors (id, name, parameter_id, is_active) \
-             VALUES ('{sensor_id}', '{name}', '{parameter_id}', true)"
-        ),
+        &format!("INSERT INTO sensors (id, name, is_active) VALUES ('{sensor_id}', '{name}', true)"),
     )
     .await;
 
     exec(
         db,
         &format!(
-            "INSERT INTO sensor_calibrations (id, sensor_id, slope, intercept, valid_from, notes) \
-             VALUES ('{cal_id}', '{sensor_id}', 1.0, 0.0, '2000-01-01T00:00:00Z', 'identity')"
+            "INSERT INTO sensor_calibrations \
+             (id, sensor_id, parameter_id, slope, intercept, valid_from, mode, notes) \
+             VALUES ('{cal_id}', '{sensor_id}', '{parameter_id}', 1.0, 0.0, \
+             '2000-01-01T00:00:00Z', 'windowed', 'identity')"
         ),
     )
     .await;
@@ -137,7 +138,9 @@ pub async fn create_sensor(
     }
 }
 
-/// Deploy a sensor to a site starting at `from`. Returns the deployment ID.
+/// Deploy a sensor to a site starting at `from`. The deployment's parameter is derived from the
+/// sensor's identity calibration (a sensor made via `create_sensor` always has one). Returns the
+/// deployment ID.
 pub async fn deploy_sensor(
     db: &DatabaseConnection,
     sensor_id: Uuid,
@@ -148,8 +151,12 @@ pub async fn deploy_sensor(
     exec(
         db,
         &format!(
-            "INSERT INTO sensor_deployments (id, sensor_id, site_id, deployed_from, deployment_type) \
-             VALUES ('{id}', '{sensor_id}', '{site_id}', '{}', 'permanent')",
+            "INSERT INTO sensor_deployments (id, sensor_id, site_id, parameter_id, deployed_from, deployment_type) \
+             SELECT '{id}', '{sensor_id}', '{site_id}', \
+                    (SELECT parameter_id FROM sensor_calibrations \
+                     WHERE sensor_id = '{sensor_id}' AND parameter_id IS NOT NULL \
+                     ORDER BY valid_from LIMIT 1), \
+                    '{}', 'permanent'",
             from.to_rfc3339()
         ),
     )
@@ -181,8 +188,12 @@ pub async fn add_calibration(
     exec(
         db,
         &format!(
-            "INSERT INTO sensor_calibrations (id, sensor_id, slope, intercept, valid_from) \
-             VALUES ('{id}', '{sensor_id}', {slope}, {intercept}, '{}')",
+            "INSERT INTO sensor_calibrations (id, sensor_id, parameter_id, slope, intercept, valid_from) \
+             SELECT '{id}', '{sensor_id}', \
+                    (SELECT parameter_id FROM sensor_calibrations \
+                     WHERE sensor_id = '{sensor_id}' AND parameter_id IS NOT NULL \
+                     ORDER BY valid_from LIMIT 1), \
+                    {slope}, {intercept}, '{}'",
             valid_from.to_rfc3339()
         ),
     )

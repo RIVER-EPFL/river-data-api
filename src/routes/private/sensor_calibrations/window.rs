@@ -59,9 +59,8 @@ pub async fn get_calibration_window(
     let cal = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT c.sensor_id, c.slope, c.intercept, c.valid_from, c.valid_until, s.parameter_id
+            r"SELECT c.sensor_id, c.slope, c.intercept, c.valid_from, c.valid_until, c.parameter_id
               FROM sensor_calibrations c
-              JOIN sensors s ON s.id = c.sensor_id
               WHERE c.id = $1",
             [calibration_id.into()],
         ))

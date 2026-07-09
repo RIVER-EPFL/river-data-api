@@ -85,9 +85,8 @@ async fn reprocess_creates_tracked_job_for_seeded_sensor() {
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO sensors (id, name, parameter_id, is_active) \
-             VALUES ('{sensor_id}', 'Reprocess-Probe', '{}', true)",
-            crate::common::GLOBAL_PARAM_TEMP_ID
+            "INSERT INTO sensors (id, name, is_active) \
+             VALUES ('{sensor_id}', 'Reprocess-Probe', true)"
         ),
     )
     .await;

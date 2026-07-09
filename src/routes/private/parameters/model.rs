@@ -49,8 +49,6 @@ pub struct Model {
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    #[sea_orm(has_many = "crate::routes::private::sensors::Entity")]
-    Sensors,
     #[sea_orm(has_many = "crate::routes::private::site_parameters::Entity")]
     SiteParameters,
     #[sea_orm(has_many = "crate::routes::private::alarm_thresholds::Entity")]
@@ -59,12 +57,6 @@ pub enum Relation {
     StatusEvents,
     #[sea_orm(has_many = "crate::routes::private::derived_parameters::source_model::Entity")]
     DerivedParameterSources,
-}
-
-impl Related<crate::routes::private::sensors::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::Sensors.def()
-    }
 }
 
 impl Related<crate::routes::private::site_parameters::Entity> for Entity {

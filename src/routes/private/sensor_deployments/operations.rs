@@ -12,11 +12,12 @@ pub struct SensorDeploymentOperations;
 /// (`reprocess_site_parameter_readings`) so a backdated/edited window re-attributes the affected
 /// (site, parameter) by deployment timeline — stamping `sensor_id` onto previously unattributed
 /// (NULL-sensor) history — then a per-sensor pass to reconcile the sensor's own rows at any vacated
-/// slot. `parameter_id` is resolved from the sensor (a deployment is always for the sensor's parameter).
+/// slot. `parameter_id` is the deployment's authored parameter (passed through to the job).
 async fn spawn_slot_reprocess(
     db: &DatabaseConnection,
     sensor_id: Uuid,
     site_id: Uuid,
+    parameter_id: Uuid,
     trigger_type: &str,
     trigger_id: Uuid,
 ) -> Result<(), sea_orm::DbErr> {
@@ -25,7 +26,7 @@ async fn spawn_slot_reprocess(
         trigger_type,
         Some(sensor_id),
         Some(trigger_id),
-        &serde_json::json!({ "sensor_id": sensor_id, "site_id": site_id }),
+        &serde_json::json!({ "sensor_id": sensor_id, "site_id": site_id, "parameter_id": parameter_id }),
         None,
     )
     .await?;
@@ -69,7 +70,7 @@ impl CRUDOperations for SensorDeploymentOperations {
                 sea_orm::DatabaseBackend::Postgres,
                 r"SELECT 1 FROM sensor_deployments d
                   WHERE d.site_id = $1
-                    AND d.parameter_id = (SELECT parameter_id FROM sensors WHERE id = $2)
+                    AND d.parameter_id = $5
                     AND d.sensor_id <> $2
                     AND tstzrange(d.deployed_from, COALESCE(d.deployed_until, 'infinity'::timestamptz), '[)')
                         && tstzrange($3, COALESCE($4, 'infinity'::timestamptz), '[)')
@@ -79,6 +80,7 @@ impl CRUDOperations for SensorDeploymentOperations {
                     data.sensor_id.into(),
                     data.deployed_from.into(),
                     data.deployed_until.into(),
+                    data.parameter_id.into(),
                 ],
             ))
             .await
@@ -121,7 +123,7 @@ impl CRUDOperations for SensorDeploymentOperations {
         let Some(existing) = db
             .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                "SELECT sensor_id, site_id, deployed_from, deployed_until \
+                "SELECT sensor_id, site_id, parameter_id, deployed_from, deployed_until \
                  FROM sensor_deployments WHERE id = $1",
                 [id.into()],
             ))
@@ -131,6 +133,8 @@ impl CRUDOperations for SensorDeploymentOperations {
             return Ok(()); // unknown id — let CrudCrate's update produce the 404
         };
 
+        // parameter_id is immutable on update (exclude(update)); the slot's parameter is the row's own.
+        let cur_param: Uuid = existing.try_get("", "parameter_id").map_err(ApiError::database)?;
         let cur_sensor: Uuid = existing.try_get("", "sensor_id").map_err(ApiError::database)?;
         let cur_site: Uuid = existing.try_get("", "site_id").map_err(ApiError::database)?;
         let cur_from: chrono::DateTime<chrono::FixedOffset> =
@@ -161,7 +165,7 @@ impl CRUDOperations for SensorDeploymentOperations {
                 sea_orm::DatabaseBackend::Postgres,
                 r"SELECT 1 FROM sensor_deployments d
                   WHERE d.site_id = $1
-                    AND d.parameter_id = (SELECT parameter_id FROM sensors WHERE id = $2)
+                    AND d.parameter_id = $6
                     AND d.sensor_id <> $2
                     AND d.id <> $3
                     AND tstzrange(d.deployed_from, COALESCE(d.deployed_until, 'infinity'::timestamptz), '[)')
@@ -173,6 +177,7 @@ impl CRUDOperations for SensorDeploymentOperations {
                     id.into(),
                     new_from.into(),
                     new_until.into(),
+                    cur_param.into(),
                 ],
             ))
             .await
@@ -219,9 +224,16 @@ impl CRUDOperations for SensorDeploymentOperations {
             .await
             .map_err(ApiError::database)?;
 
-        spawn_slot_reprocess(db, entity.sensor_id, entity.site_id, "deployment_create", entity.id)
-            .await
-            .map_err(ApiError::database)?;
+        spawn_slot_reprocess(
+            db,
+            entity.sensor_id,
+            entity.site_id,
+            entity.parameter_id,
+            "deployment_create",
+            entity.id,
+        )
+        .await
+        .map_err(ApiError::database)?;
 
         Ok(())
     }
@@ -235,9 +247,16 @@ impl CRUDOperations for SensorDeploymentOperations {
             .await
             .map_err(ApiError::database)?;
 
-        spawn_slot_reprocess(db, entity.sensor_id, entity.site_id, "deployment_update", entity.id)
-            .await
-            .map_err(ApiError::database)?;
+        spawn_slot_reprocess(
+            db,
+            entity.sensor_id,
+            entity.site_id,
+            entity.parameter_id,
+            "deployment_update",
+            entity.id,
+        )
+        .await
+        .map_err(ApiError::database)?;
 
         Ok(())
     }
@@ -250,7 +269,7 @@ impl CRUDOperations for SensorDeploymentOperations {
         let row = db
             .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                "SELECT sensor_id, site_id FROM sensor_deployments WHERE id = $1",
+                "SELECT sensor_id, site_id, parameter_id FROM sensor_deployments WHERE id = $1",
                 [id.into()],
             ))
             .await
@@ -267,6 +286,9 @@ impl CRUDOperations for SensorDeploymentOperations {
             .map_err(ApiError::database)?;
         let site_id: Uuid = row
             .try_get("", "site_id")
+            .map_err(ApiError::database)?;
+        let parameter_id: Uuid = row
+            .try_get("", "parameter_id")
             .map_err(ApiError::database)?;
 
         // readings.deployment_id has no ON DELETE action — clear references first, then delete.
@@ -291,7 +313,7 @@ impl CRUDOperations for SensorDeploymentOperations {
             .await
             .map_err(ApiError::database)?;
 
-        spawn_slot_reprocess(db, sensor_id, site_id, "deployment_delete", id)
+        spawn_slot_reprocess(db, sensor_id, site_id, parameter_id, "deployment_delete", id)
             .await
             .map_err(ApiError::database)?;
 

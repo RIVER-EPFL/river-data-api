@@ -227,9 +227,8 @@ async fn worker_runs_registered_reprocess_job() {
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO sensors (id, name, parameter_id, is_active) \
-             VALUES ('{sensor_id}', 'Worker-Probe', '{}', true)",
-            crate::common::GLOBAL_PARAM_TEMP_ID
+            "INSERT INTO sensors (id, name, is_active) \
+             VALUES ('{sensor_id}', 'Worker-Probe', true)"
         ),
     )
     .await;

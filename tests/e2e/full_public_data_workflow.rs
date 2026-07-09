@@ -179,7 +179,7 @@ async fn test_full_public_data_workflow() {
         &app,
         "/api/sensors",
         &serde_json::json!({
-            "parameter_id": do_param_id, "serial_number": "E2E-DO-1",
+            "serial_number": "E2E-DO-1",
             "manufacturer": "Aanderaa", "model": "4531",
         }),
         &token,

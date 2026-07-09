@@ -237,15 +237,27 @@ impl Job for ReprocessDeployment {
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         let sensor_id = required_uuid(ctx.params(), "sensor_id")?;
         let site_id = required_uuid(ctx.params(), "site_id")?;
-        let parameter_id: Option<Uuid> = ctx
-            .db()
-            .query_one(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT parameter_id FROM sensors WHERE id = $1",
-                [sensor_id.into()],
-            ))
-            .await?
-            .and_then(|r| r.try_get::<Uuid>("", "parameter_id").ok());
+        // The deployment's parameter is carried in the job params (spawn_slot_reprocess). Fall back to
+        // the sensor's deployment at this site for jobs queued before the parameter was passed through.
+        let parameter_id: Option<Uuid> = match ctx
+            .params()
+            .get("parameter_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())
+        {
+            Some(p) => Some(p),
+            None => ctx
+                .db()
+                .query_one(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT parameter_id FROM sensor_deployments \
+                     WHERE sensor_id = $1 AND site_id = $2 \
+                     ORDER BY (deployed_until IS NULL) DESC, deployed_from DESC LIMIT 1",
+                    [sensor_id.into(), site_id.into()],
+                ))
+                .await?
+                .and_then(|r| r.try_get::<Uuid>("", "parameter_id").ok()),
+        };
         let count = if let Some(parameter_id) = parameter_id {
             reprocess_site_parameter_readings(ctx.db(), site_id, parameter_id).await? as i64
         } else {

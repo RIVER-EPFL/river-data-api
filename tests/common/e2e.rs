@@ -135,12 +135,13 @@ pub async fn assign_site_parameter_minimal(app: &Router, token: &str, site_id: &
     .await
 }
 
-pub async fn create_sensor(app: &Router, token: &str, parameter_id: &str, serial: &str) -> String {
+pub async fn create_sensor(app: &Router, token: &str, _parameter_id: &str, serial: &str) -> String {
+    // A sensor is parameter-free; the parameter is bound at deploy time (see `create_deployment`).
     create(
         app,
         token,
         "/api/sensors",
-        json!({ "parameter_id": parameter_id, "serial_number": serial, "manufacturer": "e2e", "model": "test" }),
+        json!({ "serial_number": serial, "manufacturer": "e2e", "model": "test" }),
     )
     .await
 }
@@ -167,13 +168,19 @@ pub async fn create_deployment(
     token: &str,
     sensor_id: &str,
     site_id: &str,
+    parameter_id: &str,
     deployed_from: &str,
 ) -> String {
     create(
         app,
         token,
         "/api/sensor_deployments",
-        json!({ "sensor_id": sensor_id, "site_id": site_id, "deployed_from": deployed_from }),
+        json!({
+            "sensor_id": sensor_id,
+            "site_id": site_id,
+            "parameter_id": parameter_id,
+            "deployed_from": deployed_from,
+        }),
     )
     .await
 }

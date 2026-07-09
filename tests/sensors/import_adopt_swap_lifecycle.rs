@@ -91,7 +91,7 @@ async fn import_then_adopt_backfills_by_window() {
     let (status, body) = crate::common::post_json_with_token(
         &app,
         &format!("/api/sensors/{sensor_id}/adopt"),
-        &serde_json::json!({ "site_id": crate::common::SITE1_ID, "deployed_from": "2025-05-01T00:00:00Z" }),
+        &serde_json::json!({ "site_id": crate::common::SITE1_ID, "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID, "deployed_from": "2025-05-01T00:00:00Z" }),
         &token,
     )
     .await;

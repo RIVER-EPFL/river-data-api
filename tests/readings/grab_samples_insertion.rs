@@ -327,9 +327,8 @@ async fn test_grab_applies_instant_curve_server_side() {
     db.execute(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
-            "INSERT INTO sensors (id, name, parameter_id, is_active, is_lab_instrument, created_at)
-             VALUES ('{sensor_id}', 'Microplate reader', '{}', true, true, now())",
-            crate::common::GLOBAL_PARAM_TEMP_ID
+            "INSERT INTO sensors (id, name, is_active, is_lab_instrument, created_at)
+             VALUES ('{sensor_id}', 'Microplate reader', true, true, now())"
         ),
     ))
     .await

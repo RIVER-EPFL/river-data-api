@@ -325,6 +325,7 @@ async fn deployment_change_updates_site_and_deployment() {
         &serde_json::json!({
             "sensor_id": sensor.id,
             "site_id": SITE2_ID,
+            "parameter_id": GLOBAL_PARAM_TEMP_ID,
             "deployed_from": "2025-01-01T12:00:00Z",
             "deployment_type": "permanent"
         }),
@@ -533,6 +534,7 @@ async fn lab_sensor_multiple_deployments_same_day() {
         &serde_json::json!({
             "sensor_id": sensor.id,
             "site_id": SITE2_ID,
+            "parameter_id": GLOBAL_PARAM_TEMP_ID,
             "deployed_from": "2025-06-15T10:00:00Z",
             "deployed_until": "2025-06-15T12:00:00Z",
             "deployment_type": "field_campaign"
@@ -552,6 +554,7 @@ async fn lab_sensor_multiple_deployments_same_day() {
         &serde_json::json!({
             "sensor_id": sensor.id,
             "site_id": SITE1_ID,
+            "parameter_id": GLOBAL_PARAM_TEMP_ID,
             "deployed_from": "2025-06-15T12:00:00Z",
             "deployed_until": "2025-06-15T14:00:00Z",
             "deployment_type": "field_campaign"

@@ -502,8 +502,9 @@ async fn delete_site_param_remnants(
     Ok(())
 }
 
-/// Move sensors, derived sources, alarms, annotations, samples, and standard curves
-/// from source to target parameter.
+/// Move deployments, calibrations, derived sources, alarms, annotations, samples, and standard
+/// curves from source to target parameter. (Sensors no longer carry a parameter — it lives on the
+/// deployment / calibration.)
 async fn reassign_parameter_references(
     txn: &impl ConnectionTrait,
     source_id: Uuid,
@@ -511,18 +512,18 @@ async fn reassign_parameter_references(
 ) -> AppResult<()> {
     let pg = sea_orm::DatabaseBackend::Postgres;
 
-    // Sensors: delete conflicts on UNIQUE(serial_number, parameter_id), then reassign
+    // Deployments and calibrations both reference parameters(id); move them to the survivor so the
+    // source parameter can be deleted (the deployment FK is RESTRICT).
     txn.execute(Statement::from_sql_and_values(
         pg,
-        r#"DELETE FROM sensors WHERE parameter_id = $1
-           AND serial_number IN (SELECT serial_number FROM sensors WHERE parameter_id = $2)"#,
-        vec![source_id.into(), target_id.into()],
+        "UPDATE sensor_deployments SET parameter_id = $1 WHERE parameter_id = $2",
+        vec![target_id.into(), source_id.into()],
     ))
     .await
     .map_err(AppError::Database)?;
     txn.execute(Statement::from_sql_and_values(
         pg,
-        "UPDATE sensors SET parameter_id = $1 WHERE parameter_id = $2",
+        "UPDATE sensor_calibrations SET parameter_id = $1 WHERE parameter_id = $2",
         vec![target_id.into(), source_id.into()],
     ))
     .await
