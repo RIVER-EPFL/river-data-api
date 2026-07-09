@@ -39,7 +39,16 @@ impl MigrationTrait for Migration {
             ) c ON c.serial_number = s.serial_number
             WHERE s.serial_number IS NOT NULL AND s.id <> c.canon_id;
 
-            -- 2. Re-point child references from every duplicate to its canonical survivor.
+            -- 2. Deployment parameter becomes authored: drop the derive-from-sensor trigger + function
+            --    BEFORE re-pointing. The trigger fires on UPDATE OF sensor_id and overwrites
+            --    parameter_id from the sensor, so re-pointing every sibling deployment onto one
+            --    canonical sensor would collapse their distinct parameters onto the canon's single
+            --    parameter -- violating excl_deployment_site_param_slot. Dropping it first preserves
+            --    each deployment's authored parameter through the re-point.
+            DROP TRIGGER IF EXISTS trg_set_deployment_parameter_id ON sensor_deployments;
+            DROP FUNCTION IF EXISTS set_deployment_parameter_id();
+
+            -- 3. Re-point child references from every duplicate to its canonical survivor.
             UPDATE sensor_deployments d SET sensor_id = m.canon_id
                 FROM _sensor_canon m WHERE d.sensor_id = m.dup_id;
             UPDATE sensor_calibrations sc SET sensor_id = m.canon_id
@@ -49,12 +58,8 @@ impl MigrationTrait for Migration {
             UPDATE readings r SET sensor_id = m.canon_id
                 FROM _sensor_canon m WHERE r.sensor_id = m.dup_id;
 
-            -- 3. Delete the now-orphaned duplicate sensor rows.
+            -- 4. Delete the now-orphaned duplicate sensor rows.
             DELETE FROM sensors s USING _sensor_canon m WHERE s.id = m.dup_id;
-
-            -- 4. Deployment parameter becomes authored: drop the derive-from-sensor trigger + function.
-            DROP TRIGGER IF EXISTS trg_set_deployment_parameter_id ON sensor_deployments;
-            DROP FUNCTION IF EXISTS set_deployment_parameter_id();
 
             -- 5. Drop the parameter coupling on sensors: the (serial, parameter) unique index, the
             --    serial grouping index, the column (+ its FK), and add the serial-only dedup key.
