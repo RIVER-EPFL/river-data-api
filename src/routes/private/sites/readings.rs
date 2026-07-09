@@ -366,6 +366,10 @@ pub async fn get_site_readings(
 
     let measurement_type_condition = if measurement_type_filter.is_empty() {
         String::new()
+    } else if measurement_type_filter == "continuous" {
+        // "continuous" also covers legacy rows written before the measurement_type
+        // column existed (NULL), so the field-sensor line keeps its historical data.
+        " AND (r.measurement_type = 'continuous' OR r.measurement_type IS NULL)".to_string()
     } else {
         let idx = values.len() + 1;
         values.push(measurement_type_filter.to_string().into());
