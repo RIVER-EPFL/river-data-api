@@ -613,6 +613,12 @@ pub async fn reprocess_sensor_readings(
     // Creates or extends an identity calibration for any pre-first-calibration gap.
     ensure_calibration_coverage(db, sensor_id).await?;
 
+    // Chain each parameter's calibration windows (valid_until = next valid_from) before deriving, so
+    // the window UPDATE below is single-valued. Calibrations inserted outside the CRUD hooks (bulk
+    // load, tests) may carry no valid_until; without this two open windows on the same parameter would
+    // both cover a reading and the UPDATE..FROM would pick one arbitrarily (nondeterministic).
+    recompute_valid_until(db, sensor_id).await?;
+
     // The bulk re-derivation runs in one transaction with TimescaleDB's per-statement decompression
     // cap lifted (default 100k tuples). A deep-historical reprocess rewrites rows in compressed
     // (>30-day) chunks and would otherwise abort the job; SET LOCAL resets on commit and is a no-op
