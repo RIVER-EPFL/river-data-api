@@ -1,4 +1,4 @@
-//! `GET /api/me` — the UI's single source of truth for the caller's identity, access level, and
+//! `GET /api/me` returns the UI's single source of truth for the caller's identity, access level, and
 //! project visibility. Keycloak-only (an API token has no user identity or grant set). The response
 //! drives the whole role-aware shell: `role`/`is_admin` gate the menu, `grants` names the projects
 //! the portal may show. Administrators are unrestricted, so their `grants` lists every project.

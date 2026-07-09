@@ -91,9 +91,8 @@ impl AccessScope {
     }
 }
 
-/// Keycloak realm roles, ordered by access level. `riverdata-user` is a deprecated alias for
-/// [`Role::River`] (kept until the realm role is renamed); unrelated realm roles (`admin`,
-/// `offline_access`, `uma_authorization`, …) land in `Unknown` and grant nothing.
+/// Keycloak realm roles, ordered by access level. Unrelated realm roles (`admin`, `offline_access`,
+/// `uma_authorization`, …) land in `Unknown` and grant nothing.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Role {
     Intern,
@@ -103,14 +102,12 @@ pub enum Role {
     Unknown(String),
 }
 
-/// Every realm role that admits a user, canonical first. Includes the deprecated
-/// `riverdata-user` alias so member listings keep finding legacy holders.
-pub const RIVER_ROLE_NAMES: [&str; 5] = [
+/// Every realm role that admits a user, canonical first.
+pub const RIVER_ROLE_NAMES: [&str; 4] = [
     "riverdata-admin",
     "riverdata-manager",
     "riverdata-river",
     "riverdata-intern",
-    "riverdata-user",
 ];
 
 impl Role {
@@ -152,9 +149,7 @@ impl From<String> for Role {
         match value.as_ref() {
             "riverdata-admin" => Role::Administrator,
             "riverdata-manager" => Role::Manager,
-            // `riverdata-user` predates the level rename and stays accepted until the realm
-            // role itself is renamed.
-            "riverdata-river" | "riverdata-user" => Role::River,
+            "riverdata-river" => Role::River,
             "riverdata-intern" => Role::Intern,
             _ => Role::Unknown(value),
         }

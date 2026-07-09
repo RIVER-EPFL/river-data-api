@@ -3,7 +3,7 @@
 //! These reuse the dev Keycloak (realm `river-data`; users `admin/admin` + `user/user`) for token
 //! issuance and JWKS validation, while running the API in-process against the **test DB**. They
 //! cover the Keycloak side of the capability model that the default `keycloak_auth_instance: None`
-//! harness can't: `require_admin` accepts a real `riverdata-admin` JWT, a `riverdata-user` is denied
+//! harness can't: `require_admin` accepts a real `riverdata-admin` JWT, a River user is denied
 //! admin + `write_metadata` but allowed `write_data`, anonymous is 401, and the public tier is open.
 //!
 //! They auto-skip when Keycloak is unreachable, so the default `cargo test` stays green without it.

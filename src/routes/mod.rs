@@ -457,7 +457,7 @@ pub fn build_router(state: AppState) -> Router {
                 // No `required_roles` here: the access gate lives in `service_auth_middleware`,
                 // which rejects role-less logins with a distinct 403 (`no_river_role`) instead of
                 // silently failing JWT validation and misreporting them as 401 via token auth.
-                // This also admits future role holders (e.g. admins without `riverdata-user`).
+                // This also admits future role holders (e.g. admins without a lower level).
                 KeycloakAuthLayer::<crate::common::authz::Role>::builder()
                     .instance(instance)
                     .passthrough_mode(PassthroughMode::Pass)

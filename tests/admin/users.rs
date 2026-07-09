@@ -86,7 +86,7 @@ async fn search_users_matches_directory_with_roles() {
         .as_array()
         .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
-    assert!(roles.contains(&"riverdata-user"), "search roles: {roles:?}");
+    assert!(roles.contains(&"riverdata-admin"), "search roles: {roles:?}");
 
     let (status, body) =
         crate::common::get_with_token(&app, "/api/users/search?q=no-such-account-xyz", &jwt).await;

@@ -56,14 +56,14 @@ async fn login_without_river_role_is_rejected_everywhere() {
 #[serial]
 async fn admin_only_role_passes_the_gate() {
     // Regression for the removed `required_roles(vec![Role::User])` layer, which rejected any JWT
-    // lacking `riverdata-user` during validation — locking out a pure `riverdata-admin` account.
+    // lacking the base role during validation — locking out a pure `riverdata-admin` account.
     require_keycloak!();
     let app = seeded_app().await;
     ensure_realm_user("adminonly", "adminonly", &["riverdata-admin"]).await;
     let jwt = get_keycloak_jwt("adminonly", "adminonly").await;
 
     let (s, body) = crate::common::get_with_token(&app, "/api/tokens", &jwt).await;
-    assert_eq!(s, 200, "riverdata-admin without riverdata-user must pass: {body}");
+    assert_eq!(s, 200, "riverdata-admin alone must pass the gate: {body}");
 }
 
 #[tokio::test]
@@ -74,5 +74,5 @@ async fn river_user_access_is_unchanged() {
     let jwt = get_keycloak_jwt("user", "user").await;
 
     let (s, _) = crate::common::get_with_token(&app, "/api/projects", &jwt).await;
-    assert_eq!(s, 200, "riverdata-user keeps read access through the gate");
+    assert_eq!(s, 200, "a River user keeps read access through the gate");
 }

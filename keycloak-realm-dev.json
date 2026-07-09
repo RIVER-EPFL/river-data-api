@@ -9,10 +9,6 @@
         "description": "River Data administrator with full access"
       },
       {
-        "name": "riverdata-user",
-        "description": "River Data standard user with read access"
-      },
-      {
         "name": "riverdata-intern",
         "description": "River Data intern: read-only access"
       },
@@ -82,8 +78,7 @@
         }
       ],
       "realmRoles": [
-        "riverdata-admin",
-        "riverdata-user"
+        "riverdata-admin"
       ]
     },
     {
@@ -100,7 +95,7 @@
         }
       ],
       "realmRoles": [
-        "riverdata-user"
+        "riverdata-river"
       ]
     },
     {

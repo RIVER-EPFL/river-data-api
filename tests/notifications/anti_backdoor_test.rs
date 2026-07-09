@@ -4,7 +4,7 @@
 //!
 //! A tiny in-process mock stands in for Keycloak's admin API, keyed off the sub so responses are
 //! deterministic:
-//!   admin-user → enabled + riverdata-admin    regular-user → enabled + riverdata-user
+//!   admin-user → enabled + riverdata-admin    regular-user → enabled + riverdata-river
 //!   no-role-user → enabled, no roles           disabled-user → enabled=false    gone-user → 404
 //!
 //! Run: cargo test --test notifications -- --test-threads=1
@@ -34,7 +34,7 @@ async fn user(Path(sub): Path<String>) -> axum::response::Response {
 async fn roles(Path(sub): Path<String>) -> Json<serde_json::Value> {
     let names = match sub.as_str() {
         "admin-user" => vec!["riverdata-admin"],
-        "regular-user" => vec!["riverdata-user"],
+        "regular-user" => vec!["riverdata-river"],
         _ => vec![],
     };
     Json(serde_json::json!(

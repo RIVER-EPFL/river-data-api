@@ -61,7 +61,7 @@ fn passed_auth(status: u16) -> bool {
 async fn ungranted_river_user_is_denied_everywhere() {
     require_keycloak!();
     let (_db, app) = seeded_app().await;
-    // `user` is riverdata-user ⇒ River level, but holds no project grant.
+    // `user` holds riverdata-river ⇒ River level, but has no project grant.
     let jwt = get_keycloak_jwt("user", "user").await;
 
     // Reads succeed at the transport layer but the scope filter empties them out.

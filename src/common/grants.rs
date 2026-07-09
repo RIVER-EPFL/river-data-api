@@ -24,7 +24,7 @@ pub fn new_grants_cache(ttl_seconds: u64) -> GrantsCache {
 }
 
 /// The projects granted to `sub`, from cache or a single indexed query. Returns an empty set (which
-/// fails closed — the member sees nothing) on any DB error rather than erroring the request; the
+/// fails closed, the member sees nothing) on any DB error rather than erroring the request; the
 /// access gate has already confirmed the member holds a river role, so an empty portal is the safe
 /// degradation.
 pub async fn load_grants(

@@ -167,7 +167,7 @@ fn simplify_user(u: &serde_json::Value) -> serde_json::Value {
     })
 }
 
-/// List Keycloak users with the `riverdata-user` realm role, with optional filtering by
+/// List Keycloak users holding any riverdata access role, with optional filtering by
 /// search query (username, email, firstName, lastName) and admin flag. Proxies to Keycloak's
 /// admin API. Requires Keycloak Administrator role (`require_admin`).
 #[utoipa::path(
@@ -223,35 +223,27 @@ pub async fn list_users(
             .map(|role| fetch_role_users(client, &token, &base, role)),
     )
     .await;
-    let mut kc_users: Vec<serde_json::Value> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for members in role_member_lists {
+    // Attribute each level to the user that holds it, first-seen order preserved. The roles a user
+    // collects across the membership lists ARE their access levels — no per-user role fetch needed.
+    let mut order: Vec<String> = Vec::new();
+    let mut by_id: std::collections::HashMap<String, (serde_json::Value, Vec<String>)> =
+        std::collections::HashMap::new();
+    for (role, members) in RIVER_ROLE_NAMES.iter().zip(role_member_lists) {
         for u in members? {
-            if let Some(id) = u["id"].as_str()
-                && seen.insert(id.to_string())
-            {
-                kc_users.push(u);
+            let Some(id) = u["id"].as_str().map(str::to_string) else { continue };
+            if let Some((_, roles)) = by_id.get_mut(&id) {
+                roles.push((*role).to_string());
+            } else {
+                order.push(id.clone());
+                by_id.insert(id, (u, vec![(*role).to_string()]));
             }
         }
     }
-
-    // Fetch roles for each user concurrently
-    let role_futures: Vec<_> = kc_users
-        .iter()
-        .map(|u| {
-            let user_id = u["id"].as_str().unwrap_or_default().to_string();
-            let token = token.clone();
-            let base = base.clone();
-            async move { fetch_user_roles(client, &token, &base, &user_id).await }
-        })
-        .collect();
-    let all_roles = futures::future::join_all(role_futures).await;
-
-    let mut users: Vec<serde_json::Value> = kc_users
-        .iter()
-        .zip(all_roles)
-        .map(|(u, roles)| {
-            let mut user = simplify_user(u);
+    let mut users: Vec<serde_json::Value> = order
+        .into_iter()
+        .map(|id| {
+            let (u, roles) = by_id.remove(&id).expect("id came from order");
+            let mut user = simplify_user(&u);
             user["roles"] = serde_json::json!(roles);
             user
         })
@@ -422,7 +414,7 @@ pub async fn get_user(
     Ok(Json(result))
 }
 
-/// Create a Keycloak user and automatically assign the `riverdata-user` realm role.
+/// Create a Keycloak user. Access-level assignment is a separate step (`POST /users/{id}/roles`).
 /// Returns the new user's ID. Requires `require_admin`.
 #[utoipa::path(
     post,
@@ -658,8 +650,8 @@ pub async fn assign_roles(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
-/// List Keycloak realm roles (just `riverdata-admin` and `riverdata-user` in the default
-/// realm config). Used by the UI's role-assignment picker. Requires `require_admin`.
+/// List the Keycloak riverdata access roles (`riverdata-admin` / `-manager` / `-river` / `-intern`).
+/// Used by the UI's role-assignment picker. Requires `require_admin`.
 #[utoipa::path(
     get,
     path = "/roles",
@@ -689,12 +681,12 @@ pub async fn list_roles(
         vec![]
     };
 
-    // Expose only the riverdata access levels (canonical names, not the deprecated `riverdata-user`
-    // alias). Unrelated realm roles — Keycloak internals and the bare `admin` role, which is NOT a
-    // river access role — are hidden so the UI role picker can only assign real levels.
+    // Expose only the riverdata access levels. Unrelated realm roles — Keycloak internals and the
+    // bare `admin` role, which is NOT a river access role — are hidden so the UI role picker can
+    // only assign real levels.
     let roles: Vec<serde_json::Value> = roles
         .into_iter()
-        .filter(|r| r.name != "riverdata-user" && RIVER_ROLE_NAMES.contains(&r.name.as_str()))
+        .filter(|r| RIVER_ROLE_NAMES.contains(&r.name.as_str()))
         .map(|r| serde_json::json!({ "id": r.id, "name": r.name }))
         .collect();
 
