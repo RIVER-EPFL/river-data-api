@@ -433,6 +433,10 @@ async fn get_latest_calibration<C: ConnectionTrait>(
             valid_from: Set(valid_from),
             performed_by: Set(Some("system".to_string())),
             notes: Set(Some("Identity calibration (auto-created)".to_string())),
+            name: Set(None),
+            mode: Set("windowed".to_string()),
+            parameter_id: Set(None),
+            r_squared: Set(None),
             valid_until: Set(None),
             created_at: Set(Some(Utc::now())),
         };

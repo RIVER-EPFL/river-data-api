@@ -26,6 +26,17 @@ pub struct Model {
     pub valid_from: chrono::DateTime<chrono::Utc>,
     pub performed_by: Option<String>,
     pub notes: Option<String>,
+    /// Human label for picking an instant (lab grab) curve by property rather than by date.
+    pub name: Option<String>,
+    /// `windowed` (field sensor, auto-applied over a time window) or `instant` (lab grab,
+    /// applied to a single reading). DB-defaulted to `windowed`; the grab path sets `instant`.
+    #[crudcrate(exclude(create, update))]
+    pub mode: String,
+    /// Per-channel parameter for windowed field curves (multi-parameter instruments get one curve
+    /// per channel); NULL for lab instant curves, whose parameter is decided at the grab.
+    #[crudcrate(filterable)]
+    pub parameter_id: Option<Uuid>,
+    pub r_squared: Option<f64>,
     #[crudcrate(exclude(create, update))]
     pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
     #[crudcrate(exclude(create, update))]
