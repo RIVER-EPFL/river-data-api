@@ -177,6 +177,88 @@ async fn recalibration_updates_all_readings() {
 }
 
 // ============================================================================
+// Multi-parameter instrument (post-collapse shape)
+// ============================================================================
+
+/// Scenario: one physical instrument measures two parameters through a single shared sensor_id
+/// (what a lab instrument, or a collapsed multi-channel sonde, looks like). Each parameter carries
+/// its own windowed calibration on that shared sensor.
+///
+/// Expected behaviour: reprocess resolves each reading against its OWN parameter's calibration —
+/// the DO curve never bleeds onto the temperature readings and vice-versa. On the pre-decoupling
+/// code (which matched calibrations by sensor_id + time only) both curves' windows cover both
+/// readings, so the wrong curve could win.
+#[tokio::test]
+#[serial]
+async fn reprocess_applies_per_parameter_calibration_on_shared_sensor() {
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+
+    let sensor = create_sensor(&db, "MultiParam-01", GLOBAL_PARAM_TEMP_ID).await;
+    // Drop the auto identity calibration (NULL parameter = wildcard) so only the two
+    // parameter-scoped windowed curves resolve.
+    delete_calibration(&db, sensor.identity_calibration_id).await;
+
+    // Temp curve: calibrated = 2*raw + 0. DO curve: calibrated = 10*raw + 5. Both open windows.
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO sensor_calibrations \
+             (id, sensor_id, parameter_id, slope, intercept, valid_from, mode, notes) VALUES \
+             ('{}', '{}', '{GLOBAL_PARAM_TEMP_ID}', 2.0, 0.0, '2000-01-01T00:00:00Z', 'windowed', 'temp'), \
+             ('{}', '{}', '{GLOBAL_PARAM_DO_ID}',  10.0, 5.0, '2000-01-01T00:00:00Z', 'windowed', 'do')",
+            uuid::Uuid::new_v4(), sensor.id, uuid::Uuid::new_v4(), sensor.id
+        ),
+    )
+    .await;
+
+    // Raw readings for both parameters on the shared sensor, calibration_id NULL and
+    // calibrated_value = raw, so reprocess has to resolve the curve and recompute the value.
+    let temp_stream = create_paired_stream(&db, "mp-temp", PARAM_S1_TEMP_ID).await;
+    let do_stream = create_paired_stream(&db, "mp-do", PARAM_S1_DO_ID).await;
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO readings \
+             (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, sensor_id, replicate_index) VALUES \
+             ('{temp_stream}', '{SITE1_ID}', '{GLOBAL_PARAM_TEMP_ID}', '2025-01-01T10:00:00Z', 3.0, 3.0, '{}', 0), \
+             ('{do_stream}',   '{SITE1_ID}', '{GLOBAL_PARAM_DO_ID}',   '2025-01-01T10:00:00Z', 4.0, 4.0, '{}', 0)",
+            sensor.id, sensor.id
+        ),
+    )
+    .await;
+
+    let app = build_test_app(db.clone());
+    let token = seed_api_token(&db, full_permissions(), None).await;
+    let (status, body) = post_json_with_token(
+        &app,
+        "/api/actions/reprocess",
+        &serde_json::json!({ "sensor_id": sensor.id }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "reprocess: {body}");
+    assert!(wait_for_reprocessing(&db, sensor.id, WAIT_TIMEOUT).await);
+
+    let rows = get_readings_for_sensor(&db, sensor.id).await;
+    assert_eq!(rows.len(), 2);
+    let temp = rows.iter().find(|r| r.raw_value == 3.0).expect("temp reading");
+    let do_r = rows.iter().find(|r| r.raw_value == 4.0).expect("do reading");
+    let param_temp: uuid::Uuid = GLOBAL_PARAM_TEMP_ID.parse().unwrap();
+    let param_do: uuid::Uuid = GLOBAL_PARAM_DO_ID.parse().unwrap();
+
+    assert_eq!(temp.parameter_id, Some(param_temp));
+    assert_eq!(temp.calibrated_value, Some(6.0), "temp: 2*3+0");
+    assert_eq!(do_r.parameter_id, Some(param_do));
+    assert_eq!(do_r.calibrated_value, Some(45.0), "do: 10*4+5");
+    // Each reading is stamped with its own parameter's curve, not the other's.
+    assert_ne!(temp.calibration_id, do_r.calibration_id, "distinct curves per parameter");
+
+    cleanup_test_db(&db).await;
+}
+
+// ============================================================================
 // Deployment changes — site_id and reading count
 // ============================================================================
 

@@ -23,7 +23,8 @@ pub async fn recalculate_for_calibration(
     let cal_row = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT sensor_id, slope, intercept, valid_from FROM sensor_calibrations WHERE id = $1",
+            r"SELECT sensor_id, slope, intercept, valid_from, parameter_id, mode
+              FROM sensor_calibrations WHERE id = $1",
             [calibration_id.into()],
         ))
         .await?;
@@ -36,14 +37,43 @@ pub async fn recalculate_for_calibration(
     let slope: f64 = cal.try_get("", "slope")?;
     let intercept: f64 = cal.try_get("", "intercept")?;
     let valid_from: chrono::DateTime<chrono::FixedOffset> = cal.try_get("", "valid_from")?;
+    let parameter_id: Option<Uuid> = cal.try_get("", "parameter_id").ok();
+    let mode: String = cal
+        .try_get::<String>("", "mode")
+        .unwrap_or_else(|_| "windowed".to_string());
 
+    // Instant (grab) curves are applied per-reading and never re-windowed: an edit rewrites only the
+    // readings stamped with this exact calibration, by calibration_id, not by time window.
+    if mode == "instant" {
+        let txn = db.begin().await?;
+        txn.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
+        ))
+        .await?;
+        let n = txn
+            .execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r"UPDATE readings SET calibrated_value = $1 * raw_value + $2 WHERE calibration_id = $3",
+                [slope.into(), intercept.into(), calibration_id.into()],
+            ))
+            .await?
+            .rows_affected();
+        txn.commit().await?;
+        return Ok(n as usize);
+    }
+
+    // The next windowed calibration for the SAME parameter bounds this one's window. A NULL
+    // parameter_id is a wildcard (pre-decoupling calibrations carry no parameter); once populated,
+    // a multi-parameter instrument's parameters each chain independently.
     let next_cal = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT valid_from FROM sensor_calibrations
-              WHERE sensor_id = $1 AND valid_from > $2
+              WHERE sensor_id = $1 AND valid_from > $2 AND mode = 'windowed'
+                AND ($3::uuid IS NULL OR parameter_id IS NULL OR parameter_id = $3)
               ORDER BY valid_from ASC LIMIT 1",
-            [sensor_id.into(), valid_from.into()],
+            [sensor_id.into(), valid_from.into(), parameter_id.into()],
         ))
         .await?;
 
@@ -60,13 +90,15 @@ pub async fn recalculate_for_calibration(
         txn.execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE readings SET calibrated_value = $1 * raw_value + $2
-              WHERE sensor_id = $3 AND time >= $4 AND time < $5",
+              WHERE sensor_id = $3 AND time >= $4 AND time < $5
+                AND ($6::uuid IS NULL OR parameter_id IS NULL OR parameter_id = $6)",
             [
                 slope.into(),
                 intercept.into(),
                 sensor_id.into(),
                 valid_from.into(),
                 next_from.into(),
+                parameter_id.into(),
             ],
         ))
         .await?
@@ -75,12 +107,14 @@ pub async fn recalculate_for_calibration(
         txn.execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE readings SET calibrated_value = $1 * raw_value + $2
-              WHERE sensor_id = $3 AND time >= $4",
+              WHERE sensor_id = $3 AND time >= $4
+                AND ($5::uuid IS NULL OR parameter_id IS NULL OR parameter_id = $5)",
             [
                 slope.into(),
                 intercept.into(),
                 sensor_id.into(),
                 valid_from.into(),
+                parameter_id.into(),
             ],
         ))
         .await?
@@ -416,11 +450,15 @@ pub async fn recompute_valid_until(
 ) -> Result<(), sea_orm::DbErr> {
     db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
+        // Windows chain within a (sensor, parameter): a multi-parameter instrument holds one
+        // calibration timeline per parameter, so LEAD must partition by parameter_id (never let one
+        // parameter's next calibration truncate another's window). Instant curves (grab curves) are
+        // matched by calibration_id, never windowed, so they are excluded from the chain.
         r"WITH ordered AS (
             SELECT id,
-                   LEAD(valid_from) OVER (ORDER BY valid_from) AS next_from
+                   LEAD(valid_from) OVER (PARTITION BY parameter_id ORDER BY valid_from) AS next_from
             FROM sensor_calibrations
-            WHERE sensor_id = $1
+            WHERE sensor_id = $1 AND mode = 'windowed'
         )
         UPDATE sensor_calibrations sc
         SET valid_until = ordered.next_from
@@ -449,7 +487,7 @@ pub async fn recompute_deployed_until<C: ConnectionTrait>(
             SELECT id,
                    LEAST(
                        COALESCE(deployed_until, 'infinity'::timestamptz),
-                       COALESCE(LEAD(deployed_from) OVER (ORDER BY deployed_from), 'infinity'::timestamptz)
+                       COALESCE(LEAD(deployed_from) OVER (PARTITION BY parameter_id ORDER BY deployed_from), 'infinity'::timestamptz)
                    ) AS new_until
             FROM sensor_deployments
             WHERE sensor_id = $1
@@ -594,14 +632,15 @@ pub async fn reprocess_sensor_readings(
             SET calibration_id = cw.id,
                 calibrated_value = cw.slope * r.raw_value + cw.intercept
             FROM (
-                SELECT id, slope, intercept, valid_from,
+                SELECT id, slope, intercept, valid_from, parameter_id,
                        COALESCE(valid_until, 'infinity'::timestamptz) AS valid_until
                 FROM sensor_calibrations
-                WHERE sensor_id = $1
+                WHERE sensor_id = $1 AND mode = 'windowed'
             ) cw
             WHERE r.sensor_id = $1
               AND r.time >= cw.valid_from
-              AND r.time < cw.valid_until",
+              AND r.time < cw.valid_until
+              AND (cw.parameter_id IS NULL OR r.parameter_id IS NULL OR cw.parameter_id = r.parameter_id)",
             [sensor_id.into()],
         ))
         .await?;
@@ -613,14 +652,15 @@ pub async fn reprocess_sensor_readings(
         SET deployment_id = dw.id,
             site_id = dw.site_id
         FROM (
-            SELECT id, site_id, deployed_from,
+            SELECT id, site_id, parameter_id, deployed_from,
                    COALESCE(deployed_until, 'infinity'::timestamptz) AS deployed_until
             FROM sensor_deployments
             WHERE sensor_id = $1
         ) dw
         WHERE r.sensor_id = $1
           AND r.time >= dw.deployed_from
-          AND r.time < dw.deployed_until",
+          AND r.time < dw.deployed_until
+          AND (dw.parameter_id IS NULL OR r.parameter_id IS NULL OR dw.parameter_id = r.parameter_id)",
         [sensor_id.into()],
     ))
     .await?;
@@ -636,10 +676,15 @@ pub async fn reprocess_sensor_readings(
         r"UPDATE readings r
           SET site_id = NULL, deployment_id = NULL
           WHERE r.sensor_id = $1
-            AND r.time >= (SELECT MIN(deployed_from) FROM sensor_deployments WHERE sensor_id = $1)
+            AND r.time >= (SELECT MIN(deployed_from) FROM sensor_deployments d2
+                           WHERE d2.sensor_id = $1
+                             AND (d2.parameter_id IS NULL OR r.parameter_id IS NULL
+                                  OR d2.parameter_id = r.parameter_id))
             AND NOT EXISTS (
                 SELECT 1 FROM sensor_deployments d
                 WHERE d.sensor_id = $1
+                  AND (d.parameter_id IS NULL OR r.parameter_id IS NULL
+                       OR d.parameter_id = r.parameter_id)
                   AND r.time >= d.deployed_from
                   AND r.time < COALESCE(d.deployed_until, 'infinity'::timestamptz)
             )",
@@ -747,6 +792,8 @@ pub async fn reprocess_site_parameter_readings(
           FROM sensor_calibrations cw
           WHERE r.site_id = $1 AND r.parameter_id = $2
             AND cw.sensor_id = r.sensor_id
+            AND cw.mode = 'windowed'
+            AND (cw.parameter_id IS NULL OR cw.parameter_id = $2)
             AND r.time >= cw.valid_from
             AND r.time < COALESCE(cw.valid_until, 'infinity'::timestamptz)",
         [site_id.into(), parameter_id.into()],
