@@ -440,6 +440,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
     // API tokens (no user sub) itself.
     let me_route = Router::new()
         .route("/me", get(crate::routes::private::me::get_me))
+        .route("/me/sites", get(crate::routes::private::me::get_my_sites))
         .with_state(state.clone());
 
     // Token lifecycle actions (revoke/rotate). Admin-only, like all token management.
