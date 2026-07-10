@@ -105,6 +105,109 @@ async fn creating_a_site_with_a_subproject_infers_the_project() {
 
 #[tokio::test]
 #[serial]
+async fn moving_a_subproject_to_another_project_carries_its_sites() {
+    let (db, app, token) = seeded().await;
+
+    let other = "00000000-0000-4000-a000-0000000000e2";
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO projects (id, name, description, data_source) \
+             VALUES ('{other}', 'Destination Project', 'x', 'other')"
+        ),
+    )
+    .await;
+
+    let (s, body) = post_json_with_token(
+        &app,
+        "/api/subprojects",
+        &serde_json::json!({ "project_id": PROJECT_ID, "name": "North Reach" }),
+        &token,
+    )
+    .await;
+    assert_eq!(s, 201, "create subproject: {body}");
+    let sub = parse(&body)["id"].as_str().unwrap().to_string();
+
+    let (s, body) = put_json_with_token(
+        &app,
+        &format!("/api/sites/{SITE1_ID}"),
+        &serde_json::json!({ "subproject_id": sub }),
+        &token,
+    )
+    .await;
+    assert_eq!(s, 200, "assign site to subproject: {body}");
+
+    let (s, body) = put_json_with_token(
+        &app,
+        &format!("/api/subprojects/{sub}"),
+        &serde_json::json!({ "project_id": other }),
+        &token,
+    )
+    .await;
+    assert_eq!(s, 200, "move subproject: {body}");
+
+    let (_s, body) = get_with_token(&app, &format!("/api/sites/{SITE1_ID}"), &token).await;
+    let site = parse(&body);
+    assert_eq!(site["project_id"], other, "site's project follows the moved subproject: {body}");
+    assert_eq!(
+        site["subproject_id"].as_str().unwrap(),
+        sub,
+        "site stays in the moved subproject: {body}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn subproject_move_flips_scoped_visibility() {
+    let (db, app, token) = seeded().await;
+
+    let other = "00000000-0000-4000-a000-0000000000e3";
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO projects (id, name, description, data_source) \
+             VALUES ('{other}', 'Destination Project', 'x', 'other')"
+        ),
+    )
+    .await;
+
+    let (_s, body) = get_with_token(&app, "/api/subprojects", &token).await;
+    let sub = parse(&body)
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["project_id"] == PROJECT_ID)
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (s, body) = put_json_with_token(
+        &app,
+        &format!("/api/subprojects/{sub}"),
+        &serde_json::json!({ "project_id": other }),
+        &token,
+    )
+    .await;
+    assert_eq!(s, 200, "move subproject: {body}");
+
+    let sees_site1 = |body: &str| {
+        parse(body).as_array().unwrap().iter().any(|s| s["id"] == SITE1_ID)
+    };
+
+    let dest_token = seed_api_token(&db, full_permissions(), Some(other)).await;
+    let (s, body) = get_with_token(&app, "/api/sites", &dest_token).await;
+    assert_eq!(s, 200, "{body}");
+    assert!(sees_site1(&body), "destination-scoped principal sees the moved sites: {body}");
+
+    let src_token = seed_api_token(&db, full_permissions(), Some(PROJECT_ID)).await;
+    let (s, body) = get_with_token(&app, "/api/sites", &src_token).await;
+    assert_eq!(s, 200, "{body}");
+    assert!(!sees_site1(&body), "source-scoped principal no longer sees them: {body}");
+}
+
+#[tokio::test]
+#[serial]
 async fn scoped_principal_sees_only_its_project_subprojects() {
     let db = setup_test_db().await;
     cleanup_test_db(&db).await;
