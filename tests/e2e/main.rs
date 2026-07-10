@@ -12,6 +12,7 @@ mod deployment_slot_and_recall;
 mod full_public_data_workflow;
 mod grab_aggregation_and_tool_save;
 mod ingest_and_pairing_attribution;
+mod instrument_grab_alongside_sensor;
 mod pairing_plan_lifecycle;
 mod provision_to_public;
 mod sensor_backfill_attribution;
