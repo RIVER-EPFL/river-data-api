@@ -772,7 +772,7 @@ fn crud_read_scope_condition(entity: &str, projects: &[Uuid]) -> Option<sea_orm:
     use crate::routes::private::{
         alarm_thresholds, annotations, data_streams, notes, projects as projects_entity,
         reprocessing_jobs, samples, sensors, sensors::calibrations, sensors::deployments,
-        site_parameters, sites, subprojects,
+        site_parameters, sites, projects::subprojects,
     };
     use sea_orm::{ColumnTrait, Condition};
     let ids = || projects.iter().copied();

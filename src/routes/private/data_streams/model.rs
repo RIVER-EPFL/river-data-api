@@ -72,9 +72,9 @@ pub enum Relation {
     )]
     Sensor,
     #[sea_orm(
-        belongs_to = "crate::routes::private::pairing_plans::Entity",
+        belongs_to = "crate::routes::private::data_streams::pairing_plans::Entity",
         from = "Column::PairingPlanId",
-        to = "crate::routes::private::pairing_plans::Column::Id"
+        to = "crate::routes::private::data_streams::pairing_plans::Column::Id"
     )]
     PairingPlan,
 }
@@ -91,7 +91,7 @@ impl Related<crate::routes::private::sensors::Entity> for Entity {
     }
 }
 
-impl Related<crate::routes::private::pairing_plans::Entity> for Entity {
+impl Related<crate::routes::private::data_streams::pairing_plans::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::PairingPlan.def()
     }

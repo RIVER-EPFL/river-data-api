@@ -46,9 +46,9 @@ pub enum Relation {
     )]
     Project,
     #[sea_orm(
-        belongs_to = "crate::routes::private::subprojects::Entity",
+        belongs_to = "crate::routes::private::projects::subprojects::Entity",
         from = "Column::SubprojectId",
-        to = "crate::routes::private::subprojects::Column::Id"
+        to = "crate::routes::private::projects::subprojects::Column::Id"
     )]
     Subproject,
     #[sea_orm(has_many = "crate::routes::private::site_parameters::Entity")]
@@ -65,7 +65,7 @@ impl Related<crate::routes::private::projects::Entity> for Entity {
     }
 }
 
-impl Related<crate::routes::private::subprojects::Entity> for Entity {
+impl Related<crate::routes::private::projects::subprojects::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Subproject.def()
     }
