@@ -5,7 +5,7 @@ use axum::{
 
 use crate::common::AppState;
 use crate::error::AppResult;
-use crate::routes::public::services::invalidate_config;
+use crate::routes::public::service::invalidate_config;
 
 /// Invalidate the in-memory cache for a public project's API config. Use after editing
 /// public visibility settings to force a re-read on next public API request. Requires

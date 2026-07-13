@@ -136,7 +136,7 @@ async fn permission_json_null_uses_defaults() {
     let (db, app) = setup().await;
 
     // Insert directly with null permissions JSON to bypass the helper.
-    use river_db::routes::private::api_tokens::services::mint_api_token;
+    use river_db::routes::private::api_tokens::service::mint_api_token;
     let minted = mint_api_token();
     let raw = minted.raw_token;
     crate::common::db::exec(

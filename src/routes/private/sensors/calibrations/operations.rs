@@ -4,7 +4,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
 use super::model::SensorCalibration;
-use super::services::recompute_valid_until;
+use super::service::recompute_valid_until;
 
 pub struct SensorCalibrationOperations;
 

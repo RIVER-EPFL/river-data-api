@@ -4,4 +4,4 @@ pub mod events_model;
 pub mod credentials_model;
 pub mod tokens_model;
 pub mod views;
-pub mod services;
+pub mod service;

@@ -26,8 +26,8 @@ pub fn service_router(state: &AppState) -> OpenApiRouter {
         .layer(middleware::from_fn(require_read_data));
 
     let metadata = OpenApiRouter::new()
-        .routes(routes!(super::handlers::list_site_parameters))
-        .routes(routes!(super::handlers::get_site_detail))
+        .routes(routes!(super::views::list_site_parameters))
+        .routes(routes!(super::views::get_site_detail))
         .with_state(state.clone())
         .layer(middleware::from_fn(require_read_metadata));
 

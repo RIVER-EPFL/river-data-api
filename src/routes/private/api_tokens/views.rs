@@ -7,7 +7,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use super::model::{self, ApiToken};
-use super::services::{invalidate_token_cache, mint_api_token};
+use super::service::{invalidate_token_cache, mint_api_token};
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 

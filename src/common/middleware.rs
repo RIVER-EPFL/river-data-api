@@ -15,7 +15,7 @@ use crate::common::authz::{self, AccessScope, Capability, Role, TokenAccess};
 // the definition now lives with the rest of the policy in `authz`.
 pub use crate::common::authz::TokenPermissions;
 use crate::error::AppError;
-use crate::routes::private::api_tokens::services::validate_bearer_token;
+use crate::routes::private::api_tokens::service::validate_bearer_token;
 
 // Type alias for the Keycloak auth status used throughout this module.
 type KcStatus = axum_keycloak_auth::KeycloakAuthStatus<
@@ -214,7 +214,7 @@ pub async fn service_auth_middleware(
         let path = request.uri().path().to_string();
         let response = next.run(request).await;
         if audit {
-            crate::routes::private::api_tokens::services::record_token_use(
+            crate::routes::private::api_tokens::service::record_token_use(
                 &state.db,
                 token_id,
                 scope,
@@ -239,7 +239,7 @@ pub async fn service_auth_middleware(
     if let Some(raw) = sync_header
         && !raw.is_empty()
     {
-        let token_hash = crate::routes::private::api_tokens::services::hash_token(raw);
+        let token_hash = crate::routes::private::api_tokens::service::hash_token(raw);
 
         use crate::routes::private::sync::tokens_model as sync_service_tokens;
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
@@ -416,7 +416,7 @@ pub async fn bust_token_cache_on_mutation(
     );
     let response = next.run(request).await;
     if mutating && response.status().is_success() {
-        crate::routes::private::api_tokens::services::invalidate_token_cache(&state.token_cache)
+        crate::routes::private::api_tokens::service::invalidate_token_cache(&state.token_cache)
             .await;
     }
     response

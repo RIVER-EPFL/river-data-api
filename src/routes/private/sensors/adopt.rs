@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, sensor_in_scope};
 use crate::error::{AppError, AppResult};
-use crate::routes::private::sensors::calibrations::services::recompute_deployed_until;
+use crate::routes::private::sensors::calibrations::service::recompute_deployed_until;
 use crate::routes::private::{parameters, sites::parameters as site_parameters};
 
 fn default_true() -> bool {

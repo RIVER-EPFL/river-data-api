@@ -1237,7 +1237,7 @@ pub async fn create_pairing_plan(
     State(state): State<AppState>,
     Json(req): Json<CreatePairingPlanRequest>,
 ) -> AppResult<Json<crate::routes::private::data_streams::pairing_plans::Model>> {
-    let plan = crate::routes::private::sync::services::create_plan(&state.db, &req.source_system).await?;
+    let plan = crate::routes::private::sync::service::create_plan(&state.db, &req.source_system).await?;
     Ok(Json(plan))
 }
 
@@ -1332,7 +1332,7 @@ pub async fn update_pairing_plan(
         return Err(AppError::BadRequest("Can only edit draft plans".to_string()));
     }
 
-    let mut entries: Vec<crate::routes::private::sync::services::PlanEntry> =
+    let mut entries: Vec<crate::routes::private::sync::service::PlanEntry> =
         serde_json::from_value(plan.entries.clone())
             .map_err(|e| AppError::Internal(format!("Failed to parse entries: {e}")))?;
 
@@ -1366,7 +1366,7 @@ pub async fn update_pairing_plan(
         }
     }
 
-    let summary = serde_json::to_value(crate::routes::private::sync::services::compute_summary_pub(&entries))
+    let summary = serde_json::to_value(crate::routes::private::sync::service::compute_summary_pub(&entries))
         .unwrap_or_default();
 
     let mut active: crate::routes::private::data_streams::pairing_plans::ActiveModel = plan.into();
@@ -1518,7 +1518,7 @@ pub async fn plan_site_metadata(
         .await?
         .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
 
-    let entries: Vec<crate::routes::private::sync::services::PlanEntry> =
+    let entries: Vec<crate::routes::private::sync::service::PlanEntry> =
         serde_json::from_value(plan.entries.clone())
             .map_err(|e| AppError::Internal(format!("Failed to parse entries: {e}")))?;
 

@@ -15,7 +15,7 @@ use crate::common::AppState;
 use crate::common::cache;
 use crate::error::{AppError, AppResult};
 use crate::common::bulk::{self, StreamableAggregateParam, StreamableParam};
-use crate::routes::public::services::{
+use crate::routes::public::service::{
     PublicProjectConfig, PublicSiteConfig, get_public_config,
 };
 

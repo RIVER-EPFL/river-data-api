@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use river_db::routes::private::sensors::calibrations::services::spawn_tracked_job_with_retry;
+use river_db::routes::private::sensors::calibrations::service::spawn_tracked_job_with_retry;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, Statement};
 use serial_test::serial;
 

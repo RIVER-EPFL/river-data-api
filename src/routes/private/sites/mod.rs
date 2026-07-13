@@ -1,6 +1,6 @@
 pub mod aggregates;
 pub mod annotations;
-pub mod handlers;
+pub mod views;
 pub mod model;
 pub mod parameters;
 pub mod readings;

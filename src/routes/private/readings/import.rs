@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::error::{AppError, AppResult};
-use crate::routes::private::data_streams::services::get_or_create_api_stream;
+use crate::routes::private::data_streams::service::get_or_create_api_stream;
 use crate::routes::private::readings::batch::ConflictMode;
 use crate::routes::private::sensors::operations::{ResolvedOwner, resolve_slot_owner_for_times};
 use crate::routes::resolve_site_with_project;

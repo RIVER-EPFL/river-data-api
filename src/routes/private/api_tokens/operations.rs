@@ -3,7 +3,7 @@ use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use sea_orm::{ActiveModelTrait, DatabaseConnection, Set};
 
 use super::model::{self, ApiToken};
-use super::services::mint_api_token;
+use super::service::mint_api_token;
 
 pub struct ApiTokenOperations;
 

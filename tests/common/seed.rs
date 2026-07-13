@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use super::db::exec;
 use super::fixtures::*;
-use river_db::routes::private::api_tokens::services::{hash_token, mint_api_token};
+use river_db::routes::private::api_tokens::service::{hash_token, mint_api_token};
 
 // ============================================================================
 // Full seed orchestrator

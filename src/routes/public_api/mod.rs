@@ -5,7 +5,7 @@ use utoipa::OpenApi;
 
 use crate::common::AppState;
 use crate::error::AppResult;
-use crate::routes::public::services::list_public_codes;
+use crate::routes::public::service::list_public_codes;
 
 // OpenAPI doc template for public APIs
 #[derive(OpenApi)]
@@ -80,7 +80,7 @@ async fn serve_docs(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Path(project_code): axum::extract::Path<String>,
 ) -> Result<axum::response::Html<String>, crate::error::AppError> {
-    use crate::routes::public::services::get_public_config;
+    use crate::routes::public::service::get_public_config;
 
     let config = get_public_config(&state.db, &state.public_config_cache, &project_code).await?;
 

@@ -566,7 +566,7 @@ async fn tracked_job_completion_reconciles_alarms() {
 
     let site = crate::common::SITE1_ID;
     let param = crate::common::GLOBAL_PARAM_TURB_ID;
-    let job_id = river_db::routes::private::sensors::calibrations::services::spawn_tracked_job(
+    let job_id = river_db::routes::private::sensors::calibrations::service::spawn_tracked_job(
         &db,
         None,
         "manual_reprocess",

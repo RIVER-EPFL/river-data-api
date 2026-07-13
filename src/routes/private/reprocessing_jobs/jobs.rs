@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::routes::private::readings;
 use crate::routes::private::readings::batch::{ConflictMode, readings_on_conflict};
 use crate::routes::private::readings::import::BATCH_SIZE as CSV_BATCH_SIZE;
-use crate::routes::private::sensors::calibrations::services::{
+use crate::routes::private::sensors::calibrations::service::{
     recalculate_derived_at_timestamp, reprocess_sensor_readings, reprocess_site_parameter_readings,
 };
 
@@ -1021,7 +1021,7 @@ impl Job for PlanApply {
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         let plan_id = required_uuid(ctx.params(), "plan_id")?;
-        let result = crate::routes::private::sync::services::apply_plan(ctx.db(), plan_id)
+        let result = crate::routes::private::sync::service::apply_plan(ctx.db(), plan_id)
             .await
             .map_err(|e| DbErr::Custom(e.to_string()))?;
         ctx.set_detail(serde_json::json!({
@@ -1051,7 +1051,7 @@ impl Job for PlanRevert {
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         let plan_id = required_uuid(ctx.params(), "plan_id")?;
-        let reverted = crate::routes::private::sync::services::revert_plan(ctx.db(), plan_id)
+        let reverted = crate::routes::private::sync::service::revert_plan(ctx.db(), plan_id)
             .await
             .map_err(|e| DbErr::Custom(e.to_string()))?;
         ctx.set_detail(serde_json::json!({

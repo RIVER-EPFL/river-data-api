@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 // The generic tracked-job lifecycle now lives in `reprocessing_jobs::lifecycle` (the jobs home).
-// Re-exported here so existing `calibrations::services::{spawn_tracked_job, ...}` call sites
+// Re-exported here so existing `calibrations::service::{spawn_tracked_job, ...}` call sites
 // and tests keep compiling against the same path.
 pub use crate::routes::private::reprocessing_jobs::lifecycle::{
     JobContext, RetryPolicy, set_job_retry_policy, spawn_tracked_job, spawn_tracked_job_ctx,
