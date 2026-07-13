@@ -28,9 +28,9 @@ pub struct Model {
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
     #[sea_orm(
-        belongs_to = "crate::routes::private::derived_parameters::definition_model::Entity",
+        belongs_to = "crate::routes::private::parameters::derived::definition_model::Entity",
         from = "Column::DerivedDefinitionId",
-        to = "crate::routes::private::derived_parameters::definition_model::Column::Id"
+        to = "crate::routes::private::parameters::derived::definition_model::Column::Id"
     )]
     DerivedParameterDefinition,
     #[sea_orm(
@@ -41,7 +41,7 @@ pub enum Relation {
     Parameter,
 }
 
-impl Related<crate::routes::private::derived_parameters::definition_model::Entity> for Entity {
+impl Related<crate::routes::private::parameters::derived::definition_model::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::DerivedParameterDefinition.def()
     }

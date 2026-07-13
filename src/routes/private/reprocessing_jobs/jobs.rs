@@ -1094,7 +1094,7 @@ impl Job for JanitorRun {
     }
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
-        use crate::routes::private::derived_parameters::janitor;
+        use crate::routes::private::parameters::derived::janitor;
         let db = ctx.db();
 
         // A scheduled run carries the schedule's tunables snapshot under `params.tunables`

@@ -290,7 +290,7 @@ pub async fn ingest_readings(
     if paired
         && inserted > 0
         && let Some(sid) = site_id
-        && crate::routes::private::derived_parameters::janitor::site_has_active_derived(db, sid)
+        && crate::routes::private::parameters::derived::janitor::site_has_active_derived(db, sid)
             .await
             .unwrap_or(true)
     {

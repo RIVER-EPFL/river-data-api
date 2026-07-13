@@ -54,7 +54,7 @@ pub struct Model {
     pub parameter: Vec<crate::routes::private::parameters::Parameter>,
     #[sea_orm(ignore)]
     #[crudcrate(non_db_attr = true, exclude(create, update))]
-    pub derived_definition: Option<crate::routes::private::derived_parameters::definition_model::DerivedParameterDefinition>,
+    pub derived_definition: Option<crate::routes::private::parameters::derived::definition_model::DerivedParameterDefinition>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -72,9 +72,9 @@ pub enum Relation {
     )]
     Parameter,
     #[sea_orm(
-        belongs_to = "crate::routes::private::derived_parameters::definition_model::Entity",
+        belongs_to = "crate::routes::private::parameters::derived::definition_model::Entity",
         from = "Column::DerivedDefinitionId",
-        to = "crate::routes::private::derived_parameters::definition_model::Column::Id"
+        to = "crate::routes::private::parameters::derived::definition_model::Column::Id"
     )]
     DerivedParameterDefinition,
 }
@@ -91,7 +91,7 @@ impl Related<crate::routes::private::parameters::Entity> for Entity {
     }
 }
 
-impl Related<crate::routes::private::derived_parameters::definition_model::Entity> for Entity {
+impl Related<crate::routes::private::parameters::derived::definition_model::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::DerivedParameterDefinition.def()
     }

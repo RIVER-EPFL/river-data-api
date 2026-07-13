@@ -35,14 +35,14 @@ async fn enrich(db: &DatabaseConnection, items: &mut [SiteParameter]) -> Result<
     }
 
     if !def_ids.is_empty() {
-        let defs = crate::routes::private::derived_parameters::definition_model::Entity::find()
-            .filter(crate::routes::private::derived_parameters::definition_model::Column::Id.is_in(def_ids))
+        let defs = crate::routes::private::parameters::derived::definition_model::Entity::find()
+            .filter(crate::routes::private::parameters::derived::definition_model::Column::Id.is_in(def_ids))
             .all(db)
             .await
             .map_err(ApiError::database)?;
-        let by_id: HashMap<Uuid, crate::routes::private::derived_parameters::definition_model::DerivedParameterDefinition> = defs
+        let by_id: HashMap<Uuid, crate::routes::private::parameters::derived::definition_model::DerivedParameterDefinition> = defs
             .into_iter()
-            .map(|m| (m.id, crate::routes::private::derived_parameters::definition_model::DerivedParameterDefinition::from(m)))
+            .map(|m| (m.id, crate::routes::private::parameters::derived::definition_model::DerivedParameterDefinition::from(m)))
             .collect();
         for sp in items.iter_mut() {
             if let Some(def_id) = sp.derived_definition_id

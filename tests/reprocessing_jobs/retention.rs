@@ -3,7 +3,7 @@
 //!
 //! Run: cargo test --test reprocessing_jobs -- --test-threads=1
 
-use river_db::routes::private::derived_parameters::janitor::prune_tracked_jobs;
+use river_db::routes::private::parameters::derived::janitor::prune_tracked_jobs;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 use uuid::Uuid;

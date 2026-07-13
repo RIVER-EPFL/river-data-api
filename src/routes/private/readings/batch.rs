@@ -299,7 +299,7 @@ pub async fn insert_batch_readings(
         // sites with an active derived parameter — others would compute nothing.
         let mut derived_sites: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = HashMap::new();
         for (site_id, timestamps) in &site_timestamps_for_derived {
-            if crate::routes::private::derived_parameters::janitor::site_has_active_derived(
+            if crate::routes::private::parameters::derived::janitor::site_has_active_derived(
                 &state.db, *site_id,
             )
             .await

@@ -55,7 +55,7 @@ pub enum Relation {
     AlarmThresholds,
     #[sea_orm(has_many = "crate::routes::private::readings::status_events::Entity")]
     StatusEvents,
-    #[sea_orm(has_many = "crate::routes::private::derived_parameters::source_model::Entity")]
+    #[sea_orm(has_many = "crate::routes::private::parameters::derived::source_model::Entity")]
     DerivedParameterSources,
 }
 
@@ -77,7 +77,7 @@ impl Related<crate::routes::private::readings::status_events::Entity> for Entity
     }
 }
 
-impl Related<crate::routes::private::derived_parameters::source_model::Entity> for Entity {
+impl Related<crate::routes::private::parameters::derived::source_model::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::DerivedParameterSources.def()
     }

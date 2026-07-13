@@ -5,7 +5,6 @@ pub mod annotations;
 pub mod api_tokens;
 pub mod constants;
 pub mod data_streams;
-pub mod derived_parameters;
 pub mod events;
 pub mod me;
 pub mod notes;

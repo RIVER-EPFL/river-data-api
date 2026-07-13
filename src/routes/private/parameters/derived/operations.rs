@@ -381,7 +381,7 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
         entity.sources = resolved
             .into_iter()
             .map(|(var_name, param_id)| {
-                crate::routes::private::derived_parameters::source_model::DerivedParameterSource {
+                crate::routes::private::parameters::derived::source_model::DerivedParameterSource {
                     id: Uuid::nil(), // Will be fetched by CrudCrate on next read
                     derived_definition_id: entity.id,
                     parameter_id: param_id,
@@ -428,7 +428,7 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
         entity.sources = resolved
             .into_iter()
             .map(|(var_name, param_id)| {
-                crate::routes::private::derived_parameters::source_model::DerivedParameterSource {
+                crate::routes::private::parameters::derived::source_model::DerivedParameterSource {
                     id: Uuid::nil(),
                     derived_definition_id: entity.id,
                     parameter_id: param_id,
