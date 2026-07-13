@@ -8,7 +8,7 @@ use sea_orm::{
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::routes::private::{data_streams, sensor_calibrations, sensor_deployments, sensors};
+use crate::routes::private::{data_streams, sensors, sensors::calibrations, sensors::deployments};
 use super::model::Sensor;
 use crate::error::{AppError, AppResult};
 
@@ -393,9 +393,9 @@ async fn get_latest_calibration<C: ConnectionTrait>(
     db: &C,
     sensor_id: Uuid,
 ) -> AppResult<Uuid> {
-    let cal = sensor_calibrations::Entity::find()
-        .filter(sensor_calibrations::Column::SensorId.eq(sensor_id))
-        .order_by_desc(sensor_calibrations::Column::ValidFrom)
+    let cal = calibrations::Entity::find()
+        .filter(calibrations::Column::SensorId.eq(sensor_id))
+        .order_by_desc(calibrations::Column::ValidFrom)
         .one(db)
         .await?;
 
@@ -417,7 +417,7 @@ async fn get_latest_calibration<C: ConnectionTrait>(
             .map(|t| t.with_timezone(&Utc))
             .unwrap_or_else(Utc::now);
 
-        let cal = sensor_calibrations::ActiveModel {
+        let cal = calibrations::ActiveModel {
             id: Set(Uuid::new_v4()),
             sensor_id: Set(sensor_id),
             slope: Set(1.0),
@@ -453,13 +453,13 @@ async fn find_or_create_deployment<C: ConnectionTrait>(
     site_id: Uuid,
     parameter_id: Uuid,
 ) -> AppResult<Option<Uuid>> {
-    let existing = sensor_deployments::Entity::find()
+    let existing = deployments::Entity::find()
         .filter(
             Condition::all()
-                .add(sensor_deployments::Column::SensorId.eq(sensor_id))
-                .add(sensor_deployments::Column::SiteId.eq(site_id))
-                .add(sensor_deployments::Column::ParameterId.eq(parameter_id))
-                .add(sensor_deployments::Column::DeployedUntil.is_null()),
+                .add(deployments::Column::SensorId.eq(sensor_id))
+                .add(deployments::Column::SiteId.eq(site_id))
+                .add(deployments::Column::ParameterId.eq(parameter_id))
+                .add(deployments::Column::DeployedUntil.is_null()),
         )
         .one(db)
         .await?;

@@ -422,7 +422,7 @@ pub async fn apply_plan(
     let db_clone = db.clone();
     tokio::spawn(async move {
         for (site_id, parameter_id) in slots {
-            if let Err(e) = crate::routes::private::sensor_calibrations::services::reprocess_site_parameter_readings(
+            if let Err(e) = crate::routes::private::sensors::calibrations::services::reprocess_site_parameter_readings(
                 &db_clone, site_id, parameter_id,
             )
             .await

@@ -51,15 +51,15 @@ pub enum Relation {
     )]
     Sensor,
     #[sea_orm(
-        belongs_to = "crate::routes::private::sensor_calibrations::Entity",
+        belongs_to = "crate::routes::private::sensors::calibrations::Entity",
         from = "Column::CalibrationId",
-        to = "crate::routes::private::sensor_calibrations::Column::Id"
+        to = "crate::routes::private::sensors::calibrations::Column::Id"
     )]
     SensorCalibration,
     #[sea_orm(
-        belongs_to = "crate::routes::private::sensor_deployments::Entity",
+        belongs_to = "crate::routes::private::sensors::deployments::Entity",
         from = "Column::DeploymentId",
-        to = "crate::routes::private::sensor_deployments::Column::Id"
+        to = "crate::routes::private::sensors::deployments::Column::Id"
     )]
     SensorDeployment,
     #[sea_orm(
@@ -95,13 +95,13 @@ impl Related<crate::routes::private::sensors::Entity> for Entity {
     }
 }
 
-impl Related<crate::routes::private::sensor_calibrations::Entity> for Entity {
+impl Related<crate::routes::private::sensors::calibrations::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SensorCalibration.def()
     }
 }
 
-impl Related<crate::routes::private::sensor_deployments::Entity> for Entity {
+impl Related<crate::routes::private::sensors::deployments::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SensorDeployment.def()
     }

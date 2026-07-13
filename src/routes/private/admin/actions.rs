@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::{DenyScoped, ProjectScope, enforce_project_scope_for_sites};
 use crate::error::{AppError, AppResult};
-use crate::routes::private::sensor_calibrations::services::{
+use crate::routes::private::sensors::calibrations::services::{
     evaluate_formula, recompute_deployed_until, recompute_valid_until, reprocess_sensor_readings,
 };
 

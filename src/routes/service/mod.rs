@@ -30,9 +30,9 @@ use crate::routes::private::{
     parameters::Parameter,
     reprocessing_jobs::ReprocessingJob,
     samples::Sample,
-    sensor_calibrations::SensorCalibration,
-    sensor_deployments::SensorDeployment,
     sensors::Sensor,
+    sensors::calibrations::SensorCalibration,
+    sensors::deployments::SensorDeployment,
     site_parameters::SiteParameter,
     subprojects::Subproject,
     sync::commands_model::SyncCommand,
@@ -216,7 +216,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         )
         .route(
             "/sensor_calibrations/{id}/window",
-            get(crate::routes::private::sensor_calibrations::window::get_calibration_window),
+            get(crate::routes::private::sensors::calibrations::window::get_calibration_window),
         )
         .layer(middleware::from_fn(require_read_data))
         .with_state(state.clone());

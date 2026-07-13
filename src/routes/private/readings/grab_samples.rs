@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::routes::private::{
-    data_streams, readings, samples, sensor_calibrations, site_parameters, sites,
+    data_streams, readings, samples, sensors::calibrations, site_parameters, sites,
 };
 use crate::error::{AppError, AppResult};
 
@@ -282,8 +282,8 @@ pub async fn insert_grab_samples(
     let curves: HashMap<Uuid, (f64, f64)> = if curve_ids.is_empty() {
         HashMap::new()
     } else {
-        sensor_calibrations::Entity::find()
-            .filter(sensor_calibrations::Column::Id.is_in(curve_ids))
+        calibrations::Entity::find()
+            .filter(calibrations::Column::Id.is_in(curve_ids))
             .all(&state.db)
             .await?
             .into_iter()

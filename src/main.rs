@@ -117,8 +117,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = shutdown_tx.send(true);
     });
 
-    river_db::routes::private::sensor_calibrations::services::set_job_retry_policy(
-        river_db::routes::private::sensor_calibrations::services::RetryPolicy {
+    river_db::routes::private::sensors::calibrations::services::set_job_retry_policy(
+        river_db::routes::private::sensors::calibrations::services::RetryPolicy {
             max_retries: config.job_max_retries,
             backoff_base: Duration::from_secs(config.job_retry_backoff_seconds),
         },

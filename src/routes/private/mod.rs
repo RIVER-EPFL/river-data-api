@@ -18,8 +18,6 @@ pub mod readings;
 pub mod reprocessing_jobs;
 pub mod samples;
 pub mod search;
-pub mod sensor_calibrations;
-pub mod sensor_deployments;
 pub mod sensors;
 pub mod site_parameters;
 pub mod sites;

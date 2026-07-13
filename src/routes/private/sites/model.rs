@@ -53,7 +53,7 @@ pub enum Relation {
     Subproject,
     #[sea_orm(has_many = "crate::routes::private::site_parameters::Entity")]
     SiteParameters,
-    #[sea_orm(has_many = "crate::routes::private::sensor_deployments::Entity")]
+    #[sea_orm(has_many = "crate::routes::private::sensors::deployments::Entity")]
     SensorDeployments,
     #[sea_orm(has_many = "crate::routes::private::readings::Entity")]
     Readings,
@@ -77,7 +77,7 @@ impl Related<crate::routes::private::site_parameters::Entity> for Entity {
     }
 }
 
-impl Related<crate::routes::private::sensor_deployments::Entity> for Entity {
+impl Related<crate::routes::private::sensors::deployments::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SensorDeployments.def()
     }

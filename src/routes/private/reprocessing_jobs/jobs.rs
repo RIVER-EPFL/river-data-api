@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::routes::private::readings;
 use crate::routes::private::readings::batch::{ConflictMode, readings_on_conflict};
 use crate::routes::private::readings::import::BATCH_SIZE as CSV_BATCH_SIZE;
-use crate::routes::private::sensor_calibrations::services::{
+use crate::routes::private::sensors::calibrations::services::{
     recalculate_derived_at_timestamp, reprocess_sensor_readings, reprocess_site_parameter_readings,
 };
 

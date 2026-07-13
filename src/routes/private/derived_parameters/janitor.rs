@@ -90,7 +90,7 @@ pub async fn run_once(db: &DatabaseConnection) -> Result<usize, sea_orm::DbErr> 
                 let site_id: Uuid = row.try_get("", "site_id")?;
                 let time: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
                 let utc_time = time.with_timezone(&chrono::Utc);
-                match crate::routes::private::sensor_calibrations::services::recalculate_derived_at_timestamp(
+                match crate::routes::private::sensors::calibrations::services::recalculate_derived_at_timestamp(
                     ctx.db(), site_id, utc_time,
                 )
                 .await

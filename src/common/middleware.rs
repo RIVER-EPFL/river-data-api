@@ -712,14 +712,14 @@ pub async fn sensor_in_scope(
     scope: &AccessScope,
     sensor_id: Uuid,
 ) -> Result<bool, AppError> {
-    use crate::routes::private::sensor_deployments;
+    use crate::routes::private::sensors::deployments;
     use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
     let Some(project_ids) = scope.project_ids() else {
         return Ok(true);
     };
-    let count = sensor_deployments::Entity::find()
-        .filter(sensor_deployments::Column::SensorId.eq(sensor_id))
-        .filter(sensor_deployments::Column::SiteId.in_subquery(scoped_site_ids_query(&project_ids)))
+    let count = deployments::Entity::find()
+        .filter(deployments::Column::SensorId.eq(sensor_id))
+        .filter(deployments::Column::SiteId.in_subquery(scoped_site_ids_query(&project_ids)))
         .count(db)
         .await
         .map_err(AppError::Database)?;
@@ -742,12 +742,12 @@ fn scoped_site_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::SelectStateme
 /// Subquery selecting sensor ids that have at least one deployment at a site in the scoped set.
 /// Used to confine `sensors` and `sensor_calibrations`.
 fn scoped_sensor_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::SelectStatement {
-    use crate::routes::private::sensor_deployments;
+    use crate::routes::private::sensors::deployments;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
-    sensor_deployments::Entity::find()
+    deployments::Entity::find()
         .select_only()
-        .column(sensor_deployments::Column::SensorId)
-        .filter(sensor_deployments::Column::SiteId.in_subquery(scoped_site_ids_query(projects)))
+        .column(deployments::Column::SensorId)
+        .filter(deployments::Column::SiteId.in_subquery(scoped_site_ids_query(projects)))
         .into_query()
 }
 
@@ -771,7 +771,7 @@ fn scoped_site_parameter_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::Sel
 fn crud_read_scope_condition(entity: &str, projects: &[Uuid]) -> Option<sea_orm::Condition> {
     use crate::routes::private::{
         alarm_thresholds, annotations, data_streams, notes, projects as projects_entity,
-        reprocessing_jobs, samples, sensor_calibrations, sensor_deployments, sensors,
+        reprocessing_jobs, samples, sensors, sensors::calibrations, sensors::deployments,
         site_parameters, sites, subprojects,
     };
     use sea_orm::{ColumnTrait, Condition};
@@ -786,7 +786,7 @@ fn crud_read_scope_condition(entity: &str, projects: &[Uuid]) -> Option<sea_orm:
         "notes" => notes::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
         "annotations" => annotations::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
         "sensor_deployments" => {
-            sensor_deployments::Column::SiteId.in_subquery(scoped_site_ids_query(projects))
+            deployments::Column::SiteId.in_subquery(scoped_site_ids_query(projects))
         }
         "alarm_thresholds" => {
             alarm_thresholds::Column::SiteId.in_subquery(scoped_site_ids_query(projects))
@@ -798,7 +798,7 @@ fn crud_read_scope_condition(entity: &str, projects: &[Uuid]) -> Option<sea_orm:
         }
         "sensors" => sensors::Column::Id.in_subquery(scoped_sensor_ids_query(projects)),
         "sensor_calibrations" => {
-            sensor_calibrations::Column::SensorId.in_subquery(scoped_sensor_ids_query(projects))
+            calibrations::Column::SensorId.in_subquery(scoped_sensor_ids_query(projects))
         }
         "reprocessing_jobs" => {
             reprocessing_jobs::Column::SensorId.in_subquery(scoped_sensor_ids_query(projects))

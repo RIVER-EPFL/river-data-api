@@ -4,7 +4,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
 use super::model::SensorDeployment;
-use crate::routes::private::sensor_calibrations::services::recompute_deployed_until;
+use crate::routes::private::sensors::calibrations::services::recompute_deployed_until;
 
 pub struct SensorDeploymentOperations;
 
