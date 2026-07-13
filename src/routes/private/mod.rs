@@ -15,7 +15,6 @@ pub mod readings;
 pub mod reprocessing_jobs;
 pub mod search;
 pub mod sensors;
-pub mod site_parameters;
 pub mod sites;
 pub mod sync;
 pub mod tools;

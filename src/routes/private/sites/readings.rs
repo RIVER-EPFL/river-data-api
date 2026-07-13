@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
-use crate::routes::private::{parameters, site_parameters};
+use crate::routes::private::{parameters, sites::parameters as site_parameters};
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, validate_optional_time_range, resolve_site_with_project};
 use crate::common::bulk::{self, StreamableParam};

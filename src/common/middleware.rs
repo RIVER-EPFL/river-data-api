@@ -754,7 +754,7 @@ fn scoped_sensor_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::SelectState
 /// Subquery selecting the site_parameter ids within a restricted principal's project set. Used to
 /// confine `data_streams`, whose scoping column is `site_parameter_id`.
 fn scoped_site_parameter_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::SelectStatement {
-    use crate::routes::private::site_parameters;
+    use crate::routes::private::sites::parameters as site_parameters;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
     site_parameters::Entity::find()
         .select_only()
@@ -772,7 +772,7 @@ fn crud_read_scope_condition(entity: &str, projects: &[Uuid]) -> Option<sea_orm:
     use crate::routes::private::{
         alarm_thresholds, annotations, data_streams, notes, projects as projects_entity,
         reprocessing_jobs, readings::samples, sensors, sensors::calibrations, sensors::deployments,
-        site_parameters, sites, projects::subprojects,
+        sites::parameters as site_parameters, sites, projects::subprojects,
     };
     use sea_orm::{ColumnTrait, Condition};
     let ids = || projects.iter().copied();

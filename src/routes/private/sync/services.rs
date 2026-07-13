@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::routes::private::{data_streams, data_streams::pairing_plans, parameters, projects, site_parameters, sites};
+use crate::routes::private::{data_streams, data_streams::pairing_plans, parameters, projects, sites::parameters as site_parameters, sites};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::operations::create_sensor_for_stream;
 

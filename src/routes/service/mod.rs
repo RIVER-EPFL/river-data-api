@@ -33,7 +33,7 @@ use crate::routes::private::{
     sensors::Sensor,
     sensors::calibrations::SensorCalibration,
     sensors::deployments::SensorDeployment,
-    site_parameters::SiteParameter,
+    sites::parameters::SiteParameter,
     projects::subprojects::Subproject,
     sync::commands_model::SyncCommand,
     sync::credentials_model::SyncServiceCredential,

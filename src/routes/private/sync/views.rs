@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::routes::private::{data_streams, parameters, projects, site_parameters, sites};
+use crate::routes::private::{data_streams, parameters, projects, sites::parameters as site_parameters, sites};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::operations::{create_sensor_for_stream, extract_vaisala_device_serial};
 
