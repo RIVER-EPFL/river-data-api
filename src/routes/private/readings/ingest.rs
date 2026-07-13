@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::common::{AppEvent, AppState};
-use crate::routes::private::{data_streams, readings, status_events};
+use crate::routes::private::{data_streams, readings, readings::status_events};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::operations::{
     resolve_slot_owner_for_times, resolve_windows_for_times,

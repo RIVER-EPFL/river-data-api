@@ -29,7 +29,7 @@ use crate::routes::private::{
     data_streams::pairing_plans::PairingPlan,
     parameters::Parameter,
     reprocessing_jobs::ReprocessingJob,
-    samples::Sample,
+    readings::samples::Sample,
     sensors::Sensor,
     sensors::calibrations::SensorCalibration,
     sensors::deployments::SensorDeployment,
@@ -194,7 +194,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         data_streams::views as stream_views,
         readings::{batch as readings_batch, flags, grab_samples, import as readings_import, ingest},
         search,
-        status_events::batch as status_events_batch,
+        readings::status_events::batch as status_events_batch,
         sync::views as sync_views,
         tools,
     };

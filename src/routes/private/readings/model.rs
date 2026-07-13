@@ -63,9 +63,9 @@ pub enum Relation {
     )]
     SensorDeployment,
     #[sea_orm(
-        belongs_to = "crate::routes::private::samples::Entity",
+        belongs_to = "crate::routes::private::readings::samples::Entity",
         from = "Column::SampleId",
-        to = "crate::routes::private::samples::Column::Id",
+        to = "crate::routes::private::readings::samples::Column::Id",
         on_delete = "SetNull"
     )]
     Sample,
@@ -107,7 +107,7 @@ impl Related<crate::routes::private::sensors::deployments::Entity> for Entity {
     }
 }
 
-impl Related<crate::routes::private::samples::Entity> for Entity {
+impl Related<crate::routes::private::readings::samples::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Sample.def()
     }

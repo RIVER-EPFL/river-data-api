@@ -771,7 +771,7 @@ fn scoped_site_parameter_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::Sel
 fn crud_read_scope_condition(entity: &str, projects: &[Uuid]) -> Option<sea_orm::Condition> {
     use crate::routes::private::{
         alarm_thresholds, annotations, data_streams, notes, projects as projects_entity,
-        reprocessing_jobs, samples, sensors, sensors::calibrations, sensors::deployments,
+        reprocessing_jobs, readings::samples, sensors, sensors::calibrations, sensors::deployments,
         site_parameters, sites, projects::subprojects,
     };
     use sea_orm::{ColumnTrait, Condition};

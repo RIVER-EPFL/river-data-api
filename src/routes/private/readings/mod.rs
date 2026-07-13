@@ -5,4 +5,6 @@ pub mod import;
 pub mod ingest;
 pub mod measurement;
 pub mod model;
+pub mod samples;
+pub mod status_events;
 pub use model::*;

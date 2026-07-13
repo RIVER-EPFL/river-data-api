@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::routes::private::{
-    data_streams, readings, samples, sensors::calibrations, site_parameters, sites,
+    data_streams, readings, readings::samples, sensors::calibrations, site_parameters, sites,
 };
 use crate::error::{AppError, AppResult};
 
