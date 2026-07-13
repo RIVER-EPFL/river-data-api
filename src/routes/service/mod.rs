@@ -223,6 +223,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
 
     let stream_write_routes = Router::new()
         .route("/streams/register", post(stream_views::register_stream))
+        .route("/streams/retag", post(stream_views::retag_streams))
         .route("/streams/{id}/import", post(stream_views::import_stream))
         .route("/streams/{id}/pair", post(stream_views::pair_stream))
         .route("/streams/{id}/unpair", post(stream_views::unpair_stream))
@@ -242,6 +243,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .with_state(state.clone());
     let sensor_adopt_write = Router::new()
         .route("/sensors/{sensor_id}/adopt", post(sensor_adopt::adopt_sensor))
+        .route(
+            "/sensors/retag_frequency",
+            post(crate::routes::private::sensors::retag::retag_frequency),
+        )
         .route("/actions/swap", post(sensor_adopt::swap_sensors))
         .layer(middleware::from_fn(deny_scoped_token))
         // Deploying/swapping a sensor at a slot is sensor movement: MANAGER (write_metadata token).

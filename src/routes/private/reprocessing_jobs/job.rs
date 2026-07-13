@@ -143,6 +143,7 @@ pub fn build_registry() -> JobRegistry {
         registry.register(Arc::new(super::jobs::SiteTimestampsDerived::new(trigger)));
     }
     registry.register(Arc::new(super::jobs::ReprocessAll));
+    registry.register(Arc::new(super::jobs::MeasurementRetag));
     registry.register(Arc::new(super::jobs::CsvImport));
     registry.register(Arc::new(super::jobs::AlarmBackfill));
     registry.register(Arc::new(super::jobs::BackfillAttribution));

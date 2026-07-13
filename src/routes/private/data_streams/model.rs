@@ -37,6 +37,10 @@ pub struct Model {
     pub site_parameter_id: Option<Uuid>,
     #[crudcrate(filterable)]
     pub sensor_id: Option<Uuid>,
+    /// Stream-level default for readings.measurement_type ('continuous' | 'spot' | 'derived').
+    /// NULL defers to the owning sensor's data_frequency, then falls back to 'continuous'.
+    #[crudcrate(filterable)]
+    pub measurement_type: Option<String>,
     #[crudcrate(filterable, on_create = true)]
     pub is_active: bool,
     #[crudcrate(sortable, exclude(create, update))]

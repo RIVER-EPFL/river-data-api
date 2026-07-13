@@ -28,6 +28,10 @@ pub struct IngestReading {
     pub sensor_id: Option<Uuid>,
     pub calibration_id: Option<Uuid>,
     pub deployment_id: Option<Uuid>,
+    /// Per-reading override ('continuous' | 'spot' | 'derived'). Omit to resolve from the
+    /// stream's measurement_type, then the owning sensor's data_frequency.
+    #[serde(default)]
+    pub measurement_type: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -105,6 +109,12 @@ pub async fn ingest_readings(
     // An unpaired stream has no project, so a scoped token is rejected outright.
     enforce_ingest_scope(&state.db, &scope, site_id).await?;
 
+    for r in &payload.readings {
+        crate::routes::private::readings::measurement::validate_measurement_type(
+            r.measurement_type.as_deref(),
+        )?;
+    }
+
     // Window-aware attribution: resolve calibration/deployment/site per reading TIME from the
     // sensor's windows, agreeing with reprocess_sensor_readings. The stream's frozen sensor_id is the
     // owner; cal/deployment/site come from whichever window covers each timestamp. `calibrated_value`
@@ -129,6 +139,26 @@ pub async fn ingest_readings(
                 .unwrap_or_default()
         }
         _ => std::collections::HashMap::new(),
+    };
+
+    // Sensor-frequency defaults for every sensor a reading could resolve to (explicit, stream, or
+    // slot owner), fetched in one query. Applied when neither the reading nor the stream declares
+    // a measurement_type.
+    let sensor_types = {
+        let mut candidate_sensors: Vec<Uuid> = payload
+            .readings
+            .iter()
+            .filter_map(|r| r.sensor_id)
+            .chain(stream.sensor_id)
+            .chain(slot_owner.values().filter_map(|o| o.sensor_id))
+            .collect();
+        candidate_sensors.sort_unstable();
+        candidate_sensors.dedup();
+        crate::routes::private::readings::measurement::measurement_types_for_sensors(
+            db,
+            &candidate_sensors,
+        )
+        .await?
     };
 
     // Build reading models
@@ -157,7 +187,16 @@ pub async fn ingest_readings(
                     .or_else(|| slot.and_then(|s| s.deployment_id))
                     .or_else(|| owner.and_then(|o| o.deployment_id))),
                 logged: Set(Some(true)),
-                measurement_type: Set(Some("continuous".to_string())),
+                measurement_type: Set(Some(
+                    crate::routes::private::readings::measurement::resolve_measurement_type(
+                        r.measurement_type.as_deref(),
+                        stream.measurement_type.as_deref(),
+                        r.sensor_id
+                            .or(stream.sensor_id)
+                            .or_else(|| owner.and_then(|o| o.sensor_id)),
+                        &sensor_types,
+                    ),
+                )),
                 is_flagged: Set(Some(false)),
                 flag_reason: Set(None),
                 sample_id: Set(None),

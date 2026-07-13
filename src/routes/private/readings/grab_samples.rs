@@ -80,6 +80,7 @@ async fn get_or_create_grab_stream(
         metadata: Set(serde_json::json!({})),
         site_parameter_id: Set(site_parameter_id),
         sensor_id: Set(None),
+        measurement_type: Set(Some("spot".to_string())),
         is_active: Set(true),
         discovered_at: Set(now.into()),
         paired_at: Set(site_parameter_id.map(|_| now.into())),

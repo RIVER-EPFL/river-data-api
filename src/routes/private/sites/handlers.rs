@@ -22,21 +22,30 @@ struct ParameterExtentRow {
     min_time: Option<DateTime<Utc>>,
     max_time: Option<DateTime<Utc>>,
     count: i64,
+    spot_count: i64,
+    continuous_count: i64,
 }
 
 struct ParameterExtent {
     data_start: Option<DateTime<Utc>>,
     data_end: Option<DateTime<Utc>>,
     reading_count: i64,
+    spot_count: i64,
+    continuous_count: i64,
 }
 
 async fn parameter_extents(
     db: &sea_orm::DatabaseConnection,
     site_id: Uuid,
 ) -> AppResult<HashMap<Uuid, ParameterExtent>> {
+    // Cadence counts ride along on the extent scan: spot = grab/lab low-frequency readings;
+    // continuous counts NULL (legacy untagged) and 'derived' alongside 'continuous', since those
+    // series behave like continuous data on charts.
     let stmt = Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        "SELECT parameter_id, MIN(time) AS min_time, MAX(time) AS max_time, COUNT(*) AS count \
+        "SELECT parameter_id, MIN(time) AS min_time, MAX(time) AS max_time, COUNT(*) AS count, \
+                COUNT(*) FILTER (WHERE measurement_type = 'spot') AS spot_count, \
+                COUNT(*) FILTER (WHERE measurement_type IS DISTINCT FROM 'spot') AS continuous_count \
          FROM readings WHERE site_id = $1 GROUP BY parameter_id",
         [site_id.into()],
     );
@@ -52,6 +61,8 @@ async fn parameter_extents(
                     data_start: r.min_time,
                     data_end: r.max_time,
                     reading_count: r.count,
+                    spot_count: r.spot_count,
+                    continuous_count: r.continuous_count,
                 },
             )
         })
@@ -111,6 +122,14 @@ fn build_parameter_response(
         p.sensor_type.clone()
     };
     let extent = extents.get(&p.parameter_id);
+    let has_spot = extent.is_some_and(|e| e.spot_count > 0);
+    let has_continuous = extent.is_some_and(|e| e.continuous_count > 0);
+    let frequency = match (has_continuous, has_spot) {
+        (false, true) => "low",
+        (true, true) => "mixed",
+        _ => "high",
+    }
+    .to_string();
     ParameterResponse {
         id: p.id,
         parameter_id: p.parameter_id,
@@ -125,6 +144,9 @@ fn build_parameter_response(
         data_start: extent.and_then(|e| e.data_start),
         data_end: extent.and_then(|e| e.data_end),
         reading_count: extent.map(|e| e.reading_count),
+        has_continuous,
+        has_spot,
+        frequency,
     }
 }
 

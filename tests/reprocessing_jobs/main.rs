@@ -10,6 +10,7 @@ mod alarm_backfill_slots;
 mod cancel;
 mod job_logs_and_detail;
 mod job_tracking_on_actions;
+mod measurement_retag;
 mod rerun;
 mod retention;
 mod retry_backoff;

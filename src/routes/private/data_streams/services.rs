@@ -37,6 +37,7 @@ pub async fn get_or_create_api_stream(
         metadata: Set(serde_json::json!({})),
         site_parameter_id: Set(None),
         sensor_id: Set(None),
+        measurement_type: Set(None),
         is_active: Set(true),
         discovered_at: Set(now.into()),
         paired_at: Set(None),

@@ -429,6 +429,7 @@ pub async fn get_site_aggregates(
           AND time <= ${}
           AND is_flagged = TRUE
           AND replicate_index = 0
+          AND measurement_type IS DISTINCT FROM 'spot'
         GROUP BY bucket, parameter_id
         ",
         placeholders.join(","),
@@ -629,6 +630,7 @@ async fn aggregates_split_by_sensor(
           AND time <= ${}
           AND is_flagged = TRUE
           AND replicate_index = 0
+          AND measurement_type IS DISTINCT FROM 'spot'
         GROUP BY bucket, parameter_id, sensor_id
         ",
         placeholders.join(","),

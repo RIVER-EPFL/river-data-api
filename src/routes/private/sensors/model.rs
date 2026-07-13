@@ -35,6 +35,10 @@ pub struct Model {
     pub is_active: Option<bool>,
     #[crudcrate(filterable)]
     pub is_lab_instrument: Option<bool>,
+    /// Cadence classification: 'high' (field stream → continuous readings) or 'low'
+    /// (lab/campaign → spot readings). Resolved at ingest for streams owned by this sensor.
+    #[crudcrate(filterable, sortable, on_create = "high".to_string())]
+    pub data_frequency: String,
     pub notes: Option<String>,
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub metadata: Option<serde_json::Value>,

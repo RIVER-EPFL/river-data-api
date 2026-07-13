@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sea_orm::{ConnectionTrait, DbErr, EntityTrait, Set, Statement};
+use sea_orm::{ConnectionTrait, DbErr, EntityTrait, Set, Statement, TransactionTrait};
 use uuid::Uuid;
 
 use super::job::Job;
@@ -690,8 +690,8 @@ impl Job for AlarmBackfill {
 /// the imported window, then enqueue an `alarm_backfill` for the touched slots. Reads its inputs
 /// (and the staged rows, by `import_token`) from params, so any replica can run it. Non-rerunnable:
 /// the staging rows are deleted on completion, so the source expires. The staged rows carry only the
-/// variable fields; the readings constants (replicate_index=0, logged=false, measurement_type=
-/// 'continuous', is_flagged=false) are re-applied here.
+/// variable fields; the readings constants (replicate_index=0, logged=false, is_flagged=false) and
+/// the request-level measurement_type (from params, default 'continuous') are re-applied here.
 pub struct CsvImport;
 
 #[async_trait]
@@ -724,6 +724,11 @@ impl Job for CsvImport {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as usize;
         let param_streams = uuid_pair_array(params, "param_streams");
+        let measurement_type = params
+            .get("measurement_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("continuous")
+            .to_string();
 
         ctx.set_site(site_id).await;
 
@@ -763,7 +768,7 @@ impl Job for CsvImport {
                 calibration_id: Set(calibration_id),
                 deployment_id: Set(deployment_id),
                 logged: Set(Some(false)),
-                measurement_type: Set(Some("continuous".to_string())),
+                measurement_type: Set(Some(measurement_type.clone())),
                 is_flagged: Set(Some(false)),
                 flag_reason: Set(None),
                 sample_id: Set(None),
@@ -1290,5 +1295,130 @@ impl Job for DispatchNotifications {
         let channels = dispatcher::build_channels(&state.config);
         dispatcher::dispatch_once(ctx.db(), &channels, &state.config).await;
         Ok(0)
+    }
+}
+
+/// Retag readings.measurement_type for a sensor/stream scope, then refresh continuous aggregates
+/// over the affected window. Backs the bulk reclassification actions (mark sensors low/high
+/// frequency, classify sensorless streams): the classification columns (`sensors.data_frequency`,
+/// `data_streams.measurement_type`) are updated synchronously by the endpoint; this job makes the
+/// existing rows agree. Rerunnable (idempotent — the UPDATE skips rows already at the target).
+/// Decompression-safe: portal/lab history lives in compressed (>30-day) chunks.
+pub struct MeasurementRetag;
+
+#[async_trait]
+impl Job for MeasurementRetag {
+    fn name(&self) -> &'static str {
+        "measurement_retag"
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let params = ctx.params();
+        let target = params
+            .get("target")
+            .and_then(serde_json::Value::as_str)
+            .filter(|t| matches!(*t, "continuous" | "spot" | "derived"))
+            .ok_or_else(|| DbErr::Custom("measurement_retag needs target".to_string()))?
+            .to_string();
+        let sensor_ids = uuid_array(params, "sensor_ids");
+        let stream_ids = uuid_array(params, "stream_ids");
+        let source_system = params
+            .get("source_system")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        if sensor_ids.is_empty() && stream_ids.is_empty() && source_system.is_none() {
+            return Err(DbErr::Custom(
+                "measurement_retag needs sensor_ids, stream_ids, or source_system".to_string(),
+            ));
+        }
+
+        let scope = "(r.sensor_id = ANY($2) OR r.stream_id = ANY($3) \
+                      OR ($4::text IS NOT NULL AND r.stream_id IN \
+                          (SELECT id FROM data_streams WHERE source_system = $4)))";
+        let values: Vec<sea_orm::Value> = vec![
+            target.clone().into(),
+            sensor_ids.clone().into(),
+            stream_ids.clone().into(),
+            source_system.clone().into(),
+        ];
+
+        // Affected window (for the aggregate refresh), read before the rewrite.
+        let window = ctx
+            .db()
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                &format!(
+                    "SELECT min(time) AS lo, max(time) AS hi FROM readings r \
+                     WHERE r.measurement_type IS DISTINCT FROM $1 AND {scope}"
+                ),
+                values.clone(),
+            ))
+            .await?;
+        let (lo, hi) = match &window {
+            Some(row) => (
+                row.try_get::<Option<chrono::DateTime<chrono::FixedOffset>>>("", "lo")?,
+                row.try_get::<Option<chrono::DateTime<chrono::FixedOffset>>>("", "hi")?,
+            ),
+            None => (None, None),
+        };
+        let (Some(lo), Some(hi)) = (lo, hi) else {
+            ctx.info("Nothing to retag — every reading in scope already matches").await;
+            return Ok(0);
+        };
+
+        ctx.info(&format!("Retagging readings in scope to '{target}'")).await;
+        let txn = ctx.db().begin().await?;
+        txn.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
+        ))
+        .await?;
+        let retagged = txn
+            .execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                &format!(
+                    "UPDATE readings r SET measurement_type = $1 \
+                     WHERE r.measurement_type IS DISTINCT FROM $1 AND {scope}"
+                ),
+                values,
+            ))
+            .await?
+            .rows_affected();
+        txn.commit().await?;
+
+        // Membership in the rollups changed (spot/derived are excluded), so refresh every
+        // aggregate over the affected window. Widened by one bucket so monthly boundaries are
+        // fully covered; CALL runs outside the txn (procedures can't run inside one).
+        let refresh_lo = lo - chrono::Duration::days(32);
+        let refresh_hi = hi + chrono::Duration::days(32);
+        for agg in ["readings_hourly", "readings_daily", "readings_weekly", "readings_monthly"] {
+            if let Err(e) = ctx
+                .db()
+                .execute(Statement::from_string(
+                    sea_orm::DatabaseBackend::Postgres,
+                    format!(
+                        "CALL refresh_continuous_aggregate('{agg}', '{}'::timestamptz, '{}'::timestamptz)",
+                        refresh_lo.to_rfc3339(),
+                        refresh_hi.to_rfc3339()
+                    ),
+                ))
+                .await
+            {
+                ctx.log(
+                    "warn",
+                    &format!("Failed to refresh {agg} after retag"),
+                    serde_json::json!({ "error": e.to_string() }),
+                )
+                .await;
+            }
+        }
+
+        ctx.set_detail(serde_json::json!({
+            "counts": { "readings_retagged": retagged },
+            "target": target,
+            "window": { "from": lo.to_rfc3339(), "until": hi.to_rfc3339() },
+        }))
+        .await;
+        Ok(retagged.try_into().unwrap_or(i64::MAX))
     }
 }

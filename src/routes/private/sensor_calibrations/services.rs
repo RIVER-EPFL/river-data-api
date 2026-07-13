@@ -300,8 +300,8 @@ async fn get_or_create_derived_stream(
     db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"INSERT INTO data_streams
-            (id, source_system, source_key, source_name, site_parameter_id, is_active, discovered_at, paired_at)
-          VALUES ($1, 'derived', $2, $3, $4, true, NOW(), NOW())
+            (id, source_system, source_key, source_name, site_parameter_id, is_active, discovered_at, paired_at, measurement_type)
+          VALUES ($1, 'derived', $2, $3, $4, true, NOW(), NOW(), 'derived')
           ON CONFLICT (source_system, source_key) DO UPDATE
             SET site_parameter_id = EXCLUDED.site_parameter_id
           RETURNING id",
@@ -429,9 +429,10 @@ async fn evaluate_and_upsert_derived(
 
     db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        r"INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, replicate_index)
-          VALUES ($1, $2, $3, $4, $5, $5, 0)
-          ON CONFLICT (stream_id, time, replicate_index) DO UPDATE SET calibrated_value = $5",
+        r"INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, replicate_index, measurement_type)
+          VALUES ($1, $2, $3, $4, $5, $5, 0, 'derived')
+          ON CONFLICT (stream_id, time, replicate_index) DO UPDATE
+            SET calibrated_value = $5, measurement_type = 'derived'",
         [
             stream_id.into(),
             item.derived_site_id.into(),

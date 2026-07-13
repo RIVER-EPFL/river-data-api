@@ -53,6 +53,13 @@ pub struct ParameterResponse {
     pub data_end: Option<DateTime<Utc>>,
     /// Number of readings for this parameter at the site
     pub reading_count: Option<i64>,
+    /// Whether any continuous (or legacy untagged) readings exist for this parameter at the site
+    pub has_continuous: bool,
+    /// Whether any spot (grab/lab) readings exist for this parameter at the site
+    pub has_spot: bool,
+    /// Data-driven cadence classification: 'low' (spot-only), 'high' (no spot), or 'mixed'.
+    /// Low-frequency series render marker-only over their full range and skip the aggregate path.
+    pub frequency: String,
 }
 
 /// Detailed site response with project info, parameters, and data range

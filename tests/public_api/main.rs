@@ -7,4 +7,5 @@
 mod common;
 
 mod exposure_lockdown;
+mod measurement_type_filter;
 mod read_only_endpoints;

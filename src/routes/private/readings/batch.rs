@@ -45,6 +45,10 @@ pub struct ReadingInput {
     pub replicate_index: Option<i16>,
     #[serde(default)]
     pub sample_id: Option<Uuid>,
+    /// Per-reading override ('continuous' | 'spot' | 'derived'). Omit to resolve from the
+    /// resolved sensor's data_frequency (lab CSV uploads should pass 'spot' explicitly).
+    #[serde(default)]
+    pub measurement_type: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -99,6 +103,12 @@ pub async fn insert_batch_readings(
     // A project-scoped token may only write to sites within its project.
     let target_sites: Vec<Uuid> = payload.readings.iter().map(|r| r.site_id).collect();
     enforce_project_scope_for_sites(&state.db, &scope, &target_sites).await?;
+
+    for r in &payload.readings {
+        crate::routes::private::readings::measurement::validate_measurement_type(
+            r.measurement_type.as_deref(),
+        )?;
+    }
 
     // Validate timestamps are within reasonable bounds
     let now = chrono::Utc::now();
@@ -159,6 +169,24 @@ pub async fn insert_batch_readings(
         }
     }
 
+    // Sensor-frequency defaults for readings that don't declare a measurement_type: explicit
+    // payload sensors plus slot-owner-resolved ones, one query.
+    let sensor_types = {
+        let mut candidate_sensors: Vec<Uuid> = payload
+            .readings
+            .iter()
+            .filter_map(|r| r.sensor_id)
+            .chain(owner_map.values().filter_map(|o| o.sensor_id))
+            .collect();
+        candidate_sensors.sort_unstable();
+        candidate_sensors.dedup();
+        crate::routes::private::readings::measurement::measurement_types_for_sensors(
+            &state.db,
+            &candidate_sensors,
+        )
+        .await?
+    };
+
     let models: Vec<readings::ActiveModel> = payload
         .readings
         .into_iter()
@@ -181,7 +209,14 @@ pub async fn insert_batch_readings(
                 calibration_id: Set(r.calibration_id.or(owner.calibration_id)),
                 deployment_id: Set(r.deployment_id.or(owner.deployment_id)),
                 logged: Set(Some(true)),
-                measurement_type: Set(Some("continuous".to_string())),
+                measurement_type: Set(Some(
+                    crate::routes::private::readings::measurement::resolve_measurement_type(
+                        r.measurement_type.as_deref(),
+                        None,
+                        r.sensor_id.or(owner.sensor_id),
+                        &sensor_types,
+                    ),
+                )),
                 is_flagged: Set(Some(false)),
                 flag_reason: Set(None),
                 sample_id: Set(r.sample_id),

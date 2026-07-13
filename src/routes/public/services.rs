@@ -178,7 +178,7 @@ async fn load_public_config(
             .unwrap_or_else(|| "Public sensor data API.".to_string()),
         api_version: project
             .public_api_version
-            .unwrap_or_else(|| "2.0.0".to_string()),
+            .unwrap_or_else(|| "2.1.0".to_string()),
         contact_email: project.public_contact_email,
         sites: site_configs,
         exposed_params: exposed_configs,

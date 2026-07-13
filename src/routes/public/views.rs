@@ -332,6 +332,12 @@ pub struct ReadingsQuery {
     pub end: Option<String>,
     /// Comma-separated list of parameter public names. Omit for all.
     pub parameters: Option<String>,
+    /// Filter by cadence: continuous (includes untagged legacy rows), spot (grab/lab), or
+    /// derived. Omit for all readings.
+    pub measurement_type: Option<String>,
+    /// Include a per-point measurement_type array (continuous/spot/derived) on each parameter.
+    #[serde(default)]
+    pub include_measurement_type: Option<bool>,
     /// json (default), csv, or ndjson.
     #[serde(default = "default_format")]
     pub format: String,
@@ -357,6 +363,10 @@ pub struct ParameterData {
     pub units: String,
     /// One value per entry in `times`. Null where no reading exists.
     pub values: Vec<Option<f64>>,
+    /// Per-point measurement type (continuous/spot/derived), aligned with `values`.
+    /// Only present when `include_measurement_type=true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement_types: Option<Vec<Option<String>>>,
 }
 
 impl StreamableParam for ParameterData {
@@ -366,6 +376,15 @@ impl StreamableParam for ParameterData {
     fn value_at(&self, index: usize) -> Option<f64> {
         self.values.get(index).and_then(|v| *v)
     }
+    fn measurement_type_at(&self, index: usize) -> Option<&str> {
+        self.measurement_types
+            .as_ref()
+            .and_then(|m| m.get(index))
+            .and_then(|m| m.as_deref())
+    }
+    fn has_measurement_types(&self) -> bool {
+        self.measurement_types.is_some()
+    }
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -373,6 +392,7 @@ struct ReadingRow {
     param_id: String,
     time: chrono::DateTime<chrono::FixedOffset>,
     value: f64,
+    measurement_type: Option<String>,
 }
 
 /// Raw time-series readings for a public project site.
@@ -418,6 +438,14 @@ pub async fn get_readings(
     let start = Some(effective_start);
     let end = end_parsed;
     let format = query.format.to_lowercase();
+    let measurement_type = query.measurement_type.as_deref().unwrap_or("");
+    if !measurement_type.is_empty() && !matches!(measurement_type, "continuous" | "spot" | "derived")
+    {
+        return Err(AppError::BadRequest(format!(
+            "invalid measurement_type '{measurement_type}' (expected continuous, spot, or derived)"
+        )));
+    }
+    let include_measurement_type = query.include_measurement_type.unwrap_or(false);
 
     let requested_names = resolve_requested_param_names(query.parameters.as_deref(), &config)?;
 
@@ -450,6 +478,8 @@ pub async fn get_readings(
             &names_key.join(","),
             &effective_start.to_rfc3339(),
             &end.map(|e| e.to_rfc3339()).unwrap_or_default(),
+            measurement_type,
+            if include_measurement_type { "mt" } else { "" },
         ],
     );
 
@@ -459,7 +489,15 @@ pub async fn get_readings(
         return readings_response_from_data(site, cached.times, cached.parameters, &format, true);
     }
 
-    let (times_formatted, output_params) = fetch_readings(&state, &resolved, start, end).await?;
+    let (times_formatted, output_params) = fetch_readings(
+        &state,
+        &resolved,
+        start,
+        end,
+        measurement_type,
+        include_measurement_type,
+    )
+    .await?;
 
     let max_time = times_formatted.last().and_then(|s| parse_time(s).ok());
     if let Ok(bytes) = serde_json::to_vec(&CachedReadings {
@@ -902,6 +940,8 @@ async fn fetch_readings(
     resolved: &[&ResolvedParam],
     start: Option<DateTime<Utc>>,
     end: Option<DateTime<Utc>>,
+    measurement_type: &str,
+    include_measurement_type: bool,
 ) -> AppResult<(Vec<String>, Vec<ParameterData>)> {
     let param_ids: Vec<Uuid> = {
         let mut ids: Vec<Uuid> = resolved.iter().map(|rp| rp.parameter_id).collect();
@@ -942,6 +982,7 @@ async fn fetch_readings(
             Expr::cust("COALESCE(r.calibrated_value, r.raw_value)"),
             Alias::new("value"),
         )
+        .column((r.clone(), Alias::new("measurement_type")))
         .from_as(Alias::new("readings"), r.clone())
         .join_as(
             sea_orm::sea_query::JoinType::Join,
@@ -961,6 +1002,18 @@ async fn fetch_readings(
     if let Some(e) = end {
         query.and_where(Expr::col((r.clone(), Alias::new("time"))).lte(e));
     }
+    // Same semantics as the private readings filter: 'continuous' includes legacy NULL rows.
+    match measurement_type {
+        "" => {}
+        "continuous" => {
+            query.and_where(Expr::cust(
+                "(r.measurement_type = 'continuous' OR r.measurement_type IS NULL)",
+            ));
+        }
+        other => {
+            query.and_where(Expr::col((r.clone(), Alias::new("measurement_type"))).eq(other));
+        }
+    }
 
     let (sql, values) = query.build(PostgresQueryBuilder);
     let stmt = Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values.0);
@@ -975,8 +1028,9 @@ async fn fetch_readings(
 
     let mut times_ordered: Vec<DateTime<Utc>> = Vec::new();
     let mut time_set: std::collections::HashSet<DateTime<Utc>> = std::collections::HashSet::new();
-    // Map from parameter name -> Vec<(time, value)>
-    let mut param_values: HashMap<String, Vec<(DateTime<Utc>, f64)>> = HashMap::new();
+    // Map from parameter name -> Vec<(time, value, measurement_type)>
+    let mut param_values: HashMap<String, Vec<(DateTime<Utc>, f64, Option<String>)>> =
+        HashMap::new();
 
     for row in &rows {
         let time = row.time.with_timezone(&Utc);
@@ -987,10 +1041,11 @@ async fn fetch_readings(
         let param_uuid = row.param_id.parse::<Uuid>().ok();
         if let Some(configs) = param_uuid.and_then(|uuid| id_to_publics.get(&uuid)) {
             for (name, _units) in configs {
-                param_values
-                    .entry(name.to_string())
-                    .or_default()
-                    .push((time, row.value));
+                param_values.entry(name.to_string()).or_default().push((
+                    time,
+                    row.value,
+                    row.measurement_type.clone(),
+                ));
             }
         }
     }
@@ -1021,10 +1076,20 @@ async fn fetch_readings(
         let units = matched.map_or("", |rp| rp.units.as_str());
 
         let mut values = vec![None; num_times];
+        let mut measurement_types = if include_measurement_type {
+            Some(vec![None::<String>; num_times])
+        } else {
+            None
+        };
         if let Some(readings) = param_values.get(code.as_str()) {
-            for (time, value) in readings {
+            for (time, value, mt) in readings {
                 if let Some(&idx) = time_index.get(time) {
                     values[idx] = Some(*value);
+                    if let Some(mts) = measurement_types.as_mut() {
+                        // NULL legacy rows read as continuous, matching the filter semantics.
+                        mts[idx] =
+                            Some(mt.clone().unwrap_or_else(|| "continuous".to_string()));
+                    }
                 }
             }
         }
@@ -1033,6 +1098,7 @@ async fn fetch_readings(
             name: name.to_string(),
             units: units.to_string(),
             values,
+            measurement_types,
         });
     }
 

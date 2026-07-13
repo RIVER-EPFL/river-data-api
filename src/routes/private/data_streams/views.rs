@@ -112,6 +112,10 @@ pub struct RegisterStreamRequest {
     #[serde(default = "default_metadata")]
     #[schema(value_type = Object)]
     pub metadata: serde_json::Value,
+    /// Stream-level default for readings.measurement_type ('continuous' | 'spot' | 'derived').
+    /// Omit to defer to the owning sensor's data_frequency.
+    #[serde(default)]
+    pub measurement_type: Option<String>,
 }
 
 fn default_metadata() -> serde_json::Value {
@@ -129,6 +133,7 @@ pub struct StreamResponse {
     pub metadata: serde_json::Value,
     pub site_parameter_id: Option<Uuid>,
     pub sensor_id: Option<Uuid>,
+    pub measurement_type: Option<String>,
     pub is_active: bool,
     pub discovered_at: chrono::DateTime<Utc>,
     pub paired_at: Option<chrono::DateTime<Utc>>,
@@ -146,6 +151,7 @@ impl From<data_streams::Model> for StreamResponse {
             metadata: m.metadata,
             site_parameter_id: m.site_parameter_id,
             sensor_id: m.sensor_id,
+            measurement_type: m.measurement_type,
             is_active: m.is_active,
             discovered_at: m.discovered_at.with_timezone(&Utc),
             paired_at: m.paired_at.map(|t| t.with_timezone(&Utc)),
@@ -169,6 +175,13 @@ pub async fn register_stream(
     State(state): State<AppState>,
     Json(payload): Json<RegisterStreamRequest>,
 ) -> AppResult<Json<StreamResponse>> {
+    if let Some(mt) = payload.measurement_type.as_deref()
+        && !matches!(mt, "continuous" | "spot" | "derived")
+    {
+        return Err(AppError::BadRequest(format!(
+            "invalid measurement_type '{mt}' (expected continuous, spot, or derived)"
+        )));
+    }
     let now = Utc::now();
 
     let model = data_streams::ActiveModel {
@@ -180,6 +193,7 @@ pub async fn register_stream(
         metadata: Set(payload.metadata.clone()),
         site_parameter_id: Set(None),
         sensor_id: Set(None),
+        measurement_type: Set(payload.measurement_type.clone()),
         is_active: Set(true),
         discovered_at: Set(now.into()),
         paired_at: Set(None),
@@ -208,12 +222,21 @@ pub async fn register_stream(
         .await?;
 
     // Re-fetch the upserted row
-    let stream = data_streams::Entity::find()
+    let mut stream = data_streams::Entity::find()
         .filter(data_streams::Column::SourceSystem.eq(&payload.source_system))
         .filter(data_streams::Column::SourceKey.eq(&payload.source_key))
         .one(&state.db)
         .await?
         .ok_or_else(|| AppError::Internal("Failed to fetch registered stream".to_string()))?;
+
+    // A declared classification wins on re-registration; an omitted one (None) never clears an
+    // operator-set value, so measurement_type is not in the upsert's update_columns.
+    if payload.measurement_type.is_some() && stream.measurement_type != payload.measurement_type {
+        let mut active: data_streams::ActiveModel = stream.clone().into();
+        active.measurement_type = Set(payload.measurement_type.clone());
+        active.updated_at = Set(now.into());
+        stream = active.update(&state.db).await?;
+    }
 
     Ok(Json(stream.into()))
 }
@@ -526,5 +549,97 @@ pub async fn unpair_stream(
     Ok(Json(UnpairStreamResponse {
         stream: updated.into(),
         cleared,
+    }))
+}
+
+#[derive(Debug, serde::Deserialize, ToSchema)]
+pub struct RetagStreamsRequest {
+    /// Explicit streams to classify. Combined with `source_system` when both are given.
+    #[serde(default)]
+    pub stream_ids: Vec<Uuid>,
+    /// Classify every stream of a source system (e.g. 'metalp', 'nomis').
+    #[serde(default)]
+    pub source_system: Option<String>,
+    /// 'continuous' | 'spot' | 'derived'.
+    pub measurement_type: String,
+    /// Also retag the streams' existing readings and refresh aggregates (tracked job).
+    #[serde(default)]
+    pub retag_existing: bool,
+}
+
+#[derive(Debug, serde::Serialize, ToSchema)]
+pub struct RetagStreamsResponse {
+    pub streams_updated: u64,
+    pub measurement_type: String,
+    /// The tracked `measurement_retag` job, when `retag_existing` was requested.
+    pub job_id: Option<Uuid>,
+}
+
+/// Classify data streams' measurement_type in bulk — the sensorless-stream counterpart of
+/// `POST /sensors/retag_frequency` (portal imports like metalp/nomis carry no sensor to hang the
+/// classification on). Requires `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/streams/retag",
+    request_body = RetagStreamsRequest,
+    responses(
+        (status = 200, description = "Streams reclassified", body = RetagStreamsResponse),
+        (status = 400, description = "Invalid measurement_type or empty scope"),
+    ),
+    tag = "streams"
+)]
+pub async fn retag_streams(
+    State(state): State<AppState>,
+    Json(req): Json<RetagStreamsRequest>,
+) -> AppResult<Json<RetagStreamsResponse>> {
+    if req.stream_ids.is_empty() && req.source_system.is_none() {
+        return Err(AppError::BadRequest(
+            "provide stream_ids and/or source_system".to_string(),
+        ));
+    }
+    if !matches!(req.measurement_type.as_str(), "continuous" | "spot" | "derived") {
+        return Err(AppError::BadRequest(format!(
+            "invalid measurement_type '{}' (expected continuous, spot, or derived)",
+            req.measurement_type
+        )));
+    }
+
+    let streams_updated = state
+        .db
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE data_streams SET measurement_type = $1, updated_at = now() \
+             WHERE id = ANY($2) OR ($3::text IS NOT NULL AND source_system = $3)",
+            [
+                req.measurement_type.clone().into(),
+                req.stream_ids.clone().into(),
+                req.source_system.clone().into(),
+            ],
+        ))
+        .await?
+        .rows_affected();
+
+    let job_id = if req.retag_existing {
+        crate::routes::private::reprocessing_jobs::worker::enqueue(
+            &state.db,
+            "measurement_retag",
+            None,
+            None,
+            &serde_json::json!({
+                "stream_ids": req.stream_ids,
+                "source_system": req.source_system,
+                "target": req.measurement_type,
+            }),
+            None,
+        )
+        .await?
+    } else {
+        None
+    };
+
+    Ok(Json(RetagStreamsResponse {
+        streams_updated,
+        measurement_type: req.measurement_type,
+        job_id,
     }))
 }

@@ -53,6 +53,10 @@ pub struct ImportCsvRequest {
     /// this offset to convert to UTC, e.g. `2.0` for CEST (UTC+02:00).
     #[serde(default)]
     pub tz_offset_hours: Option<f64>,
+    /// measurement_type stamped on every imported reading ('continuous' | 'spot' | 'derived').
+    /// Use 'spot' for lab/campaign result sheets. Defaults to 'continuous'.
+    #[serde(default)]
+    pub measurement_type: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -168,6 +172,10 @@ pub async fn import_csv(
     ProjectScope(scope): ProjectScope,
     Json(req): Json<ImportCsvRequest>,
 ) -> AppResult<Json<ImportCsvResponse>> {
+    crate::routes::private::readings::measurement::validate_measurement_type(
+        req.measurement_type.as_deref(),
+    )?;
+
     // --- Resolve CSV text: from request body or staging cache ---------------------------------
     let (csv_text, session_id) = if let Some(csv) = req.csv.as_deref() {
         let sid = Uuid::new_v4();
@@ -537,6 +545,7 @@ pub async fn import_csv(
             "overlapping": overlapping,
             "overlap_differing": overlap_differing,
             "param_streams": param_streams,
+            "measurement_type": req.measurement_type.as_deref().unwrap_or("continuous"),
         });
 
         crate::routes::private::reprocessing_jobs::worker::enqueue(
@@ -585,7 +594,7 @@ pub async fn import_csv(
 
 /// One parsed CSV reading staged for the worker job. Carries only the variable per-row fields; the
 /// `csv_import` job re-applies the readings constants (replicate_index=0, logged=false,
-/// measurement_type='continuous', is_flagged=false) when it reads these back.
+/// is_flagged=false) and the request-level measurement_type when it reads these back.
 struct StagedRow {
     stream_id: Uuid,
     site_id: Uuid,
