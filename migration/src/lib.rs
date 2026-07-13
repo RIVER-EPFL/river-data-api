@@ -41,6 +41,8 @@ mod m20260711_000004_inherit_calibration_parameter;
 mod m20260711_000005_drop_standard_curves;
 mod m20260711_000006_inherit_windowed_only;
 mod m20260711_000007_subproject_move_cascade;
+mod m20260713_000001_data_frequency;
+mod m20260713_000002_aggregates_include_derived;
 
 pub struct Migrator;
 
@@ -89,6 +91,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260711_000005_drop_standard_curves::Migration),
             Box::new(m20260711_000006_inherit_windowed_only::Migration),
             Box::new(m20260711_000007_subproject_move_cascade::Migration),
+            Box::new(m20260713_000001_data_frequency::Migration),
+            Box::new(m20260713_000002_aggregates_include_derived::Migration),
         ]
     }
 }
