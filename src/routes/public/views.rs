@@ -37,10 +37,6 @@ fn parse_time(s: &str) -> Result<DateTime<Utc>, AppError> {
 
 // Shared Types
 
-fn default_format() -> String {
-    "json".to_string()
-}
-
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SiteRef {
     pub code: String,
@@ -339,7 +335,7 @@ pub struct ReadingsQuery {
     #[serde(default)]
     pub include_measurement_type: Option<bool>,
     /// json (default), csv, or ndjson.
-    #[serde(default = "default_format")]
+    #[serde(default = "crate::common::bulk::default_format")]
     pub format: String,
 }
 
@@ -521,7 +517,7 @@ pub struct AggregatesQuery {
     /// Comma-separated list of parameter public names. Omit for all.
     pub parameters: Option<String>,
     /// json (default), csv, or ndjson.
-    #[serde(default = "default_format")]
+    #[serde(default = "crate::common::bulk::default_format")]
     pub format: String,
 }
 

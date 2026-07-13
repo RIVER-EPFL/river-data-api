@@ -8,6 +8,13 @@ use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 
+/// The default response format for readings/aggregates/status-events/alarms query params.
+/// Shared serde `#[serde(default = "crate::common::bulk::default_format")]` helper.
+#[must_use]
+pub fn default_format() -> String {
+    "json".to_string()
+}
+
 /// Semaphore limiting concurrent bulk (CSV/NDJSON) requests.
 /// Created from the config value at startup via `new_bulk_semaphore`.
 #[must_use] 

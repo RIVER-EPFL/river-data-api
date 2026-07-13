@@ -16,149 +16,10 @@ pub fn apply_calibration(raw: f64, slope: f64, intercept: f64) -> f64 {
     slope * raw + intercept
 }
 
-pub async fn recalculate_for_calibration(
-    db: &DatabaseConnection,
-    calibration_id: Uuid,
-) -> Result<usize, sea_orm::DbErr> {
-    let cal_row = db
-        .query_one(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT sensor_id, slope, intercept, valid_from, parameter_id, mode
-              FROM sensor_calibrations WHERE id = $1",
-            [calibration_id.into()],
-        ))
-        .await?;
-
-    let Some(cal) = cal_row else {
-        return Ok(0);
-    };
-
-    let sensor_id: Uuid = cal.try_get("", "sensor_id")?;
-    let slope: f64 = cal.try_get("", "slope")?;
-    let intercept: f64 = cal.try_get("", "intercept")?;
-    let valid_from: chrono::DateTime<chrono::FixedOffset> = cal.try_get("", "valid_from")?;
-    let parameter_id: Option<Uuid> = cal.try_get("", "parameter_id").ok();
-    let mode: String = cal
-        .try_get::<String>("", "mode")
-        .unwrap_or_else(|_| "windowed".to_string());
-
-    // Instant (grab) curves are applied per-reading and never re-windowed: an edit rewrites only the
-    // readings stamped with this exact calibration, by calibration_id, not by time window.
-    if mode == "instant" {
-        let txn = db.begin().await?;
-        txn.execute(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
-        ))
-        .await?;
-        let n = txn
-            .execute(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"UPDATE readings SET calibrated_value = $1 * raw_value + $2 WHERE calibration_id = $3",
-                [slope.into(), intercept.into(), calibration_id.into()],
-            ))
-            .await?
-            .rows_affected();
-        txn.commit().await?;
-        return Ok(n as usize);
-    }
-
-    // The next windowed calibration for the SAME parameter bounds this one's window. A NULL
-    // parameter_id is a wildcard (pre-decoupling calibrations carry no parameter); once populated,
-    // a multi-parameter instrument's parameters each chain independently.
-    let next_cal = db
-        .query_one(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT valid_from FROM sensor_calibrations
-              WHERE sensor_id = $1 AND valid_from > $2 AND mode = 'windowed'
-                AND ($3::uuid IS NULL OR parameter_id IS NULL OR parameter_id = $3)
-              ORDER BY valid_from ASC LIMIT 1",
-            [sensor_id.into(), valid_from.into(), parameter_id.into()],
-        ))
-        .await?;
-
-    // The calibrated_value rewrite runs in a txn with TimescaleDB's per-statement decompression cap
-    // lifted (see `reprocess_sensor_readings`); the derived cascade below runs after commit.
-    let txn = db.begin().await?;
-    txn.execute(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
-    ))
-    .await?;
-    let rows_affected = if let Some(ref next) = next_cal {
-        let next_from: chrono::DateTime<chrono::FixedOffset> = next.try_get("", "valid_from")?;
-        txn.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings SET calibrated_value = $1 * raw_value + $2
-              WHERE sensor_id = $3 AND time >= $4 AND time < $5
-                AND ($6::uuid IS NULL OR parameter_id IS NULL OR parameter_id = $6)",
-            [
-                slope.into(),
-                intercept.into(),
-                sensor_id.into(),
-                valid_from.into(),
-                next_from.into(),
-                parameter_id.into(),
-            ],
-        ))
-        .await?
-        .rows_affected()
-    } else {
-        txn.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings SET calibrated_value = $1 * raw_value + $2
-              WHERE sensor_id = $3 AND time >= $4
-                AND ($5::uuid IS NULL OR parameter_id IS NULL OR parameter_id = $5)",
-            [
-                slope.into(),
-                intercept.into(),
-                sensor_id.into(),
-                valid_from.into(),
-                parameter_id.into(),
-            ],
-        ))
-        .await?
-        .rows_affected()
-    };
-    txn.commit().await?;
-
-    if rows_affected > 0 {
-        let affected_rows = if let Some(ref next) = next_cal {
-            let next_from: chrono::DateTime<chrono::FixedOffset> =
-                next.try_get("", "valid_from")?;
-            db.query_all(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"SELECT DISTINCT site_id, time FROM readings
-                  WHERE sensor_id = $1 AND time >= $2 AND time < $3",
-                [sensor_id.into(), valid_from.into(), next_from.into()],
-            ))
-            .await?
-        } else {
-            db.query_all(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"SELECT DISTINCT site_id, time FROM readings
-                  WHERE sensor_id = $1 AND time >= $2",
-                [sensor_id.into(), valid_from.into()],
-            ))
-            .await?
-        };
-
-        for row in &affected_rows {
-            let site_id: Uuid = row.try_get("", "site_id")?;
-            let time: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
-            let utc_time = time.with_timezone(&chrono::Utc);
-            if let Err(e) = recalculate_derived_at_timestamp(db, site_id, utc_time).await {
-                tracing::warn!(
-                    error = %e,
-                    site_id = %site_id,
-                    time = %utc_time,
-                    "Failed to cascade recalculation to derived parameter"
-                );
-            }
-        }
-    }
-
-    Ok(rows_affected as usize)
+/// Whether a calibration is the identity transform (slope 1, intercept 0), i.e. `calibrated == raw`.
+#[must_use]
+pub fn is_identity_calibration(slope: f64, intercept: f64) -> bool {
+    (slope - 1.0).abs() < f64::EPSILON && intercept.abs() < f64::EPSILON
 }
 
 pub fn evaluate_formula(formula: &str, variables: &HashMap<String, f64>) -> Result<f64, String> {
@@ -573,8 +434,7 @@ async fn ensure_calibration_coverage(
             let slope: f64 = cal.try_get("", "slope").unwrap_or(1.0);
             let intercept: f64 = cal.try_get("", "intercept").unwrap_or(0.0);
             let cal_id: Uuid = cal.try_get("", "id")?;
-            let is_identity =
-                (slope - 1.0).abs() < f64::EPSILON && intercept.abs() < f64::EPSILON;
+            let is_identity = is_identity_calibration(slope, intercept);
 
             if is_identity {
                 db.execute(Statement::from_sql_and_values(
@@ -859,51 +719,4 @@ pub async fn reprocess_site_parameter_readings(
         crate::common::sync_state::refresh_continuous_aggregates(db, Some(since)).await;
     }
     Ok(updated)
-}
-
-/// Thin wrapper over [`spawn_tracked_job`] whose work re-derives FK columns and
-/// `calibrated_value` for every reading owned by `sensor_id`. Signature unchanged so the
-/// calibration/deployment CrudCrate hooks keep compiling against it.
-pub async fn spawn_reprocessing_job(
-    db: &DatabaseConnection,
-    sensor_id: Uuid,
-    trigger_type: &str,
-    trigger_id: Option<Uuid>,
-    events: crate::common::EventSender,
-) -> Result<Uuid, sea_orm::DbErr> {
-    spawn_tracked_job_ctx(
-        db,
-        Some(sensor_id),
-        trigger_type,
-        trigger_id,
-        events,
-        move |ctx| async move {
-            ctx.info(&format!("Reprocessing readings for sensor {sensor_id}"))
-                .await;
-            let count = reprocess_sensor_readings(ctx.db(), sensor_id).await?;
-            // Scope the job to the sensor's site(s) and record what it touched, so the timeline
-            // shows which sensor/site and how many readings were re-derived.
-            if let Ok(Some(row)) = ctx
-                .db()
-                .query_one(sea_orm::Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "SELECT DISTINCT site_id FROM readings WHERE sensor_id = $1 AND site_id IS NOT NULL LIMIT 1",
-                    [sensor_id.into()],
-                ))
-                .await
-            {
-                if let Ok(site_id) = row.try_get::<Uuid>("", "site_id") {
-                    ctx.set_site(site_id).await;
-                }
-            }
-            ctx.set_detail(serde_json::json!({
-                "scope": { "sensor_id": sensor_id },
-                "counts": { "readings_updated": count },
-            }))
-            .await;
-            ctx.info(&format!("Re-derived {count} readings")).await;
-            Ok(count as i64)
-        },
-    )
-    .await
 }

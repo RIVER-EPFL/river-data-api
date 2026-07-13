@@ -31,10 +31,6 @@ fn default_window_start() -> f64 {
 fn default_window_end() -> f64 {
     6.0
 }
-fn default_format() -> String {
-    "json".to_string()
-}
-
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct SensorVsGrabQuery {
     /// Global parameter id to compare (continuous sensor readings vs grab samples).
@@ -50,7 +46,7 @@ pub struct SensorVsGrabQuery {
     #[serde(default = "default_window_end")]
     pub window_end_hours: f64,
     /// Response format: json (default) or csv.
-    #[serde(default = "default_format")]
+    #[serde(default = "crate::common::bulk::default_format")]
     pub format: String,
 }
 

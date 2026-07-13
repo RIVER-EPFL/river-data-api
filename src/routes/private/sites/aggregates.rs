@@ -23,10 +23,6 @@ use super::types::{ProjectRef, SiteRef};
 /// Per-parameter aggregate data: (avg, min, max, count) keyed by timestamp.
 type ParamAggMap = HashMap<Uuid, HashMap<DateTime<Utc>, (Option<f64>, Option<f64>, Option<f64>, i64)>>;
 
-fn default_format() -> String {
-    "json".to_string()
-}
-
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AggregatesResponse {
     /// Project this data belongs to
@@ -133,7 +129,6 @@ struct FlaggedSensorRow {
 }
 
 fn build_csv_response(
-    _resolution: &str,
     times: &[DateTime<Utc>],
     params: &[ParameterAggregateData],
 ) -> AppResult<Response> {
@@ -156,7 +151,7 @@ pub struct SiteAggregatesQuery {
     /// Filter by sensor types (comma-separated)
     pub sensor_types: Option<String>,
     /// Response format: json (default), ndjson, csv
-    #[serde(default = "default_format")]
+    #[serde(default = "crate::common::bulk::default_format")]
     pub format: String,
     /// Include alarm severity data (threshold violations)
     pub alarms: Option<bool>,
@@ -527,7 +522,7 @@ pub async fn get_site_aggregates(
     let max_time = times.last().copied();
 
     match format.as_str() {
-        "csv" => build_csv_response(&resolution, &times, &param_data),
+        "csv" => build_csv_response(&times, &param_data),
         "ndjson" => build_ndjson_response(&times, &param_data),
         _ => {
             let response = AggregatesResponse {

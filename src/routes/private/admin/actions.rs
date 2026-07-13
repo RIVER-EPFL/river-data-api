@@ -1040,7 +1040,9 @@ async fn fetch_calibration_candidates(
             let intercept: f64 = cr.try_get("", "intercept")?;
             (
                 Some(vf.with_timezone(&chrono::Utc)),
-                (slope - 1.0).abs() < f64::EPSILON && intercept.abs() < f64::EPSILON,
+                crate::routes::private::sensors::calibrations::service::is_identity_calibration(
+                    slope, intercept,
+                ),
             )
         } else {
             (None, false)

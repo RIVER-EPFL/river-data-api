@@ -48,12 +48,8 @@ pub struct SiteAlarmsQuery {
     /// Filter by sensor types (comma-separated)
     pub sensor_types: Option<String>,
     /// Response format: json (default), ndjson, csv
-    #[serde(default = "default_format")]
+    #[serde(default = "crate::common::bulk::default_format")]
     pub format: String,
-}
-
-fn default_format() -> String {
-    "json".to_string()
 }
 
 /// Information about an alarm threshold configuration

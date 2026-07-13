@@ -28,10 +28,6 @@ struct StatusEventRow {
     sensor_id: Option<Uuid>,
 }
 
-fn default_format() -> String {
-    "json".to_string()
-}
-
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct StatusEventsQuery {
     /// Start time (optional, ISO 8601). If omitted, returns from earliest data.
@@ -39,7 +35,7 @@ pub struct StatusEventsQuery {
     /// End time (optional, ISO 8601). If omitted, returns to latest data.
     pub end: Option<DateTime<Utc>>,
     /// Response format: json (default), ndjson, csv
-    #[serde(default = "default_format")]
+    #[serde(default = "crate::common::bulk::default_format")]
     pub format: String,
     /// Max events to return (JSON only, capped at 1000). If omitted, returns all
     /// matching events. CSV/NDJSON always export the full range.

@@ -6,7 +6,7 @@
 //! The core takes a [`JobContext`] closure so work can report incremental progress
 //! ([`JobContext::set_progress`]). Simple jobs that don't need progress use the `db`-closure
 //! adapters ([`spawn_tracked_job`] / [`spawn_tracked_job_with_retry`]); loop-based jobs that report
-//! progress use [`spawn_tracked_job_ctx`]. Domain glue (e.g. `spawn_reprocessing_job`) wraps these.
+//! progress use [`spawn_tracked_job_ctx`]. Domain glue (the reprocessing job registry) wraps these.
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use std::collections::HashMap;

@@ -51,10 +51,6 @@ struct ReadingRowWithSeverity {
     measurement_type: Option<String>,
 }
 
-fn default_format() -> String {
-    "json".to_string()
-}
-
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ReadingsResponse {
     /// Project this data belongs to
@@ -132,7 +128,7 @@ pub struct SiteReadingsQuery {
     /// Filter to a specific subset of parameters (comma-separated UUIDs). If omitted, returns all parameters configured for the site.
     pub parameter_ids: Option<String>,
     /// Response format: json (default), ndjson, csv
-    #[serde(default = "default_format")]
+    #[serde(default = "crate::common::bulk::default_format")]
     pub format: String,
     /// Include alarm severity data (threshold violations)
     pub alarms: Option<bool>,
