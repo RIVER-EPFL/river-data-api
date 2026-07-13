@@ -18,8 +18,8 @@ use crate::common::rate_limit::FallbackIpKeyExtractor;
 use crate::routes::private::{
     alarm_thresholds::AlarmThreshold,
     annotations::Annotation,
-    api_token_audit_log::ApiTokenAuditLog,
     api_tokens::ApiToken,
+    api_tokens::audit_log::ApiTokenAuditLog,
     constants::Constant,
     data_streams::DataStream,
     derived_parameters::definition_model::DerivedParameterDefinition,
@@ -464,7 +464,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         )
         .route(
             "/api_token_audit_logs/distinct/status_codes",
-            get(crate::routes::private::api_token_audit_log::views::distinct_status_codes),
+            get(crate::routes::private::api_tokens::audit_log::views::distinct_status_codes),
         )
         .layer(middleware::from_fn(require_admin))
         .with_state(state.clone());

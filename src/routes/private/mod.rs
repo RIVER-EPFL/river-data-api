@@ -2,7 +2,6 @@ pub mod admin;
 pub mod alarm_thresholds;
 pub mod alarms;
 pub mod annotations;
-pub mod api_token_audit_log;
 pub mod api_tokens;
 pub mod constants;
 pub mod data_streams;

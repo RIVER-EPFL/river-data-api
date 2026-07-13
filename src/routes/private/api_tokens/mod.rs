@@ -1,3 +1,4 @@
+pub mod audit_log;
 pub mod model;
 pub mod operations;
 pub mod services;
