@@ -16,7 +16,7 @@ use crate::common::middleware::{
 };
 use crate::common::rate_limit::FallbackIpKeyExtractor;
 use crate::routes::private::{
-    alarm_thresholds::AlarmThreshold,
+    alarms::thresholds::AlarmThreshold,
     annotations::Annotation,
     api_tokens::ApiToken,
     api_tokens::audit_log::ApiTokenAuditLog,

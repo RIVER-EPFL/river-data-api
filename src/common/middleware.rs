@@ -770,7 +770,7 @@ fn scoped_site_parameter_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::Sel
 /// (unpaired streams, site-less global thresholds) fall out by construction.
 fn crud_read_scope_condition(entity: &str, projects: &[Uuid]) -> Option<sea_orm::Condition> {
     use crate::routes::private::{
-        alarm_thresholds, annotations, data_streams, notes, projects as projects_entity,
+        alarms::thresholds, annotations, data_streams, notes, projects as projects_entity,
         reprocessing_jobs, readings::samples, sensors, sensors::calibrations, sensors::deployments,
         sites::parameters as site_parameters, sites, projects::subprojects,
     };
@@ -789,7 +789,7 @@ fn crud_read_scope_condition(entity: &str, projects: &[Uuid]) -> Option<sea_orm:
             deployments::Column::SiteId.in_subquery(scoped_site_ids_query(projects))
         }
         "alarm_thresholds" => {
-            alarm_thresholds::Column::SiteId.in_subquery(scoped_site_ids_query(projects))
+            thresholds::Column::SiteId.in_subquery(scoped_site_ids_query(projects))
         }
         "samples" => samples::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
         "data_streams" => {

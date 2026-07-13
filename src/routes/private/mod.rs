@@ -1,5 +1,4 @@
 pub mod admin;
-pub mod alarm_thresholds;
 pub mod alarms;
 pub mod annotations;
 pub mod api_tokens;

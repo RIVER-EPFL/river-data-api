@@ -51,7 +51,7 @@ pub struct Model {
 pub enum Relation {
     #[sea_orm(has_many = "crate::routes::private::sites::parameters::Entity")]
     SiteParameters,
-    #[sea_orm(has_many = "crate::routes::private::alarm_thresholds::Entity")]
+    #[sea_orm(has_many = "crate::routes::private::alarms::thresholds::Entity")]
     AlarmThresholds,
     #[sea_orm(has_many = "crate::routes::private::readings::status_events::Entity")]
     StatusEvents,
@@ -65,7 +65,7 @@ impl Related<crate::routes::private::sites::parameters::Entity> for Entity {
     }
 }
 
-impl Related<crate::routes::private::alarm_thresholds::Entity> for Entity {
+impl Related<crate::routes::private::alarms::thresholds::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::AlarmThresholds.def()
     }
