@@ -34,7 +34,9 @@ pub struct Model {
     /// The parameter this deployment binds the sensor to at the site. Authored at create time (a
     /// multi-parameter instrument gets one deployment per parameter); immutable afterwards
     /// (`exclude(update)`). The `excl_deployment_site_param_slot` constraint enforces one sensor per
-    /// (site, parameter, time).
+    /// (site, parameter, time). Canonical open-deployment cardinality is one per (sensor, parameter):
+    /// deploy/adopt/swap auto-recalls are scoped to the parameter, so a same-parameter move across
+    /// sites closes the old row while other channels of a multi-channel instrument stay open.
     #[crudcrate(filterable, exclude(update))]
     pub parameter_id: Uuid,
     #[crudcrate(sortable)]

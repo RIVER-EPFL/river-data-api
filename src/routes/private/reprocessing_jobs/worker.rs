@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::FutureExt;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
@@ -247,8 +248,24 @@ async fn execute(
         cancel.clone(),
     ));
 
-    let outcome = job.run(ctx).await;
+    // Catch a handler panic so it becomes a normal job failure instead of unwinding the worker task.
+    // Without this, a panic skips `hb.abort()` below — the detached heartbeat then renews the lease
+    // forever (the reaper never reclaims the row) while this replica is left with no worker.
+    let run_result = std::panic::AssertUnwindSafe(job.run(ctx)).catch_unwind().await;
     hb.abort();
+
+    let outcome = match run_result {
+        Ok(result) => result,
+        Err(panic) => {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "job handler panicked".to_string());
+            tracing::error!(job_id = %claimed.id, panic = %msg, "job handler panicked");
+            Err(sea_orm::DbErr::Custom(format!("job handler panicked: {msg}")))
+        }
+    };
 
     match outcome {
         Ok(count) => {

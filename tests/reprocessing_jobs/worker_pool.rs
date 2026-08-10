@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use river_db::common::AppEvent;
 use river_db::routes::private::reprocessing_jobs::job::{Job, JobRegistry};
-use river_db::routes::private::reprocessing_jobs::lifecycle::JobContext;
+use river_db::routes::private::reprocessing_jobs::lifecycle::{self, JobContext};
 use river_db::routes::private::reprocessing_jobs::worker;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
@@ -31,6 +31,19 @@ impl Job for CompletingJob {
     async fn run(&self, _ctx: JobContext) -> Result<i64, sea_orm::DbErr> {
         self.runs.fetch_add(1, Ordering::Relaxed);
         Ok(self.count)
+    }
+}
+
+/// Panics instead of returning — stands in for a handler bug.
+struct PanickingJob;
+
+#[async_trait]
+impl Job for PanickingJob {
+    fn name(&self) -> &'static str {
+        "test_panic"
+    }
+    async fn run(&self, _ctx: JobContext) -> Result<i64, sea_orm::DbErr> {
+        panic!("handler exploded");
     }
 }
 
@@ -211,6 +224,117 @@ async fn failure_records_error_and_releases_lease() {
     assert!(row.owner_is_null, "lease released on failure");
     assert_eq!(row.retry_count, 1);
     assert!(matches!(row.status.as_str(), "failed" | "pending"));
+}
+
+#[tokio::test]
+#[serial]
+async fn handler_panic_fails_job_and_worker_survives() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let ev = events();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut reg = JobRegistry::new();
+    reg.register(Arc::new(PanickingJob));
+    reg.register(Arc::new(CompletingJob {
+        name: "test_complete",
+        count: 9,
+        runs: runs.clone(),
+    }));
+    let wid = worker::worker_id();
+
+    let panic_id = worker::enqueue(&db, "test_panic", None, None, &serde_json::json!({}), None)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // The panic is caught inside the worker: `run_one` returns normally (no unwind through it), so a
+    // panicking handler can't take down the replica's only worker task.
+    assert!(
+        worker::run_one(&db, &ev, &reg, &wid).await.unwrap(),
+        "the panicking job is claimed and handled without unwinding the worker"
+    );
+    let row = job_row(&db, panic_id).await;
+    assert!(
+        matches!(row.status.as_str(), "failed" | "pending"),
+        "a panic terminalizes the job (got {}), not the worker",
+        row.status
+    );
+    assert!(
+        row.error_message.unwrap_or_default().to_lowercase().contains("panic"),
+        "the panic is recorded as the job error"
+    );
+    assert!(row.owner_is_null, "lease released after a panic");
+
+    // The same worker claims and runs the next job — proof the loop wasn't killed.
+    let ok_id = worker::enqueue(&db, "test_complete", None, None, &serde_json::json!({}), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(worker::run_one(&db, &ev, &reg, &wid).await.unwrap());
+    assert_eq!(runs.load(Ordering::Relaxed), 1, "worker still processes work after a panic");
+    assert_eq!(job_row(&db, ok_id).await.status, "completed");
+}
+
+#[tokio::test]
+#[serial]
+async fn startup_reaps_own_leaseless_orphans_only() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let own = lifecycle::process_owner();
+
+    // This replica's crashed in-process job: running, our owner, no lease → the reaper can't see it
+    // (it keys on an expired lease), so the startup sweep must reclaim it.
+    let orphan = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO reprocessing_jobs (id, trigger_type, status, category, owner) \
+             VALUES ('{orphan}', 'x_orphan', 'running', 'operator', '{own}')"
+        ),
+    )
+    .await;
+
+    // A peer replica's leaseless orphan (different owner) — left for that pod's own boot.
+    let peer = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO reprocessing_jobs (id, trigger_type, status, category, owner) \
+             VALUES ('{peer}', 'x_peer', 'running', 'operator', 'other-pod')"
+        ),
+    )
+    .await;
+
+    // A live worker-pool job: running, worker owner, valid lease — must not be touched.
+    let leased = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO reprocessing_jobs \
+                (id, trigger_type, status, category, owner, lease_expires_at) \
+             VALUES ('{leased}', 'x_leased', 'running', 'operator', 'worker-live', \
+                     now() + interval '5 minutes')"
+        ),
+    )
+    .await;
+
+    let reclaimed = lifecycle::reconcile_orphaned_inline_jobs(&db).await.unwrap();
+    assert_eq!(reclaimed, 1, "only this replica's leaseless orphan is reaped");
+
+    let orphan_row = job_row(&db, orphan).await;
+    assert_eq!(orphan_row.status, "failed", "the own orphan is failed");
+    assert!(orphan_row.owner_is_null, "the reaped orphan's owner is cleared");
+    assert!(orphan_row.completed, "the reaped orphan gets a completed_at");
+    assert_eq!(
+        job_row(&db, peer).await.status,
+        "running",
+        "a peer's orphan is left for its own boot"
+    );
+    assert_eq!(
+        job_row(&db, leased).await.status,
+        "running",
+        "a live leased worker job is untouched"
+    );
 }
 
 #[tokio::test]

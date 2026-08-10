@@ -92,6 +92,81 @@ async fn csv_import_runs_on_worker_and_clears_staging() {
     assert_eq!(job_status, "completed", "the csv_import job reaches completed");
 }
 
+const CSV_DUP_TS: &str = "DateTime,Dissolved_O2,DO_Temperature\n\
+2025-06-01 00:00:00,250,12.0\n\
+2025-06-01 00:00:00,260,12.5\n";
+
+async fn scalar_f64(db: &DatabaseConnection, sql: &str) -> f64 {
+    db.query_one(Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.to_string()))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<f64>("", "v")
+        .unwrap()
+}
+
+#[tokio::test]
+#[serial]
+async fn csv_import_overwrite_collapses_duplicate_timestamps() {
+    let (db, app, token) = setup().await;
+
+    // A source file with a repeated timestamp for the same parameter: without deduping the staged
+    // rows, the worker's `ON CONFLICT DO UPDATE` fails the whole chunk ("cannot affect row a second
+    // time") — after the handler already returned an optimistic count. The dedup keeps the last row.
+    let (status, resp) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/import_csv",
+        &serde_json::json!({
+            "site": crate::common::SITE1_ID,
+            "csv": CSV_DUP_TS,
+            "conflict": "overwrite",
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "import ({status}): {resp}");
+    let job_id = resp["derived_job_id"].as_str().expect("a worker job id is returned");
+
+    let staging_left =
+        poll_count(&db, "SELECT count(*) AS n FROM csv_import_staging", 0, 10).await;
+    assert_eq!(staging_left, 0, "staging is drained even with a duplicated timestamp");
+
+    let row = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT status FROM reprocessing_jobs WHERE id = '{job_id}'"),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let job_status: String = row.try_get("", "status").unwrap();
+    assert_eq!(job_status, "completed", "the duplicate-timestamp import completes, not fails");
+
+    let at_ts = scalar_i64(
+        &db,
+        &format!(
+            "SELECT count(*) AS n FROM readings \
+             WHERE site_id = '{}' AND time = '2025-06-01T00:00:00Z'",
+            crate::common::SITE1_ID
+        ),
+    )
+    .await;
+    assert_eq!(at_ts, 2, "one reading per parameter survives the collapse (not a duplicate row)");
+
+    let do_value = scalar_f64(
+        &db,
+        &format!(
+            "SELECT r.raw_value AS v FROM readings r \
+             JOIN parameters p ON p.id = r.parameter_id \
+             WHERE r.site_id = '{}' AND p.code = 'Dissolved_O2' \
+               AND r.time = '2025-06-01T00:00:00Z'",
+            crate::common::SITE1_ID
+        ),
+    )
+    .await;
+    assert!((do_value - 260.0).abs() < 1e-9, "the last duplicate wins (overwrite): got {do_value}");
+}
+
 #[tokio::test]
 #[serial]
 async fn csv_import_recomputes_derived_via_worker() {

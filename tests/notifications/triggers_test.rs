@@ -5,6 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use river_db::common::AppState;
 use river_db::routes::private::notifications::{
     DeliveryResult, NotificationChannel, OutgoingMessage, triggers,
 };
@@ -25,7 +26,7 @@ impl NotificationChannel for MockChannel {
         Ok("mock healthy".to_string())
     }
 
-    async fn deliver(&self, _db: &DatabaseConnection, msg: &OutgoingMessage) -> Vec<DeliveryResult> {
+    async fn deliver(&self, _state: &AppState, msg: &OutgoingMessage) -> Vec<DeliveryResult> {
         self.sent.lock().unwrap().push(msg.clone());
         vec![DeliveryResult {
             recipient: "mock".to_string(),
@@ -94,7 +95,7 @@ async fn stale_data_fires_then_recovers() {
 
     let sent = Arc::new(Mutex::new(Vec::new()));
     let channels: Vec<Box<dyn NotificationChannel>> = vec![Box::new(MockChannel { sent: sent.clone() })];
-    triggers::run(&db, &channels, state.config.as_ref()).await;
+    triggers::run(&state, &channels).await;
 
     {
         let msgs = sent.lock().unwrap();
@@ -106,13 +107,13 @@ async fn stale_data_fires_then_recovers() {
 
     // A second run while still stale must not re-notify.
     sent.lock().unwrap().clear();
-    triggers::run(&db, &channels, state.config.as_ref()).await;
+    triggers::run(&state, &channels).await;
     assert!(kinds(&sent.lock().unwrap(), "stale_data").is_empty(), "no re-notify while still stale");
 
     // Data resumes → recovery notice, state cleared.
     insert_reading(&db, &stream, "NOW()").await;
     sent.lock().unwrap().clear();
-    triggers::run(&db, &channels, state.config.as_ref()).await;
+    triggers::run(&state, &channels).await;
     {
         let msgs = sent.lock().unwrap();
         let recovered: Vec<_> = kinds(&msgs, "stale_data")

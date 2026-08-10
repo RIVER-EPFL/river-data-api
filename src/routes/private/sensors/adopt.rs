@@ -251,13 +251,14 @@ pub async fn adopt_sensor(
         resolve_or_create_site_parameter(&txn, payload.site_id, parameter_id, payload.create_site_parameter)
             .await?;
 
-    // Auto-recall this sensor's currently-open deployment at the new start (twin of the
-    // sensor_deployments before_create hook).
+    // Auto-recall this sensor's currently-open deployment FOR THIS PARAMETER at the new start (twin of
+    // the sensor_deployments before_create hook). Scoped to the parameter so adopting one channel of a
+    // multi-channel instrument doesn't recall its other channels.
     txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE sensor_deployments SET deployed_until = $1
-          WHERE sensor_id = $2 AND deployed_until IS NULL",
-        [deployed_from.into(), sensor_id.into()],
+          WHERE sensor_id = $2 AND parameter_id = $3 AND deployed_until IS NULL",
+        [deployed_from.into(), sensor_id.into(), parameter_id.into()],
     ))
     .await?;
 
@@ -473,24 +474,31 @@ pub async fn swap_sensors(
     )
     .await?;
 
-    // Recall the INCOMING sensor's open deployment(s) anywhere else at the swap instant, so it can't
-    // end up double-open across two slots (twin of the outgoing recall + the adopt before_create hook).
+    // Recall the INCOMING sensor's open deployment for THIS PARAMETER at the swap instant, so it can't
+    // end up double-open for the channel (twin of the outgoing recall + the adopt before_create hook).
+    // Scoped to the parameter so swapping one channel doesn't recall the instrument's other channels.
     txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE sensor_deployments SET deployed_until = $1
-          WHERE sensor_id = $2 AND deployed_until IS NULL",
-        [at.into(), payload.incoming_sensor_id.into()],
+          WHERE sensor_id = $2 AND parameter_id = $3 AND deployed_until IS NULL",
+        [at.into(), payload.incoming_sensor_id.into(), parameter_id.into()],
     ))
     .await?;
 
-    // End the outgoing sensor's open deployment at the slot.
+    // End the outgoing sensor's open deployment at THIS (site, parameter) slot only — a multi-channel
+    // outgoing instrument keeps its other channels running.
     let ended = txn
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE sensor_deployments SET deployed_until = $1
-              WHERE sensor_id = $2 AND site_id = $3 AND deployed_until IS NULL
+              WHERE sensor_id = $2 AND site_id = $3 AND parameter_id = $4 AND deployed_until IS NULL
               RETURNING id",
-            [at.into(), payload.outgoing_sensor_id.into(), payload.site_id.into()],
+            [
+                at.into(),
+                payload.outgoing_sensor_id.into(),
+                payload.site_id.into(),
+                parameter_id.into(),
+            ],
         ))
         .await?;
     let ended_deployment_id: Option<Uuid> = ended.and_then(|r| r.try_get("", "id").ok());

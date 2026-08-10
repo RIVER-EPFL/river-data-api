@@ -158,7 +158,7 @@ pub async fn prune_tracked_jobs(
             format!(
                 "DELETE FROM reprocessing_jobs \
                  WHERE category = 'maintenance' AND created_at < NOW() - INTERVAL '{maintenance_days} days' \
-                   AND status NOT IN ('queued', 'running', 'retrying')"
+                   AND status NOT IN ('queued', 'pending', 'running', 'retrying')"
             ),
             "maintenance age",
         )
@@ -170,7 +170,7 @@ pub async fn prune_tracked_jobs(
             format!(
                 "DELETE FROM reprocessing_jobs \
                  WHERE category IN ('operator', 'metadata') AND created_at < NOW() - INTERVAL '{operator_days} days' \
-                   AND status NOT IN ('queued', 'running', 'retrying')"
+                   AND status NOT IN ('queued', 'pending', 'running', 'retrying')"
             ),
             "operator/metadata age",
         )
@@ -181,7 +181,7 @@ pub async fn prune_tracked_jobs(
         let sql = format!(
             "DELETE FROM reprocessing_jobs WHERE id IN ( \
                 SELECT id FROM reprocessing_jobs \
-                WHERE category = 'maintenance' AND status NOT IN ('queued', 'running', 'retrying') \
+                WHERE category = 'maintenance' AND status NOT IN ('queued', 'pending', 'running', 'retrying') \
                 ORDER BY created_at DESC OFFSET {maintenance_max_rows} \
             )"
         );

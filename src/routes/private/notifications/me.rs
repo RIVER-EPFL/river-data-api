@@ -9,11 +9,14 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use std::collections::HashSet;
+
 use crate::common::AppState;
+use crate::common::authz::AccessScope;
 use crate::common::middleware::AuthContext;
 use crate::error::{AppError, AppResult};
 
-use super::access::{accessible_project_ids, project_allowed};
+use super::access::project_allowed;
 use super::views::{LinkCodeResponse, generate_code};
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
@@ -235,8 +238,12 @@ pub async fn set_my_subscriptions(
         }
     }
 
-    // Project-access guard (no-op while every user can see every project — see access.rs).
-    let accessible = accessible_project_ids(&state.db, &sub).await;
+    // Project-access guard: a member may only subscribe to projects in their grant set. The live
+    // request's scope is authoritative, so derive it from the auth context rather than re-resolving.
+    let accessible: Option<HashSet<Uuid>> = match auth.access_scope() {
+        AccessScope::Unrestricted => None,
+        AccessScope::Projects(set) => Some((*set).clone()),
+    };
     if accessible.is_some() {
         for s in &req.subscriptions {
             let project = resolve_project(&state, s).await?;

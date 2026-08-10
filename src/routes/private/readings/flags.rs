@@ -215,16 +215,22 @@ async fn refresh_aggregates_for_range(
     max_t: DateTime<Utc>,
     op: &str,
 ) {
+    // Widen by a full monthly bucket on each side: TimescaleDB rejects a `refresh_continuous_aggregate`
+    // window narrower than the aggregate's bucket, so a `[t, t+1s)` window (a single flagged reading)
+    // failed on every view — the flagged value then kept being served from stale rollups. ±32 days
+    // guarantees each of hourly/daily/weekly/monthly spans at least one whole bucket.
+    let lo = min_t - chrono::Duration::days(32);
+    let hi = max_t + chrono::Duration::days(32);
     for view in ["readings_hourly", "readings_daily", "readings_weekly", "readings_monthly"] {
         let sql = format!(
-            "CALL refresh_continuous_aggregate('{}', $1::timestamptz, $2::timestamptz + INTERVAL '1 second')",
+            "CALL refresh_continuous_aggregate('{}', $1::timestamptz, $2::timestamptz)",
             view
         );
         if let Err(e) = state.db.execute(
             sea_orm::Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 &sql,
-                vec![min_t.into(), max_t.into()],
+                vec![lo.into(), hi.into()],
             )
         ).await {
             tracing::warn!(view, error = %e, op, "Failed to refresh continuous aggregate");

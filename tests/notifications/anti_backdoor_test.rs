@@ -14,6 +14,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use river_db::common::AppState;
+use river_db::common::authz::Role;
 use river_db::routes::private::notifications::authz::RoleResolution;
 use river_db::routes::private::notifications::reconcile;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
@@ -94,11 +95,11 @@ async fn resolves_current_role_from_keycloak() {
 
     assert_eq!(
         state.authorizer.resolve(&state, "admin-user").await,
-        Some(RoleResolution::Admin)
+        Some(RoleResolution::Active(Role::Administrator))
     );
     assert_eq!(
         state.authorizer.resolve(&state, "regular-user").await,
-        Some(RoleResolution::User)
+        Some(RoleResolution::Active(Role::River))
     );
     assert_eq!(
         state.authorizer.resolve(&state, "no-role-user").await,

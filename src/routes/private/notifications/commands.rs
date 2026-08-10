@@ -10,6 +10,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::authz::AccessScope;
 use crate::common::middleware::ProjectScope;
 use crate::routes::private::readings::grab_samples::{
     GrabSampleReading, GrabSampleRequest, insert_grab_samples,
@@ -18,6 +19,20 @@ use crate::routes::private::readings::grab_samples::{
 use super::messages::severity_label;
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
+
+/// A `uuid[]` bind for confining a `sites` query to the caller's scope: SQL NULL when unrestricted
+/// (administrator — no filter), else the granted project ids (an empty array matches nothing). Pair
+/// with a `(... IS NULL OR <site>.project_id = ANY(...))` fragment so one bind serves both cases.
+fn scope_projects_bind(scope: &AccessScope) -> sea_orm::Value {
+    use sea_orm::sea_query::ArrayType;
+    match scope.project_ids() {
+        None => sea_orm::Value::Array(ArrayType::Uuid, None),
+        Some(ids) => sea_orm::Value::Array(
+            ArrayType::Uuid,
+            Some(Box::new(ids.into_iter().map(sea_orm::Value::from).collect())),
+        ),
+    }
+}
 
 pub fn help() -> String {
     "River Data bot commands:\n\
@@ -46,13 +61,21 @@ enum SiteMatch {
     Ambiguous(Vec<String>),
 }
 
-async fn resolve_site(db: &DatabaseConnection, arg: &str) -> Result<SiteMatch, sea_orm::DbErr> {
+async fn resolve_site(
+    db: &DatabaseConnection,
+    scope: &AccessScope,
+    arg: &str,
+) -> Result<SiteMatch, sea_orm::DbErr> {
+    // Out-of-scope sites resolve to NotFound (indistinguishable from a bad name), so a member can't
+    // even probe for a site outside their granted projects.
+    let projects = scope_projects_bind(scope);
     if let Ok(id) = Uuid::parse_str(arg) {
         let row = db
             .query_one(Statement::from_sql_and_values(
                 PG,
-                "SELECT name FROM sites WHERE id = $1",
-                [id.into()],
+                "SELECT name FROM sites WHERE id = $1 \
+                 AND ($2::uuid[] IS NULL OR project_id = ANY($2))",
+                [id.into(), projects],
             ))
             .await?;
         return Ok(match row {
@@ -63,8 +86,9 @@ async fn resolve_site(db: &DatabaseConnection, arg: &str) -> Result<SiteMatch, s
     let rows = db
         .query_all(Statement::from_sql_and_values(
             PG,
-            "SELECT id, name FROM sites WHERE name ILIKE $1 ORDER BY name",
-            [format!("%{arg}%").into()],
+            "SELECT id, name FROM sites WHERE name ILIKE $1 \
+             AND ($2::uuid[] IS NULL OR project_id = ANY($2)) ORDER BY name",
+            [format!("%{arg}%").into(), projects],
         ))
         .await?;
     match rows.len() {
@@ -87,14 +111,15 @@ fn ambiguous_reply(kind: &str, names: &[String]) -> String {
     format!("Multiple {kind} match — be more specific: {}", names.join(", "))
 }
 
-pub async fn stations(db: &DatabaseConnection) -> String {
+pub async fn stations(db: &DatabaseConnection, scope: &AccessScope) -> String {
     let rows = match db
-        .query_all(Statement::from_string(
+        .query_all(Statement::from_sql_and_values(
             PG,
             "SELECT COALESCE(pr.name, '(no project)') AS project, s.name AS site \
              FROM sites s LEFT JOIN projects pr ON pr.id = s.project_id \
-             ORDER BY project, site"
-                .to_string(),
+             WHERE ($1::uuid[] IS NULL OR s.project_id = ANY($1)) \
+             ORDER BY project, site",
+            [scope_projects_bind(scope)],
         ))
         .await
     {
@@ -118,9 +143,9 @@ pub async fn stations(db: &DatabaseConnection) -> String {
     out.trim_end().to_string()
 }
 
-pub async fn alarms(db: &DatabaseConnection) -> String {
+pub async fn alarms(db: &DatabaseConnection, scope: &AccessScope) -> String {
     let rows = match db
-        .query_all(Statement::from_string(
+        .query_all(Statement::from_sql_and_values(
             PG,
             "SELECT s.name AS site, p.name AS param, ae.severity AS severity, \
                     ae.last_value AS value, p.default_units AS units \
@@ -128,8 +153,9 @@ pub async fn alarms(db: &DatabaseConnection) -> String {
              JOIN sites s ON s.id = ae.site_id \
              JOIN parameters p ON p.id = ae.parameter_id \
              WHERE ae.resolved_at IS NULL \
-             ORDER BY ae.severity DESC, s.name"
-                .to_string(),
+               AND ($1::uuid[] IS NULL OR s.project_id = ANY($1)) \
+             ORDER BY ae.severity DESC, s.name",
+            [scope_projects_bind(scope)],
         ))
         .await
     {
@@ -154,13 +180,16 @@ pub async fn alarms(db: &DatabaseConnection) -> String {
     out.trim_end().to_string()
 }
 
-pub async fn status(db: &DatabaseConnection) -> String {
+pub async fn status(db: &DatabaseConnection, scope: &AccessScope) -> String {
     let rows = match db
-        .query_all(Statement::from_string(
+        .query_all(Statement::from_sql_and_values(
             PG,
-            "SELECT severity, COUNT(*) AS n FROM alarm_events \
-             WHERE resolved_at IS NULL GROUP BY severity"
-                .to_string(),
+            "SELECT ae.severity, COUNT(*) AS n FROM alarm_events ae \
+             JOIN sites s ON s.id = ae.site_id \
+             WHERE ae.resolved_at IS NULL \
+               AND ($1::uuid[] IS NULL OR s.project_id = ANY($1)) \
+             GROUP BY ae.severity",
+            [scope_projects_bind(scope)],
         ))
         .await
     {
@@ -186,11 +215,11 @@ pub async fn status(db: &DatabaseConnection) -> String {
     }
 }
 
-pub async fn latest(db: &DatabaseConnection, arg: &str) -> String {
+pub async fn latest(db: &DatabaseConnection, scope: &AccessScope, arg: &str) -> String {
     if arg.is_empty() {
         return "Usage: /latest <site>".to_string();
     }
-    let (site_id, site_name) = match resolve_site(db, arg).await {
+    let (site_id, site_name) = match resolve_site(db, scope, arg).await {
         Ok(SiteMatch::One(id, name)) => (id, name),
         Ok(SiteMatch::NotFound) => return format!("No site matches \"{arg}\"."),
         Ok(SiteMatch::Ambiguous(names)) => return ambiguous_reply("sites", &names),
@@ -224,11 +253,11 @@ pub async fn latest(db: &DatabaseConnection, arg: &str) -> String {
     out.trim_end().to_string()
 }
 
-pub async fn thresholds(db: &DatabaseConnection, arg: &str) -> String {
+pub async fn thresholds(db: &DatabaseConnection, scope: &AccessScope, arg: &str) -> String {
     let (site_filter, header) = if arg.is_empty() {
         (None, "Global default thresholds:".to_string())
     } else {
-        match resolve_site(db, arg).await {
+        match resolve_site(db, scope, arg).await {
             Ok(SiteMatch::One(id, name)) => (Some(id), format!("Thresholds at {name}:")),
             Ok(SiteMatch::NotFound) => return format!("No site matches \"{arg}\"."),
             Ok(SiteMatch::Ambiguous(names)) => return ambiguous_reply("sites", &names),
@@ -323,7 +352,7 @@ pub async fn server(db: &DatabaseConnection) -> String {
     out.trim_end().to_string()
 }
 
-pub async fn battery(db: &DatabaseConnection, arg: &str, cutoff_volts: f64) -> String {
+pub async fn battery(db: &DatabaseConnection, scope: &AccessScope, arg: &str, cutoff_volts: f64) -> String {
     let battery_param = match db
         .query_one(Statement::from_string(
             PG,
@@ -345,7 +374,7 @@ pub async fn battery(db: &DatabaseConnection, arg: &str, cutoff_volts: f64) -> S
     let site_filter = if arg.is_empty() {
         None
     } else {
-        match resolve_site(db, arg).await {
+        match resolve_site(db, scope, arg).await {
             Ok(SiteMatch::One(id, _)) => Some(id),
             Ok(SiteMatch::NotFound) => return format!("No site matches \"{arg}\"."),
             Ok(SiteMatch::Ambiguous(names)) => return ambiguous_reply("sites", &names),
@@ -367,8 +396,9 @@ pub async fn battery(db: &DatabaseConnection, arg: &str, cutoff_volts: f64) -> S
                      AND EXTRACT(HOUR FROM r3.time) BETWEEN 2 AND 4) AS slope \
              FROM sites s \
              WHERE ($2::uuid IS NULL OR s.id = $2) \
+               AND ($3::uuid[] IS NULL OR s.project_id = ANY($3)) \
              ORDER BY s.name",
-            [battery_param.into(), site_filter.into()],
+            [battery_param.into(), site_filter.into(), scope_projects_bind(scope)],
         ))
         .await
     {
@@ -438,7 +468,8 @@ async fn resolve_mute_target(
     if toks.len() != 2 {
         return Ok(Err("Usage: /mute <site> <param> [days]".to_string()));
     }
-    let (site_id, site_name) = match resolve_site(db, toks[0]).await? {
+    // Mute commands are Administrator-only (unrestricted scope) — resolved against all sites.
+    let (site_id, site_name) = match resolve_site(db, &AccessScope::Unrestricted, toks[0]).await? {
         SiteMatch::One(id, name) => (id, name),
         SiteMatch::NotFound => return Ok(Err(format!("No site matches \"{}\".", toks[0]))),
         SiteMatch::Ambiguous(names) => return Ok(Err(ambiguous_reply("sites", &names))),
@@ -488,7 +519,7 @@ pub async fn unmute(db: &DatabaseConnection, args: &str) -> String {
     if toks.len() != 2 {
         return "Usage: /unmute <site> <param>".to_string();
     }
-    let (site_id, site_name) = match resolve_site(db, toks[0]).await {
+    let (site_id, site_name) = match resolve_site(db, &AccessScope::Unrestricted, toks[0]).await {
         Ok(SiteMatch::One(id, name)) => (id, name),
         Ok(SiteMatch::NotFound) => return format!("No site matches \"{}\".", toks[0]),
         Ok(SiteMatch::Ambiguous(names)) => return ambiguous_reply("sites", &names),
@@ -582,7 +613,13 @@ pub async fn start(
 /// the field. Reuses the full grab-sample insert path (stream creation, sample aggregation, alarm
 /// reconciliation). When `TELEGRAM_GRAB_FLAG_FOR_REVIEW` is set, the readings are flagged on insert
 /// so they're held out of aggregates until a curator reviews them.
-pub async fn grab(state: &AppState, args: &str, username: Option<&str>, chat_id: i64) -> String {
+pub async fn grab(
+    state: &AppState,
+    scope: &AccessScope,
+    args: &str,
+    username: Option<&str>,
+    chat_id: i64,
+) -> String {
     let toks: Vec<&str> = args.split_whitespace().collect();
     if toks.len() < 3 {
         return "Usage: /grab <site> <param> <value> [more values…]".to_string();
@@ -596,7 +633,7 @@ pub async fn grab(state: &AppState, args: &str, username: Option<&str>, chat_id:
         }
     }
 
-    let (site_id, site_name) = match resolve_site(&state.db, site_arg).await {
+    let (site_id, site_name) = match resolve_site(&state.db, scope, site_arg).await {
         Ok(SiteMatch::One(id, name)) => (id, name),
         Ok(SiteMatch::NotFound) => return format!("No site matches \"{site_arg}\"."),
         Ok(SiteMatch::Ambiguous(names)) => return ambiguous_reply("sites", &names),
@@ -627,15 +664,9 @@ pub async fn grab(state: &AppState, args: &str, username: Option<&str>, chat_id:
         readings,
     };
 
-    // The Telegram user's authority was already resolved live (anti-backdoor); grab-sample writes
-    // from a linked chat run unrestricted here, matching the pre-grants behaviour.
-    match insert_grab_samples(
-        State(state.clone()),
-        ProjectScope(crate::common::authz::AccessScope::Unrestricted),
-        Json(req),
-    )
-    .await
-    {
+    // The Telegram user's authority was resolved live (anti-backdoor) and gated to River level in the
+    // router; the write is confined to the caller's project scope, exactly like HTTP `/grab_samples`.
+    match insert_grab_samples(State(state.clone()), ProjectScope(scope.clone()), Json(req)).await {
         Ok(Json(resp)) => {
             let mut reply =
                 format!("✅ Recorded {} value(s) for {site_name} / {param_name}.", resp.inserted);

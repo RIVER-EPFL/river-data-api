@@ -701,8 +701,27 @@ impl Job for CsvImport {
     }
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let import_token = required_uuid(ctx.params(), "import_token")?;
+        let outcome = Self::run_import(&ctx, import_token).await;
+        if outcome.is_err() {
+            // Success deletes the staging rows below; a mid-run error would otherwise orphan them
+            // (there is no janitor for csv_import_staging), so drop them on the failure path too.
+            let _ = ctx
+                .db()
+                .execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "DELETE FROM csv_import_staging WHERE import_token = $1",
+                    [import_token.into()],
+                ))
+                .await;
+        }
+        outcome
+    }
+}
+
+impl CsvImport {
+    async fn run_import(ctx: &JobContext, import_token: Uuid) -> Result<i64, DbErr> {
         let params = ctx.params();
-        let import_token = required_uuid(params, "import_token")?;
         let site_id = required_uuid(params, "site_id")?;
         let site_name = params
             .get("site_name")
@@ -776,6 +795,30 @@ impl Job for CsvImport {
         }
         distinct_ts.sort_unstable();
         distinct_ts.dedup();
+
+        // Collapse rows that share a conflict key (stream_id, time, replicate_index=0): a source file
+        // with a repeated timestamp would otherwise make `ON CONFLICT DO UPDATE` fail the whole chunk
+        // ("cannot affect row a second time"). Keep the last occurrence (overwrite semantics).
+        let pre_dedup = models.len();
+        {
+            let mut seen: std::collections::HashMap<(Uuid, chrono::DateTime<chrono::Utc>), usize> =
+                std::collections::HashMap::with_capacity(models.len());
+            let mut deduped: Vec<readings::ActiveModel> = Vec::with_capacity(models.len());
+            for m in models {
+                let key = (
+                    *m.stream_id.as_ref(),
+                    m.time.as_ref().with_timezone(&chrono::Utc),
+                );
+                if let Some(&idx) = seen.get(&key) {
+                    deduped[idx] = m;
+                } else {
+                    seen.insert(key, deduped.len());
+                    deduped.push(m);
+                }
+            }
+            models = deduped;
+        }
+        let collapsed_duplicates = pre_dedup - models.len();
 
         let total = i32::try_from(models.len()).unwrap_or(i32::MAX);
         ctx.set_progress(0, Some(total)).await;
@@ -883,7 +926,11 @@ impl Job for CsvImport {
 
         ctx.set_detail(serde_json::json!({
             "scope": { "site_id": site_id },
-            "counts": { "inserted": inserted_total, "overwritten": overwritten },
+            "counts": {
+                "inserted": inserted_total,
+                "overwritten": overwritten,
+                "collapsed_duplicates": collapsed_duplicates,
+            },
         }))
         .await;
         Ok(i64::from(
@@ -1286,14 +1333,14 @@ impl Job for DispatchNotifications {
         Some(Schedule::every_secs(self.interval_seconds.max(1) as i64))
     }
 
-    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+    async fn run(&self, _ctx: JobContext) -> Result<i64, DbErr> {
         use crate::routes::private::notifications::dispatcher;
         let Some(state) = crate::common::global_app_state() else {
             tracing::debug!("dispatch_notifications: no AppState in process; skipping");
             return Ok(0);
         };
         let channels = dispatcher::build_channels(&state.config);
-        dispatcher::dispatch_once(ctx.db(), &channels, &state.config).await;
+        dispatcher::dispatch_once(&state, &channels).await;
         Ok(0)
     }
 }

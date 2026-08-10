@@ -86,8 +86,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     migrate_result?;
     tracing::info!("Migrations completed");
 
-    // Tracked jobs left mid-flight by a dead process are recovered by the worker pool's
-    // lease reaper (worker-pool jobs carry a lease); no startup sweep is needed.
+    // Worker-pool jobs left mid-flight by a dead process are recovered by the lease reaper (they
+    // carry a lease). In-process jobs do not carry a lease, so reap this replica's own leaseless
+    // orphans on boot — before any in-process job of this incarnation is spawned.
+    match river_db::routes::private::reprocessing_jobs::lifecycle::reconcile_orphaned_inline_jobs(&db)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(reclaimed = n, "Reaped orphaned in-process jobs on startup"),
+        Err(e) => tracing::warn!(error = %e, "Startup orphaned-job reconcile failed"),
+    }
 
     // Initialize Keycloak authentication (optional in dev, required in prod)
     let keycloak_instance = if let (Some(url), Some(realm)) = (&config.keycloak_url, &config.keycloak_realm) {

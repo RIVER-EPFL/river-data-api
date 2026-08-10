@@ -9,6 +9,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use river_db::common::AppState;
 use river_db::routes::private::notifications::{
     DeliveryResult, NotificationChannel, OutgoingMessage, dispatcher,
 };
@@ -30,7 +31,7 @@ impl NotificationChannel for MockChannel {
         Ok("mock healthy".to_string())
     }
 
-    async fn deliver(&self, _db: &DatabaseConnection, msg: &OutgoingMessage) -> Vec<DeliveryResult> {
+    async fn deliver(&self, _state: &AppState, msg: &OutgoingMessage) -> Vec<DeliveryResult> {
         self.sent.lock().unwrap().push(msg.clone());
         vec![DeliveryResult {
             recipient: "mock".to_string(),
@@ -101,7 +102,7 @@ async fn opened_alarm_is_notified_and_stamped() {
     assert_eq!(count(&db, "notified_at IS NULL AND resolved_at IS NULL").await, 1);
 
     let sent = Arc::new(Mutex::new(Vec::new()));
-    dispatcher::dispatch_once(&db, &channels(&sent, false), state.config.as_ref()).await;
+    dispatcher::dispatch_once(&state, &channels(&sent, false)).await;
 
     let opened = sent.lock().unwrap().iter().filter(|m| m.kind == "alarm_opened").count();
     assert_eq!(opened, 1, "one batched opened message");
@@ -134,7 +135,7 @@ async fn muted_alarm_is_suppressed_but_stamped() {
     .await;
 
     let sent = Arc::new(Mutex::new(Vec::new()));
-    dispatcher::dispatch_once(&db, &channels(&sent, false), state.config.as_ref()).await;
+    dispatcher::dispatch_once(&state, &channels(&sent, false)).await;
 
     assert!(
         sent.lock().unwrap().iter().all(|m| m.kind != "alarm_opened"),
@@ -158,7 +159,7 @@ async fn failed_delivery_is_not_stamped_and_retries() {
     insert_open_event(&db).await;
 
     let sent = Arc::new(Mutex::new(Vec::new()));
-    dispatcher::dispatch_once(&db, &channels(&sent, true), state.config.as_ref()).await;
+    dispatcher::dispatch_once(&state, &channels(&sent, true)).await;
 
     let attempted = sent.lock().unwrap().iter().filter(|m| m.kind == "alarm_opened").count();
     assert_eq!(attempted, 1, "the alarm delivery was attempted");
@@ -188,7 +189,7 @@ async fn resolved_alarm_sends_resolution_notice() {
     .await;
 
     let sent = Arc::new(Mutex::new(Vec::new()));
-    dispatcher::dispatch_once(&db, &channels(&sent, false), state.config.as_ref()).await;
+    dispatcher::dispatch_once(&state, &channels(&sent, false)).await;
 
     let resolved = sent.lock().unwrap().iter().filter(|m| m.kind == "alarm_resolved").count();
     assert_eq!(resolved, 1, "one batched resolved message");
@@ -214,10 +215,9 @@ async fn concurrent_dispatchers_send_each_event_once() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let ch_a = channels(&sent, false);
     let ch_b = channels(&sent, false);
-    let cfg = state.config.clone();
     tokio::join!(
-        dispatcher::dispatch_once(&db, &ch_a, cfg.as_ref()),
-        dispatcher::dispatch_once(&db, &ch_b, cfg.as_ref()),
+        dispatcher::dispatch_once(&state, &ch_a),
+        dispatcher::dispatch_once(&state, &ch_b),
     );
 
     let opened = sent.lock().unwrap().iter().filter(|m| m.kind == "alarm_opened").count();

@@ -37,6 +37,56 @@ async fn deployed_until(db: &DatabaseConnection, id: &str) -> Option<chrono::Dat
         .map(|t| t.with_timezone(&chrono::Utc))
 }
 
+/// H8/H9 — a multi-channel instrument holds one open deployment per parameter. Deploying a second
+/// channel (a different parameter) at the same site must NOT auto-recall the first channel: the recall
+/// is scoped to the parameter being deployed.
+#[tokio::test]
+#[serial]
+async fn deploying_a_second_channel_keeps_the_first_open() {
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+
+    let sensor = create_sensor(&db, "MultiChan-01", GLOBAL_PARAM_TEMP_ID).await;
+    let temp_dep = deploy_sensor(&db, sensor.id, SITE1_ID, dt("2025-01-01T00:00:00Z")).await;
+    assert!(deployed_until(&db, &temp_dep.to_string()).await.is_none(), "temperature channel starts open");
+
+    let app = build_test_app(db.clone());
+    let token = seed_api_token(&db, full_permissions(), None).await;
+    // Deploy the SAME sensor for a DIFFERENT parameter (DO) at the same site via the create hook.
+    let (status, body) = post_json_with_token(
+        &app,
+        "/api/sensor_deployments",
+        &serde_json::json!({
+            "sensor_id": sensor.id,
+            "site_id": SITE1_ID,
+            "parameter_id": GLOBAL_PARAM_DO_ID,
+            "deployed_from": "2025-06-01T00:00:00Z",
+            "deployment_type": "permanent",
+        }),
+        &token,
+    )
+    .await;
+    assert!(status == 200 || status == 201, "deploy DO channel: {status} {body}");
+
+    assert!(
+        deployed_until(&db, &temp_dep.to_string()).await.is_none(),
+        "the temperature channel stays open when the DO channel is deployed — recall is parameter-scoped"
+    );
+    let open = count(
+        &db,
+        &format!(
+            "SELECT COUNT(*) AS c FROM sensor_deployments \
+             WHERE sensor_id = '{}' AND deployed_until IS NULL",
+            sensor.id
+        ),
+    )
+    .await;
+    assert_eq!(open, 2, "both channels are open concurrently");
+
+    cleanup_test_db(&db).await;
+}
+
 /// §3 — calibration windows are gap-absorbing: a window runs to the NEXT calibration's `valid_from`,
 /// so a reading between two calibrations resolves to the EARLIER one, never the later or the prior.
 #[tokio::test]

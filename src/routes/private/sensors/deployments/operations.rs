@@ -42,13 +42,20 @@ impl CRUDOperations for SensorDeploymentOperations {
         db: &DatabaseConnection,
         data: &<SensorDeployment as CRUDResource>::CreateModel,
     ) -> Result<(), ApiError> {
+        // Recall is scoped to the SAME parameter (channel): a multi-channel instrument holds one open
+        // deployment per parameter, so deploying its temperature channel must not close its still-live
+        // conductivity channel. A same-parameter move across sites still closes the old site's row.
         let result = db
             .execute(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r"UPDATE sensor_deployments
                   SET deployed_until = $1
-                  WHERE sensor_id = $2 AND deployed_until IS NULL",
-                [data.deployed_from.into(), data.sensor_id.into()],
+                  WHERE sensor_id = $2 AND parameter_id = $3 AND deployed_until IS NULL",
+                [
+                    data.deployed_from.into(),
+                    data.sensor_id.into(),
+                    data.parameter_id.into(),
+                ],
             ))
             .await
             .map_err(ApiError::database)?;
@@ -56,8 +63,9 @@ impl CRUDOperations for SensorDeploymentOperations {
         if result.rows_affected() > 0 {
             tracing::info!(
                 sensor_id = %data.sensor_id,
+                parameter_id = %data.parameter_id,
                 recalled = result.rows_affected(),
-                "Auto-recalled active deployment(s) on new deploy"
+                "Auto-recalled active deployment(s) for this parameter on new deploy"
             );
         }
 
@@ -197,9 +205,11 @@ impl CRUDOperations for SensorDeploymentOperations {
             let recalled = db
                 .execute(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
+                    // Same-parameter scope as before_create: don't close other channels of a
+                    // multi-channel instrument.
                     r"UPDATE sensor_deployments SET deployed_until = $1
-                      WHERE sensor_id = $2 AND deployed_until IS NULL AND id <> $3",
-                    [new_from.into(), new_sensor.into(), id.into()],
+                      WHERE sensor_id = $2 AND parameter_id = $4 AND deployed_until IS NULL AND id <> $3",
+                    [new_from.into(), new_sensor.into(), id.into(), cur_param.into()],
                 ))
                 .await
                 .map_err(ApiError::database)?;

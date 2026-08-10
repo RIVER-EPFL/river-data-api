@@ -338,7 +338,7 @@ pub async fn rollback_deployment(
     State(app_state): State<AppState>,
     Json(payload): Json<RollbackDeploymentRequest>,
 ) -> AppResult<Json<RollbackDeploymentResponse>> {
-    use sea_orm::{ConnectionTrait, Statement};
+    use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
 
     let db = &app_state.db;
 
@@ -346,7 +346,7 @@ pub async fn rollback_deployment(
     let target = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT id, sensor_id, site_id, deployed_from, deployed_until
+            r"SELECT id, sensor_id, site_id, parameter_id, deployed_from, deployed_until
               FROM sensor_deployments WHERE id = $1",
             [payload.deployment_id.into()],
         ))
@@ -355,6 +355,7 @@ pub async fn rollback_deployment(
         .ok_or_else(|| AppError::NotFound("Deployment not found".into()))?;
 
     let sensor_id: Uuid = target.try_get("", "sensor_id").map_err(|e| AppError::Internal(format!("{e}")))?;
+    let parameter_id: Uuid = target.try_get("", "parameter_id").map_err(|e| AppError::Internal(format!("{e}")))?;
     let target_deployed_from: chrono::DateTime<chrono::FixedOffset> =
         target.try_get("", "deployed_from").map_err(|e| AppError::Internal(format!("{e}")))?;
     // The boundary the rolled-back deployment vacates — the previous deployment re-extends to here
@@ -362,23 +363,40 @@ pub async fn rollback_deployment(
     let target_deployed_until: Option<chrono::DateTime<chrono::FixedOffset>> =
         target.try_get("", "deployed_until").map_err(|e| AppError::Internal(format!("{e}")))?;
 
-    // 2. Find the previous deployment for the same sensor
+    // 2. Find the previous deployment for the same sensor AND THE SAME PARAMETER — on a multi-channel
+    //    instrument the immediately-prior deployment by time could belong to a different channel;
+    //    reopening that one would extend the wrong channel's window.
     let previous = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT id, site_id FROM sensor_deployments
-              WHERE sensor_id = $1 AND deployed_from < $2 AND id != $3
+              WHERE sensor_id = $1 AND parameter_id = $4 AND deployed_from < $2 AND id != $3
               ORDER BY deployed_from DESC LIMIT 1",
-            [sensor_id.into(), target_deployed_from.into(), payload.deployment_id.into()],
+            [
+                sensor_id.into(),
+                target_deployed_from.into(),
+                payload.deployment_id.into(),
+                parameter_id.into(),
+            ],
         ))
         .await
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
     let previous_deployment_id: Option<Uuid> = previous.as_ref().and_then(|r| r.try_get("", "id").ok());
 
-    // 3. Clear readings' FK to the rolled-back deployment (readings.deployment_id has no ON DELETE
-    //    action, so the row can't be removed while referenced), then delete the deployment.
-    let cleared = db
+    // 3-4. Clear readings' FK to the rolled-back deployment, delete it, and reopen the previous
+    //    deployment — atomically, so a mid-operation failure can't leave the deployment deleted with
+    //    nothing reopened (which would silently un-attribute its readings). The decompression cap is
+    //    lifted so the readings FK-clear can't fail on old compressed chunks.
+    let txn = db.begin().await.map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    txn.execute(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
+    ))
+    .await
+    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+
+    let cleared = txn
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE readings SET deployment_id = NULL WHERE deployment_id = $1",
@@ -388,7 +406,7 @@ pub async fn rollback_deployment(
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
     let readings_reassigned = cleared.rows_affected();
 
-    db.execute(Statement::from_sql_and_values(
+    txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"DELETE FROM sensor_deployments WHERE id = $1",
         [payload.deployment_id.into()],
@@ -396,14 +414,14 @@ pub async fn rollback_deployment(
     .await
     .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
-    // 4. Reopen the previous deployment to absorb the vacated window. `recompute_deployed_until` only
-    //    ever SHORTENS (LEAST), so without this the previous deployment — which was auto-closed when
-    //    the rolled-back one was created — stays closed and the readings would un-attribute (site_id
-    //    NULL) instead of reverting to the previous site. Reopening to the target's own
-    //    `deployed_until` reclaims exactly the window the target held (NULL = open-ended), which can't
-    //    overlap anything the slot constraint already excluded.
+    // Reopen the previous deployment to absorb the vacated window. `recompute_deployed_until` only ever
+    //    SHORTENS (LEAST), so without this the previous deployment — auto-closed when the rolled-back
+    //    one was created — stays closed and the readings would un-attribute (site_id NULL) instead of
+    //    reverting to the previous site. Reopening to the target's own `deployed_until` reclaims exactly
+    //    the window the target held (NULL = open-ended), which can't overlap anything the slot
+    //    constraint already excluded.
     if let Some(prev_id) = previous_deployment_id {
-        db.execute(Statement::from_sql_and_values(
+        txn.execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE sensor_deployments SET deployed_until = $1 WHERE id = $2",
             [target_deployed_until.into(), prev_id.into()],
@@ -411,6 +429,7 @@ pub async fn rollback_deployment(
         .await
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
     }
+    txn.commit().await.map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
     // 5. Re-chain the remaining timeline and re-derive every reading for the sensor by window. The
     //    rolled-back deployment's readings now fall in the reopened previous deployment's window (or

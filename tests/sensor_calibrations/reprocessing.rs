@@ -258,6 +258,135 @@ async fn reprocess_applies_per_parameter_calibration_on_shared_sensor() {
     cleanup_test_db(&db).await;
 }
 
+/// H7 regression: production auto-creates the identity calibration with `parameter_id = NULL` (a
+/// wildcard), and `recompute_valid_until` partitions by parameter_id, so that identity's window never
+/// closes and overlaps a later real curve. Reprocess must still deterministically apply the real,
+/// parameter-specific curve — never the open-ended identity — to a parameter's readings.
+#[tokio::test]
+#[serial]
+async fn reprocess_prefers_real_curve_over_open_null_identity() {
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+
+    let sensor = uuid::Uuid::new_v4();
+    let real_cal = uuid::Uuid::new_v4();
+    exec(&db, &format!("INSERT INTO sensors (id, name, is_active) VALUES ('{sensor}', 'NullIdentity-01', true)")).await;
+    // The production shape: a NULL-parameter identity (slope 1) with an open window, plus a real
+    // temperature curve (slope 2) that also stays open — both cover the reading's time.
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO sensor_calibrations \
+             (id, sensor_id, parameter_id, slope, intercept, valid_from, mode, notes) VALUES \
+             ('{}', '{sensor}', NULL, 1.0, 0.0, '2000-01-01T00:00:00Z', 'windowed', 'Identity calibration (auto-created)'), \
+             ('{real_cal}', '{sensor}', '{GLOBAL_PARAM_TEMP_ID}', 2.0, 0.0, '2000-01-01T00:00:00Z', 'windowed', 'temp')",
+            uuid::Uuid::new_v4()
+        ),
+    )
+    .await;
+    deploy_sensor(&db, sensor, SITE1_ID, dt("2000-01-01T00:00:00Z")).await;
+    let stream = create_paired_stream(&db, "null-identity-temp", PARAM_S1_TEMP_ID).await;
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO readings \
+             (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, sensor_id, replicate_index) VALUES \
+             ('{stream}', '{SITE1_ID}', '{GLOBAL_PARAM_TEMP_ID}', '2025-01-01T10:00:00Z', 3.0, 3.0, '{sensor}', 0)"
+        ),
+    )
+    .await;
+
+    let app = build_test_app(db.clone());
+    let token = seed_api_token(&db, full_permissions(), None).await;
+    let (status, body) = post_json_with_token(
+        &app,
+        "/api/actions/reprocess",
+        &serde_json::json!({ "sensor_id": sensor }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "reprocess: {body}");
+    assert!(wait_for_reprocessing(&db, sensor, WAIT_TIMEOUT).await);
+
+    let rows = get_readings_for_sensor(&db, sensor).await;
+    let r = rows.iter().find(|r| r.raw_value == 3.0).expect("temp reading");
+    assert_eq!(r.calibrated_value, Some(6.0), "the real curve (2*3), never the identity (1*3)");
+    assert_eq!(r.calibration_id, Some(real_cal), "stamped with the real curve, not the identity");
+
+    cleanup_test_db(&db).await;
+}
+
+/// H10 regression: a lab instrument's grab (measurement_type = 'spot', its own instant curve) that
+/// shares a (site, parameter) with a deployed field sensor must survive that slot's reprocess
+/// untouched — its sensor_id, calibration_id and instant-curve `calibrated_value` are preserved while
+/// the field sensor's continuous readings are re-derived.
+#[tokio::test]
+#[serial]
+async fn slot_reprocess_leaves_spot_grabs_untouched() {
+    use river_db::routes::private::sensors::calibrations::service::reprocess_site_parameter_readings;
+
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+
+    // Field sensor: deployed at SITE1 for temperature. A windowed curve (calibrated = 2*raw) that
+    // starts after the auto identity, so a 2025 reading resolves to slope 2.
+    let field = create_sensor(&db, "Field-Temp-01", GLOBAL_PARAM_TEMP_ID).await;
+    add_calibration(&db, field.id, 2.0, 0.0, dt("2020-01-01T00:00:00Z")).await;
+    deploy_sensor(&db, field.id, SITE1_ID, dt("2000-01-01T00:00:00Z")).await;
+    let cont_stream = create_paired_stream(&db, "field-temp", PARAM_S1_TEMP_ID).await;
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO readings \
+             (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, sensor_id, replicate_index) \
+             VALUES ('{cont_stream}', '{SITE1_ID}', '{GLOBAL_PARAM_TEMP_ID}', '2025-01-01T10:00:00Z', 3.0, 3.0, '{}', 0)",
+            field.id
+        ),
+    )
+    .await;
+
+    // Lab instrument grab at the same site/parameter within the field deployment window: its own
+    // instant curve produced calibrated_value 99.0, and it is tagged measurement_type = 'spot'.
+    let lab = uuid::Uuid::new_v4();
+    let instant_cal = uuid::Uuid::new_v4();
+    exec(&db, &format!("INSERT INTO sensors (id, name, is_active) VALUES ('{lab}', 'Lab-Instrument-01', true)")).await;
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO sensor_calibrations (id, sensor_id, parameter_id, slope, intercept, valid_from, mode, notes) \
+             VALUES ('{instant_cal}', '{lab}', '{GLOBAL_PARAM_TEMP_ID}', 9.9, 0.0, '2000-01-01T00:00:00Z', 'instant', 'grab curve')"
+        ),
+    )
+    .await;
+    let grab_stream = create_unpaired_stream(&db, "lab-grab").await;
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO readings \
+             (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, sensor_id, calibration_id, measurement_type, replicate_index) \
+             VALUES ('{grab_stream}', '{SITE1_ID}', '{GLOBAL_PARAM_TEMP_ID}', '2025-01-01T11:00:00Z', 10.0, 99.0, '{lab}', '{instant_cal}', 'spot', 0)"
+        ),
+    )
+    .await;
+
+    reprocess_site_parameter_readings(&db, SITE1_ID.parse().unwrap(), GLOBAL_PARAM_TEMP_ID.parse().unwrap())
+        .await
+        .expect("reprocess");
+
+    // Continuous reading re-derived by the field curve; grab preserved end-to-end.
+    let cont = get_readings(&db, cont_stream).await;
+    assert_eq!(cont[0].calibrated_value, Some(6.0), "continuous reading re-derived: 2*3");
+
+    let grab = get_readings(&db, grab_stream).await;
+    assert_eq!(grab[0].calibrated_value, Some(99.0), "grab's instant-curve value is preserved");
+    assert_eq!(grab[0].sensor_id, Some(lab), "grab keeps its lab instrument, not the field sensor");
+    assert_eq!(grab[0].calibration_id, Some(instant_cal), "grab keeps its instant curve");
+
+    cleanup_test_db(&db).await;
+}
+
 // ============================================================================
 // Deployment changes — site_id and reading count
 // ============================================================================

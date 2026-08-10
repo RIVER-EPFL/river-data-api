@@ -5,23 +5,22 @@
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, Statement};
 
-use crate::config::Config;
-
 use super::dispatcher::deliver;
 use super::{NotificationChannel, OutgoingMessage, Slot};
+use crate::common::AppState;
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
 const BATTERY_RENOTIFY_DAYS: i64 = 7;
 
 /// Run all signal triggers. Called from the dispatcher cycle when at least one channel is enabled.
-pub async fn run(db: &DatabaseConnection, channels: &[Box<dyn NotificationChannel>], config: &Config) {
-    if let Err(e) = stale_data(db, channels, config).await {
+pub async fn run(state: &AppState, channels: &[Box<dyn NotificationChannel>]) {
+    if let Err(e) = stale_data(state, channels).await {
         tracing::warn!(error = %e, "stale-data trigger failed");
     }
-    if let Err(e) = battery_forecast(db, channels, config).await {
+    if let Err(e) = battery_forecast(state, channels).await {
         tracing::warn!(error = %e, "battery-forecast trigger failed");
     }
-    if let Err(e) = sync_failures(db, channels).await {
+    if let Err(e) = sync_failures(state, channels).await {
         tracing::warn!(error = %e, "sync-failure trigger failed");
     }
 }
@@ -133,14 +132,16 @@ async fn claim_cas(db: &DatabaseConnection, kind: &str, key: &str, expected: Dat
 }
 
 async fn stale_data(
-    db: &DatabaseConnection,
+    state: &AppState,
     channels: &[Box<dyn NotificationChannel>],
-    config: &Config,
 ) -> Result<(), DbErr> {
+    let db = &state.db;
+    let config = state.config.as_ref();
     let rows = db
         .query_all(Statement::from_string(
             PG,
-            "SELECT sp.site_id, sp.parameter_id, s.name AS site_name, p.name AS param_name, \
+            "SELECT sp.site_id, sp.parameter_id, s.project_id, s.name AS site_name, \
+                    p.name AS param_name, \
                     (SELECT MAX(r.time) FROM readings r \
                        WHERE r.site_id = sp.site_id AND r.parameter_id = sp.parameter_id \
                          AND r.replicate_index = 0) AS last_time \
@@ -156,6 +157,7 @@ async fn stale_data(
     for r in &rows {
         let site_id: uuid::Uuid = r.try_get("", "site_id")?;
         let parameter_id: uuid::Uuid = r.try_get("", "parameter_id")?;
+        let project_id: Option<uuid::Uuid> = r.try_get("", "project_id")?;
         let site_name: String = r.try_get("", "site_name")?;
         let param_name: String = r.try_get("", "param_name")?;
         let Some(last_time) = r.try_get::<Option<DateTime<Utc>>>("", "last_time")? else {
@@ -176,9 +178,9 @@ async fn stale_data(
                         "⏳ No data from {site_name} / {param_name} for ~{}h.",
                         age.num_hours()
                     ),
-                    slot: Some(Slot { project_id: None, site_id, parameter_id }),
+                    slot: Some(Slot { project_id, site_id, parameter_id }),
                 };
-                if !deliver(db, channels, &msg, None).await {
+                if !deliver(state, channels, &msg, None).await {
                     state_clear(db, "stale_data", &key).await?; // release so it retries next tick
                 }
             }
@@ -189,9 +191,9 @@ async fn stale_data(
                     kind: "stale_data",
                     subject: format!("River Data: data resumed from {site_name}"),
                     body: format!("✅ Data flowing again from {site_name} / {param_name}."),
-                    slot: Some(Slot { project_id: None, site_id, parameter_id }),
+                    slot: Some(Slot { project_id, site_id, parameter_id }),
                 };
-                if !deliver(db, channels, &msg, None).await {
+                if !deliver(state, channels, &msg, None).await {
                     state_upsert(db, "stale_data", &key, "firing").await?; // restore so it retries
                 }
             }
@@ -201,10 +203,11 @@ async fn stale_data(
 }
 
 async fn battery_forecast(
-    db: &DatabaseConnection,
+    state: &AppState,
     channels: &[Box<dyn NotificationChannel>],
-    config: &Config,
 ) -> Result<(), DbErr> {
+    let db = &state.db;
+    let config = state.config.as_ref();
     let Some(battery_param) = db
         .query_one(Statement::from_string(
             PG,
@@ -223,7 +226,7 @@ async fn battery_forecast(
     let rows = db
         .query_all(Statement::from_sql_and_values(
             PG,
-            "SELECT s.id AS site_id, s.name AS site_name, \
+            "SELECT s.id AS site_id, s.project_id, s.name AS site_name, \
                 (SELECT COALESCE(r2.calibrated_value, r2.raw_value) FROM readings r2 \
                    WHERE r2.site_id = s.id AND r2.parameter_id = $1 AND r2.replicate_index = 0 \
                    ORDER BY r2.time DESC LIMIT 1) AS latest, \
@@ -240,6 +243,7 @@ async fn battery_forecast(
     let cutoff = config.battery_cutoff_volts;
     for r in &rows {
         let site_id: uuid::Uuid = r.try_get("", "site_id")?;
+        let project_id: Option<uuid::Uuid> = r.try_get("", "project_id")?;
         let site_name: String = r.try_get("", "site_name")?;
         let (Some(latest), Some(slope)) = (
             r.try_get::<Option<f64>>("", "latest")?,
@@ -269,17 +273,18 @@ async fn battery_forecast(
             body: format!(
                 "🔋 {site_name}: {latest:.2}V, trend {slope:+.3}V/day — ~{days:.0}d to {cutoff:.1}V."
             ),
-            slot: Some(Slot { project_id: None, site_id, parameter_id: battery_param }),
+            slot: Some(Slot { project_id, site_id, parameter_id: battery_param }),
         };
-        let _ = deliver(db, channels, &msg, None).await;
+        let _ = deliver(state, channels, &msg, None).await;
     }
     Ok(())
 }
 
 async fn sync_failures(
-    db: &DatabaseConnection,
+    state: &AppState,
     channels: &[Box<dyn NotificationChannel>],
 ) -> Result<(), DbErr> {
+    let db = &state.db;
     let services = db
         .query_all(Statement::from_string(
             PG,
@@ -322,7 +327,7 @@ async fn sync_failures(
             // System-wide infrastructure alert — no per-site scope, every enabled recipient gets it.
             slot: None,
         };
-        let _ = deliver(db, channels, &msg, None).await;
+        let _ = deliver(state, channels, &msg, None).await;
     }
     Ok(())
 }

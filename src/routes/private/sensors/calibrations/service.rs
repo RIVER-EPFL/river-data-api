@@ -492,22 +492,38 @@ pub async fn reprocess_sensor_readings(
     ))
     .await?;
 
+    // Pick exactly one calibration per reading — the most specific overlapping window — so an
+    // open-ended identity calibration (parameter_id NULL) can never non-deterministically shadow a
+    // real parameter-specific one. Preference: exact parameter match, then a parameter-bearing curve
+    // over the NULL identity, then the latest window.
     let cal_result = txn
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings r
-            SET calibration_id = cw.id,
-                calibrated_value = cw.slope * r.raw_value + cw.intercept
+            r"UPDATE readings tgt
+            SET calibration_id = picked.cal_id,
+                calibrated_value = picked.slope * tgt.raw_value + picked.intercept
             FROM (
-                SELECT id, slope, intercept, valid_from, parameter_id,
-                       COALESCE(valid_until, 'infinity'::timestamptz) AS valid_until
-                FROM sensor_calibrations
-                WHERE sensor_id = $1 AND mode = 'windowed'
-            ) cw
-            WHERE r.sensor_id = $1
-              AND r.time >= cw.valid_from
-              AND r.time < cw.valid_until
-              AND (cw.parameter_id IS NULL OR r.parameter_id IS NULL OR cw.parameter_id = r.parameter_id)",
+                SELECT r.stream_id, r.time, r.replicate_index,
+                       cw.id AS cal_id, cw.slope, cw.intercept
+                FROM readings r
+                JOIN LATERAL (
+                    SELECT c.id, c.slope, c.intercept
+                    FROM sensor_calibrations c
+                    WHERE c.sensor_id = $1 AND c.mode = 'windowed'
+                      AND (c.parameter_id = r.parameter_id OR c.parameter_id IS NULL OR r.parameter_id IS NULL)
+                      AND r.time >= c.valid_from
+                      AND r.time < COALESCE(c.valid_until, 'infinity'::timestamptz)
+                    ORDER BY (c.parameter_id IS NOT DISTINCT FROM r.parameter_id) DESC,
+                             (c.parameter_id IS NOT NULL) DESC,
+                             c.valid_from DESC
+                    LIMIT 1
+                ) cw ON true
+                WHERE r.sensor_id = $1
+                  AND r.measurement_type IS DISTINCT FROM 'spot'
+            ) picked
+            WHERE tgt.stream_id = picked.stream_id
+              AND tgt.time = picked.time
+              AND tgt.replicate_index = picked.replicate_index",
             [sensor_id.into()],
         ))
         .await?;
@@ -525,6 +541,7 @@ pub async fn reprocess_sensor_readings(
             WHERE sensor_id = $1
         ) dw
         WHERE r.sensor_id = $1
+          AND r.measurement_type IS DISTINCT FROM 'spot'
           AND r.time >= dw.deployed_from
           AND r.time < dw.deployed_until
           AND (dw.parameter_id IS NULL OR r.parameter_id IS NULL OR dw.parameter_id = r.parameter_id)",
@@ -543,6 +560,7 @@ pub async fn reprocess_sensor_readings(
         r"UPDATE readings r
           SET site_id = NULL, deployment_id = NULL
           WHERE r.sensor_id = $1
+            AND r.measurement_type IS DISTINCT FROM 'spot'
             AND r.time >= (SELECT MIN(deployed_from) FROM sensor_deployments d2
                            WHERE d2.sensor_id = $1
                              AND (d2.parameter_id IS NULL OR r.parameter_id IS NULL
@@ -642,6 +660,7 @@ pub async fn reprocess_site_parameter_readings(
                   WHERE site_id = $1 AND parameter_id = $2
               ) dw
               WHERE r.parameter_id = $2
+                AND r.measurement_type IS DISTINCT FROM 'spot'
                 AND (r.site_id = $1 OR r.sensor_id = dw.sensor_id)
                 AND r.time >= dw.deployed_from
                 AND r.time < dw.deployed_until",
@@ -650,19 +669,34 @@ pub async fn reprocess_site_parameter_readings(
         .await?;
     let updated = dep_result.rows_affected() as usize;
 
-    // 2. Re-derive calibrated_value/calibration_id for the (now correct) owner per cal window.
+    // 2. Re-derive calibrated_value/calibration_id for the (now correct) owner. Pick exactly one
+    //    calibration per reading — the most specific overlapping window — so an open-ended identity
+    //    calibration (parameter_id NULL) can't non-deterministically shadow the real one.
     txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE readings r
-          SET calibration_id = cw.id,
-              calibrated_value = cw.slope * r.raw_value + cw.intercept
-          FROM sensor_calibrations cw
-          WHERE r.site_id = $1 AND r.parameter_id = $2
-            AND cw.sensor_id = r.sensor_id
-            AND cw.mode = 'windowed'
-            AND (cw.parameter_id IS NULL OR cw.parameter_id = $2)
-            AND r.time >= cw.valid_from
-            AND r.time < COALESCE(cw.valid_until, 'infinity'::timestamptz)",
+        r"UPDATE readings tgt
+          SET calibration_id = picked.cal_id,
+              calibrated_value = picked.slope * tgt.raw_value + picked.intercept
+          FROM (
+              SELECT r.stream_id, r.time, r.replicate_index,
+                     cw.id AS cal_id, cw.slope, cw.intercept
+              FROM readings r
+              JOIN LATERAL (
+                  SELECT c.id, c.slope, c.intercept
+                  FROM sensor_calibrations c
+                  WHERE c.sensor_id = r.sensor_id AND c.mode = 'windowed'
+                    AND (c.parameter_id = $2 OR c.parameter_id IS NULL)
+                    AND r.time >= c.valid_from
+                    AND r.time < COALESCE(c.valid_until, 'infinity'::timestamptz)
+                  ORDER BY (c.parameter_id IS NOT NULL) DESC, c.valid_from DESC
+                  LIMIT 1
+              ) cw ON true
+              WHERE r.site_id = $1 AND r.parameter_id = $2
+                AND r.measurement_type IS DISTINCT FROM 'spot'
+          ) picked
+          WHERE tgt.stream_id = picked.stream_id
+            AND tgt.time = picked.time
+            AND tgt.replicate_index = picked.replicate_index",
         [site_id.into(), parameter_id.into()],
     ))
     .await?;
@@ -674,6 +708,7 @@ pub async fn reprocess_site_parameter_readings(
         r"UPDATE readings r
           SET site_id = NULL, deployment_id = NULL
           WHERE r.site_id = $1 AND r.parameter_id = $2
+            AND r.measurement_type IS DISTINCT FROM 'spot'
             AND r.time >= (SELECT MIN(deployed_from) FROM sensor_deployments
                            WHERE site_id = $1 AND parameter_id = $2)
             AND NOT EXISTS (

@@ -7,14 +7,11 @@
 //! every channel is left unstamped so the next tick retries it.
 
 use std::collections::HashSet;
-use std::sync::Arc;
-use std::time::Duration;
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, Statement};
-use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
-use crate::common::{AppEvent, EventSender};
+use crate::common::AppState;
 use crate::config::Config;
 
 use super::email::{self, EmailChannel};
@@ -50,60 +47,29 @@ pub fn build_channels(config: &Config) -> Vec<Box<dyn NotificationChannel>> {
     channels
 }
 
-pub async fn periodic(db: DatabaseConnection, config: Arc<Config>, events: EventSender) {
-    let channels = build_channels(&config);
-    tracing::info!(
-        channels = channels.len(),
-        poll_secs = config.notify_poll_interval_seconds,
-        "Notification dispatcher: starting"
-    );
-
-    let mut rx = events.subscribe();
-    dispatch_once(&db, &channels, &config).await;
-
-    let mut ticker = tokio::time::interval(Duration::from_secs(config.notify_poll_interval_seconds));
-    ticker.tick().await;
-    loop {
-        let should_run = tokio::select! {
-            _ = ticker.tick() => true,
-            ev = rx.recv() => match ev {
-                Ok(AppEvent::AlarmStateChanged { .. }) => true,
-                Ok(_) => false,
-                Err(RecvError::Lagged(_)) => true,
-                Err(RecvError::Closed) => return,
-            },
-        };
-        if should_run {
-            dispatch_once(&db, &channels, &config).await;
-        }
-    }
-}
-
 /// One drain of the outbox (open + resolve passes). Exposed `pub` so integration tests can drive it
-/// deterministically with injected channels instead of waiting on the interval.
-pub async fn dispatch_once(
-    db: &DatabaseConnection,
-    channels: &[Box<dyn NotificationChannel>],
-    config: &Config,
-) {
-    if let Err(e) = process_pending(db, channels, config, true).await {
+/// deterministically with injected channels instead of waiting on the interval. Needs the live
+/// `AppState` so the per-recipient project-access guard can resolve grants and roles.
+pub async fn dispatch_once(state: &AppState, channels: &[Box<dyn NotificationChannel>]) {
+    if let Err(e) = process_pending(state, channels, true).await {
         tracing::warn!(error = %e, "notification dispatcher: open pass failed");
     }
-    if let Err(e) = process_pending(db, channels, config, false).await {
+    if let Err(e) = process_pending(state, channels, false).await {
         tracing::warn!(error = %e, "notification dispatcher: resolve pass failed");
     }
     // Signal triggers only run when a channel is configured (they do heavier detection queries).
     if !channels.is_empty() {
-        super::triggers::run(db, channels, config).await;
+        super::triggers::run(state, channels).await;
     }
 }
 
 async fn process_pending(
-    db: &DatabaseConnection,
+    state: &AppState,
     channels: &[Box<dyn NotificationChannel>],
-    config: &Config,
     opened: bool,
 ) -> Result<(), DbErr> {
+    let db = &state.db;
+    let config = state.config.as_ref();
     let rows = fetch_pending(db, opened).await?;
     if rows.is_empty() {
         return Ok(());
@@ -140,7 +106,7 @@ async fn process_pending(
             site_id: r.slot.0,
             parameter_id: r.slot.1,
         });
-        if !deliver(db, channels, &msg, Some(r.id)).await {
+        if !deliver(state, channels, &msg, Some(r.id)).await {
             release_claim(db, column, r.id).await?;
         }
     }
@@ -213,15 +179,16 @@ async fn fetch_active_mutes(db: &DatabaseConnection) -> Result<HashSet<(Uuid, Uu
 /// nothing was attempted (no channels/recipients) or at least one delivery succeeded; otherwise leave
 /// it for the next tick to retry.
 pub(super) async fn deliver(
-    db: &DatabaseConnection,
+    state: &AppState,
     channels: &[Box<dyn NotificationChannel>],
     msg: &OutgoingMessage,
     single_event_id: Option<Uuid>,
 ) -> bool {
+    let db = &state.db;
     let mut attempted = 0usize;
     let mut any_success = false;
     for ch in channels {
-        for r in ch.deliver(db, msg).await {
+        for r in ch.deliver(state, msg).await {
             attempted += 1;
             let (status, error) = match &r.outcome {
                 Ok(()) => {

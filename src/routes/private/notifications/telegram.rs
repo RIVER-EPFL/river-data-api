@@ -9,6 +9,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 
 use super::access::{accessible_project_ids, project_allowed};
 use super::{DeliveryResult, NotificationChannel, OutgoingMessage, Slot};
+use crate::common::AppState;
 
 const API_BASE: &str = "https://api.telegram.org";
 
@@ -17,6 +18,9 @@ const API_BASE: &str = "https://api.telegram.org";
 pub struct Update {
     pub update_id: i64,
     pub chat_id: Option<i64>,
+    /// Telegram chat type: `private`, `group`, `supergroup`, or `channel`. Write/privileged commands
+    /// are refused outside a 1:1 `private` chat, where the sender's identity can't be established.
+    pub chat_type: Option<String>,
     pub username: Option<String>,
     pub text: Option<String>,
 }
@@ -64,6 +68,7 @@ impl TelegramClient {
                 Update {
                     update_id: r["update_id"].as_i64().unwrap_or(0),
                     chat_id: msg["chat"]["id"].as_i64(),
+                    chat_type: msg["chat"]["type"].as_str().map(String::from),
                     username: msg["from"]["username"].as_str().map(String::from),
                     text: msg["text"].as_str().map(String::from),
                 }
@@ -184,7 +189,8 @@ impl NotificationChannel for TelegramChannel {
         self.client.get_me().await
     }
 
-    async fn deliver(&self, db: &DatabaseConnection, msg: &OutgoingMessage) -> Vec<DeliveryResult> {
+    async fn deliver(&self, state: &AppState, msg: &OutgoingMessage) -> Vec<DeliveryResult> {
+        let db = &state.db;
         let recipients = match slot_recipients(db, &msg.slot).await {
             Ok(r) => r,
             Err(e) => {
@@ -192,14 +198,15 @@ impl NotificationChannel for TelegramChannel {
                 return Vec::new();
             }
         };
-        // Project-access guard (no-op until project access is role-scoped — see access.rs). Routing
-        // fan-out through the same seam as subscription writes keeps the leak guard in one place.
+        // Project-access guard: a member only receives alerts for projects in their grant set.
+        // Routing fan-out through the same seam as subscription writes keeps the leak guard in one
+        // place. A `None` project (system-wide alert) passes for everyone.
         let project = msg.slot.as_ref().and_then(|s| s.project_id);
 
         let mut results = Vec::with_capacity(recipients.len());
         for (sub, chat_id) in recipients {
             if let Some(p) = project
-                && !project_allowed(&accessible_project_ids(db, &sub).await, p)
+                && !project_allowed(&accessible_project_ids(state, &sub).await, p)
             {
                 continue;
             }

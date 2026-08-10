@@ -4,8 +4,9 @@
 //! backstop), renders messages, and fans them out to the enabled channels. Telegram is restricted
 //! to linked identities whose Keycloak role is resolved live (`authz`), never from a cached value.
 
-use sea_orm::DatabaseConnection;
 use uuid::Uuid;
+
+use crate::common::AppState;
 
 pub mod access;
 pub mod authz;
@@ -60,7 +61,7 @@ pub struct DeliveryResult {
 #[async_trait::async_trait]
 pub trait NotificationChannel: Send + Sync {
     fn name(&self) -> &'static str;
-    async fn deliver(&self, db: &DatabaseConnection, msg: &OutgoingMessage) -> Vec<DeliveryResult>;
+    async fn deliver(&self, state: &AppState, msg: &OutgoingMessage) -> Vec<DeliveryResult>;
     /// Live reachability probe (no message sent): `getMe` for Telegram, an SMTP connection test or a
     /// Graph token fetch for email. `Ok(detail)` is healthy; `Err(detail)` carries the failure reason.
     async fn check_health(&self) -> Result<String, String>;

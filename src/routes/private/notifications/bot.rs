@@ -7,7 +7,9 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::authz::{AccessScope, Role};
 
+use super::access::accessible_project_ids;
 use super::authz::RoleResolution;
 use super::commands;
 use super::telegram::{TelegramClient, Update};
@@ -53,12 +55,19 @@ async fn handle_update(state: &AppState, client: &TelegramClient, u: Update) {
     if !text.starts_with('/') {
         return;
     }
+    let is_private = u.chat_type.as_deref() == Some("private");
     let (cmd, args) = parse_command(text);
-    if let Some(reply) = route(state, chat_id, u.username.as_deref(), &cmd, args).await {
+    if let Some(reply) = route(state, chat_id, is_private, u.username.as_deref(), &cmd, args).await {
         if let Err(e) = client.send_message(chat_id, &reply).await {
             tracing::warn!(error = %e, "telegram send_message failed");
         }
     }
+}
+
+/// Commands that write data or change state. They are refused outside a 1:1 `private` chat because in
+/// a group every member shares the linked chat id, so the acting individual can't be identified.
+fn is_write_command(cmd: &str) -> bool {
+    matches!(cmd, "grab" | "mute" | "unmute")
 }
 
 fn parse_command(text: &str) -> (String, &str) {
@@ -75,6 +84,7 @@ fn parse_command(text: &str) -> (String, &str) {
 async fn route(
     state: &AppState,
     chat_id: i64,
+    is_private: bool,
     username: Option<&str>,
     cmd: &str,
     args: &str,
@@ -82,6 +92,16 @@ async fn route(
     // /start is the only command reachable before a chat is linked.
     if cmd == "start" {
         return Some(commands::start(&state.db, chat_id, username, args).await);
+    }
+
+    // A write/state-changing command in a group chat can't be attributed to an individual — refuse
+    // before touching identity or the DB.
+    if !is_private && is_write_command(cmd) {
+        return Some(
+            "This command changes data and only works in a direct (1:1) chat with the bot, \
+             not in a group."
+                .to_string(),
+        );
     }
 
     let Some(identity) = lookup_identity(&state.db, chat_id).await else {
@@ -109,18 +129,41 @@ async fn route(
     };
     stamp_verified(&state.db, identity.id).await;
 
+    // The linked user's project confinement — the same set that gates HTTP reads and alert delivery.
+    // `None` (administrator) means unrestricted; a member is confined to their granted projects so a
+    // bot read can't surface data they can't see in the portal.
+    let scope = match accessible_project_ids(state, &identity.sub).await {
+        None => AccessScope::Unrestricted,
+        Some(projects) => AccessScope::Projects(std::sync::Arc::new(projects)),
+    };
+
     let cutoff = state.config.battery_cutoff_volts;
     let reply = match cmd {
         "help" => commands::help(),
         "ping" => commands::ping(),
-        "status" => commands::status(&state.db).await,
-        "alarms" => commands::alarms(&state.db).await,
-        "stations" => commands::stations(&state.db).await,
-        "latest" => commands::latest(&state.db, args).await,
-        "thresholds" => commands::thresholds(&state.db, args).await,
-        "server" => commands::server(&state.db).await,
-        "battery" => commands::battery(&state.db, args, cutoff).await,
-        "grab" => commands::grab(state, args, username, chat_id).await,
+        "status" => commands::status(&state.db, &scope).await,
+        "alarms" => commands::alarms(&state.db, &scope).await,
+        "stations" => commands::stations(&state.db, &scope).await,
+        "latest" => commands::latest(&state.db, &scope, args).await,
+        "thresholds" => commands::thresholds(&state.db, &scope, args).await,
+        // Sync-service internals (endpoints, last_error) are operational data — Administrators only.
+        "server" => {
+            if role.allows_admin() {
+                commands::server(&state.db).await
+            } else {
+                "This command requires an administrator role.".to_string()
+            }
+        }
+        "battery" => commands::battery(&state.db, &scope, args, cutoff).await,
+        // Grab-sample submission is a data write: require the same River level as HTTP `/grab_samples`
+        // (interns are read-only) and confine the site to the caller's scope.
+        "grab" => {
+            if role.allows_level(&Role::River) {
+                commands::grab(state, &scope, args, username, chat_id).await
+            } else {
+                "Submitting grab samples requires at least the River role.".to_string()
+            }
+        }
         "mute" | "unmute" | "muted" => {
             if role.allows_admin() {
                 let by = username

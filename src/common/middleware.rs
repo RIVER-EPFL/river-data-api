@@ -489,15 +489,34 @@ pub async fn enforce_scope_on_crud(
     };
     let json: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
 
+    let outside = || {
+        AppError::Forbidden("That resource is outside your project access".to_string())
+            .into_response()
+    };
     match resolve_scope_project(&state.db, &entity, id.as_deref(), json.as_ref()).await {
-        ScopeOutcome::Project(project) if scope.allows_project(project) => {}
-        ScopeOutcome::Project(_) => {
-            return AppError::Forbidden("That resource is outside your project access".to_string())
-                .into_response();
+        // Every owning/target project must be in scope (a single owner, or owner + repoint target).
+        ScopeOutcome::RequireAll(projects) => {
+            if projects.is_empty() || !projects.iter().all(|p| scope.allows_project(*p)) {
+                return outside();
+            }
         }
-        // A global/unresolvable entity: fail closed for tokens, allow for members (their capability
-        // gate already governs whether they may write shared metadata).
-        ScopeOutcome::Deny(msg) => {
+        // At least one must be in scope — matches read confinement for a multi-project entity (a
+        // calibration is visible/writable if its sensor touches a granted project). Empty fails closed.
+        ScopeOutcome::RequireAny(projects) => {
+            if !projects.iter().any(|p| scope.allows_project(*p)) {
+                return outside();
+            }
+        }
+        // A project-scoped entity whose owning project couldn't be resolved (row missing/unbound, or a
+        // create that omits the owning FK to dodge the check): fail closed for any restricted principal.
+        // Administrators never reach here — the unrestricted early-return above skips this whole guard.
+        ScopeOutcome::Unresolved(msg) => {
+            return AppError::Forbidden(msg).into_response();
+        }
+        // An entity with no project dimension (global catalog: parameters, constants, sensors, …):
+        // a project-scoped token may not touch it; a member may (their role capability governs shared
+        // metadata writes).
+        ScopeOutcome::Global(msg) => {
             if is_token {
                 return AppError::Forbidden(msg).into_response();
             }
@@ -509,8 +528,14 @@ pub async fn enforce_scope_on_crud(
 }
 
 enum ScopeOutcome {
-    Project(Uuid),
-    Deny(String),
+    /// All listed projects must be in the caller's scope (owning project + any repoint target).
+    RequireAll(Vec<Uuid>),
+    /// At least one listed project must be in scope (a multi-project entity). Empty → fail closed.
+    RequireAny(Vec<Uuid>),
+    /// Project-scoped but the owning project couldn't be resolved → fail closed for restricted callers.
+    Unresolved(String),
+    /// No project dimension (global catalog) → members allowed (role governs), tokens denied.
+    Global(String),
 }
 
 /// Extract `(entity, optional id)` from a CRUD path like `/api/site_parameters/{id}`.
@@ -528,11 +553,30 @@ async fn resolve_scope_project(
     id: Option<&str>,
     body: Option<&serde_json::Value>,
 ) -> ScopeOutcome {
-    // Update / delete: resolve the owning project from the existing row.
+    let fk = |key: &str| {
+        body.and_then(|b| b.get(key))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| Uuid::parse_str(s).ok())
+    };
+
+    // Update / delete: resolve the owning project(s) from the existing row.
     if let Some(id) = id {
         let Ok(uuid) = Uuid::parse_str(id) else {
-            return ScopeOutcome::Deny("Project-scoped token cannot resolve target".to_string());
+            return ScopeOutcome::Unresolved("Could not resolve target".to_string());
         };
+        // sensor_calibrations spans every project its sensor is deployed to; matches read scoping
+        // (visible/writable if the sensor touches a granted project), so require ANY.
+        if entity == "sensor_calibrations" {
+            let projects = distinct_projects(
+                db,
+                "SELECT DISTINCT s.project_id FROM sensor_calibrations c \
+                 JOIN sensor_deployments d ON d.sensor_id = c.sensor_id \
+                 JOIN sites s ON s.id = d.site_id WHERE c.id = $1",
+                uuid,
+            )
+            .await;
+            return require_any(projects, "calibration");
+        }
         let sql = match entity {
             "sites" => "SELECT project_id FROM sites WHERE id = $1",
             "subprojects" => "SELECT project_id FROM subprojects WHERE id = $1",
@@ -551,90 +595,145 @@ async fn resolve_scope_project(
             "alarm_thresholds" => {
                 "SELECT s.project_id FROM alarm_thresholds t JOIN sites s ON s.id = t.site_id WHERE t.id = $1"
             }
+            "samples" => {
+                "SELECT s.project_id FROM samples sm JOIN sites s ON s.id = sm.site_id WHERE sm.id = $1"
+            }
             "data_streams" => {
                 "SELECT s.project_id FROM data_streams ds JOIN site_parameters sp ON sp.id = ds.site_parameter_id JOIN sites s ON s.id = sp.site_id WHERE ds.id = $1"
             }
             other => {
-                return ScopeOutcome::Deny(format!(
-                    "Project-scoped token cannot modify '{other}'"
-                ));
+                return ScopeOutcome::Global(format!("Project-scoped token cannot modify '{other}'"));
             }
         };
-        return project_from_query(db, sql, uuid).await;
+        // The owning project of the existing row, plus any repoint target in the update body: moving a
+        // site to another subproject, or a subproject to another project, must land in a scope the
+        // caller also holds. All resolved projects must be in scope.
+        let mut projects = distinct_projects(db, sql, uuid).await;
+        if projects.is_empty() {
+            return ScopeOutcome::Unresolved("Target not found within your project access".to_string());
+        }
+        match entity {
+            "sites" => {
+                if let Some(sp) = fk("subproject_id") {
+                    projects.extend(
+                        distinct_projects(db, "SELECT project_id FROM subprojects WHERE id = $1", sp)
+                            .await,
+                    );
+                } else if let Some(p) = fk("project_id") {
+                    projects.push(p);
+                }
+            }
+            "subprojects" => {
+                if let Some(p) = fk("project_id") {
+                    projects.push(p);
+                }
+            }
+            _ => {}
+        }
+        return ScopeOutcome::RequireAll(projects);
     }
 
     // Create: resolve the owning project from the request body's foreign key.
-    let Some(body) = body else {
-        return ScopeOutcome::Deny("Missing request body".to_string());
-    };
-    let fk = |key: &str| {
-        body.get(key)
-            .and_then(serde_json::Value::as_str)
-            .and_then(|s| Uuid::parse_str(s).ok())
-    };
+    if body.is_none() {
+        return ScopeOutcome::Unresolved("Missing request body".to_string());
+    }
 
     match entity {
-        "sites" => fk("project_id").map_or_else(
-            || ScopeOutcome::Deny("Site create must specify project_id".to_string()),
-            ScopeOutcome::Project,
-        ),
-        "subprojects" => fk("project_id").map_or_else(
-            || ScopeOutcome::Deny("Subproject create must specify project_id".to_string()),
-            ScopeOutcome::Project,
-        ),
-        "site_parameters" | "notes" | "annotations" | "sensor_deployments" => match fk("site_id") {
-            Some(site) => {
-                project_from_query(db, "SELECT project_id FROM sites WHERE id = $1", site).await
+        "sites" => match (fk("project_id"), fk("subproject_id")) {
+            (Some(p), _) => ScopeOutcome::RequireAll(vec![p]),
+            (None, Some(sp)) => require_all(
+                distinct_projects(db, "SELECT project_id FROM subprojects WHERE id = $1", sp).await,
+            ),
+            (None, None) => {
+                ScopeOutcome::Unresolved("Site create must specify project_id or subproject_id".to_string())
             }
-            None => ScopeOutcome::Deny(format!("{entity} create must specify site_id")),
         },
-        "alarm_thresholds" => match fk("site_id") {
-            Some(site) => {
-                project_from_query(db, "SELECT project_id FROM sites WHERE id = $1", site).await
+        "subprojects" => fk("project_id").map_or_else(
+            || ScopeOutcome::Unresolved("Subproject create must specify project_id".to_string()),
+            |p| ScopeOutcome::RequireAll(vec![p]),
+        ),
+        "site_parameters" | "notes" | "annotations" | "sensor_deployments" | "samples" => {
+            match fk("site_id") {
+                Some(site) => require_all(
+                    distinct_projects(db, "SELECT project_id FROM sites WHERE id = $1", site).await,
+                ),
+                None => ScopeOutcome::Unresolved(format!("{entity} create must specify site_id")),
             }
-            None => ScopeOutcome::Deny(
-                "Project-scoped token cannot create a global (site-less) alarm threshold"
-                    .to_string(),
+        }
+        "alarm_thresholds" => match fk("site_id") {
+            Some(site) => require_all(
+                distinct_projects(db, "SELECT project_id FROM sites WHERE id = $1", site).await,
+            ),
+            None => ScopeOutcome::Unresolved(
+                "Project-scoped token cannot create a global (site-less) alarm threshold".to_string(),
             ),
         },
+        "sensor_calibrations" => match fk("sensor_id") {
+            Some(sensor) => require_any(
+                distinct_projects(
+                    db,
+                    "SELECT DISTINCT s.project_id FROM sensor_deployments d \
+                     JOIN sites s ON s.id = d.site_id WHERE d.sensor_id = $1",
+                    sensor,
+                )
+                .await,
+                "calibration",
+            ),
+            None => ScopeOutcome::Unresolved("Calibration create must specify sensor_id".to_string()),
+        },
         "data_streams" => match fk("site_parameter_id") {
-            Some(sp) => {
-                project_from_query(
+            Some(sp) => require_all(
+                distinct_projects(
                     db,
                     "SELECT s.project_id FROM site_parameters sp JOIN sites s ON s.id = sp.site_id WHERE sp.id = $1",
                     sp,
                 )
-                .await
-            }
-            None => ScopeOutcome::Deny(
+                .await,
+            ),
+            None => ScopeOutcome::Unresolved(
                 "Project-scoped token cannot create an unpaired stream".to_string(),
             ),
         },
-        other => ScopeOutcome::Deny(format!("Project-scoped token cannot create '{other}'")),
+        other => ScopeOutcome::Global(format!("Project-scoped token cannot create '{other}'")),
     }
 }
 
-async fn project_from_query(
-    db: &sea_orm::DatabaseConnection,
-    sql: &str,
-    id: Uuid,
-) -> ScopeOutcome {
-    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-    match db
-        .query_one(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            sql,
-            [id.into()],
-        ))
-        .await
-    {
-        Ok(Some(row)) => match row.try_get::<Option<Uuid>>("", "project_id").ok().flatten() {
-            Some(project) => ScopeOutcome::Project(project),
-            None => ScopeOutcome::Deny("Target is not bound to a project".to_string()),
-        },
-        Ok(None) => ScopeOutcome::Deny("Target not found within token scope".to_string()),
-        Err(_) => ScopeOutcome::Deny("Could not resolve target project".to_string()),
+/// Build a `RequireAll` from resolved projects, or `Unresolved` when nothing resolved (a create FK
+/// pointing at a missing/unbound site).
+fn require_all(projects: Vec<Uuid>) -> ScopeOutcome {
+    if projects.is_empty() {
+        ScopeOutcome::Unresolved("Target is not bound to a project".to_string())
+    } else {
+        ScopeOutcome::RequireAll(projects)
     }
+}
+
+/// Build a `RequireAny` from resolved projects, or `Unresolved` when the entity resolves to no project
+/// at all (e.g. a calibration for a never-deployed sensor) — fail closed for a restricted caller.
+fn require_any(projects: Vec<Uuid>, what: &str) -> ScopeOutcome {
+    if projects.is_empty() {
+        ScopeOutcome::Unresolved(format!("This {what} is not within your project access"))
+    } else {
+        ScopeOutcome::RequireAny(projects)
+    }
+}
+
+/// All distinct non-NULL `project_id`s a scope query resolves. A DB error yields an empty set, which
+/// the callers treat as unresolved → fail closed.
+async fn distinct_projects(db: &sea_orm::DatabaseConnection, sql: &str, id: Uuid) -> Vec<Uuid> {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    db.query_all(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        sql,
+        [id.into()],
+    ))
+    .await
+    .map(|rows| {
+        rows.iter()
+            .filter_map(|r| r.try_get::<Option<Uuid>>("", "project_id").ok().flatten())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Reject the request if a restricted principal is writing to any site outside its scope. No-op for

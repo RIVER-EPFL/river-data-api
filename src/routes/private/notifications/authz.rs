@@ -15,25 +15,41 @@ use crate::common::AppState;
 use crate::common::authz::Role;
 use crate::routes::private::admin::users;
 
-/// The live authority for a linked chat. `Revoked` means the link must be deactivated.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The live authority for a linked chat. `Active` carries the user's current highest riverdata role
+/// (so command gates can compare levels); `Revoked` means the link must be deactivated.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RoleResolution {
-    Admin,
-    User,
+    Active(Role),
     Revoked,
 }
 
 impl RoleResolution {
-    /// Read commands and grab-sample submission: any current riverdata user.
+    /// Read commands: any current riverdata user (Intern and up).
     #[must_use]
-    pub fn allows_user(self) -> bool {
-        matches!(self, Self::Admin | Self::User)
+    pub fn allows_user(&self) -> bool {
+        matches!(self, Self::Active(_))
     }
 
     /// Operational commands (mutes): Administrator only.
     #[must_use]
-    pub fn allows_admin(self) -> bool {
-        matches!(self, Self::Admin)
+    pub fn allows_admin(&self) -> bool {
+        matches!(self, Self::Active(Role::Administrator))
+    }
+
+    /// At least `min`'s access level — e.g. `Role::River` for data writes like `/grab`, matching the
+    /// HTTP `WriteData` capability so the bot can't be a lower-privilege side door.
+    #[must_use]
+    pub fn allows_level(&self, min: &Role) -> bool {
+        matches!(self, Self::Active(r) if r.level() >= min.level())
+    }
+
+    /// The resolved role, if the user is active.
+    #[must_use]
+    pub fn role(&self) -> Option<&Role> {
+        match self {
+            Self::Active(r) => Some(r),
+            Self::Revoked => None,
+        }
     }
 }
 
@@ -66,7 +82,7 @@ impl Authorizer {
             return Some(cached);
         }
         let resolved = resolve_live(state, sub).await?;
-        self.cache.insert(sub.to_string(), resolved).await;
+        self.cache.insert(sub.to_string(), resolved.clone()).await;
         Some(resolved)
     }
 
@@ -111,17 +127,14 @@ async fn resolve_live(state: &AppState, sub: &str) -> Option<RoleResolution> {
         return None;
     }
     let roles: Vec<serde_json::Value> = roles_resp.json().await.ok()?;
-    let role_names: Vec<Role> = roles
+    // The user's highest riverdata role governs; a non-riverdata realm role (level 0) is revoked.
+    let best = roles
         .iter()
         .filter_map(|r| r["name"].as_str())
         .map(|n| Role::from(n.to_string()))
-        .collect();
-    if role_names.contains(&Role::Administrator) {
-        Some(RoleResolution::Admin)
-    } else if role_names.iter().any(Role::grants_access) {
-        // Any current riverdata level (intern/river/manager) is a delivery-authorized user.
-        Some(RoleResolution::User)
-    } else {
-        Some(RoleResolution::Revoked)
+        .max_by_key(Role::level);
+    match best {
+        Some(role) if role.grants_access() => Some(RoleResolution::Active(role)),
+        _ => Some(RoleResolution::Revoked),
     }
 }

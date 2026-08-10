@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
-use sea_orm::DatabaseConnection;
 use tokio::sync::Mutex;
 
+use crate::common::AppState;
 use crate::config::{Config, EmailBackend};
 
 use super::{DeliveryResult, NotificationChannel, OutgoingMessage};
@@ -249,7 +249,7 @@ impl NotificationChannel for EmailChannel {
         self.mailer.check_health().await
     }
 
-    async fn deliver(&self, _db: &DatabaseConnection, msg: &OutgoingMessage) -> Vec<DeliveryResult> {
+    async fn deliver(&self, _state: &AppState, msg: &OutgoingMessage) -> Vec<DeliveryResult> {
         let outcome = self
             .mailer
             .send(&self.recipient, &msg.subject, &msg.body)

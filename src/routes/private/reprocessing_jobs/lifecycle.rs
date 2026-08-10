@@ -85,6 +85,33 @@ pub fn process_owner() -> &'static str {
     })
 }
 
+/// Startup reconcile for in-process jobs. Both in-process spawn paths
+/// ([`spawn_tracked_job_ctx_with_retry`] and [`run_tracked_job`]) stamp `owner = process_owner()`
+/// with **no lease**, so the worker pool's lease reaper (which keys on an expired
+/// `lease_expires_at`) can never reclaim one orphaned by a crash — it would sit `pending`/`running`/
+/// `retrying` forever. On boot, fail this replica's own leaseless non-terminal rows. Scoped to
+/// [`process_owner`] (stable across a container restart) and run before any in-process job of the new
+/// incarnation is spawned, so it only ever touches a prior incarnation's orphans, never a live job;
+/// worker-pool rows are excluded twice over (they carry a lease and a `worker-…` owner). Peer
+/// replicas reconcile their own orphans on their own boot. Returns the number reclaimed.
+pub async fn reconcile_orphaned_inline_jobs(db: &DatabaseConnection) -> Result<u64, sea_orm::DbErr> {
+    let res = db
+        .execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE reprocessing_jobs \
+             SET status = 'failed', \
+                 error_message = COALESCE(NULLIF(error_message, ''), \
+                     'orphaned in-process job reclaimed on startup'), \
+                 completed_at = now(), owner = NULL \
+             WHERE status IN ('pending', 'running', 'retrying') \
+               AND lease_expires_at IS NULL \
+               AND owner = $1",
+            [process_owner().into()],
+        ))
+        .await?;
+    Ok(res.rows_affected())
+}
+
 /// Handle passed to a tracked job's work closure. Owns a DB connection, the job id, and the event
 /// sender so work can report incremental progress, structured `detail`, and a timeline of log lines
 /// that the UI sees live. Cheap to clone (the retry loop hands a fresh clone to each attempt); the
