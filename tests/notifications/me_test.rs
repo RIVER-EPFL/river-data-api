@@ -4,8 +4,11 @@
 //!
 //! Run with the dev stack up: cargo test --test notifications -- --test-threads=1
 
-use crate::common::fixtures::{GLOBAL_PARAM_TURB_ID, SITE1_ID};
-use crate::common::keycloak::{build_test_app_with_keycloak, get_keycloak_jwt, keycloak_reachable};
+use crate::common::fixtures::{GLOBAL_PARAM_TURB_ID, PROJECT_ID, SITE1_ID};
+use crate::common::keycloak::{
+    build_test_app_with_keycloak, get_keycloak_jwt, grant_project, keycloak_reachable,
+    keycloak_user_id,
+};
 use serial_test::serial;
 
 macro_rules! require_keycloak {
@@ -21,6 +24,9 @@ async fn seeded_app() -> axum::Router {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
+    // `user` is river level; site-scoped subscriptions require a project grant
+    let user_sub = keycloak_user_id("user").await;
+    grant_project(&db, &user_sub, PROJECT_ID).await;
     build_test_app_with_keycloak(db).await
 }
 

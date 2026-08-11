@@ -15,7 +15,8 @@ use river_db::routes::private::admin::users::{ListQuery, list_users};
 use serial_test::serial;
 
 use crate::common::keycloak::{
-    build_test_app_with_keycloak_admin, get_keycloak_jwt, keycloak_reachable,
+    build_test_app_with_keycloak_admin, ensure_realm_user, get_keycloak_jwt, keycloak_reachable,
+    keycloak_user_id,
 };
 
 macro_rules! require_keycloak {
@@ -42,6 +43,7 @@ async fn seeded_app() -> (sea_orm::DatabaseConnection, axum::Router) {
 async fn list_users_returns_role_holders_deduped() {
     require_keycloak!();
     let (_db, app) = seeded_app().await;
+    ensure_realm_user("dualrole", "dualrole", &["riverdata-admin", "riverdata-manager"]).await;
     let jwt = get_keycloak_jwt("admin", "admin").await;
 
     let (status, body) = crate::common::get_with_token(&app, "/api/users", &jwt).await;
@@ -52,20 +54,21 @@ async fn list_users_returns_role_holders_deduped() {
     assert!(usernames.contains(&"admin"), "admin user missing: {usernames:?}");
     assert!(usernames.contains(&"user"), "regular user missing: {usernames:?}");
 
-    // `admin` holds both riverdata roles, so the per-role fetches each return it — the union
-    // must dedupe by id.
+    // A user holding two levels appears in both per-role member lists — the union must dedupe.
     assert_eq!(
-        usernames.iter().filter(|u| **u == "admin").count(),
+        usernames.iter().filter(|u| **u == "dualrole").count(),
         1,
-        "users with both roles must appear once"
+        "users with two roles must appear once: {usernames:?}"
     );
-
-    let admin = users.iter().find(|u| u["username"] == "admin").unwrap();
-    let roles: Vec<&str> = admin["roles"]
+    let dual = users.iter().find(|u| u["username"] == "dualrole").unwrap();
+    let roles: Vec<&str> = dual["roles"]
         .as_array()
         .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
-    assert!(roles.contains(&"riverdata-admin"), "admin roles: {roles:?}");
+    assert!(
+        roles.contains(&"riverdata-admin") && roles.contains(&"riverdata-manager"),
+        "dualrole roles: {roles:?}"
+    );
 }
 
 #[tokio::test]
@@ -106,6 +109,95 @@ async fn non_admin_cannot_reach_user_management() {
     assert_eq!(status, 403);
     let (status, _) = crate::common::get_with_token(&app, "/api/users/search?q=a", &jwt).await;
     assert_eq!(status, 403);
+}
+
+#[tokio::test]
+#[serial]
+async fn assign_unknown_role_rejected_and_current_roles_untouched() {
+    require_keycloak!();
+    let (_db, app) = seeded_app().await;
+    ensure_realm_user("rolevictim", "rolevictim", &["riverdata-river"]).await;
+    let victim_id = keycloak_user_id("rolevictim").await;
+    let jwt = get_keycloak_jwt("admin", "admin").await;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/users/{victim_id}/roles"),
+        &serde_json::json!({ "roles": ["riverdata-nonexistent"] }),
+        &jwt,
+    )
+    .await;
+    assert_eq!(status, 400, "unknown role must be rejected: {body}");
+    assert!(
+        body.contains("riverdata-nonexistent"),
+        "error names the unknown role: {body}"
+    );
+
+    let (status, body) =
+        crate::common::get_with_token(&app, &format!("/api/users/{victim_id}"), &jwt).await;
+    assert_eq!(status, 200, "{body}");
+    let user: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let roles: Vec<&str> = user["roles"]
+        .as_array()
+        .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        roles,
+        vec!["riverdata-river"],
+        "rejected assignment must leave existing roles untouched"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn create_user_endpoint_is_removed() {
+    require_keycloak!();
+    let (_db, app) = seeded_app().await;
+    let jwt = get_keycloak_jwt("admin", "admin").await;
+
+    let (status, _) = crate::common::post_json_with_token(
+        &app,
+        "/api/users",
+        &serde_json::json!({ "username": "should-not-exist" }),
+        &jwt,
+    )
+    .await;
+    assert_eq!(status, 405, "POST /users must no longer be routable");
+}
+
+#[tokio::test]
+#[serial]
+async fn list_and_search_report_identical_roles_for_same_user() {
+    require_keycloak!();
+    let (_db, app) = seeded_app().await;
+    let jwt = get_keycloak_jwt("admin", "admin").await;
+
+    let roles_from = |body: &str, username: &str| -> Option<Vec<String>> {
+        let users: Vec<serde_json::Value> = serde_json::from_str(body).ok()?;
+        let user = users.iter().find(|u| u["username"] == username)?;
+        Some(
+            user["roles"]
+                .as_array()?
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect(),
+        )
+    };
+
+    let (status, list_body) = crate::common::get_with_token(&app, "/api/users", &jwt).await;
+    assert_eq!(status, 200, "{list_body}");
+    let (status, search_body) =
+        crate::common::get_with_token(&app, "/api/users/search?q=user", &jwt).await;
+    assert_eq!(status, 200, "{search_body}");
+
+    let mut list_roles = roles_from(&list_body, "user").expect("user in list");
+    let mut search_roles = roles_from(&search_body, "user").expect("user in search");
+    list_roles.sort();
+    search_roles.sort();
+    assert_eq!(
+        list_roles, search_roles,
+        "list and search must report the same roles shape"
+    );
 }
 
 /// Mock Keycloak: token grant succeeds, role-members listing is 403 (service account without

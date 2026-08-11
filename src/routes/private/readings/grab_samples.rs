@@ -131,6 +131,17 @@ async fn auto_create_samples(
         if count < 2 {
             continue;
         }
+        // Re-posting the same grab must reuse its sample, not accumulate empty duplicates
+        if let Some(existing) = samples::Entity::find()
+            .filter(samples::Column::SiteId.eq(site_id))
+            .filter(samples::Column::ParameterId.eq(parameter_id))
+            .filter(samples::Column::CollectedAt.eq(time))
+            .one(txn)
+            .await?
+        {
+            sample_map.insert((parameter_id, time), existing.id);
+            continue;
+        }
         let sample = samples::ActiveModel {
             id: Set(Uuid::new_v4()),
             site_id: Set(site_id),
@@ -312,15 +323,16 @@ pub async fn insert_grab_samples(
 
             let sample_id = sample_map.get(&group_key).copied();
 
-            // Auto-assign replicate_index: if part of a sample, start at 1
+            // Auto-assign replicate_index from 0 within the (parameter, time) group so every
+            // group has an index-0 row and default (replicate_index = 0) queries see one point
+            // per grab.
             let replicate_index = if let Some(idx) = r.replicate_index {
                 idx
-            } else if sample_id.is_some() {
-                let counter = index_counters.entry(group_key).or_insert(0);
-                *counter += 1;
-                *counter
             } else {
-                0
+                let counter = index_counters.entry(group_key).or_insert(0);
+                let idx = *counter;
+                *counter += 1;
+                idx
             };
 
             // An explicit instant curve wins: store raw + corrected + the curve id. Otherwise keep the

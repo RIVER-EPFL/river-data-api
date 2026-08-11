@@ -223,7 +223,8 @@ async fn reconcile(
         "UPDATE alarm_events ae \
          SET resolved_at = NOW(), \
              updated_at = NOW(), \
-             resolved_value = (SELECT COALESCE(r.calibrated_value, r.raw_value) FROM readings r \
+             resolved_value = (SELECT COALESCE(smp.mean, r.calibrated_value, r.raw_value) FROM readings r \
+                               LEFT JOIN samples smp ON smp.id = r.sample_id \
                                WHERE r.site_id = ae.site_id AND r.parameter_id = ae.parameter_id \
                                  AND r.replicate_index = 0 \
                                ORDER BY r.time DESC LIMIT 1) \

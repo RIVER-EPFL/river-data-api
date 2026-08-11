@@ -246,7 +246,7 @@ pub async fn get_site_alarms(
     let alarm_param_ids: Vec<uuid::Uuid> = params_with_thresholds.iter().map(|p| p.id).collect();
 
     let min_severity = query.severity.unwrap_or(1);
-    let val_expr = "COALESCE(r.calibrated_value, r.raw_value)";
+    let val_expr = "COALESCE(smp.mean, r.calibrated_value, r.raw_value)";
 
     let violation_condition = super::thresholds::violation_condition(
         val_expr,
@@ -276,9 +276,10 @@ pub async fn get_site_alarms(
         SELECT
             r.parameter_id,
             r.time,
-            COALESCE(r.calibrated_value, r.raw_value) AS value,
+            COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value,
             ({sev_case})::smallint as severity
         FROM readings r
+        LEFT JOIN samples smp ON smp.id = r.sample_id
         JOIN resolved_thresholds t ON r.parameter_id = t.parameter_id
         WHERE r.site_id = $1
           AND r.time >= $2
@@ -482,8 +483,9 @@ pub(crate) async fn fetch_active_alarm_rows(
             AND sp.parameter_id = rt.parameter_id
             AND sp.is_active = true
         CROSS JOIN LATERAL (
-            SELECT COALESCE(r.calibrated_value, r.raw_value) AS value, r.time
+            SELECT COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value, r.time
             FROM readings r
+            LEFT JOIN samples smp ON smp.id = r.sample_id
             WHERE r.site_id = rt.site_id AND r.parameter_id = rt.parameter_id
               AND r.replicate_index = 0
             ORDER BY r.time DESC
@@ -1144,11 +1146,12 @@ pub async fn get_thresholds(
     let sql = format!(
         "WITH resolved AS ({resolved_cte}), \
          latest AS ( \
-            SELECT DISTINCT ON (site_id, parameter_id) site_id, parameter_id, \
-                   COALESCE(calibrated_value, raw_value) AS current_value \
-            FROM readings \
-            WHERE replicate_index = 0 AND site_id IS NOT NULL AND time > now() - interval '30 days' \
-            ORDER BY site_id, parameter_id, time DESC \
+            SELECT DISTINCT ON (r.site_id, r.parameter_id) r.site_id, r.parameter_id, \
+                   COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS current_value \
+            FROM readings r \
+            LEFT JOIN samples smp ON smp.id = r.sample_id \
+            WHERE r.replicate_index = 0 AND r.site_id IS NOT NULL AND r.time > now() - interval '30 days' \
+            ORDER BY r.site_id, r.parameter_id, r.time DESC \
          ) \
          SELECT r.site_id, r.parameter_id, r.warning_min, r.warning_max, r.alarm_min, r.alarm_max, \
                 r.source, l.current_value \

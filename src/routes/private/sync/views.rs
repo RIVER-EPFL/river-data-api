@@ -194,24 +194,8 @@ pub async fn get_discovery(
     let mut items = Vec::new();
 
     for stream in streams {
-        // Parse hierarchy from metadata or source_path
-        let hierarchy = stream.metadata.get("hierarchy").cloned();
-        let (project_name, site_name, param_name) = if let Some(h) = &hierarchy {
-            (
-                h.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                h.get("site").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                h.get("parameter").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            )
-        } else if let Some(ref path) = stream.source_path {
-            let segs: Vec<&str> = path.split('/').collect();
-            (
-                segs.get(1).unwrap_or(&"").to_string(),
-                segs.get(2).unwrap_or(&"").to_string(),
-                segs.get(3).unwrap_or(&"").to_string(),
-            )
-        } else {
-            (String::new(), String::new(), stream.source_name.clone().unwrap_or_default())
-        };
+        let h = super::service::extract_hierarchy(&stream);
+        let (project_name, site_name, param_name) = (h.project, h.site, h.parameter);
 
         let units = stream.metadata.get("units")
             .and_then(|v| v.as_str())
@@ -487,12 +471,18 @@ pub async fn apply_discovery(
 
     txn.commit().await?;
 
-    // Trigger aggregate refresh if any readings were backfilled
+    // Refresh aggregates as a tracked job so a failure is visible and rerunnable
     if resp.total_backfilled > 0 {
-        let db_clone = db.clone();
-        tokio::spawn(async move {
-            crate::common::sync_state::refresh_continuous_aggregates_full(&db_clone).await;
-        });
+        crate::routes::private::reprocessing_jobs::worker::enqueue(
+            db,
+            "refresh_aggregates_full",
+            None,
+            None,
+            &serde_json::json!({ "full": true }),
+            None,
+        )
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     }
 
     Ok(Json(resp))
@@ -503,6 +493,7 @@ async fn resolve_or_create_project<C: ConnectionTrait>(
     db: &C,
     use_id: Option<Uuid>,
     create: Option<&CreateProjectAction>,
+    data_source: Option<&str>,
 ) -> Result<(Uuid, bool), String> {
     if let Some(pid) = use_id {
         return Ok((pid, false));
@@ -518,7 +509,7 @@ async fn resolve_or_create_project<C: ConnectionTrait>(
         id: Set(Uuid::new_v4()),
         name: Set(cp.name.clone()),
         description: Set(None),
-        data_source: Set(Some("vaisala".to_string())),
+        data_source: Set(data_source.map(String::from)),
         is_public: Set(false),
         public_code: Set(None),
         public_api_title: Set(None),
@@ -708,7 +699,18 @@ async fn process_action<C: ConnectionTrait>(
     db: &C,
     action: &ApplyAction,
 ) -> Result<ActionStats, String> {
-    let (project_id, proj_new) = resolve_or_create_project(db, action.use_project_id, action.create_project.as_ref()).await?;
+    let stream_source = data_streams::Entity::find_by_id(action.stream_id)
+        .one(db)
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|s| s.source_system);
+    let (project_id, proj_new) = resolve_or_create_project(
+        db,
+        action.use_project_id,
+        action.create_project.as_ref(),
+        stream_source.as_deref(),
+    )
+    .await?;
     let (site_id, site_new) = resolve_or_create_site(db, action.use_site_id, action.create_site.as_ref(), project_id).await?;
     let (parameter_id, param_new) = resolve_or_create_parameter(db, action.use_parameter_id, action.create_parameter.as_ref()).await?;
     let (site_parameter_id, sp_new) = resolve_or_create_site_parameter(
@@ -802,37 +804,31 @@ pub async fn grouped_discovery(
     let mut param_info: std::collections::HashMap<String, (String, usize)> = std::collections::HashMap::new();
 
     for stream in &streams {
-        // Project: use hierarchy metadata or capitalize source_system
-        let project_name = stream.metadata.get("hierarchy")
-            .and_then(|h| h.get("project"))
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .unwrap_or_else(|| req.source_system.to_uppercase());
+        let hierarchy = super::service::extract_hierarchy(stream);
+        let project_name = if hierarchy.project.is_empty() {
+            req.source_system.to_uppercase()
+        } else {
+            hierarchy.project.clone()
+        };
         *project_counts.entry(project_name).or_default() += 1;
 
-        // Site: extract from source_path segment 3 (e.g., "nomis/GL1/GL1_DN/..." → "GL1_DN")
-        let site_name = stream.source_path.as_deref()
-            .and_then(|p| p.split('/').nth(2))
-            .unwrap_or("")
-            .to_string();
+        let site_name = hierarchy.site.clone();
         let glacier_name = stream.metadata.get("glacier")
             .and_then(|g| g.get("name"))
             .and_then(|v| v.as_str())
             .map(|s| s.trim_matches('"').to_string());
         if !site_name.is_empty() {
-            let coords = stream.metadata.get("coordinates");
-            let lat = coords.and_then(|c| c.get("latitude")).and_then(|v| v.as_f64());
-            let lon = coords.and_then(|c| c.get("longitude")).and_then(|v| v.as_f64());
-            let alt = coords.and_then(|c| c.get("altitude_m")).and_then(|v| v.as_f64());
-            let entry = site_info.entry(site_name).or_insert((glacier_name.clone(), 0, lat, lon, alt));
+            let entry = site_info.entry(site_name).or_insert((
+                glacier_name.clone(),
+                0,
+                hierarchy.latitude,
+                hierarchy.longitude,
+                hierarchy.altitude_m,
+            ));
             entry.1 += 1;
         }
 
-        // Parameter: extract display name from source_name (e.g., "GL1_DN - Conductivity" → "Conductivity")
-        let param_display = stream.source_name.as_deref()
-            .and_then(|n| n.split(" - ").nth(1))
-            .unwrap_or("")
-            .to_string();
+        let param_display = hierarchy.parameter.clone();
         let units = stream.metadata.get("units")
             .and_then(|v| v.as_str())
             .unwrap_or("")
@@ -1071,14 +1067,9 @@ pub async fn bulk_pair(
     let mut stream_to_sp: Vec<(Uuid, Uuid)> = Vec::with_capacity(streams.len()); // stream_id → site_parameter_id
 
     for stream in &streams {
-        let site_name = stream.source_path.as_deref()
-            .and_then(|p| p.split('/').nth(2))
-            .unwrap_or("")
-            .to_lowercase();
-        let param_name = stream.source_name.as_deref()
-            .and_then(|n| n.split(" - ").nth(1))
-            .unwrap_or("")
-            .to_lowercase();
+        let hierarchy = super::service::extract_hierarchy(stream);
+        let site_name = hierarchy.site.to_lowercase();
+        let param_name = hierarchy.parameter.to_lowercase();
 
         let Some(&site_id) = site_map.get(&site_name) else {
             stream_to_sp.push((stream.id, Uuid::nil()));
@@ -1177,7 +1168,7 @@ pub async fn bulk_pair(
     )).await?;
 
     // Backfill status_events too
-    let _ = txn.execute(Statement::from_sql_and_values(
+    txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE status_events se
           SET site_id = sp.site_id, parameter_id = sp.parameter_id
@@ -1186,16 +1177,23 @@ pub async fn bulk_pair(
           WHERE se.stream_id = ds.id AND se.site_id IS NULL
             AND ds.source_system = $1",
         [req.source_system.clone().into()],
-    )).await;
+    ))
+    .await?;
 
     txn.commit().await?;
 
-    // Trigger aggregate refresh in background
+    // Refresh aggregates as a tracked job so a failure is visible and rerunnable
     if paired > 0 {
-        let db_clone = db.clone();
-        tokio::spawn(async move {
-            crate::common::sync_state::refresh_continuous_aggregates_full(&db_clone).await;
-        });
+        crate::routes::private::reprocessing_jobs::worker::enqueue(
+            db,
+            "refresh_aggregates_full",
+            None,
+            None,
+            &serde_json::json!({ "full": true }),
+            None,
+        )
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     }
 
     tracing::info!(
@@ -1301,8 +1299,6 @@ struct PlanEntryUpdate {
     parameter_name: Option<String>,
     #[serde(default)]
     parameter_units: Option<String>,
-    #[serde(default)]
-    parameter_id: Option<Uuid>,
 }
 
 /// Edit a draft pairing plan (only `draft` status allows updates). Requires `write_metadata`.
@@ -1336,6 +1332,8 @@ pub async fn update_pairing_plan(
         serde_json::from_value(plan.entries.clone())
             .map_err(|e| AppError::Internal(format!("Failed to parse entries: {e}")))?;
 
+    let catalog = crate::routes::private::sync::service::load_entity_catalog(&state.db).await?;
+
     for update in &req.updates {
         if let Some(entry) = entries.iter_mut().find(|e| e.stream_id == update.stream_id) {
             if let Some(ref action) = update.action {
@@ -1343,25 +1341,29 @@ pub async fn update_pairing_plan(
             }
             if let Some(ref name) = update.project_name {
                 entry.project.name = name.clone();
-                entry.project.id = None;
-                entry.project.create = true;
             }
             if let Some(ref name) = update.site_name {
                 entry.site.name = name.clone();
-                entry.site.id = None;
-                entry.site.create = true;
             }
             if let Some(ref name) = update.parameter_name {
                 entry.parameter.name = name.clone();
-                entry.parameter.id = None;
-                entry.parameter.create = true;
             }
             if let Some(ref units) = update.parameter_units {
                 entry.parameter.units = units.clone();
             }
-            if let Some(pid) = update.parameter_id {
-                entry.parameter.id = Some(pid);
-                entry.parameter.create = false;
+            crate::routes::private::sync::service::reclassify_entry(entry, &catalog);
+            // A renamed entry that resolves to an existing site must not carry the stream's
+            // coordinates: apply would backfill them onto that unrelated site.
+            if update.site_name.is_some() && entry.site.id.is_some() {
+                entry.site.latitude = None;
+                entry.site.longitude = None;
+                entry.site.altitude_m = None;
+            }
+            if entry.action == "pair"
+                && (entry.site.name.trim().is_empty() || entry.parameter.name.trim().is_empty())
+            {
+                entry.action = "skip".to_string();
+                entry.warnings.push("site or parameter name is empty".to_string());
             }
         }
     }

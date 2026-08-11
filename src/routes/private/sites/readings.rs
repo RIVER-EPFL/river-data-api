@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
-use crate::routes::private::{parameters, sites::parameters as site_parameters};
+use crate::routes::private::{parameters, readings::samples, sites::parameters as site_parameters};
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, validate_optional_time_range, resolve_site_with_project};
 use crate::common::bulk::{self, StreamableParam};
@@ -38,6 +38,7 @@ struct ReadingRow {
     is_flagged: Option<bool>,
     flag_reason: Option<String>,
     measurement_type: Option<String>,
+    sample_id: Option<Uuid>,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -49,6 +50,7 @@ struct ReadingRowWithSeverity {
     is_flagged: Option<bool>,
     flag_reason: Option<String>,
     measurement_type: Option<String>,
+    sample_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -94,6 +96,36 @@ pub struct ParameterData {
     /// Per-point measurement type (continuous/spot/derived). Only present when `include_measurement_type=true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub measurement_types: Option<Vec<Option<String>>>,
+    /// Per-point sample stats with individual replicates (same length as times; null where the
+    /// point is not a replicate group). Only present when `include_sample_stats=true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub samples: Option<Vec<Option<SampleStatOut>>>,
+}
+
+/// One replicate behind a grab-sample point.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ReplicateOut {
+    pub replicate_index: i16,
+    pub raw_value: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calibrated_value: Option<f64>,
+    pub flagged: bool,
+}
+
+/// Sample statistics and replicate values behind one served grab point.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SampleStatOut {
+    pub sample_id: Uuid,
+    pub n: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mean: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdev: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+    pub replicates: Vec<ReplicateOut>,
 }
 
 impl StreamableParam for ParameterData {
@@ -142,6 +174,9 @@ pub struct SiteReadingsQuery {
     pub sample_id: Option<Uuid>,
     /// Include a per-point measurement_type indicator (continuous/spot/derived) on each parameter.
     pub include_measurement_type: Option<bool>,
+    /// Attach per-point sample statistics (n, mean, stdev, min, max) and the individual
+    /// replicate values behind each grab point. Spot data only; one batched lookup.
+    pub include_sample_stats: Option<bool>,
 }
 
 /// Get readings for a specific site
@@ -253,6 +288,7 @@ pub async fn get_site_readings(
     let include_flagged = query.include_flagged.unwrap_or(true);
     let include_replicates = query.include_replicates.unwrap_or(false) || query.sample_id.is_some();
     let include_measurement_type = query.include_measurement_type.unwrap_or(false);
+    let include_sample_stats = query.include_sample_stats.unwrap_or(false) && !include_replicates;
 
     let measurement_type_filter = query.measurement_type.as_deref().unwrap_or("");
 
@@ -271,6 +307,7 @@ pub async fn get_site_readings(
             if include_replicates { "replicates" } else { "" },
             &query.sample_id.map(|id| id.to_string()).unwrap_or_default(),
             if include_measurement_type { "mtype" } else { "" },
+            if include_sample_stats { "sstats" } else { "" },
         ],
     );
 
@@ -307,23 +344,39 @@ pub async fn get_site_readings(
         .collect();
     values.extend(param_ids.iter().map(|id| (*id).into()));
 
+    // A grab with replicates is represented by its sample: the served value is the sample mean
+    // (portal parity: the plotted grab value is the replicate average). Individual replicate
+    // values are only served on the replicate drill-down (include_replicates / sample_id).
+    let value_expr = if include_replicates {
+        "COALESCE(r.calibrated_value, r.raw_value)"
+    } else {
+        "COALESCE(smp.mean, r.calibrated_value, r.raw_value)"
+    };
+    let samples_join = if include_replicates {
+        ""
+    } else {
+        " LEFT JOIN samples smp ON smp.id = r.sample_id"
+    };
+
     let select_clause: String = if include_alarms {
         // Severity from the one shared ladder (alarms engine). NULL when the slot has no threshold
         // at any tier (no `t` row); otherwise the ladder treats all-NULL bounds as 0 (disabled).
         let sev = crate::routes::private::alarms::thresholds::severity_case(
-            "COALESCE(r.calibrated_value, r.raw_value)",
+            value_expr,
             "t.warning_min",
             "t.warning_max",
             "t.alarm_min",
             "t.alarm_max",
         );
         format!(
-            "r.parameter_id, r.time, COALESCE(r.calibrated_value, r.raw_value) AS value, \
+            "r.parameter_id, r.time, {value_expr} AS value, \
              CASE WHEN t.parameter_id IS NULL THEN NULL ELSE ({sev})::smallint END as severity, \
-             r.is_flagged, r.flag_reason, r.measurement_type"
+             r.is_flagged, r.flag_reason, r.measurement_type, r.sample_id"
         )
     } else {
-        "r.parameter_id, r.time, COALESCE(r.calibrated_value, r.raw_value) AS value, r.is_flagged, r.flag_reason, r.measurement_type".to_string()
+        format!(
+            "r.parameter_id, r.time, {value_expr} AS value, r.is_flagged, r.flag_reason, r.measurement_type, r.sample_id"
+        )
     };
 
     let from_clause: String = if include_alarms {
@@ -335,10 +388,10 @@ pub async fn get_site_readings(
             Some(param_ids.clone()),
         );
         format!(
-            "readings r LEFT JOIN ({cte}) t ON t.parameter_id = r.parameter_id AND t.site_id = r.site_id"
+            "readings r{samples_join} LEFT JOIN ({cte}) t ON t.parameter_id = r.parameter_id AND t.site_id = r.site_id"
         )
     } else {
-        "readings r".to_string()
+        format!("readings r{samples_join}")
     };
 
     let next_param = param_ids.len() + 2;
@@ -490,6 +543,7 @@ pub async fn get_site_readings(
                     flagged: flagged_vec,
                     flag_reasons: flag_reasons_vec,
                     measurement_types: measurement_types_vec,
+                    samples: None,
                 }
             })
             .collect();
@@ -521,6 +575,8 @@ pub async fn get_site_readings(
     let mut param_flags: HashMap<Uuid, FlagVec> = HashMap::new();
     let mut param_meas_types: HashMap<Uuid, Vec<(DateTime<Utc>, Option<String>)>> = HashMap::new();
 
+    let mut param_sample_ids: HashMap<Uuid, Vec<(DateTime<Utc>, Uuid)>> = HashMap::new();
+
     if include_alarms {
         for row in query_result {
             if let Ok(r) = ReadingRowWithSeverity::from_query_result(&row, "") {
@@ -546,6 +602,12 @@ pub async fn get_site_readings(
                         .or_default()
                         .push((time, r.measurement_type));
                 }
+                if include_sample_stats && let Some(sid) = r.sample_id {
+                    param_sample_ids
+                        .entry(r.parameter_id)
+                        .or_default()
+                        .push((time, sid));
+                }
             }
         }
     } else {
@@ -569,9 +631,28 @@ pub async fn get_site_readings(
                         .or_default()
                         .push((time, r.measurement_type));
                 }
+                if include_sample_stats && let Some(sid) = r.sample_id {
+                    param_sample_ids
+                        .entry(r.parameter_id)
+                        .or_default()
+                        .push((time, sid));
+                }
             }
         }
     }
+
+    // One batched lookup resolves every referenced sample and its replicate readings
+    let sample_stats: HashMap<Uuid, SampleStatOut> = if include_sample_stats {
+        let ids: Vec<Uuid> = param_sample_ids
+            .values()
+            .flat_map(|v| v.iter().map(|(_, sid)| *sid))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        fetch_sample_stats(&state.db, &ids).await?
+    } else {
+        HashMap::new()
+    };
 
     let mut times: Vec<DateTime<Utc>> = time_set.into_iter().collect();
     times.sort_unstable();
@@ -646,6 +727,20 @@ pub async fn get_site_readings(
                 }
             }
 
+            let samples_vec: Option<Vec<Option<SampleStatOut>>> = if include_sample_stats {
+                let mut vec: Vec<Option<SampleStatOut>> = vec![None; times.len()];
+                if let Some(sids) = param_sample_ids.get(&global_param_id) {
+                    for (time, sid) in sids {
+                        if let Some(&idx) = time_index.get(time) {
+                            vec[idx] = sample_stats.get(sid).cloned();
+                        }
+                    }
+                }
+                Some(vec)
+            } else {
+                None
+            };
+
             ParameterData {
                 id: sp.id,
                 parameter_id: sp.parameter_id,
@@ -659,6 +754,7 @@ pub async fn get_site_readings(
                 flagged: flagged_vec,
                 flag_reasons: flag_reasons_vec,
                 measurement_types: measurement_types_vec,
+                samples: samples_vec,
             }
         })
         .collect();
@@ -681,4 +777,64 @@ pub async fn get_site_readings(
             cache::cache_and_respond(&state, cache_key, &response, actual_end).await
         }
     }
+}
+
+/// Resolve sample rows and their replicate readings for the given sample ids in two batched
+/// queries, keyed by sample id.
+async fn fetch_sample_stats(
+    db: &sea_orm::DatabaseConnection,
+    sample_ids: &[Uuid],
+) -> Result<HashMap<Uuid, SampleStatOut>, AppError> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    if sample_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut stats: HashMap<Uuid, SampleStatOut> = samples::Entity::find()
+        .filter(samples::Column::Id.is_in(sample_ids.to_vec()))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|s| {
+            (
+                s.id,
+                SampleStatOut {
+                    sample_id: s.id,
+                    n: s.n,
+                    mean: s.mean,
+                    stdev: s.stdev,
+                    min: s.min_value,
+                    max: s.max_value,
+                    replicates: Vec::new(),
+                },
+            )
+        })
+        .collect();
+
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT sample_id, replicate_index, raw_value, calibrated_value, is_flagged \
+             FROM readings WHERE sample_id = ANY($1) ORDER BY sample_id, replicate_index",
+            [sample_ids.to_vec().into()],
+        ))
+        .await?;
+    for row in rows {
+        let Ok(sid) = row.try_get::<Uuid>("", "sample_id") else { continue };
+        if let Some(stat) = stats.get_mut(&sid) {
+            stat.replicates.push(ReplicateOut {
+                replicate_index: row.try_get("", "replicate_index").unwrap_or(0),
+                raw_value: row.try_get("", "raw_value").unwrap_or(f64::NAN),
+                calibrated_value: row.try_get("", "calibrated_value").ok(),
+                flagged: row
+                    .try_get::<Option<bool>>("", "is_flagged")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false),
+            });
+        }
+    }
+
+    Ok(stats)
 }

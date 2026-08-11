@@ -52,17 +52,6 @@ pub struct ListQuery {
     pub filter: Option<String>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateUserRequest {
-    pub username: String,
-    pub email: Option<String>,
-    pub first_name: Option<String>,
-    pub last_name: Option<String>,
-    pub password: Option<String>,
-    pub enabled: Option<bool>,
-}
-
 #[derive(Debug, Deserialize, serde::Serialize, ToSchema)]
 pub struct KeycloakRole {
     pub id: String,
@@ -350,15 +339,12 @@ pub async fn search_users(
         .collect();
     let all_roles = futures::future::join_all(role_futures).await;
 
-    let users: Vec<serde_json::Value> = kc_users
-        .iter()
-        .zip(all_roles)
-        .map(|(u, roles)| {
-            let mut user = simplify_user(u);
-            user["roles"] = serde_json::json!(roles);
-            user
-        })
-        .collect();
+    let mut users: Vec<serde_json::Value> = Vec::with_capacity(kc_users.len());
+    for (u, roles) in kc_users.iter().zip(all_roles) {
+        let mut user = simplify_user(u);
+        user["roles"] = serde_json::json!(roles?);
+        users.push(user);
+    }
 
     Ok(Json(users))
 }
@@ -407,93 +393,11 @@ pub async fn get_user(
         .map_err(|e| AppError::Internal(format!("Failed to parse user: {e}")))?;
 
     // Fetch realm role mappings
-    let roles = fetch_user_roles(client, &token, &base, &id).await;
+    let roles = fetch_user_roles(client, &token, &base, &id).await?;
 
     let mut result = simplify_user(&user);
     result["roles"] = serde_json::json!(roles);
     Ok(Json(result))
-}
-
-/// Create a Keycloak user. Access-level assignment is a separate step (`POST /users/{id}/roles`).
-/// Returns the new user's ID. Requires `require_admin`.
-#[utoipa::path(
-    post,
-    path = "/users",
-    request_body = CreateUserRequest,
-    responses(
-        (status = 201, description = "User created"),
-        (status = 409, description = "Username or email already exists"),
-    ),
-    tag = "admin"
-)]
-pub async fn create_user(
-    State(state): State<AppState>,
-    Json(req): Json<CreateUserRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    let token = get_admin_token(&state).await?;
-    let client = admin_client(&state)?;
-    let base = admin_base_url(&state)?;
-
-    let mut body = serde_json::json!({
-        "username": req.username,
-        "email": req.email,
-        "firstName": req.first_name,
-        "lastName": req.last_name,
-        "enabled": req.enabled.unwrap_or(true),
-    });
-
-    if let Some(password) = &req.password {
-        body["credentials"] = serde_json::json!([{
-            "type": "password",
-            "value": password,
-            "temporary": false,
-        }]);
-    }
-
-    let resp = client
-        .http_client
-        .post(format!("{base}/users"))
-        .bearer_auth(&token)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(format!("Keycloak request failed: {e}")))?;
-
-    if resp.status() == reqwest::StatusCode::CONFLICT {
-        return Err(AppError::BadRequest("User already exists".to_string()));
-    }
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(AppError::Internal(format!(
-            "Keycloak create user failed ({status}): {body}"
-        )));
-    }
-
-    // Extract user ID from Location header
-    let user_id = resp
-        .headers()
-        .get("location")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.rsplit('/').next())
-        .map(String::from)
-        .ok_or_else(|| AppError::Internal("No user ID in Keycloak response".to_string()))?;
-
-    // Fetch the created user to return it
-    let user_resp = client
-        .http_client
-        .get(format!("{base}/users/{user_id}"))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to fetch created user: {e}")))?;
-
-    let user: serde_json::Value = user_resp
-        .json()
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to parse created user: {e}")))?;
-
-    Ok(Json(simplify_user(&user)))
 }
 
 /// Update a Keycloak user (partial JSON merge). Requires `require_admin`.
@@ -568,7 +472,7 @@ pub async fn update_user(
         set_user_roles(client, &token, &base, &id, &role_names).await?;
         role_names
     } else {
-        fetch_user_roles(client, &token, &base, &id).await
+        fetch_user_roles(client, &token, &base, &id).await?
     };
 
     let enabled = current["enabled"].as_bool().unwrap_or(true);
@@ -735,34 +639,39 @@ async fn fetch_role_users(
     Ok(users)
 }
 
+/// A user's directly assigned riverdata access roles. Only the four canonical levels are
+/// returned so every endpoint reports the same `roles` shape as `list_users`.
 async fn fetch_user_roles(
     client: &KeycloakAdmin,
     token: &str,
     base: &str,
     user_id: &str,
-) -> Vec<String> {
+) -> AppResult<Vec<String>> {
     let resp = client
         .http_client
         .get(format!("{base}/users/{user_id}/role-mappings/realm"))
         .bearer_auth(token)
         .send()
-        .await;
+        .await
+        .map_err(|e| AppError::Internal(format!("Keycloak role mappings request failed: {e}")))?;
 
-    match resp {
-        Ok(r) if r.status().is_success() => {
-            let roles: Vec<KeycloakRole> = r.json().await.unwrap_or_default();
-            roles
-                .into_iter()
-                .map(|r| r.name)
-                .filter(|n| {
-                    !n.starts_with("default-roles-")
-                        && n != "uma_authorization"
-                        && n != "offline_access"
-                })
-                .collect()
-        }
-        _ => vec![],
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!(
+            "Keycloak role mappings request failed ({status}): {body}"
+        )));
     }
+
+    let roles: Vec<KeycloakRole> = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to parse role mappings: {e}")))?;
+    Ok(roles
+        .into_iter()
+        .map(|r| r.name)
+        .filter(|n| RIVER_ROLE_NAMES.contains(&n.as_str()))
+        .collect())
 }
 
 async fn set_user_roles(
@@ -781,7 +690,34 @@ async fn set_user_roles(
         .await
         .map_err(|e| AppError::Internal(format!("Failed to fetch roles: {e}")))?;
 
-    let all_roles: Vec<KeycloakRole> = all_roles_resp.json().await.unwrap_or_default();
+    if !all_roles_resp.status().is_success() {
+        let status = all_roles_resp.status();
+        let body = all_roles_resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!(
+            "Failed to fetch roles ({status}): {body}"
+        )));
+    }
+    let all_roles: Vec<KeycloakRole> = all_roles_resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to parse roles: {e}")))?;
+
+    // Every requested role must exist in the realm before anything is removed — a partial
+    // apply would strip the user's current access and silently assign nothing.
+    let unknown: Vec<&String> = role_names
+        .iter()
+        .filter(|name| !all_roles.iter().any(|r| &r.name == *name))
+        .collect();
+    if !unknown.is_empty() {
+        let names = unknown
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(AppError::BadRequest(format!(
+            "Unknown realm role(s): {names}"
+        )));
+    }
 
     // Remove current realm role mappings
     let current_resp = client
@@ -805,7 +741,7 @@ async fn set_user_roles(
         .collect();
 
     if !removable.is_empty() {
-        client
+        let resp = client
             .http_client
             .delete(format!(
                 "{base}/users/{user_id}/role-mappings/realm"
@@ -815,6 +751,14 @@ async fn set_user_roles(
             .send()
             .await
             .map_err(|e| AppError::Internal(format!("Failed to remove roles: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AppError::Internal(format!(
+                "Failed to remove roles ({status}): {body}"
+            )));
+        }
     }
 
     // Assign requested roles
@@ -925,7 +869,7 @@ pub async fn set_user_grants(
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/", get(list_users).post(create_user))
+        .route("/", get(list_users))
         .route("/search", get(search_users))
         .route("/{id}", get(get_user).put(update_user).delete(delete_user))
         .route("/{id}/roles", axum::routing::post(assign_roles))

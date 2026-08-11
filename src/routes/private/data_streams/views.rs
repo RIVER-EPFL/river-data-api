@@ -12,7 +12,6 @@ use crate::common::middleware::ProjectScope;
 use crate::routes::private::{data_streams, sites::parameters as site_parameters};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::operations::{close_sensor_deployment, create_sensor_for_stream};
-use crate::common::sync_state::refresh_continuous_aggregates_full;
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct StreamStatsResponse {
@@ -533,12 +532,18 @@ pub async fn unpair_stream(
     ))
     .await?;
 
-    // Trigger aggregate refresh in background
+    // Refresh aggregates as a tracked job so a failure is visible and rerunnable
     if cleared > 0 {
-        let db_clone = db.clone();
-        tokio::spawn(async move {
-            refresh_continuous_aggregates_full(&db_clone).await;
-        });
+        crate::routes::private::reprocessing_jobs::worker::enqueue(
+            db,
+            "refresh_aggregates_full",
+            None,
+            Some(stream_id),
+            &serde_json::json!({ "full": true }),
+            None,
+        )
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     }
 
     let updated = data_streams::Entity::find_by_id(stream_id)

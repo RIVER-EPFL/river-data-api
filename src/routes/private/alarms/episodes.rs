@@ -48,7 +48,7 @@ pub async fn evaluate_alarm_episodes(
     }
 
     let sev_case = severity_case(
-        "COALESCE(r.calibrated_value, r.raw_value)",
+        "COALESCE(smp.mean, r.calibrated_value, r.raw_value)",
         "$5::double precision",
         "$6::double precision",
         "$7::double precision",
@@ -64,9 +64,10 @@ pub async fn evaluate_alarm_episodes(
         r"
         WITH ordered AS (
             SELECT r.time AS t,
-                   COALESCE(r.calibrated_value, r.raw_value) AS v,
+                   COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS v,
                    {sev_case} AS sev
             FROM readings r
+            LEFT JOIN samples smp ON smp.id = r.sample_id
             WHERE r.site_id = $1 AND r.parameter_id = $2 AND r.replicate_index = 0
               AND r.time >= $3 AND r.time <= $4
         ),
