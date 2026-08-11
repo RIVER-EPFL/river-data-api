@@ -116,9 +116,42 @@ async fn get_or_create_grab_stream(
     Ok(stream.id)
 }
 
-/// Group readings by (parameter_id, time) and auto-create `samples` rows for
-/// groups with 2+ readings, or any group when a label/note needs a home.
-/// Returns a map from group key to sample_id.
+/// Return the sample already recorded for this (site, parameter, time), refreshing its label and
+/// notes when the request carries them.
+async fn reuse_existing_sample(
+    txn: &sea_orm::DatabaseTransaction,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    time: chrono::DateTime<chrono::Utc>,
+    label: Option<&str>,
+    notes: Option<&str>,
+) -> Result<Option<Uuid>, AppError> {
+    let Some(existing) = samples::Entity::find()
+        .filter(samples::Column::SiteId.eq(site_id))
+        .filter(samples::Column::ParameterId.eq(parameter_id))
+        .filter(samples::Column::CollectedAt.eq(time))
+        .one(txn)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let sample_id = existing.id;
+    if label.is_some() || notes.is_some() {
+        let mut active: samples::ActiveModel = existing.into();
+        if let Some(l) = label {
+            active.label = Set(Some(l.to_string()));
+        }
+        if let Some(n) = notes {
+            active.notes = Set(Some(n.to_string()));
+        }
+        active.updated_at = Set(Some(chrono::Utc::now()));
+        active.update(txn).await?;
+    }
+    Ok(Some(sample_id))
+}
+
+/// Create a `samples` row per (parameter_id, time) group of 2+ readings, or for any group when a
+/// label or note needs a home. Returns the group-to-sample map and how many rows were created.
 async fn auto_create_samples(
     txn: &sea_orm::DatabaseTransaction,
     readings: &[GrabSampleReading],
@@ -139,25 +172,9 @@ async fn auto_create_samples(
             continue;
         }
         // Re-posting the same grab must reuse its sample, not accumulate empty duplicates
-        if let Some(existing) = samples::Entity::find()
-            .filter(samples::Column::SiteId.eq(site_id))
-            .filter(samples::Column::ParameterId.eq(parameter_id))
-            .filter(samples::Column::CollectedAt.eq(time))
-            .one(txn)
-            .await?
+        if let Some(sample_id) =
+            reuse_existing_sample(txn, site_id, parameter_id, time, label, notes).await?
         {
-            let sample_id = existing.id;
-            if label.is_some() || notes.is_some() {
-                let mut active: samples::ActiveModel = existing.into();
-                if let Some(l) = label {
-                    active.label = Set(Some(l.to_string()));
-                }
-                if let Some(n) = notes {
-                    active.notes = Set(Some(n.to_string()));
-                }
-                active.updated_at = Set(Some(chrono::Utc::now()));
-                active.update(txn).await?;
-            }
             sample_map.insert((parameter_id, time), sample_id);
             continue;
         }
@@ -415,12 +432,15 @@ pub async fn insert_grab_samples(
     };
 
     // Readings the insert skipped on conflict still belong to the group's sample; linking them
-    // fires the aggregate trigger so the stats cover every replicate.
+    // fires the aggregate trigger so the stats cover every replicate. Scoped to spot readings:
+    // a sonde reading sharing the grab's snapped timestamp must not be adopted into the sample,
+    // or the trigger folds sensor data into the grab statistics.
     for ((parameter_id, time), sample_id) in &sample_map {
         txn.execute(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE readings SET sample_id = $1
-              WHERE site_id = $2 AND parameter_id = $3 AND time = $4 AND sample_id IS NULL",
+              WHERE site_id = $2 AND parameter_id = $3 AND time = $4 AND sample_id IS NULL
+                AND measurement_type = 'spot'",
             [
                 (*sample_id).into(),
                 payload.site_id.into(),

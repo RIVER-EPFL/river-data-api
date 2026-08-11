@@ -469,3 +469,133 @@ async fn health_state_derived_from_heartbeat_recency() {
     assert_eq!(status, 200, "get service ({status}): {one}");
     assert_eq!(one["health"], "healthy");
 }
+
+#[tokio::test]
+#[serial]
+async fn heartbeat_for_another_service_is_forbidden() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let (token, _service_id) = crate::common::seed_sync_session_token(&db).await;
+    let (_other_token, other_service) = crate::common::seed_sync_session_token(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let (status, _) = crate::common::post_json_with_token(
+        &app,
+        "/api/sync/heartbeat",
+        &serde_json::json!({"service_id": other_service, "status": "idle"}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 403, "cannot heartbeat as another service");
+}
+
+#[tokio::test]
+#[serial]
+async fn pause_persists_across_reenroll() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_sync_credentials(&db, "svc_pause_client", "super-secret", "test").await;
+    let admin = crate::common::seed_token_full(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let enroll_body = serde_json::json!({
+        "client_id": "svc_pause_client",
+        "client_secret": "super-secret",
+        "instance_id": "inst-pause"
+    });
+    let (status, body) =
+        crate::common::post_json_parse_with_token(&app, "/api/sync/enroll", &enroll_body, "").await;
+    assert_eq!(status, 200, "enroll ({status}): {body}");
+    assert_eq!(body["paused"], false, "fresh service is not paused: {body}");
+    let service_id = body["service_id"].as_str().expect("service_id").to_string();
+    let token = body["session_token"].as_str().expect("token").to_string();
+
+    let (status, _) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/sync/services/{service_id}/commands"),
+        &serde_json::json!({"command": "pause"}),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "issue pause");
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT count(*) AS c FROM sync_services WHERE id = '{service_id}' AND paused"),
+        )
+        .await,
+        1,
+        "paused persisted at command issue time"
+    );
+
+    let (status, body) =
+        crate::common::post_json_parse_with_token(&app, "/api/sync/enroll", &enroll_body, "").await;
+    assert_eq!(status, 200, "re-enroll ({status}): {body}");
+    assert_eq!(body["paused"], true, "pause survives re-enrollment: {body}");
+
+    let (status, hb) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sync/heartbeat",
+        &serde_json::json!({"service_id": service_id, "status": "paused"}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "heartbeat ({status}): {hb}");
+    assert_eq!(hb["paused"], true, "heartbeat reports pause: {hb}");
+
+    let (status, _) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/sync/services/{service_id}/commands"),
+        &serde_json::json!({"command": "resume"}),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "issue resume");
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM sync_services WHERE id = '{service_id}' AND NOT paused"
+            ),
+        )
+        .await,
+        1,
+        "resume clears the persisted pause"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn stale_running_sync_events_are_swept() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let (_token, service_id) = crate::common::seed_sync_session_token(&db).await;
+
+    for (age, label) in [("2 hours", "stale"), ("1 minute", "fresh")] {
+        db.execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "INSERT INTO sync_events (service_id, event_type, status, started_at) \
+                 VALUES ('{service_id}', 'scheduled', 'running', NOW() - INTERVAL '{age}')"
+            ),
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("insert {label} event: {e}"));
+    }
+
+    let closed = river_db::routes::private::reprocessing_jobs::jobs::sweep_stale_sync_events(&db, 3600)
+        .await
+        .expect("sweep");
+    assert_eq!(closed, 1, "only the stale event is closed");
+
+    assert_eq!(
+        count(&db, "SELECT count(*) AS c FROM sync_events WHERE status = 'failed'").await,
+        1,
+        "stale event failed"
+    );
+    assert_eq!(
+        count(&db, "SELECT count(*) AS c FROM sync_events WHERE status = 'running'").await,
+        1,
+        "fresh event untouched"
+    );
+}

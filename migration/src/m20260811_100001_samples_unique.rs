@@ -1,16 +1,8 @@
 use sea_orm_migration::prelude::*;
 
-/// Samples uniqueness + lifecycle hardening.
-///
-/// - Unique index on samples(site_id, parameter_id, collected_at) so replicate groups resolve to
-///   exactly one sample and writers can use `ON CONFLICT DO NOTHING` find-or-create.
-/// - Before creating the index, duplicate rows for the same key are collapsed: readings referencing
-///   a duplicate are repointed at the keeper (preferring a row readings already reference), then
-///   the duplicates are deleted.
-/// - `refresh_sample_aggregate` treats the nullable is_flagged as "not flagged" via
-///   `is_flagged IS NOT TRUE`, and DELETEs a sample once no readings (any flag state) reference it
-///   instead of leaving an n=0 tombstone. A sample with only-flagged readings keeps its row
-///   (stats NULL, n=0) because readings still reference it.
+/// Unique index on samples(site_id, parameter_id, collected_at), collapsing duplicates first, and
+/// a refresh_sample_aggregate that reads a NULL is_flagged as unflagged and deletes a sample once
+/// no reading references it.
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
@@ -126,7 +118,7 @@ impl MigrationTrait for Migration {
         db.execute_unprepared("DROP INDEX IF EXISTS samples_site_param_time_uniq")
             .await?;
 
-        // Restore the m20260420 function body (is_flagged = FALSE, no zero-ref delete).
+        // Sample aggregate over non-flagged readings.
         db.execute_unprepared(
             r#"
             CREATE OR REPLACE FUNCTION refresh_sample_aggregate(target_sample_id UUID)

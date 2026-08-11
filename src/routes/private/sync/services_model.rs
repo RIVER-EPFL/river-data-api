@@ -28,6 +28,8 @@ pub struct Model {
     pub instance_id: String,
     #[crudcrate(filterable)]
     pub status: String,
+    #[crudcrate(filterable, exclude(create), on_create = false)]
+    pub paused: bool,
     pub current_operation: Option<String>,
     #[crudcrate(sortable, exclude(create, update))]
     pub last_heartbeat: Option<DateTimeWithTimeZone>,

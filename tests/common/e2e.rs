@@ -146,22 +146,6 @@ pub async fn create_sensor(app: &Router, token: &str, _parameter_id: &str, seria
     .await
 }
 
-pub async fn create_calibration(
-    app: &Router,
-    token: &str,
-    sensor_id: &str,
-    slope: f64,
-    intercept: f64,
-    valid_from: &str,
-) -> String {
-    create(
-        app,
-        token,
-        "/api/sensor_calibrations",
-        json!({ "sensor_id": sensor_id, "slope": slope, "intercept": intercept, "valid_from": valid_from }),
-    )
-    .await
-}
 
 pub async fn create_deployment(
     app: &Router,

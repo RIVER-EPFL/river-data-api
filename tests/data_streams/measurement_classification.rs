@@ -23,9 +23,10 @@ async fn measurement_types(db: &DatabaseConnection, stream_id: Uuid) -> Vec<Stri
     .collect()
 }
 
-async fn seed_stream(db: &DatabaseConnection, declared: Option<&str>, tagged_as: &str) -> Uuid {
+async fn seed_stream(db: &DatabaseConnection, declared: Option<&str>, tagged_as: Option<&str>) -> Uuid {
     let stream_id = Uuid::new_v4();
     let declared_sql = declared.map_or("NULL".to_string(), |d| format!("'{d}'"));
+    let tagged_sql = tagged_as.map_or("NULL".to_string(), |t| format!("'{t}'"));
     crate::common::exec(
         db,
         &format!(
@@ -39,7 +40,7 @@ async fn seed_stream(db: &DatabaseConnection, declared: Option<&str>, tagged_as:
         db,
         &format!(
             "INSERT INTO readings (stream_id, time, replicate_index, raw_value, measurement_type) \
-             VALUES ('{stream_id}', '2025-03-01T09:00:00Z', 0, 4.0, '{tagged_as}')"
+             VALUES ('{stream_id}', '2025-03-01T09:00:00Z', 0, 4.0, {tagged_sql})"
         ),
     )
     .await;
@@ -48,28 +49,41 @@ async fn seed_stream(db: &DatabaseConnection, declared: Option<&str>, tagged_as:
 
 #[tokio::test]
 #[serial]
-async fn pairing_adopts_the_streams_declared_measurement_type() {
+async fn pairing_applies_declaration_without_clobbering_reading_tags() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
     let token = crate::common::seed_token_full(&db).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let stream_id = seed_stream(&db, Some("spot"), "continuous").await;
+    // A per-reading tag set at ingest outranks the stream declaration; the
+    // declaration classifies only untagged (legacy) rows on pairing.
+    let tagged = seed_stream(&db, Some("spot"), Some("continuous")).await;
+    let untagged = seed_stream(&db, Some("spot"), None).await;
 
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        &format!("/api/streams/{stream_id}/pair"),
-        &serde_json::json!({ "site_parameter_id": crate::common::PARAM_S1_TEMP_ID }),
-        &token,
-    )
-    .await;
-    assert_eq!(status, 200, "pair ({status}): {body}");
+    for (stream_id, site_param) in [
+        (tagged, crate::common::PARAM_S1_TEMP_ID),
+        (untagged, crate::common::PARAM_S1_DO_ID),
+    ] {
+        let (status, body) = crate::common::post_json_with_token(
+            &app,
+            &format!("/api/streams/{stream_id}/pair"),
+            &serde_json::json!({ "site_parameter_id": site_param }),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "pair ({status}): {body}");
+    }
 
     assert_eq!(
-        measurement_types(&db, stream_id).await,
+        measurement_types(&db, tagged).await,
+        vec!["continuous".to_string()],
+        "a per-reading tag survives pairing"
+    );
+    assert_eq!(
+        measurement_types(&db, untagged).await,
         vec!["spot".to_string()],
-        "backfilled history takes the stream's declared classification"
+        "untagged history adopts the stream's declared classification"
     );
 }
 
@@ -82,9 +96,9 @@ async fn declared_retag_aligns_each_stream_separately() {
     let token = crate::common::seed_token_full(&db).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let grab = seed_stream(&db, Some("spot"), "continuous").await;
-    let logger = seed_stream(&db, Some("continuous"), "continuous").await;
-    let undeclared = seed_stream(&db, None, "continuous").await;
+    let grab = seed_stream(&db, Some("spot"), Some("continuous")).await;
+    let logger = seed_stream(&db, Some("continuous"), Some("continuous")).await;
+    let undeclared = seed_stream(&db, None, Some("continuous")).await;
 
     let (status, body) = crate::common::post_json_with_token(
         &app,

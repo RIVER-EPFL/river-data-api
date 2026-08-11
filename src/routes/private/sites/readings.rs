@@ -166,7 +166,7 @@ pub struct SiteReadingsQuery {
     pub format: String,
     /// Include alarm severity data (threshold violations)
     pub alarms: Option<bool>,
-    /// Filter by measurement type: continuous (default), spot, derived
+    /// Filter by measurement type: continuous, spot, derived. Omit to return all types mixed.
     pub measurement_type: Option<String>,
     /// Include flagged readings with flag metadata (default: true). When false, excludes flagged readings entirely.
     pub include_flagged: Option<bool>,
@@ -292,6 +292,11 @@ pub async fn get_site_readings(
     let include_measurement_type = query.include_measurement_type.unwrap_or(false);
     let include_sample_stats = query.include_sample_stats.unwrap_or(false) && !include_replicates;
 
+    if let Some(mt) = query.measurement_type.as_deref()
+        && !mt.is_empty()
+    {
+        crate::routes::private::readings::measurement::validate_measurement_type(Some(mt))?;
+    }
     let measurement_type_filter = query.measurement_type.as_deref().unwrap_or("");
 
     // Build cache key from request parameters
@@ -346,9 +351,7 @@ pub async fn get_site_readings(
         .collect();
     values.extend(param_ids.iter().map(|id| (*id).into()));
 
-    // A grab with replicates is represented by its sample: the served value is the sample mean
-    // (portal parity: the plotted grab value is the replicate average). Individual replicate
-    // values are only served on the replicate drill-down (include_replicates / sample_id).
+    // Replicate groups serve their sample mean unless the caller asks for replicates.
     let value_expr = if include_replicates {
         "COALESCE(r.calibrated_value, r.raw_value)"
     } else {

@@ -54,7 +54,8 @@ pub struct ImportCsvRequest {
     #[serde(default)]
     pub tz_offset_hours: Option<f64>,
     /// measurement_type stamped on every imported reading ('continuous' | 'spot' | 'derived').
-    /// Use 'spot' for lab/campaign result sheets. Defaults to 'continuous'.
+    /// Use 'spot' for lab/campaign result sheets. Omit to resolve per row from the stream's
+    /// declaration, then the owning sensor's data_frequency.
     #[serde(default)]
     pub measurement_type: Option<String>,
 }
@@ -545,7 +546,7 @@ pub async fn import_csv(
             "overlapping": overlapping,
             "overlap_differing": overlap_differing,
             "param_streams": param_streams,
-            "measurement_type": req.measurement_type.as_deref().unwrap_or("continuous"),
+            "measurement_type": req.measurement_type.as_deref(),
         });
 
         crate::routes::private::reprocessing_jobs::worker::enqueue(
@@ -592,10 +593,7 @@ pub async fn import_csv(
     }))
 }
 
-/// One parsed CSV reading staged for the worker job. Carries only the variable per-row fields; the
-/// `csv_import` job re-applies the readings constants (logged=false, is_flagged=false) and the
-/// request-level measurement_type when it reads these back, and numbers rows sharing
-/// (stream_id, time) as replicate_index 0..n-1 in file order.
+/// One parsed CSV reading staged for the worker job, holding only the per-row fields.
 struct StagedRow {
     stream_id: Uuid,
     site_id: Uuid,
@@ -674,12 +672,8 @@ const OVERLAP_SAMPLE_CAP: usize = 20;
 /// Tolerance for treating an incoming value as identical to the stored one.
 const OVERLAP_EPSILON: f64 = 1e-9;
 
-/// Bucket incoming `(parameter_id, time, stored_value)` rows against existing readings for the
-/// site into identical vs differing overlaps. Fetches all existing readings in the time range for
-/// the relevant parameters in a single query, then compares in memory. Replicate-aware: existing
-/// rows are keyed by (parameter, time) in replicate order, and the Nth incoming row for a key is
-/// compared against the Nth existing replicate, so intra-group rows of a fresh import are not
-/// reported as duplicates while a full re-import matches replicate for replicate.
+/// Bucket incoming rows against existing readings into identical and differing overlaps. The Nth
+/// incoming row for a (parameter, time) key is compared against the Nth existing replicate.
 async fn compute_overlaps(
     db: &sea_orm::DatabaseConnection,
     site_id: Uuid,

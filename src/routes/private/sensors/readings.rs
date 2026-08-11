@@ -23,6 +23,9 @@ pub struct SensorReadingsQuery {
     /// Downsampling resolution: `raw` (default, per-point), or `hourly`/`daily`/`weekly`/`monthly`
     /// time-bucketed averages with min/max envelopes. Mirrors the site plot's resolution selector.
     pub resolution: Option<String>,
+    /// Filter by measurement type: continuous, spot, derived. Omit for all types at `raw`
+    /// resolution; bucketed resolutions always exclude spot (continuous-aggregate semantics).
+    pub measurement_type: Option<String>,
 }
 
 /// Map a resolution keyword to a `time_bucket` interval. `None`/`raw` → no bucketing.
@@ -192,9 +195,13 @@ pub async fn get_sensor_readings(
         .and_then(|r| r.try_get::<DateTime<chrono::FixedOffset>>("", "slot_start").ok())
         .map(|t| t.with_timezone(&Utc));
 
+    crate::routes::private::readings::measurement::validate_measurement_type(
+        query.measurement_type.as_deref().filter(|m| !m.is_empty()),
+    )?;
+
     // Build the query. Aggregated resolutions time-bucket the readings (avg + min/max of raw and
-    // calibrated), excluding flagged points to match continuous-aggregate semantics; raw mode
-    // returns per-point values including flagged.
+    // calibrated), excluding flagged points and spot readings to match continuous-aggregate
+    // semantics; raw mode returns per-point values including flagged.
     let mut values: Vec<sea_orm::Value> = vec![sensor_id.into()];
     let mut sql = if let Some(interval) = bucket {
         format!(
@@ -203,7 +210,8 @@ pub async fn get_sensor_readings(
                      avg(calibrated_value) AS calibrated_value, min(calibrated_value) AS cal_min, max(calibrated_value) AS cal_max,
                      last(site_id, time) AS site_id
               FROM readings
-              WHERE sensor_id = $1 AND replicate_index = 0 AND is_flagged IS NOT TRUE"
+              WHERE sensor_id = $1 AND replicate_index = 0 AND is_flagged IS NOT TRUE
+                AND measurement_type IS DISTINCT FROM 'spot'"
         )
     } else {
         String::from(
@@ -212,6 +220,16 @@ pub async fn get_sensor_readings(
               WHERE sensor_id = $1 AND replicate_index = 0",
         )
     };
+    if bucket.is_none()
+        && let Some(mt) = query.measurement_type.as_deref().filter(|m| !m.is_empty())
+    {
+        values.push(mt.into());
+        sql.push_str(&format!(
+            " AND (measurement_type = ${} OR (${} = 'continuous' AND measurement_type IS NULL))",
+            values.len(),
+            values.len()
+        ));
+    }
     sql.push_str(&scope_filter(&mut values, "site_id"));
     if let Some(start) = query.start {
         values.push(start.into());

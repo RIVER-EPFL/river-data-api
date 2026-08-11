@@ -163,7 +163,9 @@ pub struct SiteAggregatesQuery {
 /// Get aggregates for a specific site
 ///
 /// Returns aggregated parameter data for all parameters in the specified site.
-/// Supports JSON, CSV, and NDJSON formats.
+/// Supports JSON, CSV, and NDJSON formats. Aggregates cover continuous and derived
+/// readings only; grab samples (measurement_type 'spot') are excluded — fetch them at
+/// raw resolution via the readings endpoint.
 #[utoipa::path(
     get,
     path = "/{site_id}/aggregates/{resolution}",

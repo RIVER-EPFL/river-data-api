@@ -679,6 +679,35 @@ async fn fetch_user_roles(
         .collect())
 }
 
+/// Reject role assignments that name a role the realm does not have, or a role that is not one of
+/// the river access levels. Checked before any mapping is removed.
+fn validate_requested_roles(role_names: &[String], all_roles: &[KeycloakRole]) -> AppResult<()> {
+    let join = |names: Vec<&String>| {
+        names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+    };
+    let outside: Vec<&String> = role_names
+        .iter()
+        .filter(|name| !RIVER_ROLE_NAMES.contains(&name.as_str()))
+        .collect();
+    if !outside.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "Not a river access role: {}",
+            join(outside)
+        )));
+    }
+    let unknown: Vec<&String> = role_names
+        .iter()
+        .filter(|name| !all_roles.iter().any(|r| &r.name == *name))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "Unknown realm role(s): {}",
+            join(unknown)
+        )));
+    }
+    Ok(())
+}
+
 async fn set_user_roles(
     client: &KeycloakAdmin,
     token: &str,
@@ -707,36 +736,7 @@ async fn set_user_roles(
         .await
         .map_err(|e| AppError::Internal(format!("Failed to parse roles: {e}")))?;
 
-    // Every requested role must exist in the realm before anything is removed, otherwise a
-    // partial apply strips the user's current access and assigns nothing.
-    let unknown: Vec<&String> = role_names
-        .iter()
-        .filter(|name| !all_roles.iter().any(|r| &r.name == *name))
-        .collect();
-    let outside: Vec<&String> = role_names
-        .iter()
-        .filter(|name| !RIVER_ROLE_NAMES.contains(&name.as_str()))
-        .collect();
-    if !outside.is_empty() {
-        let names = outside
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(AppError::BadRequest(format!(
-            "Not a river access role: {names}"
-        )));
-    }
-    if !unknown.is_empty() {
-        let names = unknown
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(AppError::BadRequest(format!(
-            "Unknown realm role(s): {names}"
-        )));
-    }
+    validate_requested_roles(role_names, &all_roles)?;
 
     // Remove current realm role mappings
     let current_resp = client

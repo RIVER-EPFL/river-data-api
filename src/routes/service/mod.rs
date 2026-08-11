@@ -506,7 +506,7 @@ pub fn sync_control_router(_state: &AppState) -> Router<AppState> {
     use std::sync::Arc;
     use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
-    let (service_routes, _admin_routes) = river_data_core::server::routes::<AppState>();
+    let service_routes = river_data_core::server::routes::<AppState>();
 
     let enroll_limiter = GovernorConfigBuilder::default()
         .key_extractor(FallbackIpKeyExtractor)

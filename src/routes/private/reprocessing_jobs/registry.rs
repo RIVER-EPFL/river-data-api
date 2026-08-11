@@ -17,6 +17,7 @@ pub fn category_for(trigger_type: &str) -> &'static str {
         "janitor_run"
         | "janitor_service"
         | "alarm_sweep"
+        | "sync_event_sweep"
         | "identity_reconcile"
         | "notify_health"
         | "dispatch_notifications"

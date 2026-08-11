@@ -607,7 +607,7 @@ async fn backfill_plan_readings<C: ConnectionTrait>(txn: &C, plan_id: Uuid) -> A
         r"UPDATE readings r
           SET site_id = sp.site_id, parameter_id = sp.parameter_id,
               calibrated_value = COALESCE(r.calibrated_value, r.raw_value),
-              measurement_type = COALESCE(ds.measurement_type, r.measurement_type)
+              measurement_type = COALESCE(r.measurement_type, ds.measurement_type)
           FROM data_streams ds
           JOIN site_parameters sp ON ds.site_parameter_id = sp.id
           WHERE r.stream_id = ds.id AND r.site_id IS NULL
@@ -638,6 +638,7 @@ async fn backfill_plan_readings<C: ConnectionTrait>(txn: &C, plan_id: Uuid) -> A
           FROM readings r
           JOIN data_streams ds ON r.stream_id = ds.id
           WHERE ds.pairing_plan_id = $1 AND r.sample_id IS NULL AND r.site_id IS NOT NULL
+            AND r.measurement_type = 'spot'
           GROUP BY r.stream_id, r.site_id, r.parameter_id, r.time
           HAVING COUNT(*) >= 2
           ON CONFLICT (site_id, parameter_id, collected_at) DO NOTHING",
@@ -652,10 +653,12 @@ async fn backfill_plan_readings<C: ConnectionTrait>(txn: &C, plan_id: Uuid) -> A
               FROM readings r2
               JOIN data_streams ds ON r2.stream_id = ds.id
               WHERE ds.pairing_plan_id = $1 AND r2.sample_id IS NULL AND r2.site_id IS NOT NULL
+                AND r2.measurement_type = 'spot'
               GROUP BY r2.stream_id, r2.time
               HAVING COUNT(*) >= 2
           ) g, samples s
           WHERE r.stream_id = g.stream_id AND r.time = g.time AND r.sample_id IS NULL
+            AND r.measurement_type = 'spot'
             AND s.site_id = r.site_id AND s.parameter_id = r.parameter_id
             AND s.collected_at = r.time",
         [plan_id.into()],

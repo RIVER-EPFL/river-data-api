@@ -55,6 +55,72 @@ pub async fn evaluate_alarm_episodes(
         "$8::double precision",
     );
 
+    // Sensor and grab series form separate episode streams: a grab breach must not be
+    // "resolved" by the next in-range sonde point (or vice versa).
+    let mut written = 0i64;
+    let mut all_episodes: Vec<(&'static str, Vec<EpisodeRow>)> = Vec::new();
+    for spot in [false, true] {
+        let episodes =
+            fetch_episodes(db, site_id, parameter_id, start, end, &threshold, &sev_case, spot)
+                .await?;
+        all_episodes.push((super::views::cadence_label(spot), episodes));
+    }
+
+    // Idempotent: clear the resolved episodes previously written for this slot+window, then reinsert
+    // the freshly computed set. Open rows (`resolved_at IS NULL`) are owned by the sweeper and left
+    // alone.
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "DELETE FROM alarm_events \
+         WHERE site_id = $1 AND parameter_id = $2 AND resolved_at IS NOT NULL \
+           AND started_at >= $3 AND started_at <= $4",
+        [site_id.into(), parameter_id.into(), start.into(), end.into()],
+    ))
+    .await?;
+
+    for (cadence, episodes) in &all_episodes {
+        for ep in episodes {
+            db.execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "INSERT INTO alarm_events \
+                    (site_id, parameter_id, measurement_type, severity, max_severity, started_at, \
+                     value_at_start, last_seen_at, last_value, resolved_at, resolved_value) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                [
+                    site_id.into(),
+                    parameter_id.into(),
+                    (*cadence).into(),
+                    ep.severity.into(),
+                    ep.max_severity.into(),
+                    ep.started_at.with_timezone(&Utc).into(),
+                    ep.value_at_start.into(),
+                    ep.last_seen_at.with_timezone(&Utc).into(),
+                    ep.last_value.into(),
+                    ep.resolved_at.map(|t| t.with_timezone(&Utc)).into(),
+                    ep.resolved_value.into(),
+                ],
+            ))
+            .await?;
+            written += 1;
+        }
+    }
+
+    Ok(written)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_episodes(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    threshold: &super::thresholds::ResolvedThreshold,
+    sev_case: &str,
+    spot: bool,
+) -> Result<Vec<EpisodeRow>, sea_orm::DbErr> {
+    let cadence_pred = super::views::cadence_predicate(spot);
+
     // Per-reading severity, then gaps-and-islands. `marked` computes the LAG/LEAD neighbours;
     // `runs` then cumulatively sums the run-start flag (a window function can't be nested inside
     // another, so these must be separate CTEs). `run_id` increments at each breach that follows a
@@ -70,6 +136,7 @@ pub async fn evaluate_alarm_episodes(
             LEFT JOIN samples smp ON smp.id = r.sample_id
             WHERE r.site_id = $1 AND r.parameter_id = $2 AND r.replicate_index = 0
               AND r.time >= $3 AND r.time <= $4
+              AND {cadence_pred}
         ),
         marked AS (
             SELECT t, v, sev,
@@ -124,44 +191,7 @@ pub async fn evaluate_alarm_episodes(
         .filter_map(|r| EpisodeRow::from_query_result(&r, "").ok())
         .collect();
 
-    // Idempotent: clear the resolved episodes previously written for this slot+window, then reinsert
-    // the freshly computed set. Open rows (`resolved_at IS NULL`) are owned by the sweeper and left
-    // alone.
-    db.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "DELETE FROM alarm_events \
-         WHERE site_id = $1 AND parameter_id = $2 AND resolved_at IS NOT NULL \
-           AND started_at >= $3 AND started_at <= $4",
-        [site_id.into(), parameter_id.into(), start.into(), end.into()],
-    ))
-    .await?;
-
-    let mut written = 0i64;
-    for ep in &episodes {
-        db.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO alarm_events \
-                (site_id, parameter_id, severity, max_severity, started_at, value_at_start, \
-                 last_seen_at, last_value, resolved_at, resolved_value) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-            [
-                site_id.into(),
-                parameter_id.into(),
-                ep.severity.into(),
-                ep.max_severity.into(),
-                ep.started_at.with_timezone(&Utc).into(),
-                ep.value_at_start.into(),
-                ep.last_seen_at.with_timezone(&Utc).into(),
-                ep.last_value.into(),
-                ep.resolved_at.map(|t| t.with_timezone(&Utc)).into(),
-                ep.resolved_value.into(),
-            ],
-        ))
-        .await?;
-        written += 1;
-    }
-
-    Ok(written)
+    Ok(episodes)
 }
 
 /// Rebuild resolved alarm episodes across every active slot matching the optional `site_id` /

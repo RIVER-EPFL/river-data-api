@@ -242,10 +242,12 @@ pub async fn get_site(
         }
         let placeholders = placeholders_parts.join(", ");
 
+        // Count only what the readings endpoint serves by default: unflagged replicate-0 rows.
         let sql = format!(
             "SELECT MIN(r.time) AS min_time, MAX(r.time) AS max_time, COUNT(*) AS count \
              FROM readings r \
-             WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders})"
+             WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
+               AND r.replicate_index = 0 AND r.is_flagged IS NOT TRUE"
         );
 
         let mut values: Vec<sea_orm::Value> = vec![site.site_id.into()];
@@ -573,6 +575,8 @@ struct AggregateRow {
 }
 
 /// Aggregated time-series (hourly, daily, weekly, monthly) for a public project site.
+/// Covers continuous and derived readings only; grab samples (measurement_type 'spot')
+/// are excluded — fetch them from the readings endpoint with `measurement_type=spot`.
 #[utoipa::path(
     get,
     path = "/api/public/{project_code}/sites/{site_code}/aggregates/{resolution}",

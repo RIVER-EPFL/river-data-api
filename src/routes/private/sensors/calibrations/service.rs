@@ -250,21 +250,36 @@ async fn resolve_variables_for_derived(
         let var_name: String = row.try_get("", "variable_name")?;
         let source_param_id: Uuid = row.try_get("", "parameter_id")?;
 
+        // Deterministic input pick when a sensor point and a grab share the timestamp:
+        // prefer the continuous reading, then tie-break by stream_id (stable across VACUUM).
         let value_row = db
             .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                r"SELECT COALESCE(smp.mean, r.calibrated_value, r.raw_value) as val
+                r"SELECT COALESCE(smp.mean, r.calibrated_value, r.raw_value) as val,
+                         r.measurement_type
                   FROM readings r
                   LEFT JOIN samples smp ON smp.id = r.sample_id
                   WHERE r.site_id = $1 AND r.parameter_id = $2 AND r.time = $3
-                  ORDER BY r.replicate_index ASC
+                  ORDER BY (r.measurement_type IS NOT DISTINCT FROM 'spot') ASC,
+                           r.replicate_index ASC, r.stream_id
                   LIMIT 1",
                 [item.derived_site_id.into(), source_param_id.into(), time.into()],
             ))
             .await?;
 
         match value_row {
-            Some(vr) => variables.insert(var_name, vr.try_get("", "val")?),
+            Some(vr) => {
+                let mt: Option<String> = vr.try_get("", "measurement_type")?;
+                if mt.as_deref() == Some("spot") {
+                    tracing::debug!(
+                        variable = %var_name,
+                        parameter_id = %source_param_id,
+                        time = %time,
+                        "Derived input resolved from a grab (spot) reading"
+                    );
+                }
+                variables.insert(var_name, vr.try_get("", "val")?)
+            }
             None => return Ok(None),
         };
     }

@@ -211,3 +211,60 @@ async fn unpaired_readings_excluded_from_aggregates_until_paired() {
         "after pairing the readings appear in the continuous aggregate"
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn ingest_overwrite_updates_values_and_is_sync_only() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let (sync_token, _service_id) = crate::common::seed_sync_session_token(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+    let stream = register_stream(&app, &token, "ow1").await;
+
+    let t = "2025-01-15T00:00:00Z";
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app, "/api/ingest",
+        &serde_json::json!({"stream_id": stream, "readings": [{"time": t, "raw_value": 10.0}]}),
+        &sync_token,
+    ).await;
+    assert_eq!(status, 200, "first ingest ({status}): {body}");
+
+    db.execute(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            "UPDATE readings SET is_flagged = TRUE, flag_reason = 'manual' WHERE stream_id = '{stream}'"
+        ),
+    ))
+    .await
+    .expect("flag reading");
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app, "/api/ingest",
+        &serde_json::json!({"stream_id": stream, "overwrite": true, "readings": [{"time": t, "raw_value": 42.5}]}),
+        &sync_token,
+    ).await;
+    assert_eq!(status, 200, "overwrite ingest ({status}): {body}");
+
+    assert_eq!(
+        count(&db, &format!("SELECT count(*) AS c FROM readings WHERE stream_id = '{stream}' AND raw_value = 42.5")).await,
+        1, "correction applied in place"
+    );
+    assert_eq!(
+        count(&db, &format!("SELECT count(*) AS c FROM readings WHERE stream_id = '{stream}'")).await,
+        1, "still one row"
+    );
+    assert_eq!(
+        count(&db, &format!(
+            "SELECT count(*) AS c FROM readings WHERE stream_id = '{stream}' AND is_flagged AND flag_reason = 'manual'"
+        )).await,
+        1, "operator flag survives the overwrite"
+    );
+
+    let (status, _) = crate::common::post_json_with_token(
+        &app, "/api/ingest",
+        &serde_json::json!({"stream_id": stream, "overwrite": true, "readings": [{"time": t, "raw_value": 1.0}]}),
+        &token,
+    ).await;
+    assert_eq!(status, 403, "overwrite is refused for API tokens");
+}

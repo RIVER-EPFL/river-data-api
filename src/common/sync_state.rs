@@ -42,6 +42,31 @@ pub async fn refresh_continuous_aggregates(
         Ok(_) => tracing::debug!("Daily continuous aggregate refreshed"),
         Err(e) => tracing::warn!(error = %e, "Failed to refresh daily aggregate"),
     }
+
+    // Weekly and monthly need wider windows so a correction always lands inside
+    // the bucket it changed; widened like the retag job's 32-day margin.
+    let weekly_start = since
+        .map(|s| format!("'{}'::timestamptz", (s - chrono::Duration::days(7)).to_rfc3339()))
+        .unwrap_or_else(|| "NOW() - INTERVAL '14 days'".to_string());
+    let monthly_start = since
+        .map(|s| format!("'{}'::timestamptz", (s - chrono::Duration::days(32)).to_rfc3339()))
+        .unwrap_or_else(|| "NOW() - INTERVAL '62 days'".to_string());
+
+    for (agg, start) in [
+        ("readings_weekly", weekly_start),
+        ("readings_monthly", monthly_start),
+    ] {
+        let result = db
+            .execute(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!("CALL refresh_continuous_aggregate('{agg}', {start}, NOW())"),
+            ))
+            .await;
+        match &result {
+            Ok(_) => tracing::debug!(aggregate = agg, "Continuous aggregate refreshed"),
+            Err(e) => tracing::warn!(error = %e, aggregate = agg, "Failed to refresh aggregate"),
+        }
+    }
 }
 
 /// Refresh all continuous aggregates for the entire data range.

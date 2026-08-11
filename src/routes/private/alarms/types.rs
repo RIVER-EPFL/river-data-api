@@ -69,6 +69,8 @@ pub struct ActiveAlarm {
     pub parameter_id: Uuid,
     pub parameter_name: String,
     pub current_value: f64,
+    /// Cadence of the series that raised this breach: 'continuous' (sensor) or 'spot' (grab).
+    pub measurement_type: String,
     pub threshold: AlarmThresholdInfo,
     /// 1=warning, 2=alarm
     pub severity: i16,
@@ -170,6 +172,8 @@ pub struct AlarmEventResponse {
     pub site_name: String,
     pub parameter_id: Uuid,
     pub parameter_name: String,
+    /// Cadence of the series that raised this event: 'continuous' (sensor) or 'spot' (grab).
+    pub measurement_type: String,
     /// Current severity (1=warning, 2=alarm)
     pub severity: i16,
     /// Highest severity seen while the event has been open (1=warning, 2=alarm)

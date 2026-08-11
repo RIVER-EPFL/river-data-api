@@ -179,27 +179,6 @@ pub async fn get_with_auth_header(app: &Router, uri: &str, auth_value: &str) -> 
     (status, text)
 }
 
-pub async fn post_csv_with_token(
-    app: &Router,
-    uri: &str,
-    csv_body: &str,
-    token: &str,
-) -> (u16, String) {
-    let req = axum::http::Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Content-Type", "text/csv")
-        .body(Body::from(csv_body.to_owned()))
-        .unwrap();
-
-    let response = app.clone().oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let text = String::from_utf8_lossy(&body).to_string();
-
-    (status, text)
-}
 
 pub async fn get_csv_with_token(app: &Router, uri: &str, token: &str) -> (u16, String) {
     let req = axum::http::Request::builder()

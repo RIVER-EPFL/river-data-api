@@ -1,4 +1,4 @@
-//! Concrete `Job` implementations — the worker-run handler for each `trigger_type`. Each reads its
+//! Concrete `Job` implementations: the worker-run handler for each `trigger_type`. Each reads its
 //! inputs from `ctx.params()` and calls the same service function the inline trigger used.
 
 use std::time::Duration;
@@ -52,7 +52,7 @@ fn parse_timestamps(value: Option<&serde_json::Value>) -> Vec<chrono::DateTime<c
 }
 
 /// Parse an array of UUID strings under `key` (missing/empty → empty vec). Non-UUID elements are
-/// skipped — the persisted params are produced by our own handlers, so this is defensive only.
+/// skipped; the persisted params are produced by our own handlers, so this is defensive only.
 fn uuid_array(params: &serde_json::Value, key: &str) -> Vec<Uuid> {
     params
         .get(key)
@@ -689,10 +689,8 @@ impl Job for AlarmBackfill {
 /// Insert a CSV import's staged readings, recompute derived parameters and refresh aggregates over
 /// the imported window, then enqueue an `alarm_backfill` for the touched slots. Reads its inputs
 /// (and the staged rows, by `import_token`) from params, so any replica can run it. Non-rerunnable:
-/// the staging rows are deleted on completion, so the source expires. The staged rows carry only the
-/// variable fields; the readings constants (logged=false, is_flagged=false) and the request-level
-/// measurement_type (from params, default 'continuous') are re-applied here. Rows sharing
-/// (stream_id, time) are numbered replicate_index 0..n-1 in file order and grouped into a sample.
+/// the staging rows are deleted on completion. Readings constants and the request-level
+/// measurement_type are re-applied here, and replicate groups are numbered and given a sample.
 pub struct CsvImport;
 
 #[async_trait]
@@ -744,11 +742,12 @@ impl CsvImport {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as usize;
         let param_streams = uuid_pair_array(params, "param_streams");
-        let measurement_type = params
+        // Explicit request-level classification, or None to resolve per row from the
+        // stream declaration and the owning sensor's data_frequency.
+        let request_measurement_type = params
             .get("measurement_type")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("continuous")
-            .to_string();
+            .map(str::to_string);
 
         ctx.set_site(site_id).await;
 
@@ -764,6 +763,44 @@ impl CsvImport {
             ))
             .await?;
 
+        let (stream_defaults, sensor_types) = if request_measurement_type.is_none() {
+            let mut stream_ids: Vec<Uuid> = Vec::new();
+            let mut sensor_ids: Vec<Uuid> = Vec::new();
+            for row in &staged {
+                stream_ids.push(row.try_get("", "stream_id")?);
+                if let Some(sid) = row.try_get::<Option<Uuid>>("", "sensor_id")? {
+                    sensor_ids.push(sid);
+                }
+            }
+            stream_ids.sort_unstable();
+            stream_ids.dedup();
+            sensor_ids.sort_unstable();
+            sensor_ids.dedup();
+
+            let mut defaults: std::collections::HashMap<Uuid, Option<String>> =
+                std::collections::HashMap::new();
+            for row in ctx
+                .db()
+                .query_all(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT id, measurement_type FROM data_streams WHERE id = ANY($1)",
+                    [stream_ids.into()],
+                ))
+                .await?
+            {
+                let id: Uuid = row.try_get("", "id")?;
+                defaults.insert(id, row.try_get("", "measurement_type")?);
+            }
+            let types = crate::routes::private::readings::measurement::measurement_types_for_sensors(
+                ctx.db(),
+                &sensor_ids,
+            )
+            .await?;
+            (defaults, types)
+        } else {
+            (std::collections::HashMap::new(), std::collections::HashMap::new())
+        };
+
         let mut models: Vec<readings::ActiveModel> = Vec::with_capacity(staged.len());
         let mut distinct_ts: Vec<chrono::DateTime<chrono::Utc>> = Vec::new();
         for row in &staged {
@@ -776,6 +813,13 @@ impl CsvImport {
             let calibration_id: Option<Uuid> = row.try_get("", "calibration_id")?;
             let deployment_id: Option<Uuid> = row.try_get("", "deployment_id")?;
             distinct_ts.push(time.with_timezone(&chrono::Utc));
+            let measurement_type =
+                crate::routes::private::readings::measurement::resolve_measurement_type(
+                    request_measurement_type.as_deref(),
+                    stream_defaults.get(&stream_id).and_then(|d| d.as_deref()),
+                    sensor_id,
+                    &sensor_types,
+                );
             models.push(readings::ActiveModel {
                 stream_id: Set(stream_id),
                 site_id: Set(row_site_id),
@@ -788,7 +832,7 @@ impl CsvImport {
                 calibration_id: Set(calibration_id),
                 deployment_id: Set(deployment_id),
                 logged: Set(Some(false)),
-                measurement_type: Set(Some(measurement_type.clone())),
+                measurement_type: Set(Some(measurement_type)),
                 is_flagged: Set(Some(false)),
                 flag_reason: Set(None),
                 sample_id: Set(None),
@@ -797,10 +841,7 @@ impl CsvImport {
         distinct_ts.sort_unstable();
         distinct_ts.dedup();
 
-        // Rows sharing a (stream_id, time) group are replicates: number them 0..n-1 in file order
-        // (staging `seq`), so the numbering is deterministic and a re-import hits the same PKs
-        // (conflict-skip, no renumbering). This also keeps the conflict keys within one statement
-        // unique, so `ON CONFLICT DO UPDATE` cannot hit the same row twice.
+        // Rows sharing (stream_id, time) are numbered replicate_index 0..n-1 in staging seq order.
         let mut group_counts: std::collections::HashMap<
             (Uuid, chrono::DateTime<chrono::Utc>),
             i16,
@@ -935,7 +976,8 @@ impl CsvImport {
                      WHERE s.site_id = t.site_id AND s.parameter_id = t.parameter_id \
                        AND s.collected_at = t.collected_at \
                        AND r.site_id = s.site_id AND r.parameter_id = s.parameter_id \
-                       AND r.time = s.collected_at AND r.sample_id IS NULL",
+                       AND r.time = s.collected_at AND r.sample_id IS NULL \
+                       AND r.measurement_type = 'spot'",
                     [slot_sites.into(), slot_params.into(), slot_times.into()],
                 ))
                 .await?;
@@ -1327,6 +1369,59 @@ impl Job for AlarmSweep {
     }
 }
 
+/// Close sync_events rows left 'running' past a staleness threshold. A sync service killed
+/// mid-cycle (SIGKILL, node loss) can never terminate its own event; without this sweep the
+/// row reads as "sync in progress" forever.
+pub struct SyncEventSweep {
+    interval_seconds: u64,
+    stale_after_seconds: u64,
+}
+
+impl SyncEventSweep {
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            interval_seconds: config.sync_event_sweep_interval_seconds,
+            stale_after_seconds: config.sync_event_stale_after_seconds,
+        }
+    }
+}
+
+#[async_trait]
+impl Job for SyncEventSweep {
+    fn name(&self) -> &'static str {
+        "sync_event_sweep"
+    }
+
+    fn default_schedule(&self) -> Option<Schedule> {
+        Some(Schedule::every_secs(self.interval_seconds.max(1) as i64))
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let closed = sweep_stale_sync_events(ctx.db(), self.stale_after_seconds).await?;
+        Ok(closed as i64)
+    }
+}
+
+/// Close 'running' sync_events older than the staleness threshold; returns the row count.
+pub async fn sweep_stale_sync_events(
+    db: &sea_orm::DatabaseConnection,
+    stale_after_seconds: u64,
+) -> Result<u64, DbErr> {
+    let res = db
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE sync_events
+             SET status = 'failed',
+                 completed_at = NOW(),
+                 errors = COALESCE(errors, '[]'::jsonb) || '[\"Closed by sweeper: service stopped reporting\"]'::jsonb
+             WHERE status = 'running' AND started_at < NOW() - ($1 || ' seconds')::interval",
+            [stale_after_seconds.to_string().into()],
+        ))
+        .await?;
+    Ok(res.rows_affected())
+}
+
 /// Re-resolve every active linked Telegram identity against Keycloak and deactivate any whose user
 /// is gone/disabled/role-revoked — the anti-backdoor identity reconciliation. Wraps
 /// [`reconcile::sweep`]. Needs the live `AppState` (Keycloak admin proxy + the shared `Authorizer`
@@ -1477,9 +1572,12 @@ impl Job for MeasurementRetag {
 
         // 'declared' joins each reading to its stream in both the window probe and the rewrite and
         // drops the target parameter; a fixed target compares against $1.
+        // The sensor arm also matches by stream ownership: readings ingested before attribution
+        // backfill carry sensor_id NULL but belong to the sensor's streams all the same.
         let (scope, from_clause, mismatch, new_value, update_from) = if declared {
             (
                 "(r.sensor_id = ANY($1) OR r.stream_id = ANY($2) \
+                  OR r.stream_id IN (SELECT id FROM data_streams WHERE sensor_id = ANY($1)) \
                   OR ($3::text IS NOT NULL AND r.stream_id IN \
                       (SELECT id FROM data_streams WHERE source_system = $3)))",
                 ", data_streams ds",
@@ -1491,6 +1589,7 @@ impl Job for MeasurementRetag {
         } else {
             (
                 "(r.sensor_id = ANY($2) OR r.stream_id = ANY($3) \
+                  OR r.stream_id IN (SELECT id FROM data_streams WHERE sensor_id = ANY($2)) \
                   OR ($4::text IS NOT NULL AND r.stream_id IN \
                       (SELECT id FROM data_streams WHERE source_system = $4)))",
                 "",
@@ -1530,6 +1629,39 @@ impl Job for MeasurementRetag {
             ctx.info("Nothing to retag — every reading in scope already matches").await;
             return Ok(0);
         };
+
+        // A stream declaring a different classification will keep writing its own value on
+        // ingest, so the retag would drift back; surface the conflict in the job timeline.
+        if !declared {
+            let conflicting = ctx
+                .db()
+                .query_all(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT source_system, source_key FROM data_streams \
+                     WHERE measurement_type IS NOT NULL AND measurement_type <> $1 \
+                       AND (sensor_id = ANY($2) OR id = ANY($3) \
+                            OR ($4::text IS NOT NULL AND source_system = $4))",
+                    [
+                        target.clone().into(),
+                        sensor_ids.clone().into(),
+                        stream_ids.clone().into(),
+                        source_system.clone().into(),
+                    ],
+                ))
+                .await?;
+            for row in &conflicting {
+                let system: String = row.try_get("", "source_system")?;
+                let key: String = row.try_get("", "source_key")?;
+                ctx.log(
+                    "warn",
+                    &format!(
+                        "Stream {system}/{key} declares a different measurement_type; future ingest will keep writing its declared value. Retag the stream too or use target 'declared'."
+                    ),
+                    serde_json::json!({}),
+                )
+                .await;
+            }
+        }
 
         ctx.info(&format!("Retagging readings in scope to '{target}'")).await;
         let txn = ctx.db().begin().await?;
@@ -1576,6 +1708,13 @@ impl Job for MeasurementRetag {
                 )
                 .await;
             }
+        }
+
+        // Reclassified rows change what bounded cached responses would serve.
+        if retagged > 0
+            && let Some(state) = crate::common::global_app_state()
+        {
+            state.response_cache.invalidate_all();
         }
 
         ctx.set_detail(serde_json::json!({

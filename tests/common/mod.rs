@@ -96,6 +96,8 @@ fn test_config() -> Config {
         job_maintenance_retention_days: 14,
         job_maintenance_max_rows: 50_000,
         alarm_sweep_interval_seconds: 60,
+        sync_event_sweep_interval_seconds: 300,
+        sync_event_stale_after_seconds: 3600,
         job_max_retries: 3,
         job_retry_backoff_seconds: 60,
         telegram_bot_token: None,
@@ -121,15 +123,6 @@ fn test_config() -> Config {
         telegram_grab_flag_for_review: false,
         dashboard_base_url: None,
     }
-}
-
-pub fn build_test_app_with_cache(db: DatabaseConnection) -> axum::Router {
-    let mut config = test_config();
-    config.cache_ttl_seconds = 300;
-    config.cache_max_bytes = 10_000_000;
-    let state = AppState::new(db, config, None);
-    spawn_test_worker(&state);
-    river_db::routes::build_router(state)
 }
 
 pub fn build_test_app_with_rate_limiting(db: DatabaseConnection) -> axum::Router {

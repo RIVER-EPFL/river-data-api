@@ -1,5 +1,5 @@
 use axum::{Json, extract::State};
-use sea_orm::{EntityTrait, Set};
+use sea_orm::{ConnectionTrait, EntityTrait, Set};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
@@ -77,6 +77,7 @@ pub(crate) fn readings_on_conflict(mode: ConflictMode) -> sea_orm::sea_query::On
                 readings::Column::RawValue,
                 readings::Column::CalibratedValue,
                 readings::Column::SampleId,
+                readings::Column::MeasurementType,
             ]);
         }
     }
@@ -170,6 +171,26 @@ pub async fn insert_batch_readings(
         }
     }
 
+    // Stream-declared defaults: a retagged "api" stream must classify batch writes the same
+    // way it classifies /ingest writes.
+    let stream_defaults: HashMap<Uuid, Option<String>> = {
+        let stream_ids: Vec<Uuid> = stream_cache.values().copied().collect();
+        let mut map = HashMap::with_capacity(stream_ids.len());
+        for row in state
+            .db
+            .query_all(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT id, measurement_type FROM data_streams WHERE id = ANY($1)",
+                [stream_ids.into()],
+            ))
+            .await?
+        {
+            let id: Uuid = row.try_get("", "id")?;
+            map.insert(id, row.try_get("", "measurement_type")?);
+        }
+        map
+    };
+
     // Sensor-frequency defaults for readings that don't declare a measurement_type: explicit
     // payload sensors plus slot-owner-resolved ones, one query.
     let sensor_types = {
@@ -213,7 +234,7 @@ pub async fn insert_batch_readings(
                 measurement_type: Set(Some(
                     crate::routes::private::readings::measurement::resolve_measurement_type(
                         r.measurement_type.as_deref(),
-                        None,
+                        stream_defaults.get(&stream_id).and_then(|d| d.as_deref()),
                         r.sensor_id.or(owner.sensor_id),
                         &sensor_types,
                     ),

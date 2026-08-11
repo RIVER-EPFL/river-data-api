@@ -13,7 +13,5 @@ path = "src/main.rs"
 
 [dependencies]
 sea-orm-migration = { version = "1.1", features = ["sqlx-postgres", "runtime-tokio-rustls"] }
-sea-orm-timescale = "0.2.0"
 tokio = { version = "1.43", features = ["full"] }
 dotenvy = "0.15"
-uuid = { version = "1.11", features = ["v4"] }

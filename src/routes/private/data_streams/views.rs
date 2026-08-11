@@ -394,7 +394,8 @@ pub async fn pair_stream(
     .await?;
 
     // Backfill: update readings with site_id + parameter_id + sensor context, apply identity
-    // calibration, and adopt the stream's declared classification for its history.
+    // calibration, and adopt the stream's declared classification for its history. A per-reading
+    // measurement_type set at ingest outranks the stream declaration and must survive pairing.
     let result = txn
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -402,7 +403,7 @@ pub async fn pair_stream(
               SET site_id = $1, parameter_id = $2,
                   sensor_id = $4, calibration_id = $5, deployment_id = $6,
                   calibrated_value = COALESCE(calibrated_value, raw_value),
-                  measurement_type = COALESCE($7, measurement_type)
+                  measurement_type = COALESCE(measurement_type, $7)
               WHERE stream_id = $3 AND site_id IS NULL",
             [
                 sp.site_id.into(),

@@ -40,12 +40,17 @@ async fn parameter_extents(
 ) -> AppResult<HashMap<Uuid, ParameterExtent>> {
     // Cadence counts ride along on the extent scan: spot = grab/lab low-frequency readings;
     // continuous counts NULL (legacy untagged) and 'derived' alongside 'continuous', since those
-    // series behave like continuous data on charts.
+    // series behave like continuous data on charts. The continuous count mirrors the continuous
+    // aggregates' population (replicate 0, unflagged) so has_continuous agrees with the rollups.
+    // Spot is counted at any replicate index: grab sets are served raw, never rolled up, and a
+    // replicate series need not start at 0.
     let stmt = Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "SELECT parameter_id, MIN(time) AS min_time, MAX(time) AS max_time, COUNT(*) AS count, \
-                COUNT(*) FILTER (WHERE measurement_type = 'spot') AS spot_count, \
-                COUNT(*) FILTER (WHERE measurement_type IS DISTINCT FROM 'spot') AS continuous_count \
+                COUNT(*) FILTER (WHERE measurement_type = 'spot' \
+                                   AND is_flagged IS NOT TRUE) AS spot_count, \
+                COUNT(*) FILTER (WHERE measurement_type IS DISTINCT FROM 'spot' \
+                                   AND replicate_index = 0 AND is_flagged IS NOT TRUE) AS continuous_count \
          FROM readings WHERE site_id = $1 GROUP BY parameter_id",
         [site_id.into()],
     );
@@ -67,6 +72,63 @@ async fn parameter_extents(
             )
         })
         .collect())
+}
+
+/// Declared cadence per site_parameter, for slots with no data yet: paired stream
+/// declarations first, then the open deployment's sensor data_frequency.
+async fn declared_frequencies(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+) -> AppResult<HashMap<Uuid, &'static str>> {
+    let mut map: HashMap<Uuid, &'static str> = HashMap::new();
+
+    for row in db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT d.parameter_id, bool_or(sn.data_frequency = 'low') AS any_low, \
+                    bool_or(sn.data_frequency = 'high') AS any_high \
+             FROM sensor_deployments d JOIN sensors sn ON sn.id = d.sensor_id \
+             WHERE d.site_id = $1 AND d.deployed_until IS NULL \
+             GROUP BY d.parameter_id",
+            [site_id.into()],
+        ))
+        .await?
+    {
+        let parameter_id: Option<Uuid> = row.try_get("", "parameter_id")?;
+        let any_low: bool = row.try_get("", "any_low")?;
+        let any_high: bool = row.try_get("", "any_high")?;
+        if let Some(pid) = parameter_id {
+            map.insert(pid, match (any_high, any_low) {
+                (false, true) => "low",
+                (true, true) => "mixed",
+                _ => "high",
+            });
+        }
+    }
+
+    for row in db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT sp.parameter_id, bool_or(ds.measurement_type = 'spot') AS any_spot, \
+                    bool_or(ds.measurement_type <> 'spot') AS any_continuous \
+             FROM site_parameters sp JOIN data_streams ds ON ds.site_parameter_id = sp.id \
+             WHERE sp.site_id = $1 AND ds.measurement_type IS NOT NULL \
+             GROUP BY sp.parameter_id",
+            [site_id.into()],
+        ))
+        .await?
+    {
+        let parameter_id: Uuid = row.try_get("", "parameter_id")?;
+        let any_spot: bool = row.try_get("", "any_spot")?;
+        let any_continuous: bool = row.try_get("", "any_continuous")?;
+        map.insert(parameter_id, match (any_continuous, any_spot) {
+            (false, true) => "low",
+            (true, true) => "mixed",
+            _ => "high",
+        });
+    }
+
+    Ok(map)
 }
 
 struct GlobalParam {
@@ -105,6 +167,7 @@ fn build_parameter_response(
     p: site_parameters::Model,
     globals: &HashMap<Uuid, GlobalParam>,
     extents: &HashMap<Uuid, ParameterExtent>,
+    declared: &HashMap<Uuid, &'static str>,
 ) -> ParameterResponse {
     let global = globals.get(&p.parameter_id);
     let code = global.map(|g| g.code.clone()).unwrap_or_default();
@@ -124,10 +187,13 @@ fn build_parameter_response(
     let extent = extents.get(&p.parameter_id);
     let has_spot = extent.is_some_and(|e| e.spot_count > 0);
     let has_continuous = extent.is_some_and(|e| e.continuous_count > 0);
+    // Observed cadence when there is data; the DECLARED tier (stream declaration, sensor
+    // data_frequency) for empty slots, so a new lab parameter opens on the right chart mode.
     let frequency = match (has_continuous, has_spot) {
         (false, true) => "low",
         (true, true) => "mixed",
-        _ => "high",
+        (true, false) => "high",
+        (false, false) => declared.get(&p.parameter_id).copied().unwrap_or("high"),
     }
     .to_string();
     ParameterResponse {
@@ -187,10 +253,11 @@ pub async fn list_site_parameters(
     let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.parameter_id).collect();
     let globals = global_param_map(&state.db, &param_ids).await?;
     let extents = parameter_extents(&state.db, site.id).await?;
+    let declared = declared_frequencies(&state.db, site.id).await?;
 
     let response: Vec<ParameterResponse> = params_list
         .into_iter()
-        .map(|p| build_parameter_response(p, &globals, &extents))
+        .map(|p| build_parameter_response(p, &globals, &extents, &declared))
         .collect();
 
     Ok(Json(response))
@@ -241,10 +308,11 @@ pub async fn get_site_detail(
     let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.parameter_id).collect();
     let globals = global_param_map(&state.db, &param_ids).await?;
     let extents = parameter_extents(&state.db, site.id).await?;
+    let declared = declared_frequencies(&state.db, site.id).await?;
 
     let parameters: Vec<ParameterResponse> = params_list
         .into_iter()
-        .map(|p| build_parameter_response(p, &globals, &extents))
+        .map(|p| build_parameter_response(p, &globals, &extents, &declared))
         .collect();
 
     // Query data range from readings

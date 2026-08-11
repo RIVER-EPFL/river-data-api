@@ -122,6 +122,11 @@ pub struct Config {
     // event-driven (~1s), so this just bounds how long a missed trigger can stay stale.
     pub alarm_sweep_interval_seconds: u64,
 
+    // Sync-event sweeper: closes sync_events rows left 'running' by a sync service
+    // that died mid-cycle (nothing client-side can terminate them).
+    pub sync_event_sweep_interval_seconds: u64,
+    pub sync_event_stale_after_seconds: u64,
+
     // Tracked-job retry policy (calibration/deployment/derived reprocessing, aggregate refresh, ...)
     pub job_max_retries: u32,
     pub job_retry_backoff_seconds: u64,
@@ -364,6 +369,15 @@ impl Config {
                 .unwrap_or_else(|_| "300".to_string())
                 .parse()
                 .unwrap_or(300),
+
+            sync_event_sweep_interval_seconds: env::var("SYNC_EVENT_SWEEP_INTERVAL_SECONDS")
+                .unwrap_or_else(|_| "300".to_string())
+                .parse()
+                .unwrap_or(300),
+            sync_event_stale_after_seconds: env::var("SYNC_EVENT_STALE_AFTER_SECONDS")
+                .unwrap_or_else(|_| "3600".to_string())
+                .parse()
+                .unwrap_or(3600),
 
             job_max_retries: env::var("JOB_MAX_RETRIES")
                 .unwrap_or_else(|_| "3".to_string())

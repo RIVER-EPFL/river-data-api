@@ -114,8 +114,29 @@ async fn reconcile(
         return Ok(SweepStats::default());
     }
 
+    // Sensor (continuous) and grab (spot) series are reconciled independently: each cadence
+    // has its own latest reading, its own open event per slot, and its own resolution.
+    let mut stats = SweepStats::default();
+    for spot in [false, true] {
+        let s = reconcile_cadence(db, slots, spot).await?;
+        stats.opened += s.opened;
+        stats.updated += s.updated;
+        stats.resolved += s.resolved;
+    }
+    Ok(stats)
+}
+
+async fn reconcile_cadence(
+    db: &DatabaseConnection,
+    slots: Option<&[(Uuid, Uuid)]>,
+    spot: bool,
+) -> AppResult<SweepStats> {
+    let cadence = super::views::cadence_label(spot);
+    let cadence_pred = super::views::cadence_predicate(spot);
+
     let breaches =
-        fetch_active_alarm_rows(db, &crate::common::authz::AccessScope::Unrestricted, slots).await?;
+        fetch_active_alarm_rows(db, &crate::common::authz::AccessScope::Unrestricted, slots, spot)
+            .await?;
 
     // Pairs that already have an open event (within scope), so we can count opened vs updated.
     let (open_keys_sql, open_keys_values): (String, Vec<sea_orm::Value>) = match slots {
@@ -130,14 +151,18 @@ async fn reconcile(
             (
                 format!(
                     "SELECT site_id, parameter_id FROM alarm_events \
-                     WHERE resolved_at IS NULL AND (site_id, parameter_id) IN ({})",
+                     WHERE resolved_at IS NULL AND measurement_type = '{cadence}' \
+                       AND (site_id, parameter_id) IN ({})",
                     pairs.join(",")
                 ),
                 vals,
             )
         }
         None => (
-            "SELECT site_id, parameter_id FROM alarm_events WHERE resolved_at IS NULL".to_string(),
+            format!(
+                "SELECT site_id, parameter_id FROM alarm_events \
+                 WHERE resolved_at IS NULL AND measurement_type = '{cadence}'"
+            ),
             Vec::new(),
         ),
     };
@@ -163,9 +188,9 @@ async fn reconcile(
         db.execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "INSERT INTO alarm_events \
-                (site_id, parameter_id, severity, max_severity, started_at, value_at_start, last_seen_at, last_value) \
-             VALUES ($1, $2, $3, $3, $4, $5, $4, $5) \
-             ON CONFLICT (site_id, parameter_id) WHERE resolved_at IS NULL \
+                (site_id, parameter_id, measurement_type, severity, max_severity, started_at, value_at_start, last_seen_at, last_value) \
+             VALUES ($1, $2, $6, $3, $3, $4, $5, $4, $5) \
+             ON CONFLICT (site_id, parameter_id, measurement_type) WHERE resolved_at IS NULL \
              DO UPDATE SET severity = EXCLUDED.severity, \
                            max_severity = GREATEST(alarm_events.max_severity, EXCLUDED.severity), \
                            last_seen_at = EXCLUDED.last_seen_at, \
@@ -177,6 +202,7 @@ async fn reconcile(
                 b.severity.into(),
                 b.time.into(),
                 b.current_value.into(),
+                cadence.into(),
             ],
         ))
         .await?;
@@ -227,8 +253,9 @@ async fn reconcile(
                                LEFT JOIN samples smp ON smp.id = r.sample_id \
                                WHERE r.site_id = ae.site_id AND r.parameter_id = ae.parameter_id \
                                  AND r.replicate_index = 0 \
+                                 AND {cadence_pred} \
                                ORDER BY r.time DESC LIMIT 1) \
-         WHERE ae.resolved_at IS NULL{scope_clause}{not_in_clause}"
+         WHERE ae.resolved_at IS NULL AND ae.measurement_type = '{cadence}'{scope_clause}{not_in_clause}"
     );
     let resolved = db
         .execute(Statement::from_sql_and_values(

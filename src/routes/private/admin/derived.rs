@@ -28,8 +28,8 @@ pub async fn recompute_derived(
     Ok(Json(serde_json::json!({ "status": "queued", "job_id": job_id })))
 }
 
-/// Enqueue a durable `derived_recompute` job for one derived parameter definition. Shared by the
-/// recompute action handler and the job-rerun dispatcher. Runs on the claim-based worker pool
+/// Enqueue a durable `derived_recompute` job for one derived parameter definition. Runs on the
+/// claim-based worker pool
 /// (`DerivedRecompute`), reading `derived_definition_id` back from the job's params.
 pub async fn spawn_recompute_derived(
     db: &sea_orm::DatabaseConnection,

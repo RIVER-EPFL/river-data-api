@@ -162,6 +162,7 @@ pub fn build_registry() -> JobRegistry {
 pub fn register_scheduled_services(registry: &mut JobRegistry, config: &crate::config::Config) {
     registry.register(Arc::new(super::jobs::JanitorRun::from_config(config)));
     registry.register(Arc::new(super::jobs::AlarmSweep::from_config(config)));
+    registry.register(Arc::new(super::jobs::SyncEventSweep::from_config(config)));
     registry.register(Arc::new(super::jobs::IdentityReconcile::from_config(config)));
     registry.register(Arc::new(super::jobs::NotifyHealth::from_config(config)));
     registry.register(Arc::new(super::jobs::DispatchNotifications::from_config(config)));

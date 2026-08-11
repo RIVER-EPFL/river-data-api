@@ -35,20 +35,6 @@ pub fn base_time() -> DateTime<Utc> {
 
 pub const READINGS_PER_PARAM: usize = 288;
 
-pub fn all_site_parameter_ids() -> Vec<&'static str> {
-    vec![
-        PARAM_S1_TEMP_ID,
-        PARAM_S1_DO_ID,
-        PARAM_S1_COND_ID,
-        PARAM_S1_TURB_ID,
-        PARAM_S1_DEPTH_ID,
-        PARAM_S2_TEMP_ID,
-        PARAM_S2_DO_ID,
-        PARAM_S2_COND_ID,
-        PARAM_S2_TURB_ID,
-    ]
-}
-
 pub struct ParamConfig {
     pub site_param_id: &'static str,
     pub site_id: &'static str,

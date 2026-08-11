@@ -1,8 +1,6 @@
 use sea_orm_migration::prelude::*;
 
-/// Adds `seq` (file order) to csv_import_staging so the csv_import job can number replicate
-/// groups deterministically: rows sharing (stream_id, time) get replicate_index 0..n-1 in the
-/// order they appeared in the uploaded file, keeping re-imports idempotent.
+/// Adds `seq` (file order) to csv_import_staging so replicate groups are numbered deterministically.
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 

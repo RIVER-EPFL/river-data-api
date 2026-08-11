@@ -678,7 +678,7 @@ async fn pair_and_backfill<C: ConnectionTrait>(
           SET site_id = $1, parameter_id = $2,
               sensor_id = $4, calibration_id = $5, deployment_id = $6,
               calibrated_value = COALESCE(r.calibrated_value, r.raw_value),
-              measurement_type = COALESCE(ds.measurement_type, r.measurement_type)
+              measurement_type = COALESCE(r.measurement_type, ds.measurement_type)
           FROM data_streams ds
           WHERE r.stream_id = ds.id AND ds.id = $3 AND r.site_id IS NULL",
         [sp.site_id.into(), sp.parameter_id.into(), stream_id.into(),

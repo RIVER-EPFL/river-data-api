@@ -144,7 +144,8 @@ async fn stale_data(
                     p.name AS param_name, \
                     (SELECT MAX(r.time) FROM readings r \
                        WHERE r.site_id = sp.site_id AND r.parameter_id = sp.parameter_id \
-                         AND r.replicate_index = 0) AS last_time \
+                         AND r.replicate_index = 0 \
+                         AND r.measurement_type IS DISTINCT FROM 'spot') AS last_time \
              FROM site_parameters sp \
              JOIN sites s ON s.id = sp.site_id \
              JOIN parameters p ON p.id = sp.parameter_id \

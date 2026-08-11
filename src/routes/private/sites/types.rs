@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use utoipa::{IntoParams, ToSchema};
+use serde::Serialize;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// Brief project reference for embedding in responses
@@ -78,10 +78,4 @@ pub struct SiteDetailResponse {
     pub data_end: Option<DateTime<Utc>>,
     /// Total number of readings for this site
     pub reading_count: i64,
-}
-
-#[derive(Debug, Deserialize, IntoParams)]
-pub struct SitesQuery {
-    /// Filter by project ID
-    pub project_id: Option<Uuid>,
 }

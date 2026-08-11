@@ -261,6 +261,7 @@ pub async fn service_auth_middleware(
                 project_scope: None,
                 rate_limit_per_second: None,
             });
+            request.extensions_mut().insert(SyncServiceMarker);
             return next.run(request).await;
         }
     }
@@ -284,19 +285,9 @@ pub async fn require_write_data(request: Request, next: Next) -> Response {
     authz::check(Capability::WriteData, TokenAccess::Same, request, next).await
 }
 
-/// Requires the `write_field_metadata` capability (RIVER member; token with write_metadata).
-pub async fn require_write_field_metadata(request: Request, next: Next) -> Response {
-    authz::check(Capability::WriteFieldMetadata, TokenAccess::Same, request, next).await
-}
-
 /// Requires the `manage_sensors` capability (MANAGER member; token with write_metadata).
 pub async fn require_manage_sensors(request: Request, next: Next) -> Response {
     authz::check(Capability::ManageSensors, TokenAccess::Same, request, next).await
-}
-
-/// Requires the `write_catalog` capability (MANAGER member; token with write_metadata).
-pub async fn require_write_catalog(request: Request, next: Next) -> Response {
-    authz::check(Capability::WriteCatalog, TokenAccess::Same, request, next).await
 }
 
 /// Requires the `Admin` capability — the Keycloak Administrator role only. NO API token can pass
@@ -329,6 +320,23 @@ pub fn require_crud(
     write_token: TokenAccess,
 ) -> impl Fn(Request, Next) -> futures::future::BoxFuture<'static, Response> + Clone {
     move |request, next| Box::pin(authz::check_crud(read, write, write_token, request, next))
+}
+
+/// Marker inserted by the dual-auth middleware when the caller authenticated with a sync
+/// service session token, for handlers whose behavior differs for sync services (ie. the
+/// ingest `overwrite` flag).
+#[derive(Clone, Copy)]
+pub struct SyncServiceMarker;
+
+/// Extractor: true when the caller is an authenticated sync service.
+pub struct IsSyncService(pub bool);
+
+impl<S: Send + Sync> FromRequestParts<S> for IsSyncService {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(IsSyncService(parts.extensions.get::<SyncServiceMarker>().is_some()))
+    }
 }
 
 /// Extractor that yields the project scope from `AuthContext::ApiToken`, if any.

@@ -284,6 +284,7 @@ pub async fn get_site_alarms(
         WHERE r.site_id = $1
           AND r.time >= $2
           AND r.time <= $3
+          AND r.replicate_index = 0
           AND {violation_condition}
         ORDER BY r.time, r.parameter_id
         "
@@ -379,6 +380,20 @@ pub async fn get_site_alarms(
     }
 }
 
+/// Cadence lens for readings queries: the grab (spot) series or everything else
+/// (continuous and derived; NULL reads as continuous).
+pub(crate) fn cadence_predicate(spot: bool) -> &'static str {
+    if spot {
+        "r.measurement_type = 'spot'"
+    } else {
+        "r.measurement_type IS DISTINCT FROM 'spot'"
+    }
+}
+
+pub(crate) fn cadence_label(spot: bool) -> &'static str {
+    if spot { "spot" } else { "continuous" }
+}
+
 /// Row from the active alarms query
 #[derive(Debug, FromQueryResult)]
 pub(crate) struct ActiveAlarmRow {
@@ -397,10 +412,13 @@ pub(crate) struct ActiveAlarmRow {
 
 /// Fetch active alarm violations across all sites. The sweeper reuses this as the "current breach
 /// set" so the persisted events never diverge from what `/alarms/active` would compute.
+/// `spot` selects the cadence lens: grab series and sensor series are evaluated independently,
+/// so a monthly grab can neither mask nor phantom-resolve a sensor breach.
 pub(crate) async fn fetch_active_alarm_rows(
     db: &sea_orm::DatabaseConnection,
     scope: &crate::common::authz::AccessScope,
     slots: Option<&[(Uuid, Uuid)]>,
+    spot: bool,
 ) -> AppResult<Vec<ActiveAlarmRow>> {
     // Empty slot list means "evaluate nothing" — short-circuit before building an invalid `IN ()`.
     if matches!(slots, Some(s) if s.is_empty()) {
@@ -425,6 +443,8 @@ pub(crate) async fn fetch_active_alarm_rows(
 
     // The single resolution definition across all active slots (no scope), spliced as the CTE.
     let resolved_cte = super::thresholds::resolve_thresholds_sql(None, None);
+
+    let cadence = cadence_predicate(spot);
 
     // Bind params are appended in order: optional project scope, then optional (site, parameter)
     // slot pairs. `next` tracks the next `$N` placeholder.
@@ -488,6 +508,7 @@ pub(crate) async fn fetch_active_alarm_rows(
             LEFT JOIN samples smp ON smp.id = r.sample_id
             WHERE r.site_id = rt.site_id AND r.parameter_id = rt.parameter_id
               AND r.replicate_index = 0
+              AND {cadence}
             ORDER BY r.time DESC
             LIMIT 1
         ) lr
@@ -512,11 +533,13 @@ pub(crate) async fn fetch_active_alarm_rows(
     Ok(rows)
 }
 
-/// Open persisted alarm event, keyed by (site, parameter) for annotating the live feed.
+/// Open persisted alarm event, keyed by (site, parameter, measurement_type) for annotating the
+/// live feed.
 #[derive(Debug, FromQueryResult)]
 struct OpenEventRow {
     site_id: Uuid,
     parameter_id: Uuid,
+    measurement_type: String,
     id: Uuid,
     started_at: chrono::DateTime<chrono::FixedOffset>,
     acknowledged_at: Option<chrono::DateTime<chrono::FixedOffset>>,
@@ -524,19 +547,20 @@ struct OpenEventRow {
     max_severity: i16,
 }
 
-/// Fetch the currently-open alarm events as a map keyed by (site_id, parameter_id). Used to attach
-/// `event_id` + acknowledgement state to the (stateless) current-breach feed.
+/// Fetch the currently-open alarm events as a map keyed by (site_id, parameter_id,
+/// measurement_type). Used to attach `event_id` + acknowledgement state to the (stateless)
+/// current-breach feed.
 async fn fetch_open_events(
     db: &sea_orm::DatabaseConnection,
     scope: &crate::common::authz::AccessScope,
-) -> AppResult<HashMap<(Uuid, Uuid), OpenEventRow>> {
+) -> AppResult<HashMap<(Uuid, Uuid, String), OpenEventRow>> {
     let project_filter = if scope.is_restricted() {
         "AND s.project_id = ANY($1)"
     } else {
         ""
     };
     let sql = format!(
-        "SELECT ae.site_id, ae.parameter_id, ae.id, ae.started_at, ae.acknowledged_at, ae.acknowledged_by, ae.max_severity \
+        "SELECT ae.site_id, ae.parameter_id, ae.measurement_type, ae.id, ae.started_at, ae.acknowledged_at, ae.acknowledged_by, ae.max_severity \
          FROM alarm_events ae JOIN sites s ON s.id = ae.site_id \
          WHERE ae.resolved_at IS NULL {project_filter}"
     );
@@ -551,7 +575,7 @@ async fn fetch_open_events(
         .await?
     {
         if let Ok(r) = OpenEventRow::from_query_result(&row, "") {
-            map.insert((r.site_id, r.parameter_id), r);
+            map.insert((r.site_id, r.parameter_id, r.measurement_type.clone()), r);
         }
     }
     Ok(map)
@@ -574,19 +598,25 @@ pub async fn get_active_alarms(
     State(state): State<AppState>,
     ProjectScope(scope): ProjectScope,
 ) -> AppResult<Json<ActiveAlarmsResponse>> {
-    let rows = fetch_active_alarm_rows(&state.db, &scope, None).await?;
+    let mut tagged: Vec<(ActiveAlarmRow, &'static str)> = Vec::new();
+    for spot in [false, true] {
+        for row in fetch_active_alarm_rows(&state.db, &scope, None, spot).await? {
+            tagged.push((row, cadence_label(spot)));
+        }
+    }
     let open = fetch_open_events(&state.db, &scope).await?;
 
-    let alarms: Vec<ActiveAlarm> = rows
+    let alarms: Vec<ActiveAlarm> = tagged
         .into_iter()
-        .map(|row| {
-            let ev = open.get(&(row.site_id, row.parameter_id));
+        .map(|(row, cadence)| {
+            let ev = open.get(&(row.site_id, row.parameter_id, cadence.to_string()));
             ActiveAlarm {
                 site_id: row.site_id,
                 site_name: row.site_name,
                 parameter_id: row.parameter_id,
                 parameter_name: row.parameter_name,
                 current_value: row.current_value,
+                measurement_type: cadence.to_string(),
                 threshold: AlarmThresholdInfo {
                     warning_min: row.warning_min,
                     warning_max: row.warning_max,
@@ -762,7 +792,8 @@ pub async fn get_alarm_summary(
     State(state): State<AppState>,
     ProjectScope(scope): ProjectScope,
 ) -> AppResult<Json<AlarmSummaryResponse>> {
-    let rows = fetch_active_alarm_rows(&state.db, &scope, None).await?;
+    let mut rows = fetch_active_alarm_rows(&state.db, &scope, None, false).await?;
+    rows.extend(fetch_active_alarm_rows(&state.db, &scope, None, true).await?);
 
     let mut warning_count = 0usize;
     let mut alarm_count = 0usize;
@@ -858,11 +889,12 @@ async fn fetch_latest_reading_times(
         ""
     };
 
+    // Continuous-only: a monthly grab must not make a dead logger look alive.
     let sql = format!(
         r"
         SELECT s.id AS site_id, s.name AS site_name, MAX(r.time) AS latest_time
         FROM sites s
-        JOIN readings r ON r.site_id = s.id
+        JOIN readings r ON r.site_id = s.id AND r.measurement_type IS DISTINCT FROM 'spot'
         {project_filter}
         GROUP BY s.id, s.name
         "
@@ -954,6 +986,7 @@ struct AlarmEventRow {
     site_name: String,
     parameter_id: Uuid,
     parameter_name: String,
+    measurement_type: String,
     severity: i16,
     max_severity: i16,
     started_at: chrono::DateTime<chrono::FixedOffset>,
@@ -1030,7 +1063,7 @@ pub async fn get_alarm_events(
     let sql = format!(
         r"
         SELECT ae.id, ae.site_id, s.name AS site_name, ae.parameter_id,
-               COALESCE(sp.name, p.name) AS parameter_name,
+               COALESCE(sp.name, p.name) AS parameter_name, ae.measurement_type,
                ae.severity, ae.max_severity, ae.started_at, ae.last_seen_at,
                ae.value_at_start, ae.last_value, ae.resolved_at, ae.resolved_value,
                ae.acknowledged_at, ae.acknowledged_by
@@ -1082,6 +1115,7 @@ pub async fn get_alarm_events(
             site_name: r.site_name,
             parameter_id: r.parameter_id,
             parameter_name: r.parameter_name,
+            measurement_type: r.measurement_type,
             severity: r.severity,
             max_severity: r.max_severity,
             started_at: r.started_at.with_timezone(&Utc),
@@ -1142,7 +1176,9 @@ pub async fn get_thresholds(
 
     // Attach the latest reading per slot so the table can show a current value beside each threshold.
     // Bounded to the last 30 days so TimescaleDB chunk-excludes to recent chunks (fast even for the
-    // unscoped/global view); a slot with no recent reading gets a NULL current value.
+    // unscoped/global view); a slot with no recent reading gets a NULL current value. Continuous
+    // readings win over spot so an occasional grab does not stand in for a sensor's current value;
+    // a spot-only slot still reports its latest grab.
     let sql = format!(
         "WITH resolved AS ({resolved_cte}), \
          latest AS ( \
@@ -1150,8 +1186,11 @@ pub async fn get_thresholds(
                    COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS current_value \
             FROM readings r \
             LEFT JOIN samples smp ON smp.id = r.sample_id \
-            WHERE r.replicate_index = 0 AND r.site_id IS NOT NULL AND r.time > now() - interval '30 days' \
-            ORDER BY r.site_id, r.parameter_id, r.time DESC \
+            WHERE r.site_id IS NOT NULL AND r.is_flagged IS NOT TRUE \
+              AND r.time > now() - interval '30 days' \
+            ORDER BY r.site_id, r.parameter_id, \
+                     (r.measurement_type IS NOT DISTINCT FROM 'spot') ASC, r.time DESC, \
+                     r.replicate_index ASC \
          ) \
          SELECT r.site_id, r.parameter_id, r.warning_min, r.warning_max, r.alarm_min, r.alarm_max, \
                 r.source, l.current_value \

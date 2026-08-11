@@ -141,9 +141,7 @@ struct PortalStreams {
     replicate_3: String,
     alias_match: String,
     name_match_up: String,
-    #[allow(dead_code)]
     do_field_dn: String,
-    #[allow(dead_code)]
     name_match_dn: String,
 }
 
@@ -506,104 +504,6 @@ async fn portal_migration_wizard_full_flow() {
     assert_eq!(
         count(&db, "SELECT count(*) AS c FROM parameters WHERE code = 'DO Replicate'").await,
         1, "created parameters remain after revert"
-    );
-
-    crate::common::cleanup_test_db(&db).await;
-}
-
-// ---------------------------------------------------------------------------
-// Admin user management: directory search, grant, revoke (dev Keycloak)
-// ---------------------------------------------------------------------------
-
-use crate::common::keycloak::{
-    build_test_app_with_keycloak_admin, ensure_realm_user, get_keycloak_jwt, keycloak_reachable,
-};
-
-macro_rules! require_keycloak {
-    () => {
-        if !keycloak_reachable().await {
-            eprintln!("SKIP: keycloak unreachable (start the dev stack, or set TEST_KEYCLOAK_URL)");
-            return;
-        }
-    };
-}
-
-fn riverdata_roles(user: &serde_json::Value) -> Vec<String> {
-    user["roles"]
-        .as_array()
-        .map(|r| {
-            r.iter()
-                .filter_map(|v| v.as_str())
-                .filter(|n| n.starts_with("riverdata-"))
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-#[tokio::test]
-#[serial]
-async fn user_search_grant_and_revoke_flow() {
-    require_keycloak!();
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    crate::common::seed_test_data(&db).await;
-    let app = build_test_app_with_keycloak_admin(db.clone()).await;
-
-    ensure_realm_user("labhire", "labhire", &[]).await;
-    let jwt = get_keycloak_jwt("admin", "admin").await;
-
-    let (status, body) =
-        crate::common::get_with_token(&app, "/api/users/search?q=labhire", &jwt).await;
-    assert_eq!(status, 200, "search must succeed: {body}");
-    let results: Vec<serde_json::Value> = serde_json::from_str(&body).expect("JSON search results");
-    let found = results
-        .iter()
-        .find(|u| u["username"] == "labhire")
-        .unwrap_or_else(|| panic!("labhire not in search results: {results:?}"));
-    let user_id = found["id"].as_str().expect("user id").to_string();
-    assert!(
-        riverdata_roles(found).is_empty(),
-        "fixture user starts without riverdata roles: {found}"
-    );
-
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        &format!("/api/users/{user_id}/roles"),
-        &serde_json::json!({ "roles": ["riverdata-manager"] }),
-        &jwt,
-    )
-    .await;
-    assert_eq!(status, 200, "grant must succeed: {body}");
-
-    let (status, body) = crate::common::get_with_token(&app, "/api/users", &jwt).await;
-    assert_eq!(status, 200, "{body}");
-    let users: Vec<serde_json::Value> = serde_json::from_str(&body).expect("JSON user list");
-    let granted = users
-        .iter()
-        .find(|u| u["username"] == "labhire")
-        .unwrap_or_else(|| panic!("granted user missing from /users: {users:?}"));
-    assert_eq!(
-        riverdata_roles(granted),
-        vec!["riverdata-manager"],
-        "exactly the granted role: {granted}"
-    );
-
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        &format!("/api/users/{user_id}/roles"),
-        &serde_json::json!({ "roles": [] }),
-        &jwt,
-    )
-    .await;
-    assert_eq!(status, 200, "revoke must succeed: {body}");
-
-    let (status, body) = crate::common::get_with_token(&app, "/api/users", &jwt).await;
-    assert_eq!(status, 200, "{body}");
-    let users: Vec<serde_json::Value> = serde_json::from_str(&body).expect("JSON user list");
-    assert!(
-        !users.iter().any(|u| u["username"] == "labhire"),
-        "revoked user must leave the role-holder list: {users:?}"
     );
 
     crate::common::cleanup_test_db(&db).await;

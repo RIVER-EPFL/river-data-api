@@ -1,8 +1,7 @@
 use sea_orm_migration::prelude::*;
 
-/// Aligns the `constants` table with the CNET/METALP portal production values
-/// and names. Drops the invented `kh_co2`/`kh_ch4`/`ch4_temp_const` entries
-/// (the portal hardcodes those literals in its calculation functions).
+/// Sets the `constants` table to the CNET/METALP portal names and values, and drops
+/// `kh_co2`/`kh_ch4`/`ch4_temp_const` (the portal hardcodes those literals).
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 

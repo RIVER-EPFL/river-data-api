@@ -1,11 +1,11 @@
 use axum::{Json, extract::State};
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Set, Statement};
+use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Set, Statement, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
+use crate::common::middleware::{IsSyncService, ProjectScope, enforce_project_scope_for_sites};
 use crate::common::{AppEvent, AppState};
 use crate::routes::private::{data_streams, readings, readings::status_events};
 use crate::error::{AppError, AppResult};
@@ -17,6 +17,11 @@ use crate::routes::private::sensors::operations::{
 pub struct IngestReadingsRequest {
     pub stream_id: Uuid,
     pub readings: Vec<IngestReading>,
+    /// Update existing rows at the same (stream, time, replicate) key instead of skipping
+    /// them, so source-side corrections propagate on re-sync. Sync-service callers only;
+    /// flag state and sample links on the existing row are preserved.
+    #[serde(default)]
+    pub overwrite: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -43,6 +48,56 @@ pub struct IngestResponse {
 
 const BATCH_SIZE: usize = 1000;
 
+/// Batched insert. With `overwrite`, conflicting rows are updated in place on the value
+/// and attribution columns; operator state (is_flagged, flag_reason, sample_id) is never
+/// touched so a correction cannot clear a flag or unlink a sample.
+async fn insert_reading_chunks<C: ConnectionTrait>(
+    conn: &C,
+    models: &[readings::ActiveModel],
+    overwrite: bool,
+) -> Result<usize, AppError> {
+    let mut conflict = sea_orm::sea_query::OnConflict::columns([
+        readings::Column::StreamId,
+        readings::Column::Time,
+        readings::Column::ReplicateIndex,
+    ]);
+    if overwrite {
+        conflict.update_columns([
+            readings::Column::RawValue,
+            readings::Column::CalibratedValue,
+            readings::Column::SiteId,
+            readings::Column::ParameterId,
+            readings::Column::SensorId,
+            readings::Column::CalibrationId,
+            readings::Column::DeploymentId,
+            readings::Column::MeasurementType,
+        ]);
+    } else {
+        conflict.do_nothing();
+    }
+
+    let mut inserted = 0usize;
+    for chunk in models.chunks(BATCH_SIZE) {
+        match readings::Entity::insert_many(chunk.to_vec())
+            .on_conflict(conflict.clone())
+            .exec_without_returning(conn)
+            .await
+        {
+            Ok(rows) => inserted += rows as usize,
+            Err(e) => {
+                let msg = e.to_string();
+                if !overwrite && msg.contains("None of the records") {
+                    // All duplicates in this chunk
+                } else {
+                    tracing::warn!(error = %e, batch_size = chunk.len(), "Failed to insert reading batch");
+                    return Err(AppError::Database(e));
+                }
+            }
+        }
+    }
+    Ok(inserted)
+}
+
 /// Stream-based data ingestion. Inserts readings keyed by `stream_id`. If the stream is
 /// paired to a `site_parameter`, readings are stamped with `site_id`/`parameter_id` and an
 /// identity calibration. Unpaired streams insert with `site_id = NULL` (and won't show up
@@ -60,8 +115,15 @@ const BATCH_SIZE: usize = 1000;
 pub async fn ingest_readings(
     State(state): State<AppState>,
     ProjectScope(scope): ProjectScope,
+    IsSyncService(is_sync_service): IsSyncService,
     Json(payload): Json<IngestReadingsRequest>,
 ) -> AppResult<Json<IngestResponse>> {
+    if payload.overwrite && !is_sync_service {
+        return Err(AppError::Forbidden(
+            "overwrite is restricted to sync services".to_string(),
+        ));
+    }
+
     if payload.readings.is_empty() {
         return Ok(Json(IngestResponse {
             inserted: 0,
@@ -205,33 +267,25 @@ pub async fn ingest_readings(
         .collect();
 
     let total = models.len();
-    let mut inserted = 0usize;
 
-    for chunk in models.chunks(BATCH_SIZE) {
-        match readings::Entity::insert_many(chunk.to_vec())
-            .on_conflict(
-                sea_orm::sea_query::OnConflict::columns([
-                    readings::Column::StreamId,
-                    readings::Column::Time,
-                    readings::Column::ReplicateIndex,
-                ])
-                .do_nothing()
-                .to_owned(),
-            )
-            .exec_without_returning(db)
-            .await
-        {
-            Ok(rows) => inserted += rows as usize,
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("None of the records") {
-                    // All duplicates in this chunk
-                } else {
-                    tracing::warn!(error = %e, batch_size = chunk.len(), "Failed to insert reading batch");
-                    return Err(AppError::Database(e));
-                }
-            }
-        }
+    // Overwrite updates existing rows, which may live in compressed chunks; run inside a
+    // transaction with the decompression cap lifted, like every other back-dated write path.
+    let inserted = if payload.overwrite {
+        let txn = db.begin().await?;
+        txn.execute_unprepared(
+            "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0",
+        )
+        .await?;
+        let n = insert_reading_chunks(&txn, &models, true).await?;
+        txn.commit().await?;
+        n
+    } else {
+        insert_reading_chunks(db, &models, false).await?
+    };
+
+    // Corrections rewrite history that bounded queries may have cached.
+    if payload.overwrite && inserted > 0 {
+        state.response_cache.invalidate_all();
     }
 
     // Emit ingestion event
