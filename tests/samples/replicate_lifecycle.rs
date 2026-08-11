@@ -121,17 +121,24 @@ async fn grab_replicates_form_sample_and_serve_mean() {
         "all replicates listed: {stats}"
     );
 
-    crate::common::exec(
-        &db,
-        &format!(
-            "UPDATE readings SET is_flagged = true \
-             WHERE site_id = '{}' AND parameter_id = '{}' \
-               AND time = '{GRAB_TIME}' AND replicate_index = 2",
-            crate::common::SITE1_ID,
-            crate::common::GLOBAL_PARAM_TEMP_ID
-        ),
+    let (status, body) = crate::common::patch_json_with_token(
+        &app,
+        "/api/readings/flag",
+        &serde_json::json!({
+            "reason": "outlier",
+            "readings": [{
+                "site_id": crate::common::SITE1_ID,
+                "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID,
+                "time": GRAB_TIME,
+                "replicate_index": 2,
+            }],
+        }),
+        &token,
     )
     .await;
+    assert_eq!(status, 200, "flag one replicate ({status}): {body}");
+    let flagged: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(flagged["updated"], 1, "only the named replicate is flagged");
 
     let series = fetch_temp_series(&app, &token, "").await;
     let values = series["parameters"][0]["values"].as_array().unwrap();

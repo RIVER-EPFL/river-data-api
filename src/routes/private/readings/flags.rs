@@ -14,6 +14,9 @@ pub struct ReadingKey {
     pub site_id: Uuid,
     pub parameter_id: Uuid,
     pub time: DateTime<Utc>,
+    /// One replicate of a grab group. Omit to act on every replicate at that timestamp.
+    #[serde(default)]
+    pub replicate_index: Option<i16>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -32,7 +35,7 @@ pub struct FlagReadingsResponse {
     pub updated: u64,
 }
 
-/// Flag a set of individual readings by (site_id, parameter_id, time). Requires `write_data`.
+/// Flag readings by (site_id, parameter_id, time), optionally one replicate. Requires `write_data`.
 #[utoipa::path(
     patch,
     path = "/readings/flag",
@@ -66,16 +69,20 @@ pub async fn flag_readings(
         let mut values: Vec<sea_orm::Value> = vec![payload.reason.clone().into()];
 
         for (i, key) in chunk.iter().enumerate() {
-            let base = i * 3 + 2; // $1 is reason, so start at $2
+            let base = i * 4 + 2; // $1 is reason, so start at $2
             conditions.push(format!(
-                "(site_id = ${} AND parameter_id = ${} AND time = ${})",
+                "(site_id = ${} AND parameter_id = ${} AND time = ${} \
+                  AND (${}::smallint IS NULL OR replicate_index = ${}))",
                 base,
                 base + 1,
-                base + 2
+                base + 2,
+                base + 3,
+                base + 3
             ));
             values.push(key.site_id.into());
             values.push(key.parameter_id.into());
             values.push(key.time.into());
+            values.push(key.replicate_index.into());
         }
 
         let sql = format!(
@@ -141,19 +148,23 @@ pub async fn unflag_readings(
 
     for chunk in payload.readings.chunks(500) {
         let mut conditions = Vec::with_capacity(chunk.len());
-        let mut values: Vec<sea_orm::Value> = Vec::with_capacity(chunk.len() * 3);
+        let mut values: Vec<sea_orm::Value> = Vec::with_capacity(chunk.len() * 4);
 
         for (i, key) in chunk.iter().enumerate() {
-            let base = i * 3 + 1;
+            let base = i * 4 + 1;
             conditions.push(format!(
-                "(site_id = ${} AND parameter_id = ${} AND time = ${})",
+                "(site_id = ${} AND parameter_id = ${} AND time = ${} \
+                  AND (${}::smallint IS NULL OR replicate_index = ${}))",
                 base,
                 base + 1,
-                base + 2
+                base + 2,
+                base + 3,
+                base + 3
             ));
             values.push(key.site_id.into());
             values.push(key.parameter_id.into());
             values.push(key.time.into());
+            values.push(key.replicate_index.into());
         }
 
         let sql = format!(

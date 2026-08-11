@@ -381,12 +381,16 @@ impl AnalyticalTool for NutrientsTool {
         if let Some(species) = &payload.species {
             let multi = river_data_core::toolbox::multi_nutrient_replicates(species);
             for (name, nr) in &multi {
-                // Portal column casing: NUT_NOx_avg, NUT_P_avg, ...; the METALP
-                // portal stores NH4/SRP as standalone ugL columns.
+                // Portal column casing: NUT_NOx_avg, NUT_P_avg, ...; a NUT_ prefix on
+                // the species name selects that family (NUT_NH4 -> NUT_NH4_avg), while
+                // bare NH4/SRP address the METALP standalone ugL columns.
                 let (avg_key, sd_key) = match name.as_str() {
                     "NH4" => ("NH4_avg_ugL".to_string(), "NH4_sd_ugL".to_string()),
                     "SRP" => ("SRP_avg_ugL".to_string(), "SRP_sd_ugL".to_string()),
-                    _ => (format!("NUT_{name}_avg"), format!("NUT_{name}_sd")),
+                    _ => {
+                        let base = name.strip_prefix("NUT_").unwrap_or(name);
+                        (format!("NUT_{base}_avg"), format!("NUT_{base}_sd"))
+                    }
                 };
                 insert_num(&mut results, &avg_key, nr.mean);
                 insert_num(&mut results, &sd_key, nr.std_dev);
@@ -633,14 +637,24 @@ impl AnalyticalTool for Pco2Tool {
                     insert_num(&mut results, "CO2_HS_Um_B", rep.b.co2_hs_umol);
                     insert_num(&mut results, "CO2_HS_Um_avg", rep.co2_hs_umol_avg);
                     insert_num(&mut results, "CO2_HS_Um_sd", rep.co2_hs_umol_sd);
+                    insert_num(&mut results, "pCO2_HS_uatm_A", rep.a.pco2_uatm);
+                    insert_num(&mut results, "pCO2_HS_uatm_B", rep.b.pco2_uatm);
                     insert_num(&mut results, "pCO2_HS_uatm_avg", rep.pco2_uatm_avg);
                     insert_num(&mut results, "pCO2_HS_uatm_sd", rep.pco2_uatm_sd);
+                    insert_num(&mut results, "pCO2_HS_P1_uatm_A", rep.a.pco2_p1_uatm);
+                    insert_num(&mut results, "pCO2_HS_P1_uatm_B", rep.b.pco2_p1_uatm);
                     insert_num(&mut results, "pCO2_HS_P1_uatm_avg", rep.pco2_p1_uatm_avg);
                     insert_num(&mut results, "pCO2_HS_P1_uatm_sd", rep.pco2_p1_uatm_sd);
+                    insert_num(&mut results, "pCO2_HS_P2_uatm_A", rep.a.pco2_p2_uatm);
+                    insert_num(&mut results, "pCO2_HS_P2_uatm_B", rep.b.pco2_p2_uatm);
                     insert_num(&mut results, "pCO2_HS_P2_uatm_avg", rep.pco2_p2_uatm_avg);
                     insert_num(&mut results, "pCO2_HS_P2_uatm_sd", rep.pco2_p2_uatm_sd);
                     insert_opt(&mut results, "d13C_CO2_avg", rep.d13co2_permil_avg);
                     insert_opt(&mut results, "d13C_CO2_sd", rep.d13co2_permil_sd);
+                    insert_num(&mut results, "lab_co2_ch4_dry_A", rep.a.ch4_dry_ppm);
+                    insert_num(&mut results, "lab_co2_ch4_dry_B", rep.b.ch4_dry_ppm);
+                    insert_num(&mut results, "CH4_calc_umol_L_A", rep.a.ch4_dissolved_umol);
+                    insert_num(&mut results, "CH4_calc_umol_L_B", rep.b.ch4_dissolved_umol);
                     insert_num(&mut results, "CH4_umol_L_avg", rep.ch4_dissolved_umol_avg);
                     insert_num(&mut results, "CH4_umol_L_sd", rep.ch4_dissolved_umol_sd);
                 } else {
@@ -1094,10 +1108,10 @@ impl AnalyticalTool for ChlaBenthicTool {
         insert_opt(&mut results, "Chla_acid_ugL_sd", result.chla_acid_ug_l_sd);
         insert_num(&mut results, "Chla_noacid_ugL_avg", result.chla_noacid_ug_l_avg);
         insert_num(&mut results, "Chla_noacid_ugL_sd", result.chla_noacid_ug_l_sd);
-        insert_opt(&mut results, "Chla_acid_ugm2_avg", result.chla_acid_ug_m2_avg);
-        insert_opt(&mut results, "Chla_acid_ugm2_sd", result.chla_acid_ug_m2_sd);
-        insert_num(&mut results, "Chla_noacid_ugm2_avg", result.chla_noacid_ug_m2_avg);
-        insert_num(&mut results, "Chla_noacid_ugm2_sd", result.chla_noacid_ug_m2_sd);
+        insert_opt(&mut results, "Chla_acid_avg_ugm2", result.chla_acid_ug_m2_avg);
+        insert_opt(&mut results, "Chla_acid_sd_ugm2", result.chla_acid_ug_m2_sd);
+        insert_num(&mut results, "Chla_noacid_avg_ugm2", result.chla_noacid_ug_m2_avg);
+        insert_num(&mut results, "Chla_noacid_sd_ugm2", result.chla_noacid_ug_m2_sd);
         insert_opt(&mut results, "benthic_AFDM_avg_gm2", result.afdm_g_m2_avg);
         insert_opt(&mut results, "benthic_AFDM_sd_gm2", result.afdm_g_m2_sd);
 

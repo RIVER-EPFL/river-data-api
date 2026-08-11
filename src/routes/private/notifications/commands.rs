@@ -229,8 +229,9 @@ pub async fn latest(db: &DatabaseConnection, scope: &AccessScope, arg: &str) -> 
         .query_all(Statement::from_sql_and_values(
             PG,
             "SELECT DISTINCT ON (p.id) p.name AS param, p.default_units AS units, \
-                    COALESCE(r.calibrated_value, r.raw_value) AS value, r.time AS time \
+                    COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value, r.time AS time \
              FROM readings r JOIN parameters p ON p.id = r.parameter_id \
+             LEFT JOIN samples smp ON smp.id = r.sample_id \
              WHERE r.site_id = $1 AND r.replicate_index = 0 \
              ORDER BY p.id, r.time DESC",
             [site_id.into()],

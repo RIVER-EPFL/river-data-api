@@ -182,7 +182,7 @@ pub async fn list_users(
         let r: Vec<usize> = serde_json::from_str(range).unwrap_or_else(|_| vec![0, 24]);
         let start = r.first().copied().unwrap_or(0);
         let end = r.get(1).copied().unwrap_or(24);
-        (start, end - start + 1)
+        (start, end.saturating_sub(start).saturating_add(1))
     } else {
         (0, 25)
     };
@@ -579,15 +579,20 @@ pub async fn list_roles(
         .await
         .map_err(|e| AppError::Internal(format!("Keycloak request failed: {e}")))?;
 
-    let roles: Vec<KeycloakRole> = if resp.status().is_success() {
-        resp.json().await.unwrap_or_default()
-    } else {
-        vec![]
-    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!(
+            "Failed to fetch roles ({status}): {body}"
+        )));
+    }
+    let roles: Vec<KeycloakRole> = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to parse roles: {e}")))?;
 
-    // Expose only the riverdata access levels. Unrelated realm roles — Keycloak internals and the
-    // bare `admin` role, which is NOT a river access role — are hidden so the UI role picker can
-    // only assign real levels.
+    // Only the riverdata access levels are exposed, so the role picker cannot assign Keycloak
+    // internals or the bare `admin` role.
     let roles: Vec<serde_json::Value> = roles
         .into_iter()
         .filter(|r| RIVER_ROLE_NAMES.contains(&r.name.as_str()))
@@ -702,12 +707,26 @@ async fn set_user_roles(
         .await
         .map_err(|e| AppError::Internal(format!("Failed to parse roles: {e}")))?;
 
-    // Every requested role must exist in the realm before anything is removed — a partial
-    // apply would strip the user's current access and silently assign nothing.
+    // Every requested role must exist in the realm before anything is removed, otherwise a
+    // partial apply strips the user's current access and assigns nothing.
     let unknown: Vec<&String> = role_names
         .iter()
         .filter(|name| !all_roles.iter().any(|r| &r.name == *name))
         .collect();
+    let outside: Vec<&String> = role_names
+        .iter()
+        .filter(|name| !RIVER_ROLE_NAMES.contains(&name.as_str()))
+        .collect();
+    if !outside.is_empty() {
+        let names = outside
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(AppError::BadRequest(format!(
+            "Not a river access role: {names}"
+        )));
+    }
     if !unknown.is_empty() {
         let names = unknown
             .iter()
@@ -728,16 +747,22 @@ async fn set_user_roles(
         .await
         .map_err(|e| AppError::Internal(format!("Failed to fetch current roles: {e}")))?;
 
-    let current_roles: Vec<KeycloakRole> = current_resp.json().await.unwrap_or_default();
+    if !current_resp.status().is_success() {
+        let status = current_resp.status();
+        let body = current_resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!(
+            "Failed to fetch current roles ({status}): {body}"
+        )));
+    }
+    let current_roles: Vec<KeycloakRole> = current_resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to parse current roles: {e}")))?;
 
-    // Only remove non-default roles
+    // Only river access levels are removable; roles granted for other applications stay.
     let removable: Vec<&KeycloakRole> = current_roles
         .iter()
-        .filter(|r| {
-            !r.name.starts_with("default-roles-")
-                && r.name != "uma_authorization"
-                && r.name != "offline_access"
-        })
+        .filter(|r| RIVER_ROLE_NAMES.contains(&r.name.as_str()))
         .collect();
 
     if !removable.is_empty() {

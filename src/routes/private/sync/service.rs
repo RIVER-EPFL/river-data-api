@@ -377,20 +377,19 @@ pub async fn apply_plan(
             counters.streams_skipped += 1;
             continue;
         };
-        let (site_parameter_id, parameter_id) = resolve_plan_entry(
-            &txn, entry, &plan.source_system, &mut caches, &mut counters,
-        ).await?;
-        if let Some(existing_sp) = stream.site_parameter_id
-            && existing_sp != site_parameter_id
-        {
+        // Checked before resolving so a skipped entry leaves no orphan site or parameter behind.
+        if let Some(existing_sp) = stream.site_parameter_id {
             tracing::warn!(
                 stream_id = %entry.stream_id,
                 site_parameter_id = %existing_sp,
-                "apply_plan: skipping stream already paired to a different site_parameter",
+                "apply_plan: skipping stream that is already paired",
             );
             counters.streams_skipped += 1;
             continue;
         }
+        let (site_parameter_id, parameter_id) = resolve_plan_entry(
+            &txn, entry, &plan.source_system, &mut caches, &mut counters,
+        ).await?;
         pair_entry_stream(&txn, stream, plan_id, site_parameter_id, parameter_id).await?;
         counters.streams_paired += 1;
     }
@@ -424,19 +423,28 @@ pub async fn apply_plan(
             Some((s, p))
         })
         .collect();
-    let db_clone = db.clone();
-    tokio::spawn(async move {
-        for (site_id, parameter_id) in slots {
-            if let Err(e) = crate::routes::private::sensors::calibrations::service::reprocess_site_parameter_readings(
-                &db_clone, site_id, parameter_id,
-            )
-            .await
-            {
-                tracing::warn!(error = %e, %site_id, %parameter_id, "apply_plan: slot reprocess failed");
-            }
-        }
-        crate::common::sync_state::refresh_continuous_aggregates_full(&db_clone).await;
-    });
+    // Re-derivation runs as tracked jobs so a failure is visible and rerunnable rather than a log
+    // line lost on restart.
+    for (site_id, parameter_id) in slots {
+        crate::routes::private::reprocessing_jobs::worker::enqueue(
+            db,
+            "pairing_backfill",
+            None,
+            None,
+            &serde_json::json!({ "site_id": site_id, "parameter_id": parameter_id }),
+            None,
+        )
+        .await?;
+    }
+    crate::routes::private::reprocessing_jobs::worker::enqueue(
+        db,
+        "refresh_aggregates_full",
+        None,
+        None,
+        &serde_json::json!({ "full": true }),
+        None,
+    )
+    .await?;
 
     let result = ApplyResult {
         projects_created: counters.projects_created,
@@ -598,13 +606,27 @@ async fn backfill_plan_readings<C: ConnectionTrait>(txn: &C, plan_id: Uuid) -> A
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE readings r
           SET site_id = sp.site_id, parameter_id = sp.parameter_id,
-              calibrated_value = COALESCE(r.calibrated_value, r.raw_value)
+              calibrated_value = COALESCE(r.calibrated_value, r.raw_value),
+              measurement_type = COALESCE(ds.measurement_type, r.measurement_type)
           FROM data_streams ds
           JOIN site_parameters sp ON ds.site_parameter_id = sp.id
           WHERE r.stream_id = ds.id AND r.site_id IS NULL
             AND ds.pairing_plan_id = $1",
         [plan_id.into()],
     )).await?;
+
+    let plan_streams: Vec<Uuid> = txn
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM data_streams WHERE pairing_plan_id = $1",
+            [plan_id.into()],
+        ))
+        .await?
+        .iter()
+        .filter_map(|row| row.try_get::<Uuid>("", "id").ok())
+        .collect();
+    crate::routes::private::readings::replicates::densify_stream_replicates(txn, &plan_streams)
+        .await?;
 
     // Replicate groups on the newly paired streams (2+ readings sharing a stream+timestamp, e.g.
     // migrated NOMIS A/B/C rows mapped to replicate_index 0/1/2) form samples: find-or-create the
@@ -639,7 +661,7 @@ async fn backfill_plan_readings<C: ConnectionTrait>(txn: &C, plan_id: Uuid) -> A
         [plan_id.into()],
     )).await?;
 
-    if let Err(e) = txn.execute(Statement::from_sql_and_values(
+    txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE status_events se
           SET site_id = sp.site_id, parameter_id = sp.parameter_id
@@ -648,13 +670,7 @@ async fn backfill_plan_readings<C: ConnectionTrait>(txn: &C, plan_id: Uuid) -> A
           WHERE se.stream_id = ds.id AND se.site_id IS NULL
             AND ds.pairing_plan_id = $1",
         [plan_id.into()],
-    )).await {
-        tracing::warn!(
-            error = %e,
-            plan_id = %plan_id,
-            "Failed to backfill status_events site_id/parameter_id during plan apply; readings were still updated",
-        );
-    }
+    )).await?;
 
     Ok(backfill_result.rows_affected())
 }
@@ -722,6 +738,20 @@ pub async fn revert_plan(
 
     // NULL out readings for streams from this plan; samples formed by the pairing backfill
     // lose their last reference and are removed below
+    // Samples referenced by this plan's readings, so only those can be removed below.
+    let sample_ids: Vec<Uuid> = txn
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT DISTINCT r.sample_id AS id FROM readings r
+              JOIN data_streams ds ON r.stream_id = ds.id
+              WHERE ds.pairing_plan_id = $1 AND r.sample_id IS NOT NULL",
+            [plan_id.into()],
+        ))
+        .await?
+        .iter()
+        .filter_map(|row| row.try_get::<Uuid>("", "id").ok())
+        .collect();
+
     txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE readings r SET site_id = NULL, parameter_id = NULL, sample_id = NULL
@@ -730,27 +760,23 @@ pub async fn revert_plan(
         [plan_id.into()],
     )).await?;
 
-    txn.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"DELETE FROM samples s
-          WHERE NOT EXISTS (SELECT 1 FROM readings r WHERE r.sample_id = s.id)",
-        Vec::<sea_orm::Value>::new(),
-    )).await?;
+    if !sample_ids.is_empty() {
+        txn.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"DELETE FROM samples s
+              WHERE s.id = ANY($1)
+                AND NOT EXISTS (SELECT 1 FROM readings r WHERE r.sample_id = s.id)",
+            [sample_ids.into()],
+        )).await?;
+    }
 
-    // NULL out status_events — best-effort: readings are already cleared above
-    if let Err(e) = txn.execute(Statement::from_sql_and_values(
+    txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE status_events se SET site_id = NULL, parameter_id = NULL
           FROM data_streams ds
           WHERE se.stream_id = ds.id AND ds.pairing_plan_id = $1",
         [plan_id.into()],
-    )).await {
-        tracing::warn!(
-            error = %e,
-            plan_id = %plan_id,
-            "Failed to NULL status_events during plan revert; readings were already cleared",
-        );
-    }
+    )).await?;
 
     // Unpair the streams; pairing_plan_id stays as the audit link back to this plan
     let result = txn.execute(Statement::from_sql_and_values(

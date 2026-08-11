@@ -832,6 +832,7 @@ impl CsvImport {
                 .filter_map(|(key, _)| group_slots.get(key).map(|slot| (*key, *slot)))
                 .collect();
         let replicate_groups = sample_groups.len();
+        let mut sample_slots: Option<(Vec<Uuid>, Vec<Uuid>, Vec<String>)> = None;
         if !sample_groups.is_empty() {
             let site_ids: Vec<Uuid> = sample_groups.iter().map(|(_, (s, _))| *s).collect();
             let param_ids: Vec<Uuid> = sample_groups.iter().map(|(_, (_, p))| *p).collect();
@@ -887,6 +888,11 @@ impl CsvImport {
                     m.sample_id = Set(Some(*sample_id));
                 }
             }
+            sample_slots = Some((
+                sample_by_slot.keys().map(|(s, _, _)| *s).collect(),
+                sample_by_slot.keys().map(|(_, p, _)| *p).collect(),
+                sample_by_slot.keys().map(|(_, _, t)| t.to_rfc3339()).collect(),
+            ));
         }
 
         let total = i32::try_from(models.len()).unwrap_or(i32::MAX);
@@ -915,6 +921,24 @@ impl CsvImport {
                 ctx.set_progress(i32::try_from(inserted_so_far).unwrap_or(i32::MAX), Some(total))
                     .await;
             }
+        }
+
+        // Readings already present from an earlier import belong to the group's sample too, so the
+        // statistics cover every replicate rather than only the rows this run inserted.
+        if let Some((slot_sites, slot_params, slot_times)) = sample_slots {
+            ctx.db()
+                .execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "UPDATE readings r SET sample_id = s.id \
+                     FROM samples s, unnest($1::uuid[], $2::uuid[], $3::text[]::timestamptz[]) \
+                          AS t(site_id, parameter_id, collected_at) \
+                     WHERE s.site_id = t.site_id AND s.parameter_id = t.parameter_id \
+                       AND s.collected_at = t.collected_at \
+                       AND r.site_id = s.site_id AND r.parameter_id = s.parameter_id \
+                       AND r.time = s.collected_at AND r.sample_id IS NULL",
+                    [slot_sites.into(), slot_params.into(), slot_times.into()],
+                ))
+                .await?;
         }
 
         let (inserted_total, overwritten) = match conflict {
@@ -1433,9 +1457,12 @@ impl Job for MeasurementRetag {
         let target = params
             .get("target")
             .and_then(serde_json::Value::as_str)
-            .filter(|t| matches!(*t, "continuous" | "spot" | "derived"))
+            .filter(|t| matches!(*t, "continuous" | "spot" | "derived" | "declared"))
             .ok_or_else(|| DbErr::Custom("measurement_retag needs target".to_string()))?
             .to_string();
+        // 'declared' aligns each reading with its own stream's classification, for source systems
+        // that mix grab and logger columns.
+        let declared = target == "declared";
         let sensor_ids = uuid_array(params, "sensor_ids");
         let stream_ids = uuid_array(params, "stream_ids");
         let source_system = params
@@ -1448,15 +1475,37 @@ impl Job for MeasurementRetag {
             ));
         }
 
-        let scope = "(r.sensor_id = ANY($2) OR r.stream_id = ANY($3) \
-                      OR ($4::text IS NOT NULL AND r.stream_id IN \
-                          (SELECT id FROM data_streams WHERE source_system = $4)))";
-        let values: Vec<sea_orm::Value> = vec![
-            target.clone().into(),
-            sensor_ids.clone().into(),
-            stream_ids.clone().into(),
-            source_system.clone().into(),
-        ];
+        // 'declared' joins each reading to its stream in both the window probe and the rewrite and
+        // drops the target parameter; a fixed target compares against $1.
+        let (scope, from_clause, mismatch, new_value, update_from) = if declared {
+            (
+                "(r.sensor_id = ANY($1) OR r.stream_id = ANY($2) \
+                  OR ($3::text IS NOT NULL AND r.stream_id IN \
+                      (SELECT id FROM data_streams WHERE source_system = $3)))",
+                ", data_streams ds",
+                "r.stream_id = ds.id AND ds.measurement_type IS NOT NULL \
+                 AND r.measurement_type IS DISTINCT FROM ds.measurement_type",
+                "ds.measurement_type",
+                "FROM data_streams ds",
+            )
+        } else {
+            (
+                "(r.sensor_id = ANY($2) OR r.stream_id = ANY($3) \
+                  OR ($4::text IS NOT NULL AND r.stream_id IN \
+                      (SELECT id FROM data_streams WHERE source_system = $4)))",
+                "",
+                "r.measurement_type IS DISTINCT FROM $1",
+                "$1",
+                "",
+            )
+        };
+        let mut values: Vec<sea_orm::Value> = Vec::new();
+        if !declared {
+            values.push(target.clone().into());
+        }
+        values.push(sensor_ids.clone().into());
+        values.push(stream_ids.clone().into());
+        values.push(source_system.clone().into());
 
         // Affected window (for the aggregate refresh), read before the rewrite.
         let window = ctx
@@ -1464,8 +1513,8 @@ impl Job for MeasurementRetag {
             .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 &format!(
-                    "SELECT min(time) AS lo, max(time) AS hi FROM readings r \
-                     WHERE r.measurement_type IS DISTINCT FROM $1 AND {scope}"
+                    "SELECT min(r.time) AS lo, max(r.time) AS hi FROM readings r{from_clause} \
+                     WHERE {mismatch} AND {scope}"
                 ),
                 values.clone(),
             ))
@@ -1493,8 +1542,8 @@ impl Job for MeasurementRetag {
             .execute(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 &format!(
-                    "UPDATE readings r SET measurement_type = $1 \
-                     WHERE r.measurement_type IS DISTINCT FROM $1 AND {scope}"
+                    "UPDATE readings r SET measurement_type = {new_value} \
+                     {update_from} WHERE {mismatch} AND {scope}"
                 ),
                 values,
             ))

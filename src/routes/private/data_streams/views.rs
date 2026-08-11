@@ -2,6 +2,7 @@ use axum::{Json, extract::{Path, State}};
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, Statement,
+    TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -376,20 +377,32 @@ pub async fn pair_stream(
         .one(db)
         .await?
         .ok_or_else(|| AppError::Internal("Failed to re-fetch stream".to_string()))?;
+    let stream_measurement_type = stream.measurement_type.clone();
     let mut active: data_streams::ActiveModel = stream.into();
     active.site_parameter_id = Set(Some(payload.site_parameter_id));
     active.paired_at = Set(Some(now.into()));
     active.updated_at = Set(now.into());
     active.update(db).await?;
 
-    // Backfill: update readings with site_id + parameter_id + sensor context, apply identity calibration
-    let result = db
+    // The backfill runs in one transaction with decompression unlimited, so a stream whose history
+    // reaches into compressed chunks can still be attributed.
+    let txn = db.begin().await?;
+    txn.execute(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
+    ))
+    .await?;
+
+    // Backfill: update readings with site_id + parameter_id + sensor context, apply identity
+    // calibration, and adopt the stream's declared classification for its history.
+    let result = txn
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE readings
               SET site_id = $1, parameter_id = $2,
                   sensor_id = $4, calibration_id = $5, deployment_id = $6,
-                  calibrated_value = COALESCE(calibrated_value, raw_value)
+                  calibrated_value = COALESCE(calibrated_value, raw_value),
+                  measurement_type = COALESCE($7, measurement_type)
               WHERE stream_id = $3 AND site_id IS NULL",
             [
                 sp.site_id.into(),
@@ -398,16 +411,20 @@ pub async fn pair_stream(
                 sensor_ctx.sensor_id.into(),
                 sensor_ctx.calibration_id.into(),
                 sensor_ctx.deployment_id.into(),
+                stream_measurement_type.into(),
             ],
         ))
         .await?;
 
     let backfilled = result.rows_affected();
 
+    crate::routes::private::readings::replicates::densify_stream_replicates(&txn, &[stream_id])
+        .await?;
+
     // Replicate groups (2+ readings sharing a timestamp, e.g. migrated NOMIS A/B/C rows) form
     // samples at pairing time: find-or-create the samples row per group, then stamp sample_id on
     // the group's readings. The row-level triggers populate the sample statistics.
-    db.execute(Statement::from_sql_and_values(
+    txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"INSERT INTO samples (site_id, parameter_id, collected_at)
           SELECT site_id, parameter_id, time FROM readings
@@ -418,7 +435,7 @@ pub async fn pair_stream(
         [stream_id.into()],
     ))
     .await?;
-    db.execute(Statement::from_sql_and_values(
+    txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE readings r
           SET sample_id = s.id
@@ -436,7 +453,7 @@ pub async fn pair_stream(
     .await?;
 
     // Also backfill status_events
-    db.execute(Statement::from_sql_and_values(
+    txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE status_events
           SET site_id = $1, parameter_id = $2, sensor_id = $4
@@ -449,6 +466,8 @@ pub async fn pair_stream(
         ],
     ))
     .await?;
+
+    txn.commit().await?;
 
     // Window-reprocess the slot in the background (tracked): re-attributes the backfilled readings
     // to whichever sensor's deployment window covers each time — so pairing a stream into a slot with
@@ -622,7 +641,8 @@ pub struct RetagStreamsRequest {
     /// Classify every stream of a source system (e.g. 'metalp', 'nomis').
     #[serde(default)]
     pub source_system: Option<String>,
-    /// 'continuous' | 'spot' | 'derived'.
+    /// 'continuous' | 'spot' | 'derived', or 'declared' to keep each stream's own classification
+    /// and align its readings with it (mixed source systems such as cnet).
     pub measurement_type: String,
     /// Also retag the streams' existing readings and refresh aggregates (tracked job).
     #[serde(default)]
@@ -659,27 +679,34 @@ pub async fn retag_streams(
             "provide stream_ids and/or source_system".to_string(),
         ));
     }
-    if !matches!(req.measurement_type.as_str(), "continuous" | "spot" | "derived") {
+    if !matches!(
+        req.measurement_type.as_str(),
+        "continuous" | "spot" | "derived" | "declared"
+    ) {
         return Err(AppError::BadRequest(format!(
-            "invalid measurement_type '{}' (expected continuous, spot, or derived)",
+            "invalid measurement_type '{}' (expected continuous, spot, derived, or declared)",
             req.measurement_type
         )));
     }
 
-    let streams_updated = state
-        .db
-        .execute(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE data_streams SET measurement_type = $1, updated_at = now() \
-             WHERE id = ANY($2) OR ($3::text IS NOT NULL AND source_system = $3)",
-            [
-                req.measurement_type.clone().into(),
-                req.stream_ids.clone().into(),
-                req.source_system.clone().into(),
-            ],
-        ))
-        .await?
-        .rows_affected();
+    let streams_updated = if req.measurement_type == "declared" {
+        0
+    } else {
+        state
+            .db
+            .execute(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE data_streams SET measurement_type = $1, updated_at = now() \
+                 WHERE id = ANY($2) OR ($3::text IS NOT NULL AND source_system = $3)",
+                [
+                    req.measurement_type.clone().into(),
+                    req.stream_ids.clone().into(),
+                    req.source_system.clone().into(),
+                ],
+            ))
+            .await?
+            .rows_affected()
+    };
 
     let job_id = if req.retag_existing {
         crate::routes::private::reprocessing_jobs::worker::enqueue(

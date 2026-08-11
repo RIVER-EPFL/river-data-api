@@ -82,7 +82,12 @@ async fn test_list_tools_excludes_removed() {
 async fn test_removed_tools_return_404() {
     let (app, token) = setup().await;
 
-    for tool in ["ions", "isotopes"] {
+    // Tools and helper calculations dropped for lacking a portal counterpart:
+    // the ion charge balance, the isotope excesses, Gran titration alkalinity,
+    // the standalone dry-CO2 correction, spectral slope, and percent organic.
+    for tool in [
+        "ions", "isotopes", "gran_titration", "co2_dry", "spectral_slope", "percent_organic",
+    ] {
         let (status, _) = crate::common::post_json_parse_with_token(
             &app,
             &format!("/api/tools/{tool}/calculate"),
@@ -208,6 +213,28 @@ async fn test_nutrients_legacy_species_map_to_metalp_columns() {
     assert_value(&json, "SRP_avg_ugL", 4.0);
     assert_value(&json, "SRP_sd_ugL", 1.0);
     assert_absent(&json, "NUT_NH4_avg");
+    assert_absent(&json, "NUT_SRP_avg");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_nutrients_nut_prefixed_species_map_to_current_columns() {
+    let (app, token) = setup().await;
+
+    let json = calculate(&app, "nutrients", serde_json::json!({
+        "species": {
+            "NUT_NH4": [10.0, 12.0, 11.0],
+            "NUT_SRP": [3.0, 4.0, 5.0]
+        }
+    }), &token).await;
+
+    assert_value(&json, "NUT_NH4_avg", 11.0);
+    assert_value(&json, "NUT_NH4_sd", 1.0);
+    assert_value(&json, "NUT_SRP_avg", 4.0);
+    assert_value(&json, "NUT_SRP_sd", 1.0);
+    assert_absent(&json, "NH4_avg_ugL");
+    assert_absent(&json, "SRP_avg_ugL");
+    assert_absent(&json, "NUT_NUT_NH4_avg");
 }
 
 #[tokio::test]
@@ -326,12 +353,22 @@ async fn test_pco2_full_chain_replicates() {
     assert_value(&json, "CO2_HS_Um_B", 581.832962374793);
     assert_value(&json, "CO2_HS_Um_avg", 513.455071086931);
     assert_value(&json, "CO2_HS_Um_sd", 96.7009412257675);
+    assert_value(&json, "pCO2_HS_uatm_A", 11620.0862988240);
+    assert_value(&json, "pCO2_HS_uatm_B", 15190.5097388902);
     assert_value(&json, "pCO2_HS_uatm_avg", 13405.2980188571);
     assert_value(&json, "pCO2_HS_uatm_sd", 2524.67062617817);
+    assert_value(&json, "pCO2_HS_P1_uatm_A", 11911.9971889435);
+    assert_value(&json, "pCO2_HS_P1_uatm_B", 15572.1140665359);
     assert_value(&json, "pCO2_HS_P1_uatm_avg", 13742.0556277397);
     assert_value(&json, "pCO2_HS_P1_uatm_sd", 2588.09346408091);
+    assert_value(&json, "pCO2_HS_P2_uatm_A", 11335.3288663841);
+    assert_value(&json, "pCO2_HS_P2_uatm_B", 14818.2568623227);
     assert_value(&json, "pCO2_HS_P2_uatm_avg", 13076.7928643534);
     assert_value(&json, "pCO2_HS_P2_uatm_sd", 2462.80200431262);
+    assert_value(&json, "lab_co2_ch4_dry_A", 494.014347980239);
+    assert_value(&json, "lab_co2_ch4_dry_B", 25.5140767773052);
+    assert_value(&json, "CH4_calc_umol_L_A", 21305.1026163270);
+    assert_value(&json, "CH4_calc_umol_L_B", 1100.33160830688);
     assert_value(&json, "CH4_umol_L_avg", 11202.7171123169);
     assert_value(&json, "CH4_umol_L_sd", 14286.9305920924);
     assert_absent(&json, "d13C_CO2_avg");
@@ -486,12 +523,12 @@ async fn test_chla_benthic_full_chain() {
 
     assert_value(&json, "Chla_noacid_ugL_avg", 143.488484846234);
     assert_value(&json, "Chla_noacid_ugL_sd", 4.97871851443831);
-    assert_value(&json, "Chla_noacid_ugm2_avg", 4.72170111397028);
-    assert_value(&json, "Chla_noacid_ugm2_sd", 0.636780437655608);
+    assert_value(&json, "Chla_noacid_avg_ugm2", 4.72170111397028);
+    assert_value(&json, "Chla_noacid_sd_ugm2", 0.636780437655608);
     assert_value(&json, "Chla_acid_ugL_avg", 49.5089574283813);
     assert_value(&json, "Chla_acid_ugL_sd", 6.6695978487066);
-    assert_value(&json, "Chla_acid_ugm2_avg", 1.63733115106572);
-    assert_value(&json, "Chla_acid_ugm2_sd", 0.38237474117737);
+    assert_value(&json, "Chla_acid_avg_ugm2", 1.63733115106572);
+    assert_value(&json, "Chla_acid_sd_ugm2", 0.38237474117737);
     assert_value(&json, "benthic_AFDM_avg_gm2", 0.0313778354472084);
     assert_value(&json, "benthic_AFDM_sd_gm2", 0.0314246916989114);
 }

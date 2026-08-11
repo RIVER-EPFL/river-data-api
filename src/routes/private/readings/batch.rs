@@ -76,6 +76,7 @@ pub(crate) fn readings_on_conflict(mode: ConflictMode) -> sea_orm::sea_query::On
             clause.update_columns([
                 readings::Column::RawValue,
                 readings::Column::CalibratedValue,
+                readings::Column::SampleId,
             ]);
         }
     }

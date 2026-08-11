@@ -1,5 +1,5 @@
 use axum::{Json, extract::State};
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
+use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
@@ -126,13 +126,14 @@ async fn auto_create_samples(
     created_by: Option<&str>,
     label: Option<&str>,
     notes: Option<&str>,
-) -> Result<HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Uuid>, AppError> {
+) -> Result<(HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Uuid>, usize), AppError> {
     let mut groups: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), usize> = HashMap::new();
     for r in readings {
         *groups.entry((r.parameter_id, r.time)).or_default() += 1;
     }
 
     let mut sample_map = HashMap::new();
+    let mut created = 0usize;
     for ((parameter_id, time), count) in groups {
         if count < 2 && label.is_none() && notes.is_none() {
             continue;
@@ -178,9 +179,10 @@ async fn auto_create_samples(
         };
         let sample = sample.insert(txn).await?;
         sample_map.insert((parameter_id, time), sample.id);
+        created += 1;
     }
 
-    Ok(sample_map)
+    Ok((sample_map, created))
 }
 
 /// Insert field-collected grab sample readings (manual measurements with replicate sets).
@@ -253,7 +255,7 @@ pub async fn insert_grab_samples(
     let txn = state.db.begin().await?;
 
     // Auto-create samples for replicate groups (2+ readings per parameter+time)
-    let sample_map = auto_create_samples(
+    let (sample_map, samples_created) = auto_create_samples(
         &txn,
         &payload.readings,
         payload.site_id,
@@ -263,7 +265,6 @@ pub async fn insert_grab_samples(
     )
     .await?;
 
-    let samples_created = sample_map.len();
 
     // Window-aware attribution for grabs that name a sensor: resolve calibration/deployment from the
     // sensor's windows at the grab time (site-fixed to payload.site_id), instead of writing NULL.
@@ -413,6 +414,23 @@ pub async fn insert_grab_samples(
         }
     };
 
+    // Readings the insert skipped on conflict still belong to the group's sample; linking them
+    // fires the aggregate trigger so the stats cover every replicate.
+    for ((parameter_id, time), sample_id) in &sample_map {
+        txn.execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE readings SET sample_id = $1
+              WHERE site_id = $2 AND parameter_id = $3 AND time = $4 AND sample_id IS NULL",
+            [
+                (*sample_id).into(),
+                payload.site_id.into(),
+                (*parameter_id).into(),
+                (*time).into(),
+            ],
+        ))
+        .await?;
+    }
+
     txn.commit().await?;
 
     // Event-driven open-alarm reconcile for the sampled slots (error-safe; backstop covers it),
@@ -444,6 +462,12 @@ pub async fn insert_grab_samples(
                 tracing::warn!(error = %e, site_id = %payload.site_id, parameter_id = %pid, "alarm episode reconstruction failed");
             }
         }
+    }
+
+    if inserted > 0 {
+        let site_id = payload.site_id;
+        crate::common::cache::invalidate_prefix(&state, &format!("readings:{site_id}")).await;
+        crate::common::cache::invalidate_prefix(&state, &format!("aggregates:{site_id}")).await;
     }
 
     tracing::info!(total, inserted, samples_created, site = %site.name, "Grab samples inserted");

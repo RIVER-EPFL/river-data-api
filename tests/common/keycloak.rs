@@ -250,6 +250,76 @@ async fn ensure_realm_role(
     rep
 }
 
+/// Master-realm admin token. Creating realm roles is beyond the API service account's grants, so
+/// fixtures that need a non-river realm role go through the dev Keycloak's own admin account.
+async fn master_admin_token() -> String {
+    let user = std::env::var("TEST_KEYCLOAK_MASTER_USER").unwrap_or_else(|_| "admin".to_string());
+    let password =
+        std::env::var("TEST_KEYCLOAK_MASTER_PASSWORD").unwrap_or_else(|_| "admin".to_string());
+    let body: serde_json::Value = reqwest::Client::new()
+        .post(format!(
+            "{}realms/master/protocol/openid-connect/token",
+            keycloak_base_url()
+        ))
+        .form(&[
+            ("client_id", "admin-cli"),
+            ("grant_type", "password"),
+            ("username", user.as_str()),
+            ("password", password.as_str()),
+        ])
+        .send()
+        .await
+        .expect("Keycloak unreachable")
+        .json()
+        .await
+        .expect("non-JSON master token response");
+    body["access_token"]
+        .as_str()
+        .expect("no access_token in master admin response")
+        .to_string()
+}
+
+/// Grant a realm role that is not a river access level, creating it if needed.
+pub async fn grant_realm_role(username: &str, role: &str) {
+    let admin_token = master_admin_token().await;
+    let base = format!("{}admin/realms/{}", keycloak_base_url(), keycloak_realm());
+    let client = reqwest::Client::new();
+    let rep = ensure_realm_role(&client, &admin_token, &base, role).await;
+    let user_id = keycloak_user_id(username).await;
+    client
+        .post(format!("{base}/users/{user_id}/role-mappings/realm"))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!([rep]))
+        .send()
+        .await
+        .expect("Keycloak unreachable");
+}
+
+/// Every realm role mapped to a user, river and non-river alike.
+pub async fn realm_role_names(username: &str) -> Vec<String> {
+    let admin_token = get_keycloak_admin_token().await;
+    let base = format!("{}admin/realms/{}", keycloak_base_url(), keycloak_realm());
+    let user_id = keycloak_user_id(username).await;
+    let mappings: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/users/{user_id}/role-mappings/realm"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("Keycloak unreachable")
+        .json()
+        .await
+        .expect("non-JSON role mappings");
+    mappings
+        .as_array()
+        .map(|roles| {
+            roles
+                .iter()
+                .filter_map(|r| r["name"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The Keycloak `sub` (== realm user id) for a username, via the admin API. Project grants are keyed
 /// by `sub`, so tests seed grants against this. Panics if the user doesn't exist.
 pub async fn keycloak_user_id(username: &str) -> String {

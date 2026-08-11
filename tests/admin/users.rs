@@ -2,21 +2,23 @@
 //!
 //! The happy-path suites run the in-process app against the **dev Keycloak** (realm `river-data`,
 //! users `admin/admin` + `user/user`, service account with `view-realm`) and auto-skip when it is
-//! unreachable — same harness as `tests/auth/keycloak_jwt_capability.rs`.
+//! unreachable, same harness as `tests/auth/keycloak_jwt_capability.rs`.
 //!
 //! The failure-path test needs no Keycloak: it drives the `list_users` handler against an
 //! in-process mock that answers the token grant but 403s the role-members listing (what a service
 //! account without `view-realm` gets), and asserts the handler errors instead of answering an
-//! empty 200 — the silent-empty behaviour that long masked the missing grant in production.
+//! empty 200 instead of the silent-empty behaviour that masked the missing grant.
 
 use axum::extract::{Query, State};
 use river_db::common::AppState;
-use river_db::routes::private::admin::users::{ListQuery, list_users};
+use river_db::routes::private::admin::users::{
+    AssignRolesRequest, ListQuery, assign_roles, list_users,
+};
 use serial_test::serial;
 
 use crate::common::keycloak::{
-    build_test_app_with_keycloak_admin, ensure_realm_user, get_keycloak_jwt, keycloak_reachable,
-    keycloak_user_id,
+    build_test_app_with_keycloak_admin, ensure_realm_user, get_keycloak_jwt, grant_realm_role,
+    keycloak_reachable, keycloak_user_id, realm_role_names,
 };
 
 macro_rules! require_keycloak {
@@ -54,7 +56,7 @@ async fn list_users_returns_role_holders_deduped() {
     assert!(usernames.contains(&"admin"), "admin user missing: {usernames:?}");
     assert!(usernames.contains(&"user"), "regular user missing: {usernames:?}");
 
-    // A user holding two levels appears in both per-role member lists — the union must dedupe.
+    // A user holding two levels appears in both per-role member lists; the union must dedupe.
     assert_eq!(
         usernames.iter().filter(|u| **u == "dualrole").count(),
         1,
@@ -150,6 +152,56 @@ async fn assign_unknown_role_rejected_and_current_roles_untouched() {
 
 #[tokio::test]
 #[serial]
+async fn level_change_keeps_roles_from_other_applications() {
+    require_keycloak!();
+    let (_db, app) = seeded_app().await;
+    ensure_realm_user("multiapp", "multiapp", &["riverdata-intern"]).await;
+    grant_realm_role("multiapp", "test-external-app").await;
+    let user_id = keycloak_user_id("multiapp").await;
+    let jwt = get_keycloak_jwt("admin", "admin").await;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/users/{user_id}/roles"),
+        &serde_json::json!({ "roles": ["riverdata-river"] }),
+        &jwt,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let roles = realm_role_names("multiapp").await;
+    assert!(
+        roles.iter().any(|r| r == "test-external-app"),
+        "unrelated realm role must survive a level change: {roles:?}"
+    );
+    assert!(roles.iter().any(|r| r == "riverdata-river"), "{roles:?}");
+    assert!(!roles.iter().any(|r| r == "riverdata-intern"), "{roles:?}");
+}
+
+#[tokio::test]
+#[serial]
+async fn assigning_a_non_river_role_is_rejected() {
+    require_keycloak!();
+    let (_db, app) = seeded_app().await;
+    ensure_realm_user("levelguard", "levelguard", &["riverdata-river"]).await;
+    grant_realm_role("levelguard", "test-external-app").await;
+    let user_id = keycloak_user_id("levelguard").await;
+    let jwt = get_keycloak_jwt("admin", "admin").await;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/users/{user_id}/roles"),
+        &serde_json::json!({ "roles": ["test-external-app"] }),
+        &jwt,
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    let roles = realm_role_names("levelguard").await;
+    assert!(roles.iter().any(|r| r == "riverdata-river"), "{roles:?}");
+}
+
+#[tokio::test]
+#[serial]
 async fn create_user_endpoint_is_removed() {
     require_keycloak!();
     let (_db, app) = seeded_app().await;
@@ -224,6 +276,63 @@ async fn spawn_mock_keycloak_forbidding_role_users() -> String {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     format!("http://{addr}")
+}
+
+/// Mock Keycloak: token grant and role listings succeed, removing role mappings fails.
+async fn spawn_mock_keycloak_failing_role_delete() -> String {
+    use axum::routing::{delete, get, post};
+    let river_roles = || async {
+        axum::Json(serde_json::json!([
+            {"id": "1", "name": "riverdata-river"},
+            {"id": "2", "name": "riverdata-intern"},
+        ]))
+    };
+    let app = axum::Router::new()
+        .route(
+            "/realms/{realm}/protocol/openid-connect/token",
+            post(|| async {
+                axum::Json(serde_json::json!({"access_token": "mock-token", "expires_in": 300}))
+            }),
+        )
+        .route("/admin/realms/{realm}/roles", get(river_roles))
+        .route(
+            "/admin/realms/{realm}/users/{id}/role-mappings/realm",
+            get(|| async { axum::Json(serde_json::json!([{"id": "2", "name": "riverdata-intern"}])) })
+                .delete(|| async {
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(serde_json::json!({"error": "delete failed"})),
+                    )
+                }),
+        )
+        .route("/admin/realms/{realm}/unused", delete(|| async { "" }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+#[serial]
+async fn assign_roles_errors_when_role_removal_fails() {
+    let db = crate::common::setup_test_db().await;
+    let mock_url = spawn_mock_keycloak_failing_role_delete().await;
+
+    let mut config = crate::common::keycloak::test_config_with_mock_keycloak(&mock_url);
+    config.database_url = std::env::var("DATABASE_URL").unwrap_or_default();
+    let state = AppState::new(db, config, None);
+
+    let result = assign_roles(
+        State(state),
+        axum::extract::Path("some-user".to_string()),
+        axum::Json(AssignRolesRequest { roles: vec!["riverdata-river".to_string()] }),
+    )
+    .await;
+    let err = result.err().expect("a failed role removal must not report success");
+    assert!(
+        format!("{err:?}").contains("500"),
+        "error should carry the Keycloak status: {err:?}"
+    );
 }
 
 #[tokio::test]

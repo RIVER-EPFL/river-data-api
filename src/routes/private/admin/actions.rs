@@ -644,10 +644,12 @@ pub async fn preview_derived(
         let rows = db
             .query_all(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                r"SELECT time, COALESCE(calibrated_value, raw_value) as val
-                  FROM readings
-                  WHERE parameter_id = $1 AND site_id = $2 AND time >= $3 AND time <= $4
-                  ORDER BY time ASC",
+                r"SELECT r.time, COALESCE(smp.mean, r.calibrated_value, r.raw_value) as val
+                  FROM readings r
+                  LEFT JOIN samples smp ON smp.id = r.sample_id
+                  WHERE r.parameter_id = $1 AND r.site_id = $2 AND r.time >= $3 AND r.time <= $4
+                    AND r.replicate_index = 0
+                  ORDER BY r.time ASC",
                 [
                     (*parameter_id).into(),
                     payload.site_id.into(),

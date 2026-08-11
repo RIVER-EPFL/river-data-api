@@ -1,6 +1,6 @@
 use axum::{Json, Router, extract::{Path, State}, routing::{get, post}};
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, Condition, EntityTrait, QueryFilter, Set, TransactionTrait, sea_query::Expr};
+use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, Condition, EntityTrait, QueryFilter, Set, Statement, TransactionTrait, sea_query::Expr};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -20,7 +20,7 @@ use river_data_core::server::handlers::admin as core_admin;
 ///
 /// Group membership:
 /// - `read_routes`: list/get operations, fine for any read_metadata caller.
-/// - `write_routes`: operator actions — issuing sync commands, pairing workflows.
+/// - `write_routes`: operator actions such as issuing sync commands and pairing workflows.
 ///   Same gate as other entity mutations (Keycloak admin or write_metadata token).
 /// - `admin_routes`: credential creation and revoke — these mint full-permission
 ///   sync session tokens, so they're Keycloak-admin only (no API token can pass).
@@ -436,6 +436,10 @@ pub async fn apply_discovery(
 ) -> AppResult<Json<ApplyDiscoveryResponse>> {
     let db = &state.db;
     let txn = db.begin().await?;
+    txn.execute(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
+    )).await?;
 
     let mut resp = ApplyDiscoveryResponse {
         projects_created: 0,
@@ -449,9 +453,12 @@ pub async fn apply_discovery(
     };
 
     for action in req.actions {
-        let result = process_action(&txn, &action).await;
+        // Each action runs in a savepoint so a failure is reported without aborting the rest.
+        let savepoint = txn.begin().await?;
+        let result = process_action(&savepoint, &action).await;
         match result {
             Ok(stats) => {
+                savepoint.commit().await?;
                 resp.projects_created += stats.projects_created;
                 resp.sites_created += stats.sites_created;
                 resp.parameters_created += stats.parameters_created;
@@ -461,6 +468,7 @@ pub async fn apply_discovery(
                 resp.total_backfilled += stats.backfilled;
             }
             Err(e) => {
+                savepoint.rollback().await?;
                 resp.errors.push(format!(
                     "Stream {}: {}",
                     action.stream_id, e
@@ -664,32 +672,27 @@ async fn pair_and_backfill<C: ConnectionTrait>(
     active.updated_at = Set(now.into());
     active.update(db).await.map_err(|e| e.to_string())?;
 
-    use sea_orm::Statement;
     let result = db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE readings
+        r"UPDATE readings r
           SET site_id = $1, parameter_id = $2,
               sensor_id = $4, calibration_id = $5, deployment_id = $6,
-              calibrated_value = COALESCE(calibrated_value, raw_value)
-          WHERE stream_id = $3 AND site_id IS NULL",
+              calibrated_value = COALESCE(r.calibrated_value, r.raw_value),
+              measurement_type = COALESCE(ds.measurement_type, r.measurement_type)
+          FROM data_streams ds
+          WHERE r.stream_id = ds.id AND ds.id = $3 AND r.site_id IS NULL",
         [sp.site_id.into(), sp.parameter_id.into(), stream_id.into(),
          sensor_ctx.sensor_id.into(), sensor_ctx.calibration_id.into(), sensor_ctx.deployment_id.into()],
     )).await.map_err(|e| e.to_string())?;
     let backfilled = result.rows_affected();
 
-    if let Err(e) = db.execute(Statement::from_sql_and_values(
+    db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE status_events
           SET site_id = $1, parameter_id = $2, sensor_id = $4
           WHERE stream_id = $3 AND site_id IS NULL",
         [sp.site_id.into(), sp.parameter_id.into(), stream_id.into(), sensor_ctx.sensor_id.into()],
-    )).await {
-        tracing::warn!(
-            error = %e,
-            stream_id = %stream_id,
-            "Failed to backfill status_events during stream pairing; readings were still paired",
-        );
-    }
+    )).await.map_err(|e| e.to_string())?;
 
     Ok((sensors_created, backfilled))
 }
@@ -938,6 +941,8 @@ pub struct BulkPairResponse {
     parameters_created: u32,
     site_parameters_created: u32,
     streams_paired: u32,
+    /// Streams that could not be paired, with the reason.
+    streams_skipped: Vec<String>,
 }
 
 /// `POST /api/admin/sync/bulk-pair` — creates entities and pairs all matching streams in one transaction.
@@ -1054,6 +1059,16 @@ pub async fn bulk_pair(
             }
         };
         param_map.insert(p.code.to_lowercase(), id);
+        param_map.insert(p.name.to_lowercase(), id);
+    }
+
+    // Streams name their column by code, display name or alias, so all three resolve.
+    for param in parameters::Entity::find().all(&txn).await? {
+        param_map.entry(param.code.to_lowercase()).or_insert(param.id);
+        param_map.entry(param.name.to_lowercase()).or_insert(param.id);
+        for alias in param.aliases {
+            param_map.entry(alias.to_lowercase()).or_insert(param.id);
+        }
     }
 
     // 4. Fetch unpaired streams, build site_parameter mappings, then batch-pair
@@ -1123,72 +1138,35 @@ pub async fn bulk_pair(
         stream_to_sp.push((stream.id, site_parameter_id));
     }
 
-    // Second pass: batch-pair streams using a single UPDATE with a VALUES join
-    // Process in chunks to avoid oversized SQL
-    let valid_pairs: Vec<(Uuid, Uuid)> = stream_to_sp.into_iter()
-        .filter(|(_, sp_id)| !sp_id.is_nil())
-        .collect();
-
-    let paired = valid_pairs.len() as u32;
-    let now = Utc::now();
-
-    for chunk in valid_pairs.chunks(1000) {
-        // Build VALUES clause: ($1, $2), ($3, $4), ...
-        let mut values_parts: Vec<String> = Vec::new();
-        let mut params: Vec<sea_orm::Value> = Vec::new();
-        for (i, (stream_id, sp_id)) in chunk.iter().enumerate() {
-            let base = i * 2 + 1;
-            values_parts.push(format!("(${}, ${})", base, base + 1));
-            params.push((*stream_id).into());
-            params.push((*sp_id).into());
-        }
-
-        let values_sql = values_parts.join(",");
-        let now_param_idx = chunk.len() * 2 + 1;
-        params.push(now.into());
-
-        // Batch update data_streams
-        let sql = format!(
-            "UPDATE data_streams SET site_parameter_id = v.sp_id, paired_at = ${now_param_idx}, updated_at = ${now_param_idx} \
-             FROM (VALUES {values_sql}) AS v(stream_id, sp_id) \
-             WHERE data_streams.id = v.stream_id::uuid"
-        );
-        txn.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres, &sql, params,
-        )).await?;
-    }
-
-    // Raise TimescaleDB decompression limit for the bulk backfill
+    // Raise the TimescaleDB decompression limit so backfills reach compressed history
     txn.execute(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
     )).await?;
 
-    // Third pass: batch-backfill readings using a single JOIN update
-    txn.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE readings r
-          SET site_id = sp.site_id, parameter_id = sp.parameter_id,
-              calibrated_value = COALESCE(r.calibrated_value, r.raw_value)
-          FROM data_streams ds
-          JOIN site_parameters sp ON ds.site_parameter_id = sp.id
-          WHERE r.stream_id = ds.id AND r.site_id IS NULL
-            AND ds.source_system = $1",
-        [req.source_system.clone().into()],
-    )).await?;
+    // Second pass: pair each stream through the same helper the plan flow uses, so sensors,
+    // calibration and deployment attribution, status events and samples all follow.
+    let mut paired = 0u32;
+    let mut skipped: Vec<String> = Vec::new();
+    for (stream_id, sp_id) in stream_to_sp {
+        if sp_id.is_nil() {
+            skipped.push(stream_id.to_string());
+            continue;
+        }
+        match pair_and_backfill(&txn, stream_id, sp_id).await {
+            Ok(_) => paired += 1,
+            Err(e) => {
+                skipped.push(format!("{stream_id}: {e}"));
+            }
+        }
+    }
 
-    // Backfill status_events too
-    txn.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE status_events se
-          SET site_id = sp.site_id, parameter_id = sp.parameter_id
-          FROM data_streams ds
-          JOIN site_parameters sp ON ds.site_parameter_id = sp.id
-          WHERE se.stream_id = ds.id AND se.site_id IS NULL
-            AND ds.source_system = $1",
-        [req.source_system.clone().into()],
-    ))
-    .await?;
+    let paired_ids: Vec<Uuid> = streams
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    crate::routes::private::readings::replicates::densify_stream_replicates(&txn, &paired_ids)
+        .await?;
 
     txn.commit().await?;
 
@@ -1213,6 +1191,7 @@ pub async fn bulk_pair(
         params_created,
         sp_created,
         paired,
+        skipped = skipped.len(),
         "Bulk pair complete"
     );
 
@@ -1222,6 +1201,7 @@ pub async fn bulk_pair(
         parameters_created: params_created,
         site_parameters_created: sp_created,
         streams_paired: paired,
+        streams_skipped: skipped,
     }))
 }
 

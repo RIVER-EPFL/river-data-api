@@ -253,8 +253,9 @@ async fn resolve_variables_for_derived(
         let value_row = db
             .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                r"SELECT COALESCE(r.calibrated_value, r.raw_value) as val
+                r"SELECT COALESCE(smp.mean, r.calibrated_value, r.raw_value) as val
                   FROM readings r
+                  LEFT JOIN samples smp ON smp.id = r.sample_id
                   WHERE r.site_id = $1 AND r.parameter_id = $2 AND r.time = $3
                   ORDER BY r.replicate_index ASC
                   LIMIT 1",

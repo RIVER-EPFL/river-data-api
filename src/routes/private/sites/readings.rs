@@ -651,7 +651,7 @@ pub async fn get_site_readings(
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        fetch_sample_stats(&state.db, &ids).await?
+        fetch_sample_stats(&state.db, &ids, effective_start, effective_end).await?
     } else {
         HashMap::new()
     };
@@ -786,6 +786,8 @@ pub async fn get_site_readings(
 async fn fetch_sample_stats(
     db: &sea_orm::DatabaseConnection,
     sample_ids: &[Uuid],
+    start: DateTime<Utc>,
+    end: Option<DateTime<Utc>>,
 ) -> Result<HashMap<Uuid, SampleStatOut>, AppError> {
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
@@ -814,12 +816,23 @@ async fn fetch_sample_stats(
         })
         .collect();
 
+    // The time bounds keep chunk exclusion in play; sample_id alone plans across every chunk.
+    let (time_clause, mut values) = match end {
+        Some(e) => (
+            "AND time >= $2 AND time <= $3",
+            vec![sample_ids.to_vec().into(), start.into(), e.into()],
+        ),
+        None => ("AND time >= $2", vec![sample_ids.to_vec().into(), start.into()]),
+    };
     let rows = db
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT sample_id, replicate_index, raw_value, calibrated_value, is_flagged \
-             FROM readings WHERE sample_id = ANY($1) ORDER BY sample_id, replicate_index",
-            [sample_ids.to_vec().into()],
+            format!(
+                "SELECT sample_id, replicate_index, raw_value, calibrated_value, is_flagged \
+                 FROM readings WHERE sample_id = ANY($1) {time_clause} \
+                 ORDER BY sample_id, replicate_index"
+            ),
+            std::mem::take(&mut values),
         ))
         .await?;
     for row in rows {
