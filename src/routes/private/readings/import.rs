@@ -593,8 +593,9 @@ pub async fn import_csv(
 }
 
 /// One parsed CSV reading staged for the worker job. Carries only the variable per-row fields; the
-/// `csv_import` job re-applies the readings constants (replicate_index=0, logged=false,
-/// is_flagged=false) and the request-level measurement_type when it reads these back.
+/// `csv_import` job re-applies the readings constants (logged=false, is_flagged=false) and the
+/// request-level measurement_type when it reads these back, and numbers rows sharing
+/// (stream_id, time) as replicate_index 0..n-1 in file order.
 struct StagedRow {
     stream_id: Uuid,
     site_id: Uuid,
@@ -607,26 +608,28 @@ struct StagedRow {
 }
 
 /// Bulk-insert the parsed rows into `csv_import_staging` under `import_token`, chunked so the
-/// parameter count per statement stays bounded. The worker job reads them back by token.
+/// parameter count per statement stays bounded. `seq` records file order so the worker job can
+/// number replicate groups deterministically. The worker job reads them back by token.
 async fn stage_import_rows(
     db: &sea_orm::DatabaseConnection,
     import_token: Uuid,
     rows: &[StagedRow],
 ) -> AppResult<()> {
+    let mut seq: i64 = 0;
     for chunk in rows.chunks(BATCH_SIZE) {
         let mut sql = String::from(
             "INSERT INTO csv_import_staging \
              (import_token, stream_id, site_id, parameter_id, time, raw_value, \
-              sensor_id, calibration_id, deployment_id) VALUES ",
+              sensor_id, calibration_id, deployment_id, seq) VALUES ",
         );
-        let mut values: Vec<sea_orm::Value> = Vec::with_capacity(chunk.len() * 9);
+        let mut values: Vec<sea_orm::Value> = Vec::with_capacity(chunk.len() * 10);
         for (i, r) in chunk.iter().enumerate() {
-            let base = i * 9;
+            let base = i * 10;
             if i > 0 {
                 sql.push(',');
             }
             sql.push_str(&format!(
-                "(${},${},${},${},${},${},${},${},${})",
+                "(${},${},${},${},${},${},${},${},${},${})",
                 base + 1,
                 base + 2,
                 base + 3,
@@ -636,6 +639,7 @@ async fn stage_import_rows(
                 base + 7,
                 base + 8,
                 base + 9,
+                base + 10,
             ));
             values.push(import_token.into());
             values.push(r.stream_id.into());
@@ -646,6 +650,8 @@ async fn stage_import_rows(
             values.push(r.sensor_id.into());
             values.push(r.calibration_id.into());
             values.push(r.deployment_id.into());
+            values.push(seq.into());
+            seq += 1;
         }
         db.execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -670,7 +676,10 @@ const OVERLAP_EPSILON: f64 = 1e-9;
 
 /// Bucket incoming `(parameter_id, time, stored_value)` rows against existing readings for the
 /// site into identical vs differing overlaps. Fetches all existing readings in the time range for
-/// the relevant parameters in a single query, then compares in memory.
+/// the relevant parameters in a single query, then compares in memory. Replicate-aware: existing
+/// rows are keyed by (parameter, time) in replicate order, and the Nth incoming row for a key is
+/// compared against the Nth existing replicate, so intra-group rows of a fresh import are not
+/// reported as duplicates while a full re-import matches replicate for replicate.
 async fn compute_overlaps(
     db: &sea_orm::DatabaseConnection,
     site_id: Uuid,
@@ -696,9 +705,10 @@ async fn compute_overlaps(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT parameter_id, time, COALESCE(calibrated_value, raw_value) AS val \
              FROM readings \
-             WHERE site_id = $1 AND replicate_index = 0 \
+             WHERE site_id = $1 \
              AND parameter_id = ANY($2) \
-             AND time >= $3 AND time <= $4",
+             AND time >= $3 AND time <= $4 \
+             ORDER BY parameter_id, time, replicate_index",
             [
                 site_id.into(),
                 param_ids.into(),
@@ -708,29 +718,38 @@ async fn compute_overlaps(
         ))
         .await?;
 
-    let mut existing: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), f64> =
+    let mut existing: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Vec<f64>> =
         HashMap::with_capacity(existing_rows.len());
     for row in &existing_rows {
         let Ok(pid) = row.try_get::<Uuid>("", "parameter_id") else { continue };
         let Ok(t) = row.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "time") else { continue };
         let Ok(val) = row.try_get::<f64>("", "val") else { continue };
-        existing.insert((pid, t.with_timezone(&chrono::Utc)), val);
+        existing
+            .entry((pid, t.with_timezone(&chrono::Utc)))
+            .or_default()
+            .push(val);
     }
 
+    let mut occurrence: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), usize> = HashMap::new();
     for (pid, time, incoming) in rows {
-        if let Some(&stored) = existing.get(&(*pid, *time)) {
-            if (stored - incoming).abs() <= OVERLAP_EPSILON {
-                identical += 1;
-            } else {
-                differing += 1;
-                if sample.len() < OVERLAP_SAMPLE_CAP {
-                    sample.push(OverlapDiff {
-                        time: *time,
-                        parameter_id: *pid,
-                        existing: stored,
-                        incoming: *incoming,
-                    });
-                }
+        let key = (*pid, *time);
+        let idx = occurrence.entry(key).or_insert(0);
+        let slot = *idx;
+        *idx += 1;
+        let Some(stored) = existing.get(&key).and_then(|vs| vs.get(slot)) else {
+            continue;
+        };
+        if (stored - incoming).abs() <= OVERLAP_EPSILON {
+            identical += 1;
+        } else {
+            differing += 1;
+            if sample.len() < OVERLAP_SAMPLE_CAP {
+                sample.push(OverlapDiff {
+                    time: *time,
+                    parameter_id: *pid,
+                    existing: *stored,
+                    incoming: *incoming,
+                });
             }
         }
     }

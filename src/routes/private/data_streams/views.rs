@@ -404,6 +404,37 @@ pub async fn pair_stream(
 
     let backfilled = result.rows_affected();
 
+    // Replicate groups (2+ readings sharing a timestamp, e.g. migrated NOMIS A/B/C rows) form
+    // samples at pairing time: find-or-create the samples row per group, then stamp sample_id on
+    // the group's readings. The row-level triggers populate the sample statistics.
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"INSERT INTO samples (site_id, parameter_id, collected_at)
+          SELECT site_id, parameter_id, time FROM readings
+          WHERE stream_id = $1 AND sample_id IS NULL AND site_id IS NOT NULL
+          GROUP BY site_id, parameter_id, time
+          HAVING COUNT(*) >= 2
+          ON CONFLICT (site_id, parameter_id, collected_at) DO NOTHING",
+        [stream_id.into()],
+    ))
+    .await?;
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"UPDATE readings r
+          SET sample_id = s.id
+          FROM (
+              SELECT stream_id, time FROM readings
+              WHERE stream_id = $1 AND sample_id IS NULL AND site_id IS NOT NULL
+              GROUP BY stream_id, time
+              HAVING COUNT(*) >= 2
+          ) g, samples s
+          WHERE r.stream_id = g.stream_id AND r.time = g.time AND r.sample_id IS NULL
+            AND s.site_id = r.site_id AND s.parameter_id = r.parameter_id
+            AND s.collected_at = r.time",
+        [stream_id.into()],
+    ))
+    .await?;
+
     // Also backfill status_events
     db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
@@ -458,8 +489,8 @@ pub struct UnpairStreamResponse {
 }
 
 /// Remove pairing from a stream. Clears `site_parameter_id`/`paired_at` on the stream and
-/// nulls out `site_id`/`parameter_id` on all readings (effectively hiding them from
-/// continuous aggregates). Requires `write_metadata`.
+/// nulls out `site_id`/`parameter_id`/`sample_id` on all readings (effectively hiding them from
+/// continuous aggregates); samples left unreferenced are deleted. Requires `write_metadata`.
 #[utoipa::path(
     post,
     path = "/streams/{id}/unpair",
@@ -511,17 +542,43 @@ pub async fn unpair_stream(
     active.updated_at = Set(now.into());
     active.update(db).await?;
 
-    // Clear site_id/parameter_id on readings (keep sensor_id/calibration_id/deployment_id)
+    // Samples referenced by this stream's readings, so the ones left unreferenced after the
+    // clear below can be removed (the trigger also deletes zero-reference samples; this is the
+    // explicit backstop).
+    let sample_ids: Vec<Uuid> = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT DISTINCT sample_id AS id FROM readings
+              WHERE stream_id = $1 AND sample_id IS NOT NULL",
+            [stream_id.into()],
+        ))
+        .await?
+        .iter()
+        .filter_map(|row| row.try_get::<Uuid>("", "id").ok())
+        .collect();
+
+    // Clear site_id/parameter_id/sample_id on readings (keep sensor_id/calibration_id/deployment_id)
     let result = db
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings SET site_id = NULL, parameter_id = NULL
+            r"UPDATE readings SET site_id = NULL, parameter_id = NULL, sample_id = NULL
               WHERE stream_id = $1",
             [stream_id.into()],
         ))
         .await?;
 
     let cleared = result.rows_affected();
+
+    if !sample_ids.is_empty() {
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"DELETE FROM samples s
+              WHERE s.id = ANY($1)
+                AND NOT EXISTS (SELECT 1 FROM readings r WHERE r.sample_id = s.id)",
+            [sample_ids.into()],
+        ))
+        .await?;
+    }
 
     // Clear on status_events too
     db.execute(Statement::from_sql_and_values(

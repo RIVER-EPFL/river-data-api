@@ -16,6 +16,9 @@ use crate::error::{AppError, AppResult};
 pub struct GrabSampleRequest {
     pub site_id: Uuid,
     pub created_by: Option<String>,
+    /// Stamped onto the samples rows this request creates or reuses.
+    pub label: Option<String>,
+    pub notes: Option<String>,
     pub readings: Vec<GrabSampleReading>,
 }
 
@@ -114,12 +117,15 @@ async fn get_or_create_grab_stream(
 }
 
 /// Group readings by (parameter_id, time) and auto-create `samples` rows for
-/// groups with 2+ readings. Returns a map from group key to sample_id.
+/// groups with 2+ readings, or any group when a label/note needs a home.
+/// Returns a map from group key to sample_id.
 async fn auto_create_samples(
     txn: &sea_orm::DatabaseTransaction,
     readings: &[GrabSampleReading],
     site_id: Uuid,
     created_by: Option<&str>,
+    label: Option<&str>,
+    notes: Option<&str>,
 ) -> Result<HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Uuid>, AppError> {
     let mut groups: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), usize> = HashMap::new();
     for r in readings {
@@ -128,7 +134,7 @@ async fn auto_create_samples(
 
     let mut sample_map = HashMap::new();
     for ((parameter_id, time), count) in groups {
-        if count < 2 {
+        if count < 2 && label.is_none() && notes.is_none() {
             continue;
         }
         // Re-posting the same grab must reuse its sample, not accumulate empty duplicates
@@ -139,7 +145,19 @@ async fn auto_create_samples(
             .one(txn)
             .await?
         {
-            sample_map.insert((parameter_id, time), existing.id);
+            let sample_id = existing.id;
+            if label.is_some() || notes.is_some() {
+                let mut active: samples::ActiveModel = existing.into();
+                if let Some(l) = label {
+                    active.label = Set(Some(l.to_string()));
+                }
+                if let Some(n) = notes {
+                    active.notes = Set(Some(n.to_string()));
+                }
+                active.updated_at = Set(Some(chrono::Utc::now()));
+                active.update(txn).await?;
+            }
+            sample_map.insert((parameter_id, time), sample_id);
             continue;
         }
         let sample = samples::ActiveModel {
@@ -147,8 +165,8 @@ async fn auto_create_samples(
             site_id: Set(site_id),
             parameter_id: Set(parameter_id),
             collected_at: Set(time),
-            label: Set(None),
-            notes: Set(None),
+            label: Set(label.map(String::from)),
+            notes: Set(notes.map(String::from)),
             created_by: Set(created_by.map(String::from)),
             created_at: Set(Some(chrono::Utc::now())),
             mean: Set(None),
@@ -240,6 +258,8 @@ pub async fn insert_grab_samples(
         &payload.readings,
         payload.site_id,
         payload.created_by.as_deref(),
+        payload.label.as_deref(),
+        payload.notes.as_deref(),
     )
     .await?;
 

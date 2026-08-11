@@ -6,4 +6,6 @@
 #[allow(dead_code, unused_imports)]
 mod common;
 
+mod label_notes;
+mod replicate_lifecycle;
 mod trigger_aggregates;

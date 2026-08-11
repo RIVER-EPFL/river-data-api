@@ -270,3 +270,80 @@ async fn streams_retag_endpoint_by_source_system() {
         "existing readings across the source system retagged"
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn retag_job_source_system_scope_flips_readings_and_refreshes_aggregates() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let ev = events();
+    let registry = job::build_registry();
+    let wid = worker::worker_id();
+
+    let s1 = make_stream(&db, "portaly").await;
+    let s2 = make_stream(&db, "portaly").await;
+    let other = make_stream(&db, "vaisala").await;
+    insert_paired_reading(&db, s1, "2025-03-04T00:00:00Z", 10.0, None).await;
+    insert_paired_reading(&db, s2, "2025-03-04T00:10:00Z", 20.0, None).await;
+    insert_paired_reading(&db, other, "2025-03-04T00:20:00Z", 30.0, None).await;
+    crate::common::exec(
+        &db,
+        "CALL refresh_continuous_aggregate('readings_hourly', '2025-02-25', '2025-03-10')",
+    )
+    .await;
+
+    let hourly = format!(
+        "readings_hourly WHERE site_id = '{}' AND parameter_id = '{}' \
+         AND bucket = '2025-03-04T00:00:00Z'",
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TURB_ID
+    );
+    assert!(count_where(&db, &hourly).await > 0, "all three roll up before the retag");
+
+    let id = worker::enqueue(
+        &db,
+        "measurement_retag",
+        None,
+        None,
+        &serde_json::json!({ "source_system": "portaly", "target": "spot" }),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("enqueue inserts a row");
+    worker::drain(&db, &ev, &registry, &wid).await.unwrap();
+    assert_eq!(job_status(&db, id).await, "completed");
+
+    assert_eq!(
+        count_where(
+            &db,
+            &format!("readings WHERE stream_id IN ('{s1}', '{s2}') AND measurement_type = 'spot'")
+        )
+        .await,
+        2,
+        "the source system's readings flip to spot"
+    );
+    assert_eq!(
+        count_where(
+            &db,
+            &format!("readings WHERE stream_id = '{other}' AND measurement_type = 'spot'")
+        )
+        .await,
+        0,
+        "streams outside the source system are untouched"
+    );
+
+    // The job's aggregate refresh drops the retagged spot rows out of the rollup; the untouched
+    // vaisala reading keeps the bucket alive with only its own contribution.
+    let row = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT SUM(count)::bigint AS n FROM {hourly}"),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let rolled_up: i64 = row.try_get("", "n").unwrap();
+    assert_eq!(rolled_up, 1, "only the continuous reading remains in the refreshed rollup");
+}

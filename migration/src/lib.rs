@@ -43,6 +43,9 @@ mod m20260711_000006_inherit_windowed_only;
 mod m20260711_000007_subproject_move_cascade;
 mod m20260713_000001_data_frequency;
 mod m20260713_000002_aggregates_include_derived;
+mod m20260811_000001_portal_constants;
+mod m20260811_100001_samples_unique;
+mod m20260811_100002_csv_staging_seq;
 
 pub struct Migrator;
 
@@ -93,6 +96,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260711_000007_subproject_move_cascade::Migration),
             Box::new(m20260713_000001_data_frequency::Migration),
             Box::new(m20260713_000002_aggregates_include_derived::Migration),
+            Box::new(m20260811_100001_samples_unique::Migration),
+            Box::new(m20260811_100002_csv_staging_seq::Migration),
+            Box::new(m20260811_000001_portal_constants::Migration),
         ]
     }
 }

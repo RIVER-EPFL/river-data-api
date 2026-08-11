@@ -1,0 +1,179 @@
+//! Grab replicate lifecycle through the API: a replicated grab is stored as replicate_index
+//! 0..n-1 rows behind one sample, the site endpoint serves the sample mean as the point value,
+//! include_sample_stats exposes the replicates, and flagging a replicate moves the served mean.
+//!
+//! Run with: cargo test --test samples
+
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use serial_test::serial;
+
+const GRAB_TIME: &str = "2025-01-20T10:00:00Z";
+
+async fn scalar_i64(db: &DatabaseConnection, sql: &str) -> i64 {
+    db.query_one(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql.to_string(),
+    ))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get::<i64>("", "n")
+    .unwrap()
+}
+
+fn grab_payload() -> serde_json::Value {
+    let readings: Vec<serde_json::Value> = [10.0, 20.0, 30.0]
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID,
+                "value": v,
+                "time": GRAB_TIME,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "site_id": crate::common::SITE1_ID,
+        "created_by": "test",
+        "readings": readings,
+    })
+}
+
+async fn fetch_temp_series(
+    app: &axum::Router,
+    token: &str,
+    extra: &str,
+) -> serde_json::Value {
+    let uri = format!(
+        "/api/sites/{}/readings?start=2025-01-20T00:00:00Z&end=2025-01-21T00:00:00Z\
+         &parameter_ids={}&measurement_type=spot{extra}",
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+    );
+    let (status, body) = crate::common::get_with_token(app, &uri, token).await;
+    assert_eq!(status, 200, "readings fetch ({status}): {body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+#[tokio::test]
+#[serial]
+async fn grab_replicates_form_sample_and_serve_mean() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let (status, body) =
+        crate::common::post_json_with_token(&app, "/api/grab_samples", &grab_payload(), &token)
+            .await;
+    assert_eq!(status, 200, "grab insert ({status}): {body}");
+    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(resp["inserted"], 3);
+    assert_eq!(resp["samples_created"], 1);
+
+    let indices = db
+        .query_all(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT replicate_index FROM readings \
+                 WHERE site_id = '{}' AND parameter_id = '{}' AND time = '{GRAB_TIME}' \
+                 ORDER BY replicate_index",
+                crate::common::SITE1_ID,
+                crate::common::GLOBAL_PARAM_TEMP_ID
+            ),
+        ))
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.try_get::<i16>("", "replicate_index").unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(indices, vec![0, 1, 2]);
+
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM samples \
+                 WHERE site_id = '{}' AND parameter_id = '{}'",
+                crate::common::SITE1_ID,
+                crate::common::GLOBAL_PARAM_TEMP_ID
+            ),
+        )
+        .await,
+        1
+    );
+
+    let series = fetch_temp_series(&app, &token, "").await;
+    let values = series["parameters"][0]["values"].as_array().unwrap();
+    assert_eq!(values.len(), 1, "one point per replicate group: {series}");
+    assert!(
+        (values[0].as_f64().unwrap() - 20.0).abs() < 1e-9,
+        "served value is the sample mean: {values:?}"
+    );
+
+    let with_stats = fetch_temp_series(&app, &token, "&include_sample_stats=true").await;
+    let stats = &with_stats["parameters"][0]["samples"][0];
+    assert_eq!(stats["n"], 3, "sample stats attached: {with_stats}");
+    assert_eq!(
+        stats["replicates"].as_array().unwrap().len(),
+        3,
+        "all replicates listed: {stats}"
+    );
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE readings SET is_flagged = true \
+             WHERE site_id = '{}' AND parameter_id = '{}' \
+               AND time = '{GRAB_TIME}' AND replicate_index = 2",
+            crate::common::SITE1_ID,
+            crate::common::GLOBAL_PARAM_TEMP_ID
+        ),
+    )
+    .await;
+
+    let series = fetch_temp_series(&app, &token, "").await;
+    let values = series["parameters"][0]["values"].as_array().unwrap();
+    assert!(
+        (values[0].as_f64().unwrap() - 15.0).abs() < 1e-9,
+        "flagging a replicate moves the served mean: {values:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn grab_repost_reuses_sample_and_inserts_nothing() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let (status, _body) =
+        crate::common::post_json_with_token(&app, "/api/grab_samples", &grab_payload(), &token)
+            .await;
+    assert_eq!(status, 200);
+
+    let (status, body) =
+        crate::common::post_json_with_token(&app, "/api/grab_samples", &grab_payload(), &token)
+            .await;
+    assert_eq!(status, 200, "re-post ({status}): {body}");
+    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(resp["inserted"], 0, "re-post inserts nothing: {resp}");
+
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM samples \
+                 WHERE site_id = '{}' AND parameter_id = '{}'",
+                crate::common::SITE1_ID,
+                crate::common::GLOBAL_PARAM_TEMP_ID
+            ),
+        )
+        .await,
+        1,
+        "no duplicate sample accumulates on re-post"
+    );
+}

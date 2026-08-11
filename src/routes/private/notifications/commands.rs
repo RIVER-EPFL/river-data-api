@@ -661,6 +661,8 @@ pub async fn grab(
     let req = GrabSampleRequest {
         site_id,
         created_by: Some(created_by),
+        label: None,
+        notes: None,
         readings,
     };
 

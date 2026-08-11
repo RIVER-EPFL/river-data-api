@@ -690,8 +690,9 @@ impl Job for AlarmBackfill {
 /// the imported window, then enqueue an `alarm_backfill` for the touched slots. Reads its inputs
 /// (and the staged rows, by `import_token`) from params, so any replica can run it. Non-rerunnable:
 /// the staging rows are deleted on completion, so the source expires. The staged rows carry only the
-/// variable fields; the readings constants (replicate_index=0, logged=false, is_flagged=false) and
-/// the request-level measurement_type (from params, default 'continuous') are re-applied here.
+/// variable fields; the readings constants (logged=false, is_flagged=false) and the request-level
+/// measurement_type (from params, default 'continuous') are re-applied here. Rows sharing
+/// (stream_id, time) are numbered replicate_index 0..n-1 in file order and grouped into a sample.
 pub struct CsvImport;
 
 #[async_trait]
@@ -758,7 +759,7 @@ impl CsvImport {
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT stream_id, site_id, parameter_id, time, raw_value, \
                         sensor_id, calibration_id, deployment_id \
-                 FROM csv_import_staging WHERE import_token = $1 ORDER BY time",
+                 FROM csv_import_staging WHERE import_token = $1 ORDER BY seq",
                 [import_token.into()],
             ))
             .await?;
@@ -796,29 +797,97 @@ impl CsvImport {
         distinct_ts.sort_unstable();
         distinct_ts.dedup();
 
-        // Collapse rows that share a conflict key (stream_id, time, replicate_index=0): a source file
-        // with a repeated timestamp would otherwise make `ON CONFLICT DO UPDATE` fail the whole chunk
-        // ("cannot affect row a second time"). Keep the last occurrence (overwrite semantics).
-        let pre_dedup = models.len();
-        {
-            let mut seen: std::collections::HashMap<(Uuid, chrono::DateTime<chrono::Utc>), usize> =
-                std::collections::HashMap::with_capacity(models.len());
-            let mut deduped: Vec<readings::ActiveModel> = Vec::with_capacity(models.len());
-            for m in models {
+        // Rows sharing a (stream_id, time) group are replicates: number them 0..n-1 in file order
+        // (staging `seq`), so the numbering is deterministic and a re-import hits the same PKs
+        // (conflict-skip, no renumbering). This also keeps the conflict keys within one statement
+        // unique, so `ON CONFLICT DO UPDATE` cannot hit the same row twice.
+        let mut group_counts: std::collections::HashMap<
+            (Uuid, chrono::DateTime<chrono::Utc>),
+            i16,
+        > = std::collections::HashMap::with_capacity(models.len());
+        let mut group_slots: std::collections::HashMap<
+            (Uuid, chrono::DateTime<chrono::Utc>),
+            (Uuid, Uuid),
+        > = std::collections::HashMap::new();
+        for m in &mut models {
+            let key = (
+                *m.stream_id.as_ref(),
+                m.time.as_ref().with_timezone(&chrono::Utc),
+            );
+            let counter = group_counts.entry(key).or_insert(0);
+            m.replicate_index = Set(*counter);
+            *counter += 1;
+            if let (Some(sid), Some(pid)) = (*m.site_id.as_ref(), *m.parameter_id.as_ref()) {
+                group_slots.entry(key).or_insert((sid, pid));
+            }
+        }
+
+        // Groups with 2+ rows on a paired slot form a sample: find-or-create the samples row
+        // (unique on site/parameter/collected_at) and stamp sample_id on the group's readings.
+        type SampleGroup = ((Uuid, chrono::DateTime<chrono::Utc>), (Uuid, Uuid));
+        let sample_groups: Vec<SampleGroup> =
+            group_counts
+                .iter()
+                .filter(|(_, count)| **count >= 2)
+                .filter_map(|(key, _)| group_slots.get(key).map(|slot| (*key, *slot)))
+                .collect();
+        let replicate_groups = sample_groups.len();
+        if !sample_groups.is_empty() {
+            let site_ids: Vec<Uuid> = sample_groups.iter().map(|(_, (s, _))| *s).collect();
+            let param_ids: Vec<Uuid> = sample_groups.iter().map(|(_, (_, p))| *p).collect();
+            // Timestamps travel as RFC3339 text and are cast server-side: sea-query's
+            // timestamptz array binding rejects chrono values here.
+            let times: Vec<String> = sample_groups
+                .iter()
+                .map(|((_, t), _)| t.to_rfc3339())
+                .collect();
+            ctx.db()
+                .execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "INSERT INTO samples (site_id, parameter_id, collected_at) \
+                     SELECT DISTINCT * FROM unnest($1::uuid[], $2::uuid[], $3::text[]::timestamptz[]) \
+                     ON CONFLICT (site_id, parameter_id, collected_at) DO NOTHING",
+                    [site_ids.clone().into(), param_ids.clone().into(), times.clone().into()],
+                ))
+                .await?;
+            let sample_rows = ctx
+                .db()
+                .query_all(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT s.id, s.site_id, s.parameter_id, s.collected_at FROM samples s \
+                     JOIN unnest($1::uuid[], $2::uuid[], $3::text[]::timestamptz[]) \
+                       AS t(site_id, parameter_id, collected_at) \
+                       ON s.site_id = t.site_id AND s.parameter_id = t.parameter_id \
+                      AND s.collected_at = t.collected_at",
+                    [site_ids.into(), param_ids.into(), times.into()],
+                ))
+                .await?;
+            let mut sample_by_slot: std::collections::HashMap<
+                (Uuid, Uuid, chrono::DateTime<chrono::Utc>),
+                Uuid,
+            > = std::collections::HashMap::with_capacity(sample_rows.len());
+            for row in &sample_rows {
+                let id: Uuid = row.try_get("", "id")?;
+                let sid: Uuid = row.try_get("", "site_id")?;
+                let pid: Uuid = row.try_get("", "parameter_id")?;
+                let t: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "collected_at")?;
+                sample_by_slot.insert((sid, pid, t.with_timezone(&chrono::Utc)), id);
+            }
+            for m in &mut models {
                 let key = (
                     *m.stream_id.as_ref(),
                     m.time.as_ref().with_timezone(&chrono::Utc),
                 );
-                if let Some(&idx) = seen.get(&key) {
-                    deduped[idx] = m;
-                } else {
-                    seen.insert(key, deduped.len());
-                    deduped.push(m);
+                if group_counts.get(&key).copied().unwrap_or(0) < 2 {
+                    continue;
+                }
+                if let (Some(sid), Some(pid)) = (*m.site_id.as_ref(), *m.parameter_id.as_ref())
+                    && let Some(sample_id) = sample_by_slot.get(&(sid, pid, key.1))
+                {
+                    m.sample_id = Set(Some(*sample_id));
                 }
             }
-            models = deduped;
         }
-        let collapsed_duplicates = pre_dedup - models.len();
 
         let total = i32::try_from(models.len()).unwrap_or(i32::MAX);
         ctx.set_progress(0, Some(total)).await;
@@ -929,7 +998,7 @@ impl CsvImport {
             "counts": {
                 "inserted": inserted_total,
                 "overwritten": overwritten,
-                "collapsed_duplicates": collapsed_duplicates,
+                "replicate_groups": replicate_groups,
             },
         }))
         .await;

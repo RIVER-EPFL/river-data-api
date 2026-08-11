@@ -606,6 +606,39 @@ async fn backfill_plan_readings<C: ConnectionTrait>(txn: &C, plan_id: Uuid) -> A
         [plan_id.into()],
     )).await?;
 
+    // Replicate groups on the newly paired streams (2+ readings sharing a stream+timestamp, e.g.
+    // migrated NOMIS A/B/C rows mapped to replicate_index 0/1/2) form samples: find-or-create the
+    // samples row per group, then stamp sample_id. The row-level triggers populate the statistics.
+    txn.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"INSERT INTO samples (site_id, parameter_id, collected_at)
+          SELECT r.site_id, r.parameter_id, r.time
+          FROM readings r
+          JOIN data_streams ds ON r.stream_id = ds.id
+          WHERE ds.pairing_plan_id = $1 AND r.sample_id IS NULL AND r.site_id IS NOT NULL
+          GROUP BY r.stream_id, r.site_id, r.parameter_id, r.time
+          HAVING COUNT(*) >= 2
+          ON CONFLICT (site_id, parameter_id, collected_at) DO NOTHING",
+        [plan_id.into()],
+    )).await?;
+    txn.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"UPDATE readings r
+          SET sample_id = s.id
+          FROM (
+              SELECT r2.stream_id, r2.time
+              FROM readings r2
+              JOIN data_streams ds ON r2.stream_id = ds.id
+              WHERE ds.pairing_plan_id = $1 AND r2.sample_id IS NULL AND r2.site_id IS NOT NULL
+              GROUP BY r2.stream_id, r2.time
+              HAVING COUNT(*) >= 2
+          ) g, samples s
+          WHERE r.stream_id = g.stream_id AND r.time = g.time AND r.sample_id IS NULL
+            AND s.site_id = r.site_id AND s.parameter_id = r.parameter_id
+            AND s.collected_at = r.time",
+        [plan_id.into()],
+    )).await?;
+
     if let Err(e) = txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE status_events se
@@ -687,13 +720,21 @@ pub async fn revert_plan(
         "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
     )).await?;
 
-    // NULL out readings for streams from this plan
+    // NULL out readings for streams from this plan; samples formed by the pairing backfill
+    // lose their last reference and are removed below
     txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE readings r SET site_id = NULL, parameter_id = NULL
+        r"UPDATE readings r SET site_id = NULL, parameter_id = NULL, sample_id = NULL
           FROM data_streams ds
           WHERE r.stream_id = ds.id AND ds.pairing_plan_id = $1",
         [plan_id.into()],
+    )).await?;
+
+    txn.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"DELETE FROM samples s
+          WHERE NOT EXISTS (SELECT 1 FROM readings r WHERE r.sample_id = s.id)",
+        Vec::<sea_orm::Value>::new(),
     )).await?;
 
     // NULL out status_events — best-effort: readings are already cleared above

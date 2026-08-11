@@ -6,4 +6,5 @@
 #[allow(dead_code, unused_imports)]
 mod common;
 
+mod pair_replicate_samples;
 mod register_pair_stats;

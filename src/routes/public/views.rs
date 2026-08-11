@@ -975,7 +975,9 @@ async fn fetch_readings(
         )
         .column((r.clone(), Alias::new("time")))
         .expr_as(
-            Expr::cust("COALESCE(r.calibrated_value, r.raw_value)"),
+            // A replicate group is served as its sample mean (same as the private endpoint),
+            // so a replicated timestamp yields one deterministic value.
+            Expr::cust("COALESCE(smp.mean, r.calibrated_value, r.raw_value)"),
             Alias::new("value"),
         )
         .column((r.clone(), Alias::new("measurement_type")))
@@ -987,7 +989,15 @@ async fn fetch_readings(
             Expr::col((r.clone(), Alias::new("parameter_id")))
                 .equals((p.clone(), Alias::new("id"))),
         )
+        .join_as(
+            sea_orm::sea_query::JoinType::LeftJoin,
+            Alias::new("samples"),
+            Alias::new("smp"),
+            Expr::col((Alias::new("smp"), Alias::new("id")))
+                .equals((r.clone(), Alias::new("sample_id"))),
+        )
         .and_where(Expr::col((r.clone(), Alias::new("site_id"))).eq(site_id))
+        .and_where(Expr::col((r.clone(), Alias::new("replicate_index"))).eq(0))
         .and_where(Expr::col((p.clone(), Alias::new("id"))).is_in(param_ids.clone()))
         .order_by((r.clone(), Alias::new("time")), Order::Asc)
         .order_by((p.clone(), Alias::new("code")), Order::Asc);

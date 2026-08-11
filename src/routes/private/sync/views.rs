@@ -846,9 +846,16 @@ pub async fn grouped_discovery(
     let existing_sites: Vec<(Uuid, String)> = sites::Entity::find()
         .all(db).await?
         .into_iter().map(|s| (s.id, s.name.to_lowercase())).collect();
-    let existing_params: Vec<(Uuid, String, String)> = parameters::Entity::find()
+    // (id, lowercased code, lowercased name, lowercased aliases) so the grouped view
+    // matches the same way the pairing plan resolves parameters
+    let existing_params: Vec<(Uuid, String, String, Vec<String>)> = parameters::Entity::find()
         .all(db).await?
-        .into_iter().map(|p| (p.id, p.code.to_lowercase(), p.name)).collect();
+        .into_iter()
+        .map(|p| {
+            let aliases = p.aliases.into_iter().map(|a| a.to_lowercase()).collect();
+            (p.id, p.code.to_lowercase(), p.name.to_lowercase(), aliases)
+        })
+        .collect();
 
     let grouped_projects: Vec<GroupedProject> = project_counts.into_iter()
         .map(|(name, count)| {
@@ -871,9 +878,12 @@ pub async fn grouped_discovery(
 
     let mut grouped_params: Vec<GroupedParameter> = param_info.into_iter()
         .map(|(label, (units, count))| {
+            let key = label.to_lowercase();
             let existing_id = existing_params.iter()
-                .find(|(_, c, _)| *c == label.to_lowercase())
-                .map(|(id, _, _)| *id);
+                .find(|(_, code, name, aliases)| {
+                    *code == key || *name == key || aliases.contains(&key)
+                })
+                .map(|(id, ..)| *id);
             GroupedParameter {
                 code: label.clone(),
                 name: label,

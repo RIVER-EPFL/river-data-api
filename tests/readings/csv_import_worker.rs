@@ -107,12 +107,12 @@ async fn scalar_f64(db: &DatabaseConnection, sql: &str) -> f64 {
 
 #[tokio::test]
 #[serial]
-async fn csv_import_overwrite_collapses_duplicate_timestamps() {
+async fn csv_import_duplicate_timestamps_become_replicates() {
     let (db, app, token) = setup().await;
 
-    // A source file with a repeated timestamp for the same parameter: without deduping the staged
-    // rows, the worker's `ON CONFLICT DO UPDATE` fails the whole chunk ("cannot affect row a second
-    // time") — after the handler already returned an optimistic count. The dedup keeps the last row.
+    // Rows sharing a timestamp for the same parameter are replicates 0..n-1 in file order and are
+    // grouped into a sample. The distinct replicate indices also keep the conflict keys unique, so
+    // overwrite mode's `ON CONFLICT DO UPDATE` cannot fail with "cannot affect row a second time".
     let (status, resp) = crate::common::post_json_parse_with_token(
         &app,
         "/api/readings/import_csv",
@@ -151,7 +151,7 @@ async fn csv_import_overwrite_collapses_duplicate_timestamps() {
         ),
     )
     .await;
-    assert_eq!(at_ts, 2, "one reading per parameter survives the collapse (not a duplicate row)");
+    assert_eq!(at_ts, 4, "two replicates per parameter, no rows collapsed");
 
     let do_value = scalar_f64(
         &db,
@@ -159,12 +159,25 @@ async fn csv_import_overwrite_collapses_duplicate_timestamps() {
             "SELECT r.raw_value AS v FROM readings r \
              JOIN parameters p ON p.id = r.parameter_id \
              WHERE r.site_id = '{}' AND p.code = 'Dissolved_O2' \
-               AND r.time = '2025-06-01T00:00:00Z'",
+               AND r.time = '2025-06-01T00:00:00Z' AND r.replicate_index = 1",
             crate::common::SITE1_ID
         ),
     )
     .await;
-    assert!((do_value - 260.0).abs() < 1e-9, "the last duplicate wins (overwrite): got {do_value}");
+    assert!((do_value - 260.0).abs() < 1e-9, "replicates numbered in file order: got {do_value}");
+
+    let sample_mean = scalar_f64(
+        &db,
+        &format!(
+            "SELECT s.mean AS v FROM samples s \
+             JOIN parameters p ON p.id = s.parameter_id \
+             WHERE s.site_id = '{}' AND p.code = 'Dissolved_O2' \
+               AND s.collected_at = '2025-06-01T00:00:00Z'",
+            crate::common::SITE1_ID
+        ),
+    )
+    .await;
+    assert!((sample_mean - 255.0).abs() < 1e-9, "replicate group formed a sample: got {sample_mean}");
 }
 
 #[tokio::test]
@@ -220,4 +233,105 @@ async fn csv_import_recomputes_derived_via_worker() {
     )
     .await;
     assert_eq!(derived, 2, "the worker recomputes a derived value per imported timestamp");
+}
+
+const CSV_TRIPLICATE: &str = "DateTime,Dissolved_O2\n\
+2025-06-02 00:00:00,100\n\
+2025-06-02 00:00:00,110\n\
+2025-06-02 00:00:00,120\n";
+
+#[tokio::test]
+#[serial]
+async fn csv_import_triplicate_rows_form_sample_and_reimport_is_idempotent() {
+    let (db, app, token) = setup().await;
+
+    let (status, resp) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/import_csv",
+        &serde_json::json!({ "site": crate::common::SITE1_ID, "csv": CSV_TRIPLICATE }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "import ({status}): {resp}");
+    assert_eq!(resp["inserted_total"], 3, "intra-group rows are not reported as duplicates: {resp}");
+    assert_eq!(resp["duplicates"], 0, "{resp}");
+
+    let readings = poll_count(
+        &db,
+        &format!(
+            "SELECT count(*) AS n FROM readings \
+             WHERE site_id = '{}' AND time = '2025-06-02T00:00:00Z'",
+            crate::common::SITE1_ID
+        ),
+        3,
+        10,
+    )
+    .await;
+    assert_eq!(readings, 3, "three replicate readings inserted");
+
+    let samples = scalar_i64(
+        &db,
+        &format!(
+            "SELECT count(*) AS n FROM samples \
+             WHERE site_id = '{}' AND collected_at = '2025-06-02T00:00:00Z'",
+            crate::common::SITE1_ID
+        ),
+    )
+    .await;
+    assert_eq!(samples, 1, "one sample per replicate group");
+
+    let stamped = scalar_i64(
+        &db,
+        &format!(
+            "SELECT count(*) AS n FROM readings \
+             WHERE site_id = '{}' AND time = '2025-06-02T00:00:00Z' AND sample_id IS NOT NULL",
+            crate::common::SITE1_ID
+        ),
+    )
+    .await;
+    assert_eq!(stamped, 3, "every replicate references the sample");
+
+    let mean = scalar_f64(
+        &db,
+        &format!(
+            "SELECT mean AS v FROM samples \
+             WHERE site_id = '{}' AND collected_at = '2025-06-02T00:00:00Z'",
+            crate::common::SITE1_ID
+        ),
+    )
+    .await;
+    assert!((mean - 110.0).abs() < 1e-9, "trigger populated the sample mean: got {mean}");
+
+    let (status, resp) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/import_csv",
+        &serde_json::json!({ "site": crate::common::SITE1_ID, "csv": CSV_TRIPLICATE }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "re-import ({status}): {resp}");
+    assert_eq!(resp["inserted_total"], 0, "re-import inserts nothing: {resp}");
+    assert_eq!(resp["duplicates"], 3, "the whole file overlaps identically: {resp}");
+
+    let readings_after = scalar_i64(
+        &db,
+        &format!(
+            "SELECT count(*) AS n FROM readings \
+             WHERE site_id = '{}' AND time = '2025-06-02T00:00:00Z'",
+            crate::common::SITE1_ID
+        ),
+    )
+    .await;
+    assert_eq!(readings_after, 3, "no renumbered duplicates on re-import");
+
+    let samples_after = scalar_i64(
+        &db,
+        &format!(
+            "SELECT count(*) AS n FROM samples \
+             WHERE site_id = '{}' AND collected_at = '2025-06-02T00:00:00Z'",
+            crate::common::SITE1_ID
+        ),
+    )
+    .await;
+    assert_eq!(samples_after, 1, "the sample is reused, not duplicated");
 }

@@ -28,6 +28,8 @@ type ReadingRowTuple = Vec<(DateTime<Utc>, f64, Option<bool>, Option<String>, Op
 type SeverityVec = Vec<(DateTime<Utc>, Option<i16>)>;
 /// Per-parameter flag info: (time, is_flagged, flag_reason).
 type FlagVec = Vec<(DateTime<Utc>, Option<bool>, Option<String>)>;
+/// Per-parameter measurement types: (time, measurement_type).
+type MeasTypeVec = Vec<(DateTime<Utc>, Option<String>)>;
 
 /// Minimal struct for efficient readings query
 #[derive(Debug, FromQueryResult)]
@@ -573,7 +575,7 @@ pub async fn get_site_readings(
         HashMap::with_capacity(num_params);
     let mut param_severities: HashMap<Uuid, SeverityVec> = HashMap::new();
     let mut param_flags: HashMap<Uuid, FlagVec> = HashMap::new();
-    let mut param_meas_types: HashMap<Uuid, Vec<(DateTime<Utc>, Option<String>)>> = HashMap::new();
+    let mut param_meas_types: HashMap<Uuid, MeasTypeVec> = HashMap::new();
 
     let mut param_sample_ids: HashMap<Uuid, Vec<(DateTime<Utc>, Uuid)>> = HashMap::new();
 

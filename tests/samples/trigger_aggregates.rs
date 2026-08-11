@@ -209,10 +209,10 @@ async fn samples_trigger_recomputes_on_flag() {
     assert!((agg.mean.unwrap() - 12.0).abs() < 1e-9);
 }
 
-/// Delete all replicates → sample persists with n=0 and NULL aggregates.
+/// Delete all replicates → the unreferenced sample row is deleted, not left as an n=0 tombstone.
 #[tokio::test]
 #[serial]
-async fn samples_trigger_handles_all_deleted() {
+async fn samples_trigger_deletes_unreferenced_sample() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
@@ -238,6 +238,48 @@ async fn samples_trigger_handles_all_deleted() {
     exec(
         &db,
         &format!("DELETE FROM readings WHERE sample_id = '{sample_id}'"),
+    )
+    .await;
+
+    let survivors = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT COUNT(*) AS n FROM samples WHERE id = '{sample_id}'"),
+        ))
+        .await
+        .expect("query samples")
+        .expect("count row")
+        .try_get::<i64>("", "n")
+        .unwrap();
+    assert_eq!(survivors, 0, "sample deleted once no readings reference it");
+}
+
+/// A sample whose readings are all flagged keeps its row (still referenced) with NULL stats.
+#[tokio::test]
+#[serial]
+async fn samples_trigger_keeps_row_when_only_flagged_readings_remain() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+
+    let stream_id = ensure_stream(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID).await;
+    let sample_id =
+        create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID, "test-flagged-only").await;
+
+    insert_replicate(
+        &db,
+        stream_id,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        sample_id,
+        1,
+        7.0,
+    )
+    .await;
+
+    exec(
+        &db,
+        &format!("UPDATE readings SET is_flagged = true WHERE sample_id = '{sample_id}'"),
     )
     .await;
 

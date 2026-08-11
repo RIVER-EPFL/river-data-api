@@ -14,6 +14,7 @@ mod grab_aggregation_and_tool_save;
 mod ingest_and_pairing_attribution;
 mod instrument_grab_alongside_sensor;
 mod pairing_plan_lifecycle;
+mod portal_migration_wizard;
 mod provision_to_public;
 mod sensor_backfill_attribution;
 mod sensor_deploy_move_recall;

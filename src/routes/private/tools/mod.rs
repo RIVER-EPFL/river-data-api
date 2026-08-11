@@ -3,23 +3,38 @@ use axum::{Json, extract::{Path, State}};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
-use tokio::sync::OnceCell;
 
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 
-static GAS_CONSTANTS: OnceCell<river_data_core::toolbox::GasConstants> = OnceCell::const_new();
-
-async fn get_constant(db: &DatabaseConnection, name: &str, default: f64) -> f64 {
+/// Reads a named constant from the `constants` table. A missing row falls back
+/// to the default with a warning; a database error propagates as 500.
+async fn get_constant(db: &DatabaseConnection, name: &str, default: f64) -> AppResult<f64> {
     use crate::routes::private::constants;
-    constants::Entity::find()
+    match constants::Entity::find()
         .filter(constants::Column::Name.eq(name))
         .one(db)
-        .await
-        .ok()
-        .flatten()
-        .map(|c| c.value)
-        .unwrap_or(default)
+        .await?
+    {
+        Some(c) => Ok(c.value),
+        None => {
+            tracing::warn!(constant = name, default, "constant missing, using default");
+            Ok(default)
+        }
+    }
+}
+
+async fn load_gas_constants(
+    db: &DatabaseConnection,
+) -> AppResult<river_data_core::toolbox::GasConstants> {
+    let defaults = river_data_core::toolbox::GasConstants::default();
+    Ok(river_data_core::toolbox::GasConstants {
+        c_const: get_constant(db, "c_const", defaults.c_const).await?,
+        gas_const_r_atm: get_constant(db, "gas_const_r_atm", defaults.gas_const_r_atm).await?,
+        gas_const_r_mol: get_constant(db, "gas_const_r_mol", defaults.gas_const_r_mol).await?,
+        h_ch4_29815k: get_constant(db, "h_ch4_29815k", defaults.h_ch4_29815k).await?,
+        ch4_in_sa: get_constant(db, "ch4_in_sa", defaults.ch4_in_sa).await?,
+    })
 }
 
 fn parse_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> AppResult<T> {
@@ -32,16 +47,20 @@ fn require_field(val: Option<f64>, name: &str) -> AppResult<f64> {
         .ok_or_else(|| AppError::BadRequest(format!("{name} is required and must be a finite number")))
 }
 
-async fn load_gas_constants(db: &DatabaseConnection) -> river_data_core::toolbox::GasConstants {
-    let defaults = river_data_core::toolbox::GasConstants::default();
-    river_data_core::toolbox::GasConstants {
-        kh_co2: get_constant(db, "kh_co2", defaults.kh_co2).await,
-        c_const: get_constant(db, "c_const", defaults.c_const).await,
-        gas_const_r_atm: get_constant(db, "gas_const_r_atm", defaults.gas_const_r_atm).await,
-        gas_const_r_mol: get_constant(db, "gas_const_r_mol", defaults.gas_const_r_mol).await,
-        kh_ch4: get_constant(db, "kh_ch4", defaults.kh_ch4).await,
-        ch4_temp_const: get_constant(db, "ch4_temp_const", defaults.ch4_temp_const).await,
-        ch4_in_sa: get_constant(db, "ch4_in_sa", defaults.ch4_in_sa).await,
+type ResultMap = serde_json::Map<String, serde_json::Value>;
+
+/// Inserts a numeric result, omitting non-finite values. This encodes the
+/// portal's 'KEEP OLD' semantics: an uncomputable value is absent from the
+/// response so a save cannot clobber stored data.
+fn insert_num(results: &mut ResultMap, key: &str, value: f64) {
+    if value.is_finite() {
+        results.insert(key.to_string(), serde_json::json!(value));
+    }
+}
+
+fn insert_opt(results: &mut ResultMap, key: &str, value: Option<f64>) {
+    if let Some(v) = value {
+        insert_num(results, key, v);
     }
 }
 
@@ -52,6 +71,17 @@ pub struct ToolResult {
     pub results: serde_json::Value,
     pub inputs_used: Vec<String>,
     pub inputs_ignored: Vec<String>,
+}
+
+impl ToolResult {
+    fn new(tool: &str, results: ResultMap) -> Self {
+        Self {
+            tool: tool.to_string(),
+            results: serde_json::Value::Object(results),
+            inputs_used: vec![],
+            inputs_ignored: vec![],
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Clone, utoipa::ToSchema)]
@@ -84,14 +114,12 @@ fn registry() -> &'static [Box<dyn AnalyticalTool>] {
         Box::new(TssAfdmTool),
         Box::new(ChlorophyllTool),
         Box::new(NutrientsTool),
-        Box::new(IonsTool),
         Box::new(AlkalinityTool),
         Box::new(Pco2Tool),
         Box::new(DicTool),
         Box::new(DomTool),
         Box::new(FieldDataTool),
         Box::new(Co2AirTool),
-        Box::new(IsotopesTool),
         Box::new(BenthicTool),
         Box::new(ChlaBenthicTool),
     ])
@@ -193,15 +221,10 @@ impl AnalyticalTool for DocTool {
         let avg = river_data_core::toolbox::doc_average(&payload.replicates, curve);
         let sd = river_data_core::toolbox::doc_std_dev(&payload.replicates, curve);
 
-        Ok(ToolResult {
-            tool: "doc".to_string(),
-            results: serde_json::json!({
-                "DOC_avg_ppb": avg,
-                "DOC_sd_ppb": sd,
-            }),
-            inputs_used: vec![],
-            inputs_ignored: vec![],
-        })
+        let mut results = ResultMap::new();
+        insert_num(&mut results, "DOC_avg_ppb", avg);
+        insert_num(&mut results, "DOC_sd_ppb", sd);
+        Ok(ToolResult::new("doc", results))
     }
 }
 
@@ -241,19 +264,17 @@ impl AnalyticalTool for TssAfdmTool {
             payload.vol_filtered_ml,
         );
 
-        let afdm = payload.wgt_ashed_g.map(|ashed| {
-            river_data_core::toolbox::afdm_mg_l(payload.wgt_dried_g, ashed, payload.vol_filtered_ml)
-        });
-
-        Ok(ToolResult {
-            tool: "tss_afdm".to_string(),
-            results: serde_json::json!({
-                "TSS_dry_weight_mgL": tss,
-                "AFDM_mgL": afdm,
-            }),
-            inputs_used: vec![],
-            inputs_ignored: vec![],
-        })
+        let mut results = ResultMap::new();
+        insert_num(&mut results, "TSS_dry_weight_mgL", tss);
+        if let Some(ashed) = payload.wgt_ashed_g {
+            let afdm = river_data_core::toolbox::afdm_mg_l(
+                payload.wgt_dried_g,
+                ashed,
+                payload.vol_filtered_ml,
+            );
+            insert_num(&mut results, "AFDM_mgL", afdm);
+        }
+        Ok(ToolResult::new("tss_afdm", results))
     }
 }
 
@@ -296,43 +317,32 @@ impl AnalyticalTool for ChlorophyllTool {
 
     async fn calculate(&self, body: &[u8], _db: &DatabaseConnection) -> AppResult<ToolResult> {
         let payload: ChlorophyllRequest = parse_body(body)?;
-        let chla = match payload.method {
+        let mut results = ResultMap::new();
+        match payload.method {
             ChlorophyllMethod::Acid => {
                 let after = payload.fluorescence_after.ok_or_else(|| {
                     AppError::BadRequest(
                         "fluorescence_after required for acid method".to_string(),
                     )
                 })?;
-                river_data_core::toolbox::chla_acid(
+                let chla = river_data_core::toolbox::chla_acid(
                     payload.fluorescence_before,
                     after,
                     payload.slope,
                     payload.intercept,
-                )
-            }
-            ChlorophyllMethod::NoAcid => river_data_core::toolbox::chla_no_acid(
-                payload.fluorescence_before,
-                payload.slope,
-                payload.intercept,
-            ),
-        };
-
-        let mut results = serde_json::Map::new();
-        match payload.method {
-            ChlorophyllMethod::Acid => {
-                results.insert("Chla_acid_ugL_avg".into(), serde_json::json!(chla));
+                );
+                insert_num(&mut results, "Chla_acid_ugL_avg", chla);
             }
             ChlorophyllMethod::NoAcid => {
-                results.insert("Chla_noacid_ugL_avg".into(), serde_json::json!(chla));
+                let chla = river_data_core::toolbox::chla_no_acid(
+                    payload.fluorescence_before,
+                    payload.slope,
+                    payload.intercept,
+                );
+                insert_num(&mut results, "Chla_noacid_ugL_avg", chla);
             }
         }
-
-        Ok(ToolResult {
-            tool: "chlorophyll".to_string(),
-            results: serde_json::Value::Object(results),
-            inputs_used: vec![],
-            inputs_ignored: vec![],
-        })
+        Ok(ToolResult::new("chlorophyll", results))
     }
 }
 
@@ -351,7 +361,7 @@ impl AnalyticalTool for NutrientsTool {
     fn info(&self) -> &'static ToolInfo {
         static INFO: ToolInfo = ToolInfo {
             name: "nutrients",
-            description: "Nutrient replicates (PO4, NH4, NOx, NO2, TDP, TDN)",
+            description: "Nutrient replicates (P, NH4, SRP, NOx, NO2, TDP, TDN)",
             endpoint: "/api/tools/nutrients/calculate",
             params: &[
                 ToolParamInfo { name: "species", label: "Species (multi-species map)", required: false },
@@ -359,106 +369,63 @@ impl AnalyticalTool for NutrientsTool {
                 ToolParamInfo { name: "nox", label: "NOx", required: false },
                 ToolParamInfo { name: "no2", label: "NO2", required: false },
             ],
-            match_keywords: &["po4", "nh4", "nox", "no2", "no3", "tdp", "tdn", "nutrient", "phosph", "nitrate", "nitrite", "ammonium"],
+            match_keywords: &["po4", "nh4", "srp", "nox", "no2", "no3", "tdp", "tdn", "nutrient", "phosph", "nitrate", "nitrite", "ammonium"],
         };
         &INFO
     }
 
     async fn calculate(&self, body: &[u8], _db: &DatabaseConnection) -> AppResult<ToolResult> {
         let payload: NutrientsRequest = parse_body(body)?;
-        let mut results = serde_json::Map::new();
+        let mut results = ResultMap::new();
 
         if let Some(species) = &payload.species {
             let multi = river_data_core::toolbox::multi_nutrient_replicates(species);
             for (name, nr) in &multi {
-                let upper = name.to_uppercase();
-                results.insert(format!("NUT_{upper}_avg"), serde_json::json!(nr.mean));
-                results.insert(format!("NUT_{upper}_sd"), serde_json::json!(nr.std_dev));
+                // Portal column casing: NUT_NOx_avg, NUT_P_avg, ...; the METALP
+                // portal stores NH4/SRP as standalone ugL columns.
+                let (avg_key, sd_key) = match name.as_str() {
+                    "NH4" => ("NH4_avg_ugL".to_string(), "NH4_sd_ugL".to_string()),
+                    "SRP" => ("SRP_avg_ugL".to_string(), "SRP_sd_ugL".to_string()),
+                    _ => (format!("NUT_{name}_avg"), format!("NUT_{name}_sd")),
+                };
+                insert_num(&mut results, &avg_key, nr.mean);
+                insert_num(&mut results, &sd_key, nr.std_dev);
             }
         } else if let Some(replicates) = &payload.replicates {
             let result = river_data_core::toolbox::nutrient_from_replicates(replicates);
-            let no3 = match (payload.nox, payload.no2) {
-                (Some(nox), Some(no2)) => Some(river_data_core::toolbox::nitrate_from_nox_no2(nox, no2)),
-                _ => None,
-            };
-            results.insert("NUT_avg".into(), serde_json::json!(result.mean));
-            results.insert("NUT_sd".into(), serde_json::json!(result.std_dev));
-            results.insert("NUT_NO3_avg".into(), serde_json::json!(no3));
+            insert_num(&mut results, "NUT_avg", result.mean);
+            insert_num(&mut results, "NUT_sd", result.std_dev);
+            if let (Some(nox), Some(no2)) = (payload.nox, payload.no2) {
+                let no3 = river_data_core::toolbox::nitrate_from_nox_no2(nox, no2);
+                insert_num(&mut results, "NUT_NO3_avg", no3);
+            }
         }
 
-        Ok(ToolResult {
-            tool: "nutrients".to_string(),
-            results: serde_json::Value::Object(results),
-            inputs_used: vec![],
-            inputs_ignored: vec![],
-        })
+        Ok(ToolResult::new("nutrients", results))
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct IonsRequest {
-    pub cations: Vec<IonEntry>,
-    pub anions: Vec<IonEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct IonEntry {
-    pub name: String,
-    pub concentration_mg_l: f64,
-}
-
-struct IonsTool;
-
-#[async_trait]
-impl AnalyticalTool for IonsTool {
-    fn info(&self) -> &'static ToolInfo {
-        static INFO: ToolInfo = ToolInfo {
-            name: "ions",
-            description: "IC ion charge balance verification",
-            endpoint: "/api/tools/ions/calculate",
-            params: &[
-                ToolParamInfo { name: "cations", label: "Cations (array)", required: true },
-                ToolParamInfo { name: "anions", label: "Anions (array)", required: true },
-            ],
-            match_keywords: &["ion", "anion", "cation", "charge balance", "ca2", "mg2", "na", "cl", "so4", "hco3"],
-        };
-        &INFO
-    }
-
-    async fn calculate(&self, body: &[u8], _db: &DatabaseConnection) -> AppResult<ToolResult> {
-        let payload: IonsRequest = parse_body(body)?;
-        let cations: Vec<(&str, f64)> = payload
-            .cations
-            .iter()
-            .map(|e| (e.name.as_str(), e.concentration_mg_l))
-            .collect();
-        let anions: Vec<(&str, f64)> = payload
-            .anions
-            .iter()
-            .map(|e| (e.name.as_str(), e.concentration_mg_l))
-            .collect();
-
-        let result = river_data_core::toolbox::charge_balance(&cations, &anions);
-
-        Ok(ToolResult {
-            tool: "ions".to_string(),
-            results: serde_json::json!({
-                "sum_cations_meq": result.sum_cations_meq,
-                "sum_anions_meq": result.sum_anions_meq,
-                "balance_percent": result.balance_percent
-            }),
-            inputs_used: vec![],
-            inputs_ignored: vec![],
-        })
-    }
-}
-
+/// Raw alkalinity entry. The portal computes nothing from these columns; its
+/// only calculation is filling WTW_pH_1 from Alk_init_pH when missing
+/// (`calcEquals`). Raw values echo through so the save path can persist them.
 #[derive(Debug, Deserialize)]
 pub struct AlkalinityRequest {
-    pub sample_weight_g: f64,
-    pub acid_normality: f64,
-    pub titrant_volume_ml: f64,
-    pub initial_ph: Option<f64>,
+    #[serde(rename = "Alk_meqL")]
+    pub alk_meq_l: Option<f64>,
+    #[serde(rename = "Alk_mgL")]
+    pub alk_mg_l: Option<f64>,
+    #[serde(rename = "Alk_w_weight_g")]
+    pub alk_w_weight_g: Option<f64>,
+    #[serde(rename = "Alk_dyn_pH")]
+    pub alk_dyn_ph: Option<f64>,
+    #[serde(rename = "Alk_dyn_trit")]
+    pub alk_dyn_trit: Option<f64>,
+    #[serde(rename = "Alk_temp_degC")]
+    pub alk_temp_deg_c: Option<f64>,
+    #[serde(rename = "Alk_init_pH")]
+    pub alk_init_ph: Option<f64>,
+    #[serde(rename = "WTW_pH_1")]
+    pub wtw_ph_1: Option<f64>,
 }
 
 struct AlkalinityTool;
@@ -468,13 +435,17 @@ impl AnalyticalTool for AlkalinityTool {
     fn info(&self) -> &'static ToolInfo {
         static INFO: ToolInfo = ToolInfo {
             name: "alkalinity",
-            description: "Gran titration alkalinity (meq/L, mg/L CaCO3)",
+            description: "Alkalinity raw entry (fills WTW_pH_1 from Alk_init_pH when missing)",
             endpoint: "/api/tools/alkalinity/calculate",
             params: &[
-                ToolParamInfo { name: "sample_weight_g", label: "Sample Weight (g)", required: true },
-                ToolParamInfo { name: "acid_normality", label: "Acid Normality", required: true },
-                ToolParamInfo { name: "titrant_volume_ml", label: "Titrant Volume (mL)", required: true },
-                ToolParamInfo { name: "initial_ph", label: "Initial pH", required: false },
+                ToolParamInfo { name: "Alk_meqL", label: "Alkalinity (meq/L)", required: false },
+                ToolParamInfo { name: "Alk_mgL", label: "Alkalinity (mg/L)", required: false },
+                ToolParamInfo { name: "Alk_w_weight_g", label: "Water Weight (g)", required: false },
+                ToolParamInfo { name: "Alk_dyn_pH", label: "Dynamic pH", required: false },
+                ToolParamInfo { name: "Alk_dyn_trit", label: "Dynamic Titrant", required: false },
+                ToolParamInfo { name: "Alk_temp_degC", label: "Temperature (degC)", required: false },
+                ToolParamInfo { name: "Alk_init_pH", label: "Initial pH", required: false },
+                ToolParamInfo { name: "WTW_pH_1", label: "Existing WTW pH", required: false },
             ],
             match_keywords: &["alkalinity", "alk", "titration", "caco3"],
         };
@@ -483,26 +454,22 @@ impl AnalyticalTool for AlkalinityTool {
 
     async fn calculate(&self, body: &[u8], _db: &DatabaseConnection) -> AppResult<ToolResult> {
         let payload: AlkalinityRequest = parse_body(body)?;
-        let result = river_data_core::toolbox::gran_titration(
-            payload.sample_weight_g,
-            payload.acid_normality,
-            payload.titrant_volume_ml,
+        let mut results = ResultMap::new();
+
+        insert_opt(&mut results, "Alk_meqL", payload.alk_meq_l);
+        insert_opt(&mut results, "Alk_mgL", payload.alk_mg_l);
+        insert_opt(&mut results, "Alk_w_weight_g", payload.alk_w_weight_g);
+        insert_opt(&mut results, "Alk_dyn_pH", payload.alk_dyn_ph);
+        insert_opt(&mut results, "Alk_dyn_trit", payload.alk_dyn_trit);
+        insert_opt(&mut results, "Alk_temp_degC", payload.alk_temp_deg_c);
+
+        let ph = river_data_core::toolbox::equals(
+            payload.wtw_ph_1.unwrap_or(f64::NAN),
+            payload.alk_init_ph.unwrap_or(f64::NAN),
         );
+        insert_num(&mut results, "WTW_pH_1", ph);
 
-        let mut results = serde_json::Map::new();
-        results.insert("alkalinity_meq_l".into(), serde_json::json!(result.alkalinity_meq_l));
-        results.insert("alkalinity_mg_l_caco3".into(), serde_json::json!(result.alkalinity_mg_l_caco3));
-
-        if let Some(ph) = payload.initial_ph {
-            results.insert("WTW_pH_1".into(), serde_json::json!(ph));
-        }
-
-        Ok(ToolResult {
-            tool: "alkalinity".to_string(),
-            results: serde_json::Value::Object(results),
-            inputs_used: vec![],
-            inputs_ignored: vec![],
-        })
+        Ok(ToolResult::new("alkalinity", results))
     }
 }
 
@@ -583,9 +550,7 @@ impl AnalyticalTool for Pco2Tool {
 
     async fn calculate(&self, body: &[u8], db: &DatabaseConnection) -> AppResult<ToolResult> {
         let payload: Pco2Request = parse_body(body)?;
-        let constants = GAS_CONSTANTS
-            .get_or_init(|| load_gas_constants(db))
-            .await;
+        let constants = load_gas_constants(db).await?;
 
         match payload.mode {
             Pco2Mode::Simple => {
@@ -595,19 +560,19 @@ impl AnalyticalTool for Pco2Tool {
 
                 let pco2 = match payload.variant {
                     Pco2Variant::Simple => {
-                        river_data_core::toolbox::pco2_from_co2aq(co2_aq, payload.water_temp_c, constants)
+                        river_data_core::toolbox::pco2_from_co2aq(co2_aq, payload.water_temp_c, &constants)
                     }
                     Pco2Variant::P1 => {
                         let bp = payload.pressure_hpa.ok_or_else(|| {
                             AppError::BadRequest("pressure_hpa required for P1 variant".to_string())
                         })?;
-                        river_data_core::toolbox::pco2_p1(co2_aq, payload.water_temp_c, bp, constants)
+                        river_data_core::toolbox::pco2_p1(co2_aq, payload.water_temp_c, bp, &constants)
                     }
                     Pco2Variant::P2 => {
                         let bp = payload.pressure_hpa.ok_or_else(|| {
                             AppError::BadRequest("pressure_hpa required for P2 variant".to_string())
                         })?;
-                        river_data_core::toolbox::pco2_p2(co2_aq, payload.water_temp_c, bp, constants)
+                        river_data_core::toolbox::pco2_p2(co2_aq, payload.water_temp_c, bp, &constants)
                     }
                 };
 
@@ -616,15 +581,9 @@ impl AnalyticalTool for Pco2Tool {
                     Pco2Variant::P1 => "pCO2_HS_P1_uatm_avg",
                     Pco2Variant::P2 => "pCO2_HS_P2_uatm_avg",
                 };
-                let mut results = serde_json::Map::new();
-                results.insert(key.into(), serde_json::json!(pco2));
-
-                Ok(ToolResult {
-                    tool: "pco2".to_string(),
-                    results: serde_json::Value::Object(results),
-                    inputs_used: vec![],
-                    inputs_ignored: vec![],
-                })
+                let mut results = ResultMap::new();
+                insert_num(&mut results, key, pco2);
+                Ok(ToolResult::new("pco2", results))
             }
 
             Pco2Mode::FullPipeline => {
@@ -652,7 +611,7 @@ impl AnalyticalTool for Pco2Tool {
                     field_pressure_hpa,
                 };
 
-                let mut results = serde_json::Map::new();
+                let mut results = ResultMap::new();
 
                 if let Some(rep_b) = &payload.replicate_b {
                     let input_b = river_data_core::toolbox::Pco2FullInput {
@@ -668,39 +627,34 @@ impl AnalyticalTool for Pco2Tool {
                         field_pressure_hpa,
                     };
 
-                    let rep = river_data_core::toolbox::pco2_replicates(&input_a, &input_b, constants);
+                    let rep = river_data_core::toolbox::pco2_replicates(&input_a, &input_b, &constants);
 
-                    results.insert("CO2_HS_Um_A".into(), serde_json::json!(rep.a.co2_hs_umol));
-                    results.insert("CO2_HS_Um_B".into(), serde_json::json!(rep.b.co2_hs_umol));
-                    results.insert("CO2_HS_Um_avg".into(), serde_json::json!(rep.co2_hs_umol_avg));
-                    results.insert("CO2_HS_Um_sd".into(), serde_json::json!(rep.co2_hs_umol_sd));
-                    results.insert("pCO2_HS_uatm_avg".into(), serde_json::json!(rep.pco2_uatm_avg));
-                    results.insert("pCO2_HS_uatm_sd".into(), serde_json::json!(rep.pco2_uatm_sd));
-                    results.insert("pCO2_HS_P1_uatm_avg".into(), serde_json::json!(rep.pco2_p1_uatm_avg));
-                    results.insert("pCO2_HS_P1_uatm_sd".into(), serde_json::json!(rep.pco2_p1_uatm_sd));
-                    results.insert("pCO2_HS_P2_uatm_avg".into(), serde_json::json!(rep.pco2_p2_uatm_avg));
-                    results.insert("pCO2_HS_P2_uatm_sd".into(), serde_json::json!(rep.pco2_p2_uatm_sd));
-                    results.insert("d13C_CO2_avg".into(), serde_json::json!(rep.d13co2_permil_avg));
-                    results.insert("d13C_CO2_sd".into(), serde_json::json!(rep.d13co2_permil_sd));
-                    results.insert("CH4_umol_L_avg".into(), serde_json::json!(rep.ch4_dissolved_umol_avg));
-                    results.insert("CH4_umol_L_sd".into(), serde_json::json!(rep.ch4_dissolved_umol_sd));
+                    insert_num(&mut results, "CO2_HS_Um_A", rep.a.co2_hs_umol);
+                    insert_num(&mut results, "CO2_HS_Um_B", rep.b.co2_hs_umol);
+                    insert_num(&mut results, "CO2_HS_Um_avg", rep.co2_hs_umol_avg);
+                    insert_num(&mut results, "CO2_HS_Um_sd", rep.co2_hs_umol_sd);
+                    insert_num(&mut results, "pCO2_HS_uatm_avg", rep.pco2_uatm_avg);
+                    insert_num(&mut results, "pCO2_HS_uatm_sd", rep.pco2_uatm_sd);
+                    insert_num(&mut results, "pCO2_HS_P1_uatm_avg", rep.pco2_p1_uatm_avg);
+                    insert_num(&mut results, "pCO2_HS_P1_uatm_sd", rep.pco2_p1_uatm_sd);
+                    insert_num(&mut results, "pCO2_HS_P2_uatm_avg", rep.pco2_p2_uatm_avg);
+                    insert_num(&mut results, "pCO2_HS_P2_uatm_sd", rep.pco2_p2_uatm_sd);
+                    insert_opt(&mut results, "d13C_CO2_avg", rep.d13co2_permil_avg);
+                    insert_opt(&mut results, "d13C_CO2_sd", rep.d13co2_permil_sd);
+                    insert_num(&mut results, "CH4_umol_L_avg", rep.ch4_dissolved_umol_avg);
+                    insert_num(&mut results, "CH4_umol_L_sd", rep.ch4_dissolved_umol_sd);
                 } else {
-                    let r = river_data_core::toolbox::pco2_full_pipeline(&input_a, constants);
+                    let r = river_data_core::toolbox::pco2_full_pipeline(&input_a, &constants);
 
-                    results.insert("CO2_HS_Um_avg".into(), serde_json::json!(r.co2_hs_umol));
-                    results.insert("pCO2_HS_uatm_avg".into(), serde_json::json!(r.pco2_uatm));
-                    results.insert("pCO2_HS_P1_uatm_avg".into(), serde_json::json!(r.pco2_p1_uatm));
-                    results.insert("pCO2_HS_P2_uatm_avg".into(), serde_json::json!(r.pco2_p2_uatm));
-                    results.insert("d13C_CO2_avg".into(), serde_json::json!(r.d13co2_permil));
-                    results.insert("CH4_umol_L_avg".into(), serde_json::json!(r.ch4_dissolved_umol));
+                    insert_num(&mut results, "CO2_HS_Um_avg", r.co2_hs_umol);
+                    insert_num(&mut results, "pCO2_HS_uatm_avg", r.pco2_uatm);
+                    insert_num(&mut results, "pCO2_HS_P1_uatm_avg", r.pco2_p1_uatm);
+                    insert_num(&mut results, "pCO2_HS_P2_uatm_avg", r.pco2_p2_uatm);
+                    insert_opt(&mut results, "d13C_CO2_avg", r.d13co2_permil);
+                    insert_num(&mut results, "CH4_umol_L_avg", r.ch4_dissolved_umol);
                 }
 
-                Ok(ToolResult {
-                    tool: "pco2".to_string(),
-                    results: serde_json::Value::Object(results),
-                    inputs_used: vec![],
-                    inputs_ignored: vec![],
-                })
+                Ok(ToolResult::new("pco2", results))
             }
         }
     }
@@ -724,7 +678,7 @@ pub struct DicRequest {
     pub sa_added_ml: f64,
     pub co2_dry_ppm: f64,
     pub d13co2_permil: Option<f64>,
-    pub lab_temp_c: f64,
+    pub lab_temp_c: Option<f64>,
     pub h_co2_29815k: Option<f64>,
     pub gas_const_r_mol: Option<f64>,
     pub vial_volume: Option<f64>,
@@ -748,7 +702,7 @@ impl AnalyticalTool for DicTool {
                 ToolParamInfo { name: "sa_added_ml", label: "SA Added (mL)", required: true },
                 ToolParamInfo { name: "co2_dry_ppm", label: "CO2 Dry (ppm)", required: true },
                 ToolParamInfo { name: "d13co2_permil", label: "d13CO2 (permil)", required: false },
-                ToolParamInfo { name: "lab_temp_c", label: "Lab Temp (°C)", required: true },
+                ToolParamInfo { name: "lab_temp_c", label: "Lab Temp (°C, defaults to lab_temp_avg_degC constant)", required: false },
                 ToolParamInfo { name: "h_co2_29815k", label: "H CO2 @298.15K", required: false },
                 ToolParamInfo { name: "gas_const_r_mol", label: "Gas Const R (mol)", required: false },
                 ToolParamInfo { name: "vial_volume", label: "Vial Volume (mL)", required: false },
@@ -763,35 +717,46 @@ impl AnalyticalTool for DicTool {
     async fn calculate(&self, body: &[u8], db: &DatabaseConnection) -> AppResult<ToolResult> {
         let payload: DicRequest = parse_body(body)?;
         let constants = river_data_core::toolbox::DICConstants {
-            h_co2_29815k: payload.h_co2_29815k.unwrap_or(get_constant(db, "h_co2_29815k", 0.034).await),
-            gas_const_r_mol: payload.gas_const_r_mol.unwrap_or(get_constant(db, "gas_const_r_mol", 8.314).await),
-            vial_volume: payload.vial_volume.unwrap_or(get_constant(db, "vial_volume", 12.0).await),
-            h3po4_added: payload.h3po4_added.unwrap_or(get_constant(db, "h3po4_added", 0.1).await),
+            h_co2_29815k: match payload.h_co2_29815k {
+                Some(v) => v,
+                None => get_constant(db, "h_co2_29815k", 0.034733).await?,
+            },
+            gas_const_r_mol: match payload.gas_const_r_mol {
+                Some(v) => v,
+                None => get_constant(db, "gas_const_r_mol", 8.31446).await?,
+            },
+            vial_volume: match payload.vial_volume {
+                Some(v) => v,
+                None => get_constant(db, "vial_volume", 12.168).await?,
+            },
+            h3po4_added: match payload.h3po4_added {
+                Some(v) => v,
+                None => get_constant(db, "h3po4_added", 0.3).await?,
+            },
+        };
+        // Portal behavior: missing lab temp falls back to the lab_temp_avg_degC constant.
+        let lab_temp_c = match payload.lab_temp_c {
+            Some(t) => t,
+            None => get_constant(db, "lab_temp_avg_degC", 22.5).await?,
         };
 
+        let mut results = ResultMap::new();
         if let Some(ref rep_b) = payload.replicate_b {
             let rep = river_data_core::toolbox::dic_replicates(
                 payload.acid_sample_weight_g, payload.acid_weight_g, payload.vol_overpressure_ml, payload.sa_added_ml, payload.co2_dry_ppm, payload.d13co2_permil,
                 rep_b.acid_sample_weight_g, rep_b.acid_weight_g, rep_b.vol_overpressure_ml, rep_b.sa_added_ml, rep_b.co2_dry_ppm, rep_b.d13co2_permil,
-                payload.lab_temp_c,
+                lab_temp_c,
                 &constants,
             );
 
-            Ok(ToolResult {
-                tool: "dic".to_string(),
-                results: serde_json::json!({
-                    "DIC_A": rep.dic_a,
-                    "DIC_B": rep.dic_b,
-                    "DIC_avg": rep.dic_avg,
-                    "DIC_std": rep.dic_std,
-                    "d13C_DIC_A": rep.d13c_a,
-                    "d13C_DIC_B": rep.d13c_b,
-                    "d13C_DIC_avg": rep.d13c_avg,
-                    "d13C_DIC_std": rep.d13c_std,
-                }),
-                inputs_used: vec![],
-                inputs_ignored: vec![],
-            })
+            insert_num(&mut results, "DIC_A", rep.dic_a);
+            insert_num(&mut results, "DIC_B", rep.dic_b);
+            insert_num(&mut results, "DIC_avg", rep.dic_avg);
+            insert_num(&mut results, "DIC_std", rep.dic_std);
+            insert_opt(&mut results, "d13C_DIC_A", rep.d13c_a);
+            insert_opt(&mut results, "d13C_DIC_B", rep.d13c_b);
+            insert_opt(&mut results, "d13C_DIC_avg", rep.d13c_avg);
+            insert_opt(&mut results, "d13C_DIC_std", rep.d13c_std);
         } else {
             let dic = river_data_core::toolbox::dic_concentration(
                 payload.acid_sample_weight_g,
@@ -799,31 +764,24 @@ impl AnalyticalTool for DicTool {
                 payload.vol_overpressure_ml,
                 payload.sa_added_ml,
                 payload.co2_dry_ppm,
-                payload.lab_temp_c,
+                lab_temp_c,
                 &constants,
             );
+            insert_num(&mut results, "DIC_avg", dic);
 
-            let d13c = payload.d13co2_permil.map(|d13| {
-                river_data_core::toolbox::d13c_dic(
+            if let Some(d13) = payload.d13co2_permil {
+                let d13c = river_data_core::toolbox::d13c_dic(
                     payload.acid_sample_weight_g,
                     payload.acid_weight_g,
                     payload.vol_overpressure_ml,
                     d13,
-                    payload.lab_temp_c,
+                    lab_temp_c,
                     &constants,
-                )
-            });
-
-            Ok(ToolResult {
-                tool: "dic".to_string(),
-                results: serde_json::json!({
-                    "DIC_avg": dic,
-                    "d13C_DIC_avg": d13c,
-                }),
-                inputs_used: vec![],
-                inputs_ignored: vec![],
-            })
+                );
+                insert_num(&mut results, "d13C_DIC_avg", d13c);
+            }
         }
+        Ok(ToolResult::new("dic", results))
     }
 }
 
@@ -846,7 +804,7 @@ impl AnalyticalTool for DomTool {
     fn info(&self) -> &'static ToolInfo {
         static INFO: ToolInfo = ToolInfo {
             name: "dom",
-            description: "SUVA, absorbance ratios, spectral slopes",
+            description: "SUVA and absorbance/fluorescence peak ratios",
             endpoint: "/api/tools/dom/calculate",
             params: &[
                 ToolParamInfo { name: "a254", label: "Absorbance @254nm", required: false },
@@ -865,39 +823,28 @@ impl AnalyticalTool for DomTool {
 
     async fn calculate(&self, body: &[u8], _db: &DatabaseConnection) -> AppResult<ToolResult> {
         let payload: DomRequest = parse_body(body)?;
-        let mut results = serde_json::Map::new();
+        let mut results = ResultMap::new();
 
-        let suva = match (payload.a254, payload.doc_avg_ppb) {
-            (Some(a), Some(d)) => Some(river_data_core::toolbox::suva(a, d)),
-            _ => None,
-        };
-        results.insert("SUVA".into(), serde_json::json!(suva));
-
-        let ratio = match (payload.abs_numerator, payload.abs_denominator) {
-            (Some(n), Some(d)) => Some(river_data_core::toolbox::absorbance_ratio(n, d)),
-            _ => None,
-        };
-        results.insert("absorbance_ratio".into(), serde_json::json!(ratio));
-
+        if let (Some(a), Some(d)) = (payload.a254, payload.doc_avg_ppb) {
+            insert_num(&mut results, "SUVA", river_data_core::toolbox::suva(a, d));
+        }
+        if let (Some(n), Some(d)) = (payload.abs_numerator, payload.abs_denominator) {
+            insert_num(&mut results, "absorbance_ratio", river_data_core::toolbox::absorbance_ratio(n, d));
+        }
         if let (Some(pa), Some(pt)) = (payload.peak_a, payload.peak_t) {
-            results.insert("A_T".into(), serde_json::json!(river_data_core::toolbox::absorbance_ratio(pa, pt)));
+            insert_num(&mut results, "A_T", river_data_core::toolbox::absorbance_ratio(pa, pt));
         }
         if let (Some(pc), Some(pa)) = (payload.peak_c, payload.peak_a) {
-            results.insert("C_A".into(), serde_json::json!(river_data_core::toolbox::absorbance_ratio(pc, pa)));
+            insert_num(&mut results, "C_A", river_data_core::toolbox::absorbance_ratio(pc, pa));
         }
         if let (Some(pc), Some(pm)) = (payload.peak_c, payload.peak_m) {
-            results.insert("C_M".into(), serde_json::json!(river_data_core::toolbox::absorbance_ratio(pc, pm)));
+            insert_num(&mut results, "C_M", river_data_core::toolbox::absorbance_ratio(pc, pm));
         }
         if let (Some(pc), Some(pt)) = (payload.peak_c, payload.peak_t) {
-            results.insert("C_T".into(), serde_json::json!(river_data_core::toolbox::absorbance_ratio(pc, pt)));
+            insert_num(&mut results, "C_T", river_data_core::toolbox::absorbance_ratio(pc, pt));
         }
 
-        Ok(ToolResult {
-            tool: "dom".to_string(),
-            results: serde_json::Value::Object(results),
-            inputs_used: vec![],
-            inputs_ignored: vec![],
-        })
+        Ok(ToolResult::new("dom", results))
     }
 }
 
@@ -907,6 +854,7 @@ pub struct FieldDataRequest {
     pub temp_c: Option<f64>,
     pub raw_co2: Option<f64>,
     pub pressure_hpa: Option<f64>,
+    pub field_bp: Option<f64>,
     pub std_curve: Option<StdCurve>,
     pub raw_co2_min: Option<f64>,
     pub raw_co2_avg: Option<f64>,
@@ -921,12 +869,13 @@ impl AnalyticalTool for FieldDataTool {
     fn info(&self) -> &'static ToolInfo {
         static INFO: ToolInfo = ToolInfo {
             name: "field_data",
-            description: "Barometric pressure from altitude, CO2 correction",
+            description: "Barometric pressure from altitude, pressure selection, CO2 correction, reach depths",
             endpoint: "/api/tools/field_data/calculate",
             params: &[
                 ToolParamInfo { name: "elevation_m", label: "Elevation (m)", required: false },
                 ToolParamInfo { name: "temp_c", label: "Temperature (°C)", required: false },
-                ToolParamInfo { name: "pressure_hpa", label: "Pressure (hPa)", required: false },
+                ToolParamInfo { name: "pressure_hpa", label: "Pressure (hPa, explicit override)", required: false },
+                ToolParamInfo { name: "field_bp", label: "Field BP (hPa, used when in 700-1050 range)", required: false },
                 ToolParamInfo { name: "raw_co2", label: "Raw CO2 (ppm)", required: false },
                 ToolParamInfo { name: "raw_co2_min", label: "Raw CO2 Min (ppm)", required: false },
                 ToolParamInfo { name: "raw_co2_avg", label: "Raw CO2 Avg (ppm)", required: false },
@@ -941,59 +890,55 @@ impl AnalyticalTool for FieldDataTool {
 
     async fn calculate(&self, body: &[u8], _db: &DatabaseConnection) -> AppResult<ToolResult> {
         let payload: FieldDataRequest = parse_body(body)?;
-        let mut results = serde_json::Map::new();
+        let mut results = ResultMap::new();
 
-        let bp = match (payload.elevation_m, payload.temp_c) {
-            (Some(e), Some(t)) => Some(river_data_core::toolbox::barometric_pressure_from_altitude(e, t)),
+        let alt_bp = match (payload.elevation_m, payload.temp_c) {
+            (Some(e), Some(t)) => {
+                Some(river_data_core::toolbox::barometric_pressure_from_altitude(e, t))
+            }
             _ => None,
         };
-        results.insert("Field_BP_altitude".into(), serde_json::json!(bp));
+        insert_opt(&mut results, "Field_BP_altitude", alt_bp);
+
+        // Portal pressure rule: field BP wins when within 700-1050 hPa, else the
+        // altitude-derived BP. An explicit pressure_hpa overrides both.
+        let pressure = payload
+            .pressure_hpa
+            .or_else(|| river_data_core::toolbox::select_pressure(payload.field_bp, alt_bp));
 
         let curve = payload.std_curve.as_ref().map(|c| (c.slope, c.intercept));
 
         if payload.raw_co2_min.is_some() || payload.raw_co2_avg.is_some() || payload.raw_co2_max.is_some() {
-            if let (Some(p), Some(t)) = (payload.pressure_hpa, payload.temp_c) {
+            if let (Some(p), Some(t)) = (pressure, payload.temp_c) {
                 if let Some(co2_min) = payload.raw_co2_min {
-                    results.insert("Vaisala_CO2_min_corr".into(), serde_json::json!(river_data_core::toolbox::co2_correction(co2_min, p, t, curve)));
+                    insert_num(&mut results, "Vaisala_CO2_min_corr", river_data_core::toolbox::co2_correction(co2_min, p, t, curve));
                 }
                 if let Some(co2_avg) = payload.raw_co2_avg {
-                    results.insert("Vaisala_CO2_avg_corr".into(), serde_json::json!(river_data_core::toolbox::co2_correction(co2_avg, p, t, curve)));
+                    insert_num(&mut results, "Vaisala_CO2_avg_corr", river_data_core::toolbox::co2_correction(co2_avg, p, t, curve));
                 }
                 if let Some(co2_max) = payload.raw_co2_max {
-                    results.insert("Vaisala_CO2_max_corr".into(), serde_json::json!(river_data_core::toolbox::co2_correction(co2_max, p, t, curve)));
+                    insert_num(&mut results, "Vaisala_CO2_max_corr", river_data_core::toolbox::co2_correction(co2_max, p, t, curve));
                 }
             }
-        } else {
-            let co2_corr = match (payload.raw_co2, payload.pressure_hpa, payload.temp_c) {
-                (Some(co2), Some(p), Some(t)) => {
-                    Some(river_data_core::toolbox::co2_correction(co2, p, t, curve))
-                }
-                _ => None,
-            };
-            results.insert("Vaisala_CO2_avg_corr".into(), serde_json::json!(co2_corr));
+        } else if let (Some(co2), Some(p), Some(t)) = (payload.raw_co2, pressure, payload.temp_c) {
+            insert_num(&mut results, "Vaisala_CO2_avg_corr", river_data_core::toolbox::co2_correction(co2, p, t, curve));
         }
 
         if let Some(ref depths) = payload.reach_depths
             && !depths.is_empty()
         {
             let (avg, sd) = river_data_core::toolbox::reach_depth_stats(depths);
-            results.insert("Reach_depth_avg_cm".into(), serde_json::json!(avg));
-            results.insert("Reach_depth_sd_cm".into(), serde_json::json!(sd));
+            insert_num(&mut results, "Reach_depth_avg_cm", avg);
+            insert_num(&mut results, "Reach_depth_sd_cm", sd);
         }
 
-        Ok(ToolResult {
-            tool: "field_data".to_string(),
-            results: serde_json::Value::Object(results),
-            inputs_used: vec![],
-            inputs_ignored: vec![],
-        })
+        Ok(ToolResult::new("field_data", results))
     }
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Co2AirRequest {
-    pub co2_wet: Option<f64>,
-    pub ch4_wet: Option<f64>,
+    pub ch4_wet: f64,
     pub h2o_percent: f64,
 }
 
@@ -1004,85 +949,24 @@ impl AnalyticalTool for Co2AirTool {
     fn info(&self) -> &'static ToolInfo {
         static INFO: ToolInfo = ToolInfo {
             name: "co2_air",
-            description: "CO2/CH4 dry concentrations from wet measurements",
+            description: "CH4 dry concentration from wet measurement",
             endpoint: "/api/tools/co2_air/calculate",
             params: &[
-                ToolParamInfo { name: "co2_wet", label: "CO2 Wet (ppm)", required: false },
-                ToolParamInfo { name: "ch4_wet", label: "CH4 Wet (ppm)", required: false },
+                ToolParamInfo { name: "ch4_wet", label: "CH4 Wet (ppm)", required: true },
                 ToolParamInfo { name: "h2o_percent", label: "H2O (%)", required: true },
             ],
-            match_keywords: &["co2_air", "ch4", "methane", "co2"],
+            match_keywords: &["co2_air", "ch4", "methane"],
         };
         &INFO
     }
 
     async fn calculate(&self, body: &[u8], _db: &DatabaseConnection) -> AppResult<ToolResult> {
         let payload: Co2AirRequest = parse_body(body)?;
-        let co2 = payload
-            .co2_wet
-            .map(|c| river_data_core::toolbox::co2_air::co2_dry(c, payload.h2o_percent));
-        let ch4 = payload
-            .ch4_wet
-            .map(|c| river_data_core::toolbox::co2_air::ch4_dry_air(c, payload.h2o_percent));
+        let ch4 = river_data_core::toolbox::co2_air::ch4_dry_air(payload.ch4_wet, payload.h2o_percent);
 
-        Ok(ToolResult {
-            tool: "co2_air".to_string(),
-            results: serde_json::json!({
-                "lab_co2air_co2_dry": co2,
-                "lab_co2air_ch4_dry": ch4,
-            }),
-            inputs_used: vec![],
-            inputs_ignored: vec![],
-        })
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct IsotopesRequest {
-    pub d_d: Option<f64>,
-    pub d18o: Option<f64>,
-    pub d17o: Option<f64>,
-}
-
-struct IsotopesTool;
-
-#[async_trait]
-impl AnalyticalTool for IsotopesTool {
-    fn info(&self) -> &'static ToolInfo {
-        static INFO: ToolInfo = ToolInfo {
-            name: "isotopes",
-            description: "Deuterium excess, 17O excess",
-            endpoint: "/api/tools/isotopes/calculate",
-            params: &[
-                ToolParamInfo { name: "d_d", label: "dD (permil)", required: false },
-                ToolParamInfo { name: "d18o", label: "d18O (permil)", required: false },
-                ToolParamInfo { name: "d17o", label: "d17O (permil)", required: false },
-            ],
-            match_keywords: &["isotop", "d18o", "deuterium", "d17o", "o18", "o17"],
-        };
-        &INFO
-    }
-
-    async fn calculate(&self, body: &[u8], _db: &DatabaseConnection) -> AppResult<ToolResult> {
-        let payload: IsotopesRequest = parse_body(body)?;
-        let d_excess = match (payload.d_d, payload.d18o) {
-            (Some(dd), Some(d18)) => Some(river_data_core::toolbox::deuterium_excess(dd, d18)),
-            _ => None,
-        };
-        let o17_excess = match (payload.d17o, payload.d18o) {
-            (Some(d17), Some(d18)) => Some(river_data_core::toolbox::o17_excess(d17, d18)),
-            _ => None,
-        };
-
-        Ok(ToolResult {
-            tool: "isotopes".to_string(),
-            results: serde_json::json!({
-                "d_excess": d_excess,
-                "o17_excess_permeg": o17_excess,
-            }),
-            inputs_used: vec![],
-            inputs_ignored: vec![],
-        })
+        let mut results = ResultMap::new();
+        insert_num(&mut results, "lab_co2air_ch4_dry", ch4);
+        Ok(ToolResult::new("co2_air", results))
     }
 }
 
@@ -1120,34 +1004,25 @@ impl AnalyticalTool for BenthicTool {
         let payload: BenthicRequest = parse_body(body)?;
         let area = river_data_core::toolbox::rock_surface_area_m2(&payload.diameters_cm);
 
-        let afdm_per_m2 = payload.afdm_g_filter.map(|afdm| {
-            river_data_core::toolbox::per_m2(
+        let mut results = ResultMap::new();
+        insert_num(&mut results, "rock_surface_area_m2", area);
+        if let Some(afdm) = payload.afdm_g_filter {
+            insert_num(&mut results, "benthic_AFDM_avg_gm2", river_data_core::toolbox::benthic_afdm_per_m2(
                 afdm,
-                payload.total_volume_ml,
+                &payload.diameters_cm,
                 payload.volume_filtered_ml,
-                area,
-            )
-        });
-
-        let chla_per_m2 = payload.chla_ug_l.map(|chla| {
-            river_data_core::toolbox::per_m2(
-                chla * 0.005,
                 payload.total_volume_ml,
+            ));
+        }
+        if let Some(chla) = payload.chla_ug_l {
+            insert_num(&mut results, "chla_per_m2", river_data_core::toolbox::benthic_chla_per_m2(
+                chla,
+                &payload.diameters_cm,
                 payload.volume_filtered_ml,
-                area,
-            )
-        });
-
-        Ok(ToolResult {
-            tool: "benthic".to_string(),
-            results: serde_json::json!({
-                "rock_surface_area_m2": area,
-                "benthic_AFDM_avg_gm2": afdm_per_m2,
-                "chla_per_m2": chla_per_m2,
-            }),
-            inputs_used: vec![],
-            inputs_ignored: vec![],
-        })
+                payload.total_volume_ml,
+            ));
+        }
+        Ok(ToolResult::new("benthic", results))
     }
 }
 
@@ -1214,23 +1089,18 @@ impl AnalyticalTool for ChlaBenthicTool {
             payload.noacid_intercept,
         );
 
-        let mut results = serde_json::Map::new();
-        results.insert("Chla_acid_ugL_avg".into(), serde_json::json!(result.chla_acid_ug_l_avg));
-        results.insert("Chla_acid_ugL_sd".into(), serde_json::json!(result.chla_acid_ug_l_sd));
-        results.insert("Chla_noacid_ugL_avg".into(), serde_json::json!(result.chla_noacid_ug_l_avg));
-        results.insert("Chla_noacid_ugL_sd".into(), serde_json::json!(result.chla_noacid_ug_l_sd));
-        results.insert("Chla_acid_ugm2_avg".into(), serde_json::json!(result.chla_acid_ug_m2_avg));
-        results.insert("Chla_acid_ugm2_sd".into(), serde_json::json!(result.chla_acid_ug_m2_sd));
-        results.insert("Chla_noacid_ugm2_avg".into(), serde_json::json!(result.chla_noacid_ug_m2_avg));
-        results.insert("Chla_noacid_ugm2_sd".into(), serde_json::json!(result.chla_noacid_ug_m2_sd));
-        results.insert("benthic_AFDM_avg_gm2".into(), serde_json::json!(result.afdm_g_m2_avg));
-        results.insert("benthic_AFDM_sd_gm2".into(), serde_json::json!(result.afdm_g_m2_sd));
+        let mut results = ResultMap::new();
+        insert_opt(&mut results, "Chla_acid_ugL_avg", result.chla_acid_ug_l_avg);
+        insert_opt(&mut results, "Chla_acid_ugL_sd", result.chla_acid_ug_l_sd);
+        insert_num(&mut results, "Chla_noacid_ugL_avg", result.chla_noacid_ug_l_avg);
+        insert_num(&mut results, "Chla_noacid_ugL_sd", result.chla_noacid_ug_l_sd);
+        insert_opt(&mut results, "Chla_acid_ugm2_avg", result.chla_acid_ug_m2_avg);
+        insert_opt(&mut results, "Chla_acid_ugm2_sd", result.chla_acid_ug_m2_sd);
+        insert_num(&mut results, "Chla_noacid_ugm2_avg", result.chla_noacid_ug_m2_avg);
+        insert_num(&mut results, "Chla_noacid_ugm2_sd", result.chla_noacid_ug_m2_sd);
+        insert_opt(&mut results, "benthic_AFDM_avg_gm2", result.afdm_g_m2_avg);
+        insert_opt(&mut results, "benthic_AFDM_sd_gm2", result.afdm_g_m2_sd);
 
-        Ok(ToolResult {
-            tool: "chla_benthic".to_string(),
-            results: serde_json::Value::Object(results),
-            inputs_used: vec![],
-            inputs_ignored: vec![],
-        })
+        Ok(ToolResult::new("chla_benthic", results))
     }
 }
