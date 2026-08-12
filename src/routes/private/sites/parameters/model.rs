@@ -26,21 +26,34 @@ pub struct Model {
     pub name: String,
     #[crudcrate(filterable, on_create = String::new())]
     pub sensor_type: String,
+    /// Site-level units override. NULL means "no override": every endpoint serving this slot
+    /// resolves units through [`super::descriptor::SlotDescriptor`], which falls back to the
+    /// catalog `default_units`.
     pub display_units: Option<String>,
+    /// Stored and returned by the CRUD endpoint; no server-side reader. Kept because existing
+    /// rows carry values.
     pub units_name: Option<String>,
+    /// Stored and returned by the CRUD endpoint; no server-side reader.
     pub units_min: Option<f64>,
+    /// Stored and returned by the CRUD endpoint; no server-side reader.
     pub units_max: Option<f64>,
+    /// Display precision, carried to the client by [`super::descriptor::SlotDescriptor`]. The API
+    /// serves full precision and the client formats, so a change here never rewrites a value.
     pub decimal_places: Option<i16>,
     pub channel_id: Option<i32>,
     pub sample_interval_sec: Option<i32>,
-    #[crudcrate(filterable)]
+    // `on_create` is where the create-time default lives: the field stays in the create model so
+    // the client's value is honoured, and an omitted field takes the expression rather than NULL.
+    #[crudcrate(filterable, on_create = true)]
     pub is_active: Option<bool>,
-    #[crudcrate(filterable, exclude(create))]
+    #[crudcrate(filterable, on_create = false)]
     pub is_public: Option<bool>,
     #[crudcrate(filterable)]
     pub is_derived: Option<bool>,
     #[crudcrate(filterable)]
     pub derived_definition_id: Option<Uuid>,
+    /// Stored and returned by the CRUD endpoint; no server-side reader. Derived-formula variables
+    /// bind through `derived_parameter_sources.variable_name`, never through this column.
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub variable_mappings: Option<serde_json::Value>,
     #[crudcrate(exclude(create, update), sortable)]

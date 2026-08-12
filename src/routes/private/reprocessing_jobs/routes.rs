@@ -7,7 +7,30 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::authz::AccessScope;
+use crate::common::middleware::ProjectScope;
+use crate::common::scope::{self, RowProject, Unowned};
 use crate::error::{AppError, AppResult};
+
+/// Refuse a job whose target lies outside the caller's grants. An out-of-scope job and an absent
+/// one answer 404 alike, so the response does not confirm the job exists.
+///
+/// A job with no project-bearing target (`refresh_aggregates`, `reprocess_all`) is admitted: any
+/// member may trigger one, so withholding its timeline would hide the record of their own run.
+/// A job naming a target that resolves to no project is refused.
+async fn confine_job(
+    state: &AppState,
+    scope: &AccessScope,
+    job_id: Uuid,
+) -> AppResult<()> {
+    let project = scope::project_of_job(&state.db, job_id).await?;
+    let unowned = if matches!(project, RowProject::Global) {
+        Unowned::Allow
+    } else {
+        Unowned::Deny
+    };
+    scope::require_row_in_scope(scope, &project, unowned, "Job")
+}
 
 #[derive(Debug, Deserialize)]
 pub struct JobLogsQuery {
@@ -32,9 +55,11 @@ pub struct JobLogLine {
 /// so the UI can lazy-load the full record and tail new lines. Requires `read_data`.
 pub async fn get_job_logs(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Path(id): Path<Uuid>,
     Query(q): Query<JobLogsQuery>,
 ) -> AppResult<Json<Vec<JobLogLine>>> {
+    confine_job(&state, &scope, id).await?;
     let limit = i64::try_from(q.limit.unwrap_or(1000).min(5000)).unwrap_or(1000);
     let after = q.after_seq.unwrap_or(-1);
 
@@ -76,8 +101,10 @@ pub struct CancelResponse {
 /// state; 404 if the id is unknown. Requires `write_metadata`.
 pub async fn cancel_job(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<CancelResponse>> {
+    confine_job(&state, &scope, id).await?;
     let row = state
         .db
         .query_one(Statement::from_sql_and_values(
@@ -133,8 +160,10 @@ pub struct RerunResponse {
 /// or an equivalent job is already in flight; 404 if the job id is unknown. Requires `write_metadata`.
 pub async fn rerun_job(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<RerunResponse>> {
+    confine_job(&state, &scope, id).await?;
     let row = state
         .db
         .query_one(Statement::from_sql_and_values(

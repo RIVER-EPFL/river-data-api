@@ -6,8 +6,6 @@
 //! to every enabled channel. A muted slot is stamped without sending; a slot whose delivery fails on
 //! every channel is left unstamped so the next tick retries it.
 
-use std::collections::HashSet;
-
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, Statement};
 use uuid::Uuid;
 
@@ -17,7 +15,7 @@ use crate::config::Config;
 use super::email::{self, EmailChannel};
 use super::messages::{self, PendingEvent};
 use super::telegram::{TelegramChannel, TelegramClient};
-use super::{NotificationChannel, OutgoingMessage, Slot};
+use super::{NotificationChannel, OutgoingMessage, Slot, mutes_model};
 
 struct Row {
     id: Uuid,
@@ -75,23 +73,18 @@ async fn process_pending(
         return Ok(());
     }
 
-    let muted_slots = fetch_active_mutes(db).await?;
-    let (to_notify, muted): (Vec<Row>, Vec<Row>) =
-        rows.into_iter().partition(|r| !muted_slots.contains(&r.slot));
-
     let column = if opened { "notified_at" } else { "resolution_notified_at" };
 
-    // Suppressed by a mute: stamp so neither this replica nor a peer sends or re-picks it.
-    let muted_ids: Vec<Uuid> = muted.iter().map(|r| r.id).collect();
-    stamp(db, column, &muted_ids).await?;
-
+    // A muted slot is suppressed inside `deliver`, which reports success, so the claim below
+    // stands and neither this replica nor a peer re-picks the event.
+    //
     // One message per event so each carries its own slot, fan-out is per-subscriber by scope, which
     // a single batched message spanning multiple slots couldn't express. Each event is CLAIMED with an
     // atomic stamp before the send, so at 2-3 replicas exactly one replica owns it; a transient send
     // failure releases the claim so the next tick retries (at-least-once). The claim is one autocommit
     // UPDATE, no DB connection is held across the external send.
     let base = config.dashboard_base_url.as_deref();
-    for r in &to_notify {
+    for r in &rows {
         if !claim_event(db, column, r.id).await? {
             continue; // a peer replica already claimed this event
         }
@@ -157,27 +150,15 @@ async fn fetch_pending(db: &DatabaseConnection, opened: bool) -> Result<Vec<Row>
     Ok(out)
 }
 
-async fn fetch_active_mutes(db: &DatabaseConnection) -> Result<HashSet<(Uuid, Uuid)>, DbErr> {
-    let rows = db
-        .query_all(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT site_id, parameter_id FROM notification_mutes \
-             WHERE expires_at IS NULL OR expires_at > NOW()"
-                .to_string(),
-        ))
-        .await?;
-    let mut set = HashSet::new();
-    for row in rows {
-        let site_id: Uuid = row.try_get("", "site_id")?;
-        let parameter_id: Uuid = row.try_get("", "parameter_id")?;
-        set.insert((site_id, parameter_id));
-    }
-    Ok(set)
-}
-
 /// Deliver to every channel, log each attempt, and decide whether to stamp the outbox: stamp when
 /// nothing was attempted (no channels/recipients) or at least one delivery succeeded; otherwise leave
 /// it for the next tick to retry.
+///
+/// This is the single gate every notification passes through, so the mute check lives here rather
+/// than in each caller: a slot-keyed message for a muted slot is dropped before any channel sees it
+/// and reported as delivered, which is what stamps the outbox and leaves the trigger dedup state in
+/// place. A message with no slot (a sync-failure digest) has nothing to mute against and always
+/// goes out.
 pub(super) async fn deliver(
     state: &AppState,
     channels: &[Box<dyn NotificationChannel>],
@@ -185,6 +166,18 @@ pub(super) async fn deliver(
     single_event_id: Option<Uuid>,
 ) -> bool {
     let db = &state.db;
+    if let Some(slot) = &msg.slot {
+        match mutes_model::is_muted(db, slot.site_id, slot.parameter_id).await {
+            Ok(true) => return true,
+            Ok(false) => {}
+            // An unreadable mute table must not silently unmute a slot, nor drop the alert: leave
+            // the message unsent and unstamped so the next tick reassesses it.
+            Err(e) => {
+                tracing::warn!(error = %e, "mute lookup failed, deferring delivery");
+                return false;
+            }
+        }
+    }
     let mut attempted = 0usize;
     let mut any_success = false;
     for ch in channels {
@@ -230,21 +223,6 @@ pub(super) async fn log_delivery(
     if let Err(e) = res {
         tracing::warn!(error = %e, "failed to write notification_log row");
     }
-}
-
-async fn stamp(db: &DatabaseConnection, column: &str, ids: &[Uuid]) -> Result<(), DbErr> {
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("${i}")).collect();
-    let sql = format!(
-        "UPDATE alarm_events SET {column} = NOW(), updated_at = NOW() WHERE id IN ({})",
-        placeholders.join(",")
-    );
-    let values: Vec<sea_orm::Value> = ids.iter().map(|id| (*id).into()).collect();
-    db.execute(Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, &sql, values))
-        .await?;
-    Ok(())
 }
 
 /// Atomically claim one outbox event by stamping its sent-marker column iff still NULL. The single

@@ -206,6 +206,25 @@ fn default_per_page() -> u64 {
     25
 }
 
+/// Largest page either listing will serve.
+const MAX_PER_PAGE: u64 = 100;
+
+impl PaginationQuery {
+    /// The zero-based page index and page size to query with.
+    ///
+    /// An oversized page is clamped, but a page size of zero is refused: `Paginator::paginate`
+    /// asserts a non-zero size, so a silent clamp would turn a caller's mistake into a page they
+    /// did not ask for while a panic would take the request down with no answer.
+    fn resolve(&self) -> AppResult<(u64, u64)> {
+        if self.per_page == 0 {
+            return Err(AppError::BadRequest(
+                "per_page must be at least 1".to_string(),
+            ));
+        }
+        Ok((self.page.max(1) - 1, self.per_page.min(MAX_PER_PAGE)))
+    }
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -339,6 +358,7 @@ pub async fn issue_command(
             description = "Page of commands. Response includes a `Content-Range` header with `items start-end/total` for pagination.",
             body = [SyncCommandResponse]
         ),
+        (status = 400, description = "per_page is zero"),
     ),
     tag = "sync"
 )]
@@ -348,8 +368,7 @@ pub async fn list_commands(
 ) -> AppResult<(StatusCode, HeaderMap, Json<Vec<SyncCommandResponse>>)> {
     use sea_orm::PaginatorTrait;
 
-    let per_page = params.per_page.min(100);
-    let page = params.page.max(1) - 1;
+    let (page, per_page) = params.resolve()?;
 
     let paginator = sync_commands::Entity::find()
         .order_by_desc(sync_commands::Column::CreatedAt)
@@ -410,7 +429,9 @@ pub async fn create_credential(
 }
 
 /// List enrollment credentials with their service binding and revocation status. The
-/// client_secret is never returned here, only the hash is stored. Requires `read_metadata`.
+/// client_secret is never returned here, only the hash is stored. Gated by `require_admin`
+/// upstream, matching credential mint and revoke: a credential bootstraps a full-permission
+/// sync session token, so no API token may enumerate them.
 #[utoipa::path(
     get,
     path = "/credentials",
@@ -491,6 +512,7 @@ pub async fn revoke_credential(
             description = "Page of sync events. Response includes a `Content-Range` header.",
             body = [SyncEventResponse]
         ),
+        (status = 400, description = "per_page is zero"),
     ),
     tag = "sync"
 )]
@@ -500,8 +522,7 @@ pub async fn list_sync_events(
 ) -> AppResult<(StatusCode, HeaderMap, Json<Vec<SyncEventResponse>>)> {
     use sea_orm::PaginatorTrait;
 
-    let per_page = params.per_page.min(100);
-    let page = params.page.max(1) - 1;
+    let (page, per_page) = params.resolve()?;
 
     let paginator = sync_events::Entity::find()
         .order_by_desc(sync_events::Column::StartedAt)

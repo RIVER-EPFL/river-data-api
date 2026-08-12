@@ -354,16 +354,16 @@ async fn forward_calibration_closes_the_previous_window_and_leaves_history_alone
         "C1's window runs up to the next curve on the timeline: {before:?}"
     );
 
-    // A reading that arrives while C1 is still the newest field curve. Ingest stores the raw value
-    // and leaves the curve to reprocess, so this row is the probe that proves the job C2 enqueues
-    // actually ran: only that job can turn 40.0 into 2*40+5.
+    // A reading that arrives while C1 is still the newest field curve. Ingest resolves the window
+    // covering the reading time and stores the corrected value, so this row carries 2*40+5 from the
+    // moment it lands, and a later reprocess recomputes the same number.
     ingest_cycle(&app, &admin, &fx.stream_id, &[(LATE_C1, 40.0)]).await;
     let rows = get_readings(&db, fx.stream_uuid).await;
     let probe = reading_at(&rows, LATE_C1);
     assert_eq!(
         probe.calibrated_value,
-        Some(40.0),
-        "POST /ingest stores the raw value and defers the curve to reprocess"
+        Some(85.0),
+        "POST /ingest applies the curve covering the reading time (2*40+5)"
     );
     assert_eq!(
         probe.calibration_id,
@@ -489,7 +489,7 @@ async fn readings_ingested_after_the_new_calibration_carry_it_and_take_its_curve
     kc::ensure_realm_user("intern1", "intern1", &["riverdata-intern"]).await;
     kc::ensure_realm_user("river1", "river1", &["riverdata-river"]).await;
     kc::ensure_realm_user("manager1", "manager1", &["riverdata-manager"]).await;
-    for user in ["intern1", "river1"] {
+    for user in ["intern1", "river1", "manager1"] {
         let sub = kc::keycloak_user_id(user).await;
         kc::grant_project(&db, &sub, &fx.track.project_id).await;
     }
@@ -517,8 +517,8 @@ async fn readings_ingested_after_the_new_calibration_carry_it_and_take_its_curve
         );
         assert_eq!(
             row.calibrated_value,
-            Some(raw),
-            "POST /ingest stores the raw value and defers the curve to reprocess"
+            Some(3.0 * raw + 1.0),
+            "POST /ingest applies C2, the curve covering {time}"
         );
         assert_eq!(row.sensor_id, Some(fx.sensor_uuid), "{time} is owned by the stream's sensor");
         assert_eq!(row.site_id, Some(fx.site_uuid()), "{time} lands attributed to the site");
@@ -621,6 +621,7 @@ async fn a_backdated_reading_resolves_to_the_older_window_not_the_latest_calibra
     let manager = kc::get_keycloak_jwt("manager1", "manager1").await;
 
     let fx = arrange(&db, &app, &admin).await;
+    kc::grant_project(&db, &kc::keycloak_user_id("manager1").await, &fx.track.project_id).await;
 
     let (status, c2) = create_calibration(&app, &admin, &fx.sensor_id, 3.0, 1.0, T2).await;
     assert_eq!(status, 201, "record C2 on top of C1: {c2}");
@@ -741,6 +742,7 @@ async fn aggregates_report_the_new_curve_for_the_new_bucket_and_leave_the_old_bu
     let manager = kc::get_keycloak_jwt("manager1", "manager1").await;
 
     let fx = arrange(&db, &app, &admin).await;
+    kc::grant_project(&db, &kc::keycloak_user_id("manager1").await, &fx.track.project_id).await;
     let parameter_id = fx.parameter_id().to_string();
 
     refresh_hourly(&db, dt("2025-06-01T00:00:00Z")).await;

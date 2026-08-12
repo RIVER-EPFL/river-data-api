@@ -1,5 +1,6 @@
 use crudcrate::{CRUDResource, EntityToModels};
 use sea_orm::entity::prelude::*;
+use sea_orm::{Condition, sea_query::Expr};
 
 #[derive(
     Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
@@ -55,3 +56,35 @@ impl Related<crate::routes::private::parameters::Entity> for Entity {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
+
+/// A mute is in force until it expires; a NULL `expires_at` never expires. The predicate is
+/// defined once here so the delivery gate and the listings cannot disagree about what "muted"
+/// means.
+pub fn in_force() -> Condition {
+    Condition::any()
+        .add(Column::ExpiresAt.is_null())
+        .add(Expr::col(Column::ExpiresAt).gt(Expr::current_timestamp()))
+}
+
+/// Whether the `(site, parameter)` slot is muted right now.
+///
+/// Every notification carrying a slot passes through here before delivery, so muting one slot
+/// suppresses every slot-keyed alert for it, not just the threshold alarms.
+pub async fn is_muted(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+    parameter_id: Uuid,
+) -> Result<bool, DbErr> {
+    let found = Entity::find()
+        .filter(Column::SiteId.eq(site_id))
+        .filter(Column::ParameterId.eq(parameter_id))
+        .filter(in_force())
+        .one(db)
+        .await?;
+    Ok(found.is_some())
+}
+
+/// Every mute in force, newest slot ordering left to the caller.
+pub async fn in_force_all(db: &DatabaseConnection) -> Result<Vec<Model>, DbErr> {
+    Entity::find().filter(in_force()).all(db).await
+}

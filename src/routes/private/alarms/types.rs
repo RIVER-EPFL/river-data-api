@@ -30,14 +30,15 @@ pub struct ParameterViolationData {
     #[serde(rename = "type")]
     pub sensor_type: String,
     pub units: Option<String>,
-    /// Values array (same length as times)
-    pub values: Vec<f64>,
-    /// Severity levels (same length as times): 1=warning, 2=alarm
-    pub severities: Vec<i16>,
+    /// Values array (same length as times). Null at a timestamp where this parameter did not
+    /// violate, matching every other series endpoint; the axis is the union across parameters.
+    pub values: Vec<Option<f64>>,
+    /// Severity levels (same length as times): 1=warning, 2=alarm, null where no violation.
+    pub severities: Vec<Option<i16>>,
 }
 
 /// Query parameters for site alarms endpoint
-#[derive(Debug, Deserialize, IntoParams)]
+#[derive(Debug, Deserialize, Serialize, IntoParams)]
 pub struct SiteAlarmsQuery {
     /// Start time (required, ISO 8601)
     pub start: DateTime<Utc>,

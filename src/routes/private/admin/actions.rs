@@ -5,11 +5,100 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::common::middleware::{DenyScoped, ProjectScope, enforce_project_scope_for_sites};
-use crate::error::{AppError, AppResult};
-use crate::routes::private::sensors::calibrations::service::{
-    evaluate_formula, recompute_deployed_until, recompute_valid_until, reprocess_sensor_readings,
+use crate::common::authz::AccessScope;
+use crate::common::middleware::{DenyScoped, ProjectScope};
+use crate::common::scope::{
+    RowProject, Unowned, project_filter_sql, project_of_sensor, project_of_site,
+    require_sites_in_scope, require_target_in_scope,
 };
+use crate::error::{AppError, AppResult};
+use crate::routes::private::sensors::deployments::slots;
+use crate::routes::private::sensors::calibrations::service::{
+    evaluate_formula, recompute_deployed_until, reprocess_sensor_readings,
+};
+
+// ---------------------------------------------------------------------------
+// Project scope on the operator actions
+//
+// Three rules, applied by every action in this file:
+//
+// 1. A named site is confined with `require_sites_in_scope` (403), matching `preview_derived` and
+//    the ingestion write paths.
+// 2. A named row (a sensor, a deployment) is confined with `confine_target` (404 when no such row,
+//    403 when it exists outside the caller's grants).
+// 3. An action that names nothing runs against every project, so a restricted caller must name a
+//    target: `require_named_target` refuses it. Administrators, unscoped tokens and sync tokens are
+//    unrestricted and unaffected.
+//
+// `refresh_aggregates` and `reconcile_alarms` are the two exceptions to rule 3, and the reason is
+// what they write: neither takes a target because neither touches stored measurements or history.
+// They recompute derived state (the rollups, the open-alarm set) that the scheduler already
+// recomputes on its own cadence, so a member triggering one changes nothing they could not obtain
+// by waiting.
+//
+// `deny_scoped_token` on the route group stops a project-scoped API TOKEN before any of this; it
+// was never a check on granted members, who reach these handlers as `AccessScope::Projects`.
+// ---------------------------------------------------------------------------
+
+/// Confine an action's named row to the caller's projects.
+///
+/// A row that does not exist is 404 for everyone, including an administrator: the action has
+/// nothing to act on. A row outside a restricted caller's grants is 403, the same answer the route
+/// already gives a project-scoped token, and the enumerations that could hand out such an id are
+/// confined by the same scope.
+fn confine_target(
+    scope: &AccessScope,
+    row: &RowProject,
+    unowned: Unowned,
+    what: &str,
+) -> AppResult<()> {
+    if matches!(row, RowProject::Missing) {
+        return Err(AppError::NotFound(format!("{what} not found")));
+    }
+    require_target_in_scope(scope, row, unowned, what)
+}
+
+/// The sites the named deployments sit at, for confining a deployment-addressed action. An id that
+/// resolves to no row contributes nothing; the action's own candidate selection reports it.
+async fn deployment_sites(
+    db: &sea_orm::DatabaseConnection,
+    deployment_ids: &[Uuid],
+) -> AppResult<Vec<Uuid>> {
+    use sea_orm::{ConnectionTrait, Statement};
+    if deployment_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<sea_orm::Value> = deployment_ids.iter().map(|id| (*id).into()).collect();
+    let placeholders: Vec<String> = (1..=ids.len()).map(|n| format!("${n}")).collect();
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT DISTINCT site_id FROM sensor_deployments WHERE id IN ({})",
+                placeholders.join(",")
+            ),
+            ids,
+        ))
+        .await
+        .map_err(AppError::Database)?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| r.try_get::<Uuid>("", "site_id").ok())
+        .collect())
+}
+
+/// Refuse an untargeted run to a restricted caller: with nothing named, the action reaches every
+/// project. `named` is whether the request identified something narrower than the whole
+/// installation; `what` names what to pass instead. A request that names nothing *and* asks for
+/// nothing keeps its existing 400, which is a bad request rather than a scope answer.
+fn require_named_target(scope: &AccessScope, named: bool, what: &str) -> AppResult<()> {
+    if named || !scope.is_restricted() {
+        return Ok(());
+    }
+    Err(AppError::Forbidden(format!(
+        "Name the {what} this action should touch; an unnamed target is not confined to your projects"
+    )))
+}
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RefreshAggregatesRequest {
@@ -75,13 +164,19 @@ pub struct SiteTimestamps {
     request_body = ComputeDerivedRequest,
     responses(
         (status = 200, description = "Computation triggered; returns job_id, status 'pending', total_timestamps"),
+        (status = 403, description = "A named site is outside the caller's projects, or no site was named"),
     ),
     tag = "actions"
 )]
 pub async fn compute_derived(
     State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(payload): Json<ComputeDerivedRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let sites: Vec<Uuid> = payload.site_timestamps.iter().map(|st| st.site_id).collect();
+    require_named_target(&scope, !sites.is_empty(), "site")?;
+    require_sites_in_scope(&app_state.db, &scope, &sites).await?;
+
     let total_timestamps: usize = payload
         .site_timestamps
         .iter()
@@ -132,14 +227,22 @@ pub struct ReprocessSensorRequest {
     request_body = ReprocessSensorRequest,
     responses(
         (status = 200, description = "Reprocessing triggered; returns job_id and status 'pending'"),
+        (status = 403, description = "The sensor is deployed only outside the caller's projects"),
+        (status = 404, description = "No such sensor"),
     ),
     tag = "actions"
 )]
 pub async fn reprocess_sensor(
     State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(payload): Json<ReprocessSensorRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     let sensor_id = payload.sensor_id;
+    // A sensor that has never been deployed belongs to no project, and neither do its readings, so
+    // it stays reachable: an instrument sits in inventory before anyone decides where it goes.
+    let target = project_of_sensor(&app_state.db, sensor_id).await?;
+    confine_target(&scope, &target, Unowned::Allow, "sensor")?;
+
     let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
         &app_state.db,
         "manual_reprocess",
@@ -172,13 +275,18 @@ pub struct ReprocessAllResponse {
     path = "/actions/reprocess_all",
     responses(
         (status = 200, description = "Backdate reprocessing triggered; returns job_id and slot count", body = ReprocessAllResponse),
+        (status = 403, description = "The backdate names no target, so a caller confined to a project set is refused"),
     ),
     tag = "actions"
 )]
 pub async fn reprocess_all(
     State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
 ) -> AppResult<Json<ReprocessAllResponse>> {
     use sea_orm::{ConnectionTrait, Statement};
+
+    // The backdate has no target field at all: it re-derives every slot in the installation.
+    require_named_target(&scope, false, "sensor (POST /actions/reprocess)")?;
 
     let db = &app_state.db;
     let slot_rows = db
@@ -244,11 +352,13 @@ pub struct RebuildAlarmEventsRequest {
     request_body = RebuildAlarmEventsRequest,
     responses(
         (status = 200, description = "Rebuild triggered; returns job_id and status 'pending'"),
+        (status = 403, description = "The named site is outside the caller's projects, or no site was named"),
     ),
     tag = "actions"
 )]
 pub async fn rebuild_alarm_events(
     State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(payload): Json<RebuildAlarmEventsRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     let RebuildAlarmEventsRequest {
@@ -257,6 +367,11 @@ pub async fn rebuild_alarm_events(
         start,
         end,
     } = payload;
+
+    require_named_target(&scope, site_id.is_some(), "site")?;
+    if let Some(site_id) = site_id {
+        require_sites_in_scope(&app_state.db, &scope, &[site_id]).await?;
+    }
 
     let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
         &app_state.db,
@@ -330,12 +445,14 @@ pub struct RollbackDeploymentResponse {
     request_body = RollbackDeploymentRequest,
     responses(
         (status = 200, description = "Rollback complete with reassignment count", body = RollbackDeploymentResponse),
+        (status = 403, description = "The deployment is outside the caller's projects"),
         (status = 404, description = "Deployment not found"),
     ),
     tag = "actions"
 )]
 pub async fn rollback_deployment(
     State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(payload): Json<RollbackDeploymentRequest>,
 ) -> AppResult<Json<RollbackDeploymentResponse>> {
     use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
@@ -354,6 +471,12 @@ pub async fn rollback_deployment(
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
         .ok_or_else(|| AppError::NotFound("Deployment not found".into()))?;
 
+    // A deployment is always at a site, so its project is the site's. This deletes the row, the
+    // same destruction `DELETE /sensor_deployments/{id}` performs under `enforce_scope_on_crud`.
+    let deployment_site: Uuid = target.try_get("", "site_id").map_err(|e| AppError::Internal(format!("{e}")))?;
+    let owner = project_of_site(db, deployment_site).await?;
+    confine_target(&scope, &owner, Unowned::Deny, "deployment")?;
+
     let sensor_id: Uuid = target.try_get("", "sensor_id").map_err(|e| AppError::Internal(format!("{e}")))?;
     let parameter_id: Uuid = target.try_get("", "parameter_id").map_err(|e| AppError::Internal(format!("{e}")))?;
     let target_deployed_from: chrono::DateTime<chrono::FixedOffset> =
@@ -369,7 +492,7 @@ pub async fn rollback_deployment(
     let previous = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT id, site_id FROM sensor_deployments
+            r"SELECT id, site_id, deployed_from FROM sensor_deployments
               WHERE sensor_id = $1 AND parameter_id = $4 AND deployed_from < $2 AND id != $3
               ORDER BY deployed_from DESC LIMIT 1",
             [
@@ -420,14 +543,51 @@ pub async fn rollback_deployment(
     //    reverting to the previous site. Reopening to the target's own `deployed_until` reclaims exactly
     //    the window the target held (NULL = open-ended), which can't overlap anything the slot
     //    constraint already excluded.
+    //    Another instrument may have moved into the window the predecessor is about to reclaim. The
+    //    check runs after the DELETE above so the deployment being rolled back is not itself
+    //    reported as the occupant; a conflict aborts the transaction and nothing is destroyed.
     if let Some(prev_id) = previous_deployment_id {
+        let prev = previous.as_ref().expect("previous row present with its id");
+        let prev_site: Uuid = prev
+            .try_get("", "site_id")
+            .map_err(|e| AppError::Internal(format!("{e}")))?;
+        let prev_from: chrono::DateTime<chrono::FixedOffset> = prev
+            .try_get("", "deployed_from")
+            .map_err(|e| AppError::Internal(format!("{e}")))?;
+
+        let request = slots::SlotRequest {
+            site_id: prev_site,
+            parameter_id,
+            deployed_from: prev_from.with_timezone(&chrono::Utc),
+            deployed_until: target_deployed_until.map(|t| t.with_timezone(&chrono::Utc)),
+            exclude_deployment: Some(prev_id),
+            recalled_sensor: None,
+        };
+        if let Some(occupant) = slots::find_occupant(&txn, &request)
+            .await
+            .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
+        {
+            return Err(AppError::Conflict(slots::conflict_message(
+                &occupant, sensor_id, "roll back",
+            )));
+        }
+
         txn.execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE sensor_deployments SET deployed_until = $1 WHERE id = $2",
             [target_deployed_until.into(), prev_id.into()],
         ))
         .await
-        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+        .map_err(|e| {
+            if slots::is_slot_conflict(&e) {
+                AppError::Conflict(format!(
+                    "Rolling back would extend deployment {prev_id} into a period another \
+                     instrument now holds at this site and parameter."
+                ))
+            } else {
+                AppError::Internal(format!("DB error: {e}"))
+            }
+        })?;
     }
     txn.commit().await.map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
@@ -553,8 +713,8 @@ pub async fn preview_derived(
 ) -> AppResult<Json<PreviewDerivedResponse>> {
     use sea_orm::{ConnectionTrait, Statement};
 
-    // A project-scoped key may only preview a derived computation against a site in its project.
-    enforce_project_scope_for_sites(&app_state.db, &scope, &[payload.site_id]).await?;
+    // A restricted caller may only preview a derived computation against a site in its projects.
+    require_sites_in_scope(&app_state.db, &scope, &[payload.site_id]).await?;
 
     // Validate formula
     if payload.formula.len() > 1000 {
@@ -802,33 +962,47 @@ pub struct BackfillCandidatesResponse {
 /// Open deployments that have claimable pre-start history: readings at the same `(site, parameter)`
 /// with `sensor_id IS NULL` before `deployed_from`, bounded below by any prior deployment's end so
 /// backdating can't overlap it. `target_from` is the earliest such reading.
+///
+/// Confined to the caller's projects. The rows carry the site, sensor and deployment ids the write
+/// actions in this file take, so an unconfined enumeration hands out exactly what a cross-project
+/// write needs; the CRUD reads of the same rows confine by the same project set.
 async fn fetch_backfill_candidates(
     db: &sea_orm::DatabaseConnection,
+    scope: &AccessScope,
 ) -> AppResult<Vec<BackfillCandidate>> {
     use sea_orm::{ConnectionTrait, Statement};
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    let project_filter = project_filter_sql(scope, "s.project_id", &mut values)
+        .map(|predicate| format!("AND {predicate}"))
+        .unwrap_or_default();
+    let sql = format!(
+        r"SELECT d.id AS deployment_id, d.sensor_id, d.site_id, d.parameter_id,
+                 d.deployed_from, c.target_from, c.claimable_count
+          FROM sensor_deployments d
+          JOIN sites s ON s.id = d.site_id
+          CROSS JOIN LATERAL (
+              SELECT MAX(p.deployed_until) AS prior_end
+              FROM sensor_deployments p
+              WHERE p.site_id = d.site_id AND p.parameter_id = d.parameter_id
+                AND p.id <> d.id AND p.deployed_until IS NOT NULL
+                AND p.deployed_until <= d.deployed_from
+          ) pe
+          CROSS JOIN LATERAL (
+              SELECT MIN(r.time) AS target_from, COUNT(*) AS claimable_count
+              FROM readings r
+              WHERE r.site_id = d.site_id AND r.parameter_id = d.parameter_id
+                AND r.sensor_id IS NULL AND r.time < d.deployed_from
+                AND (pe.prior_end IS NULL OR r.time >= pe.prior_end)
+          ) c
+          WHERE d.deployed_until IS NULL AND c.claimable_count > 0
+          {project_filter}
+          ORDER BY c.claimable_count DESC"
+    );
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT d.id AS deployment_id, d.sensor_id, d.site_id, d.parameter_id,
-                     d.deployed_from, c.target_from, c.claimable_count
-              FROM sensor_deployments d
-              CROSS JOIN LATERAL (
-                  SELECT MAX(p.deployed_until) AS prior_end
-                  FROM sensor_deployments p
-                  WHERE p.site_id = d.site_id AND p.parameter_id = d.parameter_id
-                    AND p.id <> d.id AND p.deployed_until IS NOT NULL
-                    AND p.deployed_until <= d.deployed_from
-              ) pe
-              CROSS JOIN LATERAL (
-                  SELECT MIN(r.time) AS target_from, COUNT(*) AS claimable_count
-                  FROM readings r
-                  WHERE r.site_id = d.site_id AND r.parameter_id = d.parameter_id
-                    AND r.sensor_id IS NULL AND r.time < d.deployed_from
-                    AND (pe.prior_end IS NULL OR r.time >= pe.prior_end)
-              ) c
-              WHERE d.deployed_until IS NULL AND c.claimable_count > 0
-              ORDER BY c.claimable_count DESC"
-                .to_owned(),
+            &sql,
+            values,
         ))
         .await
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
@@ -862,9 +1036,10 @@ async fn fetch_backfill_candidates(
 )]
 pub async fn backfill_candidates(
     State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     _: DenyScoped,
 ) -> AppResult<Json<BackfillCandidatesResponse>> {
-    let candidates = fetch_backfill_candidates(&app_state.db).await?;
+    let candidates = fetch_backfill_candidates(&app_state.db, &scope).await?;
 
     let mut by_site_map: HashMap<Uuid, (i64, i64)> = HashMap::new();
     let mut total_claimable = 0i64;
@@ -919,17 +1094,33 @@ pub struct BackfillAttributionResponse {
     post,
     path = "/actions/backfill_attribution",
     request_body = BackfillAttributionRequest,
-    responses((status = 200, description = "Backfill triggered", body = BackfillAttributionResponse)),
+    responses(
+        (status = 200, description = "Backfill triggered", body = BackfillAttributionResponse),
+        (status = 403, description = "A named site or deployment is outside the caller's projects, or nothing was named"),
+    ),
     tag = "actions"
 )]
 pub async fn backfill_attribution(
     State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(payload): Json<BackfillAttributionRequest>,
 ) -> AppResult<Json<BackfillAttributionResponse>> {
     use sea_orm::{ConnectionTrait, Statement};
     let db = &app_state.db;
 
-    let all_candidates = fetch_backfill_candidates(db).await?;
+    // `all` with no site and no deployments is the whole installation; a request that names nothing
+    // at all selects nothing and keeps its 400 below.
+    let named = payload.site_id.is_some() || !payload.deployment_ids.is_empty() || !payload.all;
+    require_named_target(&scope, named, "site or deployments")?;
+    if let Some(site_id) = payload.site_id {
+        require_sites_in_scope(db, &scope, &[site_id]).await?;
+    }
+    if !payload.deployment_ids.is_empty() {
+        let sites = deployment_sites(db, &payload.deployment_ids).await?;
+        require_sites_in_scope(db, &scope, &sites).await?;
+    }
+
+    let all_candidates = fetch_backfill_candidates(db, &scope).await?;
     let dep_filter: HashSet<Uuid> = payload.deployment_ids.iter().copied().collect();
     let selected: Vec<BackfillCandidate> = all_candidates
         .into_iter()
@@ -1017,21 +1208,43 @@ pub struct CalibrationBackfillCandidatesResponse {
     pub total_uncalibrated: i64,
 }
 
+/// Sensors carrying readings no calibration window covers.
+///
+/// Confined to the caller's projects by the sensor's deployments, the same rule the `sensors` CRUD
+/// read applies. A sensor never deployed anywhere resolves to no project and so does not appear in
+/// a restricted caller's enumeration, while `backfill_calibrations` still accepts it by name: an
+/// instrument in inventory is nobody's project, and the enumeration is what must not leak.
 async fn fetch_calibration_candidates(
     db: &sea_orm::DatabaseConnection,
+    scope: &AccessScope,
 ) -> AppResult<Vec<CalibrationBackfillCandidate>> {
     use sea_orm::{ConnectionTrait, Statement};
 
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    let project_filter = project_filter_sql(scope, "s.project_id", &mut values)
+        .map(|predicate| {
+            format!(
+                "AND EXISTS (SELECT 1 FROM sensor_deployments d \
+                 JOIN sites s ON s.id = d.site_id \
+                 WHERE d.sensor_id = r.sensor_id AND {predicate})"
+            )
+        })
+        .unwrap_or_default();
+    let sql = format!(
+        r"SELECT r.sensor_id, COUNT(*) AS uncalibrated_count, MIN(r.time) AS target_from
+          FROM readings r
+          WHERE r.sensor_id IS NOT NULL AND r.calibration_id IS NULL
+          {project_filter}
+          GROUP BY r.sensor_id
+          HAVING COUNT(*) > 0
+          ORDER BY COUNT(*) DESC"
+    );
+
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT r.sensor_id, COUNT(*) AS uncalibrated_count, MIN(r.time) AS target_from
-              FROM readings r
-              WHERE r.sensor_id IS NOT NULL AND r.calibration_id IS NULL
-              GROUP BY r.sensor_id
-              HAVING COUNT(*) > 0
-              ORDER BY COUNT(*) DESC"
-                .to_owned(),
+            &sql,
+            values,
         ))
         .await
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
@@ -1091,9 +1304,10 @@ async fn fetch_calibration_candidates(
 )]
 pub async fn calibration_candidates(
     State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     _: DenyScoped,
 ) -> AppResult<Json<CalibrationBackfillCandidatesResponse>> {
-    let candidates = fetch_calibration_candidates(&app_state.db).await?;
+    let candidates = fetch_calibration_candidates(&app_state.db, &scope).await?;
     let total_uncalibrated: i64 = candidates.iter().map(|c| c.uncalibrated_count).sum();
     Ok(Json(CalibrationBackfillCandidatesResponse {
         total_candidates: candidates.len(),
@@ -1126,17 +1340,40 @@ pub struct BackfillCalibrationsResponse {
     post,
     path = "/actions/backfill_calibrations",
     request_body = BackfillCalibrationsRequest,
-    responses((status = 200, description = "Calibration backfill triggered", body = BackfillCalibrationsResponse)),
+    responses(
+        (status = 200, description = "Calibration backfill triggered", body = BackfillCalibrationsResponse),
+        (status = 403, description = "A named sensor is outside the caller's projects, or no sensor was named"),
+        (status = 404, description = "No such sensor"),
+    ),
     tag = "actions"
 )]
 pub async fn backfill_calibrations(
     State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(payload): Json<BackfillCalibrationsRequest>,
 ) -> AppResult<Json<BackfillCalibrationsResponse>> {
-    use sea_orm::{ConnectionTrait, Statement};
+
     let db = &app_state.db;
 
-    let all_candidates = fetch_calibration_candidates(db).await?;
+    // Named instruments are confined one by one, including inventory (`Unowned::Allow`): a sensor
+    // with no deployment belongs to no project, and refusing it would put a newly imported
+    // instrument out of reach of every member. `all` names nothing, so a restricted caller may not
+    // use it.
+    let named: Vec<Uuid> = payload
+        .sensor_id
+        .into_iter()
+        .chain(payload.sensor_ids.iter().copied())
+        .collect();
+    require_named_target(&scope, !named.is_empty() || !payload.all, "sensor")?;
+    for sensor_id in &named {
+        let target = project_of_sensor(db, *sensor_id).await?;
+        confine_target(&scope, &target, Unowned::Allow, "sensor")?;
+    }
+
+    // With instruments named, each was confined just above and the selection below keeps only
+    // those, so the candidate query runs unfiltered and inventory stays reachable. With nothing
+    // named the caller is unrestricted (`require_named_target`), and the query is unfiltered too.
+    let all_candidates = fetch_calibration_candidates(db, &AccessScope::Unrestricted).await?;
     let id_filter: HashSet<Uuid> = payload.sensor_ids.iter().copied().collect();
     let selected: Vec<CalibrationBackfillCandidate> = all_candidates
         .into_iter()
@@ -1161,50 +1398,17 @@ pub async fn backfill_calibrations(
     let mut sensor_ids_touched: Vec<Uuid> = Vec::new();
 
     for c in &selected {
-        match (c.earliest_calibration_from, c.is_identity) {
-            // No calibrations at all, create identity starting at earliest reading. The guarded
-            // INSERT (NOT EXISTS) makes a client retry to another replica a no-op: there is no unique
-            // constraint to lean on `ON CONFLICT`, so the existence check on
-            // (sensor_id, identity coeffs, valid_from) prevents a duplicate identity row.
-            (None, _) | (Some(_), false) => {
-                let cal_id = Uuid::new_v4();
-                db.execute(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    r"INSERT INTO sensor_calibrations
-                          (id, sensor_id, slope, intercept, valid_from, performed_by, notes, created_at)
-                      SELECT $1, $2, 1.0, 0.0, $3, 'system', 'Identity calibration (backfill)', NOW()
-                      WHERE NOT EXISTS (
-                          SELECT 1 FROM sensor_calibrations
-                          WHERE sensor_id = $2 AND slope = 1.0 AND intercept = 0.0 AND valid_from = $3
-                      )",
-                    [cal_id.into(), c.sensor_id.into(), c.target_from.into()],
-                ))
-                .await
-                .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-            }
-            // Earliest calibration is identity, backdate it. `valid_from > $1` makes the move
-            // idempotent: once it sits at `target_from`, a retry matches no rows.
-            (Some(_), true) => {
-                db.execute(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    r"UPDATE sensor_calibrations
-                      SET valid_from = $1
-                      WHERE sensor_id = $2
-                        AND slope = 1.0 AND intercept = 0.0
-                        AND valid_from > $1
-                        AND valid_from = (
-                            SELECT MIN(valid_from) FROM sensor_calibrations WHERE sensor_id = $2
-                        )",
-                    [c.target_from.into(), c.sensor_id.into()],
-                ))
-                .await
-                .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-            }
-        }
-
-        recompute_valid_until(db, c.sensor_id)
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?;
+        // One writer of an auto-created identity curve. It backdates a leading identity in place,
+        // inserts one ahead of a real curve when the readings start earlier, and no-ops when the
+        // first real curve already covers `target_from`, so a backfill can never retract a
+        // scientist's curve to identity. It re-chains the windows itself.
+        crate::routes::private::sensors::calibrations::service::ensure_identity_covers(
+            db,
+            c.sensor_id,
+            c.target_from,
+        )
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
         sensor_ids_touched.push(c.sensor_id);
     }
 

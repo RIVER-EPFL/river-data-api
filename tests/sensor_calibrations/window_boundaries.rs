@@ -12,7 +12,8 @@
 //! Everything is provisioned over HTTP from the CSV onboarding track, as the roles that own each
 //! step: administrator for inventory and for the curves of never-deployed sensors (a calibration on
 //! a sensor with no deployment resolves to no project, so a granted member is refused), manager for
-//! deployments, river for ingestion and the operator data actions.
+//! deployments and for the rollback that deletes one, river for ingestion and the operator data
+//! actions.
 
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
@@ -235,7 +236,7 @@ async fn series(fx: &Fixture, sensor_id: &str, start: &str, end: &str) -> Series
     Series { times, raw: numbers("raw"), calibrated: numbers("calibrated") }
 }
 
-/// RD-024: `backfill_calibrations` must not insert an identity curve inside an entered
+/// `backfill_calibrations` must not insert an identity curve inside an entered
 /// calibration's window, which truncates that window and reverts its readings to raw.
 #[tokio::test]
 #[serial]
@@ -366,7 +367,7 @@ async fn backfill_calibrations_leaves_an_entered_curve_covering_its_readings() {
     );
 }
 
-/// RD-028: a deployment create refused by the slot pre-check must leave the sensor's current
+/// a deployment create refused by the slot pre-check must leave the sensor's current
 /// deployment open, ie. the refused request has no side effect.
 #[tokio::test]
 #[serial]
@@ -447,7 +448,7 @@ async fn a_refused_deployment_create_leaves_the_current_deployment_open() {
     assert_eq!(rows.len(), 1, "the refused create writes no deployment row: {rows:?}");
 }
 
-/// RD-030: two calibrations entered with the same `valid_from` must not leave one owning an empty
+/// two calibrations entered with the same `valid_from` must not leave one owning an empty
 /// `[valid_from, valid_until)` window, ie. a curve that can never apply to a reading.
 #[tokio::test]
 #[serial]
@@ -503,7 +504,7 @@ async fn curves_sharing_a_valid_from_never_collapse_into_an_empty_window() {
     }
 }
 
-/// RD-031: rolling a deployment back into a slot that has since been refilled must report a
+/// rolling a deployment back into a slot that has since been refilled must report a
 /// conflict, not fail on the raw slot-exclusion constraint.
 #[tokio::test]
 #[serial]
@@ -562,7 +563,7 @@ async fn rolling_back_into_a_refilled_slot_reports_a_conflict() {
         &fx.app,
         "/api/actions/rollback_deployment",
         &json!({ "deployment_id": moved }),
-        &fx.river,
+        &fx.manager,
     )
     .await;
     assert_eq!(
@@ -608,7 +609,7 @@ async fn rolling_back_into_a_refilled_slot_reports_a_conflict() {
         &fx.app,
         "/api/actions/rollback_deployment",
         &json!({ "deployment_id": moved }),
-        &fx.river,
+        &fx.manager,
     )
     .await;
     assert_eq!(status, 200, "with the slot free the same rollback completes: {body}");

@@ -310,7 +310,7 @@ impl Fixture {
     }
 }
 
-// RD-023: a reading ingested while a curve is in force is served through that curve, in the
+// a reading ingested while a curve is in force is served through that curve, in the
 // readings response, the sensor plot and the hourly rollup, with no operator reprocess in between.
 #[tokio::test]
 #[serial]
@@ -398,7 +398,7 @@ async fn routine_ingest_serves_the_active_calibration() {
     );
 }
 
-// RD-025: an explicit end date an operator sets on a curve is stored and read back, on the update
+// an explicit end date an operator sets on a curve is stored and read back, on the update
 // response, on the entity and in the window editor's own read path.
 #[tokio::test]
 #[serial]
@@ -488,7 +488,7 @@ async fn operator_can_set_an_explicit_calibration_window() {
     );
 }
 
-// RD-026: ingest stamps the curve covering the reading's own parameter, and a later reprocess
+// ingest stamps the curve covering the reading's own parameter, and a later reprocess
 // resolves the same curve, so provenance does not change under a rerun.
 #[tokio::test]
 #[serial]
@@ -581,7 +581,7 @@ async fn ingest_stamps_the_curve_for_the_readings_own_parameter() {
     );
 }
 
-// RD-027: a grab whose instrument resolves a windowed curve is served through that curve, and an
+// a grab whose instrument resolves a windowed curve is served through that curve, and an
 // operator reprocess keeps it corrected rather than skipping it.
 #[tokio::test]
 #[serial]
@@ -682,7 +682,7 @@ async fn grab_readings_receive_their_resolved_curve() {
     );
 }
 
-// RD-029: importing a stream's instrument stamps each reading with the curve whose window covers
+// importing a stream's instrument stamps each reading with the curve whose window covers
 // it, and an identity curve minted by the import covers the history it is stamped on.
 #[tokio::test]
 #[serial]

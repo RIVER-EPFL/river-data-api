@@ -16,6 +16,8 @@ use crate::routes::private::readings::grab_samples::{
     GrabSampleReading, GrabSampleRequest, insert_grab_samples,
 };
 
+use crate::routes::private::alarms::thresholds::resolve_thresholds_sql;
+
 use super::messages::severity_label;
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
@@ -266,14 +268,22 @@ pub async fn thresholds(db: &DatabaseConnection, scope: &AccessScope, arg: &str)
         }
     };
     let stmt = match site_filter {
-        Some(id) => Statement::from_sql_and_values(
+        // Site branch: the same three-tier resolution `GET /api/alarms/thresholds` reports, so a
+        // slot whose bounds come from the parameter defaults is not reported as unconfigured.
+        Some(id) => Statement::from_string(
             PG,
-            "SELECT p.name AS param, p.default_units AS units, at.warning_min, at.warning_max, \
-                    at.alarm_min, at.alarm_max \
-             FROM alarm_thresholds at JOIN parameters p ON p.id = at.parameter_id \
-             WHERE at.site_id = $1 ORDER BY p.name",
-            [id.into()],
+            format!(
+                "SELECT p.name AS param, p.default_units AS units, r.warning_min, r.warning_max, \
+                        r.alarm_min, r.alarm_max \
+                 FROM ({resolved}) r JOIN parameters p ON p.id = r.parameter_id \
+                 ORDER BY p.name",
+                resolved = resolve_thresholds_sql(Some(id), None)
+            ),
         ),
+        // No-arg branch: the configured global rows only. The resolution engine is defined per
+        // active `(site, parameter)` slot, so it cannot express a site-less listing; a global
+        // tier that also falls back to the parameter defaults needs the engine to grow that
+        // shape rather than a second ladder here.
         None => Statement::from_string(
             PG,
             "SELECT p.name AS param, p.default_units AS units, at.warning_min, at.warning_max, \
@@ -545,38 +555,65 @@ pub async fn unmute(db: &DatabaseConnection, args: &str) -> String {
     }
 }
 
+type NameMaps = (
+    std::collections::HashMap<Uuid, String>,
+    std::collections::HashMap<Uuid, String>,
+);
+
+/// Site and parameter display names for a set of mutes, keyed by id.
+async fn mute_slot_names(
+    db: &DatabaseConnection,
+    mutes: &[super::mutes_model::Model],
+) -> Result<NameMaps, sea_orm::DbErr> {
+    use crate::routes::private::{parameters, sites};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    let site_rows = sites::Entity::find()
+        .filter(sites::Column::Id.is_in(mutes.iter().map(|m| m.site_id).collect::<Vec<_>>()))
+        .all(db)
+        .await?;
+    let parameter_rows = parameters::Entity::find()
+        .filter(
+            parameters::Column::Id.is_in(mutes.iter().map(|m| m.parameter_id).collect::<Vec<_>>()),
+        )
+        .all(db)
+        .await?;
+    Ok((
+        site_rows.into_iter().map(|s| (s.id, s.name)).collect(),
+        parameter_rows.into_iter().map(|p| (p.id, p.name)).collect(),
+    ))
+}
+
+/// The mutes currently suppressing delivery, read through the same `in_force` predicate the
+/// delivery gate uses, so the listing can never disagree with what is actually muted.
 pub async fn muted(db: &DatabaseConnection) -> String {
-    let rows = match db
-        .query_all(Statement::from_string(
-            PG,
-            "SELECT s.name AS site, p.name AS param, m.expires_at \
-             FROM notification_mutes m \
-             JOIN sites s ON s.id = m.site_id \
-             JOIN parameters p ON p.id = m.parameter_id \
-             WHERE m.expires_at IS NULL OR m.expires_at > NOW() \
-             ORDER BY s.name, p.name"
-                .to_string(),
-        ))
-        .await
-    {
-        Ok(r) => r,
+    let mutes = match super::mutes_model::in_force_all(db).await {
+        Ok(m) => m,
         Err(e) => return db_error(&e),
     };
-    if rows.is_empty() {
+    if mutes.is_empty() {
         return "No active mutes.".to_string();
     }
-    let mut out = String::from("Active mutes:\n");
-    for r in &rows {
-        let site: String = r.try_get("", "site").unwrap_or_default();
-        let param: String = r.try_get("", "param").unwrap_or_default();
-        let expires: Option<chrono::DateTime<chrono::Utc>> =
-            r.try_get("", "expires_at").ok().flatten();
-        let until = expires.map_or("permanent".to_string(), |e| {
-            e.format("until %Y-%m-%d %H:%M UTC").to_string()
-        });
-        out.push_str(&format!("{site} / {param} ({until})\n"));
-    }
-    out.trim_end().to_string()
+
+    let (site_names, param_names) = match mute_slot_names(db, &mutes).await {
+        Ok(names) => names,
+        Err(e) => return db_error(&e),
+    };
+
+    let unknown = "(unknown)".to_string();
+    let mut lines: Vec<String> = mutes
+        .iter()
+        .map(|m| {
+            let site = site_names.get(&m.site_id).unwrap_or(&unknown);
+            let param = param_names.get(&m.parameter_id).unwrap_or(&unknown);
+            let until = m.expires_at.map_or("permanent".to_string(), |e| {
+                e.format("until %Y-%m-%d %H:%M UTC").to_string()
+            });
+            format!("{site} / {param} ({until})")
+        })
+        .collect();
+    lines.sort();
+    format!("Active mutes:\n{}", lines.join("\n"))
 }
 
 pub async fn start(

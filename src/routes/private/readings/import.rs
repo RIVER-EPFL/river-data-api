@@ -23,7 +23,7 @@ use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams::service::get_or_create_api_stream;
-use crate::routes::private::readings::batch::ConflictMode;
+use crate::routes::private::readings::batch::{ConflictMode, admission};
 use crate::routes::private::sensors::operations::{ResolvedOwner, resolve_slot_owner_for_times};
 use crate::routes::resolve_site_with_project;
 
@@ -138,6 +138,9 @@ struct ColumnMapping {
     conversion_offset: f64,
 }
 
+/// Resolve a CSV timestamp cell to an instant. `tz_offset` is the zone the operator declared for
+/// the file and applies to the naive forms only: an RFC 3339 timestamp already carries its offset
+/// and is a resolved instant, so applying the declared zone to it would shift it a second time.
 fn parse_datetime(s: &str, tz_offset: chrono::Duration) -> Option<chrono::DateTime<chrono::Utc>> {
     let s = s.trim();
     if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
@@ -147,7 +150,7 @@ fn parse_datetime(s: &str, tz_offset: chrono::Duration) -> Option<chrono::DateTi
         return Some(ndt.and_utc() - tz_offset);
     }
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&chrono::Utc) - tz_offset);
+        return Some(dt.with_timezone(&chrono::Utc));
     }
     None
 }
@@ -384,6 +387,16 @@ pub async fn import_csv(
         }
     };
 
+    // A file that declares a non-spot cadence holds one reading per (parameter, timestamp): a
+    // repeat is a source defect, and absorbing it as replicate 1 hides the row from the default
+    // read and from every rollup while fabricating a grab sample around it. A file declared 'spot'
+    // is a replicate plate, where the repeat is the point.
+    let one_reading_per_timestamp = match req.measurement_type.as_deref() {
+        Some(declared @ ("continuous" | "derived")) => Some(declared),
+        _ => None,
+    };
+    let mut seen_slots: HashSet<(Uuid, chrono::DateTime<chrono::Utc>)> = HashSet::new();
+
     for record in reader.records() {
         line += 1;
         let record = match record {
@@ -398,31 +411,45 @@ pub async fn import_csv(
             record_error(line, format!("Unparseable DateTime '{dt_cell}'"), &mut errors, &mut error_count);
             continue;
         };
+        // The same bound /ingest and /readings/batch enforce, reported per row so the rest of the
+        // file still imports.
+        if let Some(reason) = admission::time_rejection(time) {
+            record_error(line, reason, &mut errors, &mut error_count);
+            continue;
+        }
         row_count += 1;
         earliest = Some(earliest.map_or(time, |e| e.min(time)));
         latest = Some(latest.map_or(time, |l| l.max(time)));
         for m in &mappings {
-            let cell = record.get(m.idx).unwrap_or("").trim();
-            if cell.is_empty()
-                || cell.eq_ignore_ascii_case("nan")
-                || cell.eq_ignore_ascii_case("na")
-                || cell == "-9999"
-            {
-                continue; // intentional missing value
-            }
-            let raw = match cell.parse::<f64>() {
-                Ok(v) => v,
-                Err(_) => {
+            let stored = match admission::classify_cell(record.get(m.idx).unwrap_or("")) {
+                admission::Cell::Missing => continue,
+                admission::Cell::Invalid(reason) => {
                     record_error(
                         line,
-                        format!("Column '{}': '{}' is not a number", m.header, cell),
+                        format!("Column '{}': {reason}", m.header),
                         &mut errors,
                         &mut error_count,
                     );
                     continue;
                 }
+                admission::Cell::Value(raw) => (raw - m.conversion_offset) / m.conversion_factor,
             };
-            let stored = (raw - m.conversion_offset) / m.conversion_factor;
+            if let Some(declared) = one_reading_per_timestamp
+                && !seen_slots.insert((m.parameter_id, time))
+            {
+                record_error(
+                    line,
+                    format!(
+                        "Column '{}': timestamp {} is repeated, and a '{declared}' series holds \
+                         one reading per timestamp",
+                        m.header,
+                        time.to_rfc3339()
+                    ),
+                    &mut errors,
+                    &mut error_count,
+                );
+                continue;
+            }
             rows.push((m.parameter_id, time, stored));
         }
     }
@@ -490,12 +517,35 @@ pub async fn import_csv(
         }
     }
 
+    // Write onto the stream that already holds the slot, whatever it is, so an overwrite replaces
+    // the stored reading instead of adding a second one beside it on the importer's own stream.
+    // Both rows would otherwise satisfy the rollup predicate and double-count the slot's bucket.
+    // A slot nothing has written to yet lands on the importer's "api" stream.
+    //
+    // A stream that resolves for more than one of this file's parameters is not usable as a
+    // target: replicates are numbered per (stream, time), so two parameters sharing a stream at
+    // one timestamp would be numbered as each other's replicates.
+    let mut params_per_stream: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
+    for ((parameter_id, _), stream_id) in &overlap.owning_stream {
+        params_per_stream.entry(*stream_id).or_default().insert(*parameter_id);
+    }
+    let write_target = |parameter_id: &Uuid, time: &chrono::DateTime<chrono::Utc>| -> Uuid {
+        overlap
+            .owning_stream
+            .get(&(*parameter_id, *time))
+            .filter(|stream_id| {
+                params_per_stream.get(*stream_id).is_some_and(|params| params.len() == 1)
+            })
+            .copied()
+            .unwrap_or(stream_cache[parameter_id])
+    };
+
     let staged: Vec<StagedRow> = rows
         .iter()
         .map(|(parameter_id, time, value)| {
             let owner = owner_map.get(&(*parameter_id, *time)).cloned().unwrap_or_default();
             StagedRow {
-                stream_id: stream_cache[parameter_id],
+                stream_id: write_target(parameter_id, time),
                 site_id,
                 parameter_id: *parameter_id,
                 time: *time,
@@ -665,6 +715,9 @@ struct OverlapReport {
     identical: usize,
     differing: usize,
     sample: Vec<OverlapDiff>,
+    /// Stream already holding readings for a (parameter, time), ie. the row an incoming value for
+    /// that slot must be written onto. Absent when the slot is empty.
+    owning_stream: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Uuid>,
 }
 
 /// Cap on differing-overlap rows returned for UI preview.
@@ -672,8 +725,9 @@ const OVERLAP_SAMPLE_CAP: usize = 20;
 /// Tolerance for treating an incoming value as identical to the stored one.
 const OVERLAP_EPSILON: f64 = 1e-9;
 
-/// Bucket incoming rows against existing readings into identical and differing overlaps. The Nth
-/// incoming row for a (parameter, time) key is compared against the Nth existing replicate.
+/// Bucket incoming rows against existing readings into identical and differing overlaps, and
+/// report which stream already owns each occupied slot. The Nth incoming row for a
+/// (parameter, time) key is compared against the Nth existing replicate.
 async fn compute_overlaps(
     db: &sea_orm::DatabaseConnection,
     site_id: Uuid,
@@ -684,12 +738,13 @@ async fn compute_overlaps(
     let mut identical = 0usize;
     let mut differing = 0usize;
     let mut sample = Vec::new();
+    let mut owning_stream = HashMap::new();
 
     let (Some(t_min), Some(t_max)) = (earliest, latest) else {
-        return Ok(OverlapReport { identical, differing, sample });
+        return Ok(OverlapReport { identical, differing, sample, owning_stream });
     };
     if rows.is_empty() {
-        return Ok(OverlapReport { identical, differing, sample });
+        return Ok(OverlapReport { identical, differing, sample, owning_stream });
     }
 
     let param_ids: Vec<Uuid> = rows.iter().map(|(pid, _, _)| *pid).collect::<HashSet<_>>().into_iter().collect();
@@ -697,7 +752,7 @@ async fn compute_overlaps(
     let existing_rows = db
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT parameter_id, time, COALESCE(calibrated_value, raw_value) AS val \
+            "SELECT parameter_id, time, stream_id, COALESCE(calibrated_value, raw_value) AS val \
              FROM readings \
              WHERE site_id = $1 \
              AND parameter_id = ANY($2) \
@@ -718,10 +773,11 @@ async fn compute_overlaps(
         let Ok(pid) = row.try_get::<Uuid>("", "parameter_id") else { continue };
         let Ok(t) = row.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "time") else { continue };
         let Ok(val) = row.try_get::<f64>("", "val") else { continue };
-        existing
-            .entry((pid, t.with_timezone(&chrono::Utc)))
-            .or_default()
-            .push(val);
+        let key = (pid, t.with_timezone(&chrono::Utc));
+        if let Ok(stream_id) = row.try_get::<Uuid>("", "stream_id") {
+            owning_stream.entry(key).or_insert(stream_id);
+        }
+        existing.entry(key).or_default().push(val);
     }
 
     let mut occurrence: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), usize> = HashMap::new();
@@ -748,5 +804,5 @@ async fn compute_overlaps(
         }
     }
 
-    Ok(OverlapReport { identical, differing, sample })
+    Ok(OverlapReport { identical, differing, sample, owning_stream })
 }

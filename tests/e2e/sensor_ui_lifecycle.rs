@@ -966,16 +966,16 @@ async fn recalculate_action_rewrites_the_calibration_window() {
 
     ingest_cycle(&app, &river, &flow.stream, 0).await;
 
-    // Ingest stamps the covering curve but writes the raw value through unchanged
-    // (`readings/ingest.rs`: "calibrated_value is written as identity (raw) here; reprocess
-    // refines it"), which is the drift the sensor page's recalculate button exists to clear.
-    let stale = slot_readings(&db, &flow.parameter).await;
+    // Ingest resolves the covering curve and applies it, so the recalculate button below is a
+    // re-derivation of an already-correct value rather than a repair. Asserting it here is what
+    // makes the recalculate assertions a genuine no-change rather than a hidden fix.
+    let landed = slot_readings(&db, &flow.parameter).await;
     assert_eq!(
-        stale.len(),
+        landed.len(),
         tracks::FLOW_READINGS_PER_CYCLE,
-        "the cycle landed: {stale:?}"
+        "the cycle landed: {landed:?}"
     );
-    for r in &stale {
+    for r in &landed {
         assert_eq!(
             r.calibration_id,
             Some(curve),
@@ -984,8 +984,8 @@ async fn recalculate_action_rewrites_the_calibration_window() {
         );
         assert_eq!(
             r.calibrated_value,
-            Some(r.raw_value),
-            "but arrives carrying its raw value: {}",
+            Some(2.0 * r.raw_value + 5.0),
+            "and arrives carrying that curve applied to its raw value: {}",
             r.time
         );
     }

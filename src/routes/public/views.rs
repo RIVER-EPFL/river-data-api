@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use chrono::{DateTime, NaiveDateTime, Utc};
 use sea_orm::sea_query::{Alias, Expr, Order, PostgresQueryBuilder, Query as SeaQuery};
@@ -13,11 +13,18 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::cache;
+use crate::common::cache_key;
+use crate::common::series::{self, Cells, Table};
 use crate::error::{AppError, AppResult};
-use crate::common::bulk::{self, StreamableAggregateParam, StreamableParam};
+use crate::routes::private::sites::aggregates::resolution_of;
 use crate::routes::public::service::{
     PublicProjectConfig, PublicSiteConfig, get_public_config,
 };
+
+/// What the public tier treats as this site's data: one canonical row per timestamp, and nothing an
+/// operator has flagged. The site-detail count and the readings query share this predicate so the
+/// count, the series and the rollups cannot disagree about what the site serves.
+const SERVED_READINGS: &str = "r.replicate_index = 0 AND r.is_flagged IS NOT TRUE";
 
 // Time Format
 
@@ -99,6 +106,22 @@ fn resolve_site_parameters(
         .collect();
     resolved.sort_by(|a, b| a.code.cmp(&b.code));
     resolved
+}
+
+/// The parameter codes this site exposes, in resolution order, deduplicated (several
+/// site_parameters can point at one catalog parameter).
+///
+/// Both series endpoints index their output by this list, so the readings and aggregates
+/// endpoints report the same parameter set for a site and neither can emit a code the site does
+/// not expose.
+fn served_codes(resolved: &[&ResolvedParam]) -> Vec<String> {
+    let mut codes: Vec<String> = Vec::new();
+    for rp in resolved {
+        if !codes.contains(&rp.code) {
+            codes.push(rp.code.clone());
+        }
+    }
+    codes
 }
 
 #[derive(Debug, Clone)]
@@ -242,12 +265,11 @@ pub async fn get_site(
         }
         let placeholders = placeholders_parts.join(", ");
 
-        // Count only what the readings endpoint serves by default: unflagged replicate-0 rows.
         let sql = format!(
             "SELECT MIN(r.time) AS min_time, MAX(r.time) AS max_time, COUNT(*) AS count \
              FROM readings r \
              WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
-               AND r.replicate_index = 0 AND r.is_flagged IS NOT TRUE"
+               AND {SERVED_READINGS}"
         );
 
         let mut values: Vec<sea_orm::Value> = vec![site.site_id.into()];
@@ -322,7 +344,7 @@ pub async fn list_parameters(
 
 // GET /{project_code}/sites/{site_code}/readings -- Raw time-series
 
-#[derive(Debug, Deserialize, IntoParams)]
+#[derive(Debug, Deserialize, Serialize, IntoParams)]
 pub struct ReadingsQuery {
     /// Format: YYYY-MM-DD HH:MM:SS or ISO 8601.
     pub start: Option<String>,
@@ -337,7 +359,10 @@ pub struct ReadingsQuery {
     #[serde(default)]
     pub include_measurement_type: Option<bool>,
     /// json (default), csv, or ndjson.
-    #[serde(default = "crate::common::bulk::default_format")]
+    ///
+    /// Deliberately outside the cache key: the public tier caches the fetched data, and every
+    /// format is rendered from that one entry.
+    #[serde(default = "crate::common::bulk::default_format", skip_serializing)]
     pub format: String,
 }
 
@@ -367,22 +392,22 @@ pub struct ParameterData {
     pub measurement_types: Option<Vec<Option<String>>>,
 }
 
-impl StreamableParam for ParameterData {
-    fn column_key(&self) -> &str {
-        &self.code
+/// The public readings export: the value column per parameter, plus the per-point cadence when
+/// the caller opted into it. Built from the same structs the JSON body serialises.
+fn readings_table(times: &[String], params: &[ParameterData]) -> Table {
+    let mut table = Table::new(times.to_vec());
+    for p in params {
+        table.column(p.code.clone(), Cells::Float(p.values.clone()));
     }
-    fn value_at(&self, index: usize) -> Option<f64> {
-        self.values.get(index).and_then(|v| *v)
+    if params.iter().any(|p| p.measurement_types.is_some()) {
+        for p in params {
+            table.column(
+                format!("{}_measurement_type", p.code),
+                Cells::Text(p.measurement_types.clone().unwrap_or_default()),
+            );
+        }
     }
-    fn measurement_type_at(&self, index: usize) -> Option<&str> {
-        self.measurement_types
-            .as_ref()
-            .and_then(|m| m.get(index))
-            .and_then(|m| m.as_deref())
-    }
-    fn has_measurement_types(&self) -> bool {
-        self.measurement_types.is_some()
-    }
+    table
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -448,7 +473,7 @@ pub async fn get_readings(
     let requested_names = resolve_requested_param_names(query.parameters.as_deref(), &config)?;
 
     if requested_names.is_empty() {
-        return readings_response_from_data(site, Vec::new(), Vec::new(), &format, false);
+        return readings_response_from_data(site, Vec::new(), Vec::new(), &format, false).await;
     }
 
     // Resolve DB parameters matching the requested names
@@ -464,27 +489,26 @@ pub async fn get_readings(
         ids
     };
 
-    // Serve from the response cache when possible (any format), so repeat queries
-    // don't re-hit the DB. Key on the data inputs, not the output format.
+    // Serve from the response cache when possible (any format), so repeat queries don't re-hit the
+    // DB. The key carries the canonical parameter set plus every query field bar the output
+    // format, which is rendered from the one cached entry.
     let mut names_key = requested_names.clone();
     names_key.sort();
-    let cache_key = cache::cache_key(
-        "pub_readings",
-        &[
-            &project_code,
-            &site.code,
-            &names_key.join(","),
-            &effective_start.to_rfc3339(),
-            &end.map(|e| e.to_rfc3339()).unwrap_or_default(),
-            measurement_type,
-            if include_measurement_type { "mt" } else { "" },
-        ],
+    let cache_key = cache_key::key_for(
+        &format!("pub_readings:{project_code}:{}", site.code),
+        &ReadingsCacheKey {
+            resolved_names: &names_key,
+            effective_start,
+            effective_end: end,
+            query: &query,
+        },
     );
 
     if let Some(bytes) = cache::get_cached(&state, &cache_key, &param_ids, end).await
         && let Ok(cached) = serde_json::from_slice::<CachedReadings>(&bytes)
     {
-        return readings_response_from_data(site, cached.times, cached.parameters, &format, true);
+        return readings_response_from_data(site, cached.times, cached.parameters, &format, true)
+            .await;
     }
 
     let (times_formatted, output_params) = fetch_readings(
@@ -505,12 +529,32 @@ pub async fn get_readings(
         cache::store_cached(&state, cache_key, bytes, max_time).await;
     }
 
-    readings_response_from_data(site, times_formatted, output_params, &format, false)
+    readings_response_from_data(site, times_formatted, output_params, &format, false).await
+}
+
+/// Everything that shapes a public readings body. The query is flattened in whole (bar the output
+/// format), so a field added to `ReadingsQuery` enters the key by construction.
+#[derive(Serialize)]
+struct ReadingsCacheKey<'a> {
+    resolved_names: &'a [String],
+    effective_start: DateTime<Utc>,
+    effective_end: Option<DateTime<Utc>>,
+    #[serde(flatten)]
+    query: &'a ReadingsQuery,
+}
+
+/// The same, for the public aggregates body.
+#[derive(Serialize)]
+struct AggregatesCacheKey<'a> {
+    resolution: &'a str,
+    resolved_names: &'a [String],
+    #[serde(flatten)]
+    query: &'a AggregatesQuery,
 }
 
 // GET /{project_code}/sites/{site_code}/aggregates/{resolution} -- Aggregated
 
-#[derive(Debug, Deserialize, IntoParams)]
+#[derive(Debug, Deserialize, Serialize, IntoParams)]
 pub struct AggregatesQuery {
     /// Format: YYYY-MM-DD HH:MM:SS or ISO 8601.
     pub start: String,
@@ -519,7 +563,10 @@ pub struct AggregatesQuery {
     /// Comma-separated list of parameter public names. Omit for all.
     pub parameters: Option<String>,
     /// json (default), csv, or ndjson.
-    #[serde(default = "crate::common::bulk::default_format")]
+    ///
+    /// Deliberately outside the cache key: the public tier caches the fetched data, and every
+    /// format is rendered from that one entry.
+    #[serde(default = "crate::common::bulk::default_format", skip_serializing)]
     pub format: String,
 }
 
@@ -546,22 +593,19 @@ pub struct ParameterAggregateData {
     pub count: Vec<i64>,
 }
 
-impl StreamableAggregateParam for ParameterAggregateData {
-    fn column_key(&self) -> &str {
-        &self.code
+/// The public aggregates export: the four statistics per parameter.
+fn aggregates_table(times: &[String], params: &[ParameterAggregateData]) -> Table {
+    let mut table = Table::new(times.to_vec());
+    for p in params {
+        table.column(format!("{}_avg", p.code), Cells::Float(p.avg.clone()));
+        table.column(format!("{}_min", p.code), Cells::Float(p.min.clone()));
+        table.column(format!("{}_max", p.code), Cells::Float(p.max.clone()));
+        table.column(
+            format!("{}_count", p.code),
+            Cells::Int(p.count.iter().map(|c| Some(*c)).collect()),
+        );
     }
-    fn avg_at(&self, index: usize) -> Option<f64> {
-        self.avg.get(index).and_then(|v| *v)
-    }
-    fn min_at(&self, index: usize) -> Option<f64> {
-        self.min.get(index).and_then(|v| *v)
-    }
-    fn max_at(&self, index: usize) -> Option<f64> {
-        self.max.get(index).and_then(|v| *v)
-    }
-    fn count_at(&self, index: usize) -> Option<i64> {
-        self.count.get(index).copied()
-    }
+    table
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -600,16 +644,10 @@ pub async fn get_aggregates(
     let config = get_public_config(&state.db, &state.public_config_cache, &project_code).await?;
     let site = resolve_site_from_config(&config, &site_code)?;
 
-    let view_name = match resolution.as_str() {
-        "hourly" => "readings_hourly",
-        "daily" => "readings_daily",
-        "weekly" => "readings_weekly",
-        "monthly" => "readings_monthly",
-        _ => {
-            return Err(AppError::BadRequest(format!(
-                "Invalid resolution: {resolution}. Must be: hourly, daily, weekly, monthly"
-            )));
-        }
+    let Some(rollup) = resolution_of(resolution.as_str()) else {
+        return Err(AppError::BadRequest(format!(
+            "Invalid resolution: {resolution}. Must be: hourly, daily, weekly, monthly"
+        )));
     };
 
     let start = parse_time(&query.start)?;
@@ -620,29 +658,18 @@ pub async fn get_aggregates(
         ));
     }
 
+    let format = query.format.to_lowercase();
     let requested_names = resolve_requested_param_names(query.parameters.as_deref(), &config)?;
 
-    if requested_names.is_empty() {
-        let response = AggregatesResponse {
-            site: SiteRef {
-                code: site.code.clone(),
-                name: site.name.clone(),
-            },
-            resolution,
-            start: format_time(start),
-            end: format_time(end),
-            times: Vec::new(),
-            parameters: Vec::new(),
-        };
-        return Ok(Json(response).into_response());
-    }
-
-    // Resolve DB parameters matching the requested names
+    // Resolve DB parameters matching the requested names. The site's own resolution decides both
+    // the query and the output index, so a parameter another site in the project exposes cannot
+    // appear here as an all-null series.
     let all_resolved = resolve_site_parameters(site.site_id, &config);
     let resolved: Vec<&ResolvedParam> = all_resolved
         .iter()
         .filter(|rp| requested_names.contains(&rp.code))
         .collect();
+    let codes = served_codes(&resolved);
 
     let param_ids: Vec<Uuid> = {
         let mut ids: Vec<Uuid> = resolved.iter().map(|rp| rp.parameter_id).collect();
@@ -652,33 +679,29 @@ pub async fn get_aggregates(
     };
 
     if param_ids.is_empty() {
-        let response = AggregatesResponse {
-            site: SiteRef {
-                code: site.code.clone(),
-                name: site.name.clone(),
-            },
-            resolution,
-            start: format_time(start),
-            end: format_time(end),
-            times: Vec::new(),
-            parameters: Vec::new(),
-        };
-        return Ok(Json(response).into_response());
+        return aggregates_response_from_data(
+            site,
+            &resolution,
+            format_time(start),
+            format_time(end),
+            Vec::new(),
+            Vec::new(),
+            &format,
+            false,
+        )
+        .await;
     }
 
     // Serve cached aggregate data when possible (bounded query ⇒ TTL-cached).
-    let mut names_key = requested_names.clone();
+    let mut names_key = codes.clone();
     names_key.sort();
-    let cache_key = cache::cache_key(
-        "pub_aggregates",
-        &[
-            &project_code,
-            &site.code,
-            &resolution,
-            &names_key.join(","),
-            &start.to_rfc3339(),
-            &end.to_rfc3339(),
-        ],
+    let cache_key = cache_key::key_for(
+        &format!("pub_aggregates:{project_code}:{}", site.code),
+        &AggregatesCacheKey {
+            resolution: &resolution,
+            resolved_names: &names_key,
+            query: &query,
+        },
     );
 
     if let Some(bytes) = cache::get_cached(&state, &cache_key, &param_ids, Some(end)).await
@@ -691,9 +714,10 @@ pub async fn get_aggregates(
             format_time(end),
             cached.times,
             cached.parameters,
-            &query.format.to_lowercase(),
+            &format,
             true,
-        );
+        )
+        .await;
     }
 
     let mut id_to_publics: HashMap<Uuid, Vec<(&str, &str)>> = HashMap::new();
@@ -725,18 +749,17 @@ pub async fn get_aggregates(
             MIN(a.min_value) AS min_value,
             MAX(a.max_value) AS max_value,
             SUM(a.count)::bigint AS count
-        FROM {view_name} a
+        FROM {view} a
         JOIN parameters p ON a.parameter_id = p.id
         WHERE a.site_id = $1
-          AND p.id IN ({})
-          AND a.bucket >= ${}
-          AND a.bucket <= ${}
+          AND p.id IN ({ids})
+          AND a.bucket >= ${start_idx}
+          AND a.bucket <= ${end_idx}
         GROUP BY a.bucket, p.id, p.code
         ORDER BY a.bucket ASC, p.code ASC
         ",
-        id_placeholders.join(","),
-        start_idx,
-        end_idx,
+        view = rollup.view(),
+        ids = id_placeholders.join(","),
     );
     let mut values: Vec<sea_orm::Value> = vec![site.site_id.into()];
     values.extend(param_ids.iter().map(|id| (*id).into()));
@@ -796,10 +819,10 @@ pub async fn get_aggregates(
 
     let num_times = times_ordered.len();
 
-    // Build output parameters in the order of requested names
+    // One series per code the site exposes, the same index the readings endpoint builds.
     let mut output_params: Vec<ParameterAggregateData> = Vec::new();
 
-    for code in &requested_names {
+    for code in &codes {
         let matched = resolved.iter().find(|rp| &rp.code == code);
         let name = matched.map_or("", |rp| rp.name.as_str());
         let units = matched.map_or("", |rp| rp.units.as_str());
@@ -848,9 +871,10 @@ pub async fn get_aggregates(
         format_time(end),
         times_formatted,
         output_params,
-        &query.format.to_lowercase(),
+        &format,
         false,
     )
+    .await
 }
 
 // Response Cache Payloads + Format Helpers
@@ -869,17 +893,18 @@ struct CachedAggregates {
     parameters: Vec<ParameterAggregateData>,
 }
 
-fn readings_response_from_data(
+async fn readings_response_from_data(
     site: &PublicSiteConfig,
     times: Vec<String>,
     parameters: Vec<ParameterData>,
     format: &str,
     cache_hit: bool,
 ) -> AppResult<Response> {
-    match format {
-        "csv" => build_csv_response(times, &parameters),
-        "ndjson" => build_ndjson_response(times, &parameters),
-        _ => {
+    series::respond(
+        format,
+        (times, parameters),
+        |(times, params)| readings_table(times, params),
+        |(times, parameters)| async move {
             let start = times.first().cloned();
             let end = times.last().cloned();
             let response = ReadingsResponse {
@@ -895,12 +920,13 @@ fn readings_response_from_data(
             let bytes =
                 serde_json::to_vec(&response).map_err(|e| AppError::Internal(e.to_string()))?;
             cache::json_response(bytes, cache_hit)
-        }
-    }
+        },
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
-fn aggregates_response_from_data(
+async fn aggregates_response_from_data(
     site: &PublicSiteConfig,
     resolution: &str,
     start: String,
@@ -910,10 +936,11 @@ fn aggregates_response_from_data(
     format: &str,
     cache_hit: bool,
 ) -> AppResult<Response> {
-    match format {
-        "csv" => build_aggregates_csv(times, &parameters),
-        "ndjson" => build_aggregates_ndjson(times, &parameters),
-        _ => {
+    series::respond(
+        format,
+        (times, parameters),
+        |(times, params)| aggregates_table(times, params),
+        |(times, parameters)| async move {
             let response = AggregatesResponse {
                 site: SiteRef {
                     code: site.code.clone(),
@@ -928,8 +955,9 @@ fn aggregates_response_from_data(
             let bytes =
                 serde_json::to_vec(&response).map_err(|e| AppError::Internal(e.to_string()))?;
             cache::json_response(bytes, cache_hit)
-        }
-    }
+        },
+    )
+    .await
 }
 
 // Shared Helpers
@@ -1001,7 +1029,7 @@ async fn fetch_readings(
                 .equals((r.clone(), Alias::new("sample_id"))),
         )
         .and_where(Expr::col((r.clone(), Alias::new("site_id"))).eq(site_id))
-        .and_where(Expr::col((r.clone(), Alias::new("replicate_index"))).eq(0))
+        .and_where(Expr::cust(SERVED_READINGS))
         .and_where(Expr::col((p.clone(), Alias::new("id"))).is_in(param_ids.clone()))
         .order_by((r.clone(), Alias::new("time")), Order::Asc)
         .order_by((p.clone(), Alias::new("code")), Order::Asc);
@@ -1070,17 +1098,8 @@ async fn fetch_readings(
 
     let num_times = times_ordered.len();
 
-    // Build output in the order the resolved params appear (sorted by code).
-    // Deduplicate codes (multiple site_parameters can share a parameter).
-    let mut seen_codes: Vec<String> = Vec::new();
-    for rp in resolved {
-        if !seen_codes.contains(&rp.code) {
-            seen_codes.push(rp.code.clone());
-        }
-    }
-
     let mut output_params: Vec<ParameterData> = Vec::new();
-    for code in &seen_codes {
+    for code in &served_codes(resolved) {
         let matched = resolved.iter().find(|rp| &rp.code == code);
         let name = matched.map_or("", |rp| rp.name.as_str());
         let units = matched.map_or("", |rp| rp.units.as_str());
@@ -1116,26 +1135,3 @@ async fn fetch_readings(
     Ok((times_formatted, output_params))
 }
 
-// Streaming CSV/NDJSON Builders (delegated to bulk.rs)
-
-fn build_csv_response(times: Vec<String>, parameters: &[ParameterData]) -> AppResult<Response> {
-    bulk::build_csv_response_with_times(times, parameters)
-}
-
-fn build_aggregates_csv(
-    times: Vec<String>,
-    parameters: &[ParameterAggregateData],
-) -> AppResult<Response> {
-    bulk::build_aggregates_csv_response_with_times(times, parameters)
-}
-
-fn build_ndjson_response(times: Vec<String>, parameters: &[ParameterData]) -> AppResult<Response> {
-    bulk::build_ndjson_response_with_times(times, parameters)
-}
-
-fn build_aggregates_ndjson(
-    times: Vec<String>,
-    parameters: &[ParameterAggregateData],
-) -> AppResult<Response> {
-    bulk::build_aggregates_ndjson_response_with_times(times, parameters)
-}

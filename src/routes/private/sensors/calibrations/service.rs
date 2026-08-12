@@ -1,7 +1,17 @@
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use std::collections::HashMap;
 use uuid::Uuid;
+
+/// The reprocess engines are driven by `Job::run`, whose error type is `DbErr`. The shared bulk-write
+/// and aggregate-refresh primitives report `AppError`; carrying the message through keeps a failed
+/// refresh a failed job rather than a job that reports `completed`.
+fn app_error_as_db_err(e: crate::error::AppError) -> sea_orm::DbErr {
+    match e {
+        crate::error::AppError::Database(inner) => inner,
+        other => sea_orm::DbErr::Custom(other.to_string()),
+    }
+}
 
 // The generic tracked-job lifecycle now lives in `reprocessing_jobs::lifecycle` (the jobs home).
 // Re-exported here so existing `calibrations::service::{spawn_tracked_job, ...}` call sites
@@ -322,8 +332,8 @@ async fn evaluate_and_upsert_derived(
     Ok(())
 }
 
-pub async fn recompute_valid_until(
-    db: &DatabaseConnection,
+pub async fn recompute_valid_until<C: ConnectionTrait>(
+    db: &C,
     sensor_id: Uuid,
 ) -> Result<(), sea_orm::DbErr> {
     db.execute(Statement::from_sql_and_values(
@@ -332,16 +342,22 @@ pub async fn recompute_valid_until(
         // calibration timeline per parameter, so LEAD must partition by parameter_id (never let one
         // parameter's next calibration truncate another's window). Instant curves (grab curves) are
         // matched by calibration_id, never windowed, so they are excluded from the chain.
+        //
+        // `, id` breaks a tie on valid_from so the chain is single-valued, and the guard refuses to
+        // write a zero-width `valid_until = valid_from` window, which would leave a curve the
+        // operator can see applying to nothing. Duplicate instants are refused at create
+        // (`SensorCalibrationOperations`); the guard covers rows loaded outside the API.
         r"WITH ordered AS (
-            SELECT id,
-                   LEAD(valid_from) OVER (PARTITION BY parameter_id ORDER BY valid_from) AS next_from
+            SELECT id, valid_from,
+                   LEAD(valid_from) OVER (PARTITION BY parameter_id ORDER BY valid_from, id) AS next_from
             FROM sensor_calibrations
             WHERE sensor_id = $1 AND mode = 'windowed'
         )
         UPDATE sensor_calibrations sc
         SET valid_until = ordered.next_from
         FROM ordered
-        WHERE sc.id = ordered.id AND sc.sensor_id = $1",
+        WHERE sc.id = ordered.id AND sc.sensor_id = $1
+          AND (ordered.next_from IS NULL OR ordered.next_from > ordered.valid_from)",
         [sensor_id.into()],
     ))
     .await?;
@@ -381,11 +397,90 @@ pub async fn recompute_deployed_until<C: ConnectionTrait>(
     Ok(())
 }
 
-/// If readings exist before the sensor's first calibration, create or extend an identity
-/// calibration (slope=1, intercept=0) to cover them. Never modifies existing non-identity
-/// calibrations, the identity only fills the uncovered region before the first real calibration.
-async fn ensure_calibration_coverage(
-    db: &DatabaseConnection,
+/// Extend the sensor's calibration timeline backwards so `earliest` is covered, and no further.
+///
+/// The only writer of an auto-created identity curve. Three shapes, all of which only ever grow
+/// coverage at the front of the timeline:
+///
+/// - no timeline yet, insert an identity curve starting at `earliest`;
+/// - the timeline opens with an identity curve, backdate its `valid_from` to `earliest`;
+/// - the timeline opens with a real curve, insert an identity curve ahead of it.
+///
+/// `earliest` at or after the first curve's `valid_from` is a no-op. That bound is what keeps an
+/// identity curve out of the middle of a timeline: inserted there it becomes the next window, the
+/// chain retracts the scientist's curve to it, and the readings after that instant revert to raw.
+/// Existing curves are otherwise never modified.
+pub async fn ensure_identity_covers<C: ConnectionTrait>(
+    db: &C,
+    sensor_id: Uuid,
+    earliest: DateTime<Utc>,
+) -> Result<(), sea_orm::DbErr> {
+    const INSERT_IDENTITY: &str = r"INSERT INTO sensor_calibrations
+            (id, sensor_id, slope, intercept, valid_from, performed_by, notes, created_at)
+        VALUES (gen_random_uuid(), $1, 1.0, 0.0, $2, 'system', 'Identity calibration (auto-created)', NOW())";
+
+    let first_cal = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT id, slope, intercept, valid_from
+              FROM sensor_calibrations
+              WHERE sensor_id = $1 AND mode = 'windowed'
+              ORDER BY valid_from ASC, id ASC
+              LIMIT 1",
+            [sensor_id.into()],
+        ))
+        .await?;
+
+    match first_cal {
+        None => {
+            db.execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                INSERT_IDENTITY,
+                [sensor_id.into(), earliest.into()],
+            ))
+            .await?;
+        }
+        Some(ref cal) => {
+            let first_from: chrono::DateTime<chrono::FixedOffset> = cal.try_get("", "valid_from")?;
+            if earliest >= first_from.with_timezone(&Utc) {
+                return Ok(());
+            }
+            let slope: f64 = cal.try_get("", "slope").unwrap_or(1.0);
+            let intercept: f64 = cal.try_get("", "intercept").unwrap_or(0.0);
+            let cal_id: Uuid = cal.try_get("", "id")?;
+
+            if is_identity_calibration(slope, intercept) {
+                db.execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "UPDATE sensor_calibrations SET valid_from = $1 WHERE id = $2",
+                    [earliest.into(), cal_id.into()],
+                ))
+                .await?;
+            } else {
+                db.execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    INSERT_IDENTITY,
+                    [sensor_id.into(), earliest.into()],
+                ))
+                .await?;
+            }
+        }
+    }
+
+    recompute_valid_until(db, sensor_id).await?;
+    tracing::info!(
+        sensor_id = %sensor_id,
+        extended_to = %earliest,
+        "auto-extended calibration coverage"
+    );
+    Ok(())
+}
+
+/// Cover the sensor's readings that predate its first calibration, by delegating to
+/// [`ensure_identity_covers`]. Readings from the first curve onwards are already covered by the
+/// chain, so only the leading region is in question.
+pub async fn ensure_calibration_coverage<C: ConnectionTrait>(
+    db: &C,
     sensor_id: Uuid,
 ) -> Result<(), sea_orm::DbErr> {
     let row = db
@@ -418,68 +513,11 @@ async fn ensure_calibration_coverage(
     if cnt == 0 {
         return Ok(());
     }
-    let earliest = match earliest {
-        Some(t) => t,
-        None => return Ok(()),
+    let Some(earliest) = earliest else {
+        return Ok(());
     };
 
-    let first_cal = db
-        .query_one(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT id, slope, intercept, valid_from
-              FROM sensor_calibrations
-              WHERE sensor_id = $1
-              ORDER BY valid_from ASC
-              LIMIT 1",
-            [sensor_id.into()],
-        ))
-        .await?;
-
-    match first_cal {
-        None => {
-            db.execute(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"INSERT INTO sensor_calibrations
-                      (id, sensor_id, slope, intercept, valid_from, performed_by, notes, created_at)
-                  VALUES (gen_random_uuid(), $1, 1.0, 0.0, $2, 'system', 'Identity calibration (auto-created)', NOW())",
-                [sensor_id.into(), earliest.into()],
-            ))
-            .await?;
-        }
-        Some(ref cal) => {
-            let slope: f64 = cal.try_get("", "slope").unwrap_or(1.0);
-            let intercept: f64 = cal.try_get("", "intercept").unwrap_or(0.0);
-            let cal_id: Uuid = cal.try_get("", "id")?;
-            let is_identity = is_identity_calibration(slope, intercept);
-
-            if is_identity {
-                db.execute(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "UPDATE sensor_calibrations SET valid_from = $1 WHERE id = $2",
-                    [earliest.into(), cal_id.into()],
-                ))
-                .await?;
-            } else {
-                db.execute(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    r"INSERT INTO sensor_calibrations
-                          (id, sensor_id, slope, intercept, valid_from, performed_by, notes, created_at)
-                      VALUES (gen_random_uuid(), $1, 1.0, 0.0, $2, 'system', 'Identity calibration (auto-created)', NOW())",
-                    [sensor_id.into(), earliest.into()],
-                ))
-                .await?;
-            }
-        }
-    }
-
-    recompute_valid_until(db, sensor_id).await?;
-    tracing::info!(
-        sensor_id = %sensor_id,
-        uncalibrated = cnt,
-        extended_to = %earliest,
-        "auto-extended calibration coverage"
-    );
-    Ok(())
+    ensure_identity_covers(db, sensor_id, earliest).await
 }
 
 pub async fn reprocess_sensor_readings(
@@ -496,104 +534,95 @@ pub async fn reprocess_sensor_readings(
     // both cover a reading and the UPDATE..FROM would pick one arbitrarily (nondeterministic).
     recompute_valid_until(db, sensor_id).await?;
 
-    // The bulk re-derivation runs in one transaction with TimescaleDB's per-statement decompression
-    // cap lifted (default 100k tuples). A deep-historical reprocess rewrites rows in compressed
-    // (>30-day) chunks and would otherwise abort the job; SET LOCAL resets on commit and is a no-op
-    // on uncompressed data. The read-back, derived cascade, and continuous-aggregate refresh run
-    // AFTER commit, a CAGG refresh cannot run inside a transaction.
-    let txn = db.begin().await?;
-    txn.execute(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
-    ))
-    .await?;
-
-    // Pick exactly one calibration per reading, the most specific overlapping window, so an
-    // open-ended identity calibration (parameter_id NULL) can never non-deterministically shadow a
-    // real parameter-specific one. Preference: exact parameter match, then a parameter-bearing curve
-    // over the NULL identity, then the latest window.
-    let cal_result = txn
-        .execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings tgt
+    // The bulk re-derivation runs in one guarded transaction (`common::bulk_write`), which lifts
+    // TimescaleDB's per-statement decompression cap: a deep-historical reprocess rewrites rows in
+    // compressed (>30-day) chunks and would otherwise abort the job. The read-back, derived cascade
+    // and continuous-aggregate refresh run AFTER commit, a CAGG refresh cannot run inside a
+    // transaction.
+    //
+    // The calibration pick is `resolver::pick_calibration_lateral`, the same ranking the write paths
+    // resolve with, so reprocess recomputes the value ingest already stored rather than a different
+    // one.
+    let cal_sql = format!(
+        r"UPDATE readings tgt
             SET calibration_id = picked.cal_id,
                 calibrated_value = picked.slope * tgt.raw_value + picked.intercept
             FROM (
                 SELECT r.stream_id, r.time, r.replicate_index,
                        cw.id AS cal_id, cw.slope, cw.intercept
                 FROM readings r
-                JOIN LATERAL (
-                    SELECT c.id, c.slope, c.intercept
-                    FROM sensor_calibrations c
-                    WHERE c.sensor_id = $1 AND c.mode = 'windowed'
-                      AND (c.parameter_id = r.parameter_id OR c.parameter_id IS NULL OR r.parameter_id IS NULL)
-                      AND r.time >= c.valid_from
-                      AND r.time < COALESCE(c.valid_until, 'infinity'::timestamptz)
-                    ORDER BY (c.parameter_id IS NOT DISTINCT FROM r.parameter_id) DESC,
-                             (c.parameter_id IS NOT NULL) DESC,
-                             c.valid_from DESC
-                    LIMIT 1
-                ) cw ON true
+                JOIN LATERAL ({pick}) cw ON true
                 WHERE r.sensor_id = $1
                   AND r.measurement_type IS DISTINCT FROM 'spot'
             ) picked
             WHERE tgt.stream_id = picked.stream_id
               AND tgt.time = picked.time
               AND tgt.replicate_index = picked.replicate_index",
+        pick = super::resolver::pick_calibration_lateral("$1")
+    );
+
+    let readings_updated = crate::common::bulk_write::guarded(db, async |txn| {
+        let cal_result = txn
+            .execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                &cal_sql,
+                [sensor_id.into()],
+            ))
+            .await?;
+        let readings_updated = cal_result.rows_affected() as usize;
+
+        txn.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE readings r
+            SET deployment_id = dw.id,
+                site_id = dw.site_id
+            FROM (
+                SELECT id, site_id, parameter_id, deployed_from,
+                       COALESCE(deployed_until, 'infinity'::timestamptz) AS deployed_until
+                FROM sensor_deployments
+                WHERE sensor_id = $1
+            ) dw
+            WHERE r.sensor_id = $1
+              AND r.measurement_type IS DISTINCT FROM 'spot'
+              AND r.time >= dw.deployed_from
+              AND r.time < dw.deployed_until
+              AND (dw.parameter_id IS NULL OR r.parameter_id IS NULL OR dw.parameter_id = r.parameter_id)",
             [sensor_id.into()],
         ))
         .await?;
-    let readings_updated = cal_result.rows_affected() as usize;
 
-    txn.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE readings r
-        SET deployment_id = dw.id,
-            site_id = dw.site_id
-        FROM (
-            SELECT id, site_id, parameter_id, deployed_from,
-                   COALESCE(deployed_until, 'infinity'::timestamptz) AS deployed_until
-            FROM sensor_deployments
-            WHERE sensor_id = $1
-        ) dw
-        WHERE r.sensor_id = $1
-          AND r.measurement_type IS DISTINCT FROM 'spot'
-          AND r.time >= dw.deployed_from
-          AND r.time < dw.deployed_until
-          AND (dw.parameter_id IS NULL OR r.parameter_id IS NULL OR dw.parameter_id = r.parameter_id)",
-        [sensor_id.into()],
-    ))
-    .await?;
+        // Recall: a reading that falls in a gap between/after the sensor's deployments (the sensor
+        // was pulled out, e.g. sitting in the lab) belongs to no site. Clear its site/deployment so
+        // it drops out of the continuous aggregates. Guarded to `time >= the sensor's first
+        // deployment` so readings that predate any deployment keep the site_id the stream pairing
+        // gave them (auto-created deployments start at pairing time, not data start; without this
+        // guard a reprocess would un-attribute all historical data).
+        txn.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE readings r
+              SET site_id = NULL, deployment_id = NULL
+              WHERE r.sensor_id = $1
+                AND r.measurement_type IS DISTINCT FROM 'spot'
+                AND r.time >= (SELECT MIN(deployed_from) FROM sensor_deployments d2
+                               WHERE d2.sensor_id = $1
+                                 AND (d2.parameter_id IS NULL OR r.parameter_id IS NULL
+                                      OR d2.parameter_id = r.parameter_id))
+                AND NOT EXISTS (
+                    SELECT 1 FROM sensor_deployments d
+                    WHERE d.sensor_id = $1
+                      AND (d.parameter_id IS NULL OR r.parameter_id IS NULL
+                           OR d.parameter_id = r.parameter_id)
+                      AND r.time >= d.deployed_from
+                      AND r.time < COALESCE(d.deployed_until, 'infinity'::timestamptz)
+                )",
+            [sensor_id.into()],
+        ))
+        .await?;
 
-    // Recall: a reading that falls in a gap between/after the sensor's deployments (the sensor was
-    // pulled out, e.g. sitting in the lab) belongs to no site. Clear its site/deployment so it
-    // drops out of the continuous aggregates. Guarded to `time >= the sensor's first deployment` so
-    // readings that predate any deployment keep the site_id the stream pairing gave them (auto-created
-    // deployments start at pairing time, not data start, without this guard a reprocess would
-    // un-attribute all historical data).
-    txn.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE readings r
-          SET site_id = NULL, deployment_id = NULL
-          WHERE r.sensor_id = $1
-            AND r.measurement_type IS DISTINCT FROM 'spot'
-            AND r.time >= (SELECT MIN(deployed_from) FROM sensor_deployments d2
-                           WHERE d2.sensor_id = $1
-                             AND (d2.parameter_id IS NULL OR r.parameter_id IS NULL
-                                  OR d2.parameter_id = r.parameter_id))
-            AND NOT EXISTS (
-                SELECT 1 FROM sensor_deployments d
-                WHERE d.sensor_id = $1
-                  AND (d.parameter_id IS NULL OR r.parameter_id IS NULL
-                       OR d.parameter_id = r.parameter_id)
-                  AND r.time >= d.deployed_from
-                  AND r.time < COALESCE(d.deployed_until, 'infinity'::timestamptz)
-            )",
-        [sensor_id.into()],
-    ))
-    .await?;
-
-    txn.commit().await?;
+        Ok(readings_updated)
+    })
+    .await
+    .map_err(app_error_as_db_err)?;
 
     let affected = db
         .query_all(Statement::from_sql_and_values(
@@ -630,7 +659,9 @@ pub async fn reprocess_sensor_readings(
     if let Some(ref range) = time_range {
         let min_time: Option<DateTime<Utc>> = range.try_get("", "min_time").ok();
         if let Some(since) = min_time {
-            crate::common::sync_state::refresh_continuous_aggregates(db, Some(since)).await;
+            crate::common::aggregates::refresh(db, crate::common::aggregates::Window::Since(since))
+                .await
+                .map_err(app_error_as_db_err)?;
         }
     }
 
@@ -652,44 +683,10 @@ pub async fn reprocess_site_parameter_readings(
     site_id: Uuid,
     parameter_id: Uuid,
 ) -> Result<usize, sea_orm::DbErr> {
-    // Steps 1-3 run in one transaction with TimescaleDB's per-statement decompression cap lifted
-    // (see `reprocess_sensor_readings`); the derived cascade + aggregate refresh follow after commit.
-    let txn = db.begin().await?;
-    txn.execute(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
-    ))
-    .await?;
-
-    // 1. Re-own + re-stamp deployment/site from the (site, parameter) deployment timeline.
-    let dep_result = txn
-        .execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings r
-              SET sensor_id = dw.sensor_id,
-                  deployment_id = dw.id,
-                  site_id = dw.site_id
-              FROM (
-                  SELECT id, sensor_id, site_id, deployed_from,
-                         COALESCE(deployed_until, 'infinity'::timestamptz) AS deployed_until
-                  FROM sensor_deployments
-                  WHERE site_id = $1 AND parameter_id = $2
-              ) dw
-              WHERE r.parameter_id = $2
-                AND r.measurement_type IS DISTINCT FROM 'spot'
-                AND (r.site_id = $1 OR r.sensor_id = dw.sensor_id)
-                AND r.time >= dw.deployed_from
-                AND r.time < dw.deployed_until",
-            [site_id.into(), parameter_id.into()],
-        ))
-        .await?;
-    let updated = dep_result.rows_affected() as usize;
-
-    // 2. Re-derive calibrated_value/calibration_id for the (now correct) owner. Pick exactly one
-    //    calibration per reading, the most specific overlapping window, so an open-ended identity
-    //    calibration (parameter_id NULL) can't non-deterministically shadow the real one.
-    txn.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
+    // Steps 1-3 run in one guarded transaction (`common::bulk_write`), which lifts TimescaleDB's
+    // per-statement decompression cap; the derived cascade and aggregate refresh follow after commit.
+    // Step 2 resolves with `resolver::pick_calibration_lateral`, the ranking every other path uses.
+    let cal_sql = format!(
         r"UPDATE readings tgt
           SET calibration_id = picked.cal_id,
               calibrated_value = picked.slope * tgt.raw_value + picked.intercept
@@ -697,47 +694,73 @@ pub async fn reprocess_site_parameter_readings(
               SELECT r.stream_id, r.time, r.replicate_index,
                      cw.id AS cal_id, cw.slope, cw.intercept
               FROM readings r
-              JOIN LATERAL (
-                  SELECT c.id, c.slope, c.intercept
-                  FROM sensor_calibrations c
-                  WHERE c.sensor_id = r.sensor_id AND c.mode = 'windowed'
-                    AND (c.parameter_id = $2 OR c.parameter_id IS NULL)
-                    AND r.time >= c.valid_from
-                    AND r.time < COALESCE(c.valid_until, 'infinity'::timestamptz)
-                  ORDER BY (c.parameter_id IS NOT NULL) DESC, c.valid_from DESC
-                  LIMIT 1
-              ) cw ON true
+              JOIN LATERAL ({pick}) cw ON true
               WHERE r.site_id = $1 AND r.parameter_id = $2
                 AND r.measurement_type IS DISTINCT FROM 'spot'
           ) picked
           WHERE tgt.stream_id = picked.stream_id
             AND tgt.time = picked.time
             AND tgt.replicate_index = picked.replicate_index",
-        [site_id.into(), parameter_id.into()],
-    ))
-    .await?;
+        pick = super::resolver::pick_calibration_lateral("r.sensor_id")
+    );
 
-    // 3. Recall NULL-clear: a reading in a deployment gap drops out of the site (guarded to
-    //    time >= the slot's first deployment so pre-deployment history is kept).
-    txn.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE readings r
-          SET site_id = NULL, deployment_id = NULL
-          WHERE r.site_id = $1 AND r.parameter_id = $2
-            AND r.measurement_type IS DISTINCT FROM 'spot'
-            AND r.time >= (SELECT MIN(deployed_from) FROM sensor_deployments
-                           WHERE site_id = $1 AND parameter_id = $2)
-            AND NOT EXISTS (
-                SELECT 1 FROM sensor_deployments d
-                WHERE d.site_id = $1 AND d.parameter_id = $2
-                  AND r.time >= d.deployed_from
-                  AND r.time < COALESCE(d.deployed_until, 'infinity'::timestamptz)
-            )",
-        [site_id.into(), parameter_id.into()],
-    ))
-    .await?;
+    let updated = crate::common::bulk_write::guarded(db, async |txn| {
+        // 1. Re-own + re-stamp deployment/site from the (site, parameter) deployment timeline.
+        let dep_result = txn
+            .execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r"UPDATE readings r
+                  SET sensor_id = dw.sensor_id,
+                      deployment_id = dw.id,
+                      site_id = dw.site_id
+                  FROM (
+                      SELECT id, sensor_id, site_id, deployed_from,
+                             COALESCE(deployed_until, 'infinity'::timestamptz) AS deployed_until
+                      FROM sensor_deployments
+                      WHERE site_id = $1 AND parameter_id = $2
+                  ) dw
+                  WHERE r.parameter_id = $2
+                    AND r.measurement_type IS DISTINCT FROM 'spot'
+                    AND (r.site_id = $1 OR r.sensor_id = dw.sensor_id)
+                    AND r.time >= dw.deployed_from
+                    AND r.time < dw.deployed_until",
+                [site_id.into(), parameter_id.into()],
+            ))
+            .await?;
+        let updated = dep_result.rows_affected() as usize;
 
-    txn.commit().await?;
+        // 2. Re-derive calibrated_value/calibration_id for the (now correct) owner.
+        txn.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &cal_sql,
+            [site_id.into(), parameter_id.into()],
+        ))
+        .await?;
+
+        // 3. Recall NULL-clear: a reading in a deployment gap drops out of the site (guarded to
+        //    time >= the slot's first deployment so pre-deployment history is kept).
+        txn.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE readings r
+              SET site_id = NULL, deployment_id = NULL
+              WHERE r.site_id = $1 AND r.parameter_id = $2
+                AND r.measurement_type IS DISTINCT FROM 'spot'
+                AND r.time >= (SELECT MIN(deployed_from) FROM sensor_deployments
+                               WHERE site_id = $1 AND parameter_id = $2)
+                AND NOT EXISTS (
+                    SELECT 1 FROM sensor_deployments d
+                    WHERE d.site_id = $1 AND d.parameter_id = $2
+                      AND r.time >= d.deployed_from
+                      AND r.time < COALESCE(d.deployed_until, 'infinity'::timestamptz)
+                )",
+            [site_id.into(), parameter_id.into()],
+        ))
+        .await?;
+
+        Ok(updated)
+    })
+    .await
+    .map_err(app_error_as_db_err)?;
 
     // 4. Cascade derived + refresh aggregates over the affected range (same tail as per-sensor).
     let affected = db
@@ -767,7 +790,9 @@ pub async fn reprocess_site_parameter_readings(
     if let Some(r) = range
         && let Ok(since) = r.try_get::<DateTime<Utc>>("", "min_time")
     {
-        crate::common::sync_state::refresh_continuous_aggregates(db, Some(since)).await;
+        crate::common::aggregates::refresh(db, crate::common::aggregates::Window::Since(since))
+            .await
+            .map_err(app_error_as_db_err)?;
     }
     Ok(updated)
 }

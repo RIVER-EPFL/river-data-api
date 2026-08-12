@@ -7,9 +7,12 @@ use super::merge_services::{
     MergeSiteParametersResponse,
 };
 
-/// Merge two `site_parameters`, absorb `source` into `target`. Moves readings, status
-/// events, streams, and sensor deployments; deletes the source row. Idempotent on the
-/// `(stream_id, time, replicate_index)` PK. Requires `write_metadata`.
+/// Merge two `site_parameters`, absorb `source` into `target`. Moves every slot-keyed table's rows
+/// (readings, status events, samples, annotations) and the streams feeding the slot, then deletes
+/// the source row. All or nothing: the whole move is one transaction. Requires `write_metadata`.
+///
+/// Refused with 409 when source and target both hold a grab sample at the same instant: merging two
+/// separately collected groups would rewrite the survivor's stored mean, sd and n.
 #[utoipa::path(
     post,
     path = "/actions/merge_site_parameters",
@@ -17,6 +20,7 @@ use super::merge_services::{
     responses(
         (status = 200, description = "Counts of moved rows and source deletion status", body = MergeSiteParametersResponse),
         (status = 404, description = "Source or target not found"),
+        (status = 409, description = "Source and target hold a sample at the same instant"),
     ),
     tag = "actions"
 )]
@@ -52,6 +56,7 @@ pub async fn merge_site_parameters_handler(
     responses(
         (status = 200, description = "Counts of moved rows", body = MergeParametersResponse),
         (status = 404, description = "Source or target parameter not found"),
+        (status = 409, description = "Source and target hold a sample at the same instant"),
     ),
     tag = "actions"
 )]

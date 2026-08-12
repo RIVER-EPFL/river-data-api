@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, sensor_in_scope};
+use crate::common::scope;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::calibrations::service::recompute_deployed_until;
 use crate::routes::private::{parameters, sites::parameters as site_parameters};
@@ -213,10 +214,14 @@ async fn resolve_swap_parameter<C: ConnectionTrait>(
 )]
 pub async fn adopt_sensor(
     State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Path(sensor_id): Path<Uuid>,
     Json(payload): Json<AdoptRequest>,
 ) -> AppResult<Json<AdoptResponse>> {
     let db = &app_state.db;
+    // Confine to the target site before any write: deploying an instrument into a project the
+    // caller has no grant on is the write this refuses.
+    scope::require_sites_in_scope(db, &scope, &[payload.site_id]).await?;
     let parameter_id = resolve_sensor_parameter(db, sensor_id, payload.parameter_id).await?;
 
     let site_exists = db
@@ -447,9 +452,19 @@ pub struct SwapResponse {
 )]
 pub async fn swap_sensors(
     State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(payload): Json<SwapRequest>,
 ) -> AppResult<Json<SwapResponse>> {
     let db = &app_state.db;
+    // The target slot, plus the incoming instrument, which this call recalls from wherever it is
+    // deployed now. Both are refused outside the caller's grants, before any write.
+    scope::require_sites_in_scope(db, &scope, &[payload.site_id]).await?;
+    scope::require_target_in_scope(
+        &scope,
+        &scope::project_of_sensor(db, payload.incoming_sensor_id).await?,
+        scope::Unowned::Allow,
+        "Sensor",
+    )?;
     let parameter_id = resolve_swap_parameter(
         db,
         payload.outgoing_sensor_id,

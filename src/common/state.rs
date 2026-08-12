@@ -79,11 +79,17 @@ pub struct KeycloakAdmin {
     pub token_cache: AdminTokenCache,
 }
 
-/// Cached response with metadata for freshness checking
+/// Cached response, with what it takes to decide it is no longer current: `max_time` for the
+/// unbounded-query backstop, and `site` for write-side invalidation.
+///
+/// `site` is resolved from the cache key when the entry is stored (`cache::site_of_key`), so a
+/// private and a public entry for the same site are equally reachable. `None` means the key named
+/// no resolvable site, and any site invalidation drops the entry.
 #[derive(Clone)]
 pub struct CachedResponse {
     pub data: Arc<Vec<u8>>,
     pub max_time: Option<DateTime<Utc>>,
+    pub site: Option<uuid::Uuid>,
 }
 
 /// Cache for API responses. Key is request params, value is serialized response + metadata.
@@ -117,7 +123,9 @@ impl AppState {
         config: Config,
         keycloak_auth_instance: Option<Arc<KeycloakAuthInstance>>,
     ) -> Self {
-        // Cache weighted by byte size, not entry count
+        // Cache weighted by byte size, not entry count. Invalidation closures are what let a write
+        // drop one site's entries (`cache::invalidate_site`); without them moka rejects every
+        // predicate and nothing is ever dropped ahead of its TTL.
         let cache: ResponseCache = Cache::builder()
             .weigher(|_key: &String, value: &CachedResponse| -> u32 {
                 // Weight is the size in bytes (capped at u32::MAX)
@@ -125,6 +133,7 @@ impl AppState {
             })
             .max_capacity(config.cache_max_bytes)
             .time_to_live(Duration::from_secs(config.cache_ttl_seconds))
+            .support_invalidation_closures()
             .build();
 
         let bulk_semaphore = new_bulk_semaphore(config.bulk_concurrent_limit);
@@ -179,6 +188,9 @@ impl AppState {
         // Publish the serving state so worker-run scheduled Jobs can reach config + the shared
         // Authorizer. Set-once: the first construction (the real one in `main.rs`) wins.
         let _ = GLOBAL_APP_STATE.set(state.clone());
+        // Every writer that announces a write on the event bus invalidates the site it wrote,
+        // without a cache call of its own. No-op when caching is off.
+        super::cache::spawn_write_invalidator(&state);
         state
     }
 }

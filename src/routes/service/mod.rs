@@ -248,6 +248,9 @@ pub fn api_router(state: &AppState) -> Router<()> {
             post(crate::routes::private::sensors::retag::retag_frequency),
         )
         .route("/actions/swap", post(sensor_adopt::swap_sensors))
+        // Rolling a deployment back undoes one, so it takes the capability deleting a deployment
+        // takes rather than the weaker write_data the other operator actions carry.
+        .route("/actions/rollback_deployment", post(actions::rollback_deployment))
         .layer(middleware::from_fn(deny_scoped_token))
         // Deploying/swapping a sensor at a slot is sensor movement: MANAGER (write_metadata token).
         .layer(middleware::from_fn(require_manage_sensors))
@@ -276,7 +279,6 @@ pub fn api_router(state: &AppState) -> Router<()> {
     let data_action_routes = Router::new()
         .route("/actions/refresh_aggregates", post(actions::refresh_aggregates))
         .route("/actions/compute_derived", post(actions::compute_derived))
-        .route("/actions/rollback_deployment", post(actions::rollback_deployment))
         .route("/actions/reprocess_all", post(actions::reprocess_all))
         .route("/actions/rebuild_alarm_events", post(actions::rebuild_alarm_events))
         .route("/actions/reconcile_alarms", post(actions::reconcile_alarms))

@@ -4,9 +4,26 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
 use super::model::SensorDeployment;
+use super::slots::{self, SlotRequest};
 use crate::routes::private::sensors::calibrations::service::recompute_deployed_until;
 
 pub struct SensorDeploymentOperations;
+
+/// A window whose end precedes its start is not a range Postgres can store, and the exclusion
+/// constraint would raise a raw error on it.
+fn reject_inverted_window(
+    deployed_from: chrono::DateTime<chrono::Utc>,
+    deployed_until: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), ApiError> {
+    match deployed_until {
+        Some(until) if until < deployed_from => Err(ApiError::bad_request(format!(
+            "deployed_until ({}) precedes deployed_from ({})",
+            until.to_rfc3339(),
+            deployed_from.to_rfc3339()
+        ))),
+        _ => Ok(()),
+    }
+}
 
 /// Spawn a tracked reprocess for a deployment change. Runs the **slot-scoped** reprocess first
 /// (`reprocess_site_parameter_readings`) so a backdated/edited window re-attributes the affected
@@ -42,64 +59,55 @@ impl CRUDOperations for SensorDeploymentOperations {
         db: &DatabaseConnection,
         data: &<SensorDeployment as CRUDResource>::CreateModel,
     ) -> Result<(), ApiError> {
-        // Recall is scoped to the SAME parameter (channel): a multi-channel instrument holds one open
-        // deployment per parameter, so deploying its temperature channel must not close its still-live
-        // conductivity channel. A same-parameter move across sites still closes the old site's row.
-        let result = db
-            .execute(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"UPDATE sensor_deployments
-                  SET deployed_until = $1
-                  WHERE sensor_id = $2 AND parameter_id = $3 AND deployed_until IS NULL",
-                [
-                    data.deployed_from.into(),
-                    data.sensor_id.into(),
-                    data.parameter_id.into(),
-                ],
-            ))
-            .await
-            .map_err(ApiError::database)?;
+        reject_inverted_window(data.deployed_from, data.deployed_until)?;
 
-        if result.rows_affected() > 0 {
+        // Every rejection comes before the recall. A refused create must leave the sensor deployed
+        // exactly where it was: the recall used to run first, so a 400 still closed the open
+        // deployment and the next reprocess un-attributed everything logged after it.
+        //
+        // One sensor per (site, parameter) at a time is hard-enforced by the
+        // `excl_deployment_site_param_slot` constraint. The check names the blocking row so the
+        // operator gets an actionable 400 instead of a raw constraint violation; the constraint
+        // remains the atomic backstop. Rows this write is about to recall are not blocking, and the
+        // constraint carries no sensor term, so a same-sensor historical overlap is.
+        let occupant = slots::find_occupant(
+            db,
+            &SlotRequest {
+                site_id: data.site_id,
+                parameter_id: data.parameter_id,
+                deployed_from: data.deployed_from,
+                deployed_until: data.deployed_until,
+                exclude_deployment: None,
+                recalled_sensor: Some(data.sensor_id),
+            },
+        )
+        .await
+        .map_err(ApiError::database)?;
+
+        if let Some(occupant) = occupant {
+            return Err(ApiError::bad_request(slots::conflict_message(
+                &occupant,
+                data.sensor_id,
+                "deploy",
+            )));
+        }
+
+        let recalled = slots::recall_open_deployments(
+            db,
+            data.sensor_id,
+            data.parameter_id,
+            data.deployed_from,
+            None,
+        )
+        .await
+        .map_err(ApiError::database)?;
+        if recalled > 0 {
             tracing::info!(
                 sensor_id = %data.sensor_id,
                 parameter_id = %data.parameter_id,
-                recalled = result.rows_affected(),
+                recalled,
                 "Auto-recalled active deployment(s) for this parameter on new deploy"
             );
-        }
-
-        // One sensor per (site, parameter) at a time is hard-enforced by the
-        // `excl_deployment_site_param_slot` constraint. Pre-check for a different sensor already in
-        // this slot over an overlapping window so the operator gets a clear 400 ("recall it first")
-        // instead of a raw constraint violation; the constraint remains the atomic backstop.
-        let conflict = db
-            .query_one(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"SELECT 1 FROM sensor_deployments d
-                  WHERE d.site_id = $1
-                    AND d.parameter_id = $5
-                    AND d.sensor_id <> $2
-                    AND tstzrange(d.deployed_from, COALESCE(d.deployed_until, 'infinity'::timestamptz), '[)')
-                        && tstzrange($3, COALESCE($4, 'infinity'::timestamptz), '[)')
-                  LIMIT 1",
-                [
-                    data.site_id.into(),
-                    data.sensor_id.into(),
-                    data.deployed_from.into(),
-                    data.deployed_until.into(),
-                    data.parameter_id.into(),
-                ],
-            ))
-            .await
-            .map_err(ApiError::database)?;
-
-        if conflict.is_some() {
-            return Err(ApiError::bad_request(
-                "Another sensor is already deployed to this site for this parameter over an \
-                 overlapping period. Recall it first, then deploy."
-                    .to_string(),
-            ));
         }
 
         Ok(())
@@ -107,11 +115,11 @@ impl CRUDOperations for SensorDeploymentOperations {
 
     // Mirror of `before_create` for edits: a PATCH that moves a deployment's window/site into
     // another sensor's slot would otherwise hit `excl_deployment_site_param_slot` as a raw 500.
-    // Pre-check (excluding the row being edited) so the operator gets a clear 400, and auto-recall
-    // the sensor's other open deployments when this edit keeps/makes it open. The recall and the
-    // CrudCrate-applied UPDATE are separate statements (hooks don't share the update's txn), so the
-    // EXCLUDE constraint remains the atomic backstop and `after_update`'s recompute re-chains the
-    // sensor's own timeline.
+    // Every rejection comes first (excluding the row being edited from the slot check), then the
+    // boundary follow, then the auto-recall of the sensor's other open deployments when this edit
+    // keeps/makes it open. The recall and the CrudCrate-applied UPDATE are separate statements
+    // (hooks don't share the update's txn), so the EXCLUDE constraint remains the atomic backstop
+    // and `after_update`'s recompute re-chains the sensor's own timeline.
     async fn before_update(
         &self,
         db: &DatabaseConnection,
@@ -168,55 +176,63 @@ impl CRUDOperations for SensorDeploymentOperations {
             None => cur_until.map(|t| t.with_timezone(&chrono::Utc)),
         };
 
-        let conflict = db
-            .query_one(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"SELECT 1 FROM sensor_deployments d
-                  WHERE d.site_id = $1
-                    AND d.parameter_id = $6
-                    AND d.sensor_id <> $2
-                    AND d.id <> $3
-                    AND tstzrange(d.deployed_from, COALESCE(d.deployed_until, 'infinity'::timestamptz), '[)')
-                        && tstzrange($4, COALESCE($5, 'infinity'::timestamptz), '[)')
-                  LIMIT 1",
-                [
-                    new_site.into(),
-                    new_sensor.into(),
-                    id.into(),
-                    new_from.into(),
-                    new_until.into(),
-                    cur_param.into(),
-                ],
-            ))
-            .await
-            .map_err(ApiError::database)?;
+        reject_inverted_window(new_from, new_until)?;
 
-        if conflict.is_some() {
-            return Err(ApiError::bad_request(
-                "Another sensor is already deployed to this site for this parameter over an \
-                 overlapping period. Recall it first, then move this deployment."
-                    .to_string(),
-            ));
+        let occupant = slots::find_occupant(
+            db,
+            &SlotRequest {
+                site_id: new_site,
+                parameter_id: cur_param,
+                deployed_from: new_from,
+                deployed_until: new_until,
+                exclude_deployment: Some(id),
+                // The recall below only runs when the edit leaves this deployment open-ended.
+                recalled_sensor: new_until.is_none().then_some(new_sensor),
+            },
+        )
+        .await
+        .map_err(ApiError::database)?;
+
+        if let Some(occupant) = occupant {
+            return Err(ApiError::bad_request(slots::conflict_message(
+                &occupant,
+                new_sensor,
+                "move this deployment",
+            )));
+        }
+
+        // A move date corrected forward hands the vacated period back to where the instrument
+        // actually was; `recompute_deployed_until` cannot, it only shortens.
+        let followed = slots::follow_forward_move(
+            db,
+            cur_sensor,
+            cur_param,
+            id,
+            cur_from.with_timezone(&chrono::Utc),
+            new_from,
+        )
+        .await
+        .map_err(ApiError::database)?;
+        if followed > 0 {
+            tracing::info!(
+                sensor_id = %cur_sensor,
+                parameter_id = %cur_param,
+                followed,
+                "Adjacent deployment's end date followed the corrected move date"
+            );
         }
 
         // If the edit keeps/makes this deployment open-ended, close the sensor's other open
         // deployments at the new start (twin of the before_create recall, excluding self).
         if new_until.is_none() {
-            let recalled = db
-                .execute(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    // Same-parameter scope as before_create: don't close other channels of a
-                    // multi-channel instrument.
-                    r"UPDATE sensor_deployments SET deployed_until = $1
-                      WHERE sensor_id = $2 AND parameter_id = $4 AND deployed_until IS NULL AND id <> $3",
-                    [new_from.into(), new_sensor.into(), id.into(), cur_param.into()],
-                ))
-                .await
-                .map_err(ApiError::database)?;
-            if recalled.rows_affected() > 0 {
+            let recalled =
+                slots::recall_open_deployments(db, new_sensor, cur_param, new_from, Some(id))
+                    .await
+                    .map_err(ApiError::database)?;
+            if recalled > 0 {
                 tracing::info!(
                     sensor_id = %new_sensor,
-                    recalled = recalled.rows_affected(),
+                    recalled,
                     "Auto-recalled active deployment(s) on deployment edit"
                 );
             }
@@ -303,13 +319,25 @@ impl CRUDOperations for SensorDeploymentOperations {
 
         // readings.deployment_id has no ON DELETE action, clear references first, then delete.
         // The reprocess below re-derives deployment_id/site_id for these readings by window.
-        db.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE readings SET deployment_id = NULL WHERE deployment_id = $1",
-            [id.into()],
-        ))
+        //
+        // `deployment_id` is neither the segmentby nor the time dimension, so no compressed batch can
+        // be excluded by metadata: the clear goes through the guarded writer, which lifts the
+        // decompression cap it would otherwise hit on a sensor with historical readings.
+        crate::common::bulk_write::guarded_mutation(
+            db,
+            Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE readings SET deployment_id = NULL WHERE deployment_id = $1",
+                [id.into()],
+            ),
+        )
         .await
-        .map_err(ApiError::database)?;
+        .map_err(|e| {
+            ApiError::internal(
+                "Failed to clear the deployment's readings references",
+                Some(e.to_string()),
+            )
+        })?;
 
         db.execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,

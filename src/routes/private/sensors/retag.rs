@@ -9,6 +9,8 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::middleware::ProjectScope;
+use crate::common::scope;
 use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -43,10 +45,21 @@ pub struct RetagFrequencyResponse {
 )]
 pub async fn retag_frequency(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(req): Json<RetagFrequencyRequest>,
 ) -> AppResult<Json<RetagFrequencyResponse>> {
     if req.sensor_ids.is_empty() {
         return Err(AppError::BadRequest("sensor_ids must not be empty".to_string()));
+    }
+    // A never-deployed instrument belongs to no project, so it stays reachable as inventory;
+    // one deployed only outside the caller's grants does not.
+    for sensor_id in &req.sensor_ids {
+        scope::require_target_in_scope(
+            &scope,
+            &scope::project_of_sensor(&state.db, *sensor_id).await?,
+            scope::Unowned::Allow,
+            "Sensor",
+        )?;
     }
     if !matches!(req.data_frequency.as_str(), "high" | "low") {
         return Err(AppError::BadRequest(format!(

@@ -311,8 +311,11 @@ async fn job_log_tail_requires_read_data() {
     .await;
 
     // Intern is the lowest level holding ReadData (Capability::min_role), so an intern reads the
-    // timeline and actually gets its content.
+    // timeline and actually gets its content. The job names a site, and a job timeline is confined
+    // to the projects the caller is granted, so the grant is what leaves the capability as the
+    // thing under test here.
     kc::ensure_realm_user("intern1", "intern1", &["riverdata-intern"]).await;
+    kc::grant_project(&db, &kc::keycloak_user_id("intern1").await, &track.project_id).await;
     let intern_jwt = kc::get_keycloak_jwt("intern1", "intern1").await;
     let (status, body) = fetch_logs(&app, &intern_jwt, probe, "").await;
     assert_eq!(status, 200, "an intern reads a job timeline ({status}): {body}");

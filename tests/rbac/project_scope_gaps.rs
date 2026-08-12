@@ -12,9 +12,7 @@
 //!
 //! Every suite also exercises a sibling route in the same source file that already confines
 //! correctly, so the expectation is the codebase's own standard rather than an invention.
-//!
-//! Findings RD-001 to RD-009 in `docs/defect-findings.md`. These are expected to fail until the
-//! handlers gain their scope checks.
+
 
 use axum::Router;
 use serde_json::json;
@@ -198,11 +196,7 @@ async fn seed_claimable_history(
     (sensor, deployment)
 }
 
-// ---------------------------------------------------------------------------------------------
-// RD-001
-// ---------------------------------------------------------------------------------------------
-
-/// RD-001: `GET /api/alarms/thresholds` must confine its rows to the caller's projects, as its
+/// `GET /api/alarms/thresholds` must confine its rows to the caller's projects, as its
 /// three alarm siblings already do.
 #[tokio::test]
 #[serial]
@@ -273,11 +267,7 @@ async fn alarm_thresholds_confines_slots_to_the_callers_projects() {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// RD-002
-// ---------------------------------------------------------------------------------------------
-
-/// RD-002: `merge_parameters` hard-deletes a global catalog row and `merge_site_parameters` takes
+/// `merge_parameters` hard-deletes a global catalog row and `merge_site_parameters` takes
 /// any project's ids, both at Manager level; the equivalent destruction through CRUD is
 /// Administrator-only and project-confined.
 #[tokio::test]
@@ -427,11 +417,7 @@ async fn parameter_merges_hold_the_administrator_and_project_gates() {
     assert_eq!(status, 404, "the merge deletes the source catalog row: {body}");
 }
 
-// ---------------------------------------------------------------------------------------------
-// RD-003
-// ---------------------------------------------------------------------------------------------
-
-/// RD-003: `POST /api/actions/rollback_deployment` deletes a `sensor_deployments` row, so it must
+/// `POST /api/actions/rollback_deployment` deletes a `sensor_deployments` row, so it must
 /// need the same capability as `DELETE /api/sensor_deployments/{id}`, which is Manager /
 /// `write_metadata`, not River / `write_data`.
 #[tokio::test]
@@ -596,11 +582,7 @@ async fn rollback_deployment_needs_the_same_capability_as_deleting_the_deploymen
     );
 }
 
-// ---------------------------------------------------------------------------------------------
-// RD-004
-// ---------------------------------------------------------------------------------------------
-
-/// RD-004: `adopt` and `retag_frequency` resolve caller-supplied site and sensor ids with no
+/// `adopt` and `retag_frequency` resolve caller-supplied site and sensor ids with no
 /// project check, while their read neighbour `adopt_suggestions` confines by the same scope.
 #[tokio::test]
 #[serial]
@@ -792,11 +774,7 @@ async fn sensor_lifecycle_actions_refuse_another_projects_site_and_sensors() {
     );
 }
 
-// ---------------------------------------------------------------------------------------------
-// RD-005
-// ---------------------------------------------------------------------------------------------
-
-/// RD-005: `backfill_candidates` and `calibration_candidates` hand every member the site, sensor
+/// `backfill_candidates` and `calibration_candidates` hand every member the site, sensor
 /// and deployment ids of projects they hold no grant on, while the CRUD reads of the very same
 /// rows confine.
 #[tokio::test]
@@ -911,11 +889,7 @@ async fn backfill_and_calibration_candidates_confine_to_the_callers_projects() {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// RD-006
-// ---------------------------------------------------------------------------------------------
-
-/// RD-006: `compute_derived`, `rebuild_alarm_events` and `backfill_attribution` enqueue work
+/// `compute_derived`, `rebuild_alarm_events` and `backfill_attribution` enqueue work
 /// against a caller-supplied site id with no grant check, while `preview_derived` in the same file
 /// enforces one on the same field.
 #[tokio::test]
@@ -1018,10 +992,6 @@ async fn site_targeted_actions_refuse_a_site_outside_the_callers_grants() {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// RD-007
-// ---------------------------------------------------------------------------------------------
-
 fn parse_sse_frames(text: &str) -> Vec<(String, serde_json::Value)> {
     let mut frames = Vec::new();
     let mut current_event: Option<String> = None;
@@ -1082,7 +1052,7 @@ async fn frames_until(
     }
 }
 
-/// RD-007: `/api/events` forwards only in-scope `DataIngested` frames to any restricted principal,
+/// `/api/events` forwards only in-scope `DataIngested` frames to any restricted principal,
 /// and every non-admin Keycloak member is restricted, so a granted operator's job panel receives
 /// nothing at all.
 #[tokio::test]
@@ -1138,11 +1108,7 @@ async fn granted_members_receive_job_frames_on_the_event_stream() {
     );
 }
 
-// ---------------------------------------------------------------------------------------------
-// RD-008
-// ---------------------------------------------------------------------------------------------
-
-/// RD-008: `GET /api/sync/credentials` lists enrollment credentials at `read_metadata`, while its
+/// `GET /api/sync/credentials` lists enrollment credentials at `read_metadata`, while its
 /// create and revoke twins and the whole `sync_service_credentials` CRUD surface are
 /// Administrator-only.
 #[tokio::test]
@@ -1208,11 +1174,7 @@ async fn listing_sync_credentials_is_administrator_only() {
     );
 }
 
-// ---------------------------------------------------------------------------------------------
-// RD-009
-// ---------------------------------------------------------------------------------------------
-
-/// RD-009: alarm acknowledgement and the job timeline resolve by id alone, so a member granted one
+/// alarm acknowledgement and the job timeline resolve by id alone, so a member granted one
 /// project can act on another project's alarm event and read another project's job log, while the
 /// scoped siblings that list the very same rows return 404 / omit them.
 #[tokio::test]

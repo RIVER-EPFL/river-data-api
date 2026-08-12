@@ -801,7 +801,7 @@ pub async fn revert_plan(
     txn.commit().await?;
 
     // Refresh aggregates synchronously so callers see consistent state
-    crate::common::sync_state::refresh_continuous_aggregates_full(db).await;
+    crate::common::sync_state::refresh_continuous_aggregates_full(db).await?;
 
     tracing::info!(plan_id = %plan_id, reverted, "Pairing plan reverted");
     Ok(reverted)

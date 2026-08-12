@@ -108,7 +108,9 @@ pub async fn run_once(db: &DatabaseConnection) -> Result<usize, sea_orm::DbErr> 
 
             if let Some(since) = min_filled {
                 tracing::info!(%since, filled, "Derived janitor: refreshing continuous aggregates after backfill");
-                crate::common::sync_state::refresh_continuous_aggregates(ctx.db(), Some(since)).await;
+                crate::common::sync_state::refresh_continuous_aggregates(ctx.db(), Some(since))
+                    .await
+                    .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
             }
             ctx.set_progress(total, Some(total)).await;
             ctx.set_detail(serde_json::json!({
@@ -258,10 +260,15 @@ pub async fn periodic(
         let due_full = last_full_refresh.is_none_or(|t| now.duration_since(t) >= full_refresh_interval);
         if due_full {
             tracing::info!("Derived janitor: running scheduled full continuous aggregate refresh");
-            crate::common::sync_state::refresh_continuous_aggregates_full(db).await;
+            // The background tick has no caller to answer to, so a failed refresh is logged and
+            // the next tick retries it.
+            if let Err(e) = crate::common::sync_state::refresh_continuous_aggregates_full(db).await {
+                tracing::warn!(error = %e, "Derived janitor: full aggregate refresh failed");
+            }
             *last_full_refresh = Some(now);
-        } else {
-            crate::common::sync_state::refresh_continuous_aggregates(db, None).await;
+        } else if let Err(e) = crate::common::sync_state::refresh_continuous_aggregates(db, None).await
+        {
+            tracing::warn!(error = %e, "Derived janitor: incremental aggregate refresh failed");
         }
 
         let due_prune = last_prune.is_none_or(|t| now.duration_since(t) >= PRUNE_EVERY);

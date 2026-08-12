@@ -1,4 +1,4 @@
-//! Response-cache key completeness and invalidation, RD-010 to RD-014.
+//! Response-cache key completeness and invalidation.
 //!
 //! Every test runs against the cache-enabled builder (`cache_ttl_seconds = 300`). The default test
 //! builder has the cache off, so the same request sequences would pass on it while proving nothing.
@@ -154,7 +154,7 @@ async fn ingest_one(app: &Router, jwt: &str, stream_id: &str, time: &str, raw_va
     assert_eq!(body["paired"], true, "the stream is paired, so the reading is attributed: {body}");
 }
 
-// RD-010: `parameter_ids` is absent from the readings cache key, so a request filtered to one
+// `parameter_ids` is absent from the readings cache key, so a request filtered to one
 // parameter is answered with another filter's body, in both directions.
 #[tokio::test]
 #[serial]
@@ -248,7 +248,7 @@ async fn readings_cache_key_separates_parameter_filters() {
     );
 }
 
-// RD-011: `split_by_sensor` is absent from the aggregates cache key, so a per-sensor request is
+// `split_by_sensor` is absent from the aggregates cache key, so a per-sensor request is
 // answered with the collapsed body, which carries no sensor_id.
 #[tokio::test]
 #[serial]
@@ -377,7 +377,7 @@ async fn aggregates_cache_key_separates_split_by_sensor() {
     );
 }
 
-// RD-012: cache::invalidate_prefix removes nothing (the moka cache is built without
+// cache::invalidate_prefix removes nothing (the moka cache is built without
 // support_invalidation_closures), so a bounded read keeps serving pre-write bytes.
 #[tokio::test]
 #[serial]
@@ -450,7 +450,7 @@ async fn a_write_invalidates_the_written_sites_cached_readings() {
     );
 }
 
-// RD-013: the unbounded-query freshness probe compares only MAX(time), so a reading backfilled
+// the unbounded-query freshness probe compares only MAX(time), so a reading backfilled
 // below the cached maximum leaves the stale entry in place.
 #[tokio::test]
 #[serial]
@@ -539,7 +539,7 @@ async fn an_unbounded_read_reflects_a_backfilled_reading() {
     );
 }
 
-// RD-014: public entries are keyed `pub_readings:{project_code}:{site_code}:...`, a namespace no
+// public entries are keyed `pub_readings:{project_code}:{site_code}:...`, a namespace no
 // invalidation prefix targets, so a write to the site leaves the public response stale.
 #[tokio::test]
 #[serial]
@@ -610,7 +610,7 @@ async fn a_write_invalidates_the_sites_public_cached_readings() {
     assert_eq!(values, vec![601.0, 602.0, 603.0], "with the new value: {}", after.body);
 }
 
-// RD-010/RD-011 scope axis: the readings cache key carries no caller identity, so a primed entry
+// Scope axis: the readings cache key carries no caller identity, so a primed entry
 // must not become a way for an ungranted user to read another project's site.
 #[tokio::test]
 #[serial]

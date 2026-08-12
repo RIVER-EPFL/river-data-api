@@ -8,7 +8,9 @@ use uuid::Uuid;
 use crate::common::middleware::{IsSyncService, ProjectScope, enforce_project_scope_for_sites};
 use crate::common::{AppEvent, AppState};
 use crate::routes::private::{data_streams, readings, readings::status_events};
+use crate::routes::private::readings::batch::{Replace, admission, readings_upsert};
 use crate::error::{AppError, AppResult};
+use crate::routes::private::sensors::calibrations::resolver;
 use crate::routes::private::sensors::operations::{
     resolve_slot_owner_for_times, resolve_windows_for_times,
 };
@@ -56,25 +58,11 @@ async fn insert_reading_chunks<C: ConnectionTrait>(
     models: &[readings::ActiveModel],
     overwrite: bool,
 ) -> Result<usize, AppError> {
-    let mut conflict = sea_orm::sea_query::OnConflict::columns([
-        readings::Column::StreamId,
-        readings::Column::Time,
-        readings::Column::ReplicateIndex,
-    ]);
-    if overwrite {
-        conflict.update_columns([
-            readings::Column::RawValue,
-            readings::Column::CalibratedValue,
-            readings::Column::SiteId,
-            readings::Column::ParameterId,
-            readings::Column::SensorId,
-            readings::Column::CalibrationId,
-            readings::Column::DeploymentId,
-            readings::Column::MeasurementType,
-        ]);
+    let conflict = readings_upsert(if overwrite {
+        Replace::ValuesAndAttribution
     } else {
-        conflict.do_nothing();
-    }
+        Replace::Nothing
+    });
 
     let mut inserted = 0usize;
     for chunk in models.chunks(BATCH_SIZE) {
@@ -108,6 +96,7 @@ async fn insert_reading_chunks<C: ConnectionTrait>(
     request_body = IngestReadingsRequest,
     responses(
         (status = 200, description = "Inserted count and pairing state", body = IngestResponse),
+        (status = 400, description = "Timestamp outside [-10 years, +1 day] window, or non-finite value"),
         (status = 404, description = "Stream not found"),
     ),
     tag = "ingestion"
@@ -140,47 +129,24 @@ pub async fn ingest_readings(
         .await?
         .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
 
-    // Resolve pairing: site_id and parameter_id from site_parameter
-    let (site_id, parameter_id) = if let Some(sp_id) = stream.site_parameter_id {
-        let sp = db
-            .query_one(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"SELECT site_id, parameter_id FROM site_parameters WHERE id = $1",
-                [sp_id.into()],
-            ))
-            .await?;
-
-        if let Some(row) = sp {
-            let sid: Uuid = row.try_get("", "site_id").map_err(|e| {
-                AppError::Internal(format!("Failed to read site_id: {e}"))
-            })?;
-            let pid: Uuid = row.try_get("", "parameter_id").map_err(|e| {
-                AppError::Internal(format!("Failed to read parameter_id: {e}"))
-            })?;
-            (Some(sid), Some(pid))
-        } else {
-            (None, None)
-        }
-    } else {
-        (None, None)
-    };
-
+    let (site_id, parameter_id) = resolve_stream_slot(db, stream.site_parameter_id).await?;
     let paired = site_id.is_some();
 
     // A project-scoped token may only ingest into a stream paired to a site within its project.
     // An unpaired stream has no project, so a scoped token is rejected outright.
     enforce_ingest_scope(&state.db, &scope, site_id).await?;
 
+    // The same admission rules /readings/batch applies. An out-of-window timestamp is refused
+    // before anything is written and before the stream cursor is touched: `last_data_time` only
+    // ever moves forward, so one future timestamp would stall this stream's incremental sync
+    // until wall-clock caught up.
     for r in &payload.readings {
-        crate::routes::private::readings::measurement::validate_measurement_type(
-            r.measurement_type.as_deref(),
-        )?;
+        admission::admit(r.time, r.raw_value, r.measurement_type.as_deref())?;
     }
 
     // Window-aware attribution: resolve calibration/deployment/site per reading TIME from the
     // sensor's windows, agreeing with reprocess_sensor_readings. The stream's frozen sensor_id is the
-    // owner; cal/deployment/site come from whichever window covers each timestamp. `calibrated_value`
-    // is written as identity (raw) here; reprocess (fired by calibration edits) refines it.
+    // owner; cal/deployment/site come from whichever window covers each timestamp.
     let resolved = if let Some(stream_sensor) = stream.sensor_id {
         let times: Vec<chrono::DateTime<Utc>> = payload.readings.iter().map(|r| r.time).collect();
         resolve_windows_for_times(db, stream_sensor, None, &times)
@@ -201,6 +167,26 @@ pub async fn ingest_readings(
                 .unwrap_or_default()
         }
         _ => std::collections::HashMap::new(),
+    };
+
+    // The curve covering each reading's own time, ranked by the one resolver the set-based
+    // reprocess UPDATEs use. A value stored here and the value a later reprocess recomputes are
+    // therefore the same number, so a reading is correct the moment it lands rather than only
+    // after the next reprocess.
+    let curves = {
+        let requests: Vec<(Uuid, Option<Uuid>, chrono::DateTime<Utc>)> = payload
+            .readings
+            .iter()
+            .filter_map(|r| {
+                let owner = slot_owner.get(&r.time);
+                let sensor = r
+                    .sensor_id
+                    .or(stream.sensor_id)
+                    .or_else(|| owner.and_then(|o| o.sensor_id))?;
+                Some((sensor, parameter_id, r.time))
+            })
+            .collect();
+        resolver::resolve_many(db, &requests).await?
     };
 
     // Sensor-frequency defaults for every sensor a reading could resolve to (explicit, stream, or
@@ -230,6 +216,13 @@ pub async fn ingest_readings(
         .map(|r| {
             let slot = resolved.get(&r.time);
             let owner = slot_owner.get(&r.time);
+            let sensor_id = r
+                .sensor_id
+                .or(stream.sensor_id)
+                .or_else(|| owner.and_then(|o| o.sensor_id));
+            // No window covers the time: store the raw value uncorrected, which is what a
+            // reprocess over the same windows would leave too.
+            let curve = sensor_id.and_then(|s| curves.get(&(s, parameter_id, r.time)));
             readings::ActiveModel {
                 stream_id: Set(payload.stream_id),
                 time: Set(r.time.into()),
@@ -238,10 +231,13 @@ pub async fn ingest_readings(
                 site_id: Set(slot.and_then(|s| s.site_id).or(site_id)),
                 parameter_id: Set(parameter_id),
                 raw_value: Set(r.raw_value),
-                calibrated_value: Set(Some(r.raw_value)),
-                sensor_id: Set(r.sensor_id.or(stream.sensor_id).or_else(|| owner.and_then(|o| o.sensor_id))),
+                calibrated_value: Set(Some(
+                    curve.map_or(r.raw_value, |c| c.apply(r.raw_value)),
+                )),
+                sensor_id: Set(sensor_id),
                 calibration_id: Set(r
                     .calibration_id
+                    .or_else(|| curve.map(|c| c.calibration_id))
                     .or_else(|| slot.and_then(|s| s.calibration_id))
                     .or_else(|| owner.and_then(|o| o.calibration_id))),
                 deployment_id: Set(r
@@ -253,9 +249,7 @@ pub async fn ingest_readings(
                     crate::routes::private::readings::measurement::resolve_measurement_type(
                         r.measurement_type.as_deref(),
                         stream.measurement_type.as_deref(),
-                        r.sensor_id
-                            .or(stream.sensor_id)
-                            .or_else(|| owner.and_then(|o| o.sensor_id)),
+                        sensor_id,
                         &sensor_types,
                     ),
                 )),
@@ -429,30 +423,7 @@ pub async fn ingest_status_events(
         .await?
         .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
 
-    let (site_id, parameter_id) = if let Some(sp_id) = stream.site_parameter_id {
-        let sp = db
-            .query_one(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"SELECT site_id, parameter_id FROM site_parameters WHERE id = $1",
-                [sp_id.into()],
-            ))
-            .await?;
-
-        if let Some(row) = sp {
-            let sid: Uuid = row.try_get("", "site_id").map_err(|e| {
-                AppError::Internal(format!("Failed to read site_id: {e}"))
-            })?;
-            let pid: Uuid = row.try_get("", "parameter_id").map_err(|e| {
-                AppError::Internal(format!("Failed to read parameter_id: {e}"))
-            })?;
-            (Some(sid), Some(pid))
-        } else {
-            (None, None)
-        }
-    } else {
-        (None, None)
-    };
-
+    let (site_id, parameter_id) = resolve_stream_slot(db, stream.site_parameter_id).await?;
     let paired = site_id.is_some();
 
     enforce_ingest_scope(&state.db, &scope, site_id).await?;
@@ -505,6 +476,34 @@ pub async fn ingest_status_events(
         stream_id: payload.stream_id,
         paired,
     }))
+}
+
+/// The (site_id, parameter_id) a stream's pairing resolves to. Both are `None` when the stream is
+/// unpaired, ie. its readings land unattributed and stay out of the rollups until it is paired.
+async fn resolve_stream_slot(
+    db: &sea_orm::DatabaseConnection,
+    site_parameter_id: Option<Uuid>,
+) -> AppResult<(Option<Uuid>, Option<Uuid>)> {
+    let Some(sp_id) = site_parameter_id else {
+        return Ok((None, None));
+    };
+    let Some(row) = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT site_id, parameter_id FROM site_parameters WHERE id = $1",
+            [sp_id.into()],
+        ))
+        .await?
+    else {
+        return Ok((None, None));
+    };
+    let site_id: Uuid = row
+        .try_get("", "site_id")
+        .map_err(|e| AppError::Internal(format!("Failed to read site_id: {e}")))?;
+    let parameter_id: Uuid = row
+        .try_get("", "parameter_id")
+        .map_err(|e| AppError::Internal(format!("Failed to read parameter_id: {e}")))?;
+    Ok((Some(site_id), Some(parameter_id)))
 }
 
 /// Project-scope check for stream-based ingest. A scoped token may only write to a stream paired

@@ -15,4 +15,6 @@ mod fanout_test;
 mod grab_test;
 mod link_flow_test;
 mod me_test;
+mod mute_gate;
+mod thresholds_command;
 mod triggers_test;

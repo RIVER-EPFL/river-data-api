@@ -182,8 +182,11 @@ pub async fn get_site_status_events(
         Some(total)
     };
 
+    // `time` is not unique here (the PK is (stream_id, time), so one timestamp carries one row per
+    // stream), and LIMIT/OFFSET over a partial order can repeat or skip a tied row between pages.
+    // Ordering by the full key makes the walk a total order.
     let sql = format!(
-        "SELECT parameter_id, time, value, sensor_id FROM status_events WHERE site_id = $1{time_conditions} ORDER BY time {dir}{pagination}"
+        "SELECT parameter_id, time, value, sensor_id FROM status_events WHERE site_id = $1{time_conditions} ORDER BY time {dir}, stream_id {dir}{pagination}"
     );
 
     let query_result = state

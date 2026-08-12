@@ -1,17 +1,19 @@
 use axum::{Json, extract::{Path, State}};
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, Statement,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    Set, Statement,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::bulk_write::{self, TouchedRange};
 use crate::common::middleware::ProjectScope;
 use crate::routes::private::{data_streams, sites::parameters as site_parameters};
 use crate::error::{AppError, AppResult};
+use crate::routes::private::sensors::calibrations;
 use crate::routes::private::sensors::operations::{close_sensor_deployment, create_sensor_for_stream};
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -290,17 +292,11 @@ pub async fn import_stream(
 
     // Stamp sensor/calibration on site-less readings only; do NOT touch
     // site_id/parameter_id/deployment_id (those are set at adopt). Idempotent.
-    let result = db
-        .execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings
-              SET sensor_id = $2, calibration_id = $3,
-                  calibrated_value = COALESCE(calibrated_value, raw_value)
-              WHERE stream_id = $1 AND sensor_id IS NULL",
-            [stream_id.into(), ctx.sensor_id.into(), ctx.calibration_id.into()],
-        ))
-        .await?;
-    let attributed = result.rows_affected();
+    //
+    // Each reading takes the curve whose window covers its OWN time, not the sensor's newest one,
+    // so an import of deep history does not stamp today's curve across all of it.
+    let attributed =
+        calibrations::resolver::attribute_stream_by_window(db, stream_id, ctx.sensor_id).await?;
 
     let updated = data_streams::Entity::find_by_id(stream_id)
         .one(db)
@@ -325,6 +321,18 @@ pub struct PairStreamResponse {
     pub backfilled: u64,
 }
 
+/// A claim that waited out `lock_timeout` is another request pairing the same stream, which is a
+/// conflict the caller can retry, not a server fault.
+fn claim_error(e: sea_orm::DbErr) -> AppError {
+    let message = e.to_string();
+    if message.contains("55P03") || message.contains("lock timeout") {
+        return AppError::Conflict(
+            "Stream is being paired by another request; retry".to_string(),
+        );
+    }
+    AppError::Database(e)
+}
+
 /// Pair a stream to a site_parameter. Sets `site_parameter_id`/`paired_at` on the stream,
 /// backfills existing unpaired readings with site_id/parameter_id, applies identity
 /// calibration, and triggers an aggregate refresh. Requires `write_metadata`.
@@ -335,8 +343,9 @@ pub struct PairStreamResponse {
     request_body = PairStreamRequest,
     responses(
         (status = 200, description = "Stream paired, backfill count returned", body = PairStreamResponse),
-        (status = 404, description = "Stream not found"),
-        (status = 409, description = "Stream already paired"),
+        (status = 400, description = "Stream already paired"),
+        (status = 404, description = "Stream or site parameter not found"),
+        (status = 409, description = "Another request is pairing the same stream"),
     ),
     tag = "streams"
 )]
@@ -346,129 +355,138 @@ pub async fn pair_stream(
     Json(payload): Json<PairStreamRequest>,
 ) -> AppResult<Json<PairStreamResponse>> {
     let db = &state.db;
-
-    // Validate stream exists and is unpaired
-    let stream = data_streams::Entity::find_by_id(stream_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
-
-    if stream.site_parameter_id.is_some() {
-        return Err(AppError::BadRequest(
-            "Stream is already paired. Unpair it first.".to_string(),
-        ));
-    }
-
-    // Validate site_parameter exists and get its site_id + parameter_id
-    let sp = site_parameters::Entity::find_by_id(payload.site_parameter_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Site parameter not found".to_string()))?;
-
     let now = Utc::now();
 
-    // Create/reuse sensor for this stream
-    let sensor_ctx =
-        create_sensor_for_stream(db, &stream, sp.parameter_id, sp.site_id).await?;
-
-    // Update stream: set pairing
-    // Re-fetch stream since create_sensor_for_stream may have updated sensor_id
-    let stream = data_streams::Entity::find_by_id(stream_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| AppError::Internal("Failed to re-fetch stream".to_string()))?;
-    let stream_measurement_type = stream.measurement_type.clone();
-    let mut active: data_streams::ActiveModel = stream.into();
-    active.site_parameter_id = Set(Some(payload.site_parameter_id));
-    active.paired_at = Set(Some(now.into()));
-    active.updated_at = Set(now.into());
-    active.update(db).await?;
-
-    // The backfill runs in one transaction with decompression unlimited, so a stream whose history
-    // reaches into compressed chunks can still be attributed.
-    let txn = db.begin().await?;
-    txn.execute(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
-    ))
-    .await?;
-
-    // Backfill: update readings with site_id + parameter_id + sensor context, apply identity
-    // calibration, and adopt the stream's declared classification for its history. A per-reading
-    // measurement_type set at ingest outranks the stream declaration and must survive pairing.
-    let result = txn
-        .execute(Statement::from_sql_and_values(
+    // Claim first, then work, all in one transaction with the decompression cap lifted: the claim
+    // is what stops two concurrent pairings of one stream both succeeding, and the transaction is
+    // what stops a failed backfill leaving the stream paired with unattributed readings.
+    let (sp_site_id, sp_parameter_id, backfilled) = bulk_write::guarded(db, async |txn| {
+        // A concurrent claim holds the row lock; wait a few seconds for it rather than either
+        // failing instantly or hanging, then re-evaluate the claim predicate against its outcome.
+        txn.execute(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings
-              SET site_id = $1, parameter_id = $2,
-                  sensor_id = $4, calibration_id = $5, deployment_id = $6,
-                  calibrated_value = COALESCE(calibrated_value, raw_value),
-                  measurement_type = COALESCE(measurement_type, $7)
+            "SET LOCAL lock_timeout = '5s'".to_owned(),
+        ))
+        .await?;
+
+        let sp = site_parameters::Entity::find_by_id(payload.site_parameter_id)
+            .one(txn)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Site parameter not found".to_string()))?;
+
+        let claimed = txn
+            .execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE data_streams \
+                 SET site_parameter_id = $1, paired_at = $2, updated_at = $2 \
+                 WHERE id = $3 AND site_parameter_id IS NULL",
+                [
+                    payload.site_parameter_id.into(),
+                    now.into(),
+                    stream_id.into(),
+                ],
+            ))
+            .await
+            .map_err(claim_error)?
+            .rows_affected();
+
+        let stream = data_streams::Entity::find_by_id(stream_id)
+            .one(txn)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
+        if claimed == 0 {
+            return Err(AppError::BadRequest(
+                "Stream is already paired. Unpair it first.".to_string(),
+            ));
+        }
+
+        // Create/reuse the sensor, then re-read the stream: it may have gained a sensor_id.
+        let sensor_ctx = create_sensor_for_stream(txn, &stream, sp.parameter_id, sp.site_id).await?;
+        let stream = data_streams::Entity::find_by_id(stream_id)
+            .one(txn)
+            .await?
+            .ok_or_else(|| AppError::Internal("Failed to re-fetch stream".to_string()))?;
+        let stream_measurement_type = stream.measurement_type.clone();
+
+        // Backfill: update readings with site_id + parameter_id + sensor context, apply identity
+        // calibration, and adopt the stream's declared classification for its history. A per-reading
+        // measurement_type set at ingest outranks the stream declaration and must survive pairing.
+        let backfilled = bulk_write::mutation(
+            txn,
+            Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r"UPDATE readings
+                  SET site_id = $1, parameter_id = $2,
+                      sensor_id = $4, calibration_id = $5, deployment_id = $6,
+                      calibrated_value = COALESCE(calibrated_value, raw_value),
+                      measurement_type = COALESCE(measurement_type, $7)
+                  WHERE stream_id = $3 AND site_id IS NULL",
+                [
+                    sp.site_id.into(),
+                    sp.parameter_id.into(),
+                    stream_id.into(),
+                    sensor_ctx.sensor_id.into(),
+                    sensor_ctx.calibration_id.into(),
+                    sensor_ctx.deployment_id.into(),
+                    stream_measurement_type.into(),
+                ],
+            ),
+        )
+        .await?
+        .rows;
+
+        crate::routes::private::readings::replicates::densify_stream_replicates(txn, &[stream_id])
+            .await?;
+
+        // Replicate groups (2+ readings sharing a timestamp, e.g. migrated NOMIS A/B/C rows) form
+        // samples at pairing time: find-or-create the samples row per group, then stamp sample_id on
+        // the group's readings. The row-level triggers populate the sample statistics.
+        txn.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"INSERT INTO samples (site_id, parameter_id, collected_at)
+              SELECT site_id, parameter_id, time FROM readings
+              WHERE stream_id = $1 AND sample_id IS NULL AND site_id IS NOT NULL
+              GROUP BY site_id, parameter_id, time
+              HAVING COUNT(*) >= 2
+              ON CONFLICT (site_id, parameter_id, collected_at) DO NOTHING",
+            [stream_id.into()],
+        ))
+        .await?;
+        txn.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE readings r
+              SET sample_id = s.id
+              FROM (
+                  SELECT stream_id, time FROM readings
+                  WHERE stream_id = $1 AND sample_id IS NULL AND site_id IS NOT NULL
+                  GROUP BY stream_id, time
+                  HAVING COUNT(*) >= 2
+              ) g, samples s
+              WHERE r.stream_id = g.stream_id AND r.time = g.time AND r.sample_id IS NULL
+                AND s.site_id = r.site_id AND s.parameter_id = r.parameter_id
+                AND s.collected_at = r.time",
+            [stream_id.into()],
+        ))
+        .await?;
+
+        // Also backfill status_events
+        txn.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE status_events
+              SET site_id = $1, parameter_id = $2, sensor_id = $4
               WHERE stream_id = $3 AND site_id IS NULL",
             [
                 sp.site_id.into(),
                 sp.parameter_id.into(),
                 stream_id.into(),
                 sensor_ctx.sensor_id.into(),
-                sensor_ctx.calibration_id.into(),
-                sensor_ctx.deployment_id.into(),
-                stream_measurement_type.into(),
             ],
         ))
         .await?;
 
-    let backfilled = result.rows_affected();
-
-    crate::routes::private::readings::replicates::densify_stream_replicates(&txn, &[stream_id])
-        .await?;
-
-    // Replicate groups (2+ readings sharing a timestamp, e.g. migrated NOMIS A/B/C rows) form
-    // samples at pairing time: find-or-create the samples row per group, then stamp sample_id on
-    // the group's readings. The row-level triggers populate the sample statistics.
-    txn.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"INSERT INTO samples (site_id, parameter_id, collected_at)
-          SELECT site_id, parameter_id, time FROM readings
-          WHERE stream_id = $1 AND sample_id IS NULL AND site_id IS NOT NULL
-          GROUP BY site_id, parameter_id, time
-          HAVING COUNT(*) >= 2
-          ON CONFLICT (site_id, parameter_id, collected_at) DO NOTHING",
-        [stream_id.into()],
-    ))
+        Ok((sp.site_id, sp.parameter_id, backfilled))
+    })
     .await?;
-    txn.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE readings r
-          SET sample_id = s.id
-          FROM (
-              SELECT stream_id, time FROM readings
-              WHERE stream_id = $1 AND sample_id IS NULL AND site_id IS NOT NULL
-              GROUP BY stream_id, time
-              HAVING COUNT(*) >= 2
-          ) g, samples s
-          WHERE r.stream_id = g.stream_id AND r.time = g.time AND r.sample_id IS NULL
-            AND s.site_id = r.site_id AND s.parameter_id = r.parameter_id
-            AND s.collected_at = r.time",
-        [stream_id.into()],
-    ))
-    .await?;
-
-    // Also backfill status_events
-    txn.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE status_events
-          SET site_id = $1, parameter_id = $2, sensor_id = $4
-          WHERE stream_id = $3 AND site_id IS NULL",
-        [
-            sp.site_id.into(),
-            sp.parameter_id.into(),
-            stream_id.into(),
-            sensor_ctx.sensor_id.into(),
-        ],
-    ))
-    .await?;
-
-    txn.commit().await?;
 
     // Window-reprocess the slot in the background (tracked): re-attributes the backfilled readings
     // to whichever sensor's deployment window covers each time, so pairing a stream into a slot with
@@ -476,8 +494,8 @@ pub async fn pair_stream(
     // and refreshes continuous aggregates + cascades derived params. (For a fresh pair whose
     // auto-deployment starts now, this is effectively the aggregate refresh.)
     if backfilled > 0 {
-        let slot_site = sp.site_id;
-        let slot_param = sp.parameter_id;
+        let slot_site = sp_site_id;
+        let slot_param = sp_parameter_id;
         crate::routes::private::reprocessing_jobs::worker::enqueue(
             db,
             "pairing_backfill",
@@ -532,25 +550,16 @@ pub async fn unpair_stream(
         .await?
         .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
 
-    if stream.site_parameter_id.is_none() {
+    let Some(sp_id) = stream.site_parameter_id else {
         return Err(AppError::BadRequest("Stream is not paired".to_string()));
-    }
+    };
 
-    // Close sensor deployment if stream has a sensor
+    // Ahead of the teardown, and fatal rather than warn-logged: closing is idempotent (it matches
+    // only an open deployment), so a retry after any later failure closes nothing twice.
     if let Some(sensor_id) = stream.sensor_id
-        && let Some(sp_id) = stream.site_parameter_id
-        && let Ok(Some(sp)) = site_parameters::Entity::find_by_id(sp_id).one(db).await
+        && let Some(sp) = site_parameters::Entity::find_by_id(sp_id).one(db).await?
     {
-        let site_id = sp.site_id;
-        match close_sensor_deployment(db, sensor_id, site_id).await {
-            Ok(_) => {}
-            Err(e) => tracing::warn!(
-                error = %e,
-                sensor_id = %sensor_id,
-                site_id = %site_id,
-                "Failed to close sensor deployment during unpair"
-            ),
-        }
+        close_sensor_deployment(db, sensor_id, sp.site_id).await?;
     }
 
     let now = Utc::now();
@@ -562,66 +571,9 @@ pub async fn unpair_stream(
     active.updated_at = Set(now.into());
     active.update(db).await?;
 
-    // Samples referenced by this stream's readings, so the ones left unreferenced after the
-    // clear below can be removed (the trigger also deletes zero-reference samples; this is the
-    // explicit backstop).
-    let sample_ids: Vec<Uuid> = db
-        .query_all(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT DISTINCT sample_id AS id FROM readings
-              WHERE stream_id = $1 AND sample_id IS NOT NULL",
-            [stream_id.into()],
-        ))
-        .await?
-        .iter()
-        .filter_map(|row| row.try_get::<Uuid>("", "id").ok())
-        .collect();
-
-    // Clear site_id/parameter_id/sample_id on readings (keep sensor_id/calibration_id/deployment_id)
-    let result = db
-        .execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings SET site_id = NULL, parameter_id = NULL, sample_id = NULL
-              WHERE stream_id = $1",
-            [stream_id.into()],
-        ))
-        .await?;
-
-    let cleared = result.rows_affected();
-
-    if !sample_ids.is_empty() {
-        db.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"DELETE FROM samples s
-              WHERE s.id = ANY($1)
-                AND NOT EXISTS (SELECT 1 FROM readings r WHERE r.sample_id = s.id)",
-            [sample_ids.into()],
-        ))
-        .await?;
-    }
-
-    // Clear on status_events too
-    db.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE status_events SET site_id = NULL, parameter_id = NULL
-          WHERE stream_id = $1",
-        [stream_id.into()],
-    ))
-    .await?;
-
-    // Refresh aggregates as a tracked job so a failure is visible and rerunnable
-    if cleared > 0 {
-        crate::routes::private::reprocessing_jobs::worker::enqueue(
-            db,
-            "refresh_aggregates_full",
-            None,
-            Some(stream_id),
-            &serde_json::json!({ "full": true }),
-            None,
-        )
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    }
+    // Release the stream's rows from the slot: one transaction, cap lifted, rollup rebuild queued
+    // as a tracked job. The slot itself survives; only this stream stops feeding it.
+    let cleared = retire_slot(db, SlotScope::Stream(stream_id)).await?.rows;
 
     let updated = data_streams::Entity::find_by_id(stream_id)
         .one(db)
@@ -732,4 +684,377 @@ pub async fn retag_streams(
         measurement_type: req.measurement_type,
         job_id,
     }))
+}
+
+// ============================================================================
+// The (site, parameter) slot: one declaration, two directions
+// ============================================================================
+
+/// What a dying slot does with one table's rows.
+#[derive(Debug, Clone, Copy)]
+pub enum Release {
+    /// The measurement outlives the slot: null these columns and keep the row.
+    Unattribute(&'static [&'static str]),
+    /// The row only describes a group of readings: delete it once none references it.
+    DeleteWhenOrphaned,
+    /// Describes the site and the parameter rather than the slot's data, so it outlives the slot.
+    Retain,
+}
+
+/// A table addressed by the (site, parameter) slot rather than by the stream that wrote its rows.
+#[derive(Debug, Clone, Copy)]
+pub struct SlotTable {
+    pub table: &'static str,
+    pub release: Release,
+    /// Rows carry a `time` column, so a mutation can report the span it touched.
+    pub timed: bool,
+    /// Rows feed the continuous aggregates, so a mutation here decides the refresh window.
+    pub feeds_rollups: bool,
+    /// Column completing a `(site_id, parameter_id, ...)` unique constraint, so moving these rows
+    /// onto a surviving slot can collide.
+    pub unique_with: Option<&'static str>,
+}
+
+/// Every table keyed by `(site_id, parameter_id)`.
+///
+/// A merge re-points all of them onto the survivor ([`move_slot_rows`]); a slot that dies releases
+/// each according to its `release` ([`retire_slot`]). Both directions read this one list, which is
+/// what stops a merge stranding rows on a deleted parameter and a slot delete abandoning them.
+pub const SLOT_TABLES: [SlotTable; 4] = [
+    SlotTable {
+        table: "readings",
+        release: Release::Unattribute(&["site_id", "parameter_id", "sample_id"]),
+        timed: true,
+        feeds_rollups: true,
+        unique_with: None,
+    },
+    SlotTable {
+        table: "status_events",
+        release: Release::Unattribute(&["site_id", "parameter_id"]),
+        timed: true,
+        feeds_rollups: false,
+        unique_with: None,
+    },
+    SlotTable {
+        table: "samples",
+        release: Release::DeleteWhenOrphaned,
+        timed: false,
+        feeds_rollups: false,
+        unique_with: Some("collected_at"),
+    },
+    SlotTable {
+        table: "annotations",
+        release: Release::Retain,
+        timed: false,
+        feeds_rollups: false,
+        unique_with: None,
+    },
+];
+
+/// Which rows a slot teardown covers.
+#[derive(Debug, Clone, Copy)]
+pub enum SlotScope {
+    /// One stream's rows. The slot itself survives; this stream stops feeding it (unpair).
+    Stream(Uuid),
+    /// Everything the slot owns, whatever wrote it, plus the streams pointing at it. The slot is
+    /// going away (site_parameter delete).
+    SiteParameter(Uuid),
+}
+
+/// Which sites a slot move covers.
+#[derive(Debug, Clone, Copy)]
+pub enum MoveScope {
+    /// One site's rows, for a site-level merge.
+    Site(Uuid),
+    /// Every site carrying the source parameter, for a catalog-level merge.
+    EverySite,
+}
+
+/// Rows a slot move carried, and the span the moved readings cover.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SlotMove {
+    pub readings: u64,
+    pub status_events: u64,
+    /// Feeds the caller's post-commit rollup refresh; the rollups group by `parameter_id`, so both
+    /// the source's and the survivor's buckets are recomputed by the same window.
+    pub touched: TouchedRange,
+}
+
+/// Timestamps at which moving the source's rows onto `target_param` would violate a slot table's
+/// unique constraint, at most `LIMIT` of them. Empty when the move is safe.
+///
+/// Resolving a collision by merging the two rows would rewrite a stored measurement statistic
+/// (`samples.mean`/`sd`/`n` are computed over one collection group), so callers refuse instead.
+pub async fn slot_move_collisions<C: ConnectionTrait>(
+    conn: &C,
+    scope: MoveScope,
+    source_param: Uuid,
+    target_param: Uuid,
+) -> AppResult<Vec<String>> {
+    let mut collisions = Vec::new();
+    for slot in SLOT_TABLES {
+        let Some(unique_with) = slot.unique_with else {
+            continue;
+        };
+        let table = slot.table;
+        let mut values: Vec<sea_orm::Value> = vec![source_param.into(), target_param.into()];
+        let site_filter = match scope {
+            MoveScope::EverySite => String::new(),
+            MoveScope::Site(site_id) => {
+                values.push(site_id.into());
+                " AND src.site_id = $3".to_string()
+            }
+        };
+        let sql = format!(
+            "SELECT DISTINCT src.{unique_with}::text AS value \
+             FROM {table} src JOIN {table} dst \
+               ON dst.site_id = src.site_id AND dst.{unique_with} = src.{unique_with} \
+              AND dst.parameter_id = $2 \
+             WHERE src.parameter_id = $1{site_filter} \
+             ORDER BY 1 LIMIT 20"
+        );
+        for row in conn
+            .query_all(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                &sql,
+                values,
+            ))
+            .await?
+        {
+            let value: String = row.try_get("", "value")?;
+            collisions.push(format!("{table} {value}"));
+        }
+    }
+    Ok(collisions)
+}
+
+/// Re-point every slot-keyed row from `source_param` onto `target_param`.
+///
+/// Runs inside the caller's guarded transaction. Call [`slot_move_collisions`] first: a table with
+/// a `unique_with` column can refuse the move mid-way otherwise.
+pub async fn move_slot_rows<C: ConnectionTrait>(
+    conn: &C,
+    scope: MoveScope,
+    source_param: Uuid,
+    target_param: Uuid,
+) -> AppResult<SlotMove> {
+    // $1 is the target parameter, $2 the source, $3 the site when the scope names one.
+    let (predicate, site) = match scope {
+        MoveScope::EverySite => ("parameter_id = $2", None),
+        MoveScope::Site(site_id) => ("parameter_id = $2 AND site_id = $3", Some(site_id)),
+    };
+    let mut moved = SlotMove::default();
+
+    for slot in SLOT_TABLES {
+        let mut values: Vec<sea_orm::Value> = vec![target_param.into(), source_param.into()];
+        if let Some(site_id) = site {
+            values.push(site_id.into());
+        }
+        let sql = format!(
+            "UPDATE {} SET parameter_id = $1 WHERE {predicate}",
+            slot.table
+        );
+        let statement = Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            values,
+        );
+
+        let rows = if slot.timed {
+            let touched = bulk_write::mutation(conn, statement).await?;
+            if slot.feeds_rollups {
+                moved.touched = moved.touched.merge(touched);
+            }
+            touched.rows
+        } else {
+            conn.execute(statement).await?.rows_affected()
+        };
+
+        match slot.table {
+            "readings" => moved.readings = rows,
+            "status_events" => moved.status_events = rows,
+            _ => {}
+        }
+    }
+
+    Ok(moved)
+}
+
+/// The rows one [`SlotScope`] addresses.
+struct RetireTarget {
+    /// `WHERE` fragment over the slot tables, binding `$1` (and `$2` for a slot).
+    predicate: &'static str,
+    values: Vec<sea_orm::Value>,
+    /// The slot itself is going away, so the streams pointing at it are unpaired too.
+    site_parameter_id: Option<Uuid>,
+}
+
+async fn resolve_retire_target<C: ConnectionTrait>(
+    conn: &C,
+    scope: SlotScope,
+) -> AppResult<Option<RetireTarget>> {
+    match scope {
+        SlotScope::Stream(stream_id) => Ok(Some(RetireTarget {
+            predicate: "stream_id = $1",
+            values: vec![stream_id.into()],
+            site_parameter_id: None,
+        })),
+        SlotScope::SiteParameter(sp_id) => {
+            let Some(row) = conn
+                .query_one(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT site_id, parameter_id FROM site_parameters WHERE id = $1",
+                    [sp_id.into()],
+                ))
+                .await?
+            else {
+                return Ok(None);
+            };
+            let site_id: Uuid = row.try_get("", "site_id")?;
+            let parameter_id: Uuid = row.try_get("", "parameter_id")?;
+            Ok(Some(RetireTarget {
+                predicate: "site_id = $1 AND parameter_id = $2",
+                values: vec![site_id.into(), parameter_id.into()],
+                site_parameter_id: Some(sp_id),
+            }))
+        }
+    }
+}
+
+/// Release everything a slot owns, in one transaction with the decompression cap lifted, and queue
+/// the rollup rebuild that has to follow it.
+///
+/// This is the whole teardown, in the order that keeps it recoverable: the samples a scope
+/// references are collected before the readings lose their `sample_id`, the readings and status
+/// events are unattributed rather than deleted (the measurement outlives the slot), the samples
+/// nothing references any more are deleted, and a slot that is going away releases the streams
+/// pointing at it last. Unpair, and a `site_parameters` delete, are the same operation over
+/// different scopes.
+///
+/// The rollups are rebuilt by a tracked `refresh_aggregates_full` job rather than inline: a
+/// teardown can span a stream's whole history, and a refresh that fails then belongs in `/jobs`,
+/// where it is visible and rerunnable, not as a 500 on an operation that already committed.
+///
+/// A slot the scope cannot resolve reports an empty range rather than an error, so retiring a row
+/// that is already gone is not a failure.
+pub async fn retire_slot(db: &DatabaseConnection, scope: SlotScope) -> AppResult<TouchedRange> {
+    let touched = bulk_write::guarded(db, async |txn| {
+        let Some(target) = resolve_retire_target(txn, scope).await? else {
+            return Ok(TouchedRange::default());
+        };
+        release_slot_rows(txn, &target).await
+    })
+    .await?;
+
+    if !touched.is_empty() {
+        let trigger_id = match scope {
+            SlotScope::Stream(id) | SlotScope::SiteParameter(id) => id,
+        };
+        crate::routes::private::reprocessing_jobs::worker::enqueue(
+            db,
+            "refresh_aggregates_full",
+            None,
+            Some(trigger_id),
+            &serde_json::json!({ "full": true }),
+            None,
+        )
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    }
+    Ok(touched)
+}
+
+async fn release_slot_rows<C: ConnectionTrait>(
+    conn: &C,
+    target: &RetireTarget,
+) -> AppResult<TouchedRange> {
+    let sample_ids = referenced_sample_ids(conn, target).await?;
+    let mut touched = TouchedRange::default();
+
+    for slot in SLOT_TABLES {
+        match slot.release {
+            Release::Retain => {}
+            Release::Unattribute(columns) => {
+                let assignments = columns
+                    .iter()
+                    .map(|c| format!("{c} = NULL"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                // Narrow to rows that still carry something to release: an UPDATE that rewrites
+                // already-null rows maximises what it has to decompress and changes nothing.
+                let already = columns
+                    .iter()
+                    .map(|c| format!("{c} IS NOT NULL"))
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                let sql = format!(
+                    "UPDATE {} SET {assignments} WHERE {} AND ({already})",
+                    slot.table, target.predicate
+                );
+                let statement = Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    &sql,
+                    target.values.clone(),
+                );
+                if slot.timed {
+                    let range = bulk_write::mutation(conn, statement).await?;
+                    if slot.feeds_rollups {
+                        touched = touched.merge(range);
+                    }
+                } else {
+                    conn.execute(statement).await?;
+                }
+            }
+            Release::DeleteWhenOrphaned => {
+                if sample_ids.is_empty() {
+                    continue;
+                }
+                conn.execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    format!(
+                        "DELETE FROM {} s WHERE s.id = ANY($1) \
+                         AND NOT EXISTS (SELECT 1 FROM readings r WHERE r.sample_id = s.id)",
+                        slot.table
+                    ),
+                    [sample_ids.clone().into()],
+                ))
+                .await?;
+            }
+        }
+    }
+
+    if let Some(sp_id) = target.site_parameter_id {
+        // Load-bearing rather than tidy-up: `data_streams.site_parameter_id` has no ON DELETE
+        // clause, so the row cannot be deleted while a stream points at it.
+        conn.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE data_streams SET site_parameter_id = NULL, paired_at = NULL, updated_at = now() \
+             WHERE site_parameter_id = $1",
+            [sp_id.into()],
+        ))
+        .await?;
+    }
+
+    Ok(touched)
+}
+
+/// Samples the scope's readings point at, read before the readings lose their `sample_id`.
+async fn referenced_sample_ids<C: ConnectionTrait>(
+    conn: &C,
+    target: &RetireTarget,
+) -> AppResult<Vec<Uuid>> {
+    let sql = format!(
+        "SELECT DISTINCT sample_id AS id FROM readings WHERE {} AND sample_id IS NOT NULL",
+        target.predicate
+    );
+    Ok(conn
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            target.values.clone(),
+        ))
+        .await?
+        .iter()
+        .filter_map(|row| row.try_get::<Uuid>("", "id").ok())
+        .collect())
 }

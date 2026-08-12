@@ -22,15 +22,16 @@ use super::operator;
 /// - `read_routes`: list/get operations, fine for any read_metadata caller.
 /// - `write_routes`: operator actions such as issuing sync commands and pairing workflows.
 ///   Same gate as other entity mutations (Keycloak admin or write_metadata token).
-/// - `admin_routes`: credential creation and revoke, these mint full-permission
-///   sync session tokens, so they're Keycloak-admin only (no API token can pass).
+/// - `admin_routes`: credential listing, creation and revoke, these mint full-permission
+///   sync session tokens, so they're Keycloak-admin only (no API token can pass). The listing
+///   is admin-gated alongside them, matching `sync_service_credentials` CRUD, so a leaked token
+///   cannot enumerate which credentials exist.
 pub fn read_routes() -> Router<AppState> {
     Router::new()
         .route("/services", get(operator::list_services))
         .route("/services/{id}", get(operator::get_service))
         .route("/commands", get(operator::list_commands))
         .route("/events", get(operator::list_sync_events))
-        .route("/credentials", get(operator::list_credentials))
         .route("/discovery", get(get_discovery))
         .route("/pairing-plans", get(list_pairing_plans))
         .route("/pairing-plans/{id}", get(get_pairing_plan))
@@ -53,7 +54,10 @@ pub fn write_routes() -> Router<AppState> {
 
 pub fn admin_routes() -> Router<AppState> {
     Router::new()
-        .route("/credentials", post(operator::create_credential))
+        .route(
+            "/credentials",
+            get(operator::list_credentials).post(operator::create_credential),
+        )
         .route("/credentials/{id}/revoke", post(operator::revoke_credential))
 }
 

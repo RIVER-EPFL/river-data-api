@@ -13,3 +13,4 @@ mod historical_edit;
 mod instant_curve;
 mod reprocessing;
 mod window_boundaries;
+mod window_invariants;

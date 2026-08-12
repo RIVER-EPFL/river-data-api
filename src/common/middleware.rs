@@ -334,21 +334,29 @@ impl<S: Send + Sync> FromRequestParts<S> for IsSyncService {
     }
 }
 
-/// Extractor that yields the project scope from `AuthContext::ApiToken`, if any.
+/// Extractor yielding the caller's [`AccessScope`]: `Unrestricted` for an administrator, an
+/// unscoped token and a sync token; the granted project set for a member; the single project of a
+/// scoped token.
 ///
-/// Returns `None` for Keycloak users or unscoped API tokens.
-/// Handlers use this to filter queries by project when a token is scoped.
+/// Fails closed. Every route carrying this extractor sits behind [`service_auth_middleware`], which
+/// inserts an [`AuthContext`] or rejects, so a missing context means the route was wired outside the
+/// authenticated surface. Defaulting that to `Unrestricted` (the previous behavior) turned a wiring
+/// mistake into a silent cross-project read.
 #[derive(Debug, Clone)]
 pub struct ProjectScope(pub AccessScope);
 
 impl<S: Send + Sync> FromRequestParts<S> for ProjectScope {
-    type Rejection = std::convert::Infallible;
+    type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let scope = parts
             .extensions
             .get::<AuthContext>()
-            .map_or(AccessScope::Unrestricted, AuthContext::access_scope);
+            .map(AuthContext::access_scope)
+            .ok_or_else(|| {
+                AppError::Unauthorized("Valid Keycloak JWT or API token required".to_string())
+                    .into_response()
+            })?;
         Ok(ProjectScope(scope))
     }
 }
@@ -809,23 +817,19 @@ pub async fn scope_site_ids(
 /// Whether a sensor is visible to a restricted principal: `true` if unrestricted, otherwise `true`
 /// only when the sensor has at least one deployment to a site within the scoped project set.
 /// Single-resource sensor read endpoints use this to 404 a cross-scope sensor.
+///
+/// One resolver: the projects come from [`crate::common::scope::project_of_sensor`], the same one
+/// the id-addressed action guards use, so a sensor cannot be visible on one surface and invisible on
+/// another. A sensor with no deployment resolves to no project and is denied here; an action that
+/// deliberately admits uncommitted inventory passes [`crate::common::scope::Unowned::Allow`] instead.
 pub async fn sensor_in_scope(
     db: &sea_orm::DatabaseConnection,
     scope: &AccessScope,
     sensor_id: Uuid,
 ) -> Result<bool, AppError> {
-    use crate::routes::private::sensors::deployments;
-    use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
-    let Some(project_ids) = scope.project_ids() else {
-        return Ok(true);
-    };
-    let count = deployments::Entity::find()
-        .filter(deployments::Column::SensorId.eq(sensor_id))
-        .filter(deployments::Column::SiteId.in_subquery(scoped_site_ids_query(&project_ids)))
-        .count(db)
-        .await
-        .map_err(AppError::Database)?;
-    Ok(count > 0)
+    use crate::common::scope::{Unowned, project_of_sensor, require_row_in_scope};
+    let row = project_of_sensor(db, sensor_id).await?;
+    Ok(require_row_in_scope(scope, &row, Unowned::Deny, "sensor").is_ok())
 }
 
 /// Subquery selecting the ids of the sites in a restricted principal's project set. Used to confine

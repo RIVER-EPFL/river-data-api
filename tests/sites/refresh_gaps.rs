@@ -9,14 +9,14 @@
 //!
 //! Each test asserts bucket VALUES rather than a job status: `common/sync_state.rs` warn-logs and
 //! drops every `refresh_continuous_aggregate` error, so "completed" is not evidence that anything
-//! was materialised (that swallow is itself RD-041 below).
+//! was materialised (that swallow is itself one of the defects below).
 //!
 //! Every fixture timestamp is in the past, since the refresh window is `[since, NOW()]`. Suites own
 //! distinct months (2026-01 to 2026-05) so no two materialise the same bucket.
 //!
-//! These run as real Keycloak users and self-skip when Keycloak is unreachable, except RD-039,
-//! which needs a worker whose registry carries the recurring Services (the shared builders register
-//! only the on-demand jobs) and so builds its own app with an API token.
+//! These run as real Keycloak users and self-skip when Keycloak is unreachable. The janitor cadence
+//! suite is the exception: it needs a worker whose registry carries the recurring Services (the
+//! shared builders register only the on-demand jobs) and so builds its own app with an API token.
 //!
 //! Run: cargo test --test sites refresh_gaps -- --test-threads=1
 
@@ -236,11 +236,7 @@ async fn list_len(app: &Router, jwt: &str, path: &str, field: &str, value: &str)
         .len()
 }
 
-// ============================================================================
-// RD-039
-// ============================================================================
-
-/// RD-039: with the janitor on a 6-hourly operator cadence, the full aggregate refresh must fire on
+/// with the janitor on a 6-hourly operator cadence, the full aggregate refresh must fire on
 /// exactly one of the day's four slots, not on none of them (or all four).
 #[tokio::test]
 #[serial]
@@ -380,11 +376,7 @@ async fn janitor_full_refresh_follows_the_operator_cadence() {
     crate::common::cleanup_test_db(&db).await;
 }
 
-// ============================================================================
-// RD-040
-// ============================================================================
-
-/// RD-040: merging two site parameters moves the readings, so the survivor's rollups must move with
+/// merging two site parameters moves the readings, so the survivor's rollups must move with
 /// them and the absorbed parameter's must go.
 #[tokio::test]
 #[serial]
@@ -412,7 +404,7 @@ async fn merging_site_parameters_moves_the_rollups_with_the_readings() {
     assert!(jobs_settled(&db, 60).await, "ingestion settles before the rollup is built");
 
     // Bucket-aligned start, so the fixture is materialised whatever TimescaleDB does with a partial
-    // leading bucket (that alignment question is RD-044's, not this test's).
+    // leading bucket, which is a separate suite's subject.
     e2e::refresh_hourly(&db, instant(&format!("{day}T00:00:00Z"))).await;
     let at = instant(&format!("{day}T10:00:00Z"));
     assert_eq!(
@@ -471,11 +463,7 @@ async fn merging_site_parameters_moves_the_rollups_with_the_readings() {
     crate::common::cleanup_test_db(&db).await;
 }
 
-// ============================================================================
-// RD-041
-// ============================================================================
-
-/// RD-041: a refresh whose `refresh_continuous_aggregate` call errors must fail its job, not report
+/// a refresh whose `refresh_continuous_aggregate` call errors must fail its job, not report
 /// completed with no error.
 #[tokio::test]
 #[serial]
@@ -535,11 +523,7 @@ async fn a_refresh_that_cannot_run_fails_its_job() {
     crate::common::cleanup_test_db(&db).await;
 }
 
-// ============================================================================
-// RD-042
-// ============================================================================
-
-/// RD-042: a site-parameter merge must carry the source's grab samples and annotations to the
+/// a site-parameter merge must carry the source's grab samples and annotations to the
 /// survivor, not strand them on the deleted slot.
 #[tokio::test]
 #[serial]
@@ -680,11 +664,7 @@ async fn merging_site_parameters_carries_samples_and_annotations() {
     crate::common::cleanup_test_db(&db).await;
 }
 
-// ============================================================================
-// RD-043
-// ============================================================================
-
-/// RD-043: deleting a site parameter must either be refused while a stream is paired to it or tear
+/// deleting a site parameter must either be refused while a stream is paired to it or tear
 /// the slot's readings down, never leave half of the stream's data attributed and half not.
 #[tokio::test]
 #[serial]
@@ -792,11 +772,7 @@ async fn deleting_a_slot_does_not_split_its_streams_attribution() {
     crate::common::cleanup_test_db(&db).await;
 }
 
-// ============================================================================
-// RD-044
-// ============================================================================
-
-/// RD-044: an incremental refresh started at a reading's timestamp must materialise the hourly and
+/// an incremental refresh started at a reading's timestamp must materialise the hourly and
 /// daily buckets containing it, not only the ones starting after it.
 #[tokio::test]
 #[serial]

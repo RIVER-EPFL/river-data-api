@@ -196,7 +196,7 @@ fn ndjson_objects(body: &str) -> Vec<Value> {
         .collect()
 }
 
-/// RD-045: a flagged reading must be excluded from every surface that claims to serve the site's
+/// a flagged reading must be excluded from every surface that claims to serve the site's
 /// data, so the public count, the public series and the aggregate agree on one definition.
 #[tokio::test]
 #[serial]
@@ -330,7 +330,7 @@ async fn flagged_readings_are_served_consistently_by_count_series_and_aggregate(
     );
 }
 
-/// RD-046: `alarms` and `include_sample_stats` are accepted on CSV and NDJSON exports, so the data
+/// `alarms` and `include_sample_stats` are accepted on CSV and NDJSON exports, so the data
 /// they ask for must appear there, not only in JSON.
 #[tokio::test]
 #[serial]
@@ -470,7 +470,7 @@ async fn csv_and_ndjson_exports_honour_the_readings_opt_ins() {
     );
 }
 
-/// RD-047: a sensor bound to two parameters must serve one parameter's series, not both merged
+/// a sensor bound to two parameters must serve one parameter's series, not both merged
 /// into the single array the response labels with one parameter id.
 #[tokio::test]
 #[serial]
@@ -577,7 +577,7 @@ async fn sensor_readings_serve_one_parameter_not_every_channel() {
     );
 }
 
-/// RD-053: public aggregates must list the requested site's exposed parameters, not the whole
+/// public aggregates must list the requested site's exposed parameters, not the whole
 /// project's, so no phantom all-null series appears.
 #[tokio::test]
 #[serial]
@@ -721,7 +721,7 @@ async fn public_aggregates_list_only_the_requested_sites_parameters() {
     );
 }
 
-/// RD-054: `/sites/{id}/alarms` must report null where a parameter did not violate, matching every
+/// `/sites/{id}/alarms` must report null where a parameter did not violate, matching every
 /// other series endpoint, rather than a literal 0.0 on the shared time axis.
 #[tokio::test]
 #[serial]
@@ -825,7 +825,7 @@ async fn site_alarms_leave_non_violating_timestamps_null_in_every_format() {
     );
 }
 
-/// RD-056: an empty result must still be delivered in the format the caller asked for, on the
+/// an empty result must still be delivered in the format the caller asked for, on the
 /// private readings, aggregates and alarms handlers and on the public aggregates handler.
 #[tokio::test]
 #[serial]

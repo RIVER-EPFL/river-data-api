@@ -8,8 +8,11 @@ mod common;
 
 mod aggregate_and_readings_query_correctness;
 mod aggregate_propagation;
+mod aggregate_refresh_windows;
 mod aggregate_sensor_split;
 mod data_endpoints;
 mod parameter_frequency;
 mod refresh_gaps;
+mod series_export_edges;
+mod status_event_page_order;
 mod subprojects;

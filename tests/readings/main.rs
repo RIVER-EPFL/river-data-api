@@ -11,6 +11,8 @@ mod csv_import_column_resolution;
 mod csv_import_sessions;
 mod csv_import_worker;
 mod grab_samples_insertion;
+mod guarded_bulk_write;
 mod ingest_dedup_and_visibility;
 mod ingest_validation;
 mod measurement_type_resolution;
+mod write_path_admission;

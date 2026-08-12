@@ -1,3 +1,9 @@
+//! Batch reading insert, and the write rules the other reading paths share.
+//!
+//! `admission` holds what every stored reading must satisfy and `readings_upsert` holds what an
+//! upsert may replace on the row it collides with. `/ingest`, `/grab_samples` and the CSV importer
+//! call into both, so the five write paths cannot drift apart on what they accept or overwrite.
+
 use axum::{Json, extract::State};
 use sea_orm::{ConnectionTrait, EntityTrait, Set};
 use serde::{Deserialize, Serialize};
@@ -11,6 +17,197 @@ use crate::routes::private::readings;
 use crate::error::AppResult;
 use crate::routes::private::data_streams::service::get_or_create_api_stream;
 use crate::routes::private::sensors::operations::{ResolvedOwner, resolve_slot_owner_for_times};
+
+/// What a reading must satisfy to be stored, whichever path it arrived on.
+///
+/// The rules are here rather than in each handler because they were in each handler: the timestamp
+/// bound existed on `/readings/batch` alone, no path rejected a non-finite value, and the
+/// missing-value sentinel was recognised by its spelling in one branch of one importer.
+pub mod admission {
+    use chrono::{DateTime, Duration, Utc};
+
+    use crate::error::{AppError, AppResult};
+    use crate::routes::private::readings::measurement::validate_measurement_type;
+
+    /// How far back a stored timestamp may reach (archive imports) and how far forward (logger
+    /// clock skew). Outside this window the timestamp is a source-side error, and on `/ingest` it
+    /// would also latch the stream's forward-only `last_data_time` cursor.
+    const MAX_AGE_DAYS: i64 = 365 * 10;
+    const MAX_LEAD_DAYS: i64 = 1;
+
+    /// Missing-value marker the loggers and the portal exports write in place of a measurement.
+    /// Compared numerically, so `-9999`, `-9999.0` and `-9999.00` are one marker.
+    pub const MISSING_SENTINEL: f64 = -9999.0;
+    const SENTINEL_TOLERANCE: f64 = 1e-9;
+
+    /// The window a reading's timestamp must fall in, evaluated against `now`.
+    pub fn window(now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
+        (
+            now - Duration::days(MAX_AGE_DAYS),
+            now + Duration::days(MAX_LEAD_DAYS),
+        )
+    }
+
+    /// Why this timestamp is not admissible, or `None` when it is. Callers that reject a whole
+    /// request raise it as a 400; the CSV importer reports it against the offending row.
+    pub fn time_rejection(time: DateTime<Utc>) -> Option<String> {
+        let (min_time, max_time) = window(Utc::now());
+        if time >= min_time && time <= max_time {
+            return None;
+        }
+        Some(format!(
+            "Reading timestamp {} is outside valid range ({} to {})",
+            time.to_rfc3339(),
+            min_time.to_rfc3339(),
+            max_time.to_rfc3339(),
+        ))
+    }
+
+    /// Why this value is not admissible, or `None` when it is. `NaN` and the infinities have no
+    /// meaning as a measurement and blank every aggregate bucket they reach.
+    pub fn value_rejection(raw_value: f64) -> Option<String> {
+        if raw_value.is_finite() {
+            return None;
+        }
+        Some(format!("{raw_value} is not a finite number"))
+    }
+
+    pub fn admit_time(time: DateTime<Utc>) -> AppResult<()> {
+        time_rejection(time).map_or(Ok(()), |reason| Err(AppError::BadRequest(reason)))
+    }
+
+    pub fn admit_value(raw_value: f64) -> AppResult<()> {
+        value_rejection(raw_value)
+            .map_or(Ok(()), |reason| Err(AppError::BadRequest(format!("Reading value {reason}"))))
+    }
+
+    /// The full admission check for one reading: classification vocabulary, timestamp bound,
+    /// finite value.
+    pub fn admit(
+        time: DateTime<Utc>,
+        raw_value: f64,
+        measurement_type: Option<&str>,
+    ) -> AppResult<()> {
+        validate_measurement_type(measurement_type)?;
+        admit_time(time)?;
+        admit_value(raw_value)
+    }
+
+    pub fn is_missing_sentinel(value: f64) -> bool {
+        (value - MISSING_SENTINEL).abs() <= SENTINEL_TOLERANCE
+    }
+
+    /// What one delimited cell resolves to.
+    #[derive(Debug, PartialEq)]
+    pub enum Cell {
+        Value(f64),
+        /// Declared missing: empty, `NaN`/`NA`, or the sentinel. Contributes no reading and is not
+        /// a row error.
+        Missing,
+        /// Unusable: unparseable, or parseable but not finite.
+        Invalid(String),
+    }
+
+    /// Classify a cell by value, not by spelling. Declared missing markers are recognised before
+    /// parsing (`NaN` is a marker, not a number), and the sentinel after it, so every spelling of
+    /// `-9999` lands in the same branch.
+    pub fn classify_cell(cell: &str) -> Cell {
+        let cell = cell.trim();
+        if cell.is_empty() || cell.eq_ignore_ascii_case("nan") || cell.eq_ignore_ascii_case("na") {
+            return Cell::Missing;
+        }
+        let Ok(value) = cell.parse::<f64>() else {
+            return Cell::Invalid(format!("'{cell}' is not a number"));
+        };
+        if value_rejection(value).is_some() {
+            return Cell::Invalid(format!("'{cell}' is not a finite number"));
+        }
+        if is_missing_sentinel(value) {
+            return Cell::Missing;
+        }
+        Cell::Value(value)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn declared_missing_markers_carry_no_value_and_no_error() {
+            for cell in ["", "   ", "NaN", "nan", "NA", "na"] {
+                assert_eq!(classify_cell(cell), Cell::Missing, "cell {cell:?}");
+            }
+        }
+
+        #[test]
+        fn every_spelling_of_the_sentinel_is_the_same_marker() {
+            for cell in ["-9999", "-9999.0", "-9999.00", " -9999.000 ", "-9.999e3"] {
+                assert_eq!(classify_cell(cell), Cell::Missing, "cell {cell:?}");
+            }
+            assert!(is_missing_sentinel(-9999.0));
+            assert!(!is_missing_sentinel(-9998.9));
+            assert!(!is_missing_sentinel(9999.0));
+        }
+
+        #[test]
+        fn a_value_next_to_the_sentinel_is_a_measurement() {
+            assert_eq!(classify_cell("-9999.5"), Cell::Value(-9999.5));
+            assert_eq!(classify_cell("-999.9"), Cell::Value(-999.9));
+        }
+
+        #[test]
+        fn non_finite_cells_are_errors_rather_than_missing_values() {
+            for cell in ["Inf", "inf", "-inf", "Infinity", "-Infinity"] {
+                assert!(
+                    matches!(classify_cell(cell), Cell::Invalid(_)),
+                    "cell {cell:?} must be a row error"
+                );
+            }
+        }
+
+        #[test]
+        fn unparseable_cells_are_errors() {
+            assert!(matches!(classify_cell("n/a"), Cell::Invalid(_)));
+            assert!(matches!(classify_cell("12,5"), Cell::Invalid(_)));
+        }
+
+        #[test]
+        fn ordinary_cells_parse() {
+            assert_eq!(classify_cell(" 12.5 "), Cell::Value(12.5));
+            assert_eq!(classify_cell("0"), Cell::Value(0.0));
+            assert_eq!(classify_cell("1e3"), Cell::Value(1000.0));
+        }
+
+        #[test]
+        fn non_finite_values_are_refused_on_every_path() {
+            assert!(admit_value(f64::NAN).is_err());
+            assert!(admit_value(f64::INFINITY).is_err());
+            assert!(admit_value(f64::NEG_INFINITY).is_err());
+            assert!(admit_value(0.0).is_ok());
+            assert!(admit_value(MISSING_SENTINEL).is_ok());
+        }
+
+        #[test]
+        fn the_timestamp_window_holds_at_its_edges_and_refuses_beyond_them() {
+            let now = Utc::now();
+            let (min_time, max_time) = window(now);
+            assert!(admit_time(now).is_ok());
+            assert!(admit_time(min_time + Duration::minutes(1)).is_ok());
+            assert!(admit_time(max_time - Duration::minutes(1)).is_ok());
+            assert!(admit_time(min_time - Duration::days(1)).is_err());
+            assert!(admit_time(max_time + Duration::days(1)).is_err());
+        }
+
+        #[test]
+        fn the_classification_vocabulary_is_closed() {
+            let now = Utc::now();
+            for declared in [None, Some("continuous"), Some("spot"), Some("derived")] {
+                assert!(admit(now, 1.0, declared).is_ok(), "declared {declared:?}");
+            }
+            assert!(admit(now, 1.0, Some("grab")).is_err());
+        }
+    }
+}
 
 /// How to handle readings that collide with an existing (stream_id, time, replicate_index).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, ToSchema)]
@@ -60,28 +257,74 @@ pub struct BatchReadingsResponse {
 
 const BATCH_SIZE: usize = 1000;
 
-/// Build the `ON CONFLICT` clause for the readings PK. In `skip` mode collisions are dropped;
-/// in `overwrite` mode the value columns are replaced from the incoming row.
-pub(crate) fn readings_on_conflict(mode: ConflictMode) -> sea_orm::sea_query::OnConflict {
+/// What an upsert may replace on the row it collides with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replace {
+    /// Keep the stored row, drop the incoming one.
+    Nothing,
+    /// The measurement and its classification, ie. an operator or source correction.
+    Values,
+    /// The measurement plus the row's attribution, ie. a sync re-send that also re-resolves which
+    /// site, parameter, sensor, calibration and deployment the row belongs to.
+    ValuesAndAttribution,
+}
+
+impl From<ConflictMode> for Replace {
+    fn from(mode: ConflictMode) -> Self {
+        match mode {
+            ConflictMode::Skip => Replace::Nothing,
+            ConflictMode::Overwrite => Replace::Values,
+        }
+    }
+}
+
+/// Build the `ON CONFLICT` clause for the readings PK, shared by every path that upserts a
+/// reading.
+///
+/// Operator state is never replaced: `is_flagged` and `flag_reason` are left out entirely, and the
+/// sample link is written as `COALESCE(EXCLUDED.sample_id, readings.sample_id)` so a correction
+/// that carries only a value keeps the reading inside its sample. Writing the incoming NULL there
+/// would fire the samples refresh trigger with the replicate removed, and the refresh deletes a
+/// `samples` row nothing references any more, taking its label, notes and created_by with it.
+pub(crate) fn readings_upsert(replace: Replace) -> sea_orm::sea_query::OnConflict {
     let mut clause = sea_orm::sea_query::OnConflict::columns([
         readings::Column::StreamId,
         readings::Column::Time,
         readings::Column::ReplicateIndex,
     ]);
-    match mode {
-        ConflictMode::Skip => {
+    match replace {
+        Replace::Nothing => {
             clause.do_nothing();
         }
-        ConflictMode::Overwrite => {
+        Replace::Values | Replace::ValuesAndAttribution => {
             clause.update_columns([
                 readings::Column::RawValue,
                 readings::Column::CalibratedValue,
-                readings::Column::SampleId,
                 readings::Column::MeasurementType,
             ]);
+            if replace == Replace::ValuesAndAttribution {
+                clause.update_columns([
+                    readings::Column::SiteId,
+                    readings::Column::ParameterId,
+                    readings::Column::SensorId,
+                    readings::Column::CalibrationId,
+                    readings::Column::DeploymentId,
+                ]);
+            }
+            clause.value(
+                readings::Column::SampleId,
+                sea_orm::sea_query::Expr::cust(
+                    r#"COALESCE(EXCLUDED.sample_id, "readings"."sample_id")"#,
+                ),
+            );
         }
     }
     clause.to_owned()
+}
+
+/// The upsert clause for a request-level `conflict` mode.
+pub(crate) fn readings_on_conflict(mode: ConflictMode) -> sea_orm::sea_query::OnConflict {
+    readings_upsert(mode.into())
 }
 
 /// Batch insert readings keyed by (site_id, parameter_id). Auto-creates "api" streams when
@@ -92,7 +335,7 @@ pub(crate) fn readings_on_conflict(mode: ConflictMode) -> sea_orm::sea_query::On
     request_body = BatchReadingsRequest,
     responses(
         (status = 200, description = "Inserted count", body = BatchReadingsResponse),
-        (status = 400, description = "Timestamp outside [-10 years, +1 day] window"),
+        (status = 400, description = "Timestamp outside [-10 years, +1 day] window, or non-finite value"),
         (status = 413, description = "Body exceeds 10MB limit"),
     ),
     tag = "ingestion"
@@ -107,23 +350,9 @@ pub async fn insert_batch_readings(
     enforce_project_scope_for_sites(&state.db, &scope, &target_sites).await?;
 
     for r in &payload.readings {
-        crate::routes::private::readings::measurement::validate_measurement_type(
-            r.measurement_type.as_deref(),
-        )?;
-    }
-
-    // Validate timestamps are within reasonable bounds
-    let now = chrono::Utc::now();
-    let min_time = now - chrono::Duration::days(365 * 10); // 10 years ago
-    let max_time = now + chrono::Duration::days(1); // 1 day in the future
-    for r in &payload.readings {
-        if r.time < min_time || r.time > max_time {
-            return Err(crate::error::AppError::BadRequest(format!(
-                "Reading timestamp {} is outside valid range ({} to {})",
-                r.time.to_rfc3339(),
-                min_time.to_rfc3339(),
-                max_time.to_rfc3339(),
-            )));
+        admission::admit(r.time, r.raw_value, r.measurement_type.as_deref())?;
+        if let Some(calibrated) = r.calibrated_value {
+            admission::admit_value(calibrated)?;
         }
     }
 
@@ -247,40 +476,50 @@ pub async fn insert_batch_readings(
         .collect();
 
     let total = models.len();
-    let mut inserted = 0usize;
-    let mut overwritten = 0usize;
+    let inserted: usize;
+    let overwritten: usize;
     let conflict = payload.conflict;
 
-    for chunk in models.chunks(BATCH_SIZE) {
-        // In overwrite mode `rows_affected` counts both inserts and updates, so the count of
-        // keys already present (looked up before the write) tells us how many were replaced.
-        let pre_existing = if conflict == ConflictMode::Overwrite {
-            count_existing(&state.db, chunk).await?
-        } else {
-            0
-        };
+    // One guarded transaction for every chunk: an overwrite rewrites stored rows, which on a
+    // hypertable older than the compression policy means decompressing them, and the per-statement
+    // cap refuses that outside a transaction that lifts it. Chunking stays, so the statement size
+    // is bounded; the transaction is what makes a part-written correction impossible.
+    (inserted, overwritten) = crate::common::bulk_write::guarded(&state.db, async |txn| {
+        let mut inserted = 0usize;
+        let mut overwritten = 0usize;
+        for chunk in models.chunks(BATCH_SIZE) {
+            // In overwrite mode `rows_affected` counts both inserts and updates, so the count of
+            // keys already present (looked up before the write) tells us how many were replaced.
+            let pre_existing = if conflict == ConflictMode::Overwrite {
+                count_existing(txn, chunk).await?
+            } else {
+                0
+            };
 
-        match readings::Entity::insert_many(chunk.to_vec())
-            .on_conflict(readings_on_conflict(conflict))
-            .exec_without_returning(&state.db)
-            .await
-        {
-            Ok(rows) => {
-                let affected = rows as usize;
-                inserted += affected.saturating_sub(pre_existing);
-                overwritten += pre_existing;
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("None of the records") {
-                    // All duplicates in this chunk
-                } else {
-                    tracing::warn!(error = %e, batch_size = chunk.len(), "Failed to insert reading batch");
-                    return Err(crate::error::AppError::Database(e));
+            match readings::Entity::insert_many(chunk.to_vec())
+                .on_conflict(readings_on_conflict(conflict))
+                .exec_without_returning(txn)
+                .await
+            {
+                Ok(rows) => {
+                    let affected = rows as usize;
+                    inserted += affected.saturating_sub(pre_existing);
+                    overwritten += pre_existing;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("None of the records") {
+                        // All duplicates in this chunk
+                    } else {
+                        tracing::warn!(error = %e, batch_size = chunk.len(), "Failed to insert reading batch");
+                        return Err(crate::error::AppError::Database(e));
+                    }
                 }
             }
         }
-    }
+        Ok((inserted, overwritten))
+    })
+    .await?;
 
     tracing::info!(total, inserted, overwritten, "Batch readings insert complete");
 
@@ -392,8 +631,8 @@ pub async fn insert_batch_readings(
 
 /// Count how many of the chunk's (stream_id, time, replicate_index) keys already exist, so the
 /// caller can split `rows_affected` into inserts vs overwrites in `overwrite` mode.
-async fn count_existing(
-    db: &sea_orm::DatabaseConnection,
+async fn count_existing<C: ConnectionTrait>(
+    db: &C,
     chunk: &[readings::ActiveModel],
 ) -> AppResult<usize> {
     use sea_orm::{ColumnTrait, Condition, QueryFilter, QuerySelect, sea_query::Expr};

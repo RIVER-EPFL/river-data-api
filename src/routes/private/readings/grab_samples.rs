@@ -10,7 +10,11 @@ use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::routes::private::{
     data_streams, readings, readings::samples, sensors::calibrations, sites::parameters as site_parameters, sites,
 };
+use crate::routes::private::readings::batch::{Replace, admission, readings_upsert};
 use crate::error::{AppError, AppResult};
+
+/// Grabs are spot measurements by definition: a bottle, not a logger cadence.
+const GRAB_MEASUREMENT_TYPE: &str = "spot";
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct GrabSampleRequest {
@@ -227,6 +231,10 @@ pub async fn insert_grab_samples(
     // A project-scoped token may only write to a site within its project.
     enforce_project_scope_for_sites(&state.db, &scope, &[payload.site_id]).await?;
 
+    for r in &payload.readings {
+        admission::admit(r.time, r.value, Some(GRAB_MEASUREMENT_TYPE))?;
+    }
+
     // Validate site exists
     let site = sites::Entity::find_by_id(payload.site_id)
         .one(&state.db)
@@ -397,7 +405,7 @@ pub async fn insert_grab_samples(
                 calibration_id: Set(calibration_id),
                 deployment_id: Set(r.sensor_id.and_then(|sid| grab_slots.get(&(sid, r.time)).and_then(|s| s.deployment_id))),
                 logged: Set(Some(true)),
-                measurement_type: Set(Some("spot".to_string())),
+                measurement_type: Set(Some(GRAB_MEASUREMENT_TYPE.to_string())),
                 is_flagged: Set(Some(false)),
                 flag_reason: Set(None),
                 sample_id: Set(sample_id),
@@ -408,15 +416,7 @@ pub async fn insert_grab_samples(
     let total = models.len();
 
     let inserted = match readings::Entity::insert_many(models)
-        .on_conflict(
-            sea_orm::sea_query::OnConflict::columns([
-                readings::Column::StreamId,
-                readings::Column::Time,
-                readings::Column::ReplicateIndex,
-            ])
-            .do_nothing()
-            .to_owned(),
-        )
+        .on_conflict(readings_upsert(Replace::Nothing))
         .exec_without_returning(&txn)
         .await
     {

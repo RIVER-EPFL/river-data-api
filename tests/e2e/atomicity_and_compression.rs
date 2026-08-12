@@ -283,7 +283,7 @@ fn readings_for(stream: &str) -> String {
     format!("stream_id = '{stream}'")
 }
 
-// RD-032: unpairing a stream must clear its readings' attribution even when those readings sit in
+// unpairing a stream must clear its readings' attribution even when those readings sit in
 // compressed chunks, the way its mirror (pairing) already does, and must never leave the stream
 // unpaired while its readings keep a site.
 #[tokio::test]
@@ -414,7 +414,7 @@ async fn unpairing_a_stream_clears_readings_in_compressed_chunks() {
     );
 }
 
-// RD-033: deleting a calibration or a deployment clears the readings FK with a bulk UPDATE that
+// deleting a calibration or a deployment clears the readings FK with a bulk UPDATE that
 // carries neither a time restriction nor the decompression cap lift, so both deletes must still
 // succeed over compressed history.
 #[tokio::test]
@@ -591,7 +591,7 @@ async fn deleting_a_calibration_or_deployment_rewrites_compressed_readings() {
     );
 }
 
-// RD-034: flag and unflag write in 500-key chunks with no transaction and refresh the aggregates
+// flag and unflag write in 500-key chunks with no transaction and refresh the aggregates
 // only after the loop, so a partial write must not be possible and the refresh must run.
 #[tokio::test]
 #[serial]
@@ -735,7 +735,7 @@ async fn flagging_readings_is_all_or_nothing_and_refreshes_the_rollups() {
     );
 }
 
-// RD-035: merge_site_parameters runs five mutations with no transaction, so a failure part-way
+// merge_site_parameters runs five mutations with no transaction, so a failure part-way
 // must not leave readings relabelled while the streams and the source slot still exist.
 #[tokio::test]
 #[serial]
@@ -895,7 +895,7 @@ async fn merging_site_parameters_applies_every_step_or_none() {
     );
 }
 
-// RD-036: POST /readings/batch in overwrite mode upserts in 1000-row chunks with neither a
+// POST /readings/batch in overwrite mode upserts in 1000-row chunks with neither a
 // transaction nor the cap lift /ingest applies, so a re-import spanning compressed history must
 // replace every row rather than the first chunk only.
 #[tokio::test]
@@ -1016,7 +1016,7 @@ async fn batch_overwrite_replaces_readings_in_compressed_chunks() {
     );
 }
 
-// RD-038: pair_stream reads the stream without a claim and commits the pairing before its backfill,
+// pair_stream reads the stream without a claim and commits the pairing before its backfill,
 // so two pairings racing for one stream must not both win.
 #[tokio::test]
 #[serial]

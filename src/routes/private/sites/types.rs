@@ -45,6 +45,8 @@ pub struct ParameterResponse {
     pub is_derived: bool,
     pub sensor_type: String,
     pub display_units: Option<String>,
+    /// Display precision the client formats with; the API serves full precision.
+    pub decimal_places: Option<i16>,
     pub sample_interval_sec: Option<i32>,
     pub is_active: Option<bool>,
     /// Earliest reading timestamp for this parameter at the site

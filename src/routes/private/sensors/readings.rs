@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, sensor_in_scope};
 use crate::error::{AppError, AppResult};
+use crate::routes::private::sites::aggregates::{bucket_interval, resolution_of};
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct SensorReadingsQuery {
@@ -26,23 +27,59 @@ pub struct SensorReadingsQuery {
     /// Filter by measurement type: continuous, spot, derived. Omit for all types at `raw`
     /// resolution; bucketed resolutions always exclude spot (continuous-aggregate semantics).
     pub measurement_type: Option<String>,
+    /// Which channel of a multi-parameter instrument to serve. Defaults to the parameter of the
+    /// sensor's most recent deployment, which is the one the response names.
+    pub parameter_id: Option<Uuid>,
 }
 
-/// Map a resolution keyword to a `time_bucket` interval. `None`/`raw` → no bucketing.
-fn resolution_interval(res: &str) -> Option<&'static str> {
-    match res {
-        "hourly" => Some("1 hour"),
-        "daily" => Some("1 day"),
-        "weekly" => Some("7 days"),
-        "monthly" => Some("1 month"),
-        _ => None,
-    }
+/// The parameter this response is about, and the units that go with it.
+///
+/// One resolution step feeds both the reported identity and every query's predicate, so the
+/// series can no longer hold a different quantity from the one the response names. A sensor with
+/// no deployment and no explicit request resolves to `None`, and the series is then unfiltered,
+/// which keeps a never-deployed instrument's plot from coming back empty.
+async fn resolve_series_parameter(
+    db: &sea_orm::DatabaseConnection,
+    sensor_id: Uuid,
+    requested: Option<Uuid>,
+) -> AppResult<(Option<Uuid>, Option<String>)> {
+    let row = if let Some(parameter_id) = requested {
+        db.query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT p.id AS parameter_id, p.default_units FROM parameters p WHERE p.id = $1",
+            [parameter_id.into()],
+        ))
+        .await?
+        .ok_or_else(|| AppError::BadRequest(format!("Unknown parameter {parameter_id}")))?
+    } else {
+        let Some(row) = db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r"SELECT d.parameter_id, p.default_units
+                  FROM sensor_deployments d
+                  JOIN parameters p ON p.id = d.parameter_id
+                  WHERE d.sensor_id = $1
+                  ORDER BY d.deployed_from DESC
+                  LIMIT 1",
+                [sensor_id.into()],
+            ))
+            .await?
+        else {
+            return Ok((None, None));
+        };
+        row
+    };
+
+    Ok((
+        row.try_get("", "parameter_id").ok(),
+        row.try_get("", "default_units").ok(),
+    ))
 }
 
-/// Columnar raw + calibrated series for one sensor (the sensor's single global parameter),
-/// aligned to `times`. `site_ids[i]` is the site the reading was attributed to (null when the
-/// sensor was undeployed at that time). In an aggregated `resolution`, `raw`/`calibrated` are the
-/// per-bucket averages and the `*_min`/`*_max` envelopes are populated (empty in `raw` mode).
+/// Columnar raw + calibrated series for one channel of a sensor, aligned to `times`.
+/// `site_ids[i]` is the site the reading was attributed to (null when the sensor was undeployed at
+/// that time). In an aggregated `resolution`, `raw`/`calibrated` are the per-bucket averages and
+/// the `*_min`/`*_max` envelopes are populated (empty in `raw` mode).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SensorReadingsResponse {
     pub sensor_id: Uuid,
@@ -58,8 +95,8 @@ pub struct SensorReadingsResponse {
     pub calibrated_min: Vec<Option<f64>>,
     pub calibrated_max: Vec<Option<f64>>,
     pub site_ids: Vec<Option<Uuid>>,
-    /// Earliest/latest reading time **attributed to this sensor** (full extent, independent of the
-    /// query window).
+    /// Earliest/latest reading time **attributed to this sensor** on the served parameter (full
+    /// extent, independent of the query window).
     pub data_start: Option<DateTime<Utc>>,
     pub data_end: Option<DateTime<Utc>>,
     /// Earliest reading at the sensor's current (open) deployment slot, same site + parameter,
@@ -93,9 +130,9 @@ pub async fn get_sensor_readings(
     let db = &state.db;
     let include_raw = query.include_raw.unwrap_or(true);
 
-    // A sensor has no intrinsic parameter; take the parameter (and its units) from the sensor's
-    // most recent deployment. Multi-parameter instruments resolve to their latest bound parameter
-    // here, the detail plot is single-series and the readings query below is not parameter-scoped.
+    // A sensor has no intrinsic parameter; a multi-parameter instrument holds one deployment per
+    // channel. The channel resolved here is the one the response names, the one whose units it
+    // reports, and the one every query below filters on.
     let sensor_exists = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -106,20 +143,8 @@ pub async fn get_sensor_readings(
     if sensor_exists.is_none() {
         return Err(AppError::NotFound("Sensor not found".to_string()));
     }
-    let meta = db
-        .query_one(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT d.parameter_id, p.default_units
-              FROM sensor_deployments d
-              JOIN parameters p ON p.id = d.parameter_id
-              WHERE d.sensor_id = $1
-              ORDER BY d.deployed_from DESC
-              LIMIT 1",
-            [sensor_id.into()],
-        ))
-        .await?;
-    let parameter_id: Option<Uuid> = meta.as_ref().and_then(|m| m.try_get("", "parameter_id").ok());
-    let units: Option<String> = meta.as_ref().and_then(|m| m.try_get("", "default_units").ok());
+    let (parameter_id, units) =
+        resolve_series_parameter(db, sensor_id, query.parameter_id).await?;
 
     // A project-scoped key may only read a sensor that has been deployed within its project, and
     // even then only sees the readings attributed to in-project sites. A sensor never deployed in
@@ -142,24 +167,40 @@ pub async fn get_sensor_readings(
             None => String::new(),
         }
     };
+    // Confines a query to the resolved channel. A sensor with no resolved parameter is unfiltered,
+    // so its plot still shows whatever is attributed to it.
+    let param_filter = |values: &mut Vec<sea_orm::Value>, col: &str| -> String {
+        match parameter_id {
+            Some(pid) => {
+                values.push(pid.into());
+                format!(" AND {col} = ${}", values.len())
+            }
+            None => String::new(),
+        }
+    };
 
     let resolution = query.resolution.as_deref().unwrap_or("raw");
-    let bucket = resolution_interval(resolution);
-    if query.resolution.as_deref().is_some_and(|r| r != "raw" && bucket.is_none()) {
-        return Err(AppError::BadRequest(format!(
-            "Invalid resolution '{resolution}' (expected raw|hourly|daily|weekly|monthly)"
-        )));
-    }
+    let bucket = if resolution == "raw" {
+        None
+    } else {
+        Some(bucket_interval(resolution_of(resolution).ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "Invalid resolution '{resolution}' (expected raw|hourly|daily|weekly|monthly)"
+            ))
+        })?))
+    };
 
-    // Full reading extent for this sensor (drives the UI slider bounds, independent of the window).
+    // Full reading extent for this sensor on the served channel (drives the UI slider bounds,
+    // independent of the window).
     let mut extent_vals: Vec<sea_orm::Value> = vec![sensor_id.into()];
     let extent_scope = scope_filter(&mut extent_vals, "site_id");
+    let extent_param = param_filter(&mut extent_vals, "parameter_id");
     let extent = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &format!(
                 r"SELECT MIN(time) AS data_start, MAX(time) AS data_end
-                  FROM readings WHERE sensor_id = $1 AND replicate_index = 0{extent_scope}"
+                  FROM readings WHERE sensor_id = $1 AND replicate_index = 0{extent_scope}{extent_param}"
             ),
             extent_vals,
         ))
@@ -178,6 +219,7 @@ pub async fn get_sensor_readings(
     // but lives here, and backdating `deployed_from` to it lets the slot reprocess claim it.
     let mut slot_vals: Vec<sea_orm::Value> = vec![sensor_id.into()];
     let slot_scope = scope_filter(&mut slot_vals, "r.site_id");
+    let slot_param = param_filter(&mut slot_vals, "d.parameter_id");
     let slot_data_start = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -187,7 +229,7 @@ pub async fn get_sensor_readings(
                   JOIN sensor_deployments d
                     ON d.sensor_id = $1 AND d.deployed_until IS NULL
                   WHERE r.site_id = d.site_id AND r.parameter_id = d.parameter_id
-                    AND r.replicate_index = 0{slot_scope}"
+                    AND r.replicate_index = 0{slot_scope}{slot_param}"
             ),
             slot_vals,
         ))
@@ -231,6 +273,7 @@ pub async fn get_sensor_readings(
         ));
     }
     sql.push_str(&scope_filter(&mut values, "site_id"));
+    sql.push_str(&param_filter(&mut values, "parameter_id"));
     if let Some(start) = query.start {
         values.push(start.into());
         sql.push_str(&format!(" AND time >= ${}", values.len()));

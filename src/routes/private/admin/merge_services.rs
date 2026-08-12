@@ -1,9 +1,14 @@
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::common::aggregates::{self, Window};
+use crate::common::bulk_write::{self, TouchedRange};
 use crate::error::{AppError, AppResult};
+use crate::routes::private::data_streams::views::{
+    MoveScope, SlotMove, move_slot_rows, slot_move_collisions,
+};
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct MergeSiteParametersRequest {
@@ -20,11 +25,34 @@ pub struct MergeSiteParametersResponse {
     pub source_deleted: bool,
 }
 
+/// Reject a move whose slot-keyed rows would collide on the survivor's unique constraint.
+///
+/// Merging two collection groups would rewrite `samples.mean`/`sd`/`n` over a union of samples
+/// taken separately, so the merge is refused and the operator resolves it.
+async fn refuse_on_collision<C: ConnectionTrait>(
+    conn: &C,
+    scope: MoveScope,
+    source_param: Uuid,
+    target_param: Uuid,
+) -> AppResult<()> {
+    let collisions = slot_move_collisions(conn, scope, source_param, target_param).await?;
+    if collisions.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::Conflict(format!(
+        "Source and target already hold a row at the same instant, so the merge would have to \
+         combine two separately collected groups: {}",
+        collisions.join(", ")
+    )))
+}
+
 /// Merge two site_parameters: absorb source into target.
 ///
-/// Moves readings, status_events, data_streams, and
-/// sensor_deployments from source to target, then deletes the source.
-/// Duplicate readings (same PK) are skipped via ON CONFLICT DO NOTHING.
+/// Moves every slot-keyed table's rows (readings, status events, samples, annotations) plus the
+/// data streams onto the target, then deletes the source. One transaction with the decompression
+/// cap lifted, so it applies whole or not at all even when the readings sit in compressed chunks;
+/// the rollup refresh follows the commit, since `refresh_continuous_aggregate` cannot run inside a
+/// transaction block.
 pub async fn merge_site_parameters(
     db: &DatabaseConnection,
     req: &MergeSiteParametersRequest,
@@ -38,48 +66,53 @@ pub async fn merge_site_parameters(
         ));
     }
 
-    // Validate both site_parameters exist and are compatible
-    let (source_site_id, source_param_id, target_site_id, target_param_id) =
-        validate_merge_candidates(db, source_id, target_id).await?;
+    let (response, touched) = bulk_write::guarded(db, async |txn| {
+        let (source_site_id, source_param_id, target_site_id, target_param_id) =
+            validate_merge_candidates(txn, source_id, target_id).await?;
+        if source_site_id != target_site_id {
+            return Err(AppError::BadRequest(
+                "Source and target must belong to the same site".to_string(),
+            ));
+        }
 
-    if source_site_id != target_site_id {
-        return Err(AppError::BadRequest(
-            "Source and target must belong to the same site".to_string(),
-        ));
-    }
+        let scope = MoveScope::Site(source_site_id);
+        refuse_on_collision(txn, scope, source_param_id, target_param_id).await?;
+        let moved = move_slot_rows(txn, scope, source_param_id, target_param_id).await?;
+        let streams_updated = update_data_streams(txn, source_id, target_id).await?;
+        delete_source(txn, source_id, source_site_id, source_param_id).await?;
 
-    // Step 1: Move readings (ON CONFLICT DO NOTHING for overlap)
-    let merged_readings = move_readings(db, source_site_id, source_param_id, target_param_id).await?;
-
-    // Step 2: Move status_events (ON CONFLICT DO NOTHING for overlap)
-    let merged_status_events =
-        move_status_events(db, source_site_id, source_param_id, target_param_id).await?;
-
-    // Step 3: Update data_streams to point to target site_parameter
-    let streams_updated = update_data_streams(db, source_id, target_id).await?;
-
-    // Step 4: Move sensor_deployments to target site_parameter's parameter_id
-    let deployments_moved = move_sensor_deployments(db, source_param_id, target_param_id).await?;
-
-    // Step 5: Delete the source site_parameter (readings/status_events already moved)
-    delete_source(db, source_id, source_site_id, source_param_id).await?;
-
-    Ok(MergeSiteParametersResponse {
-        merged_readings,
-        merged_status_events,
-        streams_updated,
-        deployments_moved,
-        source_deleted: true,
+        Ok((
+            MergeSiteParametersResponse {
+                merged_readings: moved.readings,
+                merged_status_events: moved.status_events,
+                streams_updated,
+                // Deployments link a sensor to a site, and both slots are on the same site.
+                deployments_moved: 0,
+                source_deleted: true,
+            },
+            moved.touched,
+        ))
     })
+    .await?;
+
+    refresh_moved_rollups(db, touched).await?;
+    Ok(response)
 }
 
-async fn validate_merge_candidates(
-    db: &DatabaseConnection,
+/// The rollups group by `parameter_id`, so recomputing the buckets the moved readings occupy
+/// rebuilds both the survivor's series and the absorbed one's in the same pass.
+async fn refresh_moved_rollups(db: &DatabaseConnection, touched: TouchedRange) -> AppResult<()> {
+    if let Some(window) = Window::touched(&touched) {
+        aggregates::refresh(db, window).await?;
+    }
+    Ok(())
+}
+
+async fn validate_merge_candidates<C: ConnectionTrait>(
+    db: &C,
     source_id: Uuid,
     target_id: Uuid,
 ) -> AppResult<(Uuid, Uuid, Uuid, Uuid)> {
-    use sea_orm::{ConnectionTrait, Statement};
-
     let sql = "SELECT id, site_id, parameter_id FROM site_parameters WHERE id = ANY($1)";
     let rows = db
         .query_all(Statement::from_sql_and_values(
@@ -95,12 +128,8 @@ async fn validate_merge_candidates(
 
     for row in &rows {
         let id: Uuid = row.try_get("", "id").map_err(AppError::Database)?;
-        let site_id: Uuid = row
-            .try_get("", "site_id")
-            .map_err(AppError::Database)?;
-        let param_id: Uuid = row
-            .try_get("", "parameter_id")
-            .map_err(AppError::Database)?;
+        let site_id: Uuid = row.try_get("", "site_id").map_err(AppError::Database)?;
+        let param_id: Uuid = row.try_get("", "parameter_id").map_err(AppError::Database)?;
 
         if id == source_id {
             source = Some((site_id, param_id));
@@ -118,64 +147,11 @@ async fn validate_merge_candidates(
     Ok((source_site_id, source_param_id, target_site_id, target_param_id))
 }
 
-async fn move_readings(
-    db: &DatabaseConnection,
-    site_id: Uuid,
-    source_param_id: Uuid,
-    target_param_id: Uuid,
-) -> AppResult<u64> {
-    use sea_orm::{ConnectionTrait, Statement};
-
-    // Update parameter_id on readings from source to target
-    let sql = r#"
-        UPDATE readings SET parameter_id = $1
-        WHERE site_id = $2 AND parameter_id = $3
-    "#;
-
-    let result = db
-        .execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-            vec![target_param_id.into(), site_id.into(), source_param_id.into()],
-        ))
-        .await
-        .map_err(AppError::Database)?;
-
-    Ok(result.rows_affected())
-}
-
-async fn move_status_events(
-    db: &DatabaseConnection,
-    site_id: Uuid,
-    source_param_id: Uuid,
-    target_param_id: Uuid,
-) -> AppResult<u64> {
-    use sea_orm::{ConnectionTrait, Statement};
-
-    let sql = r#"
-        UPDATE status_events SET parameter_id = $1
-        WHERE site_id = $2 AND parameter_id = $3
-    "#;
-
-    let result = db
-        .execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-            vec![target_param_id.into(), site_id.into(), source_param_id.into()],
-        ))
-        .await
-        .map_err(AppError::Database)?;
-
-    Ok(result.rows_affected())
-}
-
-async fn update_data_streams(
-    db: &DatabaseConnection,
+async fn update_data_streams<C: ConnectionTrait>(
+    db: &C,
     source_id: Uuid,
     target_id: Uuid,
 ) -> AppResult<u64> {
-    use sea_orm::{ConnectionTrait, Statement};
-
     let sql = "UPDATE data_streams SET site_parameter_id = $1 WHERE site_parameter_id = $2";
     let result = db
         .execute(Statement::from_sql_and_values(
@@ -189,26 +165,15 @@ async fn update_data_streams(
     Ok(result.rows_affected())
 }
 
-async fn move_sensor_deployments(
-    _db: &DatabaseConnection,
-    _source_param_id: Uuid,
-    _target_param_id: Uuid,
-) -> AppResult<u64> {
-    // Sensor deployments link sensor to site, not to parameter.
-    // After merge, the readings already have the right sensor_id.
-    // Since both site_parameters are on the same site, deployments don't need moving.
-    Ok(0)
-}
-
-async fn delete_source(
-    db: &DatabaseConnection,
+async fn delete_source<C: ConnectionTrait>(
+    db: &C,
     source_id: Uuid,
     site_id: Uuid,
     source_param_id: Uuid,
 ) -> AppResult<()> {
-    use sea_orm::{ConnectionTrait, Statement};
-
-    // Delete remaining readings for source parameter (already moved; these are the originals)
+    // Backstop: the move above re-points every slot-keyed row, so these match nothing unless a row
+    // was written between the two statements. Deleting the site_parameter without them would leave
+    // readings attributed to a slot that no longer exists.
     let sql = "DELETE FROM readings WHERE site_id = $1 AND parameter_id = $2";
     db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
@@ -218,7 +183,6 @@ async fn delete_source(
     .await
     .map_err(AppError::Database)?;
 
-    // Delete remaining status_events for source parameter
     let sql = "DELETE FROM status_events WHERE site_id = $1 AND parameter_id = $2";
     db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
@@ -228,7 +192,6 @@ async fn delete_source(
     .await
     .map_err(AppError::Database)?;
 
-    // Delete alarm_thresholds for source
     let sql = "DELETE FROM alarm_thresholds WHERE parameter_id = $1 AND site_id = $2";
     db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
@@ -238,7 +201,6 @@ async fn delete_source(
     .await
     .map_err(AppError::Database)?;
 
-    // Delete the source site_parameter
     let sql = "DELETE FROM site_parameters WHERE id = $1";
     db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
@@ -266,6 +228,9 @@ pub struct MergeParametersResponse {
     pub source_deleted: bool,
 }
 
+/// Merge two catalog parameters: absorb source into target at every site, then delete the source
+/// row. Same guarantees as [`merge_site_parameters`]: one guarded transaction, rollups refreshed
+/// after the commit.
 pub async fn merge_parameters(
     db: &DatabaseConnection,
     req: &MergeParametersRequest,
@@ -279,24 +244,40 @@ pub async fn merge_parameters(
         ));
     }
 
-    let txn = db.begin().await.map_err(AppError::Database)?;
-    validate_both_parameters_exist(&txn, source_id, target_id).await?;
+    let (response, touched) = bulk_write::guarded(db, async |txn| {
+        validate_both_parameters_exist(txn, source_id, target_id).await?;
+        refuse_on_collision(txn, MoveScope::EverySite, source_id, target_id).await?;
 
-    let (sites_merged, sites_reassigned, total_readings, total_streams) =
-        merge_site_parameters_per_site(&txn, source_id, target_id).await?;
+        let (sites_merged, sites_reassigned, moved) =
+            merge_site_parameters_per_site(txn, source_id, target_id).await?;
 
-    reassign_parameter_references(&txn, source_id, target_id).await?;
-    delete_parameter(&txn, source_id).await?;
+        let swept = reassign_parameter_references(txn, source_id, target_id).await?;
+        delete_parameter(txn, source_id).await?;
 
-    txn.commit().await.map_err(AppError::Database)?;
-
-    Ok(MergeParametersResponse {
-        sites_merged,
-        sites_reassigned,
-        readings_moved: total_readings,
-        streams_updated: total_streams,
-        source_deleted: true,
+        Ok((
+            MergeParametersResponse {
+                sites_merged,
+                sites_reassigned,
+                readings_moved: moved.readings + swept.readings,
+                streams_updated: moved.streams,
+                source_deleted: true,
+            },
+            moved.touched.merge(swept.touched),
+        ))
     })
+    .await?;
+
+    refresh_moved_rollups(db, touched).await?;
+    Ok(response)
+}
+
+/// Totals accumulated across the sites a catalog-level merge walks.
+#[derive(Default)]
+struct MergeTotals {
+    readings: u64,
+    /// Streams re-pointed at a surviving site_parameter.
+    streams: u64,
+    touched: TouchedRange,
 }
 
 async fn validate_both_parameters_exist(
@@ -329,7 +310,7 @@ async fn merge_site_parameters_per_site(
     txn: &impl ConnectionTrait,
     source_id: Uuid,
     target_id: Uuid,
-) -> AppResult<(u64, u64, u64, u64)> {
+) -> AppResult<(u64, u64, MergeTotals)> {
     let pg = sea_orm::DatabaseBackend::Postgres;
 
     let source_sps = txn
@@ -343,8 +324,7 @@ async fn merge_site_parameters_per_site(
 
     let mut sites_merged: u64 = 0;
     let mut sites_reassigned: u64 = 0;
-    let mut total_readings: u64 = 0;
-    let mut total_streams: u64 = 0;
+    let mut totals = MergeTotals::default();
 
     for row in &source_sps {
         let sp_id: Uuid = row.try_get("", "id").map_err(AppError::Database)?;
@@ -361,155 +341,43 @@ async fn merge_site_parameters_per_site(
 
         if let Some(target_row) = target_sp {
             let target_sp_id: Uuid = target_row.try_get("", "id").map_err(AppError::Database)?;
-            let (readings, streams) = merge_conflicting_site_param(
-                txn, sp_id, target_sp_id, site_id, source_id, target_id,
-            ).await?;
-            total_readings += readings;
-            total_streams += streams;
+            let moved =
+                move_slot_rows(txn, MoveScope::Site(site_id), source_id, target_id).await?;
+            let streams = update_data_streams(txn, sp_id, target_sp_id).await?;
+            delete_source(txn, sp_id, site_id, source_id).await?;
+
+            totals.readings += moved.readings;
+            totals.streams += streams;
+            totals.touched = totals.touched.merge(moved.touched);
             sites_merged += 1;
         } else {
-            let readings = reassign_site_param(txn, sp_id, site_id, source_id, target_id).await?;
-            total_readings += readings;
+            txn.execute(Statement::from_sql_and_values(
+                pg,
+                "UPDATE site_parameters SET parameter_id = $1 WHERE id = $2",
+                vec![target_id.into(), sp_id.into()],
+            ))
+            .await
+            .map_err(AppError::Database)?;
+            let moved =
+                move_slot_rows(txn, MoveScope::Site(site_id), source_id, target_id).await?;
+
+            totals.readings += moved.readings;
+            totals.touched = totals.touched.merge(moved.touched);
             sites_reassigned += 1;
         }
     }
 
-    Ok((sites_merged, sites_reassigned, total_readings, total_streams))
+    Ok((sites_merged, sites_reassigned, totals))
 }
 
-/// Both source and target have a site_parameter at this site -- absorb source into target.
-async fn merge_conflicting_site_param(
-    txn: &impl ConnectionTrait,
-    source_sp_id: Uuid,
-    target_sp_id: Uuid,
-    site_id: Uuid,
-    source_param_id: Uuid,
-    target_param_id: Uuid,
-) -> AppResult<(u64, u64)> {
-    let pg = sea_orm::DatabaseBackend::Postgres;
-
-    let r = txn
-        .execute(Statement::from_sql_and_values(
-            pg,
-            "UPDATE readings SET parameter_id = $1 WHERE site_id = $2 AND parameter_id = $3",
-            vec![target_param_id.into(), site_id.into(), source_param_id.into()],
-        ))
-        .await
-        .map_err(AppError::Database)?;
-    let readings_moved = r.rows_affected();
-
-    txn.execute(Statement::from_sql_and_values(
-        pg,
-        "UPDATE status_events SET parameter_id = $1 WHERE site_id = $2 AND parameter_id = $3",
-        vec![target_param_id.into(), site_id.into(), source_param_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
-
-    let s = txn
-        .execute(Statement::from_sql_and_values(
-            pg,
-            "UPDATE data_streams SET site_parameter_id = $1 WHERE site_parameter_id = $2",
-            vec![target_sp_id.into(), source_sp_id.into()],
-        ))
-        .await
-        .map_err(AppError::Database)?;
-    let streams_moved = s.rows_affected();
-
-    delete_site_param_remnants(txn, source_sp_id, site_id, source_param_id).await?;
-
-    Ok((readings_moved, streams_moved))
-}
-
-/// No conflict at this site -- just reassign the site_parameter's parameter_id.
-async fn reassign_site_param(
-    txn: &impl ConnectionTrait,
-    sp_id: Uuid,
-    site_id: Uuid,
-    source_param_id: Uuid,
-    target_param_id: Uuid,
-) -> AppResult<u64> {
-    let pg = sea_orm::DatabaseBackend::Postgres;
-
-    txn.execute(Statement::from_sql_and_values(
-        pg,
-        "UPDATE site_parameters SET parameter_id = $1 WHERE id = $2",
-        vec![target_param_id.into(), sp_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
-
-    let r = txn
-        .execute(Statement::from_sql_and_values(
-            pg,
-            "UPDATE readings SET parameter_id = $1 WHERE site_id = $2 AND parameter_id = $3",
-            vec![target_param_id.into(), site_id.into(), source_param_id.into()],
-        ))
-        .await
-        .map_err(AppError::Database)?;
-
-    txn.execute(Statement::from_sql_and_values(
-        pg,
-        "UPDATE status_events SET parameter_id = $1 WHERE site_id = $2 AND parameter_id = $3",
-        vec![target_param_id.into(), site_id.into(), source_param_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
-
-    Ok(r.rows_affected())
-}
-
-async fn delete_site_param_remnants(
-    txn: &impl ConnectionTrait,
-    sp_id: Uuid,
-    site_id: Uuid,
-    source_param_id: Uuid,
-) -> AppResult<()> {
-    let pg = sea_orm::DatabaseBackend::Postgres;
-
-    txn.execute(Statement::from_sql_and_values(
-        pg,
-        "DELETE FROM alarm_thresholds WHERE parameter_id = $1 AND site_id = $2",
-        vec![source_param_id.into(), site_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
-
-    txn.execute(Statement::from_sql_and_values(
-        pg,
-        "DELETE FROM readings WHERE site_id = $1 AND parameter_id = $2",
-        vec![site_id.into(), source_param_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
-
-    txn.execute(Statement::from_sql_and_values(
-        pg,
-        "DELETE FROM status_events WHERE site_id = $1 AND parameter_id = $2",
-        vec![site_id.into(), source_param_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
-
-    txn.execute(Statement::from_sql_and_values(
-        pg,
-        "DELETE FROM site_parameters WHERE id = $1",
-        vec![sp_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
-
-    Ok(())
-}
-
-/// Move deployments, calibrations, derived sources, alarms, annotations, and samples from source to
-/// target parameter. (Sensors no longer carry a parameter, it lives on the deployment /
-/// calibration.)
+/// Move what a catalog parameter owns outside the slot tables: deployments, calibrations, derived
+/// sources, thresholds and aliases, plus a final slot-table sweep for rows at sites that carry no
+/// `site_parameter` row for the source (nothing walked them per site).
 async fn reassign_parameter_references(
     txn: &impl ConnectionTrait,
     source_id: Uuid,
     target_id: Uuid,
-) -> AppResult<()> {
+) -> AppResult<SlotMove> {
     let pg = sea_orm::DatabaseBackend::Postgres;
 
     // Deployments and calibrations both reference parameters(id); move them to the survivor so the
@@ -556,21 +424,9 @@ async fn reassign_parameter_references(
     .await
     .map_err(AppError::Database)?;
 
-    txn.execute(Statement::from_sql_and_values(
-        pg,
-        "UPDATE annotations SET parameter_id = $1 WHERE parameter_id = $2",
-        vec![target_id.into(), source_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
-
-    txn.execute(Statement::from_sql_and_values(
-        pg,
-        "UPDATE samples SET parameter_id = $1 WHERE parameter_id = $2",
-        vec![target_id.into(), source_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
+    // The per-site walk covers every site with a source `site_parameter`; this catches rows at
+    // sites that never had one, so the source parameter can be deleted.
+    let swept = move_slot_rows(txn, MoveScope::EverySite, source_id, target_id).await?;
 
     // Merge aliases: target gets source's aliases + source's name as a new alias
     txn.execute(Statement::from_sql_and_values(
@@ -588,7 +444,7 @@ async fn reassign_parameter_references(
     .await
     .map_err(AppError::Database)?;
 
-    Ok(())
+    Ok(swept)
 }
 
 async fn delete_parameter(txn: &impl ConnectionTrait, source_id: Uuid) -> AppResult<()> {

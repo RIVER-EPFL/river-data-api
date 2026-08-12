@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::{StatusCode, header::{self, HeaderMap, HeaderValue}},
+    http::{StatusCode, header::HeaderMap},
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
@@ -9,11 +9,12 @@ use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement,
 };
 use std::collections::{HashMap, HashSet};
-use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::{AuthContext, ProjectScope};
+use crate::common::scope::{Unowned, project_filter_sql, project_of_alarm_event, require_row_in_scope};
+use crate::common::series::{self, Cells, Table};
 use crate::routes::private::sites::parameters as site_parameters;
 use crate::error::{AppError, AppResult};
 use crate::routes::{cache, resolve_site_with_project, validate_time_range};
@@ -44,93 +45,21 @@ struct ParameterWithThreshold {
     display_units: Option<String>,
 }
 
-fn build_csv_response(
-    times: &[DateTime<Utc>],
-    params: &[ParameterViolationData],
-) -> AppResult<Response> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
-
-    let times = times.to_vec();
-    let params = params.to_vec();
-
-    tokio::spawn(async move {
-        let mut header = "time".to_string();
-        for param in &params {
-            header.push(',');
-            header.push_str(&param.name);
-            header.push_str("_value,");
-            header.push_str(&param.name);
-            header.push_str("_severity");
-        }
-        header.push('\n');
-        let _ = tx.send(Ok(header)).await;
-
-        for (i, time) in times.iter().enumerate() {
-            let mut row = time.to_rfc3339();
-            for param in &params {
-                row.push(',');
-                if let Some(v) = param.values.get(i) {
-                    row.push_str(&v.to_string());
-                }
-                row.push(',');
-                if let Some(s) = param.severities.get(i) {
-                    row.push_str(&s.to_string());
-                }
-            }
-            row.push('\n');
-            if tx.send(Ok(row)).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let stream = ReceiverStream::new(rx);
-    let body = axum::body::Body::from_stream(stream);
-
-    Response::builder()
-        .header(header::CONTENT_TYPE, HeaderValue::from_static("text/csv"))
-        .body(body)
-        .map_err(|e| AppError::Internal(e.to_string()))
-}
-
-fn build_ndjson_response(
-    times: &[DateTime<Utc>],
-    params: &[ParameterViolationData],
-) -> AppResult<Response> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
-
-    let times = times.to_vec();
-    let params = params.to_vec();
-
-    tokio::spawn(async move {
-        for (i, time) in times.iter().enumerate() {
-            let mut obj = serde_json::Map::new();
-            obj.insert("time".to_string(), serde_json::json!(time.to_rfc3339()));
-
-            for param in &params {
-                if let (Some(v), Some(s)) = (param.values.get(i), param.severities.get(i)) {
-                    obj.insert(format!("{}_value", param.name), serde_json::json!(v));
-                    obj.insert(format!("{}_severity", param.name), serde_json::json!(s));
-                }
-            }
-
-            let line = format!("{}\n", serde_json::Value::Object(obj));
-            if tx.send(Ok(line)).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let stream = ReceiverStream::new(rx);
-    let body = axum::body::Body::from_stream(stream);
-
-    Response::builder()
-        .header(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/x-ndjson"),
-        )
-        .body(body)
-        .map_err(|e| AppError::Internal(e.to_string()))
+/// The violations export, built from the same structs the JSON body serialises. A parameter that
+/// did not violate at a timestamp has no value and no severity there, in every format.
+fn alarms_table(times: &[DateTime<Utc>], params: &[ParameterViolationData]) -> Table {
+    let mut table = Table::at(times);
+    for param in params {
+        table.column(
+            format!("{}_value", param.name),
+            Cells::Float(param.values.clone()),
+        );
+        table.column(
+            format!("{}_severity", param.name),
+            Cells::Int(param.severities.iter().map(|s| s.map(i64::from)).collect()),
+        );
+    }
+    table
 }
 
 /// Get alarm violations for a specific site
@@ -199,39 +128,41 @@ pub async fn get_site_alarms(
         .await?;
 
     if params_list.is_empty() {
-        return Ok(Json(AlarmViolationsResponse {
-            project: project_ref,
-            site: site_ref,
-            start: None,
-            end: None,
-            times: vec![],
-            parameters: vec![],
-        })
-        .into_response());
+        return empty_violations(&format, project_ref, site_ref).await;
     }
 
     let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.parameter_id).collect();
 
+    // Units, name and sensor_type resolve through the one slot resolver, so an alarm series
+    // reports the same units the readings series and the site detail report for that slot.
+    let catalog = site_parameters::catalog_map(&state.db, param_ids.iter().copied()).await?;
     let params_with_thresholds: Vec<ParameterWithThreshold> = params_list
         .iter()
-        .map(|p| ParameterWithThreshold {
-            id: p.parameter_id,
-            name: p.name.clone(),
-            sensor_type: if p.sensor_type.is_empty() { p.name.clone() } else { p.sensor_type.clone() },
-            display_units: p.display_units.clone(),
+        .map(|p| {
+            let d = site_parameters::SlotDescriptor::resolve(p, catalog.get(&p.parameter_id));
+            ParameterWithThreshold {
+                id: p.parameter_id,
+                name: d.slot_name,
+                sensor_type: d.sensor_type,
+                display_units: d.units,
+            }
         })
         .collect();
 
-    let cache_key = cache::cache_key(
-        "alarms",
-        &[
-            &site.id.to_string(),
-            &query.start.to_rfc3339(),
-            &query.end.to_rfc3339(),
-            &query.severity.map(|s| s.to_string()).unwrap_or_default(),
-            query.sensor_types.as_deref().unwrap_or(""),
-            &format,
-        ],
+    // The site id leads the key so a per-site invalidation can find every entry it owns; the query
+    // is flattened in whole so a field added to it enters the key by construction.
+    #[derive(serde::Serialize)]
+    struct AlarmsCacheKey<'a> {
+        resolved_format: &'a str,
+        #[serde(flatten)]
+        query: &'a SiteAlarmsQuery,
+    }
+    let cache_key = crate::common::cache_key::key_for(
+        &format!("alarms:{}", site.id),
+        &AlarmsCacheKey {
+            resolved_format: &format,
+            query: &query,
+        },
     );
 
     if format == "json"
@@ -305,15 +236,7 @@ pub async fn get_site_alarms(
         .collect();
 
     if violations.is_empty() {
-        return Ok(Json(AlarmViolationsResponse {
-            project: project_ref,
-            site: site_ref,
-            start: None,
-            end: None,
-            times: vec![],
-            parameters: vec![],
-        })
-        .into_response());
+        return empty_violations(&format, project_ref, site_ref).await;
     }
 
     let mut time_set: HashSet<DateTime<Utc>> = HashSet::new();
@@ -339,20 +262,22 @@ pub async fn get_site_alarms(
         .filter_map(|param| {
             let violations = param_violations.get(&param.id)?;
 
-            let mut values = vec![0.0; times.len()];
-            let mut severities = vec![0i16; times.len()];
+            // A timestamp where this parameter did not violate carries no value and no severity,
+            // rather than a zero that reads as a measurement.
+            let mut values: Vec<Option<f64>> = vec![None; times.len()];
+            let mut severities: Vec<Option<i16>> = vec![None; times.len()];
 
             for (time, value, severity) in violations {
                 if let Some(&idx) = time_index.get(time) {
-                    values[idx] = *value;
-                    severities[idx] = *severity;
+                    values[idx] = Some(*value);
+                    severities[idx] = Some(*severity);
                 }
             }
 
             Some(ParameterViolationData {
                 id: param.id,
                 name: param.name.clone(),
-                sensor_type: if param.sensor_type.is_empty() { param.name.clone() } else { param.sensor_type.clone() },
+                sensor_type: param.sensor_type.clone(),
                 units: param.display_units.clone(),
                 values,
                 severities,
@@ -363,21 +288,50 @@ pub async fn get_site_alarms(
     let actual_start = times.first().copied();
     let actual_end = times.last().copied();
 
-    match format.as_str() {
-        "csv" => build_csv_response(&times, &param_data),
-        "ndjson" => build_ndjson_response(&times, &param_data),
-        _ => {
+    series::respond(
+        &format,
+        (times, param_data),
+        |(times, params)| alarms_table(times, params),
+        |(times, parameters)| async move {
             let response = AlarmViolationsResponse {
                 project: project_ref,
                 site: site_ref,
                 start: actual_start,
                 end: actual_end,
                 times,
-                parameters: param_data,
+                parameters,
             };
             cache::cache_and_respond(&state, cache_key, &response, actual_end).await
-        }
-    }
+        },
+    )
+    .await
+}
+
+/// A window with no violations, in whatever format was asked for. The empty case is the common
+/// one here, so it goes through the same return point as the populated case.
+async fn empty_violations(
+    format: &str,
+    project: Option<ProjectRef>,
+    site: SiteRef,
+) -> AppResult<Response> {
+    let empty: (Vec<DateTime<Utc>>, Vec<ParameterViolationData>) = (Vec::new(), Vec::new());
+    series::respond(
+        format,
+        empty,
+        |(times, params)| alarms_table(times, params),
+        |(times, parameters)| async move {
+            Ok(Json(AlarmViolationsResponse {
+                project,
+                site,
+                start: None,
+                end: None,
+                times,
+                parameters,
+            })
+            .into_response())
+        },
+    )
+    .await
 }
 
 /// Cadence lens for readings queries: the grab (spot) series or everything else
@@ -449,16 +403,11 @@ pub(crate) async fn fetch_active_alarm_rows(
     // Bind params are appended in order: optional project scope, then optional (site, parameter)
     // slot pairs. `next` tracks the next `$N` placeholder.
     let mut values: Vec<sea_orm::Value> = Vec::new();
-    let mut next = 1usize;
 
-    let project_filter = if let Some(projects) = scope.sql_project_array() {
-        values.push(projects);
-        let clause = format!("AND s.project_id = ANY(${next})");
-        next += 1;
-        clause
-    } else {
-        String::new()
-    };
+    let project_filter = project_filter_sql(scope, "s.project_id", &mut values)
+        .map(|predicate| format!("AND {predicate}"))
+        .unwrap_or_default();
+    let mut next = values.len() + 1;
 
     let slot_filter = if let Some(slots) = slots {
         let mut pairs = Vec::with_capacity(slots.len());
@@ -554,17 +503,15 @@ async fn fetch_open_events(
     db: &sea_orm::DatabaseConnection,
     scope: &crate::common::authz::AccessScope,
 ) -> AppResult<HashMap<(Uuid, Uuid, String), OpenEventRow>> {
-    let project_filter = if scope.is_restricted() {
-        "AND s.project_id = ANY($1)"
-    } else {
-        ""
-    };
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    let project_filter = project_filter_sql(scope, "s.project_id", &mut values)
+        .map(|predicate| format!("AND {predicate}"))
+        .unwrap_or_default();
     let sql = format!(
         "SELECT ae.site_id, ae.parameter_id, ae.measurement_type, ae.id, ae.started_at, ae.acknowledged_at, ae.acknowledged_by, ae.max_severity \
          FROM alarm_events ae JOIN sites s ON s.id = ae.site_id \
          WHERE ae.resolved_at IS NULL {project_filter}"
     );
-    let values: Vec<sea_orm::Value> = scope.sql_project_array().map(|p| vec![p]).unwrap_or_default();
     let mut map = HashMap::new();
     for row in db
         .query_all(Statement::from_sql_and_values(
@@ -639,6 +586,18 @@ pub async fn get_active_alarms(
     Ok(Json(ActiveAlarmsResponse { alarms, total }))
 }
 
+/// Confine an id-addressed alarm event to the caller's projects. An event outside them and an event
+/// that does not exist answer identically, so acknowledging by id cannot be used to discover that
+/// another project's alarm exists. The listing (`/alarms/events`) is filtered by the same rule.
+async fn confine_alarm_event(
+    state: &AppState,
+    scope: &crate::common::authz::AccessScope,
+    event_id: Uuid,
+) -> AppResult<()> {
+    let row = project_of_alarm_event(&state.db, event_id).await?;
+    require_row_in_scope(scope, &row, Unowned::Deny, "Alarm event")
+}
+
 /// Best-effort actor identity for the `acknowledged_by` audit field.
 fn actor_label(auth: &AuthContext) -> String {
     match auth {
@@ -652,7 +611,8 @@ fn actor_label(auth: &AuthContext) -> String {
 ///
 /// Marks the open `alarm_event` as acknowledged by the calling user/token. Acknowledging does not
 /// resolve the alarm; it stays active (flagged `acknowledged: true`) until the reading returns to
-/// range. Returns 404 if the event does not exist, 409 if it is already resolved.
+/// range. Returns 404 if the event does not exist or sits outside the caller's projects, 409 if it
+/// is already resolved.
 #[utoipa::path(
     post,
     path = "/alarms/{event_id}/acknowledge",
@@ -667,6 +627,7 @@ fn actor_label(auth: &AuthContext) -> String {
 pub async fn acknowledge_alarm(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<AuthContext>,
+    ProjectScope(scope): ProjectScope,
     Path(event_id): Path<Uuid>,
 ) -> AppResult<Json<AcknowledgedAlarmResponse>> {
     #[derive(Debug, FromQueryResult)]
@@ -675,6 +636,8 @@ pub async fn acknowledge_alarm(
         acknowledged_at: Option<chrono::DateTime<chrono::FixedOffset>>,
         acknowledged_by: Option<String>,
     }
+
+    confine_alarm_event(&state, &scope, event_id).await?;
 
     let existing = state
         .db
@@ -725,8 +688,8 @@ pub async fn acknowledge_alarm(
 /// Remove acknowledgement from an open alarm event
 ///
 /// Clears `acknowledged_at` and `acknowledged_by`, re-raising the alarm in the UI notification
-/// badge. Returns 404 if the event does not exist, 409 if already resolved. Idempotent, returns
-/// 204 even if already unacknowledged.
+/// badge. Returns 404 if the event does not exist or sits outside the caller's projects, 409 if
+/// already resolved. Idempotent, returns 204 even if already unacknowledged.
 #[utoipa::path(
     delete,
     path = "/alarms/{event_id}/acknowledge",
@@ -740,12 +703,15 @@ pub async fn acknowledge_alarm(
 )]
 pub async fn unacknowledge_alarm(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Path(event_id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
     #[derive(Debug, FromQueryResult)]
     struct EventCheck {
         resolved_at: Option<chrono::DateTime<chrono::FixedOffset>>,
     }
+
+    confine_alarm_event(&state, &scope, event_id).await?;
 
     let existing = state
         .db
@@ -883,11 +849,10 @@ async fn fetch_latest_reading_times(
     db: &sea_orm::DatabaseConnection,
     scope: &crate::common::authz::AccessScope,
 ) -> AppResult<HashMap<Uuid, (String, DateTime<Utc>)>> {
-    let project_filter = if scope.is_restricted() {
-        "WHERE s.project_id = ANY($1)"
-    } else {
-        ""
-    };
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    let project_filter = project_filter_sql(scope, "s.project_id", &mut values)
+        .map(|predicate| format!("WHERE {predicate}"))
+        .unwrap_or_default();
 
     // Continuous-only: a monthly grab must not make a dead logger look alive.
     let sql = format!(
@@ -899,8 +864,6 @@ async fn fetch_latest_reading_times(
         GROUP BY s.id, s.name
         "
     );
-
-    let values: Vec<sea_orm::Value> = scope.sql_project_array().map(|p| vec![p]).unwrap_or_default();
 
     let rows: Vec<LatestReadingTimeRow> = db
         .query_all(Statement::from_sql_and_values(
@@ -933,11 +896,10 @@ async fn fetch_last_alarm_warning_times(
     db: &sea_orm::DatabaseConnection,
     scope: &crate::common::authz::AccessScope,
 ) -> AppResult<HashMap<Uuid, (Option<DateTime<Utc>>, Option<DateTime<Utc>>)>> {
-    let project_filter = if scope.is_restricted() {
-        "WHERE s.project_id = ANY($1)"
-    } else {
-        ""
-    };
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    let project_filter = project_filter_sql(scope, "s.project_id", &mut values)
+        .map(|predicate| format!("WHERE {predicate}"))
+        .unwrap_or_default();
 
     let sql = format!(
         r"
@@ -950,8 +912,6 @@ async fn fetch_last_alarm_warning_times(
         GROUP BY s.id
         "
     );
-
-    let values: Vec<sea_orm::Value> = scope.sql_project_array().map(|p| vec![p]).unwrap_or_default();
 
     let rows: Vec<LastAlarmWarningRow> = db
         .query_all(Statement::from_sql_and_values(
@@ -1022,9 +982,8 @@ pub async fn get_alarm_events(
     let mut values: Vec<sea_orm::Value> = Vec::new();
     let mut conditions: Vec<String> = Vec::new();
 
-    if let Some(projects) = scope.sql_project_array() {
-        values.push(projects);
-        conditions.push(format!("s.project_id = ANY(${})", values.len()));
+    if let Some(predicate) = project_filter_sql(&scope, "s.project_id", &mut values) {
+        conditions.push(predicate);
     }
     if let Some(site_id) = query.site_id {
         values.push(site_id.into());
@@ -1167,12 +1126,21 @@ pub struct ThresholdWithValue {
 )]
 pub async fn get_thresholds(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Query(query): Query<ThresholdsQuery>,
 ) -> AppResult<Json<Vec<ThresholdWithValue>>> {
     let resolved_cte = super::thresholds::resolve_thresholds_sql(
         query.site_id,
         query.parameter_id.map(|p| vec![p]),
     );
+
+    // Confined to the caller's projects, the same rule the three alarm siblings apply: the payload
+    // is one row per active slot, so an unconfined answer is an inventory of every project's slots
+    // and their current values.
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    let project_filter = project_filter_sql(&scope, "s.project_id", &mut values)
+        .map(|predicate| format!("WHERE {predicate}"))
+        .unwrap_or_default();
 
     // Attach the latest reading per slot so the table can show a current value beside each threshold.
     // Bounded to the last 30 days so TimescaleDB chunk-excludes to recent chunks (fast even for the
@@ -1195,14 +1163,17 @@ pub async fn get_thresholds(
          SELECT r.site_id, r.parameter_id, r.warning_min, r.warning_max, r.alarm_min, r.alarm_max, \
                 r.source, l.current_value \
          FROM resolved r \
-         LEFT JOIN latest l ON l.site_id = r.site_id AND l.parameter_id = r.parameter_id"
+         JOIN sites s ON s.id = r.site_id \
+         LEFT JOIN latest l ON l.site_id = r.site_id AND l.parameter_id = r.parameter_id \
+         {project_filter}"
     );
 
     let rows = state
         .db
-        .query_all(Statement::from_string(
+        .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            sql,
+            &sql,
+            values,
         ))
         .await?
         .into_iter()

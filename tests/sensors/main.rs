@@ -7,5 +7,6 @@
 mod common;
 
 mod import_adopt_swap_lifecycle;
+mod multi_parameter_channel;
 mod read_endpoints;
 mod swap_reattributes;

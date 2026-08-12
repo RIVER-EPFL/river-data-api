@@ -60,7 +60,7 @@ fn csv_cell(body: &str, column: &str) -> String {
         .to_string()
 }
 
-// RD-050: the Public toggle sent on site_parameter create is dropped, so a slot created public
+// the Public toggle sent on site_parameter create is dropped, so a slot created public
 // comes back private and stays out of the public API until a separate update.
 #[tokio::test]
 #[serial]
@@ -165,7 +165,7 @@ async fn site_parameter_create_honours_is_public() {
     );
 }
 
-// RD-051: /sites/{id}/readings serves the site-level units with no catalog fallback, so an
+// /sites/{id}/readings serves the site-level units with no catalog fallback, so an
 // adopt-created slot reports null units while /sites/{id}/parameters reports the catalog default.
 #[tokio::test]
 #[serial]
@@ -264,7 +264,7 @@ async fn adopted_slot_reports_the_same_units_on_both_site_endpoints() {
     );
 }
 
-// RD-052: units_name, units_min, units_max, variable_mappings and decimal_places are accepted and
+// units_name, units_min, units_max, variable_mappings and decimal_places are accepted and
 // stored, and nothing consumes them: a slot set to one decimal place still renders full precision
 // and the setting never reaches the renderer.
 #[tokio::test]
@@ -390,7 +390,7 @@ async fn site_parameter_display_config_reaches_a_reader() {
     );
 }
 
-// RD-055: status-event pages are ordered by time with no tiebreaker, so rows sharing a timestamp
+// status-event pages are ordered by time with no tiebreaker, so rows sharing a timestamp
 // can repeat or vanish across pages instead of each appearing exactly once.
 #[tokio::test]
 #[serial]
@@ -532,7 +532,7 @@ async fn get_without_unwinding(
         .map_err(|e| e.to_string())
 }
 
-// RD-057: per_page=0 is clamped on the upper bound only, so it reaches SeaORM's paginate() and
+// per_page=0 is clamped on the upper bound only, so it reaches SeaORM's paginate() and
 // panics instead of answering the caller.
 #[tokio::test]
 #[serial]
@@ -592,7 +592,7 @@ impl NotificationChannel for RecordingChannel {
     }
 }
 
-// RD-048: a notification mute is consulted only by the alarm dispatcher, so a muted slot still
+// a notification mute is consulted only by the alarm dispatcher, so a muted slot still
 // receives stale-data notifications.
 #[tokio::test]
 #[serial]
@@ -678,7 +678,7 @@ async fn muted_slot_receives_no_stale_data_notification() {
     );
 }
 
-// RD-049: the Telegram /thresholds command queries alarm_thresholds directly, so a site whose
+// the Telegram /thresholds command queries alarm_thresholds directly, so a site whose
 // thresholds resolve from the parameter-default tier reports none configured.
 #[tokio::test]
 #[serial]

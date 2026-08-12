@@ -11,7 +11,9 @@
 #[allow(dead_code, unused_imports)]
 mod common;
 
+mod action_scope_edges;
 mod grants_api;
 mod me_sites;
 mod project_isolation;
+mod project_of_row;
 mod project_scope_gaps;

@@ -103,18 +103,39 @@ impl CRUDOperations for SiteParameterOperations {
             .collect())
     }
 
+    /// Retire everything the slot owns before it goes away: unattribute its readings and status
+    /// events, delete the samples nothing references any more, release the streams that fed it,
+    /// and rebuild the rollups. `retire_slot` also does the `data_streams` NULLing the foreign key
+    /// requires, so the delete CrudCrate performs next succeeds.
     async fn before_delete(
         &self,
         db: &DatabaseConnection,
         id: Uuid,
     ) -> Result<(), ApiError> {
-        db.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE data_streams SET site_parameter_id = NULL WHERE site_parameter_id = $1",
-            [id.into()],
-        ))
+        crate::routes::private::data_streams::views::retire_slot(
+            db,
+            crate::routes::private::data_streams::views::SlotScope::SiteParameter(id),
+        )
         .await
-        .map_err(ApiError::database)?;
+        .map_err(|e| ApiError::internal(e.to_string(), None))?;
+        Ok(())
+    }
+
+    /// The bulk delete takes the same teardown per slot; without it a multi-slot delete leaves
+    /// readings attributed to a slot that no longer exists and fails on the stream foreign key.
+    async fn before_delete_many(
+        &self,
+        db: &DatabaseConnection,
+        ids: &[Uuid],
+    ) -> Result<(), ApiError> {
+        for id in ids {
+            crate::routes::private::data_streams::views::retire_slot(
+                db,
+                crate::routes::private::data_streams::views::SlotScope::SiteParameter(*id),
+            )
+            .await
+            .map_err(|e| ApiError::internal(e.to_string(), None))?;
+        }
         Ok(())
     }
 
@@ -123,27 +144,8 @@ impl CRUDOperations for SiteParameterOperations {
         db: &DatabaseConnection,
         entity: &mut SiteParameter,
     ) -> Result<(), ApiError> {
-        if entity.is_active.is_none() {
-            db.execute(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "UPDATE site_parameters SET is_active = true WHERE id = $1",
-                [entity.id.into()],
-            ))
-            .await
-            .map_err(ApiError::database)?;
-            entity.is_active = Some(true);
-        }
-        if entity.is_public.is_none() {
-            db.execute(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "UPDATE site_parameters SET is_public = false WHERE id = $1",
-                [entity.id.into()],
-            ))
-            .await
-            .map_err(ApiError::database)?;
-            entity.is_public = Some(false);
-        }
-
+        // `is_active` and `is_public` defaults live in the model's `on_create`, so an omitted
+        // field is already resolved by the time this hook runs and an explicit null stays null.
         let parameter = crate::routes::private::parameters::Entity::find_by_id(entity.parameter_id)
             .one(db)
             .await

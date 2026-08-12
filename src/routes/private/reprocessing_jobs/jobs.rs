@@ -19,6 +19,12 @@ use crate::routes::private::sensors::calibrations::service::{
     recalculate_derived_at_timestamp, reprocess_sensor_readings, reprocess_site_parameter_readings,
 };
 
+/// `Job::run` answers in `DbErr`, the refresh in `AppError`. A refresh that could not run fails
+/// the job that asked for it rather than being logged and forgotten.
+fn as_db_err(e: crate::error::AppError) -> DbErr {
+    DbErr::Custom(e.to_string())
+}
+
 fn required_uuid(params: &serde_json::Value, key: &str) -> Result<Uuid, DbErr> {
     params
         .get(key)
@@ -165,17 +171,23 @@ impl Job for RefreshAggregates {
     }
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        // A refresh that could not run must fail the job: reporting `completed` while the rollups
+        // still serve the old numbers is the failure this job exists to make visible.
         let outcome = tokio::time::timeout(Duration::from_secs(600), async {
             if self.full {
-                sync_state::refresh_continuous_aggregates_full(ctx.db()).await;
+                sync_state::refresh_continuous_aggregates_full(ctx.db()).await
             } else {
-                sync_state::refresh_continuous_aggregates(ctx.db(), None).await;
+                sync_state::refresh_continuous_aggregates(ctx.db(), None).await
             }
         })
         .await;
-        outcome
-            .map(|()| 0)
-            .map_err(|_| DbErr::Custom("Aggregate refresh timed out after 10 minutes".into()))
+        match outcome {
+            Ok(Ok(())) => Ok(0),
+            Ok(Err(e)) => Err(DbErr::Custom(e.to_string())),
+            Err(_) => Err(DbErr::Custom(
+                "Aggregate refresh timed out after 10 minutes".into(),
+            )),
+        }
     }
 }
 
@@ -338,7 +350,7 @@ impl Job for DerivedRecompute {
 
             if let Some(since) = min_filled {
                 tracing::info!(%since, "Refreshing continuous aggregates after derived recompute");
-                sync_state::refresh_continuous_aggregates(ctx.db(), Some(since)).await;
+                sync_state::refresh_continuous_aggregates(ctx.db(), Some(since)).await.map_err(as_db_err)?;
             }
             ctx.set_progress(total, Some(total)).await;
             tracing::info!(derived_id = %derived_id, total, filled, "Derived parameter recomputation complete");
@@ -399,7 +411,7 @@ impl Job for DerivedAssignment {
         }
 
         if let Some(since) = earliest {
-            sync_state::refresh_continuous_aggregates(ctx.db(), Some(since)).await;
+            sync_state::refresh_continuous_aggregates(ctx.db(), Some(since)).await.map_err(as_db_err)?;
         }
 
         tracing::info!(%def_id, %site_id, filled, "Derived assignment backfill completed");
@@ -503,7 +515,7 @@ impl Job for SiteTimestampsDerived {
 
         if let Some(since) = earliest {
             tracing::info!(%since, "Refreshing continuous aggregates after derived computation");
-            sync_state::refresh_continuous_aggregates(ctx.db(), Some(since)).await;
+            sync_state::refresh_continuous_aggregates(ctx.db(), Some(since)).await.map_err(as_db_err)?;
         }
         ctx.set_progress(progress, Some(total)).await;
         tracing::info!(computed = progress, "Derived computation complete");
@@ -1018,7 +1030,7 @@ impl CsvImport {
             }
 
             if let Some(s) = since {
-                sync_state::refresh_continuous_aggregates(ctx.db(), Some(s)).await;
+                sync_state::refresh_continuous_aggregates(ctx.db(), Some(s)).await.map_err(as_db_err)?;
             }
             if let Some(app) = crate::common::global_app_state() {
                 crate::common::cache::invalidate_prefix(&app, &format!("readings:{site_id}")).await;
@@ -1309,9 +1321,9 @@ impl Job for JanitorRun {
         };
         if do_full {
             tracing::info!("Derived janitor: running scheduled full continuous aggregate refresh");
-            sync_state::refresh_continuous_aggregates_full(db).await;
+            sync_state::refresh_continuous_aggregates_full(db).await.map_err(as_db_err)?;
         } else {
-            sync_state::refresh_continuous_aggregates(db, None).await;
+            sync_state::refresh_continuous_aggregates(db, None).await.map_err(as_db_err)?;
         }
 
         // 3. Tiered tracked-job retention (cheap deletes; idempotent to run every tick).

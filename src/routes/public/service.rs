@@ -176,9 +176,11 @@ async fn load_public_config(
         api_description: project
             .public_api_description
             .unwrap_or_else(|| "Public sensor data API.".to_string()),
+        // 2.2.0: flagged readings are excluded from the served series, so the site count and the
+        // readings a caller receives now agree.
         api_version: project
             .public_api_version
-            .unwrap_or_else(|| "2.1.0".to_string()),
+            .unwrap_or_else(|| "2.2.0".to_string()),
         contact_email: project.public_contact_email,
         sites: site_configs,
         exposed_params: exposed_configs,

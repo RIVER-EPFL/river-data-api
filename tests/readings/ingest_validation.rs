@@ -1,9 +1,8 @@
 //! What the write paths accept that they should refuse, and what they drop that they should keep.
 //!
-//! Each test names the finding it proves (`RD-0xx` in `docs/defect-findings.md`) and asserts the
-//! intended behaviour, so a red run is the evidence that the defect is real and a later green run
-//! is the evidence that the fix works. Every flow is provisioned from nothing over HTTP as a real
-//! Keycloak user, in the order the dashboard drives it.
+//! Each test asserts the intended behaviour, so a red run is the evidence that the defect is real
+//! and a later green run is the evidence that the fix works. Every flow is provisioned from nothing
+//! over HTTP as a real Keycloak user, in the order the dashboard drives it.
 
 use axum::Router;
 use serde_json::json;
@@ -171,11 +170,7 @@ async fn bucket(
     materialised.unwrap()
 }
 
-// ---------------------------------------------------------------------------------------------
-// RD-015
-// ---------------------------------------------------------------------------------------------
-
-/// RD-015: a `conflict: "overwrite"` correction must keep the corrected reading's sample link, so
+/// a `conflict: "overwrite"` correction must keep the corrected reading's sample link, so
 /// the sample survives with every replicate still counted.
 #[tokio::test]
 #[serial]
@@ -324,11 +319,7 @@ async fn batch_overwrite_keeps_the_sample_link_of_the_reading_it_corrects() {
     );
 }
 
-// ---------------------------------------------------------------------------------------------
-// RD-016
-// ---------------------------------------------------------------------------------------------
-
-/// RD-016: a CSV import in `overwrite` mode must replace the value already stored for the slot,
+/// a CSV import in `overwrite` mode must replace the value already stored for the slot,
 /// even when that value arrived on a sync stream, rather than adding a second reading beside it.
 #[tokio::test]
 #[serial]
@@ -428,11 +419,7 @@ async fn csv_overwrite_replaces_a_synced_reading_instead_of_duplicating_the_slot
     );
 }
 
-// ---------------------------------------------------------------------------------------------
-// RD-017
-// ---------------------------------------------------------------------------------------------
-
-/// RD-017: `/ingest` must reject a timestamp outside `[now - 10 years, now + 1 day]` the way
+/// `/ingest` must reject a timestamp outside `[now - 10 years, now + 1 day]` the way
 /// `/readings/batch` already does, so a bad upstream timestamp cannot latch the stream cursor.
 #[tokio::test]
 #[serial]
@@ -539,11 +526,7 @@ async fn ingest_refuses_timestamps_outside_the_window_batch_already_enforces() {
     );
 }
 
-// ---------------------------------------------------------------------------------------------
-// RD-018
-// ---------------------------------------------------------------------------------------------
-
-/// RD-018: a non-finite CSV cell is a row error, not a stored measurement, so one bad cell cannot
+/// a non-finite CSV cell is a row error, not a stored measurement, so one bad cell cannot
 /// blank the aggregate bucket it falls in.
 #[tokio::test]
 #[serial]
@@ -635,11 +618,7 @@ async fn csv_import_refuses_a_non_finite_cell_and_leaves_the_bucket_computable()
     );
 }
 
-// ---------------------------------------------------------------------------------------------
-// RD-019
-// ---------------------------------------------------------------------------------------------
-
-/// RD-019: the `-9999` missing-value sentinel is recognised by value, so its decimal spellings are
+/// the `-9999` missing-value sentinel is recognised by value, so its decimal spellings are
 /// skipped like the bare one rather than averaged in as measurements.
 #[tokio::test]
 #[serial]
@@ -728,11 +707,7 @@ async fn csv_import_treats_every_spelling_of_the_sentinel_as_missing() {
     );
 }
 
-// ---------------------------------------------------------------------------------------------
-// RD-020
-// ---------------------------------------------------------------------------------------------
-
-/// RD-020: a timestamp repeated in a continuous-cadence import is a row error, not a hidden
+/// a timestamp repeated in a continuous-cadence import is a row error, not a hidden
 /// replicate and not a fabricated grab sample.
 #[tokio::test]
 #[serial]
@@ -872,11 +847,7 @@ async fn csv_import_refuses_a_duplicated_timestamp_in_a_continuous_file() {
     );
 }
 
-// ---------------------------------------------------------------------------------------------
-// RD-021
-// ---------------------------------------------------------------------------------------------
-
-/// RD-021: a grab collected without replicates is still a sample, so it appears in the
+/// a grab collected without replicates is still a sample, so it appears in the
 /// sensor-vs-grab comparison alongside grabs that happen to carry two.
 #[tokio::test]
 #[serial]
@@ -1024,11 +995,7 @@ async fn a_single_replicate_grab_reaches_the_sensor_vs_grab_export() {
     );
 }
 
-// ---------------------------------------------------------------------------------------------
-// RD-022
-// ---------------------------------------------------------------------------------------------
-
-/// RD-022: a CSV timestamp that already carries an offset is a resolved instant, so the
+/// a CSV timestamp that already carries an offset is a resolved instant, so the
 /// request-level `tz_offset_hours` must not shift it a second time.
 #[tokio::test]
 #[serial]
