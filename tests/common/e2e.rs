@@ -61,6 +61,31 @@ pub async fn hourly_bucket(
     }
 }
 
+/// Percent-encode a CrudCrate `filter` value for use in a query string.
+pub fn percent_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// The identity calibration auto-created alongside a sensor, if one exists.
+///
+/// Returned as an Option rather than unwrapped so a caller can assert on its presence: the
+/// auto-creation is behaviour worth pinning, not an assumption to build on silently.
+pub async fn identity_calibration_id(app: &Router, token: &str, sensor_id: &str) -> Option<String> {
+    let filter = percent_encode(&format!(r#"{{"sensor_id":"{sensor_id}"}}"#));
+    let (status, body) =
+        super::get_json_with_token(app, &format!("/api/sensor_calibrations?filter={filter}"), token).await;
+    assert_eq!(status, 200, "list calibrations for {sensor_id}: {body}");
+    body.as_array()
+        .and_then(|a| a.first())
+        .and_then(|c| c["id"].as_str())
+        .map(str::to_string)
+}
+
 /// Extract the `id` field from a created-entity response.
 pub fn id_of(json: &serde_json::Value) -> String {
     json["id"]

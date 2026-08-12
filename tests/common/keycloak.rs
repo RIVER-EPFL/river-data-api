@@ -77,6 +77,24 @@ pub async fn keycloak_reachable() -> bool {
     matches!(client.get(&url).send().await, Ok(r) if r.status().is_success())
 }
 
+/// Gate a Keycloak-dependent test: true to proceed, false to skip.
+///
+/// Skipping reports as a pass, so a CI run with no Keycloak would silently assert nothing. Setting
+/// `REQUIRE_KEYCLOAK` turns the skip into a panic, which is what makes "the e2e suite runs in CI"
+/// mean anything. Left unset locally so a bare `cargo test` still works without the dev stack.
+pub async fn require_keycloak_or_skip(test_name: &str) -> bool {
+    if keycloak_reachable().await {
+        return true;
+    }
+    assert!(
+        std::env::var("REQUIRE_KEYCLOAK").is_err(),
+        "REQUIRE_KEYCLOAK is set but Keycloak at {} is unreachable, so {test_name} cannot run",
+        keycloak_base_url()
+    );
+    eprintln!("skipping {test_name}: Keycloak unreachable at {}", keycloak_base_url());
+    false
+}
+
 /// Obtain a service-account admin token for the dev Keycloak's admin REST API (client credentials
 /// grant with the same confidential client the app's admin proxy uses).
 async fn get_keycloak_admin_token() -> String {
@@ -428,5 +446,8 @@ async fn build_test_app_with_keycloak_inner(
     }
 
     let state = AppState::new(db, config, Some(instance));
+    // The non-Keycloak builders all start the tracked-job worker; without it here any Keycloak
+    // test that triggers a job would wait on one that is queued and never runs.
+    super::spawn_test_worker(&state);
     river_db::routes::build_router(state)
 }
