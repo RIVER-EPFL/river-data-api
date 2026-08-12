@@ -104,8 +104,8 @@ async fn get_keycloak_admin_token() -> String {
 
 /// Idempotently ensure a realm user exists with the given password and EXACTLY the given
 /// `riverdata-*` realm roles (any other riverdata mappings are removed; unrelated realm roles are
-/// left alone). Lets tests provision fixture identities — e.g. a role-less user for the access
-/// gate — without a realm re-import (Keycloak's `--import-realm` skips existing realms).
+/// left alone). Lets tests provision fixture identities, e.g. a role-less user for the access
+/// gate, without a realm re-import (Keycloak's `--import-realm` skips existing realms).
 pub async fn ensure_realm_user(username: &str, password: &str, river_roles: &[&str]) {
     let admin_token = get_keycloak_admin_token().await;
     let base = format!("{}admin/realms/{}", keycloak_base_url(), keycloak_realm());
@@ -380,7 +380,7 @@ pub async fn get_keycloak_jwt(username: &str, password: &str) -> String {
 }
 
 /// Build the in-process app WITH a real `KeycloakAuthInstance` pointing at the dev Keycloak, so
-/// bearer JWTs are validated against its JWKS — exercising the Keycloak side of the auth model
+/// bearer JWTs are validated against its JWKS, exercising the Keycloak side of the auth model
 /// (which the default `keycloak_auth_instance: None` harness cannot). Mirrors `src/main.rs`.
 ///
 /// Awaits the initial OIDC discovery before returning: the `KeycloakAuthLayer`'s `poll_ready` panics
@@ -418,7 +418,7 @@ async fn build_test_app_with_keycloak_inner(
             .build(),
     ));
     // Poll until JWKS/OIDC discovery has landed. `is_operational()` only peeks the current state, so
-    // a single await can return before discovery completes — leaving the layer's `poll_ready` to race
+    // a single await can return before discovery completes, leaving the layer's `poll_ready` to race
     // (and panic) on a no-token request. Bounded so a misconfigured Keycloak can't hang the test.
     for _ in 0..100 {
         if instance.is_operational().await {

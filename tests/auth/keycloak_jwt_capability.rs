@@ -1,4 +1,4 @@
-//! Keycloak auth tests — the in-process app validating REAL JWTs from the **dev Keycloak**.
+//! Keycloak auth tests, the in-process app validating REAL JWTs from the **dev Keycloak**.
 //!
 //! These reuse the dev Keycloak (realm `river-data`; users `admin/admin` + `user/user`) for token
 //! issuance and JWKS validation, while running the API in-process against the **test DB**. They
@@ -151,8 +151,8 @@ async fn keycloak_admin_can_post_sync_credentials() {
     let (_db, app) = seeded_app().await;
     let jwt = get_keycloak_jwt("admin", "admin").await;
 
-    // The allow side of `require_admin`: a real admin JWT must PASS the gate. The handler's business
-    // outcome (created / conflict / validation) is incidental — assert only that auth was accepted.
+    // The allow side of `require_admin`: a real admin JWT must pass the gate and mint a usable
+    // credential. The minted shape itself is asserted in tests/sync/credentials.rs.
     let (s, body) = crate::common::post_json_with_token(
         &app,
         "/api/sync/credentials",
@@ -160,8 +160,10 @@ async fn keycloak_admin_can_post_sync_credentials() {
         &jwt,
     )
     .await;
+    assert_eq!(s, 200, "admin JWT on POST /sync/credentials ({s}): {body}");
+    let minted: serde_json::Value = serde_json::from_str(&body).expect("credential body");
     assert!(
-        s != 401 && s != 403,
-        "admin JWT must pass require_admin on POST /sync/credentials, got {s}: {body}"
+        minted["client_id"].as_str().expect("client_id").starts_with("svc_"),
+        "minted client_id: {minted}"
     );
 }

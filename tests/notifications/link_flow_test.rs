@@ -79,7 +79,7 @@ async fn start_is_single_use() {
     let first = commands::start(&db, 100, Some("carol"), "single123").await;
     assert!(first.contains("Linked"), "first: {first}");
 
-    // The same code can't link a second chat — it was cleared.
+    // The same code can't link a second chat; it was cleared.
     let second = commands::start(&db, 200, Some("mallory"), "single123").await;
     assert!(second.contains("Invalid or expired"), "second: {second}");
     assert_eq!(chat_id_for(&db, "sub-carol").await, Some(100), "still the first chat");

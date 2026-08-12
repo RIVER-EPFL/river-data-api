@@ -49,7 +49,7 @@ async fn write_only_key_cannot_read_back_separate_read_key_can() {
 
     let readings_url = format!("/api/sites/{SITE1_ID}/readings?{READ_WINDOW}&parameter_ids={GLOBAL_PARAM_TEMP_ID}");
 
-    // The writer cannot read its own data back — it has no read_data.
+    // The writer cannot read its own data back; it has no read_data.
     let (s, _) = crate::common::get_with_token(&app, &readings_url, &writer).await;
     assert_eq!(s, 403, "write_data-only key must be denied reading data, got {s}");
 

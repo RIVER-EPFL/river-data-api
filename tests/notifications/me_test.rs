@@ -1,5 +1,5 @@
 //! Self-service `/api/notifications/me`: a Keycloak user manages only their OWN preferences. Every
-//! handler binds to the JWT `sub`, so a second user gets a separate, empty record — no cross-user
+//! handler binds to the JWT `sub`, so a second user gets a separate, empty record, no cross-user
 //! access. Requires the dev Keycloak for real JWTs; auto-skips when it's unreachable.
 //!
 //! Run with the dev stack up: cargo test --test notifications -- --test-threads=1
@@ -72,7 +72,7 @@ async fn me_defaults_then_self_scoped_changes() {
     assert_eq!(subs[0]["site_id"], SITE1_ID);
     assert_eq!(subs[0]["enabled"], false);
 
-    // A different user sees a separate, empty record — no cross-user leakage of prefs.
+    // A different user sees a separate, empty record, no cross-user leakage of prefs.
     let admin = get_keycloak_jwt("admin", "admin").await;
     let (s, body) = crate::common::get_json_with_token(&app, "/api/notifications/me", &admin).await;
     assert_eq!(s, 200);

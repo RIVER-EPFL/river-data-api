@@ -109,7 +109,7 @@ fn view_from_row(r: &sea_orm::QueryResult) -> Result<ScheduleView, sea_orm::DbEr
     })
 }
 
-/// `GET /api/schedules` — every recurring-Service schedule, ordered by `job_name`. Requires
+/// `GET /api/schedules`, every recurring-Service schedule, ordered by `job_name`. Requires
 /// `read_metadata`.
 pub async fn list_schedules(State(state): State<AppState>) -> AppResult<Json<Vec<ScheduleView>>> {
     let rows = state
@@ -136,7 +136,7 @@ pub async fn list_schedules(State(state): State<AppState>) -> AppResult<Json<Vec
     Ok(Json(out))
 }
 
-/// `GET /api/schedules/{job_name}` — one schedule. 404 if unknown. Requires `read_metadata`.
+/// `GET /api/schedules/{job_name}`, one schedule. 404 if unknown. Requires `read_metadata`.
 pub async fn get_schedule(
     State(state): State<AppState>,
     Path(job_name): Path<String>,
@@ -147,7 +147,7 @@ pub async fn get_schedule(
         .ok_or_else(|| AppError::NotFound(format!("schedule '{job_name}' not found")))
 }
 
-/// PATCH body — every field optional; absent fields are left unchanged.
+/// PATCH body, every field optional; absent fields are left unchanged.
 #[derive(Debug, Default, Deserialize)]
 pub struct UpdateScheduleRequest {
     pub enabled: Option<bool>,
@@ -167,7 +167,7 @@ fn known_catchup(s: &str) -> bool {
     CatchupPolicy::from_str_or_default(Some(s)).as_str() == s
 }
 
-/// `PATCH /api/schedules/{job_name}` — edit cadence/policies/tunables. 404 unknown row; 400 on a
+/// `PATCH /api/schedules/{job_name}`, edit cadence/policies/tunables. 404 unknown row; 400 on a
 /// bad interval, unknown policy, or rejected tunables. Applies only provided fields, recomputes
 /// `next_run_at` when the interval changes or a disabled schedule is enabled, stamps the actor, and
 /// writes a `schedule_audit` row. Requires `write_metadata` (+ non-scoped token). Returns the
@@ -200,7 +200,7 @@ pub async fn update_schedule(
         )));
     }
 
-    // Read the pre-image (also the 404 check). Locked nowhere — the single UPDATE below is atomic and
+    // Read the pre-image (also the 404 check). Locked nowhere, the single UPDATE below is atomic and
     // we don't need cross-statement consistency for an operator edit.
     let before = load_view(&state.db, &job_name)
         .await?
@@ -295,14 +295,14 @@ pub async fn update_schedule(
 }
 
 /// `POST /api/schedules/{job_name}/run_now` response: the enqueued job id (None on a dedupe
-/// collision — an identical run_now in the same second) and whether one was created.
+/// collision, an identical run_now in the same second) and whether one was created.
 #[derive(Debug, Serialize)]
 pub struct RunNowResponse {
     pub job_id: Option<Uuid>,
     pub enqueued: bool,
 }
 
-/// `POST /api/schedules/{job_name}/run_now` — fire one off-cadence run with the schedule's current
+/// `POST /api/schedules/{job_name}/run_now`, fire one off-cadence run with the schedule's current
 /// tunables snapshot. 404 if `job_name` is not a known job. Requires `write_metadata` (+ non-scoped
 /// token).
 pub async fn run_now(
@@ -355,7 +355,7 @@ pub struct ScheduleAuditEntry {
     pub new_value: Option<serde_json::Value>,
 }
 
-/// `GET /api/schedules/{job_name}/audit` — up to the 100 newest edits for one schedule, newest
+/// `GET /api/schedules/{job_name}/audit`, up to the 100 newest edits for one schedule, newest
 /// first. Returns an empty list for an unknown/never-edited job. Requires `read_metadata`.
 pub async fn get_schedule_audit(
     State(state): State<AppState>,

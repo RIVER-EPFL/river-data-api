@@ -30,7 +30,7 @@ use crate::common::AppState;
 use crate::routes::private::{projects as projects_entity, sites as sites_entity};
 use crate::error::{AppError, AppResult};
 
-/// Liveness probe — returns 200 if the process is running.
+/// Liveness probe, returns 200 if the process is running.
 #[utoipa::path(
     get,
     path = "/healthz",
@@ -43,7 +43,7 @@ async fn healthz() -> StatusCode {
     StatusCode::OK
 }
 
-/// Readiness probe — returns 200 only if the database is reachable.
+/// Readiness probe, returns 200 only if the database is reachable.
 #[utoipa::path(
     get,
     path = "/readyz",
@@ -241,20 +241,20 @@ pub fn validate_optional_time_range(
         private::admin::users::delete_user,
         private::admin::users::assign_roles,
         private::admin::users::list_roles,
-        river_data_core::server::handlers::enroll::enroll,
-        river_data_core::server::handlers::heartbeat::heartbeat,
-        river_data_core::server::handlers::commands::update_command,
-        river_data_core::server::handlers::events::create_sync_event,
-        river_data_core::server::handlers::events::update_sync_event,
-        river_data_core::server::handlers::admin::list_services,
-        river_data_core::server::handlers::admin::get_service,
-        river_data_core::server::handlers::admin::issue_command,
-        river_data_core::server::handlers::admin::list_commands,
-        river_data_core::server::handlers::admin::list_credentials,
-        river_data_core::server::handlers::admin::create_credential,
-        river_data_core::server::handlers::admin::revoke_credential,
-        river_data_core::server::handlers::admin::list_sync_events,
-        river_data_core::server::handlers::admin::revoke_service,
+        private::sync::control::enroll::enroll,
+        private::sync::control::heartbeat::heartbeat,
+        private::sync::control::commands::update_command,
+        private::sync::control::events::create_sync_event,
+        private::sync::control::events::update_sync_event,
+        private::sync::operator::list_services,
+        private::sync::operator::get_service,
+        private::sync::operator::issue_command,
+        private::sync::operator::list_commands,
+        private::sync::operator::list_credentials,
+        private::sync::operator::create_credential,
+        private::sync::operator::revoke_credential,
+        private::sync::operator::list_sync_events,
+        private::sync::operator::revoke_service,
     ),
     components(
         schemas(
@@ -361,15 +361,15 @@ pub fn validate_optional_time_range(
             river_data_core::models::HeartbeatResponse,
             river_data_core::models::PendingCommand,
             river_data_core::models::CommandUpdateRequest,
-            river_data_core::server::handlers::events::CreateSyncEventRequest,
-            river_data_core::server::handlers::events::UpdateSyncEventRequest,
-            river_data_core::server::handlers::admin::SyncServiceResponse,
-            river_data_core::server::handlers::admin::SyncCommandResponse,
-            river_data_core::server::handlers::admin::IssueCommandRequest,
-            river_data_core::server::handlers::admin::CreateCredentialRequest,
-            river_data_core::server::handlers::admin::CreateCredentialResponse,
-            river_data_core::server::handlers::admin::CredentialResponse,
-            river_data_core::server::handlers::admin::SyncEventResponse,
+            private::sync::control::events::CreateSyncEventRequest,
+            private::sync::control::events::UpdateSyncEventRequest,
+            private::sync::operator::SyncServiceResponse,
+            private::sync::operator::SyncCommandResponse,
+            private::sync::operator::IssueCommandRequest,
+            private::sync::operator::CreateCredentialRequest,
+            private::sync::operator::CreateCredentialResponse,
+            private::sync::operator::CredentialResponse,
+            private::sync::operator::SyncEventResponse,
         )
     ),
     tags(
@@ -384,7 +384,7 @@ pub fn validate_optional_time_range(
         (name = "tools", description = "Analytical calculators (DOC, DIC, pCO2, etc.)"),
         (name = "actions", description = "Operator actions: aggregate refresh, recalibration, merging, derived recomputation"),
         (name = "sync", description = "Sync service control plane: discovery, pairing plans, service/credential management"),
-        (name = "admin", description = "Keycloak user/role management (require_admin — Keycloak admin role only, no token can pass)"),
+        (name = "admin", description = "Keycloak user/role management (require_admin, Keycloak admin role only, no token can pass)"),
     ),
     modifiers(&SecurityAddon),
     // `version` is overwritten at serve time from CARGO_PKG_VERSION (see build_router); the literal
@@ -508,7 +508,7 @@ pub fn build_router(state: AppState) -> Router {
         })
     };
 
-    // Sync control routes — separate auth path (body-based creds + session tokens,
+    // Sync control routes, separate auth path (body-based creds + session tokens,
     // NOT dual auth via service_auth_middleware). These paths live under /sync/* but
     // don't collide with sync admin views which use /sync/services, /sync/credentials etc.
     let sync_control_routes = service::sync_control_router(&state);
@@ -611,7 +611,7 @@ pub fn build_router(state: AppState) -> Router {
 
     // Combine all routes. The API is versioned at /api/; health and docs stay at root.
     // All sub-routers have state already bound (Router<()>), so the top-level Router is
-    // also Router<()> — no trailing .with_state() needed.
+    // also Router<()>, no trailing .with_state() needed.
     Router::new()
         .nest("/api", api_routes)
         .merge(health_routes.with_state(state.clone()))

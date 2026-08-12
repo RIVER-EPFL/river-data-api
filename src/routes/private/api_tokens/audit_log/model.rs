@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Read-only CrudCrate view over the `api_token_audit_log` forensic table (written fire-and-forget on
 /// every API-token request, see `api_tokens::service::record_token_use`). All fields are
-/// `exclude(create, update)` — the table is append-only and the generated mutation routes are unused.
+/// `exclude(create, update)`, the table is append-only and the generated mutation routes are unused.
 /// Mounted behind `require_admin` (no API token can read the audit trail); the UI surfaces it in the
 /// System → Logs hub with filtering/sorting/pagination for free.
 #[derive(

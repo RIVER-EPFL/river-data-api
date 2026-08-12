@@ -123,7 +123,7 @@ async fn resolves_current_role_from_keycloak() {
 async fn unavailable_keycloak_fails_closed() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
-    // Nothing listening here — connection refused.
+    // Nothing listening here, connection refused.
     let state = state_with_keycloak(db.clone(), "http://127.0.0.1:1");
 
     assert_eq!(

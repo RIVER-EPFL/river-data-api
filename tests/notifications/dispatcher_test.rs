@@ -221,7 +221,7 @@ async fn concurrent_dispatchers_send_each_event_once() {
     );
 
     let opened = sent.lock().unwrap().iter().filter(|m| m.kind == "alarm_opened").count();
-    assert_eq!(opened, 1, "exactly one replica sends the alarm — no duplicate alerts");
+    assert_eq!(opened, 1, "exactly one replica sends the alarm, no duplicate alerts");
     assert_eq!(
         count(&db, "notified_at IS NULL AND resolved_at IS NULL").await,
         0,

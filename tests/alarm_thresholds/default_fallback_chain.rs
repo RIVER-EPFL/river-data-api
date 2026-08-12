@@ -188,7 +188,7 @@ async fn test_active_alarms_includes_parameter_default_violations() {
     // At minimum, the endpoint must not error when resolving thresholds from defaults.
     if alarms.is_empty() {
         // Verify it's because the latest reading is in range, not because defaults were ignored.
-        // Query site alarms over the full range — this MUST find violations.
+        // Query site alarms over the full range, this MUST find violations.
         let site_id = crate::common::SITE1_ID;
         let (s2, b2) = crate::common::get_json_with_token(
             &app,

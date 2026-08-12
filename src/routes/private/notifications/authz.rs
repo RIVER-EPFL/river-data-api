@@ -1,10 +1,10 @@
-//! Live role resolution for Telegram chats — the anti-backdoor core.
+//! Live role resolution for Telegram chats, the anti-backdoor core.
 //!
 //! A linked chat is only a delivery address; its authority is the linked Keycloak user's *current*
 //! state. Every command resolves the user live (enabled flag + realm roles) through the Keycloak
 //! admin proxy, with a short TTL cache to absorb bursts. Resolution fails closed: if Keycloak can't
 //! be reached the command is denied, but the identity is NOT deactivated (so an outage can't mass
-//! unlink). A definitive negative — user gone, disabled, or holding no riverdata role — is
+//! unlink). A definitive negative, user gone, disabled, or holding no riverdata role, is
 //! `Revoked`, which deactivates the identity.
 
 use std::time::Duration;
@@ -36,7 +36,7 @@ impl RoleResolution {
         matches!(self, Self::Active(Role::Administrator))
     }
 
-    /// At least `min`'s access level — e.g. `Role::River` for data writes like `/grab`, matching the
+    /// At least `min`'s access level, e.g. `Role::River` for data writes like `/grab`, matching the
     /// HTTP `WriteData` capability so the bot can't be a lower-privilege side door.
     #[must_use]
     pub fn allows_level(&self, min: &Role) -> bool {

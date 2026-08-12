@@ -73,7 +73,7 @@ pub struct Config {
     pub keycloak_realm: Option<String>,
     pub keycloak_client_id: Option<String>,
 
-    // Keycloak admin proxy (optional — enables user management)
+    // Keycloak admin proxy (optional, enables user management)
     pub keycloak_admin_client_id: Option<String>,
     pub keycloak_admin_client_secret: Option<String>,
 
@@ -94,7 +94,7 @@ pub struct Config {
     pub public_rate_limit_burst: u32,
     pub public_rate_limit_period_secs: u64,
 
-    // Authenticated-tier per-IP rate limit, in true requests/second (+ burst). Generous by design —
+    // Authenticated-tier per-IP rate limit, in true requests/second (+ burst). Generous by design,
     // auth is still the primary gate; this only bounds an auth-failure / argon2 flood from a single
     // client IP, and real loggers push infrequent large batches well under it. Honors
     // DISABLE_RATE_LIMITING.
@@ -113,12 +113,12 @@ pub struct Config {
     /// Retention for high-volume `maintenance` tracked jobs (janitor/ingest/refresh/alarm backfill).
     /// Much shorter than operator/metadata. 0 disables age-based pruning. See also the count cap.
     pub job_maintenance_retention_days: u32,
-    /// Hard cap on retained `maintenance` job rows regardless of age — a burst can't blow storage
+    /// Hard cap on retained `maintenance` job rows regardless of age, a burst can't blow storage
     /// between daily prunes. 0 disables the cap.
     pub job_maintenance_max_rows: u64,
 
     // Alarm sweeper: how often to reconcile persisted alarm_events against current breaches.
-    // The sweep is only the backstop — ingest, config changes, and job completions reconcile
+    // The sweep is only the backstop, ingest, config changes, and job completions reconcile
     // event-driven (~1s), so this just bounds how long a missed trigger can stay stale.
     pub alarm_sweep_interval_seconds: u64,
 
@@ -127,28 +127,37 @@ pub struct Config {
     pub sync_event_sweep_interval_seconds: u64,
     pub sync_event_stale_after_seconds: u64,
 
+    // Sync control plane: session token lifetime, how long an unacknowledged command stays
+    // deliverable, the heartbeat-age thresholds behind a service's health, and the prefix on a
+    // minted enrollment client_id. Services in the field hold tokens issued under these values.
+    pub sync_session_token_ttl_secs: u64,
+    pub sync_command_expiry_secs: u64,
+    pub sync_health_healthy_secs: i64,
+    pub sync_health_warning_secs: i64,
+    pub sync_client_id_prefix: String,
+
     // Tracked-job retry policy (calibration/deployment/derived reprocessing, aggregate refresh, ...)
     pub job_max_retries: u32,
     pub job_retry_backoff_seconds: u64,
 
-    // Notifications (Telegram bot + email). Every channel is optional — an unset token or a
+    // Notifications (Telegram bot + email). Every channel is optional, an unset token or a
     // disabled/incomplete email backend is simply skipped, so the API runs identically without them.
     pub telegram_bot_token: Option<String>,
-    // Public bot username (no @, e.g. `riverdata_bot`). Optional — only used to build the
+    // Public bot username (no @, e.g. `riverdata_bot`). Optional, only used to build the
     // `t.me/<bot>?start=<code>` self-service deep link; not a secret.
     pub telegram_bot_username: Option<String>,
     // Whether THIS replica runs the Telegram bot poller. The bot long-polls getUpdates (a global
-    // feed, not a competing-consumer queue), so at >1 replica it must run on exactly one — set false
+    // feed, not a competing-consumer queue), so at >1 replica it must run on exactly one, set false
     // on every replica except the single bot replica. Default true (single-replica behaviour).
     pub enable_telegram_bot: bool,
     pub email_backend: EmailBackend,
-    // SMTP submission (lettre) — used when email_backend = Smtp.
+    // SMTP submission (lettre), used when email_backend = Smtp.
     pub smtp_host: Option<String>,
     pub smtp_port: u16,
     pub smtp_username: Option<String>,
     pub smtp_password: Option<String>,
     pub smtp_from: Option<String>,
-    // Microsoft Graph sendMail — used when email_backend = Graph.
+    // Microsoft Graph sendMail, used when email_backend = Graph.
     pub graph_tenant_id: Option<String>,
     pub graph_client_id: Option<String>,
     pub graph_client_secret: Option<String>,
@@ -175,7 +184,7 @@ pub struct Config {
 }
 
 impl Config {
-    /// Whether the Telegram channel is configured (a bot token is present). Pure check — no I/O.
+    /// Whether the Telegram channel is configured (a bot token is present). Pure check, no I/O.
     #[must_use]
     pub fn telegram_configured(&self) -> bool {
         self.telegram_bot_token.is_some()
@@ -257,7 +266,7 @@ impl Config {
             token_cache_ttl_seconds: env::var("TOKEN_CACHE_TTL_SECONDS")
                 .unwrap_or_else(|_| "5".to_string())
                 .parse()
-                .unwrap_or(5), // 5s default — tight revocation/expiry window, negligible DB load
+                .unwrap_or(5), // 5s default, tight revocation/expiry window, negligible DB load
                                // (expiry is re-checked every request; revoke/rotate bust the cache)
             grants_cache_ttl_seconds: env::var("GRANTS_CACHE_TTL_SECONDS")
                 .unwrap_or_else(|_| "30".to_string())
@@ -318,7 +327,7 @@ impl Config {
                 .parse()
                 .unwrap_or(7),
 
-            // Public API rate limit — modest by design; responses are cache-backed.
+            // Public API rate limit, modest by design; responses are cache-backed.
             // Defaults: burst 10, 1 token per 2s ⇒ ~30/min sustained.
             public_rate_limit_burst: env::var("PUBLIC_RATE_LIMIT_BURST")
                 .unwrap_or_else(|_| "10".to_string())
@@ -378,6 +387,25 @@ impl Config {
                 .unwrap_or_else(|_| "3600".to_string())
                 .parse()
                 .unwrap_or(3600),
+
+            sync_session_token_ttl_secs: env::var("SYNC_SESSION_TOKEN_TTL_SECS")
+                .unwrap_or_else(|_| "900".to_string())
+                .parse()
+                .unwrap_or(900),
+            sync_command_expiry_secs: env::var("SYNC_COMMAND_EXPIRY_SECS")
+                .unwrap_or_else(|_| "300".to_string())
+                .parse()
+                .unwrap_or(300),
+            sync_health_healthy_secs: env::var("SYNC_HEALTH_HEALTHY_SECS")
+                .unwrap_or_else(|_| "90".to_string())
+                .parse()
+                .unwrap_or(90),
+            sync_health_warning_secs: env::var("SYNC_HEALTH_WARNING_SECS")
+                .unwrap_or_else(|_| "300".to_string())
+                .parse()
+                .unwrap_or(300),
+            sync_client_id_prefix: env::var("SYNC_CLIENT_ID_PREFIX")
+                .unwrap_or_else(|_| "svc_".to_string()),
 
             job_max_retries: env::var("JOB_MAX_RETRIES")
                 .unwrap_or_else(|_| "3".to_string())
@@ -457,3 +485,4 @@ pub enum ConfigError {
     #[error("Missing required environment variable: {0}")]
     Missing(&'static str),
 }
+

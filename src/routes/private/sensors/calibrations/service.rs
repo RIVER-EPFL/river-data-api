@@ -350,7 +350,7 @@ pub async fn recompute_valid_until(
 
 /// Twin of [`recompute_valid_until`] for the deployment timeline: chain each of a sensor's
 /// deployments' `deployed_until` down to the next deployment's `deployed_from`. Unlike calibrations
-/// — which absorb gaps (`valid_until = LEAD(valid_from)`) so coverage is continuous — deployments
+///, which absorb gaps (`valid_until = LEAD(valid_from)`) so coverage is continuous, deployments
 /// may legitimately have gaps (a sensor sitting in the lab between field campaigns), so this only
 /// ever *shortens* a window to remove overlap (`LEAST` keeps an existing earlier bound) and never
 /// extends one. Shortening can't create an overlap, so the result always satisfies the per-(site,
@@ -383,7 +383,7 @@ pub async fn recompute_deployed_until<C: ConnectionTrait>(
 
 /// If readings exist before the sensor's first calibration, create or extend an identity
 /// calibration (slope=1, intercept=0) to cover them. Never modifies existing non-identity
-/// calibrations — the identity only fills the uncovered region before the first real calibration.
+/// calibrations, the identity only fills the uncovered region before the first real calibration.
 async fn ensure_calibration_coverage(
     db: &DatabaseConnection,
     sensor_id: Uuid,
@@ -500,7 +500,7 @@ pub async fn reprocess_sensor_readings(
     // cap lifted (default 100k tuples). A deep-historical reprocess rewrites rows in compressed
     // (>30-day) chunks and would otherwise abort the job; SET LOCAL resets on commit and is a no-op
     // on uncompressed data. The read-back, derived cascade, and continuous-aggregate refresh run
-    // AFTER commit — a CAGG refresh cannot run inside a transaction.
+    // AFTER commit, a CAGG refresh cannot run inside a transaction.
     let txn = db.begin().await?;
     txn.execute(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
@@ -508,7 +508,7 @@ pub async fn reprocess_sensor_readings(
     ))
     .await?;
 
-    // Pick exactly one calibration per reading — the most specific overlapping window — so an
+    // Pick exactly one calibration per reading, the most specific overlapping window, so an
     // open-ended identity calibration (parameter_id NULL) can never non-deterministically shadow a
     // real parameter-specific one. Preference: exact parameter match, then a parameter-bearing curve
     // over the NULL identity, then the latest window.
@@ -566,10 +566,10 @@ pub async fn reprocess_sensor_readings(
     .await?;
 
     // Recall: a reading that falls in a gap between/after the sensor's deployments (the sensor was
-    // pulled out — e.g. sitting in the lab) belongs to no site. Clear its site/deployment so it
+    // pulled out, e.g. sitting in the lab) belongs to no site. Clear its site/deployment so it
     // drops out of the continuous aggregates. Guarded to `time >= the sensor's first deployment` so
     // readings that predate any deployment keep the site_id the stream pairing gave them (auto-created
-    // deployments start at pairing time, not data start — without this guard a reprocess would
+    // deployments start at pairing time, not data start, without this guard a reprocess would
     // un-attribute all historical data).
     txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
@@ -686,7 +686,7 @@ pub async fn reprocess_site_parameter_readings(
     let updated = dep_result.rows_affected() as usize;
 
     // 2. Re-derive calibrated_value/calibration_id for the (now correct) owner. Pick exactly one
-    //    calibration per reading — the most specific overlapping window — so an open-ended identity
+    //    calibration per reading, the most specific overlapping window, so an open-ended identity
     //    calibration (parameter_id NULL) can't non-deterministically shadow the real one.
     txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,

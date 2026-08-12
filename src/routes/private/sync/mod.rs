@@ -1,3 +1,5 @@
+pub mod control;
+pub mod operator;
 pub mod services_model;
 pub mod commands_model;
 pub mod events_model;

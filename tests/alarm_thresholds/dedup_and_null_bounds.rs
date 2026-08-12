@@ -103,7 +103,7 @@ async fn test_global_plus_site_specific_threshold_no_duplicate_rows() {
     assert_eq!(
         times_sorted.len(),
         original_len,
-        "times array should have no duplicates — indicates JOIN produced duplicate rows"
+        "times array should have no duplicates, indicates JOIN produced duplicate rows"
     );
 
     crate::common::cleanup_test_db(&db).await;

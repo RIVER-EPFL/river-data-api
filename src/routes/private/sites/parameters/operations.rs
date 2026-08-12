@@ -168,7 +168,7 @@ impl CRUDOperations for SiteParameterOperations {
 
         // NOTE: alarm thresholds are intentionally NOT auto-created from parameter defaults.
         // Alarm evaluation already falls back to the parameter's `default_*` columns when no
-        // `alarm_thresholds` row exists, so a default-valued row is redundant — and worse, a
+        // `alarm_thresholds` row exists, so a default-valued row is redundant, and worse, a
         // site-specific copy would silently shadow a global threshold an operator set. A
         // site-specific row is created only when a user explicitly overrides via the editor.
 

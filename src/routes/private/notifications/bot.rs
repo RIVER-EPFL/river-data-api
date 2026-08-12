@@ -94,7 +94,7 @@ async fn route(
         return Some(commands::start(&state.db, chat_id, username, args).await);
     }
 
-    // A write/state-changing command in a group chat can't be attributed to an individual — refuse
+    // A write/state-changing command in a group chat can't be attributed to an individual, refuse
     // before touching identity or the DB.
     if !is_private && is_write_command(cmd) {
         return Some(
@@ -129,7 +129,7 @@ async fn route(
     };
     stamp_verified(&state.db, identity.id).await;
 
-    // The linked user's project confinement — the same set that gates HTTP reads and alert delivery.
+    // The linked user's project confinement, the same set that gates HTTP reads and alert delivery.
     // `None` (administrator) means unrestricted; a member is confined to their granted projects so a
     // bot read can't surface data they can't see in the portal.
     let scope = match accessible_project_ids(state, &identity.sub).await {
@@ -146,7 +146,7 @@ async fn route(
         "stations" => commands::stations(&state.db, &scope).await,
         "latest" => commands::latest(&state.db, &scope, args).await,
         "thresholds" => commands::thresholds(&state.db, &scope, args).await,
-        // Sync-service internals (endpoints, last_error) are operational data — Administrators only.
+        // Sync-service internals (endpoints, last_error) are operational data, Administrators only.
         "server" => {
             if role.allows_admin() {
                 commands::server(&state.db).await

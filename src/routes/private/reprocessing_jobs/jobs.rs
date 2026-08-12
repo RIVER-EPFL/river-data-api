@@ -140,7 +140,7 @@ impl Job for ReprocessSensor {
     }
 }
 
-/// Refresh continuous aggregates — incremental (recent window) or full. Single bounded statement.
+/// Refresh continuous aggregates, incremental (recent window) or full. Single bounded statement.
 pub struct RefreshAggregates {
     name: &'static str,
     full: bool,
@@ -429,10 +429,10 @@ impl SiteTimestampsDerived {
 // the periodic task called, once. Each `default_schedule` returns the cadence from `Config` so the
 // scheduler can seed a `schedules` row on first start; the seconds are captured at registry-build
 // time. Services that need config / shared in-process services beyond `db`+`params` read the
-// process-global `AppState` (`crate::common::global_app_state`) — the same set-once handle pattern
+// process-global `AppState` (`crate::common::global_app_state`), the same set-once handle pattern
 // the CrudCrate hooks use for the event sender.
 
-/// Fill missing derived readings, refresh continuous aggregates, and prune old tracked-job rows —
+/// Fill missing derived readings, refresh continuous aggregates, and prune old tracked-job rows,
 /// the derived-consistency janitor. Wraps [`janitor::run_once`] plus the per-tick full/incremental
 /// refresh and periodic retention the old `janitor::periodic` loop did.
 pub struct JanitorRun {
@@ -558,7 +558,7 @@ impl Job for IngestDerived {
 /// Backdate every `(site, parameter)` slot that has a deployment, re-deriving its readings from the
 /// current deployment + calibration timelines. The slot set is recomputed inside the job from
 /// `sensor_deployments`, so a rerun always reflects the current deployment topology. Backs the
-/// `reprocess_all` operator action. A failed slot logs and continues — a partial backdate is more
+/// `reprocess_all` operator action. A failed slot logs and continues, a partial backdate is more
 /// useful than aborting the whole batch on one bad slot.
 pub struct ReprocessAll;
 
@@ -611,12 +611,12 @@ impl Job for ReprocessAll {
 /// Reconstruct persisted alarm events from the actual readings. Two scoping shapes:
 ///
 /// - `slots` present (array of `[site_id, parameter_id]`): loop `evaluate_alarm_episodes` over each
-///   pair with the shared `start`/`end` window — the per-slot shape the inline batch/CSV ingest
+///   pair with the shared `start`/`end` window, the per-slot shape the inline batch/CSV ingest
 ///   spawns used.
 /// - `slots` absent: the single/widened `rebuild_alarm_events` path scoped by the optional
 ///   `site_id`/`parameter_id`/`start`/`end` (the `rebuild_alarm_events` operator action).
 ///
-/// Idempotent either way — re-derives the same episodes.
+/// Idempotent either way, re-derives the same episodes.
 pub struct AlarmBackfill;
 
 #[async_trait]
@@ -1050,7 +1050,7 @@ impl CsvImport {
             }
         }
 
-        // The staging source has served its purpose — drop it (makes this job non-rerunnable).
+        // The staging source has served its purpose, drop it (makes this job non-rerunnable).
         ctx.db()
             .execute(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
@@ -1140,7 +1140,7 @@ impl Job for BackfillCalibrations {
     }
 }
 
-/// Absorb one `site_parameter` into another — moves readings, status events, streams, and
+/// Absorb one `site_parameter` into another, moves readings, status events, streams, and
 /// deployments, then deletes the source. Idempotent on the readings PK and a no-op DELETE of an
 /// absent source, so a rerun is safe. Backs the `merge_site_parameters` operator action.
 pub struct MergeSiteParameters;
@@ -1165,7 +1165,7 @@ impl Job for MergeSiteParameters {
     }
 }
 
-/// Absorb one global parameter into another — re-points every `site_parameter`, reading, status
+/// Absorb one global parameter into another, re-points every `site_parameter`, reading, status
 /// event, and stream from source to target, then deletes the source. Idempotent enough to rerun.
 /// Backs the `merge_parameters` operator action.
 pub struct MergeParameters;
@@ -1327,7 +1327,7 @@ impl Job for JanitorRun {
 }
 
 /// Reconcile persisted `alarm_events` against the current breach set (open/update/resolve), then
-/// emit an `AlarmStateChanged` SSE on change — the alarm-sweeper backstop. Wraps
+/// emit an `AlarmStateChanged` SSE on change, the alarm-sweeper backstop. Wraps
 /// [`sweeper::evaluate_alarm_events`] + the same SSE the old `sweeper::periodic` emitted.
 pub struct AlarmSweep {
     interval_seconds: u64,
@@ -1423,7 +1423,7 @@ pub async fn sweep_stale_sync_events(
 }
 
 /// Re-resolve every active linked Telegram identity against Keycloak and deactivate any whose user
-/// is gone/disabled/role-revoked — the anti-backdoor identity reconciliation. Wraps
+/// is gone/disabled/role-revoked, the anti-backdoor identity reconciliation. Wraps
 /// [`reconcile::sweep`]. Needs the live `AppState` (Keycloak admin proxy + the shared `Authorizer`
 /// cache), read from the process global; a no-op when no `AppState` was built (some test contexts).
 pub struct IdentityReconcile {
@@ -1464,7 +1464,7 @@ impl Job for IdentityReconcile {
 }
 
 /// Probe each configured notification channel (Telegram `getMe` / SMTP / Graph token) and upsert
-/// `notification_channel_health` — the channel health heartbeat. Wraps [`health::probe_once`].
+/// `notification_channel_health`, the channel health heartbeat. Wraps [`health::probe_once`].
 pub struct NotifyHealth {
     interval_seconds: u64,
 }
@@ -1496,7 +1496,7 @@ impl Job for NotifyHealth {
     }
 }
 
-/// Drain the `alarm_events` notification outbox (open + resolve passes) and run the signal triggers —
+/// Drain the `alarm_events` notification outbox (open + resolve passes) and run the signal triggers,
 /// the notification dispatcher. Wraps [`dispatcher::dispatch_once`]. The `AlarmStateChanged`
 /// broadcast still wakes an immediate enqueue in `main.rs` for low latency; this schedule is the
 /// fallback cadence.
@@ -1537,7 +1537,7 @@ impl Job for DispatchNotifications {
 /// over the affected window. Backs the bulk reclassification actions (mark sensors low/high
 /// frequency, classify sensorless streams): the classification columns (`sensors.data_frequency`,
 /// `data_streams.measurement_type`) are updated synchronously by the endpoint; this job makes the
-/// existing rows agree. Rerunnable (idempotent — the UPDATE skips rows already at the target).
+/// existing rows agree. Rerunnable (idempotent, the UPDATE skips rows already at the target).
 /// Decompression-safe: portal/lab history lives in compressed (>30-day) chunks.
 pub struct MeasurementRetag;
 
@@ -1626,7 +1626,7 @@ impl Job for MeasurementRetag {
             None => (None, None),
         };
         let (Some(lo), Some(hi)) = (lo, hi) else {
-            ctx.info("Nothing to retag — every reading in scope already matches").await;
+            ctx.info("Nothing to retag, every reading in scope already matches").await;
             return Ok(0);
         };
 

@@ -471,8 +471,8 @@ pub async fn pair_stream(
     txn.commit().await?;
 
     // Window-reprocess the slot in the background (tracked): re-attributes the backfilled readings
-    // to whichever sensor's deployment window covers each time — so pairing a stream into a slot with
-    // a real deployment timeline is attributed by window, not by the single frozen sensor context —
+    // to whichever sensor's deployment window covers each time, so pairing a stream into a slot with
+    // a real deployment timeline is attributed by window, not by the single frozen sensor context,
     // and refreshes continuous aggregates + cascades derived params. (For a fresh pair whose
     // auto-deployment starts now, this is effectively the aggregate refresh.)
     if backfilled > 0 {
@@ -555,7 +555,7 @@ pub async fn unpair_stream(
 
     let now = Utc::now();
 
-    // Clear pairing on stream (keep sensor_id — sensor persists)
+    // Clear pairing on stream (keep sensor_id, sensor persists)
     let mut active: data_streams::ActiveModel = stream.into();
     active.site_parameter_id = Set(None);
     active.paired_at = Set(None);
@@ -658,7 +658,7 @@ pub struct RetagStreamsResponse {
     pub job_id: Option<Uuid>,
 }
 
-/// Classify data streams' measurement_type in bulk — the sensorless-stream counterpart of
+/// Classify data streams' measurement_type in bulk, the sensorless-stream counterpart of
 /// `POST /sensors/retag_frequency` (portal imports like metalp/nomis carry no sensor to hang the
 /// classification on). Requires `write_metadata`.
 #[utoipa::path(

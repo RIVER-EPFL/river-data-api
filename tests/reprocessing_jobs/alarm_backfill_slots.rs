@@ -1,6 +1,6 @@
 //! The `alarm_backfill` job's slot-list shape: when `params.slots` carries `[site_id, parameter_id]`
 //! pairs, the job loops `evaluate_alarm_episodes` over each pair with the shared `start`/`end`
-//! window — the per-slot path the inline batch/CSV ingest spawns used before they were flipped to
+//! window, the per-slot path the inline batch/CSV ingest spawns used before they were flipped to
 //! `worker::enqueue`.
 //!
 //! Run: cargo test --test reprocessing_jobs -- --test-threads=1

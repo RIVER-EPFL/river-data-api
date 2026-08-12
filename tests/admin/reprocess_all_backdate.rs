@@ -1,5 +1,5 @@
 //! `POST /api/actions/reprocess_all` (the backdate operation) re-derives site/deployment attribution
-//! for every (site, parameter) slot from the deployment timeline — re-owning readings that were
+//! for every (site, parameter) slot from the deployment timeline, re-owning readings that were
 //! unattributed (site_id NULL) but fall within a deployment window.
 //!
 //! Run: cargo test --test admin -- --test-threads=1

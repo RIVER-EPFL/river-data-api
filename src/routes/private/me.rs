@@ -87,7 +87,7 @@ pub struct NavigatorSite {
 
 #[derive(Serialize)]
 pub struct NavigatorSubproject {
-    /// `None` for sites without a subproject (defensive — the sites trigger normally assigns the
+    /// `None` for sites without a subproject (defensive, the sites trigger normally assigns the
     /// project's default subproject).
     pub id: Option<Uuid>,
     pub name: String,
@@ -101,7 +101,7 @@ pub struct NavigatorProject {
     pub subprojects: Vec<NavigatorSubproject>,
 }
 
-/// `GET /api/me/sites` — the caller's visible sites as a project → subproject → site tree, for the
+/// `GET /api/me/sites`, the caller's visible sites as a project → subproject → site tree, for the
 /// sidebar site navigator. Same visibility rule the CRUD scope filter enforces on `/api/sites`:
 /// administrators see every project, other members see exactly their grant set. Keycloak-only,
 /// like `/api/me`. Projects and subprojects without sites are omitted.

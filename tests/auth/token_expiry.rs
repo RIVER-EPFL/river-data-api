@@ -25,7 +25,7 @@ async fn token_expiring_in_five_seconds_works_then_stops() {
     )
     .await;
 
-    // Works now — and this use caches it as valid, so the post-expiry check also proves the cache
+    // Works now, and this use caches it as valid, so the post-expiry check also proves the cache
     // cannot keep an expired token alive (expiry is re-checked on every cache hit).
     let (s, _) = crate::common::get_with_token(&app, "/api/sites", &token).await;
     assert_eq!(s, 200, "token must work before its expiry");

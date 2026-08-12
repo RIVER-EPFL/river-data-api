@@ -21,7 +21,7 @@ pub struct ResolvedThreshold {
 }
 
 impl ResolvedThreshold {
-    /// A threshold with every bound NULL never fires — this is the "Disabled" state written by the
+    /// A threshold with every bound NULL never fires; this is the "Disabled" state written by the
     /// UI (a null-valued row at priority 1 that blocks the parameter-default fallback).
     pub fn is_disabled(&self) -> bool {
         self.warning_min.is_none()
@@ -32,8 +32,8 @@ impl ResolvedThreshold {
 }
 
 /// SQL `CASE` mapping a value to a severity (`2`=alarm, `1`=warning, `0`=ok). Callers pass the value
-/// expression and the four bound expressions — column refs for the live queries (`t.alarm_min`,
-/// `rt.alarm_min`), bind-param refs for the episode query (`$7::double precision`) — so the severity
+/// expression and the four bound expressions, column refs for the live queries (`t.alarm_min`,
+/// `rt.alarm_min`), bind-param refs for the episode query (`$7::double precision`), so the severity
 /// ladder is defined in exactly one place. Result is a bare integer; cast to `smallint` at the call
 /// site if needed.
 pub fn severity_case(val: &str, wmin: &str, wmax: &str, amin: &str, amax: &str) -> String {
@@ -60,7 +60,7 @@ pub fn severity_of(value: f64, t: &ResolvedThreshold) -> i16 {
 }
 
 /// Severity of an aggregate bucket: its `min` can breach a lower bound and its `max` an upper bound,
-/// so the bucket severity is the worse of the two — expressed via [`severity_of`] so the ladder is
+/// so the bucket severity is the worse of the two, expressed via [`severity_of`] so the ladder is
 /// defined once.
 pub fn severity_of_range(min: Option<f64>, max: Option<f64>, t: &ResolvedThreshold) -> i16 {
     let lo = min.map(|v| severity_of(v, t)).unwrap_or(0);
@@ -98,7 +98,7 @@ pub struct ThresholdRow {
     pub warning_max: Option<f64>,
     pub alarm_min: Option<f64>,
     pub alarm_max: Option<f64>,
-    /// `"site"` | `"global"` | `"default"` — which tier supplied this threshold.
+    /// `"site"` | `"global"` | `"default"`, which tier supplied this threshold.
     pub source: String,
 }
 
@@ -231,10 +231,10 @@ pub fn resolve_thresholds_sql(site_id: Option<Uuid>, param_ids: Option<Vec<Uuid>
     resolve_thresholds_query(site_id, param_ids).to_string(PostgresQueryBuilder)
 }
 
-/// Resolve the resolved threshold for one `(site, parameter)` slot — the per-slot wrapper over the
+/// Resolve the resolved threshold for one `(site, parameter)` slot, the per-slot wrapper over the
 /// single [`resolve_thresholds_query`] definition. Returns `None` when the slot has no threshold
 /// at any tier. An all-NULL row (the "Disabled" state) resolves to `Some(..)` with every bound
-/// `None` and suppresses alarms — see [`ResolvedThreshold::is_disabled`].
+/// `None` and suppresses alarms, see [`ResolvedThreshold::is_disabled`].
 pub async fn resolve_threshold(
     db: &DatabaseConnection,
     site_id: Uuid,

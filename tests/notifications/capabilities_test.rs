@@ -1,5 +1,5 @@
 //! `GET /api/config/notifications` reports which channels the deployment has configured (env-gated)
-//! so the frontend can grey out unavailable ones. It answers without auth and leaks no secrets — the
+//! so the frontend can grey out unavailable ones. It answers without auth and leaks no secrets, the
 //! payload is exactly availability booleans + the email backend kind + an optional public bot username.
 //!
 //! Run: cargo test --test notifications -- --test-threads=1
@@ -19,7 +19,7 @@ async fn capabilities_report_disabled_and_leak_no_secrets() {
     assert_eq!(body["email"]["available"], false);
     assert_eq!(body["email"]["backend"], "disabled");
 
-    // Exact key shape — guards against any credential field ever leaking into the payload.
+    // Exact key shape, guards against any credential field ever leaking into the payload.
     let obj = body.as_object().expect("object payload");
     assert_eq!(obj.len(), 2, "only telegram + email");
     let tg = body["telegram"].as_object().unwrap();

@@ -8,14 +8,14 @@ use crate::routes::private::alarms::sweeper::reconcile_all_from_hook;
 
 /// Alarm thresholds are intentionally NOT auto-created from a parameter's `default_*` columns when
 /// the defaults change. Alarm evaluation already falls back to those defaults (priority 3) whenever
-/// no `alarm_thresholds` row exists, so materializing default-valued rows is redundant — and a
+/// no `alarm_thresholds` row exists, so materializing default-valued rows is redundant, and a
 /// site-specific copy would silently shadow a global threshold an operator set. A threshold row
 /// exists only when a user explicitly creates one via the editor.
 ///
 /// Because evaluation reads `default_*` live, an edit can change breach state with no new reading;
 /// the post-mutation hooks reconcile immediately instead of waiting for the backstop sweep. The
 /// hook can't see the previous values to detect whether defaults actually changed, so it runs
-/// unconditionally — parameter edits are rare and the reconcile is O(active slots).
+/// unconditionally, parameter edits are rare and the reconcile is O(active slots).
 pub struct ParameterOperations;
 
 #[async_trait]

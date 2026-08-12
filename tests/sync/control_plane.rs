@@ -1,11 +1,11 @@
 //! Sync control plane over the in-process HTTP surface: enrollment, heartbeat, the command
 //! issue→deliver→update lifecycle, sync-event reporting, service revocation, and health derivation.
-//! `SyncState` is implemented for `AppState`, so every handler runs against the test DB with no live
+//! The handlers take `AppState` directly, so every one runs against the test DB with no live
 //! infra. Auth: enroll is unauthenticated; heartbeat/command-update/event endpoints take a sync
 //! session token; the admin issue-command/revoke/list endpoints take an API token.
 //!
 //! Out of scope here: `POST /api/sync/credentials` and `/credentials/{id}/revoke` are `require_admin`
-//! (Keycloak Administrator only — no API token can pass, and the harness has no Keycloak), so
+//! (Keycloak Administrator only, no API token can pass, and the harness has no Keycloak), so
 //! credential minting is exercised via the `seed_sync_credentials` helper and the
 //! `revoke_service` path instead. The Keycloak-gated routes live in `e2e_keycloak_test.rs`.
 //!
@@ -468,6 +468,27 @@ async fn health_state_derived_from_heartbeat_recency() {
         crate::common::get_json_with_token(&app, &format!("/api/sync/services/{healthy}"), &read_token).await;
     assert_eq!(status, 200, "get service ({status}): {one}");
     assert_eq!(one["health"], "healthy");
+
+    // The dashboard consumes these by name, so an added or renamed field is a breaking change.
+    let mut keys: Vec<&str> = one.as_object().expect("object").keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "created_at",
+            "current_operation",
+            "health",
+            "id",
+            "instance_id",
+            "last_error",
+            "last_heartbeat",
+            "last_sync_completed_at",
+            "paused",
+            "service_type",
+            "status",
+            "updated_at",
+        ]
+    );
 }
 
 #[tokio::test]
@@ -597,5 +618,309 @@ async fn stale_running_sync_events_are_swept() {
         count(&db, "SELECT count(*) AS c FROM sync_events WHERE status = 'running'").await,
         1,
         "fresh event untouched"
+    );
+}
+
+/// The session token cache is a process-global `LazyLock`, so a rotation that appears to work
+/// per-request can still be minting a token row per heartbeat. Both halves are asserted: the
+/// token the caller sees, and the row count behind it.
+#[tokio::test]
+#[serial]
+async fn heartbeat_reuses_the_cached_session_token() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_sync_credentials(&db, "svc_cache", "cache-secret", "test").await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let (status, body) = crate::common::post_json(
+        &app,
+        "/api/sync/enroll",
+        &serde_json::json!({
+            "client_id": "svc_cache",
+            "client_secret": "cache-secret",
+            "instance_id": "inst-cache",
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "enroll ({status}): {body}");
+    let enrolled: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let service_id = enrolled["service_id"].as_str().unwrap().to_string();
+    let enrolled_token = enrolled["session_token"].as_str().unwrap().to_string();
+
+    for beat in 0..2 {
+        let (status, body) = crate::common::post_json_with_token(
+            &app,
+            "/api/sync/heartbeat",
+            &serde_json::json!({ "service_id": service_id, "status": "idle" }),
+            &enrolled_token,
+        )
+        .await;
+        assert_eq!(status, 200, "heartbeat {beat} ({status}): {body}");
+        let beat_body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            beat_body["session_token"].as_str().unwrap(),
+            enrolled_token,
+            "heartbeat {beat} returned a different token"
+        );
+    }
+
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT COUNT(*) AS c FROM sync_service_tokens WHERE service_id = '{service_id}'")
+        )
+        .await,
+        1,
+        "heartbeats must not mint a token row each"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn re_enrolling_replaces_the_cached_session_token() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_sync_credentials(&db, "svc_recache", "recache-secret", "test").await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let enroll = || async {
+        let (status, body) = crate::common::post_json(
+            &app,
+            "/api/sync/enroll",
+            &serde_json::json!({
+                "client_id": "svc_recache",
+                "client_secret": "recache-secret",
+                "instance_id": "inst-recache",
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "enroll ({status}): {body}");
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()
+    };
+
+    let first = enroll().await;
+    let second = enroll().await;
+    assert_ne!(
+        first["session_token"], second["session_token"],
+        "re-enrolling must issue a fresh token"
+    );
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/sync/heartbeat",
+        &serde_json::json!({ "service_id": second["service_id"], "status": "idle" }),
+        second["session_token"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200, "heartbeat on the new token ({status}): {body}");
+    let beat: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(beat["session_token"], second["session_token"]);
+}
+
+/// Poll until `sql` reports `expected`, or fail. The two cleanups below run in detached tasks,
+/// so a fixed sleep would be either flaky or slow.
+async fn poll_count(db: &DatabaseConnection, sql: &str, expected: i64, what: &str) {
+    for _ in 0..100 {
+        if count(db, sql).await == expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("{what}: still {} after 10s, expected {expected}", count(db, sql).await);
+}
+
+#[tokio::test]
+#[serial]
+async fn expired_session_tokens_are_swept_per_service_on_enroll() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_sync_credentials(&db, "svc_sweep", "sweep-secret", "test").await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let (_raw, bystander) = crate::common::seed_sync_session_token(&db).await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO sync_service_tokens (id, service_id, token_hash, expires_at, created_at) \
+             VALUES (gen_random_uuid(), '{bystander}', 'stale-bystander', now() - interval '1 hour', now())"
+        ),
+    )
+    .await;
+
+    let (status, body) = crate::common::post_json(
+        &app,
+        "/api/sync/enroll",
+        &serde_json::json!({
+            "client_id": "svc_sweep",
+            "client_secret": "sweep-secret",
+            "instance_id": "inst-sweep",
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "enroll ({status}): {body}");
+    let service_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["service_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO sync_service_tokens (id, service_id, token_hash, expires_at, created_at) \
+             VALUES (gen_random_uuid(), '{service_id}', 'stale-own', now() - interval '1 hour', now())"
+        ),
+    )
+    .await;
+
+    let (status, _body) = crate::common::post_json(
+        &app,
+        "/api/sync/enroll",
+        &serde_json::json!({
+            "client_id": "svc_sweep",
+            "client_secret": "sweep-secret",
+            "instance_id": "inst-sweep",
+        }),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    poll_count(
+        &db,
+        &format!(
+            "SELECT COUNT(*) AS c FROM sync_service_tokens \
+             WHERE service_id = '{service_id}' AND token_hash = 'stale-own'"
+        ),
+        0,
+        "the service's own expired token",
+    )
+    .await;
+    assert!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS c FROM sync_service_tokens \
+                 WHERE service_id = '{service_id}' AND expires_at > now()"
+            )
+        )
+        .await
+            > 0,
+        "the sweep takes only expired rows, the live session survives"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS c FROM sync_service_tokens \
+                 WHERE service_id = '{bystander}' AND token_hash = 'stale-bystander'"
+            )
+        )
+        .await,
+        1,
+        "the sweep is scoped to the enrolling service"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn pending_commands_past_expiry_are_hidden_then_marked_expired() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let (session_token, service_id) = crate::common::seed_sync_session_token(&db).await;
+
+    let expired = uuid::Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO sync_commands (id, service_id, command, status, created_at, expires_at) \
+             VALUES ('{expired}', '{service_id}', 'trigger_sync', 'pending', now(), now() - interval '1 minute')"
+        ),
+    )
+    .await;
+
+    let app = crate::common::build_test_app(db.clone());
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/sync/heartbeat",
+        &serde_json::json!({ "service_id": service_id, "status": "idle" }),
+        &session_token,
+    )
+    .await;
+    assert_eq!(status, 200, "heartbeat ({status}): {body}");
+    let beat: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        beat["pending_commands"].as_array().unwrap().is_empty(),
+        "an expired command must not be delivered: {beat}"
+    );
+
+    poll_count(
+        &db,
+        &format!("SELECT COUNT(*) AS c FROM sync_commands WHERE id = '{expired}' AND status = 'expired'"),
+        1,
+        "the expired command's status",
+    )
+    .await;
+}
+
+/// The three control plane durations are what services in the field were enrolled under, so they
+/// are asserted on the rows themselves rather than on a constant: a session lasts 15 minutes and
+/// an issued command stays deliverable for 5.
+#[tokio::test]
+#[serial]
+async fn session_and_command_lifetimes_match_the_configured_defaults() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_sync_credentials(&db, "svc_ttl", "ttl-secret", "test").await;
+    let token = crate::common::seed_token_full(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let (status, body) = crate::common::post_json(
+        &app,
+        "/api/sync/enroll",
+        &serde_json::json!({
+            "client_id": "svc_ttl",
+            "client_secret": "ttl-secret",
+            "instance_id": "inst-ttl",
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "enroll ({status}): {body}");
+    let service_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["service_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS c FROM sync_service_tokens WHERE service_id = '{service_id}' \
+                 AND expires_at BETWEEN now() + interval '880 seconds' AND now() + interval '920 seconds'"
+            )
+        )
+        .await,
+        1,
+        "session token TTL is 900s"
+    );
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/sync/services/{service_id}/commands"),
+        &serde_json::json!({ "command": "trigger_sync" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "issue command ({status}): {body}");
+
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS c FROM sync_commands WHERE service_id = '{service_id}' \
+                 AND expires_at BETWEEN now() + interval '280 seconds' AND now() + interval '320 seconds'"
+            )
+        )
+        .await,
+        1,
+        "command expiry is 300s"
     );
 }

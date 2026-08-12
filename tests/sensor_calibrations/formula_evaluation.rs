@@ -20,7 +20,7 @@ fn test_division_by_zero_produces_non_finite() {
     vars.insert("b".to_string(), 0.0);
 
     let result = river_db::routes::private::sensors::calibrations::service::evaluate_formula("a / b", &vars);
-    // evaluate_formula returns Ok(Infinity) — the caller must check is_finite()
+    // evaluate_formula returns Ok(Infinity), the caller must check is_finite()
     assert!(result.is_ok(), "meval should not error on division by zero");
     let value = result.unwrap();
     assert!(

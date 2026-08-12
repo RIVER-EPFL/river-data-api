@@ -208,7 +208,7 @@ async fn delete_source(
 ) -> AppResult<()> {
     use sea_orm::{ConnectionTrait, Statement};
 
-    // Delete remaining readings for source parameter (already moved, these are the originals)
+    // Delete remaining readings for source parameter (already moved; these are the originals)
     let sql = "DELETE FROM readings WHERE site_id = $1 AND parameter_id = $2";
     db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
@@ -503,7 +503,7 @@ async fn delete_site_param_remnants(
 }
 
 /// Move deployments, calibrations, derived sources, alarms, annotations, and samples from source to
-/// target parameter. (Sensors no longer carry a parameter — it lives on the deployment /
+/// target parameter. (Sensors no longer carry a parameter, it lives on the deployment /
 /// calibration.)
 async fn reassign_parameter_references(
     txn: &impl ConnectionTrait,

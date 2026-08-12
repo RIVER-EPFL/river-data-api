@@ -1,6 +1,6 @@
 //! `POST /actions/merge_site_parameters` now runs as a tracked `merge_site_parameters` job: the
-//! endpoint returns a `job_id` and the multi-table move runs in the job. This pins the end state —
-//! the source site_parameter is absorbed and deleted — so the conversion can't change behavior.
+//! endpoint returns a `job_id` and the multi-table move runs in the job. This pins the end state,
+//! the source site_parameter is absorbed and deleted, so the conversion can't change behavior.
 //!
 //! Run: cargo test --test admin -- --test-threads=1
 

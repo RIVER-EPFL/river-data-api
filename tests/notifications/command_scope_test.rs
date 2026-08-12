@@ -1,4 +1,4 @@
-//! H4 — bot read commands are confined to the caller's project scope. A member scoped to project A
+//! H4, bot read commands are confined to the caller's project scope. A member scoped to project A
 //! sees only A's stations and cannot resolve a site in project B (it reads as "no match"), so the bot
 //! never surfaces data the member couldn't see in the portal. Administrators (Unrestricted) see all.
 //!

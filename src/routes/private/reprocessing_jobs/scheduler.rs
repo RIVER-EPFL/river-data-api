@@ -62,14 +62,14 @@ pub async fn seed_default_schedules(
 /// A due schedule row claimed for this tick.
 struct DueSchedule {
     job_name: String,
-    /// The slot time this firing represents — the `next_run_at` that just came due. The dedupe key
+    /// The slot time this firing represents, the `next_run_at` that just came due. The dedupe key
     /// is built from this so a re-pick of the same slot collapses to one job.
     scheduled_at: DateTime<Utc>,
     interval_seconds: i64,
     overlap: OverlapPolicy,
     /// The operator-edited tunables snapshot, carried onto the enqueued job's params. Jobs read it
     /// from `ctx.params()["tunables"]`; it is fixed at enqueue time, so a mid-run edit to the
-    /// schedule does NOT affect a job already queued/running (intentional — a run uses one snapshot).
+    /// schedule does NOT affect a job already queued/running (intentional, a run uses one snapshot).
     tunables: serde_json::Value,
 }
 
@@ -190,7 +190,7 @@ async fn enqueue_due(
     Ok(created.is_some())
 }
 
-/// Whether a non-terminal job of this `job_name` already exists — the skip-if-running guard. Covers
+/// Whether a non-terminal job of this `job_name` already exists, the skip-if-running guard. Covers
 /// every pre-completion state a worker-pool or inline job can be in.
 async fn non_terminal_exists(
     db: &DatabaseConnection,

@@ -97,7 +97,7 @@ pub async fn generate_link_code(
 pub struct TestSendRequest {
     /// `telegram` or `email`.
     pub channel: String,
-    /// Telegram chat id (numeric) or an email address — entered in the UI for this test only.
+    /// Telegram chat id (numeric) or an email address, entered in the UI for this test only.
     pub recipient: String,
 }
 
@@ -190,7 +190,7 @@ pub struct SubscriberRow {
     pub subscription_overrides: i64,
 }
 
-/// Roster of everyone with notification state — subscribers and linked Telegram chats (the union, so
+/// Roster of everyone with notification state, subscribers and linked Telegram chats (the union, so
 /// chats linked before opting in still appear). Read-only oversight. Admin-only.
 #[utoipa::path(
     get,

@@ -87,7 +87,7 @@ async fn pairing_attributes_by_deployment_window() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    // The slot already has sensor A deployed (open). Pairing must attribute to A by window — not to
+    // The slot already has sensor A deployed (open). Pairing must attribute to A by window, not to
     // the sensor the pairing path auto-creates for the stream.
     let a = sl::create_sensor(&db, "incumbent-A", crate::common::GLOBAL_PARAM_TEMP_ID).await;
     let dep_a = sl::deploy_sensor(&db, a.id, crate::common::SITE1_ID, sl::dt("2025-06-01T00:00:00Z")).await;

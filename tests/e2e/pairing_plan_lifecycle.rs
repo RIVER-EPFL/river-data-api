@@ -5,7 +5,7 @@
 //!
 //! Apply and revert run as tracked `plan_apply`/`plan_revert` jobs: the endpoint returns a `job_id`
 //! and the pairing, backfill, and plan status transition happen in the job. `run_plan_action` posts
-//! the action, waits for the job to reach `completed`, and returns its `detail.counts` — so count
+//! the action, waits for the job to reach `completed`, and returns its `detail.counts`, so count
 //! assertions read the job detail and DB-fact assertions run only after the job has finished.
 //!
 //! Run: cargo test --test e2e -- --test-threads=1
@@ -33,8 +33,8 @@ fn find_entry<'a>(plan: &'a serde_json::Value, stream_id: &str) -> &'a serde_jso
 }
 
 /// Post `apply`/`revert` on a plan (both run as tracked `plan_apply`/`plan_revert` jobs), wait for
-/// the job to reach `completed`, and return its `detail.counts` object. The heavy work — pairing,
-/// backfill, and the plan status transition — happens in the job, so DB-fact assertions run only
+/// the job to reach `completed`, and return its `detail.counts` object. The heavy work, pairing,
+/// backfill, and the plan status transition, happens in the job, so DB-fact assertions run only
 /// after this returns.
 async fn run_plan_action(
     app: &axum::Router,

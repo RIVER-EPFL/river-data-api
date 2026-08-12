@@ -1,6 +1,6 @@
 //! Pairing-plan apply/revert now run as tracked background jobs (`plan_apply`/`plan_revert`): the
 //! endpoint returns a `job_id` immediately and the heavy backfill runs in the job. This test pins
-//! the end state — applying pairs the stream and backfills its readings; reverting unpairs them —
+//! the end state, applying pairs the stream and backfills its readings; reverting unpairs them,
 //! so the conversion can't silently change behavior.
 //!
 //! Run: cargo test --test sync -- --test-threads=1
@@ -101,7 +101,7 @@ async fn apply_then_revert_pairing_plan_via_jobs() {
     )
     .await;
 
-    // Apply — returns a job id immediately; the backfill runs in the job.
+    // Apply, returns a job id immediately; the backfill runs in the job.
     let (status, text) = crate::common::post_json_with_token(
         &app,
         &format!("/api/sync/pairing-plans/{plan_id}/apply"),
@@ -133,7 +133,7 @@ async fn apply_then_revert_pairing_plan_via_jobs() {
         "readings should be backfilled with a site_id"
     );
 
-    // Revert — also a job; unpairs the stream and clears the readings' site_id.
+    // Revert, also a job; unpairs the stream and clears the readings' site_id.
     let (status, text) = crate::common::post_json_with_token(
         &app,
         &format!("/api/sync/pairing-plans/{plan_id}/revert"),

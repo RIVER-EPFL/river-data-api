@@ -159,7 +159,7 @@ async fn list_grants_returns_named_projects() {
     assert_eq!(grants[0]["name"], "Test River Project");
 }
 
-/// A non-admin (even a manager) cannot read or write another user's grants — grant management is
+/// A non-admin (even a manager) cannot read or write another user's grants, grant management is
 /// Administrator-only, like all of `/api/users`.
 #[tokio::test]
 #[serial]

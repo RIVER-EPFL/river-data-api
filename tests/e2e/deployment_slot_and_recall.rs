@@ -93,7 +93,7 @@ async fn editing_deployment_start_rechains_previous() {
     let sensor = sl::create_sensor(&db, "mover", crate::common::GLOBAL_PARAM_TEMP_ID).await;
     let sensor_id = sensor.id.to_string();
 
-    // Deploy at site 1 from 00:00, then move to site 2 at 02:00 — the move auto-closes site 1 at 02:00.
+    // Deploy at site 1 from 00:00, then move to site 2 at 02:00, the move auto-closes site 1 at 02:00.
     let dep1 = e2e::create_deployment(&app, &token, &sensor_id, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID, "2025-06-01T00:00:00Z").await;
     let dep2 = e2e::create_deployment(&app, &token, &sensor_id, crate::common::SITE2_ID, crate::common::GLOBAL_PARAM_TEMP_ID, "2025-06-01T02:00:00Z").await;
     assert_eq!(
@@ -102,7 +102,7 @@ async fn editing_deployment_start_rechains_previous() {
         "site-1 deployment closes when site-2 begins"
     );
 
-    // Correct the move to 01:00 — the previous deployment's end must follow.
+    // Correct the move to 01:00, the previous deployment's end must follow.
     let (status, body) = crate::common::put_json_with_token(
         &app,
         &format!("/api/sensor_deployments/{dep2}"),
@@ -142,7 +142,7 @@ async fn recall_unattributes_post_recall_readings() {
     )
     .await;
 
-    // Recall the sensor at 00:30 — everything from 00:30 onward was logged with the sensor pulled out.
+    // Recall the sensor at 00:30, everything from 00:30 onward was logged with the sensor pulled out.
     let (status, body) = crate::common::put_json_with_token(
         &app,
         &format!("/api/sensor_deployments/{dep}"),
@@ -181,13 +181,13 @@ async fn patch_into_occupied_slot_is_a_clean_client_error() {
     let sensor_a = sl::create_sensor(&db, "patch-a", crate::common::GLOBAL_PARAM_TEMP_ID).await;
     let sensor_b = sl::create_sensor(&db, "patch-b", crate::common::GLOBAL_PARAM_TEMP_ID).await;
 
-    // A holds (site 1, Temperature); B holds (site 2, Temperature) — different slots, both allowed.
+    // A holds (site 1, Temperature); B holds (site 2, Temperature), different slots, both allowed.
     let _dep_a =
         e2e::create_deployment(&app, &token, &sensor_a.id.to_string(), crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID, "2025-06-01T00:00:00Z").await;
     let dep_b =
         e2e::create_deployment(&app, &token, &sensor_b.id.to_string(), crate::common::SITE2_ID, crate::common::GLOBAL_PARAM_TEMP_ID, "2025-06-01T00:00:00Z").await;
 
-    // Moving B into A's slot via PATCH must surface the `before_update` pre-check as a clean 400 —
+    // Moving B into A's slot via PATCH must surface the `before_update` pre-check as a clean 400,
     // not the raw `excl_deployment_site_param_slot` 500 the path produced before the hook existed.
     let (status, body) = crate::common::put_json_with_token(
         &app,

@@ -8,6 +8,6 @@ COPY migration/Cargo.toml migration/Cargo.toml
 # Create stub source files so cargo can resolve the workspace
 RUN mkdir -p src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs \
     && mkdir -p migration/src && echo "fn main() {}" > migration/src/main.rs && echo "" > migration/src/lib.rs
-# Pre-fetch dependencies (|| true: local [patch] deps may not exist at build time)
-RUN cargo fetch || true
+# Pre-fetch dependencies
+RUN cargo fetch
 ENTRYPOINT ["bacon", "--headless", "run"]

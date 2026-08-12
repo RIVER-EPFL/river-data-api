@@ -1,6 +1,6 @@
 //! End-to-end: build a project from an empty database entirely through the API, ingest historical
 //! data in the client's wide-CSV format, expose parameters publicly, and assert the public endpoints
-//! reproduce the data — including the dynamically derived parameter and the continuous aggregates.
+//! reproduce the data, including the dynamically derived parameter and the continuous aggregates.
 //!
 //! This mirrors the production migration/cutover: fresh schema → configure entities → ingest CSV →
 //! serve the public contract. No SQL seed; every entity is created via its real endpoint.

@@ -1,7 +1,7 @@
 //! The uniform `Job` abstraction (ADR 0001).
 //!
 //! Every tracked-job kind implements [`Job`], and a name-keyed [`JobRegistry`] lets the worker pool
-//! and the scheduler dispatch a claimed row (or a due schedule) to its handler by `trigger_type` —
+//! and the scheduler dispatch a claimed row (or a due schedule) to its handler by `trigger_type`,
 //! so first-run and rerun share one code path. Implementations are **stateless handlers**: every
 //! per-run input arrives via the job row's `params` (read through [`JobContext`]), so any replica
 //! can run any job after claiming it.
@@ -23,7 +23,7 @@ use super::schedule::Schedule;
 /// `reprocessing_jobs` and referenced by `schedules.job_name`).
 #[async_trait]
 pub trait Job: Send + Sync {
-    /// Stable identifier — must equal the `trigger_type` persisted on the row and any
+    /// Stable identifier, must equal the `trigger_type` persisted on the row and any
     /// `schedules.job_name` that enqueues this job.
     fn name(&self) -> &'static str;
 
@@ -77,7 +77,7 @@ impl JobRegistry {
         }
     }
 
-    /// Register a job kind. Panics on a duplicate `name()` — a programming error caught at startup
+    /// Register a job kind. Panics on a duplicate `name()`, a programming error caught at startup
     /// rather than a silent dispatch ambiguity at runtime.
     pub fn register(&mut self, job: Arc<dyn Job>) {
         let name = job.name();
@@ -177,7 +177,7 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Arc;
 
-    /// A handler used only to exercise registry mechanics — `run` is never called in these tests
+    /// A handler used only to exercise registry mechanics, `run` is never called in these tests
     /// (it would need a live `JobContext`), so its body is a placeholder.
     struct Dummy {
         name: &'static str,

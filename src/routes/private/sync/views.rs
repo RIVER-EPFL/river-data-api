@@ -13,7 +13,7 @@ use crate::routes::private::sensors::operations::{create_sensor_for_stream, extr
 type SiteInfoMap = std::collections::HashMap<String, (Option<String>, usize, Option<f64>, Option<f64>, Option<f64>)>;
 
 use axum::routing::patch;
-use river_data_core::server::handlers::admin as core_admin;
+use super::operator;
 
 /// Sync admin views are split by required authorization so the unified `/api/` router
 /// can layer the right middleware per group without route-level overrides.
@@ -22,15 +22,15 @@ use river_data_core::server::handlers::admin as core_admin;
 /// - `read_routes`: list/get operations, fine for any read_metadata caller.
 /// - `write_routes`: operator actions such as issuing sync commands and pairing workflows.
 ///   Same gate as other entity mutations (Keycloak admin or write_metadata token).
-/// - `admin_routes`: credential creation and revoke — these mint full-permission
+/// - `admin_routes`: credential creation and revoke, these mint full-permission
 ///   sync session tokens, so they're Keycloak-admin only (no API token can pass).
 pub fn read_routes() -> Router<AppState> {
     Router::new()
-        .route("/services", get(core_admin::list_services::<AppState>))
-        .route("/services/{id}", get(core_admin::get_service::<AppState>))
-        .route("/commands", get(core_admin::list_commands::<AppState>))
-        .route("/events", get(core_admin::list_sync_events::<AppState>))
-        .route("/credentials", get(core_admin::list_credentials::<AppState>))
+        .route("/services", get(operator::list_services))
+        .route("/services/{id}", get(operator::get_service))
+        .route("/commands", get(operator::list_commands))
+        .route("/events", get(operator::list_sync_events))
+        .route("/credentials", get(operator::list_credentials))
         .route("/discovery", get(get_discovery))
         .route("/pairing-plans", get(list_pairing_plans))
         .route("/pairing-plans/{id}", get(get_pairing_plan))
@@ -40,8 +40,8 @@ pub fn read_routes() -> Router<AppState> {
 
 pub fn write_routes() -> Router<AppState> {
     Router::new()
-        .route("/services/{id}/commands", post(core_admin::issue_command::<AppState>))
-        .route("/services/{id}/revoke", post(core_admin::revoke_service::<AppState>))
+        .route("/services/{id}/commands", post(operator::issue_command))
+        .route("/services/{id}/revoke", post(operator::revoke_service))
         .route("/apply-discovery", post(apply_discovery))
         .route("/grouped-discovery", post(grouped_discovery))
         .route("/bulk-pair", post(bulk_pair))
@@ -53,8 +53,8 @@ pub fn write_routes() -> Router<AppState> {
 
 pub fn admin_routes() -> Router<AppState> {
     Router::new()
-        .route("/credentials", post(core_admin::create_credential::<AppState>))
-        .route("/credentials/{id}/revoke", post(core_admin::revoke_credential::<AppState>))
+        .route("/credentials", post(operator::create_credential))
+        .route("/credentials/{id}/revoke", post(operator::revoke_credential))
 }
 
 #[derive(Serialize)]
@@ -413,7 +413,7 @@ struct ActionStats {
     backfilled: u64,
 }
 
-/// `POST /api/admin/sync/apply-discovery` — batch-processes discovery actions.
+/// `POST /api/admin/sync/apply-discovery`, batch-processes discovery actions.
 ///
 /// Runs all actions within a single database transaction so that partial failures
 /// don't leave orphaned entities or inconsistent pairing state.
@@ -773,7 +773,7 @@ struct GroupedParameter {
     existing_id: Option<Uuid>,
 }
 
-/// `POST /api/admin/sync/grouped-discovery` — server-side grouping of unpaired streams.
+/// `POST /api/admin/sync/grouped-discovery`, server-side grouping of unpaired streams.
 /// Like apply-discovery but groups streams by site for bulk creation. Returns counts
 /// of created/paired entities per group. Requires `write_metadata`.
 #[utoipa::path(
@@ -945,7 +945,7 @@ pub struct BulkPairResponse {
     streams_skipped: Vec<String>,
 }
 
-/// `POST /api/admin/sync/bulk-pair` — creates entities and pairs all matching streams in one transaction.
+/// `POST /api/admin/sync/bulk-pair`, creates entities and pairs all matching streams in one transaction.
 /// Bulk-pair multiple streams to existing site_parameters in a single transaction.
 /// Backfills readings for each paired stream. Requires `write_metadata`.
 #[utoipa::path(
@@ -1062,7 +1062,8 @@ pub async fn bulk_pair(
         param_map.insert(p.name.to_lowercase(), id);
     }
 
-    // Streams name their column by code, display name or alias, so all three resolve.
+    // Same precedence as `lookup_parameter_by_code_name_or_alias`: code wins over display name,
+    // which wins over alias. `or_insert` preserves that order as the map is filled.
     for param in parameters::Entity::find().all(&txn).await? {
         param_map.entry(param.code.to_lowercase()).or_insert(param.id);
         param_map.entry(param.name.to_lowercase()).or_insert(param.id);
@@ -1161,11 +1162,10 @@ pub async fn bulk_pair(
         }
     }
 
-    let paired_ids: Vec<Uuid> = streams
-        .iter()
-        .map(|s| s.id)
-        .collect();
-    crate::routes::private::readings::replicates::densify_stream_replicates(&txn, &paired_ids)
+    // Every stream considered, not only the paired ones: densification is idempotent per stream
+    // and a stream skipped this run may still carry a group that starts above index 0.
+    let considered_ids: Vec<Uuid> = streams.iter().map(|s| s.id).collect();
+    crate::routes::private::readings::replicates::densify_stream_replicates(&txn, &considered_ids)
         .await?;
 
     txn.commit().await?;

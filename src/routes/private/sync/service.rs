@@ -866,18 +866,32 @@ fn match_entity(name: &str, existing: &[(Uuid, String)]) -> (Option<Uuid>, bool)
     }
 }
 
-// Same resolution order as `resolve_or_create_param` uses at apply: code, then name, then alias,
-// all case-insensitive, so the review shows the result apply will produce.
+/// A stream names its column by code, display name or alias, so all three resolve. The order is
+/// canonical and shared: `resolve_or_create_param` runs it as SQL at apply time and `bulk_pair`
+/// builds the same precedence into its lookup map, so a review shows what apply will produce.
+pub fn lookup_parameter_by_code_name_or_alias(name: &str, existing: &[CatalogParam]) -> Option<Uuid> {
+    if name.is_empty() {
+        return None;
+    }
+    let lower = name.to_lowercase();
+    existing
+        .iter()
+        .find(|p| p.code.to_lowercase() == lower)
+        .or_else(|| existing.iter().find(|p| p.name.to_lowercase() == lower))
+        .or_else(|| {
+            existing
+                .iter()
+                .find(|p| p.aliases.iter().any(|a| a.to_lowercase() == lower))
+        })
+        .map(|p| p.id)
+}
+
 fn match_entity_display(name: &str, existing: &[CatalogParam]) -> (Option<Uuid>, bool) {
     if name.is_empty() {
         return (None, false);
     }
-    let lower = name.to_lowercase();
-    let matched = existing.iter().find(|p| p.code.to_lowercase() == lower)
-        .or_else(|| existing.iter().find(|p| p.name.to_lowercase() == lower))
-        .or_else(|| existing.iter().find(|p| p.aliases.iter().any(|a| a.to_lowercase() == lower)));
-    match matched {
-        Some(p) => (Some(p.id), false),
+    match lookup_parameter_by_code_name_or_alias(name, existing) {
+        Some(id) => (Some(id), false),
         None => (None, true),
     }
 }
@@ -1003,7 +1017,7 @@ async fn resolve_or_create_site(
 ) -> AppResult<Uuid> {
     if let Some(id) = site_ref.id {
         // The site was matched at plan-creation time. Still backfill coordinates from the stream
-        // metadata if the site lacks them — otherwise a site discovered before its coordinates were
+        // metadata if the site lacks them, otherwise a site discovered before its coordinates were
         // known never picks them up (the common case, since match_entity sets the id).
         if site_ref.latitude.is_some()
             && let Some(existing) = sites::Entity::find_by_id(id).one(txn).await?

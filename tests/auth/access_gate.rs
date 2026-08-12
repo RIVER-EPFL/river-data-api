@@ -56,7 +56,7 @@ async fn login_without_river_role_is_rejected_everywhere() {
 #[serial]
 async fn admin_only_role_passes_the_gate() {
     // Regression for the removed `required_roles(vec![Role::User])` layer, which rejected any JWT
-    // lacking the base role during validation — locking out a pure `riverdata-admin` account.
+    // lacking the base role during validation, locking out a pure `riverdata-admin` account.
     require_keycloak!();
     let app = seeded_app().await;
     ensure_realm_user("adminonly", "adminonly", &["riverdata-admin"]).await;

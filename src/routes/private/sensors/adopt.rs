@@ -304,7 +304,7 @@ pub async fn adopt_sensor(
         return Err(AppError::Database(e));
     }
     // Re-chain the timeline and backfill parameter_id (reprocess sets site_id/deployment_id but not
-    // parameter_id — aggregates group by parameter) inside the same transaction as the deployment
+    // parameter_id, aggregates group by parameter) inside the same transaction as the deployment
     // insert, so a failure can't leave a half-applied adopt. The reprocess itself is a post-commit
     // tracked job (heavy, async, retryable).
     recompute_deployed_until(&txn, sensor_id).await?;
@@ -316,7 +316,7 @@ pub async fn adopt_sensor(
     .await?;
     txn.commit().await?;
 
-    // Slot-scoped reprocess re-attributes the (site, parameter) by deployment window — so a backdated
+    // Slot-scoped reprocess re-attributes the (site, parameter) by deployment window, so a backdated
     // deployed_from stamps the sensor onto previously unattributed (sensor_id NULL) history. The
     // per-sensor pass then reconciles the sensor's own rows at any vacated slot.
     let adopt_site_id = payload.site_id;
@@ -485,7 +485,7 @@ pub async fn swap_sensors(
     ))
     .await?;
 
-    // End the outgoing sensor's open deployment at THIS (site, parameter) slot only — a multi-channel
+    // End the outgoing sensor's open deployment at THIS (site, parameter) slot only, a multi-channel
     // outgoing instrument keeps its other channels running.
     let ended = txn
         .query_one(Statement::from_sql_and_values(
@@ -530,7 +530,7 @@ pub async fn swap_sensors(
         return Err(AppError::Database(e));
     }
     // Re-chain both sensors' timelines, relink the feed to the incoming sensor (so FUTURE ingest
-    // stamps B — the stream's frozen sensor_id is only a hint; the deployment timeline is
+    // stamps B, the stream's frozen sensor_id is only a hint; the deployment timeline is
     // authoritative), and backfill parameter_id, all inside the swap transaction so a failure can't
     // leave a half-applied swap. The handover reprocess is a post-commit tracked job.
     recompute_deployed_until(&txn, payload.outgoing_sensor_id).await?;
@@ -550,7 +550,7 @@ pub async fn swap_sensors(
     txn.commit().await?;
 
     // Per-(site,parameter) handover reprocess: re-owns existing readings to whichever sensor's
-    // deployment window covers each time — so the outgoing sensor's post-swap readings re-attribute
+    // deployment window covers each time, so the outgoing sensor's post-swap readings re-attribute
     // to the incoming sensor (a per-sensor reprocess can't, since those rows still carry sensor A).
     let site_id = payload.site_id;
     let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(

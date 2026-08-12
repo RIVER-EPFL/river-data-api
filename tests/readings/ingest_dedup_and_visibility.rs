@@ -172,7 +172,7 @@ async fn unpaired_readings_excluded_from_aggregates_until_paired() {
     let sp = e2e::assign_site_parameter_minimal(&app, &token, &site, &param).await;
     let stream = register_stream(&app, &token, "agg1").await;
 
-    // Ingest onto the UNPAIRED stream — readings carry site_id = NULL.
+    // Ingest onto the UNPAIRED stream, readings carry site_id = NULL.
     let readings: Vec<serde_json::Value> = (0..6)
         .map(|i| serde_json::json!({"time": format!("2025-01-15T0{i}:00:00Z"), "raw_value": 100.0 + i as f64}))
         .collect();

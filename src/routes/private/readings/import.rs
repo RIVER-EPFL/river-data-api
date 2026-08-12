@@ -1,10 +1,10 @@
-//! Wide-CSV historical ingestion — the backend for the dashboard's CSV import flow.
+//! Wide-CSV historical ingestion, the backend for the dashboard's CSV import flow.
 //!
 //! Accepts the client's delivery format: a `DateTime` column plus one column per parameter
 //! (e.g. `DateTime,DOmgL,DOuM,WaterTempdegC`) for a single target site. Each column is resolved to
 //! a parameter via, in order: an explicit per-request `mapping`, site_parameter names,
 //! site parameter aliases, then the global catalog name. Columns that resolve to a
-//! derived-output parameter (e.g. `DOmgL`) are skipped — derived
+//! derived-output parameter (e.g. `DOmgL`) are skipped, derived
 //! values are recomputed from their sources, never ingested.
 //!
 //! `dry_run` returns the resolution plan (which columns map where, which are skipped/unmapped, plus
@@ -185,7 +185,7 @@ pub async fn import_csv(
         (arc, sid)
     } else if let Some(sid) = req.session_id {
         let cached = state.import_staging.get(&sid.to_string()).await.ok_or_else(|| {
-            AppError::BadRequest("Staging session expired or not found — re-upload the file".into())
+            AppError::BadRequest("Staging session expired or not found, re-upload the file".into())
         })?;
         (cached, sid)
     } else {
@@ -350,7 +350,7 @@ pub async fn import_csv(
                 if !site_param_ids.contains(&pid) {
                     let name = param_names.get(&pid).cloned().unwrap_or_default();
                     warnings.push(format!(
-                        "Column '{header}' maps to parameter '{name}', which is not assigned to site '{}' — it will be stored but not exposed until you add the site parameter",
+                        "Column '{header}' maps to parameter '{name}', which is not assigned to site '{}'; it will be stored but not exposed until you add the site parameter",
                         site.name
                     ));
                 }

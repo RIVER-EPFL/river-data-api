@@ -20,7 +20,7 @@ pub struct Model {
     pub id: Uuid,
     #[crudcrate(filterable, fulltext, sortable)]
     pub name: String,
-    /// Per-key allocation label — which external client/logger this key was issued to.
+    /// Per-key allocation label, which external client/logger this key was issued to.
     #[crudcrate(filterable, fulltext)]
     pub description: Option<String>,
     /// Argon2id PHC hash of the token secret. Excluded from create/update (set on mint).

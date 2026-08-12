@@ -10,8 +10,8 @@ pub struct SensorDeploymentOperations;
 
 /// Spawn a tracked reprocess for a deployment change. Runs the **slot-scoped** reprocess first
 /// (`reprocess_site_parameter_readings`) so a backdated/edited window re-attributes the affected
-/// (site, parameter) by deployment timeline — stamping `sensor_id` onto previously unattributed
-/// (NULL-sensor) history — then a per-sensor pass to reconcile the sensor's own rows at any vacated
+/// (site, parameter) by deployment timeline, stamping `sensor_id` onto previously unattributed
+/// (NULL-sensor) history, then a per-sensor pass to reconcile the sensor's own rows at any vacated
 /// slot. `parameter_id` is the deployment's authored parameter (passed through to the job).
 async fn spawn_slot_reprocess(
     db: &DatabaseConnection,
@@ -138,7 +138,7 @@ impl CRUDOperations for SensorDeploymentOperations {
             .await
             .map_err(ApiError::database)?
         else {
-            return Ok(()); // unknown id — let CrudCrate's update produce the 404
+            return Ok(()); // unknown id, let CrudCrate's update produce the 404
         };
 
         // parameter_id is immutable on update (exclude(update)); the slot's parameter is the row's own.
@@ -301,7 +301,7 @@ impl CRUDOperations for SensorDeploymentOperations {
             .try_get("", "parameter_id")
             .map_err(ApiError::database)?;
 
-        // readings.deployment_id has no ON DELETE action — clear references first, then delete.
+        // readings.deployment_id has no ON DELETE action, clear references first, then delete.
         // The reprocess below re-derives deployment_id/site_id for these readings by window.
         db.execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,

@@ -1,5 +1,5 @@
 //! The unauthenticated public tier must expose ONLY public-flagged projects, sites, and
-//! parameters — never private data, never via coercion, and never a write.
+//! parameters, never private data, never via coercion, and never a write.
 
 
 use serial_test::serial;
@@ -75,7 +75,7 @@ async fn private_project_and_coercion_are_blocked() {
     )
     .await;
 
-    // Unknown / non-public codes 404 — no leakage of existence.
+    // Unknown / non-public codes 404, no leakage of existence.
     for code in ["nonexistent", "Secret"] {
         let (s, _) = crate::common::get(&app, &format!("/api/public/{code}/sites")).await;
         assert_eq!(s, 404, "non-public code '{code}' must 404 on the public tier, got {s}");

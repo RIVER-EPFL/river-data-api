@@ -1,5 +1,5 @@
 //! Subprojects: the mandatory project→subproject→site level. Enforcement is a DB trigger, so these
-//! assert the observable contract rather than the mechanism — every project gets a default
+//! assert the observable contract rather than the mechanism, every project gets a default
 //! subproject, every site is auto-assigned one, moving a site between subprojects keeps its project
 //! consistent, and a project-scoped principal sees only its own project's subprojects.
 
@@ -89,7 +89,7 @@ async fn creating_a_site_with_a_subproject_infers_the_project() {
     let (_s, body) = get_with_token(&app, "/api/subprojects", &token).await;
     let default_sub = parse(&body)[0]["id"].as_str().unwrap().to_string();
 
-    // No project_id in the body — the trigger derives it from the subproject.
+    // No project_id in the body, the trigger derives it from the subproject.
     let (s, body) = post_json_with_token(
         &app,
         "/api/sites",

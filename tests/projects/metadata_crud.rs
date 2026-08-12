@@ -20,7 +20,7 @@ async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
 }
 
 // =============================================================================
-// Projects: GET /api/projects — CrudCrate list
+// Projects: GET /api/projects, CrudCrate list
 // =============================================================================
 
 #[tokio::test]
@@ -41,7 +41,7 @@ async fn test_list_projects() {
 }
 
 // =============================================================================
-// Projects: GET /api/projects/{id} — CrudCrate get by UUID
+// Projects: GET /api/projects/{id}, CrudCrate get by UUID
 // =============================================================================
 
 #[tokio::test]
@@ -91,7 +91,7 @@ async fn test_list_project_sites() {
 }
 
 // =============================================================================
-// Projects: GET /api/projects/{bad_uuid} — 404
+// Projects: GET /api/projects/{bad_uuid}, 404
 // =============================================================================
 
 #[tokio::test]
@@ -109,7 +109,7 @@ async fn test_get_project_not_found() {
 }
 
 // =============================================================================
-// Sites: GET /api/sites — CrudCrate list
+// Sites: GET /api/sites, CrudCrate list
 // =============================================================================
 
 #[tokio::test]
@@ -125,7 +125,7 @@ async fn test_list_sites() {
 }
 
 // =============================================================================
-// Sites: GET /api/sites/{id} — CrudCrate get by UUID
+// Sites: GET /api/sites/{id}, CrudCrate get by UUID
 // =============================================================================
 
 #[tokio::test]
@@ -172,7 +172,7 @@ async fn test_list_site_parameters() {
 }
 
 // =============================================================================
-// Sites: GET /api/sites/{bad_uuid} — 404
+// Sites: GET /api/sites/{bad_uuid}, 404
 // =============================================================================
 
 #[tokio::test]

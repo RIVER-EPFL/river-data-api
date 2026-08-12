@@ -9,7 +9,7 @@ use super::definition_model::DerivedParameterDefinition;
 /// Maximum allowed derived-from-derived chain depth.
 const MAX_DERIVED_CHAIN_DEPTH: u32 = 3;
 
-/// Math functions/constants recognized by meval — not variable names
+/// Math functions/constants recognized by meval, not variable names
 const MATH_BUILTINS: &[&str] = &[
     "sqrt", "abs", "ln", "log", "exp", "sin", "cos", "tan", "asin", "acos", "atan",
     "sinh", "cosh", "tanh", "floor", "ceil", "round", "signum",

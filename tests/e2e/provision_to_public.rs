@@ -54,7 +54,7 @@ async fn provision_pair_ingest_and_expose_publicly() {
     .await;
     assert!((200..300).contains(&status), "pair stream ({status}): {paired}");
 
-    // 4. Ingest readings through the paired stream — they should be stamped with site_id/parameter_id.
+    // 4. Ingest readings through the paired stream, they should be stamped with site_id/parameter_id.
     let times: Vec<String> = (0..6).map(|i| format!("2025-06-01T00:{:02}:00Z", i * 10)).collect();
     let raw: Vec<f64> = vec![10.0, 11.0, 12.0, 13.0, 14.0, 15.0];
     let readings_payload: Vec<serde_json::Value> = times

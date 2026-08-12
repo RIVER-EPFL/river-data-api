@@ -17,8 +17,8 @@ use crate::common::authz::Role;
 use crate::common::grants::load_grants;
 
 /// Project ids `sub` may be notified for. `None` = unrestricted (administrators). `Some(set)` confines
-/// a member to their granted projects; an empty set — a member with no grants, or a revoked/
-/// unresolvable user — receives nothing (fail closed).
+/// a member to their granted projects; an empty set, a member with no grants, or a revoked/
+/// unresolvable user, receives nothing (fail closed).
 pub async fn accessible_project_ids(state: &AppState, sub: &str) -> Option<HashSet<Uuid>> {
     match state.authorizer.resolve(state, sub).await {
         Some(RoleResolution::Active(role)) if role == Role::Administrator => None,

@@ -83,7 +83,7 @@ async-trait = "0.1"
 migration = { path = "migration" }
 
 # Core library (sync control plane + hydrochemistry toolbox)
-river-data-core = { version = "0.5.0", features = ["server", "toolbox"] }
+river-data-core = { version = "0.5.0", features = ["openapi", "toolbox"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
@@ -93,6 +93,3 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
-
-[patch.crates-io]
-river-data-core = { path = "../river-data-core" }

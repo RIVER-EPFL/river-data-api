@@ -19,7 +19,7 @@
 //!   - require_write_metadata
 //!   - require_write_data
 //!   - require_crud_permissions (method-aware: GET vs mutation)
-//!   - require_admin (Keycloak admin only — NO token can pass)
+//!   - require_admin (Keycloak admin only, NO token can pass)
 
 
 use serial_test::serial;
@@ -131,7 +131,7 @@ async fn issue(
 fn check_status(probe: &Probe, caller: Caller, actual: u16) {
     let want = expected(probe.boundary, caller);
     if want == 200 && probe.allow_non_200_when_authorized {
-        // Authorized — any non-auth status is fine (handler may 400, 404, 422 for reasons unrelated to auth).
+        // Authorized, any non-auth status is fine (handler may 400, 404, 422 for reasons unrelated to auth).
         assert!(
             !(401..=403).contains(&actual),
             "[{}] {} as {} expected ALLOWED (non-auth status), got {}",
@@ -293,7 +293,7 @@ async fn permission_matrix_covers_every_boundary() {
             boundary: Boundary::WriteData,
             allow_non_200_when_authorized: true,
         },
-        // require_admin — no token can pass
+        // require_admin, no token can pass
         Probe {
             label: "tokens-create",
             method: "POST",

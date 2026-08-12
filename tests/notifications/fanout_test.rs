@@ -74,7 +74,7 @@ async fn telegram_fanout_respects_subscription_and_channel_toggle() {
         parameter_id: crate::common::GLOBAL_PARAM_TURB_ID.parse().unwrap(),
     };
 
-    // Slot-scoped: A only — B muted this site, C disabled Telegram.
+    // Slot-scoped: A only, B muted this site, C disabled Telegram.
     let scoped = slot_recipients(&db, &Some(slot)).await.unwrap();
     assert_eq!(chat_ids(&scoped), vec![111], "only the subscribed, telegram-enabled chat");
 
@@ -91,14 +91,14 @@ async fn telegram_fanout_excludes_inactive_and_unlinked() {
     crate::common::seed_test_data(&db).await;
 
     link_chat(&db, "sub-active", 444).await;
-    // Deactivated by the anti-backdoor sweep — must never receive alerts.
+    // Deactivated by the anti-backdoor sweep, must never receive alerts.
     crate::common::exec(
         &db,
         "INSERT INTO telegram_identities (linked_keycloak_sub, telegram_chat_id, is_active) \
          VALUES ('sub-revoked', 555, FALSE)",
     )
     .await;
-    // Pending link (no chat_id yet) — not a deliverable recipient.
+    // Pending link (no chat_id yet), not a deliverable recipient.
     crate::common::exec(
         &db,
         "INSERT INTO telegram_identities (linked_keycloak_sub, link_code, is_active) \

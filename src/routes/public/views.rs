@@ -355,7 +355,7 @@ pub struct ReadingsResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ParameterData {
-    /// Stable parameter code (catalog `code`) — also the CSV/NDJSON column key.
+    /// Stable parameter code (catalog `code`), also the CSV/NDJSON column key.
     pub code: String,
     pub name: String,
     pub units: String,
@@ -536,7 +536,7 @@ pub struct AggregatesResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ParameterAggregateData {
-    /// Stable parameter code (catalog `code`) — also the CSV/NDJSON column key.
+    /// Stable parameter code (catalog `code`), also the CSV/NDJSON column key.
     pub code: String,
     pub name: String,
     pub units: String,
@@ -576,7 +576,7 @@ struct AggregateRow {
 
 /// Aggregated time-series (hourly, daily, weekly, monthly) for a public project site.
 /// Covers continuous and derived readings only; grab samples (measurement_type 'spot')
-/// are excluded — fetch them from the readings endpoint with `measurement_type=spot`.
+/// are excluded, fetch them from the readings endpoint with `measurement_type=spot`.
 #[utoipa::path(
     get,
     path = "/api/public/{project_code}/sites/{site_code}/aggregates/{resolution}",

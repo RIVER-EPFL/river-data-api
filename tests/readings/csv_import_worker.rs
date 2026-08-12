@@ -1,6 +1,6 @@
 //! CSV import runs on the worker pool: the handler stages the parsed rows and enqueues a
 //! `csv_import` job; a worker claims it, inserts the readings, recomputes derived values, and the
-//! staging rows are deleted. This is the durability flip — no inline `spawn_tracked_job_ctx` whose
+//! staging rows are deleted. This is the durability flip, no inline `spawn_tracked_job_ctx` whose
 //! in-memory `Vec` would strand on a dead replica.
 //!
 //! Run with: cargo test --test readings

@@ -1,5 +1,5 @@
 //! Keystone: with ONLY a parameter default (no `alarm_thresholds` rows), a breaching value must be
-//! seen as an alarm by EVERY path — the resolution endpoint, `/alarms/active`, `/sites/{id}/alarms`,
+//! seen as an alarm by EVERY path, the resolution endpoint, `/alarms/active`, `/sites/{id}/alarms`,
 //! `readings?alarms=true`, `aggregates?alarms=true`, and the sweeper. Guards against any consumer
 //! dropping the parameter-default tier (all now share the one alarm engine).
 //!
@@ -23,7 +23,7 @@ async fn every_path_agrees_on_a_parameter_default_breach() {
     let site = crate::common::SITE1_ID;
     let turb = crate::common::GLOBAL_PARAM_TURB_ID;
 
-    // Only a parameter default — no threshold rows anywhere.
+    // Only a parameter default, no threshold rows anywhere.
     crate::common::exec(&db, "DELETE FROM alarm_thresholds").await;
     crate::common::exec(&db, "DELETE FROM alarm_events").await;
     crate::common::exec(
@@ -136,7 +136,7 @@ async fn every_path_agrees_on_a_parameter_default_breach() {
         && !sevs.is_empty()
     {
         // When the continuous aggregate has the bucket, its severity must also come from the default
-        // tier (CAGG refresh timing in tests can leave the just-injected point unbucketed — tolerated).
+        // tier (CAGG refresh timing in tests can leave the just-injected point unbucketed, tolerated).
         assert!(
             sevs.iter().any(|v| v.as_i64() == Some(2)),
             "aggregates severity 2 from default: {ap}"

@@ -21,7 +21,7 @@ use super::messages::severity_label;
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
 
 /// A `uuid[]` bind for confining a `sites` query to the caller's scope: SQL NULL when unrestricted
-/// (administrator — no filter), else the granted project ids (an empty array matches nothing). Pair
+/// (administrator, no filter), else the granted project ids (an empty array matches nothing). Pair
 /// with a `(... IS NULL OR <site>.project_id = ANY(...))` fragment so one bind serves both cases.
 fn scope_projects_bind(scope: &AccessScope) -> sea_orm::Value {
     use sea_orm::sea_query::ArrayType;
@@ -36,18 +36,18 @@ fn scope_projects_bind(scope: &AccessScope) -> sea_orm::Value {
 
 pub fn help() -> String {
     "River Data bot commands:\n\
-     /status — alarm summary\n\
-     /alarms — open alarms\n\
-     /stations — sites by project\n\
-     /latest <site> — latest reading per parameter\n\
-     /thresholds [site] — configured thresholds\n\
-     /server — sync service status\n\
-     /battery [site] — voltage and depletion forecast\n\
-     /grab <site> <param> <value> [more] — submit a grab sample\n\
-     /mute <site> <param> [days] — suppress alerts\n\
+     /status, alarm summary\n\
+     /alarms, open alarms\n\
+     /stations, sites by project\n\
+     /latest <site>, latest reading per parameter\n\
+     /thresholds [site], configured thresholds\n\
+     /server, sync service status\n\
+     /battery [site], voltage and depletion forecast\n\
+     /grab <site> <param> <value> [more], submit a grab sample\n\
+     /mute <site> <param> [days], suppress alerts\n\
      /unmute <site> <param>\n\
-     /muted — active mutes\n\
-     /ping — liveness check"
+     /muted, active mutes\n\
+     /ping, liveness check"
         .to_string()
 }
 
@@ -108,7 +108,7 @@ async fn resolve_site(
 }
 
 fn ambiguous_reply(kind: &str, names: &[String]) -> String {
-    format!("Multiple {kind} match — be more specific: {}", names.join(", "))
+    format!("Multiple {kind} match, be more specific: {}", names.join(", "))
 }
 
 pub async fn stations(db: &DatabaseConnection, scope: &AccessScope) -> String {
@@ -209,7 +209,7 @@ pub async fn status(db: &DatabaseConnection, scope: &AccessScope) -> String {
     }
     let total = alarm + warning;
     if total == 0 {
-        "✅ All clear — no open alarms.".to_string()
+        "✅ All clear, no open alarms.".to_string()
     } else {
         format!("{total} open ({alarm} alarm, {warning} warning). Use /alarms for detail.")
     }
@@ -469,7 +469,7 @@ async fn resolve_mute_target(
     if toks.len() != 2 {
         return Ok(Err("Usage: /mute <site> <param> [days]".to_string()));
     }
-    // Mute commands are Administrator-only (unrestricted scope) — resolved against all sites.
+    // Mute commands are Administrator-only (unrestricted scope), resolved against all sites.
     let (site_id, site_name) = match resolve_site(db, &AccessScope::Unrestricted, toks[0]).await? {
         SiteMatch::One(id, name) => (id, name),
         SiteMatch::NotFound => return Ok(Err(format!("No site matches \"{}\".", toks[0]))),
@@ -602,7 +602,7 @@ pub async fn start(
         .await;
     match res {
         Ok(Some(_)) => {
-            "✅ Linked. You'll receive alerts and can use commands — try /help.".to_string()
+            "✅ Linked. You'll receive alerts and can use commands, try /help.".to_string()
         }
         Ok(None) => "Invalid or expired code.".to_string(),
         // Most likely the chat is already linked to another identity (unique constraint).
@@ -610,7 +610,7 @@ pub async fn start(
     }
 }
 
-/// `/grab <site> <param> <value> [more values…]` — submit a grab sample (and its replicates) from
+/// `/grab <site> <param> <value> [more values…]`, submit a grab sample (and its replicates) from
 /// the field. Reuses the full grab-sample insert path (stream creation, sample aggregation, alarm
 /// reconciliation). When `TELEGRAM_GRAB_FLAG_FOR_REVIEW` is set, the readings are flagged on insert
 /// so they're held out of aggregates until a curator reviews them.
@@ -681,7 +681,7 @@ pub async fn grab(
         }
         Err(e) => {
             tracing::warn!(error = %e, "bot grab insert failed");
-            format!("Couldn't record that — is {param_name} configured at {site_name}?")
+            format!("Couldn't record that, is {param_name} configured at {site_name}?")
         }
     }
 }

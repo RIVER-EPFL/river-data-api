@@ -1,4 +1,4 @@
-//! H13 — flagging a reading must refresh the continuous aggregates so the flagged value stops being
+//! H13, flagging a reading must refresh the continuous aggregates so the flagged value stops being
 //! served from the rollups. The refresh window is widened to a full bucket; before the fix a
 //! single-reading `[t, t+1s)` window was narrower than every aggregate's bucket and TimescaleDB
 //! rejected it, leaving the rollup either stale or (as here) never materialised.

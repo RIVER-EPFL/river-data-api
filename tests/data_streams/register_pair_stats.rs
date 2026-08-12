@@ -61,7 +61,7 @@ async fn test_register_stream_upsert() {
     assert_eq!(status, 200);
     let id1 = json1["id"].as_str().unwrap().to_string();
 
-    // Second registration with same source_system + source_key — should upsert
+    // Second registration with same source_system + source_key, should upsert
     let (status, json2) = crate::common::post_json_parse_with_token(
         &app,
         "/api/streams/register",
@@ -79,7 +79,7 @@ async fn test_register_stream_upsert() {
 }
 
 // ============================================================================
-// Stream pairing — pair, verify backfill, check stats
+// Stream pairing, pair, verify backfill, check stats
 // ============================================================================
 
 #[tokio::test]
@@ -180,7 +180,7 @@ async fn test_pair_already_paired_stream_fails() {
 }
 
 // ============================================================================
-// Stream unpairing — unpair, verify site_id/parameter_id cleared
+// Stream unpairing, unpair, verify site_id/parameter_id cleared
 // ============================================================================
 
 #[tokio::test]

@@ -41,7 +41,7 @@ fn deregister_cancel(job_id: Uuid) {
 }
 
 /// Retry policy for tracked jobs. Set once at startup from `Config`; code paths that don't run
-/// `main.rs` (integration tests) see the default — no retries — so their behavior is unchanged.
+/// `main.rs` (integration tests) see the default, no retries, so their behavior is unchanged.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryPolicy {
     pub max_retries: u32,
@@ -69,7 +69,7 @@ pub(crate) fn job_retry_policy() -> RetryPolicy {
 }
 
 /// Stable identity for THIS replica, stamped as `owner` on inline-spawned jobs. The startup sweep is
-/// scoped to it so a booting replica only reconciles rows it (the same pod) created — never a peer's
+/// scoped to it so a booting replica only reconciles rows it (the same pod) created, never a peer's
 /// live inline job. In k8s this is the pod name (`HOSTNAME`): unique per replica, stable across a
 /// container restart so a crashed-and-restarted pod still recovers its own orphans; a different pod
 /// (rolling deploy) gets a different id and leaves prior orphans for the leased worker pool. Falls
@@ -88,7 +88,7 @@ pub fn process_owner() -> &'static str {
 /// Startup reconcile for in-process jobs. Both in-process spawn paths
 /// ([`spawn_tracked_job_ctx_with_retry`] and [`run_tracked_job`]) stamp `owner = process_owner()`
 /// with **no lease**, so the worker pool's lease reaper (which keys on an expired
-/// `lease_expires_at`) can never reclaim one orphaned by a crash — it would sit `pending`/`running`/
+/// `lease_expires_at`) can never reclaim one orphaned by a crash, it would sit `pending`/`running`/
 /// `retrying` forever. On boot, fail this replica's own leaseless non-terminal rows. Scoped to
 /// [`process_owner`] (stable across a container restart) and run before any in-process job of the new
 /// incarnation is spawned, so it only ever touches a prior incarnation's orphans, never a live job;
@@ -148,7 +148,7 @@ impl JobContext {
         (ctx, cancel)
     }
 
-    /// The job's persisted inputs — what a worker-run job reads to do its work.
+    /// The job's persisted inputs, what a worker-run job reads to do its work.
     #[must_use]
     pub fn params(&self) -> &serde_json::Value {
         &self.params
@@ -182,7 +182,7 @@ impl JobContext {
 
     /// Append a line to the job's timeline (`reprocessing_job_logs`). `warn`/`error` lines are also
     /// streamed over SSE as `JobLog`; the full ordered timeline is fetched on demand from
-    /// `GET /api/jobs/{id}/logs`. Best-effort — a logging failure must never fail the job.
+    /// `GET /api/jobs/{id}/logs`. Best-effort, a logging failure must never fail the job.
     pub async fn log(&self, level: &str, message: &str, context: serde_json::Value) {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         if let Err(e) = self
@@ -504,10 +504,10 @@ where
 
 /// Synchronous sibling of [`spawn_tracked_job_ctx`] for jobs that must run **inline** and hand their
 /// result back to the caller (e.g. the periodic derived janitor, whose periodic loop awaits the
-/// filled count before deciding follow-up work). Runs the full lifecycle — inserts the row as
+/// filled count before deciding follow-up work). Runs the full lifecycle, inserts the row as
 /// `running`, emits `JobCreated`/`JobProgress`, runs `work` to completion, records
 /// `completed`/`failed`, and on success runs the same post-success alarm reconcile as the spawned
-/// path — but in the current task, with no retry. Returns the work's count (or its error).
+/// path, but in the current task, with no retry. Returns the work's count (or its error).
 pub async fn run_tracked_job<F, Fut>(
     db: &DatabaseConnection,
     sensor_id: Option<Uuid>,
@@ -555,7 +555,7 @@ where
         total: None,
     });
 
-    // A synchronous inline op (only the janitor uses this path) — not externally cancellable, so it
+    // A synchronous inline op (only the janitor uses this path), not externally cancellable, so it
     // carries a private flag rather than registering in a process-wide map.
     let cancel = Arc::new(AtomicBool::new(false));
     let ctx = JobContext {

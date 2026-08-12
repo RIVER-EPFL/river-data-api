@@ -5,7 +5,7 @@
 //! key; cross-project confinement on every write path; cross-project READ confinement on the
 //! auxiliary read endpoints (search, stream stats, sensor series/bands, calibration window); and the
 //! forensic audit log. Token *creation* is admin-only (Keycloak), so an admin-issued key is seeded
-//! directly — the same representation used by `e2e_api_token_lifecycle_test`.
+//! directly, the same representation used by `e2e_api_token_lifecycle_test`.
 
 
 use axum::extract::{Path, State};
@@ -19,7 +19,7 @@ use crate::common::sensor_lifecycle as slc;
 const PROJECT_B_ID: &str = "00000000-0000-4000-b000-000000000001";
 const SITE_B_ID: &str = "00000000-0000-4000-b000-000000000010";
 const SP_B_DEPTH_ID: &str = "00000000-0000-4000-b000-000000000020";
-/// Project-A seeded depth stream (paired to PARAM_S1_DEPTH at SITE1) — see `seed_streams_for_site_params`.
+/// Project-A seeded depth stream (paired to PARAM_S1_DEPTH at SITE1), see `seed_streams_for_site_params`.
 const A_DEPTH_STREAM_ID: &str = "00000000-0000-4000-d000-000000000005";
 
 fn now_rfc3339() -> String {
@@ -101,12 +101,12 @@ async fn auth_matrix_with_wrong_and_without_key() {
     let (s, _) = crate::common::post_json_with_token(&app, "/api/readings/batch", &body, "").await;
     assert_eq!(s, 401, "empty bearer must be unauthorized");
 
-    // WRONG key #1 — valid key but lacking the permission (read-only): 403 on a write.
+    // WRONG key #1, valid key but lacking the permission (read-only): 403 on a write.
     let read_only = crate::common::seed_api_token(&db, crate::common::perms(true, true, false, false), Some(PROJECT_ID)).await;
     let (s, _) = crate::common::post_json_with_token(&app, "/api/readings/batch", &body, &read_only).await;
     assert_eq!(s, 403, "a key without write_data must be forbidden on a write");
 
-    // WRONG key #2 — valid write key but scoped to the OTHER project: 403 cross-project.
+    // WRONG key #2, valid write key but scoped to the OTHER project: 403 cross-project.
     let other_project = crate::common::seed_api_token(&db, crate::common::perms(true, true, false, true), Some(PROJECT_B_ID)).await;
     let (s, _) = crate::common::post_json_with_token(&app, "/api/readings/batch", &body, &other_project).await;
     assert_eq!(s, 403, "a key scoped to another project must not write here");

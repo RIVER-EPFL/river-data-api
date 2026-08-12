@@ -21,7 +21,7 @@ fn has_riverdata_role(roles: &[String]) -> bool {
 
 /// Anti-backdoor hook: a user's bot access must not outlive their system access. On any change to a
 /// user's roles / enabled flag / existence, drop their cached role so the bot re-resolves on the next
-/// command, and — when they no longer have access — deactivate their linked Telegram chats outright
+/// command, and, when they no longer have access, deactivate their linked Telegram chats outright
 /// rather than waiting for the reconciliation sweep. Best-effort: never fails the user-management op.
 async fn revoke_telegram_access(state: &AppState, sub: &str, still_has_access: bool) {
     state.authorizer.invalidate(sub).await;
@@ -201,7 +201,7 @@ pub async fn list_users(
         v.get("admin").and_then(|a| a.as_bool())
     });
 
-    // Fetch only users holding a riverdata role (not the entire realm — it is LDAP-federated
+    // Fetch only users holding a riverdata role (not the entire realm; it is LDAP-federated
     // and contains every EPFL account). Union members of every level so admin-only users appear
     // too. A missing role (a level not yet created in Keycloak) yields no members via
     // `fetch_role_users`; any real failure (forbidden, server error) still propagates.
@@ -213,7 +213,7 @@ pub async fn list_users(
     )
     .await;
     // Attribute each level to the user that holds it, first-seen order preserved. The roles a user
-    // collects across the membership lists ARE their access levels — no per-user role fetch needed.
+    // collects across the membership lists ARE their access levels, no per-user role fetch needed.
     let mut order: Vec<String> = Vec::new();
     let mut by_id: std::collections::HashMap<String, (serde_json::Value, Vec<String>)> =
         std::collections::HashMap::new();
@@ -623,7 +623,7 @@ async fn fetch_role_users(
         })?;
 
     // A role that doesn't exist yet (the new intern/river/manager levels before they are created
-    // in Keycloak) is not an error — it simply has no members. Any other failure propagates.
+    // in Keycloak) is not an error, it simply has no members. Any other failure propagates.
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(Vec::new());
     }
@@ -817,7 +817,7 @@ async fn set_user_roles(
 }
 
 /// Replace the project visibility grants for a user (`user_project_grants`). Body is the full new
-/// set — this overwrites, not appends — mirroring `assign_roles`. Requires `require_admin`.
+/// set, this overwrites, not appends, mirroring `assign_roles`. Requires `require_admin`.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetGrantsRequest {
     /// The complete set of project ids the user may see. An empty array revokes all access.

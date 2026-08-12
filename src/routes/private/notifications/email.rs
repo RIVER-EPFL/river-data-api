@@ -21,7 +21,7 @@ pub trait Mailer: Send + Sync {
 }
 
 /// SMTP submission via lettre. Port 25 uses a plaintext relay (e.g. an on-campus mail gateway);
-/// any other port uses STARTTLS (e.g. `smtp.office365.com:587`). Credentials are optional — an
+/// any other port uses STARTTLS (e.g. `smtp.office365.com:587`). Credentials are optional, an
 /// unauthenticated campus relay needs none.
 pub struct SmtpMailer {
     transport: AsyncSmtpTransport<Tokio1Executor>,
@@ -187,7 +187,7 @@ pub fn build_mailer(config: &Config) -> Option<Box<dyn Mailer>> {
         EmailBackend::Smtp => {
             let (Some(host), Some(from)) = (config.smtp_host.as_ref(), config.smtp_from.as_ref())
             else {
-                tracing::warn!("EMAIL_BACKEND=smtp but SMTP_HOST/SMTP_FROM not set — email disabled");
+                tracing::warn!("EMAIL_BACKEND=smtp but SMTP_HOST/SMTP_FROM not set, email disabled");
                 return None;
             };
             match SmtpMailer::new(
@@ -199,7 +199,7 @@ pub fn build_mailer(config: &Config) -> Option<Box<dyn Mailer>> {
             ) {
                 Ok(m) => Some(Box::new(m)),
                 Err(e) => {
-                    tracing::warn!(error = %e, "failed to build SMTP mailer — email disabled");
+                    tracing::warn!(error = %e, "failed to build SMTP mailer, email disabled");
                     None
                 }
             }
@@ -212,7 +212,7 @@ pub fn build_mailer(config: &Config) -> Option<Box<dyn Mailer>> {
                 config.graph_sender.as_ref(),
             ) else {
                 tracing::warn!(
-                    "EMAIL_BACKEND=graph but GRAPH_TENANT_ID/CLIENT_ID/CLIENT_SECRET/SENDER not all set — email disabled"
+                    "EMAIL_BACKEND=graph but GRAPH_TENANT_ID/CLIENT_ID/CLIENT_SECRET/SENDER not all set, email disabled"
                 );
                 return None;
             };

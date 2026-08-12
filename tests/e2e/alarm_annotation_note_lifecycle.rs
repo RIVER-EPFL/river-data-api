@@ -132,7 +132,7 @@ async fn alarm_acknowledge_and_autoresolve() {
     assert_eq!(alarm["acknowledged"], serde_json::json!(false), "not acknowledged yet: {alarm}");
     let event_id = alarm["event_id"].as_str().expect("event_id present once swept").to_string();
 
-    // Acknowledge it — still firing, now flagged acknowledged.
+    // Acknowledge it, still firing, now flagged acknowledged.
     let (status, ack) = crate::common::post_json_with_token(
         &app,
         &format!("/api/alarms/{event_id}/acknowledge"),

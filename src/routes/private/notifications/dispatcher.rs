@@ -27,7 +27,7 @@ struct Row {
 }
 
 /// Build the enabled channels from config. Empty when nothing is configured (the API runs fine
-/// without notifications — the dispatcher then just stamps the outbox and sends nothing).
+/// without notifications, the dispatcher then just stamps the outbox and sends nothing).
 pub fn build_channels(config: &Config) -> Vec<Box<dyn NotificationChannel>> {
     let mut channels: Vec<Box<dyn NotificationChannel>> = Vec::new();
     if let Some(token) = &config.telegram_bot_token {
@@ -40,7 +40,7 @@ pub fn build_channels(config: &Config) -> Vec<Box<dyn NotificationChannel>> {
             tracing::info!("Notifications: email channel enabled");
         }
         (Some(_), None) => {
-            tracing::warn!("Email backend configured but ALERT_EMAIL_TO unset — email disabled");
+            tracing::warn!("Email backend configured but ALERT_EMAIL_TO unset, email disabled");
         }
         _ => {}
     }
@@ -85,11 +85,11 @@ async fn process_pending(
     let muted_ids: Vec<Uuid> = muted.iter().map(|r| r.id).collect();
     stamp(db, column, &muted_ids).await?;
 
-    // One message per event so each carries its own slot — fan-out is per-subscriber by scope, which
+    // One message per event so each carries its own slot, fan-out is per-subscriber by scope, which
     // a single batched message spanning multiple slots couldn't express. Each event is CLAIMED with an
     // atomic stamp before the send, so at 2-3 replicas exactly one replica owns it; a transient send
     // failure releases the claim so the next tick retries (at-least-once). The claim is one autocommit
-    // UPDATE — no DB connection is held across the external send.
+    // UPDATE, no DB connection is held across the external send.
     let base = config.dashboard_base_url.as_deref();
     for r in &to_notify {
         if !claim_event(db, column, r.id).await? {

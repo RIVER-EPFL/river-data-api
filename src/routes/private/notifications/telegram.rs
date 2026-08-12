@@ -1,6 +1,6 @@
 //! Telegram Bot API client and the alert delivery channel.
 //!
-//! Plain HTTPS calls against `api.telegram.org` — no bot framework. Phase 1 uses `send_message`;
+//! Plain HTTPS calls against `api.telegram.org`, no bot framework. Phase 1 uses `send_message`;
 //! the bot poller (getUpdates) and `send_photo` are added in later phases.
 
 use std::time::Duration;

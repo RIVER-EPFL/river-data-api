@@ -7,7 +7,7 @@ use super::merge_services::{
     MergeSiteParametersResponse,
 };
 
-/// Merge two `site_parameters` — absorb `source` into `target`. Moves readings, status
+/// Merge two `site_parameters`, absorb `source` into `target`. Moves readings, status
 /// events, streams, and sensor deployments; deletes the source row. Idempotent on the
 /// `(stream_id, time, replicate_index)` PK. Requires `write_metadata`.
 #[utoipa::path(
@@ -42,7 +42,7 @@ pub async fn merge_site_parameters_handler(
     Ok(Json(serde_json::json!({ "job_id": job_id, "status": "queued" })))
 }
 
-/// Merge two global parameters in the catalog — absorb `source` into `target`. Re-points
+/// Merge two global parameters in the catalog, absorb `source` into `target`. Re-points
 /// every `site_parameter`, reading, status event, and stream from source to target. Use
 /// when two catalog entries describe the same physical parameter. Requires `write_metadata`.
 #[utoipa::path(

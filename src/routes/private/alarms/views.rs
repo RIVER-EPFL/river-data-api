@@ -420,7 +420,7 @@ pub(crate) async fn fetch_active_alarm_rows(
     slots: Option<&[(Uuid, Uuid)]>,
     spot: bool,
 ) -> AppResult<Vec<ActiveAlarmRow>> {
-    // Empty slot list means "evaluate nothing" — short-circuit before building an invalid `IN ()`.
+    // Empty slot list means "evaluate nothing", short-circuit before building an invalid `IN ()`.
     if matches!(slots, Some(s) if s.is_empty()) {
         return Ok(Vec::new());
     }
@@ -651,7 +651,7 @@ fn actor_label(auth: &AuthContext) -> String {
 /// Acknowledge an open alarm event
 ///
 /// Marks the open `alarm_event` as acknowledged by the calling user/token. Acknowledging does not
-/// resolve the alarm — it stays active (flagged `acknowledged: true`) until the reading returns to
+/// resolve the alarm; it stays active (flagged `acknowledged: true`) until the reading returns to
 /// range. Returns 404 if the event does not exist, 409 if it is already resolved.
 #[utoipa::path(
     post,
@@ -725,7 +725,7 @@ pub async fn acknowledge_alarm(
 /// Remove acknowledgement from an open alarm event
 ///
 /// Clears `acknowledged_at` and `acknowledged_by`, re-raising the alarm in the UI notification
-/// badge. Returns 404 if the event does not exist, 409 if already resolved. Idempotent — returns
+/// badge. Returns 404 if the event does not exist, 409 if already resolved. Idempotent, returns
 /// 204 even if already unacknowledged.
 #[utoipa::path(
     delete,
@@ -1078,7 +1078,7 @@ pub async fn get_alarm_events(
     );
 
     // Count all matching events (before LIMIT) so `total` reflects the full match set, not the
-    // truncated page. Only the alarm_events + sites join is needed — no filter touches sp/p.
+    // truncated page. Only the alarm_events + sites join is needed, no filter touches sp/p.
     let count_sql = format!(
         r"
         SELECT COUNT(*) AS cnt
@@ -1149,7 +1149,7 @@ pub struct ThresholdWithValue {
     pub alarm_min: Option<f64>,
     pub alarm_max: Option<f64>,
     pub source: String,
-    /// Latest reading (last 30 days) for this slot, or null if none — display only.
+    /// Latest reading (last 30 days) for this slot, or null if none, display only.
     pub current_value: Option<f64>,
 }
 

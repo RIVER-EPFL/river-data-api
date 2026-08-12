@@ -29,7 +29,7 @@ async fn sensor_read_substrate_endpoints() {
     )
     .await;
 
-    // /sensors/{id}/readings — columnar raw + calibrated aligned to times.
+    // /sensors/{id}/readings, columnar raw + calibrated aligned to times.
     let (status, body) = crate::common::get_json_with_token(
         &app,
         &format!("/api/sensors/{}/readings", sensor.id),
@@ -46,7 +46,7 @@ async fn sensor_read_substrate_endpoints() {
     assert_eq!(calibrated[0].as_f64().unwrap(), 2.0 * 10.0 + 1.0, "y = 2x+1");
     assert_eq!(calibrated[5].as_f64().unwrap(), 2.0 * 15.0 + 1.0);
 
-    // /sensors/{id}/deployment_bands — one band at site 1.
+    // /sensors/{id}/deployment_bands, one band at site 1.
     let (status, body) = crate::common::get_json_with_token(
         &app,
         &format!("/api/sensors/{}/deployment_bands", sensor.id),
@@ -59,7 +59,7 @@ async fn sensor_read_substrate_endpoints() {
     assert_eq!(bands[0]["site_id"], serde_json::json!(crate::common::SITE1_ID));
     assert_eq!(bands[0]["deployment_id"], serde_json::json!(dep.to_string()));
 
-    // /sensor_calibrations/{id}/window — the readings the window resolves.
+    // /sensor_calibrations/{id}/window, the readings the window resolves.
     let (status, body) = crate::common::get_json_with_token(
         &app,
         &format!("/api/sensor_calibrations/{cal}/window"),
@@ -71,7 +71,7 @@ async fn sensor_read_substrate_endpoints() {
     assert_eq!(body["slope"].as_f64().unwrap(), 2.0);
     assert_eq!(body["points"].as_array().unwrap().len(), 6);
 
-    // /sites/{id}/sensor_identity — bands + calibration markers keyed by global parameter_id.
+    // /sites/{id}/sensor_identity, bands + calibration markers keyed by global parameter_id.
     let (status, body) = crate::common::get_json_with_token(
         &app,
         &format!(

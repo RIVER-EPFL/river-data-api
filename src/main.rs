@@ -63,8 +63,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run migrations under a cross-replica advisory lock. With 2-3 replicas booting together,
     // concurrent Migrator::up can deadlock on ALTER / non-CONCURRENT CREATE INDEX. A dedicated
-    // single-connection handle holds a session lock for the whole run — lock and unlock land on the
-    // same connection so it can't leak — serialising migrations across replicas; once one replica has
+    // single-connection handle holds a session lock for the whole run, lock and unlock land on the
+    // same connection so it can't leak, serialising migrations across replicas; once one replica has
     // applied them the others no-op. (Timescale hypertable/CAGG DDL can't run inside one txn, so a
     // transaction-scoped lock isn't an option.)
     tracing::info!("Running migrations...");
@@ -88,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Worker-pool jobs left mid-flight by a dead process are recovered by the lease reaper (they
     // carry a lease). In-process jobs do not carry a lease, so reap this replica's own leaseless
-    // orphans on boot — before any in-process job of this incarnation is spawned.
+    // orphans on boot, before any in-process job of this incarnation is spawned.
     match river_db::routes::private::reprocessing_jobs::lifecycle::reconcile_orphaned_inline_jobs(&db)
         .await
     {
@@ -113,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                  Configure KEYCLOAK_URL and KEYCLOAK_REALM environment variables."
             );
         }
-        tracing::warn!("Keycloak authentication NOT configured — admin routes unprotected");
+        tracing::warn!("Keycloak authentication NOT configured, admin routes unprotected");
         None
     };
 
@@ -133,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // The Telegram bot long-polls a global feed (not a competing-consumer queue), so it stays a
-    // dedicated single-replica task — it is NOT a scheduled Service.
+    // dedicated single-replica task; it is NOT a scheduled Service.
     if state.config.telegram_bot_token.is_some() {
         if state.config.enable_telegram_bot {
             tokio::spawn(river_db::routes::private::notifications::bot::run(state.clone()));

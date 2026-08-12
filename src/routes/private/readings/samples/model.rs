@@ -38,7 +38,7 @@ pub struct Model {
     pub created_by: Option<String>,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
-    // Aggregate columns — trigger-maintained, read-only to clients.
+    // Aggregate columns, trigger-maintained, read-only to clients.
     #[crudcrate(exclude(create, update), sortable)]
     pub mean: Option<f64>,
     #[crudcrate(exclude(create, update))]

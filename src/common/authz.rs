@@ -3,7 +3,7 @@
 //! construction, layer plumbing) and delegates every "may X do Y?" decision here.
 //!
 //! ## Model
-//! Keycloak realm roles form ordered access levels — Intern < River < Manager < Administrator —
+//! Keycloak realm roles form ordered access levels, Intern < River < Manager < Administrator,
 //! and each [`Capability`] names the minimum level that holds it ([`Capability::min_role`], the
 //! single readable policy table). The RIVER realm is EPFL-federated and auto-assigns
 //! `default-roles-river` to every login, so authentication alone proves nothing: a user with no
@@ -27,7 +27,7 @@ use crate::error::AppError;
 /// administrators, unscoped API tokens, sync session tokens); `Projects` = confined to a set (a
 /// project-scoped API token carries exactly one; a non-admin Keycloak user carries their grant
 /// set). One type serves both identities so scope filtering is written once. An empty `Projects`
-/// set (a member with no grants) correctly filters everything out — fail closed.
+/// set (a member with no grants) correctly filters everything out, fail closed.
 #[derive(Clone, Debug)]
 pub enum AccessScope {
     Unrestricted,
@@ -78,7 +78,7 @@ impl AccessScope {
 
     /// The confined project ids as a bindable Postgres `uuid[]` value for a raw `= ANY($n)` filter,
     /// or `None` when unrestricted (the caller then omits the filter). An empty set binds as an
-    /// empty array, which `= ANY` treats as matching nothing — fail closed.
+    /// empty array, which `= ANY` treats as matching nothing, fail closed.
     #[must_use]
     pub fn sql_project_array(&self) -> Option<sea_orm::Value> {
         use sea_orm::sea_query::ArrayType;
@@ -172,7 +172,7 @@ pub enum Capability {
     /// Global catalog: parameters, derived definitions, constants, alarm thresholds.
     WriteCatalog,
     /// Privileged management (tokens, sync credentials, user admin, sensor onboarding, streams).
-    /// Granted only to the Keycloak Administrator role — never to an API token, by design.
+    /// Granted only to the Keycloak Administrator role, never to an API token, by design.
     Admin,
 }
 
@@ -220,7 +220,7 @@ impl std::fmt::Display for Capability {
     }
 }
 
-/// The four API-token permission bits (frozen semantics — see `TokenPermissions`).
+/// The four API-token permission bits (frozen semantics, see `TokenPermissions`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenBit {
     ReadMetadata,
@@ -231,7 +231,7 @@ pub enum TokenBit {
 
 /// How a route gate treats API tokens, independently of its Keycloak capability. Lets a route's
 /// human-side level move (e.g. to Administrator) while the token bit that historically unlocked
-/// it stays frozen — the sync microservices' session tokens must keep working unchanged.
+/// it stays frozen, the sync microservices' session tokens must keep working unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenAccess {
     /// Token side follows the capability's [`Capability::default_token_bit`].

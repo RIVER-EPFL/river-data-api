@@ -1,7 +1,6 @@
 use axum_keycloak_auth::instance::KeycloakAuthInstance;
 use chrono::{DateTime, Utc};
 use moka::future::Cache;
-use river_data_core::server::SyncState;
 use sea_orm::DatabaseConnection;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -56,7 +55,7 @@ pub fn global_event_sender() -> Option<EventSender> {
 }
 
 /// Global handle to the running `AppState` so worker-run scheduled Jobs (which receive only a
-/// `JobContext` carrying `db`/`events`/`params`) can reach config and shared in-process services —
+/// `JobContext` carrying `db`/`events`/`params`) can reach config and shared in-process services,
 /// most importantly the live `Authorizer` cache the identity-reconcile job re-resolves against.
 /// Same single-replica, set-once contract as [`GLOBAL_EVENT_SENDER`]: the first `AppState::new` wins
 /// (later ones in tests are ignored), so this is the real serving state in `main.rs`.
@@ -184,8 +183,3 @@ impl AppState {
     }
 }
 
-impl SyncState for AppState {
-    fn db(&self) -> &DatabaseConnection {
-        &self.db
-    }
-}

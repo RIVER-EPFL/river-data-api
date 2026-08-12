@@ -34,7 +34,7 @@ impl Job for CompletingJob {
     }
 }
 
-/// Panics instead of returning — stands in for a handler bug.
+/// Panics instead of returning, stands in for a handler bug.
 struct PanickingJob;
 
 #[async_trait]
@@ -218,7 +218,7 @@ async fn failure_records_error_and_releases_lease() {
     assert!(worker::run_one(&db, &ev, &reg, &wid).await.unwrap());
     let row = job_row(&db, id).await;
     // Default policy is no-retries → 'failed'; under a retry policy the same failure reschedules to
-    // 'pending'. Either way the error is recorded, the lease released, and the attempt counted — so
+    // 'pending'. Either way the error is recorded, the lease released, and the attempt counted, so
     // assert the policy-independent invariants.
     assert!(row.error_message.unwrap_or_default().contains("boom"));
     assert!(row.owner_is_null, "lease released on failure");
@@ -265,7 +265,7 @@ async fn handler_panic_fails_job_and_worker_survives() {
     );
     assert!(row.owner_is_null, "lease released after a panic");
 
-    // The same worker claims and runs the next job — proof the loop wasn't killed.
+    // The same worker claims and runs the next job, proof the loop wasn't killed.
     let ok_id = worker::enqueue(&db, "test_complete", None, None, &serde_json::json!({}), None)
         .await
         .unwrap()
@@ -294,7 +294,7 @@ async fn startup_reaps_own_leaseless_orphans_only() {
     )
     .await;
 
-    // A peer replica's leaseless orphan (different owner) — left for that pod's own boot.
+    // A peer replica's leaseless orphan (different owner), left for that pod's own boot.
     let peer = Uuid::new_v4();
     crate::common::exec(
         &db,
@@ -305,7 +305,7 @@ async fn startup_reaps_own_leaseless_orphans_only() {
     )
     .await;
 
-    // A live worker-pool job: running, worker owner, valid lease — must not be touched.
+    // A live worker-pool job: running, worker owner, valid lease, must not be touched.
     let leased = Uuid::new_v4();
     crate::common::exec(
         &db,

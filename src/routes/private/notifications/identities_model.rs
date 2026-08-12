@@ -16,7 +16,7 @@ pub struct Model {
     #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
     pub id: Uuid,
     // The Keycloak user this chat speaks for. The effective role is resolved live from this sub on
-    // every command — never cached here as authority. See notifications::authz.
+    // every command, never cached here as authority. See notifications::authz.
     #[crudcrate(filterable)]
     pub linked_keycloak_sub: String,
     // NULL until the user claims the row with /start <code>.

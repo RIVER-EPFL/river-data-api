@@ -21,7 +21,7 @@ async fn setup() -> (DatabaseConnection, axum::Router, String) {
     (db, app, token)
 }
 
-/// Insert one schedule row directly (deterministic — no dependence on which Services seed).
+/// Insert one schedule row directly (deterministic, no dependence on which Services seed).
 async fn insert_schedule(db: &DatabaseConnection, job_name: &str, interval_seconds: i64) {
     crate::common::exec(
         db,
@@ -67,7 +67,7 @@ async fn patch_recomputes_next_run_on_interval_change() {
 
     let before = next_run_at(&db, JOB).await;
 
-    // Lower the interval — next_run_at should snap to now + the new (shorter) interval.
+    // Lower the interval, next_run_at should snap to now + the new (shorter) interval.
     let (status, body) = crate::common::patch_json_with_token(
         &app,
         &format!("/api/schedules/{JOB}"),

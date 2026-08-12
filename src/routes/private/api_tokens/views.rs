@@ -65,7 +65,7 @@ pub async fn rotate_token(
     let minted = mint_api_token();
     let mut active = existing.into_active_model();
     // Rotation is a purely cryptographic operation: replace the secret, but preserve admin state
-    // (a revoked token stays revoked — rotating it must not silently re-enable it).
+    // (a revoked token stays revoked, rotating it must not silently re-enable it).
     active.token_hash = Set(minted.token_hash);
     active.token_prefix = Set(minted.token_prefix);
     let updated = active.update(&state.db).await?;

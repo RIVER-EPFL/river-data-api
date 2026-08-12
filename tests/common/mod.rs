@@ -97,6 +97,13 @@ fn test_config() -> Config {
         job_maintenance_max_rows: 50_000,
         alarm_sweep_interval_seconds: 60,
         sync_event_sweep_interval_seconds: 300,
+        // Production defaults on purpose: the health test seeds heartbeats at 30s/200s/600s
+        // against these thresholds, and a shortened TTL here would hide a real regression.
+        sync_session_token_ttl_secs: 900,
+        sync_command_expiry_secs: 300,
+        sync_health_healthy_secs: 90,
+        sync_health_warning_secs: 300,
+        sync_client_id_prefix: "svc_".to_string(),
         sync_event_stale_after_seconds: 3600,
         job_max_retries: 3,
         job_retry_backoff_seconds: 60,

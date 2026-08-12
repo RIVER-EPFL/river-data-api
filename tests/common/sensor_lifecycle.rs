@@ -287,7 +287,7 @@ pub async fn insert_orphan_readings(
     }
 }
 
-/// Insert fully-unpaired readings (no site/parameter/sensor) on a stream — the pre-pairing state.
+/// Insert fully-unpaired readings (no site/parameter/sensor) on a stream, the pre-pairing state.
 pub async fn insert_unpaired_readings(
     db: &DatabaseConnection,
     stream_id: Uuid,

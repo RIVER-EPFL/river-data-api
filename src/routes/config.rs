@@ -31,7 +31,7 @@ pub async fn get_keycloak_config(State(state): State<AppState>) -> impl IntoResp
 }
 
 /// Which notification channels the deployment has configured (driven by env vars). The frontend uses
-/// this to enable or grey-out each channel. Carries no secrets — only availability booleans, the
+/// this to enable or grey-out each channel. Carries no secrets, only availability booleans, the
 /// email backend kind, and the public bot username.
 #[derive(Serialize)]
 pub struct NotificationsConfig {

@@ -35,7 +35,7 @@ pub async fn evaluate_alarm_events(db: &DatabaseConnection) -> AppResult<SweepSt
     reconcile(db, None).await
 }
 
-/// Scoped reconcile for just the given `(site_id, parameter_id)` slots — the event-driven entry
+/// Scoped reconcile for just the given `(site_id, parameter_id)` slots, the event-driven entry
 /// point (ingest / threshold / config change). Only opens/updates/resolves events within these
 /// slots; alarms outside them are never touched (so it's safe to fire on a partial change).
 pub async fn reconcile_open_alarms(
@@ -46,7 +46,7 @@ pub async fn reconcile_open_alarms(
 }
 
 /// Event-driven call sites use this: reconcile the given slots and emit an `AlarmStateChanged` SSE
-/// if anything opened or resolved (mirroring the periodic tick). Never fails the caller — it logs
+/// if anything opened or resolved (mirroring the periodic tick). Never fails the caller, it logs
 /// and swallows errors, so wiring it into a write/config path can never break that path. The
 /// periodic backstop still reconciles everything regardless.
 pub async fn reconcile_and_notify(
@@ -72,7 +72,7 @@ pub async fn reconcile_and_notify(
 
 /// Global variant of [`reconcile_and_notify`] for background jobs that change values across many
 /// slots (derived recompute, calibration/deployment reprocess) where enumerating the exact affected
-/// slots isn't worth it. Reconciles every active slot — cheap (O(active slots) index lookups) — and
+/// slots isn't worth it. Reconciles every active slot, cheap (O(active slots) index lookups), and
 /// emits SSE on change. Error-safe.
 pub async fn reconcile_all_and_notify(db: &DatabaseConnection, events: &EventSender) {
     match evaluate_alarm_events(db).await {
@@ -90,7 +90,7 @@ pub async fn reconcile_all_and_notify(db: &DatabaseConnection, events: &EventSen
 
 /// [`reconcile_all_and_notify`] for contexts that only hold a `&DatabaseConnection` (CrudCrate
 /// operation hooks). Uses the process-global event sender; a missing sender (some unit tests) just
-/// skips the SSE. Never returns an error — a failed reconcile must not fail the CRUD operation
+/// skips the SSE. Never returns an error, a failed reconcile must not fail the CRUD operation
 /// that triggered it.
 pub async fn reconcile_all_from_hook(db: &DatabaseConnection) {
     match crate::common::global_event_sender() {

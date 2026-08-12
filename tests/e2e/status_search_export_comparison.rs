@@ -64,8 +64,8 @@ async fn status_events_search_and_export() {
     assert!(serde_json::from_str::<serde_json::Value>(lines[0]).is_ok(), "each NDJSON line is valid JSON: {}", lines[0]);
 }
 
-/// US-8.2 (CNET/METALP port): grab samples coexist with continuous readings — tagged by
-/// `measurement_type` so they render/filter distinctly — and the comparison export pairs each grab
+/// US-8.2 (CNET/METALP port): grab samples coexist with continuous readings, tagged by
+/// `measurement_type` so they render/filter distinctly, and the comparison export pairs each grab
 /// with the continuous sensor average over the post-grab window [T+2h, T+6h].
 #[tokio::test]
 #[serial]

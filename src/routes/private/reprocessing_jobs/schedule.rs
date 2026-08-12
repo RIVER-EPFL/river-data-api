@@ -13,7 +13,7 @@ pub enum OverlapPolicy {
     /// Don't enqueue while a run is still in flight (the safe default for janitor/sweeper).
     #[default]
     SkipIfRunning,
-    /// Always enqueue, even if one is running — only for genuinely concurrency-safe jobs.
+    /// Always enqueue, even if one is running, only for genuinely concurrency-safe jobs.
     AllowConcurrent,
 }
 
@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn stays_drift_free_when_a_run_finishes_late() {
-        // Fired at 12:00:30 instead of 12:00:00 — next is still 13:00:00, not 13:00:30.
+        // Fired at 12:00:30 instead of 12:00:00, next is still 13:00:00, not 13:00:30.
         let next = next_run_after(t("2026-06-19T12:00:00Z"), Duration::hours(1), t("2026-06-19T12:00:30Z"));
         assert_eq!(next, t("2026-06-19T13:00:00Z"));
     }

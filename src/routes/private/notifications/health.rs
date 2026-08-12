@@ -103,12 +103,12 @@ async fn read_health(db: &DatabaseConnection, config: &Config) -> NotificationHe
     NotificationHealth { channels }
 }
 
-/// `GET /api/notifications/health` — latest persisted health per channel (admin-only).
+/// `GET /api/notifications/health`, latest persisted health per channel (admin-only).
 pub async fn get_health(State(state): State<AppState>) -> AppResult<Json<NotificationHealth>> {
     Ok(Json(read_health(&state.db, &state.config).await))
 }
 
-/// `POST /api/notifications/health/refresh` — probe now, then return the fresh state (admin-only).
+/// `POST /api/notifications/health/refresh`, probe now, then return the fresh state (admin-only).
 pub async fn refresh_health(State(state): State<AppState>) -> AppResult<Json<NotificationHealth>> {
     probe_once(&state.db, &state.config).await;
     Ok(Json(read_health(&state.db, &state.config).await))

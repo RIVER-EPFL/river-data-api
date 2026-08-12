@@ -13,7 +13,7 @@ async fn setup() -> (axum::Router, String, sea_orm::DatabaseConnection) {
 }
 
 // ============================================================================
-// Basic grab sample insertion — triplicate DOC readings (~192 ppb mean)
+// Basic grab sample insertion, triplicate DOC readings (~192 ppb mean)
 // ============================================================================
 
 #[tokio::test]
@@ -93,7 +93,7 @@ async fn test_insert_triplicate_grab_samples() {
 }
 
 // ============================================================================
-// Single reading (no replicates) — should NOT create a sample
+// Single reading (no replicates), should NOT create a sample
 // ============================================================================
 
 #[tokio::test]
@@ -138,7 +138,7 @@ async fn test_single_grab_sample_no_sample_row() {
 }
 
 // ============================================================================
-// Multiple parameters in one request — mixed replicates
+// Multiple parameters in one request, mixed replicates
 // ============================================================================
 
 #[tokio::test]
@@ -281,7 +281,7 @@ async fn test_grab_sample_empty_readings() {
 }
 
 // ============================================================================
-// Permission check — write_data required
+// Permission check, write_data required
 // ============================================================================
 
 #[tokio::test]

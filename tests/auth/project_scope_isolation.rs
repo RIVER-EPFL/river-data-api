@@ -130,7 +130,7 @@ async fn scoped_token_blocked_from_other_projects_status_events() {
     )
     .await;
     // Pragmatic: handler may 400 if validate_optional_time_range trips before the scope
-    // check (depends on handler ordering), but it must NOT return 200 — that would mean
+    // check (depends on handler ordering), but it must NOT return 200, that would mean
     // leaking data from project B.
     assert_ne!(status, 200, "scoped token must not read project B status events (got {status}: {body})");
     assert!(
@@ -181,7 +181,7 @@ async fn scoped_token_rejects_cross_project_uuid_in_path() {
 #[serial]
 async fn scoped_token_passes_anonymous_public_api() {
     // Sanity: the public API is unauthenticated. A project-scoped token shouldn't change
-    // that — public endpoints don't see AuthContext and don't enforce scope.
+    // that, public endpoints don't see AuthContext and don't enforce scope.
     let (db, app) = setup_two_projects().await;
     let _tok = crate::common::seed_api_token(
         &db,

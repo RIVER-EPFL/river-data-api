@@ -145,7 +145,7 @@ async fn load(state: &AppState, auth: &AuthContext, sub: &str) -> AppResult<MyNo
     })
 }
 
-/// `GET /api/notifications/me` — the caller's own preferences, link state, and subscriptions.
+/// `GET /api/notifications/me`, the caller's own preferences, link state, and subscriptions.
 #[utoipa::path(
     get,
     path = "/notifications/me",
@@ -167,7 +167,7 @@ pub struct UpdatePrefsRequest {
     pub telegram_enabled: Option<bool>,
 }
 
-/// `PATCH /api/notifications/me` — toggle the caller's channels. Email can only be enabled when the
+/// `PATCH /api/notifications/me`, toggle the caller's channels. Email can only be enabled when the
 /// caller has a verified email claim.
 #[utoipa::path(
     patch,
@@ -208,7 +208,7 @@ pub struct SetSubscriptionsRequest {
     pub subscriptions: Vec<SubscriptionScope>,
 }
 
-/// `PUT /api/notifications/me/subscriptions` — replace the caller's scope overrides. Each override
+/// `PUT /api/notifications/me/subscriptions`, replace the caller's scope overrides. Each override
 /// must target a project, a site, or a site+parameter, and (once project access is role-scoped) lie
 /// within the projects the caller can access.
 #[utoipa::path(
@@ -306,7 +306,7 @@ async fn resolve_project(state: &AppState, s: &SubscriptionScope) -> AppResult<O
     Ok(None)
 }
 
-/// `POST /api/notifications/me/link_code` — mint a one-time code bound to the caller's own sub. The
+/// `POST /api/notifications/me/link_code`, mint a one-time code bound to the caller's own sub. The
 /// user sends `/start <code>` to the bot to claim it. Any prior unclaimed code for this user is
 /// dropped, so there is at most one pending code.
 #[utoipa::path(
@@ -351,7 +351,7 @@ pub async fn mint_my_link_code(
     Ok(Json(LinkCodeResponse { code, expires_at }))
 }
 
-/// `DELETE /api/notifications/me/telegram` — unlink the caller's Telegram chat (removes the link rows
+/// `DELETE /api/notifications/me/telegram`, unlink the caller's Telegram chat (removes the link rows
 /// for their sub). Re-linking requires a fresh code.
 #[utoipa::path(
     delete,

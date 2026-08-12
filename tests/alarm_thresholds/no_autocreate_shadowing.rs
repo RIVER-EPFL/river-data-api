@@ -1,6 +1,6 @@
 //! Regression: alarm thresholds are NOT auto-created from parameter defaults. Evaluation already
 //! falls back to the parameter's `default_*` columns when no `alarm_thresholds` row exists, so a
-//! default-valued row is redundant — and a site-specific copy would silently shadow a global
+//! default-valued row is redundant, and a site-specific copy would silently shadow a global
 //! threshold an operator set (the cause of "the alarm I clicked shows nothing on the chart").
 //!
 //! Run: cargo test --test alarm_thresholds -- --test-threads=1
@@ -35,7 +35,7 @@ async fn site_parameter_create_does_not_auto_create_or_shadow_threshold() {
     let depth = crate::common::GLOBAL_PARAM_DEPTH_ID;
     let site2 = crate::common::SITE2_ID; // seed does not give SITE2 a Depth site_parameter
 
-    // Give Depth parameter defaults — the exact condition the (now-removed) hook fired on. The seed
+    // Give Depth parameter defaults, the exact condition the (now-removed) hook fired on. The seed
     // already provides a global Depth threshold, so a correct create must leave that global in force.
     crate::common::exec(
         &db,
@@ -61,6 +61,6 @@ async fn site_parameter_create_does_not_auto_create_or_shadow_threshold() {
     assert_eq!(
         threshold_count(&db, depth, site2).await,
         0,
-        "no site-specific threshold should be auto-created — the global (alarm > 500) must keep applying"
+        "no site-specific threshold should be auto-created, the global (alarm > 500) must keep applying"
     );
 }

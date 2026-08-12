@@ -28,7 +28,7 @@ pub struct JobLogLine {
     pub context: serde_json::Value,
 }
 
-/// `GET /api/reprocessing_jobs/{id}/logs` — the ordered timeline for one job. Paginated by `seq`
+/// `GET /api/reprocessing_jobs/{id}/logs`, the ordered timeline for one job. Paginated by `seq`
 /// so the UI can lazy-load the full record and tail new lines. Requires `read_data`.
 pub async fn get_job_logs(
     State(state): State<AppState>,
@@ -69,7 +69,7 @@ pub struct CancelResponse {
     pub status: String,
 }
 
-/// `POST /api/reprocessing_jobs/{id}/cancel` — cooperatively cancel a job. A `queued` job (not yet
+/// `POST /api/reprocessing_jobs/{id}/cancel`, cooperatively cancel a job. A `queued` job (not yet
 /// claimed) is cancelled outright; a `running` worker-pool job is signalled via the `cancel_requested`
 /// column, which the owning replica's heartbeat observes (possibly on a different replica) and the job
 /// honors at its next checkpoint. 409 if the type isn't cancellable or the job isn't in a cancellable
@@ -95,7 +95,7 @@ pub async fn cancel_job(
         )));
     }
 
-    // Set the durable flag so the owning replica — which may not be this one — stops the job at its
+    // Set the durable flag so the owning replica, which may not be this one, stops the job at its
     // next checkpoint; a still-queued job is cancelled outright since nothing is running it yet.
     let flagged = state
         .db
@@ -128,7 +128,7 @@ pub struct RerunResponse {
     pub status: String,
 }
 
-/// `POST /api/reprocessing_jobs/{id}/rerun` — replay a finished job by reconstructing it from the
+/// `POST /api/reprocessing_jobs/{id}/rerun`, replay a finished job by reconstructing it from the
 /// ids stored on its row. Returns a NEW job (history is preserved). 409 if the type isn't rerunnable
 /// or an equivalent job is already in flight; 404 if the job id is unknown. Requires `write_metadata`.
 pub async fn rerun_job(

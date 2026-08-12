@@ -22,7 +22,7 @@ const BUILT_AT: &str = match option_env!("BUILD_TIME") {
     None => "unknown",
 };
 
-/// Returns the API's build/version metadata. Requires `read_metadata` (authenticated only — build
+/// Returns the API's build/version metadata. Requires `read_metadata` (authenticated only, build
 /// details are not exposed to anonymous callers).
 #[utoipa::path(
     get,

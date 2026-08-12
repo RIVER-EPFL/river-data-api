@@ -117,7 +117,7 @@ async fn manager_writes_catalog_and_sensors_but_not_admin() {
         crate::common::post_json_with_token(&app, "/api/sensor_deployments", &sample_deployment(), &jwt).await;
     assert!(passed_auth(s), "manager manages sensors: {s} {body}");
 
-    // The global parameter list is Administrator-managed — a manager cannot add a global parameter.
+    // The global parameter list is Administrator-managed, a manager cannot add a global parameter.
     let (s, _) =
         crate::common::post_json_with_token(&app, "/api/parameters", &sample_parameter("mgr_cap"), &jwt).await;
     assert_eq!(s, 403, "manager cannot write the global catalog");

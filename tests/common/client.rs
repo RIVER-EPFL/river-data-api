@@ -34,6 +34,28 @@ pub async fn get_with_token(app: &Router, uri: &str, token: &str) -> (u16, Strin
     (status, text)
 }
 
+/// GET returning the response headers alongside the body, for endpoints whose pagination
+/// contract lives in `Content-Range` rather than in the payload.
+pub async fn get_with_token_headers(
+    app: &Router,
+    uri: &str,
+    token: &str,
+) -> (u16, axum::http::HeaderMap, String) {
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.clone().oneshot(req).await.unwrap();
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+
+    (status, headers, String::from_utf8_lossy(&body).to_string())
+}
+
 pub async fn get_json(app: &Router, uri: &str) -> (u16, serde_json::Value) {
     let (status, body) = get(app, uri).await;
     let json: serde_json::Value = serde_json::from_str(&body)
@@ -52,7 +74,7 @@ pub async fn get_json_with_token(
     (status, json)
 }
 
-/// Unauthenticated POST — used to assert the public tier refuses writes.
+/// Unauthenticated POST, used to assert the public tier refuses writes.
 pub async fn post_json(app: &Router, uri: &str, body: &serde_json::Value) -> (u16, String) {
     let req = axum::http::Request::builder()
         .method("POST")

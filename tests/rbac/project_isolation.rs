@@ -1,5 +1,5 @@
 //! The grant (project-visibility) axis, fail-closed. A river-level user with NO grant is authenticated
-//! and passes the access gate, yet sees an empty portal and is denied every write — capability alone
+//! and passes the access gate, yet sees an empty portal and is denied every write, capability alone
 //! is not access. A manager granted project A sees and mutates only A; project B is invisible (list
 //! filtered, cross-project GET 404) and unwritable (403), even though the manager level holds the
 //! capability globally.
@@ -146,7 +146,7 @@ async fn granted_manager_cannot_mutate_other_projects_sample() {
 }
 
 /// H1: a `sensor_calibrations` row is confined by the projects its sensor is deployed to. A manager
-/// granted only project A cannot patch a calibration whose sensor is deployed solely in project B —
+/// granted only project A cannot patch a calibration whose sensor is deployed solely in project B,
 /// editing it would rewrite project B's calibrated readings.
 #[tokio::test]
 #[serial]
@@ -199,7 +199,7 @@ async fn granted_manager_cannot_mutate_other_projects_calibration() {
 }
 
 /// H3: creating a site by omitting `project_id` and naming only a `subproject_id` must not bypass the
-/// scope guard — the DB trigger would otherwise stamp the site into the subproject's project. A
+/// scope guard, the DB trigger would otherwise stamp the site into the subproject's project. A
 /// manager granted only A cannot create a site under project B's subproject.
 #[tokio::test]
 #[serial]
@@ -224,7 +224,7 @@ async fn granted_manager_cannot_create_site_via_other_projects_subproject() {
     )
     .await;
 
-    // No project_id in the body — only a subproject that belongs to the ungranted project B.
+    // No project_id in the body, only a subproject that belongs to the ungranted project B.
     let sneaky = serde_json::json!({ "name": "Sneaky Station", "subproject_id": sub_b });
     let (s, _) = crate::common::post_json_with_token(&app, "/api/sites", &sneaky, &jwt).await;
     assert_eq!(s, 403, "omitting project_id must not let a member create a site inside project B");

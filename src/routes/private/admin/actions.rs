@@ -279,7 +279,7 @@ pub async fn rebuild_alarm_events(
 
 /// Force a full open-alarm reconcile right now, instead of waiting for the periodic backstop
 /// sweep. Runs the same single tick the sweeper runs (open new breaches, refresh still-breaching,
-/// auto-resolve returned-to-range) across every active slot, synchronously — the post-LATERAL
+/// auto-resolve returned-to-range) across every active slot, synchronously, the post-LATERAL
 /// breach query is O(active slots), so this returns in well under a second. Operator escape hatch
 /// for "I changed something and want the alarm state correct immediately". Requires `write_data`.
 #[utoipa::path(
@@ -358,12 +358,12 @@ pub async fn rollback_deployment(
     let parameter_id: Uuid = target.try_get("", "parameter_id").map_err(|e| AppError::Internal(format!("{e}")))?;
     let target_deployed_from: chrono::DateTime<chrono::FixedOffset> =
         target.try_get("", "deployed_from").map_err(|e| AppError::Internal(format!("{e}")))?;
-    // The boundary the rolled-back deployment vacates — the previous deployment re-extends to here
+    // The boundary the rolled-back deployment vacates, the previous deployment re-extends to here
     // (NULL = the target was open-ended, so the previous reopens open-ended too).
     let target_deployed_until: Option<chrono::DateTime<chrono::FixedOffset>> =
         target.try_get("", "deployed_until").map_err(|e| AppError::Internal(format!("{e}")))?;
 
-    // 2. Find the previous deployment for the same sensor AND THE SAME PARAMETER — on a multi-channel
+    // 2. Find the previous deployment for the same sensor AND THE SAME PARAMETER, on a multi-channel
     //    instrument the immediately-prior deployment by time could belong to a different channel;
     //    reopening that one would extend the wrong channel's window.
     let previous = db
@@ -385,7 +385,7 @@ pub async fn rollback_deployment(
     let previous_deployment_id: Option<Uuid> = previous.as_ref().and_then(|r| r.try_get("", "id").ok());
 
     // 3-4. Clear readings' FK to the rolled-back deployment, delete it, and reopen the previous
-    //    deployment — atomically, so a mid-operation failure can't leave the deployment deleted with
+    //    deployment, atomically, so a mid-operation failure can't leave the deployment deleted with
     //    nothing reopened (which would silently un-attribute its readings). The decompression cap is
     //    lifted so the readings FK-clear can't fail on old compressed chunks.
     let txn = db.begin().await.map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
@@ -415,8 +415,8 @@ pub async fn rollback_deployment(
     .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
     // Reopen the previous deployment to absorb the vacated window. `recompute_deployed_until` only ever
-    //    SHORTENS (LEAST), so without this the previous deployment — auto-closed when the rolled-back
-    //    one was created — stays closed and the readings would un-attribute (site_id NULL) instead of
+    //    SHORTENS (LEAST), so without this the previous deployment, auto-closed when the rolled-back
+    //    one was created, stays closed and the readings would un-attribute (site_id NULL) instead of
     //    reverting to the previous site. Reopening to the target's own `deployed_until` reclaims exactly
     //    the window the target held (NULL = open-ended), which can't overlap anything the slot
     //    constraint already excluded.
@@ -494,7 +494,7 @@ pub struct DerivedSeries {
     pub errors: Vec<Option<String>>,
 }
 
-/// Math builtins recognized by meval — not treated as variable names
+/// Math builtins recognized by meval, not treated as variable names
 const MATH_BUILTINS: &[&str] = &[
     "sqrt", "abs", "ln", "log", "exp", "sin", "cos", "tan", "asin", "acos", "atan",
     "sinh", "cosh", "tanh", "floor", "ceil", "round", "signum",
@@ -778,7 +778,7 @@ pub struct BackfillCandidate {
     pub parameter_id: Uuid,
     /// The deployment's current start.
     pub deployed_from: chrono::DateTime<chrono::Utc>,
-    /// Earliest claimable unattributed reading — the date `deployed_from` would move back to.
+    /// Earliest claimable unattributed reading, the date `deployed_from` would move back to.
     pub target_from: chrono::DateTime<chrono::Utc>,
     /// Number of unattributed readings (`sensor_id IS NULL`) in `[target_from, deployed_from)`.
     pub claimable_count: i64,
@@ -1162,7 +1162,7 @@ pub async fn backfill_calibrations(
 
     for c in &selected {
         match (c.earliest_calibration_from, c.is_identity) {
-            // No calibrations at all — create identity starting at earliest reading. The guarded
+            // No calibrations at all, create identity starting at earliest reading. The guarded
             // INSERT (NOT EXISTS) makes a client retry to another replica a no-op: there is no unique
             // constraint to lean on `ON CONFLICT`, so the existence check on
             // (sensor_id, identity coeffs, valid_from) prevents a duplicate identity row.
@@ -1182,7 +1182,7 @@ pub async fn backfill_calibrations(
                 .await
                 .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
             }
-            // Earliest calibration is identity — backdate it. `valid_from > $1` makes the move
+            // Earliest calibration is identity, backdate it. `valid_from > $1` makes the move
             // idempotent: once it sits at `target_from`, a retry matches no rows.
             (Some(_), true) => {
                 db.execute(Statement::from_sql_and_values(

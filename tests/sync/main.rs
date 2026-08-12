@@ -7,5 +7,8 @@
 mod common;
 
 mod control_plane;
+mod credentials;
+mod pagination;
 mod pairing_plan_apply;
 mod pairing_plan_hardening;
+mod routes_surface;

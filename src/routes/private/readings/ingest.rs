@@ -339,7 +339,7 @@ pub async fn ingest_readings(
     }
 
     // Auto-compute derived parameters for newly ingested timestamps (batched), tracked as a job.
-    // Spawn-guard: skip entirely when the site has no active derived parameter — the job would
+    // Spawn-guard: skip entirely when the site has no active derived parameter, the job would
     // compute nothing, and this is the dominant source of empty `ingest_derived` jobs.
     if paired
         && inserted > 0

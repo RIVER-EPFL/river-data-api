@@ -223,7 +223,7 @@ async fn scoped_reconcile_leaves_other_slots_untouched() {
     assert_eq!(open_turb_event_count(&db).await, 0, "the unscoped backstop resolves it");
 }
 
-/// Threshold CRUD re-checks breach state instantly — create, update, and delete each flip the
+/// Threshold CRUD re-checks breach state instantly, create, update, and delete each flip the
 /// persisted event with no new reading and no sweep.
 #[tokio::test]
 #[serial]
@@ -350,7 +350,7 @@ async fn site_parameter_deactivation_resolves_open_event() {
     assert_eq!(open_turb_event_count(&db).await, 0, "deactivation resolves without a sweep");
 }
 
-/// Among same-timestamp replicates, only replicate 0 decides breach state — a breaching
+/// Among same-timestamp replicates, only replicate 0 decides breach state, a breaching
 /// replicate 1 must not open an alarm when replicate 0 is in range.
 #[tokio::test]
 #[serial]

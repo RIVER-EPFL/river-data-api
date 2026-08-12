@@ -16,7 +16,7 @@ use super::lifecycle::{self, JobContext};
 /// Lease lifetime before the reaper may reclaim a row. Sized well above a plausible GC / k8s
 /// CPU-throttle stall so a slow-but-alive worker is not reaped mid-run.
 pub const LEASE_SECONDS: i64 = 120;
-/// Lease-renewal cadence — roughly one third of the lease.
+/// Lease-renewal cadence, roughly one third of the lease.
 pub const HEARTBEAT_SECONDS: u64 = 40;
 /// Idle poll cadence when nothing is claimable.
 pub const POLL_SECONDS: u64 = 2;
@@ -123,7 +123,7 @@ async fn heartbeat(
     cancel: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECONDS));
-    tick.tick().await; // the immediate first tick — skip it, the claim just set the lease
+    tick.tick().await; // the immediate first tick, skip it, the claim just set the lease
     loop {
         tick.tick().await;
         let renewed = db
@@ -234,7 +234,7 @@ async fn execute(
     claimed: Claimed,
 ) -> Result<(), sea_orm::DbErr> {
     let Some(job) = registry.get(&claimed.trigger_type) else {
-        // No handler — fail rather than let the reaper reclaim it forever.
+        // No handler, fail rather than let the reaper reclaim it forever.
         commit_terminal(db, &claimed, worker_id, "failed", None, Some("no handler registered for trigger_type")).await?;
         return Ok(());
     };
@@ -249,7 +249,7 @@ async fn execute(
     ));
 
     // Catch a handler panic so it becomes a normal job failure instead of unwinding the worker task.
-    // Without this, a panic skips `hb.abort()` below — the detached heartbeat then renews the lease
+    // Without this, a panic skips `hb.abort()` below, the detached heartbeat then renews the lease
     // forever (the reaper never reclaims the row) while this replica is left with no worker.
     let run_result = std::panic::AssertUnwindSafe(job.run(ctx)).catch_unwind().await;
     hb.abort();

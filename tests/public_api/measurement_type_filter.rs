@@ -1,5 +1,5 @@
 //! Public readings measurement_type support: the `measurement_type` filter (same semantics as
-//! the private endpoint — 'continuous' includes untagged legacy rows), the
+//! the private endpoint, 'continuous' includes untagged legacy rows), the
 //! `include_measurement_type` per-point annotation (JSON + CSV), and cache-key isolation between
 //! filter values (a spot query must never serve a cached continuous payload).
 //!

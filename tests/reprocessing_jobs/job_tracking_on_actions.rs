@@ -51,7 +51,7 @@ fn job_id_of(text: &str) -> String {
 
 /// Poll until the spawned job leaves `pending`/`running`. Returns the terminal status.
 /// The job is spawned detached via `tokio::spawn`, so the test must let it settle before
-/// teardown — otherwise a concurrent INSERT races the next test's `TRUNCATE`.
+/// teardown, otherwise a concurrent INSERT races the next test's `TRUNCATE`.
 async fn wait_for_terminal(db: &sea_orm::DatabaseConnection, job_id: &str) -> String {
     let id = Uuid::parse_str(job_id).unwrap();
     let start = Instant::now();

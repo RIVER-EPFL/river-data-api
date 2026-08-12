@@ -62,7 +62,7 @@ pub struct SensorReadingsResponse {
     /// query window).
     pub data_start: Option<DateTime<Utc>>,
     pub data_end: Option<DateTime<Utc>>,
-    /// Earliest reading at the sensor's current (open) deployment slot — same site + parameter,
+    /// Earliest reading at the sensor's current (open) deployment slot, same site + parameter,
     /// regardless of `sensor_id`. This is the true backdate target: history before `data_start`
     /// that is not yet attributed to the sensor but would be claimed by backdating `deployed_from`.
     /// Null when the sensor has no open deployment.
@@ -95,7 +95,7 @@ pub async fn get_sensor_readings(
 
     // A sensor has no intrinsic parameter; take the parameter (and its units) from the sensor's
     // most recent deployment. Multi-parameter instruments resolve to their latest bound parameter
-    // here — the detail plot is single-series and the readings query below is not parameter-scoped.
+    // here, the detail plot is single-series and the readings query below is not parameter-scoped.
     let sensor_exists = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -173,7 +173,7 @@ pub async fn get_sensor_readings(
         .and_then(|r| r.try_get::<DateTime<chrono::FixedOffset>>("", "data_end").ok())
         .map(|t| t.with_timezone(&Utc));
 
-    // Earliest reading at the sensor's OPEN deployment slot (same site + parameter, any sensor_id) —
+    // Earliest reading at the sensor's OPEN deployment slot (same site + parameter, any sensor_id),
     // the true backdate target. Unattributed history (sensor_id NULL) is invisible to `data_start`
     // but lives here, and backdating `deployed_from` to it lets the slot reprocess claim it.
     let mut slot_vals: Vec<sea_orm::Value> = vec![sensor_id.into()];

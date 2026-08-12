@@ -135,7 +135,7 @@ async fn recalibration_updates_all_readings() {
 
     assert!(wait_for_reprocessing(&db, sensor.id, WAIT_TIMEOUT).await);
 
-    // Verify AFTER state — DB level: each reading individually
+    // Verify AFTER state, DB level: each reading individually
     let rows = get_readings(&db, stream).await;
     assert_eq!(rows.len(), 3);
     for (i, raw) in raw_values.iter().enumerate() {
@@ -145,7 +145,7 @@ async fn recalibration_updates_all_readings() {
         assert_eq!(rows[i].calibration_id, Some(real_cal), "row {i} cal FK updated");
     }
 
-    // Verify AFTER state — API level: GET /sites/{id}/readings returns calibrated values
+    // Verify AFTER state, API level: GET /sites/{id}/readings returns calibrated values
     let (status, json) = get_json_with_token(
         &app,
         &format!(
@@ -184,7 +184,7 @@ async fn recalibration_updates_all_readings() {
 /// (what a lab instrument, or a collapsed multi-channel sonde, looks like). Each parameter carries
 /// its own windowed calibration on that shared sensor.
 ///
-/// Expected behaviour: reprocess resolves each reading against its OWN parameter's calibration —
+/// Expected behaviour: reprocess resolves each reading against its OWN parameter's calibration,
 /// the DO curve never bleeds onto the temperature readings and vice-versa. On the pre-decoupling
 /// code (which matched calibrations by sensor_id + time only) both curves' windows cover both
 /// readings, so the wrong curve could win.
@@ -261,7 +261,7 @@ async fn reprocess_applies_per_parameter_calibration_on_shared_sensor() {
 /// H7 regression: production auto-creates the identity calibration with `parameter_id = NULL` (a
 /// wildcard), and `recompute_valid_until` partitions by parameter_id, so that identity's window never
 /// closes and overlaps a later real curve. Reprocess must still deterministically apply the real,
-/// parameter-specific curve — never the open-ended identity — to a parameter's readings.
+/// parameter-specific curve, never the open-ended identity, to a parameter's readings.
 #[tokio::test]
 #[serial]
 async fn reprocess_prefers_real_curve_over_open_null_identity() {
@@ -273,7 +273,7 @@ async fn reprocess_prefers_real_curve_over_open_null_identity() {
     let real_cal = uuid::Uuid::new_v4();
     exec(&db, &format!("INSERT INTO sensors (id, name, is_active) VALUES ('{sensor}', 'NullIdentity-01', true)")).await;
     // The production shape: a NULL-parameter identity (slope 1) with an open window, plus a real
-    // temperature curve (slope 2) that also stays open — both cover the reading's time.
+    // temperature curve (slope 2) that also stays open, both cover the reading's time.
     exec(
         &db,
         &format!(
@@ -319,7 +319,7 @@ async fn reprocess_prefers_real_curve_over_open_null_identity() {
 
 /// H10 regression: a lab instrument's grab (measurement_type = 'spot', its own instant curve) that
 /// shares a (site, parameter) with a deployed field sensor must survive that slot's reprocess
-/// untouched — its sensor_id, calibration_id and instant-curve `calibrated_value` are preserved while
+/// untouched, its sensor_id, calibration_id and instant-curve `calibrated_value` are preserved while
 /// the field sensor's continuous readings are re-derived.
 #[tokio::test]
 #[serial]
@@ -388,7 +388,7 @@ async fn slot_reprocess_leaves_spot_grabs_untouched() {
 }
 
 // ============================================================================
-// Deployment changes — site_id and reading count
+// Deployment changes, site_id and reading count
 // ============================================================================
 
 /// Sensor moves from site 1 to site 2 at 12:00.
@@ -477,7 +477,7 @@ async fn deployment_change_updates_site_and_deployment() {
     assert_eq!(at_site1, 2, "2 readings remain at site 1 (10:00, 11:00)");
     assert_eq!(at_site2, 4, "4 readings moved to site 2 (12:00-15:00)");
 
-    // AFTER: each reading individually — deployment_id + site_id + value intact
+    // AFTER: each reading individually, deployment_id + site_id + value intact
     let expected: [(f64, uuid::Uuid, uuid::Uuid); 6] = [
         (10.0, dep_a, site1), // 10:00
         (11.0, dep_a, site1), // 11:00
@@ -497,7 +497,7 @@ async fn deployment_change_updates_site_and_deployment() {
 }
 
 // ============================================================================
-// Calibration date changes — distinct values prove which readings moved
+// Calibration date changes, distinct values prove which readings moved
 // ============================================================================
 
 /// Real calibration's valid_from moves from Jan 15 to Jan 12.
@@ -609,7 +609,7 @@ async fn retroactive_calibration_date_change() {
 }
 
 // ============================================================================
-// Lab sensor — multi-site with site_id verification
+// Lab sensor, multi-site with site_id verification
 // ============================================================================
 
 /// Lab sensor deployed at 3 sites in one day. Each reading has a distinct
@@ -637,7 +637,7 @@ async fn lab_sensor_multiple_deployments_same_day() {
 
     let stream = create_paired_stream(&db, "lab-probe", PARAM_S1_TEMP_ID).await;
 
-    // All readings initially stamped with dep_a — distinct raw values
+    // All readings initially stamped with dep_a, distinct raw values
     insert_readings(
         &db, stream, SITE1_ID, GLOBAL_PARAM_TEMP_ID,
         sensor.id, sensor.identity_calibration_id, dep_a,
@@ -784,7 +784,7 @@ async fn calibration_time_windows_auto_bounded() {
 }
 
 // ============================================================================
-// Calibration deletion — fallback with distinct values
+// Calibration deletion, fallback with distinct values
 // ============================================================================
 
 /// Three calibrations: identity → A → B. Delete A.
@@ -872,7 +872,7 @@ async fn delete_intermediate_calibration_fallback() {
 }
 
 // ============================================================================
-// Full cascade — readings + aggregates
+// Full cascade, readings + aggregates
 // ============================================================================
 
 /// Calibration change recalculates readings AND refreshes hourly aggregate.

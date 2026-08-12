@@ -64,7 +64,7 @@ fn parse_uuid_csv(s: &str) -> Vec<Uuid> {
         .collect()
 }
 
-/// `GET /sites/{site_id}/sensor_identity` — deployment bands + calibration markers per parameter.
+/// `GET /sites/{site_id}/sensor_identity`, deployment bands + calibration markers per parameter.
 #[utoipa::path(
     get,
     path = "/{site_id}/sensor_identity",

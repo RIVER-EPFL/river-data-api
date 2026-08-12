@@ -76,7 +76,7 @@ pub struct ParameterData {
     pub id: Uuid,
     /// Global parameter id (the catalog parameter this site_parameter references)
     pub parameter_id: Uuid,
-    /// Stable parameter code (catalog `code`) — used as the CSV/NDJSON column key
+    /// Stable parameter code (catalog `code`), used as the CSV/NDJSON column key
     pub code: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -386,7 +386,7 @@ pub async fn get_site_readings(
 
     let from_clause: String = if include_alarms {
         // Resolve the 3-tier threshold per slot via the single engine definition (site → global →
-        // parameter default), scoped to this site, and LEFT JOIN it — so a parameter with only
+        // parameter default), scoped to this site, and LEFT JOIN it, so a parameter with only
         // defaults still gets a severity (the old direct join to alarm_thresholds did not).
         let cte = crate::routes::private::alarms::thresholds::resolve_thresholds_sql(
             Some(site.id),

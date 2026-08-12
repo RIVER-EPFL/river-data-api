@@ -41,13 +41,13 @@ use crate::routes::private::{
     sync::services_model::SyncService,
 };
 
-const ACTION_BODY_LIMIT: usize = 1024 * 1024; // 1 MB — preserved from the former admin tier
-const DATA_BODY_LIMIT: usize = 10 * 1024 * 1024; // 10 MB — bulk ingestion
-const IMPORT_BODY_LIMIT: usize = 50 * 1024 * 1024; // 50 MB — CSV import
+const ACTION_BODY_LIMIT: usize = 1024 * 1024; // 1 MB, preserved from the former admin tier
+const DATA_BODY_LIMIT: usize = 10 * 1024 * 1024; // 10 MB, bulk ingestion
+const IMPORT_BODY_LIMIT: usize = 50 * 1024 * 1024; // 50 MB, CSV import
 
 /// Clear the public API config cache after a successful mutating request.
 ///
-/// Layered onto the projects/sites/site_parameters CRUD routers — the entities the
+/// Layered onto the projects/sites/site_parameters CRUD routers, the entities the
 /// public config (`public_config_cache`) is built from. Deliberately coarse: it drops
 /// the whole cache rather than resolving the affected project code, since the cache is
 /// a read-through convenience that rebuilds on the next public request, not a source of
@@ -125,12 +125,12 @@ pub fn api_router(state: &AppState) -> Router<()> {
     let admin_only_crud = |r: OpenApiRouter| -> OpenApiRouter {
         // CrudCrate exposes a single router for all 5 methods. For entities that mint
         // privileged credentials (API tokens, sync service credentials) we keep the
-        // entire surface — including LIST/GET — behind require_admin so leaked tokens
+        // entire surface, including LIST/GET, behind require_admin so leaked tokens
         // can't enumerate credentials. See plan: defense in depth.
         r.layer(middleware::from_fn(require_admin))
     };
     // Clear the public API config cache whenever a project/site/site_parameter is
-    // created, updated, or deleted. Coarse and best-effort — see the middleware doc.
+    // created, updated, or deleted. Coarse and best-effort, see the middleware doc.
     let invalidate_public_config = |r: OpenApiRouter| -> OpenApiRouter {
         r.layer(middleware::from_fn_with_state(
             state.clone(),
@@ -371,7 +371,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .with_state(state.clone());
 
     // Sync admin views split by required permission. Credential creation/revoke is
-    // require_admin because it mints full-permission sync session tokens — a token
+    // require_admin because it mints full-permission sync session tokens, a token
     // with write_metadata must not be able to bootstrap a more privileged token.
     let sync_admin_read = Router::new()
         .nest("/sync", sync_views::read_routes())
@@ -392,7 +392,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .layer(middleware::from_fn(require_admin))
         .with_state(state.clone());
 
-    // Keycloak user management proxy. Conditional — only mounted if AppState has
+    // Keycloak user management proxy. Conditional, only mounted if AppState has
     // admin client credentials configured. Strictly Keycloak admin: NO API token,
     // even one with full permissions, can pass require_admin.
     let user_routes = state.keycloak_admin.as_ref().map(|_| {
@@ -403,7 +403,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
             .with_state(state.clone())
     });
 
-    // Telegram identity link-code minting. Admin-only — it grants a chat the linked user's role.
+    // Telegram identity link-code minting. Admin-only, it grants a chat the linked user's role.
     let telegram_admin_routes = Router::new()
         .route(
             "/telegram_identities/link_code",
@@ -440,7 +440,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
             .with_state(state.clone())
     };
 
-    // The caller's own identity, level, and project visibility. No extra capability gate — the
+    // The caller's own identity, level, and project visibility. No extra capability gate, the
     // access gate in `service_auth_middleware` already guarantees a river role; the handler refuses
     // API tokens (no user sub) itself.
     let me_route = Router::new()
@@ -506,7 +506,7 @@ pub fn sync_control_router(_state: &AppState) -> Router<AppState> {
     use std::sync::Arc;
     use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
-    let service_routes = river_data_core::server::routes::<AppState>();
+    let service_routes = crate::routes::private::sync::control::routes();
 
     let enroll_limiter = GovernorConfigBuilder::default()
         .key_extractor(FallbackIpKeyExtractor)

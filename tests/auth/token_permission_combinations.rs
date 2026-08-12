@@ -1,6 +1,6 @@
 //! Every one of the 16 permission-bit combinations against a representative endpoint per
 //! capability. Proves the four capability bits (read_metadata, read_data, write_metadata,
-//! write_data) are independently enforced — including that annotations/samples reads require
+//! write_data) are independently enforced, including that annotations/samples reads require
 //! `read_data`, not `read_metadata` (a metadata-only key must not read time-series data).
 //!
 //! Tokens here are unscoped so the probes isolate the capability bits from project scope.

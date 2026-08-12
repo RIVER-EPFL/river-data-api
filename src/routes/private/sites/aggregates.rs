@@ -50,7 +50,7 @@ pub struct ParameterAggregateData {
     /// unattributed/legacy group). Absent in the default collapsed response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sensor_id: Option<Uuid>,
-    /// Stable parameter code (catalog `code`) — used as the CSV/NDJSON column key
+    /// Stable parameter code (catalog `code`), used as the CSV/NDJSON column key
     pub code: String,
     pub name: String,
     #[serde(rename = "type")]
@@ -164,7 +164,7 @@ pub struct SiteAggregatesQuery {
 ///
 /// Returns aggregated parameter data for all parameters in the specified site.
 /// Supports JSON, CSV, and NDJSON formats. Aggregates cover continuous and derived
-/// readings only; grab samples (measurement_type 'spot') are excluded — fetch them at
+/// readings only; grab samples (measurement_type 'spot') are excluded, fetch them at
 /// raw resolution via the readings endpoint.
 #[utoipa::path(
     get,
@@ -543,7 +543,7 @@ pub async fn get_site_aggregates(
 
 /// Per-sensor aggregate read (the `split_by_sensor=true` JSON path). Returns one
 /// `ParameterAggregateData` per `(parameter, sensor)` present in the sensor-dimension CAGG, each
-/// carrying its `sensor_id` (null = the unattributed group). Uncached and JSON-only by design — an
+/// carrying its `sensor_id` (null = the unattributed group). Uncached and JSON-only by design, an
 /// opt-in analytical view for overlay plots, kept isolated from the default collapsed path.
 #[allow(clippy::too_many_arguments)]
 async fn aggregates_split_by_sensor(

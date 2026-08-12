@@ -2,7 +2,7 @@
 //!
 //! Scenario: out-of-range readings that arrive via bulk ingestion (CSV import / batch) or are
 //! backfilled later are NOT seen by the live 60s sweeper (it only inspects the latest reading), so
-//! they must become breach episodes via the `alarm_backfill` job — automatically on ingest and on
+//! they must become breach episodes via the `alarm_backfill` job, automatically on ingest and on
 //! demand via `POST /api/actions/rebuild_alarm_events`.
 //!
 //! Run: cargo test --test alarms -- --test-threads=1
@@ -61,7 +61,7 @@ async fn turbidity_episodes(db: &sea_orm::DatabaseConnection) -> Vec<(i16, bool)
 }
 
 /// Ingesting a CSV whose values cross the Turbidity warning/alarm bands automatically fires the
-/// backfill job, which reconstructs the breach episodes (one warning, one alarm) — even though the
+/// backfill job, which reconstructs the breach episodes (one warning, one alarm), even though the
 /// live sweeper never ran.
 #[tokio::test]
 #[serial]

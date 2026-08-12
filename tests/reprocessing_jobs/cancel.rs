@@ -2,7 +2,7 @@
 //! any replica is stopped by its owning replica's heartbeat; a still-`queued` job is cancelled
 //! outright. Non-cancellable types, terminal jobs, and unknown ids report 409/404. (The worker
 //! honoring the flag is the heartbeat path in `worker.rs`; it is not exercised here because the
-//! heartbeat cadence is 40s — the fast, deterministic contract is that the flag gets set.)
+//! heartbeat cadence is 40s, the fast, deterministic contract is that the flag gets set.)
 //!
 //! Run: cargo test --test reprocessing_jobs -- --test-threads=1
 

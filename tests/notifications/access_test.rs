@@ -1,4 +1,4 @@
-//! C1 — the notification project-access choke point. `accessible_project_ids` is the single seam that
+//! C1, the notification project-access choke point. `accessible_project_ids` is the single seam that
 //! every subscription read/write and every alert fan-out routes through: it confines a member to their
 //! granted projects, leaves an administrator unrestricted, and fails closed (grants nothing) for a
 //! revoked/unknown user or when Keycloak is unreachable.
@@ -87,7 +87,7 @@ async fn member_is_confined_to_granted_projects() {
     );
     assert!(
         !project_allowed(&accessible, Uuid::parse_str(PROJECT_B).unwrap()),
-        "an ungranted project is denied — no cross-project notification leak"
+        "an ungranted project is denied, no cross-project notification leak"
     );
 }
 
@@ -114,7 +114,7 @@ async fn member_with_no_grant_gets_nothing() {
     let base = spawn_mock_keycloak().await;
     let state = state_with_keycloak(db.clone(), &base);
 
-    // A river member who was never granted any project — the exact C1 hole. Must see nothing.
+    // A river member who was never granted any project, the exact C1 hole. Must see nothing.
     let accessible = accessible_project_ids(&state, "regular-user").await;
     assert_eq!(accessible, Some(std::collections::HashSet::new()));
     assert!(!project_allowed(&accessible, Uuid::parse_str(PROJECT_A).unwrap()));

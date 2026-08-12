@@ -65,7 +65,7 @@ pub async fn wait_for_jobs_by_trigger(db: &sea_orm::DatabaseConnection, trigger_
 }
 
 /// A numeric array from a readings (`values`) or aggregate (`avg`/`min`/`max`/`count`) response.
-/// `key` matches a parameter by `code`, `name`, `display_name`, or `parameter_id` — the
+/// `key` matches a parameter by `code`, `name`, `display_name`, or `parameter_id`, the
 /// authenticated readings group by the site_parameter name while the public API exposes `code`
 /// (short code) and `name` (human label), so matching on `parameter_id` or `code` is the stable
 /// choice across both.
@@ -123,7 +123,7 @@ pub async fn create_parameter(app: &Router, token: &str, code: &str, name: &str,
     .await
 }
 
-/// Assign a parameter to a site with ONLY the required fields — exercises the `on_create` defaults
+/// Assign a parameter to a site with ONLY the required fields, exercises the `on_create` defaults
 /// and the server-side `name` backfill.
 pub async fn assign_site_parameter_minimal(app: &Router, token: &str, site_id: &str, parameter_id: &str) -> String {
     create(

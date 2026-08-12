@@ -84,7 +84,7 @@ fn random_hex(n_bytes: usize) -> String {
 /// the at-rest format never drift apart.
 #[must_use]
 pub fn mint_api_token() -> MintedToken {
-    let prefix = random_hex(8); // 16 hex chars (64 bits) — non-secret lookup key
+    let prefix = random_hex(8); // 16 hex chars (64 bits), non-secret lookup key
     let secret = random_hex(32); // 64 hex chars (256 bits)
     let raw_token = format!("{API_TOKEN_PREFIX}{prefix}_{secret}");
     let token_hash = hash_api_secret(&secret);
@@ -102,7 +102,7 @@ pub fn split_api_token(raw_token: &str) -> Option<(&str, &str)> {
     // rejects malformed `rvd_…` junk before it can reach the indexed prefix lookup, so a flood of
     // well-prefixed-but-bogus bearer values can't drive DB work (the per-IP limiter runs ahead of
     // this; the length/hex gate is the second line). A wrong-but-well-formed secret still verifies
-    // against argon2 — only the at-rest hash can reject that.
+    // against argon2, only the at-rest hash can reject that.
     if prefix.len() != PREFIX_HEX_LEN
         || secret.len() != SECRET_HEX_LEN
         || !is_lower_hex(prefix)
@@ -115,14 +115,14 @@ pub fn split_api_token(raw_token: &str) -> Option<(&str, &str)> {
 
 /// Argon2id with explicit OWASP-baseline parameters (m = 19 MiB, t = 2, p = 1). Pinned rather than
 /// using `Argon2::default()` so a future change to the crate's defaults can't silently weaken the
-/// work factor — or raise it enough to turn cache-miss verification into a CPU-DoS vector.
+/// work factor, or raise it enough to turn cache-miss verification into a CPU-DoS vector.
 fn token_argon2() -> Argon2<'static> {
     let params = Params::new(19_456, 2, 1, None).expect("static argon2 params are valid");
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
 
 /// Argon2id hash (PHC string) of a token secret. Argon2 is salted, so two identical secrets
-/// produce different hashes — that's why lookup is by `token_prefix`, not by this value.
+/// produce different hashes, that's why lookup is by `token_prefix`, not by this value.
 #[must_use]
 pub fn hash_api_secret(secret: &str) -> String {
     let salt = SaltString::generate(&mut OsRng);
@@ -212,7 +212,7 @@ fn is_expired(token: &model::Model) -> bool {
 /// Fire-and-forget write to the API-token audit log (forensic trail for the public key surface).
 /// Best-effort: spawned off the request path and errors are ignored, so it never blocks or fails a
 /// request. Captures the token, the request method+path, the response status, and the token's
-/// project scope — including the 403s a scoped key earns on a cross-project attempt.
+/// project scope, including the 403s a scoped key earns on a cross-project attempt.
 pub fn record_token_use(
     db: &DatabaseConnection,
     token_id: uuid::Uuid,

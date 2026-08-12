@@ -1,5 +1,5 @@
 //! End-to-end sensor lifecycle over the HTTP API (the astroriver model): a sensor is deployed,
-//! produces readings, is moved to another site, recalled, and explicitly reprocessed — and the
+//! produces readings, is moved to another site, recalled, and explicitly reprocessed, and the
 //! readings re-coordinate by time window automatically. Setup uses the proven `sensor_lifecycle`
 //! DB helpers; the operations under test (move = new deployment, recall = PUT deployed_until,
 //! manual reprocess) go through the real endpoints so the CrudCrate hooks + tracked jobs fire.
@@ -30,7 +30,7 @@ async fn deploy_move_recall_reprocess_over_http() {
     let site2 = Uuid::parse_str(crate::common::SITE2_ID).unwrap();
 
     // Setup: sensor with a non-identity calibration (y = 2x + 1), deployed at site 1, producing
-    // six readings across the first hour. (DB helpers — no hooks needed for setup.)
+    // six readings across the first hour. (DB helpers, no hooks needed for setup.)
     let sensor = sl::create_sensor(&db, "lifecycle", crate::common::GLOBAL_PARAM_TEMP_ID).await;
     let cal = sl::add_calibration(&db, sensor.id, 2.0, 1.0, sl::dt("2025-06-01T00:00:00Z")).await;
     let dep_a = sl::deploy_sensor(&db, sensor.id, crate::common::SITE1_ID, sl::dt("2025-06-01T00:00:00Z")).await;

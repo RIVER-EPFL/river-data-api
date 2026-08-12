@@ -85,7 +85,7 @@ async fn expired_token_returns_401_for_every_endpoint() {
 async fn permission_json_with_missing_fields_uses_serde_defaults() {
     let (db, app) = setup().await;
 
-    // Empty `{}` — serde defaults: read_metadata=true, read_data=true, write_*=false.
+    // Empty `{}`, serde defaults: read_metadata=true, read_data=true, write_*=false.
     let tok_empty = crate::common::seed_api_token(&db, serde_json::json!({}), None).await;
     let (status, _) = crate::common::get_with_token(&app, "/api/projects", &tok_empty).await;
     assert_eq!(status, 200, "empty permissions should default to read access, got {status}");
@@ -122,7 +122,7 @@ async fn permission_json_with_unknown_keys_is_tolerated() {
     let (read_status, _) = crate::common::get_with_token(&app, "/api/projects", &tok).await;
     assert_eq!(read_status, 200, "read should succeed with known scopes");
 
-    // The new unknown field must NOT escalate to admin access — proves the schema is closed.
+    // The new unknown field must NOT escalate to admin access, proves the schema is closed.
     let (admin_status, _) = crate::common::get_with_token(&app, "/api/tokens", &tok).await;
     assert_eq!(
         admin_status, 403,
@@ -150,7 +150,7 @@ async fn permission_json_null_uses_defaults() {
     .await;
 
     let (status, _) = crate::common::get_with_token(&app, "/api/projects", &raw).await;
-    // The from_json fallback returns the default TokenPermissions — reads on, writes off.
+    // The from_json fallback returns the default TokenPermissions, reads on, writes off.
     assert_eq!(status, 200, "null permissions should fall back to defaults, got {status}");
 }
 
@@ -164,7 +164,7 @@ async fn revoked_sync_session_token_rejected_on_next_use() {
     let (ok_status, _) = crate::common::get_with_token(&app, "/api/search?q=site", &tok).await;
     assert_eq!(ok_status, 200, "fresh sync session token should work, got {ok_status}");
 
-    // Manually expire by setting expires_at to the past — emulates revoke_credential.
+    // Manually expire by setting expires_at to the past, emulates revoke_credential.
     crate::common::db::exec(
         &db,
         "UPDATE sync_service_tokens SET expires_at = now() - interval '1 hour'",

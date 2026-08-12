@@ -318,7 +318,7 @@ pub async fn insert_batch_readings(
             .copied();
 
         // Auto-compute derived values for affected sites, tracked as a job. Spawn-guard: keep only
-        // sites with an active derived parameter — others would compute nothing.
+        // sites with an active derived parameter, others would compute nothing.
         let mut derived_sites: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = HashMap::new();
         for (site_id, timestamps) in &site_timestamps_for_derived {
             if crate::routes::private::parameters::derived::janitor::site_has_active_derived(
@@ -373,7 +373,7 @@ pub async fn insert_batch_readings(
 
         // Live open-alarm reconcile for the just-ingested slots (event-driven freshness). The
         // periodic backstop still reconciles everything; this just updates persisted alarms + SSE
-        // within ~1s of the write instead of waiting for the next sweep. Error-safe — the helper
+        // within ~1s of the write instead of waiting for the next sweep. Error-safe, the helper
         // logs and swallows failures, so it can never break ingestion.
         let alarm_slots: Vec<(Uuid, Uuid)> = stream_cache.keys().copied().collect();
         crate::routes::private::alarms::sweeper::reconcile_and_notify(

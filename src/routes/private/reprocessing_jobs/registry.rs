@@ -40,10 +40,10 @@ pub fn category_for(trigger_type: &str) -> &'static str {
 
 /// Whether a finished job of this `trigger_type` can be re-run by replaying it from the ids stored
 /// on its row (sensor reprocess, aggregate refresh, derived recompute). Keyed on trigger_type, not
-/// status — `failed`/`completed`/`cancelled` jobs are all rerunnable if the type is.
+/// status, `failed`/`completed`/`cancelled` jobs are all rerunnable if the type is.
 ///
 /// Excluded for now: the timestamp-driven derived jobs (`ingest_derived`/`batch_derived`/
-/// `compute_derived`) — faithful replay needs their persisted timestamps (a follow-up); the janitor
+/// `compute_derived`), faithful replay needs their persisted timestamps (a follow-up); the janitor
 /// already backfills any missed derived values. `csv_import` can never replay (source expires).
 #[must_use]
 pub fn is_rerunnable(trigger_type: &str) -> bool {
@@ -67,7 +67,7 @@ pub fn is_rerunnable(trigger_type: &str) -> bool {
     )
 }
 
-/// Whether a running job of this `trigger_type` can be cooperatively cancelled — i.e. it iterates a
+/// Whether a running job of this `trigger_type` can be cooperatively cancelled, i.e. it iterates a
 /// loop and checks `JobContext::is_cancelled` at its batch checkpoints. Single-statement jobs
 /// (aggregate refresh, pairing backfill) have no checkpoint and report 409 on a cancel attempt.
 #[must_use]

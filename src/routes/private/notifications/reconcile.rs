@@ -1,4 +1,4 @@
-//! Periodic identity reconciliation — the anti-backdoor backstop.
+//! Periodic identity reconciliation, the anti-backdoor backstop.
 //!
 //! Re-resolves every active linked identity against Keycloak and deactivates any whose user is gone,
 //! disabled, or no longer holds a riverdata role. This bounds the revocation window even for users

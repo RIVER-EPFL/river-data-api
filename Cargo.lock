@@ -2753,17 +2753,13 @@ dependencies = [
 [[package]]
 name = "river-data-core"
 version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "358c98ed7e077e8b0606347d0c87f2b0ab02520bb2084254458cf0e2e96385d3"
 dependencies = [
- "axum",
  "chrono",
- "moka",
- "rand 0.9.4",
- "sea-orm",
  "serde",
  "serde_json",
- "sha2",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
  "utoipa",
  "uuid",

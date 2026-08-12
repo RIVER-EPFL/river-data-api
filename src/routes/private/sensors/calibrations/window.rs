@@ -21,7 +21,7 @@ pub struct CalibrationWindowPoint {
     pub is_flagged: bool,
 }
 
-/// The data a calibration's time window resolves — for the interactive calibration editor.
+/// The data a calibration's time window resolves, for the interactive calibration editor.
 /// `points` is capped (most recent within the window) while `point_count` is the true total.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CalibrationWindowResponse {
@@ -38,7 +38,7 @@ pub struct CalibrationWindowResponse {
 
 const MAX_POINTS: i64 = 2000;
 
-/// `GET /sensor_calibrations/{id}/window` — the readings a calibration window resolves. `read_data`.
+/// `GET /sensor_calibrations/{id}/window`, the readings a calibration window resolves. `read_data`.
 #[utoipa::path(
     get,
     path = "/sensor_calibrations/{id}/window",

@@ -194,7 +194,7 @@ impl CRUDOperations for SensorOperations {
 pub struct SensorContext {
     pub sensor_id: Uuid,
     pub calibration_id: Uuid,
-    /// `None` when the sensor is not deployed to the target site at this time — the slot may be
+    /// `None` when the sensor is not deployed to the target site at this time, the slot may be
     /// occupied by another sensor, or the sensor isn't adopted yet. Readings still carry
     /// `sensor_id`/`calibration_id`; only the deployment FK is absent.
     pub deployment_id: Option<Uuid>,
@@ -321,7 +321,7 @@ async fn insert_or_get_sensor<C: ConnectionTrait>(
         return Ok(id);
     }
 
-    // Conflict on serial: a sensor already exists (possibly a concurrent winner) — reuse it.
+    // Conflict on serial: a sensor already exists (possibly a concurrent winner), reuse it.
     let existing = find_sensor_by_serial(db, serial)
         .await?
         .ok_or_else(|| {
@@ -353,7 +353,7 @@ pub async fn create_sensor_for_stream<C: ConnectionTrait>(
 }
 
 /// Import-only: create or reuse a sensor for a stream and resolve its latest calibration, WITHOUT
-/// deploying it to a site. The "imported, not adopted" state — readings get `sensor_id`/
+/// deploying it to a site. The "imported, not adopted" state, readings get `sensor_id`/
 /// `calibration_id` (so calibration math applies) but no `deployment_id`/`site_id` until an explicit
 /// adopt. Idempotent: reuses the stream's linked sensor, else the existing `serial` sensor, else
 /// inserts one (race-safe via `insert_or_get_sensor`). Updates `data_streams.sensor_id`.
@@ -437,12 +437,12 @@ async fn get_latest_calibration<C: ConnectionTrait>(
     }
 }
 
-/// Find this sensor's open deployment at the site, or auto-create one — but only if the
+/// Find this sensor's open deployment at the site, or auto-create one, but only if the
 /// `(site, parameter)` slot is free. Returns `None` when the slot is already occupied by another
 /// sensor (the swap case), leaving the deployment to an explicit adopt.
 ///
 /// One sensor per `(site, parameter)` is hard-enforced by the `excl_deployment_site_param_slot`
-/// exclusion constraint. A blind insert onto an occupied slot would raise an exclusion violation —
+/// exclusion constraint. A blind insert onto an occupied slot would raise an exclusion violation,
 /// which, in the sync apply path (this runs inside `create_sensor_for_stream` within a transaction),
 /// would poison the whole pairing transaction. The conditional insert below skips cleanly when the
 /// slot is occupied (the common swap case) instead of raising; the constraint remains the atomic
@@ -524,7 +524,7 @@ pub struct ResolvedSlot {
     pub site_id: Option<Uuid>,
 }
 
-/// Resolve attribution for a batch of reading times for one sensor, by window — the same half-open
+/// Resolve attribution for a batch of reading times for one sensor, by window, the same half-open
 /// `[from, COALESCE(until,'infinity'))` semantics `reprocess_sensor_readings` uses, so every write
 /// path agrees with reprocess. Two indexed range scans regardless of batch size.
 ///
@@ -544,7 +544,7 @@ pub async fn resolve_windows_for_times<C: ConnectionTrait>(
     }
 
     // Read the raw nullable bounds (NULL = open / unbounded). Do NOT COALESCE to 'infinity' in SQL
-    // and read it into a non-nullable DateTime — chrono/sqlx cannot represent infinity and would
+    // and read it into a non-nullable DateTime, chrono/sqlx cannot represent infinity and would
     // panic for the (common) open calibration/deployment.
     let cal_rows = db
         .query_all(Statement::from_sql_and_values(
@@ -617,13 +617,13 @@ pub struct ResolvedOwner {
     pub calibration_id: Option<Uuid>,
 }
 
-/// Reverse of [`resolve_windows_for_times`]: for a `(site, parameter)` slot, resolve which sensor —
-/// and its deployment + active calibration — covers each time, by the same half-open
+/// Reverse of [`resolve_windows_for_times`]: for a `(site, parameter)` slot, resolve which sensor,
+/// and its deployment + active calibration, covers each time, by the same half-open
 /// `[from, COALESCE(until,'infinity'))` windows. Used by the write paths (import/batch/ingest) to
 /// attribute a reading at write time whenever a deployment already covers its time, so new data lands
 /// attributed instead of NULL. Single-valued: the `excl_deployment_site_param_slot` constraint
 /// guarantees at most one deployment per `(site, parameter)` at any instant. Times outside every
-/// deployment window resolve to `ResolvedOwner::default()` (all `None`) — they need a backdate.
+/// deployment window resolve to `ResolvedOwner::default()` (all `None`), they need a backdate.
 pub async fn resolve_slot_owner_for_times<C: ConnectionTrait>(
     db: &C,
     site_id: Uuid,

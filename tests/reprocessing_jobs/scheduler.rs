@@ -166,7 +166,7 @@ async fn not_yet_due_service_is_left_alone() {
     let reg = registry_with("sched_future_probe", 300);
 
     scheduler::seed_default_schedules(&db, &reg).await.unwrap();
-    // Seed sets next_run_at one interval out — already in the future, so nothing is due.
+    // Seed sets next_run_at one interval out, already in the future, so nothing is due.
     let enqueued = scheduler::tick(&db, &reg).await.unwrap();
     assert_eq!(enqueued, 0, "a future schedule is not enqueued");
     assert_eq!(count_queued(&db, "sched_future_probe").await, 0);

@@ -30,7 +30,7 @@ pub use log_model::NotificationLog;
 pub use mutes_model::NotificationMute;
 
 /// The (project, site, parameter) an alert belongs to. Used to fan out only to subscribers who opted
-/// in to that scope. `None` on a message means system-wide (e.g. a sync-service failure) — every
+/// in to that scope. `None` on a message means system-wide (e.g. a sync-service failure), every
 /// enabled recipient gets it. `project_id` is `None` when the trigger didn't resolve it (site- and
 /// parameter-level subscription overrides still apply; only project-level overrides are skipped).
 #[derive(Clone, Debug)]

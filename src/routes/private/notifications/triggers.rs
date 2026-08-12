@@ -68,7 +68,7 @@ async fn state_clear(db: &DatabaseConnection, kind: &str, key: &str) -> Result<(
 }
 
 // Multi-replica claims: each transition is committed to `notification_state` BEFORE the send so that
-// at 2-3 replicas exactly one replica sends. The unique (kind, subject_key) key arbitrates the race —
+// at 2-3 replicas exactly one replica sends. The unique (kind, subject_key) key arbitrates the race,
 // the single winner gets a RETURNING row, losers get none and skip.
 
 /// Claim a fresh firing transition: insert the dedup row iff absent. Winner sends.
@@ -114,7 +114,7 @@ async fn claim_renotify(db: &DatabaseConnection, kind: &str, key: &str, within_d
 }
 
 /// Claim by advancing a watermark: win iff the stored timestamp still equals `expected` (the value
-/// just read) — or the row is absent. A replica that already advanced it wins the compare-and-swap and
+/// just read), or the row is absent. A replica that already advanced it wins the compare-and-swap and
 /// the loser skips, so a digest is sent once.
 async fn claim_cas(db: &DatabaseConnection, kind: &str, key: &str, expected: DateTime<Utc>) -> Result<bool, DbErr> {
     let row = db
@@ -162,7 +162,7 @@ async fn stale_data(
         let site_name: String = r.try_get("", "site_name")?;
         let param_name: String = r.try_get("", "param_name")?;
         let Some(last_time) = r.try_get::<Option<DateTime<Utc>>>("", "last_time")? else {
-            continue; // never produced data — not "stale", just unpaired/new
+            continue; // never produced data, not "stale", just unpaired/new
         };
         let key = format!("{site_id}:{parameter_id}");
         let age = Utc::now() - last_time;
@@ -263,7 +263,7 @@ async fn battery_forecast(
 
         let key = site_id.to_string();
         // Claim the (re-)notify atomically: suppresses re-alert within the window AND ensures a single
-        // replica sends. On a rare send failure the advisory is suppressed until the window lapses —
+        // replica sends. On a rare send failure the advisory is suppressed until the window lapses,
         // acceptable for a forecast (threshold alarms keep full at-least-once via the dispatcher).
         if !claim_renotify(db, "battery_forecast", &key, BATTERY_RENOTIFY_DAYS).await? {
             continue;
@@ -272,7 +272,7 @@ async fn battery_forecast(
             kind: "battery_forecast",
             subject: format!("River Data: battery low at {site_name}"),
             body: format!(
-                "🔋 {site_name}: {latest:.2}V, trend {slope:+.3}V/day — ~{days:.0}d to {cutoff:.1}V."
+                "🔋 {site_name}: {latest:.2}V, trend {slope:+.3}V/day, ~{days:.0}d to {cutoff:.1}V."
             ),
             slot: Some(Slot { project_id, site_id, parameter_id: battery_param }),
         };
@@ -325,7 +325,7 @@ async fn sync_failures(
             kind: "sync_failure",
             subject: format!("River Data: sync failures on {service_type}"),
             body: format!("⚠️ {n} sync failure(s) on {service_type}/{instance} since the last alert."),
-            // System-wide infrastructure alert — no per-site scope, every enabled recipient gets it.
+            // System-wide infrastructure alert, no per-site scope, every enabled recipient gets it.
             slot: None,
         };
         let _ = deliver(state, channels, &msg, None).await;

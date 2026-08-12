@@ -9,7 +9,7 @@
 //! written here. A run that reaches the last reading in the window is left for the live sweeper to
 //! open and manage, so this never races the `uq_alarm_events_open` partial unique index. Writes are
 //! idempotent: a rebuild deletes the resolved episodes it previously produced in the window, then
-//! reinserts — re-running yields identical rows.
+//! reinserts, re-running yields identical rows.
 
 use chrono::{DateTime, FixedOffset, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};

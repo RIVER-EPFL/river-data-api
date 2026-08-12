@@ -1,4 +1,4 @@
-//! `GET /api/me/sites` — the sidebar navigator's project → subproject → site tree. Visibility
+//! `GET /api/me/sites`, the sidebar navigator's project → subproject → site tree. Visibility
 //! follows the grant axis exactly like `/api/sites`: an administrator gets every project, a granted
 //! member gets only their project's tree, an ungranted member gets an empty list. Sites land under
 //! the subproject the row points at (the default subproject when none was given at insert).

@@ -228,7 +228,7 @@ async fn refresh_aggregates_for_range(
 ) {
     // Widen by a full monthly bucket on each side: TimescaleDB rejects a `refresh_continuous_aggregate`
     // window narrower than the aggregate's bucket, so a `[t, t+1s)` window (a single flagged reading)
-    // failed on every view — the flagged value then kept being served from stale rollups. ±32 days
+    // failed on every view, the flagged value then kept being served from stale rollups. ±32 days
     // guarantees each of hourly/daily/weekly/monthly spans at least one whole bucket.
     let lo = min_t - chrono::Duration::days(32);
     let hi = max_t + chrono::Duration::days(32);

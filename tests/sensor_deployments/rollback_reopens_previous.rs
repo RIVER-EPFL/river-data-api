@@ -1,6 +1,6 @@
 //! Rollback reopens the previous deployment. When a sensor is moved (deployment A at site1 closed,
 //! deployment B opened at site2) and B is rolled back, B's-window readings must revert to site1 /
-//! deployment A — not get un-attributed. `recompute_deployed_until` only shortens windows, so the
+//! deployment A, not get un-attributed. `recompute_deployed_until` only shortens windows, so the
 //! handler explicitly reopens the previous deployment to the boundary B vacated.
 //!
 //! Run: cargo test --test sensor_deployments -- --test-threads=1

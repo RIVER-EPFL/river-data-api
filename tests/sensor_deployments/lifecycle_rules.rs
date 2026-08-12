@@ -37,7 +37,7 @@ async fn deployed_until(db: &DatabaseConnection, id: &str) -> Option<chrono::Dat
         .map(|t| t.with_timezone(&chrono::Utc))
 }
 
-/// H8/H9 — a multi-channel instrument holds one open deployment per parameter. Deploying a second
+/// H8/H9, a multi-channel instrument holds one open deployment per parameter. Deploying a second
 /// channel (a different parameter) at the same site must NOT auto-recall the first channel: the recall
 /// is scoped to the parameter being deployed.
 #[tokio::test]
@@ -71,7 +71,7 @@ async fn deploying_a_second_channel_keeps_the_first_open() {
 
     assert!(
         deployed_until(&db, &temp_dep.to_string()).await.is_none(),
-        "the temperature channel stays open when the DO channel is deployed — recall is parameter-scoped"
+        "the temperature channel stays open when the DO channel is deployed, recall is parameter-scoped"
     );
     let open = count(
         &db,
@@ -87,7 +87,7 @@ async fn deploying_a_second_channel_keeps_the_first_open() {
     cleanup_test_db(&db).await;
 }
 
-/// §3 — calibration windows are gap-absorbing: a window runs to the NEXT calibration's `valid_from`,
+/// §3, calibration windows are gap-absorbing: a window runs to the NEXT calibration's `valid_from`,
 /// so a reading between two calibrations resolves to the EARLIER one, never the later or the prior.
 #[tokio::test]
 #[serial]
@@ -125,11 +125,11 @@ async fn calibration_window_absorbs_gap_to_next_valid_from() {
     let rows = get_readings(&db, stream).await;
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].calibrated_value, Some(10.0), "01-05 uses identity (1*10)");
-    assert_eq!(rows[1].calibrated_value, Some(40.0), "01-15 uses C1 (2*20) — gap absorbed to C2's start");
+    assert_eq!(rows[1].calibrated_value, Some(40.0), "01-15 uses C1 (2*20), gap absorbed to C2's start");
     assert_eq!(rows[2].calibrated_value, Some(90.0), "01-25 uses C2 (3*30)");
 }
 
-/// §6 — the recall-NULL guard. Readings at or after the sensor's first `deployed_from` that fall in
+/// §6, the recall-NULL guard. Readings at or after the sensor's first `deployed_from` that fall in
 /// a deployment gap are un-attributed (site_id NULL); readings that PREDATE the first deployment keep
 /// the site_id pairing gave them and are never silently un-attributed.
 #[tokio::test]
@@ -172,7 +172,7 @@ async fn recall_keeps_pre_first_deployment_readings_attributed() {
     assert_eq!(rows[2].site_id, None, "01-15 in the post-recall gap → un-attributed");
 }
 
-/// §3 — deployment windows are gap-preserving: `recompute_deployed_until` only ever SHORTENS
+/// §3, deployment windows are gap-preserving: `recompute_deployed_until` only ever SHORTENS
 /// (`LEAST(existing, LEAD(deployed_from))`), never extends. Trying to push a window past the next
 /// deployment's start is re-clamped, so deployments never overlap.
 #[tokio::test]
@@ -197,7 +197,7 @@ async fn deployment_recompute_only_shortens_never_extends() {
         "A auto-closed at B's start"
     );
 
-    // Attempt to EXTEND A past B's start. Different sites, so no slot conflict — but recompute must
+    // Attempt to EXTEND A past B's start. Different sites, so no slot conflict, but recompute must
     // re-clamp A back to B's start rather than letting it overlap.
     let (status, body) = put_json_with_token(
         &app,
@@ -211,11 +211,11 @@ async fn deployment_recompute_only_shortens_never_extends() {
     assert_eq!(
         deployed_until(&db, &dep_a).await,
         Some(dt("2025-03-01T02:00:00Z")),
-        "recompute re-clamped A to B's start — never extended"
+        "recompute re-clamped A to B's start, never extended"
     );
 }
 
-/// §4/§5 — pairing a stream whose `(site, parameter)` slot is already held by another sensor must
+/// §4/§5, pairing a stream whose `(site, parameter)` slot is already held by another sensor must
 /// not raise: auto-deploy is skipped (`find_or_create_deployment` returns None) and the readings
 /// carry `sensor_id`/`calibration_id` but no `deployment_id` until an explicit adopt.
 #[tokio::test]
@@ -275,7 +275,7 @@ async fn auto_deploy_skipped_when_slot_occupied() {
     );
 
     // Sensor B was created for the stream (linked via data_streams.sensor_id) but has no
-    // deployment — the slot was occupied. It stays available for an explicit adopt later.
+    // deployment, the slot was occupied. It stays available for an explicit adopt later.
     let stream_sensor = count(
         &db,
         &format!(
@@ -288,7 +288,7 @@ async fn auto_deploy_skipped_when_slot_occupied() {
     assert_eq!(stream_sensor, 1, "stream is linked to a distinct sensor B (not A)");
 }
 
-/// §6 — reprocess re-derives attribution from the timelines. Starting from readings whose
+/// §6, reprocess re-derives attribution from the timelines. Starting from readings whose
 /// `calibration_id`/`deployment_id`/`calibrated_value` have been wiped, a manual reprocess restores
 /// all of them by time window.
 #[tokio::test]

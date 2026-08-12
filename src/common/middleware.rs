@@ -37,7 +37,7 @@ pub enum AuthContext {
         /// Whether a verified email claim is present (false when `email` is a username fallback).
         email_verified: bool,
         /// The projects this user is granted (from `user_project_grants`). Empty for a member with
-        /// no grants (they see nothing — fail closed); ignored for administrators, who are
+        /// no grants (they see nothing, fail closed); ignored for administrators, who are
         /// unrestricted. Non-admin members flow through the same scope-filtering plumbing as
         /// project-scoped API tokens, generalized from one project to this set.
         grants: Arc<HashSet<Uuid>>,
@@ -64,7 +64,7 @@ impl AuthContext {
         self.has_role(&Role::Administrator)
     }
 
-    /// The Keycloak `sub` of the caller, if authenticated via Keycloak JWT. `None` for API tokens —
+    /// The Keycloak `sub` of the caller, if authenticated via Keycloak JWT. `None` for API tokens,
     /// self-service notification endpoints require a real user identity.
     pub fn keycloak_sub(&self) -> Option<&str> {
         match self {
@@ -107,7 +107,7 @@ impl AuthContext {
 
     /// Whether this identity is granted a capability under the default token rule. Delegates to
     /// the policy in [`crate::common::authz`]: a Keycloak user's highest role level must hold the
-    /// capability (level 0 — no `riverdata-*` role — holds nothing, since the EPFL-federated realm
+    /// capability (level 0, no `riverdata-*` role, holds nothing, since the EPFL-federated realm
     /// makes authentication distinct from membership); an API token is limited to whichever of its
     /// four permission bits map to the capability and never holds `Admin`.
     pub fn allows(&self, cap: Capability) -> bool {
@@ -174,7 +174,7 @@ pub async fn service_auth_middleware(
                 return next.run(request).await;
             }
             axum_keycloak_auth::KeycloakAuthStatus::Failure(_) => {
-                // Keycloak auth failed — fall through to try API token
+                // Keycloak auth failed, fall through to try API token
             }
         }
     }
@@ -239,16 +239,11 @@ pub async fn service_auth_middleware(
     if let Some(raw) = sync_header
         && !raw.is_empty()
     {
-        let token_hash = crate::routes::private::api_tokens::service::hash_token(raw);
-
-        use crate::routes::private::sync::tokens_model as sync_service_tokens;
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-
-        if let Ok(Some(token)) = sync_service_tokens::Entity::find()
-            .filter(sync_service_tokens::Column::TokenHash.eq(&token_hash))
-            .one(&state.db)
-            .await
-            && token.expires_at.with_timezone(&chrono::Utc) >= chrono::Utc::now()
+        // Same resolution the control plane extractor uses, so the expiry rule cannot drift
+        // between the two surfaces a session token reaches.
+        if let Some(token) =
+            crate::routes::private::sync::control::session::lookup_sync_session(&state.db, raw)
+                .await
         {
             request.extensions_mut().insert(AuthContext::ApiToken {
                 token_id: token.service_id,
@@ -290,7 +285,7 @@ pub async fn require_manage_sensors(request: Request, next: Next) -> Response {
     authz::check(Capability::ManageSensors, TokenAccess::Same, request, next).await
 }
 
-/// Requires the `Admin` capability — the Keycloak Administrator role only. NO API token can pass
+/// Requires the `Admin` capability, the Keycloak Administrator role only. NO API token can pass
 /// (tokens never hold `Admin`): defense in depth for user management, token mutation, and sync
 /// credential creation.
 pub async fn require_admin(request: Request, next: Next) -> Response {
@@ -370,7 +365,7 @@ impl<S: Send + Sync> FromRequestParts<S> for DenyScoped {
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        // Deny scoped API tokens only — a granted Keycloak member is confined by their grant set,
+        // Deny scoped API tokens only, a granted Keycloak member is confined by their grant set,
         // not blocked outright from operator actions their capability admits.
         let scoped_token = matches!(
             parts.extensions.get::<AuthContext>(),
@@ -432,7 +427,7 @@ pub async fn bust_token_cache_on_mutation(
 
 /// Deny project-scoped API tokens outright. Layered on operator/global action routes (sensor
 /// adopt/swap, stream management, reprocess/backfill/aggregate refresh, merges, recalculate) that
-/// either span projects or have no per-project target — work a per-client logger key has no reason
+/// either span projects or have no per-project target, work a per-client logger key has no reason
 /// to do. Keycloak users and unscoped API tokens pass through unchanged.
 pub async fn deny_scoped_token(request: Request, next: Next) -> Response {
     if let Some(AuthContext::ApiToken {
@@ -457,7 +452,7 @@ pub async fn deny_scoped_token(request: Request, next: Next) -> Response {
 /// tokens) pass through untouched (and pay no body-buffering cost).
 ///
 /// The global catalog (`parameters`, `sensors`, `constants`, …) has no owning project. A **scoped
-/// API token** is denied it (fail closed — a per-client key can never mutate shared metadata). A
+/// API token** is denied it (fail closed, a per-client key can never mutate shared metadata). A
 /// **Keycloak member** is allowed through: their capability gate already decides whether they may
 /// write it (e.g. catalog writes are Administrator-only, so a non-admin member never reaches those
 /// routes anyway), and global catalog entities are legitimately managed by members.
@@ -508,7 +503,7 @@ pub async fn enforce_scope_on_crud(
                 return outside();
             }
         }
-        // At least one must be in scope — matches read confinement for a multi-project entity (a
+        // At least one must be in scope, matches read confinement for a multi-project entity (a
         // calibration is visible/writable if its sensor touches a granted project). Empty fails closed.
         ScopeOutcome::RequireAny(projects) => {
             if !projects.iter().any(|p| scope.allows_project(*p)) {
@@ -517,7 +512,7 @@ pub async fn enforce_scope_on_crud(
         }
         // A project-scoped entity whose owning project couldn't be resolved (row missing/unbound, or a
         // create that omits the owning FK to dodge the check): fail closed for any restricted principal.
-        // Administrators never reach here — the unrestricted early-return above skips this whole guard.
+        // Administrators never reach here, the unrestricted early-return above skips this whole guard.
         ScopeOutcome::Unresolved(msg) => {
             return AppError::Forbidden(msg).into_response();
         }
@@ -717,7 +712,7 @@ fn require_all(projects: Vec<Uuid>) -> ScopeOutcome {
 }
 
 /// Build a `RequireAny` from resolved projects, or `Unresolved` when the entity resolves to no project
-/// at all (e.g. a calibration for a never-deployed sensor) — fail closed for a restricted caller.
+/// at all (e.g. a calibration for a never-deployed sensor), fail closed for a restricted caller.
 fn require_any(projects: Vec<Uuid>, what: &str) -> ScopeOutcome {
     if projects.is_empty() {
         ScopeOutcome::Unresolved(format!("This {what} is not within your project access"))
@@ -835,7 +830,7 @@ pub async fn sensor_in_scope(
 
 /// Subquery selecting the ids of the sites in a restricted principal's project set. Used to confine
 /// child entities whose own scoping column is `site_id` (`notes`, `annotations`, …) without an extra
-/// round-trip — it inlines as a SQL sub-select in the read filter.
+/// round-trip, it inlines as a SQL sub-select in the read filter.
 fn scoped_site_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::SelectStatement {
     use crate::routes::private::sites;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};

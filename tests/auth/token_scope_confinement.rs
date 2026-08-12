@@ -1,6 +1,6 @@
 //! Project-scope confinement for a token's READ surface.
 //!
-//! Scenario: a key scoped to project A must not see project B's rows through any CRUD list/get —
+//! Scenario: a key scoped to project A must not see project B's rows through any CRUD list/get,
 //! the leak `enforce_token_scope_on_crud` left open by skipping GET (closed by `inject_read_scope`,
 //! which injects a per-entity CrudCrate `ScopeCondition`). A scoped key sees only its own project;
 //! an unscoped key (the admin/private surface) sees everything. Mutations stay confined too.
@@ -68,7 +68,7 @@ async fn list_ids(app: &axum::Router, path: &str, token: &str) -> Vec<String> {
 }
 
 /// Every project-bound CRUD entity: a scoped key sees only project A (its own), never project B's
-/// row — neither in the list nor by direct id (which 404s, not 403, so it doesn't even confirm the
+/// row, neither in the list nor by direct id (which 404s, not 403, so it doesn't even confirm the
 /// row exists). The unscoped key sees both.
 #[tokio::test]
 #[serial]
@@ -114,7 +114,7 @@ async fn scoped_key_confined_on_crud_reads() {
     }
 }
 
-/// The same scoped key still reaches its OWN project's rows — confinement filters out other
+/// The same scoped key still reaches its OWN project's rows, confinement filters out other
 /// projects without breaking the token's legitimate access.
 #[tokio::test]
 #[serial]
@@ -144,7 +144,7 @@ async fn scoped_key_still_sees_own_project() {
 }
 
 /// Sync infrastructure entities (sync_services, sync_commands, sync_events, pairing_plans) are
-/// admin-only — no API token (scoped or unscoped) can list them.
+/// admin-only, no API token (scoped or unscoped) can list them.
 #[tokio::test]
 #[serial]
 async fn admin_only_entities_reject_api_tokens() {
@@ -164,7 +164,7 @@ async fn admin_only_entities_reject_api_tokens() {
     }
 }
 
-/// A batch that mixes an in-scope and an out-of-scope site in one payload is rejected wholesale —
+/// A batch that mixes an in-scope and an out-of-scope site in one payload is rejected wholesale,
 /// a scoped key can't smuggle a foreign-site reading alongside a legitimate one.
 #[tokio::test]
 #[serial]
