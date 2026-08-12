@@ -13,6 +13,7 @@ mod malformed_and_revoked_rejection;
 mod middleware_and_permissions;
 mod permission_matrix;
 mod project_scope_isolation;
+mod token_admin_over_http;
 mod token_capability_roundtrip;
 mod token_expiry;
 mod token_lifecycle;

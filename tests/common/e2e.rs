@@ -44,7 +44,9 @@ pub async fn hourly_bucket(
         .query_one(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
-                "SELECT SUM(sum_value) AS total, SUM(count) AS n FROM readings_hourly \
+                // `count` is bigint, and SUM over bigint is NUMERIC in Postgres, which does not
+                // read back as i64. The cast is what makes `n` resolve at all.
+                "SELECT SUM(sum_value) AS total, SUM(count)::bigint AS n FROM readings_hourly \
                  WHERE site_id = '{site_id}' AND parameter_id = '{parameter_id}' \
                    AND bucket = time_bucket('1 hour', '{}'::timestamptz)",
                 at.to_rfc3339()
@@ -59,6 +61,20 @@ pub async fn hourly_bucket(
         (Some(t), Some(c)) if c > 0 => Some((t / c as f64, c)),
         _ => None,
     }
+}
+
+/// The first column of a single-row COUNT query.
+pub async fn count(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
+    use sea_orm::{ConnectionTrait, Statement};
+    db.query_one(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql.to_string(),
+    ))
+    .await
+    .unwrap_or_else(|e| panic!("count query failed: {e}\n{sql}"))
+    .unwrap_or_else(|| panic!("count query returned no row: {sql}"))
+    .try_get_by_index::<i64>(0)
+    .unwrap_or_else(|e| panic!("count query has no i64 first column: {e}\n{sql}"))
 }
 
 /// Percent-encode a CrudCrate `filter` value for use in a query string.
@@ -223,6 +239,20 @@ pub async fn create_sensor(app: &Router, token: &str, _parameter_id: &str, seria
     .await
 }
 
+/// Attach a registered stream to the sensor that feeds it.
+///
+/// `POST /streams/register` accepts no sensor field, so the link is set afterwards; without it,
+/// pairing mints a second, serial-less, deployment-less sensor for the same feed.
+pub async fn link_stream_sensor(app: &Router, token: &str, stream_id: &str, sensor_id: &str) {
+    let (status, body) = super::put_json_with_token(
+        app,
+        &format!("/api/data_streams/{stream_id}"),
+        &json!({ "sensor_id": sensor_id }),
+        token,
+    )
+    .await;
+    assert_eq!(status, 200, "attach stream {stream_id} to sensor {sensor_id}: {body}");
+}
 
 pub async fn create_deployment(
     app: &Router,

@@ -8,6 +8,7 @@ mod common;
 
 mod aggregate_refresh_on_flag;
 mod csv_import_column_resolution;
+mod csv_import_sessions;
 mod csv_import_worker;
 mod grab_samples_insertion;
 mod ingest_dedup_and_visibility;
