@@ -6,4 +6,5 @@
 #[allow(dead_code, unused_imports)]
 mod common;
 
+mod key_and_invalidation;
 mod key_generation;

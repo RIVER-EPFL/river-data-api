@@ -6,6 +6,7 @@
 #[allow(dead_code, unused_imports)]
 mod common;
 
+mod export_parity;
 mod exposure_lockdown;
 mod measurement_type_filter;
 mod read_only_endpoints;

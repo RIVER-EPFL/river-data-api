@@ -1,4 +1,5 @@
 pub mod client;
+pub mod compression;
 pub mod db;
 pub mod e2e;
 pub mod fixtures;
@@ -131,6 +132,30 @@ fn test_config() -> Config {
         telegram_grab_flag_for_review: false,
         dashboard_base_url: None,
     }
+}
+
+/// `test_config()` with the response cache on (300s TTL, 10MB ceiling), the production shape.
+pub fn cached_test_config() -> Config {
+    Config {
+        cache_ttl_seconds: 300,
+        cache_max_bytes: 10_000_000,
+        ..test_config()
+    }
+}
+
+/// App with the response cache enabled, for tests that assert on cache hits and cache keys.
+pub fn build_test_app_with_cache(db: DatabaseConnection) -> axum::Router {
+    let state = AppState::new(db, cached_test_config(), None);
+    spawn_test_worker(&state);
+    river_db::routes::build_router(state)
+}
+
+/// App + shared state with the response cache enabled, so a test can also reach the cache directly.
+pub fn build_test_app_with_cache_and_state(db: DatabaseConnection) -> (axum::Router, AppState) {
+    let state = AppState::new(db, cached_test_config(), None);
+    spawn_test_worker(&state);
+    let app = river_db::routes::build_router(state.clone());
+    (app, state)
 }
 
 pub fn build_test_app_with_rate_limiting(db: DatabaseConnection) -> axum::Router {

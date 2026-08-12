@@ -8,6 +8,7 @@ mod common;
 
 mod aggregation_and_paired_series;
 mod alarm_annotation_note_lifecycle;
+mod atomicity_and_compression;
 mod calibration_spanning_two_sites;
 mod deployment_backdate_two_sites;
 mod deployment_slot_and_recall;

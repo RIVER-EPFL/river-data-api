@@ -12,4 +12,5 @@ mod csv_import_sessions;
 mod csv_import_worker;
 mod grab_samples_insertion;
 mod ingest_dedup_and_visibility;
+mod ingest_validation;
 mod measurement_type_resolution;

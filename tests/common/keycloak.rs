@@ -405,22 +405,28 @@ pub async fn get_keycloak_jwt(username: &str, password: &str) -> String {
 /// (axum-keycloak-auth 0.8.3) if a request arrives before discovery has started, which a no-token
 /// request can otherwise race.
 pub async fn build_test_app_with_keycloak(db: DatabaseConnection) -> axum::Router {
-    build_test_app_with_keycloak_inner(db, false).await
+    build_test_app_with_keycloak_inner(db, false, super::test_config()).await
 }
 
 /// Like [`build_test_app_with_keycloak`], additionally configuring the Keycloak **admin proxy**
 /// (service-account client credentials), so the conditional `/users` + `/roles` routes are mounted.
 pub async fn build_test_app_with_keycloak_admin(db: DatabaseConnection) -> axum::Router {
-    build_test_app_with_keycloak_inner(db, true).await
+    build_test_app_with_keycloak_inner(db, true, super::test_config()).await
+}
+
+/// Like [`build_test_app_with_keycloak`] with the response cache enabled, for cache tests that
+/// assert on JWT-derived scope in the cache key.
+pub async fn build_test_app_with_keycloak_and_cache(db: DatabaseConnection) -> axum::Router {
+    build_test_app_with_keycloak_inner(db, false, super::cached_test_config()).await
 }
 
 async fn build_test_app_with_keycloak_inner(
     db: DatabaseConnection,
     with_admin_proxy: bool,
+    mut config: river_db::config::Config,
 ) -> axum::Router {
     let base = keycloak_base_url();
     let realm = keycloak_realm();
-    let mut config = super::test_config();
     config.keycloak_url = Some(base.clone());
     config.keycloak_realm = Some(realm.clone());
     config.keycloak_client_id = Some(keycloak_client_id());
