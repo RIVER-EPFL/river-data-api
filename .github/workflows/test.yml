@@ -31,8 +31,40 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Started here rather than as a `services:` container: services start before the checkout, so
+      # they cannot mount the realm file this import needs.
+      - name: Start Keycloak with the test realm
+        run: |
+          docker run -d --name keycloak -p 8180:8080 \
+            -e KEYCLOAK_ADMIN=admin -e KEYCLOAK_ADMIN_PASSWORD=admin \
+            -v "$PWD/tests/fixtures/keycloak-realm-test.json:/opt/keycloak/data/import/realm.json:ro" \
+            quay.io/keycloak/keycloak:26.0 start-dev --import-realm
+          for _ in $(seq 1 60); do
+            if curl -sf http://localhost:8180/realms/river-data/.well-known/openid-configuration >/dev/null; then
+              echo "Keycloak ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "Keycloak did not become ready"; docker logs keycloak; exit 1
+
       - name: Run tests
         env:
           DATABASE_URL: postgresql://postgres:psql@localhost:5432/river_test
           RUST_LOG: warn
+          # The app validates JWTs against these; the test helper mints them from the TEST_* pair.
+          # Both must point at the same Keycloak or the issuer and JWKS checks fail.
+          KEYCLOAK_URL: http://localhost:8180/
+          KEYCLOAK_REALM: river-data
+          KEYCLOAK_CLIENT_ID: river-data-ui-local
+          KEYCLOAK_ADMIN_CLIENT_ID: river-data-api-local
+          KEYCLOAK_ADMIN_CLIENT_SECRET: river-data-api-local-secret
+          TEST_KEYCLOAK_URL: http://localhost:8180/
+          TEST_KEYCLOAK_REALM: river-data
+          TEST_KEYCLOAK_CLIENT_ID: river-data-ui-local
+          # Without this a Keycloak-gated test skips silently, and a skip reports as a pass.
+          REQUIRE_KEYCLOAK: "1"
         run: cargo test --tests -- --test-threads=1
+
+      - name: Keycloak logs on failure
+        if: failure()
+        run: docker logs keycloak

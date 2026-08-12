@@ -1,0 +1,170 @@
+{
+  "realm": "river-data",
+  "displayName": "River Data Development",
+  "enabled": true,
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "verifyEmail": false,
+  "bruteForceProtected": true,
+  "accessTokenLifespan": 3600,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "clients": [
+    {
+      "clientId": "river-data-ui-local",
+      "name": "River Data UI",
+      "enabled": true,
+      "publicClient": true,
+      "fullScopeAllowed": true,
+      "clientAuthenticatorType": "client-secret",
+      "directAccessGrantsEnabled": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "redirectUris": [
+        "http://localhost:*",
+        "http://localhost:88/*",
+        "http://localhost:5173/*",
+        "http://localhost:3005/*"
+      ],
+      "webOrigins": ["*"],
+      "protocol": "openid-connect",
+      "defaultClientScopes": ["web-origins", "profile", "roles", "email"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "protocolMappers": [
+        {
+          "name": "User ID",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "consentRequired": false,
+          "config": {
+            "userinfo.token.claim": "true",
+            "user.attribute": "id",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "sub",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "account-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "account",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "river-data-api-local",
+      "name": "River Data API (Local)",
+      "enabled": true,
+      "publicClient": false,
+      "secret": "river-data-api-local-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "clientAuthenticatorType": "client-secret",
+      "protocol": "openid-connect",
+      "defaultClientScopes": ["web-origins", "profile", "roles", "email"]
+    }
+  ],
+  "users": [
+    {
+      "username": "admin",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "admin@local.dev",
+      "firstName": "Admin",
+      "lastName": "User",
+      "credentials": [{ "type": "password", "value": "admin", "temporary": false }],
+      "realmRoles": ["riverdata-admin"]
+    },
+    {
+      "username": "user",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "user@local.dev",
+      "firstName": "Regular",
+      "lastName": "User",
+      "credentials": [{ "type": "password", "value": "user", "temporary": false }],
+      "realmRoles": ["riverdata-river"]
+    },
+    {
+      "username": "manager1",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "manager1@local.dev",
+      "firstName": "Test",
+      "lastName": "Manager",
+      "credentials": [{ "type": "password", "value": "manager1", "temporary": false }],
+      "realmRoles": ["riverdata-manager"]
+    },
+    {
+      "username": "river1",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "river1@local.dev",
+      "firstName": "Test",
+      "lastName": "River",
+      "credentials": [{ "type": "password", "value": "river1", "temporary": false }],
+      "realmRoles": ["riverdata-river"]
+    },
+    {
+      "username": "intern1",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "intern1@local.dev",
+      "firstName": "Test",
+      "lastName": "Intern",
+      "credentials": [{ "type": "password", "value": "intern1", "temporary": false }],
+      "realmRoles": ["riverdata-intern"]
+    },
+    {
+      "username": "norole",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "norole@local.dev",
+      "firstName": "No",
+      "lastName": "Role",
+      "credentials": [{ "type": "password", "value": "norole", "temporary": false }],
+      "realmRoles": []
+    },
+    {
+      "username": "service-account-river-data-api",
+      "enabled": true,
+      "serviceAccountClientId": "river-data-api-local",
+      "clientRoles": {
+        "realm-management": ["manage-users", "view-users", "query-users", "view-realm"]
+      }
+    }
+  ],
+  "roles": {
+    "realm": [
+      {
+        "name": "riverdata-admin",
+        "description": "River Data administrator with full access"
+      },
+      {
+        "name": "riverdata-manager",
+        "description": "River Data manager: manage sensors and the catalog"
+      },
+      {
+        "name": "riverdata-river",
+        "description": "River Data staff: write data and field metadata"
+      },
+      {
+        "name": "riverdata-intern",
+        "description": "River Data intern: read-only access"
+      }
+    ]
+  },
+  "requiredCredentials": ["password"]
+}
