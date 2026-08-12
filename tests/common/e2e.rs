@@ -9,6 +9,58 @@ use axum::Router;
 use serde_json::json;
 use std::time::{Duration, Instant};
 
+/// Refresh the hourly continuous aggregate from `since` to now.
+///
+/// The production refresh window is `[since, NOW()]` (`common/sync_state.rs`), so a fixture dated
+/// in the future is never materialised. Keep fixture times in the past.
+pub async fn refresh_hourly(db: &sea_orm::DatabaseConnection, since: chrono::DateTime<chrono::Utc>) {
+    use sea_orm::{ConnectionTrait, Statement};
+    db.execute(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "CALL refresh_continuous_aggregate('readings_hourly', '{}'::timestamptz, NOW())",
+            since.to_rfc3339()
+        ),
+    ))
+    .await
+    .expect("refresh readings_hourly");
+}
+
+/// The hourly bucket a (site, parameter) resolves at `at`, as `(mean, count)`, or `None` when the
+/// bucket holds no rows.
+///
+/// The aggregate is grouped by `(bucket, site_id, parameter_id, sensor_id)`, so a slot served by
+/// more than one sensor has one row per sensor. This collapses the sensor dimension the same way
+/// `sites/aggregates.rs` does, `SUM(sum_value) / SUM(count)`, rather than averaging the per-sensor
+/// averages, which would weight a sparse sensor equally with a dense one.
+pub async fn hourly_bucket(
+    db: &sea_orm::DatabaseConnection,
+    site_id: &str,
+    parameter_id: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Option<(f64, i64)> {
+    use sea_orm::{ConnectionTrait, Statement};
+    let row = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT SUM(sum_value) AS total, SUM(count) AS n FROM readings_hourly \
+                 WHERE site_id = '{site_id}' AND parameter_id = '{parameter_id}' \
+                   AND bucket = time_bucket('1 hour', '{}'::timestamptz)",
+                at.to_rfc3339()
+            ),
+        ))
+        .await
+        .expect("query readings_hourly")?;
+
+    let total: Option<f64> = row.try_get("", "total").ok().flatten();
+    let n: Option<i64> = row.try_get("", "n").ok().flatten();
+    match (total, n) {
+        (Some(t), Some(c)) if c > 0 => Some((t / c as f64, c)),
+        _ => None,
+    }
+}
+
 /// Extract the `id` field from a created-entity response.
 pub fn id_of(json: &serde_json::Value) -> String {
     json["id"]
@@ -42,7 +94,7 @@ pub async fn wait_for_jobs_by_trigger(db: &sea_orm::DatabaseConnection, trigger_
             .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT \
-                   COUNT(*) FILTER (WHERE status IN ('queued','pending','running')) AS active, \
+                   COUNT(*) FILTER (WHERE status IN ('queued','pending','running','retrying')) AS active, \
                    COUNT(*) FILTER (WHERE status = 'failed') AS failed, \
                    COUNT(*) AS total \
                  FROM reprocessing_jobs WHERE trigger_type = $1",

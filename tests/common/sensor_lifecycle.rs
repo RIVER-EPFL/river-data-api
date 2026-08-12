@@ -351,8 +351,11 @@ pub async fn get_readings(db: &DatabaseConnection, stream_id: Uuid) -> Vec<Readi
         .collect()
 }
 
-/// Wait for all pending reprocessing jobs for a sensor to complete.
-/// Returns true if all completed successfully, false on failure or timeout.
+/// Wait for a sensor's reprocessing jobs to settle. Returns true only when at least one job
+/// exists for the sensor and every one of them finished without failing.
+///
+/// A sensor with no jobs at all returns false: an enqueue that never happened is the failure
+/// this helper is most often used to rule out, so it must not read as success.
 pub async fn wait_for_reprocessing(
     db: &DatabaseConnection,
     sensor_id: Uuid,
@@ -363,25 +366,21 @@ pub async fn wait_for_reprocessing(
         let row = db
             .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                "SELECT COUNT(*) AS cnt FROM reprocessing_jobs \
-                 WHERE sensor_id = $1 AND status IN ('queued', 'pending', 'running', 'retrying')",
+                "SELECT \
+                   COUNT(*) FILTER (WHERE status IN ('queued', 'pending', 'running', 'retrying')) AS active, \
+                   COUNT(*) FILTER (WHERE status = 'failed') AS failed, \
+                   COUNT(*) AS total \
+                 FROM reprocessing_jobs WHERE sensor_id = $1",
                 [sensor_id.into()],
             ))
             .await
-            .expect("query reprocessing_jobs failed");
+            .expect("query reprocessing_jobs failed")
+            .expect("count row");
 
-        let pending: i64 = row.unwrap().try_get("", "cnt").unwrap();
-        if pending == 0 {
-            let fail_row = db
-                .query_one(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "SELECT COUNT(*) AS cnt FROM reprocessing_jobs \
-                     WHERE sensor_id = $1 AND status = 'failed'",
-                    [sensor_id.into()],
-                ))
-                .await
-                .expect("query reprocessing_jobs failed");
-            let failed: i64 = fail_row.unwrap().try_get("", "cnt").unwrap();
+        let active: i64 = row.try_get("", "active").unwrap();
+        let failed: i64 = row.try_get("", "failed").unwrap();
+        let total: i64 = row.try_get("", "total").unwrap();
+        if total > 0 && active == 0 {
             return failed == 0;
         }
 
