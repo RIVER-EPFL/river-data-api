@@ -179,3 +179,83 @@ async fn admin_reaches_everything() {
     .await;
     assert!(passed_auth(s), "admin writes the catalog: {s} {body}");
 }
+
+/// A standard curve is field metadata, one level below the windowed calibration beside it.
+///
+/// The two are deliberately asymmetric: a calibration is sensor movement and needs MANAGER, while
+/// the person entering a plate's readings adds that plate's curve in the same sitting, so RIVER is
+/// enough. Both halves are asserted here so the split is a recorded decision rather than a wiring
+/// accident, and an intern reads curves without being able to mint one.
+#[tokio::test]
+#[serial]
+async fn curve_writes_follow_the_field_metadata_level() {
+    require_keycloak!();
+    let (db, app) = seeded_app().await;
+
+    let sensor_id = uuid::Uuid::new_v4();
+    crate::common::db::exec(
+        &db,
+        &format!("INSERT INTO sensors (id, name) VALUES ('{sensor_id}', 'Plate reader')"),
+    )
+    .await;
+    let curve = |name: &str| serde_json::json!({ "sensor_id": sensor_id, "name": name, "slope": 3.0, "intercept": 0.5 });
+    let calibration = serde_json::json!({
+        "sensor_id": sensor_id, "slope": 1.0, "intercept": 0.0,
+        "valid_from": "2026-01-01T00:00:00Z",
+    });
+
+    ensure_realm_user("intern1", "intern1", &["riverdata-intern"]).await;
+    grant_project(&db, &keycloak_user_id("intern1").await, PROJECT_ID).await;
+    let intern = get_keycloak_jwt("intern1", "intern1").await;
+
+    let (s, _) = crate::common::get_with_token(&app, "/api/standard_curves", &intern).await;
+    assert_eq!(s, 200, "an intern reads which curves exist");
+    let (s, _) = crate::common::post_json_with_token(
+        &app,
+        "/api/standard_curves",
+        &curve("Plate I"),
+        &intern,
+    )
+    .await;
+    assert_eq!(s, 403, "an intern cannot mint one");
+
+    ensure_realm_user("river1", "river1", &["riverdata-river"]).await;
+    grant_project(&db, &keycloak_user_id("river1").await, PROJECT_ID).await;
+    let river = get_keycloak_jwt("river1", "river1").await;
+
+    let (s, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/standard_curves",
+        &curve("Plate R"),
+        &river,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&s),
+        "a RIVER member mints the curve for the plate they are measuring: {body}"
+    );
+    let curve_id = body["id"]
+        .as_str()
+        .expect("the created curve carries an id");
+
+    let (s, _) = crate::common::patch_json_with_token(
+        &app,
+        &format!("/api/standard_curves/{curve_id}"),
+        &serde_json::json!({ "notes": "eight point series" }),
+        &river,
+    )
+    .await;
+    assert!(passed_auth(s), "and annotates it");
+    let (s, _) =
+        crate::common::delete_with_token(&app, &format!("/api/standard_curves/{curve_id}"), &river)
+            .await;
+    assert!(passed_auth(s), "and removes one nothing has used");
+
+    let (s, _) =
+        crate::common::post_json_with_token(&app, "/api/sensor_calibrations", &calibration, &river)
+            .await;
+    assert_eq!(
+        s, 403,
+        "the windowed calibration beside it stays a manager's, which is the asymmetry"
+    );
+}

@@ -454,6 +454,9 @@ struct ActionStats {
     sensors_created: u32,
     streams_paired: u32,
     backfilled: u64,
+    /// The `(site, parameter)` slot the stream landed in, so the caller can re-derive its readings
+    /// by window once the pairing transaction has committed.
+    slot: (Uuid, Uuid),
 }
 
 /// `POST /api/admin/sync/apply-discovery`, batch-processes discovery actions.
@@ -496,6 +499,9 @@ pub async fn apply_discovery(
         errors: vec![],
     };
 
+    let mut backfilled_slots: std::collections::HashSet<(Uuid, Uuid)> =
+        std::collections::HashSet::new();
+
     for action in req.actions {
         // Each action runs in a savepoint so a failure is reported without aborting the rest.
         let savepoint = txn.begin().await?;
@@ -510,6 +516,9 @@ pub async fn apply_discovery(
                 resp.sensors_created += stats.sensors_created;
                 resp.streams_paired += stats.streams_paired;
                 resp.total_backfilled += stats.backfilled;
+                if stats.backfilled > 0 {
+                    backfilled_slots.insert(stats.slot);
+                }
             }
             Err(e) => {
                 savepoint.rollback().await?;
@@ -520,6 +529,8 @@ pub async fn apply_discovery(
     }
 
     txn.commit().await?;
+
+    enqueue_slot_reprocess(db, &backfilled_slots).await?;
 
     // Refresh aggregates as a tracked job so a failure is visible and rerunnable
     if resp.total_backfilled > 0 {
@@ -536,6 +547,32 @@ pub async fn apply_discovery(
     }
 
     Ok(Json(resp))
+}
+
+/// Re-derive each newly paired `(site, parameter)` slot's readings by window, as a tracked job per
+/// slot.
+///
+/// The pairing UPDATE attributes readings but corrects none of them: which curve covers a reading is
+/// a per-reading question its time answers, and the reprocess engine is what asks it (the same one
+/// `POST /streams/{id}/pair` and the pairing plans run). Post-commit, because it opens its own
+/// transaction and refreshes continuous aggregates, neither of which can run inside the caller's.
+async fn enqueue_slot_reprocess(
+    db: &sea_orm::DatabaseConnection,
+    slots: &std::collections::HashSet<(Uuid, Uuid)>,
+) -> AppResult<()> {
+    for (site_id, parameter_id) in slots {
+        crate::routes::private::reprocessing_jobs::worker::enqueue(
+            db,
+            "pairing_backfill",
+            None,
+            None,
+            &serde_json::json!({ "site_id": site_id, "parameter_id": parameter_id }),
+            None,
+        )
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Resolve an existing entity or create one by name (case-insensitive match).
@@ -714,6 +751,9 @@ async fn resolve_or_create_site_parameter<C: ConnectionTrait>(
 }
 
 /// Pair a stream to a site_parameter, create sensor, and backfill readings/status_events.
+///
+/// Runs inside the caller's transaction, so the window re-derivation it needs (which opens its own
+/// transaction and refreshes continuous aggregates) is left to the caller to enqueue post-commit.
 async fn pair_and_backfill<C: ConnectionTrait>(
     db: &C,
     stream_id: Uuid,
@@ -752,13 +792,18 @@ async fn pair_and_backfill<C: ConnectionTrait>(
     active.updated_at = Set(now.into());
     active.update(db).await.map_err(|e| e.to_string())?;
 
+    // Attribution only: site, parameter, the owning instrument and its deployment. No curve is
+    // stamped here. The context carries the sensor's newest calibration, which is neither the curve
+    // whose window covers a given reading nor necessarily one authored for this parameter, so
+    // claiming it on a whole backfilled history would assert a correction that was never applied.
+    // Both callers enqueue a slot reprocess post-commit; that is what resolves `calibration_id` and
+    // `calibrated_value` per reading, from the reading's own time.
     let result = db
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE readings r
           SET site_id = $1, parameter_id = $2,
-              sensor_id = $4, calibration_id = $5, deployment_id = $6,
-              calibrated_value = COALESCE(r.calibrated_value, r.raw_value),
+              sensor_id = $4, deployment_id = $5,
               measurement_type = COALESCE(r.measurement_type, ds.measurement_type)
           FROM data_streams ds
           WHERE r.stream_id = ds.id AND ds.id = $3 AND r.site_id IS NULL",
@@ -767,7 +812,6 @@ async fn pair_and_backfill<C: ConnectionTrait>(
                 sp.parameter_id.into(),
                 stream_id.into(),
                 sensor_ctx.sensor_id.into(),
-                sensor_ctx.calibration_id.into(),
                 sensor_ctx.deployment_id.into(),
             ],
         ))
@@ -842,6 +886,7 @@ async fn process_action<C: ConnectionTrait>(
         sensors_created,
         streams_paired: 1,
         backfilled,
+        slot: (site_id, parameter_id),
     })
 }
 
@@ -1327,16 +1372,26 @@ pub async fn bulk_pair(
     .await?;
 
     // Second pass: pair each stream through the same helper the plan flow uses, so sensors,
-    // calibration and deployment attribution, status events and samples all follow.
+    // deployment attribution, status events and samples all follow; the curves each reading is
+    // corrected by follow from the slot reprocess enqueued after the commit.
     let mut paired = 0u32;
     let mut skipped: Vec<String> = Vec::new();
+    let slot_of_sp: HashMap<Uuid, (Uuid, Uuid)> =
+        sp_cache.iter().map(|(&slot, &sp)| (sp, slot)).collect();
+    let mut backfilled_slots: std::collections::HashSet<(Uuid, Uuid)> =
+        std::collections::HashSet::new();
     for (stream_id, sp_id) in stream_to_sp {
         if sp_id.is_nil() {
             skipped.push(stream_id.to_string());
             continue;
         }
         match pair_and_backfill(&txn, stream_id, sp_id).await {
-            Ok(_) => paired += 1,
+            Ok((_, backfilled)) => {
+                paired += 1;
+                if let Some(&slot) = slot_of_sp.get(&sp_id).filter(|_| backfilled > 0) {
+                    backfilled_slots.insert(slot);
+                }
+            }
             Err(e) => {
                 skipped.push(format!("{stream_id}: {e}"));
             }
@@ -1350,6 +1405,8 @@ pub async fn bulk_pair(
         .await?;
 
     txn.commit().await?;
+
+    enqueue_slot_reprocess(db, &backfilled_slots).await?;
 
     // Refresh aggregates as a tracked job so a failure is visible and rerunnable
     if paired > 0 {

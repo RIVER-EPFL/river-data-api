@@ -61,7 +61,7 @@ async fn backfill_attributes_pre_deployment_history() {
         crate::common::SITE1_ID,
         crate::common::GLOBAL_PARAM_TEMP_ID,
         sensor.id,
-        sensor.identity_calibration_id,
+        sensor.base_calibration_id,
         dep,
         1.0,
         0.0,

@@ -347,6 +347,7 @@ pub fn validate_optional_time_range(
             private::admin::actions::DerivedSeries,
             private::admin::actions::CalibrationBackfillCandidate,
             private::admin::actions::CalibrationBackfillCandidatesResponse,
+            private::admin::actions::OrphanedCorrection,
             private::admin::actions::BackfillCalibrationsRequest,
             private::admin::actions::BackfillCalibrationsResponse,
             private::admin::merge_services::MergeSiteParametersRequest,

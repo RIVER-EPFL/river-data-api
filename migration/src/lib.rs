@@ -53,6 +53,8 @@ mod m20260813_000001_calibration_valid_until_explicit;
 mod m20260813_000003_standard_curves;
 mod m20260813_000004_readings_standard_curve_fk;
 mod m20260813_000005_sample_trigger_predicate;
+mod m20260813_000006_readings_calibration_id_index;
+mod m20260813_000007_retire_identity_calibrations;
 
 pub struct Migrator;
 
@@ -113,6 +115,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260813_000003_standard_curves::Migration),
             Box::new(m20260813_000004_readings_standard_curve_fk::Migration),
             Box::new(m20260813_000005_sample_trigger_predicate::Migration),
+            // The index first: the delete below is what needs it.
+            Box::new(m20260813_000006_readings_calibration_id_index::Migration),
+            Box::new(m20260813_000007_retire_identity_calibrations::Migration),
         ]
     }
 }

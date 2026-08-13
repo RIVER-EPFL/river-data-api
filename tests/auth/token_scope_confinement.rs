@@ -22,6 +22,7 @@ const THRESH_B_ID: &str = "00000000-0000-4000-b000-000000000205";
 const STREAM_B_ID: &str = "00000000-0000-4000-b000-000000000206";
 const SENSOR_B_ID: &str = "00000000-0000-4000-b000-0000000000ff";
 const CALIB_B_ID: &str = "00000000-0000-4000-b000-000000000301";
+const CURVE_B_ID: &str = "00000000-0000-4000-b000-000000000303";
 const REPROC_B_ID: &str = "00000000-0000-4000-b000-000000000302";
 // A project-A note, to prove the scoped key still reaches its own project.
 const NOTE_A_ID: &str = "00000000-0000-4000-a000-000000000901";
@@ -59,6 +60,9 @@ async fn setup() -> (sea_orm::DatabaseConnection, axum::Router) {
         ),
         format!(
             "INSERT INTO sensor_calibrations (id, sensor_id, slope, intercept, valid_from) VALUES ('{CALIB_B_ID}', '{SENSOR_B_ID}', 1.0, 0.0, '2026-01-01T00:00:00Z')"
+        ),
+        format!(
+            "INSERT INTO standard_curves (id, sensor_id, name, slope, intercept) VALUES ('{CURVE_B_ID}', '{SENSOR_B_ID}', 'Plate B', 3.0, 0.5)"
         ),
         format!(
             "INSERT INTO reprocessing_jobs (id, sensor_id, trigger_type, status) VALUES ('{REPROC_B_ID}', '{SENSOR_B_ID}', 'calibration', 'completed')"
@@ -116,6 +120,7 @@ async fn scoped_key_confined_on_crud_reads() {
         ("/api/data_streams", STREAM_B_ID),
         ("/api/sensors", SENSOR_B_ID),
         ("/api/sensor_calibrations", CALIB_B_ID),
+        ("/api/standard_curves", CURVE_B_ID),
         ("/api/reprocessing_jobs", REPROC_B_ID),
     ];
 
@@ -250,5 +255,108 @@ async fn mixed_payload_batch_rejected() {
     assert!(
         !only_scoped.iter().any(|id| id == SITE_B_ID),
         "foreign site still hidden after attempt"
+    );
+}
+
+/// A curve belongs to an instrument, and an instrument belongs to the projects it is deployed into.
+/// A key scoped to project A therefore reaches its own instruments' curves and nothing else, on
+/// every verb: it cannot read, mint, edit or remove a curve on project B's instrument.
+#[tokio::test]
+#[serial]
+async fn a_scoped_token_cannot_reach_another_projects_curve() {
+    let (db, app) = setup().await;
+    let scoped =
+        crate::common::seed_api_token(&db, crate::common::full_permissions(), Some(PROJECT_ID))
+            .await;
+
+    let sensor_a = uuid::Uuid::new_v4();
+    let undeployed = uuid::Uuid::new_v4();
+    for sql in [
+        format!("INSERT INTO sensors (id, name) VALUES ('{sensor_a}', 'Plate reader A')"),
+        format!("INSERT INTO sensors (id, name) VALUES ('{undeployed}', 'Boxed plate reader')"),
+        format!(
+            "INSERT INTO sensor_deployments (id, sensor_id, site_id, parameter_id, deployed_from, deployment_type) \
+             VALUES (gen_random_uuid(), '{sensor_a}', '{SITE1_ID}', '{GLOBAL_PARAM_TEMP_ID}', '2026-01-01T00:00:00Z', 'permanent')"
+        ),
+    ] {
+        crate::common::db::exec(&db, &sql).await;
+    }
+
+    let (s, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/standard_curves",
+        &serde_json::json!({ "sensor_id": sensor_a, "name": "Plate A", "slope": 3.0, "intercept": 0.5 }),
+        &scoped,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&s),
+        "a scoped key mints a curve on its own project's instrument: {body}"
+    );
+    let own_curve = body["id"]
+        .as_str()
+        .expect("the curve carries an id")
+        .to_string();
+
+    let (s, _) = crate::common::post_json_with_token(
+        &app,
+        "/api/standard_curves",
+        &serde_json::json!({ "sensor_id": SENSOR_B_ID, "name": "Plate B2", "slope": 2.0, "intercept": 0.0 }),
+        &scoped,
+    )
+    .await;
+    assert_eq!(s, 403, "and not on an instrument outside its project");
+
+    // An instrument that has never been deployed belongs to no project, so a scoped key cannot
+    // place a curve on it: there is nothing to check the scope against.
+    let (s, _) = crate::common::post_json_with_token(
+        &app,
+        "/api/standard_curves",
+        &serde_json::json!({ "sensor_id": undeployed, "name": "Unplaced", "slope": 2.0, "intercept": 0.0 }),
+        &scoped,
+    )
+    .await;
+    assert_eq!(s, 403, "nor on an instrument no project claims");
+
+    let (s, _) = crate::common::patch_json_with_token(
+        &app,
+        &format!("/api/standard_curves/{CURVE_B_ID}"),
+        &serde_json::json!({ "notes": "edited from outside" }),
+        &scoped,
+    )
+    .await;
+    assert!(
+        s == 403 || s == 404,
+        "a scoped key cannot edit a foreign project's curve, got {s}"
+    );
+
+    let (s, _) = crate::common::delete_with_token(
+        &app,
+        &format!("/api/standard_curves/{CURVE_B_ID}"),
+        &scoped,
+    )
+    .await;
+    assert!(s == 403 || s == 404, "nor delete one, got {s}");
+    assert_eq!(
+        crate::common::get_with_token(&app, &format!("/api/standard_curves/{CURVE_B_ID}"), &scoped)
+            .await
+            .0,
+        404,
+        "and the foreign curve is not even confirmed to exist"
+    );
+
+    let (s, _) =
+        crate::common::get_with_token(&app, &format!("/api/standard_curves/{own_curve}"), &scoped)
+            .await;
+    assert_eq!(s, 200, "its own curve stays reachable");
+    let (s, _) = crate::common::delete_with_token(
+        &app,
+        &format!("/api/standard_curves/{own_curve}"),
+        &scoped,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&s),
+        "and removable while no reading has used it"
     );
 }

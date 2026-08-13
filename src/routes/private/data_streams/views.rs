@@ -339,9 +339,9 @@ pub struct ImportStreamResponse {
 }
 
 /// Import a stream's sensor into inventory WITHOUT deploying it to a site. Creates/reuses the sensor
-/// by (serial, parameter), links it to the stream, and stamps `sensor_id`/`calibration_id` on the
-/// stream's site-less readings (calibration math applies; the readings stay un-attributed to any
-/// site until an explicit adopt). Idempotent: re-import reuses the same sensor and only fills
+/// by (serial, parameter), links it to the stream, and stamps `sensor_id` plus whichever curve
+/// covers each reading on the stream's site-less readings (an instrument with no curve leaves them
+/// uncorrected; the readings stay un-attributed to any site until an explicit adopt). Idempotent: re-import reuses the same sensor and only fills
 /// readings missing this attribution. Requires `write_metadata`.
 #[utoipa::path(
     post,
@@ -412,8 +412,9 @@ fn claim_error(e: sea_orm::DbErr) -> AppError {
 }
 
 /// Pair a stream to a site_parameter. Sets `site_parameter_id`/`paired_at` on the stream,
-/// backfills existing unpaired readings with site_id/parameter_id, applies identity
-/// calibration, and triggers an aggregate refresh. Requires `write_metadata`.
+/// backfills existing unpaired readings with site_id/parameter_id, then re-derives each reading's
+/// curve from the window covering its own time and refreshes aggregates, as a tracked job.
+/// Requires `write_metadata`.
 #[utoipa::path(
     post,
     path = "/streams/{id}/pair",
@@ -487,42 +488,31 @@ pub async fn pair_stream(
             .ok_or_else(|| AppError::Internal("Failed to re-fetch stream".to_string()))?;
         let stream_measurement_type = stream.measurement_type.clone();
 
-        // Backfill: update readings with site_id + parameter_id + sensor context, apply the
-        // calibration being stamped, and adopt the stream's declared classification for its history.
-        // A per-reading measurement_type set at ingest outranks the stream declaration and must
-        // survive pairing.
+        // Backfill: update readings with site_id + parameter_id + sensor context, and adopt the
+        // stream's declared classification for its history. A per-reading measurement_type set at
+        // ingest outranks the stream declaration and must survive pairing.
         //
-        // The value is computed from the coefficients of the curve being stamped, not copied from
-        // the raw value: the two agree only while that curve is the identity, and a row must never
-        // carry a value the calibration id it claims did not produce. A reading that already
-        // carries a corrected value keeps it.
-        let backfill_value = calibrations::service::calibrated_value_sql(
-            "readings.raw_value",
-            "c.slope",
-            "c.intercept",
-        );
+        // No curve is stamped and no value computed. The sensor context carries the instrument's
+        // NEWEST calibration, which is not in general the one covering a given reading's time, nor
+        // necessarily one authored for this parameter; applying it across a whole backfilled
+        // history would correct every row by whichever curve happens to be latest. Which curve
+        // covers a reading is a question the reading's own time answers, and the slot reprocess
+        // enqueued post-commit is what asks it, for `calibration_id` and `calibrated_value`
+        // together.
         let backfilled = bulk_write::mutation(
             txn,
             Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                format!(
-                    r"UPDATE readings
+                r"UPDATE readings
                   SET site_id = $1, parameter_id = $2,
-                      sensor_id = $4, calibration_id = $5, deployment_id = $6,
-                      calibrated_value = COALESCE(
-                          calibrated_value,
-                          (SELECT {backfill_value} FROM sensor_calibrations c WHERE c.id = $5),
-                          raw_value
-                      ),
-                      measurement_type = COALESCE(measurement_type, $7)
-                  WHERE stream_id = $3 AND site_id IS NULL"
-                ),
+                      sensor_id = $4, deployment_id = $5,
+                      measurement_type = COALESCE(measurement_type, $6)
+                  WHERE stream_id = $3 AND site_id IS NULL",
                 [
                     sp.site_id.into(),
                     sp.parameter_id.into(),
                     stream_id.into(),
                     sensor_ctx.sensor_id.into(),
-                    sensor_ctx.calibration_id.into(),
                     sensor_ctx.deployment_id.into(),
                     stream_measurement_type.into(),
                 ],
@@ -566,8 +556,8 @@ pub async fn pair_stream(
     // Window-reprocess the slot in the background (tracked): re-attributes the backfilled readings
     // to whichever sensor's deployment window covers each time, so pairing a stream into a slot with
     // a real deployment timeline is attributed by window, not by the single frozen sensor context,
-    // and refreshes continuous aggregates + cascades derived params. (For a fresh pair whose
-    // auto-deployment starts now, this is effectively the aggregate refresh.)
+    // resolves each reading's calibration and corrected value from the window covering its own time,
+    // and refreshes continuous aggregates + cascades derived params.
     if backfilled > 0 {
         let slot_site = sp_site_id;
         let slot_param = sp_parameter_id;

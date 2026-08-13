@@ -203,7 +203,7 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
     assert_eq!(
         (slope, intercept),
         (1.0, 0.0),
-        "the DOC correction the portal recorded is the identity pair, which is what lets the \
+        "the DOC correction the portal recorded is the 1:1 pair, which is what lets the \
          exact-value assertions below compare the tool against the portal's own columns"
     );
 

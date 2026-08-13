@@ -10,7 +10,7 @@ use serial_test::serial;
 use uuid::Uuid;
 
 /// A second deployment for the same sensor on another parameter, which `deploy_sensor` cannot
-/// express (it derives the parameter from the sensor's identity calibration).
+/// express (it derives the parameter from the sensor's base calibration).
 async fn deploy_on_parameter(
     db: &sea_orm::DatabaseConnection,
     sensor_id: Uuid,
@@ -79,7 +79,7 @@ async fn seed_two_channel_sensor(db: &sea_orm::DatabaseConnection) -> Uuid {
         crate::common::SITE1_ID,
         crate::common::GLOBAL_PARAM_TEMP_ID,
         sensor.id,
-        sensor.identity_calibration_id,
+        sensor.base_calibration_id,
         temp_deployment,
         1.0,
         0.0,
@@ -92,7 +92,7 @@ async fn seed_two_channel_sensor(db: &sea_orm::DatabaseConnection) -> Uuid {
         crate::common::SITE1_ID,
         crate::common::GLOBAL_PARAM_COND_ID,
         sensor.id,
-        sensor.identity_calibration_id,
+        sensor.base_calibration_id,
         cond_deployment,
         1.0,
         0.0,

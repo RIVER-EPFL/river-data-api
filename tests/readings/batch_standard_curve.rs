@@ -121,7 +121,10 @@ async fn a_spot_row_on_the_curves_instrument_is_stored_with_the_value_the_curve_
     let (raw, calibrated, stored_curve) = stored_at(&fx.db, GRAB_TIME)
         .await
         .expect("the reading is stored");
-    assert!((raw - 10.0).abs() < 1e-9, "the measured value is kept as raw");
+    assert!(
+        (raw - 10.0).abs() < 1e-9,
+        "the measured value is kept as raw"
+    );
     assert_eq!(stored_curve, Some(curve), "the curve is recorded");
     let calibrated = calibrated.expect("a curve applied means a value");
     assert!(
@@ -160,7 +163,10 @@ async fn a_curve_from_another_instrument_or_from_nowhere_is_refused() {
     );
 
     let (status, body) = post_batch(&fx, row(Uuid::new_v4(), Some(plate_reader.id))).await;
-    assert_eq!(status, 400, "an unknown curve id is refused ({status}): {body}");
+    assert_eq!(
+        status, 400,
+        "an unknown curve id is refused ({status}): {body}"
+    );
 
     let (status, body) = post_batch(&fx, row(curve, None)).await;
     assert_eq!(

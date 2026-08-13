@@ -118,12 +118,12 @@ fn assert_close(actual: f64, expected: f64, what: &str) {
     );
 }
 
-/// The identity base is a real correction that was resolved and applied, so it is recorded. Without
-/// the second reference, a row carrying an identity base and a row whose base was never resolved
-/// would look the same.
+/// A base curve that was resolved and applied is recorded, whatever its coefficients happen to be.
+/// Without the second reference, a row whose base was resolved and a row whose base was never
+/// resolved would look the same.
 #[tokio::test]
 #[serial]
-async fn grab_with_identity_base_and_curve_records_both_references() {
+async fn grab_with_a_base_curve_and_a_standard_curve_records_both_references() {
     let fx = setup().await;
     let sensor = create_sensor(&fx.db, "Microplate-01", GLOBAL_PARAM_TEMP_ID).await;
     let curve = create_curve(&fx, sensor.id, "Plate A", 2.0, 1.0).await;
@@ -145,7 +145,7 @@ async fn grab_with_identity_base_and_curve_records_both_references() {
     assert_close(stored.raw_value, 10.0, "the measured value is kept as raw");
     assert_eq!(
         stored.calibration_id,
-        Some(sensor.identity_calibration_id),
+        Some(sensor.base_calibration_id),
         "the base calibration the server resolved is the one recorded"
     );
     assert_eq!(
@@ -158,7 +158,7 @@ async fn grab_with_identity_base_and_curve_records_both_references() {
             .calibrated_value
             .expect("a curve applied means a value"),
         21.0,
-        "identity base then curve: 2.0 * (1.0 * 10.0 + 0.0) + 1.0",
+        "the 1:1 base then the curve: 2.0 * (1.0 * 10.0 + 0.0) + 1.0",
     );
     assert_eq!(stored.measurement_type.as_deref(), Some("spot"));
 }
@@ -190,7 +190,7 @@ async fn base_calibration_is_applied_before_the_standard_curve() {
     assert_eq!(
         stored.calibration_id,
         Some(base),
-        "the covering windowed calibration is the base, not the identity it superseded"
+        "the covering windowed calibration is the base, not the bench curve it superseded"
     );
     assert_eq!(stored.standard_curve_id, Some(curve));
     let value = stored.calibrated_value.expect("both curves applied");
@@ -467,7 +467,7 @@ async fn reprocessing_the_instrument_leaves_a_grab_and_its_curve_alone() {
         SITE1_ID,
         GLOBAL_PARAM_TEMP_ID,
         sensor.id,
-        sensor.identity_calibration_id,
+        sensor.base_calibration_id,
         deployment,
         1.0,
         0.0,
@@ -528,7 +528,7 @@ async fn reprocessing_the_instrument_leaves_a_grab_and_its_curve_alone() {
     );
     assert_eq!(
         grab.calibration_id,
-        Some(sensor.identity_calibration_id),
+        Some(sensor.base_calibration_id),
         "the base the grab was entered against is not re-derived"
     );
     assert_close(
@@ -553,7 +553,7 @@ async fn editing_a_windowed_calibration_still_reprocesses_history() {
         SITE1_ID,
         GLOBAL_PARAM_TEMP_ID,
         sensor.id,
-        sensor.identity_calibration_id,
+        sensor.base_calibration_id,
         deployment,
         1.0,
         0.0,
@@ -566,10 +566,7 @@ async fn editing_a_windowed_calibration_still_reprocesses_history() {
 
     let (status, body) = put_json_with_token(
         &fx.app,
-        &format!(
-            "/api/sensor_calibrations/{}",
-            sensor.identity_calibration_id
-        ),
+        &format!("/api/sensor_calibrations/{}", sensor.base_calibration_id),
         &json!({ "slope": 3.0, "intercept": 1.0 }),
         &fx.token,
     )
@@ -648,7 +645,7 @@ async fn the_export_carries_both_curve_references_in_json_and_csv() {
     );
     assert_eq!(
         parameter["calibration_ids"][position].as_str(),
-        Some(sensor.identity_calibration_id.to_string().as_str()),
+        Some(sensor.base_calibration_id.to_string().as_str()),
         "so does the base calibration: {parameter}"
     );
 

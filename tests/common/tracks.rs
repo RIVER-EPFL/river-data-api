@@ -41,7 +41,6 @@ pub struct Track {
     pub parameters: Vec<(String, String)>,
     pub site_parameter_ids: Vec<String>,
     pub sensor_id: Option<String>,
-    pub calibration_id: Option<String>,
     pub deployment_id: Option<String>,
     pub stream_ids: Vec<String>,
     pub band: (f64, f64),
@@ -115,7 +114,6 @@ pub async fn onboard_csv_track(app: &Router, token: &str) -> Track {
         parameters,
         site_parameter_ids,
         sensor_id: None,
-        calibration_id: None,
         deployment_id: None,
         stream_ids: Vec::new(),
         band: BAND_CSV,
@@ -193,15 +191,12 @@ pub async fn onboard_sensor_flow_track(app: &Router, token: &str) -> Track {
     );
     let stream_id = e2e::id_of(&stream);
 
-    let calibration_id = super::e2e::identity_calibration_id(app, token, &sensor_id).await;
-
     Track {
         project_id,
         site_id,
         parameters,
         site_parameter_ids,
         sensor_id: Some(sensor_id),
-        calibration_id,
         deployment_id: Some(deployment_id),
         stream_ids: vec![stream_id],
         band: BAND_FLOW,
@@ -240,15 +235,12 @@ pub async fn onboard_grab_track(app: &Router, token: &str) -> Track {
     .await;
 
     let sensor_id = e2e::create_sensor(app, token, &parameters[0].1, "TRK-GRAB-0001").await;
-    let calibration_id = super::e2e::identity_calibration_id(app, token, &sensor_id).await;
-
     Track {
         project_id,
         site_id,
         parameters,
         site_parameter_ids,
         sensor_id: Some(sensor_id),
-        calibration_id,
         deployment_id: None,
         stream_ids: Vec::new(),
         band: BAND_GRAB,

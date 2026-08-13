@@ -173,9 +173,9 @@ async fn count(db: &DatabaseConnection, sql: &str, param: &str) -> i64 {
     .expect("n")
 }
 
-/// Wait until nothing is in flight. Onboarding a sensor enqueues its own jobs (identity
-/// calibration, deployment), some of which refresh continuous aggregates; letting them settle
-/// before the readings arrive is what makes "the bucket is empty" a fact rather than a race.
+/// Wait until nothing is in flight. Onboarding a sensor enqueues its own jobs (deployment,
+/// pairing), some of which refresh continuous aggregates; letting them settle before the readings
+/// arrive is what makes "the bucket is empty" a fact rather than a race.
 async fn drain_job_queue(db: &DatabaseConnection, max_secs: u64) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
     loop {

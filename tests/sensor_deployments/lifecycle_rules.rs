@@ -116,12 +116,12 @@ async fn calibration_window_absorbs_gap_to_next_valid_from() {
         SITE1_ID,
         GLOBAL_PARAM_TEMP_ID,
         sensor.id,
-        sensor.identity_calibration_id,
+        sensor.base_calibration_id,
         dep,
         1.0,
         0.0,
         &[
-            (dt("2025-01-05T00:00:00Z"), 10.0), // before C1 → identity
+            (dt("2025-01-05T00:00:00Z"), 10.0), // before C1 → the base curve
             (dt("2025-01-15T00:00:00Z"), 20.0), // inside C1's window [01-10, 01-20)
             (dt("2025-01-25T00:00:00Z"), 30.0), // inside C2's window [01-20, ∞)
         ],
@@ -149,7 +149,7 @@ async fn calibration_window_absorbs_gap_to_next_valid_from() {
     assert_eq!(
         rows[0].calibrated_value,
         Some(10.0),
-        "01-05 uses identity (1*10)"
+        "01-05 uses the base curve (1*10)"
     );
     assert_eq!(
         rows[1].calibrated_value,
@@ -178,7 +178,7 @@ async fn recall_keeps_pre_first_deployment_readings_attributed() {
         SITE1_ID,
         GLOBAL_PARAM_TEMP_ID,
         sensor.id,
-        sensor.identity_calibration_id,
+        sensor.base_calibration_id,
         dep,
         1.0,
         0.0,
@@ -390,7 +390,7 @@ async fn reprocess_restores_nulled_attribution_fks() {
         SITE1_ID,
         GLOBAL_PARAM_TEMP_ID,
         sensor.id,
-        sensor.identity_calibration_id,
+        sensor.base_calibration_id,
         dep,
         1.0,
         0.0,
@@ -427,7 +427,7 @@ async fn reprocess_restores_nulled_attribution_fks() {
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0].calibration_id,
-        Some(sensor.identity_calibration_id),
+        Some(sensor.base_calibration_id),
         "calibration_id restored"
     );
     assert_eq!(rows[0].deployment_id, Some(dep), "deployment_id restored");

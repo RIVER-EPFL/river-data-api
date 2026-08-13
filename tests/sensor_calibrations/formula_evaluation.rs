@@ -201,11 +201,11 @@ async fn apply_calibration_formula_correctness() {
     );
     assert_eq!(result, 25.0, "calibrated = 2.0 * 10.0 + 5.0 = 25.0");
 
-    // Identity calibration (slope=1, intercept=0)
+    // A 1:1 curve (slope=1, intercept=0)
     let result = river_db::routes::private::sensors::calibrations::service::apply_calibration(
         42.0, 1.0, 0.0,
     );
-    assert_eq!(result, 42.0, "Identity calibration should return raw value");
+    assert_eq!(result, 42.0, "a 1:1 curve returns the raw value");
 
     // Negative intercept
     let result = river_db::routes::private::sensors::calibrations::service::apply_calibration(

@@ -57,7 +57,7 @@ async fn import_then_adopt_backfills_by_window() {
 
     let stream = seed_unpaired_stream(&db, "import-adopt").await;
 
-    // IMPORT: sensor created, readings get sensor_id/calibration_id but NO site/deployment.
+    // IMPORT: sensor created, readings get sensor_id but NO site/deployment.
     let (status, body) = crate::common::post_json_with_token(
         &app,
         &format!("/api/streams/{stream}/import"),

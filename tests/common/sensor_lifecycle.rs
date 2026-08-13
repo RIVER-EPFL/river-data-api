@@ -15,7 +15,11 @@ use super::fixtures::*;
 
 pub struct TestSensor {
     pub id: Uuid,
-    pub identity_calibration_id: Uuid,
+    /// The operator-entered 1:1 curve `create_sensor` records for the instrument. A curve whose
+    /// coefficients happen to be 1.0/0.0 is an ordinary curve someone performed, not a marker: it
+    /// carries a name and a `performed_by` like any other, and nothing in the engine reads its
+    /// coefficients to decide what it means.
+    pub base_calibration_id: Uuid,
 }
 
 #[derive(Debug)]
@@ -105,14 +109,38 @@ pub async fn seed_base_entities(db: &DatabaseConnection) {
 // Sensor lifecycle
 // ============================================================================
 
-/// Create a sensor (parameter-free device) with an identity calibration (slope=1, intercept=0,
-/// valid_from=2000-01-01) bound to `parameter_id`. The parameter lives on the calibration and
-/// deployment now, not the sensor; `deploy_sensor`/`add_calibration` derive it from this identity
-/// calibration so the sensor's whole windowed timeline shares one parameter.
+/// Create a sensor (parameter-free device) carrying one operator-entered bench curve: a named
+/// 1:1 curve on `parameter_id`, open from 2000-01-01 so it covers whatever history a test writes.
+///
+/// The parameter lives on the calibration and deployment, not the sensor, so this curve is also
+/// where `deploy_sensor`/`add_calibration` read the parameter from and is what keeps the sensor's
+/// whole windowed timeline on one channel. Use `create_sensor_without_curve` for the other ordinary
+/// case, an instrument nobody has calibrated yet.
 pub async fn create_sensor(db: &DatabaseConnection, name: &str, parameter_id: &str) -> TestSensor {
-    let sensor_id = Uuid::new_v4();
+    let sensor_id = create_sensor_without_curve(db, name).await;
     let cal_id = Uuid::new_v4();
 
+    exec(
+        db,
+        &format!(
+            "INSERT INTO sensor_calibrations \
+             (id, sensor_id, parameter_id, slope, intercept, valid_from, name, performed_by) \
+             VALUES ('{cal_id}', '{sensor_id}', '{parameter_id}', 1.0, 0.0, \
+             '2000-01-01T00:00:00Z', 'Bench base', 'test')"
+        ),
+    )
+    .await;
+
+    TestSensor {
+        id: sensor_id,
+        base_calibration_id: cal_id,
+    }
+}
+
+/// Create a sensor with no calibration at all, the state an instrument is in between entering the
+/// inventory and its first bench session. Returns the sensor ID; there is no calibration to return.
+pub async fn create_sensor_without_curve(db: &DatabaseConnection, name: &str) -> Uuid {
+    let sensor_id = Uuid::new_v4();
     exec(
         db,
         &format!(
@@ -120,27 +148,14 @@ pub async fn create_sensor(db: &DatabaseConnection, name: &str, parameter_id: &s
         ),
     )
     .await;
-
-    exec(
-        db,
-        &format!(
-            "INSERT INTO sensor_calibrations \
-             (id, sensor_id, parameter_id, slope, intercept, valid_from, notes) \
-             VALUES ('{cal_id}', '{sensor_id}', '{parameter_id}', 1.0, 0.0, \
-             '2000-01-01T00:00:00Z', 'identity')"
-        ),
-    )
-    .await;
-
-    TestSensor {
-        id: sensor_id,
-        identity_calibration_id: cal_id,
-    }
+    sensor_id
 }
 
-/// Deploy a sensor to a site starting at `from`. The deployment's parameter is derived from the
-/// sensor's identity calibration (a sensor made via `create_sensor` always has one). Returns the
-/// deployment ID.
+/// Deploy a sensor to a site starting at `from`, taking the deployment's parameter from the
+/// sensor's earliest parameter-bearing curve. Returns the deployment ID.
+///
+/// A sensor with no curve has no parameter to derive, so it lands on a parameter-less deployment;
+/// use `deploy_sensor_for_parameter` when the slot matters.
 pub async fn deploy_sensor(
     db: &DatabaseConnection,
     sensor_id: Uuid,
@@ -164,6 +179,28 @@ pub async fn deploy_sensor(
     id
 }
 
+/// Deploy a sensor to a named (site, parameter) slot. Returns the deployment ID.
+pub async fn deploy_sensor_for_parameter(
+    db: &DatabaseConnection,
+    sensor_id: Uuid,
+    site_id: &str,
+    parameter_id: &str,
+    from: DateTime<Utc>,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    exec(
+        db,
+        &format!(
+            "INSERT INTO sensor_deployments \
+             (id, sensor_id, site_id, parameter_id, deployed_from, deployment_type) \
+             VALUES ('{id}', '{sensor_id}', '{site_id}', '{parameter_id}', '{}', 'permanent')",
+            from.to_rfc3339()
+        ),
+    )
+    .await;
+    id
+}
+
 /// Close a deployment at the given time.
 pub async fn end_deployment(db: &DatabaseConnection, deployment_id: Uuid, until: DateTime<Utc>) {
     exec(
@@ -176,7 +213,32 @@ pub async fn end_deployment(db: &DatabaseConnection, deployment_id: Uuid, until:
     .await;
 }
 
-/// Add a calibration to a sensor. Returns the calibration ID.
+/// Add a calibration to a sensor on a named parameter. Returns the calibration ID.
+pub async fn add_calibration_for_parameter(
+    db: &DatabaseConnection,
+    sensor_id: Uuid,
+    parameter_id: &str,
+    slope: f64,
+    intercept: f64,
+    valid_from: DateTime<Utc>,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    exec(
+        db,
+        &format!(
+            "INSERT INTO sensor_calibrations \
+             (id, sensor_id, parameter_id, slope, intercept, valid_from, name, performed_by) \
+             VALUES ('{id}', '{sensor_id}', '{parameter_id}', {slope}, {intercept}, '{}', \
+             'Bench', 'test')",
+            valid_from.to_rfc3339()
+        ),
+    )
+    .await;
+    id
+}
+
+/// Add a calibration to a sensor, on the parameter its earliest curve already names. Returns the
+/// calibration ID.
 pub async fn add_calibration(
     db: &DatabaseConnection,
     sensor_id: Uuid,
@@ -230,9 +292,10 @@ pub async fn create_paired_stream(
     id
 }
 
-/// Insert readings with full sensor context.
-/// `slope` and `intercept` are used to compute `calibrated_value = slope * raw + intercept`
-/// at insert time, mimicking what the ingestion path does.
+/// Insert readings with full sensor context, corrected by a curve the caller names.
+/// `slope` and `intercept` compute `calibrated_value = slope * raw + intercept` at insert time,
+/// which is what the ingestion path does once a curve covers the reading. Use
+/// `insert_readings_without_curve` for the case where none does.
 pub async fn insert_readings(
     db: &DatabaseConnection,
     stream_id: Uuid,
@@ -263,8 +326,39 @@ pub async fn insert_readings(
     }
 }
 
-/// Insert orphan readings: paired to a (site, parameter) but with NO sensor/calibration/deployment
-/// (the historical-import state that needs backfill). `calibrated_value = raw` (identity).
+/// Insert readings attributed to a sensor and deployment but naming no curve, the state an
+/// instrument's readings are in until someone enters a calibration covering them: `calibration_id`
+/// and `calibrated_value` both NULL.
+pub async fn insert_readings_without_curve(
+    db: &DatabaseConnection,
+    stream_id: Uuid,
+    site_id: &str,
+    parameter_id: &str,
+    sensor_id: Uuid,
+    deployment_id: Uuid,
+    readings: &[(DateTime<Utc>, f64)],
+) {
+    for (time, raw) in readings {
+        exec(
+            db,
+            &format!(
+                "INSERT INTO readings \
+                 (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, \
+                  sensor_id, calibration_id, deployment_id, replicate_index) \
+                 VALUES ('{stream_id}', '{site_id}', '{parameter_id}', '{}', {raw}, NULL, \
+                 '{sensor_id}', NULL, '{deployment_id}', 0) \
+                 ON CONFLICT DO NOTHING",
+                time.to_rfc3339()
+            ),
+        )
+        .await;
+    }
+}
+
+/// Insert orphan readings: paired to a (site, parameter) but with NO sensor/calibration/deployment,
+/// carrying a copy of the raw value in `calibrated_value`. That is the shape historical imports
+/// left behind before an uncorrected reading was spelled NULL, and rows in it are still in the
+/// database, so the repair paths are exercised against it.
 pub async fn insert_orphan_readings(
     db: &DatabaseConnection,
     stream_id: Uuid,

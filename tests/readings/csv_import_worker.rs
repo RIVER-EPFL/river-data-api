@@ -496,3 +496,132 @@ async fn continuous_rows_sharing_a_timestamp_form_no_sample() {
     .await;
     assert_eq!(samples, 0, "no sample around undeclared logger duplicates");
 }
+
+const CSV_GRAB: &str = "DateTime,Dissolved_O2\n\
+2025-07-01 09:00:00,250\n";
+
+async fn grab_row(db: &DatabaseConnection) -> (Option<f64>, Option<Uuid>, Option<Uuid>) {
+    let row = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT calibrated_value, calibration_id, standard_curve_id FROM readings \
+                 WHERE site_id = '{}' AND time = '2025-07-01T09:00:00Z'",
+                crate::common::SITE1_ID
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the imported grab is stored");
+    (
+        row.try_get("", "calibrated_value").unwrap(),
+        row.try_get("", "calibration_id").unwrap(),
+        row.try_get("", "standard_curve_id").unwrap(),
+    )
+}
+
+async fn import_grab_csv(app: &axum::Router, token: &str) {
+    let (status, resp) = crate::common::post_json_parse_with_token(
+        app,
+        "/api/readings/import_csv",
+        &serde_json::json!({
+            "site": crate::common::SITE1_ID,
+            "csv": CSV_GRAB,
+            "measurement_type": "spot",
+        }),
+        token,
+    )
+    .await;
+    assert_eq!(status, 200, "import ({status}): {resp}");
+}
+
+/// A stored `calibrated_value` says a curve produced it. An imported grab whose slot resolves no
+/// calibration has none, so the column stays null: repeating the raw value there would claim a
+/// correction was applied, and nothing downstream could ever repair it, since a grab is outside
+/// window resolution by construction.
+#[tokio::test]
+#[serial]
+async fn an_imported_grab_with_no_curve_stores_no_corrected_value() {
+    let (db, app, token) = setup().await;
+
+    import_grab_csv(&app, &token).await;
+    let inserted = poll_count(
+        &db,
+        &format!(
+            "SELECT count(*) AS n FROM readings \
+             WHERE site_id = '{}' AND time = '2025-07-01T09:00:00Z'",
+            crate::common::SITE1_ID
+        ),
+        1,
+        10,
+    )
+    .await;
+    assert_eq!(inserted, 1, "the worker inserts the staged grab");
+
+    let (calibrated, calibration_id, standard_curve_id) = grab_row(&db).await;
+    assert_eq!(
+        calibrated, None,
+        "no curve resolved, so no corrected value is invented"
+    );
+    assert_eq!(calibration_id, None);
+    assert_eq!(standard_curve_id, None);
+}
+
+/// The paired case: the slot's calibration is applied and recorded, so the value and the reference
+/// beside it agree.
+#[tokio::test]
+#[serial]
+async fn an_imported_grab_uses_the_slot_calibration_it_records() {
+    let (db, app, token) = setup().await;
+
+    let sensor = crate::common::sensor_lifecycle::create_sensor(
+        &db,
+        "Lab-probe-01",
+        crate::common::GLOBAL_PARAM_DO_ID,
+    )
+    .await;
+    let calibration = crate::common::sensor_lifecycle::add_calibration(
+        &db,
+        sensor.id,
+        2.0,
+        1.0,
+        crate::common::sensor_lifecycle::dt("2025-01-01T00:00:00Z"),
+    )
+    .await;
+    crate::common::sensor_lifecycle::deploy_sensor(
+        &db,
+        sensor.id,
+        crate::common::SITE1_ID,
+        crate::common::sensor_lifecycle::dt("2025-01-01T00:00:00Z"),
+    )
+    .await;
+
+    import_grab_csv(&app, &token).await;
+    poll_count(
+        &db,
+        &format!(
+            "SELECT count(*) AS n FROM readings \
+             WHERE site_id = '{}' AND time = '2025-07-01T09:00:00Z'",
+            crate::common::SITE1_ID
+        ),
+        1,
+        10,
+    )
+    .await;
+
+    let (calibrated, calibration_id, standard_curve_id) = grab_row(&db).await;
+    assert_eq!(
+        calibration_id,
+        Some(calibration),
+        "the grab records the calibration its slot resolved"
+    );
+    assert_eq!(
+        calibrated,
+        Some(501.0),
+        "and serves what that calibration produces from the measured value"
+    );
+    assert_eq!(
+        standard_curve_id, None,
+        "an import picks no lab curve; that is an operator's choice per measurement"
+    );
+}

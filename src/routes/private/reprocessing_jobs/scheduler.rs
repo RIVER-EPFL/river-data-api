@@ -138,7 +138,8 @@ async fn claim_one_due(db: &DatabaseConnection) -> Result<Option<DueSchedule>, s
         .unwrap_or_else(|| serde_json::json!({}));
 
     let catchup = CatchupPolicy::from_str_or_default(
-        row.try_get::<Option<String>>("", "catchup_policy")?.as_deref(),
+        row.try_get::<Option<String>>("", "catchup_policy")?
+            .as_deref(),
     );
 
     // Advance the grid off the SCHEDULED time, not `now()`, so cadence never drifts by a run's own

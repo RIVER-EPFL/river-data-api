@@ -40,13 +40,14 @@ async fn derived_value_at(
     let row = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT calibrated_value FROM readings WHERE site_id = $1 AND parameter_id = $2 AND time = $3 LIMIT 1",
+            "SELECT COALESCE(calibrated_value, raw_value) AS value FROM readings \
+             WHERE site_id = $1 AND parameter_id = $2 AND time = $3 LIMIT 1",
             [site_id.into(), parameter_id.into(), time.into()],
         ))
         .await
         .ok()
         .flatten()?;
-    row.try_get::<f64>("", "calibrated_value").ok()
+    row.try_get::<f64>("", "value").ok()
 }
 
 #[tokio::test]

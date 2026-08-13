@@ -705,7 +705,6 @@ async fn backfill_plan_readings<C: ConnectionTrait>(txn: &C, plan_id: Uuid) -> A
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE readings r
           SET site_id = sp.site_id, parameter_id = sp.parameter_id,
-              calibrated_value = COALESCE(r.calibrated_value, r.raw_value),
               measurement_type = COALESCE(r.measurement_type, ds.measurement_type)
           FROM data_streams ds
           JOIN site_parameters sp ON ds.site_parameter_id = sp.id

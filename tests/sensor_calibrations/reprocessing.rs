@@ -19,7 +19,7 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 // Baseline: verify the current ingestion path works
 // ============================================================================
 
-/// Identity calibration (slope=1, intercept=0) preserves raw values.
+/// A 1:1 bench curve (slope=1, intercept=0) preserves raw values.
 /// All FK columns are stamped correctly at ingestion time.
 ///
 /// Input:  raw = [20.0, 21.5, 19.8]
@@ -27,7 +27,7 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Expect: calibrated = [20.0, 21.5, 19.8] (unchanged)
 #[tokio::test]
 #[serial]
-async fn baseline_identity_calibration_preserves_raw_values() {
+async fn baseline_one_to_one_calibration_preserves_raw_values() {
     let db = setup_test_db().await;
     cleanup_test_db(&db).await;
     seed_base_entities(&db).await;
@@ -42,7 +42,7 @@ async fn baseline_identity_calibration_preserves_raw_values() {
         SITE1_ID,
         GLOBAL_PARAM_TEMP_ID,
         sensor.id,
-        sensor.identity_calibration_id,
+        sensor.base_calibration_id,
         dep,
         1.0,
         0.0,
@@ -74,7 +74,7 @@ async fn baseline_identity_calibration_preserves_raw_values() {
         assert_eq!(rows[i].sensor_id, Some(sensor.id), "row {i} sensor_id");
         assert_eq!(
             rows[i].calibration_id,
-            Some(sensor.identity_calibration_id),
+            Some(sensor.base_calibration_id),
             "row {i} cal_id"
         );
         assert_eq!(rows[i].deployment_id, Some(dep), "row {i} dep_id");
@@ -93,7 +93,7 @@ async fn baseline_identity_calibration_preserves_raw_values() {
 /// Verified both in the DB and through the API endpoint.
 ///
 /// Input:  raw = [20.0, 21.0, 22.0]
-/// Before: identity → calibrated = [20.0, 21.0, 22.0]
+/// Before: the 1:1 base curve → calibrated = [20.0, 21.0, 22.0]
 /// After:  slope=2, intercept=1 → calibrated = [41.0, 43.0, 45.0]
 #[tokio::test]
 #[serial]
@@ -124,7 +124,7 @@ async fn recalibration_updates_all_readings() {
         SITE1_ID,
         GLOBAL_PARAM_TEMP_ID,
         sensor.id,
-        sensor.identity_calibration_id,
+        sensor.base_calibration_id,
         dep,
         1.0,
         0.0,
@@ -138,7 +138,7 @@ async fn recalibration_updates_all_readings() {
         assert_eq!(
             rows[i].calibrated_value,
             Some(*raw),
-            "before: row {i} = identity"
+            "before: row {i} on the 1:1 base curve"
         );
     }
 
@@ -235,9 +235,9 @@ async fn reprocess_applies_per_parameter_calibration_on_shared_sensor() {
     seed_base_entities(&db).await;
 
     let sensor = create_sensor(&db, "MultiParam-01", GLOBAL_PARAM_TEMP_ID).await;
-    // Drop the auto identity calibration (NULL parameter = wildcard) so only the two
-    // parameter-scoped windowed curves resolve.
-    delete_calibration(&db, sensor.identity_calibration_id).await;
+    // Drop the bench base curve so only the two parameter-scoped windowed curves resolve.
+
+    delete_calibration(&db, sensor.base_calibration_id).await;
 
     // Temp curve: calibrated = 2*raw + 0. DO curve: calibrated = 10*raw + 5. Both open windows.
     exec(
@@ -247,7 +247,10 @@ async fn reprocess_applies_per_parameter_calibration_on_shared_sensor() {
              (id, sensor_id, parameter_id, slope, intercept, valid_from, notes) VALUES \
              ('{}', '{}', '{GLOBAL_PARAM_TEMP_ID}', 2.0, 0.0, '2000-01-01T00:00:00Z', 'temp'), \
              ('{}', '{}', '{GLOBAL_PARAM_DO_ID}',  10.0, 5.0, '2000-01-01T00:00:00Z', 'do')",
-            uuid::Uuid::new_v4(), sensor.id, uuid::Uuid::new_v4(), sensor.id
+            uuid::Uuid::new_v4(),
+            sensor.id,
+            uuid::Uuid::new_v4(),
+            sensor.id
         ),
     )
     .await;
@@ -306,13 +309,14 @@ async fn reprocess_applies_per_parameter_calibration_on_shared_sensor() {
     cleanup_test_db(&db).await;
 }
 
-/// H7 regression: production auto-creates the identity calibration with `parameter_id = NULL` (a
-/// wildcard), and `recompute_valid_until` partitions by parameter_id, so that identity's window never
-/// closes and overlaps a later real curve. Reprocess must still deterministically apply the real,
-/// parameter-specific curve, never the open-ended identity, to a parameter's readings.
+/// H7 regression, pinned against a data shape rather than a code path: a parameter-less curve
+/// (`parameter_id = NULL`, a wildcard) with an open window overlaps a later parameter-specific
+/// curve, because `recompute_valid_until` partitions by parameter_id and so never closes it.
+/// Reprocess must deterministically apply the parameter-specific curve to that parameter's
+/// readings. Nothing creates such rows any more, but they are still in the database.
 #[tokio::test]
 #[serial]
-async fn reprocess_prefers_real_curve_over_open_null_identity() {
+async fn reprocess_prefers_a_parameter_specific_curve_over_an_open_wildcard() {
     let db = setup_test_db().await;
     cleanup_test_db(&db).await;
     seed_base_entities(&db).await;
@@ -322,25 +326,25 @@ async fn reprocess_prefers_real_curve_over_open_null_identity() {
     exec(
         &db,
         &format!(
-            "INSERT INTO sensors (id, name, is_active) VALUES ('{sensor}', 'NullIdentity-01', true)"
+            "INSERT INTO sensors (id, name, is_active) VALUES ('{sensor}', 'WildcardCurve-01', true)"
         ),
     )
     .await;
-    // The production shape: a NULL-parameter identity (slope 1) with an open window, plus a real
+    // The stored shape: a NULL-parameter wildcard (slope 1) with an open window, plus a real
     // temperature curve (slope 2) that also stays open, both cover the reading's time.
     exec(
         &db,
         &format!(
             "INSERT INTO sensor_calibrations \
              (id, sensor_id, parameter_id, slope, intercept, valid_from, notes) VALUES \
-             ('{}', '{sensor}', NULL, 1.0, 0.0, '2000-01-01T00:00:00Z', 'Identity calibration (auto-created)'), \
+             ('{}', '{sensor}', NULL, 1.0, 0.0, '2000-01-01T00:00:00Z', 'wildcard, no parameter'), \
              ('{real_cal}', '{sensor}', '{GLOBAL_PARAM_TEMP_ID}', 2.0, 0.0, '2000-01-01T00:00:00Z', 'temp')",
             uuid::Uuid::new_v4()
         ),
     )
     .await;
     deploy_sensor(&db, sensor, SITE1_ID, dt("2000-01-01T00:00:00Z")).await;
-    let stream = create_paired_stream(&db, "null-identity-temp", PARAM_S1_TEMP_ID).await;
+    let stream = create_paired_stream(&db, "wildcard-curve-temp", PARAM_S1_TEMP_ID).await;
     exec(
         &db,
         &format!(
@@ -371,12 +375,12 @@ async fn reprocess_prefers_real_curve_over_open_null_identity() {
     assert_eq!(
         r.calibrated_value,
         Some(6.0),
-        "the real curve (2*3), never the identity (1*3)"
+        "the parameter-specific curve (2*3), never the wildcard (1*3)"
     );
     assert_eq!(
         r.calibration_id,
         Some(real_cal),
-        "stamped with the real curve, not the identity"
+        "stamped with the parameter-specific curve, not the wildcard"
     );
 
     cleanup_test_db(&db).await;
@@ -396,7 +400,7 @@ async fn slot_reprocess_leaves_spot_grabs_untouched() {
     seed_base_entities(&db).await;
 
     // Field sensor: deployed at SITE1 for temperature. A windowed curve (calibrated = 2*raw) that
-    // starts after the auto identity, so a 2025 reading resolves to slope 2.
+    // starts after the wildcard, so a 2025 reading resolves to slope 2.
     let field = create_sensor(&db, "Field-Temp-01", GLOBAL_PARAM_TEMP_ID).await;
     add_calibration(&db, field.id, 2.0, 0.0, dt("2020-01-01T00:00:00Z")).await;
     deploy_sensor(&db, field.id, SITE1_ID, dt("2000-01-01T00:00:00Z")).await;
@@ -514,7 +518,7 @@ async fn deployment_change_updates_site_and_deployment() {
         SITE1_ID,
         GLOBAL_PARAM_TEMP_ID,
         sensor.id,
-        sensor.identity_calibration_id,
+        sensor.base_calibration_id,
         dep_a,
         1.0,
         0.0,
@@ -602,7 +606,7 @@ async fn deployment_change_updates_site_and_deployment() {
         assert_eq!(
             rows[i].calibrated_value,
             Some(*raw),
-            "row {i} cal (identity)"
+            "row {i} cal (1:1 base curve)"
         );
         assert_eq!(rows[i].deployment_id, Some(*dep), "row {i} deployment");
         assert_eq!(rows[i].site_id, Some(*site), "row {i} site");
@@ -617,23 +621,23 @@ async fn deployment_change_updates_site_and_deployment() {
 
 /// Real calibration's valid_from moves from Jan 15 to Jan 12.
 /// Each reading has a distinct raw_value (= day number) so we can verify
-/// exactly which readings switched from identity to real calibration.
+/// exactly which readings switched from the base curve to the field calibration.
 ///
-/// Identity:   calibrated = raw (slope=1, intercept=0)
+/// Base curve: calibrated = raw (slope=1, intercept=0)
 /// Real cal:   calibrated = 3*raw + 0.5
 ///
 /// Before move (cal starts Jan 15):
-///   Jan 10 (raw=10) → identity → 10.0
-///   Jan 11 (raw=11) → identity → 11.0
-///   Jan 12 (raw=12) → identity → 12.0      ← these 3 will switch
-///   Jan 13 (raw=13) → identity → 13.0
-///   Jan 14 (raw=14) → identity → 14.0
+///   Jan 10 (raw=10) → base → 10.0
+///   Jan 11 (raw=11) → base → 11.0
+///   Jan 12 (raw=12) → base → 12.0      ← these 3 will switch
+///   Jan 13 (raw=13) → base → 13.0
+///   Jan 14 (raw=14) → base → 14.0
 ///   Jan 15 (raw=15) → real     → 45.5
 ///   Jan 16 (raw=16) → real     → 48.5
 ///
 /// After move (cal starts Jan 12):
-///   Jan 10 (raw=10) → identity → 10.0
-///   Jan 11 (raw=11) → identity → 11.0
+///   Jan 10 (raw=10) → base → 10.0
+///   Jan 11 (raw=11) → base → 11.0
 ///   Jan 12 (raw=12) → real     → 36.5      ← changed
 ///   Jan 13 (raw=13) → real     → 39.5      ← changed
 ///   Jan 14 (raw=14) → real     → 42.5      ← changed
@@ -652,8 +656,8 @@ async fn retroactive_calibration_date_change() {
 
     let real_cal = add_calibration(&db, sensor.id, 3.0, 0.5, dt("2025-01-15T00:00:00Z")).await;
 
-    // Jan 10-14: ingested with identity calibration, raw = day number
-    let identity_readings: Vec<_> = (10..15)
+    // Jan 10-14: ingested on the base curve, raw = day number
+    let base_readings: Vec<_> = (10..15)
         .map(|d| (dt(&format!("2025-01-{d:02}T12:00:00Z")), d as f64))
         .collect();
     // Jan 15-16: ingested with real calibration, raw = day number
@@ -667,11 +671,11 @@ async fn retroactive_calibration_date_change() {
         SITE1_ID,
         GLOBAL_PARAM_TEMP_ID,
         sensor.id,
-        sensor.identity_calibration_id,
+        sensor.base_calibration_id,
         dep,
         1.0,
         0.0,
-        &identity_readings,
+        &base_readings,
     )
     .await;
     insert_readings(
@@ -688,20 +692,20 @@ async fn retroactive_calibration_date_change() {
     )
     .await;
 
-    // Verify BEFORE state: 5 under identity, 2 under real cal
+    // Verify BEFORE state: 5 under the base curve, 2 under the real cal
     let rows = get_readings(&db, stream).await;
     assert_eq!(rows.len(), 7);
-    let identity_count = rows
+    let base_count = rows
         .iter()
-        .filter(|r| r.calibration_id == Some(sensor.identity_calibration_id))
+        .filter(|r| r.calibration_id == Some(sensor.base_calibration_id))
         .count();
     let real_count = rows
         .iter()
         .filter(|r| r.calibration_id == Some(real_cal))
         .count();
     assert_eq!(
-        identity_count, 5,
-        "before: 5 readings under identity (Jan 10-14)"
+        base_count, 5,
+        "before: 5 readings on the base curve (Jan 10-14)"
     );
     assert_eq!(
         real_count, 2,
@@ -723,17 +727,17 @@ async fn retroactive_calibration_date_change() {
 
     // Verify AFTER state: counts shifted
     let rows = get_readings(&db, stream).await;
-    let identity_count = rows
+    let base_count = rows
         .iter()
-        .filter(|r| r.calibration_id == Some(sensor.identity_calibration_id))
+        .filter(|r| r.calibration_id == Some(sensor.base_calibration_id))
         .count();
     let real_count = rows
         .iter()
         .filter(|r| r.calibration_id == Some(real_cal))
         .count();
     assert_eq!(
-        identity_count, 2,
-        "after: 2 readings under identity (Jan 10-11)"
+        base_count, 2,
+        "after: 2 readings on the base curve (Jan 10-11)"
     );
     assert_eq!(
         real_count, 5,
@@ -741,16 +745,16 @@ async fn retroactive_calibration_date_change() {
     );
 
     // Verify AFTER state: each reading's exact calibrated value
-    //   Identity readings: calibrated = 1*raw + 0 = raw
+    //   Base-curve readings: calibrated = 1*raw + 0 = raw
     //   Real cal readings: calibrated = 3*raw + 0.5
     let expected: [(f64, f64, uuid::Uuid); 7] = [
-        (10.0, 10.0, sensor.identity_calibration_id), // Jan 10, identity
-        (11.0, 11.0, sensor.identity_calibration_id), // Jan 11, identity
-        (12.0, 36.5, real_cal),                       // Jan 12, SWITCHED: 3*12+0.5
-        (13.0, 39.5, real_cal),                       // Jan 13, SWITCHED: 3*13+0.5
-        (14.0, 42.5, real_cal),                       // Jan 14, SWITCHED: 3*14+0.5
-        (15.0, 45.5, real_cal),                       // Jan 15, unchanged: 3*15+0.5
-        (16.0, 48.5, real_cal),                       // Jan 16, unchanged: 3*16+0.5
+        (10.0, 10.0, sensor.base_calibration_id), // Jan 10, base curve
+        (11.0, 11.0, sensor.base_calibration_id), // Jan 11, base curve
+        (12.0, 36.5, real_cal),                   // Jan 12, SWITCHED: 3*12+0.5
+        (13.0, 39.5, real_cal),                   // Jan 13, SWITCHED: 3*13+0.5
+        (14.0, 42.5, real_cal),                   // Jan 14, SWITCHED: 3*14+0.5
+        (15.0, 45.5, real_cal),                   // Jan 15, unchanged: 3*15+0.5
+        (16.0, 48.5, real_cal),                   // Jan 16, unchanged: 3*16+0.5
     ];
     for (i, (raw, cal, cal_id)) in expected.iter().enumerate() {
         assert_eq!(rows[i].raw_value, *raw, "row {i} raw");
@@ -801,7 +805,7 @@ async fn lab_sensor_multiple_deployments_same_day() {
         SITE1_ID,
         GLOBAL_PARAM_TEMP_ID,
         sensor.id,
-        sensor.identity_calibration_id,
+        sensor.base_calibration_id,
         dep_a,
         1.0,
         0.0,
@@ -935,13 +939,13 @@ async fn calibration_time_windows_auto_bounded() {
 
     assert_eq!(rows.len(), 2);
 
-    // Identity cal: valid_until auto-set to Jan 15
-    let identity_until: Option<chrono::DateTime<chrono::FixedOffset>> =
+    // Base curve: valid_until auto-set to Jan 15
+    let base_until: Option<chrono::DateTime<chrono::FixedOffset>> =
         rows[0].try_get("", "valid_until").ok();
     assert_eq!(
-        identity_until.map(|t| t.with_timezone(&chrono::Utc)),
+        base_until.map(|t| t.with_timezone(&chrono::Utc)),
         Some(dt("2025-01-15T00:00:00Z")),
-        "identity cal should have valid_until = next cal's valid_from"
+        "the base curve should have valid_until = next cal's valid_from"
     );
 
     // New cal: open-ended
@@ -959,18 +963,18 @@ async fn calibration_time_windows_auto_bounded() {
 // Calibration deletion, fallback with distinct values
 // ============================================================================
 
-/// Three calibrations: identity → A → B. Delete A.
-/// Readings in A's window fall back to identity.
+/// Three calibrations: base → A → B. Delete A.
+/// Readings in A's window fall back to the base curve.
 /// Each reading has distinct raw_value, so exact outputs are verifiable.
 ///
 /// Before delete:
-///   Jan 5  (raw=5)  → identity  → 5.0     (1*5+0)
+///   Jan 5  (raw=5)  → base      → 5.0     (1*5+0)
 ///   Jan 15 (raw=15) → cal_a     → 31.0    (2*15+1)
 ///   Jan 25 (raw=25) → cal_b     → 77.0    (3*25+2)
 ///
 /// After deleting cal_a:
-///   Jan 5  (raw=5)  → identity  → 5.0     (unchanged)
-///   Jan 15 (raw=15) → identity  → 15.0    (CHANGED: was 31.0)
+///   Jan 5  (raw=5)  → base      → 5.0     (unchanged)
+///   Jan 15 (raw=15) → base      → 15.0    (CHANGED: was 31.0)
 ///   Jan 25 (raw=25) → cal_b     → 77.0    (unchanged)
 #[tokio::test]
 #[serial]
@@ -993,7 +997,7 @@ async fn delete_intermediate_calibration_fallback() {
         SITE1_ID,
         GLOBAL_PARAM_TEMP_ID,
         sensor.id,
-        sensor.identity_calibration_id,
+        sensor.base_calibration_id,
         dep,
         1.0,
         0.0,
@@ -1041,7 +1045,7 @@ async fn delete_intermediate_calibration_fallback() {
     assert_eq!(status, 204);
     assert!(wait_for_reprocessing(&db, sensor.id, WAIT_TIMEOUT).await);
 
-    // AFTER: Jan 15 reading falls back to identity
+    // AFTER: Jan 15 reading falls back to the base curve
     let rows = get_readings(&db, stream).await;
     assert_eq!(rows.len(), 3, "no readings lost");
 
@@ -1049,17 +1053,17 @@ async fn delete_intermediate_calibration_fallback() {
     assert_eq!(
         rows[0].calibrated_value,
         Some(5.0),
-        "after: Jan 5 unchanged (identity)"
+        "after: Jan 5 unchanged (base curve)"
     );
-    assert_eq!(rows[0].calibration_id, Some(sensor.identity_calibration_id));
+    assert_eq!(rows[0].calibration_id, Some(sensor.base_calibration_id));
 
     assert_eq!(rows[1].raw_value, 15.0);
     assert_eq!(
         rows[1].calibrated_value,
         Some(15.0),
-        "after: Jan 15 CHANGED 31→15 (fell back to identity: 1*15+0)"
+        "after: Jan 15 CHANGED 31→15 (fell back to the base curve: 1*15+0)"
     );
-    assert_eq!(rows[1].calibration_id, Some(sensor.identity_calibration_id));
+    assert_eq!(rows[1].calibration_id, Some(sensor.base_calibration_id));
 
     assert_eq!(rows[2].raw_value, 25.0);
     assert_eq!(
@@ -1079,7 +1083,7 @@ async fn delete_intermediate_calibration_fallback() {
 /// Calibration change recalculates readings AND refreshes hourly aggregate.
 ///
 /// 12 readings at raw=10.0 each, 10-min intervals 10:00-11:50.
-/// Before: identity → avg_value = 10.0
+/// Before: the 1:1 base curve → avg_value = 10.0
 /// After:  slope=2, intercept=5 → calibrated=25.0 → avg_value = 25.0
 #[tokio::test]
 #[serial]
@@ -1106,7 +1110,7 @@ async fn full_cascade_calibration_to_aggregates() {
         SITE1_ID,
         GLOBAL_PARAM_TEMP_ID,
         sensor.id,
-        sensor.identity_calibration_id,
+        sensor.base_calibration_id,
         dep,
         1.0,
         0.0,

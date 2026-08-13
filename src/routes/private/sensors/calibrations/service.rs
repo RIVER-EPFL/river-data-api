@@ -113,6 +113,29 @@ pub fn window_resolved_rows(alias: &str) -> String {
     format!("{alias}.measurement_type IS DISTINCT FROM 'spot'")
 }
 
+/// A reading holding a correction no curve accounts for: it names neither curve, yet carries a
+/// `calibrated_value` that is a different number from its raw value.
+///
+/// Nothing this code does produces such a row. Every path that drops a curve reference clears the
+/// value in the same statement (`SensorCalibrationOperations::perform_delete`, the reprocess
+/// engines, the identity retirement migration), so one of these arrived by a writer that supplied a
+/// corrected number with no provenance: `POST /readings/batch` accepts a bare `calibrated_value`,
+/// and historical imports did the same. The number is somebody's measurement, produced by a method
+/// this code cannot recover, so no rewrite here can be more than a guess.
+///
+/// They are therefore held out of every recomposition and reported instead, by
+/// `GET /actions/calibration_candidates`. A row whose stored value merely COPIES its raw value is
+/// NOT one of these: that copy is what the old writers materialised for an uncorrected reading, it
+/// carries no information, and clearing it changes nothing the API serves.
+#[must_use]
+pub fn orphaned_correction_rows(alias: &str) -> String {
+    format!(
+        "{alias}.calibration_id IS NULL AND {alias}.standard_curve_id IS NULL \
+         AND {alias}.calibrated_value IS NOT NULL \
+         AND {alias}.calibrated_value IS DISTINCT FROM {alias}.raw_value"
+    )
+}
+
 /// Rewrite each spot reading's `calibrated_value` from the curves the row itself names.
 ///
 /// This is the other half of [`window_resolved_rows`]. A grab keeps the curves it was entered
@@ -120,6 +143,11 @@ pub fn window_resolved_rows(alias: &str) -> String {
 /// calibration's coefficients moves every grab that carries it, so the served value and the
 /// provenance beside it cannot drift apart. Both reprocess engines call this, differing only in
 /// `scope_sql`, which selects the readings (as `r`) and is written against `params`.
+///
+/// A grab naming neither curve is in scope too, and is written NULL: no window resolution will ever
+/// claim such a row, so this is the only statement that can reach the copy of the raw value the old
+/// writers left in `calibrated_value`. The one exception is [`orphaned_correction_rows`], a value
+/// that is not that copy and that no curve here can reproduce; those are left exactly as they are.
 pub async fn recompose_spot_readings<C: ConnectionTrait>(
     db: &C,
     scope_sql: &str,
@@ -148,8 +176,9 @@ pub async fn recompose_spot_readings<C: ConnectionTrait>(
             AND tgt.time = r.time
             AND tgt.replicate_index = r.replicate_index
             AND r.measurement_type = 'spot'
-            AND (r.calibration_id IS NOT NULL OR r.standard_curve_id IS NOT NULL)
-            AND ({scope_sql})"
+            AND NOT ({orphaned})
+            AND ({scope_sql})",
+        orphaned = orphaned_correction_rows("r"),
     );
     let result = db
         .execute(Statement::from_sql_and_values(
@@ -159,12 +188,6 @@ pub async fn recompose_spot_readings<C: ConnectionTrait>(
         ))
         .await?;
     Ok(result.rows_affected())
-}
-
-/// Whether a calibration is the identity transform (slope 1, intercept 0), i.e. `calibrated == raw`.
-#[must_use]
-pub fn is_identity_calibration(slope: f64, intercept: f64) -> bool {
-    (slope - 1.0).abs() < f64::EPSILON && intercept.abs() < f64::EPSILON
 }
 
 pub fn evaluate_formula(formula: &str, variables: &HashMap<String, f64>) -> Result<f64, String> {
@@ -454,12 +477,22 @@ async fn evaluate_and_upsert_derived(
 
     let stream_id = get_or_create_derived_stream(db, item).await?;
 
+    // `raw_value` is the authoritative column for a derived reading and `calibrated_value` is
+    // always NULL. A derived value is a computed quantity, not an instrument measurement plus a
+    // correction: it has no sensor, no curve and therefore nothing a calibration id could point
+    // at, which is exactly the state this model spells NULL. Every consumer reads
+    // COALESCE(calibrated_value, raw_value) — including the four continuous aggregates — so the
+    // computed number is what is served either way, but only this arrangement survives a
+    // recomposition pass, which resolves no curve for a sensor-less row and would otherwise clear
+    // the value outright. Writing both columns also made the upsert lopsided: the previous
+    // ON CONFLICT maintained only `calibrated_value`, so a recomputed row's `raw_value` stayed
+    // frozen at whatever the very first evaluation produced.
     db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, replicate_index, measurement_type)
-          VALUES ($1, $2, $3, $4, $5, $5, 0, 'derived')
+          VALUES ($1, $2, $3, $4, $5, NULL, 0, 'derived')
           ON CONFLICT (stream_id, time, replicate_index) DO UPDATE
-            SET calibrated_value = $5, measurement_type = 'derived'",
+            SET raw_value = $5, calibrated_value = NULL, measurement_type = 'derived'",
         [
             stream_id.into(),
             item.derived_site_id.into(),
@@ -546,138 +579,14 @@ pub async fn recompute_deployed_until<C: ConnectionTrait>(
     Ok(())
 }
 
-/// Extend the sensor's calibration timeline backwards so `earliest` is covered, and no further.
-///
-/// The only writer of an auto-created identity curve. Three shapes, all of which only ever grow
-/// coverage at the front of the timeline:
-///
-/// - no timeline yet, insert an identity curve starting at `earliest`;
-/// - the timeline opens with an identity curve, backdate its `valid_from` to `earliest`;
-/// - the timeline opens with a real curve, insert an identity curve ahead of it.
-///
-/// `earliest` at or after the first curve's `valid_from` is a no-op. That bound is what keeps an
-/// identity curve out of the middle of a timeline: inserted there it becomes the next window, the
-/// chain retracts the scientist's curve to it, and the readings after that instant revert to raw.
-/// Existing curves are otherwise never modified.
-pub async fn ensure_identity_covers<C: ConnectionTrait>(
-    db: &C,
-    sensor_id: Uuid,
-    earliest: DateTime<Utc>,
-) -> Result<(), sea_orm::DbErr> {
-    const INSERT_IDENTITY: &str = r"INSERT INTO sensor_calibrations
-            (id, sensor_id, slope, intercept, valid_from, performed_by, notes, created_at)
-        VALUES (gen_random_uuid(), $1, 1.0, 0.0, $2, 'system', 'Identity calibration (auto-created)', NOW())";
-
-    let first_cal = db
-        .query_one(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT id, slope, intercept, valid_from
-              FROM sensor_calibrations
-              WHERE sensor_id = $1
-              ORDER BY valid_from ASC, id ASC
-              LIMIT 1",
-            [sensor_id.into()],
-        ))
-        .await?;
-
-    match first_cal {
-        None => {
-            db.execute(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                INSERT_IDENTITY,
-                [sensor_id.into(), earliest.into()],
-            ))
-            .await?;
-        }
-        Some(ref cal) => {
-            let first_from: chrono::DateTime<chrono::FixedOffset> =
-                cal.try_get("", "valid_from")?;
-            if earliest >= first_from.with_timezone(&Utc) {
-                return Ok(());
-            }
-            let slope: f64 = cal.try_get("", "slope").unwrap_or(1.0);
-            let intercept: f64 = cal.try_get("", "intercept").unwrap_or(0.0);
-            let cal_id: Uuid = cal.try_get("", "id")?;
-
-            if is_identity_calibration(slope, intercept) {
-                db.execute(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "UPDATE sensor_calibrations SET valid_from = $1 WHERE id = $2",
-                    [earliest.into(), cal_id.into()],
-                ))
-                .await?;
-            } else {
-                db.execute(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    INSERT_IDENTITY,
-                    [sensor_id.into(), earliest.into()],
-                ))
-                .await?;
-            }
-        }
-    }
-
-    recompute_valid_until(db, sensor_id).await?;
-    tracing::info!(
-        sensor_id = %sensor_id,
-        extended_to = %earliest,
-        "auto-extended calibration coverage"
-    );
-    Ok(())
-}
-
-/// Cover the sensor's readings that predate its first calibration, by delegating to
-/// [`ensure_identity_covers`]. Readings from the first curve onwards are already covered by the
-/// chain, so only the leading region is in question.
-pub async fn ensure_calibration_coverage<C: ConnectionTrait>(
-    db: &C,
-    sensor_id: Uuid,
-) -> Result<(), sea_orm::DbErr> {
-    let row = db
-        .query_one(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT COUNT(*) AS cnt, MIN(r.time) AS earliest
-              FROM readings r
-              WHERE r.sensor_id = $1
-                AND r.calibration_id IS NULL
-                AND r.time < COALESCE(
-                    (SELECT MIN(valid_from) FROM sensor_calibrations WHERE sensor_id = $1),
-                    'infinity'::timestamptz
-                )",
-            [sensor_id.into()],
-        ))
-        .await?;
-
-    let (cnt, earliest): (i64, Option<DateTime<Utc>>) = match row {
-        Some(ref r) => {
-            let c: i64 = r.try_get("", "cnt").unwrap_or(0);
-            let e = r
-                .try_get::<chrono::DateTime<chrono::FixedOffset>>("", "earliest")
-                .ok()
-                .map(|t| t.with_timezone(&Utc));
-            (c, e)
-        }
-        None => (0, None),
-    };
-
-    if cnt == 0 {
-        return Ok(());
-    }
-    let Some(earliest) = earliest else {
-        return Ok(());
-    };
-
-    ensure_identity_covers(db, sensor_id, earliest).await
-}
-
 pub async fn reprocess_sensor_readings(
     db: &DatabaseConnection,
     sensor_id: Uuid,
 ) -> Result<usize, sea_orm::DbErr> {
-    // Ensure calibration windows cover all readings before the main re-derivation.
-    // Creates or extends an identity calibration for any pre-first-calibration gap.
-    ensure_calibration_coverage(db, sensor_id).await?;
-
+    // Nothing here manufactures coverage. A reading that predates the sensor's first curve, or falls
+    // in a gap between two, is uncorrected: the re-derivation below resolves no curve for it and
+    // clears both the reference and the value.
+    //
     // Chain each parameter's calibration windows (valid_until = next valid_from) before deriving, so
     // the window UPDATE below is single-valued. Calibrations inserted outside the CRUD hooks (bulk
     // load, tests) may carry no valid_until; without this two open windows on the same parameter would
@@ -696,23 +605,54 @@ pub async fn reprocess_sensor_readings(
     //
     // Which rows a window may claim is `window_resolved_rows`; the spot rows it holds back are
     // rewritten from the curves they name by `recompose_spot_readings` below.
+    //
+    // The lateral is an outer join, so a reading no window covers is in scope rather than skipped:
+    // it is written `calibration_id = NULL` and, unless it names a standard curve, a NULL value. A
+    // gap in a calibration timeline is an ordinary state, and reprocess has to be able to CLEAR a
+    // correction as well as replace one, or a curve deleted or moved off a reading would leave that
+    // reading serving a corrected value nothing on the row accounts for. This is the same statement
+    // shape the delete path uses (`SensorCalibrationOperations::perform_delete`), including the
+    // standard curve it re-applies on top of whatever base resolves.
+    //
+    // `orphaned_correction_rows` is the one thing that clear does not reach. A row resolving no
+    // window, naming no curve, and holding a number that is not a copy of its raw value was written
+    // that way by a caller; recomputing it here would replace somebody's measurement with a NULL and
+    // leave no record it existed. Those rows are reported by `GET /actions/calibration_candidates`
+    // and left alone here.
     let cal_sql = format!(
         r"UPDATE readings tgt
             SET calibration_id = picked.cal_id,
                 calibrated_value = {value}
             FROM (
-                SELECT r.stream_id, r.time, r.replicate_index,
+                SELECT r.stream_id AS p_stream_id, r.time AS p_time,
+                       r.replicate_index AS p_replicate_index,
+                       r.standard_curve_id AS p_standard_curve_id,
                        cw.id AS cal_id, cw.slope, cw.intercept
                 FROM readings r
-                JOIN LATERAL ({pick}) cw ON true
+                LEFT JOIN LATERAL ({pick}) cw ON true
                 WHERE r.sensor_id = $1
                   AND {windowed}
+                  AND NOT (cw.id IS NULL AND ({orphaned}))
             ) picked
-            WHERE tgt.stream_id = picked.stream_id
-              AND tgt.time = picked.time
-              AND tgt.replicate_index = picked.replicate_index",
+            LEFT JOIN standard_curves sc ON sc.id = picked.p_standard_curve_id
+            WHERE tgt.stream_id = picked.p_stream_id
+              AND tgt.time = picked.p_time
+              AND tgt.replicate_index = picked.p_replicate_index",
         windowed = window_resolved_rows("r"),
-        value = calibrated_value_sql("tgt.raw_value", "picked.slope", "picked.intercept"),
+        orphaned = orphaned_correction_rows("r"),
+        value = recomposed_value_sql(
+            "tgt.raw_value",
+            &CurveColumns {
+                id: "picked.cal_id",
+                slope: "picked.slope",
+                intercept: "picked.intercept",
+            },
+            &CurveColumns {
+                id: "sc.id",
+                slope: "sc.slope",
+                intercept: "sc.intercept",
+            },
+        ),
         pick = super::resolver::pick_calibration_lateral("$1")
     );
 
@@ -850,23 +790,52 @@ pub async fn reprocess_site_parameter_readings(
     // Steps 1-3 run in one guarded transaction (`common::bulk_write`), which lifts TimescaleDB's
     // per-statement decompression cap; the derived cascade and aggregate refresh follow after commit.
     // Step 2 resolves with `resolver::pick_calibration_lateral`, the ranking every other path uses.
+    //
+    // As in the per-sensor engine the lateral is an outer join, so a reading at this slot that no
+    // window covers is cleared (`calibration_id = NULL`, and a NULL value unless it names a standard
+    // curve) rather than left carrying a correction the timeline no longer accounts for, and as
+    // there `orphaned_correction_rows` is held out of that clear: a caller-supplied corrected value
+    // with no curve behind it is reported, never overwritten.
+    //
+    // Derived readings are held out. They carry the slot's site and parameter but no instrument, so
+    // no window can ever resolve for them; they are a computed quantity rather than an instrument
+    // reading plus a correction, and the outer join would otherwise erase every value the derived
+    // cascade wrote.
     let cal_sql = format!(
         r"UPDATE readings tgt
           SET calibration_id = picked.cal_id,
               calibrated_value = {value}
           FROM (
-              SELECT r.stream_id, r.time, r.replicate_index,
+              SELECT r.stream_id AS p_stream_id, r.time AS p_time,
+                     r.replicate_index AS p_replicate_index,
+                     r.standard_curve_id AS p_standard_curve_id,
                      cw.id AS cal_id, cw.slope, cw.intercept
               FROM readings r
-              JOIN LATERAL ({pick}) cw ON true
+              LEFT JOIN LATERAL ({pick}) cw ON true
               WHERE r.site_id = $1 AND r.parameter_id = $2
                 AND {windowed}
+                AND r.measurement_type IS DISTINCT FROM 'derived'
+                AND NOT (cw.id IS NULL AND ({orphaned}))
           ) picked
-          WHERE tgt.stream_id = picked.stream_id
-            AND tgt.time = picked.time
-            AND tgt.replicate_index = picked.replicate_index",
+          LEFT JOIN standard_curves sc ON sc.id = picked.p_standard_curve_id
+          WHERE tgt.stream_id = picked.p_stream_id
+            AND tgt.time = picked.p_time
+            AND tgt.replicate_index = picked.p_replicate_index",
         windowed = window_resolved_rows("r"),
-        value = calibrated_value_sql("tgt.raw_value", "picked.slope", "picked.intercept"),
+        orphaned = orphaned_correction_rows("r"),
+        value = recomposed_value_sql(
+            "tgt.raw_value",
+            &CurveColumns {
+                id: "picked.cal_id",
+                slope: "picked.slope",
+                intercept: "picked.intercept",
+            },
+            &CurveColumns {
+                id: "sc.id",
+                slope: "sc.slope",
+                intercept: "sc.intercept",
+            },
+        ),
         pick = super::resolver::pick_calibration_lateral("r.sensor_id")
     );
 

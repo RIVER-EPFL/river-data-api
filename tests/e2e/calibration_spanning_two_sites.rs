@@ -30,7 +30,7 @@ const WAIT: Duration = Duration::from_secs(30);
 const D1_FROM: &str = "2025-06-02T00:00:00Z";
 /// The sensor moves downstream at midday.
 const D2_FROM: &str = "2025-06-02T12:00:00Z";
-/// The base identity curve predates every reading, so the span calibration is the only edit under test.
+/// The 1:1 base curve predates every reading, so the span calibration is the only edit under test.
 const BASE_CAL_FROM: &str = "2025-06-01T00:00:00Z";
 
 const R1: &str = "2025-06-02T10:00:00Z";
@@ -254,9 +254,9 @@ impl Span {
 /// starts at `span_cal_from`.
 ///
 /// Every entity is provisioned over HTTP in dashboard order. Readings are ingested before the span
-/// calibration exists (ingest writes `calibrated_value` as raw), so the calibration's own create
-/// job is what establishes the pre-state, exactly as it would for an operator entering a curve
-/// against data that already arrived.
+/// calibration exists, so they land uncorrected and the calibration's own create job is what
+/// establishes the pre-state, exactly as it would for an operator entering a curve against data
+/// that already arrived.
 async fn seed_two_site_span(span_cal_from: &str, readings: &[(&str, f64)]) -> Span {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;

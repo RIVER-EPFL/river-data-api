@@ -35,7 +35,7 @@ async fn poll_for_derived(
         let row = db
             .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                "SELECT calibrated_value FROM readings \
+                "SELECT COALESCE(calibrated_value, raw_value) AS value FROM readings \
                  WHERE site_id = $1 AND parameter_id = $2 AND time = $3 \
                  LIMIT 1",
                 [site_id.into(), parameter_id.into(), time.into()],
@@ -44,7 +44,7 @@ async fn poll_for_derived(
             .ok()
             .flatten();
         if let Some(r) = row
-            && let Ok(v) = r.try_get::<f64>("", "calibrated_value")
+            && let Ok(v) = r.try_get::<f64>("", "value")
         {
             return Some(v);
         }

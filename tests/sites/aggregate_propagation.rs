@@ -827,7 +827,7 @@ async fn calibration_edit_moves_both_deployed_sites_served_aggregates() {
         assert_eq!(
             before[i].calibrated_value,
             Some(*cal_value),
-            "reading {i} starts on the identity curve: {before:?}"
+            "reading {i} starts on the 1:1 base curve: {before:?}"
         );
         assert_eq!(
             before[i].site_id,

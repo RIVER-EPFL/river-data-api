@@ -103,51 +103,40 @@ refresh trigger having populated `samples`.
 
 ## Standard curves
 
-A standard curve is a lab curve applied on top of an instrument's base calibration, most often to
-correct a grab measurement against the microplate it was read on. It belongs to one instrument and
-is chosen by hand for a measurement; it has no time columns, so nothing ever resolves one by window.
-That is the whole reason `standard_curves` is its own table rather than a flag on
-`sensor_calibrations`: a window query cannot pick up a curve that is not in the table it reads.
+A standard curve belongs to one instrument and is chosen by hand for a measurement. It has no time
+columns, so no window query can resolve one, which is why it is its own table rather than a flag on
+`sensor_calibrations`.
 
-A reading records both references. `calibration_id` is the time-windowed base calibration the value
-was corrected with; `standard_curve_id` is the curve the operator chose. With one column an identity
-base and an unrecorded base were indistinguishable. `GET /api/sites/{id}/readings?include_curves=true`
-serves both references per point, in JSON and in the CSV and NDJSON exports.
+A reading records both references: `calibration_id` is the time-windowed base calibration,
+`standard_curve_id` the curve the operator chose. With one column an identity base and an unrecorded
+base were indistinguishable. `GET /api/sites/{id}/readings?include_curves=true` serves both per
+point, in JSON, CSV and NDJSON.
 
-`POST /grab_samples` takes the curve as `standard_curve_id` on each reading, and `POST
-/readings/batch` accepts the same field for a caller replaying grabs. Both are held to one rule
-stated once in `readings::batch::admit_standard_curves`: a reading may name a curve only when it is
-that instrument's own spot measurement, so an unknown id, another instrument's curve, a reading
-naming no instrument and a continuous or derived reading are all 400. A curve on a reading that
-names no instrument is refused rather than taken on trust, because the reference is not decoration:
-it is what freezes the curve against edits and what a served value claims to have been corrected by,
-and neither is checkable without the instrument.
-A submitted `calibrated_value` is not stored alongside a curve either, because it cannot be checked
-against one, only recomputed from it. The server resolves the base calibration from the
-instrument's windows at the grab time, applies the base first and the standard curve to that result,
-and stores the measured value, both references and the composed result together. The order is fixed
-in `calibrations::service::apply_curves`, the one function every path corrects a value through: nothing
-on a stored row reveals which order produced it, so there is only one.
+`POST /grab_samples` takes `standard_curve_id` per reading, and `POST /readings/batch` accepts the
+same field. One rule governs both, stated in `readings::batch::admit_standard_curves`: a reading may
+name a curve only when it is that instrument's own spot measurement. An unknown id, another
+instrument's curve, a reading naming no instrument, and a continuous or derived reading are all 400.
+A submitted `calibrated_value` is not stored alongside a curve, because it can only be recomputed
+from one, never checked against it. The server resolves the base calibration from the instrument's
+windows at the grab time, applies base then standard curve, and stores the measured value, both
+references and the result. That order lives in `calibrations::service::apply_curves`, the one
+function every path corrects a value through.
 
-Reprocessing never resolves a grab's curves again. A window resolution cannot recover a hand-picked
-curve, so re-deriving a grab would replace a deliberate correction with whatever the timeline
-currently says; `calibrations::service::window_resolved_rows` is the one predicate that holds spot
-rows back, and every reprocess statement is written through it.
+Reprocessing never resolves a grab's curves again: a window resolution cannot recover a hand-picked
+curve. `calibrations::service::window_resolved_rows` is the one predicate holding spot rows back, and
+every reprocess statement is written through it.
 
-What reprocessing does do is recompute a grab's value from the curves the row already names, in
-`recompose_spot_readings`. A grab records the base calibration it was corrected with, so editing
-that calibration's coefficients has to move the value it produced: leaving it would serve a number
-alongside a `calibration_id` that no longer describes it. The delete path recomposes the same way
-after repointing a reading onto its new covering curve, through the shared `recomposed_value_sql`,
-which is also what keeps a reading that ends up with neither curve at a null `calibrated_value`
+It does recompute a grab's value from the curves the row already names, in `recompose_spot_readings`,
+so editing a base calibration's coefficients moves the values it produced. The delete path recomposes
+the same way after repointing a reading onto its new covering curve, through the shared
+`recomposed_value_sql`, which also leaves a reading with neither curve at a null `calibrated_value`
 rather than a copy of its raw value.
 
-The database enforces existence: `readings.standard_curve_id` is a foreign key with no `ON DELETE`
-clause, so a curve a reading references cannot be deleted, by the API or by hand. The API enforces
-provenance: a curve that has been applied to a reading is immutable, and correcting one means
-creating a new curve and re-entering the affected measurements against it. This is deliberately
-unlike a windowed calibration, where editing coefficients is expected to reprocess the readings the
-window covers.
+The database enforces existence: `readings.standard_curve_id` is a foreign key with no `ON DELETE`,
+so a referenced curve cannot be deleted, by the API or by hand. The API enforces provenance: an
+applied curve is immutable, and correcting one means creating a new curve and re-entering the
+affected measurements against it. This is deliberately unlike a windowed calibration, where editing
+coefficients is expected to reprocess the readings the window covers.
 
 ## Stream registration and the instrument behind a feed
 

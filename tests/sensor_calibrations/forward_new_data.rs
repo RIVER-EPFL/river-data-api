@@ -222,7 +222,6 @@ struct Fixture {
     stream_uuid: Uuid,
     sensor_id: String,
     sensor_uuid: Uuid,
-    identity_id: String,
     c1_id: String,
     c1_uuid: Uuid,
 }
@@ -246,8 +245,8 @@ async fn arrange(db: &DatabaseConnection, app: &Router, admin: &str) -> Fixture 
     let stream_uuid = Uuid::parse_str(&stream_id).expect("stream id is a uuid");
 
     // Without the link the readings would be owned by the track's deployed sensor (reprocess
-    // re-derives ownership from the deployment window) while the calibrations sat on the minted
-    // one, so the link is what keeps one timeline for one feed.
+    // re-derives ownership from the deployment window) while the calibrations sat on the one the
+    // stream names, so the link is what keeps one timeline for one feed.
     let sensor_hint = track
         .sensor_id
         .clone()
@@ -273,9 +272,8 @@ async fn arrange(db: &DatabaseConnection, app: &Router, admin: &str) -> Fixture 
         "the stream carries no readings yet, so pairing has nothing to backfill: {paired}"
     );
 
-    // Pairing binds the stream to a sensor and gives that sensor an identity curve. That sensor's
-    // calibration timeline is the one these readings resolve against, so it is the one the operator
-    // records calibrations on.
+    // Pairing binds the stream to a sensor. That sensor's calibration timeline is the one these
+    // readings resolve against, so it is the one the operator records calibrations on.
     let sensor_id = paired["stream"]["sensor_id"]
         .as_str()
         .unwrap_or_else(|| panic!("pairing binds the stream to a sensor: {paired}"))
@@ -283,15 +281,10 @@ async fn arrange(db: &DatabaseConnection, app: &Router, admin: &str) -> Fixture 
     let sensor_uuid = Uuid::parse_str(&sensor_id).expect("sensor id is a uuid");
 
     let cals = calibrations_for(app, admin, &sensor_id).await;
-    assert_eq!(
-        cals.len(),
-        1,
-        "pairing leaves exactly one (identity) curve on the stream's sensor: {cals:?}"
+    assert!(
+        cals.is_empty(),
+        "pairing records no curve: a curve exists only where someone entered one: {cals:?}"
     );
-    let identity_id = cals[0]["id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("the identity curve carries an id: {cals:?}"))
-        .to_string();
 
     ingest_cycle(
         app,
@@ -331,7 +324,7 @@ async fn arrange(db: &DatabaseConnection, app: &Router, admin: &str) -> Fixture 
         assert_eq!(
             row.calibration_id,
             Some(c1_uuid),
-            "{time} is stamped with C1, not the identity curve pairing left"
+            "{time} is stamped with C1, the only curve on the sensor"
         );
         assert_eq!(
             row.site_id,
@@ -346,7 +339,6 @@ async fn arrange(db: &DatabaseConnection, app: &Router, admin: &str) -> Fixture 
         stream_uuid,
         sensor_id,
         sensor_uuid,
-        identity_id,
         c1_id,
         c1_uuid,
     }
@@ -370,17 +362,16 @@ async fn forward_calibration_closes_the_previous_window_and_leaves_history_alone
     let fx = arrange(&db, &app, &admin).await;
 
     let before = calibrations_for(&app, &admin, &fx.sensor_id).await;
-    assert_eq!(before.len(), 2, "C1 plus the identity curve: {before:?}");
+    assert_eq!(before.len(), 1, "C1 is the whole timeline: {before:?}");
     assert_eq!(
         before[0]["id"],
         fx.c1_id.as_str(),
         "C1 opens the timeline: {before:?}"
     );
-    let identity_from = valid_from(&before[1]);
     assert_eq!(
         valid_until(&before[0]),
-        Some(identity_from),
-        "C1's window runs up to the next curve on the timeline: {before:?}"
+        None,
+        "with nothing after it, C1's window stays open: {before:?}"
     );
 
     // A reading that arrives while C1 is still the newest field curve. Ingest resolves the window
@@ -444,8 +435,8 @@ async fn forward_calibration_closes_the_previous_window_and_leaves_history_alone
     );
     assert_eq!(
         c2_window["valid_until"].as_str().map(dt),
-        Some(identity_from),
-        "C2 takes over C1's former upper bound, the next curve on the timeline: {c2_window}"
+        None,
+        "C2 is now the last curve on the timeline, so its window stays open: {c2_window}"
     );
     assert_eq!(
         c2_window["point_count"].as_i64(),
@@ -458,22 +449,17 @@ async fn forward_calibration_closes_the_previous_window_and_leaves_history_alone
     );
 
     let chain = calibrations_for(&app, &admin, &fx.sensor_id).await;
-    assert_eq!(chain.len(), 3, "identity, C1 and C2: {chain:?}");
+    assert_eq!(chain.len(), 2, "C1 and C2: {chain:?}");
     for pair in chain.windows(2) {
         assert_eq!(
             valid_until(&pair[0]),
             Some(valid_from(&pair[1])),
-            "each window is closed at the next one's start (calibration coverage is continuous): {chain:?}"
+            "each window is closed at the next one's start: {chain:?}"
         );
     }
     assert!(
-        valid_until(&chain[2]).is_none(),
+        valid_until(&chain[1]).is_none(),
         "the last window on the timeline stays open: {chain:?}"
-    );
-    assert_eq!(
-        chain[2]["id"],
-        fx.identity_id.as_str(),
-        "the identity curve pairing created is the last link: {chain:?}"
     );
 
     let rows = get_readings(&db, fx.stream_uuid).await;

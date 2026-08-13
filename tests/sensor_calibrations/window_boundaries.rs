@@ -263,11 +263,12 @@ async fn series(fx: &Fixture, sensor_id: &str, start: &str, end: &str) -> Series
     }
 }
 
-/// `backfill_calibrations` must not insert an identity curve inside an entered
-/// calibration's window, which truncates that window and reverts its readings to raw.
+/// `backfill_calibrations` resolves readings against the windows that already exist and creates
+/// nothing: a reading inside an entered window picks that curve up, and a reading outside every
+/// window is left uncorrected rather than covered by a curve nobody performed.
 #[tokio::test]
 #[serial]
-async fn backfill_calibrations_leaves_an_entered_curve_covering_its_readings() {
+async fn backfill_calibrations_resolves_covered_readings_and_creates_no_curve() {
     if !kc::require_keycloak_or_skip("backfill_calibrations_window_boundaries").await {
         return;
     }
@@ -282,8 +283,8 @@ async fn backfill_calibrations_leaves_an_entered_curve_covering_its_readings() {
     );
     let entered = add_curve(&fx, &covered, &depth, 2.0, 5.0, "2025-01-01T00:00:00Z").await;
 
-    // Control: an instrument whose history genuinely predates its first curve is what the action
-    // exists to repair, so a change that simply stops backfilling fails here instead of passing.
+    // Control: an instrument whose history genuinely predates its first curve. Nothing covers that
+    // reading, so nothing may be invented to cover it.
     let gapped = add_sensor(&fx, "WB-GAPPED-0001").await;
     let late = add_curve(&fx, &gapped, &turbidity, 3.0, 0.0, "2025-05-01T00:00:00Z").await;
 
@@ -337,7 +338,7 @@ async fn backfill_calibrations_leaves_an_entered_curve_covering_its_readings() {
     assert_eq!(
         curves.len(),
         1,
-        "readings that already fall inside an entered window need no identity curve: {curves:?}"
+        "the repair resolves against existing windows and adds none: {curves:?}"
     );
     assert_eq!(
         curves[0]["id"].as_str(),
@@ -376,45 +377,35 @@ async fn backfill_calibrations_leaves_an_entered_curve_covering_its_readings() {
     let gapped_curves = curves_of(&fx, &gapped).await;
     assert_eq!(
         gapped_curves.len(),
-        2,
-        "history predating every curve is covered by a backfilled identity: {gapped_curves:?}"
+        1,
+        "history predating every curve is left uncovered, not filled in: {gapped_curves:?}"
     );
     assert_eq!(
-        gapped_curves[0]["slope"].as_f64(),
-        Some(1.0),
-        "the backfilled curve is the identity: {gapped_curves:?}"
+        gapped_curves[0]["id"].as_str(),
+        Some(late.as_str()),
+        "the entered curve is the whole timeline: {gapped_curves:?}"
     );
     assert_eq!(
-        gapped_curves[0]["intercept"].as_f64(),
-        Some(0.0),
-        "the backfilled curve is the identity: {gapped_curves:?}"
-    );
-    let identity_from = boundary(&gapped_curves[0], "valid_from")
-        .unwrap_or_else(|| panic!("valid_from is never null: {gapped_curves:?}"));
-    assert!(
-        identity_from <= ts("2025-04-15T12:00:00Z"),
-        "the identity reaches back to the earliest uncovered reading: {gapped_curves:?}"
+        boundary(&gapped_curves[0], "valid_from"),
+        Some(ts("2025-05-01T00:00:00Z")),
+        "opening where the scientist entered it, not backdated over the earlier reading: \
+         {gapped_curves:?}"
     );
     assert_eq!(
         boundary(&gapped_curves[0], "valid_until"),
-        Some(ts("2025-05-01T00:00:00Z")),
-        "the identity stops where the entered curve begins: {gapped_curves:?}"
-    );
-    assert_eq!(
-        gapped_curves[1]["id"].as_str(),
-        Some(late.as_str()),
-        "the entered curve holds the later window: {gapped_curves:?}"
-    );
-    assert_eq!(
-        boundary(&gapped_curves[1], "valid_until"),
         None,
         "the entered curve holds the open end of the timeline: {gapped_curves:?}"
     );
     let gapped_series = series(&fx, &gapped, "2025-04-01T00:00:00Z", "2025-05-01T00:00:00Z").await;
     assert_eq!(
-        gapped_series.calibrated,
+        gapped_series.raw,
         vec![Some(30.0)],
-        "a reading under a backfilled identity serves its raw value"
+        "the measurement is served as it was uploaded"
+    );
+    assert_eq!(
+        gapped_series.calibrated,
+        vec![None],
+        "and carries no corrected value, because no curve covers it"
     );
 }
 

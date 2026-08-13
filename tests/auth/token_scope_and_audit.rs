@@ -215,13 +215,13 @@ async fn write_paths_confined_ingest_status_and_flags() {
 async fn read_endpoints_filtered_to_token_project() {
     let (db, app, _state) = setup().await;
 
-    // A sensor deployed in Project A and another in Project B, each with an identity calibration.
+    // A sensor deployed in Project A and another in Project B, each with its bench calibration.
     let sensor_a = slc::create_sensor(&db, "DepthSensorA", GLOBAL_PARAM_DEPTH_ID).await;
     slc::deploy_sensor(&db, sensor_a.id, SITE1_ID, slc::dt("2025-01-01T00:00:00Z")).await;
     let sensor_b = slc::create_sensor(&db, "DepthSensorB", GLOBAL_PARAM_DEPTH_ID).await;
     slc::deploy_sensor(&db, sensor_b.id, SITE_B_ID, slc::dt("2025-01-01T00:00:00Z")).await;
-    let cal_a = sensor_a.identity_calibration_id;
-    let cal_b = sensor_b.identity_calibration_id;
+    let cal_a = sensor_a.base_calibration_id;
+    let cal_b = sensor_b.base_calibration_id;
     let b_stream = slc::create_paired_stream(&db, "key-test-b-stats", SP_B_DEPTH_ID).await;
 
     let key = crate::common::seed_api_token(

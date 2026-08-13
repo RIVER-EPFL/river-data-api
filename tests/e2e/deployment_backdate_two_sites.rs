@@ -93,10 +93,11 @@ struct TwoSites {
 
 /// Track B, plus a downstream site and a real calibration, provisioned entirely over HTTP.
 ///
-/// The readings land identity-calibrated (`/ingest` writes `calibrated_value = raw_value`) and the
-/// curve is entered afterwards, which is the ordinary order of events for a field campaign: the
-/// `calibration_create` hook reprocesses the history the new window covers. Asserting the resulting
-/// buckets here is the anchor every test below measures its transition against.
+/// The readings land uncorrected (no curve covers them yet, so `/ingest` writes a null
+/// `calibrated_value`) and the curve is entered afterwards, which is the ordinary order of events
+/// for a field campaign: the `calibration_create` hook reprocesses the history the new window
+/// covers. Asserting the resulting buckets here is the anchor every test below measures its
+/// transition against.
 async fn two_site_fixture(db: &DatabaseConnection) -> TwoSites {
     let app = kc::build_test_app_with_keycloak(db.clone()).await;
     let admin = kc::get_keycloak_jwt("admin", "admin").await;

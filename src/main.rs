@@ -52,14 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Database connection pool established"
     );
 
-    // Set statement timeout as defense-in-depth against runaway queries
     use sea_orm::ConnectionTrait;
-    db.execute(sea_orm::Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        "SET statement_timeout = '30s'".to_string(),
-    ))
-    .await?;
-    tracing::info!("Statement timeout set to 30s");
 
     // Run migrations under a cross-replica advisory lock. With 2-3 replicas booting together,
     // concurrent Migrator::up can deadlock on ALTER / non-CONCURRENT CREATE INDEX. A dedicated
@@ -85,6 +78,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     lock_db.close().await?;
     migrate_result?;
     tracing::info!("Migrations completed");
+
+    // Statement timeout as defense-in-depth against runaway queries, set only once migrations are
+    // done. A migration that moves data legitimately runs for minutes, and the migrator draws from
+    // this pool, so a ceiling meant for request handling could otherwise abort one — and because
+    // Postgres runs every pending migration of a batch in a single transaction, that abort rolls
+    // back the whole batch. Migrations that need a wider ceiling still set their own `SET LOCAL`;
+    // this ordering is what keeps that from being something each one has to remember.
+    db.execute(sea_orm::Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SET statement_timeout = '30s'".to_string(),
+    ))
+    .await?;
+    tracing::info!("Statement timeout set to 30s");
 
     // Worker-pool jobs left mid-flight by a dead process are recovered by the lease reaper (they
     // carry a lease). In-process jobs do not carry a lease, so reap this replica's own leaseless

@@ -109,7 +109,7 @@ async fn two_curves_sharing_an_opening_instant_are_refused() {
     assert_eq!(
         curves.len(),
         2,
-        "the identity plus the one accepted curve, nothing more"
+        "the bench base plus the one accepted curve, nothing more"
     );
     for curve in &curves {
         assert_ne!(
@@ -148,7 +148,7 @@ async fn the_opening_instant_belongs_to_the_curve_it_opens() {
         SITE1_ID,
         GLOBAL_PARAM_TEMP_ID,
         sensor.id,
-        sensor.identity_calibration_id,
+        sensor.base_calibration_id,
         deployment,
         1.0,
         0.0,
@@ -221,11 +221,11 @@ async fn an_out_of_order_insert_chains_by_time() {
     );
 
     let curves = curves_of(&db, sensor.id).await;
-    assert_eq!(curves.len(), 3, "the identity plus both campaigns");
+    assert_eq!(curves.len(), 3, "the bench base plus both campaigns");
     assert_eq!(
         curves[0].valid_until,
         Some(dt("2025-02-01T00:00:00Z")),
-        "the identity now ends where the earlier campaign opens"
+        "the bench base now ends where the earlier campaign opens"
     );
     assert_eq!(
         curves[1].valid_until,
@@ -238,28 +238,20 @@ async fn an_out_of_order_insert_chains_by_time() {
     );
 }
 
-/// Readings that predate a sensor's only curve are covered by an identity curve inserted AHEAD of
-/// it. Inserting one behind it instead would make it the next window, and the chain would retract
-/// the scientist's curve to that instant, reverting every later reading to raw.
+/// Readings that predate a sensor's only curve stay uncorrected. Nothing invents a curve to cover
+/// them, so reprocess clears the correction they were carrying instead of preserving it, and the
+/// scientist's curve keeps the window it was entered with.
 #[tokio::test]
 #[serial]
-async fn identity_coverage_fills_the_leading_region_without_retracting_the_real_curve() {
+async fn a_reading_before_the_first_curve_is_left_uncorrected() {
     let db = setup_test_db().await;
     cleanup_test_db(&db).await;
     seed_base_entities(&db).await;
     let app = build_test_app(db.clone());
     let token = seed_api_token(&db, full_permissions(), None).await;
 
-    // A sensor with no calibration at all: created through the catalogue rather than the test
-    // helper, which mints an identity covering all of time.
-    let sensor_id = Uuid::new_v4();
-    exec_sql(
-        &db,
-        &format!(
-            "INSERT INTO sensors (id, name, is_active) VALUES ('{sensor_id}', 'window-leading', true)"
-        ),
-    )
-    .await;
+    // No bench curve: the leading region has to be genuinely uncovered for the clear to be visible.
+    let sensor_id = create_sensor_without_curve(&db, "window-leading").await;
 
     let (status, body) = post_json_parse_with_token(
         &app,
@@ -317,23 +309,21 @@ async fn identity_coverage_fills_the_leading_region_without_retracting_the_real_
     let curves = curves_of(&db, sensor_id).await;
     assert_eq!(
         curves.len(),
-        2,
-        "one identity curve was added, ahead of the real one"
+        1,
+        "the scientist's curve is the whole timeline: nothing is created to fill the gap ahead of it"
+    );
+    assert_eq!(
+        curves[0].id, real_curve,
+        "and it is the curve that was entered"
     );
     assert_eq!(
         curves[0].valid_from,
-        dt("2025-01-15T00:00:00Z"),
-        "the identity opens at the earliest uncovered reading"
+        dt("2025-02-01T00:00:00Z"),
+        "opening where the operator said, not backdated over the leading readings"
     );
     assert_eq!(
-        curves[0].valid_until,
-        Some(dt("2025-02-01T00:00:00Z")),
-        "and closes where the real curve opens"
-    );
-    assert_eq!(curves[1].id, real_curve, "the real curve is the later link");
-    assert_eq!(
-        curves[1].valid_until, None,
-        "and is not retracted: it still runs to the end of time"
+        curves[0].valid_until, None,
+        "and running to the end of time, unretracted"
     );
 
     let rows = get_readings(&db, stream).await;
@@ -346,9 +336,12 @@ async fn identity_coverage_fills_the_leading_region_without_retracting_the_real_
         .find(|r| r.time == dt("2025-03-15T00:00:00Z"))
         .expect("the reading inside the real curve");
     assert_eq!(
-        leading.calibrated_value,
-        Some(10.0),
-        "the leading reading is identity-corrected"
+        leading.calibration_id, None,
+        "no curve covers the leading reading"
+    );
+    assert_eq!(
+        leading.calibrated_value, None,
+        "so the copy of its raw value it was carrying is cleared, not preserved"
     );
     assert_eq!(
         covered.calibration_id,
@@ -356,4 +349,194 @@ async fn identity_coverage_fills_the_leading_region_without_retracting_the_real_
         "the later reading keeps the real curve"
     );
     assert_eq!(covered.calibrated_value, Some(20.0), "and carries 2*10");
+}
+
+/// A gap between two curves is as legal as the region before the first one, and reprocess treats it
+/// the same way: a reading inside it names no curve and serves no corrected value, even though
+/// curves exist on both sides of it.
+#[tokio::test]
+#[serial]
+async fn a_reading_in_a_gap_between_two_curves_is_cleared() {
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+    let app = build_test_app(db.clone());
+    let token = seed_api_token(&db, full_permissions(), None).await;
+
+    let sensor_id = create_sensor_without_curve(&db, "window-gap").await;
+    let early = add_calibration_for_parameter(
+        &db,
+        sensor_id,
+        GLOBAL_PARAM_TEMP_ID,
+        2.0,
+        0.0,
+        dt("2025-01-01T00:00:00Z"),
+    )
+    .await;
+    let late = add_calibration_for_parameter(
+        &db,
+        sensor_id,
+        GLOBAL_PARAM_TEMP_ID,
+        3.0,
+        0.0,
+        dt("2025-03-01T00:00:00Z"),
+    )
+    .await;
+    // The operator retires the early curve a month before the next one starts, leaving February
+    // uncovered on purpose.
+    exec_sql(
+        &db,
+        &format!(
+            "UPDATE sensor_calibrations \
+             SET valid_until = '2025-02-01T00:00:00Z', valid_until_explicit = true \
+             WHERE id = '{early}'"
+        ),
+    )
+    .await;
+
+    let deployment = deploy_sensor(&db, sensor_id, SITE1_ID, dt("2024-01-01T00:00:00Z")).await;
+    let stream = create_paired_stream(&db, "window-gap", PARAM_S1_TEMP_ID).await;
+    insert_readings(
+        &db,
+        stream,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        sensor_id,
+        early,
+        deployment,
+        2.0,
+        0.0,
+        &[
+            (dt("2025-01-15T00:00:00Z"), 10.0),
+            (dt("2025-02-15T00:00:00Z"), 10.0),
+            (dt("2025-03-15T00:00:00Z"), 10.0),
+        ],
+    )
+    .await;
+
+    let (status, run) = post_json_parse_with_token(
+        &app,
+        "/api/actions/reprocess",
+        &json!({ "sensor_id": sensor_id }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "reprocess the sensor ({status}): {run}");
+    let job_id = run["job_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("reprocess returns a tracked job: {run}"))
+        .to_string();
+    assert_eq!(
+        e2e::poll_job(&app, &token, &job_id, 60).await,
+        "completed",
+        "the reprocess job runs to completion"
+    );
+
+    let rows = get_readings(&db, stream).await;
+    let at = |time: &str| {
+        rows.iter()
+            .find(|r| r.time == dt(time))
+            .unwrap_or_else(|| panic!("no reading at {time}"))
+    };
+
+    let before = at("2025-01-15T00:00:00Z");
+    assert_eq!(
+        before.calibration_id,
+        Some(early),
+        "inside the early window"
+    );
+    assert_eq!(before.calibrated_value, Some(20.0), "carrying 2*10");
+
+    let inside = at("2025-02-15T00:00:00Z");
+    assert_eq!(
+        inside.calibration_id, None,
+        "the gap resolves no curve, and the stale reference to the retired one is dropped"
+    );
+    assert_eq!(
+        inside.calibrated_value, None,
+        "so the value that curve produced goes with it"
+    );
+
+    let after = at("2025-03-15T00:00:00Z");
+    assert_eq!(after.calibration_id, Some(late), "inside the later window");
+    assert_eq!(after.calibrated_value, Some(30.0), "carrying 3*10");
+}
+
+/// An instrument nobody has calibrated is an ordinary instrument: it deploys, it takes readings, and
+/// a reprocess over it succeeds while leaving every value uncorrected.
+#[tokio::test]
+#[serial]
+async fn a_sensor_with_no_curves_reprocesses_and_stays_uncorrected() {
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+    let app = build_test_app(db.clone());
+    let token = seed_api_token(&db, full_permissions(), None).await;
+
+    let sensor_id = create_sensor_without_curve(&db, "window-uncalibrated").await;
+    let deployment = deploy_sensor_for_parameter(
+        &db,
+        sensor_id,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        dt("2024-01-01T00:00:00Z"),
+    )
+    .await;
+    let stream = create_paired_stream(&db, "window-uncalibrated", PARAM_S1_TEMP_ID).await;
+    insert_readings_without_curve(
+        &db,
+        stream,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        sensor_id,
+        deployment,
+        &[
+            (dt("2025-01-15T00:00:00Z"), 10.0),
+            (dt("2025-02-15T00:00:00Z"), 20.0),
+        ],
+    )
+    .await;
+
+    let (status, run) = post_json_parse_with_token(
+        &app,
+        "/api/actions/reprocess",
+        &json!({ "sensor_id": sensor_id }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "reprocess the sensor ({status}): {run}");
+    let job_id = run["job_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("reprocess returns a tracked job: {run}"))
+        .to_string();
+    assert_eq!(
+        e2e::poll_job(&app, &token, &job_id, 60).await,
+        "completed",
+        "a sensor with nothing to resolve is not an error"
+    );
+
+    assert!(
+        curves_of(&db, sensor_id).await.is_empty(),
+        "and no curve was created on its behalf"
+    );
+
+    let rows = get_readings(&db, stream).await;
+    assert_eq!(rows.len(), 2, "both readings are still there: {rows:?}");
+    for row in &rows {
+        assert_eq!(
+            row.sensor_id,
+            Some(sensor_id),
+            "the reading stays attributed to the instrument: {row:?}"
+        );
+        assert_eq!(
+            row.deployment_id,
+            Some(deployment),
+            "and to its deployment: {row:?}"
+        );
+        assert_eq!(row.calibration_id, None, "with no curve to name: {row:?}");
+        assert_eq!(
+            row.calibrated_value, None,
+            "and no corrected value: {row:?}"
+        );
+    }
 }

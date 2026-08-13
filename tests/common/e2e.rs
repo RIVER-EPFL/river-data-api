@@ -92,11 +92,11 @@ pub fn percent_encode(s: &str) -> String {
         .collect()
 }
 
-/// The identity calibration auto-created alongside a sensor, if one exists.
+/// The sensor's earliest recorded calibration, if it has one.
 ///
-/// Returned as an Option rather than unwrapped so a caller can assert on its presence: the
-/// auto-creation is behaviour worth pinning, not an assumption to build on silently.
-pub async fn identity_calibration_id(app: &Router, token: &str, sensor_id: &str) -> Option<String> {
+/// Returns None for a sensor nobody has entered a curve for, which is an ordinary state: no path
+/// creates a calibration on a sensor's behalf, so a curve exists only where an operator put one.
+pub async fn first_calibration_id(app: &Router, token: &str, sensor_id: &str) -> Option<String> {
     let filter = percent_encode(&format!(r#"{{"sensor_id":"{sensor_id}"}}"#));
     let (status, body) = super::get_json_with_token(
         app,
@@ -319,6 +319,31 @@ pub async fn create_deployment(
             "site_id": site_id,
             "parameter_id": parameter_id,
             "deployed_from": deployed_from,
+        }),
+    )
+    .await
+}
+
+/// Enter a calibration curve on a sensor.
+pub async fn create_calibration(
+    app: &Router,
+    token: &str,
+    sensor_id: &str,
+    parameter_id: &str,
+    slope: f64,
+    intercept: f64,
+    valid_from: &str,
+) -> String {
+    create(
+        app,
+        token,
+        "/api/sensor_calibrations",
+        json!({
+            "sensor_id": sensor_id,
+            "parameter_id": parameter_id,
+            "slope": slope,
+            "intercept": intercept,
+            "valid_from": valid_from,
         }),
     )
     .await

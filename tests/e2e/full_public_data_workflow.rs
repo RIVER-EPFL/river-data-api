@@ -193,7 +193,7 @@ async fn test_full_public_data_workflow() {
         );
     }
 
-    // 5. Sensor + identity calibration (part of station setup).
+    // 5. Sensor + its bench calibration (part of station setup).
     let (_s, sensor) = crate::common::post_json_parse_with_token(
         &app,
         "/api/sensors",

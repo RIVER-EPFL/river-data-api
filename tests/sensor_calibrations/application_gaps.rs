@@ -223,6 +223,21 @@ impl Fixture {
         e2e::id_of(&body)
     }
 
+    /// Every curve a sensor carries.
+    async fn calibrations_of(&self, sensor_id: &str) -> Vec<Value> {
+        let filter = e2e::percent_encode(&format!(r#"{{"sensor_id":"{sensor_id}"}}"#));
+        let (status, body) = get_json_with_token(
+            &self.app,
+            &format!("/api/sensor_calibrations?filter={filter}"),
+            &self.jwt,
+        )
+        .await;
+        assert_eq!(status, 200, "list curves of {sensor_id} ({status}): {body}");
+        body.as_array()
+            .unwrap_or_else(|| panic!("the calibration list is an array: {body}"))
+            .clone()
+    }
+
     async fn calibration(&self, calibration: &str) -> Value {
         let (status, body) = get_json_with_token(
             &self.app,
@@ -684,8 +699,8 @@ async fn grab_readings_receive_their_resolved_curve() {
     );
 }
 
-// importing a stream's instrument stamps each reading with the curve whose window covers
-// it, and an identity curve minted by the import covers the history it is stamped on.
+// importing a stream's instrument stamps each reading with the curve whose window covers it, and
+// leaves a reading no window covers uncorrected.
 #[tokio::test]
 #[serial]
 async fn stream_import_attributes_each_reading_to_its_covering_curve() {
@@ -750,7 +765,8 @@ async fn stream_import_attributes_each_reading_to_its_covering_curve() {
         );
     }
 
-    // A stream with no instrument mints one, and mints its identity curve with it.
+    // A stream with no instrument mints one. The instrument is all it mints: an import adopts
+    // history, it does not decide how that history was corrected.
     let fresh_stream = f.register("appgap-import-fresh").await;
     f.ingest(&fresh_stream, &[(EARLY_READING, 20.0)]).await;
     let (status, imported) = post_json_parse_with_token(
@@ -764,9 +780,9 @@ async fn stream_import_attributes_each_reading_to_its_covering_curve() {
         status, 200,
         "import a stream with no linked instrument ({status}): {imported}"
     );
+    let fresh_sensor = str_field(&imported, "sensor_id");
     assert_ne!(
-        str_field(&imported, "sensor_id"),
-        f.sensor,
+        fresh_sensor, f.sensor,
         "a stream with no instrument mints its own: {imported}"
     );
     assert_eq!(
@@ -776,20 +792,23 @@ async fn stream_import_attributes_each_reading_to_its_covering_curve() {
 
     let fresh_rows = sl::get_readings(&f.db, as_uuid(&fresh_stream)).await;
     assert_eq!(fresh_rows.len(), 1, "the fresh stream holds its reading");
-    assert!(
-        fresh_rows[0].calibration_id.is_some(),
-        "import stamps a curve on the reading it attributes"
+    assert_eq!(
+        fresh_rows[0].sensor_id,
+        Some(as_uuid(&fresh_sensor)),
+        "the reading is attributed to the instrument the import created"
     );
-    let minted_curve = fresh_rows[0].calibration_id.unwrap().to_string();
-    let curve = f.calibration(&minted_curve).await;
-    let valid_from = time_field(&curve, "valid_from");
-    assert!(
-        valid_from.is_some(),
-        "the minted curve has a window start: {curve}"
+    assert_eq!(
+        fresh_rows[0].calibration_id, None,
+        "which has no curve, so the reading names none"
     );
-    assert!(
-        valid_from.unwrap() <= sl::dt(EARLY_READING),
-        "the curve minted on import covers the reading it is stamped on: {curve}"
+    assert_eq!(
+        fresh_rows[0].calibrated_value, None,
+        "and serves no corrected value"
+    );
+    assert_eq!(
+        f.calibrations_of(&fresh_sensor).await.len(),
+        0,
+        "and the import created no curve alongside the instrument"
     );
 }
 

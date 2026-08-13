@@ -12,7 +12,9 @@ use serde_json::json;
 use serial_test::serial;
 use uuid::Uuid;
 
-use crate::common::sensor_lifecycle::{create_sensor as create_inventory_sensor, deploy_sensor, dt};
+use crate::common::sensor_lifecycle::{
+    create_sensor as create_inventory_sensor, deploy_sensor, dt,
+};
 use crate::common::{GLOBAL_PARAM_TEMP_ID, PROJECT_ID, SITE1_ID};
 use river_db::common::authz::AccessScope;
 use river_db::error::AppError;

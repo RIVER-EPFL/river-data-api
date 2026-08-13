@@ -259,7 +259,9 @@ pub async fn admit_standard_curves(
     for claim in claims {
         let id = claim.standard_curve_id;
         let Some(curve) = curves.get(&id) else {
-            return Err(AppError::BadRequest(format!("Standard curve {id} not found")));
+            return Err(AppError::BadRequest(format!(
+                "Standard curve {id} not found"
+            )));
         };
         match claim.sensor_id {
             Some(sensor_id) if sensor_id == curve.sensor_id => {}

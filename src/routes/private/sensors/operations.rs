@@ -3,14 +3,14 @@ use chrono::Utc;
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
-    QueryFilter, QueryOrder, Set, Statement,
+    QueryFilter, Set, Statement,
 };
 use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::model::Sensor;
 use crate::error::{AppError, AppResult};
-use crate::routes::private::{data_streams, sensors, sensors::calibrations, sensors::deployments};
+use crate::routes::private::{data_streams, sensors, sensors::deployments};
 
 pub struct SensorOperations;
 
@@ -207,10 +207,9 @@ impl CRUDOperations for SensorOperations {
 #[derive(Debug, Clone)]
 pub struct SensorContext {
     pub sensor_id: Uuid,
-    pub calibration_id: Uuid,
     /// `None` when the sensor is not deployed to the target site at this time, the slot may be
     /// occupied by another sensor, or the sensor isn't adopted yet. Readings still carry
-    /// `sensor_id`/`calibration_id`; only the deployment FK is absent.
+    /// `sensor_id`; the deployment FK is absent.
     pub deployment_id: Option<Uuid>,
 }
 
@@ -347,7 +346,8 @@ async fn insert_or_get_sensor<C: ConnectionTrait>(
 /// Create or reuse a sensor for a data stream being paired.
 ///
 /// If the stream already has a `sensor_id`, reuses that sensor (ensures deployment exists for the target site).
-/// Otherwise creates a new sensor with identity calibration and deployment.
+/// Otherwise creates a new sensor and deployment; no calibration is created, the context carries
+/// whichever curve the sensor already has, if any.
 /// Updates `data_streams.sensor_id` to link the stream to the sensor.
 pub async fn create_sensor_for_stream<C: ConnectionTrait>(
     db: &C,
@@ -365,8 +365,8 @@ pub async fn create_sensor_for_stream<C: ConnectionTrait>(
 }
 
 /// Import-only: create or reuse a sensor for a stream and resolve its latest calibration, WITHOUT
-/// deploying it to a site. The "imported, not adopted" state, readings get `sensor_id`/
-/// `calibration_id` (so calibration math applies) but no `deployment_id`/`site_id` until an explicit
+/// deploying it to a site. The "imported, not adopted" state, readings get `sensor_id` (and the
+/// sensor's latest curve, if it has one) but no `deployment_id`/`site_id` until an explicit
 /// adopt. Idempotent: reuses the stream's linked sensor, else the existing `serial` sensor, else
 /// inserts one (race-safe via `insert_or_get_sensor`). Updates `data_streams.sensor_id`.
 pub async fn import_sensor_for_stream<C: ConnectionTrait>(
@@ -375,9 +375,8 @@ pub async fn import_sensor_for_stream<C: ConnectionTrait>(
 ) -> AppResult<SensorContext> {
     let serial = extract_vaisala_device_serial(&stream.metadata);
 
-    let (sensor_id, calibration_id) = if let Some(existing_sensor_id) = stream.sensor_id {
-        let cal_id = get_latest_calibration(db, existing_sensor_id).await?;
-        (existing_sensor_id, cal_id)
+    let sensor_id = if let Some(existing_sensor_id) = stream.sensor_id {
+        existing_sensor_id
     } else {
         let sensor_name = stream
             .source_name
@@ -385,64 +384,14 @@ pub async fn import_sensor_for_stream<C: ConnectionTrait>(
             .unwrap_or_else(|| format!("Stream {}", stream.source_key));
         let metadata = extract_source_metadata(&stream.metadata);
         let sensor_id = insert_or_get_sensor(db, serial.as_deref(), &sensor_name, metadata).await?;
-        let cal_id = get_latest_calibration(db, sensor_id).await?;
         link_stream_to_sensor(db, stream, sensor_id).await?;
-        (sensor_id, cal_id)
+        sensor_id
     };
 
     Ok(SensorContext {
         sensor_id,
-        calibration_id,
         deployment_id: None,
     })
-}
-
-/// Find the latest calibration for a sensor, or create an identity calibration if none exists.
-/// When creating, `valid_from` is set to the sensor's earliest reading time (if readings exist)
-/// so historical data is covered. Falls back to `NOW()` when no readings exist yet.
-async fn get_latest_calibration<C: ConnectionTrait>(db: &C, sensor_id: Uuid) -> AppResult<Uuid> {
-    let cal = calibrations::Entity::find()
-        .filter(calibrations::Column::SensorId.eq(sensor_id))
-        .order_by_desc(calibrations::Column::ValidFrom)
-        .one(db)
-        .await?;
-
-    if let Some(cal) = cal {
-        Ok(cal.id)
-    } else {
-        let earliest = db
-            .query_one(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT MIN(time) AS earliest FROM readings WHERE sensor_id = $1",
-                [sensor_id.into()],
-            ))
-            .await?;
-        let valid_from = earliest
-            .and_then(|r| {
-                r.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "earliest")
-                    .ok()
-            })
-            .map(|t| t.with_timezone(&Utc))
-            .unwrap_or_else(Utc::now);
-
-        let cal = calibrations::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            sensor_id: Set(sensor_id),
-            slope: Set(1.0),
-            intercept: Set(0.0),
-            valid_from: Set(valid_from),
-            performed_by: Set(Some("system".to_string())),
-            notes: Set(Some("Identity calibration (auto-created)".to_string())),
-            name: Set(None),
-            parameter_id: Set(None),
-            r_squared: Set(None),
-            valid_until: Set(None),
-            valid_until_explicit: Set(false),
-            created_at: Set(Some(Utc::now())),
-        };
-        let cal = cal.insert(db).await?;
-        Ok(cal.id)
-    }
 }
 
 /// Find this sensor's open deployment at the site, or auto-create one, but only if the
@@ -694,52 +643,43 @@ pub async fn resolve_slot_owner_for_times<C: ConnectionTrait>(
         return Ok(out);
     }
 
-    // Calibrations for the sensors that have deployments at this slot.
-    let cal_rows = db
-        .query_all(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT id, sensor_id, valid_from, valid_until
-              FROM sensor_calibrations
-              WHERE sensor_id IN (
-                  SELECT DISTINCT sensor_id FROM sensor_deployments
-                  WHERE site_id = $1 AND parameter_id = $2
-              )
-              ORDER BY valid_from",
-            [site_id.into(), parameter_id.into()],
-        ))
+    // Which deployment owns a time is answered here, because a deployment is what a slot is.
+    let mut owner_at: HashMap<chrono::DateTime<Utc>, (Uuid, Uuid)> = HashMap::new();
+    let mut times_by_sensor: HashMap<Uuid, Vec<chrono::DateTime<Utc>>> = HashMap::new();
+    for &t in times {
+        if let Some((dep_id, sensor_id, _, _)) = deps
+            .iter()
+            .find(|(_, _, from, until)| t >= *from && until.is_none_or(|u| t < u))
+        {
+            owner_at.insert(t, (*dep_id, *sensor_id));
+            times_by_sensor.entry(*sensor_id).or_default().push(t);
+        }
+    }
+
+    // Which curve covers a time is not. `resolver::resolve_for_times` is the one answer: it ranks a
+    // parameter-matching curve over a parameter-less one, and the latest covering window over an
+    // earlier one. Scanning this slot's curves in `valid_from` order instead would take the
+    // earliest covering window and disagree with every other write path.
+    let mut curve_at: HashMap<(Uuid, chrono::DateTime<Utc>), Uuid> = HashMap::new();
+    for (sensor_id, sensor_times) in &times_by_sensor {
+        let curves = sensors::calibrations::resolver::resolve_for_times(
+            db,
+            *sensor_id,
+            Some(parameter_id),
+            sensor_times,
+        )
         .await?;
-    let cals: Vec<SlotWindowRow> = cal_rows
-        .iter()
-        .map(|r| -> AppResult<_> {
-            let id: Uuid = r.try_get("", "id")?;
-            let sensor_id: Uuid = r.try_get("", "sensor_id")?;
-            let from: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "valid_from")?;
-            let until: Option<chrono::DateTime<chrono::FixedOffset>> =
-                r.try_get("", "valid_until")?;
-            Ok((
-                id,
-                sensor_id,
-                from.with_timezone(&Utc),
-                until.map(|u| u.with_timezone(&Utc)),
-            ))
-        })
-        .collect::<AppResult<_>>()?;
+        for (t, curve) in curves {
+            curve_at.insert((*sensor_id, t), curve.id);
+        }
+    }
 
     for &t in times {
-        let dep = deps
-            .iter()
-            .find(|(_, _, from, until)| t >= *from && until.is_none_or(|u| t < u));
-        let (deployment_id, sensor_id) = match dep {
-            Some((id, sid, _, _)) => (Some(*id), Some(*sid)),
+        let (deployment_id, sensor_id) = match owner_at.get(&t) {
+            Some((dep_id, sensor_id)) => (Some(*dep_id), Some(*sensor_id)),
             None => (None, None),
         };
-        let calibration_id = sensor_id.and_then(|sid| {
-            cals.iter()
-                .find(|(_, csid, from, until)| {
-                    *csid == sid && t >= *from && until.is_none_or(|u| t < u)
-                })
-                .map(|(id, _, _, _)| *id)
-        });
+        let calibration_id = sensor_id.and_then(|sid| curve_at.get(&(sid, t)).copied());
         out.insert(
             t,
             ResolvedOwner {

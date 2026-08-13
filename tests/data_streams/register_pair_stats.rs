@@ -161,7 +161,8 @@ async fn test_pair_stream_backfills_readings() {
         "all readings should have site_id after pairing"
     );
 
-    // Verify calibrated_value was set
+    // Pairing attributes the readings; it does not correct them. The instrument the stream names
+    // has no curve, so there is nothing to apply and calibrated_value stays null.
     let row = db
         .query_one(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -174,8 +175,8 @@ async fn test_pair_stream_backfills_readings() {
         .unwrap();
     let cal_count: i64 = row.try_get("", "c").unwrap();
     assert_eq!(
-        cal_count, 10,
-        "all readings should have calibrated_value after pairing"
+        cal_count, 0,
+        "pairing applies no correction of its own, so no reading acquires a calibrated_value"
     );
 }
 

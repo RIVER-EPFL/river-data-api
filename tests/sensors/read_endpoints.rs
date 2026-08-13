@@ -130,7 +130,7 @@ async fn sensor_read_substrate_endpoints() {
     let param_cals = body["calibrations"][crate::common::GLOBAL_PARAM_TEMP_ID]
         .as_array()
         .unwrap();
-    // The non-identity calibration (valid_from 2025-06-01) overlaps the window.
+    // The later calibration (valid_from 2025-06-01) overlaps the window.
     assert!(
         param_cals
             .iter()

@@ -28,7 +28,7 @@ async fn deploy_move_recall_reprocess_over_http() {
     let site1 = Uuid::parse_str(crate::common::SITE1_ID).unwrap();
     let site2 = Uuid::parse_str(crate::common::SITE2_ID).unwrap();
 
-    // Setup: sensor with a non-identity calibration (y = 2x + 1), deployed at site 1, producing
+    // Setup: sensor with a corrective calibration (y = 2x + 1), deployed at site 1, producing
     // six readings across the first hour. (DB helpers, no hooks needed for setup.)
     let sensor = sl::create_sensor(&db, "lifecycle", crate::common::GLOBAL_PARAM_TEMP_ID).await;
     let cal = sl::add_calibration(&db, sensor.id, 2.0, 1.0, sl::dt("2025-06-01T00:00:00Z")).await;

@@ -44,6 +44,13 @@ impl MigrationTrait for Migration {
         )
         .await?;
 
+        // `main.rs` sets a 30s `statement_timeout` on the pool the migrator may draw from, and
+        // sea-orm runs every pending migration in one transaction, so a statement that overruns
+        // rolls back the whole batch rather than just this migration. The updates below scan
+        // `readings`, which is unbounded, so they need longer than a request does.
+        db.execute_unprepared("SET LOCAL statement_timeout = '30min';")
+            .await?;
+
         // Ids are preserved, so repointing readings is a move between tables rather than a remap.
         // Order matters: copy, repoint, then delete, or the delete hits the readings foreign key.
         db.execute_unprepared(
@@ -54,7 +61,19 @@ impl MigrationTrait for Migration {
         .await?;
         db.execute_unprepared(
             "UPDATE readings SET standard_curve_id = calibration_id, calibration_id = NULL \
-             WHERE calibration_id IN (SELECT id FROM standard_curves);",
+             WHERE calibration_id IN (SELECT id FROM standard_curves) \
+               AND measurement_type = 'spot';",
+        )
+        .await?;
+        // A standard curve is a grab's correction, so only a grab may come out of the move carrying
+        // one. A logger row that named an instant curve loses the reference rather than gaining a
+        // second one the write paths refuse to create and reprocess would half-rewrite. Its stored
+        // value is left alone; window resolution owns that row and re-derives both the reference and
+        // the value from the timeline it covers.
+        db.execute_unprepared(
+            "UPDATE readings SET calibration_id = NULL \
+             WHERE calibration_id IN (SELECT id FROM standard_curves) \
+               AND measurement_type IS DISTINCT FROM 'spot';",
         )
         .await?;
         db.execute_unprepared("DELETE FROM sensor_calibrations WHERE mode = 'instant';")
@@ -128,11 +147,20 @@ impl MigrationTrait for Migration {
              FROM standard_curves;",
         )
         .await?;
+        // Grabs go back to naming their curve through `calibration_id`. A logger row whose instant
+        // reference `up` dropped is not restored: which curve it named is no longer recorded
+        // anywhere, and window resolution re-derives it.
         db.execute_unprepared(
             "UPDATE readings SET calibration_id = standard_curve_id, standard_curve_id = NULL \
              WHERE standard_curve_id IS NOT NULL;",
         )
         .await?;
+
+        // The curves live in `sensor_calibrations` again and nothing references them here, so the
+        // copies go. Leaving them would make the ids exist in both tables, and re-applying `up`
+        // would then conflict on the primary key.
+        db.execute_unprepared("DELETE FROM standard_curves;")
+            .await?;
 
         db.execute_unprepared("DROP INDEX IF EXISTS idx_readings_standard_curve_id;")
             .await?;

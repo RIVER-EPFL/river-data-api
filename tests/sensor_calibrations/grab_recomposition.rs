@@ -5,8 +5,10 @@
 //! Expected behaviour: the grab serves what the curves it names produce now, so the value and the
 //! two curve references beside it always agree; no window resolution is ever imposed on a grab, so
 //! a curve the grab does not carry never reaches it; and a grab that resolved no curve at all keeps
-//! a null value, which is what says no correction was made.
+//! a null value, which is what says no correction was made, unless a caller supplied a corrected
+//! number with no curve behind it, which is reported rather than overwritten.
 
+use crate::common::e2e;
 use crate::common::sensor_lifecycle::*;
 use crate::common::*;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
@@ -269,8 +271,8 @@ async fn a_windowed_edit_elsewhere_leaves_the_grab_alone() {
     let entered = grab_at(&fx.db, EARLY_GRAB).await;
     assert_eq!(
         entered.calibration_id,
-        Some(sensor.identity_calibration_id),
-        "the grab predates the later curve, so the identity window is its base"
+        Some(sensor.base_calibration_id),
+        "the grab predates the later curve, so the bench base is the window it resolves"
     );
     assert_close(
         entered.calibrated_value.expect("the curve was applied"),
@@ -295,7 +297,7 @@ async fn a_windowed_edit_elsewhere_leaves_the_grab_alone() {
     let after = grab_at(&fx.db, EARLY_GRAB).await;
     assert_eq!(
         after.calibration_id,
-        Some(sensor.identity_calibration_id),
+        Some(sensor.base_calibration_id),
         "no window resolution is imposed on a grab"
     );
     assert_eq!(after.standard_curve_id, Some(curve));
@@ -314,7 +316,7 @@ async fn a_windowed_edit_elsewhere_leaves_the_grab_alone() {
 async fn a_grab_that_resolved_no_curve_keeps_a_null_value() {
     let fx = setup().await;
     let sensor = create_sensor(&fx.db, "Plate-reader-03", GLOBAL_PARAM_TEMP_ID).await;
-    delete_calibration(&fx.db, sensor.identity_calibration_id).await;
+    delete_calibration(&fx.db, sensor.base_calibration_id).await;
 
     let (status, body) = post_grab(
         &fx,
@@ -366,8 +368,8 @@ async fn a_grab_that_resolved_no_curve_keeps_a_null_value() {
 }
 
 /// Deleting the calibration a reading was corrected with leaves it uncorrected. Writing the raw
-/// value into `calibrated_value` instead would say an identity curve was applied, which is the one
-/// thing a null is there to distinguish.
+/// value into `calibrated_value` instead would say a curve had been applied, which is the one thing
+/// a null is there to distinguish.
 #[tokio::test]
 #[serial]
 async fn deleting_the_only_covering_curve_leaves_the_value_null() {
@@ -387,15 +389,12 @@ async fn deleting_the_only_covering_curve_leaves_the_value_null() {
     assert_eq!(status, 200, "grab should succeed: {body}");
     assert_eq!(
         grab_at(&fx.db, LATE_GRAB).await.calibration_id,
-        Some(sensor.identity_calibration_id)
+        Some(sensor.base_calibration_id)
     );
 
     let (status, body) = delete_with_token(
         &fx.app,
-        &format!(
-            "/api/sensor_calibrations/{}",
-            sensor.identity_calibration_id
-        ),
+        &format!("/api/sensor_calibrations/{}", sensor.base_calibration_id),
         &fx.token,
     )
     .await;
@@ -411,7 +410,7 @@ async fn deleting_the_only_covering_curve_leaves_the_value_null() {
     );
     assert_eq!(
         after.calibrated_value, None,
-        "so it reads as uncorrected rather than as corrected by an identity"
+        "so it reads as uncorrected rather than as corrected by a curve nobody entered"
     );
 }
 
@@ -424,12 +423,8 @@ async fn an_accepted_end_date_is_recorded_as_the_operators_and_giving_it_back_is
     let sensor = create_sensor(&fx.db, "Sonde-12", GLOBAL_PARAM_TEMP_ID).await;
     let curve = add_calibration(&fx.db, sensor.id, 2.0, 0.0, dt(CURVE_FROM)).await;
 
-    let (status, body) = edit_calibration(
-        &fx,
-        curve,
-        json!({ "valid_until": "2025-09-01T00:00:00Z" }),
-    )
-    .await;
+    let (status, body) =
+        edit_calibration(&fx, curve, json!({ "valid_until": "2025-09-01T00:00:00Z" })).await;
     assert_eq!(status, 200, "retiring a curve is allowed: {body}");
     assert!(
         window_provenance(&fx.db, curve).await,
@@ -453,8 +448,7 @@ async fn a_rejected_update_leaves_the_window_provenance_unchanged() {
     let fx = setup().await;
     let sensor = create_sensor(&fx.db, "Sonde-11", GLOBAL_PARAM_TEMP_ID).await;
     add_calibration(&fx.db, sensor.id, 2.0, 0.0, dt(CURVE_FROM)).await;
-    let second =
-        add_calibration(&fx.db, sensor.id, 3.0, 0.0, dt("2025-03-01T00:00:00Z")).await;
+    let second = add_calibration(&fx.db, sensor.id, 3.0, 0.0, dt("2025-03-01T00:00:00Z")).await;
 
     let (status, body) = edit_calibration(
         &fx,
@@ -491,4 +485,137 @@ async fn a_rejected_update_leaves_the_window_provenance_unchanged() {
         dt("2025-03-01T00:00:00Z"),
         "and leaves the start date where it was"
     );
+}
+
+/// What the spot recomposition does with a grab that names neither curve turns on what the stored
+/// value is.
+///
+/// A copy of the raw value is what the old writers materialised for an uncorrected reading: it says
+/// nothing the raw column does not, and the recomposition clears it. A different number is somebody
+/// else's correction, arrived by a caller that supplied it without provenance, and nothing here can
+/// reproduce it: it is reported by `/actions/calibration_candidates` and left standing.
+#[tokio::test]
+#[serial]
+async fn a_grab_naming_no_curve_loses_a_copy_of_its_raw_value_but_keeps_a_correction() {
+    let fx = setup().await;
+    let sensor = create_sensor(&fx.db, "Plate-reader-09", GLOBAL_PARAM_TEMP_ID).await;
+    delete_calibration(&fx.db, sensor.base_calibration_id).await;
+
+    let spot = |time: &str, calibrated: f64| {
+        json!({
+            "site_id": SITE1_ID,
+            "parameter_id": GLOBAL_PARAM_TEMP_ID,
+            "time": time,
+            "raw_value": 10.0,
+            "calibrated_value": calibrated,
+            "sensor_id": sensor.id,
+            "measurement_type": "spot",
+        })
+    };
+    let (status, body) = post_json_with_token(
+        &fx.app,
+        "/api/readings/batch",
+        &json!({ "readings": [spot(EARLY_GRAB, 10.0), spot(LATE_GRAB, 99.0)] }),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "the batch insert should succeed: {body}");
+
+    for (time, stored) in [(EARLY_GRAB, 10.0), (LATE_GRAB, 99.0)] {
+        let entered = grab_at(&fx.db, time).await;
+        assert_eq!(entered.calibration_id, None);
+        assert_eq!(entered.standard_curve_id, None);
+        assert_eq!(
+            entered.calibrated_value,
+            Some(stored),
+            "the writer's value is what is stored, so the test starts from the state it creates"
+        );
+    }
+
+    let (status, body) = post_json_with_token(
+        &fx.app,
+        "/api/actions/reprocess",
+        &json!({ "sensor_id": sensor.id }),
+        &fx.token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "reprocessing the instrument should be accepted: {body}"
+    );
+    assert!(
+        wait_for_reprocessing(&fx.db, sensor.id, WAIT).await,
+        "the reprocess job settles without failing"
+    );
+
+    let copied = grab_at(&fx.db, EARLY_GRAB).await;
+    assert_eq!(
+        copied.calibrated_value, None,
+        "the copy of the raw value goes, so a null says plainly that no correction was made"
+    );
+    assert_eq!(copied.calibration_id, None, "and no curve is acquired");
+
+    let corrected = grab_at(&fx.db, LATE_GRAB).await;
+    assert_eq!(
+        corrected.calibrated_value,
+        Some(99.0),
+        "the correction nothing here can reproduce is left exactly as the caller wrote it"
+    );
+    assert_eq!(corrected.calibration_id, None, "and stays unaccounted for");
+    assert_eq!(corrected.standard_curve_id, None);
+}
+
+/// The same rule through the (site, parameter) engine, which is the one a backdate drives.
+#[tokio::test]
+#[serial]
+async fn a_backdate_leaves_a_corrected_value_no_curve_accounts_for_standing() {
+    let fx = setup().await;
+    let sensor = create_sensor(&fx.db, "Plate-reader-10", GLOBAL_PARAM_TEMP_ID).await;
+    // The backdate walks the deployed slots, so the instrument has to occupy one.
+    deploy_sensor(&fx.db, sensor.id, SITE1_ID, dt(DEPLOY_FROM)).await;
+    delete_calibration(&fx.db, sensor.base_calibration_id).await;
+
+    let (status, body) = post_json_with_token(
+        &fx.app,
+        "/api/readings/batch",
+        &json!({
+            "readings": [{
+                "site_id": SITE1_ID,
+                "parameter_id": GLOBAL_PARAM_TEMP_ID,
+                "time": LATE_GRAB,
+                "raw_value": 10.0,
+                "calibrated_value": 99.0,
+                "sensor_id": sensor.id,
+                "measurement_type": "spot",
+            }],
+        }),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "the batch insert should succeed: {body}");
+
+    let (status, run) =
+        post_json_parse_with_token(&fx.app, "/api/actions/reprocess_all", &json!({}), &fx.token)
+            .await;
+    assert!(
+        (200..300).contains(&status),
+        "the backdate should be accepted: {run}"
+    );
+    let job_id = run["job_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the backdate returns a tracked job: {run}"))
+        .to_string();
+    assert_eq!(
+        e2e::poll_job(&fx.app, &fx.token, &job_id, 60).await,
+        "completed",
+        "the backdate runs to completion"
+    );
+
+    let after = grab_at(&fx.db, LATE_GRAB).await;
+    assert_eq!(
+        after.calibrated_value,
+        Some(99.0),
+        "the backdate reports a correction no curve accounts for, it does not overwrite one"
+    );
+    assert_eq!(after.calibration_id, None);
 }

@@ -402,7 +402,7 @@ async fn worker_runs_registered_reprocess_job() {
         &db,
         &format!(
             "INSERT INTO sensor_calibrations (id, sensor_id, slope, intercept, valid_from, notes) \
-             VALUES ('{}', '{sensor_id}', 1.0, 0.0, '2000-01-01T00:00:00Z', 'identity')",
+             VALUES ('{}', '{sensor_id}', 1.0, 0.0, '2000-01-01T00:00:00Z', 'bench base')",
             Uuid::new_v4()
         ),
     )

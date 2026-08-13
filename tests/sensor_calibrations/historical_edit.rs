@@ -161,9 +161,9 @@ async fn add_curve(fx: &Fixture, slope: f64, intercept: f64, valid_from: &str) -
 
 /// Ingest raw readings as the river-level user who owns data entry.
 ///
-/// The ingest path writes `calibrated_value = raw_value` and resolves only the FK columns from the
-/// windows, so the curve arithmetic is not applied until a reprocess runs. `reprocess` below is
-/// what turns this into the pre-edit state each test asserts.
+/// The ingest path applies whatever curve covers the reading's time at write time, and writes a
+/// null `calibrated_value` when none does. `reprocess` below is what turns this into the pre-edit
+/// state each test asserts.
 async fn ingest(fx: &Fixture, stream_id: &str, rows: &[(&str, f64)]) {
     let readings: Vec<serde_json::Value> = rows
         .iter()

@@ -152,11 +152,12 @@ async fn provision_two_projects(app: &Router, admin: &str) -> Scene {
 }
 
 /// A slot with claimable pre-deployment history: an open deployment, unattributed readings before
-/// it starts, and attributed readings inside it whose sensor carries no calibration. Returns
-/// `(sensor_id, deployment_id)`.
+/// it starts, and an attributed reading inside a calibration window that never picked the curve up.
+/// Returns `(sensor_id, deployment_id)`.
 ///
 /// The first shape is what `backfill_candidates` and `backfill_attribution` operate on, the second
-/// what `calibration_candidates` operates on.
+/// what `calibration_candidates` operates on. The batch write is what leaves the second unstamped:
+/// a reading that names its own sensor skips slot-owner resolution, so no curve is applied to it.
 async fn seed_claimable_history(
     app: &Router,
     admin: &str,
@@ -167,6 +168,7 @@ async fn seed_claimable_history(
     let sensor = e2e::create_sensor(app, admin, parameter, serial).await;
     let deployment =
         e2e::create_deployment(app, admin, &sensor, site, parameter, &days_ago(5)).await;
+    e2e::create_calibration(app, admin, &sensor, parameter, 2.0, 0.0, &days_ago(30)).await;
 
     let (status, body) = crate::common::post_json_with_token(
         app,
@@ -899,7 +901,7 @@ async fn backfill_and_calibration_candidates_confine_to_the_callers_projects() {
     );
     assert!(
         body.contains(sensor_a.as_str()) && body.contains(sensor_b.as_str()),
-        "both projects have an uncalibrated sensor before scope is applied: {body}"
+        "both projects have a sensor with an unstamped reading before scope is applied: {body}"
     );
 
     let (status, body) =
@@ -933,7 +935,7 @@ async fn backfill_and_calibration_candidates_confine_to_the_callers_projects() {
     );
     assert!(
         body.contains(sensor_a.as_str()),
-        "the manager still sees the granted project's uncalibrated sensor: {body}"
+        "the manager still sees the granted project's candidate sensor: {body}"
     );
     assert!(
         !body.contains(sensor_b.as_str()),

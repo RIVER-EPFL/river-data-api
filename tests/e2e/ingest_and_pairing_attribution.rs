@@ -75,13 +75,13 @@ async fn batch_attributes_rows_inside_the_deployment_window() {
         "batch insert ({status}): {body}"
     );
 
-    // In-window row attributed to the sensor + its deployment + identity calibration.
+    // In-window row attributed to the sensor + its deployment + its base calibration.
     let (sid, did, cid) = attr_at(&db, "2025-07-01T00:00:00Z").await;
     assert_eq!(sid, Some(sensor.id), "in-window row gets sensor");
     assert_eq!(did, Some(dep), "in-window row gets deployment");
     assert_eq!(
         cid,
-        Some(sensor.identity_calibration_id),
+        Some(sensor.base_calibration_id),
         "in-window row gets calibration"
     );
 

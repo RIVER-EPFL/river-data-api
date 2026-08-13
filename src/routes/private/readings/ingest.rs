@@ -1,7 +1,11 @@
 use axum::{Json, extract::State};
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Set, Statement, TransactionTrait};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, Statement,
+    TransactionTrait,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -9,7 +13,10 @@ use crate::common::middleware::{IsSyncService, ProjectScope, enforce_project_sco
 use crate::common::{AppEvent, AppState};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::readings::batch::{Replace, admission, readings_upsert};
-use crate::routes::private::sensors::calibrations::{resolver, service::apply_curves};
+use crate::routes::private::sensors::calibrations::{
+    self, resolver,
+    service::{Curve, apply_curves},
+};
 use crate::routes::private::sensors::operations::{
     resolve_slot_owner_for_times, resolve_windows_for_times,
 };
@@ -87,8 +94,9 @@ async fn insert_reading_chunks<C: ConnectionTrait>(
 }
 
 /// Stream-based data ingestion. Inserts readings keyed by `stream_id`. If the stream is
-/// paired to a `site_parameter`, readings are stamped with `site_id`/`parameter_id` and an
-/// identity calibration. Unpaired streams insert with `site_id = NULL` (and won't show up
+/// paired to a `site_parameter`, readings are stamped with `site_id`/`parameter_id`, and each is
+/// corrected by whichever of the owning instrument's curves covers its own time; a reading no curve
+/// covers is stored uncorrected. Unpaired streams insert with `site_id = NULL` (and won't show up
 /// in continuous aggregates until paired). Requires `write_data`.
 #[utoipa::path(
     post,
@@ -96,7 +104,7 @@ async fn insert_reading_chunks<C: ConnectionTrait>(
     request_body = IngestReadingsRequest,
     responses(
         (status = 200, description = "Inserted count and pairing state", body = IngestResponse),
-        (status = 400, description = "Timestamp outside [-10 years, +1 day] window, or non-finite value"),
+        (status = 400, description = "Timestamp outside [-10 years, +1 day] window, non-finite value, or unknown calibration_id"),
         (status = 404, description = "Stream not found"),
     ),
     tag = "ingestion"
@@ -189,6 +197,47 @@ pub async fn ingest_readings(
         resolver::resolve_many(db, &requests).await?
     };
 
+    // A caller that names its own calibration is taken at its word about which curve applies, but
+    // the stored value is still computed from that curve's coefficients rather than trusted or left
+    // empty. Reference and value come from one curve on every reading, so nothing can store a
+    // correction its `calibration_id` did not produce. An id that names no row is refused here
+    // rather than left to the foreign key.
+    let declared_curves: HashMap<Uuid, Curve> = {
+        let mut ids: Vec<Uuid> = payload
+            .readings
+            .iter()
+            .filter_map(|r| r.calibration_id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            HashMap::new()
+        } else {
+            let found: HashMap<Uuid, Curve> = calibrations::Entity::find()
+                .filter(calibrations::Column::Id.is_in(ids.clone()))
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|c| {
+                    (
+                        c.id,
+                        Curve {
+                            id: c.id,
+                            slope: c.slope,
+                            intercept: c.intercept,
+                        },
+                    )
+                })
+                .collect();
+            if let Some(missing) = ids.iter().find(|id| !found.contains_key(id)) {
+                return Err(AppError::BadRequest(format!(
+                    "Calibration {missing} not found"
+                )));
+            }
+            found
+        }
+    };
+
     // Sensor-frequency defaults for every sensor a reading could resolve to (explicit, stream, or
     // slot owner), fetched in one query. Applied when neither the reading nor the stream declares
     // a measurement_type.
@@ -220,9 +269,22 @@ pub async fn ingest_readings(
                 .sensor_id
                 .or(stream.sensor_id)
                 .or_else(|| owner.and_then(|o| o.sensor_id));
-            // No window covers the time: store the raw value uncorrected, which is what a
-            // reprocess over the same windows would leave too.
-            let curve = sensor_id.and_then(|s| curves.get(&(s, parameter_id, r.time)));
+            // The one curve this reading is stored against: the caller's if it named one, else
+            // whichever window covers its own time. Both `calibration_id` and `calibrated_value`
+            // are derived from it, so a later reprocess re-resolving the same windows recomputes
+            // what is already stored instead of disagreeing with it. The deployment-derived slot
+            // and slot owner resolve calibrations by time alone, blind to the reading's parameter,
+            // so they are not consulted for a curve; they still answer for the deployment.
+            //
+            // No curve at all: `calibrated_value` stays NULL, which is what a reprocess over the
+            // same windows would leave too. Consumers read COALESCE(calibrated_value, raw_value),
+            // so the raw value is still what is served.
+            let curve = r
+                .calibration_id
+                .and_then(|id| declared_curves.get(&id).copied())
+                .or_else(|| {
+                    sensor_id.and_then(|s| curves.get(&(s, parameter_id, r.time)).copied())
+                });
             readings::ActiveModel {
                 // Sync ingestion never picks a lab curve; grabs are the only writer that does.
                 standard_curve_id: Set(None),
@@ -236,13 +298,9 @@ pub async fn ingest_readings(
                 site_id: Set(site_id.map(|paired| slot.and_then(|s| s.site_id).unwrap_or(paired))),
                 parameter_id: Set(parameter_id),
                 raw_value: Set(r.raw_value),
-                calibrated_value: Set(Some(apply_curves(r.raw_value, curve.copied(), None))),
+                calibrated_value: Set(curve.map(|c| apply_curves(r.raw_value, Some(c), None))),
                 sensor_id: Set(sensor_id),
-                calibration_id: Set(r
-                    .calibration_id
-                    .or_else(|| curve.map(|c| c.id))
-                    .or_else(|| slot.and_then(|s| s.calibration_id))
-                    .or_else(|| owner.and_then(|o| o.calibration_id))),
+                calibration_id: Set(curve.map(|c| c.id)),
                 deployment_id: Set(r
                     .deployment_id
                     .or_else(|| slot.and_then(|s| s.deployment_id))

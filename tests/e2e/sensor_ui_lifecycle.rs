@@ -1,7 +1,7 @@
 //! The sensor detail page's lifecycle actions, driven the way the dashboard drives them.
 //!
 //! Scenario: an operator recalls, re-opens, backdates and redeploys a sensor from the sensor page,
-//! and backfills calibration coverage from the sensors list.
+//! and repairs calibration attribution from the sensors list.
 //! Expected behaviour: attribution is always re-derivable from the deployment and calibration
 //! timelines, so every edit re-attributes the readings its window covers and leaves the rest alone.
 //!
@@ -13,8 +13,10 @@
 //! Those are the surfaces exercised here, not the operator POST endpoints other suites cover.
 //!
 //! Every fixture is provisioned over HTTP from an empty database as Track B: project, site,
-//! parameter, sensor, deployment, registered stream, pairing, then ingest cycles. SQL appears only
-//! to read columns no endpoint exposes (`readings.deployment_id`, `sensor_calibrations.valid_from`).
+//! parameter, sensor, deployment, registered stream, pairing, then ingest cycles. SQL appears to
+//! read columns no endpoint exposes (`readings.deployment_id`, `sensor_calibrations.valid_from`),
+//! and once to write the stored anomalies `/actions/calibration_candidates` reports, which no live
+//! endpoint produces.
 //! Each step runs as the lowest role that should be able to perform it, and the role below it is
 //! asserted to be refused.
 
@@ -146,7 +148,16 @@ struct CurveRow {
     slope: f64,
     intercept: f64,
     valid_from: DateTime<Utc>,
-    valid_until: Option<DateTime<Utc>>,
+}
+
+/// Run a statement that shapes stored state directly, for the rows no endpoint can produce.
+async fn exec(db: &DatabaseConnection, sql: &str) {
+    db.execute(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql.to_string(),
+    ))
+    .await
+    .unwrap_or_else(|e| panic!("{sql}: {e}"));
 }
 
 /// The sensor's earliest calibration window.
@@ -154,7 +165,7 @@ async fn earliest_curve(db: &DatabaseConnection, sensor_id: &str) -> CurveRow {
     let row = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, slope, intercept, valid_from, valid_until FROM sensor_calibrations \
+            "SELECT id, slope, intercept, valid_from FROM sensor_calibrations \
              WHERE sensor_id = $1 ORDER BY valid_from LIMIT 1",
             [uid(sensor_id).into()],
         ))
@@ -168,10 +179,6 @@ async fn earliest_curve(db: &DatabaseConnection, sensor_id: &str) -> CurveRow {
         slope: row.try_get("", "slope").expect("slope"),
         intercept: row.try_get("", "intercept").expect("intercept"),
         valid_from: valid_from.with_timezone(&Utc),
-        valid_until: row
-            .try_get::<DateTime<chrono::FixedOffset>>("", "valid_until")
-            .ok()
-            .map(|t| t.with_timezone(&Utc)),
     }
 }
 
@@ -487,8 +494,11 @@ async fn recall_then_reopen_via_edit_dates_restores_attribution() {
     ingest_cycle(&app, &river, &flow.stream, 1).await;
     let total = 2 * tracks::FLOW_READINGS_PER_CYCLE;
 
-    let identity = e2e::identity_calibration_id(&app, &admin, &flow.sensor).await;
-    let identity = uid(&identity.expect("pairing gives the sensor its identity calibration"));
+    assert_eq!(
+        e2e::first_calibration_id(&app, &admin, &flow.sensor).await,
+        None,
+        "pairing binds a sensor to the stream but records no curve for it"
+    );
 
     let deployment_path = format!("/api/sensor_deployments/{}", flow.deployment);
     let recall = json!({ "deployed_until": flow_at(10) });
@@ -594,16 +604,13 @@ async fn recall_then_reopen_via_edit_dates_restores_attribution() {
             r.time
         );
         assert_eq!(
-            r.calibration_id,
-            Some(identity),
-            "the deployment round trip re-derives attribution without disturbing the calibration \
-             window: {}",
+            r.calibration_id, None,
+            "no curve covers the instrument, and the deployment round trip does not invent one: {}",
             r.time
         );
         assert_eq!(
-            r.calibrated_value,
-            Some(r.raw_value),
-            "the identity curve leaves the value alone: {}",
+            r.calibrated_value, None,
+            "so the reading is served uncorrected throughout: {}",
             r.time
         );
     }
@@ -743,15 +750,15 @@ async fn backdate_deployed_from_claims_unattributed_slot_history() {
             "and the site: {}",
             r.time
         );
-        assert!(
-            r.calibration_id.is_some(),
-            "reprocessing extends calibration coverage over the claimed history: {}",
+        assert_eq!(
+            r.calibration_id, None,
+            "the backdate claims the history for the instrument; no curve covers it, so it \
+             names none: {}",
             r.time
         );
         assert_eq!(
-            r.calibrated_value,
-            Some(r.raw_value),
-            "the sensor's only curve is the identity, so values are unchanged: {}",
+            r.calibrated_value, None,
+            "and it stays uncorrected rather than acquiring a correction from the move: {}",
             r.time
         );
     }
@@ -785,31 +792,101 @@ async fn calibration_candidates_then_backfill_calibrations() {
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
     let flow = paired_flow_track(&app, &db, &admin).await;
+    let manager = actor(&db, "manager1", "riverdata-manager", &flow.track.project_id).await;
     let river = actor(&db, "river1", "riverdata-river", &flow.track.project_id).await;
     let intern = actor(&db, "intern1", "riverdata-intern", &flow.track.project_id).await;
 
     ingest_cycle(&app, &river, &flow.stream, 0).await;
     let ingested = tracks::FLOW_READINGS_PER_CYCLE as u64;
 
-    // The identity curve pairing created starts at pairing time, so back-dated readings sit before
-    // every calibration window and carry no calibration_id: the uncovered state the sensors list
-    // reports and offers to fix.
+    // An instrument nobody has calibrated is not an anomaly, and neither are its readings: with no
+    // curve on the sensor there is nothing a reprocess could stamp, so nothing is reported.
+    let (status, quiet) =
+        crate::common::get_json_with_token(&app, "/api/actions/calibration_candidates", &intern)
+            .await;
+    assert_eq!(
+        status, 200,
+        "an intern may read the calibration candidates ({status}): {quiet}"
+    );
+    assert_eq!(
+        quiet["total_candidates"].as_u64(),
+        Some(0),
+        "an uncalibrated instrument is an ordinary instrument: {quiet}"
+    );
+    assert_eq!(
+        quiet["total_orphaned_corrections"].as_u64(),
+        Some(0),
+        "and its readings carry no correction to account for: {quiet}"
+    );
+
+    let (status, created) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sensor_calibrations",
+        &json!({
+            "sensor_id": flow.sensor,
+            "slope": 2.0,
+            "intercept": 5.0,
+            "valid_from": flow_at(0),
+        }),
+        &manager,
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "a manager records the curve ({status}): {created}"
+    );
+    let curve_id = uid(&e2e::id_of(&created));
+    assert_eq!(
+        settled_jobs(&db, "calibration_create", 1, 60).await,
+        (1, 0),
+        "recording the curve reprocesses the readings it covers"
+    );
+
+    // The anomaly the endpoint exists to find: rows a window covers whose stamp is missing. It is
+    // made here by hand because no live path produces it any more; what is in the database from
+    // before the stamp was reliable still looks exactly like this.
+    exec(
+        &db,
+        &format!(
+            "UPDATE readings SET calibration_id = NULL, calibrated_value = NULL \
+             WHERE sensor_id = '{}'",
+            flow.sensor
+        ),
+    )
+    .await;
+
+    // And beside it, a correction nothing accounts for: no instrument, no curve of either kind, yet
+    // a stored value that is not the raw one. It names no sensor, so no reprocess can reach it,
+    // which is exactly why it has to be reported rather than repaired.
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO readings \
+             (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, replicate_index) \
+             SELECT stream_id, site_id, parameter_id, '{orphan_time}', 1.0, 99.0, 0 \
+             FROM readings WHERE sensor_id = '{sensor}' LIMIT 1",
+            orphan_time = flow_at(3600),
+            sensor = flow.sensor,
+        ),
+    )
+    .await;
+
     let (status, candidates) =
         crate::common::get_json_with_token(&app, "/api/actions/calibration_candidates", &intern)
             .await;
     assert_eq!(
         status, 200,
-        "an intern may read the calibration candidates ({status}): {candidates}"
+        "candidates with an anomaly present ({status}): {candidates}"
     );
     assert_eq!(
         candidates["total_candidates"].as_u64(),
         Some(1),
-        "the one sensor with uncovered readings is reported: {candidates}"
+        "the one sensor whose stamps are missing is reported: {candidates}"
     );
     assert_eq!(
         candidates["total_uncalibrated"].as_u64(),
         Some(ingested),
-        "every uncovered reading is counted: {candidates}"
+        "every reading the window covers but does not name is counted: {candidates}"
     );
     let candidate = candidates["candidates"][0].clone();
     assert_eq!(
@@ -820,25 +897,28 @@ async fn calibration_candidates_then_backfill_calibrations() {
     assert_eq!(
         candidate["uncalibrated_count"].as_u64(),
         Some(ingested),
-        "with its own uncovered count: {candidates}"
+        "with its own count: {candidates}"
     );
     assert_eq!(
         ts(&candidate, "target_from"),
         Some(flow_dt(0)),
-        "the earliest uncovered reading is the backfill target: {candidates}"
+        "the earliest unstamped reading is the target: {candidates}"
     );
     assert_eq!(
-        candidate["is_identity"].as_bool(),
-        Some(true),
-        "the sensor's earliest curve is the identity, so coverage can be extended in place: \
-         {candidates}"
+        ts(&candidate, "earliest_calibration_from"),
+        Some(flow_dt(0)),
+        "and the curve that covers it is the one already on the sensor: {candidates}"
     );
-    let earliest = ts(&candidate, "earliest_calibration_from")
-        .unwrap_or_else(|| panic!("the candidate reports the first curve's start: {candidates}"));
-    assert!(
-        earliest > flow_dt(0),
-        "the gap is real: the only curve starts at {earliest}, after the data at {}",
-        flow_at(0)
+
+    assert_eq!(
+        candidates["total_orphaned_corrections"].as_u64(),
+        Some(1),
+        "the value with no curve behind it is reported separately: {candidates}"
+    );
+    assert_eq!(
+        candidates["orphaned_corrections"][0]["count"].as_u64(),
+        Some(1),
+        "as its own class, not folded into the backfill count: {candidates}"
     );
 
     let backfill = "/api/actions/backfill_calibrations";
@@ -871,7 +951,7 @@ async fn calibration_candidates_then_backfill_calibrations() {
     assert_eq!(
         run["estimated_readings"].as_u64(),
         Some(ingested),
-        "over its uncovered readings: {run}"
+        "over its unstamped readings: {run}"
     );
     let job_id = run["job_id"]
         .as_str()
@@ -893,46 +973,56 @@ async fn calibration_candidates_then_backfill_calibrations() {
         )
         .await,
         1,
-        "the existing identity curve is extended in place, not duplicated"
+        "the backfill creates no calibration: it only resolves against the one that exists"
     );
     let curve = earliest_curve(&db, &flow.sensor).await;
-    assert!(
-        (curve.slope - 1.0).abs() < f64::EPSILON && curve.intercept.abs() < f64::EPSILON,
-        "coverage is filled with an identity curve, never invented coefficients: \
-         slope {} intercept {}",
-        curve.slope,
-        curve.intercept
+    assert_eq!(
+        curve.id, curve_id,
+        "and it is the curve the manager recorded"
     );
     assert_eq!(
         curve.valid_from,
         flow_dt(0),
-        "the curve now starts at the earliest reading it must cover"
+        "whose window is left exactly where it was entered"
     );
-    assert_eq!(
-        curve.valid_until, None,
-        "it is the sensor's only window, so nothing chains after it"
+    assert!(
+        (curve.slope - 2.0).abs() < f64::EPSILON && (curve.intercept - 5.0).abs() < f64::EPSILON,
+        "and whose coefficients are the measured ones: slope {} intercept {}",
+        curve.slope,
+        curve.intercept
     );
 
     let rows = slot_readings(&db, &flow.parameter).await;
+    let stamped: Vec<&SlotReading> = rows.iter().filter(|r| r.time < flow_dt(3600)).collect();
     assert_eq!(
-        rows.len(),
+        stamped.len(),
         tracks::FLOW_READINGS_PER_CYCLE,
         "the cycle is intact: {rows:?}"
     );
-    for r in &rows {
+    for r in stamped {
         assert_eq!(
             r.calibration_id,
             Some(curve.id),
-            "the reading at {} now resolves to the extended curve",
+            "the reading at {} resolves to the curve covering it",
             r.time
         );
         assert_eq!(
             r.calibrated_value,
-            Some(r.raw_value),
-            "and its identity-calibrated value equals its raw value: {}",
+            Some(2.0 * r.raw_value + 5.0),
+            "and carries that curve's correction: {}",
             r.time
         );
     }
+
+    let orphan = rows
+        .iter()
+        .find(|r| r.time == flow_dt(3600))
+        .expect("the orphaned correction is still stored");
+    assert_eq!(
+        orphan.calibrated_value,
+        Some(99.0),
+        "a value nobody can trace to a curve is reported, never overwritten"
+    );
 
     let (status, cleared) =
         crate::common::get_json_with_token(&app, "/api/actions/calibration_candidates", &intern)
@@ -949,7 +1039,12 @@ async fn calibration_candidates_then_backfill_calibrations() {
     assert_eq!(
         cleared["total_uncalibrated"].as_u64(),
         Some(0),
-        "and no reading is left uncovered: {cleared}"
+        "and no covered reading is left unstamped: {cleared}"
+    );
+    assert_eq!(
+        cleared["total_orphaned_corrections"].as_u64(),
+        Some(1),
+        "while the untraceable correction still stands, because nothing rewrote it: {cleared}"
     );
 }
 

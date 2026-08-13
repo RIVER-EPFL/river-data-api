@@ -40,7 +40,8 @@ struct Scene {
 }
 
 /// Project A (the seeded one) beside project B, each with an instrument, claimable pre-deployment
-/// history, uncalibrated attributed readings and one open alarm event.
+/// history, an attributed reading a calibration window covers but never stamped, and one open alarm
+/// event.
 async fn scene() -> Option<Scene> {
     if !kc::keycloak_reachable().await {
         eprintln!("SKIP: keycloak unreachable (start the dev stack, or set TEST_KEYCLOAK_URL)");
@@ -94,8 +95,19 @@ async fn scene() -> Option<Scene> {
             ),
         )
         .await;
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO sensor_calibrations \
+                     (id, sensor_id, parameter_id, slope, intercept, valid_from, name) \
+                 VALUES (gen_random_uuid(), '{sensor}', '{GLOBAL_PARAM_TEMP_ID}', 2.0, 0.0, \
+                     NOW() - INTERVAL '30 days', 'Bench')"
+            ),
+        )
+        .await;
         // Unattributed history before the deployment opens is what `backfill_candidates` reports;
-        // the attributed reading with no calibration is what `calibration_candidates` reports.
+        // the attributed reading inside the curve's window that carries no calibration_id is what
+        // `calibration_candidates` reports.
         crate::common::exec(
             &db,
             &format!(

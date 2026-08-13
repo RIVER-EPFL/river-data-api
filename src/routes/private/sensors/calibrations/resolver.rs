@@ -10,7 +10,7 @@
 //! specific first:
 //!
 //! 1. a curve authored for the reading's own parameter,
-//! 2. a parameter-bearing curve over the parameter-less identity,
+//! 2. a parameter-bearing curve over one that names no parameter,
 //! 3. the latest `valid_from`, then the highest `id` so a pair sharing an instant still resolves to
 //!    one row rather than to whichever the planner reached first.
 //!
@@ -142,8 +142,9 @@ pub async fn resolve_many<C: ConnectionTrait>(
 ///
 /// `POST /streams/{id}/import` adopts a stream's instrument into inventory; this is the readings
 /// half. Each reading takes the curve whose window covers its own time, not the sensor's newest
-/// curve, and is corrected with that curve's coefficients. Rows outside every window keep whatever
-/// calibration they had: reprocess would not re-stamp them either.
+/// curve, and is corrected with that curve's coefficients. No curve is created for the history being
+/// adopted: an instrument with none, or with none covering this stretch of time, is an ordinary
+/// state, and those readings simply keep what they had until a reprocess resolves them.
 ///
 /// `sensor_id IS NULL` is the idempotence key, so a second import reports nothing attributed.
 ///
@@ -158,26 +159,6 @@ pub async fn attribute_stream_by_window<C>(
 where
     C: ConnectionTrait + sea_orm::TransactionTrait,
 {
-    // The identity curve the import mints must cover the history it is about to attribute, so it is
-    // backdated to the stream's own earliest reading. `MIN(readings.time) WHERE sensor_id = $1` is
-    // still NULL at this point, the readings are exactly what this call is about to own.
-    let earliest = db
-        .query_one(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT MIN(time) AS earliest FROM readings WHERE stream_id = $1",
-            [stream_id.into()],
-        ))
-        .await?
-        .and_then(|r| {
-            r.try_get::<DateTime<chrono::FixedOffset>>("", "earliest")
-                .ok()
-        })
-        .map(|t| t.with_timezone(&Utc));
-
-    if let Some(earliest) = earliest {
-        super::service::ensure_identity_covers(db, sensor_id, earliest).await?;
-    }
-
     let sql = format!(
         r"UPDATE readings tgt
           SET sensor_id = $2,

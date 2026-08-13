@@ -905,6 +905,14 @@ impl CsvImport {
                     sensor_id,
                     &sensor_types,
                 );
+            // A value is only ever what a curve produced: with none resolved the column stays
+            // NULL, the same as an entry through `/grab_samples` or `/ingest`, so an uncorrected
+            // measurement is never mistaken for a corrected one. Consumers read
+            // COALESCE(calibrated_value, raw_value), so the raw value is still what is served.
+            let base = calibration_id
+                .and_then(|id| staged_curves.get(&id))
+                .copied();
+            let calibrated_value = base.map(|c| apply_curves(raw_value, Some(c), None));
             models.push(readings::ActiveModel {
                 standard_curve_id: Set(None),
                 stream_id: Set(stream_id),
@@ -913,13 +921,7 @@ impl CsvImport {
                 time: Set(time),
                 replicate_index: Set(0),
                 raw_value: Set(raw_value),
-                calibrated_value: Set(Some(apply_curves(
-                    raw_value,
-                    calibration_id
-                        .and_then(|id| staged_curves.get(&id))
-                        .copied(),
-                    None,
-                ))),
+                calibrated_value: Set(calibrated_value),
                 sensor_id: Set(sensor_id),
                 calibration_id: Set(calibration_id),
                 deployment_id: Set(deployment_id),
@@ -1158,8 +1160,8 @@ impl Job for BackfillAttribution {
     }
 }
 
-/// Re-derive `calibrated_value`/`calibration_id` for the sensors whose identity calibrations the
-/// handler just created/backdated. The sensor set is carried in `params.sensors`. Backs the
+/// Re-derive `calibrated_value`/`calibration_id` for the sensors carrying readings a calibration
+/// window covers but never stamped. The sensor set is carried in `params.sensors`. Backs the
 /// `backfill_calibrations` operator action. A failed sensor logs and continues.
 pub struct BackfillCalibrations;
 
