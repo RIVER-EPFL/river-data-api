@@ -1,5 +1,5 @@
-//! Grab-sample label/notes are stamped onto the sample rows the request creates or
-//! reuses, and a single-reading grab with a note still gets an n=1 sample.
+//! Grab-sample label/notes are stamped onto the sample rows the request creates or reuses, and a
+//! single-reading grab gets an n=1 sample whether or not it carries a note.
 //!
 //! Run with: cargo test --test samples label_notes
 
@@ -125,9 +125,12 @@ async fn single_reading_with_note_still_creates_sample() {
     assert_eq!(n, 1, "trigger counts the single reading");
 }
 
+/// A grab is a collection event from its first measurement, so a bare single reading gets its
+/// sample row too: the views that read grabs join through `samples`, and one without a row there
+/// would be invisible to them.
 #[tokio::test]
 #[serial]
-async fn single_reading_without_note_creates_no_sample() {
+async fn single_reading_without_note_still_creates_sample() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
@@ -143,8 +146,10 @@ async fn single_reading_without_note_creates_no_sample() {
     .await;
     assert_eq!(status, 200, "grab insert ({status}): {body}");
 
-    assert!(
-        sample_row(&db).await.is_none(),
-        "plain single grab stays sample-less"
-    );
+    let (label, notes, n) = sample_row(&db)
+        .await
+        .expect("sample row created for a bare single grab");
+    assert_eq!(label, None);
+    assert_eq!(notes, None);
+    assert_eq!(n, 1, "trigger counts the single reading");
 }

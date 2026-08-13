@@ -41,19 +41,27 @@ triggers, CrudCrate model hooks, and in-process subscribers and loops.
 
 | Trigger | Fires on | When | Why here rather than in the caller |
 |---------|----------|------|------------------------------------|
-| `trg_readings_sample_refresh_ins` / `_del` / `_upd` (`m20260420_000001_samples`) | `readings`, per row | AFTER INSERT / DELETE when `sample_id` is set; AFTER UPDATE when `sample_id`, `raw_value`, `calibrated_value` or `is_flagged` changes | Recomputes `samples.mean/stdev/n/min_value/max_value` over the non-flagged replicates of that `sample_id`. Five write paths plus several raw-SQL statements mutate `readings`, so the statistic holds for all of them only if the database maintains it. An UPDATE that moves the link refreshes both the old and the new sample. |
+| `trg_readings_sample_refresh_ins` / `_del` / `_upd` (`m20260420_000001_samples`, calling the `refresh_sample_aggregate` settled by `m20260813_000005`) | `readings`, per row | AFTER INSERT / DELETE when `sample_id` is set; AFTER UPDATE when `sample_id`, `raw_value`, `calibrated_value` or `is_flagged` changes | Recomputes `samples.mean/stdev/n/min_value/max_value` over the replicates of that `sample_id` whose `is_flagged IS NOT TRUE` (a flag that was never set is not a flag), and removes the sample once no reading references it at all rather than leaving an `n = 0` tombstone. Five write paths plus several raw-SQL statements mutate `readings`, so the statistic holds for all of them only if the database maintains it. An UPDATE that moves the link refreshes both the old and the new sample. |
 | `trg_inherit_calibration_parameter_id` (`m20260711_000004`, restated without the mode predicate by `m20260813_000004`) | `sensor_calibrations`, per row | BEFORE INSERT | Fills a curve's `parameter_id` from the sensor's first parameter-bearing curve when the request omits one, so a multi-channel instrument's curves land on a channel without every client knowing the rule. |
 | `trg_set_deployment_parameter_id` (`m20260603_000006`, redefined by `m20260711_000003`) | `sensor_deployments`, per row | BEFORE INSERT OR UPDATE OF `sensor_id` | Maintains the read-only `parameter_id` twin on a deployment. It is derived state, so it is computed where the row is written. |
 | `projects_default_subproject_trg` (`m20260710_000001`) | `projects`, per row | AFTER INSERT | Gives every project a default subproject, so `sites.subproject_id` can be NOT NULL without each project-creation path remembering to make one. |
 | `sites_ensure_subproject_trg` (`m20260710_000001`) | `sites`, per row | BEFORE INSERT OR UPDATE | Keeps `sites.subproject_id` and the denormalised `sites.project_id` consistent whichever one the writer set. |
 | `subprojects_move_cascade_trg` (`m20260711_000007`) | `subprojects`, per row | AFTER UPDATE OF `project_id`, when it actually changed | Carries the subproject's sites to the new project. The denormalised `sites.project_id` would otherwise disagree with the subproject's owner. |
 
-The samples triggers answer what a sample's statistics are, never whether a sample exists. That
-second question has one answer, `readings::sample_groups::forms_sample`: a group is a sample when
-the writer declared a collection event (every `POST /grab_samples` group) or when it carries two or
-more spot readings on a paired slot. The pairing and plan-apply backfills share one SQL
-materialiser in the same module, so the find-or-create and the `sample_id` stamping cannot disagree
-about what a group is.
+The samples triggers answer what a sample's statistics are and whether anything still references it.
+They never create one. Whether a group of readings is a sample has one answer,
+`readings::sample_groups::forms_sample`: a group is a sample when the writer declared a collection
+event (every `POST /grab_samples` group, and a CSV import that declares `measurement_type: "spot"`)
+or when it carries two or more spot readings on a paired slot. The CSV import and the pairing and
+plan-apply backfills share one SQL materialiser in the same module, keyed on
+`(site_id, parameter_id, time)`, which is the `samples` unique key, so the find-or-create and the
+`sample_id` stamping cannot disagree about what a group is. The materialiser applies the caller's
+row predicate to the stamping as well as to the grouping, so it cannot pull an unrelated stream's
+reading into a sample because it sits on the same slot at the same instant. Every writer of
+`samples`, `/grab_samples` included, inserts with `ON CONFLICT DO NOTHING` and then reads the row
+back: that unique key is what two concurrent entries for one collection event collide on, and
+yielding to whichever won costs a re-read, while testing for the row first costs a whole grab to a
+unique violation.
 
 ### CrudCrate model hooks
 
@@ -61,8 +69,8 @@ Fired by the generated CRUD routes for the entity named, in the API process.
 
 | Entity | Hooks | What they do | Why in the hook |
 |--------|-------|--------------|-----------------|
-| `sensor_calibrations` | `before_create`, `before_update`, `after_create`, `after_update`, `perform_delete` | Before: reject a second curve opening at an instant already taken for that sensor and parameter, and record in `valid_until_explicit` whether the update carried an end date, so the chain can tell an operator's window from its own. After: `recompute_valid_until` re-chains the windows, shortening an operator-set end date to the next curve's start rather than rewriting it, then enqueue a tracked `calibration_create\|update\|delete` job. Delete: move the curve's readings onto whichever of the sensor's remaining curves covers their time, recomputing each value (and re-applying its standard curve) in the same guarded statement, then delete and re-chain; a reading no remaining window covers is left uncorrected, carrying its raw value and no calibration. | The CRUD route has no other place to run before the insert, and the window chain has to be rebuilt for every path that writes a curve. A windowed calibration is deletable and its history reprocesses, which is deliberately unlike a standard curve: the uncorrected value is what ingest stores for a time outside every window and what a reprocess over the same windows recomputes, so the delete leaves the same state either path reaches. |
-| `standard_curves` | `before_create`, `before_update`, `before_delete`, `before_delete_many` | Before create: reject a zero slope. Before update: refuse a change to slope, intercept, name or instrument once a reading references the curve; notes stay editable. Before delete: refuse the delete on the same condition. | The `readings.standard_curve_id` foreign key already refuses the delete, but reports a constraint violation the CRUD layer surfaces as an internal error, so the hook is what makes it a stated 400 while the constraint stays the backstop for raw SQL. Editing is refused rather than reprocessed because a standard curve is picked by hand for one measurement: there is no window to reprocess and no way to tell which readings the operator meant to change. |
+| `sensor_calibrations` | `before_create`, `before_update`, `perform_update`, `after_create`, `after_update`, `perform_delete` | Before: reject a second curve opening at an instant already taken for that sensor and parameter, and reject an end date at or before the start. Update: the row's own UPDATE carries `valid_until_explicit` in the same statement, recording whether the end date is an operator's or the chain's; nothing is written before every validation has passed, so a rejected request leaves the row untouched. After: `recompute_valid_until` re-chains the windows, shortening an operator-set end date to the next curve's start rather than rewriting it, then enqueue a tracked `calibration_create\|update\|delete` job. Delete: move the curve's readings onto whichever of the sensor's remaining curves covers their time, recomputing each value through `recomposed_value_sql` (re-applying its standard curve) in the same guarded statement, then delete and re-chain; a reading no remaining window covers is left uncorrected, with no calibration and a null value. | The CRUD route has no other place to run before the insert, and the window chain has to be rebuilt for every path that writes a curve. `valid_until_explicit` sits outside both CRUD models, so it needs a write of its own; put it in `before_update` and a later rejection leaves the row permanently on the operator-window branch of `recompute_valid_until`, where `LEAST` ignores a NULL and the window can never reopen. A windowed calibration is deletable and its history reprocesses, which is deliberately unlike a standard curve: the uncorrected value is what ingest stores for a time outside every window and what a reprocess over the same windows recomputes, so the delete leaves the same state either path reaches. |
+| `standard_curves` | `before_create`, `before_update`, `before_delete`, `before_delete_many` | Before create: reject a zero slope. Before update: refuse a change to slope, intercept, fit quality, name, instrument or attribution once a reading references the curve; only notes stay editable. Before delete: refuse the delete on the same condition. | The `readings.standard_curve_id` foreign key already refuses the delete, but reports a constraint violation the CRUD layer surfaces as an internal error, so the hook is what makes it a stated 400 while the constraint stays the backstop for raw SQL. Editing is refused rather than reprocessed because a standard curve is picked by hand for one measurement: there is no window to reprocess and no way to tell which readings the operator meant to change. |
 | `sensor_deployments` | `before_create`, `before_update`, `after_create`, `after_update`, `perform_delete` | Before create: reject an inverted window, then check slot occupancy, then auto-recall the sensor's open deployments, in that order. Before update: the same, plus `follow_forward_move` so a predecessor's end date follows a start date corrected forward. After: `recompute_deployed_until`, then enqueue a tracked `deployment_create\|update\|delete` job. Delete: clear `readings.deployment_id` through the guarded bulk write. | Hooks do not share the write's transaction, so ordering every rejection ahead of every mutation is what makes a refused request side-effect-free. The `excl_deployment_site_param_slot` constraint stays the backstop. |
 | `site_parameters` | `after_create`, `after_update`, `before_delete`, `before_delete_many`, `after_delete`, `after_delete_many` | After create: backfill `name` from the catalog when the client sent an empty one, and enqueue `derived_assignment` for a derived slot. Before delete: `retire_slot` unattributes the slot's readings and status events, deletes its orphaned samples, releases the streams pointing at it and enqueues the rollup rebuild. After update/delete: reconcile alarm events. | The name backfill and the derived enqueue need a database lookup, so they cannot be `on_create` expressions. The teardown must run before CrudCrate's delete or the stream foreign key refuses it. |
 | `alarm_thresholds` | `after_create`, `after_update`, `after_delete`, `after_delete_many` | `reconcile_all_from_hook`: reconcile every active slot's alarm events immediately. | Evaluation reads thresholds live, so an edit changes the current breach set at once. Threshold edits are rare and the reconcile is O(active slots), so it does not wait for the backstop sweep. |
@@ -106,16 +114,33 @@ was corrected with; `standard_curve_id` is the curve the operator chose. With on
 base and an unrecorded base were indistinguishable. `GET /api/sites/{id}/readings?include_curves=true`
 serves both references per point, in JSON and in the CSV and NDJSON exports.
 
-`POST /grab_samples` takes the curve as `standard_curve_id` on each reading, and refuses one fitted
-on another instrument. The server resolves the base calibration from the instrument's windows at the
-grab time, applies the base first and the standard curve to that result, and stores the measured
-value, both references and the composed result together. The order is fixed in
-`calibrations::service::apply_curves`, the one function every path corrects a value through: nothing
+`POST /grab_samples` takes the curve as `standard_curve_id` on each reading, and `POST
+/readings/batch` accepts the same field for a caller replaying grabs. Both are held to one rule
+stated once in `readings::batch::admit_standard_curves`: a reading may name a curve only when it is
+that instrument's own spot measurement, so an unknown id, another instrument's curve, a reading
+naming no instrument and a continuous or derived reading are all 400. A curve on a reading that
+names no instrument is refused rather than taken on trust, because the reference is not decoration:
+it is what freezes the curve against edits and what a served value claims to have been corrected by,
+and neither is checkable without the instrument.
+A submitted `calibrated_value` is not stored alongside a curve either, because it cannot be checked
+against one, only recomputed from it. The server resolves the base calibration from the
+instrument's windows at the grab time, applies the base first and the standard curve to that result,
+and stores the measured value, both references and the composed result together. The order is fixed
+in `calibrations::service::apply_curves`, the one function every path corrects a value through: nothing
 on a stored row reveals which order produced it, so there is only one.
 
-Reprocessing leaves spot readings alone for the same reason. A window resolution cannot recover a
-hand-picked curve, so re-deriving a grab would replace a deliberate correction with a base curve.
-Grabs are corrected at entry instead.
+Reprocessing never resolves a grab's curves again. A window resolution cannot recover a hand-picked
+curve, so re-deriving a grab would replace a deliberate correction with whatever the timeline
+currently says; `calibrations::service::window_resolved_rows` is the one predicate that holds spot
+rows back, and every reprocess statement is written through it.
+
+What reprocessing does do is recompute a grab's value from the curves the row already names, in
+`recompose_spot_readings`. A grab records the base calibration it was corrected with, so editing
+that calibration's coefficients has to move the value it produced: leaving it would serve a number
+alongside a `calibration_id` that no longer describes it. The delete path recomposes the same way
+after repointing a reading onto its new covering curve, through the shared `recomposed_value_sql`,
+which is also what keeps a reading that ends up with neither curve at a null `calibrated_value`
+rather than a copy of its raw value.
 
 The database enforces existence: `readings.standard_curve_id` is a foreign key with no `ON DELETE`
 clause, so a curve a reading references cannot be deleted, by the API or by hand. The API enforces
@@ -130,14 +155,19 @@ window covers.
 instrument that produces it as `sensor_id`. It is optional: a caller that does not know the
 instrument omits it, and the instrument is resolved later from the metadata device serial when the
 stream is imported or paired. Declaring it is what keeps pairing from minting a second, serial-less
-instrument beside the real one, which is what happened while the field was undeclared and serde
-dropped it.
+instrument beside the real one: with no `sensor_id` and no device serial in the metadata, pairing
+has nothing to match on and creates a fresh instrument for the feed.
 
-A declared instrument is confined three ways. It has to exist. It has to sit inside the caller's
-project access, where a never-deployed instrument counts as reachable because that is the normal
-state of one being wired to its first feed. And it must not contradict the device serial the
-stream's own metadata reports, so a caller cannot name an instrument the feed does not describe.
-The route already refuses project-scoped tokens outright.
+A declared instrument is confined three ways. It has to exist. A caller confined to a project set
+may only name an instrument already deployed into one of those projects: inventory deployed nowhere
+belongs to no project, so nothing distinguishes another team's spare instrument from this caller's,
+and attaching one makes every reading the feed writes resolve that instrument's calibration
+windows. Wiring undeployed inventory to its first feed is therefore an unrestricted caller's
+operation, ie. an administrator or an unscoped sync service; the route already refuses
+project-scoped tokens outright. And the instrument must not contradict the device serial the
+stream's own metadata reports. That serial check is a cross-check on feeds that describe their
+device rather than the confinement itself: metadata arrives in the same request, so a caller can
+always omit it, and the project rule is what a restricted caller is held to.
 
 An instrument attaches to a feed that has none. Re-registering with the same instrument is a no-op,
 and moving an established feed to a different instrument is refused with a 409: that reattributes

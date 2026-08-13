@@ -1,10 +1,10 @@
 use async_trait::async_trait;
-use crudcrate::{ApiError, CRUDOperations, CRUDResource};
+use crudcrate::{ApiError, CRUDOperations, CRUDResource, MergeIntoActiveModel};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
 use super::model::SensorCalibration;
-use super::service::{calibrated_value_sql, recompute_valid_until};
+use super::service::{CurveColumns, recompute_valid_until, recomposed_value_sql};
 
 pub struct SensorCalibrationOperations;
 
@@ -50,20 +50,17 @@ async fn duplicate_instant_exists(
     Ok(found.is_some())
 }
 
-/// Record whether the row's `valid_until` is an operator's end date or the chain's.
-async fn set_valid_until_explicit(
-    db: &DatabaseConnection,
-    id: Uuid,
-    explicit: bool,
-) -> Result<(), ApiError> {
-    db.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "UPDATE sensor_calibrations SET valid_until_explicit = $2 WHERE id = $1",
-        [id.into(), explicit.into()],
-    ))
-    .await
-    .map_err(ApiError::database)?;
-    Ok(())
+/// Whether an update's `valid_until` makes the row's end date an operator's or the chain's again.
+/// `None` when the update carried no end date at all, which leaves the provenance as it stands.
+fn valid_until_provenance(
+    valid_until: Option<Option<chrono::DateTime<chrono::Utc>>>,
+) -> Option<bool> {
+    match valid_until {
+        Some(Some(_)) => Some(true),
+        // Cleared, so the window chain reclaims the row on the next recompute.
+        Some(None) => Some(false),
+        None => None,
+    }
 }
 
 #[async_trait]
@@ -116,30 +113,24 @@ impl CRUDOperations for SensorCalibrationOperations {
             return Ok(()); // unknown id, let CrudCrate's update produce the 404
         };
 
-        // The flag is written here, not in `after_update`: it sits outside both CRUD models, so
-        // CrudCrate's own UPDATE writes `valid_until` from the payload without touching it, and the
-        // recompute that `after_update` runs then reads the provenance already recorded.
+        // Nothing here writes: `perform_update` carries the provenance flag in the row's own UPDATE,
+        // so a request this hook goes on to reject leaves the chain treating the row exactly as it
+        // did before.
         let stored_from: chrono::DateTime<chrono::FixedOffset> = existing
             .try_get("", "valid_from")
             .map_err(ApiError::database)?;
-        match data.valid_until {
-            Some(Some(until)) => {
-                let opens_at = match data.valid_from {
-                    Some(Some(patched)) => patched,
-                    _ => stored_from.with_timezone(&chrono::Utc),
-                };
-                if until <= opens_at {
-                    return Err(ApiError::bad_request(
-                        "A calibration's end date must fall after its start date: a window that \
-                         closes at or before it opens applies to no reading."
-                            .to_string(),
-                    ));
-                }
-                set_valid_until_explicit(db, id, true).await?;
+        if let Some(Some(until)) = data.valid_until {
+            let opens_at = match data.valid_from {
+                Some(Some(patched)) => patched,
+                _ => stored_from.with_timezone(&chrono::Utc),
+            };
+            if until <= opens_at {
+                return Err(ApiError::bad_request(
+                    "A calibration's end date must fall after its start date: a window that \
+                     closes at or before it opens applies to no reading."
+                        .to_string(),
+                ));
             }
-            // Cleared, so the window chain reclaims the row on the next recompute.
-            Some(None) => set_valid_until_explicit(db, id, false).await?,
-            None => {}
         }
 
         // Moving a curve's start onto another curve's start is the same collision as creating one
@@ -160,6 +151,37 @@ impl CRUDOperations for SensorCalibrationOperations {
             return Err(ApiError::bad_request(DUPLICATE_INSTANT.to_string()));
         }
         Ok(())
+    }
+
+    /// The default update, with the `valid_until_explicit` provenance carried in the same statement.
+    ///
+    /// The flag sits outside both CRUD models, so nothing writes it unless this hook does. Written
+    /// from `before_update` instead, a request a later validation goes on to reject would still have
+    /// moved the row onto the operator-window branch of `recompute_valid_until`, where `LEAST`
+    /// ignores a NULL and the window can no longer reopen when the following curve is deleted. Set
+    /// on the active model, a rejected update leaves the row exactly as it was.
+    async fn perform_update(
+        &self,
+        db: &DatabaseConnection,
+        id: Uuid,
+        data: <SensorCalibration as CRUDResource>::UpdateModel,
+    ) -> Result<SensorCalibration, ApiError> {
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let provenance = valid_until_provenance(data.valid_until);
+        let existing = super::model::Entity::find_by_id(id)
+            .one(db)
+            .await
+            .map_err(ApiError::database)?
+            .ok_or_else(|| ApiError::not_found("sensor_calibration", Some(id.to_string())))?;
+
+        let mut active = data.merge_into_activemodel(existing.into_active_model())?;
+        if let Some(explicit) = provenance {
+            active.valid_until_explicit = Set(explicit);
+        }
+        let updated = active.update(db).await.map_err(ApiError::database)?;
+
+        Ok(SensorCalibration::from(updated))
     }
 
     async fn after_create(
@@ -231,25 +253,32 @@ impl CRUDOperations for SensorCalibrationOperations {
         // windowed calibration is deletable and its history reprocesses; that is deliberately
         // unlike a standard curve, which is frozen once a reading references it.
         //
-        // Spot rows are repointed here even though the reprocess engines leave them alone: their
-        // `calibration_id` is the base curve resolved at entry, and the operator's standard curve is
-        // preserved, re-applied on top of the new base.
+        // Spot rows are repointed here even though a window resolution otherwise never claims one:
+        // the curve their `calibration_id` names is going away, so the reference has to move. The
+        // operator's standard curve is preserved and re-applied on top of the new base.
         // A reading no remaining curve covers is left uncorrected, which is what ingest stores for a
         // time outside every window and what a reprocess over the same windows would recompute. The
         // lateral is an outer join for that reason: an inner one would skip those rows, and the
-        // foreign key would then refuse the delete.
-        let base = format!(
-            "CASE WHEN picked.cal_id IS NULL THEN tgt.raw_value ELSE {corrected} END",
-            corrected =
-                calibrated_value_sql("tgt.raw_value", "picked.slope", "picked.intercept"),
+        // foreign key would then refuse the delete. The value expression is the shared
+        // `recomposed_value_sql`, so a row left with neither curve reads NULL rather than its raw
+        // value.
+        let value = recomposed_value_sql(
+            "tgt.raw_value",
+            &CurveColumns {
+                id: "picked.cal_id",
+                slope: "picked.slope",
+                intercept: "picked.intercept",
+            },
+            &CurveColumns {
+                id: "sc.id",
+                slope: "sc.slope",
+                intercept: "sc.intercept",
+            },
         );
         let repoint_sql = format!(
             r"UPDATE readings tgt
               SET calibration_id = picked.cal_id,
-                  calibrated_value = CASE
-                      WHEN sc.id IS NULL THEN {base}
-                      ELSE {composed}
-                  END
+                  calibrated_value = {value}
               FROM (
                   SELECT r.stream_id AS p_stream_id, r.time AS p_time,
                          r.replicate_index AS p_replicate_index,
@@ -263,7 +292,6 @@ impl CRUDOperations for SensorCalibrationOperations {
               WHERE tgt.stream_id = picked.p_stream_id
                 AND tgt.time = picked.p_time
                 AND tgt.replicate_index = picked.p_replicate_index",
-            composed = calibrated_value_sql(&format!("({base})"), "sc.slope", "sc.intercept"),
             pick = super::resolver::pick_calibration_lateral_excluding("$2", Some("$1")),
         );
         crate::common::bulk_write::guarded_mutation(

@@ -34,7 +34,8 @@ pub struct Model {
     pub notes: Option<String>,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: chrono::DateTime<chrono::Utc>,
-    #[crudcrate(exclude(create, update))]
+    /// Who fitted the curve, supplied by the caller as on notes, annotations, samples and pairing
+    /// plans. Writable, otherwise the column could never hold anything.
     pub created_by: Option<String>,
 }
 

@@ -148,9 +148,10 @@ pub async fn get_site_sensor_identity(
 
     // Calibration markers: calibrations (overlapping the window) of the sensors deployed at this
     // site over the window, grouped by the sensor's parameter.
-    // Markers use the calibration's own parameter (the sensor no longer carries one); only windowed
-    // calibrations with a resolved parameter are plottable markers (instant grab curves and
-    // not-yet-attributed identity calibrations are excluded).
+    // Markers use the calibration's own parameter (the sensor no longer carries one), so a
+    // calibration whose parameter is not resolved yet has no series to sit on and is not a
+    // plottable marker. Lab curves cannot appear here at all: they live in `standard_curves`,
+    // which has no window to plot.
     let mut cal_sql = String::from(
         r"SELECT c.id AS calibration_id, c.sensor_id, c.parameter_id,
                  c.slope, c.intercept, c.valid_from, c.valid_until

@@ -287,12 +287,18 @@ pub async fn register_stream(
 
 /// Confine a caller-declared instrument to one the caller has a relationship to.
 ///
-/// Three conditions: the instrument exists; it sits inside the caller's project access, where
-/// never-deployed inventory counts as reachable because that is the normal state of an instrument
-/// being wired to its first feed; and it does not contradict the device serial the stream's own
-/// metadata carries. A sync service legitimately knows which logger produced a feed, so the route
-/// stays open to session tokens, but a caller cannot name an instrument the feed does not describe.
-async fn validate_declared_sensor(
+/// The relationship required of a caller confined to a project set is deployment: the instrument
+/// must already be deployed into one of that caller's projects. Inventory that is deployed nowhere
+/// belongs to no project, so nothing distinguishes another team's spare instrument from this
+/// caller's, and attaching one makes every reading the feed writes resolve that instrument's
+/// calibration windows. Wiring an undeployed instrument to its first feed is therefore an
+/// unrestricted caller's operation, ie. an administrator or an unscoped sync service.
+///
+/// Two further conditions hold for every caller: the instrument exists, and it does not contradict
+/// the device serial the stream's own metadata carries. That serial check is a cross-check on feeds
+/// that describe their device, not the confinement: metadata arrives in the same request, so a
+/// caller can always omit it, and the scope guard above is what a restricted caller is held to.
+pub async fn validate_declared_sensor(
     db: &DatabaseConnection,
     scope: &crate::common::authz::AccessScope,
     sensor_id: Uuid,
@@ -304,7 +310,7 @@ async fn validate_declared_sensor(
         .ok_or_else(|| AppError::NotFound("Sensor not found".to_string()))?;
 
     let project = scope::project_of_sensor(db, sensor_id).await?;
-    scope::require_target_in_scope(scope, &project, scope::Unowned::Allow, "instrument")?;
+    scope::require_target_in_scope(scope, &project, scope::Unowned::Deny, "instrument")?;
 
     if let Some(declared_serial) = extract_vaisala_device_serial(metadata)
         && sensor.serial_number.as_deref() != Some(declared_serial.as_str())
@@ -486,10 +492,10 @@ pub async fn pair_stream(
         // A per-reading measurement_type set at ingest outranks the stream declaration and must
         // survive pairing.
         //
-        // The curve pairing mints is the identity, so copying the raw value across was the same
-        // number and the stamp-without-apply never surfaced; reading the coefficients back keeps
-        // the value and the id it claims in agreement whatever the curve turns out to be. A reading
-        // that already carries a corrected value keeps it.
+        // The value is computed from the coefficients of the curve being stamped, not copied from
+        // the raw value: the two agree only while that curve is the identity, and a row must never
+        // carry a value the calibration id it claims did not produce. A reading that already
+        // carries a corrected value keeps it.
         let backfill_value = calibrations::service::calibrated_value_sql(
             "readings.raw_value",
             "c.slope",

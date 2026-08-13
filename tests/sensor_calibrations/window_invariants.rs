@@ -37,7 +37,7 @@ async fn curves_of(db: &DatabaseConnection, sensor_id: Uuid) -> Vec<Curve> {
         DatabaseBackend::Postgres,
         format!(
             "SELECT id, slope, valid_from, valid_until FROM sensor_calibrations \
-             WHERE sensor_id = '{sensor_id}' AND mode = 'windowed' ORDER BY valid_from, id"
+             WHERE sensor_id = '{sensor_id}' ORDER BY valid_from, id"
         ),
     ))
     .await

@@ -27,6 +27,8 @@ pub struct ReadingRow {
     pub parameter_id: Option<Uuid>,
     pub sensor_id: Option<Uuid>,
     pub calibration_id: Option<Uuid>,
+    /// The hand-picked lab curve a grab names, held separately from the windowed calibration.
+    pub standard_curve_id: Option<Uuid>,
     pub deployment_id: Option<Uuid>,
 }
 
@@ -324,7 +326,7 @@ pub async fn get_readings(db: &DatabaseConnection, stream_id: Uuid) -> Vec<Readi
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT time, raw_value, calibrated_value, site_id, parameter_id, \
-                    sensor_id, calibration_id, deployment_id \
+                    sensor_id, calibration_id, standard_curve_id, deployment_id \
              FROM readings WHERE stream_id = $1 ORDER BY time",
             [stream_id.into()],
         ))
@@ -342,6 +344,7 @@ pub async fn get_readings(db: &DatabaseConnection, stream_id: Uuid) -> Vec<Readi
                 parameter_id: r.try_get("", "parameter_id").ok(),
                 sensor_id: r.try_get("", "sensor_id").ok(),
                 calibration_id: r.try_get("", "calibration_id").ok(),
+                standard_curve_id: r.try_get("", "standard_curve_id").ok(),
                 deployment_id: r.try_get("", "deployment_id").ok(),
             }
         })
@@ -394,7 +397,7 @@ pub async fn get_readings_for_sensor(db: &DatabaseConnection, sensor_id: Uuid) -
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT time, raw_value, calibrated_value, site_id, parameter_id, \
-                    sensor_id, calibration_id, deployment_id \
+                    sensor_id, calibration_id, standard_curve_id, deployment_id \
              FROM readings WHERE sensor_id = $1 ORDER BY time",
             [sensor_id.into()],
         ))
@@ -412,6 +415,7 @@ pub async fn get_readings_for_sensor(db: &DatabaseConnection, sensor_id: Uuid) -
                 parameter_id: r.try_get("", "parameter_id").ok(),
                 sensor_id: r.try_get("", "sensor_id").ok(),
                 calibration_id: r.try_get("", "calibration_id").ok(),
+                standard_curve_id: r.try_get("", "standard_curve_id").ok(),
                 deployment_id: r.try_get("", "deployment_id").ok(),
             }
         })

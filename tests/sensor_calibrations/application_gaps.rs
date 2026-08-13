@@ -725,8 +725,9 @@ async fn stream_import_attributes_each_reading_to_its_covering_curve() {
         "import reuses the instrument the stream is linked to: {imported}"
     );
     assert_eq!(
-        imported["attributed"], 2,
-        "both unattributed readings are stamped: {imported}"
+        imported["attributed"], 0,
+        "the stream declared its instrument at registration, so its readings were attributed as \
+         they were written and import finds nothing left to stamp: {imported}"
     );
 
     let rows = sl::get_readings(&f.db, as_uuid(&f.stream)).await;

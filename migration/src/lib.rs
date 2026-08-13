@@ -52,6 +52,7 @@ mod m20260812_000004_sync_command_expiry_not_null;
 mod m20260813_000001_calibration_valid_until_explicit;
 mod m20260813_000003_standard_curves;
 mod m20260813_000004_readings_standard_curve_fk;
+mod m20260813_000005_sample_trigger_predicate;
 
 pub struct Migrator;
 
@@ -111,6 +112,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260813_000001_calibration_valid_until_explicit::Migration),
             Box::new(m20260813_000003_standard_curves::Migration),
             Box::new(m20260813_000004_readings_standard_curve_fk::Migration),
+            Box::new(m20260813_000005_sample_trigger_predicate::Migration),
         ]
     }
 }

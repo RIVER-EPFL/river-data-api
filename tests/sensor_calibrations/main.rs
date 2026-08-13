@@ -8,9 +8,9 @@ mod common;
 
 mod application_gaps;
 mod formula_evaluation;
+mod grab_recomposition;
 mod forward_new_data;
 mod historical_edit;
-mod instant_curve;
 mod reprocessing;
 mod standard_curves;
 mod window_boundaries;

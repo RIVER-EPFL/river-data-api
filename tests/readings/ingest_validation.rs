@@ -875,26 +875,49 @@ async fn csv_import_refuses_a_duplicated_timestamp_in_a_continuous_file() {
         "the second csv_import job runs and succeeds"
     );
 
-    let filter = e2e::percent_encode(&format!(r#"{{"parameter_id":"{spot_parameter_id}"}}"#));
-    let (status, samples) =
-        crate::common::get_json_with_token(&app, &format!("/api/samples?filter={filter}"), &admin)
-            .await;
+    // A spot declaration says these rows are collection events, so each one is a grab with its own
+    // sample and the repeated timestamp is simply the group carrying two replicates.
+    let replicate_group = e2e::count(
+        &db,
+        &format!(
+            "SELECT count(*) FROM samples WHERE site_id = '{}' AND parameter_id = '{spot_parameter_id}' \
+             AND collected_at = '{at}' AND n = 2",
+            continuous_slot.site_id
+        ),
+    )
+    .await;
     assert_eq!(
-        status, 200,
-        "list the spot column's samples ({status}): {samples}"
+        replicate_group, 1,
+        "the repeated timestamp is one sample over both replicates"
     );
-    let rows = samples
-        .as_array()
-        .unwrap_or_else(|| panic!("the samples list is an array: {samples}"));
-    assert_eq!(
-        rows.len(),
-        1,
-        "the spot-declared replicate group is one sample: {samples}"
-    );
-    assert_eq!(rows[0]["n"], 2, "both replicates count: {samples}");
+
+    let single_row_grabs = e2e::count(
+        &db,
+        &format!(
+            "SELECT count(*) FROM samples WHERE site_id = '{}' AND parameter_id = '{spot_parameter_id}' \
+             AND collected_at <> '{at}' AND n = 1",
+            continuous_slot.site_id
+        ),
+    )
+    .await;
     assert!(
-        (f64_at(&rows[0], "mean") - repeated_value).abs() < 1e-9,
-        "the sample mean is the repeated value: {samples}"
+        single_row_grabs > 0,
+        "a grab measured once is a collection event too, and gets its samples row"
+    );
+
+    let carries_the_value = e2e::count(
+        &db,
+        &format!(
+            "SELECT count(*) FROM samples \
+             WHERE site_id = '{}' AND parameter_id = '{spot_parameter_id}' \
+               AND collected_at = '{at}' AND abs(mean - {repeated_value}) < 1e-9",
+            continuous_slot.site_id
+        ),
+    )
+    .await;
+    assert_eq!(
+        carries_the_value, 1,
+        "the sample mean is the repeated value {repeated_value}"
     );
 }
 

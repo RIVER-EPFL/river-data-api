@@ -119,12 +119,15 @@ async fn test_insert_triplicate_grab_samples() {
 }
 
 // ============================================================================
-// Single reading (no replicates), should NOT create a sample
+// Single reading (no replicates), still gets its own sample row
 // ============================================================================
 
+/// A grab is a collection event from its first measurement. The views that read grabs, the
+/// sensor-vs-grab export and the standard-curve filter among them, join through `samples`, so a
+/// single-replicate grab needs a row there to be visible at all.
 #[tokio::test]
 #[serial]
-async fn test_single_grab_sample_no_sample_row() {
+async fn test_single_grab_sample_creates_sample_row() {
     let (app, token, db) = setup().await;
 
     let (status, body) = crate::common::post_json_with_token(
@@ -143,16 +146,15 @@ async fn test_single_grab_sample_no_sample_row() {
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["inserted"], 1);
     assert_eq!(
-        json["samples_created"], 0,
-        "single reading should not create a sample"
+        json["samples_created"], 1,
+        "a single-replicate grab is still a collection event"
     );
 
-    // Verify no sample row for this parameter+time
     let row = db
         .query_one(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
-                "SELECT COUNT(*) as c FROM samples \
+                "SELECT COUNT(*) as c, MIN(n) as n FROM samples \
                  WHERE site_id = '{}' AND parameter_id = '{}' \
                  AND collected_at = '2025-06-15T11:00:00Z'",
                 crate::common::SITE1_ID,
@@ -163,7 +165,9 @@ async fn test_single_grab_sample_no_sample_row() {
         .unwrap()
         .unwrap();
     let count: i64 = row.try_get("", "c").unwrap();
-    assert_eq!(count, 0);
+    let n: Option<i32> = row.try_get("", "n").unwrap();
+    assert_eq!(count, 1, "exactly one sample row for the grab");
+    assert_eq!(n, Some(1), "trigger counts the single replicate");
 }
 
 // ============================================================================
@@ -193,7 +197,10 @@ async fn test_multi_parameter_grab_samples() {
     assert_eq!(status, 200, "insert should succeed: {body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["inserted"], 3);
-    assert_eq!(json["samples_created"], 1, "only Temp has 2+ replicates");
+    assert_eq!(
+        json["samples_created"], 2,
+        "one sample per (parameter, instant) group, the single Conductivity grab included"
+    );
 }
 
 // ============================================================================
@@ -346,12 +353,12 @@ async fn test_grab_samples_require_write_data() {
 }
 
 // ============================================================================
-// Instant standard curve applied server-side: raw kept, corrected + provenance stored
+// Standard curve applied server-side: raw kept, corrected + provenance stored
 // ============================================================================
 
 #[tokio::test]
 #[serial]
-async fn test_grab_applies_instant_curve_server_side() {
+async fn test_grab_applies_standard_curve_server_side() {
     let (app, token, db) = setup().await;
 
     let sensor_id = "00000000-0000-4000-c000-0000000000a1";
@@ -368,8 +375,8 @@ async fn test_grab_applies_instant_curve_server_side() {
     db.execute(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
-            "INSERT INTO sensor_calibrations (id, sensor_id, slope, intercept, valid_from, mode, name)
-             VALUES ('{curve_id}', '{sensor_id}', 2.0, 1.0, now(), 'instant', 'Plate A')"
+            "INSERT INTO standard_curves (id, sensor_id, slope, intercept, name)
+             VALUES ('{curve_id}', '{sensor_id}', 2.0, 1.0, 'Plate A')"
         ),
     ))
     .await
@@ -383,7 +390,7 @@ async fn test_grab_applies_instant_curve_server_side() {
             "site_id": crate::common::SITE1_ID,
             "readings": [
                 { "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID, "sensor_id": sensor_id,
-                  "calibration_id": curve_id, "value": 10.0, "time": time }
+                  "standard_curve_id": curve_id, "value": 10.0, "time": time }
             ]
         }),
         &token,
@@ -395,7 +402,7 @@ async fn test_grab_applies_instant_curve_server_side() {
         .query_one(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
-                "SELECT raw_value, calibrated_value, calibration_id, measurement_type FROM readings \
+                "SELECT raw_value, calibrated_value, standard_curve_id, measurement_type FROM readings \
                  WHERE site_id = '{}' AND parameter_id = '{}' AND time = '{time}'",
                 crate::common::SITE1_ID,
                 crate::common::GLOBAL_PARAM_TEMP_ID
@@ -406,7 +413,7 @@ async fn test_grab_applies_instant_curve_server_side() {
         .unwrap();
     let raw: f64 = row.try_get("", "raw_value").unwrap();
     let calibrated: f64 = row.try_get("", "calibrated_value").unwrap();
-    let stored_curve: Uuid = row.try_get("", "calibration_id").unwrap();
+    let stored_curve: Uuid = row.try_get("", "standard_curve_id").unwrap();
     let mtype: String = row.try_get("", "measurement_type").unwrap();
     assert_eq!(raw, 10.0, "raw value is the measured value");
     assert_eq!(calibrated, 21.0, "2.0 * 10.0 + 1.0");
@@ -418,6 +425,8 @@ async fn test_grab_applies_instant_curve_server_side() {
     assert_eq!(mtype, "spot");
 }
 
+/// A grab names its lab curve through `standard_curve_id`; a curve id that resolves to nothing is
+/// refused rather than silently dropped, which would store the measured value as if uncorrected.
 #[tokio::test]
 #[serial]
 async fn test_grab_rejects_unknown_curve() {
@@ -429,7 +438,7 @@ async fn test_grab_rejects_unknown_curve() {
             "site_id": crate::common::SITE1_ID,
             "readings": [
                 { "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID,
-                  "calibration_id": "00000000-0000-4000-c000-0000000000ff",
+                  "standard_curve_id": "00000000-0000-4000-c000-0000000000ff",
                   "value": 10.0, "time": "2025-07-01T10:00:00Z" }
             ]
         }),
@@ -437,4 +446,53 @@ async fn test_grab_rejects_unknown_curve() {
     )
     .await;
     assert_eq!(status, 400, "unknown curve id should be a 400: {body}");
+}
+
+/// A curve reference freezes the curve against edits and states what corrected the served value.
+/// Neither claim is checkable when the grab names no instrument, so the curve is refused there
+/// rather than taken on trust, on `/grab_samples` exactly as on `/readings/batch`.
+#[tokio::test]
+#[serial]
+async fn test_grab_rejects_curve_without_an_instrument() {
+    let (app, token, db) = setup().await;
+
+    let sensor_id = "00000000-0000-4000-c000-0000000000a2";
+    let curve_id = "00000000-0000-4000-c000-0000000000b2";
+    db.execute(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "INSERT INTO sensors (id, name, is_active, is_lab_instrument, created_at)
+             VALUES ('{sensor_id}', 'Plate reader B', true, true, now())"
+        ),
+    ))
+    .await
+    .unwrap();
+    db.execute(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "INSERT INTO standard_curves (id, sensor_id, slope, intercept, name)
+             VALUES ('{curve_id}', '{sensor_id}', 2.0, 1.0, 'Plate B')"
+        ),
+    ))
+    .await
+    .unwrap();
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID,
+            "readings": [
+                { "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID,
+                  "standard_curve_id": curve_id,
+                  "value": 10.0, "time": "2025-07-01T11:00:00Z" }
+            ]
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a curve on a grab naming no instrument should be a 400: {body}"
+    );
 }

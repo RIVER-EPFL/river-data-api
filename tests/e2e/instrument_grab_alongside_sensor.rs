@@ -1,5 +1,5 @@
 //! A lab instrument's grab samples coexist with a continuous field sensor at the same
-//! site+parameter: the two arrive through different paths (grab entry with an instant curve vs
+//! site+parameter: the two arrive through different paths (grab entry with a standard curve vs
 //! batch ingestion under a deployment), stay separable by `measurement_type`, keep their own curve
 //! provenance, and continuous aggregates roll up only the sensor stream.
 //!
@@ -52,7 +52,7 @@ async fn instrument_grabs_coexist_with_continuous_sensor_stream() {
         "batch insert ({status}): {body}"
     );
 
-    // Lab side: an instrument with an instant curve submits a grab in the middle of the window.
+    // Lab side: an instrument with a standard curve submits a grab in the middle of the window.
     let instrument_id = "00000000-0000-4000-c000-00000000c0e1";
     let curve_id = "00000000-0000-4000-c000-00000000c0e2";
     for sql in [
@@ -61,8 +61,8 @@ async fn instrument_grabs_coexist_with_continuous_sensor_stream() {
              VALUES ('{instrument_id}', 'Microplate reader', true, true, now())"
         ),
         format!(
-            "INSERT INTO sensor_calibrations (id, sensor_id, slope, intercept, valid_from, mode, name) \
-             VALUES ('{curve_id}', '{instrument_id}', 2.0, 1.0, now(), 'instant', 'Plate A')"
+            "INSERT INTO standard_curves (id, sensor_id, slope, intercept, name) \
+             VALUES ('{curve_id}', '{instrument_id}', 2.0, 1.0, 'Plate A')"
         ),
     ] {
         db.execute(Statement::from_string(
@@ -81,13 +81,13 @@ async fn instrument_grabs_coexist_with_continuous_sensor_stream() {
             "site_id": site, "created_by": "e2e",
             "readings": [
                 { "parameter_id": param, "sensor_id": instrument_id,
-                  "calibration_id": curve_id, "value": 100.0, "time": grab_time }
+                  "standard_curve_id": curve_id, "value": 100.0, "time": grab_time }
             ],
         }),
         &token,
     )
     .await;
-    assert_eq!(status, 200, "grab with instant curve ({status}): {body}");
+    assert_eq!(status, 200, "grab with standard curve ({status}): {body}");
 
     // measurement_type separates the two populations, disjointly.
     let (status, cont) = crate::common::get_json_with_token(
@@ -122,12 +122,12 @@ async fn instrument_grabs_coexist_with_continuous_sensor_stream() {
         "grab served curve-corrected (2.0 * 100 + 1.0): {spot_vals:?}"
     );
 
-    // Per-row provenance: the grab carries the instant curve and no deployment; the sensor
+    // Per-row provenance: the grab carries the standard curve and no deployment; the sensor
     // stream keeps its deployment attribution.
     let row = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT sensor_id, calibration_id, deployment_id, measurement_type FROM readings \
+            "SELECT sensor_id, standard_curve_id, deployment_id, measurement_type FROM readings \
              WHERE site_id = $1::uuid AND parameter_id = $2::uuid AND time = $3",
             [site.into(), param.into(), sl::dt(grab_time).into()],
         ))
@@ -135,7 +135,7 @@ async fn instrument_grabs_coexist_with_continuous_sensor_stream() {
         .unwrap()
         .expect("grab reading exists");
     let grab_sensor: Option<Uuid> = row.try_get("", "sensor_id").ok();
-    let grab_curve: Option<Uuid> = row.try_get("", "calibration_id").ok();
+    let grab_curve: Option<Uuid> = row.try_get("", "standard_curve_id").ok();
     let grab_dep: Option<Uuid> = row.try_get("", "deployment_id").ok();
     let grab_mtype: Option<String> = row.try_get("", "measurement_type").ok();
     assert_eq!(

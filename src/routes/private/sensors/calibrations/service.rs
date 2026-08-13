@@ -63,6 +63,104 @@ pub fn calibrated_value_sql(raw_expr: &str, slope_expr: &str, intercept_expr: &s
     format!("{slope_expr} * {raw_expr} + {intercept_expr}")
 }
 
+/// What names a curve in a caller's query: the id column that says whether the curve is there at
+/// all, and its two coefficients.
+pub struct CurveColumns<'a> {
+    pub id: &'a str,
+    pub slope: &'a str,
+    pub intercept: &'a str,
+}
+
+/// [`apply_curves`] as a SQL expression, for the set-based writers.
+///
+/// The two forms must agree on more than the arithmetic: a NULL `calibrated_value` means no curve
+/// was applied, so a row that resolves neither curve is written NULL rather than a copy of its raw
+/// value. Writing the raw value there would make an uncorrected reading indistinguishable from one
+/// an identity curve corrected, which is the distinction the two curve references exist to keep.
+#[must_use]
+pub fn recomposed_value_sql(
+    raw_expr: &str,
+    base: &CurveColumns,
+    standard: &CurveColumns,
+) -> String {
+    let after_base = format!(
+        "CASE WHEN {base_id} IS NULL THEN {raw_expr} ELSE {applied} END",
+        base_id = base.id,
+        applied = calibrated_value_sql(raw_expr, base.slope, base.intercept),
+    );
+    let after_standard = calibrated_value_sql(
+        &format!("({after_base})"),
+        standard.slope,
+        standard.intercept,
+    );
+    format!(
+        "CASE WHEN {base_id} IS NULL AND {std_id} IS NULL THEN NULL \
+              WHEN {std_id} IS NULL THEN {after_base} \
+              ELSE {after_standard} END",
+        base_id = base.id,
+        std_id = standard.id,
+    )
+}
+
+/// The rows a window resolution owns, ie. everything but a grab.
+///
+/// A grab's base calibration is resolved once, at entry, and its standard curve is chosen by hand;
+/// no window query can recover either choice, so re-deriving one would replace a deliberate
+/// correction with whatever the timeline currently says. `alias` names the readings row in the
+/// caller's query.
+#[must_use]
+pub fn window_resolved_rows(alias: &str) -> String {
+    format!("{alias}.measurement_type IS DISTINCT FROM 'spot'")
+}
+
+/// Rewrite each spot reading's `calibrated_value` from the curves the row itself names.
+///
+/// This is the other half of [`window_resolved_rows`]. A grab keeps the curves it was entered
+/// against, but the value it serves is whatever those curves produce now: editing a base
+/// calibration's coefficients moves every grab that carries it, so the served value and the
+/// provenance beside it cannot drift apart. Both reprocess engines call this, differing only in
+/// `scope_sql`, which selects the readings (as `r`) and is written against `params`.
+pub async fn recompose_spot_readings<C: ConnectionTrait>(
+    db: &C,
+    scope_sql: &str,
+    params: Vec<sea_orm::Value>,
+) -> Result<u64, sea_orm::DbErr> {
+    let value = recomposed_value_sql(
+        "tgt.raw_value",
+        &CurveColumns {
+            id: "c.id",
+            slope: "c.slope",
+            intercept: "c.intercept",
+        },
+        &CurveColumns {
+            id: "sc.id",
+            slope: "sc.slope",
+            intercept: "sc.intercept",
+        },
+    );
+    let sql = format!(
+        r"UPDATE readings tgt
+          SET calibrated_value = {value}
+          FROM readings r
+          LEFT JOIN sensor_calibrations c ON c.id = r.calibration_id
+          LEFT JOIN standard_curves sc ON sc.id = r.standard_curve_id
+          WHERE tgt.stream_id = r.stream_id
+            AND tgt.time = r.time
+            AND tgt.replicate_index = r.replicate_index
+            AND r.measurement_type = 'spot'
+            AND (r.calibration_id IS NOT NULL OR r.standard_curve_id IS NOT NULL)
+            AND ({scope_sql})"
+    );
+    let result = db
+        .execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            params,
+        ))
+        .await?;
+    Ok(result.rows_affected())
+}
+
 /// Whether a calibration is the identity transform (slope 1, intercept 0), i.e. `calibrated == raw`.
 #[must_use]
 pub fn is_identity_calibration(slope: f64, intercept: f64) -> bool {
@@ -596,10 +694,8 @@ pub async fn reprocess_sensor_readings(
     // resolve with, so reprocess recomputes the value ingest already stored rather than a different
     // one.
     //
-    // Spot rows are excluded throughout: a grab may carry a standard curve the operator picked by
-    // hand, and no window resolution can recover that choice, so re-deriving one would replace a
-    // deliberate correction with a window-resolved base curve. Grabs are corrected at write time
-    // instead (`/grab_samples`).
+    // Which rows a window may claim is `window_resolved_rows`; the spot rows it holds back are
+    // rewritten from the curves they name by `recompose_spot_readings` below.
     let cal_sql = format!(
         r"UPDATE readings tgt
             SET calibration_id = picked.cal_id,
@@ -610,11 +706,12 @@ pub async fn reprocess_sensor_readings(
                 FROM readings r
                 JOIN LATERAL ({pick}) cw ON true
                 WHERE r.sensor_id = $1
-                  AND r.measurement_type IS DISTINCT FROM 'spot'
+                  AND {windowed}
             ) picked
             WHERE tgt.stream_id = picked.stream_id
               AND tgt.time = picked.time
               AND tgt.replicate_index = picked.replicate_index",
+        windowed = window_resolved_rows("r"),
         value = calibrated_value_sql("tgt.raw_value", "picked.slope", "picked.intercept"),
         pick = super::resolver::pick_calibration_lateral("$1")
     );
@@ -627,11 +724,15 @@ pub async fn reprocess_sensor_readings(
                 [sensor_id.into()],
             ))
             .await?;
-        let readings_updated = cal_result.rows_affected() as usize;
+        let mut readings_updated = cal_result.rows_affected() as usize;
+
+        readings_updated +=
+            recompose_spot_readings(txn, "r.sensor_id = $1", vec![sensor_id.into()]).await? as usize;
 
         txn.execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings r
+            format!(
+                r"UPDATE readings r
             SET deployment_id = dw.id,
                 site_id = dw.site_id
             FROM (
@@ -641,10 +742,12 @@ pub async fn reprocess_sensor_readings(
                 WHERE sensor_id = $1
             ) dw
             WHERE r.sensor_id = $1
-              AND r.measurement_type IS DISTINCT FROM 'spot'
+              AND {windowed}
               AND r.time >= dw.deployed_from
               AND r.time < dw.deployed_until
               AND (dw.parameter_id IS NULL OR r.parameter_id IS NULL OR dw.parameter_id = r.parameter_id)",
+                windowed = window_resolved_rows("r")
+            ),
             [sensor_id.into()],
         ))
         .await?;
@@ -657,10 +760,11 @@ pub async fn reprocess_sensor_readings(
         // guard a reprocess would un-attribute all historical data).
         txn.execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings r
+            format!(
+                r"UPDATE readings r
               SET site_id = NULL, deployment_id = NULL
               WHERE r.sensor_id = $1
-                AND r.measurement_type IS DISTINCT FROM 'spot'
+                AND {windowed}
                 AND r.time >= (SELECT MIN(deployed_from) FROM sensor_deployments d2
                                WHERE d2.sensor_id = $1
                                  AND (d2.parameter_id IS NULL OR r.parameter_id IS NULL
@@ -673,6 +777,8 @@ pub async fn reprocess_sensor_readings(
                       AND r.time >= d.deployed_from
                       AND r.time < COALESCE(d.deployed_until, 'infinity'::timestamptz)
                 )",
+                windowed = window_resolved_rows("r")
+            ),
             [sensor_id.into()],
         ))
         .await?;
@@ -754,11 +860,12 @@ pub async fn reprocess_site_parameter_readings(
               FROM readings r
               JOIN LATERAL ({pick}) cw ON true
               WHERE r.site_id = $1 AND r.parameter_id = $2
-                AND r.measurement_type IS DISTINCT FROM 'spot'
+                AND {windowed}
           ) picked
           WHERE tgt.stream_id = picked.stream_id
             AND tgt.time = picked.time
             AND tgt.replicate_index = picked.replicate_index",
+        windowed = window_resolved_rows("r"),
         value = calibrated_value_sql("tgt.raw_value", "picked.slope", "picked.intercept"),
         pick = super::resolver::pick_calibration_lateral("r.sensor_id")
     );
@@ -768,7 +875,8 @@ pub async fn reprocess_site_parameter_readings(
         let dep_result = txn
             .execute(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                r"UPDATE readings r
+                format!(
+                    r"UPDATE readings r
                   SET sensor_id = dw.sensor_id,
                       deployment_id = dw.id,
                       site_id = dw.site_id
@@ -779,10 +887,12 @@ pub async fn reprocess_site_parameter_readings(
                       WHERE site_id = $1 AND parameter_id = $2
                   ) dw
                   WHERE r.parameter_id = $2
-                    AND r.measurement_type IS DISTINCT FROM 'spot'
+                    AND {windowed}
                     AND (r.site_id = $1 OR r.sensor_id = dw.sensor_id)
                     AND r.time >= dw.deployed_from
                     AND r.time < dw.deployed_until",
+                    windowed = window_resolved_rows("r")
+                ),
                 [site_id.into(), parameter_id.into()],
             ))
             .await?;
@@ -796,14 +906,24 @@ pub async fn reprocess_site_parameter_readings(
         ))
         .await?;
 
-        // 3. Recall NULL-clear: a reading in a deployment gap drops out of the site (guarded to
+        // 3. Grabs at this slot keep the curves they were entered against, and their value follows
+        //    those curves' current coefficients.
+        recompose_spot_readings(
+            txn,
+            "r.site_id = $1 AND r.parameter_id = $2",
+            vec![site_id.into(), parameter_id.into()],
+        )
+        .await?;
+
+        // 4. Recall NULL-clear: a reading in a deployment gap drops out of the site (guarded to
         //    time >= the slot's first deployment so pre-deployment history is kept).
         txn.execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings r
+            format!(
+                r"UPDATE readings r
               SET site_id = NULL, deployment_id = NULL
               WHERE r.site_id = $1 AND r.parameter_id = $2
-                AND r.measurement_type IS DISTINCT FROM 'spot'
+                AND {windowed}
                 AND r.time >= (SELECT MIN(deployed_from) FROM sensor_deployments
                                WHERE site_id = $1 AND parameter_id = $2)
                 AND NOT EXISTS (
@@ -812,6 +932,8 @@ pub async fn reprocess_site_parameter_readings(
                       AND r.time >= d.deployed_from
                       AND r.time < COALESCE(d.deployed_until, 'infinity'::timestamptz)
                 )",
+                windowed = window_resolved_rows("r")
+            ),
             [site_id.into(), parameter_id.into()],
         ))
         .await?;

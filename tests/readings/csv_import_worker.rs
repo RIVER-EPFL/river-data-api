@@ -121,9 +121,10 @@ async fn scalar_f64(db: &DatabaseConnection, sql: &str) -> f64 {
 async fn csv_import_duplicate_timestamps_become_replicates() {
     let (db, app, token) = setup().await;
 
-    // Rows sharing a timestamp for the same parameter are replicates 0..n-1 in file order and are
-    // grouped into a sample. The distinct replicate indices also keep the conflict keys unique, so
-    // overwrite mode's `ON CONFLICT DO UPDATE` cannot fail with "cannot affect row a second time".
+    // Rows sharing a timestamp for the same parameter are replicates 0..n-1 in file order and, the
+    // file being declared spot, are grouped into a sample. The distinct replicate indices also keep
+    // the conflict keys unique, so overwrite mode's `ON CONFLICT DO UPDATE` cannot fail with
+    // "cannot affect row a second time".
     let (status, resp) = crate::common::post_json_parse_with_token(
         &app,
         "/api/readings/import_csv",
@@ -131,6 +132,7 @@ async fn csv_import_duplicate_timestamps_become_replicates() {
             "site": crate::common::SITE1_ID,
             "csv": CSV_DUP_TS,
             "conflict": "overwrite",
+            "measurement_type": "spot",
         }),
         &token,
     )
@@ -275,7 +277,11 @@ async fn csv_import_triplicate_rows_form_sample_and_reimport_is_idempotent() {
     let (status, resp) = crate::common::post_json_parse_with_token(
         &app,
         "/api/readings/import_csv",
-        &serde_json::json!({ "site": crate::common::SITE1_ID, "csv": CSV_TRIPLICATE }),
+        &serde_json::json!({
+            "site": crate::common::SITE1_ID,
+            "csv": CSV_TRIPLICATE,
+            "measurement_type": "spot",
+        }),
         &token,
     )
     .await;
@@ -338,7 +344,11 @@ async fn csv_import_triplicate_rows_form_sample_and_reimport_is_idempotent() {
     let (status, resp) = crate::common::post_json_parse_with_token(
         &app,
         "/api/readings/import_csv",
-        &serde_json::json!({ "site": crate::common::SITE1_ID, "csv": CSV_TRIPLICATE }),
+        &serde_json::json!({
+            "site": crate::common::SITE1_ID,
+            "csv": CSV_TRIPLICATE,
+            "measurement_type": "spot",
+        }),
         &token,
     )
     .await;
@@ -373,4 +383,116 @@ async fn csv_import_triplicate_rows_form_sample_and_reimport_is_idempotent() {
     )
     .await;
     assert_eq!(samples_after, 1, "the sample is reused, not duplicated");
+}
+
+const CSV_SINGLE_GRABS: &str = "DateTime,Dissolved_O2\n\
+2025-06-03 09:00:00,140\n\
+2025-06-03 10:00:00,150\n";
+
+/// Expected behaviour: a file declared `spot` is a set of collection events, so each row is a grab
+/// with its own `samples` row even when it was measured once. Views that read grabs, the
+/// sensor-vs-grab export among them, join through `samples`.
+#[tokio::test]
+#[serial]
+async fn declared_spot_import_gives_each_grab_its_sample_row() {
+    let (db, app, token) = setup().await;
+
+    let (status, resp) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/import_csv",
+        &serde_json::json!({
+            "site": crate::common::SITE1_ID,
+            "csv": CSV_SINGLE_GRABS,
+            "measurement_type": "spot",
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "import ({status}): {resp}");
+
+    let samples = poll_count(
+        &db,
+        &format!(
+            "SELECT count(*) AS n FROM samples \
+             WHERE site_id = '{}' AND collected_at >= '2025-06-03T00:00:00Z'",
+            crate::common::SITE1_ID
+        ),
+        2,
+        10,
+    )
+    .await;
+    assert_eq!(samples, 2, "one sample per single-row grab");
+
+    let stamped = scalar_i64(
+        &db,
+        &format!(
+            "SELECT count(*) AS n FROM readings \
+             WHERE site_id = '{}' AND time >= '2025-06-03T00:00:00Z' AND sample_id IS NOT NULL",
+            crate::common::SITE1_ID
+        ),
+    )
+    .await;
+    assert_eq!(stamped, 2, "each grab references its sample");
+
+    let mean = scalar_f64(
+        &db,
+        &format!(
+            "SELECT mean AS v FROM samples \
+             WHERE site_id = '{}' AND collected_at = '2025-06-03T09:00:00Z'",
+            crate::common::SITE1_ID
+        ),
+    )
+    .await;
+    assert!(
+        (mean - 140.0).abs() < 1e-9,
+        "the sample statistic is the single measurement: got {mean}"
+    );
+}
+
+const CSV_CONTINUOUS_DUP: &str = "DateTime,Dissolved_O2\n\
+2025-06-04 00:00:00,200\n\
+2025-06-04 00:00:00,210\n";
+
+/// Expected behaviour: two logger points sharing a timestamp are a malformed file, not a sampling
+/// event. They are still stored as replicates, but no `samples` row is invented around them.
+#[tokio::test]
+#[serial]
+async fn continuous_rows_sharing_a_timestamp_form_no_sample() {
+    let (db, app, token) = setup().await;
+
+    let (status, resp) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/import_csv",
+        &serde_json::json!({ "site": crate::common::SITE1_ID, "csv": CSV_CONTINUOUS_DUP }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "import ({status}): {resp}");
+
+    let readings = poll_count(
+        &db,
+        &format!(
+            "SELECT count(*) AS n FROM readings \
+             WHERE site_id = '{}' AND time = '2025-06-04T00:00:00Z'",
+            crate::common::SITE1_ID
+        ),
+        2,
+        10,
+    )
+    .await;
+    assert_eq!(readings, 2, "both rows are stored as replicates");
+
+    let staging_left = poll_count(&db, "SELECT count(*) AS n FROM csv_import_staging", 0, 10).await;
+    assert_eq!(staging_left, 0, "the import ran to completion");
+
+    let samples = scalar_i64(
+        &db,
+        &format!(
+            "SELECT count(*) AS n FROM samples \
+             WHERE site_id = '{}' AND collected_at = '2025-06-04T00:00:00Z'",
+            crate::common::SITE1_ID
+        ),
+    )
+    .await;
+    assert_eq!(samples, 0, "no sample around undeclared logger duplicates");
 }

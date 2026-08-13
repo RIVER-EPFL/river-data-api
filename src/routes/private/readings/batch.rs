@@ -1,11 +1,12 @@
 //! Batch reading insert, and the write rules the other reading paths share.
 //!
-//! `admission` holds what every stored reading must satisfy and `readings_upsert` holds what an
-//! upsert may replace on the row it collides with. `/ingest`, `/grab_samples` and the CSV importer
-//! call into both, so the five write paths cannot drift apart on what they accept or overwrite.
+//! `admission` holds what every stored reading must satisfy, [`admit_standard_curves`] holds who
+//! may name a hand-picked standard curve, and `readings_upsert` holds what an upsert may replace on
+//! the row it collides with. `/ingest`, `/grab_samples` and the CSV importer call into them, so the
+//! five write paths cannot drift apart on what they accept or overwrite.
 
 use axum::{Json, extract::State};
-use sea_orm::{ConnectionTrait, EntityTrait, Set};
+use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
@@ -13,10 +14,12 @@ use uuid::Uuid;
 
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::common::{AppEvent, AppState};
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams::service::get_or_create_api_stream;
 use crate::routes::private::readings;
+use crate::routes::private::sensors::calibrations;
 use crate::routes::private::sensors::operations::{ResolvedOwner, resolve_slot_owner_for_times};
+use crate::routes::private::sensors::standard_curves;
 
 /// What a reading must satisfy to be stored, whichever path it arrived on.
 ///
@@ -210,6 +213,82 @@ pub mod admission {
     }
 }
 
+/// What one reading claims about the standard curve that corrected it, as its writer resolved it.
+#[derive(Debug, Clone, Copy)]
+pub struct CurveClaim<'a> {
+    pub standard_curve_id: Uuid,
+    /// The instrument the reading is attributed to, after slot-owner resolution.
+    pub sensor_id: Option<Uuid>,
+    /// The reading's classification, after the resolution chain.
+    pub measurement_type: &'a str,
+}
+
+/// Classification a hand-picked curve belongs to: a curve is fitted for one measurement, and a
+/// logger cadence has no such measurement to pick it for.
+const CURVE_MEASUREMENT_TYPE: &str = "spot";
+
+/// The standard curves a request names, refused unless every reading naming one may carry it.
+///
+/// A curve is fitted on one instrument and chosen by hand for one measurement, so a reading may
+/// name it only when the reading is that instrument's own spot measurement. Four claims are
+/// refused: an id no curve carries, a curve fitted on a different instrument, a reading that names
+/// no instrument at all, and a reading classified as anything but spot. The reference is not
+/// decoration: it freezes the curve against edits and deletion, and it is what a served value
+/// claims to have been corrected by.
+///
+/// Returns the curves so the caller computes the corrected value from the coefficients. A submitted
+/// `calibrated_value` cannot be checked against a curve, only recomputed from it, so no path trusts
+/// one alongside a curve reference.
+pub async fn admit_standard_curves(
+    db: &DatabaseConnection,
+    claims: &[CurveClaim<'_>],
+) -> AppResult<HashMap<Uuid, standard_curves::Model>> {
+    if claims.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let ids: Vec<Uuid> = claims.iter().map(|c| c.standard_curve_id).collect();
+    let curves: HashMap<Uuid, standard_curves::Model> = standard_curves::Entity::find()
+        .filter(standard_curves::Column::Id.is_in(ids))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|c| (c.id, c))
+        .collect();
+
+    for claim in claims {
+        let id = claim.standard_curve_id;
+        let Some(curve) = curves.get(&id) else {
+            return Err(AppError::BadRequest(format!("Standard curve {id} not found")));
+        };
+        match claim.sensor_id {
+            Some(sensor_id) if sensor_id == curve.sensor_id => {}
+            Some(sensor_id) => {
+                return Err(AppError::BadRequest(format!(
+                    "Standard curve {id} was fitted on instrument {}, not on {sensor_id}",
+                    curve.sensor_id
+                )));
+            }
+            None => {
+                return Err(AppError::BadRequest(format!(
+                    "Standard curve {id} was fitted on instrument {}, which this reading does not \
+                     name",
+                    curve.sensor_id
+                )));
+            }
+        }
+        if claim.measurement_type != CURVE_MEASUREMENT_TYPE {
+            return Err(AppError::BadRequest(format!(
+                "Standard curve {id} corrects a {CURVE_MEASUREMENT_TYPE} measurement, and this \
+                 reading is classified '{}'",
+                claim.measurement_type
+            )));
+        }
+    }
+
+    Ok(curves)
+}
+
 /// How to handle readings that collide with an existing (stream_id, time, replicate_index).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -239,7 +318,9 @@ pub struct ReadingInput {
     pub sensor_id: Option<Uuid>,
     pub calibration_id: Option<Uuid>,
     /// The standard curve the value was corrected with, for a caller replaying grabs that carried
-    /// one. Ordinary batch inserts leave it unset.
+    /// one. Ordinary batch inserts leave it unset. The reading must be a spot measurement on the
+    /// instrument the curve was fitted on, and the server recomputes `calibrated_value` from the
+    /// curve, so a submitted one is not what gets stored.
     #[serde(default)]
     pub standard_curve_id: Option<Uuid>,
     pub deployment_id: Option<Uuid>,
@@ -449,9 +530,17 @@ pub async fn insert_batch_readings(
         .await?
     };
 
-    let models: Vec<readings::ActiveModel> = payload
+    // Per-reading context, resolved before the models are built: which stream the row lands on,
+    // which instrument it inherits when it names none, and what it classifies as. The standard
+    // curve rules below are stated over these resolved values rather than the submitted ones.
+    struct Resolved {
+        stream_id: Uuid,
+        owner: ResolvedOwner,
+        measurement_type: String,
+    }
+    let resolved: Vec<Resolved> = payload
         .readings
-        .into_iter()
+        .iter()
         .map(|r| {
             let stream_id = stream_cache[&(r.site_id, r.parameter_id)];
             let owner = if r.sensor_id.is_none() {
@@ -462,6 +551,99 @@ pub async fn insert_batch_readings(
             } else {
                 ResolvedOwner::default()
             };
+            let measurement_type =
+                crate::routes::private::readings::measurement::resolve_measurement_type(
+                    r.measurement_type.as_deref(),
+                    stream_defaults.get(&stream_id).and_then(|d| d.as_deref()),
+                    r.sensor_id.or(owner.sensor_id),
+                    &sensor_types,
+                );
+            Resolved {
+                stream_id,
+                owner,
+                measurement_type,
+            }
+        })
+        .collect();
+
+    // A caller-supplied standard curve is held to the same rule as a grab entry: the reading must
+    // be that instrument's own spot measurement, and the corrected value is computed here from the
+    // curve rather than taken from the request.
+    let claims: Vec<CurveClaim<'_>> = payload
+        .readings
+        .iter()
+        .zip(&resolved)
+        .filter_map(|(r, res)| {
+            r.standard_curve_id.map(|id| CurveClaim {
+                standard_curve_id: id,
+                sensor_id: r.sensor_id.or(res.owner.sensor_id),
+                measurement_type: &res.measurement_type,
+            })
+        })
+        .collect();
+    let standard_curve_models = admit_standard_curves(&state.db, &claims).await?;
+
+    // The base calibrations those rows sit on, so the stored value is the one the pair of recorded
+    // curves produces: instrument correction first, hand-picked curve on its result.
+    let base_calibrations: HashMap<Uuid, calibrations::service::Curve> = {
+        let mut ids: Vec<Uuid> = payload
+            .readings
+            .iter()
+            .zip(&resolved)
+            .filter(|(r, _)| r.standard_curve_id.is_some())
+            .filter_map(|(r, res)| r.calibration_id.or(res.owner.calibration_id))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            HashMap::new()
+        } else {
+            calibrations::Entity::find()
+                .filter(calibrations::Column::Id.is_in(ids))
+                .all(&state.db)
+                .await?
+                .into_iter()
+                .map(|c| {
+                    (
+                        c.id,
+                        calibrations::service::Curve {
+                            id: c.id,
+                            slope: c.slope,
+                            intercept: c.intercept,
+                        },
+                    )
+                })
+                .collect()
+        }
+    };
+
+    let models: Vec<readings::ActiveModel> = payload
+        .readings
+        .into_iter()
+        .zip(resolved)
+        .map(|(r, res)| {
+            let Resolved {
+                stream_id,
+                owner,
+                measurement_type,
+            } = res;
+            let calibration_id = r.calibration_id.or(owner.calibration_id);
+            let standard = r.standard_curve_id.map(|id| {
+                let c = &standard_curve_models[&id];
+                calibrations::service::Curve {
+                    id: c.id,
+                    slope: c.slope,
+                    intercept: c.intercept,
+                }
+            });
+            let calibrated_value = match standard {
+                Some(curve) => Some(calibrations::service::apply_curves(
+                    r.raw_value,
+                    calibration_id.and_then(|id| base_calibrations.get(&id).copied()),
+                    Some(curve),
+                )),
+                None => r.calibrated_value,
+            };
             readings::ActiveModel {
                 standard_curve_id: Set(r.standard_curve_id),
                 stream_id: Set(stream_id),
@@ -470,19 +652,12 @@ pub async fn insert_batch_readings(
                 time: Set(r.time.into()),
                 replicate_index: Set(r.replicate_index.unwrap_or(0)),
                 raw_value: Set(r.raw_value),
-                calibrated_value: Set(r.calibrated_value),
+                calibrated_value: Set(calibrated_value),
                 sensor_id: Set(r.sensor_id.or(owner.sensor_id)),
-                calibration_id: Set(r.calibration_id.or(owner.calibration_id)),
+                calibration_id: Set(calibration_id),
                 deployment_id: Set(r.deployment_id.or(owner.deployment_id)),
                 logged: Set(Some(true)),
-                measurement_type: Set(Some(
-                    crate::routes::private::readings::measurement::resolve_measurement_type(
-                        r.measurement_type.as_deref(),
-                        stream_defaults.get(&stream_id).and_then(|d| d.as_deref()),
-                        r.sensor_id.or(owner.sensor_id),
-                        &sensor_types,
-                    ),
-                )),
+                measurement_type: Set(Some(measurement_type)),
                 is_flagged: Set(Some(false)),
                 flag_reason: Set(None),
                 sample_id: Set(r.sample_id),

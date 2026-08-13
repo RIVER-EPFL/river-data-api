@@ -15,6 +15,7 @@ use crate::config::Config;
 use crate::routes::private::readings;
 use crate::routes::private::readings::batch::{ConflictMode, readings_on_conflict};
 use crate::routes::private::readings::import::BATCH_SIZE as CSV_BATCH_SIZE;
+use crate::routes::private::readings::sample_groups;
 use crate::routes::private::sensors::calibrations::service::{
     Curve, apply_curves, recalculate_derived_at_timestamp, reprocess_sensor_readings,
     reprocess_site_parameter_readings,
@@ -937,10 +938,6 @@ impl CsvImport {
             (Uuid, chrono::DateTime<chrono::Utc>),
             i16,
         > = std::collections::HashMap::with_capacity(models.len());
-        let mut group_slots: std::collections::HashMap<
-            (Uuid, chrono::DateTime<chrono::Utc>),
-            (Uuid, Uuid),
-        > = std::collections::HashMap::new();
         for m in &mut models {
             let key = (
                 *m.stream_id.as_ref(),
@@ -949,85 +946,32 @@ impl CsvImport {
             let counter = group_counts.entry(key).or_insert(0);
             m.replicate_index = Set(*counter);
             *counter += 1;
-            if let (Some(sid), Some(pid)) = (*m.site_id.as_ref(), *m.parameter_id.as_ref()) {
-                group_slots.entry(key).or_insert((sid, pid));
-            }
         }
 
-        // Groups with 2+ rows on a paired slot form a sample: find-or-create the samples row
-        // (unique on site/parameter/collected_at) and stamp sample_id on the group's readings.
-        type SampleGroup = ((Uuid, chrono::DateTime<chrono::Utc>), (Uuid, Uuid));
-        let sample_groups: Vec<SampleGroup> = group_counts
-            .iter()
-            .filter(|(_, count)| **count >= 2)
-            .filter_map(|(key, _)| group_slots.get(key).map(|slot| (*key, *slot)))
-            .collect();
-        let replicate_groups = sample_groups.len();
-        let mut sample_slots: Option<(Vec<Uuid>, Vec<Uuid>, Vec<String>)> = None;
-        if !sample_groups.is_empty() {
-            let site_ids: Vec<Uuid> = sample_groups.iter().map(|(_, (s, _))| *s).collect();
-            let param_ids: Vec<Uuid> = sample_groups.iter().map(|(_, (_, p))| *p).collect();
-            // Timestamps travel as RFC3339 text and are cast server-side: sea-query's
-            // timestamptz array binding rejects chrono values here.
-            let times: Vec<String> = sample_groups
-                .iter()
-                .map(|((_, t), _)| t.to_rfc3339())
-                .collect();
-            ctx.db()
-                .execute(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "INSERT INTO samples (site_id, parameter_id, collected_at) \
-                     SELECT DISTINCT * FROM unnest($1::uuid[], $2::uuid[], $3::text[]::timestamptz[]) \
-                     ON CONFLICT (site_id, parameter_id, collected_at) DO NOTHING",
-                    [site_ids.clone().into(), param_ids.clone().into(), times.clone().into()],
-                ))
-                .await?;
-            let sample_rows = ctx
-                .db()
-                .query_all(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "SELECT s.id, s.site_id, s.parameter_id, s.collected_at FROM samples s \
-                     JOIN unnest($1::uuid[], $2::uuid[], $3::text[]::timestamptz[]) \
-                       AS t(site_id, parameter_id, collected_at) \
-                       ON s.site_id = t.site_id AND s.parameter_id = t.parameter_id \
-                      AND s.collected_at = t.collected_at",
-                    [site_ids.into(), param_ids.into(), times.into()],
-                ))
-                .await?;
-            let mut sample_by_slot: std::collections::HashMap<
-                (Uuid, Uuid, chrono::DateTime<chrono::Utc>),
-                Uuid,
-            > = std::collections::HashMap::with_capacity(sample_rows.len());
-            for row in &sample_rows {
-                let id: Uuid = row.try_get("", "id")?;
-                let sid: Uuid = row.try_get("", "site_id")?;
-                let pid: Uuid = row.try_get("", "parameter_id")?;
-                let t: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "collected_at")?;
-                sample_by_slot.insert((sid, pid, t.with_timezone(&chrono::Utc)), id);
+        // Whether a group is a sample is not decided here: `sample_groups::forms_sample` is the
+        // one answer. A request-level `spot` is the writer declaring a collection event, so a
+        // single row is a grab that has to reach the views reading `samples`; without that
+        // declaration only two or more rows classified spot on a paired slot form one, because two
+        // logger points sharing a timestamp are a malformed file rather than a sampling event.
+        let declared_collection = request_measurement_type.as_deref() == Some(sample_groups::SPOT);
+        let mut spot_groups: std::collections::HashMap<
+            (Uuid, Uuid, chrono::DateTime<chrono::Utc>),
+            usize,
+        > = std::collections::HashMap::new();
+        for m in &models {
+            if m.measurement_type.as_ref().as_deref() != Some(sample_groups::SPOT) {
+                continue;
             }
-            for m in &mut models {
-                let key = (
-                    *m.stream_id.as_ref(),
-                    m.time.as_ref().with_timezone(&chrono::Utc),
-                );
-                if group_counts.get(&key).copied().unwrap_or(0) < 2 {
-                    continue;
-                }
-                if let (Some(sid), Some(pid)) = (*m.site_id.as_ref(), *m.parameter_id.as_ref())
-                    && let Some(sample_id) = sample_by_slot.get(&(sid, pid, key.1))
-                {
-                    m.sample_id = Set(Some(*sample_id));
-                }
+            if let (Some(sid), Some(pid)) = (*m.site_id.as_ref(), *m.parameter_id.as_ref()) {
+                *spot_groups
+                    .entry((sid, pid, m.time.as_ref().with_timezone(&chrono::Utc)))
+                    .or_default() += 1;
             }
-            sample_slots = Some((
-                sample_by_slot.keys().map(|(s, _, _)| *s).collect(),
-                sample_by_slot.keys().map(|(_, p, _)| *p).collect(),
-                sample_by_slot
-                    .keys()
-                    .map(|(_, _, t)| t.to_rfc3339())
-                    .collect(),
-            ));
         }
+        let replicate_groups = spot_groups
+            .values()
+            .filter(|count| sample_groups::forms_sample(declared_collection, **count))
+            .count();
 
         let total = i32::try_from(models.len()).unwrap_or(i32::MAX);
         ctx.set_progress(0, Some(total)).await;
@@ -1060,23 +1004,29 @@ impl CsvImport {
             }
         }
 
-        // Readings already present from an earlier import belong to the group's sample too, so the
-        // statistics cover every replicate rather than only the rows this run inserted.
-        if let Some((slot_sites, slot_params, slot_times)) = sample_slots {
-            ctx.db()
-                .execute(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "UPDATE readings r SET sample_id = s.id \
-                     FROM samples s, unnest($1::uuid[], $2::uuid[], $3::text[]::timestamptz[]) \
-                          AS t(site_id, parameter_id, collected_at) \
-                     WHERE s.site_id = t.site_id AND s.parameter_id = t.parameter_id \
-                       AND s.collected_at = t.collected_at \
-                       AND r.site_id = s.site_id AND r.parameter_id = s.parameter_id \
-                       AND r.time = s.collected_at AND r.sample_id IS NULL \
-                       AND r.measurement_type = 'spot'",
-                    [slot_sites.into(), slot_params.into(), slot_times.into()],
-                ))
-                .await?;
+        // Samples are found-or-created and stamped after the insert, by the one materialiser, over
+        // the streams and the time span this import touched. Scoping it that way rather than to the
+        // rows this run inserted is deliberate: a reading already present at a group's slot is part
+        // of the same collection event, whose identity is (site, parameter, instant).
+        if !spot_groups.is_empty()
+            && let (Some(first), Some(last)) = (distinct_ts.first(), distinct_ts.last())
+        {
+            let mut stream_ids: Vec<Uuid> = models.iter().map(|m| *m.stream_id.as_ref()).collect();
+            stream_ids.sort_unstable();
+            stream_ids.dedup();
+            let row_predicate = format!(
+                "r.stream_id = ANY($1) AND r.time >= '{}'::timestamptz AND r.time <= '{}'::timestamptz",
+                first.to_rfc3339(),
+                last.to_rfc3339()
+            );
+            sample_groups::materialise_samples(
+                ctx.db(),
+                &row_predicate,
+                vec![stream_ids.into()],
+                declared_collection,
+            )
+            .await
+            .map_err(as_db_err)?;
         }
 
         let (inserted_total, overwritten) = match conflict {

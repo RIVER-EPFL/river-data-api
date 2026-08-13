@@ -182,12 +182,12 @@ where
         r"UPDATE readings tgt
           SET sensor_id = $2,
               calibration_id = CASE
-                  WHEN tgt.measurement_type IS DISTINCT FROM 'spot'
+                  WHEN {windowed}
                       THEN COALESCE(picked.cal_id, tgt.calibration_id)
                   ELSE tgt.calibration_id
               END,
               calibrated_value = CASE
-                  WHEN picked.cal_id IS NOT NULL AND tgt.measurement_type IS DISTINCT FROM 'spot'
+                  WHEN picked.cal_id IS NOT NULL AND {windowed}
                       THEN {value}
                   ELSE tgt.calibrated_value
               END
@@ -202,6 +202,7 @@ where
           WHERE tgt.stream_id = picked.p_stream_id
             AND tgt.time = picked.p_time
             AND tgt.replicate_index = picked.p_replicate_index",
+        windowed = super::service::window_resolved_rows("tgt"),
         value = calibrated_value_sql("tgt.raw_value", "picked.slope", "picked.intercept"),
         pick = pick_calibration_lateral("$2")
     );
@@ -278,6 +279,35 @@ mod tests {
             calibrated_value_sql("tgt.raw_value", "picked.slope", "picked.intercept"),
             "picked.slope * tgt.raw_value + picked.intercept",
             "the set-based writers correct a row the way `apply_calibration` does"
+        );
+    }
+
+    /// The SQL form carries the same rule as the Rust one about what a missing curve means: a row
+    /// that resolves neither is uncorrected, and an uncorrected row's value is null rather than a
+    /// copy of its raw value.
+    #[test]
+    fn the_sql_recomposition_writes_null_when_no_curve_applies() {
+        use super::super::service::{CurveColumns, recomposed_value_sql};
+        let sql = recomposed_value_sql(
+            "tgt.raw_value",
+            &CurveColumns {
+                id: "picked.cal_id",
+                slope: "picked.slope",
+                intercept: "picked.intercept",
+            },
+            &CurveColumns {
+                id: "sc.id",
+                slope: "sc.slope",
+                intercept: "sc.intercept",
+            },
+        );
+        assert!(
+            sql.contains("WHEN picked.cal_id IS NULL AND sc.id IS NULL THEN NULL"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("sc.slope * (CASE WHEN picked.cal_id IS NULL THEN tgt.raw_value"),
+            "the standard curve corrects what the base produced: {sql}"
         );
     }
 

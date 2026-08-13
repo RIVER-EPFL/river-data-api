@@ -10,10 +10,12 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::error::{AppError, AppResult};
-use crate::routes::private::readings::batch::{Replace, admission, readings_upsert};
+use crate::routes::private::readings::batch::{
+    CurveClaim, Replace, admission, admit_standard_curves, readings_upsert,
+};
 use crate::routes::private::{
     data_streams, readings, readings::sample_groups, readings::samples, sensors::calibrations,
-    sensors::standard_curves, sites, sites::parameters as site_parameters,
+    sites, sites::parameters as site_parameters,
 };
 
 /// Grabs are spot measurements by definition: a bottle, not a logger cadence.
@@ -127,27 +129,72 @@ async fn get_or_create_grab_stream(
     Ok(stream.id)
 }
 
-/// Return the sample already recorded for this (site, parameter, time), refreshing its label and
-/// notes when the request carries them.
-async fn reuse_existing_sample(
+/// The samples row for this collection event, created if it is not already there, with its label and
+/// notes refreshed when the request carries them.
+///
+/// Returns the row's id and whether this call is the one that created it.
+///
+/// The insert yields to a concurrent one rather than testing for the row first: two field entries
+/// for the same (site, parameter, time) both see nothing, both insert, and the unique index on
+/// those three columns then fails one of them, losing an entire grab to a 500. `DO NOTHING` is what
+/// every other writer of `samples` does, and the read below picks up whichever row won.
+async fn find_or_create_sample(
     txn: &sea_orm::DatabaseTransaction,
     site_id: Uuid,
     parameter_id: Uuid,
     time: chrono::DateTime<chrono::Utc>,
+    created_by: Option<&str>,
     label: Option<&str>,
     notes: Option<&str>,
-) -> Result<Option<Uuid>, AppError> {
-    let Some(existing) = samples::Entity::find()
+) -> Result<(Uuid, bool), AppError> {
+    let candidate = samples::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        site_id: Set(site_id),
+        parameter_id: Set(parameter_id),
+        collected_at: Set(time),
+        label: Set(label.map(String::from)),
+        notes: Set(notes.map(String::from)),
+        created_by: Set(created_by.map(String::from)),
+        created_at: Set(Some(chrono::Utc::now())),
+        mean: Set(None),
+        stdev: Set(None),
+        n: Set(0),
+        min_value: Set(None),
+        max_value: Set(None),
+        updated_at: Set(None),
+    };
+    let inserted = match samples::Entity::insert(candidate)
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::columns([
+                samples::Column::SiteId,
+                samples::Column::ParameterId,
+                samples::Column::CollectedAt,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec_without_returning(txn)
+        .await
+    {
+        Ok(rows) => rows > 0,
+        // A conflict that inserted nothing is the expected outcome of re-posting a grab, not a
+        // failure.
+        Err(sea_orm::DbErr::RecordNotInserted) => false,
+        Err(e) => return Err(AppError::Database(e)),
+    };
+
+    let existing = samples::Entity::find()
         .filter(samples::Column::SiteId.eq(site_id))
         .filter(samples::Column::ParameterId.eq(parameter_id))
         .filter(samples::Column::CollectedAt.eq(time))
         .one(txn)
         .await?
-    else {
-        return Ok(None);
-    };
+        .ok_or_else(|| {
+            AppError::Internal("Failed to record the sample for this grab".to_string())
+        })?;
     let sample_id = existing.id;
-    if label.is_some() || notes.is_some() {
+
+    if !inserted && (label.is_some() || notes.is_some()) {
         let mut active: samples::ActiveModel = existing.into();
         if let Some(l) = label {
             active.label = Set(Some(l.to_string()));
@@ -158,7 +205,8 @@ async fn reuse_existing_sample(
         active.updated_at = Set(Some(chrono::Utc::now()));
         active.update(txn).await?;
     }
-    Ok(Some(sample_id))
+
+    Ok((sample_id, inserted))
 }
 
 /// Create a `samples` row per (parameter_id, time) group. Returns the group-to-sample map and how
@@ -186,32 +234,14 @@ async fn auto_create_samples(
         if !sample_groups::forms_sample(GRAB_IS_A_COLLECTION_EVENT, count) {
             continue;
         }
-        // Re-posting the same grab must reuse its sample, not accumulate empty duplicates
-        if let Some(sample_id) =
-            reuse_existing_sample(txn, site_id, parameter_id, time, label, notes).await?
-        {
-            sample_map.insert((parameter_id, time), sample_id);
-            continue;
+        // Re-posting the same grab must reuse its sample, not accumulate empty duplicates.
+        let (sample_id, is_new) =
+            find_or_create_sample(txn, site_id, parameter_id, time, created_by, label, notes)
+                .await?;
+        sample_map.insert((parameter_id, time), sample_id);
+        if is_new {
+            created += 1;
         }
-        let sample = samples::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            site_id: Set(site_id),
-            parameter_id: Set(parameter_id),
-            collected_at: Set(time),
-            label: Set(label.map(String::from)),
-            notes: Set(notes.map(String::from)),
-            created_by: Set(created_by.map(String::from)),
-            created_at: Set(Some(chrono::Utc::now())),
-            mean: Set(None),
-            stdev: Set(None),
-            n: Set(0),
-            min_value: Set(None),
-            max_value: Set(None),
-            updated_at: Set(None),
-        };
-        let sample = sample.insert(txn).await?;
-        sample_map.insert((parameter_id, time), sample.id);
-        created += 1;
     }
 
     Ok((sample_map, created))
@@ -344,43 +374,22 @@ pub async fn insert_grab_samples(
             .or_insert((r.time, r.time));
     }
 
-    // The chosen standard curves, so the correction is applied server-side. An unknown id is a 400
-    // rather than a silent miss, and a curve fitted on another instrument is refused: it would put a
-    // second instrument's coefficients on this instrument's measurement.
-    let curve_ids: Vec<Uuid> = payload
+    // The chosen standard curves, admitted by the one rule every writer of `standard_curve_id`
+    // uses, so the correction can be applied server-side below. A grab is spot by construction, so
+    // the only claims this path can be refused for are an unknown id, a curve fitted on another
+    // instrument, and a curve on a grab that names no instrument at all.
+    let claims: Vec<CurveClaim<'_>> = payload
         .readings
         .iter()
-        .filter_map(|r| r.standard_curve_id)
+        .filter_map(|r| {
+            r.standard_curve_id.map(|id| CurveClaim {
+                standard_curve_id: id,
+                sensor_id: r.sensor_id,
+                measurement_type: GRAB_MEASUREMENT_TYPE,
+            })
+        })
         .collect();
-    let standard_curves: HashMap<Uuid, standard_curves::Model> = if curve_ids.is_empty() {
-        HashMap::new()
-    } else {
-        standard_curves::Entity::find()
-            .filter(standard_curves::Column::Id.is_in(curve_ids))
-            .all(&state.db)
-            .await?
-            .into_iter()
-            .map(|c| (c.id, c))
-            .collect()
-    };
-    for r in &payload.readings {
-        let Some(cid) = r.standard_curve_id else {
-            continue;
-        };
-        let Some(curve) = standard_curves.get(&cid) else {
-            return Err(AppError::BadRequest(format!(
-                "Standard curve {cid} not found"
-            )));
-        };
-        if let Some(sensor_id) = r.sensor_id
-            && curve.sensor_id != sensor_id
-        {
-            return Err(AppError::BadRequest(format!(
-                "Standard curve {cid} was fitted on instrument {}, not on {sensor_id}",
-                curve.sensor_id
-            )));
-        }
-    }
+    let standard_curves = admit_standard_curves(&state.db, &claims).await?;
 
     // The base calibration covering each grab that names an instrument, ranked by the one resolver
     // the ingest and reprocess paths use. Resolving it here is what lets the row carry both the id

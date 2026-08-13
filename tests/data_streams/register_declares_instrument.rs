@@ -3,9 +3,20 @@
 //! Expected behaviour: a declared instrument is stored on the stream, so pairing reuses it instead
 //! of minting a second, serial-less one; and a caller cannot name an instrument the feed has no
 //! relationship to.
+//!
+//! The confinement rule is asserted against the guard itself rather than over HTTP: the route
+//! already refuses project-scoped tokens outright, so the restricted principal the guard exists for
+//! cannot be produced by a request.
 
 use serde_json::json;
 use serial_test::serial;
+use uuid::Uuid;
+
+use crate::common::sensor_lifecycle::{create_sensor as create_inventory_sensor, deploy_sensor, dt};
+use crate::common::{GLOBAL_PARAM_TEMP_ID, PROJECT_ID, SITE1_ID};
+use river_db::common::authz::AccessScope;
+use river_db::error::AppError;
+use river_db::routes::private::data_streams::views::validate_declared_sensor;
 
 async fn setup() -> (axum::Router, String, sea_orm::DatabaseConnection) {
     let db = crate::common::setup_test_db().await;
@@ -188,5 +199,96 @@ async fn re_registering_is_idempotent_but_will_not_move_the_instrument() {
     assert_eq!(
         status, 409,
         "reattributing an established feed is refused ({status}): {body}"
+    );
+}
+
+const OTHER_PROJECT_ID: &str = "00000000-0000-4000-a000-0000000000d1";
+const OTHER_SITE_ID: &str = "00000000-0000-4000-a000-0000000000d2";
+
+/// A project the caller below holds no grant for, to deploy an instrument into.
+async fn seed_other_project(db: &sea_orm::DatabaseConnection) {
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO projects (id, name, description, data_source) \
+             VALUES ('{OTHER_PROJECT_ID}', 'Declared Other', 'second project', 'test')"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO sites (id, project_id, name, latitude, longitude, altitude_m) \
+             VALUES ('{OTHER_SITE_ID}', '{OTHER_PROJECT_ID}', 'Other Station', 46.0, 7.0, 500.0)"
+        ),
+    )
+    .await;
+}
+
+fn feed_without_a_serial() -> serde_json::Value {
+    json!({})
+}
+
+/// A feed that describes no device cannot contradict anything, so the serial cross-check never
+/// fires and the project confinement is the whole rule. An instrument deployed nowhere belongs to
+/// no project, and attaching one would resolve its calibration windows onto everything the feed
+/// writes.
+#[tokio::test]
+#[serial]
+async fn a_confined_caller_may_only_name_an_instrument_its_own_projects_deploy() {
+    let (_app, _token, db) = setup().await;
+    seed_other_project(&db).await;
+    let scope = AccessScope::one(PROJECT_ID.parse::<Uuid>().expect("project id is a uuid"));
+    let metadata = feed_without_a_serial();
+    let from = dt("2025-01-01T00:00:00Z");
+
+    let inventory = create_inventory_sensor(&db, "declared-inventory", GLOBAL_PARAM_TEMP_ID).await;
+    assert!(
+        matches!(
+            validate_declared_sensor(&db, &scope, inventory.id, &metadata).await,
+            Err(AppError::Forbidden(_))
+        ),
+        "an instrument deployed nowhere is not this caller's to claim"
+    );
+
+    let elsewhere = create_inventory_sensor(&db, "declared-elsewhere", GLOBAL_PARAM_TEMP_ID).await;
+    deploy_sensor(&db, elsewhere.id, OTHER_SITE_ID, from).await;
+    assert!(
+        matches!(
+            validate_declared_sensor(&db, &scope, elsewhere.id, &metadata).await,
+            Err(AppError::Forbidden(_))
+        ),
+        "another project's instrument is refused even though the feed names no serial"
+    );
+
+    let own = create_inventory_sensor(&db, "declared-own", GLOBAL_PARAM_TEMP_ID).await;
+    deploy_sensor(&db, own.id, SITE1_ID, from).await;
+    assert!(
+        validate_declared_sensor(&db, &scope, own.id, &metadata)
+            .await
+            .is_ok(),
+        "an instrument deployed into the caller's own project is claimable"
+    );
+}
+
+/// Wiring inventory to its first feed is the discovery case, and it stays open to the callers that
+/// span projects: an administrator and an unscoped sync service.
+#[tokio::test]
+#[serial]
+async fn an_unrestricted_caller_still_claims_undeployed_inventory() {
+    let (_app, _token, db) = setup().await;
+    let inventory =
+        create_inventory_sensor(&db, "declared-unrestricted", GLOBAL_PARAM_TEMP_ID).await;
+
+    assert!(
+        validate_declared_sensor(
+            &db,
+            &AccessScope::Unrestricted,
+            inventory.id,
+            &feed_without_a_serial()
+        )
+        .await
+        .is_ok(),
+        "an unconfined caller reaches inventory that is deployed nowhere yet"
     );
 }

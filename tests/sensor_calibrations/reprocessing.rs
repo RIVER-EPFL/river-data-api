@@ -244,9 +244,9 @@ async fn reprocess_applies_per_parameter_calibration_on_shared_sensor() {
         &db,
         &format!(
             "INSERT INTO sensor_calibrations \
-             (id, sensor_id, parameter_id, slope, intercept, valid_from, mode, notes) VALUES \
-             ('{}', '{}', '{GLOBAL_PARAM_TEMP_ID}', 2.0, 0.0, '2000-01-01T00:00:00Z', 'windowed', 'temp'), \
-             ('{}', '{}', '{GLOBAL_PARAM_DO_ID}',  10.0, 5.0, '2000-01-01T00:00:00Z', 'windowed', 'do')",
+             (id, sensor_id, parameter_id, slope, intercept, valid_from, notes) VALUES \
+             ('{}', '{}', '{GLOBAL_PARAM_TEMP_ID}', 2.0, 0.0, '2000-01-01T00:00:00Z', 'temp'), \
+             ('{}', '{}', '{GLOBAL_PARAM_DO_ID}',  10.0, 5.0, '2000-01-01T00:00:00Z', 'do')",
             uuid::Uuid::new_v4(), sensor.id, uuid::Uuid::new_v4(), sensor.id
         ),
     )
@@ -332,9 +332,9 @@ async fn reprocess_prefers_real_curve_over_open_null_identity() {
         &db,
         &format!(
             "INSERT INTO sensor_calibrations \
-             (id, sensor_id, parameter_id, slope, intercept, valid_from, mode, notes) VALUES \
-             ('{}', '{sensor}', NULL, 1.0, 0.0, '2000-01-01T00:00:00Z', 'windowed', 'Identity calibration (auto-created)'), \
-             ('{real_cal}', '{sensor}', '{GLOBAL_PARAM_TEMP_ID}', 2.0, 0.0, '2000-01-01T00:00:00Z', 'windowed', 'temp')",
+             (id, sensor_id, parameter_id, slope, intercept, valid_from, notes) VALUES \
+             ('{}', '{sensor}', NULL, 1.0, 0.0, '2000-01-01T00:00:00Z', 'Identity calibration (auto-created)'), \
+             ('{real_cal}', '{sensor}', '{GLOBAL_PARAM_TEMP_ID}', 2.0, 0.0, '2000-01-01T00:00:00Z', 'temp')",
             uuid::Uuid::new_v4()
         ),
     )
@@ -382,10 +382,10 @@ async fn reprocess_prefers_real_curve_over_open_null_identity() {
     cleanup_test_db(&db).await;
 }
 
-/// H10 regression: a lab instrument's grab (measurement_type = 'spot', its own instant curve) that
-/// shares a (site, parameter) with a deployed field sensor must survive that slot's reprocess
-/// untouched, its sensor_id, calibration_id and instant-curve `calibrated_value` are preserved while
-/// the field sensor's continuous readings are re-derived.
+/// A lab instrument's grab (measurement_type = 'spot', its own standard curve) that shares a
+/// (site, parameter) with a deployed field sensor survives that slot's reprocess untouched: its
+/// sensor_id, its standard curve reference and the value that curve produces are preserved, while
+/// the field sensor's continuous readings are re-derived. A window resolution never claims a grab.
 #[tokio::test]
 #[serial]
 async fn slot_reprocess_leaves_spot_grabs_untouched() {
@@ -413,9 +413,9 @@ async fn slot_reprocess_leaves_spot_grabs_untouched() {
     .await;
 
     // Lab instrument grab at the same site/parameter within the field deployment window: its own
-    // instant curve produced calibrated_value 99.0, and it is tagged measurement_type = 'spot'.
+    // standard curve produced calibrated_value 95.0, and it is tagged measurement_type = 'spot'.
     let lab = uuid::Uuid::new_v4();
-    let instant_cal = uuid::Uuid::new_v4();
+    let standard_curve = uuid::Uuid::new_v4();
     exec(
         &db,
         &format!(
@@ -426,8 +426,8 @@ async fn slot_reprocess_leaves_spot_grabs_untouched() {
     exec(
         &db,
         &format!(
-            "INSERT INTO sensor_calibrations (id, sensor_id, parameter_id, slope, intercept, valid_from, mode, notes) \
-             VALUES ('{instant_cal}', '{lab}', '{GLOBAL_PARAM_TEMP_ID}', 9.9, 0.0, '2000-01-01T00:00:00Z', 'instant', 'grab curve')"
+            "INSERT INTO standard_curves (id, sensor_id, name, slope, intercept) \
+             VALUES ('{standard_curve}', '{lab}', 'grab curve', 9.5, 0.0)"
         ),
     )
     .await;
@@ -436,8 +436,8 @@ async fn slot_reprocess_leaves_spot_grabs_untouched() {
         &db,
         &format!(
             "INSERT INTO readings \
-             (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, sensor_id, calibration_id, measurement_type, replicate_index) \
-             VALUES ('{grab_stream}', '{SITE1_ID}', '{GLOBAL_PARAM_TEMP_ID}', '2025-01-01T11:00:00Z', 10.0, 99.0, '{lab}', '{instant_cal}', 'spot', 0)"
+             (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, sensor_id, standard_curve_id, measurement_type, replicate_index) \
+             VALUES ('{grab_stream}', '{SITE1_ID}', '{GLOBAL_PARAM_TEMP_ID}', '2025-01-01T11:00:00Z', 10.0, 95.0, '{lab}', '{standard_curve}', 'spot', 0)"
         ),
     )
     .await;
@@ -461,8 +461,8 @@ async fn slot_reprocess_leaves_spot_grabs_untouched() {
     let grab = get_readings(&db, grab_stream).await;
     assert_eq!(
         grab[0].calibrated_value,
-        Some(99.0),
-        "grab's instant-curve value is preserved"
+        Some(95.0),
+        "grab's standard-curve value is preserved"
     );
     assert_eq!(
         grab[0].sensor_id,
@@ -470,9 +470,13 @@ async fn slot_reprocess_leaves_spot_grabs_untouched() {
         "grab keeps its lab instrument, not the field sensor"
     );
     assert_eq!(
-        grab[0].calibration_id,
-        Some(instant_cal),
-        "grab keeps its instant curve"
+        grab[0].standard_curve_id,
+        Some(standard_curve),
+        "grab keeps its standard curve"
+    );
+    assert_eq!(
+        grab[0].calibration_id, None,
+        "the field sensor's windowed curve is not stamped onto the grab"
     );
 
     cleanup_test_db(&db).await;

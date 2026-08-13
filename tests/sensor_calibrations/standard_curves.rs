@@ -674,3 +674,117 @@ async fn the_export_carries_both_curve_references_in_json_and_csv() {
         "the curve id is in the csv body: {csv}"
     );
 }
+
+/// `created_by` records who fitted the curve, so it is supplied on create like every other entity
+/// that carries it, and `r_squared` is the fit provenance of a value that has been published, so it
+/// is frozen alongside the coefficients once a reading references the curve.
+#[tokio::test]
+#[serial]
+async fn attribution_is_stored_on_create_and_the_fit_quality_freezes_with_the_coefficients() {
+    let fx = setup().await;
+    let sensor = create_sensor(&fx.db, "Microplate-06", GLOBAL_PARAM_TEMP_ID).await;
+
+    let (status, created) = post_json_parse_with_token(
+        &fx.app,
+        "/api/standard_curves",
+        &json!({
+            "sensor_id": sensor.id,
+            "name": "Plate E",
+            "slope": 2.0,
+            "intercept": 1.0,
+            "r_squared": 0.97,
+            "created_by": "lab.tech@epfl.ch",
+        }),
+        &fx.token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "creating the curve should succeed: {created}"
+    );
+    assert_eq!(
+        created["created_by"].as_str(),
+        Some("lab.tech@epfl.ch"),
+        "the caller's attribution is stored, not dropped: {created}"
+    );
+    let curve: Uuid = created["id"]
+        .as_str()
+        .expect("created curve carries an id")
+        .parse()
+        .expect("curve id is a uuid");
+
+    let (status, body) = put_json_with_token(
+        &fx.app,
+        &format!("/api/standard_curves/{curve}"),
+        &json!({ "r_squared": 0.99 }),
+        &fx.token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "an unused curve can still be re-fitted: {body}"
+    );
+
+    let (status, body) = post_grab(
+        &fx,
+        json!({
+            "parameter_id": GLOBAL_PARAM_TEMP_ID,
+            "sensor_id": sensor.id,
+            "standard_curve_id": curve,
+            "value": 10.0,
+            "time": GRAB_TIME,
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "grab should succeed: {body}");
+
+    let (status, body) = put_json_with_token(
+        &fx.app,
+        &format!("/api/standard_curves/{curve}"),
+        &json!({ "r_squared": 0.42 }),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "restating the fit quality of an applied curve is refused: {body}"
+    );
+
+    let (status, body) = put_json_with_token(
+        &fx.app,
+        &format!("/api/standard_curves/{curve}"),
+        &json!({ "created_by": "someone.else@epfl.ch" }),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "reassigning the attribution of an applied curve is refused: {body}"
+    );
+
+    let (status, served) =
+        get_json_with_token(&fx.app, &format!("/api/standard_curves/{curve}"), &fx.token).await;
+    assert_eq!(status, 200, "curve still readable: {served}");
+    assert_close(
+        served["r_squared"].as_f64().expect("r_squared is a number"),
+        0.99,
+        "the fit quality recorded when the value was published is unchanged",
+    );
+    assert_eq!(
+        served["created_by"].as_str(),
+        Some("lab.tech@epfl.ch"),
+        "the attribution is unchanged: {served}"
+    );
+
+    let (status, body) = put_json_with_token(
+        &fx.app,
+        &format!("/api/standard_curves/{curve}"),
+        &json!({ "notes": "plate rerun scheduled" }),
+        &fx.token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "notes stay editable on an applied curve: {body}"
+    );
+}
