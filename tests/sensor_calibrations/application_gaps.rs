@@ -35,6 +35,8 @@ const JOB_TIMEOUT_SECS: u64 = 30;
 const CURVE_FROM: &str = "2025-06-01T00:00:00Z";
 const LATER_CURVE_FROM: &str = "2025-07-01T00:00:00Z";
 const RETIRED_AT: &str = "2025-06-15T00:00:00Z";
+/// An end date reaching past `LATER_CURVE_FROM`, ie. into the next curve's window.
+const OVERLAPPING_UNTIL: &str = "2025-08-01T00:00:00Z";
 
 const T_BEFORE_CURVE_ENTRY: &str = "2025-06-02T10:00:00Z";
 const T_AFTER_CURVE_ENTRY: &str = "2025-06-02T12:00:00Z";
@@ -787,5 +789,116 @@ async fn stream_import_attributes_each_reading_to_its_covering_curve() {
     assert!(
         valid_from.unwrap() <= sl::dt(EARLY_READING),
         "the curve minted on import covers the reading it is stamped on: {curve}"
+    );
+}
+
+// clearing an operator's end date hands the curve back to the window chain.
+#[tokio::test]
+#[serial]
+async fn clearing_an_explicit_window_returns_the_curve_to_the_chain() {
+    if !kc::require_keycloak_or_skip("clearing_an_explicit_window_returns_the_curve_to_the_chain")
+        .await
+    {
+        return;
+    }
+    let f = onboard().await;
+    let curve = f.create_curve(&f.parameter, 2.0, 5.0, CURVE_FROM).await;
+
+    let (status, body) = put_json_with_token(
+        &f.app,
+        &format!("/api/sensor_calibrations/{curve}"),
+        &json!({ "valid_until": RETIRED_AT }),
+        &f.jwt,
+    )
+    .await;
+    assert_eq!(status, 200, "retire the curve ({status}): {body}");
+
+    let (status, body) = put_json_with_token(
+        &f.app,
+        &format!("/api/sensor_calibrations/{curve}"),
+        &json!({ "valid_until": Value::Null }),
+        &f.jwt,
+    )
+    .await;
+    assert_eq!(status, 200, "un-retire the curve ({status}): {body}");
+    let stored = f.calibration(&curve).await;
+    assert_eq!(
+        time_field(&stored, "valid_until"),
+        None,
+        "with nothing after it, the un-retired curve is open-ended again: {stored}"
+    );
+
+    f.create_curve(&f.parameter, 3.0, 0.0, LATER_CURVE_FROM)
+        .await;
+    let stored = f.calibration(&curve).await;
+    assert_eq!(
+        time_field(&stored, "valid_until"),
+        Some(sl::dt(LATER_CURVE_FROM)),
+        "the chain closes the curve on the next one's start again: {stored}"
+    );
+}
+
+// an operator's end date is shortened, never honoured past the next curve: two curves covering one
+// instant would leave the resolver a choice it cannot make.
+#[tokio::test]
+#[serial]
+async fn an_explicit_window_is_shortened_to_the_next_curve() {
+    if !kc::require_keycloak_or_skip("an_explicit_window_is_shortened_to_the_next_curve").await {
+        return;
+    }
+    let f = onboard().await;
+    let curve = f.create_curve(&f.parameter, 2.0, 5.0, CURVE_FROM).await;
+    f.create_curve(&f.parameter, 3.0, 0.0, LATER_CURVE_FROM)
+        .await;
+
+    let (status, body) = put_json_with_token(
+        &f.app,
+        &format!("/api/sensor_calibrations/{curve}"),
+        &json!({ "valid_until": OVERLAPPING_UNTIL }),
+        &f.jwt,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "set an overlapping end date ({status}): {body}"
+    );
+
+    let stored = f.calibration(&curve).await;
+    assert_eq!(
+        time_field(&stored, "valid_until"),
+        Some(sl::dt(LATER_CURVE_FROM)),
+        "the operator's end date is cut back to where the next curve opens: {stored}"
+    );
+}
+
+// a window that closes at or before it opens applies to no reading, so it is refused.
+#[tokio::test]
+#[serial]
+async fn an_inverted_explicit_window_is_refused() {
+    if !kc::require_keycloak_or_skip("an_inverted_explicit_window_is_refused").await {
+        return;
+    }
+    let f = onboard().await;
+    let curve = f
+        .create_curve(&f.parameter, 2.0, 5.0, LATER_CURVE_FROM)
+        .await;
+
+    let (status, body) = put_json_with_token(
+        &f.app,
+        &format!("/api/sensor_calibrations/{curve}"),
+        &json!({ "valid_until": CURVE_FROM }),
+        &f.jwt,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "an end date before the start date is refused ({status}): {body}"
+    );
+
+    let stored = f.calibration(&curve).await;
+    assert_eq!(
+        time_field(&stored, "valid_until"),
+        None,
+        "the refused edit left the window alone: {stored}"
     );
 }

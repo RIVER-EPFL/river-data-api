@@ -13,9 +13,9 @@ use uuid::Uuid;
 
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::common::{AppEvent, AppState};
-use crate::routes::private::readings;
 use crate::error::AppResult;
 use crate::routes::private::data_streams::service::get_or_create_api_stream;
+use crate::routes::private::readings;
 use crate::routes::private::sensors::operations::{ResolvedOwner, resolve_slot_owner_for_times};
 
 /// What a reading must satisfy to be stored, whichever path it arrived on.
@@ -77,8 +77,9 @@ pub mod admission {
     }
 
     pub fn admit_value(raw_value: f64) -> AppResult<()> {
-        value_rejection(raw_value)
-            .map_or(Ok(()), |reason| Err(AppError::BadRequest(format!("Reading value {reason}"))))
+        value_rejection(raw_value).map_or(Ok(()), |reason| {
+            Err(AppError::BadRequest(format!("Reading value {reason}")))
+        })
     }
 
     /// The full admission check for one reading: classification vocabulary, timestamp bound,
@@ -237,6 +238,10 @@ pub struct ReadingInput {
     pub calibrated_value: Option<f64>,
     pub sensor_id: Option<Uuid>,
     pub calibration_id: Option<Uuid>,
+    /// The standard curve the value was corrected with, for a caller replaying grabs that carried
+    /// one. Ordinary batch inserts leave it unset.
+    #[serde(default)]
+    pub standard_curve_id: Option<Uuid>,
     pub deployment_id: Option<Uuid>,
     #[serde(default)]
     pub replicate_index: Option<i16>,
@@ -265,7 +270,9 @@ pub enum Replace {
     /// The measurement and its classification, ie. an operator or source correction.
     Values,
     /// The measurement plus the row's attribution, ie. a sync re-send that also re-resolves which
-    /// site, parameter, sensor, calibration and deployment the row belongs to.
+    /// site, parameter, sensor, calibration, standard curve and deployment the row belongs to. The
+    /// standard curve is operator-chosen, so only this mode replaces it; a value-only correction
+    /// leaves it standing.
     ValuesAndAttribution,
 }
 
@@ -308,6 +315,7 @@ pub(crate) fn readings_upsert(replace: Replace) -> sea_orm::sea_query::OnConflic
                     readings::Column::ParameterId,
                     readings::Column::SensorId,
                     readings::Column::CalibrationId,
+                    readings::Column::StandardCurveId,
                     readings::Column::DeploymentId,
                 ]);
             }
@@ -389,7 +397,10 @@ pub async fn insert_batch_readings(
             HashMap::new();
         for r in &payload.readings {
             if r.sensor_id.is_none() {
-                times_by_slot.entry((r.site_id, r.parameter_id)).or_default().push(r.time);
+                times_by_slot
+                    .entry((r.site_id, r.parameter_id))
+                    .or_default()
+                    .push(r.time);
             }
         }
         for ((site, param), ts) in &times_by_slot {
@@ -444,11 +455,15 @@ pub async fn insert_batch_readings(
         .map(|r| {
             let stream_id = stream_cache[&(r.site_id, r.parameter_id)];
             let owner = if r.sensor_id.is_none() {
-                owner_map.get(&(r.site_id, r.parameter_id, r.time)).cloned().unwrap_or_default()
+                owner_map
+                    .get(&(r.site_id, r.parameter_id, r.time))
+                    .cloned()
+                    .unwrap_or_default()
             } else {
                 ResolvedOwner::default()
             };
             readings::ActiveModel {
+                standard_curve_id: Set(r.standard_curve_id),
                 stream_id: Set(stream_id),
                 site_id: Set(Some(r.site_id)),
                 parameter_id: Set(Some(r.parameter_id)),
@@ -521,7 +536,12 @@ pub async fn insert_batch_readings(
     })
     .await?;
 
-    tracing::info!(total, inserted, overwritten, "Batch readings insert complete");
+    tracing::info!(
+        total,
+        inserted,
+        overwritten,
+        "Batch readings insert complete"
+    );
 
     // Emit DataIngested events per unique (site_id, parameter_id) pair
     if inserted > 0 || overwritten > 0 {
@@ -643,8 +663,15 @@ async fn count_existing<C: ConnectionTrait>(
 
     let mut condition = Condition::any();
     for m in chunk {
-        let (sea_orm::ActiveValue::Set(stream_id), sea_orm::ActiveValue::Set(time), sea_orm::ActiveValue::Set(rep)) =
-            (m.stream_id.clone(), m.time.clone(), m.replicate_index.clone())
+        let (
+            sea_orm::ActiveValue::Set(stream_id),
+            sea_orm::ActiveValue::Set(time),
+            sea_orm::ActiveValue::Set(rep),
+        ) = (
+            m.stream_id.clone(),
+            m.time.clone(),
+            m.replicate_index.clone(),
+        )
         else {
             continue;
         };

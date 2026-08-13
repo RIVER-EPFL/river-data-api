@@ -1,6 +1,7 @@
 use axum::{
-    Router, middleware,
+    Router,
     extract::{Request, State},
+    middleware,
     response::Response,
     routing::{delete, get, patch, post, put},
 };
@@ -22,19 +23,20 @@ use crate::routes::private::{
     api_tokens::audit_log::ApiTokenAuditLog,
     constants::Constant,
     data_streams::DataStream,
-    parameters::derived::definition_model::DerivedParameterDefinition,
-    parameters::derived::source_model::DerivedParameterSource,
+    data_streams::pairing_plans::PairingPlan,
     notes::Note,
     notifications::{NotificationLog, NotificationMute, TelegramIdentity},
-    data_streams::pairing_plans::PairingPlan,
     parameters::Parameter,
-    reprocessing_jobs::ReprocessingJob,
+    parameters::derived::definition_model::DerivedParameterDefinition,
+    parameters::derived::source_model::DerivedParameterSource,
+    projects::subprojects::Subproject,
     readings::samples::Sample,
+    reprocessing_jobs::ReprocessingJob,
     sensors::Sensor,
     sensors::calibrations::SensorCalibration,
     sensors::deployments::SensorDeployment,
+    sensors::standard_curves::StandardCurve,
     sites::parameters::SiteParameter,
-    projects::subprojects::Subproject,
     sync::commands_model::SyncCommand,
     sync::credentials_model::SyncServiceCredential,
     sync::events_model::SyncEvent,
@@ -139,19 +141,49 @@ pub fn api_router(state: &AppState) -> Router<()> {
     };
 
     let entity_router: Router<()> = OpenApiRouter::new()
-        .nest("/projects", invalidate_public_config(crate::routes::private::projects::router::service_router(state)))
-        .nest("/sites", invalidate_public_config(crate::routes::private::sites::router::service_router(state)))
+        .nest(
+            "/projects",
+            invalidate_public_config(crate::routes::private::projects::router::service_router(
+                state,
+            )),
+        )
+        .nest(
+            "/sites",
+            invalidate_public_config(crate::routes::private::sites::router::service_router(state)),
+        )
         // Global catalog (the shared parameter list, constants, derived definitions) is
         // Administrator-managed: onboarding a new global parameter is an admin act. Managers
         // instead ASSIGN parameters to sites (site_parameters) and manage per-site alarm thresholds.
         .nest("/parameters", admin_write_crud(Parameter::router(db)))
-        .nest("/site_parameters", invalidate_public_config(catalog_crud(SiteParameter::router(db))))
+        .nest(
+            "/site_parameters",
+            invalidate_public_config(catalog_crud(SiteParameter::router(db))),
+        )
         .nest("/sensors", admin_write_crud(Sensor::router(db)))
-        .nest("/sensor_calibrations", sensor_crud(SensorCalibration::router(db)))
-        .nest("/sensor_deployments", sensor_crud(SensorDeployment::router(db)))
-        .nest("/derived_parameters", admin_write_crud(DerivedParameterDefinition::router(db)))
-        .nest("/derived_parameter_sources", admin_write_crud(DerivedParameterSource::router(db)))
-        .nest("/alarm_thresholds", catalog_crud(AlarmThreshold::router(db)))
+        .nest(
+            "/sensor_calibrations",
+            sensor_crud(SensorCalibration::router(db)),
+        )
+        .nest(
+            "/sensor_deployments",
+            sensor_crud(SensorDeployment::router(db)),
+        )
+        // Field metadata, not sensor movement: a standard curve affects only the grabs an operator
+        // enters against it, so the person entering the plate's readings adds its curve in the same
+        // sitting. `sensor_crud` (MANAGER) is the alternative, and would make them wait on a manager.
+        .nest("/standard_curves", field_crud(StandardCurve::router(db)))
+        .nest(
+            "/derived_parameters",
+            admin_write_crud(DerivedParameterDefinition::router(db)),
+        )
+        .nest(
+            "/derived_parameter_sources",
+            admin_write_crud(DerivedParameterSource::router(db)),
+        )
+        .nest(
+            "/alarm_thresholds",
+            catalog_crud(AlarmThreshold::router(db)),
+        )
         .nest(
             "/tokens",
             admin_only_crud(ApiToken::router(db)).layer(middleware::from_fn_with_state(
@@ -159,19 +191,40 @@ pub fn api_router(state: &AppState) -> Router<()> {
                 bust_token_cache_on_mutation,
             )),
         )
-        .nest("/sync_service_credentials", admin_only_crud(SyncServiceCredential::router(db)))
+        .nest(
+            "/sync_service_credentials",
+            admin_only_crud(SyncServiceCredential::router(db)),
+        )
         // Read-only forensic audit trail of API-token use. Admin-only (no token can read it).
-        .nest("/api_token_audit_logs", admin_only_crud(ApiTokenAuditLog::router(db)))
+        .nest(
+            "/api_token_audit_logs",
+            admin_only_crud(ApiTokenAuditLog::router(db)),
+        )
         .nest("/data_streams", admin_write_crud(DataStream::router(db)))
-        .nest("/subprojects", invalidate_public_config(field_crud(Subproject::router(db))))
+        .nest(
+            "/subprojects",
+            invalidate_public_config(field_crud(Subproject::router(db))),
+        )
         .nest("/notes", field_crud(Note::router(db)))
-        .nest("/telegram_identities", admin_only_crud(TelegramIdentity::router(db)))
-        .nest("/notification_mutes", catalog_crud(NotificationMute::router(db)))
-        .nest("/notification_logs", admin_only_crud(NotificationLog::router(db)))
+        .nest(
+            "/telegram_identities",
+            admin_only_crud(TelegramIdentity::router(db)),
+        )
+        .nest(
+            "/notification_mutes",
+            catalog_crud(NotificationMute::router(db)),
+        )
+        .nest(
+            "/notification_logs",
+            admin_only_crud(NotificationLog::router(db)),
+        )
         .nest("/annotations", field_data_crud(Annotation::router(db)))
         .nest("/constants", catalog_crud(Constant::router(db)))
         .nest("/samples", field_data_crud(Sample::router(db)))
-        .nest("/reprocessing_jobs", admin_write_crud(ReprocessingJob::router(db)))
+        .nest(
+            "/reprocessing_jobs",
+            admin_write_crud(ReprocessingJob::router(db)),
+        )
         .nest("/sync_services", admin_only_crud(SyncService::router(db)))
         .nest("/sync_commands", admin_only_crud(SyncCommand::router(db)))
         .nest("/sync_events", admin_only_crud(SyncEvent::router(db)))
@@ -192,9 +245,11 @@ pub fn api_router(state: &AppState) -> Router<()> {
         admin::{actions, calibrations, derived, merge, public_config, users},
         alarms::views as alarm_views,
         data_streams::views as stream_views,
-        readings::{batch as readings_batch, flags, grab_samples, import as readings_import, ingest},
-        search,
         readings::status_events::batch as status_events_batch,
+        readings::{
+            batch as readings_batch, flags, grab_samples, import as readings_import, ingest,
+        },
+        search,
         sync::views as sync_views,
         tools,
     };
@@ -242,7 +297,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .layer(middleware::from_fn(require_read_metadata))
         .with_state(state.clone());
     let sensor_adopt_write = Router::new()
-        .route("/sensors/{sensor_id}/adopt", post(sensor_adopt::adopt_sensor))
+        .route(
+            "/sensors/{sensor_id}/adopt",
+            post(sensor_adopt::adopt_sensor),
+        )
         .route(
             "/sensors/retag_frequency",
             post(crate::routes::private::sensors::retag::retag_frequency),
@@ -250,7 +308,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route("/actions/swap", post(sensor_adopt::swap_sensors))
         // Rolling a deployment back undoes one, so it takes the capability deleting a deployment
         // takes rather than the weaker write_data the other operator actions carry.
-        .route("/actions/rollback_deployment", post(actions::rollback_deployment))
+        .route(
+            "/actions/rollback_deployment",
+            post(actions::rollback_deployment),
+        )
         .layer(middleware::from_fn(deny_scoped_token))
         // Deploying/swapping a sensor at a slot is sensor movement: MANAGER (write_metadata token).
         .layer(middleware::from_fn(require_manage_sensors))
@@ -261,8 +322,14 @@ pub fn api_router(state: &AppState) -> Router<()> {
     let data_push_routes = Router::new()
         .route("/ingest", post(ingest::ingest_readings))
         .route("/ingest/status_events", post(ingest::ingest_status_events))
-        .route("/readings/batch", post(readings_batch::insert_batch_readings))
-        .route("/status_events/batch", post(status_events_batch::insert_batch_status_events))
+        .route(
+            "/readings/batch",
+            post(readings_batch::insert_batch_readings),
+        )
+        .route(
+            "/status_events/batch",
+            post(status_events_batch::insert_batch_status_events),
+        )
         .layer(RequestBodyLimitLayer::new(DATA_BODY_LIMIT))
         .route("/readings/import_csv", post(readings_import::import_csv))
         .layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT))
@@ -277,14 +344,29 @@ pub fn api_router(state: &AppState) -> Router<()> {
     // Operator / global data actions that span projects or have no per-project target. Denied to
     // project-scoped tokens (a logger key has no reason to trigger a global reprocess/refresh).
     let data_action_routes = Router::new()
-        .route("/actions/refresh_aggregates", post(actions::refresh_aggregates))
+        .route(
+            "/actions/refresh_aggregates",
+            post(actions::refresh_aggregates),
+        )
         .route("/actions/compute_derived", post(actions::compute_derived))
         .route("/actions/reprocess_all", post(actions::reprocess_all))
-        .route("/actions/rebuild_alarm_events", post(actions::rebuild_alarm_events))
+        .route(
+            "/actions/rebuild_alarm_events",
+            post(actions::rebuild_alarm_events),
+        )
         .route("/actions/reconcile_alarms", post(actions::reconcile_alarms))
-        .route("/actions/backfill_attribution", post(actions::backfill_attribution))
-        .route("/actions/backfill_calibrations", post(actions::backfill_calibrations))
-        .route("/alarms/{event_id}/acknowledge", post(alarm_views::acknowledge_alarm).delete(alarm_views::unacknowledge_alarm))
+        .route(
+            "/actions/backfill_attribution",
+            post(actions::backfill_attribution),
+        )
+        .route(
+            "/actions/backfill_calibrations",
+            post(actions::backfill_calibrations),
+        )
+        .route(
+            "/alarms/{event_id}/acknowledge",
+            post(alarm_views::acknowledge_alarm).delete(alarm_views::unacknowledge_alarm),
+        )
         .layer(middleware::from_fn(deny_scoped_token))
         .layer(middleware::from_fn(require_write_data))
         .with_state(state.clone());
@@ -308,8 +390,14 @@ pub fn api_router(state: &AppState) -> Router<()> {
     let metadata_read_routes = Router::new()
         .route("/search", get(search::search))
         .route("/version", get(crate::routes::version::get_version))
-        .route("/actions/backfill_candidates", get(actions::backfill_candidates))
-        .route("/actions/calibration_candidates", get(actions::calibration_candidates))
+        .route(
+            "/actions/backfill_candidates",
+            get(actions::backfill_candidates),
+        )
+        .route(
+            "/actions/calibration_candidates",
+            get(actions::calibration_candidates),
+        )
         .route(
             "/schedules",
             get(crate::routes::private::reprocessing_jobs::schedule_routes::list_schedules),
@@ -348,10 +436,6 @@ pub fn api_router(state: &AppState) -> Router<()> {
             post(merge::merge_site_parameters_handler),
         )
         .route(
-            "/actions/merge_parameters",
-            post(merge::merge_parameters_handler),
-        )
-        .route(
             "/reprocessing_jobs/{id}/rerun",
             post(crate::routes::private::reprocessing_jobs::routes::rerun_job),
         )
@@ -370,6 +454,20 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(middleware::from_fn(deny_scoped_token))
         .layer(middleware::from_fn(require_manage_sensors))
+        .with_state(state.clone());
+
+    // A catalog merge hard-deletes a `parameters` row, so it holds the same Administrator gate as
+    // DELETE /parameters/{id} rather than the MANAGER gate the other operator actions carry. The
+    // write_metadata token bit is preserved for automation; scoped tokens are still denied, a
+    // per-project key has no business destroying a global catalog entry.
+    let catalog_merge_routes = Router::new()
+        .route(
+            "/actions/merge_parameters",
+            post(merge::merge_parameters_handler),
+        )
+        .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
+        .layer(middleware::from_fn(deny_scoped_token))
+        .layer(middleware::from_fn(require_admin_or_token_write_metadata))
         .with_state(state.clone());
 
     // Sync admin views split by required permission. Credential creation/revoke is
@@ -419,9 +517,15 @@ pub fn api_router(state: &AppState) -> Router<()> {
         use crate::routes::private::notifications::{health, views as notif_views};
         Router::new()
             .route("/notifications/health", get(health::get_health))
-            .route("/notifications/health/refresh", post(health::refresh_health))
+            .route(
+                "/notifications/health/refresh",
+                post(health::refresh_health),
+            )
             .route("/notifications/test-send", post(notif_views::test_send))
-            .route("/notifications/subscribers", get(notif_views::list_subscribers))
+            .route(
+                "/notifications/subscribers",
+                get(notif_views::list_subscribers),
+            )
             .layer(middleware::from_fn(require_admin))
             .with_state(state.clone())
     };
@@ -435,7 +539,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
                 "/notifications/me",
                 get(me::get_my_notifications).patch(me::update_my_notifications),
             )
-            .route("/notifications/me/subscriptions", put(me::set_my_subscriptions))
+            .route(
+                "/notifications/me/subscriptions",
+                put(me::set_my_subscriptions),
+            )
             .route("/notifications/me/link_code", post(me::mint_my_link_code))
             .route("/notifications/me/telegram", delete(me::unlink_my_telegram))
             .layer(middleware::from_fn(require_read_data))
@@ -488,6 +595,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .merge(data_action_routes)
         .merge(data_read_routes)
         .merge(operator_action_routes)
+        .merge(catalog_merge_routes)
         .merge(sync_admin_read)
         .merge(sync_admin_write)
         .merge(sync_admin_admin);

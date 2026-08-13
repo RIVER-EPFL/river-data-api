@@ -26,20 +26,23 @@ pub struct Model {
     pub valid_from: chrono::DateTime<chrono::Utc>,
     pub performed_by: Option<String>,
     pub notes: Option<String>,
-    /// Human label for picking an instant (lab grab) curve by property rather than by date.
+    /// Human label for the curve, an alternative to picking it by date in the editor.
     pub name: Option<String>,
-    /// `windowed` (field sensor, auto-applied over a time window) or `instant` (lab grab,
-    /// applied to a single reading). Defaults to `windowed` on create; the lab curve path sends
-    /// `instant`. Not updatable after creation.
-    #[crudcrate(exclude(update), on_create = String::from("windowed"))]
-    pub mode: String,
-    /// Per-channel parameter for windowed field curves (multi-parameter instruments get one curve
-    /// per channel); NULL for lab instant curves, whose parameter is decided at the grab.
+    /// Per-channel parameter (multi-parameter instruments get one curve per channel); NULL applies
+    /// the curve to every channel.
     #[crudcrate(filterable)]
     pub parameter_id: Option<Uuid>,
     pub r_squared: Option<f64>,
-    #[crudcrate(exclude(create, update))]
+    /// End of the window, exclusive. Normally chain-written (the next curve's `valid_from`), but an
+    /// operator may retire a curve by setting it on update. A retired curve leaves the time after
+    /// it uncovered: readings there keep the calibration they were stamped with, because reprocess
+    /// only rewrites a reading a curve covers.
+    #[crudcrate(exclude(create))]
     pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// True when `valid_until` was set by an operator rather than by the window chain. Provenance,
+    /// not data: no client sets it, `before_update` maintains it from what the update carried.
+    #[crudcrate(exclude(create, update), on_create = false)]
+    pub valid_until_explicit: bool,
     #[crudcrate(exclude(create, update))]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }

@@ -8,14 +8,17 @@ use sea_orm::{
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::routes::private::{data_streams, sensors, sensors::calibrations, sensors::deployments};
 use super::model::Sensor;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::{data_streams, sensors, sensors::calibrations, sensors::deployments};
 
 pub struct SensorOperations;
 
 fn build_in_clause(count: usize) -> String {
-    (1..=count).map(|i| format!("${i}")).collect::<Vec<_>>().join(", ")
+    (1..=count)
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn uuid_values(ids: &[Uuid]) -> Vec<sea_orm::Value> {
@@ -60,7 +63,10 @@ impl CRUDOperations for SensorOperations {
             .map_err(ApiError::database)?;
 
         entity.last_calibration_at = cal_row
-            .and_then(|r| r.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "last_cal").ok())
+            .and_then(|r| {
+                r.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "last_cal")
+                    .ok()
+            })
             .map(|t| t.with_timezone(&Utc));
 
         // Also populate current_site fields for detail view
@@ -105,7 +111,9 @@ impl CRUDOperations for SensorOperations {
         );
         let dep_rows = db
             .query_all(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres, &dep_sql, values.clone(),
+                sea_orm::DatabaseBackend::Postgres,
+                &dep_sql,
+                values.clone(),
             ))
             .await
             .map_err(ApiError::database)?;
@@ -117,7 +125,9 @@ impl CRUDOperations for SensorOperations {
                 row.try_get::<Uuid>("", "site_id"),
                 row.try_get::<String>("", "site_name"),
             ) {
-                site_by_sensor.entry(sensor_id).or_insert((site_id, site_name));
+                site_by_sensor
+                    .entry(sensor_id)
+                    .or_insert((site_id, site_name));
             }
         }
 
@@ -130,7 +140,9 @@ impl CRUDOperations for SensorOperations {
         );
         let reading_rows = db
             .query_all(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres, &reading_sql, values.clone(),
+                sea_orm::DatabaseBackend::Postgres,
+                &reading_sql,
+                values.clone(),
             ))
             .await
             .map_err(ApiError::database)?;
@@ -155,7 +167,9 @@ impl CRUDOperations for SensorOperations {
         );
         let cal_rows = db
             .query_all(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres, &cal_sql, values,
+                sea_orm::DatabaseBackend::Postgres,
+                &cal_sql,
+                values,
             ))
             .await
             .map_err(ApiError::database)?;
@@ -322,13 +336,11 @@ async fn insert_or_get_sensor<C: ConnectionTrait>(
     }
 
     // Conflict on serial: a sensor already exists (possibly a concurrent winner), reuse it.
-    let existing = find_sensor_by_serial(db, serial)
-        .await?
-        .ok_or_else(|| {
-            AppError::Internal(
-                "sensor upsert conflicted but the existing serial row was not found".to_string(),
-            )
-        })?;
+    let existing = find_sensor_by_serial(db, serial).await?.ok_or_else(|| {
+        AppError::Internal(
+            "sensor upsert conflicted but the existing serial row was not found".to_string(),
+        )
+    })?;
     Ok(existing.id)
 }
 
@@ -372,8 +384,7 @@ pub async fn import_sensor_for_stream<C: ConnectionTrait>(
             .clone()
             .unwrap_or_else(|| format!("Stream {}", stream.source_key));
         let metadata = extract_source_metadata(&stream.metadata);
-        let sensor_id =
-            insert_or_get_sensor(db, serial.as_deref(), &sensor_name, metadata).await?;
+        let sensor_id = insert_or_get_sensor(db, serial.as_deref(), &sensor_name, metadata).await?;
         let cal_id = get_latest_calibration(db, sensor_id).await?;
         link_stream_to_sensor(db, stream, sensor_id).await?;
         (sensor_id, cal_id)
@@ -389,10 +400,7 @@ pub async fn import_sensor_for_stream<C: ConnectionTrait>(
 /// Find the latest calibration for a sensor, or create an identity calibration if none exists.
 /// When creating, `valid_from` is set to the sensor's earliest reading time (if readings exist)
 /// so historical data is covered. Falls back to `NOW()` when no readings exist yet.
-async fn get_latest_calibration<C: ConnectionTrait>(
-    db: &C,
-    sensor_id: Uuid,
-) -> AppResult<Uuid> {
+async fn get_latest_calibration<C: ConnectionTrait>(db: &C, sensor_id: Uuid) -> AppResult<Uuid> {
     let cal = calibrations::Entity::find()
         .filter(calibrations::Column::SensorId.eq(sensor_id))
         .order_by_desc(calibrations::Column::ValidFrom)
@@ -426,10 +434,10 @@ async fn get_latest_calibration<C: ConnectionTrait>(
             performed_by: Set(Some("system".to_string())),
             notes: Set(Some("Identity calibration (auto-created)".to_string())),
             name: Set(None),
-            mode: Set("windowed".to_string()),
             parameter_id: Set(None),
             r_squared: Set(None),
             valid_until: Set(None),
+            valid_until_explicit: Set(false),
             created_at: Set(Some(Utc::now())),
         };
         let cal = cal.insert(db).await?;
@@ -561,7 +569,11 @@ pub async fn resolve_windows_for_times<C: ConnectionTrait>(
             let from: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "valid_from")?;
             let until: Option<chrono::DateTime<chrono::FixedOffset>> =
                 r.try_get("", "valid_until")?;
-            Ok((id, from.with_timezone(&Utc), until.map(|u| u.with_timezone(&Utc))))
+            Ok((
+                id,
+                from.with_timezone(&Utc),
+                until.map(|u| u.with_timezone(&Utc)),
+            ))
         })
         .collect::<AppResult<_>>()?;
 
@@ -573,7 +585,12 @@ pub async fn resolve_windows_for_times<C: ConnectionTrait>(
             [sensor_id.into()],
         ))
         .await?;
-    let deps: Vec<(Uuid, Uuid, chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>)> = dep_rows
+    let deps: Vec<(
+        Uuid,
+        Uuid,
+        chrono::DateTime<Utc>,
+        Option<chrono::DateTime<Utc>>,
+    )> = dep_rows
         .iter()
         .map(|r| -> AppResult<_> {
             let id: Uuid = r.try_get("", "id")?;
@@ -581,7 +598,12 @@ pub async fn resolve_windows_for_times<C: ConnectionTrait>(
             let from: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "deployed_from")?;
             let until: Option<chrono::DateTime<chrono::FixedOffset>> =
                 r.try_get("", "deployed_until")?;
-            Ok((id, site_id, from.with_timezone(&Utc), until.map(|u| u.with_timezone(&Utc))))
+            Ok((
+                id,
+                site_id,
+                from.with_timezone(&Utc),
+                until.map(|u| u.with_timezone(&Utc)),
+            ))
         })
         .collect::<AppResult<_>>()?;
 
@@ -607,7 +629,12 @@ pub async fn resolve_windows_for_times<C: ConnectionTrait>(
 }
 
 /// `(id, sensor_id, from, until)` for a deployment or calibration window row.
-type SlotWindowRow = (Uuid, Uuid, chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>);
+type SlotWindowRow = (
+    Uuid,
+    Uuid,
+    chrono::DateTime<Utc>,
+    Option<chrono::DateTime<Utc>>,
+);
 
 /// Owner (sensor + deployment + active calibration) resolved for a reading time at a slot.
 #[derive(Debug, Clone, Default)]
@@ -652,7 +679,12 @@ pub async fn resolve_slot_owner_for_times<C: ConnectionTrait>(
             let from: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "deployed_from")?;
             let until: Option<chrono::DateTime<chrono::FixedOffset>> =
                 r.try_get("", "deployed_until")?;
-            Ok((id, sensor_id, from.with_timezone(&Utc), until.map(|u| u.with_timezone(&Utc))))
+            Ok((
+                id,
+                sensor_id,
+                from.with_timezone(&Utc),
+                until.map(|u| u.with_timezone(&Utc)),
+            ))
         })
         .collect::<AppResult<_>>()?;
     if deps.is_empty() {
@@ -684,7 +716,12 @@ pub async fn resolve_slot_owner_for_times<C: ConnectionTrait>(
             let from: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "valid_from")?;
             let until: Option<chrono::DateTime<chrono::FixedOffset>> =
                 r.try_get("", "valid_until")?;
-            Ok((id, sensor_id, from.with_timezone(&Utc), until.map(|u| u.with_timezone(&Utc))))
+            Ok((
+                id,
+                sensor_id,
+                from.with_timezone(&Utc),
+                until.map(|u| u.with_timezone(&Utc)),
+            ))
         })
         .collect::<AppResult<_>>()?;
 
@@ -719,10 +756,7 @@ pub async fn resolve_slot_owner_for_times<C: ConnectionTrait>(
 pub fn extract_vaisala_device_serial(metadata: &serde_json::Value) -> Option<String> {
     metadata
         .get("device")
-        .and_then(|d| {
-            d.get("logger_serial")
-                .or_else(|| d.get("probe_serial"))
-        })
+        .and_then(|d| d.get("logger_serial").or_else(|| d.get("probe_serial")))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())

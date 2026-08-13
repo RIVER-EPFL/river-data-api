@@ -14,33 +14,17 @@
 //! 3. the latest `valid_from`, then the highest `id` so a pair sharing an instant still resolves to
 //!    one row rather than to whichever the planner reached first.
 //!
-//! Instant (lab grab) curves take no part: they apply only to the single grab reading that names
-//! them, and are matched by `calibration_id`, never by window.
+//! Standard curves take no part: they live in their own table, apply only to the reading that names
+//! one, and are matched by `readings.standard_curve_id`, never by window.
 
 use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, Statement};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use super::service::apply_calibration;
+use super::service::{Curve, calibrated_value_sql};
 use crate::common::bulk_write;
 use crate::error::AppResult;
-
-/// The calibration covering one reading time, with the coefficients needed to correct it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ResolvedCalibration {
-    pub calibration_id: Uuid,
-    pub slope: f64,
-    pub intercept: f64,
-}
-
-impl ResolvedCalibration {
-    /// The corrected value for `raw`. The only expression of the arithmetic outside SQL.
-    #[must_use]
-    pub fn apply(&self, raw: f64) -> f64 {
-        apply_calibration(raw, self.slope, self.intercept)
-    }
-}
 
 /// A `LATERAL` subquery selecting `(id, slope, intercept)` of the one calibration covering reading
 /// row `r`, where `r` exposes `time` and `parameter_id`. `sensor_expr` is whatever names the owning
@@ -50,10 +34,19 @@ impl ResolvedCalibration {
 /// join, `JOIN LATERAL` when they must not.
 #[must_use]
 pub fn pick_calibration_lateral(sensor_expr: &str) -> String {
+    pick_calibration_lateral_excluding(sensor_expr, None)
+}
+
+/// [`pick_calibration_lateral`] with one curve held out of the candidates. The delete path is the
+/// only caller: a curve on its way out must not be the answer to what covers a reading now.
+#[must_use]
+pub fn pick_calibration_lateral_excluding(sensor_expr: &str, exclude_expr: Option<&str>) -> String {
+    let exclude =
+        exclude_expr.map_or_else(String::new, |e| format!("\n            AND c.id <> {e}"));
     format!(
         r"SELECT c.id, c.slope, c.intercept
           FROM sensor_calibrations c
-          WHERE c.sensor_id = {sensor_expr} AND c.mode = 'windowed'
+          WHERE c.sensor_id = {sensor_expr}{exclude}
             AND (c.parameter_id = r.parameter_id OR c.parameter_id IS NULL OR r.parameter_id IS NULL)
             AND r.time >= c.valid_from
             AND r.time < COALESCE(c.valid_until, 'infinity'::timestamptz)
@@ -76,7 +69,7 @@ pub async fn resolve_for_times<C: ConnectionTrait>(
     sensor_id: Uuid,
     parameter_id: Option<Uuid>,
     times: &[DateTime<Utc>],
-) -> AppResult<HashMap<DateTime<Utc>, ResolvedCalibration>> {
+) -> AppResult<HashMap<DateTime<Utc>, Curve>> {
     let mut out = HashMap::new();
     if times.is_empty() {
         return Ok(out);
@@ -110,8 +103,8 @@ pub async fn resolve_for_times<C: ConnectionTrait>(
         let t: DateTime<chrono::FixedOffset> = row.try_get("", "t")?;
         out.insert(
             t.with_timezone(&Utc),
-            ResolvedCalibration {
-                calibration_id: row.try_get("", "cal_id")?,
+            Curve {
+                id: row.try_get("", "cal_id")?,
                 slope: row.try_get("", "slope")?,
                 intercept: row.try_get("", "intercept")?,
             },
@@ -126,7 +119,7 @@ pub async fn resolve_for_times<C: ConnectionTrait>(
 pub async fn resolve_many<C: ConnectionTrait>(
     db: &C,
     requests: &[(Uuid, Option<Uuid>, DateTime<Utc>)],
-) -> AppResult<HashMap<(Uuid, Option<Uuid>, DateTime<Utc>), ResolvedCalibration>> {
+) -> AppResult<HashMap<(Uuid, Option<Uuid>, DateTime<Utc>), Curve>> {
     let mut by_channel: HashMap<(Uuid, Option<Uuid>), Vec<DateTime<Utc>>> = HashMap::new();
     for (sensor_id, parameter_id, time) in requests {
         by_channel
@@ -154,9 +147,9 @@ pub async fn resolve_many<C: ConnectionTrait>(
 ///
 /// `sensor_id IS NULL` is the idempotence key, so a second import reports nothing attributed.
 ///
-/// Spot rows take the owner and nothing else: a grab is corrected by the instant curve it names
-/// (`/grab_samples`), and stamping a windowed curve on one would be provenance the served value
-/// does not carry.
+/// Spot rows take the owner and nothing else: a grab is corrected at entry (`/grab_samples`),
+/// against the base curve resolved then and the standard curve the operator picked, and re-stamping
+/// a windowed curve here would claim provenance the served value does not carry.
 pub async fn attribute_stream_by_window<C>(
     db: &C,
     stream_id: Uuid,
@@ -195,7 +188,7 @@ where
               END,
               calibrated_value = CASE
                   WHEN picked.cal_id IS NOT NULL AND tgt.measurement_type IS DISTINCT FROM 'spot'
-                      THEN picked.slope * tgt.raw_value + picked.intercept
+                      THEN {value}
                   ELSE tgt.calibrated_value
               END
           FROM (
@@ -209,6 +202,7 @@ where
           WHERE tgt.stream_id = picked.p_stream_id
             AND tgt.time = picked.p_time
             AND tgt.replicate_index = picked.p_replicate_index",
+        value = calibrated_value_sql("tgt.raw_value", "picked.slope", "picked.intercept"),
         pick = pick_calibration_lateral("$2")
     );
 
@@ -253,29 +247,56 @@ mod tests {
     }
 
     #[test]
-    fn the_window_is_half_open_and_windowed_only() {
+    fn the_window_is_half_open() {
         let sql = pick_calibration_lateral("$1");
         assert!(sql.contains("r.time >= c.valid_from"), "{sql}");
         assert!(
             sql.contains("r.time < COALESCE(c.valid_until, 'infinity'::timestamptz)"),
             "{sql}"
         );
-        assert!(sql.contains("c.mode = 'windowed'"), "{sql}");
     }
 
     #[test]
     fn applying_a_resolved_curve_is_slope_times_raw_plus_intercept() {
-        let curve = ResolvedCalibration {
-            calibration_id: Uuid::nil(),
+        let curve = Curve {
+            id: Uuid::nil(),
             slope: 2.0,
             intercept: 5.0,
         };
         assert!((curve.apply(10.0) - 25.0).abs() < f64::EPSILON);
-        let identity = ResolvedCalibration {
-            calibration_id: Uuid::nil(),
+        let identity = Curve {
+            id: Uuid::nil(),
             slope: 1.0,
             intercept: 0.0,
         };
         assert!((identity.apply(10.0) - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn the_sql_and_rust_forms_name_the_same_operands_in_the_same_order() {
+        assert_eq!(
+            calibrated_value_sql("tgt.raw_value", "picked.slope", "picked.intercept"),
+            "picked.slope * tgt.raw_value + picked.intercept",
+            "the set-based writers correct a row the way `apply_calibration` does"
+        );
+    }
+
+    #[test]
+    fn a_standard_curve_corrects_what_the_base_calibration_produced() {
+        use super::super::service::apply_curves;
+        let base = Curve {
+            id: Uuid::nil(),
+            slope: 2.0,
+            intercept: 5.0,
+        };
+        let standard = Curve {
+            id: Uuid::nil(),
+            slope: 10.0,
+            intercept: 1.0,
+        };
+        assert!((apply_curves(10.0, Some(base), Some(standard)) - 251.0).abs() < f64::EPSILON);
+        assert!((apply_curves(10.0, Some(base), None) - 25.0).abs() < f64::EPSILON);
+        assert!((apply_curves(10.0, None, Some(standard)) - 101.0).abs() < f64::EPSILON);
+        assert!((apply_curves(10.0, None, None) - 10.0).abs() < f64::EPSILON);
     }
 }

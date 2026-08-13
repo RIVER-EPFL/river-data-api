@@ -8,5 +8,6 @@ mod common;
 
 mod measurement_classification;
 mod pair_replicate_samples;
+mod register_declares_instrument;
 mod register_pair_stats;
 mod slot_retirement;

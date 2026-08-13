@@ -5,4 +5,5 @@ pub mod model;
 pub mod operations;
 pub mod readings;
 pub mod retag;
+pub mod standard_curves;
 pub use model::*;

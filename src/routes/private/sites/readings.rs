@@ -34,6 +34,8 @@ struct ReadingRow {
     flag_reason: Option<String>,
     measurement_type: Option<String>,
     sample_id: Option<Uuid>,
+    calibration_id: Option<Uuid>,
+    standard_curve_id: Option<Uuid>,
 }
 
 /// Where a row lands on the response's time axis.
@@ -61,6 +63,7 @@ struct Annotations {
     flagged: bool,
     measurement_type: bool,
     sample_stats: bool,
+    curves: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -106,6 +109,15 @@ pub struct ParameterData {
     /// Per-point measurement type (continuous/spot/derived). Only present when `include_measurement_type=true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub measurement_types: Option<Vec<Option<String>>>,
+    /// Per-point base calibration reference (same length as times). Only present when
+    /// `include_curves=true`. Null where no calibration was applied, which is what distinguishes an
+    /// unrecorded base from an identity one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calibration_ids: Option<Vec<Option<Uuid>>>,
+    /// Per-point standard curve reference, applied after the base calibration (same length as
+    /// times). Only present when `include_curves=true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standard_curve_ids: Option<Vec<Option<Uuid>>>,
     /// Per-point sample stats with individual replicates (same length as times; null where the
     /// point is not a replicate group). Only present when `include_sample_stats=true`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,6 +131,12 @@ pub struct ReplicateOut {
     pub raw_value: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub calibrated_value: Option<f64>,
+    /// The base calibration this replicate was corrected with, null when none was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calibration_id: Option<Uuid>,
+    /// The standard curve applied on top of the base calibration, null when none was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standard_curve_id: Option<Uuid>,
     pub flagged: bool,
 }
 
@@ -167,6 +185,9 @@ pub struct SiteReadingsQuery {
     pub sample_id: Option<Uuid>,
     /// Include a per-point measurement_type indicator (continuous/spot/derived) on each parameter.
     pub include_measurement_type: Option<bool>,
+    /// Add the per-point `calibration_id` and `standard_curve_id` references, so a served value
+    /// states which curves produced it.
+    pub include_curves: Option<bool>,
     /// Attach per-point sample statistics (n, mean, stdev, min, max) and the individual
     /// replicate values behind each grab point. Spot data only; one batched lookup.
     pub include_sample_stats: Option<bool>,
@@ -188,6 +209,11 @@ struct ReadingsCacheKey<'a> {
 ///
 /// The value and parameter-id columns are the whole default header, grouped by kind across
 /// parameters as they always were; every other kind appears only for the opt-in that asked for it.
+fn uuid_cells(ids: Option<&Vec<Option<Uuid>>>) -> Vec<Option<String>> {
+    ids.map(|v| v.iter().map(|id| id.map(|id| id.to_string())).collect())
+        .unwrap_or_default()
+}
+
 fn readings_table(times: &[DateTime<Utc>], params: &[ParameterData], include_flags: bool) -> Table {
     let mut table = Table::at(times);
     for p in params {
@@ -207,6 +233,20 @@ fn readings_table(times: &[DateTime<Utc>], params: &[ParameterData], include_fla
             );
         }
     }
+    if params.iter().any(|p| p.calibration_ids.is_some()) {
+        for p in params {
+            table.column(
+                format!("{}_calibration_id", p.code),
+                Cells::Text(uuid_cells(p.calibration_ids.as_ref())),
+            );
+        }
+        for p in params {
+            table.column(
+                format!("{}_standard_curve_id", p.code),
+                Cells::Text(uuid_cells(p.standard_curve_ids.as_ref())),
+            );
+        }
+    }
     if params.iter().any(|p| p.severities.is_some()) {
         for p in params {
             let cells = p
@@ -222,23 +262,48 @@ fn readings_table(times: &[DateTime<Utc>], params: &[ParameterData], include_fla
             let stats = p.samples.clone().unwrap_or_default();
             table.column(
                 format!("{}_n", p.code),
-                Cells::Int(stats.iter().map(|s| s.as_ref().map(|s| i64::from(s.n))).collect()),
+                Cells::Int(
+                    stats
+                        .iter()
+                        .map(|s| s.as_ref().map(|s| i64::from(s.n)))
+                        .collect(),
+                ),
             );
             table.column(
                 format!("{}_mean", p.code),
-                Cells::Float(stats.iter().map(|s| s.as_ref().and_then(|s| s.mean)).collect()),
+                Cells::Float(
+                    stats
+                        .iter()
+                        .map(|s| s.as_ref().and_then(|s| s.mean))
+                        .collect(),
+                ),
             );
             table.column(
                 format!("{}_sd", p.code),
-                Cells::Float(stats.iter().map(|s| s.as_ref().and_then(|s| s.stdev)).collect()),
+                Cells::Float(
+                    stats
+                        .iter()
+                        .map(|s| s.as_ref().and_then(|s| s.stdev))
+                        .collect(),
+                ),
             );
             table.column(
                 format!("{}_min", p.code),
-                Cells::Float(stats.iter().map(|s| s.as_ref().and_then(|s| s.min)).collect()),
+                Cells::Float(
+                    stats
+                        .iter()
+                        .map(|s| s.as_ref().and_then(|s| s.min))
+                        .collect(),
+                ),
             );
             table.column(
                 format!("{}_max", p.code),
-                Cells::Float(stats.iter().map(|s| s.as_ref().and_then(|s| s.max)).collect()),
+                Cells::Float(
+                    stats
+                        .iter()
+                        .map(|s| s.as_ref().and_then(|s| s.max))
+                        .collect(),
+                ),
             );
         }
     }
@@ -357,6 +422,7 @@ pub async fn get_site_readings(
         flagged: query.include_flagged.unwrap_or(true),
         measurement_type: query.include_measurement_type.unwrap_or(false),
         sample_stats: query.include_sample_stats.unwrap_or(false) && !include_replicates,
+        curves: query.include_curves.unwrap_or(false),
     };
     let include_flags = query.include_flags.unwrap_or(false);
 
@@ -450,7 +516,8 @@ pub async fn get_site_readings(
     };
     let select_clause = format!(
         "r.parameter_id, r.time, {value_expr} AS value, {severity_expr} AS severity, \
-         r.is_flagged, r.flag_reason, r.measurement_type, r.sample_id"
+         r.is_flagged, r.flag_reason, r.measurement_type, r.sample_id, \
+         r.calibration_id, r.standard_curve_id"
     );
 
     let from_clause: String = if annotations.alarms {
@@ -602,6 +669,8 @@ pub async fn get_site_readings(
             let mut flagged = annotations.flagged.then(|| vec![None; len]);
             let mut flag_reasons = annotations.flagged.then(|| vec![None; len]);
             let mut measurement_types = annotations.measurement_type.then(|| vec![None; len]);
+            let mut calibration_ids = annotations.curves.then(|| vec![None; len]);
+            let mut standard_curve_ids = annotations.curves.then(|| vec![None; len]);
             let mut samples = annotations.sample_stats.then(|| vec![None; len]);
 
             if let Some(rows) = param_rows.get(&sp.parameter_id) {
@@ -625,8 +694,16 @@ pub async fn get_site_readings(
                     if let Some(v) = measurement_types.as_mut() {
                         v[i] = row.measurement_type.clone();
                     }
+                    if let Some(v) = calibration_ids.as_mut() {
+                        v[i] = row.calibration_id;
+                    }
+                    if let Some(v) = standard_curve_ids.as_mut() {
+                        v[i] = row.standard_curve_id;
+                    }
                     if let Some(v) = samples.as_mut() {
-                        v[i] = row.sample_id.and_then(|sid| sample_stats.get(&sid).cloned());
+                        v[i] = row
+                            .sample_id
+                            .and_then(|sid| sample_stats.get(&sid).cloned());
                     }
                 }
             }
@@ -646,6 +723,8 @@ pub async fn get_site_readings(
                 flagged,
                 flag_reasons,
                 measurement_types,
+                calibration_ids,
+                standard_curve_ids,
                 samples,
             }
         })
@@ -714,13 +793,17 @@ async fn fetch_sample_stats(
             "AND time >= $2 AND time <= $3",
             vec![sample_ids.to_vec().into(), start.into(), e.into()],
         ),
-        None => ("AND time >= $2", vec![sample_ids.to_vec().into(), start.into()]),
+        None => (
+            "AND time >= $2",
+            vec![sample_ids.to_vec().into(), start.into()],
+        ),
     };
     let rows = db
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
-                "SELECT sample_id, replicate_index, raw_value, calibrated_value, is_flagged \
+                "SELECT sample_id, replicate_index, raw_value, calibrated_value, is_flagged, \
+                 calibration_id, standard_curve_id \
                  FROM readings WHERE sample_id = ANY($1) {time_clause} \
                  ORDER BY sample_id, replicate_index"
             ),
@@ -728,12 +811,16 @@ async fn fetch_sample_stats(
         ))
         .await?;
     for row in rows {
-        let Ok(sid) = row.try_get::<Uuid>("", "sample_id") else { continue };
+        let Ok(sid) = row.try_get::<Uuid>("", "sample_id") else {
+            continue;
+        };
         if let Some(stat) = stats.get_mut(&sid) {
             stat.replicates.push(ReplicateOut {
                 replicate_index: row.try_get("", "replicate_index").unwrap_or(0),
                 raw_value: row.try_get("", "raw_value").unwrap_or(f64::NAN),
                 calibrated_value: row.try_get("", "calibrated_value").ok(),
+                calibration_id: row.try_get("", "calibration_id").ok(),
+                standard_curve_id: row.try_get("", "standard_curve_id").ok(),
                 flagged: row
                     .try_get::<Option<bool>>("", "is_flagged")
                     .ok()

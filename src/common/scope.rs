@@ -158,6 +158,22 @@ pub async fn project_of_site(db: &DatabaseConnection, site_id: Uuid) -> AppResul
     .await
 }
 
+/// The project a site parameter belongs to, through its site.
+pub async fn project_of_site_parameter(
+    db: &DatabaseConnection,
+    site_parameter_id: Uuid,
+) -> AppResult<RowProject> {
+    resolve(
+        db,
+        "SELECT false AS untargeted, s.project_id \
+         FROM site_parameters sp \
+         JOIN sites s ON s.id = sp.site_id \
+         WHERE sp.id = $1",
+        site_parameter_id,
+    )
+    .await
+}
+
 /// The projects a sensor is deployed into. A sensor with no deployment is
 /// [`RowProject::Unresolved`], ie. inventory whose owner is not decided yet: pass
 /// [`Unowned::Allow`] where a manager is meant to reach an undeployed instrument.

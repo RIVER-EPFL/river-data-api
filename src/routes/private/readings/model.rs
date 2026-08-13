@@ -15,7 +15,10 @@ pub struct Model {
     pub raw_value: f64,
     pub calibrated_value: Option<f64>,
     pub sensor_id: Option<Uuid>,
+    /// The time-windowed base calibration the value was corrected with.
     pub calibration_id: Option<Uuid>,
+    /// The hand-picked lab curve applied on top of the base calibration, for grab measurements.
+    pub standard_curve_id: Option<Uuid>,
     pub deployment_id: Option<Uuid>,
     pub logged: Option<bool>,
     pub measurement_type: Option<String>,
@@ -56,6 +59,12 @@ pub enum Relation {
         to = "crate::routes::private::sensors::calibrations::Column::Id"
     )]
     SensorCalibration,
+    #[sea_orm(
+        belongs_to = "crate::routes::private::sensors::standard_curves::Entity",
+        from = "Column::StandardCurveId",
+        to = "crate::routes::private::sensors::standard_curves::Column::Id"
+    )]
+    StandardCurve,
     #[sea_orm(
         belongs_to = "crate::routes::private::sensors::deployments::Entity",
         from = "Column::DeploymentId",
@@ -98,6 +107,12 @@ impl Related<crate::routes::private::sensors::Entity> for Entity {
 impl Related<crate::routes::private::sensors::calibrations::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SensorCalibration.def()
+    }
+}
+
+impl Related<crate::routes::private::sensors::standard_curves::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::StandardCurve.def()
     }
 }
 

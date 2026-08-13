@@ -6,6 +6,7 @@ pub mod ingest;
 pub mod measurement;
 pub mod model;
 pub mod replicates;
+pub mod sample_groups;
 pub mod samples;
 pub mod status_events;
 pub use model::*;

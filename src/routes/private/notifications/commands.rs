@@ -31,7 +31,9 @@ fn scope_projects_bind(scope: &AccessScope) -> sea_orm::Value {
         None => sea_orm::Value::Array(ArrayType::Uuid, None),
         Some(ids) => sea_orm::Value::Array(
             ArrayType::Uuid,
-            Some(Box::new(ids.into_iter().map(sea_orm::Value::from).collect())),
+            Some(Box::new(
+                ids.into_iter().map(sea_orm::Value::from).collect(),
+            )),
         ),
     }
 }
@@ -110,7 +112,10 @@ async fn resolve_site(
 }
 
 fn ambiguous_reply(kind: &str, names: &[String]) -> String {
-    format!("Multiple {kind} match, be more specific: {}", names.join(", "))
+    format!(
+        "Multiple {kind} match, be more specific: {}",
+        names.join(", ")
+    )
 }
 
 pub async fn stations(db: &DatabaseConnection, scope: &AccessScope) -> String {
@@ -363,7 +368,12 @@ pub async fn server(db: &DatabaseConnection) -> String {
     out.trim_end().to_string()
 }
 
-pub async fn battery(db: &DatabaseConnection, scope: &AccessScope, arg: &str, cutoff_volts: f64) -> String {
+pub async fn battery(
+    db: &DatabaseConnection,
+    scope: &AccessScope,
+    arg: &str,
+    cutoff_volts: f64,
+) -> String {
     let battery_param = match db
         .query_one(Statement::from_string(
             PG,
@@ -409,7 +419,11 @@ pub async fn battery(db: &DatabaseConnection, scope: &AccessScope, arg: &str, cu
              WHERE ($2::uuid IS NULL OR s.id = $2) \
                AND ($3::uuid[] IS NULL OR s.project_id = ANY($3)) \
              ORDER BY s.name",
-            [battery_param.into(), site_filter.into(), scope_projects_bind(scope)],
+            [
+                battery_param.into(),
+                site_filter.into(),
+                scope_projects_bind(scope),
+            ],
         ))
         .await
     {
@@ -684,7 +698,10 @@ pub async fn grab(
     };
 
     let now = Utc::now();
-    let created_by = username.map_or_else(|| format!("telegram:{chat_id}"), |u| format!("telegram:{u}"));
+    let created_by = username.map_or_else(
+        || format!("telegram:{chat_id}"),
+        |u| format!("telegram:{u}"),
+    );
     let readings = values
         .iter()
         .map(|&value| GrabSampleReading {
@@ -693,7 +710,7 @@ pub async fn grab(
             value,
             time: now,
             replicate_index: None,
-            calibration_id: None,
+            standard_curve_id: None,
         })
         .collect();
     let req = GrabSampleRequest {
@@ -708,8 +725,10 @@ pub async fn grab(
     // router; the write is confined to the caller's project scope, exactly like HTTP `/grab_samples`.
     match insert_grab_samples(State(state.clone()), ProjectScope(scope.clone()), Json(req)).await {
         Ok(Json(resp)) => {
-            let mut reply =
-                format!("✅ Recorded {} value(s) for {site_name} / {param_name}.", resp.inserted);
+            let mut reply = format!(
+                "✅ Recorded {} value(s) for {site_name} / {param_name}.",
+                resp.inserted
+            );
             if state.config.telegram_grab_flag_for_review {
                 flag_for_review(&state.db, site_id, param_id, now).await;
                 reply.push_str(" Flagged for review.");
@@ -723,7 +742,12 @@ pub async fn grab(
     }
 }
 
-async fn flag_for_review(db: &DatabaseConnection, site_id: Uuid, param_id: Uuid, time: chrono::DateTime<chrono::Utc>) {
+async fn flag_for_review(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+    param_id: Uuid,
+    time: chrono::DateTime<chrono::Utc>,
+) {
     let res = db
         .execute(Statement::from_sql_and_values(
             PG,

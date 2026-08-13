@@ -15,4 +15,5 @@ mod guarded_bulk_write;
 mod ingest_dedup_and_visibility;
 mod ingest_validation;
 mod measurement_type_resolution;
+mod sample_row_predicate;
 mod write_path_admission;

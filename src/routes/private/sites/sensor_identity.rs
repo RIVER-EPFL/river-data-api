@@ -174,7 +174,6 @@ pub async fn get_site_sensor_identity(
     cal_sql.push_str(
         r" )
             AND c.parameter_id IS NOT NULL
-            AND c.mode = 'windowed'
             AND c.valid_from < $2
             AND COALESCE(c.valid_until, 'infinity'::timestamptz) > $3
           ORDER BY c.parameter_id, c.valid_from",
@@ -192,7 +191,8 @@ pub async fn get_site_sensor_identity(
     for row in &cal_rows {
         let parameter_id: Uuid = row.try_get("", "parameter_id")?;
         let valid_from: DateTime<chrono::FixedOffset> = row.try_get("", "valid_from")?;
-        let valid_until: Option<DateTime<chrono::FixedOffset>> = row.try_get("", "valid_until").ok();
+        let valid_until: Option<DateTime<chrono::FixedOffset>> =
+            row.try_get("", "valid_until").ok();
         calibrations
             .entry(parameter_id)
             .or_default()

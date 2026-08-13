@@ -7,13 +7,13 @@ use uuid::Uuid;
 
 use crate::common::middleware::{IsSyncService, ProjectScope, enforce_project_scope_for_sites};
 use crate::common::{AppEvent, AppState};
-use crate::routes::private::{data_streams, readings, readings::status_events};
-use crate::routes::private::readings::batch::{Replace, admission, readings_upsert};
 use crate::error::{AppError, AppResult};
-use crate::routes::private::sensors::calibrations::resolver;
+use crate::routes::private::readings::batch::{Replace, admission, readings_upsert};
+use crate::routes::private::sensors::calibrations::{resolver, service::apply_curves};
 use crate::routes::private::sensors::operations::{
     resolve_slot_owner_for_times, resolve_windows_for_times,
 };
+use crate::routes::private::{data_streams, readings, readings::status_events};
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct IngestReadingsRequest {
@@ -224,20 +224,23 @@ pub async fn ingest_readings(
             // reprocess over the same windows would leave too.
             let curve = sensor_id.and_then(|s| curves.get(&(s, parameter_id, r.time)));
             readings::ActiveModel {
+                // Sync ingestion never picks a lab curve; grabs are the only writer that does.
+                standard_curve_id: Set(None),
                 stream_id: Set(payload.stream_id),
                 time: Set(r.time.into()),
                 replicate_index: Set(r.replicate_index),
-                // Deployment-derived site when a deployment covers the time; else the pairing site.
-                site_id: Set(slot.and_then(|s| s.site_id).or(site_id)),
+                // Pairing is what attributes a reading to a site, so an unpaired stream stores its
+                // readings unattributed even when a deployment of its sensor covers their time.
+                // Within a paired stream the deployment decides which site, since a sensor can move
+                // between sites while the stream keeps pointing at one slot.
+                site_id: Set(site_id.map(|paired| slot.and_then(|s| s.site_id).unwrap_or(paired))),
                 parameter_id: Set(parameter_id),
                 raw_value: Set(r.raw_value),
-                calibrated_value: Set(Some(
-                    curve.map_or(r.raw_value, |c| c.apply(r.raw_value)),
-                )),
+                calibrated_value: Set(Some(apply_curves(r.raw_value, curve.copied(), None))),
                 sensor_id: Set(sensor_id),
                 calibration_id: Set(r
                     .calibration_id
-                    .or_else(|| curve.map(|c| c.calibration_id))
+                    .or_else(|| curve.map(|c| c.id))
                     .or_else(|| slot.and_then(|s| s.calibration_id))
                     .or_else(|| owner.and_then(|o| o.calibration_id))),
                 deployment_id: Set(r

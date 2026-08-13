@@ -1,4 +1,7 @@
-use axum::{Json, extract::{Path, State}};
+use axum::{
+    Json,
+    extract::{Path, State},
+};
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
@@ -11,10 +14,14 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::bulk_write::{self, TouchedRange};
 use crate::common::middleware::ProjectScope;
-use crate::routes::private::{data_streams, sites::parameters as site_parameters};
+use crate::common::scope;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::sensors;
 use crate::routes::private::sensors::calibrations;
-use crate::routes::private::sensors::operations::{close_sensor_deployment, create_sensor_for_stream};
+use crate::routes::private::sensors::operations::{
+    close_sensor_deployment, create_sensor_for_stream, extract_vaisala_device_serial,
+};
+use crate::routes::private::{data_streams, sites::parameters as site_parameters};
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct StreamStatsResponse {
@@ -79,15 +86,22 @@ pub async fn stream_stats(
 
     let (count, min_time, max_time) = if let Some(row) = row {
         let count: i64 = row.try_get("", "count").unwrap_or(0);
-        let min_time: Option<chrono::DateTime<chrono::FixedOffset>> = row.try_get("", "min_time").ok();
-        let max_time: Option<chrono::DateTime<chrono::FixedOffset>> = row.try_get("", "max_time").ok();
-        (count, min_time.map(|t| t.with_timezone(&Utc)), max_time.map(|t| t.with_timezone(&Utc)))
+        let min_time: Option<chrono::DateTime<chrono::FixedOffset>> =
+            row.try_get("", "min_time").ok();
+        let max_time: Option<chrono::DateTime<chrono::FixedOffset>> =
+            row.try_get("", "max_time").ok();
+        (
+            count,
+            min_time.map(|t| t.with_timezone(&Utc)),
+            max_time.map(|t| t.with_timezone(&Utc)),
+        )
     } else {
         (0, None, None)
     };
 
     // Get latest value
-    let latest_row = state.db
+    let latest_row = state
+        .db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT raw_value FROM readings WHERE stream_id = $1 ORDER BY time DESC LIMIT 1",
@@ -118,6 +132,11 @@ pub struct RegisterStreamRequest {
     /// Omit to defer to the owning sensor's data_frequency.
     #[serde(default)]
     pub measurement_type: Option<String>,
+    /// The instrument that produces this feed. Omit when the caller does not know it: the sensor
+    /// is then resolved from the metadata serial at import or pairing time. Declaring it is what
+    /// stops pairing minting a second, serial-less instrument alongside the real one.
+    #[serde(default)]
+    pub sensor_id: Option<Uuid>,
 }
 
 fn default_metadata() -> serde_json::Value {
@@ -175,6 +194,7 @@ impl From<data_streams::Model> for StreamResponse {
 )]
 pub async fn register_stream(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(payload): Json<RegisterStreamRequest>,
 ) -> AppResult<Json<StreamResponse>> {
     if let Some(mt) = payload.measurement_type.as_deref()
@@ -183,6 +203,9 @@ pub async fn register_stream(
         return Err(AppError::BadRequest(format!(
             "invalid measurement_type '{mt}' (expected continuous, spot, or derived)"
         )));
+    }
+    if let Some(sensor_id) = payload.sensor_id {
+        validate_declared_sensor(&state.db, &scope, sensor_id, &payload.metadata).await?;
     }
     let now = Utc::now();
 
@@ -194,7 +217,7 @@ pub async fn register_stream(
         source_path: Set(payload.source_path.clone()),
         metadata: Set(payload.metadata.clone()),
         site_parameter_id: Set(None),
-        sensor_id: Set(None),
+        sensor_id: Set(payload.sensor_id),
         measurement_type: Set(payload.measurement_type.clone()),
         is_active: Set(true),
         discovered_at: Set(now.into()),
@@ -240,7 +263,58 @@ pub async fn register_stream(
         stream = active.update(&state.db).await?;
     }
 
+    // A declared instrument attaches to a feed that has none, which is the discovery case. Moving
+    // an already-attached feed to a different instrument changes the attribution of everything it
+    // has ever written, so it is refused here and left to the explicit swap and relink paths.
+    if let Some(declared) = payload.sensor_id
+        && stream.sensor_id != Some(declared)
+    {
+        if let Some(current) = stream.sensor_id {
+            return Err(AppError::Conflict(format!(
+                "stream {} already reports instrument {current}; relink it explicitly rather than \
+                 on registration",
+                stream.id
+            )));
+        }
+        let mut active: data_streams::ActiveModel = stream.clone().into();
+        active.sensor_id = Set(Some(declared));
+        active.updated_at = Set(now.into());
+        stream = active.update(&state.db).await?;
+    }
+
     Ok(Json(stream.into()))
+}
+
+/// Confine a caller-declared instrument to one the caller has a relationship to.
+///
+/// Three conditions: the instrument exists; it sits inside the caller's project access, where
+/// never-deployed inventory counts as reachable because that is the normal state of an instrument
+/// being wired to its first feed; and it does not contradict the device serial the stream's own
+/// metadata carries. A sync service legitimately knows which logger produced a feed, so the route
+/// stays open to session tokens, but a caller cannot name an instrument the feed does not describe.
+async fn validate_declared_sensor(
+    db: &DatabaseConnection,
+    scope: &crate::common::authz::AccessScope,
+    sensor_id: Uuid,
+    metadata: &serde_json::Value,
+) -> AppResult<()> {
+    let sensor = sensors::Entity::find_by_id(sensor_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Sensor not found".to_string()))?;
+
+    let project = scope::project_of_sensor(db, sensor_id).await?;
+    scope::require_target_in_scope(scope, &project, scope::Unowned::Allow, "instrument")?;
+
+    if let Some(declared_serial) = extract_vaisala_device_serial(metadata)
+        && sensor.serial_number.as_deref() != Some(declared_serial.as_str())
+    {
+        return Err(AppError::BadRequest(format!(
+            "stream metadata reports device serial '{declared_serial}', which is not the serial of \
+             instrument {sensor_id}"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -326,9 +400,7 @@ pub struct PairStreamResponse {
 fn claim_error(e: sea_orm::DbErr) -> AppError {
     let message = e.to_string();
     if message.contains("55P03") || message.contains("lock timeout") {
-        return AppError::Conflict(
-            "Stream is being paired by another request; retry".to_string(),
-        );
+        return AppError::Conflict("Stream is being paired by another request; retry".to_string());
     }
     AppError::Database(e)
 }
@@ -401,26 +473,44 @@ pub async fn pair_stream(
         }
 
         // Create/reuse the sensor, then re-read the stream: it may have gained a sensor_id.
-        let sensor_ctx = create_sensor_for_stream(txn, &stream, sp.parameter_id, sp.site_id).await?;
+        let sensor_ctx =
+            create_sensor_for_stream(txn, &stream, sp.parameter_id, sp.site_id).await?;
         let stream = data_streams::Entity::find_by_id(stream_id)
             .one(txn)
             .await?
             .ok_or_else(|| AppError::Internal("Failed to re-fetch stream".to_string()))?;
         let stream_measurement_type = stream.measurement_type.clone();
 
-        // Backfill: update readings with site_id + parameter_id + sensor context, apply identity
-        // calibration, and adopt the stream's declared classification for its history. A per-reading
-        // measurement_type set at ingest outranks the stream declaration and must survive pairing.
+        // Backfill: update readings with site_id + parameter_id + sensor context, apply the
+        // calibration being stamped, and adopt the stream's declared classification for its history.
+        // A per-reading measurement_type set at ingest outranks the stream declaration and must
+        // survive pairing.
+        //
+        // The curve pairing mints is the identity, so copying the raw value across was the same
+        // number and the stamp-without-apply never surfaced; reading the coefficients back keeps
+        // the value and the id it claims in agreement whatever the curve turns out to be. A reading
+        // that already carries a corrected value keeps it.
+        let backfill_value = calibrations::service::calibrated_value_sql(
+            "readings.raw_value",
+            "c.slope",
+            "c.intercept",
+        );
         let backfilled = bulk_write::mutation(
             txn,
             Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                r"UPDATE readings
+                format!(
+                    r"UPDATE readings
                   SET site_id = $1, parameter_id = $2,
                       sensor_id = $4, calibration_id = $5, deployment_id = $6,
-                      calibrated_value = COALESCE(calibrated_value, raw_value),
+                      calibrated_value = COALESCE(
+                          calibrated_value,
+                          (SELECT {backfill_value} FROM sensor_calibrations c WHERE c.id = $5),
+                          raw_value
+                      ),
                       measurement_type = COALESCE(measurement_type, $7)
-                  WHERE stream_id = $3 AND site_id IS NULL",
+                  WHERE stream_id = $3 AND site_id IS NULL"
+                ),
                 [
                     sp.site_id.into(),
                     sp.parameter_id.into(),
@@ -438,35 +528,14 @@ pub async fn pair_stream(
         crate::routes::private::readings::replicates::densify_stream_replicates(txn, &[stream_id])
             .await?;
 
-        // Replicate groups (2+ readings sharing a timestamp, e.g. migrated NOMIS A/B/C rows) form
-        // samples at pairing time: find-or-create the samples row per group, then stamp sample_id on
-        // the group's readings. The row-level triggers populate the sample statistics.
-        txn.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"INSERT INTO samples (site_id, parameter_id, collected_at)
-              SELECT site_id, parameter_id, time FROM readings
-              WHERE stream_id = $1 AND sample_id IS NULL AND site_id IS NOT NULL
-              GROUP BY site_id, parameter_id, time
-              HAVING COUNT(*) >= 2
-              ON CONFLICT (site_id, parameter_id, collected_at) DO NOTHING",
-            [stream_id.into()],
-        ))
-        .await?;
-        txn.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings r
-              SET sample_id = s.id
-              FROM (
-                  SELECT stream_id, time FROM readings
-                  WHERE stream_id = $1 AND sample_id IS NULL AND site_id IS NOT NULL
-                  GROUP BY stream_id, time
-                  HAVING COUNT(*) >= 2
-              ) g, samples s
-              WHERE r.stream_id = g.stream_id AND r.time = g.time AND r.sample_id IS NULL
-                AND s.site_id = r.site_id AND s.parameter_id = r.parameter_id
-                AND s.collected_at = r.time",
-            [stream_id.into()],
-        ))
+        // Replicate groups on the newly paired stream (2+ spot readings sharing a timestamp, e.g.
+        // migrated NOMIS A/B/C rows) form samples at pairing time. The row-level triggers populate
+        // the sample statistics.
+        crate::routes::private::readings::sample_groups::materialise_backfilled_samples(
+            txn,
+            "r.stream_id = $1",
+            stream_id.into(),
+        )
         .await?;
 
         // Also backfill status_events
@@ -854,11 +923,8 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
             "UPDATE {} SET parameter_id = $1 WHERE {predicate}",
             slot.table
         );
-        let statement = Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &sql,
-            values,
-        );
+        let statement =
+            Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, &sql, values);
 
         let rows = if slot.timed {
             let touched = bulk_write::mutation(conn, statement).await?;

@@ -26,6 +26,43 @@ pub fn apply_calibration(raw: f64, slope: f64, intercept: f64) -> f64 {
     slope * raw + intercept
 }
 
+/// A pair of coefficients and the row they came from, whether that row is a windowed
+/// `sensor_calibration` or a hand-picked `standard_curve`. Both tables correct a value the same way,
+/// so they share one struct and one arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Curve {
+    pub id: Uuid,
+    pub slope: f64,
+    pub intercept: f64,
+}
+
+impl Curve {
+    /// The corrected value for `raw`.
+    #[must_use]
+    pub fn apply(&self, raw: f64) -> f64 {
+        apply_calibration(raw, self.slope, self.intercept)
+    }
+}
+
+/// The value a reading is served at, given the curves that apply to it.
+///
+/// The base calibration corrects the instrument, so it runs first; a standard curve maps the
+/// instrument's corrected output onto the quantity the operator wants and runs on that result. The
+/// order is not recoverable from a stored row, so it is fixed here and nowhere else.
+#[must_use]
+pub fn apply_curves(raw: f64, base: Option<Curve>, standard: Option<Curve>) -> f64 {
+    let corrected = base.map_or(raw, |c| c.apply(raw));
+    standard.map_or(corrected, |c| c.apply(corrected))
+}
+
+/// [`apply_calibration`] as a SQL expression, for the set-based writers that correct millions of
+/// rows in one statement. `raw_expr`, `slope_expr` and `intercept_expr` name the operands in the
+/// caller's query.
+#[must_use]
+pub fn calibrated_value_sql(raw_expr: &str, slope_expr: &str, intercept_expr: &str) -> String {
+    format!("{slope_expr} * {raw_expr} + {intercept_expr}")
+}
+
 /// Whether a calibration is the identity transform (slope 1, intercept 0), i.e. `calibrated == raw`.
 #[must_use]
 pub fn is_identity_calibration(slope: f64, intercept: f64) -> bool {
@@ -89,7 +126,8 @@ async fn build_evaluation_order(
 
     let mut deps: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
     for item in work_items {
-        let source_param_ids = source_parameter_ids_for_definition(db, item.derived_definition_id).await?;
+        let source_param_ids =
+            source_parameter_ids_for_definition(db, item.derived_definition_id).await?;
         let mut item_deps = Vec::new();
         for source_param_id in source_param_ids {
             if derived_param_ids.contains(&source_param_id)
@@ -273,7 +311,11 @@ async fn resolve_variables_for_derived(
                   ORDER BY (r.measurement_type IS NOT DISTINCT FROM 'spot') ASC,
                            r.replicate_index ASC, r.stream_id
                   LIMIT 1",
-                [item.derived_site_id.into(), source_param_id.into(), time.into()],
+                [
+                    item.derived_site_id.into(),
+                    source_param_id.into(),
+                    time.into(),
+                ],
             ))
             .await?;
 
@@ -347,14 +389,24 @@ pub async fn recompute_valid_until<C: ConnectionTrait>(
         // write a zero-width `valid_until = valid_from` window, which would leave a curve the
         // operator can see applying to nothing. Duplicate instants are refused at create
         // (`SensorCalibrationOperations`); the guard covers rows loaded outside the API.
+        //
+        // A chain-written bound is derived state and is rebuilt from scratch each time. An
+        // operator-written one (`valid_until_explicit`) is data, so it is only ever shortened, and
+        // then only far enough to keep windows non-overlapping, because the resolver depends on at
+        // most one curve covering an instant. `LEAST` ignores a NULL `next_from`, so an explicit
+        // bound on the newest curve survives. This is the same policy
+        // `recompute_deployed_until` applies to a deployment's end date.
         r"WITH ordered AS (
             SELECT id, valid_from,
                    LEAD(valid_from) OVER (PARTITION BY parameter_id ORDER BY valid_from, id) AS next_from
             FROM sensor_calibrations
-            WHERE sensor_id = $1 AND mode = 'windowed'
+            WHERE sensor_id = $1
         )
         UPDATE sensor_calibrations sc
-        SET valid_until = ordered.next_from
+        SET valid_until = CASE
+                WHEN sc.valid_until_explicit THEN LEAST(sc.valid_until, ordered.next_from)
+                ELSE ordered.next_from
+            END
         FROM ordered
         WHERE sc.id = ordered.id AND sc.sensor_id = $1
           AND (ordered.next_from IS NULL OR ordered.next_from > ordered.valid_from)",
@@ -365,12 +417,11 @@ pub async fn recompute_valid_until<C: ConnectionTrait>(
 }
 
 /// Twin of [`recompute_valid_until`] for the deployment timeline: chain each of a sensor's
-/// deployments' `deployed_until` down to the next deployment's `deployed_from`. Unlike calibrations
-///, which absorb gaps (`valid_until = LEAD(valid_from)`) so coverage is continuous, deployments
-/// may legitimately have gaps (a sensor sitting in the lab between field campaigns), so this only
-/// ever *shortens* a window to remove overlap (`LEAST` keeps an existing earlier bound) and never
-/// extends one. Shortening can't create an overlap, so the result always satisfies the per-(site,
-/// parameter) exclusion constraint.
+/// deployments' `deployed_until` down to the next deployment's `deployed_from`. A deployment's end
+/// date is always caller-settable, so this only ever *shortens* a window to remove overlap
+/// (`LEAST` keeps an existing earlier bound) and never extends one; a calibration's is
+/// chain-written unless an operator set it, and shortens only in that case. Shortening can't create
+/// an overlap, so the result always satisfies the per-(site, parameter) exclusion constraint.
 pub async fn recompute_deployed_until<C: ConnectionTrait>(
     db: &C,
     sensor_id: Uuid,
@@ -424,7 +475,7 @@ pub async fn ensure_identity_covers<C: ConnectionTrait>(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT id, slope, intercept, valid_from
               FROM sensor_calibrations
-              WHERE sensor_id = $1 AND mode = 'windowed'
+              WHERE sensor_id = $1
               ORDER BY valid_from ASC, id ASC
               LIMIT 1",
             [sensor_id.into()],
@@ -441,7 +492,8 @@ pub async fn ensure_identity_covers<C: ConnectionTrait>(
             .await?;
         }
         Some(ref cal) => {
-            let first_from: chrono::DateTime<chrono::FixedOffset> = cal.try_get("", "valid_from")?;
+            let first_from: chrono::DateTime<chrono::FixedOffset> =
+                cal.try_get("", "valid_from")?;
             if earliest >= first_from.with_timezone(&Utc) {
                 return Ok(());
             }
@@ -543,10 +595,15 @@ pub async fn reprocess_sensor_readings(
     // The calibration pick is `resolver::pick_calibration_lateral`, the same ranking the write paths
     // resolve with, so reprocess recomputes the value ingest already stored rather than a different
     // one.
+    //
+    // Spot rows are excluded throughout: a grab may carry a standard curve the operator picked by
+    // hand, and no window resolution can recover that choice, so re-deriving one would replace a
+    // deliberate correction with a window-resolved base curve. Grabs are corrected at write time
+    // instead (`/grab_samples`).
     let cal_sql = format!(
         r"UPDATE readings tgt
             SET calibration_id = picked.cal_id,
-                calibrated_value = picked.slope * tgt.raw_value + picked.intercept
+                calibrated_value = {value}
             FROM (
                 SELECT r.stream_id, r.time, r.replicate_index,
                        cw.id AS cal_id, cw.slope, cw.intercept
@@ -558,6 +615,7 @@ pub async fn reprocess_sensor_readings(
             WHERE tgt.stream_id = picked.stream_id
               AND tgt.time = picked.time
               AND tgt.replicate_index = picked.replicate_index",
+        value = calibrated_value_sql("tgt.raw_value", "picked.slope", "picked.intercept"),
         pick = super::resolver::pick_calibration_lateral("$1")
     );
 
@@ -689,7 +747,7 @@ pub async fn reprocess_site_parameter_readings(
     let cal_sql = format!(
         r"UPDATE readings tgt
           SET calibration_id = picked.cal_id,
-              calibrated_value = picked.slope * tgt.raw_value + picked.intercept
+              calibrated_value = {value}
           FROM (
               SELECT r.stream_id, r.time, r.replicate_index,
                      cw.id AS cal_id, cw.slope, cw.intercept
@@ -701,6 +759,7 @@ pub async fn reprocess_site_parameter_readings(
           WHERE tgt.stream_id = picked.stream_id
             AND tgt.time = picked.time
             AND tgt.replicate_index = picked.replicate_index",
+        value = calibrated_value_sql("tgt.raw_value", "picked.slope", "picked.intercept"),
         pick = super::resolver::pick_calibration_lateral("r.sensor_id")
     );
 

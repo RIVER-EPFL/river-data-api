@@ -16,7 +16,8 @@ use crate::routes::private::readings;
 use crate::routes::private::readings::batch::{ConflictMode, readings_on_conflict};
 use crate::routes::private::readings::import::BATCH_SIZE as CSV_BATCH_SIZE;
 use crate::routes::private::sensors::calibrations::service::{
-    recalculate_derived_at_timestamp, reprocess_sensor_readings, reprocess_site_parameter_readings,
+    Curve, apply_curves, recalculate_derived_at_timestamp, reprocess_sensor_readings,
+    reprocess_site_parameter_readings,
 };
 
 /// `Job::run` answers in `DbErr`, the refresh in `AppError`. A refresh that could not run fails
@@ -81,8 +82,14 @@ fn uuid_pair_array(params: &serde_json::Value, key: &str) -> Vec<(Uuid, Uuid)> {
             arr.iter()
                 .filter_map(|v| {
                     let pair = v.as_array()?;
-                    let a = pair.first()?.as_str().and_then(|s| Uuid::parse_str(s).ok())?;
-                    let b = pair.get(1)?.as_str().and_then(|s| Uuid::parse_str(s).ok())?;
+                    let a = pair
+                        .first()?
+                        .as_str()
+                        .and_then(|s| Uuid::parse_str(s).ok())?;
+                    let b = pair
+                        .get(1)?
+                        .as_str()
+                        .and_then(|s| Uuid::parse_str(s).ok())?;
                     Some((a, b))
                 })
                 .collect()
@@ -122,7 +129,8 @@ impl Job for ReprocessSensor {
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         let sensor_id = required_uuid(ctx.params(), "sensor_id")?;
-        ctx.info(&format!("Reprocessing readings for sensor {sensor_id}")).await;
+        ctx.info(&format!("Reprocessing readings for sensor {sensor_id}"))
+            .await;
         let count = reprocess_sensor_readings(ctx.db(), sensor_id).await?;
         if let Ok(Some(row)) = ctx
             .db()
@@ -155,12 +163,18 @@ pub struct RefreshAggregates {
 impl RefreshAggregates {
     #[must_use]
     pub fn incremental() -> Self {
-        Self { name: "refresh_aggregates", full: false }
+        Self {
+            name: "refresh_aggregates",
+            full: false,
+        }
     }
 
     #[must_use]
     pub fn full() -> Self {
-        Self { name: "refresh_aggregates_full", full: true }
+        Self {
+            name: "refresh_aggregates_full",
+            full: true,
+        }
     }
 }
 
@@ -213,7 +227,8 @@ impl Job for ReprocessSlot {
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         let site_id = required_uuid(ctx.params(), "site_id")?;
         let parameter_id = required_uuid(ctx.params(), "parameter_id")?;
-        let count = reprocess_site_parameter_readings(ctx.db(), site_id, parameter_id).await? as i64;
+        let count =
+            reprocess_site_parameter_readings(ctx.db(), site_id, parameter_id).await? as i64;
         if let Some(sensor_id) = optional_uuid(ctx.params(), "sensor_id") {
             reprocess_sensor_readings(ctx.db(), sensor_id).await?;
         }
@@ -341,7 +356,9 @@ impl Job for DerivedRecompute {
                         filled += 1;
                         min_filled = Some(min_filled.map_or(utc_time, |m| m.min(utc_time)));
                     }
-                    Err(e) => tracing::error!(error = %e, time = %time, "Failed to recompute derived value"),
+                    Err(e) => {
+                        tracing::error!(error = %e, time = %time, "Failed to recompute derived value")
+                    }
                 }
                 if (i + 1) % 500 == 0 {
                     ctx.set_progress(i as i32 + 1, Some(total)).await;
@@ -350,7 +367,9 @@ impl Job for DerivedRecompute {
 
             if let Some(since) = min_filled {
                 tracing::info!(%since, "Refreshing continuous aggregates after derived recompute");
-                sync_state::refresh_continuous_aggregates(ctx.db(), Some(since)).await.map_err(as_db_err)?;
+                sync_state::refresh_continuous_aggregates(ctx.db(), Some(since))
+                    .await
+                    .map_err(as_db_err)?;
             }
             ctx.set_progress(total, Some(total)).await;
             tracing::info!(derived_id = %derived_id, total, filled, "Derived parameter recomputation complete");
@@ -404,14 +423,19 @@ impl Job for DerivedAssignment {
                 continue;
             };
             let utc = time.with_timezone(&chrono::Utc);
-            if recalculate_derived_at_timestamp(ctx.db(), site_id, utc).await.is_ok() {
+            if recalculate_derived_at_timestamp(ctx.db(), site_id, utc)
+                .await
+                .is_ok()
+            {
                 filled += 1;
                 earliest = Some(earliest.map_or(utc, |e| e.min(utc)));
             }
         }
 
         if let Some(since) = earliest {
-            sync_state::refresh_continuous_aggregates(ctx.db(), Some(since)).await.map_err(as_db_err)?;
+            sync_state::refresh_continuous_aggregates(ctx.db(), Some(since))
+                .await
+                .map_err(as_db_err)?;
         }
 
         tracing::info!(%def_id, %site_id, filled, "Derived assignment backfill completed");
@@ -448,6 +472,8 @@ impl SiteTimestampsDerived {
 /// the derived-consistency janitor. Wraps [`janitor::run_once`] plus the per-tick full/incremental
 /// refresh and periodic retention the old `janitor::periodic` loop did.
 pub struct JanitorRun {
+    /// Fallback cadence for the full-refresh decision, used only when the run carries no
+    /// scheduler-stamped `interval_seconds` (`run_now`). The `schedules` row is the authority.
     interval_seconds: u64,
     full_refresh_seconds: u64,
     maintenance_retention_days: u32,
@@ -490,8 +516,8 @@ impl Job for SiteTimestampsDerived {
             work.push((site_id, parse_timestamps(group.get("timestamps"))));
         }
 
-        let total = i32::try_from(work.iter().map(|(_, ts)| ts.len()).sum::<usize>())
-            .unwrap_or(i32::MAX);
+        let total =
+            i32::try_from(work.iter().map(|(_, ts)| ts.len()).sum::<usize>()).unwrap_or(i32::MAX);
         ctx.set_progress(0, Some(total)).await;
 
         let mut progress = 0i32;
@@ -515,7 +541,9 @@ impl Job for SiteTimestampsDerived {
 
         if let Some(since) = earliest {
             tracing::info!(%since, "Refreshing continuous aggregates after derived computation");
-            sync_state::refresh_continuous_aggregates(ctx.db(), Some(since)).await.map_err(as_db_err)?;
+            sync_state::refresh_continuous_aggregates(ctx.db(), Some(since))
+                .await
+                .map_err(as_db_err)?;
         }
         ctx.set_progress(progress, Some(total)).await;
         tracing::info!(computed = progress, "Derived computation complete");
@@ -775,6 +803,46 @@ impl CsvImport {
             ))
             .await?;
 
+        // Staging carries the calibration each row resolved at upload time. The coefficients are
+        // read back here so the stored value is the one that calibration produces: a row that names
+        // a curve and carries the uncorrected number claims a correction it never had.
+        let staged_curves = {
+            let mut ids: Vec<Uuid> = staged
+                .iter()
+                .filter_map(|row| {
+                    row.try_get::<Option<Uuid>>("", "calibration_id")
+                        .ok()
+                        .flatten()
+                })
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            let mut curves: std::collections::HashMap<Uuid, Curve> =
+                std::collections::HashMap::new();
+            if !ids.is_empty() {
+                for row in ctx
+                    .db()
+                    .query_all(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        "SELECT id, slope, intercept FROM sensor_calibrations WHERE id = ANY($1)",
+                        [ids.into()],
+                    ))
+                    .await?
+                {
+                    let id: Uuid = row.try_get("", "id")?;
+                    curves.insert(
+                        id,
+                        Curve {
+                            id,
+                            slope: row.try_get("", "slope")?,
+                            intercept: row.try_get("", "intercept")?,
+                        },
+                    );
+                }
+            }
+            curves
+        };
+
         let (stream_defaults, sensor_types) = if request_measurement_type.is_none() {
             let mut stream_ids: Vec<Uuid> = Vec::new();
             let mut sensor_ids: Vec<Uuid> = Vec::new();
@@ -803,14 +871,18 @@ impl CsvImport {
                 let id: Uuid = row.try_get("", "id")?;
                 defaults.insert(id, row.try_get("", "measurement_type")?);
             }
-            let types = crate::routes::private::readings::measurement::measurement_types_for_sensors(
-                ctx.db(),
-                &sensor_ids,
-            )
-            .await?;
+            let types =
+                crate::routes::private::readings::measurement::measurement_types_for_sensors(
+                    ctx.db(),
+                    &sensor_ids,
+                )
+                .await?;
             (defaults, types)
         } else {
-            (std::collections::HashMap::new(), std::collections::HashMap::new())
+            (
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            )
         };
 
         let mut models: Vec<readings::ActiveModel> = Vec::with_capacity(staged.len());
@@ -833,13 +905,20 @@ impl CsvImport {
                     &sensor_types,
                 );
             models.push(readings::ActiveModel {
+                standard_curve_id: Set(None),
                 stream_id: Set(stream_id),
                 site_id: Set(row_site_id),
                 parameter_id: Set(parameter_id),
                 time: Set(time),
                 replicate_index: Set(0),
                 raw_value: Set(raw_value),
-                calibrated_value: Set(Some(raw_value)),
+                calibrated_value: Set(Some(apply_curves(
+                    raw_value,
+                    calibration_id
+                        .and_then(|id| staged_curves.get(&id))
+                        .copied(),
+                    None,
+                ))),
                 sensor_id: Set(sensor_id),
                 calibration_id: Set(calibration_id),
                 deployment_id: Set(deployment_id),
@@ -878,12 +957,11 @@ impl CsvImport {
         // Groups with 2+ rows on a paired slot form a sample: find-or-create the samples row
         // (unique on site/parameter/collected_at) and stamp sample_id on the group's readings.
         type SampleGroup = ((Uuid, chrono::DateTime<chrono::Utc>), (Uuid, Uuid));
-        let sample_groups: Vec<SampleGroup> =
-            group_counts
-                .iter()
-                .filter(|(_, count)| **count >= 2)
-                .filter_map(|(key, _)| group_slots.get(key).map(|slot| (*key, *slot)))
-                .collect();
+        let sample_groups: Vec<SampleGroup> = group_counts
+            .iter()
+            .filter(|(_, count)| **count >= 2)
+            .filter_map(|(key, _)| group_slots.get(key).map(|slot| (*key, *slot)))
+            .collect();
         let replicate_groups = sample_groups.len();
         let mut sample_slots: Option<(Vec<Uuid>, Vec<Uuid>, Vec<String>)> = None;
         if !sample_groups.is_empty() {
@@ -944,7 +1022,10 @@ impl CsvImport {
             sample_slots = Some((
                 sample_by_slot.keys().map(|(s, _, _)| *s).collect(),
                 sample_by_slot.keys().map(|(_, p, _)| *p).collect(),
-                sample_by_slot.keys().map(|(_, _, t)| t.to_rfc3339()).collect(),
+                sample_by_slot
+                    .keys()
+                    .map(|(_, _, t)| t.to_rfc3339())
+                    .collect(),
             ));
         }
 
@@ -971,8 +1052,11 @@ impl CsvImport {
             }
             inserted_so_far += chunk.len();
             if inserted_so_far % 5000 < CSV_BATCH_SIZE {
-                ctx.set_progress(i32::try_from(inserted_so_far).unwrap_or(i32::MAX), Some(total))
-                    .await;
+                ctx.set_progress(
+                    i32::try_from(inserted_so_far).unwrap_or(i32::MAX),
+                    Some(total),
+                )
+                .await;
             }
         }
 
@@ -997,9 +1081,10 @@ impl CsvImport {
 
         let (inserted_total, overwritten) = match conflict {
             ConflictMode::Skip => (affected_total, 0),
-            ConflictMode::Overwrite => {
-                (affected_total.saturating_sub(overlapping), overlap_differing)
-            }
+            ConflictMode::Overwrite => (
+                affected_total.saturating_sub(overlapping),
+                overlap_differing,
+            ),
         };
         tracing::info!(site = %site_name, inserted_total, overwritten, "CSV import inserted readings");
 
@@ -1014,10 +1099,12 @@ impl CsvImport {
             }
 
             // Phase 2: derived recompute over the imported timestamps.
-            let derived_total =
-                i32::try_from(models.len() + distinct_ts.len()).unwrap_or(i32::MAX);
-            ctx.set_progress(i32::try_from(models.len()).unwrap_or(i32::MAX), Some(derived_total))
-                .await;
+            let derived_total = i32::try_from(models.len() + distinct_ts.len()).unwrap_or(i32::MAX);
+            ctx.set_progress(
+                i32::try_from(models.len()).unwrap_or(i32::MAX),
+                Some(derived_total),
+            )
+            .await;
             for (i, time) in distinct_ts.iter().enumerate() {
                 if ctx.is_cancelled() {
                     break;
@@ -1030,7 +1117,9 @@ impl CsvImport {
             }
 
             if let Some(s) = since {
-                sync_state::refresh_continuous_aggregates(ctx.db(), Some(s)).await.map_err(as_db_err)?;
+                sync_state::refresh_continuous_aggregates(ctx.db(), Some(s))
+                    .await
+                    .map_err(as_db_err)?;
             }
             if let Some(app) = crate::common::global_app_state() {
                 crate::common::cache::invalidate_prefix(&app, &format!("readings:{site_id}")).await;
@@ -1085,7 +1174,6 @@ impl CsvImport {
         ))
     }
 }
-
 
 /// Window-reprocess the slots whose open deployments the handler just backdated, so the
 /// previously-unattributed readings are stamped with `sensor_id`/`deployment_id`/`calibration_id`.
@@ -1172,7 +1260,8 @@ impl Job for MergeSiteParameters {
             crate::routes::private::admin::merge_services::merge_site_parameters(ctx.db(), &req)
                 .await
                 .map_err(|e| DbErr::Custom(e.to_string()))?;
-        ctx.set_detail(serde_json::json!({ "counts": result })).await;
+        ctx.set_detail(serde_json::json!({ "counts": result }))
+            .await;
         Ok(i64::try_from(result.merged_readings).unwrap_or(i64::MAX))
     }
 }
@@ -1197,7 +1286,8 @@ impl Job for MergeParameters {
             crate::routes::private::admin::merge_services::merge_parameters(ctx.db(), &req)
                 .await
                 .map_err(|e| DbErr::Custom(e.to_string()))?;
-        ctx.set_detail(serde_json::json!({ "counts": result })).await;
+        ctx.set_detail(serde_json::json!({ "counts": result }))
+            .await;
         Ok(i64::try_from(result.readings_moved).unwrap_or(i64::MAX))
     }
 }
@@ -1253,7 +1343,8 @@ impl Job for PlanRevert {
             "counts": { "reverted": reverted },
         }))
         .await;
-        ctx.info(&format!("Reverted plan: {reverted} streams unpaired")).await;
+        ctx.info(&format!("Reverted plan: {reverted} streams unpaired"))
+            .await;
         Ok(i64::from(reverted))
     }
 }
@@ -1309,21 +1400,42 @@ impl Job for JanitorRun {
             tracing::warn!(error = %e, "Derived janitor: run failed");
         }
 
-        // 2. The old loop ran a full continuous-aggregate refresh once every `full_refresh_seconds`
-        //    and an incremental one otherwise. Without per-replica loop state to track "last full",
-        //    derive it from the wall clock: do the full refresh on the tick whose scheduled epoch
-        //    falls in the first `interval` window of each `full_refresh` period.
+        // 2. A full continuous-aggregate refresh opens each `full_refresh_seconds` period and an
+        //    incremental one runs otherwise. The tick that carries it is the one whose scheduled
+        //    slot falls in the first cadence window of the period, and the cadence is the
+        //    `schedules` row's, not the process's: the scheduler stamps both the slot and the
+        //    interval it fired on into the job params, so an operator cadence change cannot leave
+        //    the full refresh unreachable. A `run_now` carries neither and falls back to the
+        //    wall clock and the configured interval. A cadence longer than `full_refresh_seconds`
+        //    makes every tick a full refresh, which is the safe direction but is a real cost on a
+        //    large database.
+        let scheduled_epoch = ctx
+            .params()
+            .get("scheduled_at")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map_or_else(|| chrono::Utc::now().timestamp(), |t| t.timestamp())
+            .max(0) as u64;
+        let cadence_seconds = ctx
+            .params()
+            .get("interval_seconds")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(self.interval_seconds)
+            .max(1);
         let do_full = if self.full_refresh_seconds == 0 {
             false
         } else {
-            let now = chrono::Utc::now().timestamp().max(0) as u64;
-            (now % self.full_refresh_seconds) < self.interval_seconds.max(1)
+            (scheduled_epoch % self.full_refresh_seconds) < cadence_seconds
         };
         if do_full {
             tracing::info!("Derived janitor: running scheduled full continuous aggregate refresh");
-            sync_state::refresh_continuous_aggregates_full(db).await.map_err(as_db_err)?;
+            sync_state::refresh_continuous_aggregates_full(db)
+                .await
+                .map_err(as_db_err)?;
         } else {
-            sync_state::refresh_continuous_aggregates(db, None).await.map_err(as_db_err)?;
+            sync_state::refresh_continuous_aggregates(db, None)
+                .await
+                .map_err(as_db_err)?;
         }
 
         // 3. Tiered tracked-job retention (cheap deletes; idempotent to run every tick).
@@ -1348,7 +1460,9 @@ pub struct AlarmSweep {
 impl AlarmSweep {
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
-        Self { interval_seconds: config.alarm_sweep_interval_seconds }
+        Self {
+            interval_seconds: config.alarm_sweep_interval_seconds,
+        }
     }
 }
 
@@ -1445,7 +1559,9 @@ pub struct IdentityReconcile {
 impl IdentityReconcile {
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
-        Self { interval_seconds: config.identity_reconcile_interval_seconds }
+        Self {
+            interval_seconds: config.identity_reconcile_interval_seconds,
+        }
     }
 }
 
@@ -1467,7 +1583,10 @@ impl Job for IdentityReconcile {
         match crate::routes::private::notifications::reconcile::sweep(&state).await {
             Ok(0) => Ok(0),
             Ok(n) => {
-                tracing::warn!(count = n, "Identity reconciliation: deactivated revoked links");
+                tracing::warn!(
+                    count = n,
+                    "Identity reconciliation: deactivated revoked links"
+                );
                 Ok(n as i64)
             }
             Err(e) => Err(e),
@@ -1484,7 +1603,9 @@ pub struct NotifyHealth {
 impl NotifyHealth {
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
-        Self { interval_seconds: config.notify_health_interval_seconds.max(30) }
+        Self {
+            interval_seconds: config.notify_health_interval_seconds.max(30),
+        }
     }
 }
 
@@ -1519,7 +1640,9 @@ pub struct DispatchNotifications {
 impl DispatchNotifications {
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
-        Self { interval_seconds: config.notify_poll_interval_seconds }
+        Self {
+            interval_seconds: config.notify_poll_interval_seconds,
+        }
     }
 }
 
@@ -1638,7 +1761,8 @@ impl Job for MeasurementRetag {
             None => (None, None),
         };
         let (Some(lo), Some(hi)) = (lo, hi) else {
-            ctx.info("Nothing to retag, every reading in scope already matches").await;
+            ctx.info("Nothing to retag, every reading in scope already matches")
+                .await;
             return Ok(0);
         };
 
@@ -1675,7 +1799,8 @@ impl Job for MeasurementRetag {
             }
         }
 
-        ctx.info(&format!("Retagging readings in scope to '{target}'")).await;
+        ctx.info(&format!("Retagging readings in scope to '{target}'"))
+            .await;
         let txn = ctx.db().begin().await?;
         txn.execute(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -1700,7 +1825,12 @@ impl Job for MeasurementRetag {
         // fully covered; CALL runs outside the txn (procedures can't run inside one).
         let refresh_lo = lo - chrono::Duration::days(32);
         let refresh_hi = hi + chrono::Duration::days(32);
-        for agg in ["readings_hourly", "readings_daily", "readings_weekly", "readings_monthly"] {
+        for agg in [
+            "readings_hourly",
+            "readings_daily",
+            "readings_weekly",
+            "readings_monthly",
+        ] {
             if let Err(e) = ctx
                 .db()
                 .execute(Statement::from_string(

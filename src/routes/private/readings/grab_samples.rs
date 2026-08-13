@@ -1,5 +1,7 @@
 use axum::{Json, extract::State};
-use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, TransactionTrait,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
@@ -7,14 +9,18 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
-use crate::routes::private::{
-    data_streams, readings, readings::samples, sensors::calibrations, sites::parameters as site_parameters, sites,
-};
-use crate::routes::private::readings::batch::{Replace, admission, readings_upsert};
 use crate::error::{AppError, AppResult};
+use crate::routes::private::readings::batch::{Replace, admission, readings_upsert};
+use crate::routes::private::{
+    data_streams, readings, readings::sample_groups, readings::samples, sensors::calibrations,
+    sensors::standard_curves, sites, sites::parameters as site_parameters,
+};
 
 /// Grabs are spot measurements by definition: a bottle, not a logger cadence.
 const GRAB_MEASUREMENT_TYPE: &str = "spot";
+
+/// Posting to this endpoint is the declaration that a collection event happened.
+const GRAB_IS_A_COLLECTION_EVENT: bool = true;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct GrabSampleRequest {
@@ -34,12 +40,13 @@ pub struct GrabSampleReading {
     pub time: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub replicate_index: Option<i16>,
-    /// Instant standard curve (a `sensor_calibrations` row) chosen for this reading. When set, the
-    /// server stores `raw_value = value`, `calibrated_value = slope * value + intercept`, and stamps
-    /// `calibration_id` for publication provenance. When absent, `value` is stored raw and the
-    /// calibration is window-resolved from the sensor (if any).
+    /// The standard curve the operator fitted for this measurement, typically per microplate. It is
+    /// applied on top of the instrument's base calibration, which the server resolves from the
+    /// sensor's windows at `time`. The stored row carries the measured `raw_value`, both curve
+    /// references and the value they produce together, so a recorded identity base and an
+    /// unrecorded one stay distinguishable.
     #[serde(default)]
-    pub calibration_id: Option<Uuid>,
+    pub standard_curve_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -154,8 +161,8 @@ async fn reuse_existing_sample(
     Ok(Some(sample_id))
 }
 
-/// Create a `samples` row per (parameter_id, time) group of 2+ readings, or for any group when a
-/// label or note needs a home. Returns the group-to-sample map and how many rows were created.
+/// Create a `samples` row per (parameter_id, time) group. Returns the group-to-sample map and how
+/// many rows were created.
 async fn auto_create_samples(
     txn: &sea_orm::DatabaseTransaction,
     readings: &[GrabSampleReading],
@@ -172,7 +179,11 @@ async fn auto_create_samples(
     let mut sample_map = HashMap::new();
     let mut created = 0usize;
     for ((parameter_id, time), count) in groups {
-        if count < 2 && label.is_none() && notes.is_none() {
+        // A grab request is an operator recording a collection event, so every group is a sample
+        // whether or not it was measured twice. Views that read grabs, the sensor-vs-grab export
+        // and the curve filter among them, join through `samples`, so a grab without a row there
+        // is invisible to them.
+        if !sample_groups::forms_sample(GRAB_IS_A_COLLECTION_EVENT, count) {
             continue;
         }
         // Re-posting the same grab must reuse its sample, not accumulate empty duplicates
@@ -268,7 +279,8 @@ pub async fn insert_grab_samples(
     // Resolve stream_ids for each unique (site_id, parameter_id)
     let mut stream_cache: HashMap<Uuid, Uuid> = HashMap::new();
     for r in &payload.readings {
-        if let std::collections::hash_map::Entry::Vacant(entry) = stream_cache.entry(r.parameter_id) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = stream_cache.entry(r.parameter_id)
+        {
             let sp_id = sp_lookup.get(&r.parameter_id).copied();
             let stream_id =
                 get_or_create_grab_stream(&state.db, payload.site_id, r.parameter_id, sp_id)
@@ -279,7 +291,7 @@ pub async fn insert_grab_samples(
 
     let txn = state.db.begin().await?;
 
-    // Auto-create samples for replicate groups (2+ readings per parameter+time)
+    // One samples row per (parameter, time) group in the request.
     let (sample_map, samples_created) = auto_create_samples(
         &txn,
         &payload.readings,
@@ -290,24 +302,25 @@ pub async fn insert_grab_samples(
     )
     .await?;
 
-
-    // Window-aware attribution for grabs that name a sensor: resolve calibration/deployment from the
-    // sensor's windows at the grab time (site-fixed to payload.site_id), instead of writing NULL.
-    // Grabs without a sensor_id keep NULL cal/deployment (manual lab values with no instrument).
+    // Window-aware attribution for grabs that name a sensor: which deployment the instrument was on
+    // at the grab time (site-fixed to payload.site_id), instead of writing NULL. Grabs without a
+    // sensor_id keep NULL deployment (manual lab values with no instrument).
     let grab_slots = {
-        use crate::routes::private::sensors::operations::{resolve_windows_for_times, ResolvedSlot};
+        use crate::routes::private::sensors::operations::{
+            ResolvedSlot, resolve_windows_for_times,
+        };
         let mut times_by_sensor: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = HashMap::new();
         for r in &payload.readings {
             if let Some(sid) = r.sensor_id {
                 times_by_sensor.entry(sid).or_default().push(r.time);
             }
         }
-        let mut slots: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), ResolvedSlot> = HashMap::new();
+        let mut slots: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), ResolvedSlot> =
+            HashMap::new();
         for (sid, times) in &times_by_sensor {
-            let resolved =
-                resolve_windows_for_times(&state.db, *sid, Some(payload.site_id), times)
-                    .await
-                    .unwrap_or_default();
+            let resolved = resolve_windows_for_times(&state.db, *sid, Some(payload.site_id), times)
+                .await
+                .unwrap_or_default();
             for (t, slot) in resolved {
                 slots.insert((*sid, t), slot);
             }
@@ -317,8 +330,10 @@ pub async fn insert_grab_samples(
 
     // Per-parameter time windows for the alarm episode reconstruction below (computed up front
     // because the readings vec is consumed building the insert models).
-    let mut alarm_windows: HashMap<Uuid, (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> =
-        HashMap::new();
+    let mut alarm_windows: HashMap<
+        Uuid,
+        (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
+    > = HashMap::new();
     for r in &payload.readings {
         alarm_windows
             .entry(r.parameter_id)
@@ -329,33 +344,56 @@ pub async fn insert_grab_samples(
             .or_insert((r.time, r.time));
     }
 
-    // Resolve any explicitly chosen instant standard curves up front (slope/intercept per id) so the
-    // correction is applied server-side. An unknown curve id is a 400 rather than a silent miss.
+    // The chosen standard curves, so the correction is applied server-side. An unknown id is a 400
+    // rather than a silent miss, and a curve fitted on another instrument is refused: it would put a
+    // second instrument's coefficients on this instrument's measurement.
     let curve_ids: Vec<Uuid> = payload
         .readings
         .iter()
-        .filter_map(|r| r.calibration_id)
+        .filter_map(|r| r.standard_curve_id)
         .collect();
-    let curves: HashMap<Uuid, (f64, f64)> = if curve_ids.is_empty() {
+    let standard_curves: HashMap<Uuid, standard_curves::Model> = if curve_ids.is_empty() {
         HashMap::new()
     } else {
-        calibrations::Entity::find()
-            .filter(calibrations::Column::Id.is_in(curve_ids))
+        standard_curves::Entity::find()
+            .filter(standard_curves::Column::Id.is_in(curve_ids))
             .all(&state.db)
             .await?
             .into_iter()
-            .map(|c| (c.id, (c.slope, c.intercept)))
+            .map(|c| (c.id, c))
             .collect()
     };
     for r in &payload.readings {
-        if let Some(cid) = r.calibration_id
-            && !curves.contains_key(&cid)
-        {
+        let Some(cid) = r.standard_curve_id else {
+            continue;
+        };
+        let Some(curve) = standard_curves.get(&cid) else {
             return Err(AppError::BadRequest(format!(
                 "Standard curve {cid} not found"
             )));
+        };
+        if let Some(sensor_id) = r.sensor_id
+            && curve.sensor_id != sensor_id
+        {
+            return Err(AppError::BadRequest(format!(
+                "Standard curve {cid} was fitted on instrument {}, not on {sensor_id}",
+                curve.sensor_id
+            )));
         }
     }
+
+    // The base calibration covering each grab that names an instrument, ranked by the one resolver
+    // the ingest and reprocess paths use. Resolving it here is what lets the row carry both the id
+    // and the value that id produced: a stamped calibration the stored value was never corrected by
+    // is provenance that reads as true and is not.
+    let base_curves = {
+        let requests: Vec<(Uuid, Option<Uuid>, chrono::DateTime<chrono::Utc>)> = payload
+            .readings
+            .iter()
+            .filter_map(|r| r.sensor_id.map(|sid| (sid, Some(r.parameter_id), r.time)))
+            .collect();
+        calibrations::resolver::resolve_many(&state.db, &requests).await?
+    };
 
     // Track replicate_index per (parameter_id, time) group for auto-assignment
     let mut index_counters: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), i16> = HashMap::new();
@@ -381,19 +419,27 @@ pub async fn insert_grab_samples(
                 idx
             };
 
-            // An explicit instant curve wins: store raw + corrected + the curve id. Otherwise keep the
-            // raw value and let the sensor's window resolution attribute the calibration (if any).
-            let (calibrated_value, calibration_id) = if let Some(cid) = r.calibration_id {
-                let (slope, intercept) = curves[&cid];
-                (Some(slope * r.value + intercept), Some(cid))
-            } else {
-                let cid = r
-                    .sensor_id
-                    .and_then(|sid| grab_slots.get(&(sid, r.time)).and_then(|s| s.calibration_id));
-                (None, cid)
-            };
+            // Both corrections, in the one order the arithmetic is defined in: the instrument's
+            // base calibration, then the operator's standard curve on that result. A grab that
+            // resolves neither is stored uncorrected, and `calibrated_value` stays NULL so a null
+            // still means "no curve was applied" rather than "a curve happened to be identity".
+            let base = r
+                .sensor_id
+                .and_then(|sid| base_curves.get(&(sid, Some(r.parameter_id), r.time)))
+                .copied();
+            let standard = r.standard_curve_id.map(|cid| {
+                let c = &standard_curves[&cid];
+                calibrations::service::Curve {
+                    id: c.id,
+                    slope: c.slope,
+                    intercept: c.intercept,
+                }
+            });
+            let calibrated_value = (base.is_some() || standard.is_some())
+                .then(|| calibrations::service::apply_curves(r.value, base, standard));
 
             readings::ActiveModel {
+                standard_curve_id: Set(standard.map(|c| c.id)),
                 stream_id: Set(stream_id),
                 site_id: Set(Some(payload.site_id)),
                 parameter_id: Set(Some(r.parameter_id)),
@@ -402,8 +448,10 @@ pub async fn insert_grab_samples(
                 raw_value: Set(r.value),
                 calibrated_value: Set(calibrated_value),
                 sensor_id: Set(r.sensor_id),
-                calibration_id: Set(calibration_id),
-                deployment_id: Set(r.sensor_id.and_then(|sid| grab_slots.get(&(sid, r.time)).and_then(|s| s.deployment_id))),
+                calibration_id: Set(base.map(|c| c.id)),
+                deployment_id: Set(r
+                    .sensor_id
+                    .and_then(|sid| grab_slots.get(&(sid, r.time)).and_then(|s| s.deployment_id))),
                 logged: Set(Some(true)),
                 measurement_type: Set(Some(GRAB_MEASUREMENT_TYPE.to_string())),
                 is_flagged: Set(Some(false)),

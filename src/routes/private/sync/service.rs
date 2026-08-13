@@ -7,9 +7,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::routes::private::{data_streams, data_streams::pairing_plans, parameters, projects, sites::parameters as site_parameters, sites};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::operations::create_sensor_for_stream;
+use crate::routes::private::{
+    data_streams, data_streams::pairing_plans, parameters, projects, sites,
+    sites::parameters as site_parameters,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamHierarchy {
@@ -33,18 +36,48 @@ pub fn extract_hierarchy(stream: &data_streams::Model) -> StreamHierarchy {
 
     // Try metadata.hierarchy first
     if let Some(h) = meta.get("hierarchy") {
-        let project = h.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let site = h.get("site").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let parameter = h.get("parameter").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let units = meta.get("units").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let project = h
+            .get("project")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let site = h
+            .get("site")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let parameter = h
+            .get("parameter")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let units = meta
+            .get("units")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         let coords = meta.get("coordinates");
-        let lat = coords.and_then(|c| c.get("latitude")).and_then(|v| v.as_f64());
-        let lon = coords.and_then(|c| c.get("longitude")).and_then(|v| v.as_f64());
-        let alt = coords.and_then(|c| c.get("altitude_m")).and_then(|v| v.as_f64());
+        let lat = coords
+            .and_then(|c| c.get("latitude"))
+            .and_then(|v| v.as_f64());
+        let lon = coords
+            .and_then(|c| c.get("longitude"))
+            .and_then(|v| v.as_f64());
+        let alt = coords
+            .and_then(|c| c.get("altitude_m"))
+            .and_then(|v| v.as_f64());
 
         if !project.is_empty() || !site.is_empty() || !parameter.is_empty() {
-            return StreamHierarchy { project, site, parameter, units, latitude: lat, longitude: lon, altitude_m: alt };
+            return StreamHierarchy {
+                project,
+                site,
+                parameter,
+                units,
+                latitude: lat,
+                longitude: lon,
+                altitude_m: alt,
+            };
         }
     }
 
@@ -54,28 +87,45 @@ pub fn extract_hierarchy(stream: &data_streams::Model) -> StreamHierarchy {
         let project = segs.get(1).unwrap_or(&"").to_string();
         let site = segs.get(2).unwrap_or(&"").to_string();
         let parameter = segs.get(3).unwrap_or(&"").to_string();
-        let units = meta.get("units").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let units = meta
+            .get("units")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         return StreamHierarchy {
-            project, site, parameter, units,
-            latitude: None, longitude: None, altitude_m: None,
+            project,
+            site,
+            parameter,
+            units,
+            latitude: None,
+            longitude: None,
+            altitude_m: None,
         };
     }
 
     // Last resort: source_name, stripping the "{site} - " prefix without truncating
     // display names that themselves contain " - "
-    let parameter = stream.source_name.as_deref()
+    let parameter = stream
+        .source_name
+        .as_deref()
         .and_then(|n| n.splitn(2, " - ").nth(1))
         .unwrap_or("")
         .to_string();
-    let units = meta.get("units").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let units = meta
+        .get("units")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     StreamHierarchy {
         project: stream.source_system.to_uppercase(),
         site: String::new(),
         parameter,
         units,
-        latitude: None, longitude: None, altitude_m: None,
+        latitude: None,
+        longitude: None,
+        altitude_m: None,
     }
 }
 
@@ -144,19 +194,19 @@ struct ParamGroupProposal {
     entry_indices: Vec<usize>,
 }
 
-fn group_streams_by_parameter(
-    entries: &[(usize, String, String)],
-) -> Vec<ParamGroupProposal> {
+fn group_streams_by_parameter(entries: &[(usize, String, String)]) -> Vec<ParamGroupProposal> {
     // Distinct quantities can share a units suffix (e.g. "Nitrate [µg/L]" vs
     // "Ammonia [µg/L]"), so only entries whose names are identical group together.
     let mut by_key: HashMap<(String, String), Vec<(usize, String)>> = HashMap::new();
     for (idx, name, units) in entries {
-        by_key.entry((units.to_lowercase(), name.to_lowercase()))
+        by_key
+            .entry((units.to_lowercase(), name.to_lowercase()))
             .or_default()
             .push((*idx, name.clone()));
     }
 
-    by_key.into_iter()
+    by_key
+        .into_iter()
         .map(|((units, _), members)| {
             let mut original_names: Vec<String> = members.iter().map(|(_, n)| n.clone()).collect();
             original_names.sort();
@@ -238,7 +288,9 @@ pub async fn create_plan(
     }
 
     // Group new-to-create parameters with identical names (per units) across sites
-    let to_group: Vec<(usize, String, String)> = entries.iter().enumerate()
+    let to_group: Vec<(usize, String, String)> = entries
+        .iter()
+        .enumerate()
         .filter(|(_, e)| e.action == "pair" && e.parameter.create)
         .map(|(i, e)| (i, e.parameter.name.clone(), e.parameter.units.clone()))
         .collect();
@@ -305,17 +357,16 @@ struct ApplyCounters {
 }
 
 /// Apply a pairing plan: create entities, pair streams, backfill readings.
-pub async fn apply_plan(
-    db: &sea_orm::DatabaseConnection,
-    plan_id: Uuid,
-) -> AppResult<ApplyResult> {
+pub async fn apply_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> AppResult<ApplyResult> {
     let plan = pairing_plans::Entity::find_by_id(plan_id)
-        .one(db).await?
+        .one(db)
+        .await?
         .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
 
     if plan.status != "draft" {
         return Err(AppError::BadRequest(format!(
-            "Plan is '{}', can only apply 'draft' plans", plan.status
+            "Plan is '{}', can only apply 'draft' plans",
+            plan.status
         )));
     }
 
@@ -326,11 +377,13 @@ pub async fn apply_plan(
 
     // Atomic status claim: a concurrent apply of the same plan matches zero rows and bails.
     // A rollback restores 'draft'.
-    let claimed = txn.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "UPDATE pairing_plans SET status = 'applying' WHERE id = $1 AND status = 'draft'",
-        [plan_id.into()],
-    )).await?;
+    let claimed = txn
+        .execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE pairing_plans SET status = 'applying' WHERE id = $1 AND status = 'draft'",
+            [plan_id.into()],
+        ))
+        .await?;
     if claimed.rows_affected() == 0 {
         return Err(AppError::BadRequest(
             "Plan is no longer in draft status".to_string(),
@@ -340,11 +393,15 @@ pub async fn apply_plan(
     txn.execute(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
-    )).await?;
+    ))
+    .await?;
 
     let param_names: HashMap<Uuid, String> = parameters::Entity::find()
-        .all(&txn).await?
-        .into_iter().map(|p| (p.id, p.name)).collect();
+        .all(&txn)
+        .await?
+        .into_iter()
+        .map(|p| (p.id, p.name))
+        .collect();
 
     let mut caches = EntityCaches {
         projects: HashMap::new(),
@@ -354,8 +411,12 @@ pub async fn apply_plan(
         param_names,
     };
     let mut counters = ApplyCounters {
-        projects_created: 0, sites_created: 0, params_created: 0,
-        sp_created: 0, streams_paired: 0, streams_skipped: 0,
+        projects_created: 0,
+        sites_created: 0,
+        params_created: 0,
+        sp_created: 0,
+        streams_paired: 0,
+        streams_skipped: 0,
     };
 
     for entry in entries.iter().filter(|e| e.action == "pair") {
@@ -369,7 +430,10 @@ pub async fn apply_plan(
             counters.streams_skipped += 1;
             continue;
         }
-        let Some(stream) = data_streams::Entity::find_by_id(entry.stream_id).one(&txn).await? else {
+        let Some(stream) = data_streams::Entity::find_by_id(entry.stream_id)
+            .one(&txn)
+            .await?
+        else {
             tracing::warn!(
                 stream_id = %entry.stream_id,
                 "apply_plan: skipping entry whose stream no longer exists",
@@ -387,9 +451,9 @@ pub async fn apply_plan(
             counters.streams_skipped += 1;
             continue;
         }
-        let (site_parameter_id, parameter_id) = resolve_plan_entry(
-            &txn, entry, &plan.source_system, &mut caches, &mut counters,
-        ).await?;
+        let (site_parameter_id, parameter_id) =
+            resolve_plan_entry(&txn, entry, &plan.source_system, &mut caches, &mut counters)
+                .await?;
         pair_entry_stream(&txn, stream, plan_id, site_parameter_id, parameter_id).await?;
         counters.streams_paired += 1;
     }
@@ -478,19 +542,40 @@ async fn resolve_plan_entry<C: ConnectionTrait>(
     counters: &mut ApplyCounters,
 ) -> AppResult<(Uuid, Uuid)> {
     let project_id = resolve_or_create_project(
-        txn, &entry.project, &mut caches.projects, &mut counters.projects_created, source_system,
-    ).await?;
+        txn,
+        &entry.project,
+        &mut caches.projects,
+        &mut counters.projects_created,
+        source_system,
+    )
+    .await?;
     let site_id = resolve_or_create_site(
-        txn, &entry.site, &mut caches.sites, &mut counters.sites_created, project_id,
-    ).await?;
+        txn,
+        &entry.site,
+        &mut caches.sites,
+        &mut counters.sites_created,
+        project_id,
+    )
+    .await?;
     let parameter_id = resolve_or_create_param(
-        txn, &entry.parameter, entry.original_parameter_name.as_deref(),
-        &mut caches.params, &mut caches.param_names, &mut counters.params_created,
-    ).await?;
+        txn,
+        &entry.parameter,
+        entry.original_parameter_name.as_deref(),
+        &mut caches.params,
+        &mut caches.param_names,
+        &mut counters.params_created,
+    )
+    .await?;
     let site_parameter_id = resolve_or_create_site_param(
-        txn, site_id, parameter_id, &entry.parameter.units, &caches.param_names,
-        &mut caches.site_params, &mut counters.sp_created,
-    ).await?;
+        txn,
+        site_id,
+        parameter_id,
+        &entry.parameter.units,
+        &caches.param_names,
+        &mut caches.site_params,
+        &mut counters.sp_created,
+    )
+    .await?;
     Ok((site_parameter_id, parameter_id))
 }
 
@@ -509,10 +594,13 @@ async fn resolve_or_create_site_param<C: ConnectionTrait>(
     }
 
     let existing = site_parameters::Entity::find()
-        .filter(Condition::all()
-            .add(site_parameters::Column::SiteId.eq(site_id))
-            .add(site_parameters::Column::ParameterId.eq(parameter_id)))
-        .one(txn).await?;
+        .filter(
+            Condition::all()
+                .add(site_parameters::Column::SiteId.eq(site_id))
+                .add(site_parameters::Column::ParameterId.eq(parameter_id)),
+        )
+        .one(txn)
+        .await?;
 
     let id = if let Some(existing) = existing {
         existing.id
@@ -522,17 +610,21 @@ async fn resolve_or_create_site_param<C: ConnectionTrait>(
         // (site_id, name) is unique; a clash here means the name belongs to a different
         // parameter's slot, so suffix with units (or the parameter code) to disambiguate.
         let name_taken = site_parameters::Entity::find()
-            .filter(Condition::all()
-                .add(site_parameters::Column::SiteId.eq(site_id))
-                .add(site_parameters::Column::Name.eq(param_name_val.clone())))
-            .one(txn).await?
+            .filter(
+                Condition::all()
+                    .add(site_parameters::Column::SiteId.eq(site_id))
+                    .add(site_parameters::Column::Name.eq(param_name_val.clone())),
+            )
+            .one(txn)
+            .await?
             .is_some();
         if name_taken {
             let suffix = if !units.trim().is_empty() {
                 units.trim().to_string()
             } else {
                 parameters::Entity::find_by_id(parameter_id)
-                    .one(txn).await?
+                    .one(txn)
+                    .await?
                     .map(|p| p.code)
                     .unwrap_or_else(|| parameter_id.to_string())
             };
@@ -548,9 +640,12 @@ async fn resolve_or_create_site_param<C: ConnectionTrait>(
             parameter_id: Set(parameter_id),
             name: Set(param_name_val),
             sensor_type: Set(String::new()),
-            display_units: Set(units_val.clone()), units_name: Set(units_val),
-            units_min: Set(None), units_max: Set(None),
-            decimal_places: Set(None), channel_id: Set(None),
+            display_units: Set(units_val.clone()),
+            units_name: Set(units_val),
+            units_min: Set(None),
+            units_max: Set(None),
+            decimal_places: Set(None),
+            channel_id: Set(None),
             sample_interval_sec: Set(None),
             is_active: Set(Some(true)),
             is_public: Set(Some(false)),
@@ -560,7 +655,9 @@ async fn resolve_or_create_site_param<C: ConnectionTrait>(
             created_at: Set(Some(Utc::now())),
             updated_at: Set(Some(Utc::now())),
             discovered_at: Set(Some(Utc::now())),
-        }.insert(txn).await?;
+        }
+        .insert(txn)
+        .await?;
         *sp_created += 1;
         id
     };
@@ -577,7 +674,8 @@ async fn pair_entry_stream<C: ConnectionTrait>(
 ) -> AppResult<()> {
     if stream.sensor_id.is_none() {
         let site_id = site_parameters::Entity::find_by_id(site_parameter_id)
-            .one(txn).await?
+            .one(txn)
+            .await?
             .map(|sp| sp.site_id)
             .unwrap_or_default();
         if let Err(e) = create_sensor_for_stream(txn, &stream, parameter_id, site_id).await {
@@ -602,9 +700,10 @@ async fn pair_entry_stream<C: ConnectionTrait>(
 }
 
 async fn backfill_plan_readings<C: ConnectionTrait>(txn: &C, plan_id: Uuid) -> AppResult<u64> {
-    let backfill_result = txn.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE readings r
+    let backfill_result = txn
+        .execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE readings r
           SET site_id = sp.site_id, parameter_id = sp.parameter_id,
               calibrated_value = COALESCE(r.calibrated_value, r.raw_value),
               measurement_type = COALESCE(r.measurement_type, ds.measurement_type)
@@ -612,8 +711,9 @@ async fn backfill_plan_readings<C: ConnectionTrait>(txn: &C, plan_id: Uuid) -> A
           JOIN site_parameters sp ON ds.site_parameter_id = sp.id
           WHERE r.stream_id = ds.id AND r.site_id IS NULL
             AND ds.pairing_plan_id = $1",
-        [plan_id.into()],
-    )).await?;
+            [plan_id.into()],
+        ))
+        .await?;
 
     let plan_streams: Vec<Uuid> = txn
         .query_all(Statement::from_sql_and_values(
@@ -628,41 +728,15 @@ async fn backfill_plan_readings<C: ConnectionTrait>(txn: &C, plan_id: Uuid) -> A
     crate::routes::private::readings::replicates::densify_stream_replicates(txn, &plan_streams)
         .await?;
 
-    // Replicate groups on the newly paired streams (2+ readings sharing a stream+timestamp, e.g.
-    // migrated NOMIS A/B/C rows mapped to replicate_index 0/1/2) form samples: find-or-create the
-    // samples row per group, then stamp sample_id. The row-level triggers populate the statistics.
-    txn.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"INSERT INTO samples (site_id, parameter_id, collected_at)
-          SELECT r.site_id, r.parameter_id, r.time
-          FROM readings r
-          JOIN data_streams ds ON r.stream_id = ds.id
-          WHERE ds.pairing_plan_id = $1 AND r.sample_id IS NULL AND r.site_id IS NOT NULL
-            AND r.measurement_type = 'spot'
-          GROUP BY r.stream_id, r.site_id, r.parameter_id, r.time
-          HAVING COUNT(*) >= 2
-          ON CONFLICT (site_id, parameter_id, collected_at) DO NOTHING",
-        [plan_id.into()],
-    )).await?;
-    txn.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE readings r
-          SET sample_id = s.id
-          FROM (
-              SELECT r2.stream_id, r2.time
-              FROM readings r2
-              JOIN data_streams ds ON r2.stream_id = ds.id
-              WHERE ds.pairing_plan_id = $1 AND r2.sample_id IS NULL AND r2.site_id IS NOT NULL
-                AND r2.measurement_type = 'spot'
-              GROUP BY r2.stream_id, r2.time
-              HAVING COUNT(*) >= 2
-          ) g, samples s
-          WHERE r.stream_id = g.stream_id AND r.time = g.time AND r.sample_id IS NULL
-            AND r.measurement_type = 'spot'
-            AND s.site_id = r.site_id AND s.parameter_id = r.parameter_id
-            AND s.collected_at = r.time",
-        [plan_id.into()],
-    )).await?;
+    // Replicate groups on the newly paired streams (2+ spot readings sharing a slot and timestamp,
+    // e.g. migrated NOMIS A/B/C rows mapped to replicate_index 0/1/2) form samples. The row-level
+    // triggers populate the statistics.
+    crate::routes::private::readings::sample_groups::materialise_backfilled_samples(
+        txn,
+        "ds.pairing_plan_id = $1",
+        plan_id.into(),
+    )
+    .await?;
 
     txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
@@ -673,7 +747,8 @@ async fn backfill_plan_readings<C: ConnectionTrait>(txn: &C, plan_id: Uuid) -> A
           WHERE se.stream_id = ds.id AND se.site_id IS NULL
             AND ds.pairing_plan_id = $1",
         [plan_id.into()],
-    )).await?;
+    ))
+    .await?;
 
     Ok(backfill_result.rows_affected())
 }
@@ -695,7 +770,8 @@ async fn finalize_plan<C: ConnectionTrait>(
     };
 
     let mut plan_active: pairing_plans::ActiveModel = pairing_plans::Entity::find_by_id(plan_id)
-        .one(txn).await?
+        .one(txn)
+        .await?
         .ok_or_else(|| AppError::Internal("Plan disappeared during apply".to_string()))?
         .into();
     plan_active.status = Set("applied".to_string());
@@ -706,28 +782,29 @@ async fn finalize_plan<C: ConnectionTrait>(
 }
 
 /// Revert a pairing plan: bulk unpair all streams that were paired by this plan.
-pub async fn revert_plan(
-    db: &sea_orm::DatabaseConnection,
-    plan_id: Uuid,
-) -> AppResult<u32> {
+pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> AppResult<u32> {
     let plan = pairing_plans::Entity::find_by_id(plan_id)
-        .one(db).await?
+        .one(db)
+        .await?
         .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
 
     if plan.status != "applied" {
         return Err(AppError::BadRequest(format!(
-            "Plan is '{}', can only revert 'applied' plans", plan.status
+            "Plan is '{}', can only revert 'applied' plans",
+            plan.status
         )));
     }
 
     let txn = db.begin().await?;
 
     // Atomic status claim: a concurrent revert of the same plan matches zero rows and bails.
-    let claimed = txn.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "UPDATE pairing_plans SET status = 'reverting' WHERE id = $1 AND status = 'applied'",
-        [plan_id.into()],
-    )).await?;
+    let claimed = txn
+        .execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE pairing_plans SET status = 'reverting' WHERE id = $1 AND status = 'applied'",
+            [plan_id.into()],
+        ))
+        .await?;
     if claimed.rows_affected() == 0 {
         return Err(AppError::BadRequest(
             "Plan is no longer in applied status".to_string(),
@@ -737,7 +814,8 @@ pub async fn revert_plan(
     txn.execute(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
-    )).await?;
+    ))
+    .await?;
 
     // NULL out readings for streams from this plan; samples formed by the pairing backfill
     // lose their last reference and are removed below
@@ -761,7 +839,8 @@ pub async fn revert_plan(
           FROM data_streams ds
           WHERE r.stream_id = ds.id AND ds.pairing_plan_id = $1",
         [plan_id.into()],
-    )).await?;
+    ))
+    .await?;
 
     if !sample_ids.is_empty() {
         txn.execute(Statement::from_sql_and_values(
@@ -770,7 +849,8 @@ pub async fn revert_plan(
               WHERE s.id = ANY($1)
                 AND NOT EXISTS (SELECT 1 FROM readings r WHERE r.sample_id = s.id)",
             [sample_ids.into()],
-        )).await?;
+        ))
+        .await?;
     }
 
     txn.execute(Statement::from_sql_and_values(
@@ -779,20 +859,24 @@ pub async fn revert_plan(
           FROM data_streams ds
           WHERE se.stream_id = ds.id AND ds.pairing_plan_id = $1",
         [plan_id.into()],
-    )).await?;
+    ))
+    .await?;
 
     // Unpair the streams; pairing_plan_id stays as the audit link back to this plan
-    let result = txn.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE data_streams SET site_parameter_id = NULL, paired_at = NULL
+    let result = txn
+        .execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE data_streams SET site_parameter_id = NULL, paired_at = NULL
           WHERE pairing_plan_id = $1",
-        [plan_id.into()],
-    )).await?;
+            [plan_id.into()],
+        ))
+        .await?;
     let reverted = result.rows_affected() as u32;
 
     // Update plan status
     let mut plan_active: pairing_plans::ActiveModel = pairing_plans::Entity::find_by_id(plan_id)
-        .one(&txn).await?
+        .one(&txn)
+        .await?
         .ok_or_else(|| AppError::Internal("Plan disappeared during revert".to_string()))?
         .into();
     plan_active.status = Set("reverted".to_string());
@@ -815,31 +899,40 @@ fn compute_summary(entries: &[PlanEntry]) -> PlanSummary {
     let will_pair = entries.iter().filter(|e| e.action == "pair").count();
     let will_skip = entries.iter().filter(|e| e.action == "skip").count();
 
-    let unique_projects: std::collections::HashSet<&str> = entries.iter()
+    let unique_projects: std::collections::HashSet<&str> = entries
+        .iter()
         .filter(|e| e.action == "pair")
         .map(|e| e.project.name.as_str())
         .collect();
-    let unique_sites: std::collections::HashSet<&str> = entries.iter()
+    let unique_sites: std::collections::HashSet<&str> = entries
+        .iter()
         .filter(|e| e.action == "pair")
         .map(|e| e.site.name.as_str())
         .collect();
-    let unique_params: std::collections::HashSet<&str> = entries.iter()
+    let unique_params: std::collections::HashSet<&str> = entries
+        .iter()
         .filter(|e| e.action == "pair")
         .map(|e| e.parameter.name.as_str())
         .collect();
 
-    let projects_to_create = entries.iter()
+    let projects_to_create = entries
+        .iter()
         .filter(|e| e.action == "pair" && e.project.create)
         .map(|e| &e.project.name)
-        .collect::<std::collections::HashSet<_>>().len();
-    let sites_to_create = entries.iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let sites_to_create = entries
+        .iter()
         .filter(|e| e.action == "pair" && e.site.create)
         .map(|e| &e.site.name)
-        .collect::<std::collections::HashSet<_>>().len();
-    let params_to_create = entries.iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let params_to_create = entries
+        .iter()
         .filter(|e| e.action == "pair" && e.parameter.create)
         .map(|e| &e.parameter.name)
-        .collect::<std::collections::HashSet<_>>().len();
+        .collect::<std::collections::HashSet<_>>()
+        .len();
 
     PlanSummary {
         total_streams: entries.len(),
@@ -869,7 +962,10 @@ fn match_entity(name: &str, existing: &[(Uuid, String)]) -> (Option<Uuid>, bool)
 /// A stream names its column by code, display name or alias, so all three resolve. The order is
 /// canonical and shared: `resolve_or_create_param` runs it as SQL at apply time and `bulk_pair`
 /// builds the same precedence into its lookup map, so a review shows what apply will produce.
-pub fn lookup_parameter_by_code_name_or_alias(name: &str, existing: &[CatalogParam]) -> Option<Uuid> {
+pub fn lookup_parameter_by_code_name_or_alias(
+    name: &str,
+    existing: &[CatalogParam],
+) -> Option<Uuid> {
     if name.is_empty() {
         return None;
     }
@@ -912,14 +1008,22 @@ pub struct EntityCatalog {
 
 pub async fn load_entity_catalog(db: &impl ConnectionTrait) -> AppResult<EntityCatalog> {
     let projects = projects::Entity::find()
-        .all(db).await?
-        .into_iter().map(|p| (p.id, p.name)).collect();
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|p| (p.id, p.name))
+        .collect();
     let sites = sites::Entity::find()
-        .all(db).await?
-        .into_iter().map(|s| (s.id, s.name)).collect();
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|s| (s.id, s.name))
+        .collect();
     let params = parameters::Entity::find()
-        .all(db).await?
-        .into_iter().map(|p| CatalogParam {
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|p| CatalogParam {
             id: p.id,
             code: p.code,
             name: p.name,
@@ -927,7 +1031,11 @@ pub async fn load_entity_catalog(db: &impl ConnectionTrait) -> AppResult<EntityC
             units: p.default_units,
         })
         .collect();
-    Ok(EntityCatalog { projects, sites, params })
+    Ok(EntityCatalog {
+        projects,
+        sites,
+        params,
+    })
 }
 
 /// Recompute an entry's entity resolution against the current catalog: project/site/parameter
@@ -949,7 +1057,8 @@ pub fn reclassify_entry(entry: &mut PlanEntry, catalog: &EntityCatalog) {
     entry.warnings.clear();
     if let Some(pid) = param_id
         && let Some(p) = catalog.params.iter().find(|p| p.id == pid)
-        && !p.units.is_empty() && !entry.parameter.units.is_empty()
+        && !p.units.is_empty()
+        && !entry.parameter.units.is_empty()
         && p.units.to_lowercase() != entry.parameter.units.to_lowercase()
     {
         entry.warnings.push(format!(
@@ -962,7 +1071,8 @@ pub fn reclassify_entry(entry: &mut PlanEntry, catalog: &EntityCatalog) {
         "exact"
     } else {
         "none"
-    }.to_string();
+    }
+    .to_string();
 }
 
 use sea_orm::sea_query::Expr;
@@ -983,7 +1093,8 @@ async fn resolve_or_create_project<C: ConnectionTrait>(
     }
     let existing = projects::Entity::find()
         .filter(Expr::cust_with_values("LOWER(name) = $1", [key.clone()]))
-        .one(txn).await?;
+        .one(txn)
+        .await?;
     if let Some(existing) = existing {
         cache.insert(key, existing.id);
         return Ok(existing.id);
@@ -1002,7 +1113,9 @@ async fn resolve_or_create_project<C: ConnectionTrait>(
         public_contact_email: Set(None),
         created_at: Set(Some(Utc::now())),
         discovered_at: Set(Some(Utc::now())),
-    }.insert(txn).await?;
+    }
+    .insert(txn)
+    .await?;
     *created_count += 1;
     cache.insert(key, id);
     Ok(id)
@@ -1037,7 +1150,8 @@ async fn resolve_or_create_site(
     }
     let existing = sites::Entity::find()
         .filter(Expr::cust_with_values("LOWER(name) = $1", [key.clone()]))
-        .one(txn).await?;
+        .one(txn)
+        .await?;
     if let Some(existing) = existing {
         if existing.latitude.is_none() && site_ref.latitude.is_some() {
             let mut update: sites::ActiveModel = existing.clone().into();
@@ -1061,7 +1175,9 @@ async fn resolve_or_create_site(
         public_code: Set(None),
         created_at: Set(Some(Utc::now())),
         discovered_at: Set(Some(Utc::now())),
-    }.insert(txn).await?;
+    }
+    .insert(txn)
+    .await?;
     *created_count += 1;
     cache.insert(key, id);
     Ok(id)
@@ -1086,7 +1202,8 @@ async fn resolve_or_create_param(
     // all case-insensitive.
     let existing = parameters::Entity::find()
         .filter(Expr::cust_with_values("LOWER(code) = $1", [key.clone()]))
-        .one(txn).await?;
+        .one(txn)
+        .await?;
     if let Some(existing) = existing {
         cache.insert(key, existing.id);
         param_names.entry(existing.id).or_insert(existing.name);
@@ -1094,7 +1211,8 @@ async fn resolve_or_create_param(
     }
     let name_match = parameters::Entity::find()
         .filter(Expr::cust_with_values("LOWER(name) = $1", [key.clone()]))
-        .one(txn).await?;
+        .one(txn)
+        .await?;
     if let Some(matched) = name_match {
         cache.insert(key, matched.id);
         param_names.entry(matched.id).or_insert(matched.name);
@@ -1105,14 +1223,18 @@ async fn resolve_or_create_param(
             "EXISTS (SELECT 1 FROM unnest(aliases) a WHERE LOWER(a) = $1)",
             [key.clone()],
         ))
-        .one(txn).await?;
+        .one(txn)
+        .await?;
     if let Some(matched) = alias_match {
         cache.insert(key, matched.id);
         param_names.entry(matched.id).or_insert(matched.name);
         return Ok(matched.id);
     }
     // No match: create, seeding aliases from the source names so future plans resolve them
-    let mut aliases: Vec<String> = param_ref.original_names.iter().cloned()
+    let mut aliases: Vec<String> = param_ref
+        .original_names
+        .iter()
+        .cloned()
         .chain(original_parameter_name.map(str::to_string))
         .filter(|a| !a.trim().is_empty() && a.to_lowercase() != key)
         .collect();
@@ -1128,10 +1250,14 @@ async fn resolve_or_create_param(
         category: Set(category),
         description: Set(None),
         aliases: Set(aliases),
-        default_warning_min: Set(None), default_warning_max: Set(None),
-        default_alarm_min: Set(None), default_alarm_max: Set(None),
+        default_warning_min: Set(None),
+        default_warning_max: Set(None),
+        default_alarm_min: Set(None),
+        default_alarm_max: Set(None),
         created_at: Set(Some(Utc::now())),
-    }.insert(txn).await?;
+    }
+    .insert(txn)
+    .await?;
     *created_count += 1;
     cache.insert(key, id);
     param_names.insert(id, param_ref.name.clone());

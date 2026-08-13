@@ -107,17 +107,15 @@ pub async fn seed_base_entities(db: &DatabaseConnection) {
 /// valid_from=2000-01-01) bound to `parameter_id`. The parameter lives on the calibration and
 /// deployment now, not the sensor; `deploy_sensor`/`add_calibration` derive it from this identity
 /// calibration so the sensor's whole windowed timeline shares one parameter.
-pub async fn create_sensor(
-    db: &DatabaseConnection,
-    name: &str,
-    parameter_id: &str,
-) -> TestSensor {
+pub async fn create_sensor(db: &DatabaseConnection, name: &str, parameter_id: &str) -> TestSensor {
     let sensor_id = Uuid::new_v4();
     let cal_id = Uuid::new_v4();
 
     exec(
         db,
-        &format!("INSERT INTO sensors (id, name, is_active) VALUES ('{sensor_id}', '{name}', true)"),
+        &format!(
+            "INSERT INTO sensors (id, name, is_active) VALUES ('{sensor_id}', '{name}', true)"
+        ),
     )
     .await;
 
@@ -125,9 +123,9 @@ pub async fn create_sensor(
         db,
         &format!(
             "INSERT INTO sensor_calibrations \
-             (id, sensor_id, parameter_id, slope, intercept, valid_from, mode, notes) \
+             (id, sensor_id, parameter_id, slope, intercept, valid_from, notes) \
              VALUES ('{cal_id}', '{sensor_id}', '{parameter_id}', 1.0, 0.0, \
-             '2000-01-01T00:00:00Z', 'windowed', 'identity')"
+             '2000-01-01T00:00:00Z', 'identity')"
         ),
     )
     .await;
@@ -335,8 +333,7 @@ pub async fn get_readings(db: &DatabaseConnection, stream_id: Uuid) -> Vec<Readi
 
     rows.iter()
         .map(|r| {
-            let time_tz: chrono::DateTime<chrono::FixedOffset> =
-                r.try_get("", "time").unwrap();
+            let time_tz: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "time").unwrap();
             ReadingRow {
                 time: time_tz.with_timezone(&Utc),
                 raw_value: r.try_get("", "raw_value").unwrap(),
@@ -392,10 +389,7 @@ pub async fn wait_for_reprocessing(
 }
 
 /// Query all readings for a sensor across all streams, ordered by time.
-pub async fn get_readings_for_sensor(
-    db: &DatabaseConnection,
-    sensor_id: Uuid,
-) -> Vec<ReadingRow> {
+pub async fn get_readings_for_sensor(db: &DatabaseConnection, sensor_id: Uuid) -> Vec<ReadingRow> {
     let rows = db
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -409,8 +403,7 @@ pub async fn get_readings_for_sensor(
 
     rows.iter()
         .map(|r| {
-            let time_tz: chrono::DateTime<chrono::FixedOffset> =
-                r.try_get("", "time").unwrap();
+            let time_tz: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "time").unwrap();
             ReadingRow {
                 time: time_tz.with_timezone(&Utc),
                 raw_value: r.try_get("", "raw_value").unwrap(),

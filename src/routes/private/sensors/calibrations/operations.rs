@@ -4,22 +4,21 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
 use super::model::SensorCalibration;
-use super::service::recompute_valid_until;
+use super::service::{calibrated_value_sql, recompute_valid_until};
 
 pub struct SensorCalibrationOperations;
 
-const DUPLICATE_INSTANT: &str =
-    "A windowed calibration for this sensor and parameter already starts at that instant. Two \
+const DUPLICATE_INSTANT: &str = "A calibration for this sensor and parameter already starts at that instant. Two \
      curves sharing a valid_from leave one with an empty window: edit the existing curve, or start \
      this one at a different instant.";
 
-/// Whether another windowed curve on the same `(sensor, parameter)` channel already opens at
+/// Whether another curve on the same `(sensor, parameter)` channel already opens at
 /// `valid_from`. Zero-width windows are what a duplicate produces (`recompute_valid_until` chains
 /// each curve's end to the next curve's start), and a curve applying to nothing is invisible in
 /// every reading but visible in the editor.
 ///
 /// A request that names no parameter matches any curve at that instant. The
-/// `inherit_calibration_parameter_id` BEFORE-INSERT trigger fills a windowed curve's parameter in
+/// `inherit_calibration_parameter_id` BEFORE-INSERT trigger fills a curve's parameter in
 /// from the sensor's first parameter-bearing curve, so the channel the row lands on is not knowable
 /// here without restating the trigger's rule: treating the instant itself as taken is the answer
 /// that needs no second copy of it.
@@ -35,7 +34,6 @@ async fn duplicate_instant_exists(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT 1 AS one FROM sensor_calibrations
               WHERE sensor_id = $1
-                AND mode = 'windowed'
                 AND ($2::uuid IS NULL OR parameter_id IS NOT DISTINCT FROM $2::uuid)
                 AND valid_from = $3
                 AND ($4::uuid IS NULL OR id <> $4::uuid)
@@ -50,6 +48,22 @@ async fn duplicate_instant_exists(
         .await
         .map_err(ApiError::database)?;
     Ok(found.is_some())
+}
+
+/// Record whether the row's `valid_until` is an operator's end date or the chain's.
+async fn set_valid_until_explicit(
+    db: &DatabaseConnection,
+    id: Uuid,
+    explicit: bool,
+) -> Result<(), ApiError> {
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "UPDATE sensor_calibrations SET valid_until_explicit = $2 WHERE id = $1",
+        [id.into(), explicit.into()],
+    ))
+    .await
+    .map_err(ApiError::database)?;
+    Ok(())
 }
 
 #[async_trait]
@@ -67,11 +81,8 @@ impl CRUDOperations for SensorCalibrationOperations {
             ));
         }
 
-        // Only windowed curves chain. An instant (lab grab) curve may share an instant with a
-        // windowed one, it is matched by id at the grab and never by window.
-        if data.mode.as_deref().unwrap_or("windowed") == "windowed"
-            && duplicate_instant_exists(db, data.sensor_id, data.parameter_id, data.valid_from, None)
-                .await?
+        if duplicate_instant_exists(db, data.sensor_id, data.parameter_id, data.valid_from, None)
+            .await?
         {
             return Err(ApiError::bad_request(DUPLICATE_INSTANT.to_string()));
         }
@@ -90,15 +101,13 @@ impl CRUDOperations for SensorCalibrationOperations {
             ));
         }
 
-        // Moving a curve's start onto another curve's start is the same collision as creating one
-        // there. `mode` is immutable after create, so the row's own mode decides whether it chains.
-        let Some(Some(new_from)) = data.valid_from else {
+        if data.valid_from.is_none() && data.valid_until.is_none() {
             return Ok(());
-        };
+        }
         let Some(existing) = db
             .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                "SELECT sensor_id, parameter_id, mode FROM sensor_calibrations WHERE id = $1",
+                "SELECT sensor_id, parameter_id, valid_from FROM sensor_calibrations WHERE id = $1",
                 [id.into()],
             ))
             .await
@@ -106,11 +115,41 @@ impl CRUDOperations for SensorCalibrationOperations {
         else {
             return Ok(()); // unknown id, let CrudCrate's update produce the 404
         };
-        let mode: String = existing.try_get("", "mode").map_err(ApiError::database)?;
-        if mode != "windowed" {
-            return Ok(());
+
+        // The flag is written here, not in `after_update`: it sits outside both CRUD models, so
+        // CrudCrate's own UPDATE writes `valid_until` from the payload without touching it, and the
+        // recompute that `after_update` runs then reads the provenance already recorded.
+        let stored_from: chrono::DateTime<chrono::FixedOffset> = existing
+            .try_get("", "valid_from")
+            .map_err(ApiError::database)?;
+        match data.valid_until {
+            Some(Some(until)) => {
+                let opens_at = match data.valid_from {
+                    Some(Some(patched)) => patched,
+                    _ => stored_from.with_timezone(&chrono::Utc),
+                };
+                if until <= opens_at {
+                    return Err(ApiError::bad_request(
+                        "A calibration's end date must fall after its start date: a window that \
+                         closes at or before it opens applies to no reading."
+                            .to_string(),
+                    ));
+                }
+                set_valid_until_explicit(db, id, true).await?;
+            }
+            // Cleared, so the window chain reclaims the row on the next recompute.
+            Some(None) => set_valid_until_explicit(db, id, false).await?,
+            None => {}
         }
-        let sensor_id: Uuid = existing.try_get("", "sensor_id").map_err(ApiError::database)?;
+
+        // Moving a curve's start onto another curve's start is the same collision as creating one
+        // there.
+        let Some(Some(new_from)) = data.valid_from else {
+            return Ok(());
+        };
+        let sensor_id: Uuid = existing
+            .try_get("", "sensor_id")
+            .map_err(ApiError::database)?;
         let parameter_id: Option<Uuid> = existing.try_get("", "parameter_id").ok();
         let parameter_id = match data.parameter_id {
             Some(patched) => patched,
@@ -128,12 +167,6 @@ impl CRUDOperations for SensorCalibrationOperations {
         db: &DatabaseConnection,
         entity: &mut SensorCalibration,
     ) -> Result<(), ApiError> {
-        // Instant (lab grab) curves take no part in windowed chaining and drive no reprocessing:
-        // they apply only to the single grab reading that names them.
-        if entity.mode != "windowed" {
-            return Ok(());
-        }
-
         recompute_valid_until(db, entity.sensor_id)
             .await
             .map_err(ApiError::database)?;
@@ -157,10 +190,6 @@ impl CRUDOperations for SensorCalibrationOperations {
         db: &DatabaseConnection,
         entity: &mut SensorCalibration,
     ) -> Result<(), ApiError> {
-        if entity.mode != "windowed" {
-            return Ok(());
-        }
-
         recompute_valid_until(db, entity.sensor_id)
             .await
             .map_err(ApiError::database)?;
@@ -179,11 +208,7 @@ impl CRUDOperations for SensorCalibrationOperations {
         Ok(())
     }
 
-    async fn perform_delete(
-        &self,
-        db: &DatabaseConnection,
-        id: Uuid,
-    ) -> Result<Uuid, ApiError> {
+    async fn perform_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<Uuid, ApiError> {
         let row = db
             .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
@@ -199,25 +224,60 @@ impl CRUDOperations for SensorCalibrationOperations {
                 Some(id.to_string()),
             ));
         };
-        let sensor_id: Uuid = row
-            .try_get("", "sensor_id")
-            .map_err(ApiError::database)?;
+        let sensor_id: Uuid = row.try_get("", "sensor_id").map_err(ApiError::database)?;
 
-        // `calibration_id` is neither the segmentby nor the time dimension, so no compressed batch
-        // can be excluded by metadata: the clear goes through the guarded writer, which lifts the
-        // decompression cap it would otherwise hit on a sensor with historical readings.
+        // The readings this curve corrected move onto whichever of the sensor's remaining curves
+        // covers their time, value recomputed in the same statement, before the row goes. A
+        // windowed calibration is deletable and its history reprocesses; that is deliberately
+        // unlike a standard curve, which is frozen once a reading references it.
+        //
+        // Spot rows are repointed here even though the reprocess engines leave them alone: their
+        // `calibration_id` is the base curve resolved at entry, and the operator's standard curve is
+        // preserved, re-applied on top of the new base.
+        // A reading no remaining curve covers is left uncorrected, which is what ingest stores for a
+        // time outside every window and what a reprocess over the same windows would recompute. The
+        // lateral is an outer join for that reason: an inner one would skip those rows, and the
+        // foreign key would then refuse the delete.
+        let base = format!(
+            "CASE WHEN picked.cal_id IS NULL THEN tgt.raw_value ELSE {corrected} END",
+            corrected =
+                calibrated_value_sql("tgt.raw_value", "picked.slope", "picked.intercept"),
+        );
+        let repoint_sql = format!(
+            r"UPDATE readings tgt
+              SET calibration_id = picked.cal_id,
+                  calibrated_value = CASE
+                      WHEN sc.id IS NULL THEN {base}
+                      ELSE {composed}
+                  END
+              FROM (
+                  SELECT r.stream_id AS p_stream_id, r.time AS p_time,
+                         r.replicate_index AS p_replicate_index,
+                         r.standard_curve_id AS p_standard_curve_id,
+                         cw.id AS cal_id, cw.slope, cw.intercept
+                  FROM readings r
+                  LEFT JOIN LATERAL ({pick}) cw ON true
+                  WHERE r.calibration_id = $1
+              ) picked
+              LEFT JOIN standard_curves sc ON sc.id = picked.p_standard_curve_id
+              WHERE tgt.stream_id = picked.p_stream_id
+                AND tgt.time = picked.p_time
+                AND tgt.replicate_index = picked.p_replicate_index",
+            composed = calibrated_value_sql(&format!("({base})"), "sc.slope", "sc.intercept"),
+            pick = super::resolver::pick_calibration_lateral_excluding("$2", Some("$1")),
+        );
         crate::common::bulk_write::guarded_mutation(
             db,
             Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                "UPDATE readings SET calibration_id = NULL WHERE calibration_id = $1",
-                [id.into()],
+                &repoint_sql,
+                [id.into(), sensor_id.into()],
             ),
         )
         .await
         .map_err(|e| {
             ApiError::internal(
-                "Failed to clear the calibration's readings references",
+                "Failed to move the calibration's readings onto their covering curve",
                 Some(e.to_string()),
             )
         })?;

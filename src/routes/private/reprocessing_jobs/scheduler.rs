@@ -22,7 +22,7 @@ use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, TransactionTrait};
 
 use super::job::JobRegistry;
-use super::schedule::{self, OverlapPolicy};
+use super::schedule::{self, CatchupPolicy, OverlapPolicy};
 use super::worker;
 
 /// How often each replica scans `schedules` for due rows. Well below the shortest Service cadence
@@ -67,6 +67,10 @@ struct DueSchedule {
     scheduled_at: DateTime<Utc>,
     interval_seconds: i64,
     overlap: OverlapPolicy,
+    catchup: CatchupPolicy,
+    /// Whether this slot is a backlog slot rather than the cadence coming round: its scheduled time
+    /// is a full interval or more behind now, which only happens after a gap in the scheduler.
+    missed: bool,
     /// The operator-edited tunables snapshot, carried onto the enqueued job's params. Jobs read it
     /// from `ctx.params()["tunables"]`; it is fixed at enqueue time, so a mid-run edit to the
     /// schedule does NOT affect a job already queued/running (intentional, a run uses one snapshot).
@@ -77,7 +81,10 @@ struct DueSchedule {
 /// Returns how many Services were enqueued this tick. Separated from [`run`] so a test can drive a
 /// single deterministic tick. Each due row is claimed and advanced in its own short transaction so a
 /// slow enqueue can't hold a lock across the whole batch.
-pub async fn tick(db: &DatabaseConnection, registry: &JobRegistry) -> Result<usize, sea_orm::DbErr> {
+pub async fn tick(
+    db: &DatabaseConnection,
+    registry: &JobRegistry,
+) -> Result<usize, sea_orm::DbErr> {
     let mut enqueued = 0usize;
     loop {
         let Some(due) = claim_one_due(db).await? else {
@@ -99,7 +106,7 @@ async fn claim_one_due(db: &DatabaseConnection) -> Result<Option<DueSchedule>, s
     let row = txn
         .query_one(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, job_name, next_run_at, interval_seconds, overlap_policy, tunables \
+            "SELECT id, job_name, next_run_at, interval_seconds, overlap_policy, catchup_policy, tunables \
              FROM schedules \
              WHERE enabled AND next_run_at IS NOT NULL AND next_run_at <= now() \
              ORDER BY next_run_at \
@@ -117,21 +124,29 @@ async fn claim_one_due(db: &DatabaseConnection) -> Result<Option<DueSchedule>, s
     let id: uuid::Uuid = row.try_get("", "id")?;
     let job_name: String = row.try_get("", "job_name")?;
     let scheduled_at: DateTime<Utc> = row.try_get("", "next_run_at")?;
-    let interval_seconds: i64 = row.try_get::<i64>("", "interval_seconds").unwrap_or(0).max(1);
-    let overlap =
-        OverlapPolicy::from_str_or_default(row.try_get::<Option<String>>("", "overlap_policy")?.as_deref());
+    let interval_seconds: i64 = row
+        .try_get::<i64>("", "interval_seconds")
+        .unwrap_or(0)
+        .max(1);
+    let overlap = OverlapPolicy::from_str_or_default(
+        row.try_get::<Option<String>>("", "overlap_policy")?
+            .as_deref(),
+    );
     // `tunables` is `NOT NULL DEFAULT '{}'`; default to an empty object if a hand-edited row is null.
     let tunables: serde_json::Value = row
         .try_get::<Option<serde_json::Value>>("", "tunables")?
         .unwrap_or_else(|| serde_json::json!({}));
 
+    let catchup = CatchupPolicy::from_str_or_default(
+        row.try_get::<Option<String>>("", "catchup_policy")?.as_deref(),
+    );
+
     // Advance the grid off the SCHEDULED time, not `now()`, so cadence never drifts by a run's own
     // latency and a downtime gap snaps forward to the next future slot (discarding the backlog).
-    let next = schedule::next_run_after(
-        scheduled_at,
-        chrono::Duration::seconds(interval_seconds),
-        Utc::now(),
-    );
+    let now = Utc::now();
+    let interval = chrono::Duration::seconds(interval_seconds);
+    let missed = scheduled_at + interval <= now;
+    let next = schedule::next_run_after(scheduled_at, interval, now);
     txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "UPDATE schedules SET next_run_at = $1, last_enqueued_at = now() WHERE id = $2",
@@ -145,12 +160,15 @@ async fn claim_one_due(db: &DatabaseConnection) -> Result<Option<DueSchedule>, s
         scheduled_at,
         interval_seconds,
         overlap,
+        catchup,
+        missed,
         tunables,
     }))
 }
 
-/// Enqueue the job for a claimed slot, honoring its overlap policy. Returns whether a job row was
-/// actually created (false when skipped-if-running, the dedupe key collided, or no handler exists).
+/// Enqueue the job for a claimed slot, honoring its catchup and overlap policies. Returns whether a
+/// job row was actually created (false when the slot is a skipped backlog slot, when skipped-if-
+/// running, when the dedupe key collided, or when no handler exists).
 async fn enqueue_due(
     db: &DatabaseConnection,
     registry: &JobRegistry,
@@ -161,6 +179,13 @@ async fn enqueue_due(
     // let the row keep advancing harmlessly.
     if registry.get(&due.job_name).is_none() {
         tracing::warn!(job_name = %due.job_name, "scheduler: no registered job for schedule; skipping");
+        return Ok(false);
+    }
+
+    // The grid has already been advanced, so declining here waits for the next scheduled slot
+    // rather than dropping the cadence.
+    if matches!(due.catchup, CatchupPolicy::Skip) && due.missed {
+        tracing::debug!(job_name = %due.job_name, "scheduler: missed slot not replayed (catchup=skip)");
         return Ok(false);
     }
 

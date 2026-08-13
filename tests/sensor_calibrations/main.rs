@@ -12,5 +12,6 @@ mod forward_new_data;
 mod historical_edit;
 mod instant_curve;
 mod reprocessing;
+mod standard_curves;
 mod window_boundaries;
 mod window_invariants;

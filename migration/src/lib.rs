@@ -44,11 +44,14 @@ mod m20260711_000007_subproject_move_cascade;
 mod m20260713_000001_data_frequency;
 mod m20260713_000002_aggregates_include_derived;
 mod m20260811_000001_portal_constants;
+mod m20260811_100001_samples_unique;
+mod m20260811_100002_csv_staging_seq;
 mod m20260812_000001_sync_service_paused;
 mod m20260812_000003_alarm_event_cadence;
 mod m20260812_000004_sync_command_expiry_not_null;
-mod m20260811_100001_samples_unique;
-mod m20260811_100002_csv_staging_seq;
+mod m20260813_000001_calibration_valid_until_explicit;
+mod m20260813_000003_standard_curves;
+mod m20260813_000004_readings_standard_curve_fk;
 
 pub struct Migrator;
 
@@ -105,6 +108,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260812_000001_sync_service_paused::Migration),
             Box::new(m20260812_000003_alarm_event_cadence::Migration),
             Box::new(m20260812_000004_sync_command_expiry_not_null::Migration),
+            Box::new(m20260813_000001_calibration_valid_until_explicit::Migration),
+            Box::new(m20260813_000003_standard_curves::Migration),
+            Box::new(m20260813_000004_readings_standard_curve_fk::Migration),
         ]
     }
 }

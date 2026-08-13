@@ -18,10 +18,8 @@ use crate::error::AppError;
 use crate::routes::private::api_tokens::service::validate_bearer_token;
 
 // Type alias for the Keycloak auth status used throughout this module.
-type KcStatus = axum_keycloak_auth::KeycloakAuthStatus<
-    Role,
-    axum_keycloak_auth::decode::ProfileAndEmail,
->;
+type KcStatus =
+    axum_keycloak_auth::KeycloakAuthStatus<Role, axum_keycloak_auth::decode::ProfileAndEmail>;
 
 /// How the current request was authenticated.
 #[derive(Debug, Clone)]
@@ -83,7 +81,13 @@ impl AuthContext {
 
     /// Whether the caller has a verified email claim.
     pub fn email_verified(&self) -> bool {
-        matches!(self, AuthContext::Keycloak { email_verified: true, .. })
+        matches!(
+            self,
+            AuthContext::Keycloak {
+                email_verified: true,
+                ..
+            }
+        )
     }
 
     /// The projects this identity may see and act in. Sourced identically for every auth variant so
@@ -92,8 +96,14 @@ impl AuthContext {
     /// Keycloak member is confined to their grant set.
     pub fn access_scope(&self) -> AccessScope {
         match self {
-            AuthContext::ApiToken { project_scope: Some(p), .. } => AccessScope::one(*p),
-            AuthContext::ApiToken { project_scope: None, .. } => AccessScope::Unrestricted,
+            AuthContext::ApiToken {
+                project_scope: Some(p),
+                ..
+            } => AccessScope::one(*p),
+            AuthContext::ApiToken {
+                project_scope: None,
+                ..
+            } => AccessScope::Unrestricted,
             AuthContext::Keycloak { roles, grants, .. } => {
                 if roles.contains(&Role::Administrator) {
                     AccessScope::Unrestricted
@@ -103,7 +113,6 @@ impl AuthContext {
             }
         }
     }
-
 
     /// Whether this identity is granted a capability under the default token rule. Delegates to
     /// the policy in [`crate::common::authz`]: a Keycloak user's highest role level must hold the
@@ -134,11 +143,7 @@ pub async fn service_auth_middleware(
     if let Some(status) = request.extensions().get::<KcStatus>() {
         match status {
             axum_keycloak_auth::KeycloakAuthStatus::Success(token) => {
-                let roles: Vec<Role> = token
-                    .roles
-                    .iter()
-                    .map(|kr| kr.role().clone())
-                    .collect();
+                let roles: Vec<Role> = token.roles.iter().map(|kr| kr.role().clone()).collect();
                 // Access gate: a valid EPFL login is not membership. Reject role-less users here
                 // with a distinct body (the UI keys on it) instead of falling through to token
                 // auth, which would misreport an authenticated-but-unauthorized user as 401.
@@ -187,7 +192,8 @@ pub async fn service_auth_middleware(
         .map(String::from);
 
     if let Some(header_value) = auth_header
-        && let Some(token_model) = validate_bearer_token(&state.db, &header_value, &state.token_cache).await
+        && let Some(token_model) =
+            validate_bearer_token(&state.db, &header_value, &state.token_cache).await
     {
         let permissions = TokenPermissions::from_json(&token_model.permissions);
         // Per-token rate limit. `None`/`<=0` means unlimited, so tokens without a configured
@@ -330,7 +336,9 @@ impl<S: Send + Sync> FromRequestParts<S> for IsSyncService {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        Ok(IsSyncService(parts.extensions.get::<SyncServiceMarker>().is_some()))
+        Ok(IsSyncService(
+            parts.extensions.get::<SyncServiceMarker>().is_some(),
+        ))
     }
 }
 
@@ -377,7 +385,10 @@ impl<S: Send + Sync> FromRequestParts<S> for DenyScoped {
         // not blocked outright from operator actions their capability admits.
         let scoped_token = matches!(
             parts.extensions.get::<AuthContext>(),
-            Some(AuthContext::ApiToken { project_scope: Some(_), .. })
+            Some(AuthContext::ApiToken {
+                project_scope: Some(_),
+                ..
+            })
         );
         if scoped_token {
             return Err(AppError::Forbidden(
@@ -478,7 +489,10 @@ pub async fn enforce_scope_on_crud(
         return next.run(request).await;
     }
 
-    if matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+    if matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    ) {
         return next.run(request).await;
     }
 
@@ -588,6 +602,19 @@ async fn resolve_scope_project(
             .await;
             return require_any(projects, "calibration");
         }
+        // A standard curve belongs to an instrument, so it spans the same project set as the
+        // instrument's calibrations and is scoped the same way.
+        if entity == "standard_curves" {
+            let projects = distinct_projects(
+                db,
+                "SELECT DISTINCT s.project_id FROM standard_curves c \
+                 JOIN sensor_deployments d ON d.sensor_id = c.sensor_id \
+                 JOIN sites s ON s.id = d.site_id WHERE c.id = $1",
+                uuid,
+            )
+            .await;
+            return require_any(projects, "standard curve");
+        }
         let sql = match entity {
             "sites" => "SELECT project_id FROM sites WHERE id = $1",
             "subprojects" => "SELECT project_id FROM subprojects WHERE id = $1",
@@ -613,7 +640,9 @@ async fn resolve_scope_project(
                 "SELECT s.project_id FROM data_streams ds JOIN site_parameters sp ON sp.id = ds.site_parameter_id JOIN sites s ON s.id = sp.site_id WHERE ds.id = $1"
             }
             other => {
-                return ScopeOutcome::Global(format!("Project-scoped token cannot modify '{other}'"));
+                return ScopeOutcome::Global(format!(
+                    "Project-scoped token cannot modify '{other}'"
+                ));
             }
         };
         // The owning project of the existing row, plus any repoint target in the update body: moving a
@@ -621,14 +650,20 @@ async fn resolve_scope_project(
         // caller also holds. All resolved projects must be in scope.
         let mut projects = distinct_projects(db, sql, uuid).await;
         if projects.is_empty() {
-            return ScopeOutcome::Unresolved("Target not found within your project access".to_string());
+            return ScopeOutcome::Unresolved(
+                "Target not found within your project access".to_string(),
+            );
         }
         match entity {
             "sites" => {
                 if let Some(sp) = fk("subproject_id") {
                     projects.extend(
-                        distinct_projects(db, "SELECT project_id FROM subprojects WHERE id = $1", sp)
-                            .await,
+                        distinct_projects(
+                            db,
+                            "SELECT project_id FROM subprojects WHERE id = $1",
+                            sp,
+                        )
+                        .await,
                     );
                 } else if let Some(p) = fk("project_id") {
                     projects.push(p);
@@ -691,6 +726,21 @@ async fn resolve_scope_project(
                 "calibration",
             ),
             None => ScopeOutcome::Unresolved("Calibration create must specify sensor_id".to_string()),
+        },
+        "standard_curves" => match fk("sensor_id") {
+            Some(sensor) => require_any(
+                distinct_projects(
+                    db,
+                    "SELECT DISTINCT s.project_id FROM sensor_deployments d \
+                     JOIN sites s ON s.id = d.site_id WHERE d.sensor_id = $1",
+                    sensor,
+                )
+                .await,
+                "standard curve",
+            ),
+            None => {
+                ScopeOutcome::Unresolved("Standard curve create must specify sensor_id".to_string())
+            }
         },
         "data_streams" => match fk("site_parameter_id") {
             Some(sp) => require_all(
@@ -877,8 +927,9 @@ fn scoped_site_parameter_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::Sel
 fn crud_read_scope_condition(entity: &str, projects: &[Uuid]) -> Option<sea_orm::Condition> {
     use crate::routes::private::{
         alarms::thresholds, annotations, data_streams, notes, projects as projects_entity,
-        reprocessing_jobs, readings::samples, sensors, sensors::calibrations, sensors::deployments,
-        sites::parameters as site_parameters, sites, projects::subprojects,
+        projects::subprojects, readings::samples, reprocessing_jobs, sensors,
+        sensors::calibrations, sensors::deployments, sensors::standard_curves, sites,
+        sites::parameters as site_parameters,
     };
     use sea_orm::{ColumnTrait, Condition};
     let ids = || projects.iter().copied();
@@ -898,16 +949,35 @@ fn crud_read_scope_condition(entity: &str, projects: &[Uuid]) -> Option<sea_orm:
             thresholds::Column::SiteId.in_subquery(scoped_site_ids_query(projects))
         }
         "samples" => samples::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
-        "data_streams" => {
-            data_streams::Column::SiteParameterId
-                .in_subquery(scoped_site_parameter_ids_query(projects))
-        }
+        "data_streams" => data_streams::Column::SiteParameterId
+            .in_subquery(scoped_site_parameter_ids_query(projects)),
         "sensors" => sensors::Column::Id.in_subquery(scoped_sensor_ids_query(projects)),
         "sensor_calibrations" => {
             calibrations::Column::SensorId.in_subquery(scoped_sensor_ids_query(projects))
         }
+        "standard_curves" => {
+            standard_curves::Column::SensorId.in_subquery(scoped_sensor_ids_query(projects))
+        }
+        // Mirrors `scope::project_of_job`: a job belongs to its site, else to the projects its
+        // sensor is deployed into, and a job targeting neither is global. Returning early here
+        // would hide global jobs (a CSV import targets no sensor) from the member who started one.
         "reprocessing_jobs" => {
-            reprocessing_jobs::Column::SensorId.in_subquery(scoped_sensor_ids_query(projects))
+            return Some(
+                Condition::any()
+                    .add(
+                        reprocessing_jobs::Column::SiteId
+                            .in_subquery(scoped_site_ids_query(projects)),
+                    )
+                    .add(
+                        reprocessing_jobs::Column::SensorId
+                            .in_subquery(scoped_sensor_ids_query(projects)),
+                    )
+                    .add(
+                        Condition::all()
+                            .add(reprocessing_jobs::Column::SiteId.is_null())
+                            .add(reprocessing_jobs::Column::SensorId.is_null()),
+                    ),
+            );
         }
         _ => return None,
     };
