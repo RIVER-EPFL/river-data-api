@@ -5,7 +5,6 @@
 //! `sensor_type` defaults to an empty string (the API falls back to the parameter
 //! code for display). Run with: cargo test --test site_parameters
 
-
 use serial_test::serial;
 
 async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {

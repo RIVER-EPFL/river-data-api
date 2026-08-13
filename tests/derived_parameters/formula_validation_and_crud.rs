@@ -3,7 +3,6 @@
 //! Run with: cargo test --test derived_parameters
 //! Requires: DATABASE_URL pointing to a TimescaleDB instance.
 
-
 use serial_test::serial;
 
 // ============================================================================
@@ -85,9 +84,8 @@ async fn create_derived_param(
     });
     let (status, text) =
         crate::common::post_json_with_token(app, "/api/derived_parameters", &body, token).await;
-    let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|_| {
-        serde_json::json!({ "raw": text })
-    });
+    let json: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({ "raw": text }));
     (status, json)
 }
 
@@ -115,7 +113,9 @@ async fn test_get_derived_parameter_populates_sources() {
         (200..300).contains(&status),
         "create failed {status}: {created}"
     );
-    let id = created["id"].as_str().expect("created response should have id");
+    let id = created["id"]
+        .as_str()
+        .expect("created response should have id");
 
     let (gstatus, gtext) =
         crate::common::get_with_token(&app, &format!("/api/derived_parameters/{id}"), &token).await;
@@ -137,7 +137,10 @@ async fn test_get_derived_parameter_populates_sources() {
     assert_eq!(lstatus, 200, "list failed: {ltext}");
     let list: serde_json::Value = serde_json::from_str(&ltext).expect("valid json");
     let items = list.as_array().cloned().unwrap_or_else(|| {
-        list["data"].as_array().cloned().expect("list should be an array or {data: []}")
+        list["data"]
+            .as_array()
+            .cloned()
+            .expect("list should be an array or {data: []}")
     });
     let created_in_list = items
         .iter()
@@ -177,9 +180,7 @@ async fn test_create_derived_parameter_valid_formula() {
     assert_eq!(json["formula"], "sqrt(Turbidity) * 2 + Dissolved_O2");
 
     // sources should be auto-populated with variable names and parameter UUIDs
-    let sources = json["sources"]
-        .as_array()
-        .expect("sources should be array");
+    let sources = json["sources"].as_array().expect("sources should be array");
     assert_eq!(
         sources.len(),
         2,
@@ -201,7 +202,9 @@ async fn test_create_derived_parameter_valid_formula() {
 
     // Each source should have a valid parameter_id UUID
     for source in sources {
-        let param_id = source["parameter_id"].as_str().expect("should have parameter_id");
+        let param_id = source["parameter_id"]
+            .as_str()
+            .expect("should have parameter_id");
         assert!(
             uuid::Uuid::parse_str(param_id).is_ok(),
             "parameter_id should be a valid UUID, got: {param_id}"
@@ -245,9 +248,7 @@ async fn test_create_derived_parameter_constants_only() {
 
     let id = json["id"].as_str().expect("response should have id");
 
-    let sources = json["sources"]
-        .as_array()
-        .expect("sources should be array");
+    let sources = json["sources"].as_array().expect("sources should be array");
     assert!(
         sources.is_empty(),
         "Constants-only formula should have empty sources, got: {sources:?}"
@@ -275,9 +276,7 @@ async fn test_update_derived_parameter_formula() {
     let id = json["id"].as_str().expect("response should have id");
 
     // Verify initial sources
-    let sources = json["sources"]
-        .as_array()
-        .expect("sources should be array");
+    let sources = json["sources"].as_array().expect("sources should be array");
     let var_names: Vec<&str> = sources
         .iter()
         .filter_map(|s| s["variable_name"].as_str())
@@ -293,9 +292,8 @@ async fn test_update_derived_parameter_formula() {
     });
     let uri = format!("/api/derived_parameters/{id}");
     let (put_status, put_text) = put_json_with_token(&app, &uri, &update_body, &token).await;
-    let put_json: serde_json::Value = serde_json::from_str(&put_text).unwrap_or_else(|_| {
-        serde_json::json!({ "raw": put_text })
-    });
+    let put_json: serde_json::Value =
+        serde_json::from_str(&put_text).unwrap_or_else(|_| serde_json::json!({ "raw": put_text }));
 
     assert!(
         (200..300).contains(&put_status),
@@ -378,10 +376,7 @@ async fn test_preview_derived_invalid_formula() {
         crate::common::post_json_with_token(&app, "/api/actions/preview_derived", &body, &token)
             .await;
 
-    assert_eq!(
-        status, 400,
-        "Invalid formula in preview should return 400"
-    );
+    assert_eq!(status, 400, "Invalid formula in preview should return 400");
 }
 
 // =============================================================================
@@ -394,8 +389,7 @@ async fn test_formula_nonexistent_parameter_returns_400() {
     let (_db, app, token) = setup().await;
     let name = format!("nonexistent_param_{}", uuid::Uuid::new_v4());
 
-    let (status, json) =
-        create_derived_param(&app, &token, &name, "NonexistentParam * 2").await;
+    let (status, json) = create_derived_param(&app, &token, &name, "NonexistentParam * 2").await;
 
     assert_eq!(
         status, 400,
@@ -451,10 +445,7 @@ fn test_formula_boundary_sqrt_negative() {
 
     let result = func(-1.0);
     // meval should return NaN for sqrt of a negative number, not panic
-    assert!(
-        result.is_nan(),
-        "sqrt(-1) should be NaN, got {result}"
-    );
+    assert!(result.is_nan(), "sqrt(-1) should be NaN, got {result}");
 
     // Positive case still works
     let positive = func(4.0);
@@ -475,17 +466,11 @@ fn test_formula_boundary_division_by_zero() {
 
     let result = func(1.0, 0.0);
     // meval should return Inf for division by zero, not panic
-    assert!(
-        result.is_infinite(),
-        "1/0 should be Inf, got {result}"
-    );
+    assert!(result.is_infinite(), "1/0 should be Inf, got {result}");
 
     // 0/0 should be NaN
     let nan_result = func(0.0, 0.0);
-    assert!(
-        nan_result.is_nan(),
-        "0/0 should be NaN, got {nan_result}"
-    );
+    assert!(nan_result.is_nan(), "0/0 should be NaN, got {nan_result}");
 
     // Normal division still works
     let normal = func(6.0, 3.0);

@@ -5,7 +5,6 @@
 //!
 //! Run: cargo test --test sensors -- --test-threads=1
 
-
 use crate::common::e2e;
 use crate::common::sensor_lifecycle as sl;
 use sea_orm::{ConnectionTrait, Statement};
@@ -23,8 +22,15 @@ async fn swap_reattributes_post_swap_readings() {
     let site1 = Uuid::parse_str(crate::common::SITE1_ID).unwrap();
 
     let sensor_a = sl::create_sensor(&db, "feed-a", crate::common::GLOBAL_PARAM_TEMP_ID).await;
-    let cal_a = sl::add_calibration(&db, sensor_a.id, 1.0, 0.0, sl::dt("2025-06-01T00:00:00Z")).await;
-    let dep_a = sl::deploy_sensor(&db, sensor_a.id, crate::common::SITE1_ID, sl::dt("2025-06-01T00:00:00Z")).await;
+    let cal_a =
+        sl::add_calibration(&db, sensor_a.id, 1.0, 0.0, sl::dt("2025-06-01T00:00:00Z")).await;
+    let dep_a = sl::deploy_sensor(
+        &db,
+        sensor_a.id,
+        crate::common::SITE1_ID,
+        sl::dt("2025-06-01T00:00:00Z"),
+    )
+    .await;
     let sensor_b = sl::create_sensor(&db, "feed-b", crate::common::GLOBAL_PARAM_TEMP_ID).await;
 
     // One feed (paired stream) initially owned by A, with six readings.
@@ -37,10 +43,24 @@ async fn swap_reattributes_post_swap_readings() {
     .await
     .unwrap();
     let raw: Vec<(_, f64)> = (0..6)
-        .map(|i| (sl::dt(&format!("2025-06-01T00:{:02}:00Z", i * 10)), 10.0 + i as f64))
+        .map(|i| {
+            (
+                sl::dt(&format!("2025-06-01T00:{:02}:00Z", i * 10)),
+                10.0 + i as f64,
+            )
+        })
         .collect();
     sl::insert_readings(
-        &db, stream, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID, sensor_a.id, cal_a, dep_a, 1.0, 0.0, &raw,
+        &db,
+        stream,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        sensor_a.id,
+        cal_a,
+        dep_a,
+        1.0,
+        0.0,
+        &raw,
     )
     .await;
 
@@ -69,9 +89,17 @@ async fn swap_reattributes_post_swap_readings() {
     for (i, r) in rows.iter().enumerate() {
         assert_eq!(r.site_id, Some(site1), "reading[{i}] stays at site 1");
         if i < 3 {
-            assert_eq!(r.sensor_id, Some(sensor_a.id), "reading[{i}] before swap stays sensor A");
+            assert_eq!(
+                r.sensor_id,
+                Some(sensor_a.id),
+                "reading[{i}] before swap stays sensor A"
+            );
         } else {
-            assert_eq!(r.sensor_id, Some(sensor_b.id), "reading[{i}] after swap re-attributes to sensor B");
+            assert_eq!(
+                r.sensor_id,
+                Some(sensor_b.id),
+                "reading[{i}] after swap re-attributes to sensor B"
+            );
         }
     }
 
@@ -103,8 +131,20 @@ async fn swap_recalls_incoming_sensor_open_elsewhere() {
     let sensor_b = sl::create_sensor(&db, "in", crate::common::GLOBAL_PARAM_TEMP_ID).await;
 
     // A holds site 1; B is already deployed open at site 2 (a different slot).
-    sl::deploy_sensor(&db, sensor_a.id, crate::common::SITE1_ID, sl::dt("2025-06-01T00:00:00Z")).await;
-    sl::deploy_sensor(&db, sensor_b.id, crate::common::SITE2_ID, sl::dt("2025-06-01T00:00:00Z")).await;
+    sl::deploy_sensor(
+        &db,
+        sensor_a.id,
+        crate::common::SITE1_ID,
+        sl::dt("2025-06-01T00:00:00Z"),
+    )
+    .await;
+    sl::deploy_sensor(
+        &db,
+        sensor_b.id,
+        crate::common::SITE2_ID,
+        sl::dt("2025-06-01T00:00:00Z"),
+    )
+    .await;
 
     // Swap A→B at site 1. B's pre-existing open deployment at site 2 must be recalled so B isn't
     // left open at two sites at once.
@@ -134,5 +174,8 @@ async fn swap_recalls_incoming_sensor_open_elsewhere() {
         .unwrap()
         .try_get("", "c")
         .unwrap();
-    assert_eq!(open_b, 1, "incoming sensor must have exactly one open deployment after the swap");
+    assert_eq!(
+        open_b, 1,
+        "incoming sensor must have exactly one open deployment after the swap"
+    );
 }

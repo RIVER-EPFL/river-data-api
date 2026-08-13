@@ -11,9 +11,8 @@ const MAX_DERIVED_CHAIN_DEPTH: u32 = 3;
 
 /// Math functions/constants recognized by meval, not variable names
 const MATH_BUILTINS: &[&str] = &[
-    "sqrt", "abs", "ln", "log", "exp", "sin", "cos", "tan", "asin", "acos", "atan",
-    "sinh", "cosh", "tanh", "floor", "ceil", "round", "signum",
-    "min", "max", "pi", "e",
+    "sqrt", "abs", "ln", "log", "exp", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh",
+    "tanh", "floor", "ceil", "round", "signum", "min", "max", "pi", "e",
 ];
 
 fn validate_formula(formula: &str) -> Result<(), ApiError> {
@@ -111,8 +110,7 @@ async fn find_derived_definition_for_param(
         .await
         .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
 
-    Ok(row
-        .and_then(|r| r.try_get::<Uuid>("", "id").ok()))
+    Ok(row.and_then(|r| r.try_get::<Uuid>("", "id").ok()))
 }
 
 /// Recursively compute the depth of a derived parameter chain.
@@ -303,7 +301,9 @@ async fn ensure_output_parameter(
                 ],
             ))
             .await
-            .map_err(|e| ApiError::internal(format!("Failed to insert output parameter: {e}"), None))?
+            .map_err(|e| {
+                ApiError::internal(format!("Failed to insert output parameter: {e}"), None)
+            })?
             .ok_or_else(|| {
                 ApiError::internal("No row returned from parameter insert".to_string(), None)
             })?;
@@ -330,11 +330,7 @@ pub struct DerivedParameterDefinitionOperations;
 impl CRUDOperations for DerivedParameterDefinitionOperations {
     type Resource = DerivedParameterDefinition;
 
-    async fn before_delete(
-        &self,
-        db: &DatabaseConnection,
-        id: Uuid,
-    ) -> Result<(), ApiError> {
+    async fn before_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<(), ApiError> {
         db.execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "DELETE FROM derived_parameter_sources WHERE derived_definition_id = $1",

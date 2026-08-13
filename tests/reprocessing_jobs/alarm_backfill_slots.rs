@@ -83,7 +83,11 @@ async fn alarm_backfill_with_slots_reconstructs_episodes_per_pair() {
     insert_turbidity(&db, stream_id, "2025-03-01T00:30:00Z", 600.0).await;
     insert_turbidity(&db, stream_id, "2025-03-01T00:40:00Z", 30.0).await;
 
-    assert_eq!(turbidity_episode_count(&db).await, 0, "no episodes before the backfill");
+    assert_eq!(
+        turbidity_episode_count(&db).await,
+        0,
+        "no episodes before the backfill"
+    );
 
     let id = worker::enqueue(
         &db,

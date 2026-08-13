@@ -4,7 +4,6 @@
 //! Run with: cargo test --test alarms
 //! Requires: DATABASE_URL pointing to a TimescaleDB instance.
 
-
 use serial_test::serial;
 
 async fn exec(db: &sea_orm::DatabaseConnection, sql: &str) {
@@ -61,7 +60,8 @@ async fn test_alarm_events_feed_and_filters() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let (status, body) = crate::common::get_json_with_token(&app, "/api/alarms/events", &token).await;
+    let (status, body) =
+        crate::common::get_json_with_token(&app, "/api/alarms/events", &token).await;
     assert_eq!(status, 200);
     assert_eq!(body["total"].as_u64(), Some(2));
     let events = body["events"].as_array().unwrap();
@@ -90,7 +90,8 @@ async fn test_alarm_events_feed_and_filters() {
     assert_eq!(events[0]["max_severity"].as_i64(), Some(2));
 
     let (status, body) =
-        crate::common::get_json_with_token(&app, "/api/alarms/events?status=resolved", &token).await;
+        crate::common::get_json_with_token(&app, "/api/alarms/events?status=resolved", &token)
+            .await;
     assert_eq!(status, 200);
     assert_eq!(body["total"].as_u64(), Some(1));
     let events = body["events"].as_array().unwrap();
@@ -176,7 +177,8 @@ async fn test_alarm_summary_includes_last_warning_and_alarm() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let (status, body) = crate::common::get_json_with_token(&app, "/api/alarms/summary", &token).await;
+    let (status, body) =
+        crate::common::get_json_with_token(&app, "/api/alarms/summary", &token).await;
     assert_eq!(status, 200);
 
     let by_site = body["by_site"].as_array().unwrap();

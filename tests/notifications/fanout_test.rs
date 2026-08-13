@@ -76,11 +76,19 @@ async fn telegram_fanout_respects_subscription_and_channel_toggle() {
 
     // Slot-scoped: A only, B muted this site, C disabled Telegram.
     let scoped = slot_recipients(&db, &Some(slot)).await.unwrap();
-    assert_eq!(chat_ids(&scoped), vec![111], "only the subscribed, telegram-enabled chat");
+    assert_eq!(
+        chat_ids(&scoped),
+        vec![111],
+        "only the subscribed, telegram-enabled chat"
+    );
 
     // System-wide (no slot): B's per-site mute doesn't apply, so A and B; C still off.
     let all = slot_recipients(&db, &None).await.unwrap();
-    assert_eq!(chat_ids(&all), vec![111, 222], "system-wide ignores per-slot overrides");
+    assert_eq!(
+        chat_ids(&all),
+        vec![111, 222],
+        "system-wide ignores per-slot overrides"
+    );
 }
 
 #[tokio::test]

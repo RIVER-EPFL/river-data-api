@@ -61,10 +61,8 @@ impl MigrationTrait for Migration {
         let db = manager.get_connection();
         db.execute_unprepared("DROP TABLE IF EXISTS reprocessing_jobs")
             .await?;
-        db.execute_unprepared(
-            "ALTER TABLE sensor_calibrations DROP COLUMN IF EXISTS valid_until",
-        )
-        .await?;
+        db.execute_unprepared("ALTER TABLE sensor_calibrations DROP COLUMN IF EXISTS valid_until")
+            .await?;
         Ok(())
     }
 }

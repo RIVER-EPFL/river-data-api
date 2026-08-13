@@ -98,14 +98,31 @@ async fn admin_sees_every_project_tree() {
     let (s, body) = crate::common::get_with_token(&app, "/api/me/sites", &jwt).await;
     assert_eq!(s, 200, "{body}");
     let projects = tree(&body);
-    let names: Vec<&str> =
-        projects.as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
-    assert!(names.contains(&"Test River Project"), "admin sees the seed project: {body}");
-    assert!(names.contains(&"Other Project"), "admin sees the second project: {body}");
+    let names: Vec<&str> = projects
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"Test River Project"),
+        "admin sees the seed project: {body}"
+    );
+    assert!(
+        names.contains(&"Other Project"),
+        "admin sees the second project: {body}"
+    );
 
-    let other =
-        projects.as_array().unwrap().iter().find(|p| p["name"] == "Other Project").unwrap();
-    assert!(site_ids(other).contains(&SITE_B_ID.to_string()), "sites listed per project: {body}");
+    let other = projects
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "Other Project")
+        .unwrap();
+    assert!(
+        site_ids(other).contains(&SITE_B_ID.to_string()),
+        "sites listed per project: {body}"
+    );
 }
 
 #[tokio::test]
@@ -121,12 +138,22 @@ async fn granted_member_gets_only_their_project_tree() {
     let (s, body) = crate::common::get_with_token(&app, "/api/me/sites", &jwt).await;
     assert_eq!(s, 200, "{body}");
     let projects = tree(&body);
-    assert_eq!(projects.as_array().unwrap().len(), 1, "only the granted project: {body}");
+    assert_eq!(
+        projects.as_array().unwrap().len(),
+        1,
+        "only the granted project: {body}"
+    );
     let project = &projects[0];
     assert_eq!(project["project_id"], PROJECT_ID);
     let ids = site_ids(project);
-    assert!(ids.contains(&SITE1_ID.to_string()) && ids.contains(&SITE2_ID.to_string()), "{body}");
-    assert!(!body.contains(SITE_B_ID), "ungranted project's sites are invisible: {body}");
+    assert!(
+        ids.contains(&SITE1_ID.to_string()) && ids.contains(&SITE2_ID.to_string()),
+        "{body}"
+    );
+    assert!(
+        !body.contains(SITE_B_ID),
+        "ungranted project's sites are invisible: {body}"
+    );
 }
 
 #[tokio::test]
@@ -138,7 +165,11 @@ async fn ungranted_member_gets_empty_tree() {
 
     let (s, body) = crate::common::get_with_token(&app, "/api/me/sites", &jwt).await;
     assert_eq!(s, 200, "{body}");
-    assert_eq!(tree(&body), serde_json::json!([]), "no grants means an empty navigator: {body}");
+    assert_eq!(
+        tree(&body),
+        serde_json::json!([]),
+        "no grants means an empty navigator: {body}"
+    );
 }
 
 #[tokio::test]
@@ -152,20 +183,40 @@ async fn sites_group_under_their_subproject() {
     let (s, body) = crate::common::get_with_token(&app, "/api/me/sites", &jwt).await;
     assert_eq!(s, 200, "{body}");
     let projects = tree(&body);
-    let project =
-        projects.as_array().unwrap().iter().find(|p| p["project_id"] == PROJECT_ID).unwrap();
+    let project = projects
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["project_id"] == PROJECT_ID)
+        .unwrap();
 
     let subprojects = project["subprojects"].as_array().unwrap();
-    let named = subprojects.iter().find(|sp| sp["name"] == "Tributaries").unwrap();
-    let named_sites: Vec<&str> =
-        named["sites"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
+    let named = subprojects
+        .iter()
+        .find(|sp| sp["name"] == "Tributaries")
+        .unwrap();
+    let named_sites: Vec<&str> = named["sites"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
     assert_eq!(named_sites, vec![SITE_TRIB_ID], "{body}");
 
     // The seed sites (inserted without a subproject) sit under the trigger-derived default, not
     // alongside the named subproject's site.
-    let default =
-        subprojects.iter().find(|sp| sp["name"] == "Test River Project").expect("default group");
-    let default_ids: Vec<&str> =
-        default["sites"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
-    assert!(default_ids.contains(&SITE1_ID) && default_ids.contains(&SITE2_ID), "{body}");
+    let default = subprojects
+        .iter()
+        .find(|sp| sp["name"] == "Test River Project")
+        .expect("default group");
+    let default_ids: Vec<&str> = default["sites"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        default_ids.contains(&SITE1_ID) && default_ids.contains(&SITE2_ID),
+        "{body}"
+    );
 }

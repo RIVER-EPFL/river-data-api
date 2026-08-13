@@ -26,13 +26,8 @@ pub fn category_for(trigger_type: &str) -> &'static str {
         | "refresh_aggregates"
         | "refresh_aggregates_full"
         | "alarm_backfill" => CATEGORY_MAINTENANCE,
-        "calibration_create"
-        | "calibration_update"
-        | "calibration_delete"
-        | "deployment_create"
-        | "deployment_update"
-        | "deployment_delete"
-        | "deployment_edit"
+        "calibration_create" | "calibration_update" | "calibration_delete"
+        | "deployment_create" | "deployment_update" | "deployment_delete" | "deployment_edit"
         | "derived_assignment" => CATEGORY_METADATA,
         _ => CATEGORY_OPERATOR,
     }
@@ -74,10 +69,6 @@ pub fn is_rerunnable(trigger_type: &str) -> bool {
 pub fn is_cancellable(trigger_type: &str) -> bool {
     matches!(
         trigger_type,
-        "ingest_derived"
-            | "batch_derived"
-            | "derived_recompute"
-            | "csv_import"
-            | "janitor_run"
+        "ingest_derived" | "batch_derived" | "derived_recompute" | "csv_import" | "janitor_run"
     )
 }

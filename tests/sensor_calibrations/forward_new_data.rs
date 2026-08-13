@@ -55,12 +55,7 @@ const FORWARD_BUCKET: &str = "2025-07-05T10:00:00Z";
 // Helpers
 // ============================================================================
 
-async fn ingest(
-    app: &Router,
-    token: &str,
-    stream_id: &str,
-    rows: &[(&str, f64)],
-) -> (u16, String) {
+async fn ingest(app: &Router, token: &str, stream_id: &str, rows: &[(&str, f64)]) -> (u16, String) {
     let readings: Vec<serde_json::Value> = rows
         .iter()
         .map(|(time, raw)| json!({ "time": time, "raw_value": raw }))
@@ -77,7 +72,12 @@ async fn ingest(
 /// One discrete ingest cycle, the Track B update mechanism: one HTTP call carrying the batch.
 async fn ingest_cycle(app: &Router, token: &str, stream_id: &str, rows: &[(&str, f64)]) {
     let (status, body) = ingest(app, token, stream_id, rows).await;
-    assert_eq!(status, 200, "ingest cycle of {} readings: {body}", rows.len());
+    assert_eq!(
+        status,
+        200,
+        "ingest cycle of {} readings: {body}",
+        rows.len()
+    );
     let parsed: serde_json::Value = serde_json::from_str(&body)
         .unwrap_or_else(|e| panic!("ingest response is JSON ({e}): {body}"));
     assert_eq!(
@@ -108,7 +108,10 @@ async fn wait_for_job(
             .await
             .expect("query reprocessing_jobs");
         let status: Option<String> = row.and_then(|r| r.try_get::<String>("", "status").ok());
-        let settled = matches!(status.as_deref(), Some("completed" | "failed" | "cancelled"));
+        let settled = matches!(
+            status.as_deref(),
+            Some("completed" | "failed" | "cancelled")
+        );
         if settled || Instant::now() >= deadline {
             return status;
         }
@@ -151,7 +154,10 @@ async fn window(app: &Router, token: &str, calibration_id: &str) -> serde_json::
         token,
     )
     .await;
-    assert_eq!(status, 200, "calibration window for {calibration_id}: {body}");
+    assert_eq!(
+        status, 200,
+        "calibration window for {calibration_id}: {body}"
+    );
     body
 }
 
@@ -257,7 +263,10 @@ async fn arrange(db: &DatabaseConnection, app: &Router, admin: &str) -> Fixture 
         admin,
     )
     .await;
-    assert!((200..300).contains(&status), "pair the stream ({status}): {paired}");
+    assert!(
+        (200..300).contains(&status),
+        "pair the stream ({status}): {paired}"
+    );
     assert_eq!(
         paired["backfilled"].as_u64(),
         Some(0),
@@ -284,7 +293,13 @@ async fn arrange(db: &DatabaseConnection, app: &Router, admin: &str) -> Fixture 
         .unwrap_or_else(|| panic!("the identity curve carries an id: {cals:?}"))
         .to_string();
 
-    ingest_cycle(app, admin, &stream_id, &[(H1, 10.0), (H2, 20.0), (H3, 30.0)]).await;
+    ingest_cycle(
+        app,
+        admin,
+        &stream_id,
+        &[(H1, 10.0), (H2, 20.0), (H3, 30.0)],
+    )
+    .await;
 
     let (status, c1) = create_calibration(app, admin, &sensor_id, 2.0, 5.0, T0).await;
     assert_eq!(status, 201, "record C1 over the deployment: {c1}");
@@ -292,13 +307,19 @@ async fn arrange(db: &DatabaseConnection, app: &Router, admin: &str) -> Fixture 
     let c1_uuid = Uuid::parse_str(&c1_id).expect("calibration id is a uuid");
 
     assert_eq!(
-        wait_for_job(db, "calibration_create", &c1_id, JOB_WAIT).await.as_deref(),
+        wait_for_job(db, "calibration_create", &c1_id, JOB_WAIT)
+            .await
+            .as_deref(),
         Some("completed"),
         "recording a calibration enqueues a tracked reprocess for that calibration"
     );
 
     let rows = get_readings(db, stream_uuid).await;
-    assert_eq!(rows.len(), 3, "the history cycle is the whole stream so far: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        3,
+        "the history cycle is the whole stream so far: {rows:?}"
+    );
     for (time, raw, calibrated) in [(H1, 10.0, 25.0), (H2, 20.0, 45.0), (H3, 30.0, 65.0)] {
         let row = reading_at(&rows, time);
         assert_eq!(row.raw_value, raw, "{time} keeps its raw value");
@@ -312,7 +333,11 @@ async fn arrange(db: &DatabaseConnection, app: &Router, admin: &str) -> Fixture 
             Some(c1_uuid),
             "{time} is stamped with C1, not the identity curve pairing left"
         );
-        assert_eq!(row.site_id, Some(Uuid::parse_str(&track.site_id).unwrap()), "{time} stays attributed to the site");
+        assert_eq!(
+            row.site_id,
+            Some(Uuid::parse_str(&track.site_id).unwrap()),
+            "{time} stays attributed to the site"
+        );
     }
 
     Fixture {
@@ -346,7 +371,11 @@ async fn forward_calibration_closes_the_previous_window_and_leaves_history_alone
 
     let before = calibrations_for(&app, &admin, &fx.sensor_id).await;
     assert_eq!(before.len(), 2, "C1 plus the identity curve: {before:?}");
-    assert_eq!(before[0]["id"], fx.c1_id.as_str(), "C1 opens the timeline: {before:?}");
+    assert_eq!(
+        before[0]["id"],
+        fx.c1_id.as_str(),
+        "C1 opens the timeline: {before:?}"
+    );
     let identity_from = valid_from(&before[1]);
     assert_eq!(
         valid_until(&before[0]),
@@ -375,7 +404,9 @@ async fn forward_calibration_closes_the_previous_window_and_leaves_history_alone
     assert_eq!(status, 201, "record C2 on top of C1: {c2}");
     let c2_id = e2e::id_of(&c2);
     assert_eq!(
-        wait_for_job(&db, "calibration_create", &c2_id, JOB_WAIT).await.as_deref(),
+        wait_for_job(&db, "calibration_create", &c2_id, JOB_WAIT)
+            .await
+            .as_deref(),
         Some("completed"),
         "recording C2 enqueues a tracked reprocess for C2"
     );
@@ -386,8 +417,14 @@ async fn forward_calibration_closes_the_previous_window_and_leaves_history_alone
         Some(dt(T2)),
         "adding C2 closes C1's window at C2's valid_from: {c1_window}"
     );
-    assert_eq!(c1_window["slope"], 2.0, "C1's coefficients are untouched: {c1_window}");
-    assert_eq!(c1_window["intercept"], 5.0, "C1's coefficients are untouched: {c1_window}");
+    assert_eq!(
+        c1_window["slope"], 2.0,
+        "C1's coefficients are untouched: {c1_window}"
+    );
+    assert_eq!(
+        c1_window["intercept"], 5.0,
+        "C1's coefficients are untouched: {c1_window}"
+    );
     assert_eq!(
         c1_window["point_count"].as_i64(),
         Some(4),
@@ -434,7 +471,8 @@ async fn forward_calibration_closes_the_previous_window_and_leaves_history_alone
         "the last window on the timeline stays open: {chain:?}"
     );
     assert_eq!(
-        chain[2]["id"], fx.identity_id.as_str(),
+        chain[2]["id"],
+        fx.identity_id.as_str(),
         "the identity curve pairing created is the last link: {chain:?}"
     );
 
@@ -481,7 +519,9 @@ async fn readings_ingested_after_the_new_calibration_carry_it_and_take_its_curve
     let c2_id = e2e::id_of(&c2);
     let c2_uuid = Uuid::parse_str(&c2_id).expect("calibration id is a uuid");
     assert_eq!(
-        wait_for_job(&db, "calibration_create", &c2_id, JOB_WAIT).await.as_deref(),
+        wait_for_job(&db, "calibration_create", &c2_id, JOB_WAIT)
+            .await
+            .as_deref(),
         Some("completed"),
         "recording C2 enqueues a tracked reprocess for C2"
     );
@@ -507,7 +547,11 @@ async fn readings_ingested_after_the_new_calibration_carry_it_and_take_its_curve
     ingest_cycle(&app, &river, &fx.stream_id, &forward).await;
 
     let rows = get_readings(&db, fx.stream_uuid).await;
-    assert_eq!(rows.len(), 5, "three history readings plus the new cycle: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        5,
+        "three history readings plus the new cycle: {rows:?}"
+    );
     for (time, raw) in forward {
         let row = reading_at(&rows, time);
         assert_eq!(
@@ -520,8 +564,16 @@ async fn readings_ingested_after_the_new_calibration_carry_it_and_take_its_curve
             Some(3.0 * raw + 1.0),
             "POST /ingest applies C2, the curve covering {time}"
         );
-        assert_eq!(row.sensor_id, Some(fx.sensor_uuid), "{time} is owned by the stream's sensor");
-        assert_eq!(row.site_id, Some(fx.site_uuid()), "{time} lands attributed to the site");
+        assert_eq!(
+            row.sensor_id,
+            Some(fx.sensor_uuid),
+            "{time} is owned by the stream's sensor"
+        );
+        assert_eq!(
+            row.site_id,
+            Some(fx.site_uuid()),
+            "{time} lands attributed to the site"
+        );
     }
 
     let (status, refused) = crate::common::post_json_with_token(
@@ -563,7 +615,11 @@ async fn readings_ingested_after_the_new_calibration_carry_it_and_take_its_curve
             Some(calibrated),
             "{time} takes C2's curve: 3*{raw}+1 = {calibrated}"
         );
-        assert_eq!(row.calibration_id, Some(c2_uuid), "{time} stays stamped with C2");
+        assert_eq!(
+            row.calibration_id,
+            Some(c2_uuid),
+            "{time} stays stamped with C2"
+        );
     }
     for (time, raw, calibrated) in [(H1, 10.0, 25.0), (H2, 20.0, 45.0), (H3, 30.0, 65.0)] {
         let row = reading_at(&rows, time);
@@ -621,14 +677,21 @@ async fn a_backdated_reading_resolves_to_the_older_window_not_the_latest_calibra
     let manager = kc::get_keycloak_jwt("manager1", "manager1").await;
 
     let fx = arrange(&db, &app, &admin).await;
-    kc::grant_project(&db, &kc::keycloak_user_id("manager1").await, &fx.track.project_id).await;
+    kc::grant_project(
+        &db,
+        &kc::keycloak_user_id("manager1").await,
+        &fx.track.project_id,
+    )
+    .await;
 
     let (status, c2) = create_calibration(&app, &admin, &fx.sensor_id, 3.0, 1.0, T2).await;
     assert_eq!(status, 201, "record C2 on top of C1: {c2}");
     let c2_id = e2e::id_of(&c2);
     let c2_uuid = Uuid::parse_str(&c2_id).expect("calibration id is a uuid");
     assert_eq!(
-        wait_for_job(&db, "calibration_create", &c2_id, JOB_WAIT).await.as_deref(),
+        wait_for_job(&db, "calibration_create", &c2_id, JOB_WAIT)
+            .await
+            .as_deref(),
         Some("completed"),
         "recording C2 enqueues a tracked reprocess for C2"
     );
@@ -679,7 +742,11 @@ async fn a_backdated_reading_resolves_to_the_older_window_not_the_latest_calibra
     );
 
     let rows = get_readings(&db, fx.stream_uuid).await;
-    assert_eq!(rows.len(), 6, "three history readings plus the three-row cycle: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        6,
+        "three history readings plus the three-row cycle: {rows:?}"
+    );
     for (time, raw, calibrated, cal) in [
         (BACKDATED, 40.0, 85.0, fx.c1_uuid),
         (T2, 2.0, 7.0, c2_uuid),
@@ -692,12 +759,20 @@ async fn a_backdated_reading_resolves_to_the_older_window_not_the_latest_calibra
             Some(calibrated),
             "{time} is calibrated by the window covering it, giving {calibrated}"
         );
-        assert_eq!(row.calibration_id, Some(cal), "{time} keeps the window it resolved at write time");
+        assert_eq!(
+            row.calibration_id,
+            Some(cal),
+            "{time} keeps the window it resolved at write time"
+        );
     }
     for (time, raw, calibrated) in [(H1, 10.0, 25.0), (H2, 20.0, 45.0), (H3, 30.0, 65.0)] {
         let row = reading_at(&rows, time);
         assert_eq!(row.raw_value, raw, "{time} keeps its raw value");
-        assert_eq!(row.calibrated_value, Some(calibrated), "{time} stays on C1's curve");
+        assert_eq!(
+            row.calibrated_value,
+            Some(calibrated),
+            "{time} stays on C1's curve"
+        );
         assert_eq!(row.calibration_id, Some(fx.c1_uuid), "{time} keeps C1");
     }
 
@@ -742,7 +817,12 @@ async fn aggregates_report_the_new_curve_for_the_new_bucket_and_leave_the_old_bu
     let manager = kc::get_keycloak_jwt("manager1", "manager1").await;
 
     let fx = arrange(&db, &app, &admin).await;
-    kc::grant_project(&db, &kc::keycloak_user_id("manager1").await, &fx.track.project_id).await;
+    kc::grant_project(
+        &db,
+        &kc::keycloak_user_id("manager1").await,
+        &fx.track.project_id,
+    )
+    .await;
     let parameter_id = fx.parameter_id().to_string();
 
     refresh_hourly(&db, dt("2025-06-01T00:00:00Z")).await;
@@ -759,7 +839,9 @@ async fn aggregates_report_the_new_curve_for_the_new_bucket_and_leave_the_old_bu
     assert_eq!(status, 201, "record C2 on top of C1: {c2}");
     let c2_id = e2e::id_of(&c2);
     assert_eq!(
-        wait_for_job(&db, "calibration_create", &c2_id, JOB_WAIT).await.as_deref(),
+        wait_for_job(&db, "calibration_create", &c2_id, JOB_WAIT)
+            .await
+            .as_deref(),
         Some("completed"),
         "recording C2 enqueues a tracked reprocess for C2"
     );
@@ -792,7 +874,10 @@ async fn aggregates_report_the_new_curve_for_the_new_bucket_and_leave_the_old_bu
         "the reprocess refreshes the aggregate from the sensor's earliest reading, so the new bucket exists"
     );
     let (mean, count) = forward.unwrap();
-    assert_eq!(mean, 46.0, "C2's bucket mean is (31+61)/2; the uncalibrated mean would be 15.0");
+    assert_eq!(
+        mean, 46.0,
+        "C2's bucket mean is (31+61)/2; the uncalibrated mean would be 15.0"
+    );
     assert_eq!(count, 2, "two readings roll up");
 
     let history = hourly_bucket(&db, &fx.track.site_id, &parameter_id, dt(HISTORY_BUCKET)).await;
@@ -810,15 +895,30 @@ async fn aggregates_report_the_new_curve_for_the_new_bucket_and_leave_the_old_bu
         &admin,
     )
     .await;
-    assert_eq!(status, 200, "the site's hourly aggregates are served: {served}");
+    assert_eq!(
+        status, 200,
+        "the site's hourly aggregates are served: {served}"
+    );
     let forward_idx = bucket_index(&served, FORWARD_BUCKET);
     let history_idx = bucket_index(&served, HISTORY_BUCKET);
     let avg = e2e::field_for(&served, &parameter_id, "avg");
     let counts = e2e::field_for(&served, &parameter_id, "count");
-    assert_eq!(avg[forward_idx], 46.0, "the served new bucket carries C2's mean: {served}");
-    assert_eq!(counts[forward_idx], 2.0, "two readings in the served new bucket: {served}");
-    assert_eq!(avg[history_idx], 45.0, "the served old bucket still carries C1's mean: {served}");
-    assert_eq!(counts[history_idx], 3.0, "three readings in the served old bucket: {served}");
+    assert_eq!(
+        avg[forward_idx], 46.0,
+        "the served new bucket carries C2's mean: {served}"
+    );
+    assert_eq!(
+        counts[forward_idx], 2.0,
+        "two readings in the served new bucket: {served}"
+    );
+    assert_eq!(
+        avg[history_idx], 45.0,
+        "the served old bucket still carries C1's mean: {served}"
+    );
+    assert_eq!(
+        counts[history_idx], 3.0,
+        "three readings in the served old bucket: {served}"
+    );
 
     crate::common::cleanup_test_db(&db).await;
 }

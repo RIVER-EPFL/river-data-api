@@ -1,5 +1,7 @@
 use moka::future::Cache;
-use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -40,7 +42,7 @@ pub struct ExposedParamConfig {
 }
 
 /// Create a new public config cache with a 5-minute TTL.
-#[must_use] 
+#[must_use]
 pub fn new_public_config_cache() -> PublicConfigCache {
     Cache::builder()
         .max_capacity(100)

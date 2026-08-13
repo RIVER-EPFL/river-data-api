@@ -129,7 +129,9 @@ async fn validate_merge_candidates<C: ConnectionTrait>(
     for row in &rows {
         let id: Uuid = row.try_get("", "id").map_err(AppError::Database)?;
         let site_id: Uuid = row.try_get("", "site_id").map_err(AppError::Database)?;
-        let param_id: Uuid = row.try_get("", "parameter_id").map_err(AppError::Database)?;
+        let param_id: Uuid = row
+            .try_get("", "parameter_id")
+            .map_err(AppError::Database)?;
 
         if id == source_id {
             source = Some((site_id, param_id));
@@ -139,12 +141,17 @@ async fn validate_merge_candidates<C: ConnectionTrait>(
         }
     }
 
-    let (source_site_id, source_param_id) = source
-        .ok_or_else(|| AppError::NotFound("Source site_parameter not found".to_string()))?;
-    let (target_site_id, target_param_id) = target
-        .ok_or_else(|| AppError::NotFound("Target site_parameter not found".to_string()))?;
+    let (source_site_id, source_param_id) =
+        source.ok_or_else(|| AppError::NotFound("Source site_parameter not found".to_string()))?;
+    let (target_site_id, target_param_id) =
+        target.ok_or_else(|| AppError::NotFound("Target site_parameter not found".to_string()))?;
 
-    Ok((source_site_id, source_param_id, target_site_id, target_param_id))
+    Ok((
+        source_site_id,
+        source_param_id,
+        target_site_id,
+        target_param_id,
+    ))
 }
 
 async fn update_data_streams<C: ConnectionTrait>(
@@ -341,8 +348,7 @@ async fn merge_site_parameters_per_site(
 
         if let Some(target_row) = target_sp {
             let target_sp_id: Uuid = target_row.try_get("", "id").map_err(AppError::Database)?;
-            let moved =
-                move_slot_rows(txn, MoveScope::Site(site_id), source_id, target_id).await?;
+            let moved = move_slot_rows(txn, MoveScope::Site(site_id), source_id, target_id).await?;
             let streams = update_data_streams(txn, sp_id, target_sp_id).await?;
             delete_source(txn, sp_id, site_id, source_id).await?;
 
@@ -358,8 +364,7 @@ async fn merge_site_parameters_per_site(
             ))
             .await
             .map_err(AppError::Database)?;
-            let moved =
-                move_slot_rows(txn, MoveScope::Site(site_id), source_id, target_id).await?;
+            let moved = move_slot_rows(txn, MoveScope::Site(site_id), source_id, target_id).await?;
 
             totals.readings += moved.readings;
             totals.touched = totals.touched.merge(moved.touched);

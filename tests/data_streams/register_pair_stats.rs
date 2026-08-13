@@ -1,4 +1,3 @@
-
 use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
 
@@ -37,7 +36,10 @@ async fn test_register_stream() {
     assert_eq!(json["source_system"], "vaisala");
     assert_eq!(json["source_key"], "9999");
     assert_eq!(json["source_name"], "TestSensor");
-    assert!(json["site_parameter_id"].is_null(), "new stream should be unpaired");
+    assert!(
+        json["site_parameter_id"].is_null(),
+        "new stream should be unpaired"
+    );
     assert!(json["paired_at"].is_null());
 }
 
@@ -74,7 +76,11 @@ async fn test_register_stream_upsert() {
     )
     .await;
     assert_eq!(status, 200);
-    assert_eq!(json2["id"].as_str().unwrap(), id1, "upsert should return same ID");
+    assert_eq!(
+        json2["id"].as_str().unwrap(),
+        id1,
+        "upsert should return same ID"
+    );
     assert_eq!(json2["source_name"], "Updated Name");
 }
 
@@ -116,7 +122,10 @@ async fn test_pair_stream_backfills_readings() {
         .unwrap()
         .unwrap();
     let unpaired_count: i64 = row.try_get("", "c").unwrap();
-    assert_eq!(unpaired_count, 10, "all readings should be unpaired before pairing");
+    assert_eq!(
+        unpaired_count, 10,
+        "all readings should be unpaired before pairing"
+    );
 
     // Pair the stream
     let (status, body) = crate::common::post_json_with_token(
@@ -129,7 +138,10 @@ async fn test_pair_stream_backfills_readings() {
     assert_eq!(status, 200, "pair should succeed: {body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["backfilled"], 10, "should backfill 10 readings");
-    assert!(!json["stream"]["site_parameter_id"].is_null(), "stream should now be paired");
+    assert!(
+        !json["stream"]["site_parameter_id"].is_null(),
+        "stream should now be paired"
+    );
 
     // Verify readings now have site_id and parameter_id
     let row = db
@@ -144,7 +156,10 @@ async fn test_pair_stream_backfills_readings() {
         .unwrap()
         .unwrap();
     let paired_count: i64 = row.try_get("", "c").unwrap();
-    assert_eq!(paired_count, 10, "all readings should have site_id after pairing");
+    assert_eq!(
+        paired_count, 10,
+        "all readings should have site_id after pairing"
+    );
 
     // Verify calibrated_value was set
     let row = db
@@ -158,7 +173,10 @@ async fn test_pair_stream_backfills_readings() {
         .unwrap()
         .unwrap();
     let cal_count: i64 = row.try_get("", "c").unwrap();
-    assert_eq!(cal_count, 10, "all readings should have calibrated_value after pairing");
+    assert_eq!(
+        cal_count, 10,
+        "all readings should have calibrated_value after pairing"
+    );
 }
 
 #[tokio::test]
@@ -167,7 +185,14 @@ async fn test_pair_already_paired_stream_fails() {
     let (app, token, db) = setup().await;
 
     let stream_id = "00000000-0000-4000-e000-000000000002";
-    crate::common::seed_paired_stream(&db, stream_id, "test-pair", "pair-key-2", crate::common::PARAM_S1_DO_ID).await;
+    crate::common::seed_paired_stream(
+        &db,
+        stream_id,
+        "test-pair",
+        "pair-key-2",
+        crate::common::PARAM_S1_DO_ID,
+    )
+    .await;
 
     let (status, _) = crate::common::post_json_with_token(
         &app,
@@ -190,7 +215,14 @@ async fn test_unpair_stream_clears_readings() {
 
     // Create a paired stream with readings that have site_id set
     let stream_id = "00000000-0000-4000-e000-000000000003";
-    crate::common::seed_paired_stream(&db, stream_id, "test-unpair", "unpair-key-1", crate::common::PARAM_S1_COND_ID).await;
+    crate::common::seed_paired_stream(
+        &db,
+        stream_id,
+        "test-unpair",
+        "unpair-key-1",
+        crate::common::PARAM_S1_COND_ID,
+    )
+    .await;
 
     let bt = crate::common::base_time();
     for i in 0..5 {
@@ -221,7 +253,10 @@ async fn test_unpair_stream_clears_readings() {
     assert_eq!(status, 200, "unpair should succeed: {body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["cleared"], 5, "should clear 5 readings");
-    assert!(json["stream"]["site_parameter_id"].is_null(), "stream should be unpaired");
+    assert!(
+        json["stream"]["site_parameter_id"].is_null(),
+        "stream should be unpaired"
+    );
 
     // Verify readings have site_id = NULL
     let row = db
@@ -233,7 +268,10 @@ async fn test_unpair_stream_clears_readings() {
         .unwrap()
         .unwrap();
     let count: i64 = row.try_get("", "c").unwrap();
-    assert_eq!(count, 5, "all readings should have site_id=NULL after unpairing");
+    assert_eq!(
+        count, 5,
+        "all readings should have site_id=NULL after unpairing"
+    );
 }
 
 #[tokio::test]
@@ -362,5 +400,8 @@ async fn test_streams_require_write_metadata() {
         &token,
     )
     .await;
-    assert_eq!(status, 403, "stream registration should require write_metadata");
+    assert_eq!(
+        status, 403,
+        "stream registration should require write_metadata"
+    );
 }

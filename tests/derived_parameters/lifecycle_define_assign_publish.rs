@@ -4,7 +4,6 @@
 //!
 //! Run: cargo test --test derived_parameters -- --test-threads=1
 
-
 use crate::common::e2e;
 use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
@@ -21,8 +20,14 @@ async fn create_derived(app: &axum::Router, token: &str) -> (String, String) {
         token,
     )
     .await;
-    assert!((200..300).contains(&status), "create derived ({status}): {def}");
-    let output = def["output_parameter_id"].as_str().expect("output_parameter_id").to_string();
+    assert!(
+        (200..300).contains(&status),
+        "create derived ({status}): {def}"
+    );
+    let output = def["output_parameter_id"]
+        .as_str()
+        .expect("output_parameter_id")
+        .to_string();
     (e2e::id_of(&def), output)
 }
 
@@ -40,17 +45,34 @@ async fn derived_definition_populates_sources_and_assigns() {
     let (def_id, output_param_id) = create_derived(&app, &token).await;
 
     // WS1c: the join populates `sources` on GET-by-id AND in the list endpoint.
-    let (_s, got) =
-        crate::common::get_json_with_token(&app, &format!("/api/derived_parameters/{def_id}"), &token).await;
-    let sources = got["sources"].as_array().expect("sources array on GET-by-id");
+    let (_s, got) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/derived_parameters/{def_id}"),
+        &token,
+    )
+    .await;
+    let sources = got["sources"]
+        .as_array()
+        .expect("sources array on GET-by-id");
     assert_eq!(sources.len(), 1, "exactly one source (Dissolved_O2): {got}");
     assert_eq!(sources[0]["variable_name"], "Dissolved_O2");
 
     let (_s, list) =
-        crate::common::get_json_with_token(&app, "/api/derived_parameters?page_size=100", &token).await;
-    let items = list.as_array().cloned().unwrap_or_else(|| list["data"].as_array().cloned().unwrap());
-    let in_list = items.iter().find(|d| d["id"].as_str() == Some(def_id.as_str())).expect("def in list");
-    assert_eq!(in_list["sources"].as_array().map(|a| a.len()), Some(1), "sources populated in the list");
+        crate::common::get_json_with_token(&app, "/api/derived_parameters?page_size=100", &token)
+            .await;
+    let items = list
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| list["data"].as_array().cloned().unwrap());
+    let in_list = items
+        .iter()
+        .find(|d| d["id"].as_str() == Some(def_id.as_str()))
+        .expect("def in list");
+    assert_eq!(
+        in_list["sources"].as_array().map(|a| a.len()),
+        Some(1),
+        "sources populated in the list"
+    );
 
     // Assigning the derived parameter to a site succeeds.
     let (status, sp) = crate::common::post_json_with_token(
@@ -63,7 +85,10 @@ async fn derived_definition_populates_sources_and_assigns() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "assign derived ({status}): {sp}");
+    assert!(
+        (200..300).contains(&status),
+        "assign derived ({status}): {sp}"
+    );
 }
 
 /// Assigning a derived parameter backfills historical derived readings (= source × factor) and
@@ -89,7 +114,10 @@ async fn derived_assignment_backfills_and_publishes() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "assign derived ({status}): {sp}");
+    assert!(
+        (200..300).contains(&status),
+        "assign derived ({status}): {sp}"
+    );
     let sp_id = e2e::id_of(&sp);
 
     assert!(
@@ -98,7 +126,10 @@ async fn derived_assignment_backfills_and_publishes() {
     );
 
     // Backfilled derived readings equal source × 0.032 at matching timestamps.
-    let uri = format!("/api/sites/{}/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T01:00:00Z", crate::common::SITE1_ID);
+    let uri = format!(
+        "/api/sites/{}/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T01:00:00Z",
+        crate::common::SITE1_ID
+    );
     let (status, readings) = crate::common::get_json_with_token(&app, &uri, &token).await;
     assert_eq!(status, 200, "readings ({status}): {readings}");
     let src = e2e::values_for(&readings, crate::common::GLOBAL_PARAM_DO_ID);
@@ -106,7 +137,10 @@ async fn derived_assignment_backfills_and_publishes() {
     assert!(!src.is_empty(), "expected seeded source readings");
     assert_eq!(src.len(), derived.len());
     for i in 0..src.len() {
-        assert!((derived[i] - src[i] * 0.032).abs() < 1e-6, "derived[{i}] should be source × 0.032");
+        assert!(
+            (derived[i] - src[i] * 0.032).abs() < 1e-6,
+            "derived[{i}] should be source × 0.032"
+        );
     }
 
     // Recompute + public exposure.
@@ -121,22 +155,30 @@ async fn derived_assignment_backfills_and_publishes() {
 
     db.execute(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
-        format!("UPDATE projects SET is_public = true, public_code = 'e2e_derived' WHERE id = '{}'", crate::common::PROJECT_ID),
+        format!(
+            "UPDATE projects SET is_public = true, public_code = 'e2e_derived' WHERE id = '{}'",
+            crate::common::PROJECT_ID
+        ),
     ))
     .await
     .unwrap();
     // A site is only included in the public config when it has a public_code (services.rs load_public_config).
     db.execute(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
-        format!("UPDATE sites SET public_code = 'e2e_derived_site1' WHERE id = '{}'", crate::common::SITE1_ID),
+        format!(
+            "UPDATE sites SET public_code = 'e2e_derived_site1' WHERE id = '{}'",
+            crate::common::SITE1_ID
+        ),
     ))
     .await
     .unwrap();
     e2e::set_site_parameter_public(&db, &sp_id).await;
 
-    let pub_uri =
-        "/api/public/e2e_derived/sites/e2e_derived_site1/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T01:00:00Z";
+    let pub_uri = "/api/public/e2e_derived/sites/e2e_derived_site1/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T01:00:00Z";
     let (status, pub_readings) = crate::common::get_json(&app, &pub_uri).await;
     assert_eq!(status, 200, "public readings ({status}): {pub_readings}");
-    assert!(!e2e::values_for(&pub_readings, "DOmgL_e2e").is_empty(), "derived exposed publicly");
+    assert!(
+        !e2e::values_for(&pub_readings, "DOmgL_e2e").is_empty(),
+        "derived exposed publicly"
+    );
 }

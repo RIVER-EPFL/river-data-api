@@ -1,6 +1,5 @@
 pub mod aggregates;
 pub mod annotations;
-pub mod views;
 pub mod model;
 pub mod parameters;
 pub mod readings;
@@ -9,4 +8,5 @@ pub mod sensor_identity;
 pub mod sensor_vs_grab;
 pub mod status_events;
 pub mod types;
+pub mod views;
 pub use model::*;

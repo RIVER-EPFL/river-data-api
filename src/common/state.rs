@@ -9,18 +9,17 @@ use tokio::sync::{Mutex, broadcast};
 /// Cached CSV text for the import staging flow. Keyed by session UUID.
 pub type ImportStagingCache = Cache<String, Arc<String>>;
 
+use super::bulk::{BulkSemaphore, new_bulk_semaphore};
 use crate::config::Config;
 use crate::routes::private::api_tokens::service::TokenCache;
 use crate::routes::private::notifications::authz::Authorizer;
-use super::bulk::{BulkSemaphore, new_bulk_semaphore};
 use crate::routes::public::service::{PublicConfigCache, new_public_config_cache};
 
 /// Per-token request limiters, keyed by token id. Each entry holds the configured
 /// `rate_limit_per_second` (so a changed limit rebuilds the limiter) and a direct governor
 /// limiter. Tokens with no configured limit never enter this cache (they are unlimited). Bounded
 /// by capacity + idle eviction so it can't grow without limit.
-pub type TokenRateLimiters =
-    Cache<uuid::Uuid, (i32, Arc<governor::DefaultDirectRateLimiter>)>;
+pub type TokenRateLimiters = Cache<uuid::Uuid, (i32, Arc<governor::DefaultDirectRateLimiter>)>;
 
 /// Build an empty per-token rate-limiter registry (max 10k live keys, evicted after 1h idle).
 #[must_use]
@@ -35,12 +34,38 @@ pub fn new_token_rate_limiters() -> TokenRateLimiters {
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AppEvent {
-    JobCreated { job_id: uuid::Uuid },
-    JobProgress { job_id: uuid::Uuid, status: String, progress: Option<i32>, total: Option<i32> },
-    JobCompleted { job_id: uuid::Uuid, status: String, readings_updated: Option<i32>, error_message: Option<String> },
-    JobLog { job_id: uuid::Uuid, seq: i64, level: String, message: String, context: serde_json::Value },
-    DataIngested { site_id: Option<uuid::Uuid>, parameter_id: Option<uuid::Uuid>, stream_id: uuid::Uuid, count: usize },
-    AlarmStateChanged { opened: usize, resolved: usize },
+    JobCreated {
+        job_id: uuid::Uuid,
+    },
+    JobProgress {
+        job_id: uuid::Uuid,
+        status: String,
+        progress: Option<i32>,
+        total: Option<i32>,
+    },
+    JobCompleted {
+        job_id: uuid::Uuid,
+        status: String,
+        readings_updated: Option<i32>,
+        error_message: Option<String>,
+    },
+    JobLog {
+        job_id: uuid::Uuid,
+        seq: i64,
+        level: String,
+        message: String,
+        context: serde_json::Value,
+    },
+    DataIngested {
+        site_id: Option<uuid::Uuid>,
+        parameter_id: Option<uuid::Uuid>,
+        stream_id: uuid::Uuid,
+        count: usize,
+    },
+    AlarmStateChanged {
+        opened: usize,
+        resolved: usize,
+    },
 }
 
 pub type EventSender = broadcast::Sender<AppEvent>;
@@ -156,8 +181,7 @@ impl AppState {
         let token_cache = crate::routes::private::api_tokens::service::new_token_cache(
             config.token_cache_ttl_seconds,
         );
-        let grants_cache =
-            crate::common::grants::new_grants_cache(config.grants_cache_ttl_seconds);
+        let grants_cache = crate::common::grants::new_grants_cache(config.grants_cache_ttl_seconds);
         let token_rate_limiters = new_token_rate_limiters();
         let (events, _) = broadcast::channel(256);
         let _ = GLOBAL_EVENT_SENDER.set(events.clone());
@@ -194,4 +218,3 @@ impl AppState {
         state
     }
 }
-

@@ -5,14 +5,16 @@
 //!
 //! Run: cargo test --test readings -- --test-threads=1
 
-
 use crate::common::e2e;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serial_test::serial;
 
 async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
     let row = db
-        .query_one(Statement::from_string(DatabaseBackend::Postgres, sql.to_string()))
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            sql.to_string(),
+        ))
         .await
         .expect("query")
         .expect("row");
@@ -27,7 +29,10 @@ async fn register_stream(app: &axum::Router, token: &str, key: &str) -> String {
         token,
     )
     .await;
-    assert!((200..300).contains(&status), "register ({status}): {stream}");
+    assert!(
+        (200..300).contains(&status),
+        "register ({status}): {stream}"
+    );
     e2e::id_of(&stream)
 }
 
@@ -42,32 +47,58 @@ async fn ingest_duplicate_reading_first_write_wins() {
 
     let t = "2025-01-15T00:00:00Z";
     let (status, body) = crate::common::post_json_parse_with_token(
-        &app, "/api/ingest",
+        &app,
+        "/api/ingest",
         &serde_json::json!({"stream_id": stream, "readings": [{"time": t, "raw_value": 10.0}]}),
         &token,
-    ).await;
+    )
+    .await;
     assert_eq!(status, 200, "first ingest ({status}): {body}");
     assert_eq!(body["inserted"], 1);
 
     let (status, body) = crate::common::post_json_parse_with_token(
-        &app, "/api/ingest",
+        &app,
+        "/api/ingest",
         &serde_json::json!({"stream_id": stream, "readings": [{"time": t, "raw_value": 99.0}]}),
         &token,
-    ).await;
+    )
+    .await;
     assert_eq!(status, 200, "dup ingest ({status}): {body}");
-    assert_eq!(body["inserted"], 0, "duplicate (stream,time,replicate) skipped");
+    assert_eq!(
+        body["inserted"], 0,
+        "duplicate (stream,time,replicate) skipped"
+    );
 
     assert_eq!(
-        count(&db, &format!("SELECT count(*) AS c FROM readings WHERE stream_id = '{stream}'")).await,
-        1, "only one row stored"
+        count(
+            &db,
+            &format!("SELECT count(*) AS c FROM readings WHERE stream_id = '{stream}'")
+        )
+        .await,
+        1,
+        "only one row stored"
     );
     assert_eq!(
-        count(&db, &format!("SELECT count(*) AS c FROM readings WHERE stream_id = '{stream}' AND raw_value = 10")).await,
-        1, "first write wins"
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM readings WHERE stream_id = '{stream}' AND raw_value = 10"
+            )
+        )
+        .await,
+        1,
+        "first write wins"
     );
     assert_eq!(
-        count(&db, &format!("SELECT count(*) AS c FROM readings WHERE stream_id = '{stream}' AND raw_value = 99")).await,
-        0, "second write dropped"
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM readings WHERE stream_id = '{stream}' AND raw_value = 99"
+            )
+        )
+        .await,
+        0,
+        "second write dropped"
     );
 }
 
@@ -84,12 +115,14 @@ async fn ingest_status_event_dedup_first_write_wins() {
     let t2 = "2025-01-15T01:00:00Z";
     let t3 = "2025-01-15T02:00:00Z";
     let (status, body) = crate::common::post_json_parse_with_token(
-        &app, "/api/ingest/status_events",
+        &app,
+        "/api/ingest/status_events",
         &serde_json::json!({"stream_id": stream, "events": [
             {"time": t1, "value": "ok"}, {"time": t2, "value": "ok"}, {"time": t3, "value": "ok"}
         ]}),
         &token,
-    ).await;
+    )
+    .await;
     assert_eq!(status, 200, "first status ingest ({status}): {body}");
 
     // re-send two existing timestamps (with different values) + one new
@@ -104,8 +137,13 @@ async fn ingest_status_event_dedup_first_write_wins() {
     assert_eq!(status, 200, "overlapping status ingest ({status}): {body}");
 
     assert_eq!(
-        count(&db, &format!("SELECT count(*) AS c FROM status_events WHERE stream_id = '{stream}'")).await,
-        4, "only the one genuinely-new timestamp was added"
+        count(
+            &db,
+            &format!("SELECT count(*) AS c FROM status_events WHERE stream_id = '{stream}'")
+        )
+        .await,
+        4,
+        "only the one genuinely-new timestamp was added"
     );
     assert_eq!(
         count(&db, &format!("SELECT count(*) AS c FROM status_events WHERE stream_id = '{stream}' AND value = 'changed'")).await,
@@ -129,7 +167,8 @@ async fn batch_reading_conflict_skip_then_overwrite() {
     let body = serde_json::json!({"readings": [
         {"site_id": site, "parameter_id": param, "time": t, "raw_value": 10.0}
     ]});
-    let (status, resp) = crate::common::post_json_parse_with_token(&app, "/api/readings/batch", &body, &token).await;
+    let (status, resp) =
+        crate::common::post_json_parse_with_token(&app, "/api/readings/batch", &body, &token).await;
     assert_eq!(status, 200, "first batch ({status}): {resp}");
     assert_eq!(resp["inserted"], 1);
 
@@ -137,24 +176,40 @@ async fn batch_reading_conflict_skip_then_overwrite() {
     let body = serde_json::json!({"readings": [
         {"site_id": site, "parameter_id": param, "time": t, "raw_value": 99.0}
     ]});
-    let (status, resp) = crate::common::post_json_parse_with_token(&app, "/api/readings/batch", &body, &token).await;
+    let (status, resp) =
+        crate::common::post_json_parse_with_token(&app, "/api/readings/batch", &body, &token).await;
     assert_eq!(status, 200, "skip batch ({status}): {resp}");
     assert_eq!(resp["inserted"], 0, "collision skipped by default");
     assert_eq!(
-        count(&db, &format!("SELECT count(*) AS c FROM readings WHERE site_id = '{site}' AND raw_value = 10")).await,
-        1, "skip kept the original value"
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM readings WHERE site_id = '{site}' AND raw_value = 10"
+            )
+        )
+        .await,
+        1,
+        "skip kept the original value"
     );
 
     // explicit overwrite → value replaced
     let body = serde_json::json!({"readings": [
         {"site_id": site, "parameter_id": param, "time": t, "raw_value": 77.0}
     ], "conflict": "overwrite"});
-    let (status, resp) = crate::common::post_json_parse_with_token(&app, "/api/readings/batch", &body, &token).await;
+    let (status, resp) =
+        crate::common::post_json_parse_with_token(&app, "/api/readings/batch", &body, &token).await;
     assert_eq!(status, 200, "overwrite batch ({status}): {resp}");
     assert_eq!(resp["overwritten"], 1, "overwrite replaced the row");
     assert_eq!(
-        count(&db, &format!("SELECT count(*) AS c FROM readings WHERE site_id = '{site}' AND raw_value = 77")).await,
-        1, "overwrite stored the new value"
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM readings WHERE site_id = '{site}' AND raw_value = 77"
+            )
+        )
+        .await,
+        1,
+        "overwrite stored the new value"
     );
 }
 
@@ -177,10 +232,12 @@ async fn unpaired_readings_excluded_from_aggregates_until_paired() {
         .map(|i| serde_json::json!({"time": format!("2025-01-15T0{i}:00:00Z"), "raw_value": 100.0 + i as f64}))
         .collect();
     let (status, body) = crate::common::post_json_parse_with_token(
-        &app, "/api/ingest",
+        &app,
+        "/api/ingest",
         &serde_json::json!({"stream_id": stream, "readings": readings}),
         &token,
-    ).await;
+    )
+    .await;
     assert_eq!(status, 200, "ingest ({status}): {body}");
     assert_eq!(
         count(&db, &format!("SELECT count(*) AS c FROM readings WHERE stream_id = '{stream}' AND site_id IS NULL")).await,
@@ -189,16 +246,23 @@ async fn unpaired_readings_excluded_from_aggregates_until_paired() {
 
     crate::common::refresh_continuous_aggregates(&db).await;
     assert_eq!(
-        count(&db, &format!("SELECT count(*) AS c FROM readings_hourly WHERE site_id = '{site}'")).await,
-        0, "unpaired readings are excluded from the continuous aggregate"
+        count(
+            &db,
+            &format!("SELECT count(*) AS c FROM readings_hourly WHERE site_id = '{site}'")
+        )
+        .await,
+        0,
+        "unpaired readings are excluded from the continuous aggregate"
     );
 
     // Pair the stream → backfill stamps site_id onto the existing readings.
     let (status, body) = crate::common::post_json_parse_with_token(
-        &app, &format!("/api/streams/{stream}/pair"),
+        &app,
+        &format!("/api/streams/{stream}/pair"),
         &serde_json::json!({"site_parameter_id": sp}),
         &token,
-    ).await;
+    )
+    .await;
     assert_eq!(status, 200, "pair ({status}): {body}");
     assert_eq!(
         count(&db, &format!("SELECT count(*) AS c FROM readings WHERE stream_id = '{stream}' AND site_id = '{site}'")).await,
@@ -207,7 +271,12 @@ async fn unpaired_readings_excluded_from_aggregates_until_paired() {
 
     crate::common::refresh_continuous_aggregates(&db).await;
     assert!(
-        count(&db, &format!("SELECT count(*) AS c FROM readings_hourly WHERE site_id = '{site}'")).await > 0,
+        count(
+            &db,
+            &format!("SELECT count(*) AS c FROM readings_hourly WHERE site_id = '{site}'")
+        )
+        .await
+            > 0,
         "after pairing the readings appear in the continuous aggregate"
     );
 }
@@ -224,10 +293,12 @@ async fn ingest_overwrite_updates_values_and_is_sync_only() {
 
     let t = "2025-01-15T00:00:00Z";
     let (status, body) = crate::common::post_json_parse_with_token(
-        &app, "/api/ingest",
+        &app,
+        "/api/ingest",
         &serde_json::json!({"stream_id": stream, "readings": [{"time": t, "raw_value": 10.0}]}),
         &sync_token,
-    ).await;
+    )
+    .await;
     assert_eq!(status, 200, "first ingest ({status}): {body}");
 
     db.execute(Statement::from_string(
@@ -251,8 +322,13 @@ async fn ingest_overwrite_updates_values_and_is_sync_only() {
         1, "correction applied in place"
     );
     assert_eq!(
-        count(&db, &format!("SELECT count(*) AS c FROM readings WHERE stream_id = '{stream}'")).await,
-        1, "still one row"
+        count(
+            &db,
+            &format!("SELECT count(*) AS c FROM readings WHERE stream_id = '{stream}'")
+        )
+        .await,
+        1,
+        "still one row"
     );
     assert_eq!(
         count(&db, &format!(

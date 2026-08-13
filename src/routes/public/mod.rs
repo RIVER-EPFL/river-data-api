@@ -1,2 +1,2 @@
-pub mod views;
 pub mod service;
+pub mod views;

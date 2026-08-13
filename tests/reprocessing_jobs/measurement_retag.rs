@@ -102,7 +102,10 @@ async fn retag_job_moves_scope_out_of_aggregates_and_reruns_idempotently() {
         crate::common::SITE1_ID,
         crate::common::GLOBAL_PARAM_TURB_ID
     );
-    assert!(count_where(&db, &hourly).await > 0, "continuous rows roll up before the retag");
+    assert!(
+        count_where(&db, &hourly).await > 0,
+        "continuous rows roll up before the retag"
+    );
 
     let id = worker::enqueue(
         &db,
@@ -261,9 +264,7 @@ async fn streams_retag_endpoint_by_source_system() {
     assert_eq!(
         count_where(
             &db,
-            &format!(
-                "readings WHERE stream_id IN ('{s1}', '{s2}') AND measurement_type = 'spot'"
-            )
+            &format!("readings WHERE stream_id IN ('{s1}', '{s2}') AND measurement_type = 'spot'")
         )
         .await,
         2,
@@ -299,7 +300,10 @@ async fn retag_job_source_system_scope_flips_readings_and_refreshes_aggregates()
         crate::common::SITE1_ID,
         crate::common::GLOBAL_PARAM_TURB_ID
     );
-    assert!(count_where(&db, &hourly).await > 0, "all three roll up before the retag");
+    assert!(
+        count_where(&db, &hourly).await > 0,
+        "all three roll up before the retag"
+    );
 
     let id = worker::enqueue(
         &db,
@@ -345,5 +349,8 @@ async fn retag_job_source_system_scope_flips_readings_and_refreshes_aggregates()
         .unwrap()
         .unwrap();
     let rolled_up: i64 = row.try_get("", "n").unwrap();
-    assert_eq!(rolled_up, 1, "only the continuous reading remains in the refreshed rollup");
+    assert_eq!(
+        rolled_up, 1,
+        "only the continuous reading remains in the refreshed rollup"
+    );
 }

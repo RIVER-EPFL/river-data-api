@@ -213,8 +213,9 @@ pub async fn get_sensor_vs_grab(
 
     if query.format == "csv" {
         let fmt = |v: Option<f64>| v.map(|x| x.to_string()).unwrap_or_default();
-        let mut csv =
-            String::from("time,grab_value,grab_sd,grab_n,sensor_avg,sensor_sd,sensor_n,difference\n");
+        let mut csv = String::from(
+            "time,grab_value,grab_sd,grab_n,sensor_avg,sensor_sd,sensor_n,difference\n",
+        );
         for r in &rows {
             csv.push_str(&format!(
                 "{},{},{},{},{},{},{},{}\n",

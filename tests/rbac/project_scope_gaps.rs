@@ -13,7 +13,6 @@
 //! Every suite also exercises a sibling route in the same source file that already confines
 //! correctly, so the expectation is the codebase's own standard rather than an invention.
 
-
 use axum::Router;
 use serde_json::json;
 use serial_test::serial;
@@ -78,7 +77,10 @@ async fn mint_token(
     }
     let (status, created) =
         crate::common::post_json_parse_with_token(app, "/api/tokens", &payload, admin).await;
-    assert_eq!(status, 201, "an administrator mints the {name} key: {created}");
+    assert_eq!(
+        status, 201,
+        "an administrator mints the {name} key: {created}"
+    );
     created["token"]
         .as_str()
         .unwrap_or_else(|| panic!("create returns the raw secret exactly once: {created}"))
@@ -191,7 +193,10 @@ async fn seed_claimable_history(
         admin,
     )
     .await;
-    assert_eq!(status, 200, "site {site} takes its claimable history: {body}");
+    assert_eq!(
+        status, 200,
+        "site {site} takes its claimable history: {body}"
+    );
 
     (sensor, deployment)
 }
@@ -222,7 +227,8 @@ async fn alarm_thresholds_confines_slots_to_the_callers_projects() {
 
     // Both projects' slots really are in the unrestricted payload, so a confined response cannot
     // read as correct merely by being empty.
-    let (status, body) = crate::common::get_with_token(&app, "/api/alarms/thresholds", &admin).await;
+    let (status, body) =
+        crate::common::get_with_token(&app, "/api/alarms/thresholds", &admin).await;
     assert_eq!(status, 200, "an administrator resolves every slot: {body}");
     assert!(
         body.contains(&scene.site_a) && body.contains(&scene.site_b),
@@ -252,7 +258,10 @@ async fn alarm_thresholds_confines_slots_to_the_callers_projects() {
     ] {
         let (status, rows) =
             crate::common::get_json_with_token(&app, "/api/alarms/thresholds", caller).await;
-        assert_eq!(status, 200, "a {label} reads the resolved thresholds: {rows}");
+        assert_eq!(
+            status, 200,
+            "a {label} reads the resolved thresholds: {rows}"
+        );
         let sites: Vec<&str> = rows
             .as_array()
             .unwrap_or_else(|| panic!("the thresholds response is an array: {rows}"))
@@ -284,20 +293,31 @@ async fn parameter_merges_hold_the_administrator_and_project_gates() {
     let scene = provision_two_projects(&app, &admin).await;
     let manager = member(&db, &scene.project_a, "manager1", "riverdata-manager").await;
 
-    let source =
-        e2e::create_parameter(&app, &admin, "RdScopeMergeSrc", "Scope Merge Source", "degC").await;
+    let source = e2e::create_parameter(
+        &app,
+        &admin,
+        "RdScopeMergeSrc",
+        "Scope Merge Source",
+        "degC",
+    )
+    .await;
     let source_site_parameter =
         e2e::assign_site_parameter_minimal(&app, &admin, &scene.site_b, &source).await;
     let target_site_parameter = {
         let (status, body) =
             crate::common::get_json_with_token(&app, "/api/site_parameters", &admin).await;
-        assert_eq!(status, 200, "the administrator lists every site parameter: {body}");
+        assert_eq!(
+            status, 200,
+            "the administrator lists every site parameter: {body}"
+        );
         let row = body
             .as_array()
             .unwrap_or_else(|| panic!("site_parameters list is an array: {body}"))
             .iter()
-            .find(|sp| sp["site_id"] == scene.site_b.as_str()
-                && sp["parameter_id"] == scene.parameter.as_str())
+            .find(|sp| {
+                sp["site_id"] == scene.site_b.as_str()
+                    && sp["parameter_id"] == scene.parameter.as_str()
+            })
             .unwrap_or_else(|| panic!("site B carries the shared parameter: {body}"))
             .clone();
         e2e::id_of(&row)
@@ -315,7 +335,8 @@ async fn parameter_merges_hold_the_administrator_and_project_gates() {
     // Control: deleting a catalog row through CRUD is Administrator-only, and that is the gate the
     // merge is expected to match.
     let (status, body) =
-        crate::common::delete_with_token(&app, &format!("/api/parameters/{source}"), &manager).await;
+        crate::common::delete_with_token(&app, &format!("/api/parameters/{source}"), &manager)
+            .await;
     assert_eq!(
         status, 403,
         "deleting a global parameter through CRUD is Administrator-only: {body}"
@@ -339,7 +360,10 @@ async fn parameter_merges_hold_the_administrator_and_project_gates() {
 
     let (status, body) =
         crate::common::get_with_token(&app, &format!("/api/parameters/{source}"), &admin).await;
-    assert_eq!(status, 200, "the refused merge left the catalog row intact: {body}");
+    assert_eq!(
+        status, 200,
+        "the refused merge left the catalog row intact: {body}"
+    );
 
     let (status, body) = crate::common::post_json_with_token(
         &app,
@@ -362,7 +386,10 @@ async fn parameter_merges_hold_the_administrator_and_project_gates() {
         &admin,
     )
     .await;
-    assert_eq!(status, 200, "the refused merge left project B's slot intact: {body}");
+    assert_eq!(
+        status, 200,
+        "the refused merge left project B's slot intact: {body}"
+    );
 
     // Control: a project-scoped token is stopped outright, which is what confinement on this route
     // looks like when it is present. An unscoped `write_metadata` token is deliberately not tested:
@@ -390,7 +417,10 @@ async fn parameter_merges_hold_the_administrator_and_project_gates() {
         &scoped_write_token,
     )
     .await;
-    assert_eq!(status, 403, "a project-scoped token cannot merge the global catalog: {body}");
+    assert_eq!(
+        status, 403,
+        "a project-scoped token cannot merge the global catalog: {body}"
+    );
 
     // The unaffected side: an Administrator performs the same merge, and it really is a catalog
     // delete, so the refusals above are refusals of destruction rather than of a no-op.
@@ -414,7 +444,10 @@ async fn parameter_merges_hold_the_administrator_and_project_gates() {
     );
     let (status, body) =
         crate::common::get_with_token(&app, &format!("/api/parameters/{source}"), &admin).await;
-    assert_eq!(status, 404, "the merge deletes the source catalog row: {body}");
+    assert_eq!(
+        status, 404,
+        "the merge deletes the source catalog row: {body}"
+    );
 }
 
 /// `POST /api/actions/rollback_deployment` deletes a `sensor_deployments` row, so it must
@@ -544,7 +577,10 @@ async fn rollback_deployment_needs_the_same_capability_as_deleting_the_deploymen
         &admin,
     )
     .await;
-    assert_eq!(status, 200, "both refused rollbacks left the deployment in place: {body}");
+    assert_eq!(
+        status, 200,
+        "both refused rollbacks left the deployment in place: {body}"
+    );
 
     // Control: a project-scoped token is already stopped by `deny_scoped_token`, which is what
     // confinement on this route looks like when it is present.
@@ -555,7 +591,10 @@ async fn rollback_deployment_needs_the_same_capability_as_deleting_the_deploymen
         &scoped_write_token,
     )
     .await;
-    assert_eq!(status, 403, "a project-scoped token cannot roll back a deployment: {body}");
+    assert_eq!(
+        status, 403,
+        "a project-scoped token cannot roll back a deployment: {body}"
+    );
 
     // The unaffected side: Manager is the level that owns this destruction, through either door.
     let (status, body) = crate::common::delete_with_token(
@@ -642,7 +681,10 @@ async fn sensor_lifecycle_actions_refuse_another_projects_site_and_sensors() {
     // Controls: the scoped reads on the same inventory already hide project B.
     let (status, body) =
         crate::common::get_with_token(&app, &format!("/api/sensors/{sensor_b}"), &manager).await;
-    assert_eq!(status, 404, "project B's sensor reads as not-found for the manager: {body}");
+    assert_eq!(
+        status, 404,
+        "project B's sensor reads as not-found for the manager: {body}"
+    );
 
     let (status, body) = crate::common::get_with_token(
         &app,
@@ -672,9 +714,11 @@ async fn sensor_lifecycle_actions_refuse_another_projects_site_and_sensors() {
         "a manager granted only project A must not deploy a sensor into project B's site: {body}"
     );
 
-    let (status, body) =
-        crate::common::get_with_token(&app, "/api/site_parameters", &admin).await;
-    assert_eq!(status, 200, "the administrator lists every site parameter: {body}");
+    let (status, body) = crate::common::get_with_token(&app, "/api/site_parameters", &admin).await;
+    assert_eq!(
+        status, 200,
+        "the administrator lists every site parameter: {body}"
+    );
     assert!(
         !body.contains(&adopt_parameter),
         "the refused adopt created no site parameter at project B's site: {body}"
@@ -682,7 +726,10 @@ async fn sensor_lifecycle_actions_refuse_another_projects_site_and_sensors() {
 
     let (status, deployments) =
         crate::common::get_json_with_token(&app, "/api/sensor_deployments", &admin).await;
-    assert_eq!(status, 200, "the administrator lists every deployment: {deployments}");
+    assert_eq!(
+        status, 200,
+        "the administrator lists every deployment: {deployments}"
+    );
     let at_site_b = deployments
         .as_array()
         .unwrap_or_else(|| panic!("deployments list is an array: {deployments}"))
@@ -711,13 +758,12 @@ async fn sensor_lifecycle_actions_refuse_another_projects_site_and_sensors() {
         "a manager granted only project A must not reclassify project B's sensor: {body}"
     );
 
-    let (status, sensor) = crate::common::get_json_with_token(
-        &app,
-        &format!("/api/sensors/{sensor_b}"),
-        &admin,
-    )
-    .await;
-    assert_eq!(status, 200, "project B's sensor is readable by an administrator: {sensor}");
+    let (status, sensor) =
+        crate::common::get_json_with_token(&app, &format!("/api/sensors/{sensor_b}"), &admin).await;
+    assert_eq!(
+        status, 200,
+        "project B's sensor is readable by an administrator: {sensor}"
+    );
     assert_eq!(
         sensor["data_frequency"], "high",
         "the refused retag left project B's sensor classification alone: {sensor}"
@@ -736,7 +782,10 @@ async fn sensor_lifecycle_actions_refuse_another_projects_site_and_sensors() {
     ] {
         let (status, body) =
             crate::common::post_json_with_token(&app, &path, &payload, &scoped_write_token).await;
-        assert_eq!(status, 403, "a project-scoped token cannot call {path}: {body}");
+        assert_eq!(
+            status, 403,
+            "a project-scoped token cannot call {path}: {body}"
+        );
     }
 
     // The unaffected side: the same two writes inside the granted project still work.
@@ -833,7 +882,10 @@ async fn backfill_and_calibration_candidates_confine_to_the_callers_projects() {
     // Both projects really do produce a candidate, so an empty confined response would not pass.
     let (status, body) =
         crate::common::get_with_token(&app, "/api/actions/backfill_candidates", &admin).await;
-    assert_eq!(status, 200, "the administrator enumerates backfill candidates: {body}");
+    assert_eq!(
+        status, 200,
+        "the administrator enumerates backfill candidates: {body}"
+    );
     assert!(
         body.contains(deployment_a.as_str()) && body.contains(deployment_b.as_str()),
         "both projects have a claimable deployment before scope is applied: {body}"
@@ -841,7 +893,10 @@ async fn backfill_and_calibration_candidates_confine_to_the_callers_projects() {
 
     let (status, body) =
         crate::common::get_with_token(&app, "/api/actions/calibration_candidates", &admin).await;
-    assert_eq!(status, 200, "the administrator enumerates calibration candidates: {body}");
+    assert_eq!(
+        status, 200,
+        "the administrator enumerates calibration candidates: {body}"
+    );
     assert!(
         body.contains(sensor_a.as_str()) && body.contains(sensor_b.as_str()),
         "both projects have an uncalibrated sensor before scope is applied: {body}"
@@ -849,7 +904,10 @@ async fn backfill_and_calibration_candidates_confine_to_the_callers_projects() {
 
     let (status, body) =
         crate::common::get_with_token(&app, "/api/actions/backfill_candidates", &manager).await;
-    assert_eq!(status, 200, "the manager enumerates backfill candidates: {body}");
+    assert_eq!(
+        status, 200,
+        "the manager enumerates backfill candidates: {body}"
+    );
     assert!(
         body.contains(deployment_a.as_str()),
         "the manager still sees the granted project's candidate: {body}"
@@ -869,7 +927,10 @@ async fn backfill_and_calibration_candidates_confine_to_the_callers_projects() {
 
     let (status, body) =
         crate::common::get_with_token(&app, "/api/actions/calibration_candidates", &manager).await;
-    assert_eq!(status, 200, "the manager enumerates calibration candidates: {body}");
+    assert_eq!(
+        status, 200,
+        "the manager enumerates calibration candidates: {body}"
+    );
     assert!(
         body.contains(sensor_a.as_str()),
         "the manager still sees the granted project's uncalibrated sensor: {body}"
@@ -885,7 +946,10 @@ async fn backfill_and_calibration_candidates_confine_to_the_callers_projects() {
         "/api/actions/calibration_candidates",
     ] {
         let (status, body) = crate::common::get_with_token(&app, path, &scoped).await;
-        assert_eq!(status, 403, "a project-scoped token cannot enumerate {path}: {body}");
+        assert_eq!(
+            status, 403,
+            "a project-scoped token cannot enumerate {path}: {body}"
+        );
     }
 }
 
@@ -895,8 +959,10 @@ async fn backfill_and_calibration_candidates_confine_to_the_callers_projects() {
 #[tokio::test]
 #[serial]
 async fn site_targeted_actions_refuse_a_site_outside_the_callers_grants() {
-    if !kc::require_keycloak_or_skip("site_targeted_actions_refuse_a_site_outside_the_callers_grants")
-        .await
+    if !kc::require_keycloak_or_skip(
+        "site_targeted_actions_refuse_a_site_outside_the_callers_grants",
+    )
+    .await
     {
         return;
     }
@@ -988,7 +1054,10 @@ async fn site_targeted_actions_refuse_a_site_outside_the_callers_grants() {
     for (path, payload) in payloads(&scene.site_b) {
         let (status, body) =
             crate::common::post_json_with_token(&app, path, &payload, &scoped_write_token).await;
-        assert_eq!(status, 403, "a project-scoped token cannot call {path}: {body}");
+        assert_eq!(
+            status, 403,
+            "a project-scoped token cannot call {path}: {body}"
+        );
     }
 }
 
@@ -1017,7 +1086,11 @@ async fn open_event_stream(app: &Router, jwt: &str) -> axum::body::Body {
         .header("Accept", "text/event-stream")
         .body(axum::body::Body::empty())
         .expect("event stream request builds");
-    let response = app.clone().oneshot(request).await.expect("event stream responds");
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("event stream responds");
     assert_eq!(
         response.status().as_u16(),
         200,
@@ -1041,7 +1114,10 @@ async fn frames_until(
                 if let Some(data) = frame.data_ref() {
                     accumulated.push_str(&String::from_utf8_lossy(data));
                     let frames = parse_sse_frames(&accumulated);
-                    if frames.iter().any(|(event, json)| want(event.as_str(), json)) {
+                    if frames
+                        .iter()
+                        .any(|(event, json)| want(event.as_str(), json))
+                    {
                         return frames;
                     }
                 }
@@ -1078,7 +1154,10 @@ async fn granted_members_receive_job_frames_on_the_event_stream() {
         &river,
     )
     .await;
-    assert_eq!(status, 200, "a River member triggers an aggregate refresh: {queued}");
+    assert_eq!(
+        status, 200,
+        "a River member triggers an aggregate refresh: {queued}"
+    );
     let job_id = queued["job_id"]
         .as_str()
         .unwrap_or_else(|| panic!("the refresh returns a tracked job id: {queued}"))
@@ -1165,9 +1244,11 @@ async fn listing_sync_credentials_is_administrator_only() {
         );
     }
 
-    let (status, body) =
-        crate::common::get_with_token(&app, "/api/sync/credentials", &admin).await;
-    assert_eq!(status, 200, "an administrator still lists enrollment credentials: {body}");
+    let (status, body) = crate::common::get_with_token(&app, "/api/sync/credentials", &admin).await;
+    assert_eq!(
+        status, 200,
+        "an administrator still lists enrollment credentials: {body}"
+    );
     assert!(
         body.contains(&client_id),
         "the administrator's listing carries the credential: {body}"
@@ -1213,7 +1294,10 @@ async fn alarm_acknowledgement_and_job_logs_are_confined_by_project() {
 
     let (status, events) =
         crate::common::get_json_with_token(&app, "/api/alarms/events", &admin).await;
-    assert_eq!(status, 200, "the administrator lists alarm events: {events}");
+    assert_eq!(
+        status, 200,
+        "the administrator lists alarm events: {events}"
+    );
     let event_id_at = |site: &str| -> String {
         let rows = events["events"]
             .as_array()
@@ -1243,7 +1327,10 @@ async fn alarm_acknowledgement_and_job_logs_are_confined_by_project() {
             &admin,
         )
         .await;
-        assert_eq!(status, 200, "the administrator reprocesses the sensor: {queued}");
+        assert_eq!(
+            status, 200,
+            "the administrator reprocesses the sensor: {queued}"
+        );
         jobs.push(
             queued["job_id"]
                 .as_str()
@@ -1272,7 +1359,10 @@ async fn alarm_acknowledgement_and_job_logs_are_confined_by_project() {
         let (status, body) =
             crate::common::get_with_token(&app, &format!("/api/reprocessing_jobs/{job_a}"), caller)
                 .await;
-        assert_eq!(status, 200, "a {label} reads a job inside its own project: {body}");
+        assert_eq!(
+            status, 200,
+            "a {label} reads a job inside its own project: {body}"
+        );
 
         let (status, body) =
             crate::common::get_with_token(&app, &format!("/api/reprocessing_jobs/{job_b}"), caller)
@@ -1290,7 +1380,10 @@ async fn alarm_acknowledgement_and_job_logs_are_confined_by_project() {
         &manager,
     )
     .await;
-    assert_eq!(status, 200, "the manager reads a job timeline inside the grant: {body}");
+    assert_eq!(
+        status, 200,
+        "the manager reads a job timeline inside the grant: {body}"
+    );
 
     let (status, body) = crate::common::post_json_with_token(
         &app,
@@ -1299,7 +1392,10 @@ async fn alarm_acknowledgement_and_job_logs_are_confined_by_project() {
         &manager,
     )
     .await;
-    assert_eq!(status, 200, "the manager acknowledges an alarm inside the grant: {body}");
+    assert_eq!(
+        status, 200,
+        "the manager acknowledges an alarm inside the grant: {body}"
+    );
 
     let (status, body) = crate::common::post_json_with_token(
         &app,
@@ -1315,7 +1411,10 @@ async fn alarm_acknowledgement_and_job_logs_are_confined_by_project() {
 
     let (status, events) =
         crate::common::get_json_with_token(&app, "/api/alarms/events", &admin).await;
-    assert_eq!(status, 200, "the administrator re-reads alarm events: {events}");
+    assert_eq!(
+        status, 200,
+        "the administrator re-reads alarm events: {events}"
+    );
     let row_b = events["events"]
         .as_array()
         .unwrap_or_else(|| panic!("alarm events response carries an events array: {events}"))

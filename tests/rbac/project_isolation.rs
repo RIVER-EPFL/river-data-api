@@ -67,7 +67,10 @@ async fn ungranted_river_user_is_denied_everywhere() {
     // Reads succeed at the transport layer but the scope filter empties them out.
     let (s, body) = crate::common::get_with_token(&app, "/api/sites", &jwt).await;
     assert_eq!(s, 200, "listing is allowed (scope-filtered), not rejected");
-    assert!(!body.contains(SITE1_ID), "an ungranted member sees no sites: {body}");
+    assert!(
+        !body.contains(SITE1_ID),
+        "an ungranted member sees no sites: {body}"
+    );
 
     // Every write into a project the member isn't granted is refused.
     let note = serde_json::json!({ "site_id": SITE1_ID, "content": "x" });
@@ -78,7 +81,8 @@ async fn ungranted_river_user_is_denied_everywhere() {
         "readings": [{ "site_id": SITE1_ID, "parameter_id": GLOBAL_PARAM_TEMP_ID,
                        "time": "2024-01-01T00:00:00Z", "raw_value": 1.0 }]
     });
-    let (s, _) = crate::common::post_json_with_token(&app, "/api/readings/batch", &batch, &jwt).await;
+    let (s, _) =
+        crate::common::post_json_with_token(&app, "/api/readings/batch", &batch, &jwt).await;
     assert_eq!(s, 403, "ungranted member cannot write data");
 }
 
@@ -95,22 +99,34 @@ async fn granted_manager_is_confined_to_granted_project() {
     // The granted project's sites are visible; the other project's are not.
     let (s, body) = crate::common::get_with_token(&app, "/api/sites", &jwt).await;
     assert_eq!(s, 200);
-    assert!(body.contains(SITE1_ID), "granted project's sites are visible: {body}");
-    assert!(!body.contains(SITE_B_ID), "the ungranted project's sites are hidden: {body}");
+    assert!(
+        body.contains(SITE1_ID),
+        "granted project's sites are visible: {body}"
+    );
+    assert!(
+        !body.contains(SITE_B_ID),
+        "the ungranted project's sites are hidden: {body}"
+    );
 
     // A direct fetch of an out-of-scope site is a 404 (as if it didn't exist).
-    let (s, _) = crate::common::get_with_token(&app, &format!("/api/sites/{SITE_B_ID}"), &jwt).await;
+    let (s, _) =
+        crate::common::get_with_token(&app, &format!("/api/sites/{SITE_B_ID}"), &jwt).await;
     assert_eq!(s, 404, "out-of-scope site reads as not-found");
 
     // The manager capability is held globally, but writing into the ungranted project is refused...
     let sp_b = serde_json::json!({ "site_id": SITE_B_ID, "parameter_id": GLOBAL_PARAM_TEMP_ID });
-    let (s, _) = crate::common::post_json_with_token(&app, "/api/site_parameters", &sp_b, &jwt).await;
+    let (s, _) =
+        crate::common::post_json_with_token(&app, "/api/site_parameters", &sp_b, &jwt).await;
     assert_eq!(s, 403, "manager cannot write into an ungranted project");
 
     // ...while the same write into the granted project passes authorization.
     let sp_a = serde_json::json!({ "site_id": SITE1_ID, "parameter_id": GLOBAL_PARAM_TEMP_ID });
-    let (s, body) = crate::common::post_json_with_token(&app, "/api/site_parameters", &sp_a, &jwt).await;
-    assert!(passed_auth(s), "manager writes into the granted project: {s} {body}");
+    let (s, body) =
+        crate::common::post_json_with_token(&app, "/api/site_parameters", &sp_a, &jwt).await;
+    assert!(
+        passed_auth(s),
+        "manager writes into the granted project: {s} {body}"
+    );
 }
 
 /// H2: a `samples` row is confined by its site's project on the write side, not just on read. A
@@ -138,11 +154,19 @@ async fn granted_manager_cannot_mutate_other_projects_sample() {
         .await;
     }
 
-    let (s, _) = crate::common::delete_with_token(&app, &format!("/api/samples/{sample_b}"), &jwt).await;
-    assert_eq!(s, 403, "manager cannot delete a sample in an ungranted project");
+    let (s, _) =
+        crate::common::delete_with_token(&app, &format!("/api/samples/{sample_b}"), &jwt).await;
+    assert_eq!(
+        s, 403,
+        "manager cannot delete a sample in an ungranted project"
+    );
 
-    let (s, body) = crate::common::delete_with_token(&app, &format!("/api/samples/{sample_a}"), &jwt).await;
-    assert!(passed_auth(s), "manager can delete a sample in the granted project: {s} {body}");
+    let (s, body) =
+        crate::common::delete_with_token(&app, &format!("/api/samples/{sample_a}"), &jwt).await;
+    assert!(
+        passed_auth(s),
+        "manager can delete a sample in the granted project: {s} {body}"
+    );
 }
 
 /// H1: a `sensor_calibrations` row is confined by the projects its sensor is deployed to. A manager
@@ -189,13 +213,29 @@ async fn granted_manager_cannot_mutate_other_projects_calibration() {
     }
 
     let patch = serde_json::json!({ "slope": 3.0 });
-    let (s, _) =
-        crate::common::patch_json_with_token(&app, &format!("/api/sensor_calibrations/{cal_b}"), &patch, &jwt).await;
-    assert_eq!(s, 403, "manager cannot patch a calibration for a sensor deployed only in project B");
+    let (s, _) = crate::common::patch_json_with_token(
+        &app,
+        &format!("/api/sensor_calibrations/{cal_b}"),
+        &patch,
+        &jwt,
+    )
+    .await;
+    assert_eq!(
+        s, 403,
+        "manager cannot patch a calibration for a sensor deployed only in project B"
+    );
 
-    let (s, body) =
-        crate::common::patch_json_with_token(&app, &format!("/api/sensor_calibrations/{cal_a}"), &patch, &jwt).await;
-    assert!(passed_auth(s), "manager can patch a calibration for a sensor in the granted project: {s} {body}");
+    let (s, body) = crate::common::patch_json_with_token(
+        &app,
+        &format!("/api/sensor_calibrations/{cal_a}"),
+        &patch,
+        &jwt,
+    )
+    .await;
+    assert!(
+        passed_auth(s),
+        "manager can patch a calibration for a sensor in the granted project: {s} {body}"
+    );
 }
 
 /// H3: creating a site by omitting `project_id` and naming only a `subproject_id` must not bypass the
@@ -227,10 +267,16 @@ async fn granted_manager_cannot_create_site_via_other_projects_subproject() {
     // No project_id in the body, only a subproject that belongs to the ungranted project B.
     let sneaky = serde_json::json!({ "name": "Sneaky Station", "subproject_id": sub_b });
     let (s, _) = crate::common::post_json_with_token(&app, "/api/sites", &sneaky, &jwt).await;
-    assert_eq!(s, 403, "omitting project_id must not let a member create a site inside project B");
+    assert_eq!(
+        s, 403,
+        "omitting project_id must not let a member create a site inside project B"
+    );
 
     // The same shape targeting the granted project's subproject passes authorization.
     let ok = serde_json::json!({ "name": "Legit Station", "subproject_id": sub_a });
     let (s, body) = crate::common::post_json_with_token(&app, "/api/sites", &ok, &jwt).await;
-    assert!(passed_auth(s), "member can create a site under a granted project's subproject: {s} {body}");
+    assert!(
+        passed_auth(s),
+        "member can create a site under a granted project's subproject: {s} {body}"
+    );
 }

@@ -6,10 +6,10 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
-use crate::routes::private::sites;
 use crate::error::{AppError, AppResult};
-use crate::routes::resolve_project;
+use crate::routes::private::sites;
 use crate::routes::private::sites::types::SiteResponse;
+use crate::routes::resolve_project;
 
 /// List sites belonging to a project
 #[utoipa::path(

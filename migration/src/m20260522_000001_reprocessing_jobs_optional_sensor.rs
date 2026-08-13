@@ -24,14 +24,10 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        db.execute_unprepared(
-            r#"ALTER TABLE reprocessing_jobs DROP COLUMN IF EXISTS progress"#,
-        )
-        .await?;
-        db.execute_unprepared(
-            r#"ALTER TABLE reprocessing_jobs DROP COLUMN IF EXISTS total"#,
-        )
-        .await?;
+        db.execute_unprepared(r#"ALTER TABLE reprocessing_jobs DROP COLUMN IF EXISTS progress"#)
+            .await?;
+        db.execute_unprepared(r#"ALTER TABLE reprocessing_jobs DROP COLUMN IF EXISTS total"#)
+            .await?;
         db.execute_unprepared(
             r#"ALTER TABLE reprocessing_jobs ALTER COLUMN sensor_id SET NOT NULL"#,
         )

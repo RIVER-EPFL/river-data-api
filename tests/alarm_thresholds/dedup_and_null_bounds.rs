@@ -3,7 +3,6 @@
 //! Run with: cargo test --test alarm_thresholds
 //! Requires: DATABASE_URL pointing to a TimescaleDB instance.
 
-
 use serial_test::serial;
 
 // ============================================================================
@@ -52,9 +51,7 @@ async fn test_global_plus_site_specific_threshold_no_duplicate_rows() {
     // Step 50 = base_time + 50*10min = 2025-01-15T08:20:00Z
     let (status, body) = crate::common::get_json_with_token(
         &app,
-        &format!(
-            "/api/sites/{site_id}/alarms?start=2025-01-15T08:00:00Z&end=2025-01-15T09:00:00Z"
-        ),
+        &format!("/api/sites/{site_id}/alarms?start=2025-01-15T08:00:00Z&end=2025-01-15T09:00:00Z"),
         &token,
     )
     .await;
@@ -93,10 +90,7 @@ async fn test_global_plus_site_specific_threshold_no_duplicate_rows() {
 
     // Also verify that each (parameter, time) pair appears exactly once:
     // The times array should have no duplicates
-    let mut times_sorted: Vec<&str> = times
-        .iter()
-        .filter_map(|t| t.as_str())
-        .collect();
+    let mut times_sorted: Vec<&str> = times.iter().filter_map(|t| t.as_str()).collect();
     let original_len = times_sorted.len();
     times_sorted.sort();
     times_sorted.dedup();
@@ -138,9 +132,7 @@ async fn test_all_null_thresholds_no_violations() {
 
     let (status, body) = crate::common::get_json_with_token(
         &app,
-        &format!(
-            "/api/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"
-        ),
+        &format!("/api/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"),
         &token,
     )
     .await;

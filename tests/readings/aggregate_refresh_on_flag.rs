@@ -22,7 +22,10 @@ async fn hourly(db: &DatabaseConnection, bucket: &str) -> Option<(f64, i64)> {
         ))
         .await
         .expect("query readings_hourly")?;
-    Some((row.try_get("", "avg_value").unwrap(), row.try_get("", "count").unwrap()))
+    Some((
+        row.try_get("", "avg_value").unwrap(),
+        row.try_get("", "count").unwrap(),
+    ))
 }
 
 #[tokio::test]
@@ -69,7 +72,10 @@ async fn flagging_a_reading_refreshes_the_hourly_aggregate() {
         .await
         .expect("hourly bucket must exist after the flag-triggered refresh");
     assert_eq!(count, 4, "the flagged reading is excluded from the rollup");
-    assert!((avg - 25.0).abs() < 1e-9, "hourly mean excludes the flagged 50: got {avg}");
+    assert!(
+        (avg - 25.0).abs() < 1e-9,
+        "hourly mean excludes the flagged 50: got {avg}"
+    );
 
     cleanup_test_db(&db).await;
 }

@@ -4,7 +4,6 @@
 //!
 //! Run: cargo test --test e2e -- --test-threads=1
 
-
 use crate::common::e2e;
 use crate::common::sensor_lifecycle as sl;
 use river_db::routes::private::alarms;
@@ -34,11 +33,23 @@ async fn configure_threshold_annotate_and_note() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "create threshold ({status}): {thr}");
+    assert!(
+        (200..300).contains(&status),
+        "create threshold ({status}): {thr}"
+    );
     let thr_id = e2e::id_of(&thr);
-    let (status, got) = crate::common::get_json_with_token(&app, &format!("/api/alarm_thresholds/{thr_id}"), &token).await;
+    let (status, got) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/alarm_thresholds/{thr_id}"),
+        &token,
+    )
+    .await;
     assert_eq!(status, 200, "get threshold");
-    assert_eq!(got["alarm_max"].as_f64(), Some(500.0), "threshold persisted: {got}");
+    assert_eq!(
+        got["alarm_max"].as_f64(),
+        Some(500.0),
+        "threshold persisted: {got}"
+    );
 
     // US-4.1: annotate a time range on the parameter, then read it back via the site annotations.
     let (status, ann) = crate::common::post_json_with_token(
@@ -52,10 +63,21 @@ async fn configure_threshold_annotate_and_note() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "create annotation ({status}): {ann}");
-    let (status, anns) = crate::common::get_json_with_token(&app, &format!("/api/sites/{site1}/annotations"), &token).await;
+    assert!(
+        (200..300).contains(&status),
+        "create annotation ({status}): {ann}"
+    );
+    let (status, anns) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/sites/{site1}/annotations"),
+        &token,
+    )
+    .await;
     assert_eq!(status, 200, "list annotations ({status}): {anns}");
-    let list = anns.as_array().cloned().unwrap_or_else(|| anns["annotations"].as_array().cloned().unwrap_or_default());
+    let list = anns
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| anns["annotations"].as_array().cloned().unwrap_or_default());
     assert!(
         list.iter().any(|a| a["text"] == "sensor fouling suspected"),
         "annotation should appear for the site: {anns}"
@@ -69,12 +91,24 @@ async fn configure_threshold_annotate_and_note() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "create note ({status}): {note}");
+    assert!(
+        (200..300).contains(&status),
+        "create note ({status}): {note}"
+    );
     let note_id = e2e::id_of(&note);
-    let (status, notes) = crate::common::get_json_with_token(&app, "/api/notes?page_size=100", &token).await;
+    let (status, notes) =
+        crate::common::get_json_with_token(&app, "/api/notes?page_size=100", &token).await;
     assert_eq!(status, 200, "list notes ({status})");
-    let notes_list = notes.as_array().cloned().unwrap_or_else(|| notes["data"].as_array().cloned().unwrap_or_default());
-    assert!(notes_list.iter().any(|n| n["id"].as_str() == Some(note_id.as_str())), "note should list");
+    let notes_list = notes
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| notes["data"].as_array().cloned().unwrap_or_default());
+    assert!(
+        notes_list
+            .iter()
+            .any(|n| n["id"].as_str() == Some(note_id.as_str())),
+        "note should list"
+    );
 }
 
 /// US-3.2: an out-of-range reading opens a persisted alarm event (sweeper), the event can be
@@ -110,27 +144,49 @@ async fn alarm_acknowledge_and_autoresolve() {
             "INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, replicate_index) \
              VALUES ('{stream_id}', '{site1}', '{turb}', '{time}', {value}, 0) ON CONFLICT DO NOTHING"
         );
-        db.execute(Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql))
+        db.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+        ))
     };
 
     // Out-of-range turbidity (> alarm_max 500) at the latest time → a breach.
     inject("2025-02-01T00:00:00Z", 9999.0).await.unwrap();
 
     let stats = alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
-    assert!(stats.opened >= 1, "the breach should open an alarm event: {stats:?}");
+    assert!(
+        stats.opened >= 1,
+        "the breach should open an alarm event: {stats:?}"
+    );
 
     // It appears in /alarms/active with a stable event_id, severity 2, unacknowledged.
     let find_turb = |active: &serde_json::Value| -> Option<serde_json::Value> {
-        active["alarms"].as_array()?.iter()
-            .find(|a| a["site_id"].as_str() == Some(site1) && a["parameter_id"].as_str() == Some(turb))
+        active["alarms"]
+            .as_array()?
+            .iter()
+            .find(|a| {
+                a["site_id"].as_str() == Some(site1) && a["parameter_id"].as_str() == Some(turb)
+            })
             .cloned()
     };
-    let (status, active) = crate::common::get_json_with_token(&app, "/api/alarms/active", &token).await;
+    let (status, active) =
+        crate::common::get_json_with_token(&app, "/api/alarms/active", &token).await;
     assert_eq!(status, 200, "alarms/active ({status}): {active}");
     let alarm = find_turb(&active).expect("turbidity breach in active feed");
-    assert_eq!(alarm["severity"].as_i64(), Some(2), "out-of-range turbidity is an alarm: {alarm}");
-    assert_eq!(alarm["acknowledged"], serde_json::json!(false), "not acknowledged yet: {alarm}");
-    let event_id = alarm["event_id"].as_str().expect("event_id present once swept").to_string();
+    assert_eq!(
+        alarm["severity"].as_i64(),
+        Some(2),
+        "out-of-range turbidity is an alarm: {alarm}"
+    );
+    assert_eq!(
+        alarm["acknowledged"],
+        serde_json::json!(false),
+        "not acknowledged yet: {alarm}"
+    );
+    let event_id = alarm["event_id"]
+        .as_str()
+        .expect("event_id present once swept")
+        .to_string();
 
     // Acknowledge it, still firing, now flagged acknowledged.
     let (status, ack) = crate::common::post_json_with_token(
@@ -140,11 +196,19 @@ async fn alarm_acknowledge_and_autoresolve() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "acknowledge ({status}): {ack}");
+    assert!(
+        (200..300).contains(&status),
+        "acknowledge ({status}): {ack}"
+    );
 
-    let (_status, active) = crate::common::get_json_with_token(&app, "/api/alarms/active", &token).await;
+    let (_status, active) =
+        crate::common::get_json_with_token(&app, "/api/alarms/active", &token).await;
     let alarm = find_turb(&active).expect("still firing after acknowledge");
-    assert_eq!(alarm["acknowledged"], serde_json::json!(true), "now acknowledged: {alarm}");
+    assert_eq!(
+        alarm["acknowledged"],
+        serde_json::json!(true),
+        "now acknowledged: {alarm}"
+    );
 
     // Acknowledging again is idempotent (200), not a 409.
     let (status, _again) = crate::common::post_json_with_token(
@@ -154,20 +218,32 @@ async fn alarm_acknowledge_and_autoresolve() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "re-acknowledge should be idempotent (got {status})");
+    assert!(
+        (200..300).contains(&status),
+        "re-acknowledge should be idempotent (got {status})"
+    );
 
     // A later in-range reading clears the breach; the next sweep auto-resolves the event.
     inject("2025-02-01T01:00:00Z", 50.0).await.unwrap();
     let stats = alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
-    assert!(stats.resolved >= 1, "returning in-range should resolve the event: {stats:?}");
+    assert!(
+        stats.resolved >= 1,
+        "returning in-range should resolve the event: {stats:?}"
+    );
 
-    let (_status, active) = crate::common::get_json_with_token(&app, "/api/alarms/active", &token).await;
-    assert!(find_turb(&active).is_none(), "resolved alarm should drop out of the active feed: {active}");
+    let (_status, active) =
+        crate::common::get_json_with_token(&app, "/api/alarms/active", &token).await;
+    assert!(
+        find_turb(&active).is_none(),
+        "resolved alarm should drop out of the active feed: {active}"
+    );
 
     let resolved: bool = db
         .query_one(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            format!("SELECT resolved_at IS NOT NULL AS done FROM alarm_events WHERE id='{event_id}'"),
+            format!(
+                "SELECT resolved_at IS NOT NULL AS done FROM alarm_events WHERE id='{event_id}'"
+            ),
         ))
         .await
         .unwrap()

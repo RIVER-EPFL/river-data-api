@@ -4,7 +4,6 @@
 //! Expected behaviour: invoking the janitor walks source readings and computes
 //! any missing derived values.
 
-
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
@@ -72,7 +71,10 @@ async fn test_janitor_fills_derived_gaps() {
     .await;
     assert!((200..300).contains(&status));
     let derived_def_id = def_json["id"].as_str().unwrap().to_string();
-    let output_parameter_id = def_json["output_parameter_id"].as_str().unwrap().to_string();
+    let output_parameter_id = def_json["output_parameter_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let derived_param_uuid = Uuid::parse_str(&output_parameter_id).unwrap();
 
     db.execute(Statement::from_sql_and_values(
@@ -137,14 +139,16 @@ async fn test_janitor_fills_derived_gaps() {
         "derived reading should not exist before second janitor run"
     );
 
-    let filled_again =
-        river_db::routes::private::parameters::derived::janitor::run_once(&db)
-            .await
-            .unwrap();
+    let filled_again = river_db::routes::private::parameters::derived::janitor::run_once(&db)
+        .await
+        .unwrap();
     assert!(filled_again >= 1, "second janitor run should heal new gap");
 
     let v = derived_value_at(&db, site_id, derived_param_uuid, new_source_time).await;
-    assert!(v.is_some(), "derived reading should be filled by second janitor run");
+    assert!(
+        v.is_some(),
+        "derived reading should be filled by second janitor run"
+    );
     let got = v.unwrap();
     let expected = 500.0 * 0.032;
     assert!(

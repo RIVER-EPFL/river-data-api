@@ -32,8 +32,13 @@ pub struct Model {
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     #[sea_orm(ignore)]
-    #[crudcrate(non_db_attr = true, exclude(create, update), join(one, all, depth = 1, fk_column = "DerivedDefinitionId"))]
-    pub sources: Vec<crate::routes::private::parameters::derived::source_model::DerivedParameterSource>,
+    #[crudcrate(
+        non_db_attr = true,
+        exclude(create, update),
+        join(one, all, depth = 1, fk_column = "DerivedDefinitionId")
+    )]
+    pub sources:
+        Vec<crate::routes::private::parameters::derived::source_model::DerivedParameterSource>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

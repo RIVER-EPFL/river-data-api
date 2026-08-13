@@ -103,7 +103,10 @@ async fn flagged_readings_excluded_from_aggregates() {
         .unwrap()
         .expect("Should have hourly aggregate");
     let avg_before: f64 = row.try_get("", "avg_value").unwrap();
-    assert!(avg_before > 200.0, "Baseline avg should include outlier: {avg_before}");
+    assert!(
+        avg_before > 200.0,
+        "Baseline avg should include outlier: {avg_before}"
+    );
 
     // Flag the outlier reading
     crate::common::db::exec(
@@ -287,25 +290,40 @@ async fn measurement_type_continuous_includes_legacy_null_rows() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let range = "start=2025-07-01T00:00:00Z&end=2025-07-02T00:00:00Z";
 
-    let count_times = |body: &serde_json::Value| body["times"].as_array().map(|a| a.len()).unwrap_or(0);
+    let count_times =
+        |body: &serde_json::Value| body["times"].as_array().map(|a| a.len()).unwrap_or(0);
 
     let (status, body) = crate::common::get_json_with_token(
         &app,
-        &format!("/api/sites/{}/readings?{range}&measurement_type=continuous", crate::common::SITE1_ID),
+        &format!(
+            "/api/sites/{}/readings?{range}&measurement_type=continuous",
+            crate::common::SITE1_ID
+        ),
         &token,
     )
     .await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(count_times(&body), 5, "continuous should include the 3 NULL + 2 continuous rows: {body}");
+    assert_eq!(
+        count_times(&body),
+        5,
+        "continuous should include the 3 NULL + 2 continuous rows: {body}"
+    );
 
     let (status, body) = crate::common::get_json_with_token(
         &app,
-        &format!("/api/sites/{}/readings?{range}&measurement_type=spot", crate::common::SITE1_ID),
+        &format!(
+            "/api/sites/{}/readings?{range}&measurement_type=spot",
+            crate::common::SITE1_ID
+        ),
         &token,
     )
     .await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(count_times(&body), 2, "spot should return only the 2 grab samples: {body}");
+    assert_eq!(
+        count_times(&body),
+        2,
+        "spot should return only the 2 grab samples: {body}"
+    );
 
     let (status, body) = crate::common::get_json_with_token(
         &app,

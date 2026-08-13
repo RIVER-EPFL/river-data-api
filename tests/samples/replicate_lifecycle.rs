@@ -39,11 +39,7 @@ fn grab_payload() -> serde_json::Value {
     })
 }
 
-async fn fetch_temp_series(
-    app: &axum::Router,
-    token: &str,
-    extra: &str,
-) -> serde_json::Value {
+async fn fetch_temp_series(app: &axum::Router, token: &str, extra: &str) -> serde_json::Value {
     let uri = format!(
         "/api/sites/{}/readings?start=2025-01-20T00:00:00Z&end=2025-01-21T00:00:00Z\
          &parameter_ids={}&measurement_type=spot{extra}",

@@ -51,10 +51,8 @@ impl MigrationTrait for Migration {
         )
         .await?;
 
-        db.execute_unprepared(
-            r#"ALTER TABLE site_parameters DROP COLUMN IF EXISTS is_public"#,
-        )
-        .await?;
+        db.execute_unprepared(r#"ALTER TABLE site_parameters DROP COLUMN IF EXISTS is_public"#)
+            .await?;
 
         Ok(())
     }

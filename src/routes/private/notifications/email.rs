@@ -56,8 +56,14 @@ impl SmtpMailer {
 impl Mailer for SmtpMailer {
     async fn send(&self, to: &str, subject: &str, body: &str) -> Result<(), String> {
         let email = Message::builder()
-            .from(self.from.parse().map_err(|e: lettre::address::AddressError| e.to_string())?)
-            .to(to.parse().map_err(|e: lettre::address::AddressError| e.to_string())?)
+            .from(
+                self.from
+                    .parse()
+                    .map_err(|e: lettre::address::AddressError| e.to_string())?,
+            )
+            .to(to
+                .parse()
+                .map_err(|e: lettre::address::AddressError| e.to_string())?)
             .subject(subject)
             .body(body.to_string())
             .map_err(|e| e.to_string())?;
@@ -91,7 +97,12 @@ pub struct GraphMailer {
 
 impl GraphMailer {
     #[must_use]
-    pub fn new(tenant_id: String, client_id: String, client_secret: String, sender: String) -> Self {
+    pub fn new(
+        tenant_id: String,
+        client_id: String,
+        client_secret: String,
+        sender: String,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -113,8 +124,10 @@ impl GraphMailer {
                 return Ok(token.clone());
             }
         }
-        let url =
-            format!("https://login.microsoftonline.com/{}/oauth2/v2.0/token", self.tenant_id);
+        let url = format!(
+            "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
+            self.tenant_id
+        );
         let resp = self
             .http
             .post(&url)
@@ -149,7 +162,10 @@ impl GraphMailer {
 impl Mailer for GraphMailer {
     async fn send(&self, to: &str, subject: &str, body: &str) -> Result<(), String> {
         let token = self.access_token().await?;
-        let url = format!("https://graph.microsoft.com/v1.0/users/{}/sendMail", self.sender);
+        let url = format!(
+            "https://graph.microsoft.com/v1.0/users/{}/sendMail",
+            self.sender
+        );
         let payload = serde_json::json!({
             "message": {
                 "subject": subject,
@@ -176,7 +192,9 @@ impl Mailer for GraphMailer {
     }
 
     async fn check_health(&self) -> Result<String, String> {
-        self.access_token().await.map(|_| "Graph token acquired".to_string())
+        self.access_token()
+            .await
+            .map(|_| "Graph token acquired".to_string())
     }
 }
 
@@ -187,7 +205,9 @@ pub fn build_mailer(config: &Config) -> Option<Box<dyn Mailer>> {
         EmailBackend::Smtp => {
             let (Some(host), Some(from)) = (config.smtp_host.as_ref(), config.smtp_from.as_ref())
             else {
-                tracing::warn!("EMAIL_BACKEND=smtp but SMTP_HOST/SMTP_FROM not set, email disabled");
+                tracing::warn!(
+                    "EMAIL_BACKEND=smtp but SMTP_HOST/SMTP_FROM not set, email disabled"
+                );
                 return None;
             };
             match SmtpMailer::new(

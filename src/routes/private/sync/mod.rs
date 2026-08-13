@@ -1,9 +1,9 @@
-pub mod control;
-pub mod operator;
-pub mod services_model;
 pub mod commands_model;
-pub mod events_model;
+pub mod control;
 pub mod credentials_model;
+pub mod events_model;
+pub mod operator;
+pub mod service;
+pub mod services_model;
 pub mod tokens_model;
 pub mod views;
-pub mod service;

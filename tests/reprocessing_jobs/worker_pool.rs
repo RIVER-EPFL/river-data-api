@@ -12,8 +12,8 @@ use river_db::routes::private::reprocessing_jobs::lifecycle::{self, JobContext};
 use river_db::routes::private::reprocessing_jobs::worker;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
 /// Always completes, returning a fixed count and tallying how many times it ran.
@@ -111,10 +111,17 @@ async fn claims_and_runs_to_completion() {
     }));
     let wid = worker::worker_id();
 
-    let id = worker::enqueue(&db, "test_complete", None, None, &serde_json::json!({}), None)
-        .await
-        .unwrap()
-        .expect("a fresh enqueue inserts a row");
+    let id = worker::enqueue(
+        &db,
+        "test_complete",
+        None,
+        None,
+        &serde_json::json!({}),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("a fresh enqueue inserts a row");
 
     assert!(worker::run_one(&db, &ev, &reg, &wid).await.unwrap());
     assert_eq!(runs.load(Ordering::Relaxed), 1);
@@ -183,10 +190,17 @@ async fn skip_locked_gives_exclusive_claim() {
         runs: runs.clone(),
     }));
 
-    let id = worker::enqueue(&db, "test_complete", None, None, &serde_json::json!({}), None)
-        .await
-        .unwrap()
-        .unwrap();
+    let id = worker::enqueue(
+        &db,
+        "test_complete",
+        None,
+        None,
+        &serde_json::json!({}),
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
 
     let w1 = worker::worker_id();
     let w2 = worker::worker_id();
@@ -195,7 +209,10 @@ async fn skip_locked_gives_exclusive_claim() {
         worker::run_one(&db, &ev, &reg, &w2),
     );
     let (r1, r2) = (r1.unwrap(), r2.unwrap());
-    assert!(r1 ^ r2, "exactly one worker may claim the single job (got {r1},{r2})");
+    assert!(
+        r1 ^ r2,
+        "exactly one worker may claim the single job (got {r1},{r2})"
+    );
     assert_eq!(runs.load(Ordering::Relaxed), 1, "the job runs exactly once");
     assert_eq!(job_row(&db, id).await.status, "completed");
 }
@@ -260,18 +277,32 @@ async fn handler_panic_fails_job_and_worker_survives() {
         row.status
     );
     assert!(
-        row.error_message.unwrap_or_default().to_lowercase().contains("panic"),
+        row.error_message
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("panic"),
         "the panic is recorded as the job error"
     );
     assert!(row.owner_is_null, "lease released after a panic");
 
     // The same worker claims and runs the next job, proof the loop wasn't killed.
-    let ok_id = worker::enqueue(&db, "test_complete", None, None, &serde_json::json!({}), None)
-        .await
-        .unwrap()
-        .unwrap();
+    let ok_id = worker::enqueue(
+        &db,
+        "test_complete",
+        None,
+        None,
+        &serde_json::json!({}),
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(worker::run_one(&db, &ev, &reg, &wid).await.unwrap());
-    assert_eq!(runs.load(Ordering::Relaxed), 1, "worker still processes work after a panic");
+    assert_eq!(
+        runs.load(Ordering::Relaxed),
+        1,
+        "worker still processes work after a panic"
+    );
     assert_eq!(job_row(&db, ok_id).await.status, "completed");
 }
 
@@ -318,13 +349,24 @@ async fn startup_reaps_own_leaseless_orphans_only() {
     )
     .await;
 
-    let reclaimed = lifecycle::reconcile_orphaned_inline_jobs(&db).await.unwrap();
-    assert_eq!(reclaimed, 1, "only this replica's leaseless orphan is reaped");
+    let reclaimed = lifecycle::reconcile_orphaned_inline_jobs(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        reclaimed, 1,
+        "only this replica's leaseless orphan is reaped"
+    );
 
     let orphan_row = job_row(&db, orphan).await;
     assert_eq!(orphan_row.status, "failed", "the own orphan is failed");
-    assert!(orphan_row.owner_is_null, "the reaped orphan's owner is cleared");
-    assert!(orphan_row.completed, "the reaped orphan gets a completed_at");
+    assert!(
+        orphan_row.owner_is_null,
+        "the reaped orphan's owner is cleared"
+    );
+    assert!(
+        orphan_row.completed,
+        "the reaped orphan gets a completed_at"
+    );
     assert_eq!(
         job_row(&db, peer).await.status,
         "running",
@@ -381,7 +423,10 @@ async fn worker_runs_registered_reprocess_job() {
     worker::drain(&db, &ev, &registry, &wid).await.unwrap();
 
     let row = job_row(&db, id).await;
-    assert_eq!(row.status, "completed", "the registered ReprocessSensor job runs end to end");
+    assert_eq!(
+        row.status, "completed",
+        "the registered ReprocessSensor job runs end to end"
+    );
     let detail: serde_json::Value = db
         .query_one(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,

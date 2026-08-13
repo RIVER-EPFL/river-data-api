@@ -1,4 +1,6 @@
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng};
+use argon2::password_hash::{
+    PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng,
+};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chrono::Utc;
 use moka::future::Cache;
@@ -61,7 +63,9 @@ const SECRET_HEX_LEN: usize = 64;
 
 /// Whether every byte of `s` is a lowercase hex digit. Mirrors [`random_hex`]'s `{:02x}` output.
 fn is_lower_hex(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// A freshly minted API token. `raw_token` is shown to the operator exactly once; only
@@ -75,7 +79,9 @@ pub struct MintedToken {
 
 fn random_hex(n_bytes: usize) -> String {
     let mut rng = rand::rng();
-    (0..n_bytes).map(|_| format!("{:02x}", rng.random::<u8>())).collect()
+    (0..n_bytes)
+        .map(|_| format!("{:02x}", rng.random::<u8>()))
+        .collect()
 }
 
 /// Mint a new API token: `rvd_<16-hex-prefix>_<64-hex-secret>`. The prefix (64 bits) is the
@@ -88,7 +94,11 @@ pub fn mint_api_token() -> MintedToken {
     let secret = random_hex(32); // 64 hex chars (256 bits)
     let raw_token = format!("{API_TOKEN_PREFIX}{prefix}_{secret}");
     let token_hash = hash_api_secret(&secret);
-    MintedToken { raw_token, token_prefix: prefix, token_hash }
+    MintedToken {
+        raw_token,
+        token_prefix: prefix,
+        token_hash,
+    }
 }
 
 /// Split a raw API token `rvd_<prefix>_<secret>` into its lookup prefix and secret parts.

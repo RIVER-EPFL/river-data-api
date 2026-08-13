@@ -6,13 +6,7 @@ use sea_orm::entity::prelude::*;
 /// are maintained by a PostgreSQL trigger; application code never writes them
 /// and they are excluded from create/update payloads.
 #[derive(
-    Clone,
-    Debug,
-    PartialEq,
-    DeriveEntityModel,
-    serde::Serialize,
-    serde::Deserialize,
-    EntityToModels,
+    Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
 )]
 #[sea_orm(table_name = "samples")]
 #[crudcrate(

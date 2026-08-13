@@ -5,7 +5,6 @@
 //! tests/common only creates one project; we manually insert a second project with sites
 //! and assert the scoped token can only see project A.
 
-
 use serial_test::serial;
 use uuid::Uuid;
 
@@ -46,14 +45,24 @@ async fn scoped_token_blocked_from_other_projects_site_detail() {
     let project_a = crate::common::fixtures::PROJECT_ID;
     let site_b = SITE_B_ID;
 
-    let tok = crate::common::seed_api_token(&db, crate::common::full_permissions(), Some(project_a)).await;
+    let tok =
+        crate::common::seed_api_token(&db, crate::common::full_permissions(), Some(project_a))
+            .await;
 
-    let (status_b, _) = crate::common::get_with_token(&app, &format!("/api/sites/{site_b}/detail"), &tok).await;
-    assert_eq!(status_b, 403, "scoped token must not reach a site outside its project");
+    let (status_b, _) =
+        crate::common::get_with_token(&app, &format!("/api/sites/{site_b}/detail"), &tok).await;
+    assert_eq!(
+        status_b, 403,
+        "scoped token must not reach a site outside its project"
+    );
 
     let site_a = crate::common::fixtures::SITE1_ID;
-    let (status_a, _) = crate::common::get_with_token(&app, &format!("/api/sites/{site_a}/detail"), &tok).await;
-    assert_eq!(status_a, 200, "scoped token must still reach its own project's site");
+    let (status_a, _) =
+        crate::common::get_with_token(&app, &format!("/api/sites/{site_a}/detail"), &tok).await;
+    assert_eq!(
+        status_a, 200,
+        "scoped token must still reach its own project's site"
+    );
 }
 
 #[tokio::test]
@@ -70,7 +79,9 @@ async fn scoped_token_blocked_from_other_projects_readings() {
 
     let now = chrono::Utc::now();
     // Use Z-suffix UTC to avoid '+' getting URL-decoded as space.
-    let start = (now - chrono::Duration::days(2)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let start = (now - chrono::Duration::days(2))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
     let end = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     let (status, _) = crate::common::get_with_token(
@@ -79,7 +90,10 @@ async fn scoped_token_blocked_from_other_projects_readings() {
         &tok,
     )
     .await;
-    assert_eq!(status, 403, "scoped token must not read another project's site readings");
+    assert_eq!(
+        status, 403,
+        "scoped token must not read another project's site readings"
+    );
 }
 
 #[tokio::test]
@@ -96,7 +110,9 @@ async fn scoped_token_blocked_from_other_projects_aggregates() {
 
     let now = chrono::Utc::now();
     // Use Z-suffix UTC to avoid '+' getting URL-decoded as space.
-    let start = (now - chrono::Duration::days(2)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let start = (now - chrono::Duration::days(2))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
     let end = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     let (status, _) = crate::common::get_with_token(
@@ -105,7 +121,10 @@ async fn scoped_token_blocked_from_other_projects_aggregates() {
         &tok,
     )
     .await;
-    assert_eq!(status, 403, "scoped token must not read another project's aggregates");
+    assert_eq!(
+        status, 403,
+        "scoped token must not read another project's aggregates"
+    );
 }
 
 #[tokio::test]
@@ -132,7 +151,10 @@ async fn scoped_token_blocked_from_other_projects_status_events() {
     // Pragmatic: handler may 400 if validate_optional_time_range trips before the scope
     // check (depends on handler ordering), but it must NOT return 200, that would mean
     // leaking data from project B.
-    assert_ne!(status, 200, "scoped token must not read project B status events (got {status}: {body})");
+    assert_ne!(
+        status, 200,
+        "scoped token must not read project B status events (got {status}: {body})"
+    );
     assert!(
         status == 403 || status == 400,
         "expected 400 or 403 from scope rejection, got {status}: {body}"
@@ -147,8 +169,10 @@ async fn unscoped_token_can_reach_both_projects() {
     let tok = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
 
     let site_a = crate::common::fixtures::SITE1_ID;
-    let (status_a, _) = crate::common::get_with_token(&app, &format!("/api/sites/{site_a}/detail"), &tok).await;
-    let (status_b, _) = crate::common::get_with_token(&app, &format!("/api/sites/{SITE_B_ID}/detail"), &tok).await;
+    let (status_a, _) =
+        crate::common::get_with_token(&app, &format!("/api/sites/{site_a}/detail"), &tok).await;
+    let (status_b, _) =
+        crate::common::get_with_token(&app, &format!("/api/sites/{SITE_B_ID}/detail"), &tok).await;
     assert_eq!(status_a, 200, "unscoped token reaches project A");
     assert_eq!(status_b, 200, "unscoped token reaches project B");
 }
@@ -169,7 +193,8 @@ async fn scoped_token_rejects_cross_project_uuid_in_path() {
     )
     .await;
 
-    let (status, _) = crate::common::get_with_token(&app, "/api/sites/ScopeSiteB/detail", &tok).await;
+    let (status, _) =
+        crate::common::get_with_token(&app, "/api/sites/ScopeSiteB/detail", &tok).await;
     let parsed: u16 = status.into();
     assert!(
         parsed == 403 || parsed == 404,

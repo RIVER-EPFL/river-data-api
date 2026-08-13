@@ -80,7 +80,12 @@ impl TelegramClient {
     /// Liveness + token validity check. `getMe` returns the bot's identity when the token is valid.
     pub async fn get_me(&self) -> Result<String, String> {
         let url = format!("{API_BASE}/bot{}/getMe", self.token);
-        let resp = self.http.get(&url).send().await.map_err(|e| e.to_string())?;
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();

@@ -4,13 +4,7 @@ use sea_orm::entity::prelude::*;
 use super::operations::ParameterOperations;
 
 #[derive(
-    Clone,
-    Debug,
-    PartialEq,
-    DeriveEntityModel,
-    serde::Serialize,
-    serde::Deserialize,
-    EntityToModels,
+    Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
 )]
 #[sea_orm(table_name = "parameters")]
 #[crudcrate(

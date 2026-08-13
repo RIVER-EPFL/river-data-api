@@ -77,7 +77,10 @@ async fn me_defaults_then_self_scoped_changes() {
     let (s, body) = crate::common::get_json_with_token(&app, "/api/notifications/me", &admin).await;
     assert_eq!(s, 200);
     assert_eq!(body["subscriptions"].as_array().unwrap().len(), 0);
-    assert_eq!(body["telegram_enabled"], true, "admin keeps its own default");
+    assert_eq!(
+        body["telegram_enabled"], true,
+        "admin keeps its own default"
+    );
 }
 
 #[tokio::test]
@@ -95,15 +98,26 @@ async fn me_link_then_unlink_telegram() {
     )
     .await;
     assert_eq!(s, 200, "body: {body}");
-    assert_eq!(body["code"].as_str().map(str::len), Some(8), "8-char code minted");
+    assert_eq!(
+        body["code"].as_str().map(str::len),
+        Some(8),
+        "8-char code minted"
+    );
 
     let (_s, body) = crate::common::get_json_with_token(&app, "/api/notifications/me", &user).await;
-    assert_eq!(body["telegram"]["status"], "pending", "pending after minting a code");
+    assert_eq!(
+        body["telegram"]["status"], "pending",
+        "pending after minting a code"
+    );
 
-    let (s, _) = crate::common::delete_with_token(&app, "/api/notifications/me/telegram", &user).await;
+    let (s, _) =
+        crate::common::delete_with_token(&app, "/api/notifications/me/telegram", &user).await;
     assert_eq!(s, 204);
     let (_s, body) = crate::common::get_json_with_token(&app, "/api/notifications/me", &user).await;
-    assert_eq!(body["telegram"]["status"], "unlinked", "unlinked after delete");
+    assert_eq!(
+        body["telegram"]["status"], "unlinked",
+        "unlinked after delete"
+    );
 }
 
 #[tokio::test]

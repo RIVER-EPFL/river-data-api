@@ -18,7 +18,10 @@ const DO_FIELD_DISPLAY: &str = "Dissolved Oxygen - Field [mg/L]";
 
 async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
     let row = db
-        .query_one(Statement::from_string(DatabaseBackend::Postgres, sql.to_string()))
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            sql.to_string(),
+        ))
         .await
         .expect("query")
         .expect("row");
@@ -26,12 +29,15 @@ async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
 }
 
 async fn scalar_opt_string(db: &DatabaseConnection, sql: &str) -> Option<String> {
-    db.query_one(Statement::from_string(DatabaseBackend::Postgres, sql.to_owned()))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get::<Option<String>>("", "v")
-        .unwrap()
+    db.query_one(Statement::from_string(
+        DatabaseBackend::Postgres,
+        sql.to_owned(),
+    ))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get::<Option<String>>("", "v")
+    .unwrap()
 }
 
 /// Register a stream with the exact shape `RshinyBackend::discover_stream_descriptors` emits.
@@ -77,7 +83,10 @@ async fn register_portal_stream(
     });
     let (status, resp) =
         crate::common::post_json_parse_with_token(app, "/api/streams/register", &body, token).await;
-    assert_eq!(status, 200, "register {station}:{column} ({status}): {resp}");
+    assert_eq!(
+        status, 200,
+        "register {station}:{column} ({status}): {resp}"
+    );
     resp["id"].as_str().expect("stream id").to_string()
 }
 
@@ -105,7 +114,9 @@ async fn run_plan_action(
     )
     .await;
     assert_eq!(status, 200, "{action} ({status}): {res}");
-    let job_id = res["job_id"].as_str().unwrap_or_else(|| panic!("{action} job_id: {res}"));
+    let job_id = res["job_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{action} job_id: {res}"));
     assert_eq!(
         crate::common::e2e::poll_job(app, token, job_id, 30).await,
         "completed",
@@ -148,35 +159,83 @@ struct PortalStreams {
 async fn register_portal_streams(app: &axum::Router, token: &str) -> PortalStreams {
     PortalStreams {
         do_field_up: register_portal_stream(
-            app, token, STATION_UP, "WTW_DO_field_mgL", DO_FIELD_DISPLAY, "mg/L", 512.0,
+            app,
+            token,
+            STATION_UP,
+            "WTW_DO_field_mgL",
+            DO_FIELD_DISPLAY,
+            "mg/L",
+            512.0,
         )
         .await,
         replicate_1: register_portal_stream(
-            app, token, STATION_UP, "WTW_DO_mgL_1", "WTW_DO_mgL_1", "mg/L", 512.0,
+            app,
+            token,
+            STATION_UP,
+            "WTW_DO_mgL_1",
+            "WTW_DO_mgL_1",
+            "mg/L",
+            512.0,
         )
         .await,
         replicate_2: register_portal_stream(
-            app, token, STATION_UP, "WTW_DO_mgL_2", "WTW_DO_mgL_2", "mg/L", 512.0,
+            app,
+            token,
+            STATION_UP,
+            "WTW_DO_mgL_2",
+            "WTW_DO_mgL_2",
+            "mg/L",
+            512.0,
         )
         .await,
         replicate_3: register_portal_stream(
-            app, token, STATION_UP, "WTW_DO_mgL_3", "WTW_DO_mgL_3", "mg/L", 512.0,
+            app,
+            token,
+            STATION_UP,
+            "WTW_DO_mgL_3",
+            "WTW_DO_mgL_3",
+            "mg/L",
+            512.0,
         )
         .await,
         alias_match: register_portal_stream(
-            app, token, STATION_UP, "NO3_N_raw", "no3-n RAW", "mg/L", 512.0,
+            app,
+            token,
+            STATION_UP,
+            "NO3_N_raw",
+            "no3-n RAW",
+            "mg/L",
+            512.0,
         )
         .await,
         name_match_up: register_portal_stream(
-            app, token, STATION_UP, "water_temp", "water temperature", "°C", 512.0,
+            app,
+            token,
+            STATION_UP,
+            "water_temp",
+            "water temperature",
+            "°C",
+            512.0,
         )
         .await,
         do_field_dn: register_portal_stream(
-            app, token, STATION_DN, "WTW_DO_field_mgL", DO_FIELD_DISPLAY, "mg/L", 471.0,
+            app,
+            token,
+            STATION_DN,
+            "WTW_DO_field_mgL",
+            DO_FIELD_DISPLAY,
+            "mg/L",
+            471.0,
         )
         .await,
         name_match_dn: register_portal_stream(
-            app, token, STATION_DN, "water_temp", "water temperature", "°C", 471.0,
+            app,
+            token,
+            STATION_DN,
+            "water_temp",
+            "water temperature",
+            "°C",
+            471.0,
         )
         .await,
     }
@@ -202,8 +261,9 @@ async fn portal_migration_wizard_full_flow() {
 
     let streams = register_portal_streams(&app, &token).await;
 
-    let ingest_times: Vec<String> =
-        (0..4).map(|i| format!("2025-06-01T00:{:02}:00Z", i * 10)).collect();
+    let ingest_times: Vec<String> = (0..4)
+        .map(|i| format!("2025-06-01T00:{:02}:00Z", i * 10))
+        .collect();
     let readings: Vec<serde_json::Value> = ingest_times
         .iter()
         .enumerate()
@@ -233,7 +293,11 @@ async fn portal_migration_wizard_full_flow() {
 
     let sites = disco["sites"].as_array().expect("sites array");
     let site_names: Vec<&str> = sites.iter().filter_map(|s| s["name"].as_str()).collect();
-    assert_eq!(site_names, vec![STATION_DN, STATION_UP], "sites are the station names: {disco}");
+    assert_eq!(
+        site_names,
+        vec![STATION_DN, STATION_UP],
+        "sites are the station names: {disco}"
+    );
     let up = sites.iter().find(|s| s["name"] == STATION_UP).unwrap();
     assert_eq!(up["stream_count"], 6);
     assert!(up["existing_id"].is_null());
@@ -299,13 +363,23 @@ async fn portal_migration_wizard_full_flow() {
     );
 
     let alias_entry = entry_for(&plan, &streams.alias_match);
-    assert_eq!(alias_entry["parameter"]["id"], serde_json::json!(nitrate_id));
+    assert_eq!(
+        alias_entry["parameter"]["id"],
+        serde_json::json!(nitrate_id)
+    );
     assert_eq!(alias_entry["parameter"]["create"], false);
     let name_entry = entry_for(&plan, &streams.name_match_up);
-    assert_eq!(name_entry["parameter"]["id"], serde_json::json!(water_temp_id));
+    assert_eq!(
+        name_entry["parameter"]["id"],
+        serde_json::json!(water_temp_id)
+    );
     assert_eq!(name_entry["parameter"]["create"], false);
 
-    for id in [&streams.replicate_1, &streams.replicate_2, &streams.replicate_3] {
+    for id in [
+        &streams.replicate_1,
+        &streams.replicate_2,
+        &streams.replicate_3,
+    ] {
         assert_eq!(entry_for(&plan, id)["parameter"]["create"], true);
     }
 
@@ -372,13 +446,23 @@ async fn portal_migration_wizard_full_flow() {
 
     for name in ["Nitrate", "Water Temperature", "Turbidity FNU"] {
         assert_eq!(
-            count(&db, &format!("SELECT count(*) AS c FROM parameters WHERE LOWER(name) = LOWER('{name}')")).await,
+            count(
+                &db,
+                &format!(
+                    "SELECT count(*) AS c FROM parameters WHERE LOWER(name) = LOWER('{name}')"
+                )
+            )
+            .await,
             1,
             "no duplicate created for existing parameter '{name}'"
         );
     }
     assert_eq!(
-        count(&db, "SELECT count(*) AS c FROM parameters WHERE code = 'DO Replicate'").await,
+        count(
+            &db,
+            "SELECT count(*) AS c FROM parameters WHERE code = 'DO Replicate'"
+        )
+        .await,
         1,
         "converged entries create exactly one parameter"
     );
@@ -394,11 +478,16 @@ async fn portal_migration_wizard_full_flow() {
     );
 
     assert_eq!(
-        count(&db, &format!(
-            "SELECT count(*) AS c FROM data_streams \
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM data_streams \
              WHERE source_system = '{SOURCE_SYSTEM}' AND site_parameter_id IS NOT NULL"
-        )).await,
-        8, "all portal streams paired"
+            )
+        )
+        .await,
+        8,
+        "all portal streams paired"
     );
     assert_eq!(
         count(&db, &format!(
@@ -415,14 +504,19 @@ async fn portal_migration_wizard_full_flow() {
             sps.push(
                 scalar_opt_string(
                     &db,
-                    &format!("SELECT site_parameter_id::text AS v FROM data_streams WHERE id = '{id}'"),
+                    &format!(
+                        "SELECT site_parameter_id::text AS v FROM data_streams WHERE id = '{id}'"
+                    ),
                 )
                 .await,
             );
         }
         sps
     };
-    assert_eq!(converged_sp[0], converged_sp[1], "converged replicates share one site_parameter");
+    assert_eq!(
+        converged_sp[0], converged_sp[1],
+        "converged replicates share one site_parameter"
+    );
 
     let sp_name = scalar_opt_string(
         &db,
@@ -459,14 +553,19 @@ async fn portal_migration_wizard_full_flow() {
         4, "pre-apply readings are attributed to the station and existing parameter"
     );
     assert_eq!(
-        count(&db, &format!(
-            "SELECT count(*) AS c FROM data_streams ds \
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM data_streams ds \
              JOIN site_parameters sp ON ds.site_parameter_id = sp.id \
              WHERE ds.id = '{}' AND sp.parameter_id = '{water_temp_id}' \
                AND sp.site_id = (SELECT id FROM sites WHERE name = '{STATION_DN}')",
-            streams.name_match_dn,
-        )).await,
-        1, "downstream station pairs onto the same existing parameter"
+                streams.name_match_dn,
+            )
+        )
+        .await,
+        1,
+        "downstream station pairs onto the same existing parameter"
     );
 
     // Revert: streams unpair and readings un-attribute, but the created catalog stays
@@ -474,36 +573,68 @@ async fn portal_migration_wizard_full_flow() {
     assert_eq!(counts["reverted"], 8, "{counts}");
 
     assert_eq!(
-        count(&db, &format!(
-            "SELECT count(*) AS c FROM data_streams \
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM data_streams \
              WHERE source_system = '{SOURCE_SYSTEM}' AND site_parameter_id IS NULL"
-        )).await,
-        8, "all portal streams unpaired"
+            )
+        )
+        .await,
+        8,
+        "all portal streams unpaired"
     );
     assert_eq!(
-        count(&db, &format!(
-            "SELECT count(*) AS c FROM data_streams \
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM data_streams \
              WHERE source_system = '{SOURCE_SYSTEM}' AND pairing_plan_id = '{plan_id}'"
-        )).await,
-        8, "the plan link stays on the streams as the audit trail"
+            )
+        )
+        .await,
+        8,
+        "the plan link stays on the streams as the audit trail"
     );
     assert_eq!(
-        count(&db, &format!(
-            "SELECT count(*) AS c FROM readings WHERE stream_id = '{}' AND site_id IS NOT NULL",
-            streams.name_match_up,
-        )).await,
-        0, "reverted readings lose their attribution"
-    );
-    assert_eq!(count(&db, "SELECT count(*) AS c FROM projects WHERE name = 'CNET'").await, 1);
-    assert_eq!(
-        count(&db, &format!(
-            "SELECT count(*) AS c FROM sites WHERE name IN ('{STATION_UP}', '{STATION_DN}')"
-        )).await,
-        2, "created sites remain after revert"
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM readings WHERE stream_id = '{}' AND site_id IS NOT NULL",
+                streams.name_match_up,
+            )
+        )
+        .await,
+        0,
+        "reverted readings lose their attribution"
     );
     assert_eq!(
-        count(&db, "SELECT count(*) AS c FROM parameters WHERE code = 'DO Replicate'").await,
-        1, "created parameters remain after revert"
+        count(
+            &db,
+            "SELECT count(*) AS c FROM projects WHERE name = 'CNET'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM sites WHERE name IN ('{STATION_UP}', '{STATION_DN}')"
+            )
+        )
+        .await,
+        2,
+        "created sites remain after revert"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) AS c FROM parameters WHERE code = 'DO Replicate'"
+        )
+        .await,
+        1,
+        "created parameters remain after revert"
     );
 
     crate::common::cleanup_test_db(&db).await;

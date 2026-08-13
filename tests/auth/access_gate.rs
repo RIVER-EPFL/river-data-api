@@ -13,9 +13,7 @@ use serial_test::serial;
 macro_rules! require_keycloak {
     () => {
         if !keycloak_reachable().await {
-            eprintln!(
-                "SKIP: keycloak unreachable (start the dev stack, or set TEST_KEYCLOAK_URL)"
-            );
+            eprintln!("SKIP: keycloak unreachable (start the dev stack, or set TEST_KEYCLOAK_URL)");
             return;
         }
     };
@@ -38,7 +36,10 @@ async fn login_without_river_role_is_rejected_everywhere() {
 
     for uri in ["/api/projects", "/api/sites", "/api/search?q=Station"] {
         let (s, body) = crate::common::get_with_token(&app, uri, &jwt).await;
-        assert_eq!(s, 403, "role-less JWT on {uri} must be 403, got {s}: {body}");
+        assert_eq!(
+            s, 403,
+            "role-less JWT on {uri} must be 403, got {s}: {body}"
+        );
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
         assert_eq!(
             parsed["error"], "no_river_role",

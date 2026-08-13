@@ -221,7 +221,9 @@ pub async fn update_schedule(
     let catchup_policy = req.catchup_policy.clone().or(before.catchup_policy.clone());
     let tunables = req.tunables.clone().unwrap_or(before.tunables.clone());
 
-    let interval_changed = req.interval_seconds.is_some_and(|n| Some(n) != before.interval_seconds);
+    let interval_changed = req
+        .interval_seconds
+        .is_some_and(|n| Some(n) != before.interval_seconds);
     let being_enabled = enabled && !before.enabled;
     // Apply a lowered interval / a re-enable immediately: next slot is now + the (new) interval,
     // instead of waiting out the stale `next_run_at`. Otherwise leave the grid where it is.
@@ -282,8 +284,14 @@ pub async fn update_schedule(
             [
                 job_name.clone().into(),
                 actor.into(),
-                serde_json::to_value(&old_snapshot).unwrap_or_default().to_string().into(),
-                serde_json::to_value(&new_snapshot).unwrap_or_default().to_string().into(),
+                serde_json::to_value(&old_snapshot)
+                    .unwrap_or_default()
+                    .to_string()
+                    .into(),
+                serde_json::to_value(&new_snapshot)
+                    .unwrap_or_default()
+                    .to_string()
+                    .into(),
             ],
         ))
         .await?;
@@ -324,7 +332,11 @@ pub async fn run_now(
             [job_name.clone().into()],
         ))
         .await?
-        .and_then(|r| r.try_get::<Option<serde_json::Value>>("", "tunables").ok().flatten())
+        .and_then(|r| {
+            r.try_get::<Option<serde_json::Value>>("", "tunables")
+                .ok()
+                .flatten()
+        })
         .unwrap_or_else(|| serde_json::json!({}));
 
     // Per-second dedupe key so an accidental double-click collapses to one run; a deliberate second

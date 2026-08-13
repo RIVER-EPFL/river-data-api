@@ -1,4 +1,3 @@
-
 use axum::body::Body;
 use http_body_util::BodyExt;
 use river_db::common::AppEvent;
@@ -131,10 +130,7 @@ async fn sse_receives_job_created_event() {
                         .any(|(ev, data)| ev == "job_created" && data["type"] == "job_created")
                     {
                         // Verify the full content
-                        let (_, json) = frames
-                            .iter()
-                            .find(|(ev, _)| ev == "job_created")
-                            .unwrap();
+                        let (_, json) = frames.iter().find(|(ev, _)| ev == "job_created").unwrap();
                         assert_eq!(json["job_id"], job_id.to_string());
                         return;
                     }
@@ -146,9 +142,7 @@ async fn sse_receives_job_created_event() {
         }
     }
 
-    panic!(
-        "did not receive job_created event within timeout. accumulated: {accumulated}"
-    );
+    panic!("did not receive job_created event within timeout. accumulated: {accumulated}");
 }
 
 #[tokio::test]
@@ -191,9 +185,7 @@ async fn sse_receives_data_ingested_event() {
                 if let Some(data) = frame.data_ref() {
                     accumulated.push_str(&String::from_utf8_lossy(data));
                     let frames = parse_sse_frames(&accumulated);
-                    if let Some((_, json)) =
-                        frames.iter().find(|(ev, _)| ev == "data_ingested")
-                    {
+                    if let Some((_, json)) = frames.iter().find(|(ev, _)| ev == "data_ingested") {
                         assert_eq!(json["type"], "data_ingested");
                         assert_eq!(json["stream_id"], stream_id.to_string());
                         assert_eq!(json["site_id"], site_id.to_string());
@@ -209,9 +201,7 @@ async fn sse_receives_data_ingested_event() {
         }
     }
 
-    panic!(
-        "did not receive data_ingested event within timeout. accumulated: {accumulated}"
-    );
+    panic!("did not receive data_ingested event within timeout. accumulated: {accumulated}");
 }
 
 #[tokio::test]
@@ -266,27 +256,22 @@ async fn sse_receives_multiple_event_types() {
                 if let Some(data) = frame.data_ref() {
                     accumulated.push_str(&String::from_utf8_lossy(data));
                     let frames = parse_sse_frames(&accumulated);
-                    let event_types: Vec<&str> =
-                        frames.iter().map(|(ev, _)| ev.as_str()).collect();
+                    let event_types: Vec<&str> = frames.iter().map(|(ev, _)| ev.as_str()).collect();
                     if event_types.contains(&"job_created")
                         && event_types.contains(&"job_progress")
                         && event_types.contains(&"job_completed")
                         && event_types.contains(&"data_ingested")
                     {
                         // Verify job_progress payload
-                        let (_, progress) = frames
-                            .iter()
-                            .find(|(ev, _)| ev == "job_progress")
-                            .unwrap();
+                        let (_, progress) =
+                            frames.iter().find(|(ev, _)| ev == "job_progress").unwrap();
                         assert_eq!(progress["status"], "running");
                         assert_eq!(progress["progress"], 5);
                         assert_eq!(progress["total"], 10);
 
                         // Verify job_completed payload
-                        let (_, completed) = frames
-                            .iter()
-                            .find(|(ev, _)| ev == "job_completed")
-                            .unwrap();
+                        let (_, completed) =
+                            frames.iter().find(|(ev, _)| ev == "job_completed").unwrap();
                         assert_eq!(completed["status"], "completed");
                         assert_eq!(completed["readings_updated"], 100);
                         assert!(completed["error_message"].is_null());

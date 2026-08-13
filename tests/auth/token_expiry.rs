@@ -1,7 +1,6 @@
 //! Token expiry boundaries. A ~5s-ahead expiry is used so the test exercises real expiration
 //! quickly; the validation cache (1s TTL in tests) must not mask an expired token.
 
-
 use chrono::{Duration, Utc};
 use serial_test::serial;
 
@@ -33,7 +32,10 @@ async fn token_expiring_in_five_seconds_works_then_stops() {
     tokio::time::sleep(std::time::Duration::from_secs(6)).await;
 
     let (s, _) = crate::common::get_with_token(&app, "/api/sites", &token).await;
-    assert_eq!(s, 401, "token must be rejected once past its expiry, even if recently cached");
+    assert_eq!(
+        s, 401,
+        "token must be rejected once past its expiry, even if recently cached"
+    );
 }
 
 #[tokio::test]
@@ -49,7 +51,10 @@ async fn already_expired_token_is_rejected() {
     .await;
 
     let (s, _) = crate::common::get_with_token(&app, "/api/sites", &token).await;
-    assert_eq!(s, 401, "a token whose expiry is in the past must be rejected on first use");
+    assert_eq!(
+        s, 401,
+        "a token whose expiry is in the past must be rejected on first use"
+    );
 }
 
 #[tokio::test]

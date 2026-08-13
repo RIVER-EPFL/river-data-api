@@ -9,30 +9,39 @@ use uuid::Uuid;
 use crate::pairing_plan_apply::{job_id_of, wait_terminal};
 
 async fn scalar_i64(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
-    db.query_one(Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.to_owned()))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get::<i64>("", "v")
-        .unwrap()
+    db.query_one(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql.to_owned(),
+    ))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get::<i64>("", "v")
+    .unwrap()
 }
 
 async fn scalar_opt_string(db: &sea_orm::DatabaseConnection, sql: &str) -> Option<String> {
-    db.query_one(Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.to_owned()))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get::<Option<String>>("", "v")
-        .unwrap()
+    db.query_one(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql.to_owned(),
+    ))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get::<Option<String>>("", "v")
+    .unwrap()
 }
 
 async fn scalar_opt_uuid(db: &sea_orm::DatabaseConnection, sql: &str) -> Option<Uuid> {
-    db.query_one(Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.to_owned()))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get::<Option<Uuid>>("", "v")
-        .unwrap()
+    db.query_one(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql.to_owned(),
+    ))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get::<Option<Uuid>>("", "v")
+    .unwrap()
 }
 
 async fn insert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid, entries: &serde_json::Value) {
@@ -60,7 +69,10 @@ async fn apply_and_wait(
         token,
     )
     .await;
-    assert!((200..300).contains(&status), "apply should be 2xx, got {status}: {text}");
+    assert!(
+        (200..300).contains(&status),
+        "apply should be 2xx, got {status}: {text}"
+    );
     assert_eq!(wait_terminal(db, &job_id_of(&text)).await, "completed");
 }
 
@@ -96,13 +108,29 @@ async fn plan_matches_parameter_by_name_and_alias_case_insensitively() {
     let by_name = Uuid::new_v4();
     let by_alias = Uuid::new_v4();
     crate::common::seed_unpaired_stream_with_hierarchy(
-        &db, &by_name.to_string(), "hardening", "hard-name-1",
-        "Test River Project", "Upstream Station", "water temperature", "°C", None, 1,
+        &db,
+        &by_name.to_string(),
+        "hardening",
+        "hard-name-1",
+        "Test River Project",
+        "Upstream Station",
+        "water temperature",
+        "°C",
+        None,
+        1,
     )
     .await;
     crate::common::seed_unpaired_stream_with_hierarchy(
-        &db, &by_alias.to_string(), "hardening", "hard-alias-1",
-        "Test River Project", "Upstream Station", "no3-n RAW", "mg/L", None, 1,
+        &db,
+        &by_alias.to_string(),
+        "hardening",
+        "hard-alias-1",
+        "Test River Project",
+        "Upstream Station",
+        "no3-n RAW",
+        "mg/L",
+        None,
+        1,
     )
     .await;
 
@@ -120,7 +148,10 @@ async fn plan_matches_parameter_by_name_and_alias_case_insensitively() {
     assert_eq!(name_entry["parameter"]["id"], serde_json::json!(temp_id));
     assert_eq!(name_entry["parameter"]["create"], serde_json::json!(false));
     let alias_entry = entry_for(&plan, by_alias);
-    assert_eq!(alias_entry["parameter"]["id"], serde_json::json!(nitrate_id));
+    assert_eq!(
+        alias_entry["parameter"]["id"],
+        serde_json::json!(nitrate_id)
+    );
     assert_eq!(alias_entry["parameter"]["create"], serde_json::json!(false));
 
     let params_before = scalar_i64(&db, "SELECT COUNT(*) AS v FROM parameters").await;
@@ -128,7 +159,10 @@ async fn plan_matches_parameter_by_name_and_alias_case_insensitively() {
     apply_and_wait(&app, &db, &token, plan_id).await;
 
     let params_after = scalar_i64(&db, "SELECT COUNT(*) AS v FROM parameters").await;
-    assert_eq!(params_after, params_before, "apply should not create any parameter");
+    assert_eq!(
+        params_after, params_before,
+        "apply should not create any parameter"
+    );
     let paired_param = scalar_opt_uuid(
         &db,
         &format!(
@@ -137,7 +171,11 @@ async fn plan_matches_parameter_by_name_and_alias_case_insensitively() {
         ),
     )
     .await;
-    assert_eq!(paired_param, Some(nitrate_id), "alias-named stream should pair to the existing parameter");
+    assert_eq!(
+        paired_param,
+        Some(nitrate_id),
+        "alias-named stream should pair to the existing parameter"
+    );
 
     crate::common::cleanup_test_db(&db).await;
 }
@@ -153,8 +191,16 @@ async fn patch_rename_reclassifies_entry_and_recomputes_warnings() {
 
     let stream_id = Uuid::new_v4();
     crate::common::seed_unpaired_stream_with_hierarchy(
-        &db, &stream_id.to_string(), "hardening", "hard-patch-1",
-        "Test River Project", "Upstream Station", "Mystery Thing", "X", None, 1,
+        &db,
+        &stream_id.to_string(),
+        "hardening",
+        "hard-patch-1",
+        "Test River Project",
+        "Upstream Station",
+        "Mystery Thing",
+        "X",
+        None,
+        1,
     )
     .await;
 
@@ -188,7 +234,9 @@ async fn patch_rename_reclassifies_entry_and_recomputes_warnings() {
     assert_eq!(entry["confidence"], serde_json::json!("exact"));
     let warnings = entry["warnings"].as_array().unwrap();
     assert!(
-        warnings.iter().any(|w| w.as_str().unwrap().contains("units")),
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("units")),
         "unit mismatch warning expected, got {warnings:?}"
     );
 
@@ -221,8 +269,16 @@ async fn pair_action_on_empty_parameter_name_is_rejected() {
 
     let patched = Uuid::new_v4();
     crate::common::seed_unpaired_stream_with_hierarchy(
-        &db, &patched.to_string(), "hardening", "hard-empty-1",
-        "Test River Project", "Upstream Station", "", "", None, 1,
+        &db,
+        &patched.to_string(),
+        "hardening",
+        "hard-empty-1",
+        "Test River Project",
+        "Upstream Station",
+        "",
+        "",
+        None,
+        1,
     )
     .await;
 
@@ -246,9 +302,16 @@ async fn pair_action_on_empty_parameter_name_is_rejected() {
     assert_eq!(status, 200, "patch failed: {text}");
     let updated: serde_json::Value = serde_json::from_str(&text).unwrap();
     let entry = entry_for(&updated, patched);
-    assert_eq!(entry["action"], serde_json::json!("skip"), "pair with empty name must be forced to skip");
+    assert_eq!(
+        entry["action"],
+        serde_json::json!("skip"),
+        "pair with empty name must be forced to skip"
+    );
     assert!(
-        entry["warnings"].as_array().unwrap().iter()
+        entry["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
             .any(|w| w.as_str().unwrap().contains("empty")),
         "empty-name warning expected"
     );
@@ -257,8 +320,16 @@ async fn pair_action_on_empty_parameter_name_is_rejected() {
     // creating a blank parameter
     let forced = Uuid::new_v4();
     crate::common::seed_unpaired_stream_with_hierarchy(
-        &db, &forced.to_string(), "hardening", "hard-empty-2",
-        "Test River Project", "Upstream Station", "", "", None, 1,
+        &db,
+        &forced.to_string(),
+        "hardening",
+        "hard-empty-2",
+        "Test River Project",
+        "Upstream Station",
+        "",
+        "",
+        None,
+        1,
     )
     .await;
     let forced_plan = Uuid::new_v4();
@@ -277,10 +348,19 @@ async fn pair_action_on_empty_parameter_name_is_rejected() {
     .await;
     apply_and_wait(&app, &db, &token, forced_plan).await;
 
-    let blank_params = scalar_i64(&db, "SELECT COUNT(*) AS v FROM parameters WHERE TRIM(code) = ''").await;
+    let blank_params = scalar_i64(
+        &db,
+        "SELECT COUNT(*) AS v FROM parameters WHERE TRIM(code) = ''",
+    )
+    .await;
     assert_eq!(blank_params, 0, "no blank parameter should be created");
     assert!(
-        scalar_opt_uuid(&db, &format!("SELECT site_parameter_id AS v FROM data_streams WHERE id = '{forced}'")).await.is_none(),
+        scalar_opt_uuid(
+            &db,
+            &format!("SELECT site_parameter_id AS v FROM data_streams WHERE id = '{forced}'")
+        )
+        .await
+        .is_none(),
         "stream with empty parameter name should stay unpaired"
     );
     let skipped = scalar_opt_string(
@@ -304,8 +384,16 @@ async fn created_site_parameter_carries_display_name_units_and_aliases() {
 
     let stream_id = Uuid::new_v4();
     crate::common::seed_unpaired_stream_with_hierarchy(
-        &db, &stream_id.to_string(), "hardening", "hard-create-1",
-        "Test River Project", "Upstream Station", "NFlux", "mg/L", None, 1,
+        &db,
+        &stream_id.to_string(),
+        "hardening",
+        "hard-create-1",
+        "Test River Project",
+        "Upstream Station",
+        "NFlux",
+        "mg/L",
+        None,
+        1,
     )
     .await;
 
@@ -333,7 +421,11 @@ async fn created_site_parameter_carries_display_name_units_and_aliases() {
         ),
     )
     .await;
-    assert_eq!(sp_name.as_deref(), Some("Nitrate Flux"), "site_parameter should carry the display name");
+    assert_eq!(
+        sp_name.as_deref(),
+        Some("Nitrate Flux"),
+        "site_parameter should carry the display name"
+    );
     let display_units = scalar_opt_string(
         &db,
         &format!(
@@ -359,7 +451,10 @@ async fn created_site_parameter_carries_display_name_units_and_aliases() {
     )
     .await
     .unwrap();
-    assert_eq!(aliases, "NFlux", "aliases should hold source names minus the chosen one");
+    assert_eq!(
+        aliases, "NFlux",
+        "aliases should hold source names minus the chosen one"
+    );
 
     crate::common::cleanup_test_db(&db).await;
 }
@@ -377,8 +472,16 @@ async fn apply_skips_stream_paired_elsewhere_and_pairs_the_rest() {
     let free = Uuid::new_v4();
     for (id, key) in [(taken, "hard-taken-1"), (free, "hard-free-1")] {
         crate::common::seed_unpaired_stream_with_hierarchy(
-            &db, &id.to_string(), "hardening", key,
-            "Test River Project", "Upstream Station", "Water Temperature", "°C", None, 1,
+            &db,
+            &id.to_string(),
+            "hardening",
+            key,
+            "Test River Project",
+            "Upstream Station",
+            "Water Temperature",
+            "°C",
+            None,
+            1,
         )
         .await;
     }
@@ -392,23 +495,26 @@ async fn apply_skips_stream_paired_elsewhere_and_pairs_the_rest() {
     )
     .await;
 
-    let entry = |stream_id: Uuid, key: &str| serde_json::json!({
-        "stream_id": stream_id,
-        "source_key": key,
-        "source_name": null,
-        "action": "pair",
-        "project": { "id": crate::common::PROJECT_ID, "name": "Test River Project", "create": false },
-        "site": { "id": crate::common::SITE1_ID, "name": "Upstream Station", "create": false, "latitude": null, "longitude": null, "altitude_m": null },
-        "parameter": { "id": crate::common::GLOBAL_PARAM_TEMP_ID, "name": "Water Temperature", "create": false, "units": "°C", "group_key": null, "original_names": [] },
-        "confidence": "exact",
-        "warnings": [],
-        "original_parameter_name": null
-    });
+    let entry = |stream_id: Uuid, key: &str| {
+        serde_json::json!({
+            "stream_id": stream_id,
+            "source_key": key,
+            "source_name": null,
+            "action": "pair",
+            "project": { "id": crate::common::PROJECT_ID, "name": "Test River Project", "create": false },
+            "site": { "id": crate::common::SITE1_ID, "name": "Upstream Station", "create": false, "latitude": null, "longitude": null, "altitude_m": null },
+            "parameter": { "id": crate::common::GLOBAL_PARAM_TEMP_ID, "name": "Water Temperature", "create": false, "units": "°C", "group_key": null, "original_names": [] },
+            "confidence": "exact",
+            "warnings": [],
+            "original_parameter_name": null
+        })
+    };
     let plan_id = Uuid::new_v4();
-    insert_plan(&db, plan_id, &serde_json::json!([
-        entry(taken, "hard-taken-1"),
-        entry(free, "hard-free-1"),
-    ]))
+    insert_plan(
+        &db,
+        plan_id,
+        &serde_json::json!([entry(taken, "hard-taken-1"), entry(free, "hard-free-1"),]),
+    )
     .await;
     apply_and_wait(&app, &db, &token, plan_id).await;
 
@@ -466,9 +572,16 @@ async fn remap_to_existing_site_does_not_backfill_stream_coordinates() {
 
     let stream_id = Uuid::new_v4();
     crate::common::seed_unpaired_stream_with_hierarchy(
-        &db, &stream_id.to_string(), "hardening", "hard-coords-1",
-        "Test River Project", "Somewhere New", "Water Temperature", "°C",
-        Some((46.5, 6.6, 372.0)), 1,
+        &db,
+        &stream_id.to_string(),
+        "hardening",
+        "hard-coords-1",
+        "Test River Project",
+        "Somewhere New",
+        "Water Temperature",
+        "°C",
+        Some((46.5, 6.6, 372.0)),
+        1,
     )
     .await;
 
@@ -502,7 +615,10 @@ async fn remap_to_existing_site_does_not_backfill_stream_coordinates() {
         &format!("SELECT latitude::text AS v FROM sites WHERE id = '{bare_site}'"),
     )
     .await;
-    assert_eq!(lat, None, "remapped site must not inherit the stream's coordinates");
+    assert_eq!(
+        lat, None,
+        "remapped site must not inherit the stream's coordinates"
+    );
 
     crate::common::cleanup_test_db(&db).await;
 }

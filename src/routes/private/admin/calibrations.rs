@@ -35,9 +35,9 @@ pub async fn recalculate_calibration(
         .map_err(|e| crate::error::AppError::Internal(e.to_string()))?;
 
     let Some(row) = row else {
-        return Err(crate::error::AppError::NotFound(
-            format!("sensor_calibration {id} not found"),
-        ));
+        return Err(crate::error::AppError::NotFound(format!(
+            "sensor_calibration {id} not found"
+        )));
     };
     let sensor_id: Uuid = row
         .try_get("", "sensor_id")

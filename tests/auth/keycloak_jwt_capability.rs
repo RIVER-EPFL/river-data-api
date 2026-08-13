@@ -12,7 +12,6 @@
 //! Override the Keycloak URL with `TEST_KEYCLOAK_URL` (the watcher container uses
 //! `http://river-db-keycloak:8080/`).
 
-
 use crate::common::fixtures::{GLOBAL_PARAM_TEMP_ID, PROJECT_ID, SITE1_ID};
 use crate::common::keycloak::{
     build_test_app_with_keycloak, get_keycloak_jwt, grant_project, keycloak_reachable,
@@ -25,9 +24,7 @@ use serial_test::serial;
 macro_rules! require_keycloak {
     () => {
         if !keycloak_reachable().await {
-            eprintln!(
-                "SKIP: keycloak unreachable (start the dev stack, or set TEST_KEYCLOAK_URL)"
-            );
+            eprintln!("SKIP: keycloak unreachable (start the dev stack, or set TEST_KEYCLOAK_URL)");
             return;
         }
     };
@@ -77,7 +74,10 @@ async fn keycloak_user_cannot_reach_admin_routes() {
         &jwt,
     )
     .await;
-    assert_eq!(s, 403, "non-admin JWT on POST /sync/credentials must be 403");
+    assert_eq!(
+        s, 403,
+        "non-admin JWT on POST /sync/credentials must be 403"
+    );
     let (s, _) = crate::common::get_with_token(&app, "/api/api_token_audit_logs", &jwt).await;
     assert_eq!(s, 403, "non-admin JWT must not read the audit log");
 }
@@ -112,17 +112,25 @@ async fn keycloak_capability_mapping_user_vs_admin() {
         "category": "measurement", "aliases": []
     });
     let (s, _) = crate::common::post_json_with_token(&app, "/api/parameters", &param, &user).await;
-    assert_eq!(s, 403, "a non-admin Keycloak user must be denied write_metadata");
+    assert_eq!(
+        s, 403,
+        "a non-admin Keycloak user must be denied write_metadata"
+    );
     // ...but the admin is allowed (auth passes; a 2xx confirms the create).
-    let (s, body) = crate::common::post_json_with_token(&app, "/api/parameters", &param, &admin).await;
-    assert!((200..300).contains(&s), "admin must be allowed write_metadata: {body}");
+    let (s, body) =
+        crate::common::post_json_with_token(&app, "/api/parameters", &param, &admin).await;
+    assert!(
+        (200..300).contains(&s),
+        "admin must be allowed write_metadata: {body}"
+    );
 
     // write_data is a River capability, reachable inside the granted project (granted up front).
     let t = now_rfc3339();
     let batch = serde_json::json!({
         "readings": [{ "site_id": SITE1_ID, "parameter_id": GLOBAL_PARAM_TEMP_ID, "time": t, "raw_value": 1.0 }]
     });
-    let (s, body) = crate::common::post_json_with_token(&app, "/api/readings/batch", &batch, &user).await;
+    let (s, body) =
+        crate::common::post_json_with_token(&app, "/api/readings/batch", &batch, &user).await;
     assert_eq!(s, 200, "a granted River user has write_data: {body}");
 }
 
@@ -141,7 +149,10 @@ async fn public_endpoints_work_without_keycloak() {
     require_keycloak!();
     let (_db, app) = seeded_app().await;
     let (s, _) = crate::common::get(&app, "/api/public").await;
-    assert!((200..300).contains(&s), "public discovery must work without auth");
+    assert!(
+        (200..300).contains(&s),
+        "public discovery must work without auth"
+    );
 }
 
 #[tokio::test]
@@ -163,7 +174,10 @@ async fn keycloak_admin_can_post_sync_credentials() {
     assert_eq!(s, 200, "admin JWT on POST /sync/credentials ({s}): {body}");
     let minted: serde_json::Value = serde_json::from_str(&body).expect("credential body");
     assert!(
-        minted["client_id"].as_str().expect("client_id").starts_with("svc_"),
+        minted["client_id"]
+            .as_str()
+            .expect("client_id")
+            .starts_with("svc_"),
         "minted client_id: {minted}"
     );
 }

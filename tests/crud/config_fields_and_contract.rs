@@ -103,8 +103,12 @@ async fn site_parameter_create_honours_is_public() {
         "create a slot with the toggle omitted ({status}): {created_private}"
     );
 
-    let (status, after_create) = get_json(&app, "/api/public/rd050/sites/rd050-site/parameters").await;
-    assert_eq!(status, 200, "public parameter list ({status}): {after_create}");
+    let (status, after_create) =
+        get_json(&app, "/api/public/rd050/sites/rd050-site/parameters").await;
+    assert_eq!(
+        status, 200,
+        "public parameter list ({status}): {after_create}"
+    );
     let codes_after_create: HashSet<String> = after_create
         .as_array()
         .unwrap_or_else(|| panic!("public parameters must be an array: {after_create}"))
@@ -119,12 +123,19 @@ async fn site_parameter_create_honours_is_public() {
         &jwt,
     )
     .await;
-    assert_eq!(status, 200, "update the toggle on the second slot ({status}): {body}");
-    let updated: serde_json::Value =
-        serde_json::from_str(&body).unwrap_or_else(|e| panic!("update body is not JSON: {e}: {body}"));
+    assert_eq!(
+        status, 200,
+        "update the toggle on the second slot ({status}): {body}"
+    );
+    let updated: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("update body is not JSON: {e}: {body}"));
 
-    let (status, after_update) = get_json(&app, "/api/public/rd050/sites/rd050-site/parameters").await;
-    assert_eq!(status, 200, "public parameter list after update ({status}): {after_update}");
+    let (status, after_update) =
+        get_json(&app, "/api/public/rd050/sites/rd050-site/parameters").await;
+    assert_eq!(
+        status, 200,
+        "public parameter list after update ({status}): {after_update}"
+    );
     let codes_after_update: HashSet<String> = after_update
         .as_array()
         .unwrap_or_else(|| panic!("public parameters must be an array: {after_update}"))
@@ -180,8 +191,10 @@ async fn adopted_slot_reports_the_same_units_on_both_site_endpoints() {
 
     let project_id = e2e::create_project(&app, &jwt, "RD051 Project", "rd051", false).await;
     let site_id = e2e::create_site(&app, &jwt, &project_id, "RD051 Site", "rd051-site").await;
-    let adopted_param = e2e::create_parameter(&app, &jwt, "Rd051Do", "RD051 Dissolved Oxygen", "uM").await;
-    let override_param = e2e::create_parameter(&app, &jwt, "Rd051Temp", "RD051 Temperature", "degC").await;
+    let adopted_param =
+        e2e::create_parameter(&app, &jwt, "Rd051Do", "RD051 Dissolved Oxygen", "uM").await;
+    let override_param =
+        e2e::create_parameter(&app, &jwt, "Rd051Temp", "RD051 Temperature", "degC").await;
 
     let sensor_id = e2e::create_sensor(&app, &jwt, &adopted_param, "RD051-0001").await;
     let (status, adopted) = post_json_parse_with_token(
@@ -195,7 +208,10 @@ async fn adopted_slot_reports_the_same_units_on_both_site_endpoints() {
         &jwt,
     )
     .await;
-    assert_eq!(status, 200, "adopt the sensor into a new slot ({status}): {adopted}");
+    assert_eq!(
+        status, 200,
+        "adopt the sensor into a new slot ({status}): {adopted}"
+    );
     assert_eq!(
         adopted["site_parameter_created"],
         json!(true),
@@ -224,15 +240,23 @@ async fn adopted_slot_reports_the_same_units_on_both_site_endpoints() {
         &jwt,
     )
     .await;
-    assert_eq!(status, 200, "seed one reading per slot ({status}): {ingested}");
+    assert_eq!(
+        status, 200,
+        "seed one reading per slot ({status}): {ingested}"
+    );
 
     let (status, catalog_view) =
         get_json_with_token(&app, &format!("/api/sites/{site_id}/parameters"), &jwt).await;
-    assert_eq!(status, 200, "site parameter list ({status}): {catalog_view}");
+    assert_eq!(
+        status, 200,
+        "site parameter list ({status}): {catalog_view}"
+    );
 
     let (status, series_view) = get_json_with_token(
         &app,
-        &format!("/api/sites/{site_id}/readings?start=2025-06-01T00:00:00Z&end=2025-06-30T00:00:00Z"),
+        &format!(
+            "/api/sites/{site_id}/readings?start=2025-06-01T00:00:00Z&end=2025-06-30T00:00:00Z"
+        ),
         &jwt,
     )
     .await;
@@ -280,8 +304,10 @@ async fn site_parameter_display_config_reaches_a_reader() {
 
     let project_id = e2e::create_project(&app, &jwt, "RD052 Project", "rd052", false).await;
     let site_id = e2e::create_site(&app, &jwt, &project_id, "RD052 Site", "rd052-site").await;
-    let configured_param = e2e::create_parameter(&app, &jwt, "Rd052Depth", "RD052 Depth", "mm").await;
-    let plain_param = e2e::create_parameter(&app, &jwt, "Rd052Turb", "RD052 Turbidity", "NTU").await;
+    let configured_param =
+        e2e::create_parameter(&app, &jwt, "Rd052Depth", "RD052 Depth", "mm").await;
+    let plain_param =
+        e2e::create_parameter(&app, &jwt, "Rd052Turb", "RD052 Turbidity", "NTU").await;
 
     let mappings = json!({ "depth": "Rd052Depth" });
     let (status, configured) = post_json_parse_with_token(
@@ -304,14 +330,26 @@ async fn site_parameter_display_config_reaches_a_reader() {
         (200..300).contains(&status),
         "create a slot carrying display config ({status}): {configured}"
     );
-    assert_eq!(configured["decimal_places"], json!(1), "decimal_places stored: {configured}");
+    assert_eq!(
+        configured["decimal_places"],
+        json!(1),
+        "decimal_places stored: {configured}"
+    );
     assert_eq!(
         configured["units_name"],
         json!("millimetres"),
         "units_name stored: {configured}"
     );
-    assert_eq!(configured["units_min"], json!(0.5), "units_min stored: {configured}");
-    assert_eq!(configured["units_max"], json!(99.5), "units_max stored: {configured}");
+    assert_eq!(
+        configured["units_min"],
+        json!(0.5),
+        "units_min stored: {configured}"
+    );
+    assert_eq!(
+        configured["units_max"],
+        json!(99.5),
+        "units_max stored: {configured}"
+    );
     assert_eq!(
         configured["variable_mappings"], mappings,
         "variable_mappings stored: {configured}"
@@ -325,12 +363,25 @@ async fn site_parameter_display_config_reaches_a_reader() {
     .await;
     assert_eq!(status, 200, "reload the slot ({status}): {reloaded}");
     assert_eq!(
-        reloaded["decimal_places"], json!(1),
+        reloaded["decimal_places"],
+        json!(1),
         "decimal_places round-trips: {reloaded}"
     );
-    assert_eq!(reloaded["units_name"], json!("millimetres"), "units_name round-trips: {reloaded}");
-    assert_eq!(reloaded["units_min"], json!(0.5), "units_min round-trips: {reloaded}");
-    assert_eq!(reloaded["units_max"], json!(99.5), "units_max round-trips: {reloaded}");
+    assert_eq!(
+        reloaded["units_name"],
+        json!("millimetres"),
+        "units_name round-trips: {reloaded}"
+    );
+    assert_eq!(
+        reloaded["units_min"],
+        json!(0.5),
+        "units_min round-trips: {reloaded}"
+    );
+    assert_eq!(
+        reloaded["units_max"],
+        json!(99.5),
+        "units_max round-trips: {reloaded}"
+    );
     assert_eq!(
         reloaded["variable_mappings"], mappings,
         "variable_mappings round-trips: {reloaded}"
@@ -358,7 +409,10 @@ async fn site_parameter_display_config_reaches_a_reader() {
         &jwt,
     )
     .await;
-    assert_eq!(status, 200, "seed one reading per slot ({status}): {ingested}");
+    assert_eq!(
+        status, 200,
+        "seed one reading per slot ({status}): {ingested}"
+    );
 
     let range = "start=2025-06-01T00:00:00Z&end=2025-06-30T00:00:00Z";
     let (status, csv) = get_with_token(
@@ -371,7 +425,10 @@ async fn site_parameter_display_config_reaches_a_reader() {
 
     let (status, catalog_view) =
         get_json_with_token(&app, &format!("/api/sites/{site_id}/parameters"), &jwt).await;
-    assert_eq!(status, 200, "site parameter list ({status}): {catalog_view}");
+    assert_eq!(
+        status, 200,
+        "site parameter list ({status}): {catalog_view}"
+    );
     let configured_entry = entry_for(&catalog_view, &configured_param);
 
     // A slot with no decimal_places keeps full precision, so a blanket rounding is not the fix.
@@ -609,7 +666,8 @@ async fn muted_slot_receives_no_stale_data_notification() {
     let project_id = e2e::create_project(&app, &jwt, "RD048 Project", "rd048", false).await;
     let site_id = e2e::create_site(&app, &jwt, &project_id, "RD048 Site", "rd048-site").await;
     let muted_param = e2e::create_parameter(&app, &jwt, "Rd048Muted", "RD048 Muted", "mm").await;
-    let audible_param = e2e::create_parameter(&app, &jwt, "Rd048Audible", "RD048 Audible", "mm").await;
+    let audible_param =
+        e2e::create_parameter(&app, &jwt, "Rd048Audible", "RD048 Audible", "mm").await;
     e2e::assign_site_parameter_minimal(&app, &jwt, &site_id, &muted_param).await;
     e2e::assign_site_parameter_minimal(&app, &jwt, &site_id, &audible_param).await;
 
@@ -625,7 +683,10 @@ async fn muted_slot_receives_no_stale_data_notification() {
         &jwt,
     )
     .await;
-    assert_eq!(status, 200, "seed one stale reading per slot ({status}): {ingested}");
+    assert_eq!(
+        status, 200,
+        "seed one stale reading per slot ({status}): {ingested}"
+    );
 
     let (status, mute) = post_json_parse_with_token(
         &app,
@@ -651,7 +712,11 @@ async fn muted_slot_receives_no_stale_data_notification() {
     let for_slot = |parameter_id: Uuid| -> usize {
         stale
             .iter()
-            .filter(|m| m.slot.as_ref().is_some_and(|s| s.parameter_id == parameter_id))
+            .filter(|m| {
+                m.slot
+                    .as_ref()
+                    .is_some_and(|s| s.parameter_id == parameter_id)
+            })
             .count()
     };
 

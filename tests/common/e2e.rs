@@ -13,7 +13,10 @@ use std::time::{Duration, Instant};
 ///
 /// The production refresh window is `[since, NOW()]` (`common/sync_state.rs`), so a fixture dated
 /// in the future is never materialised. Keep fixture times in the past.
-pub async fn refresh_hourly(db: &sea_orm::DatabaseConnection, since: chrono::DateTime<chrono::Utc>) {
+pub async fn refresh_hourly(
+    db: &sea_orm::DatabaseConnection,
+    since: chrono::DateTime<chrono::Utc>,
+) {
     use sea_orm::{ConnectionTrait, Statement};
     db.execute(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
@@ -81,7 +84,9 @@ pub async fn count(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
 pub fn percent_encode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
             _ => format!("%{b:02X}"),
         })
         .collect()
@@ -93,8 +98,12 @@ pub fn percent_encode(s: &str) -> String {
 /// auto-creation is behaviour worth pinning, not an assumption to build on silently.
 pub async fn identity_calibration_id(app: &Router, token: &str, sensor_id: &str) -> Option<String> {
     let filter = percent_encode(&format!(r#"{{"sensor_id":"{sensor_id}"}}"#));
-    let (status, body) =
-        super::get_json_with_token(app, &format!("/api/sensor_calibrations?filter={filter}"), token).await;
+    let (status, body) = super::get_json_with_token(
+        app,
+        &format!("/api/sensor_calibrations?filter={filter}"),
+        token,
+    )
+    .await;
     assert_eq!(status, 200, "list calibrations for {sensor_id}: {body}");
     body.as_array()
         .and_then(|a| a.first())
@@ -115,7 +124,8 @@ pub async fn poll_job(app: &Router, token: &str, job_id: &str, max_secs: u64) ->
     let deadline = Instant::now() + Duration::from_secs(max_secs);
     loop {
         let (_s, job) =
-            super::get_json_with_token(app, &format!("/api/reprocessing_jobs/{job_id}"), token).await;
+            super::get_json_with_token(app, &format!("/api/reprocessing_jobs/{job_id}"), token)
+                .await;
         let status = job["status"].as_str().unwrap_or("").to_string();
         if status == "completed" || status == "failed" || Instant::now() >= deadline {
             return status;
@@ -127,7 +137,11 @@ pub async fn poll_job(app: &Router, token: &str, job_id: &str, max_secs: u64) ->
 /// Wait for all reprocessing jobs of a given `trigger_type` to reach a terminal state. Returns true
 /// if at least one job ran and none failed; false on failure or timeout. For background jobs whose
 /// id isn't returned by the triggering request (e.g. `derived_assignment`, which has a NULL sensor_id).
-pub async fn wait_for_jobs_by_trigger(db: &sea_orm::DatabaseConnection, trigger_type: &str, timeout_secs: u64) -> bool {
+pub async fn wait_for_jobs_by_trigger(
+    db: &sea_orm::DatabaseConnection,
+    trigger_type: &str,
+    timeout_secs: u64,
+) -> bool {
     use sea_orm::{ConnectionTrait, Statement};
     let start = Instant::now();
     loop {
@@ -167,7 +181,12 @@ pub fn field_for(resp: &serde_json::Value, key: &str, field: &str) -> Vec<f64> {
         .as_array()
         .unwrap_or_else(|| panic!("no 'parameters' array in response: {resp}"))
         .iter()
-        .find(|p| p["code"] == key || p["name"] == key || p["display_name"] == key || p["parameter_id"] == key)
+        .find(|p| {
+            p["code"] == key
+                || p["name"] == key
+                || p["display_name"] == key
+                || p["parameter_id"] == key
+        })
         .unwrap_or_else(|| panic!("parameter {key} missing in {resp}"))[field]
         .as_array()
         .unwrap_or_else(|| panic!("'{field}' not an array for {key}"))
@@ -182,11 +201,20 @@ pub fn values_for(resp: &serde_json::Value, key: &str) -> Vec<f64> {
 
 async fn create(app: &Router, token: &str, path: &str, body: serde_json::Value) -> String {
     let (status, json) = super::post_json_parse_with_token(app, path, &body, token).await;
-    assert!((200..300).contains(&status), "create {path} ({status}): {json}");
+    assert!(
+        (200..300).contains(&status),
+        "create {path} ({status}): {json}"
+    );
     id_of(&json)
 }
 
-pub async fn create_project(app: &Router, token: &str, name: &str, code: &str, public: bool) -> String {
+pub async fn create_project(
+    app: &Router,
+    token: &str,
+    name: &str,
+    code: &str,
+    public: bool,
+) -> String {
     create(
         app,
         token,
@@ -196,7 +224,13 @@ pub async fn create_project(app: &Router, token: &str, name: &str, code: &str, p
     .await
 }
 
-pub async fn create_site(app: &Router, token: &str, project_id: &str, name: &str, code: &str) -> String {
+pub async fn create_site(
+    app: &Router,
+    token: &str,
+    project_id: &str,
+    name: &str,
+    code: &str,
+) -> String {
     create(
         app,
         token,
@@ -206,7 +240,13 @@ pub async fn create_site(app: &Router, token: &str, project_id: &str, name: &str
     .await
 }
 
-pub async fn create_parameter(app: &Router, token: &str, code: &str, name: &str, units: &str) -> String {
+pub async fn create_parameter(
+    app: &Router,
+    token: &str,
+    code: &str,
+    name: &str,
+    units: &str,
+) -> String {
     create(
         app,
         token,
@@ -218,7 +258,12 @@ pub async fn create_parameter(app: &Router, token: &str, code: &str, name: &str,
 
 /// Assign a parameter to a site with ONLY the required fields, exercises the `on_create` defaults
 /// and the server-side `name` backfill.
-pub async fn assign_site_parameter_minimal(app: &Router, token: &str, site_id: &str, parameter_id: &str) -> String {
+pub async fn assign_site_parameter_minimal(
+    app: &Router,
+    token: &str,
+    site_id: &str,
+    parameter_id: &str,
+) -> String {
     create(
         app,
         token,
@@ -251,7 +296,10 @@ pub async fn link_stream_sensor(app: &Router, token: &str, stream_id: &str, sens
         token,
     )
     .await;
-    assert_eq!(status, 200, "attach stream {stream_id} to sensor {sensor_id}: {body}");
+    assert_eq!(
+        status, 200,
+        "attach stream {stream_id} to sensor {sensor_id}: {body}"
+    );
 }
 
 pub async fn create_deployment(

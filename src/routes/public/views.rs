@@ -17,9 +17,7 @@ use crate::common::cache_key;
 use crate::common::series::{self, Cells, Table};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sites::aggregates::resolution_of;
-use crate::routes::public::service::{
-    PublicProjectConfig, PublicSiteConfig, get_public_config,
-};
+use crate::routes::public::service::{PublicProjectConfig, PublicSiteConfig, get_public_config};
 
 /// What the public tier treats as this site's data: one canonical row per timestamp, and nothing an
 /// operator has flagged. The site-detail count and the readings query share this predicate so the
@@ -88,10 +86,7 @@ fn all_public_param_names(config: &PublicProjectConfig) -> Vec<String> {
 
 /// Resolve public site_parameters at a site from the cached config.
 /// Returns one `ResolvedParam` per exposed param belonging to this site.
-fn resolve_site_parameters(
-    site_id: Uuid,
-    config: &PublicProjectConfig,
-) -> Vec<ResolvedParam> {
+fn resolve_site_parameters(site_id: Uuid, config: &PublicProjectConfig) -> Vec<ResolvedParam> {
     let mut resolved: Vec<ResolvedParam> = config
         .exposed_params
         .iter()
@@ -462,7 +457,8 @@ pub async fn get_readings(
     let end = end_parsed;
     let format = query.format.to_lowercase();
     let measurement_type = query.measurement_type.as_deref().unwrap_or("");
-    if !measurement_type.is_empty() && !matches!(measurement_type, "continuous" | "spot" | "derived")
+    if !measurement_type.is_empty()
+        && !matches!(measurement_type, "continuous" | "spot" | "derived")
     {
         return Err(AppError::BadRequest(format!(
             "invalid measurement_type '{measurement_type}' (expected continuous, spot, or derived)"
@@ -1116,8 +1112,7 @@ async fn fetch_readings(
                     values[idx] = Some(*value);
                     if let Some(mts) = measurement_types.as_mut() {
                         // NULL legacy rows read as continuous, matching the filter semantics.
-                        mts[idx] =
-                            Some(mt.clone().unwrap_or_else(|| "continuous".to_string()));
+                        mts[idx] = Some(mt.clone().unwrap_or_else(|| "continuous".to_string()));
                     }
                 }
             }
@@ -1134,4 +1129,3 @@ async fn fetch_readings(
     let times_formatted: Vec<String> = times_ordered.iter().map(|t| format_time(*t)).collect();
     Ok((times_formatted, output_params))
 }
-

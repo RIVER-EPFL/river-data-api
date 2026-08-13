@@ -8,7 +8,6 @@
 //! revoke/rotate handlers are invoked against the same `AppState` the router uses, so the
 //! cache-busting is exercised for real.
 
-
 use axum::extract::{Path, State};
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use serial_test::serial;
@@ -27,8 +26,11 @@ fn write_metadata_perms() -> serde_json::Value {
     crate::common::perms(true, true, true, false)
 }
 
-async fn setup_two_projects() -> (sea_orm::DatabaseConnection, axum::Router, river_db::common::AppState)
-{
+async fn setup_two_projects() -> (
+    sea_orm::DatabaseConnection,
+    axum::Router,
+    river_db::common::AppState,
+) {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
@@ -88,14 +90,22 @@ async fn external_push_key_confined_to_its_project_on_every_write_path() {
         .query_one(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "SELECT token_hash, token_prefix FROM api_tokens WHERE token_prefix = $1",
-            [key.strip_prefix("rvd_").unwrap().split_once('_').unwrap().0.into()],
+            [key.strip_prefix("rvd_")
+                .unwrap()
+                .split_once('_')
+                .unwrap()
+                .0
+                .into()],
         ))
         .await
         .unwrap()
         .expect("token row");
     let hash: String = row.try_get("", "token_hash").unwrap();
     let prefix: String = row.try_get("", "token_prefix").unwrap();
-    assert!(hash.starts_with("$argon2id$"), "secret must be argon2id-hashed, got {hash}");
+    assert!(
+        hash.starts_with("$argon2id$"),
+        "secret must be argon2id-hashed, got {hash}"
+    );
     assert!(!prefix.is_empty(), "token_prefix must be set for lookup");
 
     let t = now_rfc3339();
@@ -104,14 +114,16 @@ async fn external_push_key_confined_to_its_project_on_every_write_path() {
     let batch_in = serde_json::json!({
         "readings": [{ "site_id": SITE1_ID, "parameter_id": GLOBAL_PARAM_TEMP_ID, "time": t, "raw_value": 12.3 }]
     });
-    let (s, body) = crate::common::post_json_with_token(&app, "/api/readings/batch", &batch_in, &key).await;
+    let (s, body) =
+        crate::common::post_json_with_token(&app, "/api/readings/batch", &batch_in, &key).await;
     assert_eq!(s, 200, "in-scope batch write must succeed: {body}");
 
     // ...but the same key cannot push into Project B.
     let batch_out = serde_json::json!({
         "readings": [{ "site_id": SITE_B_ID, "parameter_id": GLOBAL_PARAM_TEMP_ID, "time": t, "raw_value": 9.9 }]
     });
-    let (s, _) = crate::common::post_json_with_token(&app, "/api/readings/batch", &batch_out, &key).await;
+    let (s, _) =
+        crate::common::post_json_with_token(&app, "/api/readings/batch", &batch_out, &key).await;
     assert_eq!(s, 403, "cross-project batch write must be forbidden");
 
     // Grab samples: in-scope ok, out-of-scope forbidden.
@@ -119,20 +131,24 @@ async fn external_push_key_confined_to_its_project_on_every_write_path() {
         "site_id": SITE1_ID,
         "readings": [{ "parameter_id": GLOBAL_PARAM_TEMP_ID, "value": 1.5, "time": t }]
     });
-    let (s, body) = crate::common::post_json_with_token(&app, "/api/grab_samples", &grab_in, &key).await;
+    let (s, body) =
+        crate::common::post_json_with_token(&app, "/api/grab_samples", &grab_in, &key).await;
     assert_eq!(s, 200, "in-scope grab must succeed: {body}");
     let grab_out = serde_json::json!({
         "site_id": SITE_B_ID,
         "readings": [{ "parameter_id": GLOBAL_PARAM_TEMP_ID, "value": 1.5, "time": t }]
     });
-    let (s, _) = crate::common::post_json_with_token(&app, "/api/grab_samples", &grab_out, &key).await;
+    let (s, _) =
+        crate::common::post_json_with_token(&app, "/api/grab_samples", &grab_out, &key).await;
     assert_eq!(s, 403, "cross-project grab must be forbidden");
 
     // Status events batch: out-of-scope forbidden.
     let status_out = serde_json::json!({
         "events": [{ "site_id": SITE_B_ID, "parameter_id": GLOBAL_PARAM_TEMP_ID, "time": t, "value": "low_battery" }]
     });
-    let (s, _) = crate::common::post_json_with_token(&app, "/api/status_events/batch", &status_out, &key).await;
+    let (s, _) =
+        crate::common::post_json_with_token(&app, "/api/status_events/batch", &status_out, &key)
+            .await;
     assert_eq!(s, 403, "cross-project status events must be forbidden");
 
     let _ = &db;
@@ -151,26 +167,45 @@ async fn scoped_metadata_key_confined_and_blocked_from_global_catalog() {
     let sp_in = serde_json::json!({ "site_id": SITE2_ID, "parameter_id": GLOBAL_PARAM_DEPTH_ID });
     let (s, created) =
         crate::common::post_json_parse_with_token(&app, "/api/site_parameters", &sp_in, &key).await;
-    assert!((200..300).contains(&s), "in-scope site_parameter create must succeed: {created}");
-    let new_sp_id = created["id"].as_str().expect("created site_parameter id").to_string();
+    assert!(
+        (200..300).contains(&s),
+        "in-scope site_parameter create must succeed: {created}"
+    );
+    let new_sp_id = created["id"]
+        .as_str()
+        .expect("created site_parameter id")
+        .to_string();
 
     // The same in Project B: forbidden (create-body FK resolves to Project B).
     let sp_out = serde_json::json!({ "site_id": SITE_B_ID, "parameter_id": GLOBAL_PARAM_DEPTH_ID });
-    let (s, _) = crate::common::post_json_with_token(&app, "/api/site_parameters", &sp_out, &key).await;
-    assert_eq!(s, 403, "cross-project site_parameter create must be forbidden");
+    let (s, _) =
+        crate::common::post_json_with_token(&app, "/api/site_parameters", &sp_out, &key).await;
+    assert_eq!(
+        s, 403,
+        "cross-project site_parameter create must be forbidden"
+    );
 
     // Resolve-by-id (delete) within the project: allowed.
     let (s, _) =
-        crate::common::delete_with_token(&app, &format!("/api/site_parameters/{new_sp_id}"), &key).await;
-    assert!((200..300).contains(&s), "in-scope delete-by-id must succeed, got {s}");
+        crate::common::delete_with_token(&app, &format!("/api/site_parameters/{new_sp_id}"), &key)
+            .await;
+    assert!(
+        (200..300).contains(&s),
+        "in-scope delete-by-id must succeed, got {s}"
+    );
 
     // Resolve-by-id against a CROSS-project resource is blocked before reaching the handler.
-    let (s, _) = crate::common::delete_with_token(&app, &format!("/api/sites/{SITE_B_ID}"), &key).await;
-    assert_eq!(s, 403, "scoped key cannot delete a cross-project site by id");
+    let (s, _) =
+        crate::common::delete_with_token(&app, &format!("/api/sites/{SITE_B_ID}"), &key).await;
+    assert_eq!(
+        s, 403,
+        "scoped key cannot delete a cross-project site by id"
+    );
 
     // Mutating the GLOBAL catalog (a parameter) is denied for any scoped key (fail-closed).
     let new_param = serde_json::json!({ "code": "scoped_new", "name": "Scoped New", "default_units": "x", "category": "measurement", "aliases": [] });
-    let (s, _) = crate::common::post_json_with_token(&app, "/api/parameters", &new_param, &key).await;
+    let (s, _) =
+        crate::common::post_json_with_token(&app, "/api/parameters", &new_param, &key).await;
     assert_eq!(s, 403, "scoped key must not create global catalog entities");
 }
 
@@ -179,7 +214,9 @@ async fn scoped_metadata_key_confined_and_blocked_from_global_catalog() {
 async fn scoped_key_denied_on_operator_and_global_actions() {
     let (db, app, _state) = setup_two_projects().await;
     // Full permissions, but project-scoped: operator/global actions are still denied.
-    let key = crate::common::seed_api_token(&db, crate::common::full_permissions(), Some(PROJECT_ID)).await;
+    let key =
+        crate::common::seed_api_token(&db, crate::common::full_permissions(), Some(PROJECT_ID))
+            .await;
 
     let cases: &[(&str, serde_json::Value)] = &[
         ("/api/actions/reprocess_all", serde_json::json!({})),
@@ -202,8 +239,12 @@ async fn scoped_key_denied_on_operator_and_global_actions() {
         "csv": "DateTime,Temp\n2026-01-01T00:00:00Z,1.0",
         "site": SITE_B_ID
     });
-    let (s, _) = crate::common::post_json_with_token(&app, "/api/readings/import_csv", &csv_out, &key).await;
-    assert_eq!(s, 403, "scoped key must not import CSV into another project");
+    let (s, _) =
+        crate::common::post_json_with_token(&app, "/api/readings/import_csv", &csv_out, &key).await;
+    assert_eq!(
+        s, 403,
+        "scoped key must not import CSV into another project"
+    );
 }
 
 #[tokio::test]
@@ -212,7 +253,9 @@ async fn per_token_rate_limit_returns_429() {
     let (db, app, _state) = setup_two_projects().await;
 
     // 2 requests/second ceiling on this key.
-    let limited = crate::common::seed_api_token_with_rate_limit(&db, write_data_perms(), Some(PROJECT_ID), 2).await;
+    let limited =
+        crate::common::seed_api_token_with_rate_limit(&db, write_data_perms(), Some(PROJECT_ID), 2)
+            .await;
     let unlimited = crate::common::seed_api_token(&db, write_data_perms(), Some(PROJECT_ID)).await;
 
     let t = now_rfc3339();
@@ -222,7 +265,8 @@ async fn per_token_rate_limit_returns_429() {
 
     let mut limited_statuses = Vec::new();
     for _ in 0..8 {
-        let (s, _) = crate::common::post_json_with_token(&app, "/api/readings/batch", &body, &limited).await;
+        let (s, _) =
+            crate::common::post_json_with_token(&app, "/api/readings/batch", &body, &limited).await;
         limited_statuses.push(s);
     }
     assert!(
@@ -232,7 +276,9 @@ async fn per_token_rate_limit_returns_429() {
 
     let mut unlimited_statuses = Vec::new();
     for _ in 0..8 {
-        let (s, _) = crate::common::post_json_with_token(&app, "/api/readings/batch", &body, &unlimited).await;
+        let (s, _) =
+            crate::common::post_json_with_token(&app, "/api/readings/batch", &body, &unlimited)
+                .await;
         unlimited_statuses.push(s);
     }
     assert!(
@@ -279,8 +325,14 @@ async fn revoke_and_rotate_take_effect_immediately() {
     .await
     .expect("rotate ok")
     .0;
-    let new_secret = rotated.token.clone().expect("rotate returns the new secret once");
-    assert_ne!(new_secret, rotate_key, "rotation must mint a different secret");
+    let new_secret = rotated
+        .token
+        .clone()
+        .expect("rotate returns the new secret once");
+    assert_ne!(
+        new_secret, rotate_key,
+        "rotation must mint a different secret"
+    );
 
     // Old secret is dead, new secret works, metadata (scope) preserved.
     let (s, _) = crate::common::get_with_token(&app, "/api/sites", &rotate_key).await;
@@ -309,7 +361,10 @@ async fn revoke_and_rotate_take_effect_immediately() {
     .await
     .expect("rotate ok")
     .0;
-    assert!(!rotated_frozen.is_active, "rotating a revoked token keeps it revoked");
+    assert!(
+        !rotated_frozen.is_active,
+        "rotating a revoked token keeps it revoked"
+    );
     let new_frozen = rotated_frozen.token.clone().expect("new secret");
     let (s, _) = crate::common::get_with_token(&app, "/api/sites", &new_frozen).await;
     assert_eq!(s, 401, "a rotated-but-revoked token must not authenticate");

@@ -78,7 +78,9 @@ pub fn violation_condition(
     amax: &str,
     min_severity: i16,
 ) -> String {
-    let alarm = format!("({amin} IS NOT NULL AND {val} < {amin}) OR ({amax} IS NOT NULL AND {val} > {amax})");
+    let alarm = format!(
+        "({amin} IS NOT NULL AND {val} < {amin}) OR ({amax} IS NOT NULL AND {val} > {amax})"
+    );
     if min_severity >= 2 {
         format!("({alarm})")
     } else {
@@ -126,8 +128,11 @@ pub fn resolve_thresholds_query(
         .expr_as(col("t", "alarm_min"), Alias::new("alarm_min"))
         .expr_as(col("t", "alarm_max"), Alias::new("alarm_max"))
         .expr_as(
-            Expr::case(col("t", "site_id").equals((Alias::new("sp"), Alias::new("site_id"))), 1)
-                .finally(2),
+            Expr::case(
+                col("t", "site_id").equals((Alias::new("sp"), Alias::new("site_id"))),
+                1,
+            )
+            .finally(2),
             Alias::new("priority"),
         )
         .expr_as(
@@ -240,8 +245,8 @@ pub async fn resolve_threshold(
     site_id: Uuid,
     parameter_id: Uuid,
 ) -> Result<Option<ResolvedThreshold>, sea_orm::DbErr> {
-    let (sql, values) =
-        resolve_thresholds_query(Some(site_id), Some(vec![parameter_id])).build(PostgresQueryBuilder);
+    let (sql, values) = resolve_thresholds_query(Some(site_id), Some(vec![parameter_id]))
+        .build(PostgresQueryBuilder);
     let row = db
         .query_one(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,

@@ -36,7 +36,10 @@ async fn roles(Path(sub): Path<String>) -> Json<serde_json::Value> {
         _ => vec![],
     };
     Json(serde_json::json!(
-        names.into_iter().map(|n| serde_json::json!({ "name": n })).collect::<Vec<_>>()
+        names
+            .into_iter()
+            .map(|n| serde_json::json!({ "name": n }))
+            .collect::<Vec<_>>()
     ))
 }
 
@@ -44,7 +47,10 @@ async fn spawn_mock_keycloak() -> String {
     let app = Router::new()
         .route("/realms/mock/protocol/openid-connect/token", post(token))
         .route("/admin/realms/mock/users/{sub}", get(user))
-        .route("/admin/realms/mock/users/{sub}/role-mappings/realm", get(roles));
+        .route(
+            "/admin/realms/mock/users/{sub}/role-mappings/realm",
+            get(roles),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -62,7 +68,9 @@ async fn seed_projects(db: &DatabaseConnection) {
     for (id, name) in [(PROJECT_A, "Project A"), (PROJECT_B, "Project B")] {
         crate::common::exec(
             db,
-            &format!("INSERT INTO projects (id, name, data_source) VALUES ('{id}', '{name}', 'test')"),
+            &format!(
+                "INSERT INTO projects (id, name, data_source) VALUES ('{id}', '{name}', 'test')"
+            ),
         )
         .await;
     }
@@ -80,7 +88,10 @@ async fn member_is_confined_to_granted_projects() {
     crate::common::keycloak::grant_project(&db, "regular-user", PROJECT_A).await;
 
     let accessible = accessible_project_ids(&state, "regular-user").await;
-    assert!(accessible.is_some(), "a member is confined to a bounded set, not unrestricted");
+    assert!(
+        accessible.is_some(),
+        "a member is confined to a bounded set, not unrestricted"
+    );
     assert!(
         project_allowed(&accessible, Uuid::parse_str(PROJECT_A).unwrap()),
         "the granted project is allowed"
@@ -102,7 +113,10 @@ async fn administrator_is_unrestricted() {
 
     let accessible = accessible_project_ids(&state, "admin-user").await;
     assert!(accessible.is_none(), "an administrator is unrestricted");
-    assert!(project_allowed(&accessible, Uuid::parse_str(PROJECT_B).unwrap()));
+    assert!(project_allowed(
+        &accessible,
+        Uuid::parse_str(PROJECT_B).unwrap()
+    ));
 }
 
 #[tokio::test]
@@ -117,7 +131,10 @@ async fn member_with_no_grant_gets_nothing() {
     // A river member who was never granted any project, the exact C1 hole. Must see nothing.
     let accessible = accessible_project_ids(&state, "regular-user").await;
     assert_eq!(accessible, Some(std::collections::HashSet::new()));
-    assert!(!project_allowed(&accessible, Uuid::parse_str(PROJECT_A).unwrap()));
+    assert!(!project_allowed(
+        &accessible,
+        Uuid::parse_str(PROJECT_A).unwrap()
+    ));
 }
 
 #[tokio::test]

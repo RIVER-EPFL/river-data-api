@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use axum::{Json, extract::{Path, State}};
+use axum::{
+    Json,
+    extract::{Path, State},
+};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
@@ -43,8 +46,9 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> AppResult<T> {
 }
 
 fn require_field(val: Option<f64>, name: &str) -> AppResult<f64> {
-    val.filter(|v| v.is_finite())
-        .ok_or_else(|| AppError::BadRequest(format!("{name} is required and must be a finite number")))
+    val.filter(|v| v.is_finite()).ok_or_else(|| {
+        AppError::BadRequest(format!("{name} is required and must be a finite number"))
+    })
 }
 
 type ResultMap = serde_json::Map<String, serde_json::Value>;
@@ -109,20 +113,22 @@ pub trait AnalyticalTool: Send + Sync {
 static REGISTRY: OnceLock<Vec<Box<dyn AnalyticalTool>>> = OnceLock::new();
 
 fn registry() -> &'static [Box<dyn AnalyticalTool>] {
-    REGISTRY.get_or_init(|| vec![
-        Box::new(DocTool),
-        Box::new(TssAfdmTool),
-        Box::new(ChlorophyllTool),
-        Box::new(NutrientsTool),
-        Box::new(AlkalinityTool),
-        Box::new(Pco2Tool),
-        Box::new(DicTool),
-        Box::new(DomTool),
-        Box::new(FieldDataTool),
-        Box::new(Co2AirTool),
-        Box::new(BenthicTool),
-        Box::new(ChlaBenthicTool),
-    ])
+    REGISTRY.get_or_init(|| {
+        vec![
+            Box::new(DocTool),
+            Box::new(TssAfdmTool),
+            Box::new(ChlorophyllTool),
+            Box::new(NutrientsTool),
+            Box::new(AlkalinityTool),
+            Box::new(Pco2Tool),
+            Box::new(DicTool),
+            Box::new(DomTool),
+            Box::new(FieldDataTool),
+            Box::new(Co2AirTool),
+            Box::new(BenthicTool),
+            Box::new(ChlaBenthicTool),
+        ]
+    })
 }
 
 /// List all available analytical tools (DOC, DIC, pCO2, etc.) with their parameter schemas.
@@ -159,7 +165,8 @@ pub async fn calculate_tool(
     body: axum::body::Bytes,
 ) -> AppResult<Json<ToolResult>> {
     let tools = registry();
-    let tool = tools.iter()
+    let tool = tools
+        .iter()
         .find(|t| t.info().name == tool_name.as_str())
         .ok_or_else(|| AppError::NotFound(format!("Unknown tool: {tool_name}")))?;
 
@@ -171,12 +178,16 @@ pub async fn calculate_tool(
         .unwrap_or_default();
 
     let known_names: Vec<&str> = tool_info.params.iter().map(|p| p.name).collect();
-    let inputs_used: Vec<String> = input_keys.iter()
+    let inputs_used: Vec<String> = input_keys
+        .iter()
         .filter(|k| known_names.contains(&k.as_str()))
-        .cloned().collect();
-    let inputs_ignored: Vec<String> = input_keys.iter()
+        .cloned()
+        .collect();
+    let inputs_ignored: Vec<String> = input_keys
+        .iter()
         .filter(|k| !known_names.contains(&k.as_str()))
-        .cloned().collect();
+        .cloned()
+        .collect();
 
     let mut result = tool.calculate(&body, &state.db).await?;
     result.inputs_used = inputs_used;
@@ -207,8 +218,16 @@ impl AnalyticalTool for DocTool {
             description: "Dissolved Organic Carbon (replicate avg/sd with optional standard curve)",
             endpoint: "/api/tools/doc/calculate",
             params: &[
-                ToolParamInfo { name: "replicates", label: "Replicates (array)", required: true },
-                ToolParamInfo { name: "std_curve", label: "Standard Curve (slope/intercept)", required: false },
+                ToolParamInfo {
+                    name: "replicates",
+                    label: "Replicates (array)",
+                    required: true,
+                },
+                ToolParamInfo {
+                    name: "std_curve",
+                    label: "Standard Curve (slope/intercept)",
+                    required: false,
+                },
             ],
             match_keywords: &["doc", "organic carbon", "dissolved organic"],
         };
@@ -246,10 +265,26 @@ impl AnalyticalTool for TssAfdmTool {
             description: "Total Suspended Solids & Ash-Free Dry Mass",
             endpoint: "/api/tools/tss_afdm/calculate",
             params: &[
-                ToolParamInfo { name: "wgt_dried_g", label: "Dried Weight (g)", required: true },
-                ToolParamInfo { name: "wgt_prefilt_g", label: "Pre-filter Weight (g)", required: true },
-                ToolParamInfo { name: "wgt_ashed_g", label: "Ashed Weight (g)", required: false },
-                ToolParamInfo { name: "vol_filtered_ml", label: "Volume Filtered (mL)", required: true },
+                ToolParamInfo {
+                    name: "wgt_dried_g",
+                    label: "Dried Weight (g)",
+                    required: true,
+                },
+                ToolParamInfo {
+                    name: "wgt_prefilt_g",
+                    label: "Pre-filter Weight (g)",
+                    required: true,
+                },
+                ToolParamInfo {
+                    name: "wgt_ashed_g",
+                    label: "Ashed Weight (g)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "vol_filtered_ml",
+                    label: "Volume Filtered (mL)",
+                    required: true,
+                },
             ],
             match_keywords: &["tss", "afdm", "suspended solid", "dry mass"],
         };
@@ -304,11 +339,31 @@ impl AnalyticalTool for ChlorophyllTool {
             description: "Chlorophyll-a (acid and no-acid methods)",
             endpoint: "/api/tools/chlorophyll/calculate",
             params: &[
-                ToolParamInfo { name: "method", label: "Method (acid/no_acid)", required: true },
-                ToolParamInfo { name: "fluorescence_before", label: "Fluorescence Before", required: true },
-                ToolParamInfo { name: "fluorescence_after", label: "Fluorescence After", required: false },
-                ToolParamInfo { name: "slope", label: "Slope", required: true },
-                ToolParamInfo { name: "intercept", label: "Intercept", required: true },
+                ToolParamInfo {
+                    name: "method",
+                    label: "Method (acid/no_acid)",
+                    required: true,
+                },
+                ToolParamInfo {
+                    name: "fluorescence_before",
+                    label: "Fluorescence Before",
+                    required: true,
+                },
+                ToolParamInfo {
+                    name: "fluorescence_after",
+                    label: "Fluorescence After",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "slope",
+                    label: "Slope",
+                    required: true,
+                },
+                ToolParamInfo {
+                    name: "intercept",
+                    label: "Intercept",
+                    required: true,
+                },
             ],
             match_keywords: &["chlorophyll", "chla", "chl"],
         };
@@ -321,9 +376,7 @@ impl AnalyticalTool for ChlorophyllTool {
         match payload.method {
             ChlorophyllMethod::Acid => {
                 let after = payload.fluorescence_after.ok_or_else(|| {
-                    AppError::BadRequest(
-                        "fluorescence_after required for acid method".to_string(),
-                    )
+                    AppError::BadRequest("fluorescence_after required for acid method".to_string())
                 })?;
                 let chla = river_data_core::toolbox::chla_acid(
                     payload.fluorescence_before,
@@ -364,12 +417,31 @@ impl AnalyticalTool for NutrientsTool {
             description: "Nutrient replicates (P, NH4, SRP, NOx, NO2, TDP, TDN)",
             endpoint: "/api/tools/nutrients/calculate",
             params: &[
-                ToolParamInfo { name: "species", label: "Species (multi-species map)", required: false },
-                ToolParamInfo { name: "replicates", label: "Replicates (single-species)", required: false },
-                ToolParamInfo { name: "nox", label: "NOx", required: false },
-                ToolParamInfo { name: "no2", label: "NO2", required: false },
+                ToolParamInfo {
+                    name: "species",
+                    label: "Species (multi-species map)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "replicates",
+                    label: "Replicates (single-species)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "nox",
+                    label: "NOx",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "no2",
+                    label: "NO2",
+                    required: false,
+                },
             ],
-            match_keywords: &["po4", "nh4", "srp", "nox", "no2", "no3", "tdp", "tdn", "nutrient", "phosph", "nitrate", "nitrite", "ammonium"],
+            match_keywords: &[
+                "po4", "nh4", "srp", "nox", "no2", "no3", "tdp", "tdn", "nutrient", "phosph",
+                "nitrate", "nitrite", "ammonium",
+            ],
         };
         &INFO
     }
@@ -442,14 +514,46 @@ impl AnalyticalTool for AlkalinityTool {
             description: "Alkalinity raw entry (fills WTW_pH_1 from Alk_init_pH when missing)",
             endpoint: "/api/tools/alkalinity/calculate",
             params: &[
-                ToolParamInfo { name: "Alk_meqL", label: "Alkalinity (meq/L)", required: false },
-                ToolParamInfo { name: "Alk_mgL", label: "Alkalinity (mg/L)", required: false },
-                ToolParamInfo { name: "Alk_w_weight_g", label: "Water Weight (g)", required: false },
-                ToolParamInfo { name: "Alk_dyn_pH", label: "Dynamic pH", required: false },
-                ToolParamInfo { name: "Alk_dyn_trit", label: "Dynamic Titrant", required: false },
-                ToolParamInfo { name: "Alk_temp_degC", label: "Temperature (degC)", required: false },
-                ToolParamInfo { name: "Alk_init_pH", label: "Initial pH", required: false },
-                ToolParamInfo { name: "WTW_pH_1", label: "Existing WTW pH", required: false },
+                ToolParamInfo {
+                    name: "Alk_meqL",
+                    label: "Alkalinity (meq/L)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "Alk_mgL",
+                    label: "Alkalinity (mg/L)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "Alk_w_weight_g",
+                    label: "Water Weight (g)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "Alk_dyn_pH",
+                    label: "Dynamic pH",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "Alk_dyn_trit",
+                    label: "Dynamic Titrant",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "Alk_temp_degC",
+                    label: "Temperature (degC)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "Alk_init_pH",
+                    label: "Initial pH",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "WTW_pH_1",
+                    label: "Existing WTW pH",
+                    required: false,
+                },
             ],
             match_keywords: &["alkalinity", "alk", "titration", "caco3"],
         };
@@ -532,20 +636,76 @@ impl AnalyticalTool for Pco2Tool {
             description: "pCO2 from headspace CO2aq (simple, P1, P2 variants)",
             endpoint: "/api/tools/pco2/calculate",
             params: &[
-                ToolParamInfo { name: "mode", label: "Mode (simple/full_pipeline)", required: false },
-                ToolParamInfo { name: "variant", label: "Variant (simple/p1/p2)", required: false },
-                ToolParamInfo { name: "co2_aq_umol", label: "CO2aq (umol)", required: false },
-                ToolParamInfo { name: "water_temp_c", label: "Water Temp (°C)", required: true },
-                ToolParamInfo { name: "pressure_hpa", label: "Pressure (hPa)", required: false },
-                ToolParamInfo { name: "co2_ppm", label: "CO2 (ppm)", required: false },
-                ToolParamInfo { name: "h2o_percent", label: "H2O (%)", required: false },
-                ToolParamInfo { name: "ch4_ppm", label: "CH4 (ppm)", required: false },
-                ToolParamInfo { name: "d13co2_permil", label: "d13CO2 (permil)", required: false },
-                ToolParamInfo { name: "lab_temp_c", label: "Lab Temp (°C)", required: false },
-                ToolParamInfo { name: "lab_pressure_atm", label: "Lab Pressure (atm)", required: false },
-                ToolParamInfo { name: "vol_sa_ml", label: "Vol SA (mL)", required: false },
-                ToolParamInfo { name: "vol_water_ml", label: "Vol Water (mL)", required: false },
-                ToolParamInfo { name: "replicate_b", label: "Replicate B", required: false },
+                ToolParamInfo {
+                    name: "mode",
+                    label: "Mode (simple/full_pipeline)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "variant",
+                    label: "Variant (simple/p1/p2)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "co2_aq_umol",
+                    label: "CO2aq (umol)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "water_temp_c",
+                    label: "Water Temp (°C)",
+                    required: true,
+                },
+                ToolParamInfo {
+                    name: "pressure_hpa",
+                    label: "Pressure (hPa)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "co2_ppm",
+                    label: "CO2 (ppm)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "h2o_percent",
+                    label: "H2O (%)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "ch4_ppm",
+                    label: "CH4 (ppm)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "d13co2_permil",
+                    label: "d13CO2 (permil)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "lab_temp_c",
+                    label: "Lab Temp (°C)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "lab_pressure_atm",
+                    label: "Lab Pressure (atm)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "vol_sa_ml",
+                    label: "Vol SA (mL)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "vol_water_ml",
+                    label: "Vol Water (mL)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "replicate_b",
+                    label: "Replicate B",
+                    required: false,
+                },
             ],
             match_keywords: &["co2", "pco2", "headspace", "carbon dioxide"],
         };
@@ -563,20 +723,32 @@ impl AnalyticalTool for Pco2Tool {
                 })?;
 
                 let pco2 = match payload.variant {
-                    Pco2Variant::Simple => {
-                        river_data_core::toolbox::pco2_from_co2aq(co2_aq, payload.water_temp_c, &constants)
-                    }
+                    Pco2Variant::Simple => river_data_core::toolbox::pco2_from_co2aq(
+                        co2_aq,
+                        payload.water_temp_c,
+                        &constants,
+                    ),
                     Pco2Variant::P1 => {
                         let bp = payload.pressure_hpa.ok_or_else(|| {
                             AppError::BadRequest("pressure_hpa required for P1 variant".to_string())
                         })?;
-                        river_data_core::toolbox::pco2_p1(co2_aq, payload.water_temp_c, bp, &constants)
+                        river_data_core::toolbox::pco2_p1(
+                            co2_aq,
+                            payload.water_temp_c,
+                            bp,
+                            &constants,
+                        )
                     }
                     Pco2Variant::P2 => {
                         let bp = payload.pressure_hpa.ok_or_else(|| {
                             AppError::BadRequest("pressure_hpa required for P2 variant".to_string())
                         })?;
-                        river_data_core::toolbox::pco2_p2(co2_aq, payload.water_temp_c, bp, &constants)
+                        river_data_core::toolbox::pco2_p2(
+                            co2_aq,
+                            payload.water_temp_c,
+                            bp,
+                            &constants,
+                        )
                     }
                 };
 
@@ -599,7 +771,9 @@ impl AnalyticalTool for Pco2Tool {
                 let vol_sa_ml = require_field(payload.vol_sa_ml, "vol_sa_ml")?;
                 let vol_water_ml = require_field(payload.vol_water_ml, "vol_water_ml")?;
                 let field_pressure_hpa = payload.pressure_hpa.ok_or_else(|| {
-                    AppError::BadRequest("pressure_hpa is required for full_pipeline mode".to_string())
+                    AppError::BadRequest(
+                        "pressure_hpa is required for full_pipeline mode".to_string(),
+                    )
                 })?;
 
                 let input_a = river_data_core::toolbox::Pco2FullInput {
@@ -631,7 +805,8 @@ impl AnalyticalTool for Pco2Tool {
                         field_pressure_hpa,
                     };
 
-                    let rep = river_data_core::toolbox::pco2_replicates(&input_a, &input_b, &constants);
+                    let rep =
+                        river_data_core::toolbox::pco2_replicates(&input_a, &input_b, &constants);
 
                     insert_num(&mut results, "CO2_HS_Um_A", rep.a.co2_hs_umol);
                     insert_num(&mut results, "CO2_HS_Um_B", rep.b.co2_hs_umol);
@@ -710,18 +885,66 @@ impl AnalyticalTool for DicTool {
             description: "DIC concentration and d13C-DIC from acid digestion",
             endpoint: "/api/tools/dic/calculate",
             params: &[
-                ToolParamInfo { name: "acid_sample_weight_g", label: "Acid Sample Weight (g)", required: true },
-                ToolParamInfo { name: "acid_weight_g", label: "Acid Weight (g)", required: true },
-                ToolParamInfo { name: "vol_overpressure_ml", label: "Vol Overpressure (mL)", required: true },
-                ToolParamInfo { name: "sa_added_ml", label: "SA Added (mL)", required: true },
-                ToolParamInfo { name: "co2_dry_ppm", label: "CO2 Dry (ppm)", required: true },
-                ToolParamInfo { name: "d13co2_permil", label: "d13CO2 (permil)", required: false },
-                ToolParamInfo { name: "lab_temp_c", label: "Lab Temp (°C, defaults to lab_temp_avg_degC constant)", required: false },
-                ToolParamInfo { name: "h_co2_29815k", label: "H CO2 @298.15K", required: false },
-                ToolParamInfo { name: "gas_const_r_mol", label: "Gas Const R (mol)", required: false },
-                ToolParamInfo { name: "vial_volume", label: "Vial Volume (mL)", required: false },
-                ToolParamInfo { name: "h3po4_added", label: "H3PO4 Added (mL)", required: false },
-                ToolParamInfo { name: "replicate_b", label: "Replicate B", required: false },
+                ToolParamInfo {
+                    name: "acid_sample_weight_g",
+                    label: "Acid Sample Weight (g)",
+                    required: true,
+                },
+                ToolParamInfo {
+                    name: "acid_weight_g",
+                    label: "Acid Weight (g)",
+                    required: true,
+                },
+                ToolParamInfo {
+                    name: "vol_overpressure_ml",
+                    label: "Vol Overpressure (mL)",
+                    required: true,
+                },
+                ToolParamInfo {
+                    name: "sa_added_ml",
+                    label: "SA Added (mL)",
+                    required: true,
+                },
+                ToolParamInfo {
+                    name: "co2_dry_ppm",
+                    label: "CO2 Dry (ppm)",
+                    required: true,
+                },
+                ToolParamInfo {
+                    name: "d13co2_permil",
+                    label: "d13CO2 (permil)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "lab_temp_c",
+                    label: "Lab Temp (°C, defaults to lab_temp_avg_degC constant)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "h_co2_29815k",
+                    label: "H CO2 @298.15K",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "gas_const_r_mol",
+                    label: "Gas Const R (mol)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "vial_volume",
+                    label: "Vial Volume (mL)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "h3po4_added",
+                    label: "H3PO4 Added (mL)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "replicate_b",
+                    label: "Replicate B",
+                    required: false,
+                },
             ],
             match_keywords: &["dic", "d13c", "inorganic carbon"],
         };
@@ -757,8 +980,18 @@ impl AnalyticalTool for DicTool {
         let mut results = ResultMap::new();
         if let Some(ref rep_b) = payload.replicate_b {
             let rep = river_data_core::toolbox::dic_replicates(
-                payload.acid_sample_weight_g, payload.acid_weight_g, payload.vol_overpressure_ml, payload.sa_added_ml, payload.co2_dry_ppm, payload.d13co2_permil,
-                rep_b.acid_sample_weight_g, rep_b.acid_weight_g, rep_b.vol_overpressure_ml, rep_b.sa_added_ml, rep_b.co2_dry_ppm, rep_b.d13co2_permil,
+                payload.acid_sample_weight_g,
+                payload.acid_weight_g,
+                payload.vol_overpressure_ml,
+                payload.sa_added_ml,
+                payload.co2_dry_ppm,
+                payload.d13co2_permil,
+                rep_b.acid_sample_weight_g,
+                rep_b.acid_weight_g,
+                rep_b.vol_overpressure_ml,
+                rep_b.sa_added_ml,
+                rep_b.co2_dry_ppm,
+                rep_b.d13co2_permil,
                 lab_temp_c,
                 &constants,
             );
@@ -821,14 +1054,46 @@ impl AnalyticalTool for DomTool {
             description: "SUVA and absorbance/fluorescence peak ratios",
             endpoint: "/api/tools/dom/calculate",
             params: &[
-                ToolParamInfo { name: "a254", label: "Absorbance @254nm", required: false },
-                ToolParamInfo { name: "doc_avg_ppb", label: "DOC Avg (ppb)", required: false },
-                ToolParamInfo { name: "abs_numerator", label: "Absorbance Numerator", required: false },
-                ToolParamInfo { name: "abs_denominator", label: "Absorbance Denominator", required: false },
-                ToolParamInfo { name: "peak_a", label: "Peak A", required: false },
-                ToolParamInfo { name: "peak_c", label: "Peak C", required: false },
-                ToolParamInfo { name: "peak_m", label: "Peak M", required: false },
-                ToolParamInfo { name: "peak_t", label: "Peak T", required: false },
+                ToolParamInfo {
+                    name: "a254",
+                    label: "Absorbance @254nm",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "doc_avg_ppb",
+                    label: "DOC Avg (ppb)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "abs_numerator",
+                    label: "Absorbance Numerator",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "abs_denominator",
+                    label: "Absorbance Denominator",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "peak_a",
+                    label: "Peak A",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "peak_c",
+                    label: "Peak C",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "peak_m",
+                    label: "Peak M",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "peak_t",
+                    label: "Peak T",
+                    required: false,
+                },
             ],
             match_keywords: &["dom", "suva", "a254", "absorbance", "dissolved organic"],
         };
@@ -843,19 +1108,39 @@ impl AnalyticalTool for DomTool {
             insert_num(&mut results, "SUVA", river_data_core::toolbox::suva(a, d));
         }
         if let (Some(n), Some(d)) = (payload.abs_numerator, payload.abs_denominator) {
-            insert_num(&mut results, "absorbance_ratio", river_data_core::toolbox::absorbance_ratio(n, d));
+            insert_num(
+                &mut results,
+                "absorbance_ratio",
+                river_data_core::toolbox::absorbance_ratio(n, d),
+            );
         }
         if let (Some(pa), Some(pt)) = (payload.peak_a, payload.peak_t) {
-            insert_num(&mut results, "A_T", river_data_core::toolbox::absorbance_ratio(pa, pt));
+            insert_num(
+                &mut results,
+                "A_T",
+                river_data_core::toolbox::absorbance_ratio(pa, pt),
+            );
         }
         if let (Some(pc), Some(pa)) = (payload.peak_c, payload.peak_a) {
-            insert_num(&mut results, "C_A", river_data_core::toolbox::absorbance_ratio(pc, pa));
+            insert_num(
+                &mut results,
+                "C_A",
+                river_data_core::toolbox::absorbance_ratio(pc, pa),
+            );
         }
         if let (Some(pc), Some(pm)) = (payload.peak_c, payload.peak_m) {
-            insert_num(&mut results, "C_M", river_data_core::toolbox::absorbance_ratio(pc, pm));
+            insert_num(
+                &mut results,
+                "C_M",
+                river_data_core::toolbox::absorbance_ratio(pc, pm),
+            );
         }
         if let (Some(pc), Some(pt)) = (payload.peak_c, payload.peak_t) {
-            insert_num(&mut results, "C_T", river_data_core::toolbox::absorbance_ratio(pc, pt));
+            insert_num(
+                &mut results,
+                "C_T",
+                river_data_core::toolbox::absorbance_ratio(pc, pt),
+            );
         }
 
         Ok(ToolResult::new("dom", results))
@@ -886,18 +1171,67 @@ impl AnalyticalTool for FieldDataTool {
             description: "Barometric pressure from altitude, pressure selection, CO2 correction, reach depths",
             endpoint: "/api/tools/field_data/calculate",
             params: &[
-                ToolParamInfo { name: "elevation_m", label: "Elevation (m)", required: false },
-                ToolParamInfo { name: "temp_c", label: "Temperature (°C)", required: false },
-                ToolParamInfo { name: "pressure_hpa", label: "Pressure (hPa, explicit override)", required: false },
-                ToolParamInfo { name: "field_bp", label: "Field BP (hPa, used when in 700-1050 range)", required: false },
-                ToolParamInfo { name: "raw_co2", label: "Raw CO2 (ppm)", required: false },
-                ToolParamInfo { name: "raw_co2_min", label: "Raw CO2 Min (ppm)", required: false },
-                ToolParamInfo { name: "raw_co2_avg", label: "Raw CO2 Avg (ppm)", required: false },
-                ToolParamInfo { name: "raw_co2_max", label: "Raw CO2 Max (ppm)", required: false },
-                ToolParamInfo { name: "std_curve", label: "Standard Curve (slope/intercept)", required: false },
-                ToolParamInfo { name: "reach_depths", label: "Reach Depths (cm)", required: false },
+                ToolParamInfo {
+                    name: "elevation_m",
+                    label: "Elevation (m)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "temp_c",
+                    label: "Temperature (°C)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "pressure_hpa",
+                    label: "Pressure (hPa, explicit override)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "field_bp",
+                    label: "Field BP (hPa, used when in 700-1050 range)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "raw_co2",
+                    label: "Raw CO2 (ppm)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "raw_co2_min",
+                    label: "Raw CO2 Min (ppm)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "raw_co2_avg",
+                    label: "Raw CO2 Avg (ppm)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "raw_co2_max",
+                    label: "Raw CO2 Max (ppm)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "std_curve",
+                    label: "Standard Curve (slope/intercept)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "reach_depths",
+                    label: "Reach Depths (cm)",
+                    required: false,
+                },
             ],
-            match_keywords: &["field", "elevation", "altitude", "baro", "pressure", "co2", "depth", "reach"],
+            match_keywords: &[
+                "field",
+                "elevation",
+                "altitude",
+                "baro",
+                "pressure",
+                "co2",
+                "depth",
+                "reach",
+            ],
         };
         &INFO
     }
@@ -907,9 +1241,9 @@ impl AnalyticalTool for FieldDataTool {
         let mut results = ResultMap::new();
 
         let alt_bp = match (payload.elevation_m, payload.temp_c) {
-            (Some(e), Some(t)) => {
-                Some(river_data_core::toolbox::barometric_pressure_from_altitude(e, t))
-            }
+            (Some(e), Some(t)) => Some(
+                river_data_core::toolbox::barometric_pressure_from_altitude(e, t),
+            ),
             _ => None,
         };
         insert_opt(&mut results, "Field_BP_altitude", alt_bp);
@@ -922,20 +1256,39 @@ impl AnalyticalTool for FieldDataTool {
 
         let curve = payload.std_curve.as_ref().map(|c| (c.slope, c.intercept));
 
-        if payload.raw_co2_min.is_some() || payload.raw_co2_avg.is_some() || payload.raw_co2_max.is_some() {
+        if payload.raw_co2_min.is_some()
+            || payload.raw_co2_avg.is_some()
+            || payload.raw_co2_max.is_some()
+        {
             if let (Some(p), Some(t)) = (pressure, payload.temp_c) {
                 if let Some(co2_min) = payload.raw_co2_min {
-                    insert_num(&mut results, "Vaisala_CO2_min_corr", river_data_core::toolbox::co2_correction(co2_min, p, t, curve));
+                    insert_num(
+                        &mut results,
+                        "Vaisala_CO2_min_corr",
+                        river_data_core::toolbox::co2_correction(co2_min, p, t, curve),
+                    );
                 }
                 if let Some(co2_avg) = payload.raw_co2_avg {
-                    insert_num(&mut results, "Vaisala_CO2_avg_corr", river_data_core::toolbox::co2_correction(co2_avg, p, t, curve));
+                    insert_num(
+                        &mut results,
+                        "Vaisala_CO2_avg_corr",
+                        river_data_core::toolbox::co2_correction(co2_avg, p, t, curve),
+                    );
                 }
                 if let Some(co2_max) = payload.raw_co2_max {
-                    insert_num(&mut results, "Vaisala_CO2_max_corr", river_data_core::toolbox::co2_correction(co2_max, p, t, curve));
+                    insert_num(
+                        &mut results,
+                        "Vaisala_CO2_max_corr",
+                        river_data_core::toolbox::co2_correction(co2_max, p, t, curve),
+                    );
                 }
             }
         } else if let (Some(co2), Some(p), Some(t)) = (payload.raw_co2, pressure, payload.temp_c) {
-            insert_num(&mut results, "Vaisala_CO2_avg_corr", river_data_core::toolbox::co2_correction(co2, p, t, curve));
+            insert_num(
+                &mut results,
+                "Vaisala_CO2_avg_corr",
+                river_data_core::toolbox::co2_correction(co2, p, t, curve),
+            );
         }
 
         if let Some(ref depths) = payload.reach_depths
@@ -966,8 +1319,16 @@ impl AnalyticalTool for Co2AirTool {
             description: "CH4 dry concentration from wet measurement",
             endpoint: "/api/tools/co2_air/calculate",
             params: &[
-                ToolParamInfo { name: "ch4_wet", label: "CH4 Wet (ppm)", required: true },
-                ToolParamInfo { name: "h2o_percent", label: "H2O (%)", required: true },
+                ToolParamInfo {
+                    name: "ch4_wet",
+                    label: "CH4 Wet (ppm)",
+                    required: true,
+                },
+                ToolParamInfo {
+                    name: "h2o_percent",
+                    label: "H2O (%)",
+                    required: true,
+                },
             ],
             match_keywords: &["co2_air", "ch4", "methane"],
         };
@@ -976,7 +1337,8 @@ impl AnalyticalTool for Co2AirTool {
 
     async fn calculate(&self, body: &[u8], _db: &DatabaseConnection) -> AppResult<ToolResult> {
         let payload: Co2AirRequest = parse_body(body)?;
-        let ch4 = river_data_core::toolbox::co2_air::ch4_dry_air(payload.ch4_wet, payload.h2o_percent);
+        let ch4 =
+            river_data_core::toolbox::co2_air::ch4_dry_air(payload.ch4_wet, payload.h2o_percent);
 
         let mut results = ResultMap::new();
         insert_num(&mut results, "lab_co2air_ch4_dry", ch4);
@@ -1003,11 +1365,31 @@ impl AnalyticalTool for BenthicTool {
             description: "Rock surface area, per-m2 normalizations",
             endpoint: "/api/tools/benthic/calculate",
             params: &[
-                ToolParamInfo { name: "diameters_cm", label: "Rock Diameters (cm)", required: true },
-                ToolParamInfo { name: "afdm_g_filter", label: "AFDM per Filter (g)", required: false },
-                ToolParamInfo { name: "chla_ug_l", label: "Chl-a (ug/L)", required: false },
-                ToolParamInfo { name: "volume_filtered_ml", label: "Volume Filtered (mL)", required: true },
-                ToolParamInfo { name: "total_volume_ml", label: "Total Volume (mL)", required: true },
+                ToolParamInfo {
+                    name: "diameters_cm",
+                    label: "Rock Diameters (cm)",
+                    required: true,
+                },
+                ToolParamInfo {
+                    name: "afdm_g_filter",
+                    label: "AFDM per Filter (g)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "chla_ug_l",
+                    label: "Chl-a (ug/L)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "volume_filtered_ml",
+                    label: "Volume Filtered (mL)",
+                    required: true,
+                },
+                ToolParamInfo {
+                    name: "total_volume_ml",
+                    label: "Total Volume (mL)",
+                    required: true,
+                },
             ],
             match_keywords: &["benthic", "rock", "surface area", "periphyton"],
         };
@@ -1021,20 +1403,28 @@ impl AnalyticalTool for BenthicTool {
         let mut results = ResultMap::new();
         insert_num(&mut results, "rock_surface_area_m2", area);
         if let Some(afdm) = payload.afdm_g_filter {
-            insert_num(&mut results, "benthic_AFDM_avg_gm2", river_data_core::toolbox::benthic_afdm_per_m2(
-                afdm,
-                &payload.diameters_cm,
-                payload.volume_filtered_ml,
-                payload.total_volume_ml,
-            ));
+            insert_num(
+                &mut results,
+                "benthic_AFDM_avg_gm2",
+                river_data_core::toolbox::benthic_afdm_per_m2(
+                    afdm,
+                    &payload.diameters_cm,
+                    payload.volume_filtered_ml,
+                    payload.total_volume_ml,
+                ),
+            );
         }
         if let Some(chla) = payload.chla_ug_l {
-            insert_num(&mut results, "chla_per_m2", river_data_core::toolbox::benthic_chla_per_m2(
-                chla,
-                &payload.diameters_cm,
-                payload.volume_filtered_ml,
-                payload.total_volume_ml,
-            ));
+            insert_num(
+                &mut results,
+                "chla_per_m2",
+                river_data_core::toolbox::benthic_chla_per_m2(
+                    chla,
+                    &payload.diameters_cm,
+                    payload.volume_filtered_ml,
+                    payload.total_volume_ml,
+                ),
+            );
         }
         Ok(ToolResult::new("benthic", results))
     }
@@ -1069,11 +1459,31 @@ impl AnalyticalTool for ChlaBenthicTool {
             description: "Unified Chlorophyll-Benthic multi-replicate (acid + no-acid Chl-a, AFDM, per-m2)",
             endpoint: "/api/tools/chla_benthic/calculate",
             params: &[
-                ToolParamInfo { name: "acid_slope", label: "Acid Slope", required: true },
-                ToolParamInfo { name: "acid_intercept", label: "Acid Intercept", required: true },
-                ToolParamInfo { name: "noacid_slope", label: "No-acid Slope", required: true },
-                ToolParamInfo { name: "noacid_intercept", label: "No-acid Intercept", required: true },
-                ToolParamInfo { name: "replicates", label: "Replicates (array)", required: true },
+                ToolParamInfo {
+                    name: "acid_slope",
+                    label: "Acid Slope",
+                    required: true,
+                },
+                ToolParamInfo {
+                    name: "acid_intercept",
+                    label: "Acid Intercept",
+                    required: true,
+                },
+                ToolParamInfo {
+                    name: "noacid_slope",
+                    label: "No-acid Slope",
+                    required: true,
+                },
+                ToolParamInfo {
+                    name: "noacid_intercept",
+                    label: "No-acid Intercept",
+                    required: true,
+                },
+                ToolParamInfo {
+                    name: "replicates",
+                    label: "Replicates (array)",
+                    required: true,
+                },
             ],
             match_keywords: &["chla_benthic", "chlorophyll", "benthic", "afdm"],
         };
@@ -1106,12 +1516,32 @@ impl AnalyticalTool for ChlaBenthicTool {
         let mut results = ResultMap::new();
         insert_opt(&mut results, "Chla_acid_ugL_avg", result.chla_acid_ug_l_avg);
         insert_opt(&mut results, "Chla_acid_ugL_sd", result.chla_acid_ug_l_sd);
-        insert_num(&mut results, "Chla_noacid_ugL_avg", result.chla_noacid_ug_l_avg);
-        insert_num(&mut results, "Chla_noacid_ugL_sd", result.chla_noacid_ug_l_sd);
-        insert_opt(&mut results, "Chla_acid_avg_ugm2", result.chla_acid_ug_m2_avg);
+        insert_num(
+            &mut results,
+            "Chla_noacid_ugL_avg",
+            result.chla_noacid_ug_l_avg,
+        );
+        insert_num(
+            &mut results,
+            "Chla_noacid_ugL_sd",
+            result.chla_noacid_ug_l_sd,
+        );
+        insert_opt(
+            &mut results,
+            "Chla_acid_avg_ugm2",
+            result.chla_acid_ug_m2_avg,
+        );
         insert_opt(&mut results, "Chla_acid_sd_ugm2", result.chla_acid_ug_m2_sd);
-        insert_num(&mut results, "Chla_noacid_avg_ugm2", result.chla_noacid_ug_m2_avg);
-        insert_num(&mut results, "Chla_noacid_sd_ugm2", result.chla_noacid_ug_m2_sd);
+        insert_num(
+            &mut results,
+            "Chla_noacid_avg_ugm2",
+            result.chla_noacid_ug_m2_avg,
+        );
+        insert_num(
+            &mut results,
+            "Chla_noacid_sd_ugm2",
+            result.chla_noacid_ug_m2_sd,
+        );
         insert_opt(&mut results, "benthic_AFDM_avg_gm2", result.afdm_g_m2_avg);
         insert_opt(&mut results, "benthic_AFDM_sd_gm2", result.afdm_g_m2_sd);
 

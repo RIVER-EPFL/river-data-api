@@ -52,7 +52,8 @@ fn flow_dt(secs: i64) -> DateTime<Utc> {
 }
 
 fn dt(s: &str) -> DateTime<Utc> {
-    s.parse().unwrap_or_else(|e| panic!("invalid fixture instant '{s}': {e}"))
+    s.parse()
+        .unwrap_or_else(|e| panic!("invalid fixture instant '{s}': {e}"))
 }
 
 fn uid(s: &str) -> Uuid {
@@ -61,7 +62,9 @@ fn uid(s: &str) -> Uuid {
 
 /// A timestamp field of a JSON response, parsed rather than string-compared.
 fn ts(body: &serde_json::Value, key: &str) -> Option<DateTime<Utc>> {
-    body[key].as_str().and_then(|s| s.parse::<DateTime<Utc>>().ok())
+    body[key]
+        .as_str()
+        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
 }
 
 /// Historical CSV rows for one parameter column, the shape the importer accepts.
@@ -129,7 +132,8 @@ async fn deployment_window(
         .await
         .expect("query sensor_deployments")
         .expect("deployment row");
-    let from: DateTime<chrono::FixedOffset> = row.try_get("", "deployed_from").expect("deployed_from");
+    let from: DateTime<chrono::FixedOffset> =
+        row.try_get("", "deployed_from").expect("deployed_from");
     let until = row
         .try_get::<DateTime<chrono::FixedOffset>>("", "deployed_until")
         .ok()
@@ -157,7 +161,8 @@ async fn earliest_curve(db: &DatabaseConnection, sensor_id: &str) -> CurveRow {
         .await
         .expect("query sensor_calibrations")
         .expect("calibration row");
-    let valid_from: DateTime<chrono::FixedOffset> = row.try_get("", "valid_from").expect("valid_from");
+    let valid_from: DateTime<chrono::FixedOffset> =
+        row.try_get("", "valid_from").expect("valid_from");
     CurveRow {
         id: row.try_get("", "id").expect("id"),
         slope: row.try_get("", "slope").expect("slope"),
@@ -261,7 +266,10 @@ async fn paired_flow_track(app: &Router, db: &DatabaseConnection, admin: &str) -
     );
 
     let sensor = track.sensor_id.clone().expect("track B carries a sensor");
-    let deployment = track.deployment_id.clone().expect("track B carries a deployment");
+    let deployment = track
+        .deployment_id
+        .clone()
+        .expect("track B carries a deployment");
     let parameter = track.parameter_id("TrkFlowDO").to_string();
     let parameter_code = track.parameters[0].0.clone();
     Flow {
@@ -350,7 +358,10 @@ async fn deploy_dialog_suggestions_then_redeploy_binds_the_slot() {
     );
 
     let (status, after) = crate::common::get_json_with_token(&app, &suggestions, &intern).await;
-    assert_eq!(status, 200, "suggestions after the recall ({status}): {after}");
+    assert_eq!(
+        status, 200,
+        "suggestions after the recall ({status}): {after}"
+    );
     assert_eq!(
         ts(&after, "end_of_last_deployment"),
         Some(flow_dt(7200)),
@@ -477,9 +488,7 @@ async fn recall_then_reopen_via_edit_dates_restores_attribution() {
     let total = 2 * tracks::FLOW_READINGS_PER_CYCLE;
 
     let identity = e2e::identity_calibration_id(&app, &admin, &flow.sensor).await;
-    let identity = uid(
-        &identity.expect("pairing gives the sensor its identity calibration"),
-    );
+    let identity = uid(&identity.expect("pairing gives the sensor its identity calibration"));
 
     let deployment_path = format!("/api/sensor_deployments/{}", flow.deployment);
     let recall = json!({ "deployed_until": flow_at(10) });
@@ -530,11 +539,7 @@ async fn recall_then_reopen_via_edit_dates_restores_attribution() {
                 "the reading at {} was logged with the sensor pulled out",
                 r.time
             );
-            assert_eq!(
-                r.site_id, None,
-                "so it belongs to no site: {}",
-                r.time
-            );
+            assert_eq!(r.site_id, None, "so it belongs to no site: {}", r.time);
         }
     }
 
@@ -557,7 +562,11 @@ async fn recall_then_reopen_via_edit_dates_restores_attribution() {
     );
 
     let (from, until) = deployment_window(&db, &flow.deployment).await;
-    assert_eq!(from, flow_dt(0), "the start is the one the dialog sent back");
+    assert_eq!(
+        from,
+        flow_dt(0),
+        "the start is the one the dialog sent back"
+    );
     assert_eq!(
         until, None,
         "an explicit null re-opens the deployment, and the window recompute must not re-close it"
@@ -661,7 +670,10 @@ async fn backdate_deployed_from_claims_unattributed_slot_history() {
 
     let series = format!("/api/sensors/{}/readings", flow.sensor);
     let (status, before) = crate::common::get_json_with_token(&app, &series, &intern).await;
-    assert_eq!(status, 200, "an intern may read the sensor series ({status}): {before}");
+    assert_eq!(
+        status, 200,
+        "an intern may read the sensor series ({status}): {before}"
+    );
     assert_eq!(
         ts(&before, "data_start"),
         Some(flow_dt(0)),
@@ -745,7 +757,10 @@ async fn backdate_deployed_from_claims_unattributed_slot_history() {
     }
 
     let (status, after) = crate::common::get_json_with_token(&app, &series, &intern).await;
-    assert_eq!(status, 200, "sensor series after the backdate ({status}): {after}");
+    assert_eq!(
+        status, 200,
+        "sensor series after the backdate ({status}): {after}"
+    );
     assert_eq!(
         ts(&after, "data_start"),
         Some(dt(HISTORY_START)),
@@ -780,7 +795,8 @@ async fn calibration_candidates_then_backfill_calibrations() {
     // every calibration window and carry no calibration_id: the uncovered state the sensors list
     // reports and offers to fix.
     let (status, candidates) =
-        crate::common::get_json_with_token(&app, "/api/actions/calibration_candidates", &intern).await;
+        crate::common::get_json_with_token(&app, "/api/actions/calibration_candidates", &intern)
+            .await;
     assert_eq!(
         status, 200,
         "an intern may read the calibration candidates ({status}): {candidates}"
@@ -843,7 +859,10 @@ async fn calibration_candidates_then_backfill_calibrations() {
 
     let (status, run) =
         crate::common::post_json_parse_with_token(&app, backfill, &selector, &river).await;
-    assert_eq!(status, 200, "a river member runs the backfill ({status}): {run}");
+    assert_eq!(
+        status, 200,
+        "a river member runs the backfill ({status}): {run}"
+    );
     assert_eq!(
         run["sensors_updated"].as_u64(),
         Some(1),
@@ -895,7 +914,11 @@ async fn calibration_candidates_then_backfill_calibrations() {
     );
 
     let rows = slot_readings(&db, &flow.parameter).await;
-    assert_eq!(rows.len(), tracks::FLOW_READINGS_PER_CYCLE, "the cycle is intact: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        tracks::FLOW_READINGS_PER_CYCLE,
+        "the cycle is intact: {rows:?}"
+    );
     for r in &rows {
         assert_eq!(
             r.calibration_id,
@@ -912,8 +935,12 @@ async fn calibration_candidates_then_backfill_calibrations() {
     }
 
     let (status, cleared) =
-        crate::common::get_json_with_token(&app, "/api/actions/calibration_candidates", &intern).await;
-    assert_eq!(status, 200, "candidates after the backfill ({status}): {cleared}");
+        crate::common::get_json_with_token(&app, "/api/actions/calibration_candidates", &intern)
+            .await;
+    assert_eq!(
+        status, 200,
+        "candidates after the backfill ({status}): {cleared}"
+    );
     assert_eq!(
         cleared["total_candidates"].as_u64(),
         Some(0),
@@ -1000,7 +1027,10 @@ async fn recalculate_action_rewrites_the_calibration_window() {
 
     let (status, run) =
         crate::common::post_json_parse_with_token(&app, &recalculate, &json!({}), &manager).await;
-    assert_eq!(status, 200, "a manager recalculates the curve ({status}): {run}");
+    assert_eq!(
+        status, 200,
+        "a manager recalculates the curve ({status}): {run}"
+    );
     let job_id = run["job_id"]
         .as_str()
         .unwrap_or_else(|| panic!("recalculate returns a tracked job: {run}"))
@@ -1017,7 +1047,10 @@ async fn recalculate_action_rewrites_the_calibration_window() {
         &manager,
     )
     .await;
-    assert_eq!(status, 200, "the job is visible to the operator who ran it ({status}): {job}");
+    assert_eq!(
+        status, 200,
+        "the job is visible to the operator who ran it ({status}): {job}"
+    );
     assert_eq!(
         job["trigger_type"].as_str(),
         Some("calibration_recalculate"),
@@ -1030,7 +1063,11 @@ async fn recalculate_action_rewrites_the_calibration_window() {
     );
 
     let rows = slot_readings(&db, &flow.parameter).await;
-    assert_eq!(rows.len(), tracks::FLOW_READINGS_PER_CYCLE, "no reading was lost: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        tracks::FLOW_READINGS_PER_CYCLE,
+        "no reading was lost: {rows:?}"
+    );
     for r in &rows {
         assert_eq!(
             r.calibrated_value,
@@ -1067,10 +1104,16 @@ async fn recalculate_action_rewrites_the_calibration_window() {
 
     let (status, body) = crate::common::post_json_with_token(
         &app,
-        &format!("/api/actions/sensor_calibrations/{}/recalculate", Uuid::new_v4()),
+        &format!(
+            "/api/actions/sensor_calibrations/{}/recalculate",
+            Uuid::new_v4()
+        ),
         &json!({}),
         &manager,
     )
     .await;
-    assert_eq!(status, 404, "recalculating a curve that does not exist: {body}");
+    assert_eq!(
+        status, 404,
+        "recalculating a curve that does not exist: {body}"
+    );
 }

@@ -55,7 +55,14 @@ pub async fn get_me(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> AppResult<Json<Me>> {
-    let AuthContext::Keycloak { roles, sub, email, grants, .. } = &auth else {
+    let AuthContext::Keycloak {
+        roles,
+        sub,
+        email,
+        grants,
+        ..
+    } = &auth
+    else {
         return Err(AppError::Forbidden("me_requires_keycloak".to_string()));
     };
     let highest = highest_role(roles);
@@ -154,7 +161,9 @@ pub async fn get_my_sites(
         ) else {
             continue;
         };
-        let subproject_id = row.try_get::<Option<Uuid>>("", "subproject_id").unwrap_or(None);
+        let subproject_id = row
+            .try_get::<Option<Uuid>>("", "subproject_id")
+            .unwrap_or(None);
 
         if projects.last().is_none_or(|p| p.project_id != project_id) {
             projects.push(NavigatorProject {
@@ -164,7 +173,11 @@ pub async fn get_my_sites(
             });
         }
         let project = projects.last_mut().expect("just pushed");
-        if project.subprojects.last().is_none_or(|sp| sp.id != subproject_id) {
+        if project
+            .subprojects
+            .last()
+            .is_none_or(|sp| sp.id != subproject_id)
+        {
             project.subprojects.push(NavigatorSubproject {
                 id: subproject_id,
                 name: row
@@ -176,7 +189,10 @@ pub async fn get_my_sites(
             });
         }
         let subproject = project.subprojects.last_mut().expect("just pushed");
-        subproject.sites.push(NavigatorSite { id: site_id, name: site_name });
+        subproject.sites.push(NavigatorSite {
+            id: site_id,
+            name: site_name,
+        });
     }
     Ok(Json(projects))
 }

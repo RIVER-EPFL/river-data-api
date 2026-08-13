@@ -18,11 +18,7 @@ use crate::error::{AppError, AppResult};
 /// A job with no project-bearing target (`refresh_aggregates`, `reprocess_all`) is admitted: any
 /// member may trigger one, so withholding its timeline would hide the record of their own run.
 /// A job naming a target that resolves to no project is refused.
-async fn confine_job(
-    state: &AppState,
-    scope: &AccessScope,
-    job_id: Uuid,
-) -> AppResult<()> {
+async fn confine_job(state: &AppState, scope: &AccessScope, job_id: Uuid) -> AppResult<()> {
     let project = scope::project_of_job(&state.db, job_id).await?;
     let unowned = if matches!(project, RowProject::Global) {
         Unowned::Allow
@@ -212,9 +208,16 @@ pub async fn rerun_job(
     // Replay the original job from its persisted params: the row already carries the exact
     // `trigger_type`/`sensor_id`/`trigger_id`/`params` the first run used, so first-run and rerun
     // share the single leased `enqueue` path (no separate reconstruction, no inline spawn).
-    let new_id = super::worker::enqueue(&state.db, &trigger_type, sensor_id, trigger_id, &params, None)
-        .await?
-        .ok_or_else(|| AppError::Conflict("an equivalent job is already in flight".to_string()))?;
+    let new_id = super::worker::enqueue(
+        &state.db,
+        &trigger_type,
+        sensor_id,
+        trigger_id,
+        &params,
+        None,
+    )
+    .await?
+    .ok_or_else(|| AppError::Conflict("an equivalent job is already in flight".to_string()))?;
 
     Ok(Json(RerunResponse {
         job_id: new_id,

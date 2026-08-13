@@ -1,7 +1,4 @@
-
-use river_db::routes::private::admin::merge_services::{
-    MergeParametersRequest, merge_parameters,
-};
+use river_db::routes::private::admin::merge_services::{MergeParametersRequest, merge_parameters};
 use sea_orm::DatabaseConnection;
 use serial_test::serial;
 
@@ -16,12 +13,15 @@ async fn setup() -> (DatabaseConnection, axum::Router, String) {
 
 async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
     use sea_orm::{ConnectionTrait, Statement};
-    db.query_one(Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.to_string()))
-        .await
-        .ok()
-        .flatten()
-        .and_then(|r| r.try_get::<i64>("", "c").ok())
-        .unwrap_or(0)
+    db.query_one(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql.to_string(),
+    ))
+    .await
+    .ok()
+    .flatten()
+    .and_then(|r| r.try_get::<i64>("", "c").ok())
+    .unwrap_or(0)
 }
 
 async fn aliases(db: &DatabaseConnection, param_id: &str) -> Vec<String> {
@@ -84,11 +84,20 @@ async fn test_simple_reassign() {
     .await;
     assert!(before > 0, "source should have readings");
 
-    let result = merge_parameters(&db, &merge_req(crate::common::GLOBAL_PARAM_DO_ID, crate::common::GLOBAL_PARAM_TEMP_ID))
-        .await
-        .expect("merge should succeed");
+    let result = merge_parameters(
+        &db,
+        &merge_req(
+            crate::common::GLOBAL_PARAM_DO_ID,
+            crate::common::GLOBAL_PARAM_TEMP_ID,
+        ),
+    )
+    .await
+    .expect("merge should succeed");
 
-    assert!(result.sites_reassigned > 0, "should reassign at least one site");
+    assert!(
+        result.sites_reassigned > 0,
+        "should reassign at least one site"
+    );
     assert!(result.source_deleted);
 
     let source_exists = count(
@@ -142,9 +151,15 @@ async fn test_conflict_merge() {
     .await;
     assert!(source_readings > 0 && target_readings > 0);
 
-    let result = merge_parameters(&db, &merge_req(crate::common::GLOBAL_PARAM_DO_ID, crate::common::GLOBAL_PARAM_TEMP_ID))
-        .await
-        .expect("merge should succeed");
+    let result = merge_parameters(
+        &db,
+        &merge_req(
+            crate::common::GLOBAL_PARAM_DO_ID,
+            crate::common::GLOBAL_PARAM_TEMP_ID,
+        ),
+    )
+    .await
+    .expect("merge should succeed");
 
     assert!(result.sites_merged > 0, "should merge at conflicting sites");
     assert!(result.source_deleted);
@@ -188,9 +203,15 @@ async fn test_cross_site() {
     let (db, _, _) = setup().await;
 
     // DEPTH is only at site1 (PARAM_S1_DEPTH_ID), TURB is at both sites.
-    let result = merge_parameters(&db, &merge_req(crate::common::GLOBAL_PARAM_DEPTH_ID, crate::common::GLOBAL_PARAM_TURB_ID))
-        .await
-        .expect("merge should succeed");
+    let result = merge_parameters(
+        &db,
+        &merge_req(
+            crate::common::GLOBAL_PARAM_DEPTH_ID,
+            crate::common::GLOBAL_PARAM_TURB_ID,
+        ),
+    )
+    .await
+    .expect("merge should succeed");
 
     assert!(result.source_deleted);
     assert!(result.sites_merged + result.sites_reassigned > 0);
@@ -213,7 +234,10 @@ async fn test_cross_site() {
         ),
     )
     .await;
-    assert!(target_sp_count >= 2, "target should still have site_params at both sites");
+    assert!(
+        target_sp_count >= 2,
+        "target should still have site_params at both sites"
+    );
 }
 
 // Scenario: a derived_parameter_source points to the source parameter.
@@ -243,9 +267,15 @@ async fn test_derived_sources_reassigned() {
     )
     .await;
 
-    merge_parameters(&db, &merge_req(crate::common::GLOBAL_PARAM_DO_ID, crate::common::GLOBAL_PARAM_TEMP_ID))
-        .await
-        .expect("merge should succeed");
+    merge_parameters(
+        &db,
+        &merge_req(
+            crate::common::GLOBAL_PARAM_DO_ID,
+            crate::common::GLOBAL_PARAM_TEMP_ID,
+        ),
+    )
+    .await
+    .expect("merge should succeed");
 
     let reassigned = count(
         &db,
@@ -287,7 +317,9 @@ async fn test_aliases_absorbed() {
         db.query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT code FROM parameters WHERE id = $1",
-            [uuid::Uuid::parse_str(crate::common::GLOBAL_PARAM_DO_ID).unwrap().into()],
+            [uuid::Uuid::parse_str(crate::common::GLOBAL_PARAM_DO_ID)
+                .unwrap()
+                .into()],
         ))
         .await
         .unwrap()
@@ -296,9 +328,15 @@ async fn test_aliases_absorbed() {
         .unwrap()
     };
 
-    merge_parameters(&db, &merge_req(crate::common::GLOBAL_PARAM_DO_ID, crate::common::GLOBAL_PARAM_TEMP_ID))
-        .await
-        .expect("merge should succeed");
+    merge_parameters(
+        &db,
+        &merge_req(
+            crate::common::GLOBAL_PARAM_DO_ID,
+            crate::common::GLOBAL_PARAM_TEMP_ID,
+        ),
+    )
+    .await
+    .expect("merge should succeed");
 
     let target_aliases = aliases(&db, crate::common::GLOBAL_PARAM_TEMP_ID).await;
     assert!(
@@ -323,7 +361,10 @@ async fn test_same_id_rejection() {
     let (db, _, _) = setup().await;
     let result = merge_parameters(
         &db,
-        &merge_req(crate::common::GLOBAL_PARAM_TEMP_ID, crate::common::GLOBAL_PARAM_TEMP_ID),
+        &merge_req(
+            crate::common::GLOBAL_PARAM_TEMP_ID,
+            crate::common::GLOBAL_PARAM_TEMP_ID,
+        ),
     )
     .await;
     assert!(result.is_err(), "should reject same-id merge");
@@ -337,7 +378,10 @@ async fn test_not_found_rejection() {
     let (db, _, _) = setup().await;
     let result = merge_parameters(
         &db,
-        &merge_req("00000000-0000-4000-b000-999999999999", crate::common::GLOBAL_PARAM_TEMP_ID),
+        &merge_req(
+            "00000000-0000-4000-b000-999999999999",
+            crate::common::GLOBAL_PARAM_TEMP_ID,
+        ),
     )
     .await;
     assert!(result.is_err(), "should reject nonexistent source");
@@ -364,8 +408,14 @@ async fn test_http_round_trip() {
     .await;
 
     assert_eq!(status, 200, "merge via HTTP: {resp}");
-    let job_id = resp["job_id"].as_str().expect("response carries job_id").to_string();
-    assert_eq!(crate::merge_site_parameters_job::wait_terminal(&db, &job_id).await, "completed");
+    let job_id = resp["job_id"]
+        .as_str()
+        .expect("response carries job_id")
+        .to_string();
+    assert_eq!(
+        crate::merge_site_parameters_job::wait_terminal(&db, &job_id).await,
+        "completed"
+    );
 
     let (get_status, _) = crate::common::get_with_token(
         &app,

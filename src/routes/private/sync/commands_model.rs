@@ -2,15 +2,7 @@ use crudcrate::{CRUDResource, EntityToModels};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-#[derive(
-    Clone,
-    Debug,
-    PartialEq,
-    DeriveEntityModel,
-    Serialize,
-    Deserialize,
-    EntityToModels,
-)]
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize, EntityToModels)]
 #[sea_orm(table_name = "sync_commands")]
 #[crudcrate(
     api_struct = "SyncCommand",

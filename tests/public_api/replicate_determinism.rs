@@ -101,7 +101,11 @@ async fn replicated_timestamp_serves_one_value_the_sample_mean() {
         crate::common::get_json(&app, &format!("{base}?{WINDOW}&measurement_type=spot")).await;
     assert_eq!(status, 200, "spot: {spot}");
     let times = spot["times"].as_array().unwrap();
-    assert_eq!(times.len(), 1, "one point for the replicate group, not three: {spot}");
+    assert_eq!(
+        times.len(),
+        1,
+        "one point for the replicate group, not three: {spot}"
+    );
     let values = spot["parameters"][0]["values"].as_array().unwrap();
     assert_eq!(values.len(), 1, "{spot}");
     assert!(

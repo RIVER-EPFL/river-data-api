@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
-use crate::routes::private::annotations;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::annotations;
 use crate::routes::{resolve_site, validate_optional_time_range};
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -68,8 +68,7 @@ pub async fn get_site_annotations(
 
     validate_optional_time_range(query.start, query.end)?;
 
-    let mut q = annotations::Entity::find()
-        .filter(annotations::Column::SiteId.eq(site.id));
+    let mut q = annotations::Entity::find().filter(annotations::Column::SiteId.eq(site.id));
 
     if let Some(param_id) = query.parameter_id {
         q = q.filter(annotations::Column::ParameterId.eq(param_id));

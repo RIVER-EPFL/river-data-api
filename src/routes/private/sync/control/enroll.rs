@@ -1,20 +1,16 @@
-use axum::extract::State;
 use axum::Json;
+use axum::extract::State;
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ColumnTrait, Condition, EntityTrait, QueryFilter, Set};
 use uuid::Uuid;
 
+use super::heartbeat::SESSION_TOKEN_CACHE;
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::sync::{credentials_model, services_model, tokens_model};
 use river_data_core::models::{EnrollRequest, EnrollResponse, ServiceStatus};
-use crate::routes::private::sync::{credentials_model, tokens_model, services_model};
-use super::heartbeat::SESSION_TOKEN_CACHE;
 
-
-pub(crate) async fn create_session_token(
-    state: &AppState,
-    service_id: Uuid,
-) -> AppResult<String> {
+pub(crate) async fn create_session_token(state: &AppState, service_id: Uuid) -> AppResult<String> {
     let raw_token = super::tokens::generate_token();
     let token_hash = crate::routes::private::api_tokens::service::hash_token(&raw_token);
     let ttl_secs = state.config.sync_session_token_ttl_secs as i64;
@@ -73,9 +69,7 @@ pub async fn enroll(
 
     let secret_hash = crate::routes::private::api_tokens::service::hash_token(&req.client_secret);
     if secret_hash != cred.client_secret_hash {
-        return Err(AppError::Unauthorized(
-            "Invalid client_secret".to_string(),
-        ));
+        return Err(AppError::Unauthorized("Invalid client_secret".to_string()));
     }
 
     let existing = services_model::Entity::find()

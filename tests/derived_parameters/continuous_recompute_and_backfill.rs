@@ -7,7 +7,6 @@
 //!
 //! Run with: cargo test --test derived_parameters
 
-
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
@@ -95,13 +94,9 @@ async fn test_continuous_derived_recompute_after_ingest() {
         "derived_definition_id": derived_def_id,
         "display_units": "mg/L",
     });
-    let (status, sp_text) = crate::common::post_json_with_token(
-        &app,
-        "/api/site_parameters",
-        &assign_body,
-        &token,
-    )
-    .await;
+    let (status, sp_text) =
+        crate::common::post_json_with_token(&app, "/api/site_parameters", &assign_body, &token)
+            .await;
     assert!(
         (200..300).contains(&status),
         "assign site_parameter ({status}): {sp_text}"
@@ -118,13 +113,9 @@ async fn test_continuous_derived_recompute_after_ingest() {
             "raw_value": raw_value_1,
         }]
     });
-    let (status, text) = crate::common::post_json_with_token(
-        &app,
-        "/api/readings/batch",
-        &ingest_body_1,
-        &token,
-    )
-    .await;
+    let (status, text) =
+        crate::common::post_json_with_token(&app, "/api/readings/batch", &ingest_body_1, &token)
+            .await;
     assert!(
         (200..300).contains(&status),
         "ingest source #1 ({status}): {text}"
@@ -152,13 +143,9 @@ async fn test_continuous_derived_recompute_after_ingest() {
             "raw_value": raw_value_2,
         }]
     });
-    let (status, text) = crate::common::post_json_with_token(
-        &app,
-        "/api/readings/batch",
-        &ingest_body_2,
-        &token,
-    )
-    .await;
+    let (status, text) =
+        crate::common::post_json_with_token(&app, "/api/readings/batch", &ingest_body_2, &token)
+            .await;
     assert!(
         (200..300).contains(&status),
         "ingest source #2 ({status}): {text}"
@@ -208,7 +195,10 @@ async fn test_recompute_endpoint_backfills_historical_gap() {
     .await;
     assert!((200..300).contains(&status));
     let derived_def_id = def_json["id"].as_str().unwrap().to_string();
-    let output_parameter_id = def_json["output_parameter_id"].as_str().unwrap().to_string();
+    let output_parameter_id = def_json["output_parameter_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let derived_param_uuid = Uuid::parse_str(&output_parameter_id).unwrap();
 
     let seeded_source_time: DateTime<Utc> = "2025-01-15T00:00:00Z".parse().unwrap();
@@ -227,23 +217,27 @@ async fn test_recompute_endpoint_backfills_historical_gap() {
         "derived_definition_id": derived_def_id,
         "display_units": "mg/L",
     });
-    let (status, _) = crate::common::post_json_with_token(
-        &app,
-        "/api/site_parameters",
-        &assign_body,
-        &token,
-    )
-    .await;
+    let (status, _) =
+        crate::common::post_json_with_token(&app, "/api/site_parameters", &assign_body, &token)
+            .await;
     assert!((200..300).contains(&status));
 
     let uri = format!("/api/actions/derived_parameters/{derived_def_id}/recompute");
-    let (status, _) = crate::common::post_json_with_token(&app, &uri, &serde_json::json!({}), &token).await;
+    let (status, _) =
+        crate::common::post_json_with_token(&app, &uri, &serde_json::json!({}), &token).await;
     assert!(
         (200..300).contains(&status),
         "recompute endpoint should accept request"
     );
 
-    let v = poll_for_derived(&db, site_id, derived_param_uuid, seeded_source_time, POLL_DEADLINE_SECS).await;
+    let v = poll_for_derived(
+        &db,
+        site_id,
+        derived_param_uuid,
+        seeded_source_time,
+        POLL_DEADLINE_SECS,
+    )
+    .await;
     assert!(
         v.is_some(),
         "recompute should have backfilled a derived reading at {seeded_source_time}"

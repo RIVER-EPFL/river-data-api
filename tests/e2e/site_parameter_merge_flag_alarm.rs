@@ -3,7 +3,6 @@
 //!
 //! Run: cargo test --test e2e -- --test-threads=1
 
-
 use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
 
@@ -30,7 +29,10 @@ async fn merge_site_parameters_then_flag_and_query_alarms() {
     )
     .await;
     assert!((200..300).contains(&status), "merge ({status}): {merge}");
-    let job_id = merge["job_id"].as_str().expect("merge response carries job_id").to_string();
+    let job_id = merge["job_id"]
+        .as_str()
+        .expect("merge response carries job_id")
+        .to_string();
     assert_eq!(
         crate::common::e2e::poll_job(&app, &token, &job_id, 30).await,
         "completed",
@@ -38,9 +40,16 @@ async fn merge_site_parameters_then_flag_and_query_alarms() {
     );
 
     // Source site_parameter is gone; its readings now carry the target's parameter_id.
-    let (status, _gone) =
-        crate::common::get_with_token(&app, &format!("/api/site_parameters/{}", crate::common::PARAM_S1_TEMP_ID), &token).await;
-    assert_eq!(status, 404, "merged-away source site_parameter should be gone");
+    let (status, _gone) = crate::common::get_with_token(
+        &app,
+        &format!("/api/site_parameters/{}", crate::common::PARAM_S1_TEMP_ID),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status, 404,
+        "merged-away source site_parameter should be gone"
+    );
     let remaining_temp: i64 = db
         .query_one(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -54,7 +63,10 @@ async fn merge_site_parameters_then_flag_and_query_alarms() {
         .unwrap()
         .try_get("", "c")
         .unwrap();
-    assert_eq!(remaining_temp, 0, "no readings should remain under the source parameter after merge");
+    assert_eq!(
+        remaining_temp, 0,
+        "no readings should remain under the source parameter after merge"
+    );
 
     // --- US-4.2: flag a reading as an outlier, then unflag it ---
     let flag_time = "2025-01-15T00:00:00Z";
@@ -108,11 +120,19 @@ async fn merge_site_parameters_then_flag_and_query_alarms() {
     assert!(!still_flagged, "reading should be unflagged");
 
     // --- US-2.2 / US-3.2: the active-alarm feed and summary respond with the expected shape ---
-    let (status, active) = crate::common::get_json_with_token(&app, "/api/alarms/active", &token).await;
+    let (status, active) =
+        crate::common::get_json_with_token(&app, "/api/alarms/active", &token).await;
     assert_eq!(status, 200, "alarms/active ({status}): {active}");
-    assert!(active["alarms"].is_array(), "alarms/active has an alarms array: {active}");
-    assert!(active["total"].is_number(), "alarms/active has a total: {active}");
+    assert!(
+        active["alarms"].is_array(),
+        "alarms/active has an alarms array: {active}"
+    );
+    assert!(
+        active["total"].is_number(),
+        "alarms/active has a total: {active}"
+    );
 
-    let (status, summary) = crate::common::get_json_with_token(&app, "/api/alarms/summary", &token).await;
+    let (status, summary) =
+        crate::common::get_json_with_token(&app, "/api/alarms/summary", &token).await;
     assert_eq!(status, 200, "alarms/summary ({status}): {summary}");
 }

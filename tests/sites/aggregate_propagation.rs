@@ -91,8 +91,9 @@ fn bucket(body: &Value, parameter_id: &str, at: &str, what: &str) -> Bucket {
         series_of(body, parameter_id).is_some(),
         "{what}: no series for parameter {parameter_id}: {body}"
     );
-    bucket_at(body, parameter_id, at)
-        .unwrap_or_else(|| panic!("{what}: bucket {at} absent for parameter {parameter_id}: {body}"))
+    bucket_at(body, parameter_id, at).unwrap_or_else(|| {
+        panic!("{what}: bucket {at} absent for parameter {parameter_id}: {body}")
+    })
 }
 
 /// Guards every subsequent lookup: an empty response would make bucket assertions unreachable
@@ -101,11 +102,17 @@ fn assert_populated(body: &Value, what: &str) {
     let times = body["times"]
         .as_array()
         .unwrap_or_else(|| panic!("{what}: no times array: {body}"));
-    assert!(!times.is_empty(), "{what}: the response holds no buckets: {body}");
+    assert!(
+        !times.is_empty(),
+        "{what}: the response holds no buckets: {body}"
+    );
     let parameters = body["parameters"]
         .as_array()
         .unwrap_or_else(|| panic!("{what}: no parameters array: {body}"));
-    assert!(!parameters.is_empty(), "{what}: no parameter series returned: {body}");
+    assert!(
+        !parameters.is_empty(),
+        "{what}: no parameter series returned: {body}"
+    );
 }
 
 fn times_len(body: &Value) -> usize {
@@ -381,7 +388,10 @@ async fn served_aggregates_report_exact_values_at_every_resolution() {
 
     // Provisioning enqueues reprocessing; let it finish before any reading exists, so nothing can
     // rewrite a fixture value behind the assertions.
-    assert!(jobs_settled(&db, 60).await, "provisioning jobs settle before the readings land");
+    assert!(
+        jobs_settled(&db, 60).await,
+        "provisioning jobs settle before the readings land"
+    );
 
     let (status, denied) = crate::common::post_json_parse_with_token(
         &app,
@@ -411,7 +421,10 @@ async fn served_aggregates_report_exact_values_at_every_resolution() {
     )
     .await;
 
-    assert!(jobs_settled(&db, 60).await, "the write's follow-on jobs settle before the read");
+    assert!(
+        jobs_settled(&db, 60).await,
+        "the write's follow-on jobs settle before the read"
+    );
     refresh_views(&db, "2025-08-01", "2025-11-01").await;
 
     let hourly = aggregates(
@@ -431,28 +444,58 @@ async fn served_aggregates_report_exact_values_at_every_resolution() {
     );
     assert_eq!(
         bucket(&hourly, &flow, "2025-09-03T10:00:00Z", "hourly 10:00"),
-        Bucket { avg: Some(15.0), min: Some(10.0), max: Some(20.0), count: 2, flagged: 0 },
+        Bucket {
+            avg: Some(15.0),
+            min: Some(10.0),
+            max: Some(20.0),
+            count: 2,
+            flagged: 0
+        },
         "hourly 10:00 is the mean of 10 and 20: {hourly}"
     );
     assert_eq!(
         bucket(&hourly, &flow, "2025-09-03T11:00:00Z", "hourly 11:00"),
-        Bucket { avg: Some(40.0), min: Some(30.0), max: Some(50.0), count: 2, flagged: 0 },
+        Bucket {
+            avg: Some(40.0),
+            min: Some(30.0),
+            max: Some(50.0),
+            count: 2,
+            flagged: 0
+        },
         "hourly 11:00 is the mean of 30 and 50: {hourly}"
     );
     assert_eq!(
         bucket(&hourly, &flow, "2025-09-04T10:00:00Z", "hourly next day"),
-        Bucket { avg: Some(90.0), min: Some(90.0), max: Some(90.0), count: 1, flagged: 0 },
+        Bucket {
+            avg: Some(90.0),
+            min: Some(90.0),
+            max: Some(90.0),
+            count: 1,
+            flagged: 0
+        },
         "a single-reading hour reports that reading: {hourly}"
     );
 
     assert_eq!(
         bucket(&hourly, &cond, "2025-09-03T10:00:00Z", "conductivity 10:00"),
-        Bucket { avg: Some(7.0), min: Some(7.0), max: Some(7.0), count: 1, flagged: 0 },
+        Bucket {
+            avg: Some(7.0),
+            min: Some(7.0),
+            max: Some(7.0),
+            count: 1,
+            flagged: 0
+        },
         "a second parameter at the same site keeps its own value: {hourly}"
     );
     assert_eq!(
         bucket(&hourly, &cond, "2025-09-03T11:00:00Z", "conductivity 11:00"),
-        Bucket { avg: None, min: None, max: None, count: 0, flagged: 0 },
+        Bucket {
+            avg: None,
+            min: None,
+            max: None,
+            count: 0,
+            flagged: 0
+        },
         "and reports an empty bucket where it has no readings: {hourly}"
     );
 
@@ -470,7 +513,11 @@ async fn served_aggregates_report_exact_values_at_every_resolution() {
         "a parameter with no readings reports zero everywhere: {hourly}"
     );
     assert!(
-        turbidity["avg"].as_array().expect("avg array").iter().all(Value::is_null),
+        turbidity["avg"]
+            .as_array()
+            .expect("avg array")
+            .iter()
+            .all(Value::is_null),
         "and a null mean everywhere: {hourly}"
     );
 
@@ -487,17 +534,35 @@ async fn served_aggregates_report_exact_values_at_every_resolution() {
     assert_eq!(times_len(&daily), 3, "three days hold readings: {daily}");
     assert_eq!(
         bucket(&daily, &flow, "2025-09-03T00:00:00Z", "daily 09-03"),
-        Bucket { avg: Some(27.5), min: Some(10.0), max: Some(50.0), count: 4, flagged: 0 },
+        Bucket {
+            avg: Some(27.5),
+            min: Some(10.0),
+            max: Some(50.0),
+            count: 4,
+            flagged: 0
+        },
         "daily 09-03 is (10+20+30+50)/4: {daily}"
     );
     assert_eq!(
         bucket(&daily, &flow, "2025-09-04T00:00:00Z", "daily 09-04"),
-        Bucket { avg: Some(90.0), min: Some(90.0), max: Some(90.0), count: 1, flagged: 0 },
+        Bucket {
+            avg: Some(90.0),
+            min: Some(90.0),
+            max: Some(90.0),
+            count: 1,
+            flagged: 0
+        },
         "daily 09-04: {daily}"
     );
     assert_eq!(
         bucket(&daily, &flow, "2025-09-13T00:00:00Z", "daily 09-13"),
-        Bucket { avg: Some(100.0), min: Some(100.0), max: Some(100.0), count: 1, flagged: 0 },
+        Bucket {
+            avg: Some(100.0),
+            min: Some(100.0),
+            max: Some(100.0),
+            count: 1,
+            flagged: 0
+        },
         "daily 09-13: {daily}"
     );
 
@@ -511,15 +576,31 @@ async fn served_aggregates_report_exact_values_at_every_resolution() {
     )
     .await;
     assert_populated(&weekly, "weekly");
-    assert_eq!(times_len(&weekly), 2, "two Monday-anchored weeks hold readings: {weekly}");
+    assert_eq!(
+        times_len(&weekly),
+        2,
+        "two Monday-anchored weeks hold readings: {weekly}"
+    );
     assert_eq!(
         bucket(&weekly, &flow, "2025-09-01T00:00:00Z", "week of 09-01"),
-        Bucket { avg: Some(40.0), min: Some(10.0), max: Some(90.0), count: 5, flagged: 0 },
+        Bucket {
+            avg: Some(40.0),
+            min: Some(10.0),
+            max: Some(90.0),
+            count: 5,
+            flagged: 0
+        },
         "the 09-01 week is (10+20+30+50+90)/5: {weekly}"
     );
     assert_eq!(
         bucket(&weekly, &flow, "2025-09-08T00:00:00Z", "week of 09-08"),
-        Bucket { avg: Some(100.0), min: Some(100.0), max: Some(100.0), count: 1, flagged: 0 },
+        Bucket {
+            avg: Some(100.0),
+            min: Some(100.0),
+            max: Some(100.0),
+            count: 1,
+            flagged: 0
+        },
         "the 09-08 week holds only 09-13: {weekly}"
     );
 
@@ -533,10 +614,25 @@ async fn served_aggregates_report_exact_values_at_every_resolution() {
     )
     .await;
     assert_populated(&monthly, "monthly");
-    assert_eq!(times_len(&monthly), 1, "one month holds readings: {monthly}");
     assert_eq!(
-        bucket(&monthly, &flow, "2025-09-01T00:00:00Z", "month of September"),
-        Bucket { avg: Some(50.0), min: Some(10.0), max: Some(100.0), count: 6, flagged: 0 },
+        times_len(&monthly),
+        1,
+        "one month holds readings: {monthly}"
+    );
+    assert_eq!(
+        bucket(
+            &monthly,
+            &flow,
+            "2025-09-01T00:00:00Z",
+            "month of September"
+        ),
+        Bucket {
+            avg: Some(50.0),
+            min: Some(10.0),
+            max: Some(100.0),
+            count: 6,
+            flagged: 0
+        },
         "September is (10+20+30+50+90+100)/6: {monthly}"
     );
 
@@ -552,12 +648,23 @@ async fn served_aggregates_report_exact_values_at_every_resolution() {
     assert_populated(&neighbour, "neighbouring site hourly");
     assert_eq!(
         bucket(&neighbour, &flow, "2025-09-03T10:00:00Z", "neighbour 10:00"),
-        Bucket { avg: Some(1000.0), min: Some(1000.0), max: Some(1000.0), count: 1, flagged: 0 },
+        Bucket {
+            avg: Some(1000.0),
+            min: Some(1000.0),
+            max: Some(1000.0),
+            count: 1,
+            flagged: 0
+        },
         "the neighbouring site reports its own reading: {neighbour}"
     );
     assert_eq!(
-        bucket(&hourly, &flow, "2025-09-03T10:00:00Z", "site 1 after the neighbour read")
-            .avg,
+        bucket(
+            &hourly,
+            &flow,
+            "2025-09-03T10:00:00Z",
+            "site 1 after the neighbour read"
+        )
+        .avg,
         Some(15.0),
         "and none of its 1000.0 entered site 1's mean: {hourly}"
     );
@@ -582,7 +689,10 @@ async fn calibration_edit_moves_both_deployed_sites_served_aggregates() {
 
     let site1 = track.site_id.clone();
     let flow = track.parameter_id("TrkFlowDO").to_string();
-    let sensor_id = track.sensor_id.clone().expect("Track B provisions a sensor");
+    let sensor_id = track
+        .sensor_id
+        .clone()
+        .expect("Track B provisions a sensor");
     let sensor: Uuid = sensor_id.parse().expect("sensor uuid");
 
     let (status, cal) = crate::common::post_json_parse_with_token(
@@ -598,7 +708,10 @@ async fn calibration_edit_moves_both_deployed_sites_served_aggregates() {
         &manager,
     )
     .await;
-    assert_eq!(status, 201, "a manager authors the calibration ({status}): {cal}");
+    assert_eq!(
+        status, 201,
+        "a manager authors the calibration ({status}): {cal}"
+    );
     let calibration_id = e2e::id_of(&cal);
     let calibration: Uuid = calibration_id.parse().expect("calibration uuid");
 
@@ -614,9 +727,15 @@ async fn calibration_edit_moves_both_deployed_sites_served_aggregates() {
 
     // Opening the downstream deployment closes the upstream one at the same instant, so the two
     // windows are gapless and half-open: a reading at exactly the move instant belongs downstream.
-    let deployment_b =
-        e2e::create_deployment(&app, &manager, &sensor_id, &site2, &flow, "2025-10-01T12:00:00Z")
-            .await;
+    let deployment_b = e2e::create_deployment(
+        &app,
+        &manager,
+        &sensor_id,
+        &site2,
+        &flow,
+        "2025-10-01T12:00:00Z",
+    )
+    .await;
     let deployment_b_id: Uuid = deployment_b.parse().expect("deployment uuid");
 
     // The unaffected side: a different sensor on a different slot at the same site, over the same
@@ -630,8 +749,7 @@ async fn calibration_edit_moves_both_deployed_sites_served_aggregates() {
     )
     .await;
     e2e::assign_site_parameter_minimal(&app, &admin, &site1, &control_param).await;
-    let control_sensor =
-        e2e::create_sensor(&app, &admin, &control_param, "AGGPROP-CTL-0001").await;
+    let control_sensor = e2e::create_sensor(&app, &admin, &control_param, "AGGPROP-CTL-0001").await;
     e2e::create_deployment(
         &app,
         &manager,
@@ -659,7 +777,10 @@ async fn calibration_edit_moves_both_deployed_sites_served_aggregates() {
 
     // Calibration and deployment hooks each enqueue reprocessing; let those finish while there is
     // nothing to reprocess, so the only rewrite the assertions can see is the one under test.
-    assert!(jobs_settled(&db, 60).await, "provisioning jobs settle before the readings land");
+    assert!(
+        jobs_settled(&db, 60).await,
+        "provisioning jobs settle before the readings land"
+    );
 
     write_readings(
         &app,
@@ -676,14 +797,21 @@ async fn calibration_edit_moves_both_deployed_sites_served_aggregates() {
     )
     .await;
 
-    assert!(jobs_settled(&db, 60).await, "the write's follow-on jobs settle before the baseline");
+    assert!(
+        jobs_settled(&db, 60).await,
+        "the write's follow-on jobs settle before the baseline"
+    );
     refresh_views(&db, "2025-09-01", "2025-12-01").await;
 
     let site1_uuid: Uuid = site1.parse().expect("site uuid");
     let site2_uuid: Uuid = site2.parse().expect("site uuid");
 
     let before = sl::get_readings_for_sensor(&db, sensor).await;
-    assert_eq!(before.len(), 5, "the moved sensor owns exactly its five readings: {before:?}");
+    assert_eq!(
+        before.len(),
+        5,
+        "the moved sensor owns exactly its five readings: {before:?}"
+    );
     let expected_before = [
         (10.0, 10.0, site1_uuid),
         (20.0, 20.0, site1_uuid),
@@ -692,13 +820,20 @@ async fn calibration_edit_moves_both_deployed_sites_served_aggregates() {
         (60.0, 60.0, site2_uuid),
     ];
     for (i, (raw, cal_value, site)) in expected_before.iter().enumerate() {
-        assert_eq!(before[i].raw_value, *raw, "reading {i} raw value: {before:?}");
+        assert_eq!(
+            before[i].raw_value, *raw,
+            "reading {i} raw value: {before:?}"
+        );
         assert_eq!(
             before[i].calibrated_value,
             Some(*cal_value),
             "reading {i} starts on the identity curve: {before:?}"
         );
-        assert_eq!(before[i].site_id, Some(*site), "reading {i} site: {before:?}");
+        assert_eq!(
+            before[i].site_id,
+            Some(*site),
+            "reading {i} site: {before:?}"
+        );
         assert_eq!(
             before[i].calibration_id,
             Some(calibration),
@@ -734,23 +869,67 @@ async fn calibration_edit_moves_both_deployed_sites_served_aggregates() {
     assert_populated(&site2_before, "downstream baseline");
 
     assert_eq!(
-        bucket(&site1_before, &flow, "2025-10-01T02:00:00Z", "upstream baseline"),
-        Bucket { avg: Some(15.0), min: Some(10.0), max: Some(20.0), count: 2, flagged: 0 },
+        bucket(
+            &site1_before,
+            &flow,
+            "2025-10-01T02:00:00Z",
+            "upstream baseline"
+        ),
+        Bucket {
+            avg: Some(15.0),
+            min: Some(10.0),
+            max: Some(20.0),
+            count: 2,
+            flagged: 0
+        },
         "upstream starts at the mean of 10 and 20: {site1_before}"
     );
     assert_eq!(
-        bucket(&site2_before, &flow, "2025-10-01T12:00:00Z", "downstream baseline noon"),
-        Bucket { avg: Some(30.0), min: Some(30.0), max: Some(30.0), count: 1, flagged: 0 },
+        bucket(
+            &site2_before,
+            &flow,
+            "2025-10-01T12:00:00Z",
+            "downstream baseline noon"
+        ),
+        Bucket {
+            avg: Some(30.0),
+            min: Some(30.0),
+            max: Some(30.0),
+            count: 1,
+            flagged: 0
+        },
         "the move-instant reading rolls up downstream: {site2_before}"
     );
     assert_eq!(
-        bucket(&site2_before, &flow, "2025-10-01T14:00:00Z", "downstream baseline 14:00"),
-        Bucket { avg: Some(50.0), min: Some(40.0), max: Some(60.0), count: 2, flagged: 0 },
+        bucket(
+            &site2_before,
+            &flow,
+            "2025-10-01T14:00:00Z",
+            "downstream baseline 14:00"
+        ),
+        Bucket {
+            avg: Some(50.0),
+            min: Some(40.0),
+            max: Some(60.0),
+            count: 2,
+            flagged: 0
+        },
         "downstream starts at the mean of 40 and 60: {site2_before}"
     );
     assert_eq!(
-        bucket(&site1_before, &control_param, "2025-10-01T02:00:00Z", "control baseline"),
-        Bucket { avg: Some(10.0), min: Some(8.0), max: Some(12.0), count: 2, flagged: 0 },
+        bucket(
+            &site1_before,
+            &control_param,
+            "2025-10-01T02:00:00Z",
+            "control baseline"
+        ),
+        Bucket {
+            avg: Some(10.0),
+            min: Some(8.0),
+            max: Some(12.0),
+            count: 2,
+            flagged: 0
+        },
         "the control slot starts at the mean of 8 and 12: {site1_before}"
     );
     assert!(
@@ -781,7 +960,10 @@ async fn calibration_edit_moves_both_deployed_sites_served_aggregates() {
         &manager,
     )
     .await;
-    assert_eq!(status, 200, "a manager edits the curve ({status}): {updated}");
+    assert_eq!(
+        status, 200,
+        "a manager edits the curve ({status}): {updated}"
+    );
     assert!(
         sl::wait_for_reprocessing(&db, sensor, Duration::from_secs(120)).await,
         "the calibration edit enqueues a reprocessing job for the sensor, and it succeeds"
@@ -797,13 +979,20 @@ async fn calibration_edit_moves_both_deployed_sites_served_aggregates() {
         (60.0, 125.0, site2_uuid),
     ];
     for (i, (raw, cal_value, site)) in expected_after.iter().enumerate() {
-        assert_eq!(after[i].raw_value, *raw, "reading {i} raw value is never rewritten: {after:?}");
+        assert_eq!(
+            after[i].raw_value, *raw,
+            "reading {i} raw value is never rewritten: {after:?}"
+        );
         assert_eq!(
             after[i].calibrated_value,
             Some(*cal_value),
             "reading {i} is 2 * raw + 5: {after:?}"
         );
-        assert_eq!(after[i].site_id, Some(*site), "reading {i} keeps its site: {after:?}");
+        assert_eq!(
+            after[i].site_id,
+            Some(*site),
+            "reading {i} keeps its site: {after:?}"
+        );
         assert_eq!(
             after[i].calibration_id,
             Some(calibration),
@@ -811,12 +1000,14 @@ async fn calibration_edit_moves_both_deployed_sites_served_aggregates() {
         );
     }
 
-    let control_rows = sl::get_readings_for_sensor(
-        &db,
-        control_sensor.parse().expect("control sensor uuid"),
-    )
-    .await;
-    assert_eq!(control_rows.len(), 2, "the control sensor owns its two readings: {control_rows:?}");
+    let control_rows =
+        sl::get_readings_for_sensor(&db, control_sensor.parse().expect("control sensor uuid"))
+            .await;
+    assert_eq!(
+        control_rows.len(),
+        2,
+        "the control sensor owns its two readings: {control_rows:?}"
+    );
     for (i, value) in [8.0, 12.0].iter().enumerate() {
         assert_eq!(
             control_rows[i].calibrated_value,
@@ -852,18 +1043,51 @@ async fn calibration_edit_moves_both_deployed_sites_served_aggregates() {
     assert_populated(&site2_after, "downstream after");
 
     assert_eq!(
-        bucket(&site1_after, &flow, "2025-10-01T02:00:00Z", "upstream after"),
-        Bucket { avg: Some(35.0), min: Some(25.0), max: Some(45.0), count: 2, flagged: 0 },
+        bucket(
+            &site1_after,
+            &flow,
+            "2025-10-01T02:00:00Z",
+            "upstream after"
+        ),
+        Bucket {
+            avg: Some(35.0),
+            min: Some(25.0),
+            max: Some(45.0),
+            count: 2,
+            flagged: 0
+        },
         "the served upstream bucket carries the new curve, not merely a completed job: {site1_after}"
     );
     assert_eq!(
-        bucket(&site2_after, &flow, "2025-10-01T12:00:00Z", "downstream after noon"),
-        Bucket { avg: Some(65.0), min: Some(65.0), max: Some(65.0), count: 1, flagged: 0 },
+        bucket(
+            &site2_after,
+            &flow,
+            "2025-10-01T12:00:00Z",
+            "downstream after noon"
+        ),
+        Bucket {
+            avg: Some(65.0),
+            min: Some(65.0),
+            max: Some(65.0),
+            count: 1,
+            flagged: 0
+        },
         "one calibration window, two deployments, and the second site moves too: {site2_after}"
     );
     assert_eq!(
-        bucket(&site2_after, &flow, "2025-10-01T14:00:00Z", "downstream after 14:00"),
-        Bucket { avg: Some(105.0), min: Some(85.0), max: Some(125.0), count: 2, flagged: 0 },
+        bucket(
+            &site2_after,
+            &flow,
+            "2025-10-01T14:00:00Z",
+            "downstream after 14:00"
+        ),
+        Bucket {
+            avg: Some(105.0),
+            min: Some(85.0),
+            max: Some(125.0),
+            count: 2,
+            flagged: 0
+        },
         "the afternoon bucket is the mean of 85 and 125: {site2_after}"
     );
 
@@ -871,8 +1095,19 @@ async fn calibration_edit_moves_both_deployed_sites_served_aggregates() {
     // says its value did not change, not that it was skipped. The reading-level control above is
     // what would catch an indiscriminate rewrite.
     assert_eq!(
-        bucket(&site1_after, &control_param, "2025-10-01T02:00:00Z", "control after"),
-        Bucket { avg: Some(10.0), min: Some(8.0), max: Some(12.0), count: 2, flagged: 0 },
+        bucket(
+            &site1_after,
+            &control_param,
+            "2025-10-01T02:00:00Z",
+            "control after"
+        ),
+        Bucket {
+            avg: Some(10.0),
+            min: Some(8.0),
+            max: Some(12.0),
+            count: 2,
+            flagged: 0
+        },
         "re-materialising the control slot reproduces its unchanged values: {site1_after}"
     );
     assert!(
@@ -915,7 +1150,10 @@ async fn continuous_aggregates_apply_their_filter_algebra_exactly() {
 
     // Let the onboarding reprocess finish before any reading exists: a later pass would rewrite
     // `calibrated_value` from `raw_value` and destroy the COALESCE probe below.
-    assert!(jobs_settled(&db, 60).await, "provisioning jobs settle before the readings land");
+    assert!(
+        jobs_settled(&db, 60).await,
+        "provisioning jobs settle before the readings land"
+    );
 
     write_readings(
         &app,
@@ -958,9 +1196,18 @@ async fn continuous_aggregates_apply_their_filter_algebra_exactly() {
     );
     let (status, ingested) =
         crate::common::post_json_parse_with_token(&app, "/api/ingest", &unpaired, &admin).await;
-    assert_eq!(status, 200, "an administrator lands the unpaired row ({status}): {ingested}");
-    assert_eq!(ingested["inserted"], 1, "the unpaired row is stored: {ingested}");
-    assert_eq!(ingested["paired"], false, "and it is stored unattributed: {ingested}");
+    assert_eq!(
+        status, 200,
+        "an administrator lands the unpaired row ({status}): {ingested}"
+    );
+    assert_eq!(
+        ingested["inserted"], 1,
+        "the unpaired row is stored: {ingested}"
+    );
+    assert_eq!(
+        ingested["paired"], false,
+        "and it is stored unattributed: {ingested}"
+    );
 
     let (status, flagged) = crate::common::patch_json_with_token(
         &app,
@@ -973,9 +1220,15 @@ async fn continuous_aggregates_apply_their_filter_algebra_exactly() {
     )
     .await;
     assert_eq!(status, 200, "flagging one reading ({status}): {flagged}");
-    assert!(flagged.contains("\"updated\":1"), "exactly one reading is flagged: {flagged}");
+    assert!(
+        flagged.contains("\"updated\":1"),
+        "exactly one reading is flagged: {flagged}"
+    );
 
-    assert!(jobs_settled(&db, 60).await, "the write's follow-on jobs settle before the read");
+    assert!(
+        jobs_settled(&db, 60).await,
+        "the write's follow-on jobs settle before the read"
+    );
     refresh_views(&db, "2025-10-01", "2025-12-15").await;
 
     let hourly = aggregates(
@@ -991,29 +1244,66 @@ async fn continuous_aggregates_apply_their_filter_algebra_exactly() {
 
     assert_eq!(
         bucket(&hourly, &flow, "2025-11-05T09:00:00Z", "the filtered hour"),
-        Bucket { avg: Some(15.0), min: Some(10.0), max: Some(20.0), count: 2, flagged: 1 },
+        Bucket {
+            avg: Some(15.0),
+            min: Some(10.0),
+            max: Some(20.0),
+            count: 2,
+            flagged: 1
+        },
         "only the two eligible readings roll up: the flagged 1000, the replicate-1 2000, the spot \
          3000 and the site-less 4000 are all excluded, and COALESCE took the calibrated 20 over the \
          raw 999. The flagged row still shows in the live flagged tally: {hourly}"
     );
     assert_eq!(
-        bucket(&hourly, &derived_param, "2025-11-05T09:00:00Z", "the derived probe"),
-        Bucket { avg: Some(42.0), min: Some(42.0), max: Some(42.0), count: 1, flagged: 0 },
+        bucket(
+            &hourly,
+            &derived_param,
+            "2025-11-05T09:00:00Z",
+            "the derived probe"
+        ),
+        Bucket {
+            avg: Some(42.0),
+            min: Some(42.0),
+            max: Some(42.0),
+            count: 1,
+            flagged: 0
+        },
         "a derived reading rolls up under its own parameter; only spot is excluded: {hourly}"
     );
     assert_eq!(
-        bucket(&hourly, &derived_param, "2025-11-05T10:00:00Z", "the derived probe, next hour"),
-        Bucket { avg: None, min: None, max: None, count: 0, flagged: 0 },
+        bucket(
+            &hourly,
+            &derived_param,
+            "2025-11-05T10:00:00Z",
+            "the derived probe, next hour"
+        ),
+        Bucket {
+            avg: None,
+            min: None,
+            max: None,
+            count: 0,
+            flagged: 0
+        },
         "and it does not smear into the control hour: {hourly}"
     );
     assert_eq!(
         bucket(&hourly, &flow, "2025-11-05T10:00:00Z", "the control hour"),
-        Bucket { avg: Some(150.0), min: Some(100.0), max: Some(200.0), count: 2, flagged: 0 },
+        Bucket {
+            avg: Some(150.0),
+            min: Some(100.0),
+            max: Some(200.0),
+            count: 2,
+            flagged: 0
+        },
         "the hour with no special rows is the plain mean of 100 and 200: {hourly}"
     );
 
     let parameters = hourly["parameters"].as_array().expect("parameters array");
-    assert!(!parameters.is_empty(), "the sweep below needs series to sweep: {hourly}");
+    assert!(
+        !parameters.is_empty(),
+        "the sweep below needs series to sweep: {hourly}"
+    );
     for series in parameters {
         for value in series["max"].as_array().into_iter().flatten() {
             assert_ne!(
@@ -1059,7 +1349,10 @@ async fn editing_a_stored_raw_value_reaches_the_served_aggregate() {
 
     // The gap under test is about a value edited after the fact; let onboarding's reprocess finish
     // first so no later pass can restamp `calibrated_value` and mask the edit.
-    assert!(jobs_settled(&db, 60).await, "provisioning jobs settle before the readings land");
+    assert!(
+        jobs_settled(&db, 60).await,
+        "provisioning jobs settle before the readings land"
+    );
 
     write_readings(
         &app,
@@ -1073,19 +1366,38 @@ async fn editing_a_stored_raw_value_reaches_the_served_aggregate() {
     )
     .await;
 
-    assert!(jobs_settled(&db, 60).await, "the write's follow-on jobs settle before the baseline");
+    assert!(
+        jobs_settled(&db, 60).await,
+        "the write's follow-on jobs settle before the baseline"
+    );
     refresh_views(&db, "2025-11-01", "2026-01-15").await;
 
     let day = ("2025-12-10T00:00:00Z", "2025-12-10T23:00:00Z");
     let baseline = aggregates(&app, &intern, &site1, "hourly", day.0, day.1).await;
     assert_populated(&baseline, "baseline");
-    assert_eq!(times_len(&baseline), 2, "two hours hold readings: {baseline}");
+    assert_eq!(
+        times_len(&baseline),
+        2,
+        "two hours hold readings: {baseline}"
+    );
     assert_eq!(
         bucket(&baseline, &flow, "2025-12-10T08:00:00Z", "baseline target"),
-        Bucket { avg: Some(15.0), min: Some(10.0), max: Some(20.0), count: 2, flagged: 0 },
+        Bucket {
+            avg: Some(15.0),
+            min: Some(10.0),
+            max: Some(20.0),
+            count: 2,
+            flagged: 0
+        },
         "the target hour starts at the mean of 10 and 20: {baseline}"
     );
-    let control = Bucket { avg: Some(150.0), min: Some(100.0), max: Some(200.0), count: 2, flagged: 0 };
+    let control = Bucket {
+        avg: Some(150.0),
+        min: Some(100.0),
+        max: Some(200.0),
+        count: 2,
+        flagged: 0,
+    };
     assert_eq!(
         bucket(&baseline, &flow, "2025-12-10T09:00:00Z", "baseline control"),
         control,
@@ -1111,11 +1423,20 @@ async fn editing_a_stored_raw_value_reaches_the_served_aggregate() {
     assert_populated(&after_edit, "after the edit");
     let served_after_edit = bucket(&after_edit, &flow, "2025-12-10T08:00:00Z", "after the edit");
     assert_eq!(
-        bucket(&after_edit, &flow, "2025-12-10T09:00:00Z", "control after the edit"),
+        bucket(
+            &after_edit,
+            &flow,
+            "2025-12-10T09:00:00Z",
+            "control after the edit"
+        ),
         control,
         "editing one hour leaves the next alone: {after_edit}"
     );
-    assert_eq!(times_len(&after_edit), 2, "and invents no buckets: {after_edit}");
+    assert_eq!(
+        times_len(&after_edit),
+        2,
+        "and invents no buckets: {after_edit}"
+    );
 
     let (status, denied) = crate::common::post_json_parse_with_token(
         &app,
@@ -1124,7 +1445,10 @@ async fn editing_a_stored_raw_value_reaches_the_served_aggregate() {
         &intern,
     )
     .await;
-    assert_eq!(status, 403, "triggering a refresh is above the intern level: {denied}");
+    assert_eq!(
+        status, 403,
+        "triggering a refresh is above the intern level: {denied}"
+    );
 
     let (status, queued) = crate::common::post_json_parse_with_token(
         &app,
@@ -1133,7 +1457,10 @@ async fn editing_a_stored_raw_value_reaches_the_served_aggregate() {
         &river,
     )
     .await;
-    assert_eq!(status, 200, "a river member triggers the full refresh ({status}): {queued}");
+    assert_eq!(
+        status, 200,
+        "a river member triggers the full refresh ({status}): {queued}"
+    );
     let job_id = queued["job_id"]
         .as_str()
         .unwrap_or_else(|| panic!("the refresh returns its job id: {queued}"))
@@ -1152,18 +1479,38 @@ async fn editing_a_stored_raw_value_reaches_the_served_aggregate() {
 
     let recovered_body = aggregates(&app, &intern, &site1, "hourly", day.0, day.1).await;
     assert_populated(&recovered_body, "after the full refresh");
-    let recovered = bucket(&recovered_body, &flow, "2025-12-10T08:00:00Z", "after the full refresh");
+    let recovered = bucket(
+        &recovered_body,
+        &flow,
+        "2025-12-10T08:00:00Z",
+        "after the full refresh",
+    );
     assert_eq!(
         recovered,
-        Bucket { avg: Some(510.0), min: Some(20.0), max: Some(1000.0), count: 2, flagged: 0 },
+        Bucket {
+            avg: Some(510.0),
+            min: Some(20.0),
+            max: Some(1000.0),
+            count: 2,
+            flagged: 0
+        },
         "the documented recovery reproduces the stored data exactly: {recovered_body}"
     );
     assert_eq!(
-        bucket(&recovered_body, &flow, "2025-12-10T09:00:00Z", "control after the full refresh"),
+        bucket(
+            &recovered_body,
+            &flow,
+            "2025-12-10T09:00:00Z",
+            "control after the full refresh"
+        ),
         control,
         "and does not perturb the hour it should not touch: {recovered_body}"
     );
-    assert_eq!(times_len(&recovered_body), 2, "nor invent buckets: {recovered_body}");
+    assert_eq!(
+        times_len(&recovered_body),
+        2,
+        "nor invent buckets: {recovered_body}"
+    );
 
     assert_eq!(
         served_after_edit, recovered,
@@ -1196,7 +1543,10 @@ async fn flag_range_refreshes_its_own_window_and_leaves_others_alone() {
 
     // As in the raw-value suite: onboarding's reprocess must be done before the fixtures land, or a
     // later pass would restamp `calibrated_value` and hide the deliberate staleness below.
-    assert!(jobs_settled(&db, 60).await, "provisioning jobs settle before the readings land");
+    assert!(
+        jobs_settled(&db, 60).await,
+        "provisioning jobs settle before the readings land"
+    );
 
     write_readings(
         &app,
@@ -1211,7 +1561,10 @@ async fn flag_range_refreshes_its_own_window_and_leaves_others_alone() {
     )
     .await;
 
-    assert!(jobs_settled(&db, 60).await, "the write's follow-on jobs settle before the baseline");
+    assert!(
+        jobs_settled(&db, 60).await,
+        "the write's follow-on jobs settle before the baseline"
+    );
     refresh_views(&db, "2026-01-01", "2026-06-01").await;
 
     let near = ("2026-04-25T00:00:00Z", "2026-04-25T23:00:00Z");
@@ -1222,14 +1575,35 @@ async fn flag_range_refreshes_its_own_window_and_leaves_others_alone() {
     assert_populated(&near_before, "flagged-window baseline");
     assert_populated(&far_before, "distant-window baseline");
     assert_eq!(
-        bucket(&near_before, &flow, "2026-04-25T08:00:00Z", "flagged-window baseline"),
-        Bucket { avg: Some(20.0), min: Some(10.0), max: Some(30.0), count: 3, flagged: 0 },
+        bucket(
+            &near_before,
+            &flow,
+            "2026-04-25T08:00:00Z",
+            "flagged-window baseline"
+        ),
+        Bucket {
+            avg: Some(20.0),
+            min: Some(10.0),
+            max: Some(30.0),
+            count: 3,
+            flagged: 0
+        },
         "the hour to be flagged starts at the mean of 10, 20 and 30: {near_before}"
     );
-    let far_baseline =
-        Bucket { avg: Some(150.0), min: Some(100.0), max: Some(200.0), count: 2, flagged: 0 };
+    let far_baseline = Bucket {
+        avg: Some(150.0),
+        min: Some(100.0),
+        max: Some(200.0),
+        count: 2,
+        flagged: 0,
+    };
     assert_eq!(
-        bucket(&far_before, &flow, "2026-02-01T08:00:00Z", "distant-window baseline"),
+        bucket(
+            &far_before,
+            &flow,
+            "2026-02-01T08:00:00Z",
+            "distant-window baseline"
+        ),
         far_baseline,
         "the distant hour starts at the mean of 100 and 200: {far_before}"
     );
@@ -1260,11 +1634,18 @@ async fn flag_range_refreshes_its_own_window_and_leaves_others_alone() {
     let (status, denied) =
         crate::common::patch_json_with_token(&app, "/api/readings/flag_range", &range, &intern)
             .await;
-    assert_eq!(status, 403, "flagging is data curation, above the intern level: {denied}");
+    assert_eq!(
+        status, 403,
+        "flagging is data curation, above the intern level: {denied}"
+    );
 
     let (status, flagged) =
-        crate::common::patch_json_with_token(&app, "/api/readings/flag_range", &range, &river).await;
-    assert_eq!(status, 200, "a river member flags the range ({status}): {flagged}");
+        crate::common::patch_json_with_token(&app, "/api/readings/flag_range", &range, &river)
+            .await;
+    assert_eq!(
+        status, 200,
+        "a river member flags the range ({status}): {flagged}"
+    );
     assert!(
         flagged.contains("\"updated\":1"),
         "the narrow range selects exactly the third reading: {flagged}"
@@ -1281,12 +1662,28 @@ async fn flag_range_refreshes_its_own_window_and_leaves_others_alone() {
     assert_populated(&near_flagged, "after flagging");
     assert_populated(&far_flagged, "distant window after flagging");
     assert_eq!(
-        bucket(&near_flagged, &flow, "2026-04-25T08:00:00Z", "after flagging"),
-        Bucket { avg: Some(15.0), min: Some(10.0), max: Some(20.0), count: 2, flagged: 1 },
+        bucket(
+            &near_flagged,
+            &flow,
+            "2026-04-25T08:00:00Z",
+            "after flagging"
+        ),
+        Bucket {
+            avg: Some(15.0),
+            min: Some(10.0),
+            max: Some(20.0),
+            count: 2,
+            flagged: 1
+        },
         "the flagged reading leaves the rollup and shows in the flagged tally: {near_flagged}"
     );
     assert_eq!(
-        bucket(&far_flagged, &flow, "2026-02-01T08:00:00Z", "distant window after flagging"),
+        bucket(
+            &far_flagged,
+            &flow,
+            "2026-02-01T08:00:00Z",
+            "distant window after flagging"
+        ),
         far_baseline,
         "flagging refreshes [start - 32 days, end + 32 days] and nothing else, so an hour 83 days \
          away keeps the rollup it had, even though its stored readings now average 250.0: \
@@ -1305,7 +1702,10 @@ async fn flag_range_refreshes_its_own_window_and_leaves_others_alone() {
         &river,
     )
     .await;
-    assert_eq!(status, 200, "a river member unflags the range ({status}): {unflagged}");
+    assert_eq!(
+        status, 200,
+        "a river member unflags the range ({status}): {unflagged}"
+    );
     assert!(
         unflagged.contains("\"updated\":1"),
         "the same one reading is unflagged: {unflagged}"
@@ -1322,12 +1722,28 @@ async fn flag_range_refreshes_its_own_window_and_leaves_others_alone() {
     assert_populated(&near_unflagged, "after unflagging");
     assert_populated(&far_unflagged, "distant window after unflagging");
     assert_eq!(
-        bucket(&near_unflagged, &flow, "2026-04-25T08:00:00Z", "after unflagging"),
-        Bucket { avg: Some(20.0), min: Some(10.0), max: Some(30.0), count: 3, flagged: 0 },
+        bucket(
+            &near_unflagged,
+            &flow,
+            "2026-04-25T08:00:00Z",
+            "after unflagging"
+        ),
+        Bucket {
+            avg: Some(20.0),
+            min: Some(10.0),
+            max: Some(30.0),
+            count: 3,
+            flagged: 0
+        },
         "unflagging refreshes symmetrically, returning the reading to the mean: {near_unflagged}"
     );
     assert_eq!(
-        bucket(&far_unflagged, &flow, "2026-02-01T08:00:00Z", "distant window after unflagging"),
+        bucket(
+            &far_unflagged,
+            &flow,
+            "2026-02-01T08:00:00Z",
+            "distant window after unflagging"
+        ),
         far_baseline,
         "and still reaches no further than its own widened window: {far_unflagged}"
     );

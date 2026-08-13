@@ -60,9 +60,17 @@ pub async fn evaluate_alarm_episodes(
     let mut written = 0i64;
     let mut all_episodes: Vec<(&'static str, Vec<EpisodeRow>)> = Vec::new();
     for spot in [false, true] {
-        let episodes =
-            fetch_episodes(db, site_id, parameter_id, start, end, &threshold, &sev_case, spot)
-                .await?;
+        let episodes = fetch_episodes(
+            db,
+            site_id,
+            parameter_id,
+            start,
+            end,
+            &threshold,
+            &sev_case,
+            spot,
+        )
+        .await?;
         all_episodes.push((super::views::cadence_label(spot), episodes));
     }
 
@@ -74,7 +82,12 @@ pub async fn evaluate_alarm_episodes(
         "DELETE FROM alarm_events \
          WHERE site_id = $1 AND parameter_id = $2 AND resolved_at IS NOT NULL \
            AND started_at >= $3 AND started_at <= $4",
-        [site_id.into(), parameter_id.into(), start.into(), end.into()],
+        [
+            site_id.into(),
+            parameter_id.into(),
+            start.into(),
+            end.into(),
+        ],
     ))
     .await?;
 
@@ -247,8 +260,12 @@ pub async fn rebuild_alarm_events(
                     [s.into(), p.into()],
                 ))
                 .await?;
-            let lo = row.as_ref().and_then(|r| r.try_get::<DateTime<Utc>>("", "lo").ok());
-            let hi = row.as_ref().and_then(|r| r.try_get::<DateTime<Utc>>("", "hi").ok());
+            let lo = row
+                .as_ref()
+                .and_then(|r| r.try_get::<DateTime<Utc>>("", "lo").ok());
+            let hi = row
+                .as_ref()
+                .and_then(|r| r.try_get::<DateTime<Utc>>("", "hi").ok());
             match (start.or(lo), end.or(hi)) {
                 (Some(a), Some(b)) => (a, b),
                 _ => continue, // no readings for this slot

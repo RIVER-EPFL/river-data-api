@@ -160,12 +160,9 @@ async fn bucket_of(
 async fn poll_job_view(app: &Router, jwt: &str, job_id: &str, max_secs: u64) -> Value {
     let deadline = std::time::Instant::now() + Duration::from_secs(max_secs);
     loop {
-        let (_status, body) = crate::common::get_with_token(
-            app,
-            &format!("/api/reprocessing_jobs/{job_id}"),
-            jwt,
-        )
-        .await;
+        let (_status, body) =
+            crate::common::get_with_token(app, &format!("/api/reprocessing_jobs/{job_id}"), jwt)
+                .await;
         let job: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
         let status = job["status"].as_str().unwrap_or("").to_string();
         let errored = job["error_message"].as_str().is_some_and(|m| !m.is_empty());
@@ -305,13 +302,22 @@ async fn janitor_full_refresh_follows_the_operator_cadence() {
         &token,
     )
     .await;
-    assert_eq!(status, 200, "set the janitor to a 6-hourly cadence ({status}): {patched}");
+    assert_eq!(
+        status, 200,
+        "set the janitor to a 6-hourly cadence ({status}): {patched}"
+    );
     let view: Value = serde_json::from_str(&patched).unwrap_or(Value::Null);
-    assert_eq!(view["interval_seconds"], 21_600, "the cadence is stored: {patched}");
+    assert_eq!(
+        view["interval_seconds"], 21_600,
+        "the cadence is stored: {patched}"
+    );
 
     let track = tracks::onboard_csv_track(&app, &token).await;
     let parameter_id = track.parameter_id("TrkCsvDepth").to_string();
-    assert!(jobs_settled(&db, 60).await, "provisioning settles before the fixtures land");
+    assert!(
+        jobs_settled(&db, 60).await,
+        "provisioning settles before the fixtures land"
+    );
 
     // One 6-hourly slot per iteration, over a past UTC day: 00:00 opens a full-refresh period, the
     // other three do not. Each slot gets its own reading, seven months old so no incremental
@@ -329,7 +335,10 @@ async fn janitor_full_refresh_follows_the_operator_cadence() {
         let value = 110.0 + i as f64;
         let row = reading(&track.site_id, &parameter_id, &at, value);
         write_readings(&app, &token, vec![row]).await;
-        assert!(jobs_settled(&db, 60).await, "the batch's follow-on jobs settle before the tick");
+        assert!(
+            jobs_settled(&db, 60).await,
+            "the batch's follow-on jobs settle before the tick"
+        );
         assert!(
             e2e::hourly_bucket(&db, &track.site_id, &parameter_id, instant(&at))
                 .await
@@ -350,7 +359,10 @@ async fn janitor_full_refresh_follows_the_operator_cadence() {
         let enqueued = scheduler::tick(&db, &registry)
             .await
             .expect("scheduler tick");
-        assert_eq!(enqueued, 1, "the due janitor slot {slot} enqueues exactly one run");
+        assert_eq!(
+            enqueued, 1,
+            "the due janitor slot {slot} enqueues exactly one run"
+        );
         assert!(
             e2e::wait_for_jobs_by_trigger(&db, "janitor_service", 90).await,
             "the janitor run for slot {slot} completes"
@@ -401,7 +413,10 @@ async fn merging_site_parameters_moves_the_rollups_with_the_readings() {
         ],
     )
     .await;
-    assert!(jobs_settled(&db, 60).await, "ingestion settles before the rollup is built");
+    assert!(
+        jobs_settled(&db, 60).await,
+        "ingestion settles before the rollup is built"
+    );
 
     // Bucket-aligned start, so the fixture is materialised whatever TimescaleDB does with a partial
     // leading bucket, which is a separate suite's subject.
@@ -478,10 +493,18 @@ async fn a_refresh_that_cannot_run_fails_its_job() {
     write_readings(
         &app,
         &admin,
-        vec![reading(&track.site_id, &parameter_id, &format!("{day}T08:00:00Z"), 140.0)],
+        vec![reading(
+            &track.site_id,
+            &parameter_id,
+            &format!("{day}T08:00:00Z"),
+            140.0,
+        )],
     )
     .await;
-    assert!(jobs_settled(&db, 60).await, "ingestion settles before the refresh is asked for");
+    assert!(
+        jobs_settled(&db, 60).await,
+        "ingestion settles before the refresh is asked for"
+    );
 
     // Renaming the view is the one deterministic way to make the CALL error. Everything between
     // here and the rename back is kept assertion-free so the view is always restored.
@@ -503,7 +526,9 @@ async fn a_refresh_that_cannot_run_fails_its_job() {
          is failed (and retried), not completed: {broken}"
     );
     assert!(
-        broken["error_message"].as_str().is_some_and(|m| !m.is_empty()),
+        broken["error_message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
         "and it must carry the database's error, so an operator can see what went wrong: {broken}"
     );
 
@@ -554,7 +579,10 @@ async fn merging_site_parameters_carries_samples_and_annotations() {
     )
     .await;
     assert_eq!(status, 200, "grab entry ({status}): {grab}");
-    assert_eq!(grab["samples_created"], 1, "the replicate pair is one sample: {grab}");
+    assert_eq!(
+        grab["samples_created"], 1,
+        "the replicate pair is one sample: {grab}"
+    );
 
     // Inside the export's default [T + 2h, T + 6h] window, mean 310, and inside the grab track's
     // value band so a reading from elsewhere could not pass for one of these.
@@ -586,7 +614,10 @@ async fn merging_site_parameters_carries_samples_and_annotations() {
         (200..300).contains(&status),
         "annotate the slot ({status}): {annotation}"
     );
-    assert!(jobs_settled(&db, 60).await, "the fixtures settle before the merge");
+    assert!(
+        jobs_settled(&db, 60).await,
+        "the fixtures settle before the merge"
+    );
 
     let export_uri = |parameter_id: &str| {
         format!(
@@ -597,9 +628,16 @@ async fn merging_site_parameters_carries_samples_and_annotations() {
     };
     let (status, before) =
         crate::common::get_json_with_token(&app, &export_uri(&source), &admin).await;
-    assert_eq!(status, 200, "comparison export before the merge ({status}): {before}");
+    assert_eq!(
+        status, 200,
+        "comparison export before the merge ({status}): {before}"
+    );
     let rows = before["rows"].as_array().expect("rows array");
-    assert_eq!(rows.len(), 1, "the source slot pairs its one grab: {before}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the source slot pairs its one grab: {before}"
+    );
     assert!(
         (rows[0]["grab_value"].as_f64().unwrap_or(f64::NAN) - 320.0).abs() < 1e-9,
         "the grab value is the replicate mean: {before}"
@@ -623,7 +661,10 @@ async fn merging_site_parameters_carries_samples_and_annotations() {
 
     let (status, after) =
         crate::common::get_json_with_token(&app, &export_uri(&target), &admin).await;
-    assert_eq!(status, 200, "comparison export after the merge ({status}): {after}");
+    assert_eq!(
+        status, 200,
+        "comparison export after the merge ({status}): {after}"
+    );
     let rows = after["rows"].as_array().expect("rows array");
     assert_eq!(
         rows.len(),
@@ -685,7 +726,10 @@ async fn deleting_a_slot_does_not_split_its_streams_attribution() {
         &admin,
     )
     .await;
-    assert!((200..300).contains(&status), "pair the stream ({status}): {paired}");
+    assert!(
+        (200..300).contains(&status),
+        "pair the stream ({status}): {paired}"
+    );
 
     let ingest = |cycle: usize| {
         let app = app.clone();
@@ -704,7 +748,10 @@ async fn deleting_a_slot_does_not_split_its_streams_attribution() {
     };
 
     ingest(0).await;
-    assert!(jobs_settled(&db, 60).await, "the first cycle's follow-on jobs settle");
+    assert!(
+        jobs_settled(&db, 60).await,
+        "the first cycle's follow-on jobs settle"
+    );
     let window = (
         format!("{}T00:00:00Z", tracks::FLOW_BASE_DAY),
         format!("{}T01:00:00Z", tracks::FLOW_BASE_DAY),
@@ -716,15 +763,15 @@ async fn deleting_a_slot_does_not_split_its_streams_attribution() {
         "the paired cycle is served under the slot: {before}"
     );
 
-    let (delete_status, delete_body) = crate::common::delete_with_token(
-        &app,
-        &format!("/api/site_parameters/{slot}"),
-        &admin,
-    )
-    .await;
+    let (delete_status, delete_body) =
+        crate::common::delete_with_token(&app, &format!("/api/site_parameters/{slot}"), &admin)
+            .await;
 
     ingest(1).await;
-    assert!(jobs_settled(&db, 60).await, "the second cycle's follow-on jobs settle");
+    assert!(
+        jobs_settled(&db, 60).await,
+        "the second cycle's follow-on jobs settle"
+    );
 
     let total = e2e::count(
         &db,
@@ -757,10 +804,8 @@ async fn deleting_a_slot_does_not_split_its_streams_attribution() {
         && attributed == total
         && still_paired
         && served == total as usize;
-    let torn_down = (200..300).contains(&delete_status)
-        && attributed == 0
-        && !still_paired
-        && served == 0;
+    let torn_down =
+        (200..300).contains(&delete_status) && attributed == 0 && !still_paired && served == 0;
     assert!(
         refused || torn_down,
         "deleting a slot with a paired stream must either be refused (leaving all {total} readings \
@@ -787,9 +832,7 @@ async fn an_incremental_refresh_covers_the_bucket_containing_its_start() {
     // Two rows on one past day, neither on a bucket boundary. The import job refreshes from the
     // earliest timestamp verbatim, so 14:22 is what the hourly and daily windows start at.
     let day = "2026-05-06";
-    let csv = format!(
-        "DateTime,TrkCsvDepth\n{day}T14:22:00Z,110.00\n{day}T16:10:00Z,130.00\n"
-    );
+    let csv = format!("DateTime,TrkCsvDepth\n{day}T14:22:00Z,110.00\n{day}T16:10:00Z,130.00\n");
     let (status, imported) = crate::common::post_json_parse_with_token(
         &app,
         "/api/readings/import_csv",
@@ -814,7 +857,10 @@ async fn an_incremental_refresh_covers_the_bucket_containing_its_start() {
     let weekly = weekly_bucket(&db, &site, &parameter_id, first).await;
 
     let full = refresh_all(&app, &admin).await;
-    assert_eq!(full["status"], "completed", "the control full refresh completes: {full}");
+    assert_eq!(
+        full["status"], "completed",
+        "the control full refresh completes: {full}"
+    );
     let hourly_first_full = e2e::hourly_bucket(&db, &site, &parameter_id, first).await;
     let daily_full = daily_bucket(&db, &site, &parameter_id, first).await;
 

@@ -150,13 +150,21 @@ impl CRUDOperations for SensorDeploymentOperations {
         };
 
         // parameter_id is immutable on update (exclude(update)); the slot's parameter is the row's own.
-        let cur_param: Uuid = existing.try_get("", "parameter_id").map_err(ApiError::database)?;
-        let cur_sensor: Uuid = existing.try_get("", "sensor_id").map_err(ApiError::database)?;
-        let cur_site: Uuid = existing.try_get("", "site_id").map_err(ApiError::database)?;
-        let cur_from: chrono::DateTime<chrono::FixedOffset> =
-            existing.try_get("", "deployed_from").map_err(ApiError::database)?;
-        let cur_until: Option<chrono::DateTime<chrono::FixedOffset>> =
-            existing.try_get("", "deployed_until").map_err(ApiError::database)?;
+        let cur_param: Uuid = existing
+            .try_get("", "parameter_id")
+            .map_err(ApiError::database)?;
+        let cur_sensor: Uuid = existing
+            .try_get("", "sensor_id")
+            .map_err(ApiError::database)?;
+        let cur_site: Uuid = existing
+            .try_get("", "site_id")
+            .map_err(ApiError::database)?;
+        let cur_from: chrono::DateTime<chrono::FixedOffset> = existing
+            .try_get("", "deployed_from")
+            .map_err(ApiError::database)?;
+        let cur_until: Option<chrono::DateTime<chrono::FixedOffset>> = existing
+            .try_get("", "deployed_until")
+            .map_err(ApiError::database)?;
 
         // Merge the double-option patch over the existing row (outer None = field absent).
         let new_sensor = match data.sensor_id {
@@ -287,11 +295,7 @@ impl CRUDOperations for SensorDeploymentOperations {
         Ok(())
     }
 
-    async fn perform_delete(
-        &self,
-        db: &DatabaseConnection,
-        id: Uuid,
-    ) -> Result<Uuid, ApiError> {
+    async fn perform_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<Uuid, ApiError> {
         let row = db
             .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
@@ -307,12 +311,8 @@ impl CRUDOperations for SensorDeploymentOperations {
                 Some(id.to_string()),
             ));
         };
-        let sensor_id: Uuid = row
-            .try_get("", "sensor_id")
-            .map_err(ApiError::database)?;
-        let site_id: Uuid = row
-            .try_get("", "site_id")
-            .map_err(ApiError::database)?;
+        let sensor_id: Uuid = row.try_get("", "sensor_id").map_err(ApiError::database)?;
+        let site_id: Uuid = row.try_get("", "site_id").map_err(ApiError::database)?;
         let parameter_id: Uuid = row
             .try_get("", "parameter_id")
             .map_err(ApiError::database)?;
@@ -351,9 +351,16 @@ impl CRUDOperations for SensorDeploymentOperations {
             .await
             .map_err(ApiError::database)?;
 
-        spawn_slot_reprocess(db, sensor_id, site_id, parameter_id, "deployment_delete", id)
-            .await
-            .map_err(ApiError::database)?;
+        spawn_slot_reprocess(
+            db,
+            sensor_id,
+            site_id,
+            parameter_id,
+            "deployment_delete",
+            id,
+        )
+        .await
+        .map_err(ApiError::database)?;
 
         Ok(id)
     }

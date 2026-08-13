@@ -8,11 +8,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 use uuid::Uuid;
 
-async fn insert_backdated(
-    db: &DatabaseConnection,
-    category: &str,
-    interval: &str,
-) -> Uuid {
+async fn insert_backdated(db: &DatabaseConnection, category: &str, interval: &str) -> Uuid {
     let id = Uuid::new_v4();
     db.execute(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,

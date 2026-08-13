@@ -3,7 +3,6 @@
 //!
 //! Run: cargo test --test e2e -- --test-threads=1
 
-
 use crate::common::e2e;
 use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
@@ -39,7 +38,10 @@ async fn grab_replicates_aggregate_then_tool_result_saved_to_station() {
     assert_eq!(status, 200, "grab_samples ({status}): {body}");
     let gj: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(gj["inserted"], 3, "three replicate readings inserted");
-    assert_eq!(gj["samples_created"], 1, "three replicates collapse into one sample");
+    assert_eq!(
+        gj["samples_created"], 1,
+        "three replicates collapse into one sample"
+    );
 
     let row = db
         .query_one(Statement::from_string(
@@ -50,12 +52,27 @@ async fn grab_replicates_aggregate_then_tool_result_saved_to_station() {
         .unwrap()
         .expect("sample row exists");
     let n: i32 = row.try_get("", "n").unwrap();
-    let mean: f64 = row.try_get::<Option<f64>>("", "mean").unwrap().expect("trigger populates mean");
-    let minv: f64 = row.try_get::<Option<f64>>("", "min_value").unwrap().unwrap();
-    let maxv: f64 = row.try_get::<Option<f64>>("", "max_value").unwrap().unwrap();
+    let mean: f64 = row
+        .try_get::<Option<f64>>("", "mean")
+        .unwrap()
+        .expect("trigger populates mean");
+    let minv: f64 = row
+        .try_get::<Option<f64>>("", "min_value")
+        .unwrap()
+        .unwrap();
+    let maxv: f64 = row
+        .try_get::<Option<f64>>("", "max_value")
+        .unwrap()
+        .unwrap();
     assert_eq!(n, 3, "n = 3 replicates");
-    assert!((mean - vals.iter().sum::<f64>() / 3.0).abs() < 1e-6, "mean of replicates");
-    assert!((minv - 185.2).abs() < 1e-6 && (maxv - 198.7).abs() < 1e-6, "min/max of replicates");
+    assert!(
+        (mean - vals.iter().sum::<f64>() / 3.0).abs() < 1e-6,
+        "mean of replicates"
+    );
+    assert!(
+        (minv - 185.2).abs() < 1e-6 && (maxv - 198.7).abs() < 1e-6,
+        "min/max of replicates"
+    );
 
     // 2. Analytical tool calculation (DOC from replicates) → numeric result.
     let (status, doc) = crate::common::post_json_parse_with_token(
@@ -67,8 +84,13 @@ async fn grab_replicates_aggregate_then_tool_result_saved_to_station() {
     .await;
     assert_eq!(status, 200, "doc calculate ({status}): {doc}");
     assert_eq!(doc["tool"], "doc");
-    let doc_avg = doc["results"]["DOC_avg_ppb"].as_f64().expect("DOC_avg_ppb result");
-    assert!(doc_avg.is_finite() && doc_avg > 0.0, "DOC result should be a positive number");
+    let doc_avg = doc["results"]["DOC_avg_ppb"]
+        .as_f64()
+        .expect("DOC_avg_ppb result");
+    assert!(
+        doc_avg.is_finite() && doc_avg > 0.0,
+        "DOC result should be a positive number"
+    );
 
     // 3. Save to Station: persist the tool result as a grab sample at a site_parameter (mirrors the
     //    SaveToStationDialog flow). Use a distinct timestamp so it's isolatable.
@@ -83,10 +105,14 @@ async fn grab_replicates_aggregate_then_tool_result_saved_to_station() {
     )
     .await;
     assert_eq!(status, 200, "save to station ({status}): {save}");
-    assert_eq!(serde_json::from_str::<serde_json::Value>(&save).unwrap()["inserted"], 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&save).unwrap()["inserted"],
+        1
+    );
 
     // 4. The saved tool result is queryable as a reading (window excludes the 10:00 replicates).
-    let uri = format!("/api/sites/{site1}/readings?start=2025-06-15T10:30:00Z&end=2025-06-15T11:30:00Z");
+    let uri =
+        format!("/api/sites/{site1}/readings?start=2025-06-15T10:30:00Z&end=2025-06-15T11:30:00Z");
     let (status, readings) = crate::common::get_json_with_token(&app, &uri, &token).await;
     assert_eq!(status, 200, "readings ({status}): {readings}");
     let got = e2e::values_for(&readings, param);

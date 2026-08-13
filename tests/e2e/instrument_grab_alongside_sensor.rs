@@ -47,7 +47,10 @@ async fn instrument_grabs_coexist_with_continuous_sensor_stream() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "batch insert ({status}): {body}");
+    assert!(
+        (200..300).contains(&status),
+        "batch insert ({status}): {body}"
+    );
 
     // Lab side: an instrument with an instant curve submits a grab in the middle of the window.
     let instrument_id = "00000000-0000-4000-c000-00000000c0e1";
@@ -62,9 +65,12 @@ async fn instrument_grabs_coexist_with_continuous_sensor_stream() {
              VALUES ('{curve_id}', '{instrument_id}', 2.0, 1.0, now(), 'instant', 'Plate A')"
         ),
     ] {
-        db.execute(Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql))
-            .await
-            .unwrap();
+        db.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+        ))
+        .await
+        .unwrap();
     }
 
     let grab_time = "2025-06-01T00:35:00Z";
@@ -92,7 +98,11 @@ async fn instrument_grabs_coexist_with_continuous_sensor_stream() {
     .await;
     assert_eq!(status, 200, "{cont}");
     let cont_vals = e2e::values_for(&cont, param);
-    assert_eq!(cont_vals.len(), 6, "continuous view holds only the sensor stream: {cont}");
+    assert_eq!(
+        cont_vals.len(),
+        6,
+        "continuous view holds only the sensor stream: {cont}"
+    );
     assert!(
         cont_vals.iter().all(|v| (10.0..=15.0).contains(v)),
         "continuous values untouched by the grab: {cont_vals:?}"
@@ -128,8 +138,14 @@ async fn instrument_grabs_coexist_with_continuous_sensor_stream() {
     let grab_curve: Option<Uuid> = row.try_get("", "calibration_id").ok();
     let grab_dep: Option<Uuid> = row.try_get("", "deployment_id").ok();
     let grab_mtype: Option<String> = row.try_get("", "measurement_type").ok();
-    assert_eq!(grab_sensor.map(|u| u.to_string()), Some(instrument_id.to_string()));
-    assert_eq!(grab_curve.map(|u| u.to_string()), Some(curve_id.to_string()));
+    assert_eq!(
+        grab_sensor.map(|u| u.to_string()),
+        Some(instrument_id.to_string())
+    );
+    assert_eq!(
+        grab_curve.map(|u| u.to_string()),
+        Some(curve_id.to_string())
+    );
     assert_eq!(grab_dep, None, "grabs create no deployment");
     assert_eq!(grab_mtype.as_deref(), Some("spot"));
 
@@ -138,14 +154,22 @@ async fn instrument_grabs_coexist_with_continuous_sensor_stream() {
             sea_orm::DatabaseBackend::Postgres,
             "SELECT sensor_id, deployment_id FROM readings \
              WHERE site_id = $1::uuid AND parameter_id = $2::uuid AND time = $3",
-            [site.into(), param.into(), sl::dt("2025-06-01T00:30:00Z").into()],
+            [
+                site.into(),
+                param.into(),
+                sl::dt("2025-06-01T00:30:00Z").into(),
+            ],
         ))
         .await
         .unwrap()
         .expect("continuous reading exists");
     let cont_sensor: Option<Uuid> = row.try_get("", "sensor_id").ok();
     let cont_dep: Option<Uuid> = row.try_get("", "deployment_id").ok();
-    assert_eq!(cont_sensor, Some(field_sensor.id), "sensor attribution undisturbed by the grab");
+    assert_eq!(
+        cont_sensor,
+        Some(field_sensor.id),
+        "sensor attribution undisturbed by the grab"
+    );
     assert_eq!(cont_dep, Some(deployment));
 
     // Continuous aggregates roll up only the sensor stream: the grab's 201 would drag the
@@ -157,7 +181,10 @@ async fn instrument_grabs_coexist_with_continuous_sensor_stream() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "refresh_aggregates ({status}): {refresh}");
+    assert!(
+        (200..300).contains(&status),
+        "refresh_aggregates ({status}): {refresh}"
+    );
     let refresh: serde_json::Value = serde_json::from_str(&refresh).unwrap();
     let job_id = refresh["job_id"].as_str().expect("tracked refresh job");
     let final_status = e2e::poll_job(&app, &token, job_id, 30).await;
@@ -197,7 +224,11 @@ async fn instrument_grabs_coexist_with_continuous_sensor_stream() {
         .map(|v| v.as_str())
         .collect();
     assert_eq!(mtypes.len(), 7, "every point labelled: {mixed}");
-    assert_eq!(mtypes.iter().filter(|m| **m == Some("spot")).count(), 1, "one grab point: {mtypes:?}");
+    assert_eq!(
+        mtypes.iter().filter(|m| **m == Some("spot")).count(),
+        1,
+        "one grab point: {mtypes:?}"
+    );
     assert_eq!(
         mtypes.iter().filter(|m| **m != Some("spot")).count(),
         6,

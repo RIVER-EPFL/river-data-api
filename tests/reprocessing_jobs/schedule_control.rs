@@ -361,7 +361,9 @@ async fn unknown_policy_values_are_rejected_and_leave_the_schedule_unchanged() {
     );
 
     assert_eq!(
-        persisted(&db, REJECT_PROBE, "overlap_policy").await.as_deref(),
+        persisted(&db, REJECT_PROBE, "overlap_policy")
+            .await
+            .as_deref(),
         Some("skip_if_running"),
         "and the table agrees with the view"
     );
@@ -417,19 +419,26 @@ async fn allow_concurrent_lets_a_due_slot_enqueue_while_a_run_is_in_flight() {
         &manager,
     )
     .await;
-    assert_eq!(status, 200, "a manager may relax the overlap policy: {body}");
+    assert_eq!(
+        status, 200,
+        "a manager may relax the overlap policy: {body}"
+    );
     let view: Value = serde_json::from_str(&body).expect("the PATCH returns the updated schedule");
     assert_eq!(
         view["overlap_policy"], "allow_concurrent",
         "the response carries the new policy: {view}"
     );
     assert_eq!(
-        persisted(&db, OVERLAP_PROBE, "overlap_policy").await.as_deref(),
+        persisted(&db, OVERLAP_PROBE, "overlap_policy")
+            .await
+            .as_deref(),
         Some("allow_concurrent"),
         "and it is persisted, not merely echoed"
     );
     assert!(
-        view["updated_by"].as_str().is_some_and(|s| s.contains("manager1")),
+        view["updated_by"]
+            .as_str()
+            .is_some_and(|s| s.contains("manager1")),
         "the edit is stamped with the person who made it: {view}"
     );
 
@@ -500,7 +509,10 @@ async fn catchup_skip_is_persisted_audited_and_suppresses_a_missed_slot() {
         &manager,
     )
     .await;
-    assert_eq!(status, 200, "a manager may choose the catchup policy: {body}");
+    assert_eq!(
+        status, 200,
+        "a manager may choose the catchup policy: {body}"
+    );
     let view: Value = serde_json::from_str(&body).expect("the PATCH returns the updated schedule");
     assert_eq!(
         view["catchup_policy"], "skip",
@@ -511,7 +523,9 @@ async fn catchup_skip_is_persisted_audited_and_suppresses_a_missed_slot() {
         "the policy the operator did not touch is unchanged: {view}"
     );
     assert_eq!(
-        persisted(&db, CATCHUP_PROBE, "catchup_policy").await.as_deref(),
+        persisted(&db, CATCHUP_PROBE, "catchup_policy")
+            .await
+            .as_deref(),
         Some("skip"),
         "the edit is persisted, not merely echoed"
     );
@@ -563,7 +577,10 @@ async fn disabling_a_schedule_halts_the_tick_and_re_enabling_resets_the_grid() {
         patch_schedule(&app, ENABLED_PROBE, &json!({ "enabled": false }), &manager).await;
     assert_eq!(status, 200, "a manager may disable a schedule: {body}");
     let view: Value = serde_json::from_str(&body).expect("the PATCH returns the updated schedule");
-    assert_eq!(view["enabled"], false, "the schedule reports disabled: {view}");
+    assert_eq!(
+        view["enabled"], false,
+        "the schedule reports disabled: {view}"
+    );
     assert_eq!(
         next_run_at(&db, ENABLED_PROBE).await,
         seeded_slot,
@@ -586,7 +603,10 @@ async fn disabling_a_schedule_halts_the_tick_and_re_enabling_resets_the_grid() {
         patch_schedule(&app, ENABLED_PROBE, &json!({ "enabled": true }), &manager).await;
     assert_eq!(status, 200, "a manager may re-enable a schedule: {body}");
     let view: Value = serde_json::from_str(&body).expect("the PATCH returns the updated schedule");
-    assert_eq!(view["enabled"], true, "the schedule reports enabled: {view}");
+    assert_eq!(
+        view["enabled"], true,
+        "the schedule reports enabled: {view}"
+    );
 
     let resumed = next_run_at(&db, ENABLED_PROBE).await;
     let expected = Utc::now() + chrono::Duration::seconds(PROBE_INTERVAL);
@@ -628,9 +648,9 @@ async fn disabling_a_schedule_halts_the_tick_and_re_enabling_resets_the_grid() {
         "exactly one row records the re-enable: {entries:?}"
     );
     assert!(
-        entries
-            .iter()
-            .all(|e| e["changed_by"].as_str().is_some_and(|s| s.contains("manager1"))),
+        entries.iter().all(|e| e["changed_by"]
+            .as_str()
+            .is_some_and(|s| s.contains("manager1"))),
         "both rows name the person who toggled it: {entries:?}"
     );
 }
@@ -702,7 +722,10 @@ async fn run_now_dedupes_within_the_second_snapshots_empty_tunables_and_writes_n
         .unwrap_or_else(|| panic!("an enqueued run returns its job id: {first}"))
         .to_string();
 
-    assert_eq!(status_repeat, 200, "the repeat call is not an error: {repeat}");
+    assert_eq!(
+        status_repeat, 200,
+        "the repeat call is not an error: {repeat}"
+    );
     assert_eq!(
         repeat["enqueued"], false,
         "a double click in the same second collapses to one run: {repeat}"
@@ -916,7 +939,10 @@ async fn sse_streams_the_completion_of_an_operator_run_that_did_real_work() {
         "the operator's run materialised the hourly bucket for the ingested cycle"
     );
     let (mean, readings_in_bucket) = bucket.expect("bucket present");
-    assert_eq!(readings_in_bucket, 5, "every reading of the cycle is counted");
+    assert_eq!(
+        readings_in_bucket, 5,
+        "every reading of the cycle is counted"
+    );
     assert!(
         (mean - 202.0).abs() < 1e-9,
         "the cycle's values 200..204 average 202, got {mean}"

@@ -38,7 +38,10 @@ impl Job for TestService {
 
 fn registry_with(name: &'static str, interval_secs: i64) -> Arc<JobRegistry> {
     let mut reg = JobRegistry::new();
-    reg.register(Arc::new(TestService { name, interval_secs }));
+    reg.register(Arc::new(TestService {
+        name,
+        interval_secs,
+    }));
     Arc::new(reg)
 }
 
@@ -100,7 +103,10 @@ async fn seed_inserts_one_row_per_service_idempotently() {
         .unwrap()
         .try_get("", "n")
         .unwrap();
-    assert_eq!(n, 1, "seeding twice inserts exactly one row (ON CONFLICT DO NOTHING)");
+    assert_eq!(
+        n, 1,
+        "seeding twice inserts exactly one row (ON CONFLICT DO NOTHING)"
+    );
 }
 
 #[tokio::test]
@@ -119,8 +125,14 @@ async fn due_service_enqueues_once_and_advances_next_run() {
     assert_eq!(count_queued(&db, "sched_due_probe").await, 1);
 
     let after = next_run_at(&db, "sched_due_probe").await;
-    assert!(after > before, "next_run_at advanced past the scheduled slot");
-    assert!(after > chrono::Utc::now(), "next_run_at is now in the future");
+    assert!(
+        after > before,
+        "next_run_at advanced past the scheduled slot"
+    );
+    assert!(
+        after > chrono::Utc::now(),
+        "next_run_at is now in the future"
+    );
 }
 
 #[tokio::test]
@@ -150,7 +162,10 @@ async fn second_tick_same_slot_does_not_double_enqueue() {
     let enq2 = scheduler::tick(&db, &reg).await.unwrap();
 
     assert_eq!(enq1, 1, "first tick enqueues the slot");
-    assert_eq!(enq2, 0, "re-running the same scheduled slot is deduped (no second job)");
+    assert_eq!(
+        enq2, 0,
+        "re-running the same scheduled slot is deduped (no second job)"
+    );
     assert_eq!(
         count_queued(&db, "sched_dedupe_probe").await,
         1,
@@ -194,12 +209,18 @@ async fn skip_if_running_suppresses_enqueue_while_active() {
 
     let before = next_run_at(&db, "sched_overlap_probe").await;
     let enqueued = scheduler::tick(&db, &reg).await.unwrap();
-    assert_eq!(enqueued, 0, "overlap=skip_if_running suppresses the enqueue while a run is active");
+    assert_eq!(
+        enqueued, 0,
+        "overlap=skip_if_running suppresses the enqueue while a run is active"
+    );
     assert_eq!(
         count_queued(&db, "sched_overlap_probe").await,
         0,
         "no new queued job while the prior run is in flight"
     );
     let after = next_run_at(&db, "sched_overlap_probe").await;
-    assert!(after > before, "the cadence grid still advances so it never drifts");
+    assert!(
+        after > before,
+        "the cadence grid still advances so it never drifts"
+    );
 }

@@ -1,4 +1,3 @@
-
 use serial_test::serial;
 
 /// Authenticated endpoints must never return 429 regardless of request volume.

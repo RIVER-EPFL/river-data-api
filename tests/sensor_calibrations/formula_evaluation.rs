@@ -3,7 +3,6 @@
 //! Run with: cargo test --test sensor_calibrations
 //! Requires: DATABASE_URL pointing to a TimescaleDB instance.
 
-
 use serial_test::serial;
 use std::collections::HashMap;
 
@@ -19,7 +18,8 @@ fn test_division_by_zero_produces_non_finite() {
     vars.insert("a".to_string(), 1.0);
     vars.insert("b".to_string(), 0.0);
 
-    let result = river_db::routes::private::sensors::calibrations::service::evaluate_formula("a / b", &vars);
+    let result =
+        river_db::routes::private::sensors::calibrations::service::evaluate_formula("a / b", &vars);
     // evaluate_formula returns Ok(Infinity), the caller must check is_finite()
     assert!(result.is_ok(), "meval should not error on division by zero");
     let value = result.unwrap();
@@ -35,7 +35,8 @@ fn test_missing_variable_returns_error() {
     vars.insert("a".to_string(), 1.0);
     // "b" is missing
 
-    let result = river_db::routes::private::sensors::calibrations::service::evaluate_formula("a + b", &vars);
+    let result =
+        river_db::routes::private::sensors::calibrations::service::evaluate_formula("a + b", &vars);
     assert!(result.is_err(), "missing variable should produce an error");
 }
 
@@ -45,10 +46,16 @@ fn test_normal_formula_evaluation() {
     vars.insert("a".to_string(), 3.0);
     vars.insert("b".to_string(), 4.0);
 
-    let result = river_db::routes::private::sensors::calibrations::service::evaluate_formula("a * b + 2", &vars);
+    let result = river_db::routes::private::sensors::calibrations::service::evaluate_formula(
+        "a * b + 2",
+        &vars,
+    );
     assert!(result.is_ok());
     let value = result.unwrap();
-    assert!((value - 14.0).abs() < 1e-10, "3*4+2 should be 14, got {value}");
+    assert!(
+        (value - 14.0).abs() < 1e-10,
+        "3*4+2 should be 14, got {value}"
+    );
 }
 
 // ============================================================================
@@ -189,15 +196,21 @@ async fn exec(db: &sea_orm::DatabaseConnection, sql: &str) {
 async fn apply_calibration_formula_correctness() {
     // Test the actual formula against expected lab calibration results.
     // The code uses: calibrated = slope * raw + intercept
-    let result = river_db::routes::private::sensors::calibrations::service::apply_calibration(10.0, 2.0, 5.0);
+    let result = river_db::routes::private::sensors::calibrations::service::apply_calibration(
+        10.0, 2.0, 5.0,
+    );
     assert_eq!(result, 25.0, "calibrated = 2.0 * 10.0 + 5.0 = 25.0");
 
     // Identity calibration (slope=1, intercept=0)
-    let result = river_db::routes::private::sensors::calibrations::service::apply_calibration(42.0, 1.0, 0.0);
+    let result = river_db::routes::private::sensors::calibrations::service::apply_calibration(
+        42.0, 1.0, 0.0,
+    );
     assert_eq!(result, 42.0, "Identity calibration should return raw value");
 
     // Negative intercept
-    let result = river_db::routes::private::sensors::calibrations::service::apply_calibration(100.0, 1.0, -273.15);
+    let result = river_db::routes::private::sensors::calibrations::service::apply_calibration(
+        100.0, 1.0, -273.15,
+    );
     assert!(
         (result - (-173.15)).abs() < 0.001,
         "Kelvin to Celsius: 100 - 273.15 = -173.15, got {result}"

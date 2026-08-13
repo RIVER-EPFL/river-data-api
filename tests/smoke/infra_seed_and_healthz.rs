@@ -3,7 +3,6 @@
 //! Run with: cargo test --test smoke
 //! Requires: DATABASE_URL pointing to a TimescaleDB instance.
 
-
 use sea_orm::ConnectionTrait;
 use serial_test::serial;
 
@@ -30,7 +29,10 @@ async fn test_infra_seed_and_healthz() {
     let row = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            format!("SELECT name FROM projects WHERE id = '{}'", crate::common::PROJECT_ID),
+            format!(
+                "SELECT name FROM projects WHERE id = '{}'",
+                crate::common::PROJECT_ID
+            ),
         ))
         .await
         .unwrap()

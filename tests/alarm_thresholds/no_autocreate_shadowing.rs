@@ -5,7 +5,6 @@
 //!
 //! Run: cargo test --test alarm_thresholds -- --test-threads=1
 
-
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use serial_test::serial;
 
@@ -56,7 +55,10 @@ async fn site_parameter_create_does_not_auto_create_or_shadow_threshold() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "create site_parameter ({status}): {body}");
+    assert!(
+        (200..300).contains(&status),
+        "create site_parameter ({status}): {body}"
+    );
 
     assert_eq!(
         threshold_count(&db, depth, site2).await,

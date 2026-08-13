@@ -49,10 +49,8 @@ impl MigrationTrait for Migration {
              END; $$ LANGUAGE plpgsql",
         )
         .await?;
-        db.execute_unprepared(
-            "DROP TRIGGER IF EXISTS subprojects_move_cascade_trg ON subprojects",
-        )
-        .await?;
+        db.execute_unprepared("DROP TRIGGER IF EXISTS subprojects_move_cascade_trg ON subprojects")
+            .await?;
         db.execute_unprepared(
             "CREATE TRIGGER subprojects_move_cascade_trg AFTER UPDATE OF project_id ON subprojects \
              FOR EACH ROW WHEN (OLD.project_id IS DISTINCT FROM NEW.project_id) \

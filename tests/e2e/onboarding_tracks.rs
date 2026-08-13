@@ -12,16 +12,21 @@
 use serial_test::serial;
 
 use crate::common::keycloak as kc;
-use crate::common::tracks::{self, BAND_CSV, BAND_FLOW, BAND_GRAB, FLOW_CYCLES, FLOW_READINGS_PER_CYCLE};
+use crate::common::tracks::{
+    self, BAND_CSV, BAND_FLOW, BAND_GRAB, FLOW_CYCLES, FLOW_READINGS_PER_CYCLE,
+};
 
 async fn count(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
     use sea_orm::{ConnectionTrait, Statement};
-    db.query_one(Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.to_string()))
-        .await
-        .expect("query")
-        .expect("row")
-        .try_get::<i64>("", "c")
-        .expect("c")
+    db.query_one(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql.to_string(),
+    ))
+    .await
+    .expect("query")
+    .expect("row")
+    .try_get::<i64>("", "c")
+    .expect("c")
 }
 
 #[tokio::test]
@@ -70,7 +75,10 @@ async fn csv_dump_onboarding_from_scratch_to_served_readings() {
         Some(2),
         "both parameter columns are ingested: {imported}"
     );
-    assert_eq!(imported["row_count"], 12, "twelve data rows parsed: {imported}");
+    assert_eq!(
+        imported["row_count"], 12,
+        "twelve data rows parsed: {imported}"
+    );
 
     // Import stages rows into csv_import_staging and a tracked job moves them into readings, so
     // the rows are not visible on the import response alone.
@@ -117,7 +125,11 @@ async fn csv_dump_onboarding_from_scratch_to_served_readings() {
     .await;
     assert_eq!(status, 200, "served readings ({status}): {served}");
     let values = crate::common::e2e::values_for(&served, track.parameter_id("TrkCsvDepth"));
-    assert_eq!(values.len(), 12, "every imported row is served back: {served}");
+    assert_eq!(
+        values.len(),
+        12,
+        "every imported row is served back: {served}"
+    );
     assert!(
         values.iter().all(|v| *v >= BAND_CSV.0 && *v < BAND_CSV.1),
         "served values stay inside the CSV track's band: {values:?}"
@@ -183,7 +195,11 @@ async fn sensor_flow_onboarding_across_repeated_ingest_cycles() {
 
     let total = (FLOW_CYCLES * FLOW_READINGS_PER_CYCLE) as i64;
     assert_eq!(
-        count(&db, &format!("SELECT count(*) AS c FROM readings WHERE stream_id = '{stream_id}'")).await,
+        count(
+            &db,
+            &format!("SELECT count(*) AS c FROM readings WHERE stream_id = '{stream_id}'")
+        )
+        .await,
         total,
         "every cycle landed"
     );
@@ -270,8 +286,14 @@ async fn grab_and_tool_onboarding_produces_spot_series_with_sample_statistics() 
     let stdev: f64 = row.try_get("", "stdev").expect("stdev");
     let n: i32 = row.try_get("", "n").expect("n");
     assert_eq!(n, 3, "three replicates counted");
-    assert!((mean - 320.0).abs() < 1e-9, "mean of 310/320/330 is 320, got {mean}");
-    assert!((stdev - 10.0).abs() < 1e-9, "sample sd of 310/320/330 is 10, got {stdev}");
+    assert!(
+        (mean - 320.0).abs() < 1e-9,
+        "mean of 310/320/330 is 320, got {mean}"
+    );
+    assert!(
+        (stdev - 10.0).abs() < 1e-9,
+        "sample sd of 310/320/330 is 10, got {stdev}"
+    );
 
     assert_eq!(
         count(
@@ -307,7 +329,11 @@ async fn the_three_tracks_share_no_entities_or_readings() {
     let projects = [&a.project_id, &b.project_id, &c.project_id];
     for (label, ids) in [("site", sites), ("project", projects)] {
         let unique: std::collections::HashSet<_> = ids.iter().collect();
-        assert_eq!(unique.len(), 3, "the three tracks hold distinct {label} ids");
+        assert_eq!(
+            unique.len(),
+            3,
+            "the three tracks hold distinct {label} ids"
+        );
     }
 
     let params: Vec<&str> = a
@@ -318,11 +344,21 @@ async fn the_three_tracks_share_no_entities_or_readings() {
         .map(|(_, id)| id.as_str())
         .collect();
     let unique: std::collections::HashSet<_> = params.iter().collect();
-    assert_eq!(unique.len(), params.len(), "no parameter is shared between tracks");
+    assert_eq!(
+        unique.len(),
+        params.len(),
+        "no parameter is shared between tracks"
+    );
 
     assert_ne!(a.sensor_id, b.sensor_id, "tracks A and B differ on sensor");
-    assert_ne!(b.sensor_id, c.sensor_id, "tracks B and C hold different sensors");
-    assert!(a.sensor_id.is_none(), "the CSV track deliberately has no sensor");
+    assert_ne!(
+        b.sensor_id, c.sensor_id,
+        "tracks B and C hold different sensors"
+    );
+    assert!(
+        a.sensor_id.is_none(),
+        "the CSV track deliberately has no sensor"
+    );
 
     for (label, band) in [("csv", BAND_CSV), ("flow", BAND_FLOW), ("grab", BAND_GRAB)] {
         assert!(band.0 < band.1, "{label} band is ordered");

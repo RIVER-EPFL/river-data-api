@@ -41,14 +41,21 @@ async fn write_job_timeline(
     let sink = Arc::clone(&captured);
     let written = lines.len() as i64;
 
-    run_tracked_job(db, None, trigger_type, None, events(), move |ctx| async move {
-        *sink.lock().unwrap() = Some(ctx.job_id());
-        ctx.set_site(site_id).await;
-        for (level, message, context) in &lines {
-            ctx.log(level, message, context.clone()).await;
-        }
-        Ok(written)
-    })
+    run_tracked_job(
+        db,
+        None,
+        trigger_type,
+        None,
+        events(),
+        move |ctx| async move {
+            *sink.lock().unwrap() = Some(ctx.job_id());
+            ctx.set_site(site_id).await;
+            for (level, message, context) in &lines {
+                ctx.log(level, message, context.clone()).await;
+            }
+            Ok(written)
+        },
+    )
     .await
     .unwrap_or_else(|e| panic!("tracked {trigger_type} job runs: {e}"));
 
@@ -122,7 +129,8 @@ async fn csv_track_with_import(
     let raw = imported["derived_job_id"]
         .as_str()
         .unwrap_or_else(|| panic!("the import enqueues a tracked csv_import job: {imported}"));
-    let job_id = Uuid::parse_str(raw).unwrap_or_else(|e| panic!("csv_import job id is a uuid: {e}"));
+    let job_id =
+        Uuid::parse_str(raw).unwrap_or_else(|e| panic!("csv_import job id is a uuid: {e}"));
 
     assert!(
         crate::common::e2e::wait_for_jobs_by_trigger(db, "csv_import", 30).await,
@@ -157,7 +165,11 @@ async fn job_log_tail_is_ordered_by_seq_and_returns_only_lines_after_it() {
                 format!("{PROBE_PREFIX} slot skipped"),
                 json!({ "parameter_id": parameter_id }),
             ),
-            ("info", format!("{PROBE_PREFIX} refreshing aggregates"), json!({})),
+            (
+                "info",
+                format!("{PROBE_PREFIX} refreshing aggregates"),
+                json!({}),
+            ),
             (
                 "error",
                 format!("{PROBE_PREFIX} aggregate refresh failed"),
@@ -179,10 +191,21 @@ async fn job_log_tail_is_ordered_by_seq_and_returns_only_lines_after_it() {
     .await;
 
     let (status, body) = fetch_logs(&app, &jwt, probe, "").await;
-    assert_eq!(status, 200, "the full timeline is served ({status}): {body}");
+    assert_eq!(
+        status, 200,
+        "the full timeline is served ({status}): {body}"
+    );
     let all = parse_lines(&body);
-    assert_eq!(all.len(), 4, "every written line is returned exactly once: {body}");
-    assert_eq!(seqs(&all), vec![0, 1, 2, 3], "lines come back in seq order: {body}");
+    assert_eq!(
+        all.len(),
+        4,
+        "every written line is returned exactly once: {body}"
+    );
+    assert_eq!(
+        seqs(&all),
+        vec![0, 1, 2, 3],
+        "lines come back in seq order: {body}"
+    );
     assert_eq!(
         field(&all, "level"),
         vec!["info", "warn", "info", "error"],
@@ -228,7 +251,11 @@ async fn job_log_tail_is_ordered_by_seq_and_returns_only_lines_after_it() {
     let (status, body) = fetch_logs(&app, &jwt, probe, "?after_seq=1").await;
     assert_eq!(status, 200, "tail from seq 1 ({status}): {body}");
     let tail = parse_lines(&body);
-    assert_eq!(seqs(&tail), vec![2, 3], "after_seq=1 skips seq 0 and 1: {body}");
+    assert_eq!(
+        seqs(&tail),
+        vec![2, 3],
+        "after_seq=1 skips seq 0 and 1: {body}"
+    );
     assert_eq!(
         field(&tail, "level"),
         vec!["info", "error"],
@@ -261,7 +288,10 @@ async fn job_log_tail_is_ordered_by_seq_and_returns_only_lines_after_it() {
     // Scoping: a timeline belongs to one job. Were the job_id predicate lost, each of these would
     // carry the other job's lines too.
     let (status, body) = fetch_logs(&app, &jwt, neighbour, "").await;
-    assert_eq!(status, 200, "the neighbouring job's timeline ({status}): {body}");
+    assert_eq!(
+        status, 200,
+        "the neighbouring job's timeline ({status}): {body}"
+    );
     let neighbour_lines = parse_lines(&body);
     assert_eq!(
         neighbour_lines.len(),
@@ -279,7 +309,10 @@ async fn job_log_tail_is_ordered_by_seq_and_returns_only_lines_after_it() {
     );
 
     let (status, body) = fetch_logs(&app, &jwt, csv_job_id, "").await;
-    assert_eq!(status, 200, "the CSV import job's timeline ({status}): {body}");
+    assert_eq!(
+        status, 200,
+        "the CSV import job's timeline ({status}): {body}"
+    );
     assert!(
         !body.contains(PROBE_PREFIX) && !body.contains(NEIGHBOUR_PREFIX),
         "the import job's timeline holds no other job's lines: {body}"
@@ -315,10 +348,18 @@ async fn job_log_tail_requires_read_data() {
     // to the projects the caller is granted, so the grant is what leaves the capability as the
     // thing under test here.
     kc::ensure_realm_user("intern1", "intern1", &["riverdata-intern"]).await;
-    kc::grant_project(&db, &kc::keycloak_user_id("intern1").await, &track.project_id).await;
+    kc::grant_project(
+        &db,
+        &kc::keycloak_user_id("intern1").await,
+        &track.project_id,
+    )
+    .await;
     let intern_jwt = kc::get_keycloak_jwt("intern1", "intern1").await;
     let (status, body) = fetch_logs(&app, &intern_jwt, probe, "").await;
-    assert_eq!(status, 200, "an intern reads a job timeline ({status}): {body}");
+    assert_eq!(
+        status, 200,
+        "an intern reads a job timeline ({status}): {body}"
+    );
     let lines = parse_lines(&body);
     assert_eq!(
         field(&lines, "message"),
@@ -333,18 +374,21 @@ async fn job_log_tail_requires_read_data() {
     kc::ensure_realm_user("norole", "norole", &[]).await;
     let norole_jwt = kc::get_keycloak_jwt("norole", "norole").await;
     let (status, body) = fetch_logs(&app, &norole_jwt, probe, "").await;
-    assert_eq!(status, 403, "a role-less login is refused ({status}): {body}");
+    assert_eq!(
+        status, 403,
+        "a role-less login is refused ({status}): {body}"
+    );
     assert!(
         !body.contains(PROBE_PREFIX),
         "a refusal carries no timeline content: {body}"
     );
 
-    let (status, body) = crate::common::get(
-        &app,
-        &format!("/api/reprocessing_jobs/{probe}/logs"),
-    )
-    .await;
-    assert_eq!(status, 401, "an unauthenticated read is 401, not 403 ({status}): {body}");
+    let (status, body) =
+        crate::common::get(&app, &format!("/api/reprocessing_jobs/{probe}/logs")).await;
+    assert_eq!(
+        status, 401,
+        "an unauthenticated read is 401, not 403 ({status}): {body}"
+    );
     assert!(
         !body.contains(PROBE_PREFIX),
         "a refusal carries no timeline content: {body}"

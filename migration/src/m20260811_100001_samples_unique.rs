@@ -12,11 +12,9 @@ impl MigrationTrait for Migration {
         let db = manager.get_connection();
 
         // Repointing readings can touch compressed chunks on a long-lived deployment.
-        db.execute_unprepared(
-            "SET timescaledb.max_tuples_decompressed_per_dml_transaction = 0",
-        )
-        .await
-        .ok();
+        db.execute_unprepared("SET timescaledb.max_tuples_decompressed_per_dml_transaction = 0")
+            .await
+            .ok();
 
         db.execute_unprepared(
             r#"
@@ -45,11 +43,9 @@ impl MigrationTrait for Migration {
         )
         .await?;
 
-        db.execute_unprepared(
-            "RESET timescaledb.max_tuples_decompressed_per_dml_transaction",
-        )
-        .await
-        .ok();
+        db.execute_unprepared("RESET timescaledb.max_tuples_decompressed_per_dml_transaction")
+            .await
+            .ok();
 
         db.execute_unprepared(
             r#"

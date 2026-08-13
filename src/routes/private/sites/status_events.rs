@@ -12,10 +12,10 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::bulk;
 use crate::common::middleware::ProjectScope;
 use crate::error::{AppError, AppResult};
 use crate::routes::{resolve_site, validate_optional_time_range};
-use crate::common::bulk;
 
 use super::types::SiteRef;
 
@@ -201,12 +201,14 @@ pub async fn get_site_status_events(
     let events: Vec<StatusEventData> = query_result
         .iter()
         .filter_map(|row| {
-            StatusEventRow::from_query_result(row, "").ok().map(|r| StatusEventData {
-                parameter_id: r.parameter_id,
-                time: r.time.with_timezone(&Utc),
-                value: r.value,
-                sensor_id: r.sensor_id,
-            })
+            StatusEventRow::from_query_result(row, "")
+                .ok()
+                .map(|r| StatusEventData {
+                    parameter_id: r.parameter_id,
+                    time: r.time.with_timezone(&Utc),
+                    value: r.value,
+                    sensor_id: r.sensor_id,
+                })
         })
         .collect();
 
@@ -232,13 +234,12 @@ fn build_status_events_csv(events: &[StatusEventData]) -> AppResult<Response> {
     let events: Vec<StatusEventData> = events.to_vec();
 
     tokio::spawn(async move {
-        let _ = tx.send(Ok("time,parameter_id,value,sensor_id\n".to_string())).await;
+        let _ = tx
+            .send(Ok("time,parameter_id,value,sensor_id\n".to_string()))
+            .await;
 
         for event in &events {
-            let sensor_id_str = event
-                .sensor_id
-                .map(|id| id.to_string())
-                .unwrap_or_default();
+            let sensor_id_str = event.sensor_id.map(|id| id.to_string()).unwrap_or_default();
             let escaped_value = format!("\"{}\"", event.value.replace('"', "\"\""));
             let row = format!(
                 "{},{},{},{}\n",

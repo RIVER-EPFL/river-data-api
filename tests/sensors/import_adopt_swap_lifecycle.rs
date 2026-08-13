@@ -4,16 +4,18 @@
 //!
 //! Run: cargo test --test sensors -- --test-threads=1
 
-
 use crate::common::sensor_lifecycle as sl;
 use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
 use uuid::Uuid;
 
 async fn exec(db: &sea_orm::DatabaseConnection, sql: &str) {
-    db.execute(Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.to_string()))
-        .await
-        .unwrap_or_else(|e| panic!("SQL failed: {e}\n{sql}"));
+    db.execute(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql.to_string(),
+    ))
+    .await
+    .unwrap_or_else(|e| panic!("SQL failed: {e}\n{sql}"));
 }
 
 /// Create an UNPAIRED stream (no site_parameter, no sensor) with site-less readings.
@@ -65,7 +67,11 @@ async fn import_then_adopt_backfills_by_window() {
     .await;
     assert!((200..300).contains(&status), "import ({status}): {body}");
     let imp: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(imp["attributed"].as_u64().unwrap(), 6, "all six readings attributed");
+    assert_eq!(
+        imp["attributed"].as_u64().unwrap(),
+        6,
+        "all six readings attributed"
+    );
     let sensor_id = imp["sensor_id"].as_str().unwrap().to_string();
 
     let rows = sl::get_readings(&db, stream).await;
@@ -84,8 +90,16 @@ async fn import_then_adopt_backfills_by_window() {
     )
     .await;
     let imp2: serde_json::Value = serde_json::from_str(&body2).unwrap();
-    assert_eq!(imp2["attributed"].as_u64().unwrap(), 0, "re-import attributes nothing new");
-    assert_eq!(imp2["sensor_id"].as_str().unwrap(), sensor_id, "same sensor reused");
+    assert_eq!(
+        imp2["attributed"].as_u64().unwrap(),
+        0,
+        "re-import attributes nothing new"
+    );
+    assert_eq!(
+        imp2["sensor_id"].as_str().unwrap(),
+        sensor_id,
+        "same sensor reused"
+    );
 
     // ADOPT: deploy from before the first reading → reprocess backfills site + deployment + parameter.
     let (status, body) = crate::common::post_json_with_token(
@@ -140,7 +154,10 @@ async fn adopt_rejects_occupied_slot() {
         &token,
     )
     .await;
-    assert_eq!(status, 409, "adopting B into A's occupied slot must conflict: {body}");
+    assert_eq!(
+        status, 409,
+        "adopting B into A's occupied slot must conflict: {body}"
+    );
 }
 
 #[tokio::test]
@@ -154,7 +171,13 @@ async fn swap_ends_a_starts_b() {
 
     let sensor_a = sl::create_sensor(&db, "swap-a", crate::common::GLOBAL_PARAM_TEMP_ID).await;
     let sensor_b = sl::create_sensor(&db, "swap-b", crate::common::GLOBAL_PARAM_TEMP_ID).await;
-    sl::deploy_sensor(&db, sensor_a.id, crate::common::SITE1_ID, sl::dt("2025-06-01T00:00:00Z")).await;
+    sl::deploy_sensor(
+        &db,
+        sensor_a.id,
+        crate::common::SITE1_ID,
+        sl::dt("2025-06-01T00:00:00Z"),
+    )
+    .await;
 
     let (status, body) = crate::common::post_json_with_token(
         &app,
@@ -170,9 +193,13 @@ async fn swap_ends_a_starts_b() {
     .await;
     assert!((200..300).contains(&status), "swap ({status}): {body}");
     let swap: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert!(swap["ended_deployment_id"].is_string(), "A's deployment was ended");
     assert!(
-        crate::common::e2e::poll_job(&app, &token, swap["incoming_job_id"].as_str().unwrap(), 30).await
+        swap["ended_deployment_id"].is_string(),
+        "A's deployment was ended"
+    );
+    assert!(
+        crate::common::e2e::poll_job(&app, &token, swap["incoming_job_id"].as_str().unwrap(), 30)
+            .await
             == "completed"
     );
 
@@ -184,7 +211,9 @@ async fn swap_ends_a_starts_b() {
              WHERE site_id = $1 AND parameter_id = $2 AND deployed_until IS NULL",
             [
                 Uuid::parse_str(crate::common::SITE1_ID).unwrap().into(),
-                Uuid::parse_str(crate::common::GLOBAL_PARAM_TEMP_ID).unwrap().into(),
+                Uuid::parse_str(crate::common::GLOBAL_PARAM_TEMP_ID)
+                    .unwrap()
+                    .into(),
             ],
         ))
         .await

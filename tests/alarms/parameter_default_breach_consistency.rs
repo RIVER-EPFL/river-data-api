@@ -5,7 +5,6 @@
 //!
 //! Run: cargo test --test alarms -- --test-threads=1
 
-
 use river_db::routes::private::alarms;
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use serial_test::serial;
@@ -68,7 +67,11 @@ async fn every_path_agrees_on_a_parameter_default_breach() {
         .iter()
         .find(|r| r["parameter_id"].as_str() == Some(turb))
         .expect("turbidity resolved");
-    assert_eq!(row["source"], serde_json::json!("default"), "from default tier: {row}");
+    assert_eq!(
+        row["source"],
+        serde_json::json!("default"),
+        "from default tier: {row}"
+    );
     assert_eq!(row["alarm_max"].as_f64(), Some(500.0));
 
     // 2. /alarms/active → severity 2.
@@ -83,8 +86,12 @@ async fn every_path_agrees_on_a_parameter_default_breach() {
     assert_eq!(a["severity"].as_i64(), Some(2), "active severity: {a}");
 
     // 3. /sites/{id}/alarms → a severity-2 violation in the window.
-    let (s, b) =
-        crate::common::get_json_with_token(&app, &format!("/api/sites/{site}/alarms?{win}"), &token).await;
+    let (s, b) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/sites/{site}/alarms?{win}"),
+        &token,
+    )
+    .await;
     assert_eq!(s, 200, "site alarms: {b}");
     let tp = b["parameters"]
         .as_array()
@@ -93,7 +100,11 @@ async fn every_path_agrees_on_a_parameter_default_breach() {
         .find(|p| p["id"].as_str() == Some(turb))
         .expect("turbidity in site alarms");
     assert!(
-        tp["severities"].as_array().unwrap().iter().any(|v| v.as_i64() == Some(2)),
+        tp["severities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_i64() == Some(2)),
         "site alarms severity 2 from default: {tp}"
     );
 
@@ -112,7 +123,11 @@ async fn every_path_agrees_on_a_parameter_default_breach() {
         .find(|p| p["parameter_id"].as_str() == Some(turb))
         .expect("turbidity in readings");
     assert!(
-        rp["severities"].as_array().unwrap().iter().any(|v| v.as_i64() == Some(2)),
+        rp["severities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_i64() == Some(2)),
         "readings severity 2 from default: {rp}"
     );
 

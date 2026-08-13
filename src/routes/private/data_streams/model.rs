@@ -3,14 +3,7 @@ use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(
-    Clone,
-    Debug,
-    PartialEq,
-    Eq,
-    DeriveEntityModel,
-    Serialize,
-    Deserialize,
-    EntityToModels,
+    Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize, EntityToModels,
 )]
 #[sea_orm(table_name = "data_streams")]
 #[crudcrate(

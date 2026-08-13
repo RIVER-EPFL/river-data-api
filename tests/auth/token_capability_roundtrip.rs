@@ -2,7 +2,6 @@
 //! independent: a `write_data`-only key can push data but cannot read it back; a separate
 //! `read_data` key reads the same point and the value matches.
 
-
 use serial_test::serial;
 
 use crate::common::fixtures::{GLOBAL_PARAM_TEMP_ID, SITE1_ID};
@@ -37,21 +36,31 @@ fn readings_contain_value(body: &serde_json::Value, target: f64) -> bool {
 async fn write_only_key_cannot_read_back_separate_read_key_can() {
     let (db, app) = setup().await;
 
-    let writer = crate::common::seed_api_token(&db, crate::common::perms(false, false, false, true), None).await;
-    let reader = crate::common::seed_api_token(&db, crate::common::perms(false, true, false, false), None).await;
+    let writer =
+        crate::common::seed_api_token(&db, crate::common::perms(false, false, false, true), None)
+            .await;
+    let reader =
+        crate::common::seed_api_token(&db, crate::common::perms(false, true, false, false), None)
+            .await;
 
     // Writer pushes a distinctive point.
     let batch = serde_json::json!({
         "readings": [{ "site_id": SITE1_ID, "parameter_id": GLOBAL_PARAM_TEMP_ID, "time": WRITE_TIME, "raw_value": WRITE_VALUE }]
     });
-    let (s, body) = crate::common::post_json_with_token(&app, "/api/readings/batch", &batch, &writer).await;
+    let (s, body) =
+        crate::common::post_json_with_token(&app, "/api/readings/batch", &batch, &writer).await;
     assert_eq!(s, 200, "write_data key must ingest: {body}");
 
-    let readings_url = format!("/api/sites/{SITE1_ID}/readings?{READ_WINDOW}&parameter_ids={GLOBAL_PARAM_TEMP_ID}");
+    let readings_url = format!(
+        "/api/sites/{SITE1_ID}/readings?{READ_WINDOW}&parameter_ids={GLOBAL_PARAM_TEMP_ID}"
+    );
 
     // The writer cannot read its own data back; it has no read_data.
     let (s, _) = crate::common::get_with_token(&app, &readings_url, &writer).await;
-    assert_eq!(s, 403, "write_data-only key must be denied reading data, got {s}");
+    assert_eq!(
+        s, 403,
+        "write_data-only key must be denied reading data, got {s}"
+    );
 
     // A separate read_data key reads it back, and the value matches.
     let (s, body) = crate::common::get_json_with_token(&app, &readings_url, &reader).await;
@@ -62,6 +71,7 @@ async fn write_only_key_cannot_read_back_separate_read_key_can() {
     );
 
     // And the read key cannot write.
-    let (s, _) = crate::common::post_json_with_token(&app, "/api/readings/batch", &batch, &reader).await;
+    let (s, _) =
+        crate::common::post_json_with_token(&app, "/api/readings/batch", &batch, &reader).await;
     assert_eq!(s, 403, "read_data-only key must be denied ingest, got {s}");
 }

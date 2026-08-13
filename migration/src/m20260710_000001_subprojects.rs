@@ -85,10 +85,8 @@ impl MigrationTrait for Migration {
              END; $$ LANGUAGE plpgsql",
         )
         .await?;
-        db.execute_unprepared(
-            "DROP TRIGGER IF EXISTS projects_default_subproject_trg ON projects",
-        )
-        .await?;
+        db.execute_unprepared("DROP TRIGGER IF EXISTS projects_default_subproject_trg ON projects")
+            .await?;
         db.execute_unprepared(
             "CREATE TRIGGER projects_default_subproject_trg AFTER INSERT ON projects \
              FOR EACH ROW EXECUTE FUNCTION projects_default_subproject()",
@@ -142,9 +140,12 @@ impl MigrationTrait for Migration {
             .await?;
         db.execute_unprepared("DROP FUNCTION IF EXISTS projects_default_subproject()")
             .await?;
-        db.execute_unprepared("DROP INDEX IF EXISTS sites_subproject_idx").await?;
-        db.execute_unprepared("ALTER TABLE sites DROP COLUMN IF EXISTS subproject_id").await?;
-        db.execute_unprepared("DROP TABLE IF EXISTS subprojects").await?;
+        db.execute_unprepared("DROP INDEX IF EXISTS sites_subproject_idx")
+            .await?;
+        db.execute_unprepared("ALTER TABLE sites DROP COLUMN IF EXISTS subproject_id")
+            .await?;
+        db.execute_unprepared("DROP TABLE IF EXISTS subprojects")
+            .await?;
         Ok(())
     }
 }

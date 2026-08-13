@@ -133,7 +133,11 @@ pub fn build_registry() -> JobRegistry {
     for trigger in ["sensor_swap", "pairing_backfill", "manual_adopt"] {
         registry.register(Arc::new(super::jobs::ReprocessSlot::new(trigger)));
     }
-    for trigger in ["deployment_create", "deployment_update", "deployment_delete"] {
+    for trigger in [
+        "deployment_create",
+        "deployment_update",
+        "deployment_delete",
+    ] {
         registry.register(Arc::new(super::jobs::ReprocessDeployment::new(trigger)));
     }
     registry.register(Arc::new(super::jobs::DerivedRecompute));
@@ -163,9 +167,13 @@ pub fn register_scheduled_services(registry: &mut JobRegistry, config: &crate::c
     registry.register(Arc::new(super::jobs::JanitorRun::from_config(config)));
     registry.register(Arc::new(super::jobs::AlarmSweep::from_config(config)));
     registry.register(Arc::new(super::jobs::SyncEventSweep::from_config(config)));
-    registry.register(Arc::new(super::jobs::IdentityReconcile::from_config(config)));
+    registry.register(Arc::new(super::jobs::IdentityReconcile::from_config(
+        config,
+    )));
     registry.register(Arc::new(super::jobs::NotifyHealth::from_config(config)));
-    registry.register(Arc::new(super::jobs::DispatchNotifications::from_config(config)));
+    registry.register(Arc::new(super::jobs::DispatchNotifications::from_config(
+        config,
+    )));
 }
 
 #[cfg(test)]
@@ -198,7 +206,10 @@ mod tests {
     }
 
     fn dummy(name: &'static str, schedule_secs: Option<i64>) -> Arc<dyn Job> {
-        Arc::new(Dummy { name, schedule_secs })
+        Arc::new(Dummy {
+            name,
+            schedule_secs,
+        })
     }
 
     #[test]
@@ -213,9 +224,18 @@ mod tests {
 
     #[test]
     fn category_delegates_to_registry_table() {
-        assert_eq!(dummy("janitor_run", None).category(), registry::CATEGORY_MAINTENANCE);
-        assert_eq!(dummy("manual_reprocess", None).category(), registry::CATEGORY_OPERATOR);
-        assert_eq!(dummy("calibration_create", None).category(), registry::CATEGORY_METADATA);
+        assert_eq!(
+            dummy("janitor_run", None).category(),
+            registry::CATEGORY_MAINTENANCE
+        );
+        assert_eq!(
+            dummy("manual_reprocess", None).category(),
+            registry::CATEGORY_OPERATOR
+        );
+        assert_eq!(
+            dummy("calibration_create", None).category(),
+            registry::CATEGORY_METADATA
+        );
     }
 
     #[test]

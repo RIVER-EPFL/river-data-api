@@ -200,7 +200,10 @@ async fn pair_groups_replicates_into_samples_and_unpair_clears_them() {
         ),
     )
     .await;
-    assert_eq!(still_stamped, 0, "unpair clears sample_id on the stream's readings");
+    assert_eq!(
+        still_stamped, 0,
+        "unpair clears sample_id on the stream's readings"
+    );
 
     let samples_left = scalar_i64(
         &db,

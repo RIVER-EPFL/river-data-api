@@ -8,7 +8,11 @@ use crate::common::e2e;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serial_test::serial;
 
-async fn stored_measurement_type(db: &DatabaseConnection, stream_id: &str, raw_value: f64) -> String {
+async fn stored_measurement_type(
+    db: &DatabaseConnection,
+    stream_id: &str,
+    raw_value: f64,
+) -> String {
     let row = db
         .query_one(Statement::from_string(
             DatabaseBackend::Postgres,
@@ -37,11 +41,20 @@ async fn register_stream(
     }
     let (status, stream) =
         crate::common::post_json_parse_with_token(app, "/api/streams/register", &body, token).await;
-    assert!((200..300).contains(&status), "register ({status}): {stream}");
+    assert!(
+        (200..300).contains(&status),
+        "register ({status}): {stream}"
+    );
     e2e::id_of(&stream)
 }
 
-async fn ingest_one(app: &axum::Router, token: &str, stream: &str, value: f64, override_mt: Option<&str>) {
+async fn ingest_one(
+    app: &axum::Router,
+    token: &str,
+    stream: &str,
+    value: f64,
+    override_mt: Option<&str>,
+) {
     // Distinct time per value: readings share a PK on (stream, time, replicate).
     let time = format!("2025-02-01T{:02}:00:00Z", value as u32);
     let mut reading = serde_json::json!({"time": time, "raw_value": value});
@@ -70,16 +83,25 @@ async fn ingest_resolution_chain_override_stream_sensor_fallback() {
     // Fallback: no override, no stream default, no sensor → continuous.
     let plain = register_stream(&app, &token, "plain", None).await;
     ingest_one(&app, &token, &plain, 1.0, None).await;
-    assert_eq!(stored_measurement_type(&db, &plain, 1.0).await, "continuous");
+    assert_eq!(
+        stored_measurement_type(&db, &plain, 1.0).await,
+        "continuous"
+    );
 
     // Stream default: declared spot at registration → spot.
     let spot_stream = register_stream(&app, &token, "grabs", Some("spot")).await;
     ingest_one(&app, &token, &spot_stream, 2.0, None).await;
-    assert_eq!(stored_measurement_type(&db, &spot_stream, 2.0).await, "spot");
+    assert_eq!(
+        stored_measurement_type(&db, &spot_stream, 2.0).await,
+        "spot"
+    );
 
     // Per-reading override beats the stream default.
     ingest_one(&app, &token, &spot_stream, 3.0, Some("continuous")).await;
-    assert_eq!(stored_measurement_type(&db, &spot_stream, 3.0).await, "continuous");
+    assert_eq!(
+        stored_measurement_type(&db, &spot_stream, 3.0).await,
+        "continuous"
+    );
 
     // Sensor frequency: low-frequency sensor owning an undeclared stream → spot.
     let (status, sensor) = crate::common::post_json_parse_with_token(
@@ -89,7 +111,10 @@ async fn ingest_resolution_chain_override_stream_sensor_fallback() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "sensor create ({status}): {sensor}");
+    assert!(
+        (200..300).contains(&status),
+        "sensor create ({status}): {sensor}"
+    );
     let sensor_id = e2e::id_of(&sensor);
     assert_eq!(sensor["data_frequency"], "low", "sensor: {sensor}");
 
@@ -110,7 +135,10 @@ async fn ingest_resolution_chain_override_stream_sensor_fallback() {
     )
     .await;
     ingest_one(&app, &token, &mixed, 5.0, None).await;
-    assert_eq!(stored_measurement_type(&db, &mixed, 5.0).await, "continuous");
+    assert_eq!(
+        stored_measurement_type(&db, &mixed, 5.0).await,
+        "continuous"
+    );
 }
 
 #[tokio::test]
@@ -140,7 +168,10 @@ async fn ingest_rejects_invalid_measurement_type() {
         &token,
     )
     .await;
-    assert_eq!(status, 400, "invalid stream classification ({status}): {body}");
+    assert_eq!(
+        status, 400,
+        "invalid stream classification ({status}): {body}"
+    );
 }
 
 #[tokio::test]
@@ -164,7 +195,8 @@ async fn register_stream_omitted_classification_never_clears() {
         .expect("query")
         .expect("row");
     assert_eq!(
-        row.try_get::<Option<String>>("", "measurement_type").unwrap(),
+        row.try_get::<Option<String>>("", "measurement_type")
+            .unwrap(),
         Some("spot".to_string())
     );
 
@@ -179,7 +211,8 @@ async fn register_stream_omitted_classification_never_clears() {
         .expect("query")
         .expect("row");
     assert_eq!(
-        row.try_get::<Option<String>>("", "measurement_type").unwrap(),
+        row.try_get::<Option<String>>("", "measurement_type")
+            .unwrap(),
         Some("continuous".to_string())
     );
 }
@@ -222,7 +255,8 @@ async fn batch_readings_explicit_spot_is_stored() {
         .expect("query")
         .expect("row");
     assert_eq!(
-        row.try_get::<Option<String>>("", "measurement_type").unwrap(),
+        row.try_get::<Option<String>>("", "measurement_type")
+            .unwrap(),
         Some("spot".to_string())
     );
 }

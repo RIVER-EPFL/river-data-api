@@ -5,7 +5,6 @@
 //! regress, or (b) a property newly enforced by `require_admin` that needs explicit
 //! coverage.
 
-
 use chrono::{Duration, Utc};
 use serial_test::serial;
 
@@ -28,12 +27,16 @@ async fn malformed_authorization_headers_all_return_401() {
         ("not bearer scheme 2", "Digest realm=foo"),
         ("empty bearer", "Bearer "),
         ("bearer with only spaces", "Bearer    "),
-        ("looks-like-jwt invalid signature", "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.invalidsig"),
+        (
+            "looks-like-jwt invalid signature",
+            "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.invalidsig",
+        ),
         ("random opaque token", "Bearer not-a-real-token-12345"),
     ];
 
     for (label, header) in cases {
-        let (status, _body) = crate::common::get_with_auth_header(&app, "/api/projects", header).await;
+        let (status, _body) =
+            crate::common::get_with_auth_header(&app, "/api/projects", header).await;
         assert_eq!(status, 401, "[{label}] expected 401, got {status}");
     }
 }
@@ -45,14 +48,13 @@ async fn inactive_token_returns_401_even_for_endpoints_it_was_authorized_for() {
 
     let tok = crate::common::seed_inactive_api_token(&db, crate::common::full_permissions()).await;
 
-    let endpoints = [
-        "/api/projects",
-        "/api/sites",
-        "/api/search?q=test",
-    ];
+    let endpoints = ["/api/projects", "/api/sites", "/api/search?q=test"];
     for path in endpoints {
         let (status, _) = crate::common::get_with_token(&app, path, &tok).await;
-        assert_eq!(status, 401, "inactive token on {path} must be 401, got {status}");
+        assert_eq!(
+            status, 401,
+            "inactive token on {path} must be 401, got {status}"
+        );
     }
 }
 
@@ -69,14 +71,13 @@ async fn expired_token_returns_401_for_every_endpoint() {
     )
     .await;
 
-    let endpoints = [
-        "/api/projects",
-        "/api/search?q=foo",
-        "/api/alarms/summary",
-    ];
+    let endpoints = ["/api/projects", "/api/search?q=foo", "/api/alarms/summary"];
     for path in endpoints {
         let (status, _) = crate::common::get_with_token(&app, path, &tok).await;
-        assert_eq!(status, 401, "expired token on {path} must be 401, got {status}");
+        assert_eq!(
+            status, 401,
+            "expired token on {path} must be 401, got {status}"
+        );
     }
 }
 
@@ -88,7 +89,10 @@ async fn permission_json_with_missing_fields_uses_serde_defaults() {
     // Empty `{}`, serde defaults: read_metadata=true, read_data=true, write_*=false.
     let tok_empty = crate::common::seed_api_token(&db, serde_json::json!({}), None).await;
     let (status, _) = crate::common::get_with_token(&app, "/api/projects", &tok_empty).await;
-    assert_eq!(status, 200, "empty permissions should default to read access, got {status}");
+    assert_eq!(
+        status, 200,
+        "empty permissions should default to read access, got {status}"
+    );
 
     let (write_status, _) = crate::common::post_json_with_token(
         &app,
@@ -97,7 +101,10 @@ async fn permission_json_with_missing_fields_uses_serde_defaults() {
         &tok_empty,
     )
     .await;
-    assert_eq!(write_status, 403, "empty permissions should default to NO write_metadata");
+    assert_eq!(
+        write_status, 403,
+        "empty permissions should default to NO write_metadata"
+    );
 }
 
 #[tokio::test]
@@ -151,7 +158,10 @@ async fn permission_json_null_uses_defaults() {
 
     let (status, _) = crate::common::get_with_token(&app, "/api/projects", &raw).await;
     // The from_json fallback returns the default TokenPermissions, reads on, writes off.
-    assert_eq!(status, 200, "null permissions should fall back to defaults, got {status}");
+    assert_eq!(
+        status, 200,
+        "null permissions should fall back to defaults, got {status}"
+    );
 }
 
 #[tokio::test]
@@ -162,7 +172,10 @@ async fn revoked_sync_session_token_rejected_on_next_use() {
     let (tok, _service_id) = crate::common::seed_sync_session_token(&db).await;
 
     let (ok_status, _) = crate::common::get_with_token(&app, "/api/search?q=site", &tok).await;
-    assert_eq!(ok_status, 200, "fresh sync session token should work, got {ok_status}");
+    assert_eq!(
+        ok_status, 200,
+        "fresh sync session token should work, got {ok_status}"
+    );
 
     // Manually expire by setting expires_at to the past, emulates revoke_credential.
     crate::common::db::exec(
@@ -172,7 +185,10 @@ async fn revoked_sync_session_token_rejected_on_next_use() {
     .await;
 
     let (rev_status, _) = crate::common::get_with_token(&app, "/api/search?q=site", &tok).await;
-    assert_eq!(rev_status, 401, "expired sync session must be rejected, got {rev_status}");
+    assert_eq!(
+        rev_status, 401,
+        "expired sync session must be rejected, got {rev_status}"
+    );
 }
 
 #[tokio::test]
@@ -206,7 +222,10 @@ async fn require_admin_blocks_every_bypass_vector() {
         ("POST", "/api/tokens"),
         ("GET", "/api/sync_service_credentials"),
         ("POST", "/api/sync/credentials"),
-        ("POST", "/api/sync/credentials/00000000-0000-0000-0000-000000000000/revoke"),
+        (
+            "POST",
+            "/api/sync/credentials/00000000-0000-0000-0000-000000000000/revoke",
+        ),
     ];
 
     for (label, tok) in &attempts {
@@ -236,8 +255,14 @@ async fn anonymous_returns_401_not_403_on_admin_routes() {
     let (_db, app) = setup().await;
 
     let (status, _) = crate::common::get(&app, "/api/tokens").await;
-    assert_eq!(status, 401, "anonymous on admin route should be 401, got {status}");
+    assert_eq!(
+        status, 401,
+        "anonymous on admin route should be 401, got {status}"
+    );
 
     let (status, _) = crate::common::get(&app, "/api/sync_service_credentials").await;
-    assert_eq!(status, 401, "anonymous on admin route should be 401, got {status}");
+    assert_eq!(
+        status, 401,
+        "anonymous on admin route should be 401, got {status}"
+    );
 }

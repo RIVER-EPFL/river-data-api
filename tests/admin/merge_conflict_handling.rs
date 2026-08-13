@@ -138,7 +138,11 @@ async fn merge_preserves_conflicting_readings() {
     )
     .await;
 
-    assert!(merge_result.is_ok(), "Merge should succeed: {:?}", merge_result.err());
+    assert!(
+        merge_result.is_ok(),
+        "Merge should succeed: {:?}",
+        merge_result.err()
+    );
     let result = merge_result.unwrap();
 
     // BUG: merged_readings reports success but doesn't reveal that the
@@ -165,6 +169,7 @@ async fn merge_preserves_conflicting_readings() {
         count_after, 3,
         "After merge, target should have all 3 readings but got {count_after}. \
          BUG: Conflicting source reading was silently dropped by ON CONFLICT DO NOTHING. \
-         merged_readings reported: {}", result.merged_readings
+         merged_readings reported: {}",
+        result.merged_readings
     );
 }

@@ -6,8 +6,8 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::aggregates::{self, Window};
-use crate::common::bulk_write::{self, TouchedRange};
 use crate::common::authz::AccessScope;
+use crate::common::bulk_write::{self, TouchedRange};
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::error::{AppError, AppResult};
 
@@ -173,11 +173,7 @@ async fn apply_flags_over_range(
 
     let touched = bulk_write::guarded_mutation(
         &state.db,
-        sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &sql,
-            values,
-        ),
+        sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, &sql, values),
     )
     .await?;
 

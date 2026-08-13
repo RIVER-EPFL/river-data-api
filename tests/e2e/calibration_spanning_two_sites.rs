@@ -201,14 +201,21 @@ impl Span {
             &self.intern,
         )
         .await;
-        assert_eq!(status, 200, "sensor identity at site {site} ({status}): {body}");
+        assert_eq!(
+            status, 200,
+            "sensor identity at site {site} ({status}): {body}"
+        );
         body
     }
 
     /// Every calibrated value the control sensor holds, plus its provenance, unchanged throughout.
     async fn assert_control_untouched(&self, when: &str) {
         let rows = self.control_readings().await;
-        assert_eq!(rows.len(), 3, "{when}: the control sensor keeps its three readings");
+        assert_eq!(
+            rows.len(),
+            3,
+            "{when}: the control sensor keeps its three readings"
+        );
         for (i, expected) in [8.0, 16.0, 24.0].iter().enumerate() {
             assert_eq!(
                 rows[i].calibrated_value,
@@ -234,7 +241,11 @@ impl Span {
         let served = self.served(&self.site1, &self.control_parameter).await;
         assert_eq!(served.len(), 3, "{when}: three control values are served");
         for (i, expected) in [8.0, 16.0, 24.0].iter().enumerate() {
-            assert_close(served[i], *expected, &format!("{when}: served control value {i}"));
+            assert_close(
+                served[i],
+                *expected,
+                &format!("{when}: served control value {i}"),
+            );
         }
     }
 }
@@ -266,7 +277,10 @@ async fn seed_two_site_span(span_cal_from: &str, readings: &[(&str, f64)]) -> Sp
     let track = tracks::onboard_sensor_flow_track(&app, &admin).await;
     let parameter = track.parameter_id("TrkFlowDO").to_string();
     let site1 = track.site_id.clone();
-    let sensor = track.sensor_id.clone().expect("track B provisions a sensor");
+    let sensor = track
+        .sensor_id
+        .clone()
+        .expect("track B provisions a sensor");
     let stream = track.stream_ids[0].clone();
     let d1 = track
         .deployment_id
@@ -282,15 +296,26 @@ async fn seed_two_site_span(span_cal_from: &str, readings: &[(&str, f64)]) -> Sp
             &admin,
         )
         .await;
-        assert_eq!(status, 200, "admin grants {user} the track project ({status}): {body}");
+        assert_eq!(
+            status, 200,
+            "admin grants {user} the track project ({status}): {body}"
+        );
     }
 
-    let site2 = e2e::create_site(&app, &river, &track.project_id, "Span Downstream", "span-down").await;
+    let site2 = e2e::create_site(
+        &app,
+        &river,
+        &track.project_id,
+        "Span Downstream",
+        "span-down",
+    )
+    .await;
     // The downstream site carries the same global parameter, so the same stream's rows are servable
     // there once a deployment moves them.
     e2e::assign_site_parameter_minimal(&app, &manager, &site2, &parameter).await;
 
-    let base_cal = create_calibration(&app, &manager, &sensor, &parameter, 1.0, 0.0, BASE_CAL_FROM).await;
+    let base_cal =
+        create_calibration(&app, &manager, &sensor, &parameter, 1.0, 0.0, BASE_CAL_FROM).await;
 
     // A minted sensor's readings would be invisible to the sensor-scoped reprocess that applies the
     // span curve, so the link keeps one instrument, one deployment history and one calibration
@@ -304,7 +329,10 @@ async fn seed_two_site_span(span_cal_from: &str, readings: &[(&str, f64)]) -> Sp
         &admin,
     )
     .await;
-    assert!((200..300).contains(&status), "pair the stream ({status}): {body}");
+    assert!(
+        (200..300).contains(&status),
+        "pair the stream ({status}): {body}"
+    );
 
     let move_body = json!({
         "sensor_id": sensor,
@@ -313,43 +341,53 @@ async fn seed_two_site_span(span_cal_from: &str, readings: &[(&str, f64)]) -> Sp
         "deployed_from": D2_FROM,
     });
     let (status, body) =
-        crate::common::post_json_with_token(&app, "/api/sensor_deployments", &move_body, &river).await;
+        crate::common::post_json_with_token(&app, "/api/sensor_deployments", &move_body, &river)
+            .await;
     assert_eq!(
         status, 403,
         "moving a sensor between sites is sensor management, above the river level ({status}): {body}"
     );
-    let (status, moved) =
-        crate::common::post_json_parse_with_token(&app, "/api/sensor_deployments", &move_body, &manager).await;
-    assert!((200..300).contains(&status), "manager moves the sensor ({status}): {moved}");
+    let (status, moved) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sensor_deployments",
+        &move_body,
+        &manager,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "manager moves the sensor ({status}): {moved}"
+    );
     let d2 = e2e::id_of(&moved);
 
     let body_in = ingest_body(&stream, readings);
-    let (status, body) = crate::common::post_json_with_token(&app, "/api/ingest", &body_in, &intern).await;
-    assert_eq!(status, 403, "an intern may read data but not push it ({status}): {body}");
+    let (status, body) =
+        crate::common::post_json_with_token(&app, "/api/ingest", &body_in, &intern).await;
+    assert_eq!(
+        status, 403,
+        "an intern may read data but not push it ({status}): {body}"
+    );
     let (status, ingested) =
         crate::common::post_json_parse_with_token(&app, "/api/ingest", &body_in, &river).await;
-    assert_eq!(status, 200, "river ingests the span readings ({status}): {ingested}");
+    assert_eq!(
+        status, 200,
+        "river ingests the span readings ({status}): {ingested}"
+    );
     assert_eq!(
         ingested["inserted"],
         readings.len(),
         "every span reading lands: {ingested}"
     );
 
-    let span_cal = create_calibration(&app, &manager, &sensor, &parameter, 2.0, 5.0, span_cal_from).await;
+    let span_cal =
+        create_calibration(&app, &manager, &sensor, &parameter, 2.0, 5.0, span_cal_from).await;
     assert!(
         sl::wait_for_reprocessing(&db, as_uuid(&sensor), WAIT).await,
         "the calibration_create job applies the span curve to the ingested readings"
     );
 
-    let (control_parameter, control_sensor, control_stream, control_cal) = seed_control_sensor(
-        &app,
-        &db,
-        &admin,
-        &manager,
-        &river,
-        &site1,
-    )
-    .await;
+    let (control_parameter, control_sensor, control_stream, control_cal) =
+        seed_control_sensor(&app, &db, &admin, &manager, &river, &site1).await;
 
     Span {
         app,
@@ -395,7 +433,10 @@ async fn create_calibration(
         token,
     )
     .await;
-    assert_eq!(status, 201, "create calibration {slope}x+{intercept} ({status}): {body}");
+    assert_eq!(
+        status, 201,
+        "create calibration {slope}x+{intercept} ({status}): {body}"
+    );
     e2e::id_of(&body)
 }
 
@@ -410,7 +451,8 @@ async fn seed_control_sensor(
     river: &str,
     site1: &str,
 ) -> (String, String, String, String) {
-    let parameter = e2e::create_parameter(app, admin, "TrkSpanCtrl", "Track Span Control", "degC").await;
+    let parameter =
+        e2e::create_parameter(app, admin, "TrkSpanCtrl", "Track Span Control", "degC").await;
     let sp = e2e::assign_site_parameter_minimal(app, manager, site1, &parameter).await;
     let sensor = e2e::create_sensor(app, admin, &parameter, "TRK-SPAN-CTRL").await;
     // The deployment comes first: a calibration is confined to the projects its sensor is deployed
@@ -430,7 +472,10 @@ async fn seed_control_sensor(
         admin,
     )
     .await;
-    assert!((200..300).contains(&status), "register control stream ({status}): {stream}");
+    assert!(
+        (200..300).contains(&status),
+        "register control stream ({status}): {stream}"
+    );
     let stream_id = e2e::id_of(&stream);
 
     let (status, body) = crate::common::post_json_with_token(
@@ -440,7 +485,10 @@ async fn seed_control_sensor(
         admin,
     )
     .await;
-    assert!((200..300).contains(&status), "pair control stream ({status}): {body}");
+    assert!(
+        (200..300).contains(&status),
+        "pair control stream ({status}): {body}"
+    );
 
     let (status, body) = crate::common::post_json_parse_with_token(
         app,
@@ -463,7 +511,11 @@ async fn seed_control_sensor(
 /// The six span readings under the pre-edit curve (2x + 5), with their site and deployment split.
 async fn assert_span_pre_state(span: &Span) {
     let rows = span.readings().await;
-    assert_eq!(rows.len(), 6, "the span fixture holds six readings on one stream");
+    assert_eq!(
+        rows.len(),
+        6,
+        "the span fixture holds six readings on one stream"
+    );
 
     let expected = [
         (10.0, 25.0, &span.site1, &span.d1),
@@ -485,7 +537,11 @@ async fn assert_span_pre_state(span: &Span) {
             Some(as_uuid(&span.span_cal)),
             "row {i} resolves to the spanning calibration"
         );
-        assert_eq!(rows[i].site_id, Some(as_uuid(site.as_str())), "row {i} site");
+        assert_eq!(
+            rows[i].site_id,
+            Some(as_uuid(site.as_str())),
+            "row {i} site"
+        );
         assert_eq!(
             rows[i].deployment_id,
             Some(as_uuid(deployment.as_str())),
@@ -498,14 +554,19 @@ async fn edit_span_calibration(span: &Span) {
     let patch = json!({ "slope": 3.0, "intercept": 1.0 });
     let path = format!("/api/sensor_calibrations/{}", span.span_cal);
 
-    let (status, body) = crate::common::put_json_with_token(&span.app, &path, &patch, &span.river).await;
+    let (status, body) =
+        crate::common::put_json_with_token(&span.app, &path, &patch, &span.river).await;
     assert_eq!(
         status, 403,
         "editing a calibration is sensor management, above the river level ({status}): {body}"
     );
 
-    let (status, body) = crate::common::put_json_with_token(&span.app, &path, &patch, &span.manager).await;
-    assert_eq!(status, 200, "manager edits the spanning calibration ({status}): {body}");
+    let (status, body) =
+        crate::common::put_json_with_token(&span.app, &path, &patch, &span.manager).await;
+    assert_eq!(
+        status, 200,
+        "manager edits the spanning calibration ({status}): {body}"
+    );
 
     assert!(
         sl::wait_for_reprocessing(&span.db, as_uuid(&span.sensor), WAIT).await,
@@ -527,14 +588,30 @@ async fn calibration_edit_recalculates_readings_at_both_sites() {
     assert_span_pre_state(&span).await;
 
     let upstream_before = span.served(&span.site1, &span.parameter).await;
-    assert_eq!(upstream_before.len(), 3, "three upstream values are served before the edit");
+    assert_eq!(
+        upstream_before.len(),
+        3,
+        "three upstream values are served before the edit"
+    );
     for (i, expected) in [25.0, 45.0, 65.0].iter().enumerate() {
-        assert_close(upstream_before[i], *expected, &format!("upstream value {i} before"));
+        assert_close(
+            upstream_before[i],
+            *expected,
+            &format!("upstream value {i} before"),
+        );
     }
     let downstream_before = span.served(&span.site2, &span.parameter).await;
-    assert_eq!(downstream_before.len(), 3, "three downstream values are served before the edit");
+    assert_eq!(
+        downstream_before.len(),
+        3,
+        "three downstream values are served before the edit"
+    );
     for (i, expected) in [85.0, 105.0, 125.0].iter().enumerate() {
-        assert_close(downstream_before[i], *expected, &format!("downstream value {i} before"));
+        assert_close(
+            downstream_before[i],
+            *expected,
+            &format!("downstream value {i} before"),
+        );
     }
 
     edit_span_calibration(&span).await;
@@ -550,7 +627,10 @@ async fn calibration_edit_recalculates_readings_at_both_sites() {
         (60.0, 181.0, &span.site2, &span.d2),
     ];
     for (i, (raw, calibrated, site, deployment)) in expected.iter().enumerate() {
-        assert_eq!(rows[i].raw_value, *raw, "row {i} raw value survives reprocessing");
+        assert_eq!(
+            rows[i].raw_value, *raw,
+            "row {i} raw value survives reprocessing"
+        );
         assert_eq!(
             rows[i].calibrated_value,
             Some(*calibrated),
@@ -574,21 +654,32 @@ async fn calibration_edit_recalculates_readings_at_both_sites() {
     }
 
     let upstream = span.served(&span.site1, &span.parameter).await;
-    assert_eq!(upstream.len(), 3, "three upstream values are served after the edit");
+    assert_eq!(
+        upstream.len(),
+        3,
+        "three upstream values are served after the edit"
+    );
     for (i, expected) in [31.0, 61.0, 91.0].iter().enumerate() {
         assert_close(upstream[i], *expected, &format!("upstream value {i} after"));
     }
     let downstream = span.served(&span.site2, &span.parameter).await;
-    assert_eq!(downstream.len(), 3, "three downstream values are served after the edit");
+    assert_eq!(
+        downstream.len(),
+        3,
+        "three downstream values are served after the edit"
+    );
     for (i, expected) in [121.0, 151.0, 181.0].iter().enumerate() {
         assert_close(
             downstream[i],
             *expected,
-            &format!("downstream value {i} after, a site-scoped rewrite would leave the old curve here"),
+            &format!(
+                "downstream value {i} after, a site-scoped rewrite would leave the old curve here"
+            ),
         );
     }
 
-    span.assert_control_untouched("after the calibration edit").await;
+    span.assert_control_untouched("after the calibration edit")
+        .await;
 
     let window = span.calibration_window(&span.span_cal).await;
     assert_eq!(
@@ -605,18 +696,26 @@ async fn calibration_edit_recalculates_readings_at_both_sites() {
         let identity = span.sensor_identity(site).await;
         let bands = identity["bands"][&span.parameter]
             .as_array()
-            .unwrap_or_else(|| panic!("no identity bands for the parameter at site {site}: {identity}"));
+            .unwrap_or_else(|| {
+                panic!("no identity bands for the parameter at site {site}: {identity}")
+            });
         assert!(
-            bands.iter().any(|b| b["deployment_id"] == deployment.as_str()),
+            bands
+                .iter()
+                .any(|b| b["deployment_id"] == deployment.as_str()),
             "site {site} shows its own deployment band: {identity}"
         );
         let markers = identity["calibrations"][&span.parameter]
             .as_array()
-            .unwrap_or_else(|| panic!("no calibration markers for the parameter at site {site}: {identity}"));
+            .unwrap_or_else(|| {
+                panic!("no calibration markers for the parameter at site {site}: {identity}")
+            });
         let marker = markers
             .iter()
             .find(|m| m["calibration_id"] == span.span_cal.as_str())
-            .unwrap_or_else(|| panic!("the spanning calibration is not marked at site {site}: {identity}"));
+            .unwrap_or_else(|| {
+                panic!("the spanning calibration is not marked at site {site}: {identity}")
+            });
         assert_close(
             marker["slope"].as_f64().unwrap_or(f64::NAN),
             3.0,
@@ -649,45 +748,84 @@ async fn both_sites_aggregates_reflect_the_new_calibration() {
     let afternoon = sl::dt(BUCKET_AFTERNOON);
 
     let before_up = e2e::hourly_bucket(&span.db, &span.site1, &span.parameter, morning).await;
-    assert!(before_up.is_some(), "the upstream morning bucket is materialised before the edit");
+    assert!(
+        before_up.is_some(),
+        "the upstream morning bucket is materialised before the edit"
+    );
     let (mean, count) = before_up.unwrap();
     assert_close(mean, 45.0, "upstream morning mean before the edit");
-    assert_eq!(count, 3, "upstream morning bucket holds three readings before the edit");
+    assert_eq!(
+        count, 3,
+        "upstream morning bucket holds three readings before the edit"
+    );
 
     let before_down = e2e::hourly_bucket(&span.db, &span.site2, &span.parameter, afternoon).await;
-    assert!(before_down.is_some(), "the downstream afternoon bucket is materialised before the edit");
+    assert!(
+        before_down.is_some(),
+        "the downstream afternoon bucket is materialised before the edit"
+    );
     let (mean, count) = before_down.unwrap();
     assert_close(mean, 105.0, "downstream afternoon mean before the edit");
-    assert_eq!(count, 3, "downstream afternoon bucket holds three readings before the edit");
+    assert_eq!(
+        count, 3,
+        "downstream afternoon bucket holds three readings before the edit"
+    );
 
-    let before_ctrl = e2e::hourly_bucket(&span.db, &span.site1, &span.control_parameter, morning).await;
-    assert!(before_ctrl.is_some(), "the co-located control bucket is materialised before the edit");
+    let before_ctrl =
+        e2e::hourly_bucket(&span.db, &span.site1, &span.control_parameter, morning).await;
+    assert!(
+        before_ctrl.is_some(),
+        "the co-located control bucket is materialised before the edit"
+    );
     let (mean, count) = before_ctrl.unwrap();
     assert_close(mean, 16.0, "control mean before the edit");
-    assert_eq!(count, 3, "control bucket holds three readings before the edit");
+    assert_eq!(
+        count, 3,
+        "control bucket holds three readings before the edit"
+    );
 
     edit_span_calibration(&span).await;
 
     let after_up = e2e::hourly_bucket(&span.db, &span.site1, &span.parameter, morning).await;
-    assert!(after_up.is_some(), "the upstream morning bucket survives the refresh");
+    assert!(
+        after_up.is_some(),
+        "the upstream morning bucket survives the refresh"
+    );
     let (mean, count) = after_up.unwrap();
     assert_close(mean, 61.0, "upstream morning mean tracks the new curve");
-    assert_eq!(count, 3, "upstream morning bucket still holds three readings");
+    assert_eq!(
+        count, 3,
+        "upstream morning bucket still holds three readings"
+    );
 
     let after_down = e2e::hourly_bucket(&span.db, &span.site2, &span.parameter, afternoon).await;
-    assert!(after_down.is_some(), "the downstream afternoon bucket survives the refresh");
+    assert!(
+        after_down.is_some(),
+        "the downstream afternoon bucket survives the refresh"
+    );
     let (mean, count) = after_down.unwrap();
     assert_close(
         mean,
         151.0,
         "the refresh is time-scoped, not site-scoped, so the downstream bucket moves too",
     );
-    assert_eq!(count, 3, "downstream afternoon bucket still holds three readings");
+    assert_eq!(
+        count, 3,
+        "downstream afternoon bucket still holds three readings"
+    );
 
-    let after_ctrl = e2e::hourly_bucket(&span.db, &span.site1, &span.control_parameter, morning).await;
-    assert!(after_ctrl.is_some(), "the co-located control bucket survives the refresh");
+    let after_ctrl =
+        e2e::hourly_bucket(&span.db, &span.site1, &span.control_parameter, morning).await;
+    assert!(
+        after_ctrl.is_some(),
+        "the co-located control bucket survives the refresh"
+    );
     let (mean, count) = after_ctrl.unwrap();
-    assert_close(mean, 16.0, "a co-located parameter fed by another sensor is undisturbed");
+    assert_close(
+        mean,
+        16.0,
+        "a co-located parameter fed by another sensor is undisturbed",
+    );
     assert_eq!(count, 3, "control bucket still holds three readings");
 
     let up = span.aggregates(&span.site1, "").await;
@@ -748,7 +886,11 @@ async fn both_sites_aggregates_reflect_the_new_calibration() {
     );
 
     let rows = span.readings().await;
-    assert_eq!(rows.len(), 6, "the readings behind the buckets are still six");
+    assert_eq!(
+        rows.len(),
+        6,
+        "the readings behind the buckets are still six"
+    );
     for (i, expected) in [31.0, 61.0, 91.0, 121.0, 151.0, 181.0].iter().enumerate() {
         assert_eq!(
             rows[i].calibrated_value,
@@ -772,7 +914,10 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
     let afternoon = sl::dt(BUCKET_AFTERNOON);
 
     let before_up = e2e::hourly_bucket(&span.db, &span.site1, &span.parameter, morning).await;
-    assert!(before_up.is_some(), "the upstream morning bucket is materialised before the move");
+    assert!(
+        before_up.is_some(),
+        "the upstream morning bucket is materialised before the move"
+    );
     let (mean, count) = before_up.unwrap();
     assert_close(mean, 45.0, "upstream morning mean before the move");
     assert_eq!(count, 3, "three upstream readings before the move");
@@ -785,12 +930,14 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
 
     let correction = json!({ "deployed_from": "2025-06-02T10:30:00Z" });
     let path = format!("/api/sensor_deployments/{}", span.d2);
-    let (status, body) = crate::common::put_json_with_token(&span.app, &path, &correction, &span.river).await;
+    let (status, body) =
+        crate::common::put_json_with_token(&span.app, &path, &correction, &span.river).await;
     assert_eq!(
         status, 403,
         "correcting a move date is sensor management, above the river level ({status}): {body}"
     );
-    let (status, body) = crate::common::put_json_with_token(&span.app, &path, &correction, &span.manager).await;
+    let (status, body) =
+        crate::common::put_json_with_token(&span.app, &path, &correction, &span.manager).await;
     assert!(
         (200..300).contains(&status),
         "manager corrects the move to 10:30 ({status}): {body}"
@@ -848,7 +995,11 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
             Some(as_uuid(&span.span_cal)),
             "row {i} keeps the spanning calibration through the move"
         );
-        assert_eq!(rows[i].site_id, Some(as_uuid(site.as_str())), "row {i} site after the move");
+        assert_eq!(
+            rows[i].site_id,
+            Some(as_uuid(site.as_str())),
+            "row {i} site after the move"
+        );
         assert_eq!(
             rows[i].deployment_id,
             Some(as_uuid(deployment.as_str())),
@@ -866,21 +1017,47 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
     }
 
     let upstream = span.served(&span.site1, &span.parameter).await;
-    assert_eq!(upstream.len(), 2, "two readings remain upstream after the correction");
+    assert_eq!(
+        upstream.len(),
+        2,
+        "two readings remain upstream after the correction"
+    );
     for (i, expected) in [25.0, 45.0].iter().enumerate() {
-        assert_close(upstream[i], *expected, &format!("upstream value {i} after the move"));
+        assert_close(
+            upstream[i],
+            *expected,
+            &format!("upstream value {i} after the move"),
+        );
     }
     let downstream = span.served(&span.site2, &span.parameter).await;
-    assert_eq!(downstream.len(), 4, "four readings are downstream after the correction");
+    assert_eq!(
+        downstream.len(),
+        4,
+        "four readings are downstream after the correction"
+    );
     for (i, expected) in [65.0, 85.0, 105.0, 125.0].iter().enumerate() {
-        assert_close(downstream[i], *expected, &format!("downstream value {i} after the move"));
+        assert_close(
+            downstream[i],
+            *expected,
+            &format!("downstream value {i} after the move"),
+        );
     }
 
     let after_up = e2e::hourly_bucket(&span.db, &span.site1, &span.parameter, morning).await;
-    assert!(after_up.is_some(), "the upstream morning bucket survives the move");
+    assert!(
+        after_up.is_some(),
+        "the upstream morning bucket survives the move"
+    );
     let (mean, count) = after_up.unwrap();
-    assert_close(mean, 35.0, "the upstream morning mean drops the reading that crossed");
-    assert_eq!(count, 2, "two readings remain in the upstream morning bucket");
+    assert_close(
+        mean,
+        35.0,
+        "the upstream morning mean drops the reading that crossed",
+    );
+    assert_eq!(
+        count, 2,
+        "two readings remain in the upstream morning bucket"
+    );
 
     let new_down = e2e::hourly_bucket(&span.db, &span.site2, &span.parameter, morning).await;
     assert!(
@@ -888,13 +1065,24 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
         "the crossing reading opens a morning bucket at the downstream site"
     );
     let (mean, count) = new_down.unwrap();
-    assert_close(mean, 65.0, "the downstream morning bucket holds the crossing reading");
+    assert_close(
+        mean,
+        65.0,
+        "the downstream morning bucket holds the crossing reading",
+    );
     assert_eq!(count, 1, "exactly one reading crossed");
 
     let untouched = e2e::hourly_bucket(&span.db, &span.site2, &span.parameter, afternoon).await;
-    assert!(untouched.is_some(), "the downstream afternoon bucket survives the move");
+    assert!(
+        untouched.is_some(),
+        "the downstream afternoon bucket survives the move"
+    );
     let (mean, count) = untouched.unwrap();
-    assert_close(mean, 105.0, "the afternoon bucket is outside the correction and does not move");
+    assert_close(
+        mean,
+        105.0,
+        "the afternoon bucket is outside the correction and does not move",
+    );
     assert_eq!(count, 3, "the afternoon bucket still holds three readings");
 
     let up = span.aggregates(&span.site1, "").await;
@@ -918,11 +1106,20 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
         "the downstream afternoon average over HTTP is unmoved",
     );
 
-    span.assert_control_untouched("after the deployment move").await;
-    let ctrl_bucket = e2e::hourly_bucket(&span.db, &span.site1, &span.control_parameter, morning).await;
-    assert!(ctrl_bucket.is_some(), "the control bucket survives the move");
+    span.assert_control_untouched("after the deployment move")
+        .await;
+    let ctrl_bucket =
+        e2e::hourly_bucket(&span.db, &span.site1, &span.control_parameter, morning).await;
+    assert!(
+        ctrl_bucket.is_some(),
+        "the control bucket survives the move"
+    );
     let (mean, count) = ctrl_bucket.unwrap();
-    assert_close(mean, 16.0, "the co-located control bucket is undisturbed by the move");
+    assert_close(
+        mean,
+        16.0,
+        "the co-located control bucket is undisturbed by the move",
+    );
     assert_eq!(count, 3, "the control bucket still holds three readings");
 }
 
@@ -937,7 +1134,11 @@ async fn partial_calibration_window_splits_by_time_not_by_site() {
     let span = seed_two_site_span("2025-06-02T10:30:00Z", &PARTIAL_READINGS).await;
 
     let rows = span.readings().await;
-    assert_eq!(rows.len(), 4, "the partial-window fixture holds four readings");
+    assert_eq!(
+        rows.len(),
+        4,
+        "the partial-window fixture holds four readings"
+    );
     let before = [
         (10.0, &span.base_cal, &span.site1),
         (65.0, &span.span_cal, &span.site1),
@@ -955,7 +1156,11 @@ async fn partial_calibration_window_splits_by_time_not_by_site() {
             Some(as_uuid(calibration.as_str())),
             "row {i} resolves by time to its own calibration"
         );
-        assert_eq!(rows[i].site_id, Some(as_uuid(site.as_str())), "row {i} site before the edit");
+        assert_eq!(
+            rows[i].site_id,
+            Some(as_uuid(site.as_str())),
+            "row {i} site before the edit"
+        );
     }
 
     let window_before = span.calibration_window(&span.span_cal).await;
@@ -980,7 +1185,10 @@ async fn partial_calibration_window_splits_by_time_not_by_site() {
         (60.0, 181.0, &span.span_cal, &span.site2, &span.d2),
     ];
     for (i, (raw, calibrated, calibration, site, deployment)) in after.iter().enumerate() {
-        assert_eq!(rows[i].raw_value, *raw, "row {i} raw value survives the edit");
+        assert_eq!(
+            rows[i].raw_value, *raw,
+            "row {i} raw value survives the edit"
+        );
         assert_eq!(
             rows[i].calibrated_value,
             Some(*calibrated),
@@ -991,7 +1199,11 @@ async fn partial_calibration_window_splits_by_time_not_by_site() {
             Some(as_uuid(calibration.as_str())),
             "row {i} keeps the calibration its time resolves"
         );
-        assert_eq!(rows[i].site_id, Some(as_uuid(site.as_str())), "row {i} site after the edit");
+        assert_eq!(
+            rows[i].site_id,
+            Some(as_uuid(site.as_str())),
+            "row {i} site after the edit"
+        );
         assert_eq!(
             rows[i].deployment_id,
             Some(as_uuid(deployment.as_str())),
@@ -1006,12 +1218,20 @@ async fn partial_calibration_window_splits_by_time_not_by_site() {
         10.0,
         "the upstream reading that predates the window keeps the base curve, at the same site as an edited one",
     );
-    assert_close(upstream[1], 91.0, "the upstream reading inside the window moves");
+    assert_close(
+        upstream[1],
+        91.0,
+        "the upstream reading inside the window moves",
+    );
 
     let downstream = span.served(&span.site2, &span.parameter).await;
     assert_eq!(downstream.len(), 2, "two readings are served downstream");
     for (i, expected) in [121.0, 181.0].iter().enumerate() {
-        assert_close(downstream[i], *expected, &format!("downstream value {i} after the edit"));
+        assert_close(
+            downstream[i],
+            *expected,
+            &format!("downstream value {i} after the edit"),
+        );
     }
 
     let window_after = span.calibration_window(&span.span_cal).await;
@@ -1035,5 +1255,6 @@ async fn partial_calibration_window_splits_by_time_not_by_site() {
         "the base curve is untouched by the edit",
     );
 
-    span.assert_control_untouched("after the partial-window edit").await;
+    span.assert_control_untouched("after the partial-window edit")
+        .await;
 }

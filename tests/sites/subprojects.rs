@@ -5,8 +5,8 @@
 
 use crate::common::fixtures::{PROJECT_ID, SITE1_ID};
 use crate::common::{
-    build_test_app, cleanup_test_db, exec, full_permissions, get_with_token,
-    post_json_with_token, put_json_with_token, seed_api_token, seed_test_data, setup_test_db,
+    build_test_app, cleanup_test_db, exec, full_permissions, get_with_token, post_json_with_token,
+    put_json_with_token, seed_api_token, seed_test_data, setup_test_db,
 };
 use serde_json::Value;
 use serial_test::serial;
@@ -34,7 +34,10 @@ async fn seeding_a_project_creates_a_default_subproject() {
     let subs = list.as_array().expect("array");
     assert_eq!(subs.len(), 1, "one default subproject per project: {body}");
     assert_eq!(subs[0]["project_id"], PROJECT_ID);
-    assert_eq!(subs[0]["name"], "Test River Project", "default mirrors the project name");
+    assert_eq!(
+        subs[0]["name"], "Test River Project",
+        "default mirrors the project name"
+    );
 }
 
 #[tokio::test]
@@ -77,8 +80,15 @@ async fn moving_a_site_between_subprojects_keeps_its_project() {
 
     let (_s, body) = get_with_token(&app, &format!("/api/sites/{SITE1_ID}"), &token).await;
     let site = parse(&body);
-    assert_eq!(site["subproject_id"].as_str().unwrap(), new_sub, "site moved to the new subproject");
-    assert_eq!(site["project_id"], PROJECT_ID, "the project is unchanged (same project)");
+    assert_eq!(
+        site["subproject_id"].as_str().unwrap(),
+        new_sub,
+        "site moved to the new subproject"
+    );
+    assert_eq!(
+        site["project_id"], PROJECT_ID,
+        "the project is unchanged (same project)"
+    );
 }
 
 #[tokio::test]
@@ -100,7 +110,10 @@ async fn creating_a_site_with_a_subproject_infers_the_project() {
     assert_eq!(s, 201, "create site by subproject: {body}");
     let site = parse(&body);
     assert_eq!(site["subproject_id"].as_str().unwrap(), default_sub);
-    assert_eq!(site["project_id"], PROJECT_ID, "project inferred from the subproject");
+    assert_eq!(
+        site["project_id"], PROJECT_ID,
+        "project inferred from the subproject"
+    );
 }
 
 #[tokio::test]
@@ -148,7 +161,10 @@ async fn moving_a_subproject_to_another_project_carries_its_sites() {
 
     let (_s, body) = get_with_token(&app, &format!("/api/sites/{SITE1_ID}"), &token).await;
     let site = parse(&body);
-    assert_eq!(site["project_id"], other, "site's project follows the moved subproject: {body}");
+    assert_eq!(
+        site["project_id"], other,
+        "site's project follows the moved subproject: {body}"
+    );
     assert_eq!(
         site["subproject_id"].as_str().unwrap(),
         sub,
@@ -192,18 +208,28 @@ async fn subproject_move_flips_scoped_visibility() {
     assert_eq!(s, 200, "move subproject: {body}");
 
     let sees_site1 = |body: &str| {
-        parse(body).as_array().unwrap().iter().any(|s| s["id"] == SITE1_ID)
+        parse(body)
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == SITE1_ID)
     };
 
     let dest_token = seed_api_token(&db, full_permissions(), Some(other)).await;
     let (s, body) = get_with_token(&app, "/api/sites", &dest_token).await;
     assert_eq!(s, 200, "{body}");
-    assert!(sees_site1(&body), "destination-scoped principal sees the moved sites: {body}");
+    assert!(
+        sees_site1(&body),
+        "destination-scoped principal sees the moved sites: {body}"
+    );
 
     let src_token = seed_api_token(&db, full_permissions(), Some(PROJECT_ID)).await;
     let (s, body) = get_with_token(&app, "/api/sites", &src_token).await;
     assert_eq!(s, 200, "{body}");
-    assert!(!sees_site1(&body), "source-scoped principal no longer sees them: {body}");
+    assert!(
+        !sees_site1(&body),
+        "source-scoped principal no longer sees them: {body}"
+    );
 }
 
 #[tokio::test]
@@ -231,6 +257,10 @@ async fn scoped_principal_sees_only_its_project_subprojects() {
     assert_eq!(s, 200, "{body}");
     let subs = parse(&body);
     let subs = subs.as_array().unwrap();
-    assert_eq!(subs.len(), 1, "scoped token sees only its project's subproject: {body}");
+    assert_eq!(
+        subs.len(),
+        1,
+        "scoped token sees only its project's subproject: {body}"
+    );
     assert_eq!(subs[0]["project_id"], PROJECT_ID);
 }

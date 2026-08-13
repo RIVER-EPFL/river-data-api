@@ -12,10 +12,10 @@ use crate::common::scope::{
     require_sites_in_scope, require_target_in_scope,
 };
 use crate::error::{AppError, AppResult};
-use crate::routes::private::sensors::deployments::slots;
 use crate::routes::private::sensors::calibrations::service::{
     evaluate_formula, recompute_deployed_until, reprocess_sensor_readings,
 };
+use crate::routes::private::sensors::deployments::slots;
 
 // ---------------------------------------------------------------------------
 // Project scope on the operator actions
@@ -140,7 +140,9 @@ pub async fn refresh_aggregates(
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "queued" })))
+    Ok(Json(
+        serde_json::json!({ "job_id": job_id, "status": "queued" }),
+    ))
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -173,7 +175,11 @@ pub async fn compute_derived(
     ProjectScope(scope): ProjectScope,
     Json(payload): Json<ComputeDerivedRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let sites: Vec<Uuid> = payload.site_timestamps.iter().map(|st| st.site_id).collect();
+    let sites: Vec<Uuid> = payload
+        .site_timestamps
+        .iter()
+        .map(|st| st.site_id)
+        .collect();
     require_named_target(&scope, !sites.is_empty(), "site")?;
     require_sites_in_scope(&app_state.db, &scope, &sites).await?;
 
@@ -254,7 +260,9 @@ pub async fn reprocess_sensor(
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "queued" })))
+    Ok(Json(
+        serde_json::json!({ "job_id": job_id, "status": "queued" }),
+    ))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -301,7 +309,8 @@ pub async fn reprocess_all(
     let slot_count = slot_rows
         .into_iter()
         .filter(|r| {
-            r.try_get::<Uuid>("", "site_id").is_ok() && r.try_get::<Uuid>("", "parameter_id").is_ok()
+            r.try_get::<Uuid>("", "site_id").is_ok()
+                && r.try_get::<Uuid>("", "parameter_id").is_ok()
         })
         .count();
 
@@ -389,7 +398,9 @@ pub async fn rebuild_alarm_events(
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "queued" })))
+    Ok(Json(
+        serde_json::json!({ "job_id": job_id, "status": "queued" }),
+    ))
 }
 
 /// Force a full open-alarm reconcile right now, instead of waiting for the periodic backstop
@@ -412,10 +423,12 @@ pub async fn reconcile_alarms(
         crate::routes::private::alarms::sweeper::evaluate_alarm_events(&app_state.db).await?;
 
     if stats.opened > 0 || stats.resolved > 0 {
-        let _ = app_state.events.send(crate::common::AppEvent::AlarmStateChanged {
-            opened: stats.opened,
-            resolved: stats.resolved,
-        });
+        let _ = app_state
+            .events
+            .send(crate::common::AppEvent::AlarmStateChanged {
+                opened: stats.opened,
+                resolved: stats.resolved,
+            });
     }
 
     Ok(Json(serde_json::json!({
@@ -473,18 +486,26 @@ pub async fn rollback_deployment(
 
     // A deployment is always at a site, so its project is the site's. This deletes the row, the
     // same destruction `DELETE /sensor_deployments/{id}` performs under `enforce_scope_on_crud`.
-    let deployment_site: Uuid = target.try_get("", "site_id").map_err(|e| AppError::Internal(format!("{e}")))?;
+    let deployment_site: Uuid = target
+        .try_get("", "site_id")
+        .map_err(|e| AppError::Internal(format!("{e}")))?;
     let owner = project_of_site(db, deployment_site).await?;
     confine_target(&scope, &owner, Unowned::Deny, "deployment")?;
 
-    let sensor_id: Uuid = target.try_get("", "sensor_id").map_err(|e| AppError::Internal(format!("{e}")))?;
-    let parameter_id: Uuid = target.try_get("", "parameter_id").map_err(|e| AppError::Internal(format!("{e}")))?;
-    let target_deployed_from: chrono::DateTime<chrono::FixedOffset> =
-        target.try_get("", "deployed_from").map_err(|e| AppError::Internal(format!("{e}")))?;
+    let sensor_id: Uuid = target
+        .try_get("", "sensor_id")
+        .map_err(|e| AppError::Internal(format!("{e}")))?;
+    let parameter_id: Uuid = target
+        .try_get("", "parameter_id")
+        .map_err(|e| AppError::Internal(format!("{e}")))?;
+    let target_deployed_from: chrono::DateTime<chrono::FixedOffset> = target
+        .try_get("", "deployed_from")
+        .map_err(|e| AppError::Internal(format!("{e}")))?;
     // The boundary the rolled-back deployment vacates, the previous deployment re-extends to here
     // (NULL = the target was open-ended, so the previous reopens open-ended too).
-    let target_deployed_until: Option<chrono::DateTime<chrono::FixedOffset>> =
-        target.try_get("", "deployed_until").map_err(|e| AppError::Internal(format!("{e}")))?;
+    let target_deployed_until: Option<chrono::DateTime<chrono::FixedOffset>> = target
+        .try_get("", "deployed_until")
+        .map_err(|e| AppError::Internal(format!("{e}")))?;
 
     // 2. Find the previous deployment for the same sensor AND THE SAME PARAMETER, on a multi-channel
     //    instrument the immediately-prior deployment by time could belong to a different channel;
@@ -505,13 +526,17 @@ pub async fn rollback_deployment(
         .await
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
-    let previous_deployment_id: Option<Uuid> = previous.as_ref().and_then(|r| r.try_get("", "id").ok());
+    let previous_deployment_id: Option<Uuid> =
+        previous.as_ref().and_then(|r| r.try_get("", "id").ok());
 
     // 3-4. Clear readings' FK to the rolled-back deployment, delete it, and reopen the previous
     //    deployment, atomically, so a mid-operation failure can't leave the deployment deleted with
     //    nothing reopened (which would silently un-attribute its readings). The decompression cap is
     //    lifted so the readings FK-clear can't fail on old compressed chunks.
-    let txn = db.begin().await.map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    let txn = db
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
     txn.execute(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
@@ -568,7 +593,9 @@ pub async fn rollback_deployment(
             .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
         {
             return Err(AppError::Conflict(slots::conflict_message(
-                &occupant, sensor_id, "roll back",
+                &occupant,
+                sensor_id,
+                "roll back",
             )));
         }
 
@@ -589,7 +616,9 @@ pub async fn rollback_deployment(
             }
         })?;
     }
-    txn.commit().await.map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    txn.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
     // 5. Re-chain the remaining timeline and re-derive every reading for the sensor by window. The
     //    rolled-back deployment's readings now fall in the reopened previous deployment's window (or
@@ -656,9 +685,8 @@ pub struct DerivedSeries {
 
 /// Math builtins recognized by meval, not treated as variable names
 const MATH_BUILTINS: &[&str] = &[
-    "sqrt", "abs", "ln", "log", "exp", "sin", "cos", "tan", "asin", "acos", "atan",
-    "sinh", "cosh", "tanh", "floor", "ceil", "round", "signum",
-    "min", "max", "pi", "e",
+    "sqrt", "abs", "ln", "log", "exp", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh",
+    "tanh", "floor", "ceil", "round", "signum", "min", "max", "pi", "e",
 ];
 
 /// Extract variable names from a formula (identifiers that aren't math builtins)
@@ -718,7 +746,9 @@ pub async fn preview_derived(
 
     // Validate formula
     if payload.formula.len() > 1000 {
-        return Err(AppError::BadRequest("Formula too long (max 1000 characters)".to_string()));
+        return Err(AppError::BadRequest(
+            "Formula too long (max 1000 characters)".to_string(),
+        ));
     }
     payload
         .formula
@@ -836,15 +866,16 @@ pub async fn preview_derived(
     }
 
     // Deduplicate and sort times
-    let mut time_set: Vec<i64> = all_times.iter().map(chrono::DateTime::timestamp_millis).collect();
+    let mut time_set: Vec<i64> = all_times
+        .iter()
+        .map(chrono::DateTime::timestamp_millis)
+        .collect();
     time_set.sort_unstable();
     time_set.dedup();
 
     let times: Vec<chrono::DateTime<chrono::Utc>> = time_set
         .iter()
-        .map(|ms| {
-            chrono::DateTime::from_timestamp_millis(*ms).unwrap_or_default()
-        })
+        .map(|ms| chrono::DateTime::from_timestamp_millis(*ms).unwrap_or_default())
         .collect();
 
     // Build source parameter series
@@ -1051,11 +1082,13 @@ pub async fn backfill_candidates(
     }
     let by_site = by_site_map
         .into_iter()
-        .map(|(site_id, (deployments, claimable_count))| BackfillSiteSummary {
-            site_id,
-            deployments,
-            claimable_count,
-        })
+        .map(
+            |(site_id, (deployments, claimable_count))| BackfillSiteSummary {
+                site_id,
+                deployments,
+                claimable_count,
+            },
+        )
         .collect();
 
     Ok(Json(BackfillCandidatesResponse {
@@ -1137,7 +1170,8 @@ pub async fn backfill_attribution(
 
     if selected.is_empty() {
         return Err(AppError::BadRequest(
-            "No matching backfill candidates (pass all=true, a site_id, or deployment_ids)".to_string(),
+            "No matching backfill candidates (pass all=true, a site_id, or deployment_ids)"
+                .to_string(),
         ));
     }
 
@@ -1253,8 +1287,7 @@ async fn fetch_calibration_candidates(
     for row in &rows {
         let sensor_id: Uuid = row.try_get("", "sensor_id")?;
         let uncalibrated_count: i64 = row.try_get("", "uncalibrated_count")?;
-        let target_from: chrono::DateTime<chrono::FixedOffset> =
-            row.try_get("", "target_from")?;
+        let target_from: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "target_from")?;
 
         let cal_row = db
             .query_one(Statement::from_sql_and_values(
@@ -1352,7 +1385,6 @@ pub async fn backfill_calibrations(
     ProjectScope(scope): ProjectScope,
     Json(payload): Json<BackfillCalibrationsRequest>,
 ) -> AppResult<Json<BackfillCalibrationsResponse>> {
-
     let db = &app_state.db;
 
     // Named instruments are confined one by one, including inventory (`Unowned::Allow`): a sensor

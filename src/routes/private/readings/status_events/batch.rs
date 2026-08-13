@@ -7,9 +7,9 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
-use crate::routes::private::readings::status_events;
 use crate::error::AppResult;
 use crate::routes::private::data_streams::service::get_or_create_api_stream;
+use crate::routes::private::readings::status_events;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct BatchStatusEventsRequest {

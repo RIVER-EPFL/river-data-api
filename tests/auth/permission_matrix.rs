@@ -21,7 +21,6 @@
 //!   - require_crud_permissions (method-aware: GET vs mutation)
 //!   - require_admin (Keycloak admin only, NO token can pass)
 
-
 use serial_test::serial;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -69,10 +68,34 @@ fn expected(boundary: Boundary, caller: Caller) -> u16 {
     match caller {
         Caller::Anonymous => 401,
         Caller::Full | Caller::SyncSession => 200,
-        Caller::ReadMetaOnly => if boundary == Boundary::ReadMeta { 200 } else { 403 },
-        Caller::ReadDataOnly => if boundary == Boundary::ReadData { 200 } else { 403 },
-        Caller::WriteMetaOnly => if boundary == Boundary::WriteMeta { 200 } else { 403 },
-        Caller::WriteDataOnly => if boundary == Boundary::WriteData { 200 } else { 403 },
+        Caller::ReadMetaOnly => {
+            if boundary == Boundary::ReadMeta {
+                200
+            } else {
+                403
+            }
+        }
+        Caller::ReadDataOnly => {
+            if boundary == Boundary::ReadData {
+                200
+            } else {
+                403
+            }
+        }
+        Caller::WriteMetaOnly => {
+            if boundary == Boundary::WriteMeta {
+                200
+            } else {
+                403
+            }
+        }
+        Caller::WriteDataOnly => {
+            if boundary == Boundary::WriteData {
+                200
+            } else {
+                403
+            }
+        }
     }
 }
 
@@ -104,20 +127,30 @@ async fn issue(
             Some(t) => crate::common::post_json_with_token(app, path, b, t).await.0,
             None => {
                 let empty = "Bearer ";
-                crate::common::get_with_auth_header(app, path, empty).await.0
+                crate::common::get_with_auth_header(app, path, empty)
+                    .await
+                    .0
             }
         },
         ("POST", None) => match token {
             Some(t) => {
-                crate::common::post_json_with_token(app, path, &serde_json::json!({}), t).await.0
+                crate::common::post_json_with_token(app, path, &serde_json::json!({}), t)
+                    .await
+                    .0
             }
             None => {
                 let empty = "Bearer ";
-                crate::common::get_with_auth_header(app, path, empty).await.0
+                crate::common::get_with_auth_header(app, path, empty)
+                    .await
+                    .0
             }
         },
         ("PATCH", Some(b)) => match token {
-            Some(t) => crate::common::patch_json_with_token(app, path, b, t).await.0,
+            Some(t) => {
+                crate::common::patch_json_with_token(app, path, b, t)
+                    .await
+                    .0
+            }
             None => 401,
         },
         ("DELETE", _) => match token {
@@ -142,7 +175,8 @@ fn check_status(probe: &Probe, caller: Caller, actual: u16) {
         );
     } else {
         assert_eq!(
-            actual, want,
+            actual,
+            want,
             "[{}] {} as {} expected {} got {}",
             probe.label,
             probe.path,

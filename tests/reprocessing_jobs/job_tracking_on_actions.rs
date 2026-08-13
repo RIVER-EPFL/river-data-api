@@ -7,7 +7,6 @@
 //! Run: DATABASE_URL=postgresql://postgres:psql@localhost:5444/river_test \
 //!      cargo test --test reprocessing_jobs -- --test-threads=1
 
-
 use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
 use std::time::{Duration, Instant};
@@ -139,7 +138,8 @@ async fn refresh_aggregates_creates_tracked_job() {
 
     let body = serde_json::json!({ "full": false });
     let (status, text) =
-        crate::common::post_json_with_token(&app, "/api/actions/refresh_aggregates", &body, &token).await;
+        crate::common::post_json_with_token(&app, "/api/actions/refresh_aggregates", &body, &token)
+            .await;
 
     assert!(
         (200..300).contains(&status),
@@ -173,7 +173,8 @@ async fn compute_derived_creates_tracked_job() {
         ]
     });
     let (status, text) =
-        crate::common::post_json_with_token(&app, "/api/actions/compute_derived", &body, &token).await;
+        crate::common::post_json_with_token(&app, "/api/actions/compute_derived", &body, &token)
+            .await;
 
     assert!(
         (200..300).contains(&status),

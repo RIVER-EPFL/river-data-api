@@ -64,12 +64,19 @@ async fn command_and_event_listings_page_and_report_their_range() {
         assert_eq!(items.len(), 25, "{path} default page size");
     }
 
-    let (_s, headers, body) =
-        crate::common::get_with_token_headers(&app, "/api/sync/commands?page=2&per_page=10", &token)
-            .await;
+    let (_s, headers, body) = crate::common::get_with_token_headers(
+        &app,
+        "/api/sync/commands?page=2&per_page=10",
+        &token,
+    )
+    .await;
     let items: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
     assert_eq!(items.len(), 10);
-    assert_eq!(content_range(&headers), "items 10-19/30", "commands: inclusive end");
+    assert_eq!(
+        content_range(&headers),
+        "items 10-19/30",
+        "commands: inclusive end"
+    );
     assert!(headers.get("Access-Control-Expose-Headers").is_some());
 
     let (_s, headers, body) =
@@ -77,7 +84,11 @@ async fn command_and_event_listings_page_and_report_their_range() {
             .await;
     let items: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
     assert_eq!(items.len(), 10);
-    assert_eq!(content_range(&headers), "items 10-19/30", "events: inclusive end");
+    assert_eq!(
+        content_range(&headers),
+        "items 10-19/30",
+        "events: inclusive end"
+    );
     assert!(headers.get("Access-Control-Expose-Headers").is_some());
 }
 
@@ -98,12 +109,18 @@ async fn pagination_clamps_page_size_and_handles_out_of_range_pages() {
         let items: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
         assert_eq!(items.len(), PAGE_SIZE, "{path}: per_page clamps to 100");
 
-        let (_s, _h, first) =
-            crate::common::get_with_token_headers(&app, &format!("{path}?page=1&per_page=5"), &token)
-                .await;
-        let (_s, _h, zeroth) =
-            crate::common::get_with_token_headers(&app, &format!("{path}?page=0&per_page=5"), &token)
-                .await;
+        let (_s, _h, first) = crate::common::get_with_token_headers(
+            &app,
+            &format!("{path}?page=1&per_page=5"),
+            &token,
+        )
+        .await;
+        let (_s, _h, zeroth) = crate::common::get_with_token_headers(
+            &app,
+            &format!("{path}?page=0&per_page=5"),
+            &token,
+        )
+        .await;
         assert_eq!(first, zeroth, "{path}: page=0 behaves as page 1");
 
         let (status, headers, body) =
@@ -111,6 +128,10 @@ async fn pagination_clamps_page_size_and_handles_out_of_range_pages() {
         assert_eq!(status, 200, "{path} beyond the last page: {body}");
         let items: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
         assert!(items.is_empty());
-        assert_eq!(content_range(&headers), "items */30", "{path}: empty page range");
+        assert_eq!(
+            content_range(&headers),
+            "items */30",
+            "{path}: empty page range"
+        );
     }
 }

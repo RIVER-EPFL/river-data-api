@@ -3,7 +3,6 @@
 //! Run with: cargo test --test auth
 //! Requires: DATABASE_URL pointing to a TimescaleDB instance.
 
-
 use chrono::{Duration, Utc};
 use serial_test::serial;
 
@@ -30,7 +29,10 @@ async fn test_unauthenticated_get_returns_401() {
 
     // No Authorization header at all
     let (status, _body) = crate::common::get(&app, "/api/projects").await;
-    assert_eq!(status, 401, "unauthenticated GET to service tier should return 401");
+    assert_eq!(
+        status, 401,
+        "unauthenticated GET to service tier should return 401"
+    );
 }
 
 // ============================================================================
@@ -64,7 +66,8 @@ async fn test_expired_token_returns_401() {
 async fn test_inactive_token_returns_401() {
     let (db, app) = setup().await;
 
-    let inactive_token = crate::common::seed_inactive_api_token(&db, crate::common::full_permissions()).await;
+    let inactive_token =
+        crate::common::seed_inactive_api_token(&db, crate::common::full_permissions()).await;
 
     let (status, _body) =
         crate::common::get_with_token(&app, "/api/projects", &inactive_token).await;
@@ -93,8 +96,7 @@ async fn test_read_metadata_only_token() {
     .await;
 
     // GET projects (read_metadata) → 200
-    let (status, _body) =
-        crate::common::get_with_token(&app, "/api/projects", &token).await;
+    let (status, _body) = crate::common::get_with_token(&app, "/api/projects", &token).await;
     assert_eq!(status, 200, "read_metadata token should access projects");
 
     // GET readings (read_data) → 403
@@ -107,7 +109,10 @@ async fn test_read_metadata_only_token() {
         &token,
     )
     .await;
-    assert_eq!(status, 403, "read_metadata-only token should be denied readings access");
+    assert_eq!(
+        status, 403,
+        "read_metadata-only token should be denied readings access"
+    );
 }
 
 // ============================================================================
@@ -149,7 +154,10 @@ async fn test_project_scoped_token_cannot_access_other_project_site() {
         &token,
     )
     .await;
-    assert_eq!(status, 403, "project-scoped token should be denied access to other project's sites");
+    assert_eq!(
+        status, 403,
+        "project-scoped token should be denied access to other project's sites"
+    );
 }
 
 // ============================================================================
@@ -164,7 +172,10 @@ async fn test_malformed_auth_header_returns_401() {
     // "NotBearer xyz" instead of "Bearer xyz"
     let (status, _body) =
         crate::common::get_with_auth_header(&app, "/api/projects", "NotBearer xyz").await;
-    assert_eq!(status, 401, "malformed auth header should return 401, not 500");
+    assert_eq!(
+        status, 401,
+        "malformed auth header should return 401, not 500"
+    );
 }
 
 // ============================================================================

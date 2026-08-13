@@ -257,16 +257,19 @@ pub async fn periodic(
         }
 
         let now = std::time::Instant::now();
-        let due_full = last_full_refresh.is_none_or(|t| now.duration_since(t) >= full_refresh_interval);
+        let due_full =
+            last_full_refresh.is_none_or(|t| now.duration_since(t) >= full_refresh_interval);
         if due_full {
             tracing::info!("Derived janitor: running scheduled full continuous aggregate refresh");
             // The background tick has no caller to answer to, so a failed refresh is logged and
             // the next tick retries it.
-            if let Err(e) = crate::common::sync_state::refresh_continuous_aggregates_full(db).await {
+            if let Err(e) = crate::common::sync_state::refresh_continuous_aggregates_full(db).await
+            {
                 tracing::warn!(error = %e, "Derived janitor: full aggregate refresh failed");
             }
             *last_full_refresh = Some(now);
-        } else if let Err(e) = crate::common::sync_state::refresh_continuous_aggregates(db, None).await
+        } else if let Err(e) =
+            crate::common::sync_state::refresh_continuous_aggregates(db, None).await
         {
             tracing::warn!(error = %e, "Derived janitor: incremental aggregate refresh failed");
         }

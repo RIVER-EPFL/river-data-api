@@ -9,15 +9,11 @@ impl MigrationTrait for Migration {
         let db = manager.get_connection();
 
         // Drop foreign key constraints first
-        db.execute_unprepared(
-            "ALTER TABLE readings DROP COLUMN IF EXISTS field_trip_id",
-        )
-        .await?;
+        db.execute_unprepared("ALTER TABLE readings DROP COLUMN IF EXISTS field_trip_id")
+            .await?;
 
-        db.execute_unprepared(
-            "ALTER TABLE samples DROP COLUMN IF EXISTS field_trip_id",
-        )
-        .await?;
+        db.execute_unprepared("ALTER TABLE samples DROP COLUMN IF EXISTS field_trip_id")
+            .await?;
 
         db.execute_unprepared("DROP TABLE IF EXISTS field_trips CASCADE")
             .await?;

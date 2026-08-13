@@ -17,7 +17,11 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use axum::{extract::Request, middleware::Next, response::{IntoResponse, Response}};
+use axum::{
+    extract::Request,
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -85,7 +89,9 @@ impl AccessScope {
         self.project_ids().map(|ids| {
             sea_orm::Value::Array(
                 ArrayType::Uuid,
-                Some(Box::new(ids.into_iter().map(sea_orm::Value::from).collect())),
+                Some(Box::new(
+                    ids.into_iter().map(sea_orm::Value::from).collect(),
+                )),
             )
         })
     }
@@ -198,9 +204,9 @@ impl Capability {
             Capability::WriteData => Some(TokenBit::WriteData),
             // The historical `write_metadata` bit covered all entity management; the human-side
             // split does not change what a token may do.
-            Capability::WriteFieldMetadata | Capability::ManageSensors | Capability::WriteCatalog => {
-                Some(TokenBit::WriteMetadata)
-            }
+            Capability::WriteFieldMetadata
+            | Capability::ManageSensors
+            | Capability::WriteCatalog => Some(TokenBit::WriteMetadata),
             Capability::Admin => None,
         }
     }
@@ -341,7 +347,10 @@ pub async fn check_crud(
     request: Request,
     next: Next,
 ) -> Response {
-    let is_read = matches!(*request.method(), axum::http::Method::GET | axum::http::Method::HEAD);
+    let is_read = matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD
+    );
     if is_read {
         check(read, TokenAccess::Same, request, next).await
     } else {

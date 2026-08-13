@@ -59,8 +59,9 @@ pub async fn probe_once(db: &DatabaseConnection, config: &Config) {
 
 /// Background loop: probe on startup, then every `notify_health_interval_seconds` (min 30s).
 pub async fn periodic(db: DatabaseConnection, config: Arc<Config>) {
-    let mut ticker =
-        tokio::time::interval(Duration::from_secs(config.notify_health_interval_seconds.max(30)));
+    let mut ticker = tokio::time::interval(Duration::from_secs(
+        config.notify_health_interval_seconds.max(30),
+    ));
     loop {
         ticker.tick().await;
         probe_once(&db, &config).await;

@@ -2,8 +2,8 @@
 //! `SELECT … FOR UPDATE SKIP LOCKED`, leases it, and commits ownership-guarded so a reaped stalled
 //! worker can't clobber the new owner. Idempotency makes the rare overlap harmless. See ADR 0001.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use futures::FutureExt;
@@ -235,11 +235,24 @@ async fn execute(
 ) -> Result<(), sea_orm::DbErr> {
     let Some(job) = registry.get(&claimed.trigger_type) else {
         // No handler, fail rather than let the reaper reclaim it forever.
-        commit_terminal(db, &claimed, worker_id, "failed", None, Some("no handler registered for trigger_type")).await?;
+        commit_terminal(
+            db,
+            &claimed,
+            worker_id,
+            "failed",
+            None,
+            Some("no handler registered for trigger_type"),
+        )
+        .await?;
         return Ok(());
     };
 
-    let (ctx, cancel) = JobContext::for_worker(db.clone(), claimed.id, events.clone(), claimed.params.clone());
+    let (ctx, cancel) = JobContext::for_worker(
+        db.clone(),
+        claimed.id,
+        events.clone(),
+        claimed.params.clone(),
+    );
     let hb = tokio::spawn(heartbeat(
         db.clone(),
         claimed.id,
@@ -251,7 +264,9 @@ async fn execute(
     // Catch a handler panic so it becomes a normal job failure instead of unwinding the worker task.
     // Without this, a panic skips `hb.abort()` below, the detached heartbeat then renews the lease
     // forever (the reaper never reclaims the row) while this replica is left with no worker.
-    let run_result = std::panic::AssertUnwindSafe(job.run(ctx)).catch_unwind().await;
+    let run_result = std::panic::AssertUnwindSafe(job.run(ctx))
+        .catch_unwind()
+        .await;
     hb.abort();
 
     let outcome = match run_result {
@@ -263,7 +278,9 @@ async fn execute(
                 .or_else(|| panic.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "job handler panicked".to_string());
             tracing::error!(job_id = %claimed.id, panic = %msg, "job handler panicked");
-            Err(sea_orm::DbErr::Custom(format!("job handler panicked: {msg}")))
+            Err(sea_orm::DbErr::Custom(format!(
+                "job handler panicked: {msg}"
+            )))
         }
     };
 
@@ -275,7 +292,8 @@ async fn execute(
                 "completed"
             };
             let readings = i32::try_from(count).unwrap_or(i32::MAX);
-            let owned = commit_terminal(db, &claimed, worker_id, status, Some(readings), None).await?;
+            let owned =
+                commit_terminal(db, &claimed, worker_id, status, Some(readings), None).await?;
             if owned {
                 // Mirror the inline lifecycle's post-success reconcile. Most tracked jobs rewrite
                 // reading values or attribution (recalibration, reprocess, pairing/derived backfill,

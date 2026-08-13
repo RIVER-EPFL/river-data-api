@@ -3,7 +3,6 @@
 //!
 //! Run with: cargo test --test readings
 
-
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 use uuid::Uuid;
@@ -115,9 +114,17 @@ async fn test_csv_import_dry_run_then_write_skips_derived_and_recomputes() {
         .iter()
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
-    assert!(skipped.contains(&"DOmgL".to_string()), "DOmgL must be skipped: {plan}");
+    assert!(
+        skipped.contains(&"DOmgL".to_string()),
+        "DOmgL must be skipped: {plan}"
+    );
     assert_eq!(
-        count_readings(&db, crate::common::GLOBAL_PARAM_DO_ID, "2025-02-01T00:00:00Z").await,
+        count_readings(
+            &db,
+            crate::common::GLOBAL_PARAM_DO_ID,
+            "2025-02-01T00:00:00Z"
+        )
+        .await,
         0,
         "dry_run must not write"
     );
@@ -131,11 +138,21 @@ async fn test_csv_import_dry_run_then_write_skips_derived_and_recomputes() {
     .await;
     assert_eq!(status, 200, "import ({status}): {resp}");
     assert_eq!(resp["inserted_total"].as_u64().unwrap(), 4);
-    assert!(resp["derived_job_id"].is_string(), "expected a background derived job: {resp}");
+    assert!(
+        resp["derived_job_id"].is_string(),
+        "expected a background derived job: {resp}"
+    );
 
     // Insert runs in a background job; poll until the reading appears.
     assert_eq!(
-        poll_scalar(&db, crate::common::GLOBAL_PARAM_DO_ID, "2025-02-01T00:00:00Z", "raw_value", 10).await,
+        poll_scalar(
+            &db,
+            crate::common::GLOBAL_PARAM_DO_ID,
+            "2025-02-01T00:00:00Z",
+            "raw_value",
+            10
+        )
+        .await,
         Some(250.0),
         "background insert should write raw_value within 10s"
     );
@@ -147,8 +164,15 @@ async fn test_csv_import_dry_run_then_write_skips_derived_and_recomputes() {
         &serde_json::json!({"site": crate::common::SITE1_ID, "csv": CSV}),
     )
     .await;
-    assert_eq!(again["inserted_total"].as_u64().unwrap(), 0, "re-import must insert nothing");
-    assert!(again["derived_job_id"].is_null(), "no-op re-import should not start a job");
+    assert_eq!(
+        again["inserted_total"].as_u64().unwrap(),
+        0,
+        "re-import must insert nothing"
+    );
+    assert!(
+        again["derived_job_id"].is_null(),
+        "no-op re-import should not start a job"
+    );
 }
 
 #[tokio::test]
@@ -177,10 +201,20 @@ async fn test_csv_import_explicit_mapping_overrides_and_skips() {
         .iter()
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
-    assert!(skipped.contains(&"junk".to_string()), "junk must be skipped: {resp}");
+    assert!(
+        skipped.contains(&"junk".to_string()),
+        "junk must be skipped: {resp}"
+    );
     assert_eq!(resp["inserted_total"].as_u64().unwrap(), 2);
     assert_eq!(
-        poll_scalar(&db, crate::common::GLOBAL_PARAM_DO_ID, "2025-02-02T00:00:00Z", "raw_value", 10).await,
+        poll_scalar(
+            &db,
+            crate::common::GLOBAL_PARAM_DO_ID,
+            "2025-02-02T00:00:00Z",
+            "raw_value",
+            10
+        )
+        .await,
         Some(250.0),
         "background insert should write raw_value within 10s"
     );
@@ -217,8 +251,15 @@ not-a-date,260,13.0\n\
         &serde_json::json!({"site": crate::common::SITE1_ID, "csv": csv}),
     )
     .await;
-    assert_eq!(status, 200, "bad rows must not fail the whole import ({status}): {resp}");
-    assert_eq!(resp["inserted_total"].as_u64().unwrap(), 3, "2 good cells in row 2 + 1 in row 4: {resp}");
+    assert_eq!(
+        status, 200,
+        "bad rows must not fail the whole import ({status}): {resp}"
+    );
+    assert_eq!(
+        resp["inserted_total"].as_u64().unwrap(),
+        3,
+        "2 good cells in row 2 + 1 in row 4: {resp}"
+    );
     assert_eq!(resp["duplicates"].as_u64().unwrap(), 0, "{resp}");
     assert_eq!(resp["error_count"].as_u64().unwrap(), 2, "{resp}");
     let errors = resp["errors"].as_array().unwrap();
@@ -228,12 +269,26 @@ not-a-date,260,13.0\n\
         .map(|e| e["message"].as_str().unwrap())
         .collect::<Vec<_>>()
         .join(" | ");
-    assert!(msgs.contains("DateTime"), "should flag the bad timestamp: {msgs}");
-    assert!(msgs.contains("abc"), "should flag the non-numeric value: {msgs}");
+    assert!(
+        msgs.contains("DateTime"),
+        "should flag the bad timestamp: {msgs}"
+    );
+    assert!(
+        msgs.contains("abc"),
+        "should flag the non-numeric value: {msgs}"
+    );
 
     // Wait for the background insert to land before re-importing.
     assert!(
-        poll_scalar(&db, crate::common::GLOBAL_PARAM_DO_ID, "2025-04-01T00:00:00Z", "raw_value", 10).await.is_some(),
+        poll_scalar(
+            &db,
+            crate::common::GLOBAL_PARAM_DO_ID,
+            "2025-04-01T00:00:00Z",
+            "raw_value",
+            10
+        )
+        .await
+        .is_some(),
         "background insert should write within 10s"
     );
 
@@ -244,10 +299,25 @@ not-a-date,260,13.0\n\
         &serde_json::json!({"site": crate::common::SITE1_ID, "csv": csv}),
     )
     .await;
-    assert_eq!(again["inserted_total"].as_u64().unwrap(), 0, "re-import inserts nothing: {again}");
-    assert_eq!(again["duplicates"].as_u64().unwrap(), 3, "re-import counts duplicates: {again}");
-    assert_eq!(again["error_count"].as_u64().unwrap(), 2, "re-import still reports errors: {again}");
-    assert!(again["derived_job_id"].is_null(), "no-op re-import starts no job");
+    assert_eq!(
+        again["inserted_total"].as_u64().unwrap(),
+        0,
+        "re-import inserts nothing: {again}"
+    );
+    assert_eq!(
+        again["duplicates"].as_u64().unwrap(),
+        3,
+        "re-import counts duplicates: {again}"
+    );
+    assert_eq!(
+        again["error_count"].as_u64().unwrap(),
+        2,
+        "re-import still reports errors: {again}"
+    );
+    assert!(
+        again["derived_job_id"].is_null(),
+        "no-op re-import starts no job"
+    );
 }
 
 async fn count_readings(db: &DatabaseConnection, parameter_id: &str, time_rfc3339: &str) -> i64 {
@@ -262,7 +332,8 @@ async fn count_readings(db: &DatabaseConnection, parameter_id: &str, time_rfc333
         .await
         .ok()
         .flatten();
-    row.and_then(|r| r.try_get::<i64>("", "n").ok()).unwrap_or(0)
+    row.and_then(|r| r.try_get::<i64>("", "n").ok())
+        .unwrap_or(0)
 }
 
 async fn poll_scalar(
@@ -295,7 +366,9 @@ async fn scalar(
     let row = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &format!("SELECT {column} AS v FROM readings WHERE parameter_id = $1 AND time = $2 LIMIT 1"),
+            &format!(
+                "SELECT {column} AS v FROM readings WHERE parameter_id = $1 AND time = $2 LIMIT 1"
+            ),
             [param.into(), time.into()],
         ))
         .await

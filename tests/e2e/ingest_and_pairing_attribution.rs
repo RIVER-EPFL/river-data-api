@@ -6,7 +6,6 @@
 //!
 //! Run: cargo test --test e2e -- --test-threads=1
 
-
 use crate::common::e2e;
 use crate::common::sensor_lifecycle as sl;
 use sea_orm::{ConnectionTrait, Statement};
@@ -50,7 +49,13 @@ async fn batch_attributes_rows_inside_the_deployment_window() {
     let app = crate::common::build_test_app(db.clone());
 
     let sensor = sl::create_sensor(&db, "ingest-probe", crate::common::GLOBAL_PARAM_TEMP_ID).await;
-    let dep = sl::deploy_sensor(&db, sensor.id, crate::common::SITE1_ID, sl::dt("2025-06-01T00:00:00Z")).await;
+    let dep = sl::deploy_sensor(
+        &db,
+        sensor.id,
+        crate::common::SITE1_ID,
+        sl::dt("2025-06-01T00:00:00Z"),
+    )
+    .await;
 
     // Batch with no sensor_id: one row inside the window, one before it.
     let (status, body) = crate::common::post_json_with_token(
@@ -65,13 +70,20 @@ async fn batch_attributes_rows_inside_the_deployment_window() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "batch insert ({status}): {body}");
+    assert!(
+        (200..300).contains(&status),
+        "batch insert ({status}): {body}"
+    );
 
     // In-window row attributed to the sensor + its deployment + identity calibration.
     let (sid, did, cid) = attr_at(&db, "2025-07-01T00:00:00Z").await;
     assert_eq!(sid, Some(sensor.id), "in-window row gets sensor");
     assert_eq!(did, Some(dep), "in-window row gets deployment");
-    assert_eq!(cid, Some(sensor.identity_calibration_id), "in-window row gets calibration");
+    assert_eq!(
+        cid,
+        Some(sensor.identity_calibration_id),
+        "in-window row gets calibration"
+    );
 
     // Pre-deployment row stays unattributed (needs a backdate).
     let (sid_before, _, _) = attr_at(&db, "2025-05-01T00:00:00Z").await;
@@ -90,7 +102,13 @@ async fn pairing_attributes_by_deployment_window() {
     // The slot already has sensor A deployed (open). Pairing must attribute to A by window, not to
     // the sensor the pairing path auto-creates for the stream.
     let a = sl::create_sensor(&db, "incumbent-A", crate::common::GLOBAL_PARAM_TEMP_ID).await;
-    let dep_a = sl::deploy_sensor(&db, a.id, crate::common::SITE1_ID, sl::dt("2025-06-01T00:00:00Z")).await;
+    let dep_a = sl::deploy_sensor(
+        &db,
+        a.id,
+        crate::common::SITE1_ID,
+        sl::dt("2025-06-01T00:00:00Z"),
+    )
+    .await;
 
     let stream = sl::create_unpaired_stream(&db, "to-pair").await;
     sl::insert_unpaired_readings(
@@ -119,8 +137,21 @@ async fn pairing_attributes_by_deployment_window() {
     let rows = sl::get_readings(&db, stream).await;
     assert_eq!(rows.len(), 2, "both readings present");
     for r in &rows {
-        assert_eq!(r.site_id.map(|s| s.to_string()), Some(crate::common::SITE1_ID.to_string()));
-        assert_eq!(r.sensor_id, Some(a.id), "reading {} attributed to the slot's deployed sensor", r.time);
-        assert_eq!(r.deployment_id, Some(dep_a), "reading {} gets A's deployment", r.time);
+        assert_eq!(
+            r.site_id.map(|s| s.to_string()),
+            Some(crate::common::SITE1_ID.to_string())
+        );
+        assert_eq!(
+            r.sensor_id,
+            Some(a.id),
+            "reading {} attributed to the slot's deployed sensor",
+            r.time
+        );
+        assert_eq!(
+            r.deployment_id,
+            Some(dep_a),
+            "reading {} gets A's deployment",
+            r.time
+        );
     }
 }

@@ -1,19 +1,23 @@
-use axum::extract::State;
 use axum::Json;
+use axum::extract::State;
 use chrono::Utc;
 use moka::future::Cache;
-use sea_orm::{ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, Set, Statement, DatabaseBackend};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, EntityTrait,
+    QueryFilter, Set, Statement,
+};
 use std::sync::LazyLock;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::common::AppState;
-use crate::error::{AppError, AppResult};
-use river_data_core::models::{CommandStatus, HeartbeatRequest, HeartbeatResponse, PendingCommand, ServiceStatus};
-use crate::routes::private::sync::{commands_model, services_model};
 use super::enroll::create_session_token;
 use super::session::SyncServiceContext;
-
+use crate::common::AppState;
+use crate::error::{AppError, AppResult};
+use crate::routes::private::sync::{commands_model, services_model};
+use river_data_core::models::{
+    CommandStatus, HeartbeatRequest, HeartbeatResponse, PendingCommand, ServiceStatus,
+};
 
 pub(crate) static SESSION_TOKEN_CACHE: LazyLock<Cache<Uuid, String>> = LazyLock::new(|| {
     Cache::builder()

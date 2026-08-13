@@ -44,7 +44,10 @@ impl NotificationChannel for MockChannel {
     }
 }
 
-fn channels(sent: &Arc<Mutex<Vec<OutgoingMessage>>>, fail: bool) -> Vec<Box<dyn NotificationChannel>> {
+fn channels(
+    sent: &Arc<Mutex<Vec<OutgoingMessage>>>,
+    fail: bool,
+) -> Vec<Box<dyn NotificationChannel>> {
     vec![Box::new(MockChannel {
         sent: sent.clone(),
         fail,
@@ -99,12 +102,20 @@ async fn opened_alarm_is_notified_and_stamped() {
     let (_app, state) = crate::common::build_test_app_with_state(db.clone());
 
     insert_open_event(&db).await;
-    assert_eq!(count(&db, "notified_at IS NULL AND resolved_at IS NULL").await, 1);
+    assert_eq!(
+        count(&db, "notified_at IS NULL AND resolved_at IS NULL").await,
+        1
+    );
 
     let sent = Arc::new(Mutex::new(Vec::new()));
     dispatcher::dispatch_once(&state, &channels(&sent, false)).await;
 
-    let opened = sent.lock().unwrap().iter().filter(|m| m.kind == "alarm_opened").count();
+    let opened = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|m| m.kind == "alarm_opened")
+        .count();
     assert_eq!(opened, 1, "one batched opened message");
     assert_eq!(
         count(&db, "notified_at IS NULL AND resolved_at IS NULL").await,
@@ -138,7 +149,10 @@ async fn muted_alarm_is_suppressed_but_stamped() {
     dispatcher::dispatch_once(&state, &channels(&sent, false)).await;
 
     assert!(
-        sent.lock().unwrap().iter().all(|m| m.kind != "alarm_opened"),
+        sent.lock()
+            .unwrap()
+            .iter()
+            .all(|m| m.kind != "alarm_opened"),
         "a muted slot sends no alarm notification"
     );
     assert_eq!(
@@ -161,14 +175,22 @@ async fn failed_delivery_is_not_stamped_and_retries() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     dispatcher::dispatch_once(&state, &channels(&sent, true)).await;
 
-    let attempted = sent.lock().unwrap().iter().filter(|m| m.kind == "alarm_opened").count();
+    let attempted = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|m| m.kind == "alarm_opened")
+        .count();
     assert_eq!(attempted, 1, "the alarm delivery was attempted");
     assert_eq!(
         count(&db, "notified_at IS NULL AND resolved_at IS NULL").await,
         1,
         "an all-channel failure leaves the row unstamped for the next tick"
     );
-    assert!(log_count(&db, "failed").await >= 1, "a failed row is logged");
+    assert!(
+        log_count(&db, "failed").await >= 1,
+        "a failed row is logged"
+    );
 }
 
 #[tokio::test]
@@ -191,10 +213,19 @@ async fn resolved_alarm_sends_resolution_notice() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     dispatcher::dispatch_once(&state, &channels(&sent, false)).await;
 
-    let resolved = sent.lock().unwrap().iter().filter(|m| m.kind == "alarm_resolved").count();
+    let resolved = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|m| m.kind == "alarm_resolved")
+        .count();
     assert_eq!(resolved, 1, "one batched resolved message");
     assert_eq!(
-        count(&db, "resolved_at IS NOT NULL AND resolution_notified_at IS NULL").await,
+        count(
+            &db,
+            "resolved_at IS NOT NULL AND resolution_notified_at IS NULL"
+        )
+        .await,
         0,
         "resolution_notified_at stamped"
     );
@@ -220,8 +251,16 @@ async fn concurrent_dispatchers_send_each_event_once() {
         dispatcher::dispatch_once(&state, &ch_b),
     );
 
-    let opened = sent.lock().unwrap().iter().filter(|m| m.kind == "alarm_opened").count();
-    assert_eq!(opened, 1, "exactly one replica sends the alarm, no duplicate alerts");
+    let opened = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|m| m.kind == "alarm_opened")
+        .count();
+    assert_eq!(
+        opened, 1,
+        "exactly one replica sends the alarm, no duplicate alerts"
+    );
     assert_eq!(
         count(&db, "notified_at IS NULL AND resolved_at IS NULL").await,
         0,

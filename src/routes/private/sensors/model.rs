@@ -3,14 +3,7 @@ use sea_orm::entity::prelude::*;
 
 use super::operations::SensorOperations;
 
-#[derive(
-    Clone,
-    Debug,
-    DeriveEntityModel,
-    serde::Serialize,
-    serde::Deserialize,
-    EntityToModels,
-)]
+#[derive(Clone, Debug, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels)]
 #[sea_orm(table_name = "sensors")]
 #[crudcrate(
     api_struct = "Sensor",

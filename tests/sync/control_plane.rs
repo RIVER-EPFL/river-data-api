@@ -11,13 +11,15 @@
 //!
 //! Run: cargo test --test sync -- --test-threads=1
 
-
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serial_test::serial;
 
 async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
     let row = db
-        .query_one(Statement::from_string(DatabaseBackend::Postgres, sql.to_string()))
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            sql.to_string(),
+        ))
         .await
         .expect("query")
         .expect("row");
@@ -67,7 +69,9 @@ async fn enroll_with_seeded_credentials_returns_session_token() {
     assert!(
         count(
             &db,
-            &format!("SELECT count(*) AS c FROM sync_service_tokens WHERE service_id = '{service_id}'"),
+            &format!(
+                "SELECT count(*) AS c FROM sync_service_tokens WHERE service_id = '{service_id}'"
+            ),
         )
         .await
             >= 1,
@@ -125,7 +129,10 @@ async fn heartbeat_updates_service_and_returns_no_pending_commands() {
     .await;
     assert_eq!(status, 200, "heartbeat ({status}): {body}");
     assert!(
-        body["pending_commands"].as_array().expect("array").is_empty(),
+        body["pending_commands"]
+            .as_array()
+            .expect("array")
+            .is_empty(),
         "no commands queued: {body}"
     );
     assert!(
@@ -203,7 +210,10 @@ async fn command_lifecycle_issue_deliver_acknowledge_complete() {
         &admin,
     )
     .await;
-    assert_eq!(status, 400, "invalid command name rejected (it is trigger_full_sync)");
+    assert_eq!(
+        status, 400,
+        "invalid command name rejected (it is trigger_full_sync)"
+    );
 
     let (status, hb) = crate::common::post_json_parse_with_token(
         &app,
@@ -215,8 +225,9 @@ async fn command_lifecycle_issue_deliver_acknowledge_complete() {
     assert_eq!(status, 200, "heartbeat ({status}): {hb}");
     let pending = hb["pending_commands"].as_array().expect("array");
     assert!(
-        pending.iter().any(|c| c["id"] == serde_json::json!(command_id)
-            && c["command"] == "trigger_sync"),
+        pending
+            .iter()
+            .any(|c| c["id"] == serde_json::json!(command_id) && c["command"] == "trigger_sync"),
         "trigger_sync delivered: {hb}"
     );
 
@@ -360,7 +371,8 @@ async fn sync_event_create_update_and_read_back() {
         "successful event stamped last_sync_completed_at on the service"
     );
 
-    let (status, events) = crate::common::get_json_with_token(&app, "/api/sync/events", &admin).await;
+    let (status, events) =
+        crate::common::get_json_with_token(&app, "/api/sync/events", &admin).await;
     assert_eq!(status, 200, "list events ({status}): {events}");
     let found = events
         .as_array()
@@ -402,7 +414,9 @@ async fn revoke_service_kills_active_session() {
     assert_eq!(
         count(
             &db,
-            &format!("SELECT count(*) AS c FROM sync_service_tokens WHERE service_id = '{service_id}'"),
+            &format!(
+                "SELECT count(*) AS c FROM sync_service_tokens WHERE service_id = '{service_id}'"
+            ),
         )
         .await,
         0,
@@ -448,7 +462,8 @@ async fn health_state_derived_from_heartbeat_recency() {
     }
 
     let app = crate::common::build_test_app(db.clone());
-    let (status, services) = crate::common::get_json_with_token(&app, "/api/sync/services", &read_token).await;
+    let (status, services) =
+        crate::common::get_json_with_token(&app, "/api/sync/services", &read_token).await;
     assert_eq!(status, 200, "list services ({status}): {services}");
     let arr = services.as_array().expect("array");
     let health_of = |id: uuid::Uuid| -> String {
@@ -464,13 +479,22 @@ async fn health_state_derived_from_heartbeat_recency() {
     assert_eq!(health_of(warning), "warning");
     assert_eq!(health_of(stale), "stale");
 
-    let (status, one) =
-        crate::common::get_json_with_token(&app, &format!("/api/sync/services/{healthy}"), &read_token).await;
+    let (status, one) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/sync/services/{healthy}"),
+        &read_token,
+    )
+    .await;
     assert_eq!(status, 200, "get service ({status}): {one}");
     assert_eq!(one["health"], "healthy");
 
     // The dashboard consumes these by name, so an added or renamed field is a breaking change.
-    let mut keys: Vec<&str> = one.as_object().expect("object").keys().map(String::as_str).collect();
+    let mut keys: Vec<&str> = one
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
     keys.sort_unstable();
     assert_eq!(
         keys,
@@ -542,7 +566,9 @@ async fn pause_persists_across_reenroll() {
     assert_eq!(
         count(
             &db,
-            &format!("SELECT count(*) AS c FROM sync_services WHERE id = '{service_id}' AND paused"),
+            &format!(
+                "SELECT count(*) AS c FROM sync_services WHERE id = '{service_id}' AND paused"
+            ),
         )
         .await,
         1,
@@ -604,18 +630,27 @@ async fn stale_running_sync_events_are_swept() {
         .unwrap_or_else(|e| panic!("insert {label} event: {e}"));
     }
 
-    let closed = river_db::routes::private::reprocessing_jobs::jobs::sweep_stale_sync_events(&db, 3600)
-        .await
-        .expect("sweep");
+    let closed =
+        river_db::routes::private::reprocessing_jobs::jobs::sweep_stale_sync_events(&db, 3600)
+            .await
+            .expect("sweep");
     assert_eq!(closed, 1, "only the stale event is closed");
 
     assert_eq!(
-        count(&db, "SELECT count(*) AS c FROM sync_events WHERE status = 'failed'").await,
+        count(
+            &db,
+            "SELECT count(*) AS c FROM sync_events WHERE status = 'failed'"
+        )
+        .await,
         1,
         "stale event failed"
     );
     assert_eq!(
-        count(&db, "SELECT count(*) AS c FROM sync_events WHERE status = 'running'").await,
+        count(
+            &db,
+            "SELECT count(*) AS c FROM sync_events WHERE status = 'running'"
+        )
+        .await,
         1,
         "fresh event untouched"
     );
@@ -667,7 +702,9 @@ async fn heartbeat_reuses_the_cached_session_token() {
     assert_eq!(
         count(
             &db,
-            &format!("SELECT COUNT(*) AS c FROM sync_service_tokens WHERE service_id = '{service_id}'")
+            &format!(
+                "SELECT COUNT(*) AS c FROM sync_service_tokens WHERE service_id = '{service_id}'"
+            )
         )
         .await,
         1,
@@ -726,7 +763,10 @@ async fn poll_count(db: &DatabaseConnection, sql: &str, expected: i64, what: &st
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    panic!("{what}: still {} after 10s, expected {expected}", count(db, sql).await);
+    panic!(
+        "{what}: still {} after 10s, expected {expected}",
+        count(db, sql).await
+    );
 }
 
 #[tokio::test]
@@ -854,7 +894,9 @@ async fn pending_commands_past_expiry_are_hidden_then_marked_expired() {
 
     poll_count(
         &db,
-        &format!("SELECT COUNT(*) AS c FROM sync_commands WHERE id = '{expired}' AND status = 'expired'"),
+        &format!(
+            "SELECT COUNT(*) AS c FROM sync_commands WHERE id = '{expired}' AND status = 'expired'"
+        ),
         1,
         "the expired command's status",
     )

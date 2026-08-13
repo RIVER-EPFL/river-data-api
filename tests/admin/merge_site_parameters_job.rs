@@ -23,10 +23,16 @@ pub async fn wait_terminal(db: &sea_orm::DatabaseConnection, job_id: &str) -> St
             .unwrap()
             .unwrap();
         let status: String = row.try_get("", "status").unwrap();
-        if !matches!(status.as_str(), "queued" | "pending" | "running" | "retrying") {
+        if !matches!(
+            status.as_str(),
+            "queued" | "pending" | "running" | "retrying"
+        ) {
             return status;
         }
-        assert!(start.elapsed() < Duration::from_secs(15), "merge job did not settle");
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "merge job did not settle"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -63,7 +69,10 @@ async fn merge_site_parameters_runs_as_job_and_deletes_source() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "merge should be 2xx, got {status}: {text}");
+    assert!(
+        (200..300).contains(&status),
+        "merge should be 2xx, got {status}: {text}"
+    );
 
     let job_id = serde_json::from_str::<serde_json::Value>(&text).unwrap()["job_id"]
         .as_str()

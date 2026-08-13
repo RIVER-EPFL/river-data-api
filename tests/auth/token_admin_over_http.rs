@@ -86,24 +86,53 @@ async fn create_use_rotate_and_revoke_a_key_over_http() {
 
     let (status, body) =
         crate::common::post_json_with_token(&app, "/api/tokens", &payload, &manager).await;
-    assert_eq!(status, 403, "minting a key is Administrator-only, a manager is refused: {body}");
+    assert_eq!(
+        status, 403,
+        "minting a key is Administrator-only, a manager is refused: {body}"
+    );
 
     let (status, created) =
         crate::common::post_json_parse_with_token(&app, "/api/tokens", &payload, &admin).await;
-    assert_eq!(status, 201, "an administrator mints a key over HTTP: {created}");
+    assert_eq!(
+        status, 201,
+        "an administrator mints a key over HTTP: {created}"
+    );
 
-    let token_id = created["id"].as_str().expect("created token id").to_string();
-    token_id.parse::<uuid::Uuid>().unwrap_or_else(|e| panic!("token id is a uuid: {e}"));
+    let token_id = created["id"]
+        .as_str()
+        .expect("created token id")
+        .to_string();
+    token_id
+        .parse::<uuid::Uuid>()
+        .unwrap_or_else(|e| panic!("token id is a uuid: {e}"));
     let secret = created["token"]
         .as_str()
         .unwrap_or_else(|| panic!("the raw secret is returned exactly once, on create: {created}"))
         .to_string();
-    assert!(secret.starts_with("rvd_"), "minted secret carries the rvd_ prefix: {secret}");
-    assert!(!lookup_prefix(&secret).is_empty(), "minted secret has a lookup prefix: {secret}");
-    assert!(!secret_half(&secret).is_empty(), "minted secret has a secret half: {secret}");
-    assert_eq!(created["is_active"], true, "a fresh key is active: {created}");
-    assert_eq!(created["name"], "logger-key", "create echoes the name: {created}");
-    assert_eq!(created["project_scope"], PROJECT_ID, "create stores the project scope: {created}");
+    assert!(
+        secret.starts_with("rvd_"),
+        "minted secret carries the rvd_ prefix: {secret}"
+    );
+    assert!(
+        !lookup_prefix(&secret).is_empty(),
+        "minted secret has a lookup prefix: {secret}"
+    );
+    assert!(
+        !secret_half(&secret).is_empty(),
+        "minted secret has a secret half: {secret}"
+    );
+    assert_eq!(
+        created["is_active"], true,
+        "a fresh key is active: {created}"
+    );
+    assert_eq!(
+        created["name"], "logger-key",
+        "create echoes the name: {created}"
+    );
+    assert_eq!(
+        created["project_scope"], PROJECT_ID,
+        "create stores the project scope: {created}"
+    );
     assert_eq!(
         created["permissions"]["write_data"], true,
         "the permissions object round-trips: {created}"
@@ -114,7 +143,10 @@ async fn create_use_rotate_and_revoke_a_key_over_http() {
     );
 
     let (status, body) = crate::common::get_with_token(&app, "/api/sites", &secret).await;
-    assert_eq!(status, 200, "the secret the create response returned authenticates: {body}");
+    assert_eq!(
+        status, 200,
+        "the secret the create response returned authenticates: {body}"
+    );
 
     let batch = serde_json::json!({
         "readings": [{
@@ -126,7 +158,10 @@ async fn create_use_rotate_and_revoke_a_key_over_http() {
     });
     let (status, body) =
         crate::common::post_json_with_token(&app, "/api/readings/batch", &batch, &secret).await;
-    assert_eq!(status, 200, "the write_data bit sent on create is granted: {body}");
+    assert_eq!(
+        status, 200,
+        "the write_data bit sent on create is granted: {body}"
+    );
 
     // Scope is checked ahead of capability, and this slot is inside the key's own project (the
     // identical create succeeds for a scoped key that carries write_metadata,
@@ -137,7 +172,10 @@ async fn create_use_rotate_and_revoke_a_key_over_http() {
     let (status, body) =
         crate::common::post_json_with_token(&app, "/api/site_parameters", &site_parameter, &secret)
             .await;
-    assert_eq!(status, 403, "the withheld write_metadata bit is enforced: {body}");
+    assert_eq!(
+        status, 403,
+        "the withheld write_metadata bit is enforced: {body}"
+    );
 
     let (status, list) = crate::common::get_json_with_token(&app, "/api/tokens", &admin).await;
     assert_eq!(status, 200, "an administrator lists the keys: {list}");
@@ -147,7 +185,10 @@ async fn create_use_rotate_and_revoke_a_key_over_http() {
         .iter()
         .find(|t| t["id"].as_str() == Some(token_id.as_str()))
         .cloned();
-    assert!(listed.is_some(), "the minted key appears in the list: {list}");
+    assert!(
+        listed.is_some(),
+        "the minted key appears in the list: {list}"
+    );
     let listed = listed.expect("listed token");
     // The list model carries the `token` key with a null value rather than omitting it (the
     // model's `skip_serializing_if` does not survive CrudCrate's list-model codegen); either
@@ -156,7 +197,10 @@ async fn create_use_rotate_and_revoke_a_key_over_http() {
         listed.get("token").is_none_or(serde_json::Value::is_null),
         "the list never re-emits a secret: {listed}"
     );
-    assert!(listed.get("token_hash").is_none(), "the list never emits the hash: {listed}");
+    assert!(
+        listed.get("token_hash").is_none(),
+        "the list never emits the hash: {listed}"
+    );
     assert_eq!(
         listed["token_prefix"],
         lookup_prefix(&secret),
@@ -169,12 +213,21 @@ async fn create_use_rotate_and_revoke_a_key_over_http() {
 
     let (status, body) =
         crate::common::post_json_with_token(&app, &rotate_path, &no_body, &manager).await;
-    assert_eq!(status, 403, "rotation is Administrator-only, a manager is refused: {body}");
+    assert_eq!(
+        status, 403,
+        "rotation is Administrator-only, a manager is refused: {body}"
+    );
     let (status, body) =
         crate::common::post_json_with_token(&app, &revoke_path, &no_body, &manager).await;
-    assert_eq!(status, 403, "revocation is Administrator-only, a manager is refused: {body}");
+    assert_eq!(
+        status, 403,
+        "revocation is Administrator-only, a manager is refused: {body}"
+    );
     let (status, body) = crate::common::get_with_token(&app, "/api/sites", &secret).await;
-    assert_eq!(status, 200, "a refused rotate/revoke changed nothing about the key: {body}");
+    assert_eq!(
+        status, 200,
+        "a refused rotate/revoke changed nothing about the key: {body}"
+    );
 
     let (status, rotated) =
         crate::common::post_json_parse_with_token(&app, &rotate_path, &no_body, &admin).await;
@@ -183,41 +236,65 @@ async fn create_use_rotate_and_revoke_a_key_over_http() {
         .as_str()
         .unwrap_or_else(|| panic!("rotation returns the new secret once: {rotated}"))
         .to_string();
-    assert!(new_secret.starts_with("rvd_"), "rotated secret carries the prefix: {new_secret}");
+    assert!(
+        new_secret.starts_with("rvd_"),
+        "rotated secret carries the prefix: {new_secret}"
+    );
     assert_ne!(new_secret, secret, "rotation mints a different secret");
-    assert_eq!(rotated["id"].as_str(), Some(token_id.as_str()), "rotation keeps the id: {rotated}");
-    assert_eq!(rotated["name"], "logger-key", "rotation preserves the name: {rotated}");
+    assert_eq!(
+        rotated["id"].as_str(),
+        Some(token_id.as_str()),
+        "rotation keeps the id: {rotated}"
+    );
+    assert_eq!(
+        rotated["name"], "logger-key",
+        "rotation preserves the name: {rotated}"
+    );
     assert_eq!(
         rotated["project_scope"], PROJECT_ID,
         "rotation preserves the project scope: {rotated}"
     );
-    assert_eq!(rotated["is_active"], true, "rotating an active key leaves it active: {rotated}");
+    assert_eq!(
+        rotated["is_active"], true,
+        "rotating an active key leaves it active: {rotated}"
+    );
 
     let (status, body) = crate::common::get_with_token(&app, "/api/sites", &secret).await;
-    assert_eq!(status, 401, "the previous secret stops working immediately: {body}");
+    assert_eq!(
+        status, 401,
+        "the previous secret stops working immediately: {body}"
+    );
     let (status, body) = crate::common::get_with_token(&app, "/api/sites", &new_secret).await;
     assert_eq!(status, 200, "the rotated secret authenticates: {body}");
 
     let (status, revoked) =
         crate::common::post_json_parse_with_token(&app, &revoke_path, &no_body, &admin).await;
     assert_eq!(status, 200, "an administrator revokes the key: {revoked}");
-    assert_eq!(revoked["is_active"], false, "revocation deactivates the key: {revoked}");
+    assert_eq!(
+        revoked["is_active"], false,
+        "revocation deactivates the key: {revoked}"
+    );
     assert!(
         revoked.get("token").is_none_or(serde_json::Value::is_null),
         "revocation neither mints nor echoes a secret: {revoked}"
     );
 
     let (status, body) = crate::common::get_with_token(&app, "/api/sites", &new_secret).await;
-    assert_eq!(status, 401, "a revoked key fails on the very next request: {body}");
+    assert_eq!(
+        status, 401,
+        "a revoked key fails on the very next request: {body}"
+    );
 
-    let (status, fetched) = crate::common::get_json_with_token(
-        &app,
-        &format!("/api/tokens/{token_id}"),
-        &admin,
-    )
-    .await;
-    assert_eq!(status, 200, "the revoked key is still readable by an administrator: {fetched}");
-    assert_eq!(fetched["is_active"], false, "revocation is persisted: {fetched}");
+    let (status, fetched) =
+        crate::common::get_json_with_token(&app, &format!("/api/tokens/{token_id}"), &admin).await;
+    assert_eq!(
+        status, 200,
+        "the revoked key is still readable by an administrator: {fetched}"
+    );
+    assert_eq!(
+        fetched["is_active"], false,
+        "revocation is persisted: {fetched}"
+    );
     assert_eq!(
         fetched["token_prefix"],
         lookup_prefix(&new_secret),
@@ -231,7 +308,10 @@ async fn create_use_rotate_and_revoke_a_key_over_http() {
         &admin,
     )
     .await;
-    assert_eq!(status, 404, "revoke resolves the id rather than ignoring it: {body}");
+    assert_eq!(
+        status, 404,
+        "revoke resolves the id rather than ignoring it: {body}"
+    );
     let (status, body) = crate::common::post_json_with_token(
         &app,
         &format!("/api/tokens/{UNKNOWN_TOKEN_ID}/rotate"),
@@ -239,7 +319,10 @@ async fn create_use_rotate_and_revoke_a_key_over_http() {
         &admin,
     )
     .await;
-    assert_eq!(status, 404, "rotate resolves the id rather than ignoring it: {body}");
+    assert_eq!(
+        status, 404,
+        "rotate resolves the id rather than ignoring it: {body}"
+    );
 }
 
 #[tokio::test]
@@ -274,7 +357,10 @@ async fn usage_view_and_audit_status_codes_over_http() {
     .await;
     assert_eq!(status, 201, "mint the key whose use is audited: {used}");
     let used_id = used["id"].as_str().expect("used token id").to_string();
-    let used_secret = used["token"].as_str().expect("used token secret").to_string();
+    let used_secret = used["token"]
+        .as_str()
+        .expect("used token secret")
+        .to_string();
 
     let (status, idle) = crate::common::post_json_parse_with_token(
         &kc_app,
@@ -289,7 +375,8 @@ async fn usage_view_and_audit_status_codes_over_http() {
     // The only two requests this key ever makes, one hit and one miss, so the usage view's
     // contents are exactly known. Every later call in this test uses the admin JWT, which is not
     // audited (auditing records API-token use only).
-    let (status, body) = crate::common::get_with_token(&audit_app, "/api/sites", &used_secret).await;
+    let (status, body) =
+        crate::common::get_with_token(&audit_app, "/api/sites", &used_secret).await;
     assert_eq!(status, 200, "the audited key reads sites: {body}");
     let missing_sensor = format!("/api/sensors/{UNKNOWN_SENSOR_ID}/readings");
     let (status, body) =
@@ -300,7 +387,10 @@ async fn usage_view_and_audit_status_codes_over_http() {
     let mut usage = serde_json::Value::Null;
     for _ in 0..40 {
         let (status, body) = crate::common::get_json_with_token(&kc_app, &usage_path, &admin).await;
-        assert_eq!(status, 200, "the usage view answers an administrator: {body}");
+        assert_eq!(
+            status, 200,
+            "the usage view answers an administrator: {body}"
+        );
         let settled = body.as_array().is_some_and(|entries| entries.len() >= 2);
         usage = body;
         if settled {
@@ -335,9 +425,17 @@ async fn usage_view_and_audit_status_codes_over_http() {
 
     let sensor_entries: Vec<&serde_json::Value> = entries
         .iter()
-        .filter(|e| e["path"].as_str().is_some_and(|p| p.starts_with("/sensors/")))
+        .filter(|e| {
+            e["path"]
+                .as_str()
+                .is_some_and(|p| p.starts_with("/sensors/"))
+        })
         .collect();
-    assert_eq!(sensor_entries.len(), 1, "the failed sensor read is recorded once: {usage}");
+    assert_eq!(
+        sensor_entries.len(),
+        1,
+        "the failed sensor read is recorded once: {usage}"
+    );
     assert_eq!(
         sensor_entries[0]["status_code"].as_i64(),
         Some(404),
@@ -357,7 +455,10 @@ async fn usage_view_and_audit_status_codes_over_http() {
         &admin,
     )
     .await;
-    assert_eq!(status, 200, "the usage view answers for an unused key: {idle_usage}");
+    assert_eq!(
+        status, 200,
+        "the usage view answers for an unused key: {idle_usage}"
+    );
     assert_eq!(
         idle_usage.as_array().map(Vec::len),
         Some(0),
@@ -367,28 +468,47 @@ async fn usage_view_and_audit_status_codes_over_http() {
     let (status, body) = crate::common::get_with_token(&kc_app, &usage_path, &manager).await;
     assert_eq!(status, 403, "the usage view is Administrator-only: {body}");
     let (status, body) = crate::common::get(&kc_app, &usage_path).await;
-    assert_eq!(status, 401, "the usage view refuses an anonymous caller: {body}");
+    assert_eq!(
+        status, 401,
+        "the usage view refuses an anonymous caller: {body}"
+    );
 
     let codes_path = "/api/api_token_audit_logs/distinct/status_codes";
-    let (status, codes_body) = crate::common::get_json_with_token(&kc_app, codes_path, &admin).await;
-    assert_eq!(status, 200, "the audit filter's option list answers: {codes_body}");
+    let (status, codes_body) =
+        crate::common::get_json_with_token(&kc_app, codes_path, &admin).await;
+    assert_eq!(
+        status, 200,
+        "the audit filter's option list answers: {codes_body}"
+    );
     let codes: Vec<i64> = codes_body["status_codes"]
         .as_array()
         .unwrap_or_else(|| panic!("status_codes is an array: {codes_body}"))
         .iter()
-        .map(|c| c.as_i64().unwrap_or_else(|| panic!("status code is an integer: {codes_body}")))
+        .map(|c| {
+            c.as_i64()
+                .unwrap_or_else(|| panic!("status code is an integer: {codes_body}"))
+        })
         .collect();
     // `api_token_audit_log` is never truncated between tests (tests/common/db.rs), so this is a
     // global aggregate and only containment of the two codes this test produced can be asserted.
-    assert!(codes.contains(&200), "the 200 this test recorded is offered as a filter: {codes:?}");
-    assert!(codes.contains(&404), "the 404 this test recorded is offered as a filter: {codes:?}");
+    assert!(
+        codes.contains(&200),
+        "the 200 this test recorded is offered as a filter: {codes:?}"
+    );
+    assert!(
+        codes.contains(&404),
+        "the 404 this test recorded is offered as a filter: {codes:?}"
+    );
     assert!(
         codes.windows(2).all(|w| w[0] < w[1]),
         "the documented contract is distinct codes, ascending: {codes:?}"
     );
 
     let (status, body) = crate::common::get_with_token(&kc_app, codes_path, &manager).await;
-    assert_eq!(status, 403, "the audit filter list is Administrator-only: {body}");
+    assert_eq!(
+        status, 403,
+        "the audit filter list is Administrator-only: {body}"
+    );
 }
 
 #[tokio::test]
@@ -405,7 +525,10 @@ async fn roles_endpoint_lists_only_river_access_levels() {
     let manager = kc::get_keycloak_jwt("manager1", "manager1").await;
 
     let (status, body) = crate::common::get_json_with_token(&app, "/api/roles", &admin).await;
-    assert_eq!(status, 200, "an administrator reads the role picker's options: {body}");
+    assert_eq!(
+        status, 200,
+        "an administrator reads the role picker's options: {body}"
+    );
     let roles = body
         .as_array()
         .unwrap_or_else(|| panic!("the roles response is an array: {body}"));
@@ -433,13 +556,22 @@ async fn roles_endpoint_lists_only_river_access_levels() {
     }
     // Both of these are held by the two users this test authenticates as, so both exist in the
     // realm and an empty or over-filtered response fails here.
-    assert!(names.contains(&"riverdata-admin".to_string()), "roles: {names:?}");
-    assert!(names.contains(&"riverdata-manager".to_string()), "roles: {names:?}");
+    assert!(
+        names.contains(&"riverdata-admin".to_string()),
+        "roles: {names:?}"
+    );
+    assert!(
+        names.contains(&"riverdata-manager".to_string()),
+        "roles: {names:?}"
+    );
 
     let (status, body) = crate::common::get_with_token(&app, "/api/roles", &manager).await;
     assert_eq!(status, 403, "the role list is Administrator-only: {body}");
     let (status, body) = crate::common::get(&app, "/api/roles").await;
-    assert_eq!(status, 401, "an anonymous caller is unauthenticated, not merely forbidden: {body}");
+    assert_eq!(
+        status, 401,
+        "an anonymous caller is unauthenticated, not merely forbidden: {body}"
+    );
 }
 
 #[tokio::test]
@@ -452,16 +584,28 @@ async fn readiness_probe_version_and_keycloak_config_surface() {
     let app = crate::common::build_test_app(db.clone());
 
     let (status, body) = crate::common::get(&app, "/readyz").await;
-    assert_eq!(status, 200, "the readiness probe reports a reachable database: {body}");
+    assert_eq!(
+        status, 200,
+        "the readiness probe reports a reachable database: {body}"
+    );
 
     let (status, body) = crate::common::get(&app, "/api/version").await;
-    assert_eq!(status, 401, "build metadata is not served anonymously: {body}");
+    assert_eq!(
+        status, 401,
+        "build metadata is not served anonymously: {body}"
+    );
 
     let read_metadata = crate::common::seed_token_read_metadata_only(&db).await;
     let (status, version) =
         crate::common::get_json_with_token(&app, "/api/version", &read_metadata).await;
-    assert_eq!(status, 200, "read_metadata reaches the version endpoint: {version}");
-    assert_eq!(version["name"], "river-db", "the reported name is the crate's: {version}");
+    assert_eq!(
+        status, 200,
+        "read_metadata reaches the version endpoint: {version}"
+    );
+    assert_eq!(
+        version["name"], "river-db",
+        "the reported name is the crate's: {version}"
+    );
     assert_eq!(
         version["version"],
         env!("CARGO_PKG_VERSION"),
@@ -482,7 +626,10 @@ async fn readiness_probe_version_and_keycloak_config_surface() {
 
     let read_data = crate::common::seed_token_read_data_only(&db).await;
     let (status, body) = crate::common::get_with_token(&app, "/api/version", &read_data).await;
-    assert_eq!(status, 403, "a key without read_metadata is refused the version: {body}");
+    assert_eq!(
+        status, 403,
+        "a key without read_metadata is refused the version: {body}"
+    );
 
     let (status, body) = crate::common::get(&app, "/api/config/keycloak").await;
     assert_eq!(

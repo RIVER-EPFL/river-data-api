@@ -3,7 +3,6 @@
 //! Run with: cargo test --test projects
 //! Requires: DATABASE_URL pointing to a TimescaleDB instance.
 
-
 use serial_test::serial;
 
 // ============================================================================

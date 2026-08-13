@@ -18,11 +18,17 @@ use super::authz::RoleResolution;
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
 
 pub async fn periodic(state: AppState, interval: Duration) {
-    tracing::info!(interval_secs = interval.as_secs(), "Identity reconciliation: starting");
+    tracing::info!(
+        interval_secs = interval.as_secs(),
+        "Identity reconciliation: starting"
+    );
     loop {
         match sweep(&state).await {
             Ok(0) => {}
-            Ok(n) => tracing::warn!(count = n, "Identity reconciliation: deactivated revoked links"),
+            Ok(n) => tracing::warn!(
+                count = n,
+                "Identity reconciliation: deactivated revoked links"
+            ),
             Err(e) => tracing::warn!(error = %e, "Identity reconciliation: sweep failed"),
         }
         tokio::time::sleep(interval).await;

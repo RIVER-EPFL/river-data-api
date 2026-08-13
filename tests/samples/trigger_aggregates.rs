@@ -3,7 +3,6 @@
 //! Run with: cargo test --test samples
 //! Requires: DATABASE_URL pointing to a TimescaleDB instance.
 
-
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 use uuid::Uuid;
@@ -49,11 +48,7 @@ async fn exec(db: &DatabaseConnection, sql: &str) {
 
 /// Ensure a "grab_sample" data stream exists and return its id for a
 /// (site, parameter) pair. Mirrors the helper used by the grab_samples handler.
-async fn ensure_stream(
-    db: &DatabaseConnection,
-    site_id: &str,
-    parameter_id: &str,
-) -> Uuid {
+async fn ensure_stream(db: &DatabaseConnection, site_id: &str, parameter_id: &str) -> Uuid {
     let source_key = format!("{site_id}:{parameter_id}");
     let stream_id = Uuid::new_v4();
     exec(
@@ -144,9 +139,19 @@ async fn samples_trigger_populates_aggregate_on_insert() {
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
 
-    let stream_id = ensure_stream(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID).await;
-    let sample_id =
-        create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID, "test-happy").await;
+    let stream_id = ensure_stream(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+    )
+    .await;
+    let sample_id = create_sample(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        "test-happy",
+    )
+    .await;
 
     let values = [10.0_f64, 12.0, 14.0];
     for (i, v) in values.iter().enumerate() {
@@ -178,9 +183,19 @@ async fn samples_trigger_recomputes_on_flag() {
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
 
-    let stream_id = ensure_stream(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID).await;
-    let sample_id =
-        create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID, "test-flag").await;
+    let stream_id = ensure_stream(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+    )
+    .await;
+    let sample_id = create_sample(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        "test-flag",
+    )
+    .await;
 
     for (i, v) in [10.0_f64, 12.0, 14.0].iter().enumerate() {
         insert_replicate(
@@ -217,9 +232,19 @@ async fn samples_trigger_deletes_unreferenced_sample() {
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
 
-    let stream_id = ensure_stream(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID).await;
-    let sample_id =
-        create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID, "test-empty").await;
+    let stream_id = ensure_stream(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+    )
+    .await;
+    let sample_id = create_sample(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        "test-empty",
+    )
+    .await;
 
     insert_replicate(
         &db,
@@ -262,9 +287,19 @@ async fn samples_trigger_keeps_row_when_only_flagged_readings_remain() {
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
 
-    let stream_id = ensure_stream(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID).await;
-    let sample_id =
-        create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID, "test-flagged-only").await;
+    let stream_id = ensure_stream(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+    )
+    .await;
+    let sample_id = create_sample(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        "test-flagged-only",
+    )
+    .await;
 
     insert_replicate(
         &db,
@@ -299,9 +334,19 @@ async fn samples_trigger_handles_reassignment() {
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
 
-    let stream_id = ensure_stream(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID).await;
-    let sample_a =
-        create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID, "a").await;
+    let stream_id = ensure_stream(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+    )
+    .await;
+    let sample_a = create_sample(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        "a",
+    )
+    .await;
     // Create sample B at a different timestamp so its readings don't collide
     // with sample A's (stream_id, time, replicate_index) PK.
     let sample_b_id = Uuid::new_v4();
@@ -382,9 +427,19 @@ async fn samples_delete_sets_reading_sample_id_null() {
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
 
-    let stream_id = ensure_stream(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID).await;
-    let sample_id =
-        create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID, "del").await;
+    let stream_id = ensure_stream(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+    )
+    .await;
+    let sample_id = create_sample(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        "del",
+    )
+    .await;
 
     insert_replicate(
         &db,
@@ -397,7 +452,11 @@ async fn samples_delete_sets_reading_sample_id_null() {
     )
     .await;
 
-    exec(&db, &format!("DELETE FROM samples WHERE id = '{sample_id}'")).await;
+    exec(
+        &db,
+        &format!("DELETE FROM samples WHERE id = '{sample_id}'"),
+    )
+    .await;
 
     // The reading should still exist, with sample_id = NULL.
     let row = db
@@ -415,7 +474,10 @@ async fn samples_delete_sets_reading_sample_id_null() {
         .expect("reading persists");
 
     let sample_id_opt: Option<String> = row.try_get("", "sample_id").unwrap();
-    assert!(sample_id_opt.is_none(), "sample_id should be NULL after parent delete");
+    assert!(
+        sample_id_opt.is_none(),
+        "sample_id should be NULL after parent delete"
+    );
     let raw_value: f64 = row.try_get("", "raw_value").unwrap();
     assert!((raw_value - 7.0).abs() < 1e-9);
 }

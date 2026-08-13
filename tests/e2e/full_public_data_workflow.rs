@@ -7,7 +7,6 @@
 //!
 //! Run with: cargo test --test e2e
 
-
 use serial_test::serial;
 use std::time::{Duration, Instant};
 
@@ -47,7 +46,11 @@ fn parsed_csv() -> Vec<(String, f64, f64)> {
         .filter(|l| !l.is_empty())
         .map(|l| {
             let c: Vec<&str> = l.split(',').collect();
-            (c[0].to_string(), c[1].parse().unwrap(), c[2].parse().unwrap())
+            (
+                c[0].to_string(),
+                c[1].parse().unwrap(),
+                c[2].parse().unwrap(),
+            )
         })
         .collect()
 }
@@ -76,15 +79,22 @@ fn values_for(resp: &serde_json::Value, code: &str) -> Vec<f64> {
 }
 
 fn id_of(json: &serde_json::Value) -> String {
-    json["id"].as_str().expect("created entity must have id").to_string()
+    json["id"]
+        .as_str()
+        .expect("created entity must have id")
+        .to_string()
 }
 
 /// Poll a reprocessing job until it completes (or fails / times out).
 async fn poll_job(app: &axum::Router, token: &str, job_id: &str, max_secs: u64) {
     let deadline = Instant::now() + Duration::from_secs(max_secs);
     loop {
-        let (_s, job) =
-            crate::common::get_json_with_token(app, &format!("/api/reprocessing_jobs/{job_id}"), token).await;
+        let (_s, job) = crate::common::get_json_with_token(
+            app,
+            &format!("/api/reprocessing_jobs/{job_id}"),
+            token,
+        )
+        .await;
         let status = job["status"].as_str().unwrap_or("");
         if status == "completed" || status == "failed" || Instant::now() >= deadline {
             return;
@@ -115,7 +125,10 @@ async fn test_full_public_data_workflow() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "create project ({status}): {project}");
+    assert!(
+        (200..300).contains(&status),
+        "create project ({status}): {project}"
+    );
     let project_id = id_of(&project);
 
     // 2. Site.
@@ -132,7 +145,10 @@ async fn test_full_public_data_workflow() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "create site ({status}): {site}");
+    assert!(
+        (200..300).contains(&status),
+        "create site ({status}): {site}"
+    );
     let site_id = id_of(&site);
 
     // 3. Raw parameters (global catalog).
@@ -171,7 +187,10 @@ async fn test_full_public_data_workflow() {
             &token,
         )
         .await;
-        assert!((200..300).contains(&status), "assign {name} ({status}): {sp}");
+        assert!(
+            (200..300).contains(&status),
+            "assign {name} ({status}): {sp}"
+        );
     }
 
     // 5. Sensor + identity calibration (part of station setup).
@@ -196,7 +215,10 @@ async fn test_full_public_data_workflow() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "create calibration ({status}): {cal}");
+    assert!(
+        (200..300).contains(&status),
+        "create calibration ({status}): {cal}"
+    );
 
     // 6. Derived parameter DOmgL = dissolved_oxygen * 0.032 (after-create hook makes the output param).
     let (status, def) = crate::common::post_json_parse_with_token(
@@ -209,7 +231,10 @@ async fn test_full_public_data_workflow() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "create derived ({status}): {def}");
+    assert!(
+        (200..300).contains(&status),
+        "create derived ({status}): {def}"
+    );
     let derived_def_id = id_of(&def);
     let derived_param_id = def["output_parameter_id"].as_str().unwrap().to_string();
 
@@ -225,16 +250,17 @@ async fn test_full_public_data_workflow() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "assign derived ({status}): {sp}");
+    assert!(
+        (200..300).contains(&status),
+        "assign derived ({status}): {sp}"
+    );
 
     // 8. Mark the site_parameters as public.
     {
         use sea_orm::{ConnectionTrait, Statement};
         db.execute(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "UPDATE site_parameters SET is_public = true WHERE site_id = '{site_id}'"
-            ),
+            format!("UPDATE site_parameters SET is_public = true WHERE site_id = '{site_id}'"),
         ))
         .await
         .expect("mark site_parameters public");
@@ -258,19 +284,32 @@ async fn test_full_public_data_workflow() {
         rows.len()
     );
     // Derived recompute + aggregate refresh run as a background reprocessing job; wait for it.
-    let job_id = imp["derived_job_id"].as_str().expect("expected a derived job id");
+    let job_id = imp["derived_job_id"]
+        .as_str()
+        .expect("expected a derived job id");
     poll_job(&app, &token, job_id, 30).await;
 
     // 10. Public discovery + sites list reflect the new project/site.
     let (status, discovery) = crate::common::get_json(&app, "/api/public").await;
     assert_eq!(status, 200);
     assert!(
-        discovery.as_array().unwrap().iter().any(|p| p["code"] == "e2e_river"),
+        discovery
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["code"] == "e2e_river"),
         "discovery should list e2e_river: {discovery}"
     );
     let (status, sites) = crate::common::get_json(&app, "/api/public/e2e_river/sites").await;
     assert_eq!(status, 200);
-    assert!(sites.as_array().unwrap().iter().any(|s| s["code"] == "e2e_station"), "sites: {sites}");
+    assert!(
+        sites
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["code"] == "e2e_station"),
+        "sites: {sites}"
+    );
 
     // 11. Public readings reproduce the real raw data exactly AND the recomputed derived value.
     // Public parameters are keyed by their short `code`: "dissolved_oxygen", "temperature", "DOmgL".
@@ -285,28 +324,53 @@ async fn test_full_public_data_workflow() {
     let got_doum = values_for(&readings, "dissolved_oxygen");
     let got_temp = values_for(&readings, "temperature");
     let got_domgl = values_for(&readings, "DOmgL");
-    assert_eq!(got_doum.len(), rows.len(), "expected {} readings, got {}", rows.len(), got_doum.len());
+    assert_eq!(
+        got_doum.len(),
+        rows.len(),
+        "expected {} readings, got {}",
+        rows.len(),
+        got_doum.len()
+    );
     for (i, (_, doum, temp)) in rows.iter().enumerate() {
-        assert!((got_doum[i] - doum).abs() < 1e-6, "dissolved_oxygen[{i}]: {} != {doum}", got_doum[i]);
-        assert!((got_temp[i] - temp).abs() < 1e-6, "temperature[{i}]: {} != {temp}", got_temp[i]);
-        assert!((got_domgl[i] - doum * 0.032).abs() < 1e-6, "DOmgL[{i}]: {} != {doum}*0.032", got_domgl[i]);
+        assert!(
+            (got_doum[i] - doum).abs() < 1e-6,
+            "dissolved_oxygen[{i}]: {} != {doum}",
+            got_doum[i]
+        );
+        assert!(
+            (got_temp[i] - temp).abs() < 1e-6,
+            "temperature[{i}]: {} != {temp}",
+            got_temp[i]
+        );
+        assert!(
+            (got_domgl[i] - doum * 0.032).abs() < 1e-6,
+            "DOmgL[{i}]: {} != {doum}*0.032",
+            got_domgl[i]
+        );
     }
 
     // 12. Hourly aggregate over the first hour equals the mean of that hour's real readings.
-    let hour0: Vec<f64> = rows.iter().filter(|(dt, _, _)| &dt[11..13] == "00").map(|(_, d, _)| *d).collect();
+    let hour0: Vec<f64> = rows
+        .iter()
+        .filter(|(dt, _, _)| &dt[11..13] == "00")
+        .map(|(_, d, _)| *d)
+        .collect();
     let expected_mean = hour0.iter().sum::<f64>() / hour0.len() as f64;
-    let agg_uri =
-        "/api/public/e2e_river/sites/e2e_station/aggregates/hourly?start=2026-03-01T00:00:00Z&end=2026-03-01T00:59:00Z";
+    let agg_uri = "/api/public/e2e_river/sites/e2e_station/aggregates/hourly?start=2026-03-01T00:00:00Z&end=2026-03-01T00:59:00Z";
     let (status, agg) = crate::common::get_json(&app, &agg_uri).await;
     assert_eq!(status, 200, "public aggregates ({status}): {agg}");
     let do_avg = field_for(&agg, "dissolved_oxygen", "avg");
     assert!(
-        do_avg.first().is_some_and(|v| (v - expected_mean).abs() < 1e-6),
+        do_avg
+            .first()
+            .is_some_and(|v| (v - expected_mean).abs() < 1e-6),
         "hourly dissolved_oxygen mean should be {expected_mean}, got {do_avg:?}"
     );
     let domgl_avg = field_for(&agg, "DOmgL", "avg");
     assert!(
-        domgl_avg.first().is_some_and(|v| (v - expected_mean * 0.032).abs() < 1e-6),
+        domgl_avg
+            .first()
+            .is_some_and(|v| (v - expected_mean * 0.032).abs() < 1e-6),
         "hourly DOmgL mean should be {} (mean * 0.032), got {domgl_avg:?}",
         expected_mean * 0.032
     );

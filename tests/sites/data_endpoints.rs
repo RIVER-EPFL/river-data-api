@@ -3,7 +3,6 @@
 //! Run with: cargo test --test sites
 //! Requires: DATABASE_URL pointing to a TimescaleDB instance.
 
-
 use serial_test::serial;
 
 // ============================================================================
@@ -176,7 +175,9 @@ async fn test_readings_with_explicit_time_range() {
     // Provide explicit time range covering the seed data (default 7-day lookback would miss 2025-01-15)
     let (status, body) = crate::common::get_json_with_token(
         &app,
-        &format!("/api/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"),
+        &format!(
+            "/api/sites/{site_id}/readings?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"
+        ),
         &token,
     )
     .await;
@@ -476,9 +477,7 @@ async fn test_alarms_basic() {
 
     let (status, body) = crate::common::get_json_with_token(
         &app,
-        &format!(
-            "/api/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"
-        ),
+        &format!("/api/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"),
         &token,
     )
     .await;

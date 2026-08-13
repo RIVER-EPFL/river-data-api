@@ -14,12 +14,15 @@ fn events() -> river_db::common::EventSender {
 }
 
 async fn scalar_string(db: &DatabaseConnection, sql: &str) -> String {
-    db.query_one(Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.to_owned()))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get::<String>("", "v")
-        .unwrap()
+    db.query_one(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql.to_owned(),
+    ))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get::<String>("", "v")
+    .unwrap()
 }
 
 #[tokio::test]
@@ -54,8 +57,14 @@ async fn tracked_job_records_category_detail_and_timeline() {
         .unwrap();
     assert_eq!(row.try_get::<String>("", "category").unwrap(), "operator");
     assert_eq!(row.try_get::<String>("", "status").unwrap(), "completed");
-    assert_eq!(row.try_get::<Option<i32>>("", "readings_updated").unwrap(), Some(7));
-    assert_eq!(row.try_get::<Option<Uuid>>("", "site_id").unwrap(), Some(site));
+    assert_eq!(
+        row.try_get::<Option<i32>>("", "readings_updated").unwrap(),
+        Some(7)
+    );
+    assert_eq!(
+        row.try_get::<Option<Uuid>>("", "site_id").unwrap(),
+        Some(site)
+    );
     let detail: serde_json::Value = row.try_get("", "detail").unwrap();
     assert_eq!(detail["counts"]["readings_updated"], serde_json::json!(7));
 
@@ -63,7 +72,8 @@ async fn tracked_job_records_category_detail_and_timeline() {
     let lines = db
         .query_all(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT seq, level, message, context FROM reprocessing_job_logs ORDER BY seq".to_owned(),
+            "SELECT seq, level, message, context FROM reprocessing_job_logs ORDER BY seq"
+                .to_owned(),
         ))
         .await
         .unwrap();
@@ -82,9 +92,16 @@ async fn maintenance_trigger_types_are_categorised_maintenance() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
 
-    run_tracked_job(&db, None, "janitor_run", None, events(), |_ctx| async move { Ok(0) })
-        .await
-        .unwrap();
+    run_tracked_job(
+        &db,
+        None,
+        "janitor_run",
+        None,
+        events(),
+        |_ctx| async move { Ok(0) },
+    )
+    .await
+    .unwrap();
 
     let category = scalar_string(
         &db,

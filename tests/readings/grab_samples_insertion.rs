@@ -1,4 +1,3 @@
-
 use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
 use uuid::Uuid;
@@ -40,7 +39,10 @@ async fn test_insert_triplicate_grab_samples() {
     assert_eq!(status, 200, "insert should succeed: {body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["inserted"], 3);
-    assert_eq!(json["samples_created"], 1, "3 replicates should create 1 sample");
+    assert_eq!(
+        json["samples_created"], 1,
+        "3 replicates should create 1 sample"
+    );
 
     // Verify readings were inserted with correct site_id and parameter_id
     let row = db
@@ -75,10 +77,22 @@ async fn test_insert_triplicate_grab_samples() {
         .unwrap()
         .unwrap();
     let n: i32 = row.try_get("", "n").unwrap();
-    let mean: f64 = row.try_get::<Option<f64>>("", "mean").unwrap().expect("trigger should populate mean");
-    let stdev: f64 = row.try_get::<Option<f64>>("", "stdev").unwrap().expect("trigger should populate stdev");
-    let min_value: f64 = row.try_get::<Option<f64>>("", "min_value").unwrap().expect("trigger should populate min_value");
-    let max_value: f64 = row.try_get::<Option<f64>>("", "max_value").unwrap().expect("trigger should populate max_value");
+    let mean: f64 = row
+        .try_get::<Option<f64>>("", "mean")
+        .unwrap()
+        .expect("trigger should populate mean");
+    let stdev: f64 = row
+        .try_get::<Option<f64>>("", "stdev")
+        .unwrap()
+        .expect("trigger should populate stdev");
+    let min_value: f64 = row
+        .try_get::<Option<f64>>("", "min_value")
+        .unwrap()
+        .expect("trigger should populate min_value");
+    let max_value: f64 = row
+        .try_get::<Option<f64>>("", "max_value")
+        .unwrap()
+        .expect("trigger should populate max_value");
 
     // Expected values from the three replicates (185.2, 198.7, 191.4)
     let values = [185.2_f64, 198.7, 191.4];
@@ -86,10 +100,22 @@ async fn test_insert_triplicate_grab_samples() {
     let m = expected_mean;
     let expected_stdev = (values.iter().map(|v| (v - m).powi(2)).sum::<f64>() / 2.0).sqrt();
     assert_eq!(n, 3, "n should be 3");
-    assert!((mean - expected_mean).abs() < 1e-9, "mean {mean} should match expected {expected_mean}");
-    assert!((stdev - expected_stdev).abs() < 1e-9, "stdev {stdev} should match expected {expected_stdev}");
-    assert!((min_value - 185.2).abs() < 1e-9, "min_value should be 185.2");
-    assert!((max_value - 198.7).abs() < 1e-9, "max_value should be 198.7");
+    assert!(
+        (mean - expected_mean).abs() < 1e-9,
+        "mean {mean} should match expected {expected_mean}"
+    );
+    assert!(
+        (stdev - expected_stdev).abs() < 1e-9,
+        "stdev {stdev} should match expected {expected_stdev}"
+    );
+    assert!(
+        (min_value - 185.2).abs() < 1e-9,
+        "min_value should be 185.2"
+    );
+    assert!(
+        (max_value - 198.7).abs() < 1e-9,
+        "max_value should be 198.7"
+    );
 }
 
 // ============================================================================
@@ -116,7 +142,10 @@ async fn test_single_grab_sample_no_sample_row() {
     assert_eq!(status, 200, "insert should succeed: {body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["inserted"], 1);
-    assert_eq!(json["samples_created"], 0, "single reading should not create a sample");
+    assert_eq!(
+        json["samples_created"], 0,
+        "single reading should not create a sample"
+    );
 
     // Verify no sample row for this parameter+time
     let row = db
@@ -310,7 +339,10 @@ async fn test_grab_samples_require_write_data() {
         &token,
     )
     .await;
-    assert_eq!(status, 403, "grab_samples should require write_data permission");
+    assert_eq!(
+        status, 403,
+        "grab_samples should require write_data permission"
+    );
 }
 
 // ============================================================================
@@ -378,7 +410,11 @@ async fn test_grab_applies_instant_curve_server_side() {
     let mtype: String = row.try_get("", "measurement_type").unwrap();
     assert_eq!(raw, 10.0, "raw value is the measured value");
     assert_eq!(calibrated, 21.0, "2.0 * 10.0 + 1.0");
-    assert_eq!(stored_curve.to_string(), curve_id, "applied curve stamped for provenance");
+    assert_eq!(
+        stored_curve.to_string(),
+        curve_id,
+        "applied curve stamped for provenance"
+    );
     assert_eq!(mtype, "spot");
 }
 

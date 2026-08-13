@@ -25,7 +25,9 @@ pub async fn recompute_derived(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
     let job_id = spawn_recompute_derived(&state.db, state.events.clone(), id).await?;
-    Ok(Json(serde_json::json!({ "status": "queued", "job_id": job_id })))
+    Ok(Json(
+        serde_json::json!({ "status": "queued", "job_id": job_id }),
+    ))
 }
 
 /// Enqueue a durable `derived_recompute` job for one derived parameter definition. Runs on the

@@ -5,7 +5,6 @@
 //!
 //! Run: cargo test --test reprocessing_jobs -- --test-threads=1
 
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -80,9 +79,17 @@ async fn job_retries_then_succeeds() {
 
     let (status, readings_updated, retry_count) = wait_until_terminal(&db, job_id).await;
     assert_eq!(status, "completed", "should succeed after retrying");
-    assert_eq!(readings_updated, Some(7), "completed job records the work's count");
+    assert_eq!(
+        readings_updated,
+        Some(7),
+        "completed job records the work's count"
+    );
     assert_eq!(retry_count, 2, "two failed attempts before success");
-    assert_eq!(attempts.load(Ordering::SeqCst), 3, "work invoked three times total");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        3,
+        "work invoked three times total"
+    );
 }
 
 #[tokio::test]
@@ -117,5 +124,9 @@ async fn job_exhausts_retries_then_fails() {
     let (status, _readings_updated, retry_count) = wait_until_terminal(&db, job_id).await;
     assert_eq!(status, "failed", "should fail once retries are exhausted");
     assert_eq!(retry_count, 2, "two retries attempted");
-    assert_eq!(attempts.load(Ordering::SeqCst), 3, "initial attempt + two retries");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        3,
+        "initial attempt + two retries"
+    );
 }

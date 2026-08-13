@@ -1,16 +1,15 @@
-use axum::extract::{Path, State};
 use axum::Json;
+use axum::extract::{Path, State};
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use serde::Deserialize;
 use uuid::Uuid;
 
+use super::session::SyncServiceContext;
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
-use river_data_core::models::{SyncEventStatus, SyncEventType};
 use crate::routes::private::sync::{events_model, services_model};
-use super::session::SyncServiceContext;
-
+use river_data_core::models::{SyncEventStatus, SyncEventType};
 
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateSyncEventRequest {
@@ -84,8 +83,12 @@ pub async fn create_sync_event(
         id: Set(Uuid::new_v4()),
         service_id: Set(req.service_id),
         command_id: Set(req.command_id),
-        event_type: Set(req.event_type.unwrap_or_else(|| SyncEventType::Scheduled.as_str().to_string())),
-        status: Set(req.status.unwrap_or_else(|| SyncEventStatus::Running.as_str().to_string())),
+        event_type: Set(req
+            .event_type
+            .unwrap_or_else(|| SyncEventType::Scheduled.as_str().to_string())),
+        status: Set(req
+            .status
+            .unwrap_or_else(|| SyncEventStatus::Running.as_str().to_string())),
         readings_synced: Set(0),
         status_events_synced: Set(0),
         errors: Set(None),

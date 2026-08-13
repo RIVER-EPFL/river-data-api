@@ -7,7 +7,6 @@
 //! Run: DATABASE_URL=postgresql://postgres:psql@localhost:5444/river_test \
 //!      cargo test --test sensor_calibrations -- --test-threads=1
 
-
 use crate::common::sensor_lifecycle::*;
 use crate::common::*;
 use sea_orm::ConnectionTrait;
@@ -38,9 +37,15 @@ async fn baseline_identity_calibration_preserves_raw_values() {
     let stream = create_paired_stream(&db, "baseline-probe", PARAM_S1_TEMP_ID).await;
 
     insert_readings(
-        &db, stream, SITE1_ID, GLOBAL_PARAM_TEMP_ID,
-        sensor.id, sensor.identity_calibration_id, dep,
-        1.0, 0.0,
+        &db,
+        stream,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        sensor.id,
+        sensor.identity_calibration_id,
+        dep,
+        1.0,
+        0.0,
         &[
             (dt("2025-01-01T10:00:00Z"), 20.0),
             (dt("2025-01-01T10:10:00Z"), 21.5),
@@ -56,13 +61,22 @@ async fn baseline_identity_calibration_preserves_raw_values() {
     let param_temp: uuid::Uuid = GLOBAL_PARAM_TEMP_ID.parse().unwrap();
 
     // Each reading: calibrated = 1.0 * raw + 0.0 = raw
-    for (i, (expected_raw, expected_cal)) in
-        [(20.0, 20.0), (21.5, 21.5), (19.8, 19.8)].iter().enumerate()
+    for (i, (expected_raw, expected_cal)) in [(20.0, 20.0), (21.5, 21.5), (19.8, 19.8)]
+        .iter()
+        .enumerate()
     {
         assert_eq!(rows[i].raw_value, *expected_raw, "row {i} raw");
-        assert_eq!(rows[i].calibrated_value, Some(*expected_cal), "row {i} calibrated");
+        assert_eq!(
+            rows[i].calibrated_value,
+            Some(*expected_cal),
+            "row {i} calibrated"
+        );
         assert_eq!(rows[i].sensor_id, Some(sensor.id), "row {i} sensor_id");
-        assert_eq!(rows[i].calibration_id, Some(sensor.identity_calibration_id), "row {i} cal_id");
+        assert_eq!(
+            rows[i].calibration_id,
+            Some(sensor.identity_calibration_id),
+            "row {i} cal_id"
+        );
         assert_eq!(rows[i].deployment_id, Some(dep), "row {i} dep_id");
         assert_eq!(rows[i].site_id, Some(site1), "row {i} site_id");
         assert_eq!(rows[i].parameter_id, Some(param_temp), "row {i} param_id");
@@ -98,19 +112,34 @@ async fn recalibration_updates_all_readings() {
         dt("2025-01-01T10:10:00Z"),
         dt("2025-01-01T10:20:00Z"),
     ];
-    let readings: Vec<_> = times.iter().zip(raw_values.iter()).map(|(t, v)| (*t, *v)).collect();
+    let readings: Vec<_> = times
+        .iter()
+        .zip(raw_values.iter())
+        .map(|(t, v)| (*t, *v))
+        .collect();
 
     insert_readings(
-        &db, stream, SITE1_ID, GLOBAL_PARAM_TEMP_ID,
-        sensor.id, sensor.identity_calibration_id, dep,
-        1.0, 0.0, &readings,
+        &db,
+        stream,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        sensor.id,
+        sensor.identity_calibration_id,
+        dep,
+        1.0,
+        0.0,
+        &readings,
     )
     .await;
 
     // Verify BEFORE state
     let rows = get_readings(&db, stream).await;
     for (i, raw) in raw_values.iter().enumerate() {
-        assert_eq!(rows[i].calibrated_value, Some(*raw), "before: row {i} = identity");
+        assert_eq!(
+            rows[i].calibrated_value,
+            Some(*raw),
+            "before: row {i} = identity"
+        );
     }
 
     // Apply new calibration: calibrated = 2 * raw + 1
@@ -129,9 +158,11 @@ async fn recalibration_updates_all_readings() {
     )
     .await;
     assert_eq!(status, 201, "create calibration: {body}");
-    let real_cal: uuid::Uuid =
-        serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
-            .as_str().unwrap().parse().unwrap();
+    let real_cal: uuid::Uuid = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
 
     assert!(wait_for_reprocessing(&db, sensor.id, WAIT_TIMEOUT).await);
 
@@ -141,8 +172,16 @@ async fn recalibration_updates_all_readings() {
     for (i, raw) in raw_values.iter().enumerate() {
         let expected = 2.0 * raw + 1.0;
         assert_eq!(rows[i].raw_value, *raw, "row {i} raw unchanged");
-        assert_eq!(rows[i].calibrated_value, Some(expected), "row {i}: 2*{raw}+1 = {expected}");
-        assert_eq!(rows[i].calibration_id, Some(real_cal), "row {i} cal FK updated");
+        assert_eq!(
+            rows[i].calibrated_value,
+            Some(expected),
+            "row {i}: 2*{raw}+1 = {expected}"
+        );
+        assert_eq!(
+            rows[i].calibration_id,
+            Some(real_cal),
+            "row {i} cal FK updated"
+        );
     }
 
     // Verify AFTER state, API level: GET /sites/{id}/readings returns calibrated values
@@ -243,8 +282,14 @@ async fn reprocess_applies_per_parameter_calibration_on_shared_sensor() {
 
     let rows = get_readings_for_sensor(&db, sensor.id).await;
     assert_eq!(rows.len(), 2);
-    let temp = rows.iter().find(|r| r.raw_value == 3.0).expect("temp reading");
-    let do_r = rows.iter().find(|r| r.raw_value == 4.0).expect("do reading");
+    let temp = rows
+        .iter()
+        .find(|r| r.raw_value == 3.0)
+        .expect("temp reading");
+    let do_r = rows
+        .iter()
+        .find(|r| r.raw_value == 4.0)
+        .expect("do reading");
     let param_temp: uuid::Uuid = GLOBAL_PARAM_TEMP_ID.parse().unwrap();
     let param_do: uuid::Uuid = GLOBAL_PARAM_DO_ID.parse().unwrap();
 
@@ -253,7 +298,10 @@ async fn reprocess_applies_per_parameter_calibration_on_shared_sensor() {
     assert_eq!(do_r.parameter_id, Some(param_do));
     assert_eq!(do_r.calibrated_value, Some(45.0), "do: 10*4+5");
     // Each reading is stamped with its own parameter's curve, not the other's.
-    assert_ne!(temp.calibration_id, do_r.calibration_id, "distinct curves per parameter");
+    assert_ne!(
+        temp.calibration_id, do_r.calibration_id,
+        "distinct curves per parameter"
+    );
 
     cleanup_test_db(&db).await;
 }
@@ -271,7 +319,13 @@ async fn reprocess_prefers_real_curve_over_open_null_identity() {
 
     let sensor = uuid::Uuid::new_v4();
     let real_cal = uuid::Uuid::new_v4();
-    exec(&db, &format!("INSERT INTO sensors (id, name, is_active) VALUES ('{sensor}', 'NullIdentity-01', true)")).await;
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO sensors (id, name, is_active) VALUES ('{sensor}', 'NullIdentity-01', true)"
+        ),
+    )
+    .await;
     // The production shape: a NULL-parameter identity (slope 1) with an open window, plus a real
     // temperature curve (slope 2) that also stays open, both cover the reading's time.
     exec(
@@ -310,9 +364,20 @@ async fn reprocess_prefers_real_curve_over_open_null_identity() {
     assert!(wait_for_reprocessing(&db, sensor, WAIT_TIMEOUT).await);
 
     let rows = get_readings_for_sensor(&db, sensor).await;
-    let r = rows.iter().find(|r| r.raw_value == 3.0).expect("temp reading");
-    assert_eq!(r.calibrated_value, Some(6.0), "the real curve (2*3), never the identity (1*3)");
-    assert_eq!(r.calibration_id, Some(real_cal), "stamped with the real curve, not the identity");
+    let r = rows
+        .iter()
+        .find(|r| r.raw_value == 3.0)
+        .expect("temp reading");
+    assert_eq!(
+        r.calibrated_value,
+        Some(6.0),
+        "the real curve (2*3), never the identity (1*3)"
+    );
+    assert_eq!(
+        r.calibration_id,
+        Some(real_cal),
+        "stamped with the real curve, not the identity"
+    );
 
     cleanup_test_db(&db).await;
 }
@@ -351,7 +416,13 @@ async fn slot_reprocess_leaves_spot_grabs_untouched() {
     // instant curve produced calibrated_value 99.0, and it is tagged measurement_type = 'spot'.
     let lab = uuid::Uuid::new_v4();
     let instant_cal = uuid::Uuid::new_v4();
-    exec(&db, &format!("INSERT INTO sensors (id, name, is_active) VALUES ('{lab}', 'Lab-Instrument-01', true)")).await;
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO sensors (id, name, is_active) VALUES ('{lab}', 'Lab-Instrument-01', true)"
+        ),
+    )
+    .await;
     exec(
         &db,
         &format!(
@@ -371,18 +442,38 @@ async fn slot_reprocess_leaves_spot_grabs_untouched() {
     )
     .await;
 
-    reprocess_site_parameter_readings(&db, SITE1_ID.parse().unwrap(), GLOBAL_PARAM_TEMP_ID.parse().unwrap())
-        .await
-        .expect("reprocess");
+    reprocess_site_parameter_readings(
+        &db,
+        SITE1_ID.parse().unwrap(),
+        GLOBAL_PARAM_TEMP_ID.parse().unwrap(),
+    )
+    .await
+    .expect("reprocess");
 
     // Continuous reading re-derived by the field curve; grab preserved end-to-end.
     let cont = get_readings(&db, cont_stream).await;
-    assert_eq!(cont[0].calibrated_value, Some(6.0), "continuous reading re-derived: 2*3");
+    assert_eq!(
+        cont[0].calibrated_value,
+        Some(6.0),
+        "continuous reading re-derived: 2*3"
+    );
 
     let grab = get_readings(&db, grab_stream).await;
-    assert_eq!(grab[0].calibrated_value, Some(99.0), "grab's instant-curve value is preserved");
-    assert_eq!(grab[0].sensor_id, Some(lab), "grab keeps its lab instrument, not the field sensor");
-    assert_eq!(grab[0].calibration_id, Some(instant_cal), "grab keeps its instant curve");
+    assert_eq!(
+        grab[0].calibrated_value,
+        Some(99.0),
+        "grab's instant-curve value is preserved"
+    );
+    assert_eq!(
+        grab[0].sensor_id,
+        Some(lab),
+        "grab keeps its lab instrument, not the field sensor"
+    );
+    assert_eq!(
+        grab[0].calibration_id,
+        Some(instant_cal),
+        "grab keeps its instant curve"
+    );
 
     cleanup_test_db(&db).await;
 }
@@ -414,9 +505,15 @@ async fn deployment_change_updates_site_and_deployment() {
 
     // 6 readings with distinct values so each is identifiable
     insert_readings(
-        &db, stream, SITE1_ID, GLOBAL_PARAM_TEMP_ID,
-        sensor.id, sensor.identity_calibration_id, dep_a,
-        1.0, 0.0,
+        &db,
+        stream,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        sensor.id,
+        sensor.identity_calibration_id,
+        dep_a,
+        1.0,
+        0.0,
         &[
             (dt("2025-01-01T10:00:00Z"), 10.0),
             (dt("2025-01-01T11:00:00Z"), 11.0),
@@ -430,8 +527,16 @@ async fn deployment_change_updates_site_and_deployment() {
 
     // BEFORE: all 6 readings at site 1
     let rows = get_readings(&db, stream).await;
-    assert_eq!(rows.iter().filter(|r| r.site_id == Some(site1)).count(), 6, "before: 6 at site 1");
-    assert_eq!(rows.iter().filter(|r| r.site_id == Some(site2)).count(), 0, "before: 0 at site 2");
+    assert_eq!(
+        rows.iter().filter(|r| r.site_id == Some(site1)).count(),
+        6,
+        "before: 6 at site 1"
+    );
+    assert_eq!(
+        rows.iter().filter(|r| r.site_id == Some(site2)).count(),
+        0,
+        "before: 0 at site 2"
+    );
 
     let app = build_test_app(db.clone());
     let token = seed_api_token(&db, full_permissions(), None).await;
@@ -462,9 +567,11 @@ async fn deployment_change_updates_site_and_deployment() {
     )
     .await;
     assert_eq!(status, 201, "{body}");
-    let dep_b: uuid::Uuid =
-        serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
-            .as_str().unwrap().parse().unwrap();
+    let dep_b: uuid::Uuid = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
 
     assert!(wait_for_reprocessing(&db, sensor.id, WAIT_TIMEOUT).await);
 
@@ -488,7 +595,11 @@ async fn deployment_change_updates_site_and_deployment() {
     ];
     for (i, (raw, dep, site)) in expected.iter().enumerate() {
         assert_eq!(rows[i].raw_value, *raw, "row {i} raw");
-        assert_eq!(rows[i].calibrated_value, Some(*raw), "row {i} cal (identity)");
+        assert_eq!(
+            rows[i].calibrated_value,
+            Some(*raw),
+            "row {i} cal (identity)"
+        );
         assert_eq!(rows[i].deployment_id, Some(*dep), "row {i} deployment");
         assert_eq!(rows[i].site_id, Some(*site), "row {i} site");
     }
@@ -547,25 +658,51 @@ async fn retroactive_calibration_date_change() {
         .collect();
 
     insert_readings(
-        &db, stream, SITE1_ID, GLOBAL_PARAM_TEMP_ID,
-        sensor.id, sensor.identity_calibration_id, dep,
-        1.0, 0.0, &identity_readings,
+        &db,
+        stream,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        sensor.id,
+        sensor.identity_calibration_id,
+        dep,
+        1.0,
+        0.0,
+        &identity_readings,
     )
     .await;
     insert_readings(
-        &db, stream, SITE1_ID, GLOBAL_PARAM_TEMP_ID,
-        sensor.id, real_cal, dep,
-        3.0, 0.5, &real_readings,
+        &db,
+        stream,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        sensor.id,
+        real_cal,
+        dep,
+        3.0,
+        0.5,
+        &real_readings,
     )
     .await;
 
     // Verify BEFORE state: 5 under identity, 2 under real cal
     let rows = get_readings(&db, stream).await;
     assert_eq!(rows.len(), 7);
-    let identity_count = rows.iter().filter(|r| r.calibration_id == Some(sensor.identity_calibration_id)).count();
-    let real_count = rows.iter().filter(|r| r.calibration_id == Some(real_cal)).count();
-    assert_eq!(identity_count, 5, "before: 5 readings under identity (Jan 10-14)");
-    assert_eq!(real_count, 2, "before: 2 readings under real cal (Jan 15-16)");
+    let identity_count = rows
+        .iter()
+        .filter(|r| r.calibration_id == Some(sensor.identity_calibration_id))
+        .count();
+    let real_count = rows
+        .iter()
+        .filter(|r| r.calibration_id == Some(real_cal))
+        .count();
+    assert_eq!(
+        identity_count, 5,
+        "before: 5 readings under identity (Jan 10-14)"
+    );
+    assert_eq!(
+        real_count, 2,
+        "before: 2 readings under real cal (Jan 15-16)"
+    );
 
     // Move valid_from from Jan 15 → Jan 12
     let app = build_test_app(db.clone());
@@ -582,26 +719,42 @@ async fn retroactive_calibration_date_change() {
 
     // Verify AFTER state: counts shifted
     let rows = get_readings(&db, stream).await;
-    let identity_count = rows.iter().filter(|r| r.calibration_id == Some(sensor.identity_calibration_id)).count();
-    let real_count = rows.iter().filter(|r| r.calibration_id == Some(real_cal)).count();
-    assert_eq!(identity_count, 2, "after: 2 readings under identity (Jan 10-11)");
-    assert_eq!(real_count, 5, "after: 5 readings under real cal (Jan 12-16)");
+    let identity_count = rows
+        .iter()
+        .filter(|r| r.calibration_id == Some(sensor.identity_calibration_id))
+        .count();
+    let real_count = rows
+        .iter()
+        .filter(|r| r.calibration_id == Some(real_cal))
+        .count();
+    assert_eq!(
+        identity_count, 2,
+        "after: 2 readings under identity (Jan 10-11)"
+    );
+    assert_eq!(
+        real_count, 5,
+        "after: 5 readings under real cal (Jan 12-16)"
+    );
 
     // Verify AFTER state: each reading's exact calibrated value
     //   Identity readings: calibrated = 1*raw + 0 = raw
     //   Real cal readings: calibrated = 3*raw + 0.5
     let expected: [(f64, f64, uuid::Uuid); 7] = [
-        (10.0, 10.0, sensor.identity_calibration_id),  // Jan 10, identity
-        (11.0, 11.0, sensor.identity_calibration_id),  // Jan 11, identity
-        (12.0, 36.5, real_cal),                         // Jan 12, SWITCHED: 3*12+0.5
-        (13.0, 39.5, real_cal),                         // Jan 13, SWITCHED: 3*13+0.5
-        (14.0, 42.5, real_cal),                         // Jan 14, SWITCHED: 3*14+0.5
-        (15.0, 45.5, real_cal),                         // Jan 15, unchanged: 3*15+0.5
-        (16.0, 48.5, real_cal),                         // Jan 16, unchanged: 3*16+0.5
+        (10.0, 10.0, sensor.identity_calibration_id), // Jan 10, identity
+        (11.0, 11.0, sensor.identity_calibration_id), // Jan 11, identity
+        (12.0, 36.5, real_cal),                       // Jan 12, SWITCHED: 3*12+0.5
+        (13.0, 39.5, real_cal),                       // Jan 13, SWITCHED: 3*13+0.5
+        (14.0, 42.5, real_cal),                       // Jan 14, SWITCHED: 3*14+0.5
+        (15.0, 45.5, real_cal),                       // Jan 15, unchanged: 3*15+0.5
+        (16.0, 48.5, real_cal),                       // Jan 16, unchanged: 3*16+0.5
     ];
     for (i, (raw, cal, cal_id)) in expected.iter().enumerate() {
         assert_eq!(rows[i].raw_value, *raw, "row {i} raw");
-        assert_eq!(rows[i].calibrated_value, Some(*cal), "row {i}: raw={raw} → cal={cal}");
+        assert_eq!(
+            rows[i].calibrated_value,
+            Some(*cal),
+            "row {i}: raw={raw} → cal={cal}"
+        );
         assert_eq!(rows[i].calibration_id, Some(*cal_id), "row {i} cal FK");
     }
 
@@ -639,9 +792,15 @@ async fn lab_sensor_multiple_deployments_same_day() {
 
     // All readings initially stamped with dep_a, distinct raw values
     insert_readings(
-        &db, stream, SITE1_ID, GLOBAL_PARAM_TEMP_ID,
-        sensor.id, sensor.identity_calibration_id, dep_a,
-        1.0, 0.0,
+        &db,
+        stream,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        sensor.id,
+        sensor.identity_calibration_id,
+        dep_a,
+        1.0,
+        0.0,
         &[
             (dt("2025-06-15T09:00:00Z"), 9.0),
             (dt("2025-06-15T09:30:00Z"), 9.5),
@@ -673,7 +832,10 @@ async fn lab_sensor_multiple_deployments_same_day() {
     .await;
     assert_eq!(status, 201, "{body}");
     let dep_b: uuid::Uuid = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
-        .as_str().unwrap().parse().unwrap();
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     assert!(wait_for_reprocessing(&db, sensor.id, WAIT_TIMEOUT).await);
 
     // Create dep_c: SITE1 12:00-14:00
@@ -693,7 +855,10 @@ async fn lab_sensor_multiple_deployments_same_day() {
     .await;
     assert_eq!(status, 201, "{body}");
     let dep_c: uuid::Uuid = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
-        .as_str().unwrap().parse().unwrap();
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     assert!(wait_for_reprocessing(&db, sensor.id, WAIT_TIMEOUT).await);
 
     let rows = get_readings(&db, stream).await;
@@ -707,12 +872,12 @@ async fn lab_sensor_multiple_deployments_same_day() {
 
     // Each reading: raw_value, deployment, site
     let expected: [(f64, uuid::Uuid, uuid::Uuid); 6] = [
-        (9.0,  dep_a, site1),  // 09:00
-        (9.5,  dep_a, site1),  // 09:30
-        (10.5, dep_b, site2),  // 10:30
-        (11.0, dep_b, site2),  // 11:00
-        (12.5, dep_c, site1),  // 12:30
-        (13.0, dep_c, site1),  // 13:00
+        (9.0, dep_a, site1),  // 09:00
+        (9.5, dep_a, site1),  // 09:30
+        (10.5, dep_b, site2), // 10:30
+        (11.0, dep_b, site2), // 11:00
+        (12.5, dep_c, site1), // 12:30
+        (13.0, dep_c, site1), // 13:00
     ];
     for (i, (raw, dep, site)) in expected.iter().enumerate() {
         assert_eq!(rows[i].raw_value, *raw, "row {i} raw");
@@ -778,7 +943,10 @@ async fn calibration_time_windows_auto_bounded() {
     // New cal: open-ended
     let cal_b_until: Option<chrono::DateTime<chrono::FixedOffset>> =
         rows[1].try_get("", "valid_until").ok();
-    assert!(cal_b_until.is_none(), "latest calibration should have NULL valid_until");
+    assert!(
+        cal_b_until.is_none(),
+        "latest calibration should have NULL valid_until"
+    );
 
     cleanup_test_db(&db).await;
 }
@@ -816,23 +984,44 @@ async fn delete_intermediate_calibration_fallback() {
 
     // Distinct raw values = day number
     insert_readings(
-        &db, stream, SITE1_ID, GLOBAL_PARAM_TEMP_ID,
-        sensor.id, sensor.identity_calibration_id, dep,
-        1.0, 0.0,
+        &db,
+        stream,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        sensor.id,
+        sensor.identity_calibration_id,
+        dep,
+        1.0,
+        0.0,
         &[(dt("2025-01-05T12:00:00Z"), 5.0)],
-    ).await;
+    )
+    .await;
     insert_readings(
-        &db, stream, SITE1_ID, GLOBAL_PARAM_TEMP_ID,
-        sensor.id, cal_a, dep,
-        2.0, 1.0,
+        &db,
+        stream,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        sensor.id,
+        cal_a,
+        dep,
+        2.0,
+        1.0,
         &[(dt("2025-01-15T12:00:00Z"), 15.0)],
-    ).await;
+    )
+    .await;
     insert_readings(
-        &db, stream, SITE1_ID, GLOBAL_PARAM_TEMP_ID,
-        sensor.id, cal_b, dep,
-        3.0, 2.0,
+        &db,
+        stream,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        sensor.id,
+        cal_b,
+        dep,
+        3.0,
+        2.0,
         &[(dt("2025-01-25T12:00:00Z"), 25.0)],
-    ).await;
+    )
+    .await;
 
     // BEFORE: verify exact values
     let rows = get_readings(&db, stream).await;
@@ -843,12 +1032,8 @@ async fn delete_intermediate_calibration_fallback() {
     // Delete cal_a
     let app = build_test_app(db.clone());
     let token = seed_api_token(&db, full_permissions(), None).await;
-    let (status, _) = delete_with_token(
-        &app,
-        &format!("/api/sensor_calibrations/{cal_a}"),
-        &token,
-    )
-    .await;
+    let (status, _) =
+        delete_with_token(&app, &format!("/api/sensor_calibrations/{cal_a}"), &token).await;
     assert_eq!(status, 204);
     assert!(wait_for_reprocessing(&db, sensor.id, WAIT_TIMEOUT).await);
 
@@ -857,15 +1042,27 @@ async fn delete_intermediate_calibration_fallback() {
     assert_eq!(rows.len(), 3, "no readings lost");
 
     assert_eq!(rows[0].raw_value, 5.0);
-    assert_eq!(rows[0].calibrated_value, Some(5.0), "after: Jan 5 unchanged (identity)");
+    assert_eq!(
+        rows[0].calibrated_value,
+        Some(5.0),
+        "after: Jan 5 unchanged (identity)"
+    );
     assert_eq!(rows[0].calibration_id, Some(sensor.identity_calibration_id));
 
     assert_eq!(rows[1].raw_value, 15.0);
-    assert_eq!(rows[1].calibrated_value, Some(15.0), "after: Jan 15 CHANGED 31→15 (fell back to identity: 1*15+0)");
+    assert_eq!(
+        rows[1].calibrated_value,
+        Some(15.0),
+        "after: Jan 15 CHANGED 31→15 (fell back to identity: 1*15+0)"
+    );
     assert_eq!(rows[1].calibration_id, Some(sensor.identity_calibration_id));
 
     assert_eq!(rows[2].raw_value, 25.0);
-    assert_eq!(rows[2].calibrated_value, Some(77.0), "after: Jan 25 unchanged (cal_b: 3*25+2)");
+    assert_eq!(
+        rows[2].calibrated_value,
+        Some(77.0),
+        "after: Jan 25 unchanged (cal_b: 3*25+2)"
+    );
     assert_eq!(rows[2].calibration_id, Some(cal_b));
 
     cleanup_test_db(&db).await;
@@ -892,16 +1089,32 @@ async fn full_cascade_calibration_to_aggregates() {
     let stream = create_paired_stream(&db, "cascade-probe", PARAM_S1_TEMP_ID).await;
 
     let readings: Vec<_> = (0..12)
-        .map(|i| (dt("2025-01-15T10:00:00Z") + chrono::Duration::minutes(i * 10), 10.0))
+        .map(|i| {
+            (
+                dt("2025-01-15T10:00:00Z") + chrono::Duration::minutes(i * 10),
+                10.0,
+            )
+        })
         .collect();
     insert_readings(
-        &db, stream, SITE1_ID, GLOBAL_PARAM_TEMP_ID,
-        sensor.id, sensor.identity_calibration_id, dep,
-        1.0, 0.0, &readings,
+        &db,
+        stream,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        sensor.id,
+        sensor.identity_calibration_id,
+        dep,
+        1.0,
+        0.0,
+        &readings,
     )
     .await;
 
-    exec(&db, "CALL refresh_continuous_aggregate('readings_hourly', '2025-01-14', '2025-01-16')").await;
+    exec(
+        &db,
+        "CALL refresh_continuous_aggregate('readings_hourly', '2025-01-14', '2025-01-16')",
+    )
+    .await;
 
     let agg_before = db
         .query_one(sea_orm::Statement::from_sql_and_values(
@@ -909,11 +1122,18 @@ async fn full_cascade_calibration_to_aggregates() {
             "SELECT avg_value FROM readings_hourly \
              WHERE site_id = $1 AND parameter_id = $2 \
              AND bucket >= '2025-01-15T10:00:00Z' AND bucket < '2025-01-15T11:00:00Z'",
-            [SITE1_ID.parse::<uuid::Uuid>().unwrap().into(), GLOBAL_PARAM_TEMP_ID.parse::<uuid::Uuid>().unwrap().into()],
+            [
+                SITE1_ID.parse::<uuid::Uuid>().unwrap().into(),
+                GLOBAL_PARAM_TEMP_ID.parse::<uuid::Uuid>().unwrap().into(),
+            ],
         ))
-        .await.unwrap();
+        .await
+        .unwrap();
     let avg_before: f64 = agg_before.unwrap().try_get("", "avg_value").unwrap();
-    assert!((avg_before - 10.0).abs() < 0.01, "before: hourly avg = {avg_before}, expected 10.0");
+    assert!(
+        (avg_before - 10.0).abs() < 0.01,
+        "before: hourly avg = {avg_before}, expected 10.0"
+    );
 
     // Apply calibration: calibrated = 2*10+5 = 25.0
     let app = build_test_app(db.clone());
@@ -948,11 +1168,18 @@ async fn full_cascade_calibration_to_aggregates() {
             "SELECT avg_value FROM readings_hourly \
              WHERE site_id = $1 AND parameter_id = $2 \
              AND bucket >= '2025-01-15T10:00:00Z' AND bucket < '2025-01-15T11:00:00Z'",
-            [SITE1_ID.parse::<uuid::Uuid>().unwrap().into(), GLOBAL_PARAM_TEMP_ID.parse::<uuid::Uuid>().unwrap().into()],
+            [
+                SITE1_ID.parse::<uuid::Uuid>().unwrap().into(),
+                GLOBAL_PARAM_TEMP_ID.parse::<uuid::Uuid>().unwrap().into(),
+            ],
         ))
-        .await.unwrap();
+        .await
+        .unwrap();
     let avg_after: f64 = agg_after.unwrap().try_get("", "avg_value").unwrap();
-    assert!((avg_after - 25.0).abs() < 0.01, "after: hourly avg = {avg_after}, expected 25.0");
+    assert!(
+        (avg_after - 25.0).abs() < 0.01,
+        "after: hourly avg = {avg_after}, expected 25.0"
+    );
 
     cleanup_test_db(&db).await;
 }

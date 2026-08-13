@@ -40,7 +40,8 @@ const WAIT: Duration = Duration::from_secs(30);
 const EPS: f64 = 1e-9;
 
 fn ts(s: &str) -> DateTime<Utc> {
-    s.parse().unwrap_or_else(|e| panic!("invalid fixture timestamp '{s}': {e}"))
+    s.parse()
+        .unwrap_or_else(|e| panic!("invalid fixture timestamp '{s}': {e}"))
 }
 
 struct Fixture {
@@ -84,8 +85,18 @@ async fn onboard() -> Fixture {
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
     let track = tracks::onboard_sensor_flow_track(&app, &admin).await;
 
-    kc::grant_project(&db, &kc::keycloak_user_id("manager1").await, &track.project_id).await;
-    kc::grant_project(&db, &kc::keycloak_user_id("river1").await, &track.project_id).await;
+    kc::grant_project(
+        &db,
+        &kc::keycloak_user_id("manager1").await,
+        &track.project_id,
+    )
+    .await;
+    kc::grant_project(
+        &db,
+        &kc::keycloak_user_id("river1").await,
+        &track.project_id,
+    )
+    .await;
     let manager = kc::get_keycloak_jwt("manager1", "manager1").await;
     let river = kc::get_keycloak_jwt("river1", "river1").await;
 
@@ -109,7 +120,16 @@ async fn onboard() -> Fixture {
         "the stream pairs to the site slot ({status}): {body}"
     );
 
-    Fixture { db, app, admin, manager, river, track, sensor_id, stream_id }
+    Fixture {
+        db,
+        app,
+        admin,
+        manager,
+        river,
+        track,
+        sensor_id,
+        stream_id,
+    }
 }
 
 /// Create a windowed curve for the track's sensor and parameter, as the manager who owns sensor
@@ -128,7 +148,10 @@ async fn add_curve(fx: &Fixture, slope: f64, intercept: f64, valid_from: &str) -
         &fx.manager,
     )
     .await;
-    assert_eq!(status, 201, "manager creates a curve from {valid_from}: {body}");
+    assert_eq!(
+        status, 201,
+        "manager creates a curve from {valid_from}: {body}"
+    );
     assert!(
         wait_for_reprocessing(&fx.db, fx.sensor(), WAIT).await,
         "the calibration_create job settles without failing"
@@ -159,7 +182,10 @@ async fn ingest(fx: &Fixture, stream_id: &str, rows: &[(&str, f64)]) {
         Some(rows.len() as u64),
         "every fixture reading lands: {body}"
     );
-    assert_eq!(body["paired"], true, "the stream is paired, so readings land attributed: {body}");
+    assert_eq!(
+        body["paired"], true,
+        "the stream is paired, so readings land attributed: {body}"
+    );
 }
 
 async fn reprocess(fx: &Fixture) {
@@ -179,8 +205,12 @@ async fn reprocess(fx: &Fixture) {
 
 /// `(valid_from, valid_until)` as the API serves them.
 async fn window_of(fx: &Fixture, cal: Uuid) -> (DateTime<Utc>, Option<DateTime<Utc>>) {
-    let (status, body) =
-        get_json_with_token(&fx.app, &format!("/api/sensor_calibrations/{cal}"), &fx.manager).await;
+    let (status, body) = get_json_with_token(
+        &fx.app,
+        &format!("/api/sensor_calibrations/{cal}"),
+        &fx.manager,
+    )
+    .await;
     assert_eq!(status, 200, "read calibration {cal}: {body}");
     let from = body["valid_from"]
         .as_str()
@@ -244,7 +274,10 @@ fn check(rows: &[ReadingRow], expected: &[(&str, f64, f64, Uuid)], phase: &str) 
 
 async fn hourly(fx: &Fixture, site: &str, at: &str, why: &str) -> (f64, i64) {
     let bucket = e2e::hourly_bucket(&fx.db, site, fx.parameter(), ts(at)).await;
-    assert!(bucket.is_some(), "{why}: no hourly bucket materialised at {at} for site {site}");
+    assert!(
+        bucket.is_some(),
+        "{why}: no hourly bucket materialised at {at} for site {site}"
+    );
     bucket.expect("bucket presence asserted above")
 }
 
@@ -415,9 +448,7 @@ async fn editing_a_historical_calibrations_coefficients_rewrites_only_its_own_wi
 
     let (status, served) = get_json_with_token(
         &fx.app,
-        &format!(
-            "/api/sites/{site}/readings?start=2025-06-01T00:00:00Z&end=2025-07-01T00:00:00Z"
-        ),
+        &format!("/api/sites/{site}/readings?start=2025-06-01T00:00:00Z&end=2025-07-01T00:00:00Z"),
         &fx.river,
     )
     .await;
@@ -461,11 +492,11 @@ async fn moving_valid_from_earlier_reclaims_readings_from_the_previous_window() 
     check(
         &get_readings(&fx.db, fx.stream()).await,
         &[
-            ("2025-06-08T12:00:00Z", 202.0, 404.0, c0),    // 2 * 202
-            ("2025-06-14T12:00:00Z", 203.0, 406.0, c0),    // 2 * 203
-            ("2025-06-18T12:00:00Z", 204.0, 408.0, c0),    // 2 * 204
-            ("2025-06-22T12:00:00Z", 205.0, 2050.0, c1),   // 10 * 205
-            ("2025-06-27T12:00:00Z", 206.0, 20600.0, c2),  // 100 * 206
+            ("2025-06-08T12:00:00Z", 202.0, 404.0, c0),   // 2 * 202
+            ("2025-06-14T12:00:00Z", 203.0, 406.0, c0),   // 2 * 203
+            ("2025-06-18T12:00:00Z", 204.0, 408.0, c0),   // 2 * 204
+            ("2025-06-22T12:00:00Z", 205.0, 2050.0, c1),  // 10 * 205
+            ("2025-06-27T12:00:00Z", 206.0, 20600.0, c2), // 100 * 206
         ],
         "before the move",
     );
@@ -498,9 +529,9 @@ async fn moving_valid_from_earlier_reclaims_readings_from_the_previous_window() 
         &[
             // Before the new boundary, so it stays on C0 in value and in FK.
             ("2025-06-08T12:00:00Z", 202.0, 404.0, c0),
-            ("2025-06-14T12:00:00Z", 203.0, 2030.0, c1),  // reclaimed: 10 * 203
-            ("2025-06-18T12:00:00Z", 204.0, 2040.0, c1),  // reclaimed: 10 * 204
-            ("2025-06-22T12:00:00Z", 205.0, 2050.0, c1),  // already C1, unchanged
+            ("2025-06-14T12:00:00Z", 203.0, 2030.0, c1), // reclaimed: 10 * 203
+            ("2025-06-18T12:00:00Z", 204.0, 2040.0, c1), // reclaimed: 10 * 204
+            ("2025-06-22T12:00:00Z", 205.0, 2050.0, c1), // already C1, unchanged
             ("2025-06-27T12:00:00Z", 206.0, 20600.0, c2), // right of C1, unchanged
         ],
         "after the move",
@@ -585,9 +616,9 @@ async fn moving_valid_from_later_returns_the_uncovered_readings_to_the_previous_
     check(
         &get_readings(&fx.db, fx.stream()).await,
         &[
-            ("2025-06-08T12:00:00Z", 202.0, 404.0, c0),  // always inside C0, unchanged
-            ("2025-06-21T12:00:00Z", 203.0, 406.0, c0),  // handed back: 2 * 203
-            ("2025-06-22T12:00:00Z", 204.0, 408.0, c0),  // handed back: 2 * 204
+            ("2025-06-08T12:00:00Z", 202.0, 404.0, c0), // always inside C0, unchanged
+            ("2025-06-21T12:00:00Z", 203.0, 406.0, c0), // handed back: 2 * 203
+            ("2025-06-22T12:00:00Z", 204.0, 408.0, c0), // handed back: 2 * 204
             ("2025-06-24T12:00:00Z", 205.0, 2050.0, c1), // at/after the new start, still C1
             ("2025-06-27T12:00:00Z", 206.0, 20600.0, c2),
         ],
@@ -729,7 +760,10 @@ async fn editing_a_calibration_spanning_two_deployments_updates_both_sites_aggre
     let fx = onboard().await;
     let site1 = fx.track.site_id.clone();
     let dep1 = Uuid::parse_str(
-        fx.track.deployment_id.as_ref().expect("the track opens a deployment"),
+        fx.track
+            .deployment_id
+            .as_ref()
+            .expect("the track opens a deployment"),
     )
     .expect("deployment id is a uuid");
 
@@ -756,7 +790,10 @@ async fn editing_a_calibration_spanning_two_deployments_updates_both_sites_aggre
         &fx.manager,
     )
     .await;
-    assert_eq!(status, 201, "manager moves the sensor to the second site: {body}");
+    assert_eq!(
+        status, 201,
+        "manager moves the sensor to the second site: {body}"
+    );
     let dep2 = Uuid::parse_str(&e2e::id_of(&body)).expect("deployment id is a uuid");
     assert!(
         wait_for_reprocessing(&fx.db, fx.sensor(), WAIT).await,
@@ -774,7 +811,10 @@ async fn editing_a_calibration_spanning_two_deployments_updates_both_sites_aggre
         &fx.admin,
     )
     .await;
-    assert!((200..300).contains(&status), "register the second stream ({status}): {body}");
+    assert!(
+        (200..300).contains(&status),
+        "register the second stream ({status}): {body}"
+    );
     let stream2 = e2e::id_of(&body);
     e2e::link_stream_sensor(&fx.app, &fx.admin, &stream2, &fx.sensor_id).await;
     let (status, body) = post_json_with_token(
@@ -807,7 +847,10 @@ async fn editing_a_calibration_spanning_two_deployments_updates_both_sites_aggre
     ingest(
         &fx,
         &stream2,
-        &[("2025-06-10T02:15:00Z", 230.0), ("2025-06-10T02:45:00Z", 250.0)],
+        &[
+            ("2025-06-10T02:15:00Z", 230.0),
+            ("2025-06-10T02:45:00Z", 250.0),
+        ],
     )
     .await;
     reprocess(&fx).await;
@@ -829,8 +872,16 @@ async fn editing_a_calibration_spanning_two_deployments_updates_both_sites_aggre
         "before the edit, upstream site",
     );
     for (i, row) in upstream.iter().enumerate() {
-        assert_eq!(row.site_id, Some(site1_uuid), "before the edit: upstream row {i} site");
-        assert_eq!(row.deployment_id, Some(dep1), "before the edit: upstream row {i} deployment");
+        assert_eq!(
+            row.site_id,
+            Some(site1_uuid),
+            "before the edit: upstream row {i} site"
+        );
+        assert_eq!(
+            row.deployment_id,
+            Some(dep1),
+            "before the edit: upstream row {i} deployment"
+        );
     }
 
     let downstream = get_readings(&fx.db, stream2_uuid).await;
@@ -843,8 +894,16 @@ async fn editing_a_calibration_spanning_two_deployments_updates_both_sites_aggre
         "before the edit, downstream site",
     );
     for (i, row) in downstream.iter().enumerate() {
-        assert_eq!(row.site_id, Some(site2_uuid), "before the edit: downstream row {i} site");
-        assert_eq!(row.deployment_id, Some(dep2), "before the edit: downstream row {i} deployment");
+        assert_eq!(
+            row.site_id,
+            Some(site2_uuid),
+            "before the edit: downstream row {i} site"
+        );
+        assert_eq!(
+            row.deployment_id,
+            Some(dep2),
+            "before the edit: downstream row {i} deployment"
+        );
     }
 
     assert_bucket(
@@ -897,8 +956,16 @@ async fn editing_a_calibration_spanning_two_deployments_updates_both_sites_aggre
         "after the edit, upstream site",
     );
     for (i, row) in upstream.iter().enumerate() {
-        assert_eq!(row.site_id, Some(site1_uuid), "after the edit: upstream row {i} site");
-        assert_eq!(row.deployment_id, Some(dep1), "after the edit: upstream row {i} deployment");
+        assert_eq!(
+            row.site_id,
+            Some(site1_uuid),
+            "after the edit: upstream row {i} site"
+        );
+        assert_eq!(
+            row.deployment_id,
+            Some(dep1),
+            "after the edit: upstream row {i} deployment"
+        );
     }
 
     let downstream = get_readings(&fx.db, stream2_uuid).await;
@@ -911,8 +978,16 @@ async fn editing_a_calibration_spanning_two_deployments_updates_both_sites_aggre
         "after the edit, downstream site",
     );
     for (i, row) in downstream.iter().enumerate() {
-        assert_eq!(row.site_id, Some(site2_uuid), "after the edit: downstream row {i} site");
-        assert_eq!(row.deployment_id, Some(dep2), "after the edit: downstream row {i} deployment");
+        assert_eq!(
+            row.site_id,
+            Some(site2_uuid),
+            "after the edit: downstream row {i} site"
+        );
+        assert_eq!(
+            row.deployment_id,
+            Some(dep2),
+            "after the edit: downstream row {i} deployment"
+        );
     }
 
     // No manual refresh here: the job's own refresh is the behaviour under test, and it is

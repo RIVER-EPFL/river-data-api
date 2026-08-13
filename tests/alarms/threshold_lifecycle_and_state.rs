@@ -4,7 +4,6 @@
 //!
 //! Run: cargo test --test alarms -- --test-threads=1
 
-
 use river_db::routes::private::alarms;
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use serial_test::serial;
@@ -101,7 +100,10 @@ async fn reset_to_defaults_re_enables_alarms() {
     .unwrap();
 
     let stats = alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
-    assert!(stats.opened >= 1, "fallback re-enables the alarm: {stats:?}");
+    assert!(
+        stats.opened >= 1,
+        "fallback re-enables the alarm: {stats:?}"
+    );
     assert_eq!(open_turb_event_count(&db).await, 1);
 }
 
@@ -134,7 +136,10 @@ async fn disable_alarms_null_row_suppresses_and_resolves() {
     .unwrap();
 
     let stats = alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
-    assert!(stats.resolved >= 1, "disabling resolves the open event: {stats:?}");
+    assert!(
+        stats.resolved >= 1,
+        "disabling resolves the open event: {stats:?}"
+    );
     assert_eq!(
         open_turb_event_count(&db).await,
         0,
@@ -180,7 +185,11 @@ async fn rebreach_opens_fresh_event() {
     alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
     let after = event_ids().await;
 
-    assert_eq!(after.len(), 2, "re-breach opens a second event, history preserved: {after:?}");
+    assert_eq!(
+        after.len(),
+        2,
+        "re-breach opens a second event, history preserved: {after:?}"
+    );
     assert_ne!(after[0], after[1], "the re-raise is a new event id");
     assert_eq!(after[0], first[0], "the original event is still present");
 }
@@ -222,7 +231,10 @@ async fn unacknowledge_clears_acknowledgement() {
     .await;
     assert!((200..300).contains(&status), "acknowledge ({status})");
     let (_s, active) = crate::common::get_json_with_token(&app, "/api/alarms/active", &token).await;
-    assert_eq!(find_turb(&active).unwrap()["acknowledged"], serde_json::json!(true));
+    assert_eq!(
+        find_turb(&active).unwrap()["acknowledged"],
+        serde_json::json!(true)
+    );
 
     let (status, _b) = crate::common::delete_with_token(
         &app,

@@ -50,11 +50,9 @@ impl MigrationTrait for Migration {
         // that has compression enabled. Remove the policy, decompress existing chunks,
         // turn off compression for the DDL, then restore the same compression config
         // and policy the init migration set up.
-        db.execute_unprepared(
-            "SELECT remove_compression_policy('readings', if_exists => true)",
-        )
-        .await
-        .ok();
+        db.execute_unprepared("SELECT remove_compression_policy('readings', if_exists => true)")
+            .await
+            .ok();
 
         db.execute_unprepared(
             r#"

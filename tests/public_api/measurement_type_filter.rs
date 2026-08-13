@@ -96,13 +96,20 @@ async fn filter_and_annotation_with_cache_isolation() {
     let (status, all) = crate::common::get_json(&app, &format!("{base}?{WINDOW}")).await;
     assert_eq!(status, 200, "unfiltered: {all}");
     let all_count = all["times"].as_array().unwrap().len();
-    assert_eq!(all_count, 8, "7 grid points (00:00..=01:00) + 1 spot: {all}");
+    assert_eq!(
+        all_count, 8,
+        "7 grid points (00:00..=01:00) + 1 spot: {all}"
+    );
 
     // Spot only.
     let (status, spot) =
         crate::common::get_json(&app, &format!("{base}?{WINDOW}&measurement_type=spot")).await;
     assert_eq!(status, 200, "spot: {spot}");
-    assert_eq!(spot["times"].as_array().unwrap().len(), 1, "spot only: {spot}");
+    assert_eq!(
+        spot["times"].as_array().unwrap().len(),
+        1,
+        "spot only: {spot}"
+    );
     assert_eq!(first_param(&spot)["values"][0], 99.5);
 
     // Continuous excludes the spot point (and would include untagged legacy rows).
@@ -134,7 +141,9 @@ async fn filter_and_annotation_with_cache_isolation() {
     .await;
     assert_eq!(status, 200, "annotated: {annotated}");
     let p = first_param(&annotated);
-    let mts = p["measurement_types"].as_array().expect("measurement_types present");
+    let mts = p["measurement_types"]
+        .as_array()
+        .expect("measurement_types present");
     assert_eq!(mts.len(), annotated["times"].as_array().unwrap().len());
     let spot_count = mts.iter().filter(|m| *m == "spot").count();
     let cont_count = mts.iter().filter(|m| *m == "continuous").count();
@@ -146,11 +155,8 @@ async fn filter_and_annotation_with_cache_isolation() {
     );
 
     // Invalid filter value → 400.
-    let (status, _) = crate::common::get_json(
-        &app,
-        &format!("{base}?{WINDOW}&measurement_type=grab"),
-    )
-    .await;
+    let (status, _) =
+        crate::common::get_json(&app, &format!("{base}?{WINDOW}&measurement_type=grab")).await;
     assert_eq!(status, 400);
 }
 

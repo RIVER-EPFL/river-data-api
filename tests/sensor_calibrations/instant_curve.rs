@@ -29,8 +29,14 @@ async fn calibration_create_defaults_windowed_and_accepts_instant_override() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "windowed create should succeed: {json}");
-    assert_eq!(json["mode"], "windowed", "omitting mode defaults to windowed");
+    assert!(
+        (200..300).contains(&status),
+        "windowed create should succeed: {json}"
+    );
+    assert_eq!(
+        json["mode"], "windowed",
+        "omitting mode defaults to windowed"
+    );
 
     let (status, json) = post_json_parse_with_token(
         &app,
@@ -46,8 +52,14 @@ async fn calibration_create_defaults_windowed_and_accepts_instant_override() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "instant create should succeed: {json}");
-    assert_eq!(json["mode"], "instant", "explicit mode override is honoured");
+    assert!(
+        (200..300).contains(&status),
+        "instant create should succeed: {json}"
+    );
+    assert_eq!(
+        json["mode"], "instant",
+        "explicit mode override is honoured"
+    );
     assert_eq!(json["name"], "Plate A");
     assert!(
         json["parameter_id"].is_null(),

@@ -7,7 +7,6 @@
 //!
 //! Run: cargo test --test alarms -- --test-threads=1
 
-
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use serial_test::serial;
 use std::time::Duration;
@@ -101,7 +100,10 @@ async fn csv_import_triggers_alarm_backfill_with_warnings_and_alarms() {
     );
 
     let job_status = wait_for_alarm_backfill(&db).await;
-    assert_eq!(job_status, "completed", "alarm_backfill job should complete");
+    assert_eq!(
+        job_status, "completed",
+        "alarm_backfill job should complete"
+    );
 
     // Two resolved episodes: a warning (max_severity 1) then an alarm (max_severity 2).
     let episodes = turbidity_episodes(&db).await;
@@ -127,11 +129,15 @@ async fn csv_import_triggers_alarm_backfill_with_warnings_and_alarms() {
         .collect();
     assert_eq!(turb_events.len(), 2, "two events in the feed: {events}");
     assert!(
-        turb_events.iter().any(|e| e["max_severity"].as_i64() == Some(2)),
+        turb_events
+            .iter()
+            .any(|e| e["max_severity"].as_i64() == Some(2)),
         "an alarm-severity event is present: {events}"
     );
     assert!(
-        turb_events.iter().any(|e| e["max_severity"].as_i64() == Some(1)),
+        turb_events
+            .iter()
+            .any(|e| e["max_severity"].as_i64() == Some(1)),
         "a warning-severity event is present: {events}"
     );
 }
@@ -205,5 +211,8 @@ async fn rebuild_alarm_events_action_is_idempotent() {
     // Running it again must not duplicate or drop episodes.
     assert_eq!(rebuild().await, "completed");
     let second = turbidity_episodes(&db).await;
-    assert_eq!(second, first, "rebuild is idempotent: {second:?} vs {first:?}");
+    assert_eq!(
+        second, first,
+        "rebuild is idempotent: {second:?} vs {first:?}"
+    );
 }

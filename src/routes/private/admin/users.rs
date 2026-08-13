@@ -73,16 +73,23 @@ pub(crate) async fn get_admin_token(state: &AppState) -> AppResult<String> {
     {
         let cache = admin.token_cache.lock().await;
         if let Some((token, expiry)) = cache.as_ref()
-            && *expiry > Utc::now() + chrono::Duration::seconds(30) {
-                return Ok(token.clone());
-            }
+            && *expiry > Utc::now() + chrono::Duration::seconds(30)
+        {
+            return Ok(token.clone());
+        }
     }
 
     let url = format!(
         "{}/realms/{}/protocol/openid-connect/token",
-        state.config.keycloak_url.as_ref()
+        state
+            .config
+            .keycloak_url
+            .as_ref()
             .ok_or_else(|| AppError::ServiceUnavailable("Keycloak not configured".to_string()))?,
-        state.config.keycloak_realm.as_ref()
+        state
+            .config
+            .keycloak_realm
+            .as_ref()
             .ok_or_else(|| AppError::ServiceUnavailable("Keycloak not configured".to_string()))?,
     );
 
@@ -131,15 +138,23 @@ pub(crate) async fn get_admin_token(state: &AppState) -> AppResult<String> {
 pub(crate) fn admin_base_url(state: &AppState) -> AppResult<String> {
     Ok(format!(
         "{}/admin/realms/{}",
-        state.config.keycloak_url.as_ref()
+        state
+            .config
+            .keycloak_url
+            .as_ref()
             .ok_or_else(|| AppError::ServiceUnavailable("Keycloak not configured".to_string()))?,
-        state.config.keycloak_realm.as_ref()
+        state
+            .config
+            .keycloak_realm
+            .as_ref()
             .ok_or_else(|| AppError::ServiceUnavailable("Keycloak not configured".to_string()))?,
     ))
 }
 
 pub(crate) fn admin_client(state: &AppState) -> AppResult<&KeycloakAdmin> {
-    state.keycloak_admin.as_ref()
+    state
+        .keycloak_admin
+        .as_ref()
         .ok_or_else(|| AppError::ServiceUnavailable("Keycloak not configured".to_string()))
 }
 
@@ -188,18 +203,19 @@ pub async fn list_users(
     };
 
     // Parse filters
-    let filter_json = query.filter.as_ref().and_then(|f| {
-        serde_json::from_str::<serde_json::Value>(f).ok()
-    });
+    let filter_json = query
+        .filter
+        .as_ref()
+        .and_then(|f| serde_json::from_str::<serde_json::Value>(f).ok());
     let search = filter_json.as_ref().and_then(|v| {
         v.get("q")
             .or_else(|| v.get("search"))
             .and_then(|s| s.as_str())
             .map(|s| s.to_lowercase())
     });
-    let admin_filter = filter_json.as_ref().and_then(|v| {
-        v.get("admin").and_then(|a| a.as_bool())
-    });
+    let admin_filter = filter_json
+        .as_ref()
+        .and_then(|v| v.get("admin").and_then(|a| a.as_bool()));
 
     // Fetch only users holding a riverdata role (not the entire realm; it is LDAP-federated
     // and contains every EPFL account). Union members of every level so admin-only users appear
@@ -219,7 +235,9 @@ pub async fn list_users(
         std::collections::HashMap::new();
     for (role, members) in RIVER_ROLE_NAMES.iter().zip(role_member_lists) {
         for u in members? {
-            let Some(id) = u["id"].as_str().map(str::to_string) else { continue };
+            let Some(id) = u["id"].as_str().map(str::to_string) else {
+                continue;
+            };
             if let Some((_, roles)) = by_id.get_mut(&id) {
                 roles.push((*role).to_string());
             } else {
@@ -564,9 +582,7 @@ pub async fn assign_roles(
     ),
     tag = "admin"
 )]
-pub async fn list_roles(
-    State(state): State<AppState>,
-) -> AppResult<Json<Vec<serde_json::Value>>> {
+pub async fn list_roles(State(state): State<AppState>) -> AppResult<Json<Vec<serde_json::Value>>> {
     let token = get_admin_token(&state).await?;
     let client = admin_client(&state)?;
     let base = admin_base_url(&state)?;
@@ -683,7 +699,11 @@ async fn fetch_user_roles(
 /// the river access levels. Checked before any mapping is removed.
 fn validate_requested_roles(role_names: &[String], all_roles: &[KeycloakRole]) -> AppResult<()> {
     let join = |names: Vec<&String>| {
-        names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        names
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     let outside: Vec<&String> = role_names
         .iter()
@@ -768,9 +788,7 @@ async fn set_user_roles(
     if !removable.is_empty() {
         let resp = client
             .http_client
-            .delete(format!(
-                "{base}/users/{user_id}/role-mappings/realm"
-            ))
+            .delete(format!("{base}/users/{user_id}/role-mappings/realm"))
             .bearer_auth(token)
             .json(&removable)
             .send()
@@ -795,9 +813,7 @@ async fn set_user_roles(
     if !to_assign.is_empty() {
         let resp = client
             .http_client
-            .post(format!(
-                "{base}/users/{user_id}/role-mappings/realm"
-            ))
+            .post(format!("{base}/users/{user_id}/role-mappings/realm"))
             .bearer_auth(token)
             .json(&to_assign)
             .send()
@@ -885,11 +901,15 @@ pub async fn set_user_grants(
         .await
         .map_err(|e| AppError::BadRequest(format!("grant insert failed (unknown project?): {e}")))?;
     }
-    txn.commit().await.map_err(|e| AppError::Internal(e.to_string()))?;
+    txn.commit()
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
 
     state.grants_cache.invalidate(&id).await;
 
-    Ok(Json(serde_json::json!({ "success": true, "count": req.project_ids.len() })))
+    Ok(Json(
+        serde_json::json!({ "success": true, "count": req.project_ids.len() }),
+    ))
 }
 
 pub fn router() -> Router<AppState> {

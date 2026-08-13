@@ -1,15 +1,14 @@
-use axum::extract::{Path, State};
 use axum::Json;
+use axum::extract::{Path, State};
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use uuid::Uuid;
 
+use super::session::SyncServiceContext;
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
-use river_data_core::models::{CommandStatus, CommandUpdateRequest};
 use crate::routes::private::sync::commands_model;
-use super::session::SyncServiceContext;
-
+use river_data_core::models::{CommandStatus, CommandUpdateRequest};
 
 const VALID_UPDATE_STATUSES: &[&str] = &[
     CommandStatus::Acknowledged.as_str(),

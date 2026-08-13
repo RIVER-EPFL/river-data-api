@@ -16,10 +16,8 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        db.execute_unprepared(
-            r#"ALTER TABLE parameters DROP COLUMN IF EXISTS aliases"#,
-        )
-        .await?;
+        db.execute_unprepared(r#"ALTER TABLE parameters DROP COLUMN IF EXISTS aliases"#)
+            .await?;
         Ok(())
     }
 }

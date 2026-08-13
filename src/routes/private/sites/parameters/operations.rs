@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
-use sea_orm::{ColumnTrait, ConnectionTrait, Condition, DatabaseConnection, EntityTrait, Order, QueryFilter, QueryOrder, QuerySelect, Statement};
+use sea_orm::{
+    ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait, Order, QueryFilter,
+    QueryOrder, QuerySelect, Statement,
+};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
@@ -36,7 +39,10 @@ async fn enrich(db: &DatabaseConnection, items: &mut [SiteParameter]) -> Result<
 
     if !def_ids.is_empty() {
         let defs = crate::routes::private::parameters::derived::definition_model::Entity::find()
-            .filter(crate::routes::private::parameters::derived::definition_model::Column::Id.is_in(def_ids))
+            .filter(
+                crate::routes::private::parameters::derived::definition_model::Column::Id
+                    .is_in(def_ids),
+            )
             .all(db)
             .await
             .map_err(ApiError::database)?;
@@ -71,7 +77,9 @@ impl CRUDOperations for SiteParameterOperations {
             .one(db)
             .await
             .map_err(ApiError::database)?
-            .ok_or_else(|| ApiError::not_found(SiteParameter::RESOURCE_NAME_SINGULAR, Some(id.to_string())))?;
+            .ok_or_else(|| {
+                ApiError::not_found(SiteParameter::RESOURCE_NAME_SINGULAR, Some(id.to_string()))
+            })?;
         let mut resource = SiteParameter::from(model);
         let mut slice = std::slice::from_mut(&mut resource);
         enrich(db, &mut slice).await?;
@@ -95,7 +103,8 @@ impl CRUDOperations for SiteParameterOperations {
             .all(db)
             .await
             .map_err(ApiError::database)?;
-        let mut resources: Vec<SiteParameter> = models.into_iter().map(SiteParameter::from).collect();
+        let mut resources: Vec<SiteParameter> =
+            models.into_iter().map(SiteParameter::from).collect();
         enrich(db, &mut resources).await?;
         Ok(resources
             .into_iter()
@@ -107,11 +116,7 @@ impl CRUDOperations for SiteParameterOperations {
     /// events, delete the samples nothing references any more, release the streams that fed it,
     /// and rebuild the rollups. `retire_slot` also does the `data_streams` NULLing the foreign key
     /// requires, so the delete CrudCrate performs next succeeds.
-    async fn before_delete(
-        &self,
-        db: &DatabaseConnection,
-        id: Uuid,
-    ) -> Result<(), ApiError> {
+    async fn before_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<(), ApiError> {
         crate::routes::private::data_streams::views::retire_slot(
             db,
             crate::routes::private::data_streams::views::SlotScope::SiteParameter(id),

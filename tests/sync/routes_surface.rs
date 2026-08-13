@@ -7,8 +7,8 @@
 //!
 //! Run: cargo test --test sync -- --test-threads=1
 
-use axum::body::Body;
 use axum::Router;
+use axum::body::Body;
 use http_body_util::BodyExt;
 use serial_test::serial;
 use tower::ServiceExt;
@@ -79,7 +79,10 @@ async fn every_sync_route_the_dashboard_and_services_call_still_exists() {
         ("POST", format!("/api/sync/services/{service_id}/commands")),
         ("POST", format!("/api/sync/services/{service_id}/revoke")),
         ("POST", "/api/sync/credentials".to_string()),
-        ("POST", format!("/api/sync/credentials/{credential_id}/revoke")),
+        (
+            "POST",
+            format!("/api/sync/credentials/{credential_id}/revoke"),
+        ),
     ];
 
     // Entity listings, read by the dashboard's system page.

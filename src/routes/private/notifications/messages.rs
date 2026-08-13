@@ -61,7 +61,11 @@ pub fn render_resolved(events: &[PendingEvent], dashboard_base: Option<&str>) ->
     let subject = format!("River Data resolved: {}", events.len());
     let mut body = format!("✅ Resolved, {}\n", events.len());
     for e in events {
-        let _ = writeln!(body, "{} / {} is back in range", e.site_name, e.parameter_name);
+        let _ = writeln!(
+            body,
+            "{} / {} is back in range",
+            e.site_name, e.parameter_name
+        );
     }
     if let Some(base) = dashboard_base {
         let _ = write!(body, "View: {}/alarms", base.trim_end_matches('/'));
@@ -97,7 +101,10 @@ mod tests {
 
     #[test]
     fn test_render_opened_lists_each_event_and_links() {
-        let events = vec![event("Martigny", "Depth", 2, 2150.0), event("Saxon", "CDOM", 1, 140.0)];
+        let events = vec![
+            event("Martigny", "Depth", 2, 2150.0),
+            event("Saxon", "CDOM", 1, 140.0),
+        ];
         let msg = render_opened(&events, Some("https://dash.example/"));
         assert_eq!(msg.kind, "alarm_opened");
         assert_eq!(msg.subject, "River Data alarm: 2 active");

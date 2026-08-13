@@ -8,10 +8,10 @@
 //!
 //! Run: cargo test --test sync -- --test-threads=1
 
-use axum::extract::{Path, State};
 use axum::Json;
+use axum::extract::{Path, State};
 use river_db::routes::private::sync::operator::{
-    create_credential, revoke_credential, CreateCredentialRequest,
+    CreateCredentialRequest, create_credential, revoke_credential,
 };
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serial_test::serial;
@@ -21,7 +21,10 @@ use river_db::routes::private::api_tokens::service::hash_token;
 
 async fn scalar(db: &DatabaseConnection, sql: &str) -> String {
     let row = db
-        .query_one(Statement::from_string(DatabaseBackend::Postgres, sql.to_string()))
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            sql.to_string(),
+        ))
         .await
         .expect("query")
         .expect("row");
@@ -30,7 +33,10 @@ async fn scalar(db: &DatabaseConnection, sql: &str) -> String {
 
 async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
     let row = db
-        .query_one(Statement::from_string(DatabaseBackend::Postgres, sql.to_string()))
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            sql.to_string(),
+        ))
         .await
         .expect("query")
         .expect("row");
@@ -61,7 +67,10 @@ async fn minted_credentials_enroll_and_are_stored_hashed() {
     assert_eq!(minted.client_id.len(), 20, "svc_ plus 16 hex chars");
     assert_eq!(minted.client_secret.len(), 64, "32 random bytes as hex");
     assert!(
-        minted.client_secret.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        minted
+            .client_secret
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
         "secret alphabet: {}",
         minted.client_secret
     );
@@ -122,7 +131,10 @@ async fn minted_credentials_enroll_and_are_stored_hashed() {
         }),
     )
     .await;
-    assert_eq!(status, 200, "enroll with minted credentials ({status}): {body}");
+    assert_eq!(
+        status, 200,
+        "enroll with minted credentials ({status}): {body}"
+    );
 }
 
 #[tokio::test]
@@ -188,7 +200,9 @@ async fn revoking_a_credential_kills_enrollment_and_live_sessions() {
     assert_eq!(
         count(
             &db,
-            &format!("SELECT COUNT(*) AS c FROM sync_service_tokens WHERE service_id = '{service_id}'")
+            &format!(
+                "SELECT COUNT(*) AS c FROM sync_service_tokens WHERE service_id = '{service_id}'"
+            )
         )
         .await,
         0,

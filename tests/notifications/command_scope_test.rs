@@ -47,10 +47,16 @@ async fn stations_hides_ungranted_projects() {
     seed_project_b(&db).await;
 
     let confined = commands::stations(&db, &scope_a()).await;
-    assert!(!confined.contains("HiddenStationB"), "member must not see project B's site: {confined}");
+    assert!(
+        !confined.contains("HiddenStationB"),
+        "member must not see project B's site: {confined}"
+    );
 
     let unrestricted = commands::stations(&db, &AccessScope::Unrestricted).await;
-    assert!(unrestricted.contains("HiddenStationB"), "an admin sees every site: {unrestricted}");
+    assert!(
+        unrestricted.contains("HiddenStationB"),
+        "an admin sees every site: {unrestricted}"
+    );
 }
 
 #[tokio::test]
@@ -63,12 +69,21 @@ async fn latest_cannot_resolve_out_of_scope_site() {
 
     // By name and by id, an out-of-scope site is indistinguishable from a non-existent one.
     let by_name = commands::latest(&db, &scope_a(), "HiddenStationB").await;
-    assert!(by_name.contains("No site matches"), "member cannot target project B by name: {by_name}");
+    assert!(
+        by_name.contains("No site matches"),
+        "member cannot target project B by name: {by_name}"
+    );
 
     let by_id = commands::latest(&db, &scope_a(), SITE_B).await;
-    assert!(by_id.contains("No site matches"), "member cannot target project B by id: {by_id}");
+    assert!(
+        by_id.contains("No site matches"),
+        "member cannot target project B by id: {by_id}"
+    );
 
     // The admin can resolve it (no data seeded, so it reports no readings rather than "no match").
     let admin = commands::latest(&db, &AccessScope::Unrestricted, SITE_B).await;
-    assert!(!admin.contains("No site matches"), "an admin resolves the site: {admin}");
+    assert!(
+        !admin.contains("No site matches"),
+        "an admin resolves the site: {admin}"
+    );
 }

@@ -63,11 +63,7 @@ pub async fn get_json(app: &Router, uri: &str) -> (u16, serde_json::Value) {
     (status, json)
 }
 
-pub async fn get_json_with_token(
-    app: &Router,
-    uri: &str,
-    token: &str,
-) -> (u16, serde_json::Value) {
+pub async fn get_json_with_token(app: &Router, uri: &str, token: &str) -> (u16, serde_json::Value) {
     let (status, body) = get_with_token(app, uri, token).await;
     let json: serde_json::Value = serde_json::from_str(&body)
         .unwrap_or_else(|e| panic!("Failed to parse JSON from {uri}: {e}\nBody: {body}"));
@@ -200,7 +196,6 @@ pub async fn get_with_auth_header(app: &Router, uri: &str, auth_value: &str) -> 
 
     (status, text)
 }
-
 
 pub async fn get_csv_with_token(app: &Router, uri: &str, token: &str) -> (u16, String) {
     let req = axum::http::Request::builder()

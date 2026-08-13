@@ -9,7 +9,6 @@
 //!
 //! Run: cargo test --test e2e -- --test-threads=1
 
-
 use crate::common::e2e;
 use crate::common::sensor_lifecycle as sl;
 use sea_orm::{ConnectionTrait, Statement};
@@ -33,28 +32,59 @@ async fn deploy_move_recall_reprocess_over_http() {
     // six readings across the first hour. (DB helpers, no hooks needed for setup.)
     let sensor = sl::create_sensor(&db, "lifecycle", crate::common::GLOBAL_PARAM_TEMP_ID).await;
     let cal = sl::add_calibration(&db, sensor.id, 2.0, 1.0, sl::dt("2025-06-01T00:00:00Z")).await;
-    let dep_a = sl::deploy_sensor(&db, sensor.id, crate::common::SITE1_ID, sl::dt("2025-06-01T00:00:00Z")).await;
+    let dep_a = sl::deploy_sensor(
+        &db,
+        sensor.id,
+        crate::common::SITE1_ID,
+        sl::dt("2025-06-01T00:00:00Z"),
+    )
+    .await;
     let stream = sl::create_paired_stream(&db, "lifecycle", crate::common::PARAM_S1_TEMP_ID).await;
     let raw: Vec<(_, f64)> = (0..6)
-        .map(|i| (sl::dt(&format!("2025-06-01T00:{:02}:00Z", i * 10)), 10.0 + i as f64))
+        .map(|i| {
+            (
+                sl::dt(&format!("2025-06-01T00:{:02}:00Z", i * 10)),
+                10.0 + i as f64,
+            )
+        })
         .collect();
     sl::insert_readings(
-        &db, stream, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID,
-        sensor.id, cal, dep_a, 2.0, 1.0, &raw,
+        &db,
+        stream,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        sensor.id,
+        cal,
+        dep_a,
+        2.0,
+        1.0,
+        &raw,
     )
     .await;
 
     let rows = sl::get_readings(&db, stream).await;
     assert_eq!(rows.len(), 6);
     for (i, r) in rows.iter().enumerate() {
-        assert_eq!(r.calibrated_value, Some(2.0 * (10.0 + i as f64) + 1.0), "calibrated[{i}]");
+        assert_eq!(
+            r.calibrated_value,
+            Some(2.0 * (10.0 + i as f64) + 1.0),
+            "calibrated[{i}]"
+        );
         assert_eq!(r.site_id, Some(site1), "all readings start at site 1");
     }
 
     // MOVE to site 2 at 00:30 via the API. The before_create hook closes the open site-1 deployment
     // at the new deployed_from; after_create spawns a tracked reprocessing job.
     let sensor_id = sensor.id.to_string();
-    let _dep_b = e2e::create_deployment(&app, &token, &sensor_id, crate::common::SITE2_ID, crate::common::GLOBAL_PARAM_TEMP_ID, "2025-06-01T00:30:00Z").await;
+    let _dep_b = e2e::create_deployment(
+        &app,
+        &token,
+        &sensor_id,
+        crate::common::SITE2_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        "2025-06-01T00:30:00Z",
+    )
+    .await;
     assert!(
         sl::wait_for_reprocessing(&db, sensor.id, Duration::from_secs(30)).await,
         "reprocessing after move should complete"
@@ -72,15 +102,27 @@ async fn deploy_move_recall_reprocess_over_http() {
         .expect("dep_a row")
         .try_get("", "deployed_until")
         .expect("deployed_until should be set");
-    assert_eq!(until.with_timezone(&chrono::Utc), sl::dt("2025-06-01T00:30:00Z"), "site-1 deployment closes at the move time");
+    assert_eq!(
+        until.with_timezone(&chrono::Utc),
+        sl::dt("2025-06-01T00:30:00Z"),
+        "site-1 deployment closes at the move time"
+    );
 
     // Readings re-coordinate by time window: < 00:30 stay at site 1, >= 00:30 move to site 2.
     // Calibrated values are unchanged (same calibration window still applies).
     let rows = sl::get_readings(&db, stream).await;
     for (i, r) in rows.iter().enumerate() {
         let expected_site = if i < 3 { site1 } else { site2 };
-        assert_eq!(r.site_id, Some(expected_site), "reading[{i}] site after move");
-        assert_eq!(r.calibrated_value, Some(2.0 * (10.0 + i as f64) + 1.0), "calibrated[{i}] unchanged by move");
+        assert_eq!(
+            r.site_id,
+            Some(expected_site),
+            "reading[{i}] site after move"
+        );
+        assert_eq!(
+            r.calibrated_value,
+            Some(2.0 * (10.0 + i as f64) + 1.0),
+            "calibrated[{i}] unchanged by move"
+        );
     }
 
     // RECALL: end the open (site-2) deployment via PUT (the verb the UI's update uses). Routes through
@@ -92,7 +134,10 @@ async fn deploy_move_recall_reprocess_over_http() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "recall (PUT) ({status}): {body}");
+    assert!(
+        (200..300).contains(&status),
+        "recall (PUT) ({status}): {body}"
+    );
     assert!(
         sl::wait_for_reprocessing(&db, sensor.id, Duration::from_secs(30)).await,
         "reprocessing after recall should complete"
@@ -106,8 +151,15 @@ async fn deploy_move_recall_reprocess_over_http() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "reprocess ({status}): {repro}");
+    assert!(
+        (200..300).contains(&status),
+        "reprocess ({status}): {repro}"
+    );
     let repro: serde_json::Value = serde_json::from_str(&repro).unwrap();
     let job_id = repro["job_id"].as_str().expect("reprocess returns job_id");
-    assert_eq!(e2e::poll_job(&app, &token, job_id, 30).await, "completed", "manual reprocess job completes");
+    assert_eq!(
+        e2e::poll_job(&app, &token, job_id, 30).await,
+        "completed",
+        "manual reprocess job completes"
+    );
 }

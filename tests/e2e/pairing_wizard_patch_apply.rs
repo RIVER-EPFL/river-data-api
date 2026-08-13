@@ -73,7 +73,12 @@ async fn register_stream(
     e2e::id_of(&stream)
 }
 
-fn hierarchy_metadata(project: &str, site: &str, parameter: &str, units: &str) -> serde_json::Value {
+fn hierarchy_metadata(
+    project: &str,
+    site: &str,
+    parameter: &str,
+    units: &str,
+) -> serde_json::Value {
     json!({
         "hierarchy": { "project": project, "site": site, "parameter": parameter },
         "units": units,
@@ -97,7 +102,10 @@ async fn ingest(app: &Router, jwt: &str, stream_id: &str, n: usize) {
         jwt,
     )
     .await;
-    assert_eq!(status, 200, "ingest {n} readings into {stream_id} ({status}): {body}");
+    assert_eq!(
+        status, 200,
+        "ingest {n} readings into {stream_id} ({status}): {body}"
+    );
     assert_eq!(body["inserted"], n, "every reading lands: {body}");
     assert_eq!(
         body["paired"], false,
@@ -140,7 +148,10 @@ async fn create_plan(app: &Router, jwt: &str, source_system: &str) -> serde_json
         jwt,
     )
     .await;
-    assert_eq!(status, 200, "create plan for {source_system} ({status}): {plan}");
+    assert_eq!(
+        status, 200,
+        "create plan for {source_system} ({status}): {plan}"
+    );
     assert_eq!(plan["status"], "draft", "a new plan is a draft: {plan}");
     plan
 }
@@ -206,11 +217,27 @@ async fn final_patch_state_is_what_applies_and_late_patch_is_rejected() {
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
     let s_rename = unpaired_stream(
-        &app, &admin, "wizpatch", "rename", "WIZARD", "WZ_A", "Raw Param A", "mg/L", 3,
+        &app,
+        &admin,
+        "wizpatch",
+        "rename",
+        "WIZARD",
+        "WZ_A",
+        "Raw Param A",
+        "mg/L",
+        3,
     )
     .await;
     let s_map = unpaired_stream(
-        &app, &admin, "wizpatch", "map", "WIZARD", "WZ_A", "Mystery B", "FNU", 2,
+        &app,
+        &admin,
+        "wizpatch",
+        "map",
+        "WIZARD",
+        "WZ_A",
+        "Mystery B",
+        "FNU",
+        2,
     )
     .await;
     let s_skip = unpaired_stream(
@@ -235,9 +262,18 @@ async fn final_patch_state_is_what_applies_and_late_patch_is_rejected() {
 
     let plan = create_plan(&app, &admin, "wizpatch").await;
     let plan_id = plan["id"].as_str().expect("plan id").to_string();
-    assert_eq!(plan["summary"]["total_streams"], 3, "all three streams discovered: {plan}");
-    assert_eq!(plan["summary"]["will_pair"], 3, "every entry starts as pair: {plan}");
-    assert_eq!(plan["summary"]["will_skip"], 0, "nothing is skipped yet: {plan}");
+    assert_eq!(
+        plan["summary"]["total_streams"], 3,
+        "all three streams discovered: {plan}"
+    );
+    assert_eq!(
+        plan["summary"]["will_pair"], 3,
+        "every entry starts as pair: {plan}"
+    );
+    assert_eq!(
+        plan["summary"]["will_skip"], 0,
+        "nothing is skipped yet: {plan}"
+    );
 
     patch_plan(
         &app,
@@ -277,7 +313,10 @@ async fn final_patch_state_is_what_applies_and_late_patch_is_rejected() {
         renamed["parameter"]["units"], "ug/L",
         "the units edit sent with the rename survives the batches after it: {latest}"
     );
-    assert_eq!(renamed["parameter"]["create"], true, "'Final Name' is new: {latest}");
+    assert_eq!(
+        renamed["parameter"]["create"], true,
+        "'Final Name' is new: {latest}"
+    );
     assert!(
         renamed["parameter"]["id"].is_null(),
         "a to-be-created parameter carries no id: {latest}"
@@ -301,7 +340,10 @@ async fn final_patch_state_is_what_applies_and_late_patch_is_rejected() {
     );
 
     let summary = &latest["summary"];
-    assert_eq!(summary["will_pair"], 2, "two entries left to pair: {latest}");
+    assert_eq!(
+        summary["will_pair"], 2,
+        "two entries left to pair: {latest}"
+    );
     assert_eq!(summary["will_skip"], 1, "one entry skipped: {latest}");
     assert_eq!(
         summary["parameters_to_create"], 1,
@@ -339,7 +381,10 @@ async fn final_patch_state_is_what_applies_and_late_patch_is_rejected() {
     }
 
     let counts = run_plan_action(&app, &admin, &plan_id, "apply").await;
-    assert_eq!(counts["streams_paired"], 2, "the skipped stream is not paired: {counts}");
+    assert_eq!(
+        counts["streams_paired"], 2,
+        "the skipped stream is not paired: {counts}"
+    );
     assert_eq!(
         counts["streams_skipped"], 0,
         "a user-chosen skip is filtered before the skip counter, which counts unusable entries: {counts}"
@@ -350,7 +395,10 @@ async fn final_patch_state_is_what_applies_and_late_patch_is_rejected() {
         counts["parameters_created"], 1,
         "only the renamed parameter is created; the mapped one is reused: {counts}"
     );
-    assert_eq!(counts["site_parameters_created"], 2, "one slot per paired stream: {counts}");
+    assert_eq!(
+        counts["site_parameters_created"], 2,
+        "one slot per paired stream: {counts}"
+    );
     assert_eq!(
         counts["readings_backfilled"], 5,
         "3 from the renamed stream + 2 from the mapped one; the skipped stream's 4 stay out: {counts}"
@@ -371,7 +419,11 @@ async fn final_patch_state_is_what_applies_and_late_patch_is_rejected() {
         "the superseded rename left no catalog artifact"
     );
     assert_eq!(
-        count(&db, "SELECT count(*) AS c FROM parameters WHERE code = 'Final Name'").await,
+        count(
+            &db,
+            "SELECT count(*) AS c FROM parameters WHERE code = 'Final Name'"
+        )
+        .await,
         1,
         "the parameter apply created carries the final name"
     );
@@ -450,7 +502,10 @@ async fn final_patch_state_is_what_applies_and_late_patch_is_rejected() {
         &admin,
     )
     .await;
-    assert_eq!(status, 200, "read back the applied plan ({status}): {final_plan}");
+    assert_eq!(
+        status, 200,
+        "read back the applied plan ({status}): {final_plan}"
+    );
     assert_eq!(final_plan["status"], "applied", "plan status: {final_plan}");
     assert_eq!(
         find_entry(&final_plan, &s_rename)["parameter"]["name"],
@@ -471,15 +526,39 @@ async fn revert_after_partial_apply_leaves_skipped_stream_and_replan_sees_create
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
     let s_one = unpaired_stream(
-        &app, &admin, "wizrevert", "one", "WIZREVERT", "WR_A", "Alpha", "mg/L", 2,
+        &app,
+        &admin,
+        "wizrevert",
+        "one",
+        "WIZREVERT",
+        "WR_A",
+        "Alpha",
+        "mg/L",
+        2,
     )
     .await;
     let s_two = unpaired_stream(
-        &app, &admin, "wizrevert", "two", "WIZREVERT", "WR_A", "Beta", "mg/L", 2,
+        &app,
+        &admin,
+        "wizrevert",
+        "two",
+        "WIZREVERT",
+        "WR_A",
+        "Beta",
+        "mg/L",
+        2,
     )
     .await;
     let s_skip = unpaired_stream(
-        &app, &admin, "wizrevert", "skip", "WIZREVERT", "WR_A", "Gamma", "mg/L", 2,
+        &app,
+        &admin,
+        "wizrevert",
+        "skip",
+        "WIZREVERT",
+        "WR_A",
+        "Gamma",
+        "mg/L",
+        2,
     )
     .await;
 
@@ -550,7 +629,10 @@ async fn revert_after_partial_apply_leaves_skipped_stream_and_replan_sees_create
 
     let (status, site) =
         crate::common::get_json_with_token(&app, "/api/sites/WR_A/detail", &admin).await;
-    assert_eq!(status, 200, "the site the apply created survives the revert ({status}): {site}");
+    assert_eq!(
+        status, 200,
+        "the site the apply created survives the revert ({status}): {site}"
+    );
     let wr_a = site["id"].as_str().expect("site id").to_string();
 
     let second = create_plan(&app, &admin, "wizrevert").await;
@@ -595,7 +677,10 @@ async fn revert_after_partial_apply_leaves_skipped_stream_and_replan_sees_create
         true,
         "Gamma was never created, so it is still new: {second}"
     );
-    assert_eq!(second["summary"]["sites_to_create"], 0, "no new sites: {second}");
+    assert_eq!(
+        second["summary"]["sites_to_create"], 0,
+        "no new sites: {second}"
+    );
     assert_eq!(
         second["summary"]["parameters_to_create"], 1,
         "only Gamma remains to create: {second}"
@@ -669,24 +754,49 @@ async fn plan_site_metadata_returns_one_typed_row_per_plan_site() {
     )
     .await;
     assert_eq!(status, 200, "site-metadata ({status}): {rows}");
-    let rows = rows.as_array().expect("site-metadata returns an array").clone();
+    let rows = rows
+        .as_array()
+        .expect("site-metadata returns an array")
+        .clone();
     assert_eq!(
         rows.len(),
         2,
         "one row per distinct site, so the two GL_META_A streams collapse: {rows:?}"
     );
-    assert_eq!(rows[0]["site_name"], "GL_META_A", "rows are ordered by site name: {rows:?}");
-    assert_eq!(rows[1]["site_name"], "GL_META_B", "rows are ordered by site name: {rows:?}");
+    assert_eq!(
+        rows[0]["site_name"], "GL_META_A",
+        "rows are ordered by site name: {rows:?}"
+    );
+    assert_eq!(
+        rows[1]["site_name"], "GL_META_B",
+        "rows are ordered by site name: {rows:?}"
+    );
     assert!(
         !rows.iter().any(|r| r["site_name"] == "GL_OTHER"),
         "the endpoint is scoped to this plan's streams: {rows:?}"
     );
 
     let a = &rows[0];
-    assert_eq!(a["latitude"].as_f64(), Some(46.51), "latitude parsed as a number: {a}");
-    assert_eq!(a["longitude"].as_f64(), Some(7.98), "longitude parsed as a number: {a}");
-    assert_eq!(a["altitude_m"].as_f64(), Some(2410.5), "altitude parsed as a number: {a}");
-    assert_eq!(a["elevation"].as_f64(), Some(2410.5), "station elevation parsed as a number: {a}");
+    assert_eq!(
+        a["latitude"].as_f64(),
+        Some(46.51),
+        "latitude parsed as a number: {a}"
+    );
+    assert_eq!(
+        a["longitude"].as_f64(),
+        Some(7.98),
+        "longitude parsed as a number: {a}"
+    );
+    assert_eq!(
+        a["altitude_m"].as_f64(),
+        Some(2410.5),
+        "altitude parsed as a number: {a}"
+    );
+    assert_eq!(
+        a["elevation"].as_f64(),
+        Some(2410.5),
+        "station elevation parsed as a number: {a}"
+    );
     assert_eq!(
         a["sample_interval_sec"].as_i64(),
         Some(600),
@@ -701,7 +811,10 @@ async fn plan_site_metadata_returns_one_typed_row_per_plan_site() {
     assert_eq!(a["glacier_rgi"], "RGI60-11.02704", "glacier RGI id: {a}");
     assert_eq!(a["location_type"], "proglacial", "location type: {a}");
     assert_eq!(a["catchment"], "Rhone", "station catchment: {a}");
-    assert_eq!(a["full_name"], "Otemma Downstream", "station full name: {a}");
+    assert_eq!(
+        a["full_name"], "Otemma Downstream",
+        "station full name: {a}"
+    );
     assert_eq!(a["device_serial"], "LOG-778", "logger serial: {a}");
 
     let b = &rows[1];
@@ -734,7 +847,10 @@ async fn plan_site_metadata_returns_one_typed_row_per_plan_site() {
         &intern,
     )
     .await;
-    assert_eq!(status, 404, "site metadata for an unknown plan is a 404: {missing}");
+    assert_eq!(
+        status, 404,
+        "site metadata for an unknown plan is a 404: {missing}"
+    );
 }
 
 #[tokio::test]
@@ -750,25 +866,58 @@ async fn bulk_pair_creates_only_what_is_missing_and_skips_unlisted_sites() {
 
     // Deliberately not named BULKWIZ: bulk-pair resolves its project by case-insensitive name, and
     // a pre-existing match would make `project_created` false for reasons unrelated to the test.
-    let project = e2e::create_project(&app, &admin, "Bulk Wizard Host", "bulkwiz-host", false).await;
+    let project =
+        e2e::create_project(&app, &admin, "Bulk Wizard Host", "bulkwiz-host", false).await;
     let bw_b = e2e::create_site(&app, &admin, &project, "BW_B", "bw-b").await;
     let conductivity =
         e2e::create_parameter(&app, &admin, "Conductivity", "Conductivity", "uS/cm").await;
 
     let s_a_cond = unpaired_stream(
-        &app, &admin, "bulkwiz", "a-cond", "BULKWIZ", "BW_A", "Conductivity", "uS/cm", 2,
+        &app,
+        &admin,
+        "bulkwiz",
+        "a-cond",
+        "BULKWIZ",
+        "BW_A",
+        "Conductivity",
+        "uS/cm",
+        2,
     )
     .await;
     let s_a_temp = unpaired_stream(
-        &app, &admin, "bulkwiz", "a-temp", "BULKWIZ", "BW_A", "Bulk Temp", "degC", 3,
+        &app,
+        &admin,
+        "bulkwiz",
+        "a-temp",
+        "BULKWIZ",
+        "BW_A",
+        "Bulk Temp",
+        "degC",
+        3,
     )
     .await;
     let s_b_cond = unpaired_stream(
-        &app, &admin, "bulkwiz", "b-cond", "BULKWIZ", "BW_B", "Conductivity", "uS/cm", 1,
+        &app,
+        &admin,
+        "bulkwiz",
+        "b-cond",
+        "BULKWIZ",
+        "BW_B",
+        "Conductivity",
+        "uS/cm",
+        1,
     )
     .await;
     let s_unlisted = unpaired_stream(
-        &app, &admin, "bulkwiz", "unlisted", "BULKWIZ", "BW_UNLISTED", "Conductivity", "uS/cm", 2,
+        &app,
+        &admin,
+        "bulkwiz",
+        "unlisted",
+        "BULKWIZ",
+        "BW_UNLISTED",
+        "Conductivity",
+        "uS/cm",
+        2,
     )
     .await;
 
@@ -810,11 +959,18 @@ async fn bulk_pair_creates_only_what_is_missing_and_skips_unlisted_sites() {
         resp["site_parameters_created"], 3,
         "one slot per (site, parameter) pair the streams name: {resp}"
     );
-    assert_eq!(resp["streams_paired"], 3, "every stream on a listed site pairs: {resp}");
+    assert_eq!(
+        resp["streams_paired"], 3,
+        "every stream on a listed site pairs: {resp}"
+    );
     let skipped = resp["streams_skipped"]
         .as_array()
         .unwrap_or_else(|| panic!("streams_skipped is an array: {resp}"));
-    assert_eq!(skipped.len(), 1, "one stream names a site the request omits: {resp}");
+    assert_eq!(
+        skipped.len(),
+        1,
+        "one stream names a site the request omits: {resp}"
+    );
     assert_eq!(
         skipped[0],
         json!(s_unlisted),
@@ -936,7 +1092,11 @@ async fn bulk_pair_creates_only_what_is_missing_and_skips_unlisted_sites() {
         "BW_B holds the one parameter its stream names"
     );
     assert_eq!(
-        count(&db, "SELECT count(*) AS c FROM parameters WHERE LOWER(code) = 'conductivity'").await,
+        count(
+            &db,
+            "SELECT count(*) AS c FROM parameters WHERE LOWER(code) = 'conductivity'"
+        )
+        .await,
         1,
         "the reused parameter is not duplicated"
     );
@@ -959,10 +1119,13 @@ async fn apply_discovery_rolls_back_only_the_failing_action() {
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
     let project = e2e::create_project(&app, &admin, "Disc Host", "disc-host", false).await;
-    let target_site = e2e::create_site(&app, &admin, &project, "Disc Target Site", "disc-target").await;
-    let taken_site = e2e::create_site(&app, &admin, &project, "Disc Taken Site", "disc-taken").await;
+    let target_site =
+        e2e::create_site(&app, &admin, &project, "Disc Target Site", "disc-target").await;
+    let taken_site =
+        e2e::create_site(&app, &admin, &project, "Disc Taken Site", "disc-taken").await;
     let parameter = e2e::create_parameter(&app, &admin, "DiscExist", "Disc Existing", "mg/L").await;
-    let sp_target = e2e::assign_site_parameter_minimal(&app, &admin, &target_site, &parameter).await;
+    let sp_target =
+        e2e::assign_site_parameter_minimal(&app, &admin, &target_site, &parameter).await;
     let sp_taken = e2e::assign_site_parameter_minimal(&app, &admin, &taken_site, &parameter).await;
 
     let s_new = register_stream(
@@ -979,11 +1142,27 @@ async fn apply_discovery_rolls_back_only_the_failing_action() {
     .await;
     ingest(&app, &admin, &s_new, 3).await;
     let s_existing = unpaired_stream(
-        &app, &admin, "discwiz", "existing", "Disc Host", "Disc Target Site", "Disc Existing", "mg/L", 2,
+        &app,
+        &admin,
+        "discwiz",
+        "existing",
+        "Disc Host",
+        "Disc Target Site",
+        "Disc Existing",
+        "mg/L",
+        2,
     )
     .await;
     let s_taken = unpaired_stream(
-        &app, &admin, "discwiz", "taken", "Disc Host", "Disc Taken Site", "Disc Existing", "mg/L", 2,
+        &app,
+        &admin,
+        "discwiz",
+        "taken",
+        "Disc Host",
+        "Disc Taken Site",
+        "Disc Existing",
+        "mg/L",
+        2,
     )
     .await;
 
@@ -994,7 +1173,10 @@ async fn apply_discovery_rolls_back_only_the_failing_action() {
         &admin,
     )
     .await;
-    assert!((200..300).contains(&status), "pair the third stream first ({status}): {paired}");
+    assert!(
+        (200..300).contains(&status),
+        "pair the third stream first ({status}): {paired}"
+    );
 
     let (status, resp) = crate::common::post_json_parse_with_token(
         &app,
@@ -1033,15 +1215,30 @@ async fn apply_discovery_rolls_back_only_the_failing_action() {
     )
     .await;
     assert_eq!(status, 200, "apply-discovery ({status}): {resp}");
-    assert_eq!(resp["projects_created"], 1, "only the new action's project: {resp}");
-    assert_eq!(resp["sites_created"], 1, "only the new action's site: {resp}");
-    assert_eq!(resp["parameters_created"], 1, "only the new action's parameter: {resp}");
+    assert_eq!(
+        resp["projects_created"], 1,
+        "only the new action's project: {resp}"
+    );
+    assert_eq!(
+        resp["sites_created"], 1,
+        "only the new action's site: {resp}"
+    );
+    assert_eq!(
+        resp["parameters_created"], 1,
+        "only the new action's parameter: {resp}"
+    );
     assert_eq!(
         resp["site_parameters_created"], 1,
         "the second action pairs to an existing slot, so it creates none: {resp}"
     );
-    assert_eq!(resp["sensors_created"], 2, "one sensor per stream that pairs: {resp}");
-    assert_eq!(resp["streams_paired"], 2, "the already-paired stream does not pair again: {resp}");
+    assert_eq!(
+        resp["sensors_created"], 2,
+        "one sensor per stream that pairs: {resp}"
+    );
+    assert_eq!(
+        resp["streams_paired"], 2,
+        "the already-paired stream does not pair again: {resp}"
+    );
     assert_eq!(
         resp["total_backfilled"], 5,
         "3 readings from the new-entity stream + 2 from the existing-slot stream: {resp}"
@@ -1052,24 +1249,39 @@ async fn apply_discovery_rolls_back_only_the_failing_action() {
         .unwrap_or_else(|| panic!("errors is an array: {resp}"));
     assert_eq!(errors.len(), 1, "exactly one action fails: {resp}");
     let error = errors[0].as_str().unwrap_or_default();
-    assert!(error.contains(&s_taken), "the error names the failing stream: {resp}");
+    assert!(
+        error.contains(&s_taken),
+        "the error names the failing stream: {resp}"
+    );
     assert!(
         error.contains("already paired"),
         "and says why it failed: {resp}"
     );
 
     assert_eq!(
-        count(&db, "SELECT count(*) AS c FROM projects WHERE name = 'Orphan Project'").await,
+        count(
+            &db,
+            "SELECT count(*) AS c FROM projects WHERE name = 'Orphan Project'"
+        )
+        .await,
         0,
         "the failing action's savepoint rolled back the project it created"
     );
     assert_eq!(
-        count(&db, "SELECT count(*) AS c FROM sites WHERE LOWER(name) = 'orphan site'").await,
+        count(
+            &db,
+            "SELECT count(*) AS c FROM sites WHERE LOWER(name) = 'orphan site'"
+        )
+        .await,
         0,
         "and the site"
     );
     assert_eq!(
-        count(&db, "SELECT count(*) AS c FROM parameters WHERE code = 'OrphanParam'").await,
+        count(
+            &db,
+            "SELECT count(*) AS c FROM parameters WHERE code = 'OrphanParam'"
+        )
+        .await,
         0,
         "and the parameter"
     );
@@ -1086,7 +1298,11 @@ async fn apply_discovery_rolls_back_only_the_failing_action() {
     );
 
     assert_eq!(
-        count(&db, "SELECT count(*) AS c FROM sites WHERE name = 'Disc New Site'").await,
+        count(
+            &db,
+            "SELECT count(*) AS c FROM sites WHERE name = 'Disc New Site'"
+        )
+        .await,
         1,
         "the succeeding action's site was created and its sibling's failure did not undo it"
     );

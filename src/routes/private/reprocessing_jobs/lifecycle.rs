@@ -94,7 +94,9 @@ pub fn process_owner() -> &'static str {
 /// incarnation is spawned, so it only ever touches a prior incarnation's orphans, never a live job;
 /// worker-pool rows are excluded twice over (they carry a lease and a `worker-…` owner). Peer
 /// replicas reconcile their own orphans on their own boot. Returns the number reclaimed.
-pub async fn reconcile_orphaned_inline_jobs(db: &DatabaseConnection) -> Result<u64, sea_orm::DbErr> {
+pub async fn reconcile_orphaned_inline_jobs(
+    db: &DatabaseConnection,
+) -> Result<u64, sea_orm::DbErr> {
     let res = db
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -408,7 +410,11 @@ where
                 // A job that observed the cancel flag and returned early is `cancelled`, not
                 // `completed`. Its partial result is consistent (every op is idempotent) and the
                 // janitor finishes anything left.
-                let final_status = if ctx.is_cancelled() { "cancelled" } else { "completed" };
+                let final_status = if ctx.is_cancelled() {
+                    "cancelled"
+                } else {
+                    "completed"
+                };
                 if let Err(e) = db
                     .execute(Statement::from_sql_and_values(
                         sea_orm::DatabaseBackend::Postgres,
@@ -632,9 +638,14 @@ where
     F: Fn(DatabaseConnection) -> Fut + Send + 'static,
     Fut: Future<Output = Result<i64, sea_orm::DbErr>> + Send,
 {
-    spawn_tracked_job_ctx(db, sensor_id, trigger_type, trigger_id, events, move |ctx| {
-        work(ctx.db().clone())
-    })
+    spawn_tracked_job_ctx(
+        db,
+        sensor_id,
+        trigger_type,
+        trigger_id,
+        events,
+        move |ctx| work(ctx.db().clone()),
+    )
     .await
 }
 

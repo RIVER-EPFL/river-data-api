@@ -54,7 +54,10 @@ async fn me_reports_admin_level_and_all_projects() {
         .iter()
         .filter_map(|g| g["project_id"].as_str())
         .collect();
-    assert!(names.contains(&PROJECT_ID), "admin sees the seed project: {body}");
+    assert!(
+        names.contains(&PROJECT_ID),
+        "admin sees the seed project: {body}"
+    );
 }
 
 #[tokio::test]

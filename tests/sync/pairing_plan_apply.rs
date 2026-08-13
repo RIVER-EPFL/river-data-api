@@ -24,10 +24,16 @@ pub async fn wait_terminal(db: &sea_orm::DatabaseConnection, job_id: &str) -> St
             .unwrap()
             .unwrap();
         let status: String = row.try_get("", "status").unwrap();
-        if !matches!(status.as_str(), "queued" | "pending" | "running" | "retrying") {
+        if !matches!(
+            status.as_str(),
+            "queued" | "pending" | "running" | "retrying"
+        ) {
             return status;
         }
-        assert!(start.elapsed() < Duration::from_secs(15), "job did not settle");
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "job did not settle"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -40,12 +46,15 @@ pub fn job_id_of(text: &str) -> String {
 }
 
 async fn scalar_opt_uuid(db: &sea_orm::DatabaseConnection, sql: &str) -> Option<Uuid> {
-    db.query_one(Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.to_owned()))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get::<Option<Uuid>>("", "v")
-        .unwrap()
+    db.query_one(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql.to_owned(),
+    ))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get::<Option<Uuid>>("", "v")
+    .unwrap()
 }
 
 #[tokio::test]
@@ -109,7 +118,10 @@ async fn apply_then_revert_pairing_plan_via_jobs() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "apply should be 2xx, got {status}: {text}");
+    assert!(
+        (200..300).contains(&status),
+        "apply should be 2xx, got {status}: {text}"
+    );
     assert_eq!(wait_terminal(&db, &job_id_of(&text)).await, "completed");
 
     // Plan applied, stream paired, readings backfilled with a site_id.
@@ -125,7 +137,12 @@ async fn apply_then_revert_pairing_plan_via_jobs() {
         .unwrap();
     assert_eq!(plan_status, "applied");
     assert!(
-        scalar_opt_uuid(&db, &format!("SELECT site_parameter_id AS v FROM data_streams WHERE id = '{stream_id}'")).await.is_some(),
+        scalar_opt_uuid(
+            &db,
+            &format!("SELECT site_parameter_id AS v FROM data_streams WHERE id = '{stream_id}'")
+        )
+        .await
+        .is_some(),
         "stream should be paired"
     );
     assert!(
@@ -141,7 +158,10 @@ async fn apply_then_revert_pairing_plan_via_jobs() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "revert should be 2xx, got {status}: {text}");
+    assert!(
+        (200..300).contains(&status),
+        "revert should be 2xx, got {status}: {text}"
+    );
     assert_eq!(wait_terminal(&db, &job_id_of(&text)).await, "completed");
 
     let plan_status = db
@@ -156,7 +176,12 @@ async fn apply_then_revert_pairing_plan_via_jobs() {
         .unwrap();
     assert_eq!(plan_status, "reverted");
     assert!(
-        scalar_opt_uuid(&db, &format!("SELECT site_parameter_id AS v FROM data_streams WHERE id = '{stream_id}'")).await.is_none(),
+        scalar_opt_uuid(
+            &db,
+            &format!("SELECT site_parameter_id AS v FROM data_streams WHERE id = '{stream_id}'")
+        )
+        .await
+        .is_none(),
         "stream should be unpaired"
     );
     assert!(

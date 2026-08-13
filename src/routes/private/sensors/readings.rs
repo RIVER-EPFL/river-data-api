@@ -143,8 +143,7 @@ pub async fn get_sensor_readings(
     if sensor_exists.is_none() {
         return Err(AppError::NotFound("Sensor not found".to_string()));
     }
-    let (parameter_id, units) =
-        resolve_series_parameter(db, sensor_id, query.parameter_id).await?;
+    let (parameter_id, units) = resolve_series_parameter(db, sensor_id, query.parameter_id).await?;
 
     // A project-scoped key may only read a sensor that has been deployed within its project, and
     // even then only sees the readings attributed to in-project sites. A sensor never deployed in
@@ -180,15 +179,16 @@ pub async fn get_sensor_readings(
     };
 
     let resolution = query.resolution.as_deref().unwrap_or("raw");
-    let bucket = if resolution == "raw" {
-        None
-    } else {
-        Some(bucket_interval(resolution_of(resolution).ok_or_else(|| {
+    let bucket =
+        if resolution == "raw" {
+            None
+        } else {
+            Some(bucket_interval(resolution_of(resolution).ok_or_else(|| {
             AppError::BadRequest(format!(
                 "Invalid resolution '{resolution}' (expected raw|hourly|daily|weekly|monthly)"
             ))
         })?))
-    };
+        };
 
     // Full reading extent for this sensor on the served channel (drives the UI slider bounds,
     // independent of the window).
@@ -207,11 +207,17 @@ pub async fn get_sensor_readings(
         .await?;
     let data_start = extent
         .as_ref()
-        .and_then(|r| r.try_get::<DateTime<chrono::FixedOffset>>("", "data_start").ok())
+        .and_then(|r| {
+            r.try_get::<DateTime<chrono::FixedOffset>>("", "data_start")
+                .ok()
+        })
         .map(|t| t.with_timezone(&Utc));
     let data_end = extent
         .as_ref()
-        .and_then(|r| r.try_get::<DateTime<chrono::FixedOffset>>("", "data_end").ok())
+        .and_then(|r| {
+            r.try_get::<DateTime<chrono::FixedOffset>>("", "data_end")
+                .ok()
+        })
         .map(|t| t.with_timezone(&Utc));
 
     // Earliest reading at the sensor's OPEN deployment slot (same site + parameter, any sensor_id),
@@ -234,7 +240,10 @@ pub async fn get_sensor_readings(
             slot_vals,
         ))
         .await?
-        .and_then(|r| r.try_get::<DateTime<chrono::FixedOffset>>("", "slot_start").ok())
+        .and_then(|r| {
+            r.try_get::<DateTime<chrono::FixedOffset>>("", "slot_start")
+                .ok()
+        })
         .map(|t| t.with_timezone(&Utc));
 
     crate::routes::private::readings::measurement::validate_measurement_type(
@@ -308,7 +317,11 @@ pub async fn get_sensor_readings(
     for row in &rows {
         let t: DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
         times.push(t.with_timezone(&Utc));
-        raw.push(if include_raw { row.try_get::<f64>("", "raw_value").ok() } else { None });
+        raw.push(if include_raw {
+            row.try_get::<f64>("", "raw_value").ok()
+        } else {
+            None
+        });
         calibrated.push(row.try_get::<f64>("", "calibrated_value").ok());
         site_ids.push(row.try_get::<Uuid>("", "site_id").ok());
         if aggregated {
@@ -323,7 +336,11 @@ pub async fn get_sensor_readings(
         sensor_id,
         parameter_id,
         units,
-        resolution: if aggregated { resolution.to_string() } else { "raw".to_string() },
+        resolution: if aggregated {
+            resolution.to_string()
+        } else {
+            "raw".to_string()
+        },
         times,
         raw,
         calibrated,

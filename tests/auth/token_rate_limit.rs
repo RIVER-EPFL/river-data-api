@@ -2,7 +2,6 @@
 //! (which do bulk backfills and must never be throttled). Per-token 429 + unlimited behaviour is
 //! also covered in `e2e_api_token_lifecycle_test`; here we add refill-recovery and the sync path.
 
-
 use serial_test::serial;
 
 use crate::common::fixtures::{GLOBAL_PARAM_TEMP_ID, PROJECT_ID, SITE1_ID};
@@ -16,7 +15,9 @@ async fn setup() -> (sea_orm::DatabaseConnection, axum::Router) {
 }
 
 fn reading_body() -> serde_json::Value {
-    let t = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
+    let t = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+        .to_string();
     serde_json::json!({
         "readings": [{ "site_id": SITE1_ID, "parameter_id": GLOBAL_PARAM_TEMP_ID, "time": t, "raw_value": 1.0 }]
     })
@@ -37,7 +38,9 @@ async fn per_token_limit_recovers_after_refill() {
     // Burst until the 2/s ceiling rejects with 429.
     let mut hit_429 = false;
     for _ in 0..10 {
-        let (s, _) = crate::common::post_json_with_token(&app, "/api/readings/batch", &reading_body(), &key).await;
+        let (s, _) =
+            crate::common::post_json_with_token(&app, "/api/readings/batch", &reading_body(), &key)
+                .await;
         if s == 429 {
             hit_429 = true;
             break;
@@ -47,8 +50,13 @@ async fn per_token_limit_recovers_after_refill() {
 
     // After the window refills, the key works again.
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    let (s, _) = crate::common::post_json_with_token(&app, "/api/readings/batch", &reading_body(), &key).await;
-    assert_ne!(s, 429, "the key must recover once the rate-limit window refills, got {s}");
+    let (s, _) =
+        crate::common::post_json_with_token(&app, "/api/readings/batch", &reading_body(), &key)
+            .await;
+    assert_ne!(
+        s, 429,
+        "the key must recover once the rate-limit window refills, got {s}"
+    );
 }
 
 #[tokio::test]
@@ -60,7 +68,13 @@ async fn sync_session_token_is_never_throttled() {
 
     let mut statuses = Vec::new();
     for _ in 0..25 {
-        let (s, _) = crate::common::post_json_with_token(&app, "/api/readings/batch", &reading_body(), &sync_token).await;
+        let (s, _) = crate::common::post_json_with_token(
+            &app,
+            "/api/readings/batch",
+            &reading_body(),
+            &sync_token,
+        )
+        .await;
         statuses.push(s);
     }
     assert!(

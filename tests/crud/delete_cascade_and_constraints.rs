@@ -2,7 +2,6 @@
 //! Verifies that deleting an entity with child data either succeeds
 //! (via before_delete hooks or CASCADE) or returns a clear error.
 
-
 use serial_test::serial;
 
 async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
@@ -25,21 +24,25 @@ async fn delete_site_parameter_with_paired_streams() {
 
     let stream_count = count(
         &db,
-        &format!(
-            "SELECT count(*) AS c FROM data_streams WHERE site_parameter_id = '{sp_id}'"
-        ),
+        &format!("SELECT count(*) AS c FROM data_streams WHERE site_parameter_id = '{sp_id}'"),
     )
     .await;
-    assert!(stream_count > 0, "site_parameter should have paired streams");
+    assert!(
+        stream_count > 0,
+        "site_parameter should have paired streams"
+    );
 
-    let (status, _) = crate::common::delete_with_token(&app, &format!("/api/site_parameters/{sp_id}"), &token).await;
-    assert!(status == 200 || status == 204, "DELETE should succeed, got {status}");
+    let (status, _) =
+        crate::common::delete_with_token(&app, &format!("/api/site_parameters/{sp_id}"), &token)
+            .await;
+    assert!(
+        status == 200 || status == 204,
+        "DELETE should succeed, got {status}"
+    );
 
     let unpaired = count(
         &db,
-        &format!(
-            "SELECT count(*) AS c FROM data_streams WHERE site_parameter_id = '{sp_id}'"
-        ),
+        &format!("SELECT count(*) AS c FROM data_streams WHERE site_parameter_id = '{sp_id}'"),
     )
     .await;
     assert_eq!(unpaired, 0, "streams should be unpaired after delete");
@@ -79,7 +82,10 @@ async fn delete_derived_definition_with_sources() {
         &format!("SELECT count(*) AS c FROM derived_parameter_sources WHERE derived_definition_id = '{def_id}'"),
     )
     .await;
-    assert!(source_count > 0, "definition should have sources from formula");
+    assert!(
+        source_count > 0,
+        "definition should have sources from formula"
+    );
 
     let (status, _) = crate::common::delete_with_token(
         &app,
@@ -87,7 +93,10 @@ async fn delete_derived_definition_with_sources() {
         &token,
     )
     .await;
-    assert!(status == 200 || status == 204, "DELETE derived definition should succeed, got {status}");
+    assert!(
+        status == 200 || status == 204,
+        "DELETE derived definition should succeed, got {status}"
+    );
 
     let remaining = count(
         &db,
@@ -129,17 +138,15 @@ async fn delete_sensor_with_calibrations() {
     .await;
     assert!(cal_count > 0, "sensor should have a calibration");
 
-    let (status, body) = crate::common::delete_with_token(
-        &app,
-        &format!("/api/sensors/{sensor_id}"),
-        &token,
-    )
-    .await;
+    let (status, body) =
+        crate::common::delete_with_token(&app, &format!("/api/sensors/{sensor_id}"), &token).await;
 
     if status == 200 || status == 204 {
         let remaining = count(
             &db,
-            &format!("SELECT count(*) AS c FROM sensor_calibrations WHERE sensor_id = '{sensor_id}'"),
+            &format!(
+                "SELECT count(*) AS c FROM sensor_calibrations WHERE sensor_id = '{sensor_id}'"
+            ),
         )
         .await;
         assert_eq!(remaining, 0, "calibrations should be cleaned up");
@@ -193,10 +200,13 @@ async fn delete_site_with_data_returns_error() {
 
 async fn count(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
     use sea_orm::{ConnectionTrait, Statement};
-    db.query_one(Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.to_string()))
-        .await
-        .ok()
-        .flatten()
-        .and_then(|r| r.try_get::<i64>("", "c").ok())
-        .unwrap_or(0)
+    db.query_one(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql.to_string(),
+    ))
+    .await
+    .ok()
+    .flatten()
+    .and_then(|r| r.try_get::<i64>("", "c").ok())
+    .unwrap_or(0)
 }

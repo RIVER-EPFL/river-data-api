@@ -76,12 +76,29 @@ async fn onboard() -> Fixture {
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
     let track = tracks::onboard_csv_track(&app, &admin).await;
 
-    kc::grant_project(&db, &kc::keycloak_user_id("manager1").await, &track.project_id).await;
-    kc::grant_project(&db, &kc::keycloak_user_id("river1").await, &track.project_id).await;
+    kc::grant_project(
+        &db,
+        &kc::keycloak_user_id("manager1").await,
+        &track.project_id,
+    )
+    .await;
+    kc::grant_project(
+        &db,
+        &kc::keycloak_user_id("river1").await,
+        &track.project_id,
+    )
+    .await;
     let manager = kc::get_keycloak_jwt("manager1", "manager1").await;
     let river = kc::get_keycloak_jwt("river1", "river1").await;
 
-    Fixture { db, app, admin, manager, river, track }
+    Fixture {
+        db,
+        app,
+        admin,
+        manager,
+        river,
+        track,
+    }
 }
 
 async fn add_sensor(fx: &Fixture, serial: &str) -> String {
@@ -168,7 +185,10 @@ async fn deployments_of(fx: &Fixture, sensor_id: &str) -> Vec<Value> {
         &fx.manager,
     )
     .await;
-    assert_eq!(status, 200, "list the deployments of sensor {sensor_id}: {body}");
+    assert_eq!(
+        status, 200,
+        "list the deployments of sensor {sensor_id}: {body}"
+    );
     body.as_array()
         .unwrap_or_else(|| panic!("the deployment list must be an array: {body}"))
         .clone()
@@ -231,9 +251,16 @@ async fn series(fx: &Fixture, sensor_id: &str, start: &str, end: &str) -> Series
         .as_array()
         .unwrap_or_else(|| panic!("'times' must be an array: {body}"))
         .iter()
-        .map(|t| ts(t.as_str().unwrap_or_else(|| panic!("a time must be a string: {body}"))))
+        .map(|t| {
+            ts(t.as_str()
+                .unwrap_or_else(|| panic!("a time must be a string: {body}")))
+        })
         .collect();
-    Series { times, raw: numbers("raw"), calibrated: numbers("calibrated") }
+    Series {
+        times,
+        raw: numbers("raw"),
+        calibrated: numbers("calibrated"),
+    }
 }
 
 /// `backfill_calibrations` must not insert an identity curve inside an entered
@@ -263,9 +290,24 @@ async fn backfill_calibrations_leaves_an_entered_curve_covering_its_readings() {
     upload_history(
         &fx,
         &[
-            (depth.as_str(), "2025-02-01T12:00:00Z", 10.0, covered.as_str()),
-            (depth.as_str(), "2025-03-01T12:00:00Z", 20.0, covered.as_str()),
-            (turbidity.as_str(), "2025-04-15T12:00:00Z", 30.0, gapped.as_str()),
+            (
+                depth.as_str(),
+                "2025-02-01T12:00:00Z",
+                10.0,
+                covered.as_str(),
+            ),
+            (
+                depth.as_str(),
+                "2025-03-01T12:00:00Z",
+                20.0,
+                covered.as_str(),
+            ),
+            (
+                turbidity.as_str(),
+                "2025-04-15T12:00:00Z",
+                30.0,
+                gapped.as_str(),
+            ),
         ],
     )
     .await;
@@ -277,7 +319,10 @@ async fn backfill_calibrations_leaves_an_entered_curve_covering_its_readings() {
         &fx.river,
     )
     .await;
-    assert_eq!(status, 200, "river repairs calibration coverage for both instruments: {body}");
+    assert_eq!(
+        status, 200,
+        "river repairs calibration coverage for both instruments: {body}"
+    );
     let job_id = body["job_id"]
         .as_str()
         .unwrap_or_else(|| panic!("the action must return a tracked job id: {body}"))
@@ -305,7 +350,13 @@ async fn backfill_calibrations_leaves_an_entered_curve_covering_its_readings() {
         "the entered curve keeps its open end, ie. it still covers its later readings: {curves:?}"
     );
 
-    let covered_series = series(&fx, &covered, "2025-01-01T00:00:00Z", "2025-04-01T00:00:00Z").await;
+    let covered_series = series(
+        &fx,
+        &covered,
+        "2025-01-01T00:00:00Z",
+        "2025-04-01T00:00:00Z",
+    )
+    .await;
     assert_eq!(
         covered_series.times,
         vec![ts("2025-02-01T12:00:00Z"), ts("2025-03-01T12:00:00Z")],
@@ -412,7 +463,10 @@ async fn a_refused_deployment_create_leaves_the_current_deployment_open() {
         "the moving sensor starts open-ended at its first site"
     );
     assert_eq!(
-        boundary(&deployment(&fx, &incumbent_deployment).await, "deployed_until"),
+        boundary(
+            &deployment(&fx, &incumbent_deployment).await,
+            "deployed_until"
+        ),
         None,
         "the incumbent holds the target slot open-ended"
     );
@@ -440,12 +494,19 @@ async fn a_refused_deployment_create_leaves_the_current_deployment_open() {
         "a refused move must not recall the sensor from the site it is still deployed at"
     );
     assert_eq!(
-        boundary(&deployment(&fx, &incumbent_deployment).await, "deployed_until"),
+        boundary(
+            &deployment(&fx, &incumbent_deployment).await,
+            "deployed_until"
+        ),
         None,
         "the incumbent's deployment is untouched by the refused request"
     );
     let rows = deployments_of(&fx, &moving).await;
-    assert_eq!(rows.len(), 1, "the refused create writes no deployment row: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the refused create writes no deployment row: {rows:?}"
+    );
 }
 
 /// two calibrations entered with the same `valid_from` must not leave one owning an empty
@@ -612,7 +673,10 @@ async fn rolling_back_into_a_refilled_slot_reports_a_conflict() {
         &fx.manager,
     )
     .await;
-    assert_eq!(status, 200, "with the slot free the same rollback completes: {body}");
+    assert_eq!(
+        status, 200,
+        "with the slot free the same rollback completes: {body}"
+    );
     assert_eq!(
         body["previous_deployment_id"].as_str(),
         Some(first.as_str()),

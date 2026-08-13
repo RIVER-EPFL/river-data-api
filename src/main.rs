@@ -89,8 +89,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Worker-pool jobs left mid-flight by a dead process are recovered by the lease reaper (they
     // carry a lease). In-process jobs do not carry a lease, so reap this replica's own leaseless
     // orphans on boot, before any in-process job of this incarnation is spawned.
-    match river_db::routes::private::reprocessing_jobs::lifecycle::reconcile_orphaned_inline_jobs(&db)
-        .await
+    match river_db::routes::private::reprocessing_jobs::lifecycle::reconcile_orphaned_inline_jobs(
+        &db,
+    )
+    .await
     {
         Ok(0) => {}
         Ok(n) => tracing::info!(reclaimed = n, "Reaped orphaned in-process jobs on startup"),
@@ -98,24 +100,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Initialize Keycloak authentication (optional in dev, required in prod)
-    let keycloak_instance = if let (Some(url), Some(realm)) = (&config.keycloak_url, &config.keycloak_realm) {
-        tracing::info!(url = %url, realm = %realm, "Initializing Keycloak authentication");
-        Some(Arc::new(KeycloakAuthInstance::new(
-            KeycloakConfig::builder()
-                .server(Url::parse(url).expect("Invalid KEYCLOAK_URL"))
-                .realm(realm.clone())
-                .build(),
-        )))
-    } else {
-        if matches!(config.deployment, Deployment::Prod) {
-            panic!(
-                "SECURITY ERROR: Keycloak authentication is required in production. \
+    let keycloak_instance =
+        if let (Some(url), Some(realm)) = (&config.keycloak_url, &config.keycloak_realm) {
+            tracing::info!(url = %url, realm = %realm, "Initializing Keycloak authentication");
+            Some(Arc::new(KeycloakAuthInstance::new(
+                KeycloakConfig::builder()
+                    .server(Url::parse(url).expect("Invalid KEYCLOAK_URL"))
+                    .realm(realm.clone())
+                    .build(),
+            )))
+        } else {
+            if matches!(config.deployment, Deployment::Prod) {
+                panic!(
+                    "SECURITY ERROR: Keycloak authentication is required in production. \
                  Configure KEYCLOAK_URL and KEYCLOAK_REALM environment variables."
-            );
-        }
-        tracing::warn!("Keycloak authentication NOT configured, admin routes unprotected");
-        None
-    };
+                );
+            }
+            tracing::warn!("Keycloak authentication NOT configured, admin routes unprotected");
+            None
+        };
 
     let state = AppState::new(db.clone(), config.clone(), keycloak_instance);
 
@@ -136,10 +139,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // dedicated single-replica task; it is NOT a scheduled Service.
     if state.config.telegram_bot_token.is_some() {
         if state.config.enable_telegram_bot {
-            tokio::spawn(river_db::routes::private::notifications::bot::run(state.clone()));
+            tokio::spawn(river_db::routes::private::notifications::bot::run(
+                state.clone(),
+            ));
             tracing::info!("Spawned Telegram bot poller");
         } else {
-            tracing::info!("Telegram bot poller disabled on this replica (ENABLE_TELEGRAM_BOT=false)");
+            tracing::info!(
+                "Telegram bot poller disabled on this replica (ENABLE_TELEGRAM_BOT=false)"
+            );
         }
     }
 
@@ -171,9 +178,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let registry = registry.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         async move {
-            river_db::routes::private::reprocessing_jobs::worker::run(db, events, registry, async move {
-                let _ = shutdown_rx.changed().await;
-            })
+            river_db::routes::private::reprocessing_jobs::worker::run(
+                db,
+                events,
+                registry,
+                async move {
+                    let _ = shutdown_rx.changed().await;
+                },
+            )
             .await;
         }
     });
@@ -184,9 +196,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let registry = registry.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         async move {
-            river_db::routes::private::reprocessing_jobs::scheduler::run(db, registry, async move {
-                let _ = shutdown_rx.changed().await;
-            })
+            river_db::routes::private::reprocessing_jobs::scheduler::run(
+                db,
+                registry,
+                async move {
+                    let _ = shutdown_rx.changed().await;
+                },
+            )
             .await;
         }
     });

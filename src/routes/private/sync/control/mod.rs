@@ -9,8 +9,8 @@ pub mod heartbeat;
 pub mod session;
 pub mod tokens;
 
-use axum::routing::{patch, post};
 use axum::Router;
+use axum::routing::{patch, post};
 
 use crate::common::AppState;
 

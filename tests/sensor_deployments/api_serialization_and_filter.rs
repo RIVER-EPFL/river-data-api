@@ -4,7 +4,6 @@
 //!
 //! Run: cargo test --test sensor_deployments -- --test-threads=1
 
-
 use crate::common::sensor_lifecycle as sl;
 use serial_test::serial;
 
@@ -30,10 +29,17 @@ async fn deployment_serializes_parameter_id() {
     let app = crate::common::build_test_app(db.clone());
 
     let sensor = sl::create_sensor(&db, "ser", crate::common::GLOBAL_PARAM_TEMP_ID).await;
-    let dep = sl::deploy_sensor(&db, sensor.id, crate::common::SITE1_ID, sl::dt("2025-06-01T00:00:00Z")).await;
+    let dep = sl::deploy_sensor(
+        &db,
+        sensor.id,
+        crate::common::SITE1_ID,
+        sl::dt("2025-06-01T00:00:00Z"),
+    )
+    .await;
 
     let (status, body) =
-        crate::common::get_json_with_token(&app, &format!("/api/sensor_deployments/{dep}"), &token).await;
+        crate::common::get_json_with_token(&app, &format!("/api/sensor_deployments/{dep}"), &token)
+            .await;
     assert_eq!(status, 200, "get deployment: {body}");
     assert_eq!(
         body["parameter_id"].as_str(),
@@ -52,11 +58,21 @@ async fn deployed_until_null_filter_returns_only_open() {
     let app = crate::common::build_test_app(db.clone());
 
     let sensor = sl::create_sensor(&db, "filt", crate::common::GLOBAL_PARAM_TEMP_ID).await;
-    let closed =
-        sl::deploy_sensor(&db, sensor.id, crate::common::SITE1_ID, sl::dt("2025-06-01T00:00:00Z")).await;
+    let closed = sl::deploy_sensor(
+        &db,
+        sensor.id,
+        crate::common::SITE1_ID,
+        sl::dt("2025-06-01T00:00:00Z"),
+    )
+    .await;
     sl::end_deployment(&db, closed, sl::dt("2025-06-02T00:00:00Z")).await;
-    let open =
-        sl::deploy_sensor(&db, sensor.id, crate::common::SITE2_ID, sl::dt("2025-06-02T00:00:00Z")).await;
+    let open = sl::deploy_sensor(
+        &db,
+        sensor.id,
+        crate::common::SITE2_ID,
+        sl::dt("2025-06-02T00:00:00Z"),
+    )
+    .await;
 
     let filter = enc(&format!(
         r#"{{"sensor_id":"{}","deployed_until":null}}"#,

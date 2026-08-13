@@ -24,9 +24,7 @@ use crate::common::keycloak::{
 macro_rules! require_keycloak {
     () => {
         if !keycloak_reachable().await {
-            eprintln!(
-                "SKIP: keycloak unreachable (start the dev stack, or set TEST_KEYCLOAK_URL)"
-            );
+            eprintln!("SKIP: keycloak unreachable (start the dev stack, or set TEST_KEYCLOAK_URL)");
             return;
         }
     };
@@ -45,16 +43,30 @@ async fn seeded_app() -> (sea_orm::DatabaseConnection, axum::Router) {
 async fn list_users_returns_role_holders_deduped() {
     require_keycloak!();
     let (_db, app) = seeded_app().await;
-    ensure_realm_user("dualrole", "dualrole", &["riverdata-admin", "riverdata-manager"]).await;
+    ensure_realm_user(
+        "dualrole",
+        "dualrole",
+        &["riverdata-admin", "riverdata-manager"],
+    )
+    .await;
     let jwt = get_keycloak_jwt("admin", "admin").await;
 
     let (status, body) = crate::common::get_with_token(&app, "/api/users", &jwt).await;
     assert_eq!(status, 200, "user list must succeed: {body}");
 
     let users: Vec<serde_json::Value> = serde_json::from_str(&body).expect("JSON user list");
-    let usernames: Vec<&str> = users.iter().filter_map(|u| u["username"].as_str()).collect();
-    assert!(usernames.contains(&"admin"), "admin user missing: {usernames:?}");
-    assert!(usernames.contains(&"user"), "regular user missing: {usernames:?}");
+    let usernames: Vec<&str> = users
+        .iter()
+        .filter_map(|u| u["username"].as_str())
+        .collect();
+    assert!(
+        usernames.contains(&"admin"),
+        "admin user missing: {usernames:?}"
+    );
+    assert!(
+        usernames.contains(&"user"),
+        "regular user missing: {usernames:?}"
+    );
 
     // A user holding two levels appears in both per-role member lists; the union must dedupe.
     assert_eq!(
@@ -80,7 +92,8 @@ async fn search_users_matches_directory_with_roles() {
     let (_db, app) = seeded_app().await;
     let jwt = get_keycloak_jwt("admin", "admin").await;
 
-    let (status, body) = crate::common::get_with_token(&app, "/api/users/search?q=admin", &jwt).await;
+    let (status, body) =
+        crate::common::get_with_token(&app, "/api/users/search?q=admin", &jwt).await;
     assert_eq!(status, 200, "search must succeed: {body}");
     let users: Vec<serde_json::Value> = serde_json::from_str(&body).expect("JSON search results");
     let admin = users
@@ -91,7 +104,10 @@ async fn search_users_matches_directory_with_roles() {
         .as_array()
         .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
-    assert!(roles.contains(&"riverdata-admin"), "search roles: {roles:?}");
+    assert!(
+        roles.contains(&"riverdata-admin"),
+        "search roles: {roles:?}"
+    );
 
     let (status, body) =
         crate::common::get_with_token(&app, "/api/users/search?q=no-such-account-xyz", &jwt).await;
@@ -297,13 +313,15 @@ async fn spawn_mock_keycloak_failing_role_delete() -> String {
         .route("/admin/realms/{realm}/roles", get(river_roles))
         .route(
             "/admin/realms/{realm}/users/{id}/role-mappings/realm",
-            get(|| async { axum::Json(serde_json::json!([{"id": "2", "name": "riverdata-intern"}])) })
-                .delete(|| async {
-                    (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        axum::Json(serde_json::json!({"error": "delete failed"})),
-                    )
-                }),
+            get(|| async {
+                axum::Json(serde_json::json!([{"id": "2", "name": "riverdata-intern"}]))
+            })
+            .delete(|| async {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(serde_json::json!({"error": "delete failed"})),
+                )
+            }),
         )
         .route("/admin/realms/{realm}/unused", delete(|| async { "" }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -325,10 +343,14 @@ async fn assign_roles_errors_when_role_removal_fails() {
     let result = assign_roles(
         State(state),
         axum::extract::Path("some-user".to_string()),
-        axum::Json(AssignRolesRequest { roles: vec!["riverdata-river".to_string()] }),
+        axum::Json(AssignRolesRequest {
+            roles: vec!["riverdata-river".to_string()],
+        }),
     )
     .await;
-    let err = result.err().expect("a failed role removal must not report success");
+    let err = result
+        .err()
+        .expect("a failed role removal must not report success");
     assert!(
         format!("{err:?}").contains("500"),
         "error should carry the Keycloak status: {err:?}"
@@ -345,8 +367,17 @@ async fn list_users_errors_when_role_listing_forbidden() {
     config.database_url = std::env::var("DATABASE_URL").unwrap_or_default();
     let state = AppState::new(db, config, None);
 
-    let result = list_users(State(state), Query(ListQuery { range: None, filter: None })).await;
-    let err = result.err().expect("a forbidden role listing must error, not return empty 200");
+    let result = list_users(
+        State(state),
+        Query(ListQuery {
+            range: None,
+            filter: None,
+        }),
+    )
+    .await;
+    let err = result
+        .err()
+        .expect("a forbidden role listing must error, not return empty 200");
     assert!(
         format!("{err:?}").contains("403"),
         "error should carry the Keycloak status: {err:?}"

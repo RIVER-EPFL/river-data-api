@@ -29,7 +29,9 @@ struct Row {
 pub fn build_channels(config: &Config) -> Vec<Box<dyn NotificationChannel>> {
     let mut channels: Vec<Box<dyn NotificationChannel>> = Vec::new();
     if let Some(token) = &config.telegram_bot_token {
-        channels.push(Box::new(TelegramChannel::new(TelegramClient::new(token.clone()))));
+        channels.push(Box::new(TelegramChannel::new(TelegramClient::new(
+            token.clone(),
+        ))));
         tracing::info!("Notifications: Telegram channel enabled");
     }
     match (email::build_mailer(config), config.alert_email_to.clone()) {
@@ -73,7 +75,11 @@ async fn process_pending(
         return Ok(());
     }
 
-    let column = if opened { "notified_at" } else { "resolution_notified_at" };
+    let column = if opened {
+        "notified_at"
+    } else {
+        "resolution_notified_at"
+    };
 
     // A muted slot is suppressed inside `deliver`, which reports success, so the claim below
     // stands and neither this replica nor a peer re-picks the event.
@@ -127,7 +133,10 @@ async fn fetch_pending(db: &DatabaseConnection, opened: bool) -> Result<Vec<Row>
          ORDER BY ae.resolved_at"
     };
     let rows = db
-        .query_all(Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.to_string()))
+        .query_all(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            sql.to_string(),
+        ))
         .await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -190,7 +199,16 @@ pub(super) async fn deliver(
                 }
                 Err(e) => ("failed", Some(e.as_str())),
             };
-            log_delivery(db, single_event_id, msg.kind, ch.name(), &r.recipient, status, error).await;
+            log_delivery(
+                db,
+                single_event_id,
+                msg.kind,
+                ch.name(),
+                &r.recipient,
+                status,
+                error,
+            )
+            .await;
         }
     }
     attempted == 0 || any_success
@@ -234,7 +252,11 @@ async fn claim_event(db: &DatabaseConnection, column: &str, id: Uuid) -> Result<
          WHERE id = $1 AND {column} IS NULL RETURNING id"
     );
     let row = db
-        .query_one(Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, &sql, [id.into()]))
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            [id.into()],
+        ))
         .await?;
     Ok(row.is_some())
 }
@@ -242,7 +264,11 @@ async fn claim_event(db: &DatabaseConnection, column: &str, id: Uuid) -> Result<
 /// Release a claim after an all-channel send failure so the next tick retries it (at-least-once).
 async fn release_claim(db: &DatabaseConnection, column: &str, id: Uuid) -> Result<(), DbErr> {
     let sql = format!("UPDATE alarm_events SET {column} = NULL WHERE id = $1");
-    db.execute(Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, &sql, [id.into()]))
-        .await?;
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        &sql,
+        [id.into()],
+    ))
+    .await?;
     Ok(())
 }

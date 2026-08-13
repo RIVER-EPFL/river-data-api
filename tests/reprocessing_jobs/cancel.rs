@@ -55,7 +55,10 @@ async fn cancel_endpoint_rejects_non_cancellable_and_unknown() {
         &token,
     )
     .await;
-    assert_eq!(status, 200, "a running cancellable job accepts a cross-replica cancel");
+    assert_eq!(
+        status, 200,
+        "a running cancellable job accepts a cross-replica cancel"
+    );
     let flagged: bool = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -67,7 +70,10 @@ async fn cancel_endpoint_rejects_non_cancellable_and_unknown() {
         .unwrap()
         .try_get("", "cancel_requested")
         .unwrap();
-    assert!(flagged, "cancel_requested is set for the owning replica's heartbeat to observe");
+    assert!(
+        flagged,
+        "cancel_requested is set for the owning replica's heartbeat to observe"
+    );
 
     // A terminal job is not in a cancellable state -> 409.
     let done = Uuid::new_v4();

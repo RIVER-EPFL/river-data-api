@@ -39,12 +39,20 @@ async fn state_get(
         ))
         .await?;
     match row {
-        Some(r) => Ok(Some((r.try_get("", "state")?, r.try_get("", "last_notified_at")?))),
+        Some(r) => Ok(Some((
+            r.try_get("", "state")?,
+            r.try_get("", "last_notified_at")?,
+        ))),
         None => Ok(None),
     }
 }
 
-async fn state_upsert(db: &DatabaseConnection, kind: &str, key: &str, state: &str) -> Result<(), DbErr> {
+async fn state_upsert(
+    db: &DatabaseConnection,
+    kind: &str,
+    key: &str,
+    state: &str,
+) -> Result<(), DbErr> {
     db.execute(Statement::from_sql_and_values(
         PG,
         "INSERT INTO notification_state (kind, subject_key, state, last_notified_at) \
@@ -99,7 +107,12 @@ async fn claim_clear(db: &DatabaseConnection, kind: &str, key: &str) -> Result<b
 
 /// Claim a (re-)notify with a suppression window: win iff there is no prior alert or the last one was
 /// more than `within_days` ago. Atomically advances the timestamp so a single replica re-notifies.
-async fn claim_renotify(db: &DatabaseConnection, kind: &str, key: &str, within_days: i64) -> Result<bool, DbErr> {
+async fn claim_renotify(
+    db: &DatabaseConnection,
+    kind: &str,
+    key: &str,
+    within_days: i64,
+) -> Result<bool, DbErr> {
     let sql = format!(
         "INSERT INTO notification_state (kind, subject_key, state, last_notified_at) \
          VALUES ($1, $2, 'firing', NOW()) \
@@ -108,7 +121,11 @@ async fn claim_renotify(db: &DatabaseConnection, kind: &str, key: &str, within_d
          RETURNING 1 AS one"
     );
     let row = db
-        .query_one(Statement::from_sql_and_values(PG, &sql, [kind.into(), key.into()]))
+        .query_one(Statement::from_sql_and_values(
+            PG,
+            &sql,
+            [kind.into(), key.into()],
+        ))
         .await?;
     Ok(row.is_some())
 }
@@ -116,7 +133,12 @@ async fn claim_renotify(db: &DatabaseConnection, kind: &str, key: &str, within_d
 /// Claim by advancing a watermark: win iff the stored timestamp still equals `expected` (the value
 /// just read), or the row is absent. A replica that already advanced it wins the compare-and-swap and
 /// the loser skips, so a digest is sent once.
-async fn claim_cas(db: &DatabaseConnection, kind: &str, key: &str, expected: DateTime<Utc>) -> Result<bool, DbErr> {
+async fn claim_cas(
+    db: &DatabaseConnection,
+    kind: &str,
+    key: &str,
+    expected: DateTime<Utc>,
+) -> Result<bool, DbErr> {
     let row = db
         .query_one(Statement::from_sql_and_values(
             PG,
@@ -179,7 +201,11 @@ async fn stale_data(
                         "⏳ No data from {site_name} / {param_name} for ~{}h.",
                         age.num_hours()
                     ),
-                    slot: Some(Slot { project_id, site_id, parameter_id }),
+                    slot: Some(Slot {
+                        project_id,
+                        site_id,
+                        parameter_id,
+                    }),
                 };
                 if !deliver(state, channels, &msg, None).await {
                     state_clear(db, "stale_data", &key).await?; // release so it retries next tick
@@ -192,7 +218,11 @@ async fn stale_data(
                     kind: "stale_data",
                     subject: format!("River Data: data resumed from {site_name}"),
                     body: format!("✅ Data flowing again from {site_name} / {param_name}."),
-                    slot: Some(Slot { project_id, site_id, parameter_id }),
+                    slot: Some(Slot {
+                        project_id,
+                        site_id,
+                        parameter_id,
+                    }),
                 };
                 if !deliver(state, channels, &msg, None).await {
                     state_upsert(db, "stale_data", &key, "firing").await?; // restore so it retries
@@ -274,7 +304,11 @@ async fn battery_forecast(
             body: format!(
                 "🔋 {site_name}: {latest:.2}V, trend {slope:+.3}V/day, ~{days:.0}d to {cutoff:.1}V."
             ),
-            slot: Some(Slot { project_id, site_id, parameter_id: battery_param }),
+            slot: Some(Slot {
+                project_id,
+                site_id,
+                parameter_id: battery_param,
+            }),
         };
         let _ = deliver(state, channels, &msg, None).await;
     }
@@ -324,7 +358,9 @@ async fn sync_failures(
         let msg = OutgoingMessage {
             kind: "sync_failure",
             subject: format!("River Data: sync failures on {service_type}"),
-            body: format!("⚠️ {n} sync failure(s) on {service_type}/{instance} since the last alert."),
+            body: format!(
+                "⚠️ {n} sync failure(s) on {service_type}/{instance} since the last alert."
+            ),
             // System-wide infrastructure alert, no per-site scope, every enabled recipient gets it.
             slot: None,
         };

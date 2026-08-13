@@ -275,7 +275,12 @@ pub fn full_permissions() -> serde_json::Value {
     })
 }
 
-pub fn perms(read_metadata: bool, read_data: bool, write_metadata: bool, write_data: bool) -> serde_json::Value {
+pub fn perms(
+    read_metadata: bool,
+    read_data: bool,
+    write_metadata: bool,
+    write_data: bool,
+) -> serde_json::Value {
     serde_json::json!({
         "read_metadata": read_metadata,
         "read_data": read_data,

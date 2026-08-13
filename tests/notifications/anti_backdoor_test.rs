@@ -39,7 +39,10 @@ async fn roles(Path(sub): Path<String>) -> Json<serde_json::Value> {
         _ => vec![],
     };
     Json(serde_json::json!(
-        names.into_iter().map(|n| serde_json::json!({ "name": n })).collect::<Vec<_>>()
+        names
+            .into_iter()
+            .map(|n| serde_json::json!({ "name": n }))
+            .collect::<Vec<_>>()
     ))
 }
 
@@ -48,7 +51,10 @@ async fn spawn_mock_keycloak() -> String {
     let app = Router::new()
         .route("/realms/mock/protocol/openid-connect/token", post(token))
         .route("/admin/realms/mock/users/{sub}", get(user))
-        .route("/admin/realms/mock/users/{sub}/role-mappings/realm", get(roles));
+        .route(
+            "/admin/realms/mock/users/{sub}/role-mappings/realm",
+            get(roles),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -146,9 +152,15 @@ async fn reconcile_deactivates_revoked_links_only() {
     insert_identity(&db, "disabled-user", 3).await;
 
     let deactivated = reconcile::sweep(&state).await.unwrap();
-    assert_eq!(deactivated, 2, "the no-role and disabled users are deactivated");
+    assert_eq!(
+        deactivated, 2,
+        "the no-role and disabled users are deactivated"
+    );
 
-    assert!(is_active(&db, "regular-user").await, "an active user keeps the link");
+    assert!(
+        is_active(&db, "regular-user").await,
+        "an active user keeps the link"
+    );
     assert!(!is_active(&db, "no-role-user").await);
     assert!(!is_active(&db, "disabled-user").await);
 }
@@ -163,5 +175,8 @@ async fn reconcile_keeps_links_when_keycloak_unavailable() {
     insert_identity(&db, "regular-user", 1).await;
     let deactivated = reconcile::sweep(&state).await.unwrap();
     assert_eq!(deactivated, 0, "an outage must not mass-deactivate");
-    assert!(is_active(&db, "regular-user").await, "link survives the outage");
+    assert!(
+        is_active(&db, "regular-user").await,
+        "link survives the outage"
+    );
 }

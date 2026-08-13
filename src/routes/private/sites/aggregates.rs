@@ -503,9 +503,8 @@ pub async fn get_site_aggregates(
                 }
             }
 
-            let descriptor = slot.map(|p| {
-                site_parameters::SlotDescriptor::resolve(p, catalog.get(&p.parameter_id))
-            });
+            let descriptor = slot
+                .map(|p| site_parameters::SlotDescriptor::resolve(p, catalog.get(&p.parameter_id)));
             ParameterAggregateData {
                 id: slot.map_or(parameter_id, |p| p.id),
                 parameter_id,

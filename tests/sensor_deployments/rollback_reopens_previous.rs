@@ -5,13 +5,15 @@
 //!
 //! Run: cargo test --test sensor_deployments -- --test-threads=1
 
-
 use crate::common::sensor_lifecycle as sl;
 use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
 use uuid::Uuid;
 
-async fn deployed_until(db: &sea_orm::DatabaseConnection, id: Uuid) -> Option<chrono::DateTime<chrono::Utc>> {
+async fn deployed_until(
+    db: &sea_orm::DatabaseConnection,
+    id: Uuid,
+) -> Option<chrono::DateTime<chrono::Utc>> {
     let row = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -41,13 +43,33 @@ async fn rollback_reopens_previous_deployment() {
     let cal = sl::add_calibration(&db, sensor.id, 1.0, 0.0, sl::dt("2025-06-01T00:00:00Z")).await;
 
     // Post-move state: A at site1 [00:00, 02:00), B at site2 [02:00, ∞).
-    let dep_a = sl::deploy_sensor(&db, sensor.id, crate::common::SITE1_ID, sl::dt("2025-06-01T00:00:00Z")).await;
+    let dep_a = sl::deploy_sensor(
+        &db,
+        sensor.id,
+        crate::common::SITE1_ID,
+        sl::dt("2025-06-01T00:00:00Z"),
+    )
+    .await;
     sl::end_deployment(&db, dep_a, sl::dt("2025-06-01T02:00:00Z")).await;
-    let dep_b = sl::deploy_sensor(&db, sensor.id, crate::common::SITE2_ID, sl::dt("2025-06-01T02:00:00Z")).await;
+    let dep_b = sl::deploy_sensor(
+        &db,
+        sensor.id,
+        crate::common::SITE2_ID,
+        sl::dt("2025-06-01T02:00:00Z"),
+    )
+    .await;
 
     let stream = sl::create_paired_stream(&db, "rollback", crate::common::PARAM_S1_TEMP_ID).await;
     sl::insert_readings(
-        &db, stream, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID, sensor.id, cal, dep_a, 1.0, 0.0,
+        &db,
+        stream,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        sensor.id,
+        cal,
+        dep_a,
+        1.0,
+        0.0,
         &[
             (sl::dt("2025-06-01T00:30:00Z"), 10.0),
             (sl::dt("2025-06-01T01:00:00Z"), 11.0),
@@ -56,7 +78,15 @@ async fn rollback_reopens_previous_deployment() {
     )
     .await;
     sl::insert_readings(
-        &db, stream, crate::common::SITE2_ID, crate::common::GLOBAL_PARAM_TEMP_ID, sensor.id, cal, dep_b, 1.0, 0.0,
+        &db,
+        stream,
+        crate::common::SITE2_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        sensor.id,
+        cal,
+        dep_b,
+        1.0,
+        0.0,
         &[
             (sl::dt("2025-06-01T02:30:00Z"), 13.0),
             (sl::dt("2025-06-01T03:00:00Z"), 14.0),
@@ -79,7 +109,10 @@ async fn rollback_reopens_previous_deployment() {
         Some(3),
         "B's three readings are reassigned: {body}"
     );
-    assert_eq!(resp["previous_deployment_id"].as_str(), Some(dep_a.to_string().as_str()));
+    assert_eq!(
+        resp["previous_deployment_id"].as_str(),
+        Some(dep_a.to_string().as_str())
+    );
 
     // A reopened to open-ended (B was open), absorbing B's vacated window.
     assert_eq!(
@@ -93,7 +126,11 @@ async fn rollback_reopens_previous_deployment() {
     assert_eq!(rows.len(), 6, "all six readings remain");
     for (i, r) in rows.iter().enumerate() {
         assert_eq!(r.site_id, Some(site1), "reading[{i}] reverts to site1");
-        assert_eq!(r.deployment_id, Some(dep_a), "reading[{i}] reverts to deployment A");
+        assert_eq!(
+            r.deployment_id,
+            Some(dep_a),
+            "reading[{i}] reverts to deployment A"
+        );
     }
 
     let open_count: i64 = db

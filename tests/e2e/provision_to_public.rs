@@ -8,7 +8,6 @@
 //!
 //! Run: cargo test --test e2e -- --test-threads=1
 
-
 use crate::common::e2e;
 use serial_test::serial;
 
@@ -29,10 +28,17 @@ async fn provision_pair_ingest_and_expose_publicly() {
     //    name is backfilled from the parameter, sensor_type defaults to "".
     let sp_id = e2e::assign_site_parameter_minimal(&app, &token, &site_id, &param_id).await;
     let (status, sp) =
-        crate::common::get_json_with_token(&app, &format!("/api/site_parameters/{sp_id}"), &token).await;
+        crate::common::get_json_with_token(&app, &format!("/api/site_parameters/{sp_id}"), &token)
+            .await;
     assert_eq!(status, 200, "get site_parameter: {sp}");
-    assert_eq!(sp["name"], "E2E Depth", "name should be backfilled from the parameter: {sp}");
-    assert_eq!(sp["sensor_type"], "", "sensor_type should default to empty: {sp}");
+    assert_eq!(
+        sp["name"], "E2E Depth",
+        "name should be backfilled from the parameter: {sp}"
+    );
+    assert_eq!(
+        sp["sensor_type"], "",
+        "sensor_type should default to empty: {sp}"
+    );
 
     // 3. Register a source-agnostic stream and pair it to the site_parameter.
     let (status, stream) = crate::common::post_json_parse_with_token(
@@ -42,7 +48,10 @@ async fn provision_pair_ingest_and_expose_publicly() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "register stream ({status}): {stream}");
+    assert!(
+        (200..300).contains(&status),
+        "register stream ({status}): {stream}"
+    );
     let stream_id = e2e::id_of(&stream);
 
     let (status, paired) = crate::common::post_json_with_token(
@@ -52,10 +61,15 @@ async fn provision_pair_ingest_and_expose_publicly() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "pair stream ({status}): {paired}");
+    assert!(
+        (200..300).contains(&status),
+        "pair stream ({status}): {paired}"
+    );
 
     // 4. Ingest readings through the paired stream, they should be stamped with site_id/parameter_id.
-    let times: Vec<String> = (0..6).map(|i| format!("2025-06-01T00:{:02}:00Z", i * 10)).collect();
+    let times: Vec<String> = (0..6)
+        .map(|i| format!("2025-06-01T00:{:02}:00Z", i * 10))
+        .collect();
     let raw: Vec<f64> = vec![10.0, 11.0, 12.0, 13.0, 14.0, 15.0];
     let readings_payload: Vec<serde_json::Value> = times
         .iter()
@@ -71,16 +85,26 @@ async fn provision_pair_ingest_and_expose_publicly() {
     .await;
     assert_eq!(status, 200, "ingest ({status}): {ing}");
     let ing: serde_json::Value = serde_json::from_str(&ing).unwrap();
-    assert_eq!(ing["inserted"].as_u64().unwrap(), 6, "ingest inserted: {ing}");
+    assert_eq!(
+        ing["inserted"].as_u64().unwrap(),
+        6,
+        "ingest inserted: {ing}"
+    );
     assert_eq!(ing["paired"], true, "stream should be paired: {ing}");
 
     // 5. Authenticated readings reproduce the ingested series (COALESCE(calibrated, raw)).
-    let readings_uri =
-        format!("/api/sites/{site_id}/readings?start=2025-06-01T00:00:00Z&end=2025-06-01T00:59:00Z");
+    let readings_uri = format!(
+        "/api/sites/{site_id}/readings?start=2025-06-01T00:00:00Z&end=2025-06-01T00:59:00Z"
+    );
     let (status, readings) = crate::common::get_json_with_token(&app, &readings_uri, &token).await;
     assert_eq!(status, 200, "readings ({status}): {readings}");
     let got = e2e::values_for(&readings, &param_id);
-    assert_eq!(got.len(), 6, "expected 6 readings, got {}: {readings}", got.len());
+    assert_eq!(
+        got.len(),
+        6,
+        "expected 6 readings, got {}: {readings}",
+        got.len()
+    );
     for (i, v) in raw.iter().enumerate() {
         assert!((got[i] - v).abs() < 1e-6, "reading[{i}] {} != {v}", got[i]);
     }
@@ -93,11 +117,19 @@ async fn provision_pair_ingest_and_expose_publicly() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "refresh_aggregates ({status}): {refresh}");
+    assert!(
+        (200..300).contains(&status),
+        "refresh_aggregates ({status}): {refresh}"
+    );
     let refresh: serde_json::Value = serde_json::from_str(&refresh).unwrap();
-    let job_id = refresh["job_id"].as_str().expect("refresh_aggregates should return a job_id");
+    let job_id = refresh["job_id"]
+        .as_str()
+        .expect("refresh_aggregates should return a job_id");
     let final_status = e2e::poll_job(&app, &token, job_id, 30).await;
-    assert_eq!(final_status, "completed", "aggregate refresh job should complete");
+    assert_eq!(
+        final_status, "completed",
+        "aggregate refresh job should complete"
+    );
 
     let agg_uri = format!(
         "/api/sites/{site_id}/aggregates/hourly?start=2025-06-01T00:00:00Z&end=2025-06-01T00:59:00Z"
@@ -120,11 +152,25 @@ async fn provision_pair_ingest_and_expose_publicly() {
     assert_eq!(status, 200, "public readings ({status}): {pub_readings}");
     // Public readings key parameters by the global parameter short code (not site_parameter / id).
     let pub_got = e2e::values_for(&pub_readings, "e2e_depth");
-    assert_eq!(pub_got.len(), 6, "public should expose 6 readings: {pub_readings}");
+    assert_eq!(
+        pub_got.len(),
+        6,
+        "public should expose 6 readings: {pub_readings}"
+    );
 
-    let (status, csv) = crate::common::get_csv_with_token(&app, &format!("{pub_uri}&format=csv"), &token).await;
+    let (status, csv) =
+        crate::common::get_csv_with_token(&app, &format!("{pub_uri}&format=csv"), &token).await;
     assert_eq!(status, 200, "public CSV ({status})");
     let lines: Vec<&str> = csv.lines().filter(|l| !l.is_empty()).collect();
-    assert_eq!(lines.len(), 7, "CSV should have a header + 6 rows, got {}:\n{csv}", lines.len());
-    assert!(lines[0].to_lowercase().contains("time"), "CSV header should include a time column: {}", lines[0]);
+    assert_eq!(
+        lines.len(),
+        7,
+        "CSV should have a header + 6 rows, got {}:\n{csv}",
+        lines.len()
+    );
+    assert!(
+        lines[0].to_lowercase().contains("time"),
+        "CSV header should include a time column: {}",
+        lines[0]
+    );
 }

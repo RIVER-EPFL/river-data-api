@@ -4,7 +4,6 @@
 //!
 //! Run: cargo test --test admin -- --test-threads=1
 
-
 use crate::common::e2e;
 use crate::common::sensor_lifecycle as sl;
 use sea_orm::{ConnectionTrait, Statement};
@@ -24,11 +23,20 @@ async fn reprocess_all_reowns_unattributed_readings() {
 
     let sensor = sl::create_sensor(&db, "backdate", temp).await;
     let _cal = sl::add_calibration(&db, sensor.id, 1.0, 0.0, sl::dt("2025-06-01T00:00:00Z")).await;
-    let dep = sl::deploy_sensor(&db, sensor.id, crate::common::SITE1_ID, sl::dt("2025-06-01T00:00:00Z")).await;
+    let dep = sl::deploy_sensor(
+        &db,
+        sensor.id,
+        crate::common::SITE1_ID,
+        sl::dt("2025-06-01T00:00:00Z"),
+    )
+    .await;
     let stream = sl::create_paired_stream(&db, "backdate", crate::common::PARAM_S1_TEMP_ID).await;
 
     // Readings carry the sensor + parameter but no site/deployment, yet fall inside dep's window.
-    for (i, t) in ["2025-06-01T00:15:00Z", "2025-06-01T00:45:00Z"].iter().enumerate() {
+    for (i, t) in ["2025-06-01T00:15:00Z", "2025-06-01T00:45:00Z"]
+        .iter()
+        .enumerate()
+    {
         db.execute(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
@@ -49,9 +57,15 @@ async fn reprocess_all_reowns_unattributed_readings() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "reprocess_all ({status}): {body}");
+    assert!(
+        (200..300).contains(&status),
+        "reprocess_all ({status}): {body}"
+    );
     let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert!(resp["slots"].as_u64().unwrap() >= 1, "at least one slot queued: {body}");
+    assert!(
+        resp["slots"].as_u64().unwrap() >= 1,
+        "at least one slot queued: {body}"
+    );
     assert!(
         e2e::wait_for_jobs_by_trigger(&db, "reprocess_all", 30).await,
         "the reprocess_all job completes"
@@ -61,6 +75,10 @@ async fn reprocess_all_reowns_unattributed_readings() {
     assert_eq!(rows.len(), 2, "both readings remain");
     for (i, r) in rows.iter().enumerate() {
         assert_eq!(r.site_id, Some(site1), "reading[{i}] re-owned to site1");
-        assert_eq!(r.deployment_id, Some(dep), "reading[{i}] re-owned to the deployment");
+        assert_eq!(
+            r.deployment_id,
+            Some(dep),
+            "reading[{i}] re-owned to the deployment"
+        );
     }
 }

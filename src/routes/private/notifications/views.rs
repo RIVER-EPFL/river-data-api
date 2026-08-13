@@ -140,7 +140,9 @@ pub async fn test_send(
     let outcome = match req.channel.as_str() {
         "telegram" => {
             let Some(token) = state.config.telegram_bot_token.clone() else {
-                return Err(AppError::BadRequest("Telegram is not configured".to_string()));
+                return Err(AppError::BadRequest(
+                    "Telegram is not configured".to_string(),
+                ));
             };
             let chat_id: i64 = recipient.parse().map_err(|_| {
                 AppError::BadRequest("recipient must be a numeric Telegram chat id".to_string())
@@ -166,7 +168,16 @@ pub async fn test_send(
         Ok(()) => ("sent", None),
         Err(e) => ("failed", Some(e.as_str())),
     };
-    log_delivery(&state.db, None, "test", &req.channel, &recipient, status, error).await;
+    log_delivery(
+        &state.db,
+        None,
+        "test",
+        &req.channel,
+        &recipient,
+        status,
+        error,
+    )
+    .await;
 
     Ok(Json(TestSendResponse {
         channel: req.channel,

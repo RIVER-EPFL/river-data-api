@@ -64,14 +64,29 @@ async fn provision(
     slug: &str,
     params: &[(&str, &str, &str)],
 ) -> (String, String, Vec<(String, String)>, Vec<String>) {
-    let project_id = e2e::create_project(app, token, &format!("Track {slug}"), &format!("trk-{slug}"), true).await;
-    let site_id = e2e::create_site(app, token, &project_id, &format!("Site {slug}"), &format!("site-{slug}")).await;
+    let project_id = e2e::create_project(
+        app,
+        token,
+        &format!("Track {slug}"),
+        &format!("trk-{slug}"),
+        true,
+    )
+    .await;
+    let site_id = e2e::create_site(
+        app,
+        token,
+        &project_id,
+        &format!("Site {slug}"),
+        &format!("site-{slug}"),
+    )
+    .await;
 
     let mut parameters = Vec::new();
     let mut site_parameter_ids = Vec::new();
     for (code, name, units) in params {
         let pid = e2e::create_parameter(app, token, code, name, units).await;
-        site_parameter_ids.push(e2e::assign_site_parameter_minimal(app, token, &site_id, &pid).await);
+        site_parameter_ids
+            .push(e2e::assign_site_parameter_minimal(app, token, &site_id, &pid).await);
         parameters.push(((*code).to_string(), pid));
     }
     (project_id, site_id, parameters, site_parameter_ids)
@@ -119,9 +134,16 @@ pub fn csv_body(codes: &[&str], rows: usize, base: &str) -> String {
     out.push('\n');
     for i in 0..rows {
         let minutes = i * 10;
-        out.push_str(&format!("{base}T{:02}:{:02}:00Z", minutes / 60, minutes % 60));
+        out.push_str(&format!(
+            "{base}T{:02}:{:02}:00Z",
+            minutes / 60,
+            minutes % 60
+        ));
         for (j, _) in codes.iter().enumerate() {
-            out.push_str(&format!(",{:.2}", BAND_CSV.0 + (i * codes.len() + j) as f64 % 90.0));
+            out.push_str(&format!(
+                ",{:.2}",
+                BAND_CSV.0 + (i * codes.len() + j) as f64 % 90.0
+            ));
         }
         out.push('\n');
     }
@@ -165,7 +187,10 @@ pub async fn onboard_sensor_flow_track(app: &Router, token: &str) -> Track {
         token,
     )
     .await;
-    assert!((200..300).contains(&status), "register stream ({status}): {stream}");
+    assert!(
+        (200..300).contains(&status),
+        "register stream ({status}): {stream}"
+    );
     let stream_id = e2e::id_of(&stream);
 
     let calibration_id = super::e2e::identity_calibration_id(app, token, &sensor_id).await;

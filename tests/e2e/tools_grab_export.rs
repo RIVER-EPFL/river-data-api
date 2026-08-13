@@ -56,7 +56,10 @@ fn portal_doc_triplicate(station: &str, date: &str) -> PortalDoc {
     let rows = csv_rows(PORTAL_GRAB_ROWS);
     let row = rows
         .iter()
-        .find(|r| r.get("station").copied() == Some(station) && r.get("DATE_reading").copied() == Some(date))
+        .find(|r| {
+            r.get("station").copied() == Some(station)
+                && r.get("DATE_reading").copied() == Some(date)
+        })
         .unwrap_or_else(|| panic!("portal fixture holds no {station} row on {date}"));
     let num = |key: &str| -> f64 {
         row.get(key)
@@ -78,9 +81,9 @@ fn portal_curve(parameter: &str) -> (f64, f64) {
         .find(|r| r.get("parameter").copied() == Some(parameter))
         .unwrap_or_else(|| panic!("portal fixture holds no standard curve for {parameter}"));
     let num = |key: &str| -> f64 {
-        row[key]
-            .parse::<f64>()
-            .unwrap_or_else(|_| panic!("standard curve column {key} is not numeric for {parameter}"))
+        row[key].parse::<f64>().unwrap_or_else(|_| {
+            panic!("standard curve column {key} is not numeric for {parameter}")
+        })
     };
     (num("a"), num("b"))
 }
@@ -91,7 +94,12 @@ fn portal_curve(parameter: &str) -> (f64, f64) {
 
 /// A Keycloak fixture user at `role`, granted visibility of the track's project. Fixture passwords
 /// equal the username.
-async fn member(db: &sea_orm::DatabaseConnection, project_id: &str, user: &str, role: &str) -> String {
+async fn member(
+    db: &sea_orm::DatabaseConnection,
+    project_id: &str,
+    user: &str,
+    role: &str,
+) -> String {
     kc::ensure_realm_user(user, user, &[role]).await;
     kc::grant_project(db, &kc::keycloak_user_id(user).await, project_id).await;
     kc::get_keycloak_jwt(user, user).await
@@ -229,7 +237,10 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
         &intern,
     )
     .await;
-    assert_eq!(status, 200, "an intern may run an analytical tool ({status}): {tool}");
+    assert_eq!(
+        status, 200,
+        "an intern may run an analytical tool ({status}): {tool}"
+    );
     let tool_avg = f64_at(&tool["results"], "DOC_avg_ppb");
     let tool_sd = f64_at(&tool["results"], "DOC_sd_ppb");
 
@@ -248,7 +259,11 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
         doc.replicates
     );
 
-    let corrected: Vec<f64> = doc.replicates.iter().map(|r| slope * r + intercept).collect();
+    let corrected: Vec<f64> = doc
+        .replicates
+        .iter()
+        .map(|r| slope * r + intercept)
+        .collect();
     let expected_avg = corrected.iter().sum::<f64>() / corrected.len() as f64;
     assert!(
         (tool_avg - expected_avg).abs() < 1e-9,
@@ -282,9 +297,15 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
 
     let (status, saved) =
         crate::common::post_json_parse_with_token(&app, "/api/grab_samples", &body, &river).await;
-    assert_eq!(status, 200, "a river member saves the grab ({status}): {saved}");
+    assert_eq!(
+        status, 200,
+        "a river member saves the grab ({status}): {saved}"
+    );
     assert_eq!(saved["inserted"], 3, "one reading per replicate: {saved}");
-    assert_eq!(saved["samples_created"], 1, "the triplicate is one sample: {saved}");
+    assert_eq!(
+        saved["samples_created"], 1,
+        "the triplicate is one sample: {saved}"
+    );
 
     let stored = {
         use sea_orm::{ConnectionTrait, Statement};
@@ -304,9 +325,13 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
     for (i, row) in stored.iter().enumerate() {
         let index: i16 = row.try_get("", "replicate_index").expect("replicate_index");
         let raw: f64 = row.try_get("", "raw_value").expect("raw_value");
-        let calibrated: f64 = row.try_get("", "calibrated_value").expect("calibrated_value");
+        let calibrated: f64 = row
+            .try_get("", "calibrated_value")
+            .expect("calibrated_value");
         let stamped: uuid::Uuid = row.try_get("", "calibration_id").expect("calibration_id");
-        let mtype: String = row.try_get("", "measurement_type").expect("measurement_type");
+        let mtype: String = row
+            .try_get("", "measurement_type")
+            .expect("measurement_type");
         assert_eq!(
             index, i as i16,
             "the replicate_index the request supplied is the one stored"
@@ -374,7 +399,10 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
         &intern,
     )
     .await;
-    assert_eq!(status, 200, "an intern reads the spot series ({status}): {served}");
+    assert_eq!(
+        status, 200,
+        "an intern reads the spot series ({status}): {served}"
+    );
 
     let values = e2e::values_for(&served, &parameter_id);
     assert_eq!(
@@ -403,7 +431,10 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
         "the served spot point carries its sample statistics: {served}"
     );
     let stat = &stats[0];
-    assert_eq!(stat["n"], 3, "the attached stats count three replicates: {stat}");
+    assert_eq!(
+        stat["n"], 3,
+        "the attached stats count three replicates: {stat}"
+    );
     assert!(
         (f64_at(stat, "mean") - tool_avg).abs() < 1e-9,
         "the attached mean is the tool's average: {stat}"
@@ -465,7 +496,10 @@ async fn sensor_vs_grab_window_edges_are_inclusive_and_configurable() {
     )
     .await;
     assert_eq!(status, 200, "continuous batch ({status}): {batch}");
-    assert_eq!(batch["inserted"], 5, "all five continuous points land: {batch}");
+    assert_eq!(
+        batch["inserted"], 5,
+        "all five continuous points land: {batch}"
+    );
 
     let (status, grab) = crate::common::post_json_parse_with_token(
         &app,
@@ -522,8 +556,14 @@ async fn sensor_vs_grab_window_edges_are_inclusive_and_configurable() {
         "difference is grab_value minus sensor_avg: {row}"
     );
 
-    let (status, narrow) =
-        sensor_vs_grab(&app, &intern, &track.site_id, &cdom, "&window_start_hours=3&window_end_hours=5").await;
+    let (status, narrow) = sensor_vs_grab(
+        &app,
+        &intern,
+        &track.site_id,
+        &cdom,
+        "&window_start_hours=3&window_end_hours=5",
+    )
+    .await;
     assert_eq!(status, 200, "narrowed window ({status}): {narrow}");
     assert!(
         (f64_at(&narrow, "window_start_hours") - 3.0).abs() < 1e-9
@@ -533,7 +573,10 @@ async fn sensor_vs_grab_window_edges_are_inclusive_and_configurable() {
     let rows = narrow["rows"].as_array().expect("rows array");
     assert_eq!(rows.len(), 1, "the grab is still in range: {narrow}");
     let row = &rows[0];
-    assert_eq!(row["sensor_n"], 1, "only 10:00 falls in [09:00, 11:00]: {row}");
+    assert_eq!(
+        row["sensor_n"], 1,
+        "only 10:00 falls in [09:00, 11:00]: {row}"
+    );
     assert!(
         (f64_at(row, "sensor_avg") - 304.0).abs() < 1e-9,
         "sensor_avg is the single in-window reading: {row}"
@@ -547,8 +590,14 @@ async fn sensor_vs_grab_window_edges_are_inclusive_and_configurable() {
         "difference still pairs the grab mean against the window average: {row}"
     );
 
-    let (status, wide) =
-        sensor_vs_grab(&app, &intern, &track.site_id, &cdom, "&window_start_hours=0&window_end_hours=8").await;
+    let (status, wide) = sensor_vs_grab(
+        &app,
+        &intern,
+        &track.site_id,
+        &cdom,
+        "&window_start_hours=0&window_end_hours=8",
+    )
+    .await;
     assert_eq!(status, 200, "widened window ({status}): {wide}");
     let rows = wide["rows"].as_array().expect("rows array");
     assert_eq!(rows.len(), 1, "still one grab: {wide}");
@@ -593,7 +642,10 @@ async fn sensor_vs_grab_orders_grabs_and_reports_an_empty_post_grab_window() {
     )
     .await;
     assert_eq!(status, 200, "continuous batch ({status}): {batch}");
-    assert_eq!(batch["inserted"], 3, "three continuous points land: {batch}");
+    assert_eq!(
+        batch["inserted"], 3,
+        "three continuous points land: {batch}"
+    );
 
     // The afternoon grab is entered second but collected later, so ordering cannot come from
     // insertion order alone.
@@ -609,7 +661,10 @@ async fn sensor_vs_grab_orders_grabs_and_reports_an_empty_post_grab_window() {
     )
     .await;
     assert_eq!(status, 200, "single-bottle grab ({status}): {afternoon}");
-    assert_eq!(afternoon["inserted"], 1, "the lone reading lands: {afternoon}");
+    assert_eq!(
+        afternoon["inserted"], 1,
+        "the lone reading lands: {afternoon}"
+    );
     assert_eq!(
         afternoon["samples_created"], 1,
         "a note gives even a single reading a sample to hang on: {afternoon}"
@@ -626,7 +681,10 @@ async fn sensor_vs_grab_orders_grabs_and_reports_an_empty_post_grab_window() {
     )
     .await;
     assert_eq!(status, 200, "morning grab ({status}): {morning}");
-    assert_eq!(morning["samples_created"], 1, "the pair is one sample: {morning}");
+    assert_eq!(
+        morning["samples_created"], 1,
+        "the pair is one sample: {morning}"
+    );
 
     let (status, export) = sensor_vs_grab(&app, &intern, &track.site_id, &cdom, "").await;
     assert_eq!(status, 200, "comparison ({status}): {export}");
@@ -643,20 +701,32 @@ async fn sensor_vs_grab_orders_grabs_and_reports_an_empty_post_grab_window() {
         "the later grab comes second: {export}"
     );
 
-    assert_eq!(rows[0]["grab_n"], 2, "the morning grab has two replicates: {}", rows[0]);
+    assert_eq!(
+        rows[0]["grab_n"], 2,
+        "the morning grab has two replicates: {}",
+        rows[0]
+    );
     assert!(
         (f64_at(&rows[0], "grab_value") - 313.0).abs() < 1e-9,
         "the morning grab's value is its replicate mean: {}",
         rows[0]
     );
-    assert_eq!(rows[0]["sensor_n"], 3, "its window holds three readings: {}", rows[0]);
+    assert_eq!(
+        rows[0]["sensor_n"], 3,
+        "its window holds three readings: {}",
+        rows[0]
+    );
     assert!(
         (f64_at(&rows[0], "sensor_avg") - 304.0).abs() < 1e-9,
         "its window average is exact: {}",
         rows[0]
     );
 
-    assert_eq!(rows[1]["grab_n"], 1, "the afternoon grab has one replicate: {}", rows[1]);
+    assert_eq!(
+        rows[1]["grab_n"], 1,
+        "the afternoon grab has one replicate: {}",
+        rows[1]
+    );
     assert!(
         (f64_at(&rows[1], "grab_value") - 320.0).abs() < 1e-9,
         "its value is the single bottle: {}",
@@ -698,15 +768,48 @@ async fn sensor_vs_grab_orders_grabs_and_reports_an_empty_post_grab_window() {
     );
     let morning_cells: Vec<&str> = lines[1].split(',').collect();
     assert_eq!(morning_cells.len(), 8, "one cell per column: {}", lines[1]);
-    assert_eq!(morning_cells[3], "2", "grab_n for the morning grab: {}", lines[1]);
-    assert_eq!(morning_cells[6], "3", "sensor_n for the morning grab: {}", lines[1]);
+    assert_eq!(
+        morning_cells[3], "2",
+        "grab_n for the morning grab: {}",
+        lines[1]
+    );
+    assert_eq!(
+        morning_cells[6], "3",
+        "sensor_n for the morning grab: {}",
+        lines[1]
+    );
     let afternoon_cells: Vec<&str> = lines[2].split(',').collect();
-    assert_eq!(afternoon_cells.len(), 8, "one cell per column: {}", lines[2]);
-    assert_eq!(afternoon_cells[2], "", "a null grab_sd is an empty cell: {}", lines[2]);
-    assert_eq!(afternoon_cells[3], "1", "grab_n for the afternoon grab: {}", lines[2]);
-    assert_eq!(afternoon_cells[4], "", "a null sensor_avg is an empty cell: {}", lines[2]);
-    assert_eq!(afternoon_cells[6], "0", "sensor_n is a real zero, not a blank: {}", lines[2]);
-    assert_eq!(afternoon_cells[7], "", "a null difference is an empty cell: {}", lines[2]);
+    assert_eq!(
+        afternoon_cells.len(),
+        8,
+        "one cell per column: {}",
+        lines[2]
+    );
+    assert_eq!(
+        afternoon_cells[2], "",
+        "a null grab_sd is an empty cell: {}",
+        lines[2]
+    );
+    assert_eq!(
+        afternoon_cells[3], "1",
+        "grab_n for the afternoon grab: {}",
+        lines[2]
+    );
+    assert_eq!(
+        afternoon_cells[4], "",
+        "a null sensor_avg is an empty cell: {}",
+        lines[2]
+    );
+    assert_eq!(
+        afternoon_cells[6], "0",
+        "sensor_n is a real zero, not a blank: {}",
+        lines[2]
+    );
+    assert_eq!(
+        afternoon_cells[7], "",
+        "a null difference is an empty cell: {}",
+        lines[2]
+    );
 }
 
 #[tokio::test]
@@ -722,7 +825,8 @@ async fn sensor_vs_grab_empty_comparisons_and_invalid_windows() {
 
     let track = tracks::onboard_grab_track(&app, &admin).await;
     let cdom = add_parameter(&app, &admin, &track, "TrkGrabCdom", "Track Grab CDOM").await;
-    let ungrabbed = add_parameter(&app, &admin, &track, "TrkGrabTurb", "Track Grab Turbidity").await;
+    let ungrabbed =
+        add_parameter(&app, &admin, &track, "TrkGrabTurb", "Track Grab Turbidity").await;
     let intern = member(&db, &track.project_id, "intern1", "riverdata-intern").await;
     let river = member(&db, &track.project_id, "river1", "riverdata-river").await;
 
@@ -754,7 +858,10 @@ async fn sensor_vs_grab_empty_comparisons_and_invalid_windows() {
     assert_eq!(status, 200, "grab entry ({status}): {grab}");
 
     let (status, other) = sensor_vs_grab(&app, &intern, &track.site_id, &ungrabbed, "").await;
-    assert_eq!(status, 200, "a parameter with no grabs is not an error ({status}): {other}");
+    assert_eq!(
+        status, 200,
+        "a parameter with no grabs is not an error ({status}): {other}"
+    );
     assert_eq!(
         other["rows"].as_array().map(Vec::len),
         Some(0),
@@ -785,27 +892,50 @@ async fn sensor_vs_grab_empty_comparisons_and_invalid_windows() {
     );
 
     let (status, csv) =
-        crate::common::get_csv_with_token(&app, &format!("{out_of_range}&format=csv"), &intern).await;
+        crate::common::get_csv_with_token(&app, &format!("{out_of_range}&format=csv"), &intern)
+            .await;
     assert_eq!(status, 200, "empty CSV ({status}): {csv}");
     let lines: Vec<&str> = csv.lines().filter(|l| !l.trim().is_empty()).collect();
-    assert_eq!(lines.len(), 1, "an empty comparison is still a valid CSV:\n{csv}");
+    assert_eq!(
+        lines.len(),
+        1,
+        "an empty comparison is still a valid CSV:\n{csv}"
+    );
     assert_eq!(
         lines[0], "time,grab_value,grab_sd,grab_n,sensor_avg,sensor_sd,sensor_n,difference",
         "with the full header"
     );
 
-    let (status, degenerate) =
-        sensor_vs_grab(&app, &intern, &track.site_id, &cdom, "&window_start_hours=6&window_end_hours=6").await;
-    assert_eq!(status, 400, "a zero-width window is rejected ({status}): {degenerate}");
+    let (status, degenerate) = sensor_vs_grab(
+        &app,
+        &intern,
+        &track.site_id,
+        &cdom,
+        "&window_start_hours=6&window_end_hours=6",
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a zero-width window is rejected ({status}): {degenerate}"
+    );
     assert_eq!(
         degenerate["error"].as_str(),
         Some("window_end_hours must be greater than window_start_hours"),
         "with a message naming both bounds: {degenerate}"
     );
 
-    let (status, inverted) =
-        sensor_vs_grab(&app, &intern, &track.site_id, &cdom, "&window_start_hours=6&window_end_hours=2").await;
-    assert_eq!(status, 400, "an inverted window is rejected ({status}): {inverted}");
+    let (status, inverted) = sensor_vs_grab(
+        &app,
+        &intern,
+        &track.site_id,
+        &cdom,
+        "&window_start_hours=6&window_end_hours=2",
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "an inverted window is rejected ({status}): {inverted}"
+    );
 
     let (status, missing) = crate::common::get_json_with_token(
         &app,
@@ -816,7 +946,10 @@ async fn sensor_vs_grab_empty_comparisons_and_invalid_windows() {
         &intern,
     )
     .await;
-    assert_eq!(status, 404, "an unknown site is a 404 ({status}): {missing}");
+    assert_eq!(
+        status, 404,
+        "an unknown site is a 404 ({status}): {missing}"
+    );
 
     kc::ensure_realm_user("norole", "norole", &[]).await;
     let norole = kc::get_keycloak_jwt("norole", "norole").await;
@@ -848,7 +981,10 @@ async fn doc_tool_rejects_malformed_input_and_accounts_for_every_request_key() {
         &intern,
     )
     .await;
-    assert_eq!(status, 400, "a mistyped field is a bad request ({status}): {wrong_type}");
+    assert_eq!(
+        status, 400,
+        "a mistyped field is a bad request ({status}): {wrong_type}"
+    );
     assert!(
         wrong_type["error"]
             .as_str()
@@ -875,7 +1011,10 @@ async fn doc_tool_rejects_malformed_input_and_accounts_for_every_request_key() {
         &intern,
     )
     .await;
-    assert_eq!(status, 200, "an uncomputable calculation is not an error ({status}): {empty}");
+    assert_eq!(
+        status, 200,
+        "an uncomputable calculation is not an error ({status}): {empty}"
+    );
     assert_eq!(empty["tool"], "doc", "the response names the tool: {empty}");
     assert_eq!(
         empty["results"].as_object().map(|results| results.len()),
@@ -896,7 +1035,10 @@ async fn doc_tool_rejects_malformed_input_and_accounts_for_every_request_key() {
         &intern,
     )
     .await;
-    assert_eq!(status, 200, "a complete request calculates ({status}): {full}");
+    assert_eq!(
+        status, 200,
+        "a complete request calculates ({status}): {full}"
+    );
     assert!(
         (f64_at(&full["results"], "DOC_avg_ppb") - 205.0).abs() < 1e-9,
         "the curve is applied per replicate before averaging: (201 + 209) / 2: {full}"

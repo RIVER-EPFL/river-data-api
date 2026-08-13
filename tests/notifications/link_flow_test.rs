@@ -22,7 +22,9 @@ async fn insert_pending(db: &DatabaseConnection, sub: &str, code: &str, ttl: &st
 async fn chat_id_for(db: &DatabaseConnection, sub: &str) -> Option<i64> {
     db.query_one(Statement::from_string(
         DatabaseBackend::Postgres,
-        format!("SELECT telegram_chat_id FROM telegram_identities WHERE linked_keycloak_sub = '{sub}'"),
+        format!(
+            "SELECT telegram_chat_id FROM telegram_identities WHERE linked_keycloak_sub = '{sub}'"
+        ),
     ))
     .await
     .unwrap()
@@ -66,7 +68,11 @@ async fn start_rejects_expired_code() {
 
     let reply = commands::start(&db, 777, Some("bob"), "expired99").await;
     assert!(reply.contains("Invalid or expired"), "reply: {reply}");
-    assert_eq!(chat_id_for(&db, "sub-bob").await, None, "expired code does not link");
+    assert_eq!(
+        chat_id_for(&db, "sub-bob").await,
+        None,
+        "expired code does not link"
+    );
 }
 
 #[tokio::test]
@@ -82,7 +88,11 @@ async fn start_is_single_use() {
     // The same code can't link a second chat; it was cleared.
     let second = commands::start(&db, 200, Some("mallory"), "single123").await;
     assert!(second.contains("Invalid or expired"), "second: {second}");
-    assert_eq!(chat_id_for(&db, "sub-carol").await, Some(100), "still the first chat");
+    assert_eq!(
+        chat_id_for(&db, "sub-carol").await,
+        Some(100),
+        "still the first chat"
+    );
 }
 
 #[tokio::test]

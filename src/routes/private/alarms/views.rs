@@ -12,13 +12,15 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::common::middleware::{AuthContext, ProjectScope};
-use crate::common::scope::{Unowned, project_filter_sql, project_of_alarm_event, require_row_in_scope};
-use crate::common::series::{self, Cells, Table};
-use crate::routes::private::sites::parameters as site_parameters;
-use crate::error::{AppError, AppResult};
-use crate::routes::{cache, resolve_site_with_project, validate_time_range};
 use crate::common::bulk;
+use crate::common::middleware::{AuthContext, ProjectScope};
+use crate::common::scope::{
+    Unowned, project_filter_sql, project_of_alarm_event, require_row_in_scope,
+};
+use crate::common::series::{self, Cells, Table};
+use crate::error::{AppError, AppResult};
+use crate::routes::private::sites::parameters as site_parameters;
+use crate::routes::{cache, resolve_site_with_project, validate_time_range};
 
 use super::types::{
     AcknowledgedAlarmResponse, ActiveAlarm, ActiveAlarmsResponse, AlarmEventResponse,
@@ -650,7 +652,9 @@ pub async fn acknowledge_alarm(
         .and_then(|r| EventState::from_query_result(&r, "").ok());
 
     let Some(ev) = existing else {
-        return Err(AppError::NotFound(format!("Alarm event {event_id} not found")));
+        return Err(AppError::NotFound(format!(
+            "Alarm event {event_id} not found"
+        )));
     };
     if ev.resolved_at.is_some() {
         return Err(AppError::Conflict("Alarm already resolved".to_string()));
@@ -724,7 +728,9 @@ pub async fn unacknowledge_alarm(
         .and_then(|r| EventCheck::from_query_result(&r, "").ok());
 
     let Some(ev) = existing else {
-        return Err(AppError::NotFound(format!("Alarm event {event_id} not found")));
+        return Err(AppError::NotFound(format!(
+            "Alarm event {event_id} not found"
+        )));
     };
     if ev.resolved_at.is_some() {
         return Err(AppError::Conflict("Alarm already resolved".to_string()));

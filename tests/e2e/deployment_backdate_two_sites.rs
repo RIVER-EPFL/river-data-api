@@ -103,7 +103,12 @@ async fn two_site_fixture(db: &DatabaseConnection) -> TwoSites {
 
     let track = tracks::onboard_sensor_flow_track(&app, &admin).await;
     let parameter_id = track.parameter_id("TrkFlowDO").to_string();
-    let sensor = uuid(track.sensor_id.as_deref().expect("Track B provisions a sensor"));
+    let sensor = uuid(
+        track
+            .sensor_id
+            .as_deref()
+            .expect("Track B provisions a sensor"),
+    );
     let dep_a = uuid(
         track
             .deployment_id
@@ -115,7 +120,12 @@ async fn two_site_fixture(db: &DatabaseConnection) -> TwoSites {
 
     kc::ensure_realm_user("manager1", "manager1", &["riverdata-manager"]).await;
     kc::ensure_realm_user("river1", "river1", &["riverdata-river"]).await;
-    kc::grant_project(db, &kc::keycloak_user_id("manager1").await, &track.project_id).await;
+    kc::grant_project(
+        db,
+        &kc::keycloak_user_id("manager1").await,
+        &track.project_id,
+    )
+    .await;
     kc::grant_project(db, &kc::keycloak_user_id("river1").await, &track.project_id).await;
     let manager = kc::get_keycloak_jwt("manager1", "manager1").await;
     let river = kc::get_keycloak_jwt("river1", "river1").await;
@@ -157,8 +167,15 @@ async fn two_site_fixture(db: &DatabaseConnection) -> TwoSites {
         &river,
     )
     .await;
-    assert_eq!(status, 200, "ingest the day's readings ({status}): {ingested}");
-    assert_eq!(ingested["inserted"], READINGS.len(), "every reading lands: {ingested}");
+    assert_eq!(
+        status, 200,
+        "ingest the day's readings ({status}): {ingested}"
+    );
+    assert_eq!(
+        ingested["inserted"],
+        READINGS.len(),
+        "every reading lands: {ingested}"
+    );
     assert_eq!(
         ingested["paired"], true,
         "the stream is paired, so the readings arrive attributed: {ingested}"
@@ -214,7 +231,9 @@ async fn two_site_fixture(db: &DatabaseConnection) -> TwoSites {
         "baseline upstream 10:00",
     );
     assert!(
-        e2e::hourly_bucket(db, &site2, &parameter_id, ts("09:00:00")).await.is_none(),
+        e2e::hourly_bucket(db, &site2, &parameter_id, ts("09:00:00"))
+            .await
+            .is_none(),
         "the downstream site holds nothing yet, so a later downstream bucket cannot be satisfied \
          by rows that were already there"
     );
@@ -309,7 +328,9 @@ impl TwoSites {
             "downstream 10:00 holds the whole post-move hour",
         );
         assert!(
-            e2e::hourly_bucket(db, &self.site1, &self.parameter_id, ts("10:00:00")).await.is_none(),
+            e2e::hourly_bucket(db, &self.site1, &self.parameter_id, ts("10:00:00"))
+                .await
+                .is_none(),
             "upstream 10:00 is gone, not merely reduced"
         );
     }
@@ -346,7 +367,10 @@ fn assert_bucket(actual: Option<(f64, i64)>, mean: f64, count: i64, what: &str) 
     let (actual_mean, actual_count) = actual.unwrap_or_else(|| {
         panic!("{what}: expected mean {mean} over {count} readings, found no bucket at all")
     });
-    assert_eq!(actual_count, count, "{what}: readings counted in the bucket");
+    assert_eq!(
+        actual_count, count,
+        "{what}: readings counted in the bucket"
+    );
     // Every expected mean is an exact IEEE754 value (integer sums over integer counts); the
     // tolerance only absorbs the aggregate's summation order.
     assert!(
@@ -368,10 +392,14 @@ async fn deployment_window(
         .await
         .expect("query sensor_deployments")
         .unwrap_or_else(|| panic!("deployment {deployment} row"));
-    let from: DateTime<chrono::FixedOffset> = row.try_get("", "deployed_from").expect("deployed_from");
+    let from: DateTime<chrono::FixedOffset> =
+        row.try_get("", "deployed_from").expect("deployed_from");
     let until: Option<DateTime<chrono::FixedOffset>> =
         row.try_get("", "deployed_until").expect("deployed_until");
-    (from.with_timezone(&Utc), until.map(|t| t.with_timezone(&Utc)))
+    (
+        from.with_timezone(&Utc),
+        until.map(|t| t.with_timezone(&Utc)),
+    )
 }
 
 async fn deployment_exists(db: &DatabaseConnection, deployment: Uuid) -> bool {
@@ -465,12 +493,19 @@ async fn moving_a_sensor_moves_its_readings_and_both_sites_aggregates() {
     );
 
     let rows = sl::get_readings(&db, f.stream).await;
-    assert_eq!(rows.len(), READINGS.len(), "a move re-attributes readings, it never drops them");
+    assert_eq!(
+        rows.len(),
+        READINGS.len(),
+        "a move re-attributes readings, it never drops them"
+    );
     for (i, row) in rows.iter().enumerate() {
         let (hms, raw) = READINGS[i];
         // The deployment join is half-open at deployed_from, so 09:30 itself belongs downstream.
         let downstream = i >= 4;
-        assert_eq!(row.raw_value, raw, "reading {hms}: the measurement itself is untouched");
+        assert_eq!(
+            row.raw_value, raw,
+            "reading {hms}: the measurement itself is untouched"
+        );
         assert_attribution(
             row,
             Some(if downstream { f.site2_id } else { f.site1_id }),
@@ -489,8 +524,18 @@ async fn moving_a_sensor_moves_its_readings_and_both_sites_aggregates() {
     // Read back through the API surface the dashboard uses. `split_by_sensor=true` also pins which
     // instrument the relocated series belongs to. Each URL is issued exactly once in this test so
     // the response cache cannot mask the transition (its key omits split_by_sensor).
-    let (times, body) = split_series(&f.app, &f.river, &f.site1, "upstream aggregates after the move").await;
-    assert_eq!(times, vec![ts("08:00:00"), ts("09:00:00")], "upstream serves two buckets: {body}");
+    let (times, body) = split_series(
+        &f.app,
+        &f.river,
+        &f.site1,
+        "upstream aggregates after the move",
+    )
+    .await;
+    assert_eq!(
+        times,
+        vec![ts("08:00:00"), ts("09:00:00")],
+        "upstream serves two buckets: {body}"
+    );
     assert_eq!(
         body["parameters"][0]["sensor_id"].as_str().map(uuid),
         Some(f.sensor),
@@ -502,9 +547,18 @@ async fn moving_a_sensor_moves_its_readings_and_both_sites_aggregates() {
         "upstream means served over HTTP: {body}"
     );
 
-    let (times, body) =
-        split_series(&f.app, &f.river, &f.site2, "downstream aggregates after the move").await;
-    assert_eq!(times, vec![ts("09:00:00"), ts("10:00:00")], "downstream serves two buckets: {body}");
+    let (times, body) = split_series(
+        &f.app,
+        &f.river,
+        &f.site2,
+        "downstream aggregates after the move",
+    )
+    .await;
+    assert_eq!(
+        times,
+        vec![ts("09:00:00"), ts("10:00:00")],
+        "downstream serves two buckets: {body}"
+    );
     assert_eq!(
         e2e::field_for(&body, "TrkFlowDO", "avg"),
         vec![115.0, 155.0],
@@ -540,11 +594,18 @@ async fn backdating_the_move_pulls_the_earlier_reading_downstream() {
     );
 
     let rows = sl::get_readings(&db, f.stream).await;
-    assert_eq!(rows.len(), READINGS.len(), "correcting a date re-attributes readings, it never drops them");
+    assert_eq!(
+        rows.len(),
+        READINGS.len(),
+        "correcting a date re-attributes readings, it never drops them"
+    );
     for (i, row) in rows.iter().enumerate() {
         let (hms, raw) = READINGS[i];
         let downstream = i >= 3;
-        assert_eq!(row.raw_value, raw, "reading {hms}: the measurement itself is untouched");
+        assert_eq!(
+            row.raw_value, raw,
+            "reading {hms}: the measurement itself is untouched"
+        );
         assert_attribution(
             row,
             Some(if downstream { f.site2_id } else { f.site1_id }),
@@ -580,7 +641,9 @@ async fn backdating_the_move_pulls_the_earlier_reading_downstream() {
         "downstream 10:00 is untouched",
     );
     assert!(
-        e2e::hourly_bucket(&db, &f.site1, &f.parameter_id, ts("10:00:00")).await.is_none(),
+        e2e::hourly_bucket(&db, &f.site1, &f.parameter_id, ts("10:00:00"))
+            .await
+            .is_none(),
         "upstream 10:00 stays absent"
     );
 }
@@ -617,11 +680,18 @@ async fn moving_the_move_date_forward_returns_readings_to_the_previous_site() {
     f.correct_start(&db, dep_b, "09:45:00").await;
 
     let rows = sl::get_readings(&db, f.stream).await;
-    assert_eq!(rows.len(), READINGS.len(), "correcting a date re-attributes readings, it never drops them");
+    assert_eq!(
+        rows.len(),
+        READINGS.len(),
+        "correcting a date re-attributes readings, it never drops them"
+    );
     for (i, row) in rows.iter().enumerate() {
         let (hms, raw) = READINGS[i];
         let downstream = i >= 5;
-        assert_eq!(row.raw_value, raw, "reading {hms}: the measurement itself is untouched");
+        assert_eq!(
+            row.raw_value, raw,
+            "reading {hms}: the measurement itself is untouched"
+        );
         assert_eq!(
             row.sensor_id,
             Some(f.sensor),
@@ -706,7 +776,10 @@ async fn deleting_the_downstream_deployment_unattributes_its_readings() {
         "every reprocessing job for this instrument settles without failing"
     );
 
-    assert!(!deployment_exists(&db, dep_b).await, "the deployment row is gone");
+    assert!(
+        !deployment_exists(&db, dep_b).await,
+        "the deployment row is gone"
+    );
     assert_eq!(
         deployment_window(&db, f.dep_a).await.1,
         Some(ts("09:30:00")),
@@ -715,11 +788,18 @@ async fn deleting_the_downstream_deployment_unattributes_its_readings() {
     );
 
     let rows = sl::get_readings(&db, f.stream).await;
-    assert_eq!(rows.len(), READINGS.len(), "deleting a deployment deletes no readings");
+    assert_eq!(
+        rows.len(),
+        READINGS.len(),
+        "deleting a deployment deletes no readings"
+    );
     for (i, row) in rows.iter().enumerate() {
         let (hms, raw) = READINGS[i];
         let orphaned = i >= 4;
-        assert_eq!(row.raw_value, raw, "reading {hms}: the measurement itself is untouched");
+        assert_eq!(
+            row.raw_value, raw,
+            "reading {hms}: the measurement itself is untouched"
+        );
         assert_eq!(
             row.sensor_id,
             Some(f.sensor),
@@ -751,12 +831,16 @@ async fn deleting_the_downstream_deployment_unattributes_its_readings() {
          deployment must not touch a single upstream reading",
     );
     assert!(
-        e2e::hourly_bucket(&db, &f.site2, &f.parameter_id, ts("09:00:00")).await.is_none(),
+        e2e::hourly_bucket(&db, &f.site2, &f.parameter_id, ts("09:00:00"))
+            .await
+            .is_none(),
         "the un-attributed readings drop out of the downstream rollup entirely (the aggregate \
          filters on site_id IS NOT NULL), and this bucket was asserted present before the delete"
     );
     assert!(
-        e2e::hourly_bucket(&db, &f.site2, &f.parameter_id, ts("10:00:00")).await.is_none(),
+        e2e::hourly_bucket(&db, &f.site2, &f.parameter_id, ts("10:00:00"))
+            .await
+            .is_none(),
         "so does the whole downstream 10:00 bucket"
     );
 }

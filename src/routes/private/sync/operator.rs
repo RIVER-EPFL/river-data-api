@@ -1,23 +1,26 @@
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::Json;
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, sea_query::Expr};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, sea_query::Expr,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use river_data_core::commands;
 use river_data_core::models::CommandStatus;
 
+use super::{
+    commands_model as sync_commands, credentials_model as sync_service_credentials,
+    events_model as sync_events, services_model as sync_services,
+    tokens_model as sync_service_tokens,
+};
 use crate::common::AppState;
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::api_tokens::service::hash_token;
 use crate::routes::private::sync::control::tokens::generate_token;
-use super::{
-    commands_model as sync_commands, credentials_model as sync_service_credentials,
-    events_model as sync_events, services_model as sync_services, tokens_model as sync_service_tokens,
-};
 
 /// `Content-Range: items {start}-{end}/{total}` with an inclusive end, per RFC 7233, plus the
 /// CORS expose header a browser needs to read it. Both list endpoints share this so their
@@ -249,7 +252,12 @@ pub async fn list_services(
         .await?;
 
     let config = state.config.as_ref();
-    Ok(Json(services.into_iter().map(|s| service_to_response(s, config)).collect()))
+    Ok(Json(
+        services
+            .into_iter()
+            .map(|s| service_to_response(s, config))
+            .collect(),
+    ))
 }
 
 /// Get a single sync service by ID with its computed health. Requires `read_metadata`.
@@ -531,8 +539,7 @@ pub async fn list_sync_events(
     let total = paginator.num_items().await?;
     let events = paginator.fetch_page(page).await?;
 
-    let response: Vec<SyncEventResponse> =
-        events.into_iter().map(sync_event_to_response).collect();
+    let response: Vec<SyncEventResponse> = events.into_iter().map(sync_event_to_response).collect();
 
     let headers = content_range_headers(page, per_page, response.len(), total);
 
@@ -556,10 +563,7 @@ pub async fn revoke_service(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
     sync_service_credentials::Entity::update_many()
-        .col_expr(
-            sync_service_credentials::Column::Revoked,
-            Expr::value(true),
-        )
+        .col_expr(sync_service_credentials::Column::Revoked, Expr::value(true))
         .filter(sync_service_credentials::Column::ServiceId.eq(id))
         .exec(&state.db)
         .await?;

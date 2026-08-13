@@ -44,7 +44,11 @@ async fn inject(db: &sea_orm::DatabaseConnection, stream_id: Uuid, time: &str, v
 }
 
 async fn turb_event_count(db: &sea_orm::DatabaseConnection, only_open: bool) -> i64 {
-    let resolved_filter = if only_open { "AND resolved_at IS NULL" } else { "" };
+    let resolved_filter = if only_open {
+        "AND resolved_at IS NULL"
+    } else {
+        ""
+    };
     db.query_one(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
@@ -93,7 +97,11 @@ async fn batch_ingest_opens_and_resolves_immediately() {
     )
     .await;
     assert_eq!(status, 200, "batch insert: {body}");
-    assert_eq!(open_turb_event_count(&db).await, 1, "breach opens without a sweep");
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        1,
+        "breach opens without a sweep"
+    );
 
     let (status, body) = crate::common::post_json_with_token(
         &app,
@@ -103,7 +111,11 @@ async fn batch_ingest_opens_and_resolves_immediately() {
     )
     .await;
     assert_eq!(status, 200, "batch insert: {body}");
-    assert_eq!(open_turb_event_count(&db).await, 0, "return-to-range resolves without a sweep");
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        0,
+        "return-to-range resolves without a sweep"
+    );
 }
 
 /// `POST /ingest` (the per-stream sync path) reconciles the slot AND reconstructs historical
@@ -134,7 +146,11 @@ async fn single_ingest_reconciles_and_reconstructs_episodes() {
     .await;
     assert_eq!(status, 200, "ingest: {body}");
 
-    assert_eq!(open_turb_event_count(&db).await, 0, "latest reading is in range");
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        0,
+        "latest reading is in range"
+    );
     assert_eq!(
         turb_event_count(&db, false).await,
         1,
@@ -171,7 +187,11 @@ async fn grab_samples_reconcile_and_reconstruct_episodes() {
     )
     .await;
     assert_eq!(status, 200, "grab insert: {body}");
-    assert_eq!(open_turb_event_count(&db).await, 1, "grab breach opens without a sweep");
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        1,
+        "grab breach opens without a sweep"
+    );
 
     let (status, body) = crate::common::post_json_with_token(
         &app,
@@ -181,7 +201,11 @@ async fn grab_samples_reconcile_and_reconstruct_episodes() {
     )
     .await;
     assert_eq!(status, 200, "grab insert: {body}");
-    assert_eq!(open_turb_event_count(&db).await, 0, "in-range grab resolves without a sweep");
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        0,
+        "in-range grab resolves without a sweep"
+    );
 }
 
 /// A scoped reconcile never touches slots outside its scope: a stale open event on one slot
@@ -212,7 +236,9 @@ async fn scoped_reconcile_leaves_other_slots_untouched() {
 
     let site: Uuid = crate::common::SITE1_ID.parse().unwrap();
     let temp: Uuid = crate::common::GLOBAL_PARAM_TEMP_ID.parse().unwrap();
-    alarms::sweeper::reconcile_open_alarms(&db, &[(site, temp)]).await.unwrap();
+    alarms::sweeper::reconcile_open_alarms(&db, &[(site, temp)])
+        .await
+        .unwrap();
     assert_eq!(
         open_turb_event_count(&db).await,
         1,
@@ -220,7 +246,11 @@ async fn scoped_reconcile_leaves_other_slots_untouched() {
     );
 
     alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
-    assert_eq!(open_turb_event_count(&db).await, 0, "the unscoped backstop resolves it");
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        0,
+        "the unscoped backstop resolves it"
+    );
 }
 
 /// Threshold CRUD re-checks breach state instantly, create, update, and delete each flip the
@@ -236,7 +266,11 @@ async fn threshold_crud_reconciles_without_new_reading() {
     let stream = turb_stream(&db).await;
 
     inject(&db, stream, "2025-02-01T00:00:00Z", BREACH).await;
-    assert_eq!(open_turb_event_count(&db).await, 0, "no trigger has fired yet");
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        0,
+        "no trigger has fired yet"
+    );
 
     // Create a wide site override: the breach is suppressed, so nothing opens.
     let (status, created) = crate::common::post_json_parse_with_token(
@@ -253,7 +287,11 @@ async fn threshold_crud_reconciles_without_new_reading() {
     .await;
     assert_eq!(status, 201, "threshold create: {created}");
     let override_id = created["id"].as_str().unwrap().to_string();
-    assert_eq!(open_turb_event_count(&db).await, 0, "wide override suppresses the breach");
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        0,
+        "wide override suppresses the breach"
+    );
 
     // Narrow it: the standing reading now breaches, and the update hook opens the event.
     let (status, body) = crate::common::put_json_with_token(
@@ -264,7 +302,11 @@ async fn threshold_crud_reconciles_without_new_reading() {
     )
     .await;
     assert_eq!(status, 200, "threshold update: {body}");
-    assert_eq!(open_turb_event_count(&db).await, 1, "narrowing opens without a sweep");
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        1,
+        "narrowing opens without a sweep"
+    );
 
     // Widen it back: the update hook resolves the event.
     let (status, body) = crate::common::put_json_with_token(
@@ -275,14 +317,28 @@ async fn threshold_crud_reconciles_without_new_reading() {
     )
     .await;
     assert_eq!(status, 200, "threshold update: {body}");
-    assert_eq!(open_turb_event_count(&db).await, 0, "widening resolves without a sweep");
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        0,
+        "widening resolves without a sweep"
+    );
 
     // Delete the override: fallback to the global threshold (alarm > 500) re-opens.
-    let (status, body) =
-        crate::common::delete_with_token(&app, &format!("/api/alarm_thresholds/{override_id}"), &token)
-            .await;
-    assert!((200..300).contains(&status), "threshold delete ({status}): {body}");
-    assert_eq!(open_turb_event_count(&db).await, 1, "delete falls back and opens without a sweep");
+    let (status, body) = crate::common::delete_with_token(
+        &app,
+        &format!("/api/alarm_thresholds/{override_id}"),
+        &token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "threshold delete ({status}): {body}"
+    );
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        1,
+        "delete falls back and opens without a sweep"
+    );
 }
 
 /// Editing a parameter's `default_*` columns re-checks breach state instantly when no
@@ -300,7 +356,11 @@ async fn parameter_default_change_reconciles_without_new_reading() {
     crate::common::exec(&db, "DELETE FROM alarm_thresholds").await;
     crate::common::exec(&db, "DELETE FROM alarm_events").await;
     inject(&db, stream, "2025-02-01T00:00:00Z", BREACH).await;
-    assert_eq!(open_turb_event_count(&db).await, 0, "no thresholds, no trigger fired");
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        0,
+        "no thresholds, no trigger fired"
+    );
 
     let (status, body) = crate::common::put_json_with_token(
         &app,
@@ -310,7 +370,11 @@ async fn parameter_default_change_reconciles_without_new_reading() {
     )
     .await;
     assert_eq!(status, 200, "parameter update: {body}");
-    assert_eq!(open_turb_event_count(&db).await, 1, "tight defaults open without a sweep");
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        1,
+        "tight defaults open without a sweep"
+    );
 
     let (status, body) = crate::common::put_json_with_token(
         &app,
@@ -320,7 +384,11 @@ async fn parameter_default_change_reconciles_without_new_reading() {
     )
     .await;
     assert_eq!(status, 200, "parameter update: {body}");
-    assert_eq!(open_turb_event_count(&db).await, 0, "wide defaults resolve without a sweep");
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        0,
+        "wide defaults resolve without a sweep"
+    );
 }
 
 /// Deactivating a site_parameter removes its slot from evaluation and resolves its open event
@@ -347,7 +415,11 @@ async fn site_parameter_deactivation_resolves_open_event() {
     )
     .await;
     assert_eq!(status, 200, "site_parameter update: {body}");
-    assert_eq!(open_turb_event_count(&db).await, 0, "deactivation resolves without a sweep");
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        0,
+        "deactivation resolves without a sweep"
+    );
 }
 
 /// Among same-timestamp replicates, only replicate 0 decides breach state, a breaching
@@ -414,11 +486,19 @@ async fn site_parameter_reactivation_reopens_alarm() {
 
     let (status, body) = toggle(false).await;
     assert_eq!(status, 200, "deactivate: {body}");
-    assert_eq!(open_turb_event_count(&db).await, 0, "deactivation resolves without a sweep");
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        0,
+        "deactivation resolves without a sweep"
+    );
 
     let (status, body) = toggle(true).await;
     assert_eq!(status, 200, "reactivate: {body}");
-    assert_eq!(open_turb_event_count(&db).await, 1, "reactivation re-opens without a sweep");
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        1,
+        "reactivation re-opens without a sweep"
+    );
     assert_eq!(
         turb_event_count(&db, false).await,
         2,
@@ -453,7 +533,11 @@ async fn threshold_batch_delete_reconciles_without_new_reading() {
     .await;
     assert_eq!(status, 201, "threshold create: {created}");
     let override_id = created["id"].as_str().unwrap().to_string();
-    assert_eq!(open_turb_event_count(&db).await, 0, "wide override suppresses the breach");
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        0,
+        "wide override suppresses the breach"
+    );
 
     use http_body_util::BodyExt;
     use tower::ServiceExt;
@@ -626,7 +710,11 @@ async fn reconcile_alarms_action_runs_full_reconcile() {
     let stream = turb_stream(&db).await;
 
     inject(&db, stream, "2025-02-01T00:00:00Z", BREACH).await;
-    assert_eq!(open_turb_event_count(&db).await, 0, "no trigger fired for the raw insert");
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        0,
+        "no trigger fired for the raw insert"
+    );
 
     let (status, body) = crate::common::post_json_parse_with_token(
         &app,

@@ -18,8 +18,8 @@ use sea_orm::DatabaseConnection;
 /// `KeycloakAuthInstance` MUST share the same URL+realm, or `iss`/JWKS validation fails.
 #[must_use]
 pub fn keycloak_base_url() -> String {
-    let raw = std::env::var("TEST_KEYCLOAK_URL")
-        .unwrap_or_else(|_| "http://localhost:8180/".to_string());
+    let raw =
+        std::env::var("TEST_KEYCLOAK_URL").unwrap_or_else(|_| "http://localhost:8180/".to_string());
     if raw.ends_with('/') {
         raw
     } else {
@@ -71,7 +71,10 @@ pub async fn keycloak_reachable() -> bool {
         keycloak_base_url(),
         keycloak_realm()
     );
-    let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(2)).build() else {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    else {
         return false;
     };
     matches!(client.get(&url).send().await, Ok(r) if r.status().is_success())
@@ -91,7 +94,10 @@ pub async fn require_keycloak_or_skip(test_name: &str) -> bool {
         "REQUIRE_KEYCLOAK is set but Keycloak at {} is unreachable, so {test_name} cannot run",
         keycloak_base_url()
     );
-    eprintln!("skipping {test_name}: Keycloak unreachable at {}", keycloak_base_url());
+    eprintln!(
+        "skipping {test_name}: Keycloak unreachable at {}",
+        keycloak_base_url()
+    );
     false
 }
 
@@ -163,7 +169,10 @@ pub async fn ensure_realm_user(username: &str, password: &str, river_roles: &[&s
         .json()
         .await
         .expect("non-JSON user search");
-    let user_id = found[0]["id"].as_str().expect("user not found after create").to_string();
+    let user_id = found[0]["id"]
+        .as_str()
+        .expect("user not found after create")
+        .to_string();
 
     // Existing user: converge on the fixture representation (clears stale required actions) and
     // make sure the password matches.
@@ -197,9 +206,9 @@ pub async fn ensure_realm_user(username: &str, password: &str, river_roles: &[&s
             roles
                 .iter()
                 .filter(|r| {
-                    r["name"].as_str().is_some_and(|n| {
-                        n.starts_with("riverdata-") && !river_roles.contains(&n)
-                    })
+                    r["name"]
+                        .as_str()
+                        .is_some_and(|n| n.starts_with("riverdata-") && !river_roles.contains(&n))
                 })
                 .cloned()
                 .collect()
@@ -264,7 +273,10 @@ async fn ensure_realm_role(
         created.status()
     );
     let rep: serde_json::Value = get().await.json().await.expect("non-JSON role");
-    assert!(rep["id"].is_string(), "realm role {role} missing after create");
+    assert!(
+        rep["id"].is_string(),
+        "realm role {role} missing after create"
+    );
     rep
 }
 

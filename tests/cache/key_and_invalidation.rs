@@ -151,7 +151,10 @@ async fn ingest_one(app: &Router, jwt: &str, stream_id: &str, time: &str, raw_va
     .await;
     assert_eq!(status, 200, "ingest at {time} ({status}): {body}");
     assert_eq!(body["inserted"], 1, "one reading landed at {time}: {body}");
-    assert_eq!(body["paired"], true, "the stream is paired, so the reading is attributed: {body}");
+    assert_eq!(
+        body["paired"], true,
+        "the stream is paired, so the reading is attributed: {body}"
+    );
 }
 
 // `parameter_ids` is absent from the readings cache key, so a request filtered to one
@@ -194,7 +197,11 @@ async fn readings_cache_key_separates_parameter_filters() {
 
     let first = probe(&app, &only_depth, Some(&jwt)).await;
     assert_eq!(first.status, 200, "depth-filtered readings: {}", first.body);
-    assert_eq!(first.cache, "MISS", "an empty cache cannot hit: {}", first.body);
+    assert_eq!(
+        first.cache, "MISS",
+        "an empty cache cannot hit: {}",
+        first.body
+    );
     assert_eq!(
         param_ids(&first.json),
         vec![depth.clone()],
@@ -215,10 +222,17 @@ async fn readings_cache_key_separates_parameter_filters() {
          meaningful: {}",
         repeat.body
     );
-    assert_eq!(repeat.body, first.body, "a cache hit reproduces the stored body");
+    assert_eq!(
+        repeat.body, first.body,
+        "a cache hit reproduces the stored body"
+    );
 
     let filtered_other = probe(&app, &only_turbidity, Some(&jwt)).await;
-    assert_eq!(filtered_other.status, 200, "turbidity-filtered readings: {}", filtered_other.body);
+    assert_eq!(
+        filtered_other.status, 200,
+        "turbidity-filtered readings: {}",
+        filtered_other.body
+    );
     assert_eq!(
         param_ids(&filtered_other.json),
         vec![turbidity.clone()],
@@ -235,7 +249,11 @@ async fn readings_cache_key_separates_parameter_filters() {
     );
 
     let unfiltered = probe(&app, &base, Some(&jwt)).await;
-    assert_eq!(unfiltered.status, 200, "unfiltered readings: {}", unfiltered.body);
+    assert_eq!(
+        unfiltered.status, 200,
+        "unfiltered readings: {}",
+        unfiltered.body
+    );
     let mut got = param_ids(&unfiltered.json);
     got.sort();
     let mut expected = vec![depth, turbidity];
@@ -263,7 +281,10 @@ async fn aggregates_cache_key_separates_split_by_sensor() {
 
     let track = tracks::onboard_sensor_flow_track(&app, &jwt).await;
     let stream_id = track.stream_ids[0].clone();
-    let sensor_id = track.sensor_id.clone().expect("the sensor-flow track carries a sensor");
+    let sensor_id = track
+        .sensor_id
+        .clone()
+        .expect("the sensor-flow track carries a sensor");
     let parameter_id = track.parameter_id("TrkFlowDO").to_string();
 
     let (status, paired) = crate::common::post_json_with_token(
@@ -276,8 +297,12 @@ async fn aggregates_cache_key_separates_split_by_sensor() {
     assert!((200..300).contains(&status), "pair ({status}): {paired}");
 
     for reading in tracks::flow_cycle_readings(0) {
-        let time = reading["time"].as_str().expect("cycle readings carry a time");
-        let raw = reading["raw_value"].as_f64().expect("cycle readings carry a raw_value");
+        let time = reading["time"]
+            .as_str()
+            .expect("cycle readings carry a time");
+        let raw = reading["raw_value"]
+            .as_f64()
+            .expect("cycle readings carry a raw_value");
         ingest_one(&app, &jwt, &stream_id, time, raw).await;
     }
     assert_eq!(
@@ -301,7 +326,9 @@ async fn aggregates_cache_key_separates_split_by_sensor() {
     )
     .await;
     assert_eq!(status, 200, "refresh_aggregates ({status}): {refresh}");
-    let job_id = refresh["job_id"].as_str().expect("refresh_aggregates returns a job_id");
+    let job_id = refresh["job_id"]
+        .as_str()
+        .expect("refresh_aggregates returns a job_id");
     assert_eq!(
         e2e::poll_job(&app, &jwt, job_id, 30).await,
         "completed",
@@ -315,17 +342,31 @@ async fn aggregates_cache_key_separates_split_by_sensor() {
     let split_uri = format!("{collapsed_uri}&split_by_sensor=true");
 
     let collapsed = probe(&app, &collapsed_uri, Some(&jwt)).await;
-    assert_eq!(collapsed.status, 200, "collapsed aggregates: {}", collapsed.body);
-    assert_eq!(collapsed.cache, "MISS", "an empty cache cannot hit: {}", collapsed.body);
+    assert_eq!(
+        collapsed.status, 200,
+        "collapsed aggregates: {}",
+        collapsed.body
+    );
+    assert_eq!(
+        collapsed.cache, "MISS",
+        "an empty cache cannot hit: {}",
+        collapsed.body
+    );
     let collapsed_series: Vec<&serde_json::Value> = collapsed.json["parameters"]
         .as_array()
         .unwrap_or_else(|| panic!("no parameters in {}", collapsed.body))
         .iter()
         .filter(|p| p["parameter_id"].as_str() == Some(parameter_id.as_str()))
         .collect();
-    assert_eq!(collapsed_series.len(), 1, "collapsed returns one series: {}", collapsed.body);
     assert_eq!(
-        collapsed_series[0]["count"][0], tracks::FLOW_READINGS_PER_CYCLE as i64,
+        collapsed_series.len(),
+        1,
+        "collapsed returns one series: {}",
+        collapsed.body
+    );
+    assert_eq!(
+        collapsed_series[0]["count"][0],
+        tracks::FLOW_READINGS_PER_CYCLE as i64,
         "the hourly bucket materialised the ingested readings: {}",
         collapsed.body
     );
@@ -360,7 +401,8 @@ async fn aggregates_cache_key_separates_split_by_sensor() {
         split.body
     );
     assert_eq!(
-        split_series[0]["count"][0], tracks::FLOW_READINGS_PER_CYCLE as i64,
+        split_series[0]["count"][0],
+        tracks::FLOW_READINGS_PER_CYCLE as i64,
         "and it aggregates the same readings: {}",
         split.body
     );
@@ -402,7 +444,11 @@ async fn a_write_invalidates_the_written_sites_cached_readings() {
 
     let before = probe(&app, &written_uri, Some(&jwt)).await;
     assert_eq!(before.status, 200, "written site readings: {}", before.body);
-    assert_eq!(before.cache, "MISS", "an empty cache cannot hit: {}", before.body);
+    assert_eq!(
+        before.cache, "MISS",
+        "an empty cache cannot hit: {}",
+        before.body
+    );
     assert_eq!(
         e2e::values_for(&before.json, &written.parameter_id),
         vec![101.0],
@@ -411,7 +457,11 @@ async fn a_write_invalidates_the_written_sites_cached_readings() {
     );
 
     let untouched_before = probe(&app, &untouched_uri, Some(&jwt)).await;
-    assert_eq!(untouched_before.status, 200, "untouched site readings: {}", untouched_before.body);
+    assert_eq!(
+        untouched_before.status, 200,
+        "untouched site readings: {}",
+        untouched_before.body
+    );
     assert_eq!(
         e2e::values_for(&untouched_before.json, &untouched.parameter_id),
         vec![501.0],
@@ -434,7 +484,11 @@ async fn a_write_invalidates_the_written_sites_cached_readings() {
     );
 
     let after = probe(&app, &written_uri, Some(&jwt)).await;
-    assert_eq!(after.status, 200, "written site readings after the write: {}", after.body);
+    assert_eq!(
+        after.status, 200,
+        "written site readings after the write: {}",
+        after.body
+    );
     assert_eq!(
         e2e::values_for(&after.json, &written.parameter_id),
         vec![101.0, 102.0],
@@ -491,8 +545,16 @@ async fn an_unbounded_read_reflects_a_backfilled_reading() {
     // way, rather than on the unbounded query this test is about.
     let bounded_uri = format!("{uri}&end=2025-06-02T02:00:00Z");
     let bounded_first = probe(&app, &bounded_uri, Some(&jwt)).await;
-    assert_eq!(bounded_first.status, 200, "bounded readings: {}", bounded_first.body);
-    assert_eq!(bounded_first.cache, "MISS", "an empty cache cannot hit: {}", bounded_first.body);
+    assert_eq!(
+        bounded_first.status, 200,
+        "bounded readings: {}",
+        bounded_first.body
+    );
+    assert_eq!(
+        bounded_first.cache, "MISS",
+        "an empty cache cannot hit: {}",
+        bounded_first.body
+    );
     let bounded_repeat = probe(&app, &bounded_uri, Some(&jwt)).await;
     assert_eq!(
         bounded_repeat.cache, "HIT",
@@ -502,7 +564,11 @@ async fn an_unbounded_read_reflects_a_backfilled_reading() {
 
     let first = probe(&app, &uri, Some(&jwt)).await;
     assert_eq!(first.status, 200, "unbounded readings: {}", first.body);
-    assert_eq!(first.cache, "MISS", "the unbounded window is its own key: {}", first.body);
+    assert_eq!(
+        first.cache, "MISS",
+        "the unbounded window is its own key: {}",
+        first.body
+    );
     assert_eq!(
         e2e::values_for(&first.json, &parameter_id),
         vec![201.0, 202.0],
@@ -558,14 +624,20 @@ async fn a_write_invalidates_the_sites_public_cached_readings() {
     batch_one(&app, &jwt, &slot, "2025-06-05T00:00:00Z", 601.0).await;
     batch_one(&app, &jwt, &slot, "2025-06-05T01:00:00Z", 602.0).await;
 
-    let public_uri =
-        "/api/public/cache-public/sites/cache-site-public/readings\
+    let public_uri = "/api/public/cache-public/sites/cache-site-public/readings\
          ?start=2025-06-05T00:00:00Z&end=2025-06-05T06:00:00Z";
 
     let before = probe(&app, public_uri, None).await;
     assert_eq!(before.status, 200, "public readings: {}", before.body);
-    let params = before.json["parameters"].as_array().expect("public parameters array");
-    assert_eq!(params.len(), 1, "one parameter is exposed publicly: {}", before.body);
+    let params = before.json["parameters"]
+        .as_array()
+        .expect("public parameters array");
+    assert_eq!(
+        params.len(),
+        1,
+        "one parameter is exposed publicly: {}",
+        before.body
+    );
     assert_eq!(
         before.json["times"].as_array().map(Vec::len),
         Some(2),
@@ -593,7 +665,11 @@ async fn a_write_invalidates_the_sites_public_cached_readings() {
     );
 
     let after = probe(&app, public_uri, None).await;
-    assert_eq!(after.status, 200, "public readings after the write: {}", after.body);
+    assert_eq!(
+        after.status, 200,
+        "public readings after the write: {}",
+        after.body
+    );
     assert_eq!(
         after.json["times"].as_array().map(Vec::len),
         Some(3),
@@ -607,7 +683,12 @@ async fn a_write_invalidates_the_sites_public_cached_readings() {
         .iter()
         .map(|v| v.as_f64().unwrap_or(f64::NAN))
         .collect();
-    assert_eq!(values, vec![601.0, 602.0, 603.0], "with the new value: {}", after.body);
+    assert_eq!(
+        values,
+        vec![601.0, 602.0, 603.0],
+        "with the new value: {}",
+        after.body
+    );
 }
 
 // Scope axis: the readings cache key carries no caller identity, so a primed entry
@@ -628,14 +709,23 @@ async fn a_primed_cache_entry_is_not_served_outside_the_callers_project_scope() 
     batch_one(&app, &admin, &granted, "2025-06-06T00:00:00Z", 701.0).await;
     batch_one(&app, &admin, &ungranted, "2025-06-06T00:00:00Z", 801.0).await;
 
-    kc::grant_project(&db, &kc::keycloak_user_id("river1").await, &granted.project_id).await;
+    kc::grant_project(
+        &db,
+        &kc::keycloak_user_id("river1").await,
+        &granted.project_id,
+    )
+    .await;
     let river = kc::get_keycloak_jwt("river1", "river1").await;
 
     let window = "start=2025-06-06T00:00:00Z&end=2025-06-06T06:00:00Z";
     let ungranted_uri = format!("/api/sites/{}/readings?{window}", ungranted.site_id);
 
     let primed = probe(&app, &ungranted_uri, Some(&admin)).await;
-    assert_eq!(primed.status, 200, "an administrator sees every project: {}", primed.body);
+    assert_eq!(
+        primed.status, 200,
+        "an administrator sees every project: {}",
+        primed.body
+    );
     assert_eq!(
         e2e::values_for(&primed.json, &ungranted.parameter_id),
         vec![801.0],
@@ -664,7 +754,11 @@ async fn a_primed_cache_entry_is_not_served_outside_the_callers_project_scope() 
         Some(&river),
     )
     .await;
-    assert_eq!(allowed.status, 200, "the same user reads the project they hold: {}", allowed.body);
+    assert_eq!(
+        allowed.status, 200,
+        "the same user reads the project they hold: {}",
+        allowed.body
+    );
     assert_eq!(
         e2e::values_for(&allowed.json, &granted.parameter_id),
         vec![701.0],
@@ -673,7 +767,11 @@ async fn a_primed_cache_entry_is_not_served_outside_the_callers_project_scope() 
     );
 
     let reread = probe(&app, &ungranted_uri, Some(&admin)).await;
-    assert_eq!(reread.status, 200, "the administrator still reads the site: {}", reread.body);
+    assert_eq!(
+        reread.status, 200,
+        "the administrator still reads the site: {}",
+        reread.body
+    );
     assert_eq!(
         e2e::values_for(&reread.json, &ungranted.parameter_id),
         vec![801.0],

@@ -57,7 +57,16 @@ async fn handle_update(state: &AppState, client: &TelegramClient, u: Update) {
     }
     let is_private = u.chat_type.as_deref() == Some("private");
     let (cmd, args) = parse_command(text);
-    if let Some(reply) = route(state, chat_id, is_private, u.username.as_deref(), &cmd, args).await {
+    if let Some(reply) = route(
+        state,
+        chat_id,
+        is_private,
+        u.username.as_deref(),
+        &cmd,
+        args,
+    )
+    .await
+    {
         if let Err(e) = client.send_message(chat_id, &reply).await {
             tracing::warn!(error = %e, "telegram send_message failed");
         }
@@ -166,8 +175,10 @@ async fn route(
         }
         "mute" | "unmute" | "muted" => {
             if role.allows_admin() {
-                let by = username
-                    .map_or_else(|| format!("telegram:{chat_id}"), |u| format!("telegram:{u}"));
+                let by = username.map_or_else(
+                    || format!("telegram:{chat_id}"),
+                    |u| format!("telegram:{u}"),
+                );
                 match cmd {
                     "mute" => commands::mute(&state.db, args, &by).await,
                     "unmute" => commands::unmute(&state.db, args).await,

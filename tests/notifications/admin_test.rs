@@ -29,11 +29,15 @@ async fn health_is_admin_only_and_lists_channels() {
     let app = seeded_app().await;
 
     let admin = get_keycloak_jwt("admin", "admin").await;
-    let (s, body) = crate::common::get_json_with_token(&app, "/api/notifications/health", &admin).await;
+    let (s, body) =
+        crate::common::get_json_with_token(&app, "/api/notifications/health", &admin).await;
     assert_eq!(s, 200, "admin reads health");
     let channels = body["channels"].as_array().expect("channels array");
     let names: Vec<&str> = channels.iter().filter_map(|c| c["name"].as_str()).collect();
-    assert!(names.contains(&"telegram") && names.contains(&"email"), "both channels reported");
+    assert!(
+        names.contains(&"telegram") && names.contains(&"email"),
+        "both channels reported"
+    );
     // Test config has neither channel configured.
     for c in channels {
         assert_eq!(c["available"], false, "channel unavailable in test config");
@@ -58,7 +62,10 @@ async fn test_send_rejects_unconfigured_channel() {
         &admin,
     )
     .await;
-    assert_eq!(s, 400, "test send fails fast when the channel isn't configured: {body}");
+    assert_eq!(
+        s, 400,
+        "test send fails fast when the channel isn't configured: {body}"
+    );
 }
 
 #[tokio::test]
@@ -73,12 +80,18 @@ async fn subscriber_roster_lists_opted_in_users() {
     let (s, _) = crate::common::get_json_with_token(&app, "/api/notifications/me", &user).await;
     assert_eq!(s, 200);
 
-    let (s, body) = crate::common::get_json_with_token(&app, "/api/notifications/subscribers", &admin).await;
+    let (s, body) =
+        crate::common::get_json_with_token(&app, "/api/notifications/subscribers", &admin).await;
     assert_eq!(s, 200, "admin reads the roster");
     let roster = body.as_array().expect("roster array");
-    assert!(!roster.is_empty(), "the opted-in user appears in the roster");
     assert!(
-        roster.iter().all(|r| r["telegram_status"].is_string() && r["keycloak_sub"].is_string()),
+        !roster.is_empty(),
+        "the opted-in user appears in the roster"
+    );
+    assert!(
+        roster
+            .iter()
+            .all(|r| r["telegram_status"].is_string() && r["keycloak_sub"].is_string()),
         "each row carries sub + telegram_status"
     );
 

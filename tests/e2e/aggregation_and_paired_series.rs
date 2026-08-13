@@ -4,7 +4,6 @@
 //!
 //! Run: cargo test --test e2e -- --test-threads=1
 
-
 use crate::common::e2e;
 use serial_test::serial;
 
@@ -29,13 +28,17 @@ async fn aggregation_resolutions_and_paired_parameter_series() {
         let (status, agg) = crate::common::get_json_with_token(&app, &uri, &token).await;
         assert_eq!(status, 200, "{res} aggregate ({status}): {agg}");
         let avg = e2e::field_for(&agg, crate::common::GLOBAL_PARAM_DO_ID, "avg");
-        assert!(avg.iter().any(|v| v.is_finite()), "{res}: Dissolved_O2 should have a finite average");
+        assert!(
+            avg.iter().any(|v| v.is_finite()),
+            "{res}: Dissolved_O2 should have a finite average"
+        );
     }
 
     // US-6.4: a two-parameter query returns aligned series (scatter data) and nothing else.
     let uri = format!(
         "/api/sites/{site1}/readings?parameter_ids={},{}&start={start}&end=2025-01-15T01:00:00Z",
-        crate::common::GLOBAL_PARAM_DO_ID, crate::common::GLOBAL_PARAM_COND_ID
+        crate::common::GLOBAL_PARAM_DO_ID,
+        crate::common::GLOBAL_PARAM_COND_ID
     );
     let (status, readings) = crate::common::get_json_with_token(&app, &uri, &token).await;
     assert_eq!(status, 200, "paired readings ({status}): {readings}");
@@ -43,8 +46,16 @@ async fn aggregation_resolutions_and_paired_parameter_series() {
     assert!(times > 0, "expected readings in the window");
     let do_vals = e2e::values_for(&readings, crate::common::GLOBAL_PARAM_DO_ID);
     let cond_vals = e2e::values_for(&readings, crate::common::GLOBAL_PARAM_COND_ID);
-    assert_eq!(do_vals.len(), times, "DO series aligns with the shared time axis");
-    assert_eq!(cond_vals.len(), times, "Conductivity series aligns with the shared time axis");
+    assert_eq!(
+        do_vals.len(),
+        times,
+        "DO series aligns with the shared time axis"
+    );
+    assert_eq!(
+        cond_vals.len(),
+        times,
+        "Conductivity series aligns with the shared time axis"
+    );
     assert_eq!(
         readings["parameters"].as_array().unwrap().len(),
         2,

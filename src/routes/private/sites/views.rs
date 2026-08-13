@@ -5,13 +5,15 @@ use axum::{
     extract::{Path, State},
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement,
+};
 use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
-use crate::routes::private::sites::parameters as site_parameters;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::sites::parameters as site_parameters;
 use crate::routes::{resolve_site, resolve_site_with_project};
 
 use super::types::{ParameterResponse, ProjectRef, SiteDetailResponse};
@@ -98,11 +100,14 @@ async fn declared_frequencies(
         let any_low: bool = row.try_get("", "any_low")?;
         let any_high: bool = row.try_get("", "any_high")?;
         if let Some(pid) = parameter_id {
-            map.insert(pid, match (any_high, any_low) {
-                (false, true) => "low",
-                (true, true) => "mixed",
-                _ => "high",
-            });
+            map.insert(
+                pid,
+                match (any_high, any_low) {
+                    (false, true) => "low",
+                    (true, true) => "mixed",
+                    _ => "high",
+                },
+            );
         }
     }
 
@@ -121,11 +126,14 @@ async fn declared_frequencies(
         let parameter_id: Uuid = row.try_get("", "parameter_id")?;
         let any_spot: bool = row.try_get("", "any_spot")?;
         let any_continuous: bool = row.try_get("", "any_continuous")?;
-        map.insert(parameter_id, match (any_continuous, any_spot) {
-            (false, true) => "low",
-            (true, true) => "mixed",
-            _ => "high",
-        });
+        map.insert(
+            parameter_id,
+            match (any_continuous, any_spot) {
+                (false, true) => "low",
+                (true, true) => "mixed",
+                _ => "high",
+            },
+        );
     }
 
     Ok(map)
@@ -285,9 +293,8 @@ pub async fn get_site_detail(
         .await?
         .and_then(|row| DataRangeRow::from_query_result(&row, "").ok());
 
-    let (data_start, data_end, reading_count) = range.map_or((None, None, 0), |r| {
-        (r.min_time, r.max_time, r.count)
-    });
+    let (data_start, data_end, reading_count) =
+        range.map_or((None, None, 0), |r| (r.min_time, r.max_time, r.count));
 
     Ok(Json(SiteDetailResponse {
         id: site.id,

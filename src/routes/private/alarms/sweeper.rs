@@ -134,9 +134,13 @@ async fn reconcile_cadence(
     let cadence = super::views::cadence_label(spot);
     let cadence_pred = super::views::cadence_predicate(spot);
 
-    let breaches =
-        fetch_active_alarm_rows(db, &crate::common::authz::AccessScope::Unrestricted, slots, spot)
-            .await?;
+    let breaches = fetch_active_alarm_rows(
+        db,
+        &crate::common::authz::AccessScope::Unrestricted,
+        slots,
+        spot,
+    )
+    .await?;
 
     // Pairs that already have an open event (within scope), so we can count opened vs updated.
     let (open_keys_sql, open_keys_values): (String, Vec<sea_orm::Value>) = match slots {
@@ -216,7 +220,10 @@ async fn reconcile_cadence(
     // Resolve open events no longer in the current breach set; stamp the latest reading as the
     // resolving value. When scoped, restrict to the scoped slots so events outside this trigger are
     // never resolved. Empty breach set (within scope) → resolve everything still open (in scope).
-    let keep: Vec<(Uuid, Uuid)> = breaches.iter().map(|b| (b.site_id, b.parameter_id)).collect();
+    let keep: Vec<(Uuid, Uuid)> = breaches
+        .iter()
+        .map(|b| (b.site_id, b.parameter_id))
+        .collect();
     let mut values: Vec<sea_orm::Value> = Vec::new();
     let mut next = 1usize;
 
@@ -228,7 +235,10 @@ async fn reconcile_cadence(
             values.push((*param).into());
             next += 2;
         }
-        format!(" AND (ae.site_id, ae.parameter_id) IN ({})", pairs.join(","))
+        format!(
+            " AND (ae.site_id, ae.parameter_id) IN ({})",
+            pairs.join(",")
+        )
     } else {
         String::new()
     };
@@ -243,7 +253,10 @@ async fn reconcile_cadence(
             values.push((*param).into());
             next += 2;
         }
-        format!(" AND (ae.site_id, ae.parameter_id) NOT IN ({})", pairs.join(","))
+        format!(
+            " AND (ae.site_id, ae.parameter_id) NOT IN ({})",
+            pairs.join(",")
+        )
     };
     let resolve_sql = format!(
         "UPDATE alarm_events ae \
@@ -273,9 +286,14 @@ async fn reconcile_cadence(
 /// Long-running task: sweep once on startup, then every `interval`. Emits an `AlarmStateChanged` SSE
 /// event whenever a tick opens or resolves something, so the dashboard can refresh reactively.
 pub async fn periodic(db: DatabaseConnection, interval: Duration, events: EventSender) {
-    tracing::info!(interval_secs = interval.as_secs(), "Alarm sweeper: starting");
+    tracing::info!(
+        interval_secs = interval.as_secs(),
+        "Alarm sweeper: starting"
+    );
 
-    let tick = async |db: &DatabaseConnection, events: &EventSender| match evaluate_alarm_events(db).await {
+    let tick = async |db: &DatabaseConnection, events: &EventSender| match evaluate_alarm_events(db)
+        .await
+    {
         Ok(stats) => {
             if stats.opened > 0 || stats.resolved > 0 {
                 tracing::info!(

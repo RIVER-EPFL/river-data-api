@@ -184,20 +184,30 @@ pub async fn import_csv(
     let (csv_text, session_id) = if let Some(csv) = req.csv.as_deref() {
         let sid = Uuid::new_v4();
         let arc = Arc::new(csv.to_owned());
-        state.import_staging.insert(sid.to_string(), arc.clone()).await;
+        state
+            .import_staging
+            .insert(sid.to_string(), arc.clone())
+            .await;
         (arc, sid)
     } else if let Some(sid) = req.session_id {
-        let cached = state.import_staging.get(&sid.to_string()).await.ok_or_else(|| {
-            AppError::BadRequest("Staging session expired or not found, re-upload the file".into())
-        })?;
+        let cached = state
+            .import_staging
+            .get(&sid.to_string())
+            .await
+            .ok_or_else(|| {
+                AppError::BadRequest(
+                    "Staging session expired or not found, re-upload the file".into(),
+                )
+            })?;
         (cached, sid)
     } else {
-        return Err(AppError::BadRequest("Provide either csv or session_id".into()));
+        return Err(AppError::BadRequest(
+            "Provide either csv or session_id".into(),
+        ));
     };
 
-    let tz_offset = chrono::Duration::milliseconds(
-        (req.tz_offset_hours.unwrap_or(0.0) * 3_600_000.0) as i64,
-    );
+    let tz_offset =
+        chrono::Duration::milliseconds((req.tz_offset_hours.unwrap_or(0.0) * 3_600_000.0) as i64);
 
     let (site, _project) = resolve_site_with_project(&state.db, &req.site).await?;
     let site_id = site.id;
@@ -227,7 +237,9 @@ pub async fn import_csv(
 
     for row in &sp_rows {
         let sp_name: String = row.try_get("", "sp_name").unwrap_or_default();
-        let Ok(pid) = row.try_get::<Uuid>("", "parameter_id") else { continue };
+        let Ok(pid) = row.try_get::<Uuid>("", "parameter_id") else {
+            continue;
+        };
         let param_name: String = row.try_get("", "param_name").unwrap_or_default();
         let aliases: Vec<String> = row.try_get("", "aliases").unwrap_or_default();
 
@@ -266,7 +278,9 @@ pub async fn import_csv(
         .await?;
     let mut catalog: HashMap<String, Uuid> = HashMap::new();
     for row in &catalog_rows {
-        let Ok(pid) = row.try_get::<Uuid>("", "id") else { continue };
+        let Ok(pid) = row.try_get::<Uuid>("", "id") else {
+            continue;
+        };
         let name: String = row.try_get("", "code").unwrap_or_default();
         let aliases: Vec<String> = row.try_get("", "aliases").unwrap_or_default();
         catalog.insert(name.to_lowercase(), pid);
@@ -282,9 +296,15 @@ pub async fn import_csv(
             return param_names.get(&uuid).map(|n| (uuid, n.clone()));
         }
         let key = target.to_lowercase();
-        site_param_map.get(&key).cloned()
+        site_param_map
+            .get(&key)
+            .cloned()
             .or_else(|| site_alias_map.get(&key).cloned())
-            .or_else(|| catalog.get(&key).map(|&pid| (pid, param_names.get(&pid).cloned().unwrap_or_default())))
+            .or_else(|| {
+                catalog
+                    .get(&key)
+                    .map(|&pid| (pid, param_names.get(&pid).cloned().unwrap_or_default()))
+            })
     };
 
     // --- Parse header and classify columns ----------------------------------------------------
@@ -317,32 +337,46 @@ pub async fn import_csv(
 
         // Candidate (parameter_id, display_name, factor, offset):
         // Resolution: explicit mapping > site_param name > site aliases > exposure > catalog.
-        let candidate: Option<(Uuid, String, f64, f64)> =
-            if let Some(entry) = req.mapping.as_ref().and_then(|m| m.get(header)) {
-                match entry {
+        let candidate: Option<(Uuid, String, f64, f64)> = if let Some(entry) =
+            req.mapping.as_ref().and_then(|m| m.get(header))
+        {
+            match entry {
+                None => {
+                    skipped_columns.push(header.to_string());
+                    continue;
+                }
+                Some(target) => match resolve_target(target) {
+                    Some((pid, name)) => Some((pid, name, 1.0, 0.0)),
                     None => {
-                        skipped_columns.push(header.to_string());
-                        continue;
-                    }
-                    Some(target) => match resolve_target(target) {
-                        Some((pid, name)) => Some((pid, name, 1.0, 0.0)),
-                        None => {
-                            unmapped_columns.push(header.to_string());
-                            warnings.push(format!(
+                        unmapped_columns.push(header.to_string());
+                        warnings.push(format!(
                                 "Explicit mapping target '{target}' for column '{header}' is not a known parameter"
                             ));
-                            continue;
-                        }
-                    },
-                }
-            } else {
-                let key = header.to_lowercase();
-                site_param_map
-                    .get(&key)
-                    .map(|(pid, name)| (*pid, name.clone(), 1.0, 0.0))
-                    .or_else(|| site_alias_map.get(&key).map(|(pid, name)| (*pid, name.clone(), 1.0, 0.0)))
-                    .or_else(|| catalog.get(&key).map(|pid| (*pid, param_names.get(pid).cloned().unwrap_or_default(), 1.0, 0.0)))
-            };
+                        continue;
+                    }
+                },
+            }
+        } else {
+            let key = header.to_lowercase();
+            site_param_map
+                .get(&key)
+                .map(|(pid, name)| (*pid, name.clone(), 1.0, 0.0))
+                .or_else(|| {
+                    site_alias_map
+                        .get(&key)
+                        .map(|(pid, name)| (*pid, name.clone(), 1.0, 0.0))
+                })
+                .or_else(|| {
+                    catalog.get(&key).map(|pid| {
+                        (
+                            *pid,
+                            param_names.get(pid).cloned().unwrap_or_default(),
+                            1.0,
+                            0.0,
+                        )
+                    })
+                })
+        };
 
         match candidate {
             Some((pid, _, _, _)) if derived_outputs.contains(&pid) => {
@@ -380,12 +414,13 @@ pub async fn import_csv(
     let mut error_count = 0usize;
     let mut line = 1usize; // header is line 1
 
-    let record_error = |row: usize, message: String, errors: &mut Vec<RowError>, count: &mut usize| {
-        *count += 1;
-        if errors.len() < MAX_ERRORS {
-            errors.push(RowError { row, message });
-        }
-    };
+    let record_error =
+        |row: usize, message: String, errors: &mut Vec<RowError>, count: &mut usize| {
+            *count += 1;
+            if errors.len() < MAX_ERRORS {
+                errors.push(RowError { row, message });
+            }
+        };
 
     // A file that declares a non-spot cadence holds one reading per (parameter, timestamp): a
     // repeat is a source defect, and absorbing it as replicate 1 hides the row from the default
@@ -402,13 +437,23 @@ pub async fn import_csv(
         let record = match record {
             Ok(r) => r,
             Err(e) => {
-                record_error(line, format!("CSV parse error: {e}"), &mut errors, &mut error_count);
+                record_error(
+                    line,
+                    format!("CSV parse error: {e}"),
+                    &mut errors,
+                    &mut error_count,
+                );
                 continue;
             }
         };
         let dt_cell = record.get(datetime_idx).unwrap_or("");
         let Some(time) = parse_datetime(dt_cell, tz_offset) else {
-            record_error(line, format!("Unparseable DateTime '{dt_cell}'"), &mut errors, &mut error_count);
+            record_error(
+                line,
+                format!("Unparseable DateTime '{dt_cell}'"),
+                &mut errors,
+                &mut error_count,
+            );
             continue;
         };
         // The same bound /ingest and /readings/batch enforce, reported per row so the rest of the
@@ -503,7 +548,8 @@ pub async fn import_csv(
     // Attribute each row to the sensor whose deployment window covers its time, so imported readings
     // that fall inside an existing deployment land attributed instead of NULL (the historical-orphan
     // source). Rows outside every deployment window resolve to all-None and need a later backdate.
-    let mut owner_map: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), ResolvedOwner> = HashMap::new();
+    let mut owner_map: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), ResolvedOwner> =
+        HashMap::new();
     {
         let mut times_by_param: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = HashMap::new();
         for (pid, t, _) in &rows {
@@ -527,14 +573,19 @@ pub async fn import_csv(
     // one timestamp would be numbered as each other's replicates.
     let mut params_per_stream: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
     for ((parameter_id, _), stream_id) in &overlap.owning_stream {
-        params_per_stream.entry(*stream_id).or_default().insert(*parameter_id);
+        params_per_stream
+            .entry(*stream_id)
+            .or_default()
+            .insert(*parameter_id);
     }
     let write_target = |parameter_id: &Uuid, time: &chrono::DateTime<chrono::Utc>| -> Uuid {
         overlap
             .owning_stream
             .get(&(*parameter_id, *time))
             .filter(|stream_id| {
-                params_per_stream.get(*stream_id).is_some_and(|params| params.len() == 1)
+                params_per_stream
+                    .get(*stream_id)
+                    .is_some_and(|params| params.len() == 1)
             })
             .copied()
             .unwrap_or(stream_cache[parameter_id])
@@ -543,7 +594,10 @@ pub async fn import_csv(
     let staged: Vec<StagedRow> = rows
         .iter()
         .map(|(parameter_id, time, value)| {
-            let owner = owner_map.get(&(*parameter_id, *time)).cloned().unwrap_or_default();
+            let owner = owner_map
+                .get(&(*parameter_id, *time))
+                .cloned()
+                .unwrap_or_default();
             StagedRow {
                 stream_id: write_target(parameter_id, time),
                 site_id,
@@ -565,7 +619,8 @@ pub async fn import_csv(
 
     let overlapping = overlap.identical + overlap.differing;
     let overlap_differing = overlap.differing;
-    let has_work = rows.len() > overlapping || (overlap_differing > 0 && req.conflict == ConflictMode::Overwrite);
+    let has_work = rows.len() > overlapping
+        || (overlap_differing > 0 && req.conflict == ConflictMode::Overwrite);
 
     // --- Stage the parsed readings and enqueue the worker job ---------------------------------
     // The readings are externalised to `csv_import_staging` so any replica can run the import (the
@@ -741,13 +796,28 @@ async fn compute_overlaps(
     let mut owning_stream = HashMap::new();
 
     let (Some(t_min), Some(t_max)) = (earliest, latest) else {
-        return Ok(OverlapReport { identical, differing, sample, owning_stream });
+        return Ok(OverlapReport {
+            identical,
+            differing,
+            sample,
+            owning_stream,
+        });
     };
     if rows.is_empty() {
-        return Ok(OverlapReport { identical, differing, sample, owning_stream });
+        return Ok(OverlapReport {
+            identical,
+            differing,
+            sample,
+            owning_stream,
+        });
     }
 
-    let param_ids: Vec<Uuid> = rows.iter().map(|(pid, _, _)| *pid).collect::<HashSet<_>>().into_iter().collect();
+    let param_ids: Vec<Uuid> = rows
+        .iter()
+        .map(|(pid, _, _)| *pid)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
 
     let existing_rows = db
         .query_all(Statement::from_sql_and_values(
@@ -770,9 +840,15 @@ async fn compute_overlaps(
     let mut existing: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Vec<f64>> =
         HashMap::with_capacity(existing_rows.len());
     for row in &existing_rows {
-        let Ok(pid) = row.try_get::<Uuid>("", "parameter_id") else { continue };
-        let Ok(t) = row.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "time") else { continue };
-        let Ok(val) = row.try_get::<f64>("", "val") else { continue };
+        let Ok(pid) = row.try_get::<Uuid>("", "parameter_id") else {
+            continue;
+        };
+        let Ok(t) = row.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "time") else {
+            continue;
+        };
+        let Ok(val) = row.try_get::<f64>("", "val") else {
+            continue;
+        };
         let key = (pid, t.with_timezone(&chrono::Utc));
         if let Ok(stream_id) = row.try_get::<Uuid>("", "stream_id") {
             owning_stream.entry(key).or_insert(stream_id);
@@ -804,5 +880,10 @@ async fn compute_overlaps(
         }
     }
 
-    Ok(OverlapReport { identical, differing, sample, owning_stream })
+    Ok(OverlapReport {
+        identical,
+        differing,
+        sample,
+        owning_stream,
+    })
 }

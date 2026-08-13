@@ -720,10 +720,8 @@ impl MigrationTrait for Migration {
         )
         .await?;
 
-        db.execute_unprepared(
-            "SELECT add_compression_policy('status_events', INTERVAL '90 days')",
-        )
-        .await?;
+        db.execute_unprepared("SELECT add_compression_policy('status_events', INTERVAL '90 days')")
+            .await?;
 
         Ok(())
     }

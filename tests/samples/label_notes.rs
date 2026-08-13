@@ -8,9 +8,7 @@ use serial_test::serial;
 
 const GRAB_TIME: &str = "2025-02-10T09:00:00Z";
 
-async fn sample_row(
-    db: &DatabaseConnection,
-) -> Option<(Option<String>, Option<String>, i32)> {
+async fn sample_row(db: &DatabaseConnection) -> Option<(Option<String>, Option<String>, i32)> {
     db.query_one(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
@@ -84,8 +82,16 @@ async fn label_and_notes_land_on_replicate_sample() {
     assert_eq!(status, 200, "re-post ({status}): {body}");
 
     let (label, notes, _) = sample_row(&db).await.expect("sample row reused");
-    assert_eq!(label.as_deref(), Some("batch 7"), "unset fields keep old value");
-    assert_eq!(notes.as_deref(), Some("corrected note"), "reused sample takes new note");
+    assert_eq!(
+        label.as_deref(),
+        Some("batch 7"),
+        "unset fields keep old value"
+    );
+    assert_eq!(
+        notes.as_deref(),
+        Some("corrected note"),
+        "reused sample takes new note"
+    );
 }
 
 #[tokio::test]
@@ -106,9 +112,14 @@ async fn single_reading_with_note_still_creates_sample() {
     .await;
     assert_eq!(status, 200, "grab insert ({status}): {body}");
     let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(resp["samples_created"], 1, "n=1 group still gets a sample: {resp}");
+    assert_eq!(
+        resp["samples_created"], 1,
+        "n=1 group still gets a sample: {resp}"
+    );
 
-    let (label, notes, n) = sample_row(&db).await.expect("sample row created for single reading");
+    let (label, notes, n) = sample_row(&db)
+        .await
+        .expect("sample row created for single reading");
     assert_eq!(label, None);
     assert_eq!(notes.as_deref(), Some("lone value with context"));
     assert_eq!(n, 1, "trigger counts the single reading");
@@ -132,5 +143,8 @@ async fn single_reading_without_note_creates_no_sample() {
     .await;
     assert_eq!(status, 200, "grab insert ({status}): {body}");
 
-    assert!(sample_row(&db).await.is_none(), "plain single grab stays sample-less");
+    assert!(
+        sample_row(&db).await.is_none(),
+        "plain single grab stays sample-less"
+    );
 }

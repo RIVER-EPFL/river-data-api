@@ -23,7 +23,11 @@ async fn measurement_types(db: &DatabaseConnection, stream_id: Uuid) -> Vec<Stri
     .collect()
 }
 
-async fn seed_stream(db: &DatabaseConnection, declared: Option<&str>, tagged_as: Option<&str>) -> Uuid {
+async fn seed_stream(
+    db: &DatabaseConnection,
+    declared: Option<&str>,
+    tagged_as: Option<&str>,
+) -> Uuid {
     let stream_id = Uuid::new_v4();
     let declared_sql = declared.map_or("NULL".to_string(), |d| format!("'{d}'"));
     let tagged_sql = tagged_as.map_or("NULL".to_string(), |t| format!("'{t}'"));
@@ -109,14 +113,20 @@ async fn declared_retag_aligns_each_stream_separately() {
     .await;
     assert_eq!(status, 200, "retag ({status}): {body}");
     let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(resp["streams_updated"], 0, "declared leaves the streams as they are");
+    assert_eq!(
+        resp["streams_updated"], 0,
+        "declared leaves the streams as they are"
+    );
     let job_id = resp["job_id"].as_str().expect("a tracked job was enqueued");
 
     let status = crate::common::e2e::poll_job(&app, &token, job_id, 20).await;
     assert_eq!(status, "completed", "retag job must complete");
 
     assert_eq!(measurement_types(&db, grab).await, vec!["spot".to_string()]);
-    assert_eq!(measurement_types(&db, logger).await, vec!["continuous".to_string()]);
+    assert_eq!(
+        measurement_types(&db, logger).await,
+        vec!["continuous".to_string()]
+    );
     assert_eq!(
         measurement_types(&db, undeclared).await,
         vec!["continuous".to_string()],

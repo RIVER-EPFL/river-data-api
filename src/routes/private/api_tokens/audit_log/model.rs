@@ -7,9 +7,7 @@ use serde::{Deserialize, Serialize};
 /// `exclude(create, update)`, the table is append-only and the generated mutation routes are unused.
 /// Mounted behind `require_admin` (no API token can read the audit trail); the UI surfaces it in the
 /// System → Logs hub with filtering/sorting/pagination for free.
-#[derive(
-    Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize, EntityToModels,
-)]
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize, EntityToModels)]
 #[sea_orm(table_name = "api_token_audit_log")]
 #[crudcrate(
     api_struct = "ApiTokenAuditLog",

@@ -3,7 +3,6 @@
 //! Run with: cargo test --test public_api
 //! Requires: DATABASE_URL pointing to a TimescaleDB instance.
 
-
 use serial_test::serial;
 
 // ============================================================================
@@ -170,10 +169,20 @@ async fn test_public_readings_two_params() {
     assert_eq!(status, 200);
 
     let params = body["parameters"].as_array().unwrap();
-    assert_eq!(params.len(), 2, "should have DO_Temperature and Dissolved_O2");
+    assert_eq!(
+        params.len(),
+        2,
+        "should have DO_Temperature and Dissolved_O2"
+    );
 
-    let temp = params.iter().find(|p| p["code"] == "DO_Temperature").expect("DO_Temperature missing");
-    let do_param = params.iter().find(|p| p["code"] == "Dissolved_O2").expect("Dissolved_O2 missing");
+    let temp = params
+        .iter()
+        .find(|p| p["code"] == "DO_Temperature")
+        .expect("DO_Temperature missing");
+    let do_param = params
+        .iter()
+        .find(|p| p["code"] == "Dissolved_O2")
+        .expect("Dissolved_O2 missing");
 
     assert_eq!(temp["units"], "°C");
     assert_eq!(do_param["units"], "µM");
@@ -200,7 +209,12 @@ async fn test_public_discovery() {
     assert_eq!(projects.len(), 1);
     assert_eq!(projects[0]["code"], "test-river");
     assert!(projects[0]["docs_url"].as_str().unwrap().contains("/docs"));
-    assert!(projects[0]["sites_url"].as_str().unwrap().contains("/sites"));
+    assert!(
+        projects[0]["sites_url"]
+            .as_str()
+            .unwrap()
+            .contains("/sites")
+    );
 }
 
 // ============================================================================
@@ -220,15 +234,31 @@ async fn test_public_aggregates() {
     assert_eq!(status, 200);
 
     let params = body["parameters"].as_array().unwrap();
-    assert_eq!(params.len(), 2, "aggregates should have DO_Temperature and Dissolved_O2");
+    assert_eq!(
+        params.len(),
+        2,
+        "aggregates should have DO_Temperature and Dissolved_O2"
+    );
 
-    let temp = params.iter().find(|p| p["code"] == "DO_Temperature").expect("DO_Temperature aggregates missing");
-    let do_param = params.iter().find(|p| p["code"] == "Dissolved_O2").expect("Dissolved_O2 aggregates missing");
+    let temp = params
+        .iter()
+        .find(|p| p["code"] == "DO_Temperature")
+        .expect("DO_Temperature aggregates missing");
+    let do_param = params
+        .iter()
+        .find(|p| p["code"] == "Dissolved_O2")
+        .expect("Dissolved_O2 aggregates missing");
 
     let temp_avg = temp["avg"].as_array().unwrap();
     let do_avg = do_param["avg"].as_array().unwrap();
-    assert!(!temp_avg.is_empty(), "should have hourly aggregates for temperature");
-    assert!(!do_avg.is_empty(), "should have hourly aggregates for dissolved oxygen");
+    assert!(
+        !temp_avg.is_empty(),
+        "should have hourly aggregates for temperature"
+    );
+    assert!(
+        !do_avg.is_empty(),
+        "should have hourly aggregates for dissolved oxygen"
+    );
 }
 
 // ============================================================================
@@ -251,9 +281,18 @@ async fn test_public_readings_csv() {
     assert!(!lines.is_empty(), "CSV should have at least a header");
 
     let header = lines[0];
-    assert!(header.starts_with("time"), "CSV header should start with time");
-    assert!(header.contains("DO_Temperature"), "CSV header should include DO_Temperature");
-    assert!(header.contains("Dissolved_O2"), "CSV header should include Dissolved_O2");
+    assert!(
+        header.starts_with("time"),
+        "CSV header should start with time"
+    );
+    assert!(
+        header.contains("DO_Temperature"),
+        "CSV header should include DO_Temperature"
+    );
+    assert!(
+        header.contains("Dissolved_O2"),
+        "CSV header should include Dissolved_O2"
+    );
 
     assert!(lines.len() > 1, "CSV should have data rows");
 }
@@ -280,7 +319,10 @@ async fn test_public_docs_custom_title() {
 
     let (status, body) = crate::common::get(&app, "/api/public/test-river/docs").await;
     assert_eq!(status, 200);
-    assert!(body.contains("Mount Resilience Data"), "docs should include custom title");
+    assert!(
+        body.contains("Mount Resilience Data"),
+        "docs should include custom title"
+    );
 }
 
 // ============================================================================
@@ -314,17 +356,21 @@ async fn test_public_parameter_filtering() {
 async fn test_public_site_detail() {
     let (_db, app) = setup_two_params().await;
 
-    let (status, body) = crate::common::get_json(
-        &app,
-        "/api/public/test-river/sites/upstream",
-    )
-    .await;
+    let (status, body) =
+        crate::common::get_json(&app, "/api/public/test-river/sites/upstream").await;
     assert_eq!(status, 200);
 
     let params = body["parameters"].as_array().unwrap();
-    assert_eq!(params.len(), 2, "site detail should list both exposed params");
+    assert_eq!(
+        params.len(),
+        2,
+        "site detail should list both exposed params"
+    );
 
-    assert!(body["reading_count"].as_i64().unwrap() > 0, "should have readings");
+    assert!(
+        body["reading_count"].as_i64().unwrap() > 0,
+        "should have readings"
+    );
     assert!(body["data_start"].is_string(), "should have data_start");
     assert!(body["data_end"].is_string(), "should have data_end");
 }
@@ -338,11 +384,8 @@ async fn test_public_site_detail() {
 async fn test_public_list_parameters() {
     let (_db, app) = setup_two_params().await;
 
-    let (status, body) = crate::common::get_json(
-        &app,
-        "/api/public/test-river/sites/upstream/parameters",
-    )
-    .await;
+    let (status, body) =
+        crate::common::get_json(&app, "/api/public/test-river/sites/upstream/parameters").await;
     assert_eq!(status, 200);
 
     let params = body.as_array().unwrap();

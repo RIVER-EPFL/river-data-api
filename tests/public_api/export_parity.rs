@@ -35,7 +35,10 @@ async fn register_stream(app: &Router, jwt: &str, source_key: &str) -> String {
         jwt,
     )
     .await;
-    assert!((200..300).contains(&status), "register {source_key} ({status}): {stream}");
+    assert!(
+        (200..300).contains(&status),
+        "register {source_key} ({status}): {stream}"
+    );
     e2e::id_of(&stream)
 }
 
@@ -47,7 +50,10 @@ async fn pair_stream(app: &Router, jwt: &str, stream_id: &str, sp_id: &str) {
         jwt,
     )
     .await;
-    assert!((200..300).contains(&status), "pair {stream_id} ({status}): {paired}");
+    assert!(
+        (200..300).contains(&status),
+        "pair {stream_id} ({status}): {paired}"
+    );
 }
 
 /// Register a stream and pair it to a site_parameter, the sync-service onboarding order.
@@ -90,7 +96,10 @@ async fn ingest(app: &Router, jwt: &str, stream_id: &str, points: &[(&str, f64)]
         Some(points.len() as u64),
         "every ingested point lands: {body}"
     );
-    assert_eq!(body["paired"], true, "the stream is paired before ingest: {body}");
+    assert_eq!(
+        body["paired"], true,
+        "the stream is paired before ingest: {body}"
+    );
 }
 
 async fn create_threshold(
@@ -115,7 +124,10 @@ async fn create_threshold(
         jwt,
     )
     .await;
-    assert!((200..300).contains(&status), "create threshold ({status}): {body}");
+    assert!(
+        (200..300).contains(&status),
+        "create threshold ({status}): {body}"
+    );
 }
 
 // --- Response readers ---
@@ -243,7 +255,11 @@ async fn flagged_readings_are_served_consistently_by_count_series_and_aggregate(
     .await;
     assert_eq!(status, 200, "flag the outlier ({status}): {flagged}");
     let flagged: Value = serde_json::from_str(&flagged).unwrap();
-    assert_eq!(flagged["updated"].as_u64(), Some(1), "exactly one reading flagged: {flagged}");
+    assert_eq!(
+        flagged["updated"].as_u64(),
+        Some(1),
+        "exactly one reading flagged: {flagged}"
+    );
 
     let (status, detail) =
         crate::common::get_json(&app, "/api/public/rd045/sites/rd045-station").await;
@@ -284,19 +300,32 @@ async fn flagged_readings_are_served_consistently_by_count_series_and_aggregate(
     let private_values = optional_values(&private, &parameter);
     assert_eq!(
         private_values,
-        vec![Some(100.0), Some(200.0), Some(300.0), Some(400.0), Some(500.0)],
+        vec![
+            Some(100.0),
+            Some(200.0),
+            Some(300.0),
+            Some(400.0),
+            Some(500.0)
+        ],
         "the private default keeps the flagged reading, which it is entitled to do \
          because it labels it: {private}"
     );
     let flags = param_block(&private, &parameter)["flagged"].as_array();
-    assert!(flags.is_some(), "the private series carries a per-point flag array: {private}");
+    assert!(
+        flags.is_some(),
+        "the private series carries a per-point flag array: {private}"
+    );
     let flags = flags.unwrap();
     assert_eq!(
         flags.iter().filter(|f| **f == Value::Bool(true)).count(),
         1,
         "exactly one private point is marked flagged: {private}"
     );
-    assert_eq!(flags[4], Value::Bool(true), "and it is the 500 point: {private}");
+    assert_eq!(
+        flags[4],
+        Value::Bool(true),
+        "and it is the 500 point: {private}"
+    );
 
     let (status, unflagged) = crate::common::get_json_with_token(
         &app,
@@ -304,7 +333,10 @@ async fn flagged_readings_are_served_consistently_by_count_series_and_aggregate(
         &jwt,
     )
     .await;
-    assert_eq!(status, 200, "private readings without flagged ({status}): {unflagged}");
+    assert_eq!(
+        status, 200,
+        "private readings without flagged ({status}): {unflagged}"
+    );
     assert_eq!(
         optional_values(&unflagged, &parameter),
         vec![Some(100.0), Some(200.0), Some(300.0), Some(400.0)],
@@ -316,7 +348,10 @@ async fn flagged_readings_are_served_consistently_by_count_series_and_aggregate(
         &format!("/api/public/rd045/sites/rd045-station/aggregates/daily?{window}"),
     )
     .await;
-    assert_eq!(status, 200, "public daily aggregates ({status}): {aggregates}");
+    assert_eq!(
+        status, 200,
+        "public daily aggregates ({status}): {aggregates}"
+    );
     let block = param_block(&aggregates, "Rd045Depth");
     assert_eq!(
         block["count"][0].as_i64(),
@@ -376,7 +411,10 @@ async fn csv_and_ndjson_exports_honour_the_readings_opt_ins() {
     )
     .await;
     assert_eq!(status, 200, "grab sample ({status}): {grab}");
-    assert_eq!(grab["samples_created"], 1, "one replicate group recorded: {grab}");
+    assert_eq!(
+        grab["samples_created"], 1,
+        "one replicate group recorded: {grab}"
+    );
 
     let window = "start=2025-06-05T00:00:00Z&end=2025-06-05T03:00:00Z";
     let base = format!("/api/sites/{site}/readings?{window}");
@@ -385,12 +423,18 @@ async fn csv_and_ndjson_exports_honour_the_readings_opt_ins() {
         crate::common::get_json_with_token(&app, &format!("{base}&alarms=true"), &jwt).await;
     assert_eq!(status, 200, "JSON with alarms ({status}): {with_alarms}");
     let severities = param_block(&with_alarms, &parameter)["severities"].as_array();
-    assert!(severities.is_some(), "JSON carries the opt-in severities: {with_alarms}");
+    assert!(
+        severities.is_some(),
+        "JSON carries the opt-in severities: {with_alarms}"
+    );
     let severities = severities.unwrap();
     let breach_index = times_of(&with_alarms)
         .iter()
         .position(|t| t.starts_with("2025-06-05T01:00:00"));
-    assert!(breach_index.is_some(), "the breaching point is on the axis: {with_alarms}");
+    assert!(
+        breach_index.is_some(),
+        "the breaching point is on the axis: {with_alarms}"
+    );
     let breach_index = breach_index.unwrap();
     assert_eq!(
         severities[breach_index].as_i64(),
@@ -424,26 +468,44 @@ async fn csv_and_ndjson_exports_honour_the_readings_opt_ins() {
             .await;
     assert_eq!(status, 200, "NDJSON with alarms ({status}): {ndjson}");
     let objects = ndjson_objects(&ndjson);
-    let breach_obj = objects
-        .iter()
-        .find(|o| o["time"].as_str().unwrap_or_default().starts_with("2025-06-05T01:00:00"));
-    assert!(breach_obj.is_some(), "the breaching object is exported: {ndjson}");
+    let breach_obj = objects.iter().find(|o| {
+        o["time"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("2025-06-05T01:00:00")
+    });
+    assert!(
+        breach_obj.is_some(),
+        "the breaching object is exported: {ndjson}"
+    );
     assert_eq!(
         breach_obj.unwrap()["Rd046Turb_severity"].as_i64(),
         Some(1),
         "NDJSON carries the opt-in severity too: {ndjson}"
     );
 
-    let (status, with_stats) =
-        crate::common::get_json_with_token(&app, &format!("{base}&include_sample_stats=true"), &jwt)
-            .await;
-    assert_eq!(status, 200, "JSON with sample stats ({status}): {with_stats}");
+    let (status, with_stats) = crate::common::get_json_with_token(
+        &app,
+        &format!("{base}&include_sample_stats=true"),
+        &jwt,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "JSON with sample stats ({status}): {with_stats}"
+    );
     let samples = param_block(&with_stats, &parameter)["samples"].as_array();
-    assert!(samples.is_some(), "JSON carries the opt-in sample stats: {with_stats}");
+    assert!(
+        samples.is_some(),
+        "JSON carries the opt-in sample stats: {with_stats}"
+    );
     let grab_index = times_of(&with_stats)
         .iter()
         .position(|t| t.starts_with("2025-06-05T02:00:00"));
-    assert!(grab_index.is_some(), "the grab point is on the axis: {with_stats}");
+    assert!(
+        grab_index.is_some(),
+        "the grab point is on the axis: {with_stats}"
+    );
     assert_eq!(
         samples.unwrap()[grab_index.unwrap()]["mean"].as_f64(),
         Some(30.0),
@@ -465,7 +527,11 @@ async fn csv_and_ndjson_exports_honour_the_readings_opt_ins() {
     );
     assert_eq!(
         plain_header,
-        vec!["time".to_string(), "Rd046Turb".to_string(), "Rd046Turb_parameter_id".to_string()],
+        vec![
+            "time".to_string(),
+            "Rd046Turb".to_string(),
+            "Rd046Turb_parameter_id".to_string()
+        ],
         "the export without opt-ins stays exactly as it was: {plain_header:?}"
     );
 }
@@ -529,7 +595,10 @@ async fn sensor_readings_serve_one_parameter_not_every_channel() {
     assert_eq!(status, 200, "sensor readings ({status}): {raw}");
 
     let reported = raw["parameter_id"].as_str();
-    assert!(reported.is_some(), "the response names the parameter it serves: {raw}");
+    assert!(
+        reported.is_some(),
+        "the response names the parameter it serves: {raw}"
+    );
     let reported = reported.unwrap();
     let (expected_series, expected_mean, expected_units) = if reported == cond {
         (vec![500.0, 501.0, 502.0], 501.0, "uS/cm")
@@ -568,8 +637,14 @@ async fn sensor_readings_serve_one_parameter_not_every_channel() {
         Some(reported),
         "the bucketed arm names the same parameter as the raw arm: {daily}"
     );
-    let buckets = daily["raw"].as_array().unwrap_or_else(|| panic!("no 'raw' array in {daily}"));
-    assert_eq!(buckets.len(), 1, "all six readings fall on one day: {daily}");
+    let buckets = daily["raw"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no 'raw' array in {daily}"));
+    assert_eq!(
+        buckets.len(),
+        1,
+        "all six readings fall on one day: {daily}"
+    );
     assert_eq!(
         buckets[0].as_f64(),
         Some(expected_mean),
@@ -610,21 +685,30 @@ async fn public_aggregates_list_only_the_requested_sites_parameters() {
         &app,
         &jwt,
         &wide_shared_stream,
-        &[("2025-06-06T00:00:00Z", 9.0), ("2025-06-06T01:00:00Z", 11.0)],
+        &[
+            ("2025-06-06T00:00:00Z", 9.0),
+            ("2025-06-06T01:00:00Z", 11.0),
+        ],
     )
     .await;
     ingest(
         &app,
         &jwt,
         &wide_extra_stream,
-        &[("2025-06-06T00:00:00Z", 19.0), ("2025-06-06T01:00:00Z", 21.0)],
+        &[
+            ("2025-06-06T00:00:00Z", 19.0),
+            ("2025-06-06T01:00:00Z", 21.0),
+        ],
     )
     .await;
     ingest(
         &app,
         &jwt,
         &narrow_stream,
-        &[("2025-06-06T00:00:00Z", 29.0), ("2025-06-06T01:00:00Z", 31.0)],
+        &[
+            ("2025-06-06T00:00:00Z", 29.0),
+            ("2025-06-06T01:00:00Z", 31.0),
+        ],
     )
     .await;
 
@@ -635,7 +719,10 @@ async fn public_aggregates_list_only_the_requested_sites_parameters() {
         &jwt,
     )
     .await;
-    assert!((200..300).contains(&status), "refresh aggregates ({status}): {refresh}");
+    assert!(
+        (200..300).contains(&status),
+        "refresh aggregates ({status}): {refresh}"
+    );
     let job_id = refresh["job_id"].as_str();
     assert!(job_id.is_some(), "the refresh is a tracked job: {refresh}");
     assert_eq!(
@@ -650,7 +737,10 @@ async fn public_aggregates_list_only_the_requested_sites_parameters() {
         &format!("/api/public/rd053/sites/rd053-narrow/aggregates/daily?{window}"),
     )
     .await;
-    assert_eq!(status, 200, "narrow site aggregates ({status}): {narrow_agg}");
+    assert_eq!(
+        status, 200,
+        "narrow site aggregates ({status}): {narrow_agg}"
+    );
     let narrow_codes: Vec<String> = narrow_agg["parameters"]
         .as_array()
         .unwrap_or_else(|| panic!("no 'parameters' array in {narrow_agg}"))
@@ -668,7 +758,10 @@ async fn public_aggregates_list_only_the_requested_sites_parameters() {
         &format!("/api/public/rd053/sites/rd053-narrow/readings?{window}"),
     )
     .await;
-    assert_eq!(status, 200, "narrow site readings ({status}): {narrow_readings}");
+    assert_eq!(
+        status, 200,
+        "narrow site readings ({status}): {narrow_readings}"
+    );
     let readings_codes: Vec<String> = narrow_readings["parameters"]
         .as_array()
         .unwrap_or_else(|| panic!("no 'parameters' array in {narrow_readings}"))
@@ -745,7 +838,13 @@ async fn site_alarms_leave_non_violating_timestamps_null_in_every_format() {
 
     let alpha_stream = open_stream(&app, &jwt, "rd054-alpha", &sp_alpha).await;
     let beta_stream = open_stream(&app, &jwt, "rd054-beta", &sp_beta).await;
-    ingest(&app, &jwt, &alpha_stream, &[("2025-06-07T00:00:00Z", 500.0)]).await;
+    ingest(
+        &app,
+        &jwt,
+        &alpha_stream,
+        &[("2025-06-07T00:00:00Z", 500.0)],
+    )
+    .await;
     ingest(&app, &jwt, &beta_stream, &[("2025-06-07T01:00:00Z", 600.0)]).await;
 
     let window = "start=2025-06-07T00:00:00Z&end=2025-06-07T23:59:59Z";
@@ -754,7 +853,11 @@ async fn site_alarms_leave_non_violating_timestamps_null_in_every_format() {
     let (status, alarms) = crate::common::get_json_with_token(&app, &uri, &jwt).await;
     assert_eq!(status, 200, "site alarms ({status}): {alarms}");
     let times = times_of(&alarms);
-    assert_eq!(times.len(), 2, "the two breaches share one time axis: {alarms}");
+    assert_eq!(
+        times.len(),
+        2,
+        "the two breaches share one time axis: {alarms}"
+    );
 
     let alpha_values = optional_values(&alarms, &alpha);
     let beta_values = optional_values(&alarms, &beta);
@@ -777,7 +880,10 @@ async fn site_alarms_leave_non_violating_timestamps_null_in_every_format() {
         "and beta reports no value at alpha's timestamp: {alarms}"
     );
     let alpha_severities = param_block(&alarms, &alpha)["severities"].as_array();
-    assert!(alpha_severities.is_some(), "severities accompany the values: {alarms}");
+    assert!(
+        alpha_severities.is_some(),
+        "severities accompany the values: {alarms}"
+    );
     assert_eq!(
         alpha_severities.unwrap()[0].as_i64(),
         Some(1),
@@ -791,13 +897,23 @@ async fn site_alarms_leave_non_violating_timestamps_null_in_every_format() {
     let header = rows.first().cloned().unwrap_or_default();
     let alpha_col = column_index(&header, "RD054 Alpha_value");
     let beta_col = column_index(&header, "RD054 Beta_value");
-    assert_eq!(rows.len(), 3, "a header and one row per violating timestamp: {csv}");
-    assert_eq!(rows[1][alpha_col], "500", "alpha's breach cell carries its value: {csv}");
+    assert_eq!(
+        rows.len(),
+        3,
+        "a header and one row per violating timestamp: {csv}"
+    );
+    assert_eq!(
+        rows[1][alpha_col], "500",
+        "alpha's breach cell carries its value: {csv}"
+    );
     assert_eq!(
         rows[2][alpha_col], "",
         "alpha's cell on beta's row is empty, not a fabricated 0: {csv}"
     );
-    assert_eq!(rows[2][beta_col], "600", "beta's breach cell carries its value: {csv}");
+    assert_eq!(
+        rows[2][beta_col], "600",
+        "beta's breach cell carries its value: {csv}"
+    );
     assert_eq!(
         rows[1][beta_col], "",
         "beta's cell on alpha's row is empty, not a fabricated 0: {csv}"
@@ -807,7 +923,11 @@ async fn site_alarms_leave_non_violating_timestamps_null_in_every_format() {
         crate::common::get_with_token(&app, &format!("{uri}&format=ndjson"), &jwt).await;
     assert_eq!(status, 200, "site alarms NDJSON ({status}): {ndjson}");
     let objects = ndjson_objects(&ndjson);
-    assert_eq!(objects.len(), 2, "one object per violating timestamp: {ndjson}");
+    assert_eq!(
+        objects.len(),
+        2,
+        "one object per violating timestamp: {ndjson}"
+    );
     assert_eq!(
         objects[0]["RD054 Alpha_value"].as_f64(),
         Some(500.0),
@@ -868,7 +988,10 @@ async fn empty_results_are_delivered_in_the_requested_format() {
         &jwt,
     )
     .await;
-    assert_eq!(status, 200, "alarms CSV over a quiet window ({status}): {body}");
+    assert_eq!(
+        status, 200,
+        "alarms CSV over a quiet window ({status}): {body}"
+    );
     assert!(
         content_type(&headers).starts_with("text/csv"),
         "a window with no breaches still answers as CSV, got {} with body: {body}",
@@ -885,7 +1008,10 @@ async fn empty_results_are_delivered_in_the_requested_format() {
         &jwt,
     )
     .await;
-    assert_eq!(status, 200, "alarms CSV over a breaching window ({status}): {body}");
+    assert_eq!(
+        status, 200,
+        "alarms CSV over a breaching window ({status}): {body}"
+    );
     assert!(
         content_type(&headers).starts_with("text/csv"),
         "the non-empty case is CSV, got {}: {body}",
@@ -898,7 +1024,10 @@ async fn empty_results_are_delivered_in_the_requested_format() {
         &jwt,
     )
     .await;
-    assert_eq!(status, 200, "readings CSV for a site with no parameters ({status}): {body}");
+    assert_eq!(
+        status, 200,
+        "readings CSV for a site with no parameters ({status}): {body}"
+    );
     assert!(
         content_type(&headers).starts_with("text/csv"),
         "a site with no parameters still answers as CSV, got {} with body: {body}",
@@ -911,7 +1040,10 @@ async fn empty_results_are_delivered_in_the_requested_format() {
         &jwt,
     )
     .await;
-    assert_eq!(status, 200, "readings NDJSON for a site with no parameters ({status}): {body}");
+    assert_eq!(
+        status, 200,
+        "readings NDJSON for a site with no parameters ({status}): {body}"
+    );
     assert!(
         content_type(&headers).starts_with("application/x-ndjson"),
         "and as NDJSON when that is what was asked for, got {} with body: {body}",
@@ -924,7 +1056,10 @@ async fn empty_results_are_delivered_in_the_requested_format() {
         &jwt,
     )
     .await;
-    assert_eq!(status, 200, "aggregates CSV for a site with no parameters ({status}): {body}");
+    assert_eq!(
+        status, 200,
+        "aggregates CSV for a site with no parameters ({status}): {body}"
+    );
     assert!(
         content_type(&headers).starts_with("text/csv"),
         "the aggregates handler honours the format on the empty path too, got {} with body: {body}",
@@ -949,7 +1084,10 @@ async fn empty_results_are_delivered_in_the_requested_format() {
         &format!("/api/public/rd056/sites/rd056-bare/aggregates/daily?{full}&format=csv"),
     )
     .await;
-    assert_eq!(status, 200, "public aggregates CSV, nothing exposed ({status}): {body}");
+    assert_eq!(
+        status, 200,
+        "public aggregates CSV, nothing exposed ({status}): {body}"
+    );
     assert!(
         content_type(&headers).starts_with("text/csv"),
         "the public tier honours the format when the site exposes nothing, got {}: {body}",
@@ -961,7 +1099,10 @@ async fn empty_results_are_delivered_in_the_requested_format() {
         &format!("/api/public/rd056/sites/rd056-stocked/aggregates/daily?{full}&format=csv"),
     )
     .await;
-    assert_eq!(status, 200, "public aggregates CSV for the exposed site ({status}): {body}");
+    assert_eq!(
+        status, 200,
+        "public aggregates CSV for the exposed site ({status}): {body}"
+    );
     assert!(
         content_type(&headers).starts_with("text/csv"),
         "the exposed site's public export is CSV, got {}: {body}",

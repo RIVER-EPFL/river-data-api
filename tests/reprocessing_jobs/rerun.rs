@@ -38,7 +38,8 @@ async fn wait_for_terminal(db: &sea_orm::DatabaseConnection, job_id: &str) -> St
             .unwrap()
             .expect("job row exists");
         let status: String = row.try_get("", "status").unwrap();
-        if status != "queued" && status != "pending" && status != "running" && status != "retrying" {
+        if status != "queued" && status != "pending" && status != "running" && status != "retrying"
+        {
             return status;
         }
         if start.elapsed() > WAIT_TIMEOUT {
@@ -86,7 +87,10 @@ async fn rerun_replays_a_sensor_reprocess_as_a_new_job() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "rerun should be 2xx, got {status}: {text}");
+    assert!(
+        (200..300).contains(&status),
+        "rerun should be 2xx, got {status}: {text}"
+    );
     let rerun = job_id_of(&text);
     assert_ne!(rerun, original, "rerun must create a NEW job");
 
@@ -100,7 +104,10 @@ async fn rerun_replays_a_sensor_reprocess_as_a_new_job() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.try_get::<String>("", "trigger_type").unwrap(), "manual_reprocess");
+    assert_eq!(
+        row.try_get::<String>("", "trigger_type").unwrap(),
+        "manual_reprocess"
+    );
     assert_eq!(row.try_get::<Uuid>("", "sensor_id").unwrap(), sensor_id);
 
     assert_eq!(wait_for_terminal(&db, &rerun).await, "completed");

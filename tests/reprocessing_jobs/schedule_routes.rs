@@ -81,7 +81,10 @@ async fn patch_recomputes_next_run_on_interval_change() {
     assert_eq!(view["interval_seconds"], 60);
 
     let after = next_run_at(&db, JOB).await;
-    assert!(after < before, "lowered interval moves next_run_at earlier (was {before}, now {after})");
+    assert!(
+        after < before,
+        "lowered interval moves next_run_at earlier (was {before}, now {after})"
+    );
     let expected = chrono::Utc::now() + chrono::Duration::seconds(60);
     assert!(
         (after - expected).num_seconds().abs() < 10,
@@ -136,14 +139,21 @@ async fn patch_invalid_tunables_is_400_with_message() {
         &token,
     )
     .await;
-    assert_eq!(status, 400, "negative retention_days is rejected by the Job validate");
+    assert_eq!(
+        status, 400,
+        "negative retention_days is rejected by the Job validate"
+    );
     assert!(
         body.contains("retention_days"),
         "the 400 surfaces the validate message: {body}"
     );
 
     // The rejected edit did not persist and wrote no audit row.
-    assert_eq!(audit_count(&db, JOB).await, 0, "a rejected PATCH writes no audit row");
+    assert_eq!(
+        audit_count(&db, JOB).await,
+        0,
+        "a rejected PATCH writes no audit row"
+    );
     crate::common::cleanup_test_db(&db).await;
 }
 
@@ -166,13 +176,19 @@ async fn patch_valid_tunables_persist_and_audit_row_written() {
     assert_eq!(view["tunables"]["retention_days"], 30);
     // The token actor is stamped on updated_by.
     assert!(
-        view["updated_by"].as_str().is_some_and(|s| s.starts_with("token:")),
+        view["updated_by"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("token:")),
         "updated_by is the calling principal: {}",
         view["updated_by"]
     );
 
     // Exactly one audit row with the before/after snapshot.
-    assert_eq!(audit_count(&db, JOB).await, 1, "one accepted PATCH writes one audit row");
+    assert_eq!(
+        audit_count(&db, JOB).await,
+        1,
+        "one accepted PATCH writes one audit row"
+    );
 
     let (astatus, abody) =
         crate::common::get_json_with_token(&app, &format!("/api/schedules/{JOB}/audit"), &token)
@@ -186,7 +202,9 @@ async fn patch_valid_tunables_persist_and_audit_row_written() {
         "old_value snapshot has the pre-image tunables"
     );
     assert!(
-        entries[0]["changed_by"].as_str().is_some_and(|s| s.starts_with("token:")),
+        entries[0]["changed_by"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("token:")),
         "changed_by records the principal"
     );
     crate::common::cleanup_test_db(&db).await;
@@ -209,7 +227,10 @@ async fn run_now_enqueues_for_known_job_and_404s_for_unknown() {
     assert_eq!(status, 200, "run_now of a known job succeeds: {body}");
     let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(resp["enqueued"], true, "a fresh run_now enqueues a job");
-    assert!(resp["job_id"].as_str().is_some(), "an enqueued run returns a job_id");
+    assert!(
+        resp["job_id"].as_str().is_some(),
+        "an enqueued run returns a job_id"
+    );
 
     // An enqueued queued row of this trigger_type exists.
     let n: i64 = db
@@ -255,8 +276,7 @@ async fn list_reflects_running_for_in_flight_job() {
     )
     .await;
 
-    let (status, body) =
-        crate::common::get_json_with_token(&app, "/api/schedules", &token).await;
+    let (status, body) = crate::common::get_json_with_token(&app, "/api/schedules", &token).await;
     assert_eq!(status, 200);
     let rows = body.as_array().expect("list is an array");
 
@@ -268,11 +288,20 @@ async fn list_reflects_running_for_in_flight_job() {
     };
     // Ordered by job_name.
     assert!(
-        rows.windows(2).all(|w| w[0]["job_name"].as_str() <= w[1]["job_name"].as_str()),
+        rows.windows(2)
+            .all(|w| w[0]["job_name"].as_str() <= w[1]["job_name"].as_str()),
         "list is ordered by job_name"
     );
-    assert_eq!(find(JOB)["running"], true, "JOB shows running while a job is in flight");
-    assert_eq!(find("alarm_sweep")["running"], false, "alarm_sweep is not running");
+    assert_eq!(
+        find(JOB)["running"],
+        true,
+        "JOB shows running while a job is in flight"
+    );
+    assert_eq!(
+        find("alarm_sweep")["running"],
+        false,
+        "alarm_sweep is not running"
+    );
     crate::common::cleanup_test_db(&db).await;
 }
 

@@ -3,7 +3,6 @@
 //! Run with: cargo test --test status_events
 //! Requires: DATABASE_URL pointing to a TimescaleDB instance.
 
-
 use serial_test::serial;
 
 // ============================================================================
@@ -77,12 +76,12 @@ async fn test_csv_value_with_comma_is_properly_quoted() {
 
     // Find the data row with "running,ok", it should be properly quoted
     // If the value is NOT quoted, parsing would see 5 columns instead of 4
-    let data_line = lines
-        .iter()
-        .skip(1)
-        .find(|l| l.contains("running"));
+    let data_line = lines.iter().skip(1).find(|l| l.contains("running"));
 
-    assert!(data_line.is_some(), "should find a row with 'running' value");
+    assert!(
+        data_line.is_some(),
+        "should find a row with 'running' value"
+    );
 
     let line = data_line.unwrap();
     // Use the csv crate to parse, it handles RFC 4180 quoting

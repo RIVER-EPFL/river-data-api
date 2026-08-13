@@ -22,7 +22,8 @@ impl MigrationTrait for Migration {
             "ALTER TABLE alarm_events ALTER COLUMN measurement_type SET NOT NULL",
         )
         .await?;
-        db.execute_unprepared("DROP INDEX IF EXISTS uq_alarm_events_open").await?;
+        db.execute_unprepared("DROP INDEX IF EXISTS uq_alarm_events_open")
+            .await?;
         db.execute_unprepared(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_alarm_events_open \
              ON alarm_events (site_id, parameter_id, measurement_type) WHERE resolved_at IS NULL",
@@ -33,7 +34,8 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        db.execute_unprepared("DROP INDEX IF EXISTS uq_alarm_events_open").await?;
+        db.execute_unprepared("DROP INDEX IF EXISTS uq_alarm_events_open")
+            .await?;
         db.execute_unprepared(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_alarm_events_open \
              ON alarm_events (site_id, parameter_id) WHERE resolved_at IS NULL",

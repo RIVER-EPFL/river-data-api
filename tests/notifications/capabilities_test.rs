@@ -13,7 +13,10 @@ async fn capabilities_report_disabled_and_leak_no_secrets() {
     let app = crate::common::build_test_app(db);
 
     let (status, body) = crate::common::get_json(&app, "/api/config/notifications").await;
-    assert_eq!(status, 200, "capabilities endpoint answers (no auth, no 404)");
+    assert_eq!(
+        status, 200,
+        "capabilities endpoint answers (no auth, no 404)"
+    );
 
     assert_eq!(body["telegram"]["available"], false);
     assert_eq!(body["email"]["available"], false);

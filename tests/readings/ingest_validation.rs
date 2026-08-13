@@ -219,11 +219,20 @@ async fn batch_overwrite_keeps_the_sample_link_of_the_reading_it_corrects() {
         &admin,
     )
     .await;
-    assert_eq!(status, 200, "batch insert of both plates ({status}): {inserted}");
-    assert_eq!(inserted["inserted"], 4, "all four replicates land: {inserted}");
+    assert_eq!(
+        status, 200,
+        "batch insert of both plates ({status}): {inserted}"
+    );
+    assert_eq!(
+        inserted["inserted"], 4,
+        "all four replicates land: {inserted}"
+    );
 
     let sample = sample_row(&app, &admin, &corrected_sample, "before any correction").await;
-    assert_eq!(sample["n"], 2, "both replicates count towards the sample: {sample}");
+    assert_eq!(
+        sample["n"], 2,
+        "both replicates count towards the sample: {sample}"
+    );
     assert!(
         (f64_at(&sample, "mean") - 11.0).abs() < 1e-9,
         "the sample mean is the mean of 10.0 and 12.0: {sample}"
@@ -247,8 +256,13 @@ async fn batch_overwrite_keeps_the_sample_link_of_the_reading_it_corrects() {
         "the correction replaces the stored row rather than adding one: {corrected}"
     );
 
-    let sample =
-        sample_row(&app, &admin, &corrected_sample, "after correcting one replicate").await;
+    let sample = sample_row(
+        &app,
+        &admin,
+        &corrected_sample,
+        "after correcting one replicate",
+    )
+    .await;
     assert_eq!(
         sample["n"], 2,
         "correcting a value must not unlink the replicate from its sample: {sample}"
@@ -276,7 +290,10 @@ async fn batch_overwrite_keeps_the_sample_link_of_the_reading_it_corrects() {
         &admin,
     )
     .await;
-    assert_eq!(status, 200, "correct the remaining replicate ({status}): {corrected}");
+    assert_eq!(
+        status, 200,
+        "correct the remaining replicate ({status}): {corrected}"
+    );
 
     let sample = sample_row(
         &app,
@@ -305,10 +322,22 @@ async fn batch_overwrite_keeps_the_sample_link_of_the_reading_it_corrects() {
         &admin,
     )
     .await;
-    assert_eq!(status, 200, "correct with the link repeated ({status}): {corrected}");
+    assert_eq!(
+        status, 200,
+        "correct with the link repeated ({status}): {corrected}"
+    );
 
-    let sample = sample_row(&app, &admin, &untouched_sample, "the explicitly relinked plate").await;
-    assert_eq!(sample["n"], 2, "the relinked correction keeps both replicates: {sample}");
+    let sample = sample_row(
+        &app,
+        &admin,
+        &untouched_sample,
+        "the explicitly relinked plate",
+    )
+    .await;
+    assert_eq!(
+        sample["n"], 2,
+        "the relinked correction keeps both replicates: {sample}"
+    );
     assert!(
         (f64_at(&sample, "mean") - 16.0).abs() < 1e-9,
         "the relinked plate averages 20.0 and 12.0: {sample}"
@@ -348,7 +377,10 @@ async fn csv_overwrite_replaces_a_synced_reading_instead_of_duplicating_the_slot
     )
     .await;
     assert_eq!(status, 200, "sync ingest ({status}): {ingested}");
-    assert_eq!(ingested["inserted"], 1, "the synced reading lands: {ingested}");
+    assert_eq!(
+        ingested["inserted"], 1,
+        "the synced reading lands: {ingested}"
+    );
 
     let imported = import_csv(
         &app,
@@ -509,8 +541,14 @@ async fn ingest_refuses_timestamps_outside_the_window_batch_already_enforces() {
         &admin,
     )
     .await;
-    assert_eq!(status, 200, "an in-range ingest is accepted ({status}): {ingested}");
-    assert_eq!(ingested["inserted"], 1, "the in-range reading lands: {ingested}");
+    assert_eq!(
+        status, 200,
+        "an in-range ingest is accepted ({status}): {ingested}"
+    );
+    assert_eq!(
+        ingested["inserted"], 1,
+        "the in-range reading lands: {ingested}"
+    );
 
     let (status, stream) =
         crate::common::get_json_with_token(&app, &format!("/api/data_streams/{stream_id}"), &admin)
@@ -586,7 +624,10 @@ async fn csv_import_refuses_a_non_finite_cell_and_leaves_the_bucket_computable()
         ),
     )
     .await;
-    assert_eq!(non_finite, 0, "no non-finite value reaches the readings table");
+    assert_eq!(
+        non_finite, 0,
+        "no non-finite value reaches the readings table"
+    );
 
     let stored = e2e::count(
         &db,
@@ -780,7 +821,10 @@ async fn csv_import_refuses_a_duplicated_timestamp_in_a_continuous_file() {
         ),
     )
     .await;
-    assert_eq!(at_repeat, 1, "a continuous cadence holds one reading per timestamp");
+    assert_eq!(
+        at_repeat, 1,
+        "a continuous cadence holds one reading per timestamp"
+    );
 
     let hidden = e2e::count(
         &db,
@@ -835,11 +879,18 @@ async fn csv_import_refuses_a_duplicated_timestamp_in_a_continuous_file() {
     let (status, samples) =
         crate::common::get_json_with_token(&app, &format!("/api/samples?filter={filter}"), &admin)
             .await;
-    assert_eq!(status, 200, "list the spot column's samples ({status}): {samples}");
+    assert_eq!(
+        status, 200,
+        "list the spot column's samples ({status}): {samples}"
+    );
     let rows = samples
         .as_array()
         .unwrap_or_else(|| panic!("the samples list is an array: {samples}"));
-    assert_eq!(rows.len(), 1, "the spot-declared replicate group is one sample: {samples}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the spot-declared replicate group is one sample: {samples}"
+    );
     assert_eq!(rows[0]["n"], 2, "both replicates count: {samples}");
     assert!(
         (f64_at(&rows[0], "mean") - repeated_value).abs() < 1e-9,
@@ -879,7 +930,10 @@ async fn a_single_replicate_grab_reaches_the_sensor_vs_grab_export() {
         &admin,
     )
     .await;
-    assert_eq!(status, 200, "single-replicate grab entry ({status}): {lone}");
+    assert_eq!(
+        status, 200,
+        "single-replicate grab entry ({status}): {lone}"
+    );
     assert_eq!(lone["inserted"], 1, "the grab reading lands: {lone}");
     assert_eq!(
         lone["samples_created"], 1,
@@ -924,7 +978,10 @@ async fn a_single_replicate_grab_reaches_the_sensor_vs_grab_export() {
     )
     .await;
     assert_eq!(status, 200, "continuous batch ({status}): {batch}");
-    assert_eq!(batch["inserted"], 3, "all three continuous points land: {batch}");
+    assert_eq!(
+        batch["inserted"], 3,
+        "all three continuous points land: {batch}"
+    );
 
     let lone_sample = e2e::count(
         &db,
@@ -961,7 +1018,10 @@ async fn a_single_replicate_grab_reaches_the_sensor_vs_grab_export() {
     );
 
     let lone_row = &rows[0];
-    assert_eq!(lone_row["grab_n"], 1, "the lone grab reports one replicate: {lone_row}");
+    assert_eq!(
+        lone_row["grab_n"], 1,
+        "the lone grab reports one replicate: {lone_row}"
+    );
     assert!(
         (f64_at(lone_row, "grab_value") - 310.0).abs() < 1e-9,
         "the lone grab's value is the measurement itself: {lone_row}"
@@ -980,7 +1040,10 @@ async fn a_single_replicate_grab_reaches_the_sensor_vs_grab_export() {
     );
 
     let paired_row = &rows[1];
-    assert_eq!(paired_row["grab_n"], 2, "the replicate pair is unchanged: {paired_row}");
+    assert_eq!(
+        paired_row["grab_n"], 2,
+        "the replicate pair is unchanged: {paired_row}"
+    );
     assert!(
         (f64_at(paired_row, "grab_value") - 321.0).abs() < 1e-9,
         "the pair's value is its replicate mean: {paired_row}"
@@ -1022,7 +1085,10 @@ async fn csv_import_does_not_shift_a_timestamp_that_carries_its_own_offset() {
         }),
     )
     .await;
-    assert_eq!(offset_preview["row_count"], 1, "the row parses: {offset_preview}");
+    assert_eq!(
+        offset_preview["row_count"], 1,
+        "the row parses: {offset_preview}"
+    );
     let earliest = offset_preview["earliest"]
         .as_str()
         .unwrap_or_else(|| panic!("the preview reports the earliest instant: {offset_preview}"));

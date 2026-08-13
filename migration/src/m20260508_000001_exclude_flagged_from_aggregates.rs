@@ -9,16 +9,32 @@ impl MigrationTrait for Migration {
         let db = manager.get_connection();
 
         // Remove refresh policies before dropping views
-        db.execute_unprepared("SELECT remove_continuous_aggregate_policy('readings_monthly', if_exists => true)").await?;
-        db.execute_unprepared("SELECT remove_continuous_aggregate_policy('readings_weekly', if_exists => true)").await?;
-        db.execute_unprepared("SELECT remove_continuous_aggregate_policy('readings_daily', if_exists => true)").await?;
-        db.execute_unprepared("SELECT remove_continuous_aggregate_policy('readings_hourly', if_exists => true)").await?;
+        db.execute_unprepared(
+            "SELECT remove_continuous_aggregate_policy('readings_monthly', if_exists => true)",
+        )
+        .await?;
+        db.execute_unprepared(
+            "SELECT remove_continuous_aggregate_policy('readings_weekly', if_exists => true)",
+        )
+        .await?;
+        db.execute_unprepared(
+            "SELECT remove_continuous_aggregate_policy('readings_daily', if_exists => true)",
+        )
+        .await?;
+        db.execute_unprepared(
+            "SELECT remove_continuous_aggregate_policy('readings_hourly', if_exists => true)",
+        )
+        .await?;
 
         // Drop in reverse dependency order
-        db.execute_unprepared("DROP MATERIALIZED VIEW IF EXISTS readings_monthly CASCADE").await?;
-        db.execute_unprepared("DROP MATERIALIZED VIEW IF EXISTS readings_weekly CASCADE").await?;
-        db.execute_unprepared("DROP MATERIALIZED VIEW IF EXISTS readings_daily CASCADE").await?;
-        db.execute_unprepared("DROP MATERIALIZED VIEW IF EXISTS readings_hourly CASCADE").await?;
+        db.execute_unprepared("DROP MATERIALIZED VIEW IF EXISTS readings_monthly CASCADE")
+            .await?;
+        db.execute_unprepared("DROP MATERIALIZED VIEW IF EXISTS readings_weekly CASCADE")
+            .await?;
+        db.execute_unprepared("DROP MATERIALIZED VIEW IF EXISTS readings_daily CASCADE")
+            .await?;
+        db.execute_unprepared("DROP MATERIALIZED VIEW IF EXISTS readings_hourly CASCADE")
+            .await?;
 
         // Recreate with is_flagged filter
         db.execute_unprepared(
@@ -145,15 +161,31 @@ impl MigrationTrait for Migration {
         let db = manager.get_connection();
 
         // Remove policies, drop, and recreate without is_flagged filter
-        db.execute_unprepared("SELECT remove_continuous_aggregate_policy('readings_monthly', if_exists => true)").await?;
-        db.execute_unprepared("SELECT remove_continuous_aggregate_policy('readings_weekly', if_exists => true)").await?;
-        db.execute_unprepared("SELECT remove_continuous_aggregate_policy('readings_daily', if_exists => true)").await?;
-        db.execute_unprepared("SELECT remove_continuous_aggregate_policy('readings_hourly', if_exists => true)").await?;
+        db.execute_unprepared(
+            "SELECT remove_continuous_aggregate_policy('readings_monthly', if_exists => true)",
+        )
+        .await?;
+        db.execute_unprepared(
+            "SELECT remove_continuous_aggregate_policy('readings_weekly', if_exists => true)",
+        )
+        .await?;
+        db.execute_unprepared(
+            "SELECT remove_continuous_aggregate_policy('readings_daily', if_exists => true)",
+        )
+        .await?;
+        db.execute_unprepared(
+            "SELECT remove_continuous_aggregate_policy('readings_hourly', if_exists => true)",
+        )
+        .await?;
 
-        db.execute_unprepared("DROP MATERIALIZED VIEW IF EXISTS readings_monthly CASCADE").await?;
-        db.execute_unprepared("DROP MATERIALIZED VIEW IF EXISTS readings_weekly CASCADE").await?;
-        db.execute_unprepared("DROP MATERIALIZED VIEW IF EXISTS readings_daily CASCADE").await?;
-        db.execute_unprepared("DROP MATERIALIZED VIEW IF EXISTS readings_hourly CASCADE").await?;
+        db.execute_unprepared("DROP MATERIALIZED VIEW IF EXISTS readings_monthly CASCADE")
+            .await?;
+        db.execute_unprepared("DROP MATERIALIZED VIEW IF EXISTS readings_weekly CASCADE")
+            .await?;
+        db.execute_unprepared("DROP MATERIALIZED VIEW IF EXISTS readings_daily CASCADE")
+            .await?;
+        db.execute_unprepared("DROP MATERIALIZED VIEW IF EXISTS readings_hourly CASCADE")
+            .await?;
 
         db.execute_unprepared(
             r#"

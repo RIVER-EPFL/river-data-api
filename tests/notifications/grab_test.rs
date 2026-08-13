@@ -34,7 +34,14 @@ async fn grab_records_a_sample() {
     crate::common::seed_test_data(&db).await;
     let (_app, state) = crate::common::build_test_app_with_state(db.clone());
 
-    let reply = commands::grab(&state, &AccessScope::Unrestricted, "upstream turbidity 12.3", Some("alice"), 99).await;
+    let reply = commands::grab(
+        &state,
+        &AccessScope::Unrestricted,
+        "upstream turbidity 12.3",
+        Some("alice"),
+        99,
+    )
+    .await;
     assert!(reply.contains("Recorded 1"), "reply: {reply}");
     assert_eq!(spot_count(&db, 12.3).await, 1, "a spot reading was written");
 }
@@ -47,7 +54,14 @@ async fn grab_records_replicates() {
     crate::common::seed_test_data(&db).await;
     let (_app, state) = crate::common::build_test_app_with_state(db.clone());
 
-    let reply = commands::grab(&state, &AccessScope::Unrestricted, "upstream turbidity 10 11 12", Some("alice"), 99).await;
+    let reply = commands::grab(
+        &state,
+        &AccessScope::Unrestricted,
+        "upstream turbidity 10 11 12",
+        Some("alice"),
+        99,
+    )
+    .await;
     assert!(reply.contains("Recorded 3"), "reply: {reply}");
     assert_eq!(spot_count(&db, 10.0).await, 1);
     assert_eq!(spot_count(&db, 11.0).await, 1);
@@ -62,7 +76,14 @@ async fn grab_rejects_unknown_site() {
     crate::common::seed_test_data(&db).await;
     let (_app, state) = crate::common::build_test_app_with_state(db.clone());
 
-    let reply = commands::grab(&state, &AccessScope::Unrestricted, "nosuchplace turbidity 5", Some("alice"), 99).await;
+    let reply = commands::grab(
+        &state,
+        &AccessScope::Unrestricted,
+        "nosuchplace turbidity 5",
+        Some("alice"),
+        99,
+    )
+    .await;
     assert!(reply.contains("No site matches"), "reply: {reply}");
 }
 
@@ -74,6 +95,13 @@ async fn grab_rejects_non_numeric_value() {
     crate::common::seed_test_data(&db).await;
     let (_app, state) = crate::common::build_test_app_with_state(db.clone());
 
-    let reply = commands::grab(&state, &AccessScope::Unrestricted, "upstream turbidity oops", Some("alice"), 99).await;
+    let reply = commands::grab(
+        &state,
+        &AccessScope::Unrestricted,
+        "upstream turbidity oops",
+        Some("alice"),
+        99,
+    )
+    .await;
     assert!(reply.contains("not a number"), "reply: {reply}");
 }

@@ -1,14 +1,17 @@
 pub mod config;
-pub mod version;
 pub mod private;
 pub mod public;
 pub mod public_api;
 pub mod service;
+pub mod version;
 
 pub use crate::common::cache;
 
 use axum::{Router, http::StatusCode, middleware, response::Response, routing::get};
-use sea_orm::{Condition, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Statement, sea_query::Expr};
+use sea_orm::{
+    Condition, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Statement,
+    sea_query::Expr,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceBuilder;
@@ -27,8 +30,8 @@ use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
 use crate::common::AppState;
-use crate::routes::private::{projects as projects_entity, sites as sites_entity};
 use crate::error::{AppError, AppResult};
+use crate::routes::private::{projects as projects_entity, sites as sites_entity};
 
 /// Liveness probe, returns 200 if the process is running.
 #[utoipa::path(
@@ -53,9 +56,7 @@ async fn healthz() -> StatusCode {
     ),
     tag = "health"
 )]
-async fn readyz(
-    axum::extract::State(state): axum::extract::State<AppState>,
-) -> StatusCode {
+async fn readyz(axum::extract::State(state): axum::extract::State<AppState>) -> StatusCode {
     let result = state
         .db
         .query_one(Statement::from_string(
@@ -160,7 +161,6 @@ pub fn validate_optional_time_range(
     }
     Ok(())
 }
-
 
 #[derive(OpenApi)]
 #[openapi(
@@ -576,10 +576,8 @@ pub fn build_router(state: AppState) -> Router {
                 .allow_headers(tower_http::cors::Any)
                 .expose_headers([axum::http::header::CONTENT_RANGE])
         } else {
-            let allowed: Vec<axum::http::HeaderValue> = origins
-                .iter()
-                .filter_map(|o| o.parse().ok())
-                .collect();
+            let allowed: Vec<axum::http::HeaderValue> =
+                origins.iter().filter_map(|o| o.parse().ok()).collect();
             tracing::info!(origins = ?origins, "CORS: restricted origins");
             CorsLayer::new()
                 .allow_origin(allowed)
@@ -607,7 +605,10 @@ pub fn build_router(state: AppState) -> Router {
     };
 
     let timeout = Duration::from_secs(config.request_timeout_seconds);
-    tracing::info!(timeout_seconds = config.request_timeout_seconds, "Request timeout configured");
+    tracing::info!(
+        timeout_seconds = config.request_timeout_seconds,
+        "Request timeout configured"
+    );
 
     // Combine all routes. The API is versioned at /api/; health and docs stay at root.
     // All sub-routers have state already bound (Router<()>), so the top-level Router is
@@ -673,17 +674,15 @@ async fn request_id_middleware(
 
     request.headers_mut().insert(
         axum::http::HeaderName::from_static("x-request-id"),
-        axum::http::HeaderValue::from_str(&request_id).unwrap_or_else(|_| {
-            axum::http::HeaderValue::from_static("unknown")
-        }),
+        axum::http::HeaderValue::from_str(&request_id)
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("unknown")),
     );
 
     let mut response = next.run(request).await;
     if let Ok(val) = axum::http::HeaderValue::from_str(&request_id) {
-        response.headers_mut().insert(
-            axum::http::HeaderName::from_static("x-request-id"),
-            val,
-        );
+        response
+            .headers_mut()
+            .insert(axum::http::HeaderName::from_static("x-request-id"), val);
     }
     response
 }

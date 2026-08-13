@@ -252,9 +252,13 @@ pub async fn adopt_sensor(
         "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
     ))
     .await?;
-    let (site_parameter_id, site_parameter_created) =
-        resolve_or_create_site_parameter(&txn, payload.site_id, parameter_id, payload.create_site_parameter)
-            .await?;
+    let (site_parameter_id, site_parameter_created) = resolve_or_create_site_parameter(
+        &txn,
+        payload.site_id,
+        parameter_id,
+        payload.create_site_parameter,
+    )
+    .await?;
 
     // Auto-recall this sensor's currently-open deployment FOR THIS PARAMETER at the new start (twin of
     // the sensor_deployments before_create hook). Scoped to the parameter so adopting one channel of a
@@ -496,7 +500,11 @@ pub async fn swap_sensors(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE sensor_deployments SET deployed_until = $1
           WHERE sensor_id = $2 AND parameter_id = $3 AND deployed_until IS NULL",
-        [at.into(), payload.incoming_sensor_id.into(), parameter_id.into()],
+        [
+            at.into(),
+            payload.incoming_sensor_id.into(),
+            parameter_id.into(),
+        ],
     ))
     .await?;
 

@@ -23,12 +23,15 @@ const CSV: &str = "DateTime,Dissolved_O2,DO_Temperature\n\
 2025-06-01 00:10:00,300,12.5\n";
 
 async fn scalar_i64(db: &DatabaseConnection, sql: &str) -> i64 {
-    db.query_one(Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.to_string()))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get::<i64>("", "n")
-        .unwrap()
+    db.query_one(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql.to_string(),
+    ))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get::<i64>("", "n")
+    .unwrap()
 }
 
 async fn poll_count(db: &DatabaseConnection, sql: &str, want: i64, max_secs: u64) -> i64 {
@@ -55,7 +58,9 @@ async fn csv_import_runs_on_worker_and_clears_staging() {
     )
     .await;
     assert_eq!(status, 200, "import ({status}): {resp}");
-    let job_id = resp["derived_job_id"].as_str().expect("a worker job id is returned");
+    let job_id = resp["derived_job_id"]
+        .as_str()
+        .expect("a worker job id is returned");
 
     // The handler stages the rows; the worker reads them back. (Two parameters x two rows = 4 rows.)
     // It races with the background worker, so just assert the readings land and staging is drained.
@@ -69,16 +74,16 @@ async fn csv_import_runs_on_worker_and_clears_staging() {
         10,
     )
     .await;
-    assert_eq!(readings, 4, "all four staged readings should be inserted by the worker");
+    assert_eq!(
+        readings, 4,
+        "all four staged readings should be inserted by the worker"
+    );
 
-    let staging_left = poll_count(
-        &db,
-        "SELECT count(*) AS n FROM csv_import_staging",
-        0,
-        10,
-    )
-    .await;
-    assert_eq!(staging_left, 0, "the worker deletes its staged rows on completion");
+    let staging_left = poll_count(&db, "SELECT count(*) AS n FROM csv_import_staging", 0, 10).await;
+    assert_eq!(
+        staging_left, 0,
+        "the worker deletes its staged rows on completion"
+    );
 
     let row = db
         .query_one(Statement::from_string(
@@ -89,7 +94,10 @@ async fn csv_import_runs_on_worker_and_clears_staging() {
         .unwrap()
         .unwrap();
     let job_status: String = row.try_get("", "status").unwrap();
-    assert_eq!(job_status, "completed", "the csv_import job reaches completed");
+    assert_eq!(
+        job_status, "completed",
+        "the csv_import job reaches completed"
+    );
 }
 
 const CSV_DUP_TS: &str = "DateTime,Dissolved_O2,DO_Temperature\n\
@@ -97,12 +105,15 @@ const CSV_DUP_TS: &str = "DateTime,Dissolved_O2,DO_Temperature\n\
 2025-06-01 00:00:00,260,12.5\n";
 
 async fn scalar_f64(db: &DatabaseConnection, sql: &str) -> f64 {
-    db.query_one(Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.to_string()))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get::<f64>("", "v")
-        .unwrap()
+    db.query_one(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql.to_string(),
+    ))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get::<f64>("", "v")
+    .unwrap()
 }
 
 #[tokio::test]
@@ -125,11 +136,15 @@ async fn csv_import_duplicate_timestamps_become_replicates() {
     )
     .await;
     assert_eq!(status, 200, "import ({status}): {resp}");
-    let job_id = resp["derived_job_id"].as_str().expect("a worker job id is returned");
+    let job_id = resp["derived_job_id"]
+        .as_str()
+        .expect("a worker job id is returned");
 
-    let staging_left =
-        poll_count(&db, "SELECT count(*) AS n FROM csv_import_staging", 0, 10).await;
-    assert_eq!(staging_left, 0, "staging is drained even with a duplicated timestamp");
+    let staging_left = poll_count(&db, "SELECT count(*) AS n FROM csv_import_staging", 0, 10).await;
+    assert_eq!(
+        staging_left, 0,
+        "staging is drained even with a duplicated timestamp"
+    );
 
     let row = db
         .query_one(Statement::from_string(
@@ -140,7 +155,10 @@ async fn csv_import_duplicate_timestamps_become_replicates() {
         .unwrap()
         .unwrap();
     let job_status: String = row.try_get("", "status").unwrap();
-    assert_eq!(job_status, "completed", "the duplicate-timestamp import completes, not fails");
+    assert_eq!(
+        job_status, "completed",
+        "the duplicate-timestamp import completes, not fails"
+    );
 
     let at_ts = scalar_i64(
         &db,
@@ -164,7 +182,10 @@ async fn csv_import_duplicate_timestamps_become_replicates() {
         ),
     )
     .await;
-    assert!((do_value - 260.0).abs() < 1e-9, "replicates numbered in file order: got {do_value}");
+    assert!(
+        (do_value - 260.0).abs() < 1e-9,
+        "replicates numbered in file order: got {do_value}"
+    );
 
     let sample_mean = scalar_f64(
         &db,
@@ -177,7 +198,10 @@ async fn csv_import_duplicate_timestamps_become_replicates() {
         ),
     )
     .await;
-    assert!((sample_mean - 255.0).abs() < 1e-9, "replicate group formed a sample: got {sample_mean}");
+    assert!(
+        (sample_mean - 255.0).abs() < 1e-9,
+        "replicate group formed a sample: got {sample_mean}"
+    );
 }
 
 #[tokio::test]
@@ -232,7 +256,10 @@ async fn csv_import_recomputes_derived_via_worker() {
         10,
     )
     .await;
-    assert_eq!(derived, 2, "the worker recomputes a derived value per imported timestamp");
+    assert_eq!(
+        derived, 2,
+        "the worker recomputes a derived value per imported timestamp"
+    );
 }
 
 const CSV_TRIPLICATE: &str = "DateTime,Dissolved_O2\n\
@@ -253,7 +280,10 @@ async fn csv_import_triplicate_rows_form_sample_and_reimport_is_idempotent() {
     )
     .await;
     assert_eq!(status, 200, "import ({status}): {resp}");
-    assert_eq!(resp["inserted_total"], 3, "intra-group rows are not reported as duplicates: {resp}");
+    assert_eq!(
+        resp["inserted_total"], 3,
+        "intra-group rows are not reported as duplicates: {resp}"
+    );
     assert_eq!(resp["duplicates"], 0, "{resp}");
 
     let readings = poll_count(
@@ -300,7 +330,10 @@ async fn csv_import_triplicate_rows_form_sample_and_reimport_is_idempotent() {
         ),
     )
     .await;
-    assert!((mean - 110.0).abs() < 1e-9, "trigger populated the sample mean: got {mean}");
+    assert!(
+        (mean - 110.0).abs() < 1e-9,
+        "trigger populated the sample mean: got {mean}"
+    );
 
     let (status, resp) = crate::common::post_json_parse_with_token(
         &app,
@@ -310,8 +343,14 @@ async fn csv_import_triplicate_rows_form_sample_and_reimport_is_idempotent() {
     )
     .await;
     assert_eq!(status, 200, "re-import ({status}): {resp}");
-    assert_eq!(resp["inserted_total"], 0, "re-import inserts nothing: {resp}");
-    assert_eq!(resp["duplicates"], 3, "the whole file overlaps identically: {resp}");
+    assert_eq!(
+        resp["inserted_total"], 0,
+        "re-import inserts nothing: {resp}"
+    );
+    assert_eq!(
+        resp["duplicates"], 3,
+        "the whole file overlaps identically: {resp}"
+    );
 
     let readings_after = scalar_i64(
         &db,

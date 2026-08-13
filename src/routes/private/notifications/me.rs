@@ -104,16 +104,29 @@ async fn load(state: &AppState, auth: &AuthContext, sub: &str) -> AppResult<MyNo
     let telegram = match tg_row {
         Some(r) => {
             let chat_id: Option<i64> = r.try_get("", "telegram_chat_id").ok().flatten();
-            let expires: Option<DateTime<Utc>> = r.try_get("", "link_code_expires_at").ok().flatten();
+            let expires: Option<DateTime<Utc>> =
+                r.try_get("", "link_code_expires_at").ok().flatten();
             if chat_id.is_some() {
-                TelegramLink { status: "linked", code_expires_at: None }
+                TelegramLink {
+                    status: "linked",
+                    code_expires_at: None,
+                }
             } else if expires.is_some_and(|e| e > Utc::now()) {
-                TelegramLink { status: "pending", code_expires_at: expires }
+                TelegramLink {
+                    status: "pending",
+                    code_expires_at: expires,
+                }
             } else {
-                TelegramLink { status: "unlinked", code_expires_at: None }
+                TelegramLink {
+                    status: "unlinked",
+                    code_expires_at: None,
+                }
             }
         }
-        None => TelegramLink { status: "unlinked", code_expires_at: None },
+        None => TelegramLink {
+            status: "unlinked",
+            code_expires_at: None,
+        },
     };
 
     let sub_rows = state
@@ -197,7 +210,11 @@ pub async fn update_my_notifications(
                  telegram_enabled = COALESCE($3, telegram_enabled), \
                  updated_at = NOW() \
              WHERE keycloak_sub = $1",
-            [sub.clone().into(), req.email_enabled.into(), req.telegram_enabled.into()],
+            [
+                sub.clone().into(),
+                req.email_enabled.into(),
+                req.telegram_enabled.into(),
+            ],
         ))
         .await?;
     Ok(Json(load(&state, &auth, &sub).await?))
@@ -340,7 +357,11 @@ pub async fn mint_my_link_code(
                 (linked_keycloak_sub, link_code, link_code_expires_at, is_active) \
              VALUES ($1, $2, NOW() + ($3 || ' minutes')::interval, TRUE) \
              RETURNING link_code_expires_at",
-            [sub.into(), code.clone().into(), LINK_CODE_TTL_MINUTES.to_string().into()],
+            [
+                sub.into(),
+                code.clone().into(),
+                LINK_CODE_TTL_MINUTES.to_string().into(),
+            ],
         ))
         .await?
         .ok_or_else(|| AppError::Internal("no row returned minting link code".to_string()))?;

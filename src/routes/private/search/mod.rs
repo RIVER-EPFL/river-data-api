@@ -1,4 +1,7 @@
-use axum::{Json, extract::{Query, State}};
+use axum::{
+    Json,
+    extract::{Query, State},
+};
 use sea_orm::{DatabaseBackend, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;

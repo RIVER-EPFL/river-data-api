@@ -4,7 +4,6 @@
 //! Run with: cargo test --test alarm_thresholds
 //! Requires: DATABASE_URL pointing to a TimescaleDB instance.
 
-
 use serial_test::serial;
 
 async fn exec(db: &sea_orm::DatabaseConnection, sql: &str) {
@@ -46,9 +45,7 @@ async fn test_parameter_defaults_trigger_alarms_without_explicit_thresholds() {
 
     let (status, body) = crate::common::get_json_with_token(
         &app,
-        &format!(
-            "/api/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"
-        ),
+        &format!("/api/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"),
         &token,
     )
     .await;
@@ -65,9 +62,7 @@ async fn test_parameter_defaults_trigger_alarms_without_explicit_thresholds() {
     let param_names: Vec<&str> = params.iter().filter_map(|p| p["name"].as_str()).collect();
     let temp_param = params
         .iter()
-        .find(|p| {
-            p["id"].as_str() == Some(crate::common::GLOBAL_PARAM_TEMP_ID)
-        });
+        .find(|p| p["id"].as_str() == Some(crate::common::GLOBAL_PARAM_TEMP_ID));
 
     assert!(
         temp_param.is_some(),
@@ -77,7 +72,10 @@ async fn test_parameter_defaults_trigger_alarms_without_explicit_thresholds() {
     let severities = temp_param.unwrap()["severities"].as_array().unwrap();
     let has_warning = severities.iter().any(|s| s.as_i64() == Some(1));
     let has_alarm = severities.iter().any(|s| s.as_i64() == Some(2));
-    assert!(has_warning, "should have at least one warning-level violation");
+    assert!(
+        has_warning,
+        "should have at least one warning-level violation"
+    );
     assert!(has_alarm, "should have at least one alarm-level violation");
 
     crate::common::cleanup_test_db(&db).await;
@@ -123,9 +121,7 @@ async fn test_explicit_threshold_overrides_parameter_default() {
 
     let (status, body) = crate::common::get_json_with_token(
         &app,
-        &format!(
-            "/api/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"
-        ),
+        &format!("/api/sites/{site_id}/alarms?start=2025-01-15T00:00:00Z&end=2025-01-17T00:00:00Z"),
         &token,
     )
     .await;
@@ -133,9 +129,11 @@ async fn test_explicit_threshold_overrides_parameter_default() {
     assert_eq!(status, 200);
 
     let params = body["parameters"].as_array().unwrap();
-    let temp_param = params
-        .iter()
-        .find(|p| p["name"].as_str().map_or(false, |n| n.contains("temperature")));
+    let temp_param = params.iter().find(|p| {
+        p["name"]
+            .as_str()
+            .map_or(false, |n| n.contains("temperature"))
+    });
 
     assert!(
         temp_param.is_none(),
@@ -171,12 +169,8 @@ async fn test_active_alarms_includes_parameter_default_violations() {
     )
     .await;
 
-    let (status, body) = crate::common::get_json_with_token(
-        &app,
-        "/api/alarms/active",
-        &token,
-    )
-    .await;
+    let (status, body) =
+        crate::common::get_json_with_token(&app, "/api/alarms/active", &token).await;
 
     assert_eq!(status, 200, "response: {body}");
 

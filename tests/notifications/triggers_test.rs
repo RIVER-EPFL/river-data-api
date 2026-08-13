@@ -94,7 +94,8 @@ async fn stale_data_fires_then_recovers() {
     insert_reading(&db, &stream, "NOW() - INTERVAL '10 hours'").await;
 
     let sent = Arc::new(Mutex::new(Vec::new()));
-    let channels: Vec<Box<dyn NotificationChannel>> = vec![Box::new(MockChannel { sent: sent.clone() })];
+    let channels: Vec<Box<dyn NotificationChannel>> =
+        vec![Box::new(MockChannel { sent: sent.clone() })];
     triggers::run(&state, &channels).await;
 
     {
@@ -108,7 +109,10 @@ async fn stale_data_fires_then_recovers() {
     // A second run while still stale must not re-notify.
     sent.lock().unwrap().clear();
     triggers::run(&state, &channels).await;
-    assert!(kinds(&sent.lock().unwrap(), "stale_data").is_empty(), "no re-notify while still stale");
+    assert!(
+        kinds(&sent.lock().unwrap(), "stale_data").is_empty(),
+        "no re-notify while still stale"
+    );
 
     // Data resumes → recovery notice, state cleared.
     insert_reading(&db, &stream, "NOW()").await;
@@ -122,5 +126,9 @@ async fn stale_data_fires_then_recovers() {
             .collect();
         assert_eq!(recovered.len(), 1, "one recovery notice");
     }
-    assert_eq!(stale_state_count(&db).await, 0, "state cleared after recovery");
+    assert_eq!(
+        stale_state_count(&db).await,
+        0,
+        "state cleared after recovery"
+    );
 }

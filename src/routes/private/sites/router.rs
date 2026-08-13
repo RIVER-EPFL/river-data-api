@@ -18,7 +18,9 @@ pub fn service_router(state: &AppState) -> OpenApiRouter {
         .routes(routes!(super::readings::get_site_readings))
         .routes(routes!(super::aggregates::get_site_aggregates))
         .routes(routes!(super::status_events::get_site_status_events))
-        .routes(routes!(crate::routes::private::alarms::views::get_site_alarms))
+        .routes(routes!(
+            crate::routes::private::alarms::views::get_site_alarms
+        ))
         .routes(routes!(super::annotations::get_site_annotations))
         .routes(routes!(super::sensor_vs_grab::get_sensor_vs_grab))
         .routes(routes!(super::sensor_identity::get_site_sensor_identity))

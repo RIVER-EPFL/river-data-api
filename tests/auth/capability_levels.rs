@@ -70,10 +70,12 @@ async fn intern_reads_but_cannot_write() {
     let (s, _) = crate::common::get_with_token(&app, "/api/sites", &jwt).await;
     assert_eq!(s, 200, "intern reads sites");
 
-    let (s, _) = crate::common::post_json_with_token(&app, "/api/notes", &sample_note(), &jwt).await;
+    let (s, _) =
+        crate::common::post_json_with_token(&app, "/api/notes", &sample_note(), &jwt).await;
     assert_eq!(s, 403, "intern cannot write field metadata");
     let batch = serde_json::json!({"readings": []});
-    let (s, _) = crate::common::post_json_with_token(&app, "/api/readings/batch", &batch, &jwt).await;
+    let (s, _) =
+        crate::common::post_json_with_token(&app, "/api/readings/batch", &batch, &jwt).await;
     assert_eq!(s, 403, "intern cannot write data");
 }
 
@@ -88,14 +90,28 @@ async fn river_writes_data_and_field_metadata_only() {
     grant_project(&db, &keycloak_user_id("river1").await, PROJECT_ID).await;
     let jwt = get_keycloak_jwt("river1", "river1").await;
 
-    let (s, body) = crate::common::post_json_with_token(&app, "/api/notes", &sample_note(), &jwt).await;
-    assert!(passed_auth(s), "river writes field metadata (notes): {s} {body}");
+    let (s, body) =
+        crate::common::post_json_with_token(&app, "/api/notes", &sample_note(), &jwt).await;
+    assert!(
+        passed_auth(s),
+        "river writes field metadata (notes): {s} {body}"
+    );
 
-    let (s, _) =
-        crate::common::post_json_with_token(&app, "/api/parameters", &sample_parameter("river_cap"), &jwt).await;
+    let (s, _) = crate::common::post_json_with_token(
+        &app,
+        "/api/parameters",
+        &sample_parameter("river_cap"),
+        &jwt,
+    )
+    .await;
     assert_eq!(s, 403, "river cannot write the catalog");
-    let (s, _) =
-        crate::common::post_json_with_token(&app, "/api/sensor_deployments", &sample_deployment(), &jwt).await;
+    let (s, _) = crate::common::post_json_with_token(
+        &app,
+        "/api/sensor_deployments",
+        &sample_deployment(),
+        &jwt,
+    )
+    .await;
     assert_eq!(s, 403, "river cannot manage sensors");
     let (s, _) = crate::common::get_with_token(&app, "/api/tokens", &jwt).await;
     assert_eq!(s, 403, "river cannot reach admin surfaces");
@@ -110,16 +126,34 @@ async fn manager_writes_catalog_and_sensors_but_not_admin() {
     grant_project(&db, &keycloak_user_id("manager1").await, PROJECT_ID).await;
     let jwt = get_keycloak_jwt("manager1", "manager1").await;
 
-    let (s, body) =
-        crate::common::post_json_with_token(&app, "/api/site_parameters", &sample_site_parameter(), &jwt).await;
-    assert!(passed_auth(s), "manager assigns parameters to sites: {s} {body}");
-    let (s, body) =
-        crate::common::post_json_with_token(&app, "/api/sensor_deployments", &sample_deployment(), &jwt).await;
+    let (s, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/site_parameters",
+        &sample_site_parameter(),
+        &jwt,
+    )
+    .await;
+    assert!(
+        passed_auth(s),
+        "manager assigns parameters to sites: {s} {body}"
+    );
+    let (s, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/sensor_deployments",
+        &sample_deployment(),
+        &jwt,
+    )
+    .await;
     assert!(passed_auth(s), "manager manages sensors: {s} {body}");
 
     // The global parameter list is Administrator-managed, a manager cannot add a global parameter.
-    let (s, _) =
-        crate::common::post_json_with_token(&app, "/api/parameters", &sample_parameter("mgr_cap"), &jwt).await;
+    let (s, _) = crate::common::post_json_with_token(
+        &app,
+        "/api/parameters",
+        &sample_parameter("mgr_cap"),
+        &jwt,
+    )
+    .await;
     assert_eq!(s, 403, "manager cannot write the global catalog");
     let (s, _) = crate::common::get_with_token(&app, "/api/tokens", &jwt).await;
     assert_eq!(s, 403, "manager cannot reach admin token surface");
@@ -136,7 +170,12 @@ async fn admin_reaches_everything() {
 
     let (s, _) = crate::common::get_with_token(&app, "/api/tokens", &jwt).await;
     assert_eq!(s, 200, "admin reaches the token surface");
-    let (s, body) =
-        crate::common::post_json_with_token(&app, "/api/parameters", &sample_parameter("adm_cap"), &jwt).await;
+    let (s, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/parameters",
+        &sample_parameter("adm_cap"),
+        &jwt,
+    )
+    .await;
     assert!(passed_auth(s), "admin writes the catalog: {s} {body}");
 }

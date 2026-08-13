@@ -49,7 +49,9 @@ pub async fn retag_frequency(
     Json(req): Json<RetagFrequencyRequest>,
 ) -> AppResult<Json<RetagFrequencyResponse>> {
     if req.sensor_ids.is_empty() {
-        return Err(AppError::BadRequest("sensor_ids must not be empty".to_string()));
+        return Err(AppError::BadRequest(
+            "sensor_ids must not be empty".to_string(),
+        ));
     }
     // A never-deployed instrument belongs to no project, so it stays reachable as inventory;
     // one deployed only outside the caller's grants does not.
@@ -73,13 +75,20 @@ pub async fn retag_frequency(
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE sensors SET data_frequency = $1 WHERE id = ANY($2)",
-            [req.data_frequency.clone().into(), req.sensor_ids.clone().into()],
+            [
+                req.data_frequency.clone().into(),
+                req.sensor_ids.clone().into(),
+            ],
         ))
         .await?
         .rows_affected();
 
     let job_id = if req.retag_existing {
-        let target = if req.data_frequency == "low" { "spot" } else { "continuous" };
+        let target = if req.data_frequency == "low" {
+            "spot"
+        } else {
+            "continuous"
+        };
         crate::routes::private::reprocessing_jobs::worker::enqueue(
             &state.db,
             "measurement_retag",

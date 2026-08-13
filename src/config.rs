@@ -267,7 +267,7 @@ impl Config {
                 .unwrap_or_else(|_| "5".to_string())
                 .parse()
                 .unwrap_or(5), // 5s default, tight revocation/expiry window, negligible DB load
-                               // (expiry is re-checked every request; revoke/rotate bust the cache)
+            // (expiry is re-checked every request; revoke/rotate bust the cache)
             grants_cache_ttl_seconds: env::var("GRANTS_CACHE_TTL_SECONDS")
                 .unwrap_or_else(|_| "30".to_string())
                 .parse()
@@ -416,7 +416,9 @@ impl Config {
                 .parse()
                 .unwrap_or(60),
 
-            telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN").ok().filter(|s| !s.is_empty()),
+            telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
             telegram_bot_username: env::var("TELEGRAM_BOT_USERNAME")
                 .ok()
                 .map(|s| s.trim().trim_start_matches('@').to_string())
@@ -439,7 +441,9 @@ impl Config {
             smtp_from: env::var("SMTP_FROM").ok().filter(|s| !s.is_empty()),
             graph_tenant_id: env::var("GRAPH_TENANT_ID").ok().filter(|s| !s.is_empty()),
             graph_client_id: env::var("GRAPH_CLIENT_ID").ok().filter(|s| !s.is_empty()),
-            graph_client_secret: env::var("GRAPH_CLIENT_SECRET").ok().filter(|s| !s.is_empty()),
+            graph_client_secret: env::var("GRAPH_CLIENT_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty()),
             graph_sender: env::var("GRAPH_SENDER").ok().filter(|s| !s.is_empty()),
             alert_email_to: env::var("ALERT_EMAIL_TO").ok().filter(|s| !s.is_empty()),
             notify_poll_interval_seconds: env::var("NOTIFY_POLL_INTERVAL_SECONDS")
@@ -470,7 +474,9 @@ impl Config {
                 .unwrap_or_else(|_| "false".to_string())
                 .parse()
                 .unwrap_or(false),
-            dashboard_base_url: env::var("DASHBOARD_BASE_URL").ok().filter(|s| !s.is_empty()),
+            dashboard_base_url: env::var("DASHBOARD_BASE_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
         })
     }
 
@@ -485,4 +491,3 @@ pub enum ConfigError {
     #[error("Missing required environment variable: {0}")]
     Missing(&'static str),
 }
-
