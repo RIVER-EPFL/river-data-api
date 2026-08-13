@@ -63,6 +63,9 @@ jobs:
           TEST_KEYCLOAK_CLIENT_ID: river-data-ui-local
           # Without this a Keycloak-gated test skips silently, and a skip reports as a pass.
           REQUIRE_KEYCLOAK: "1"
+          # libtest sizes its threads from this (2 MB default). The unoptimised `e2e` binary needs
+          # 3-4 MB, measured, and aborts with SIGABRT below that, taking the rest of the run with it.
+          RUST_MIN_STACK: "16777216"
         run: cargo test --tests -- --test-threads=1
 
       - name: Keycloak logs on failure
