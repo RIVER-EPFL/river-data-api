@@ -602,8 +602,10 @@ async fn resolve_scope_project(
             .await;
             return require_any(projects, "calibration");
         }
-        // A standard curve belongs to an instrument, so it spans the same project set as the
-        // instrument's calibrations and is scoped the same way.
+        // A standard curve belongs to an instrument, so it spans the project set that instrument
+        // has been deployed to. A bench instrument is deployed nowhere, which is why the empty
+        // resolution reads as no project dimension rather than as a denial; see
+        // [`require_any_or_unbound`].
         if entity == "standard_curves" {
             let projects = distinct_projects(
                 db,
@@ -613,7 +615,7 @@ async fn resolve_scope_project(
                 uuid,
             )
             .await;
-            return require_any(projects, "standard curve");
+            return require_any_or_unbound(projects, "standard curve");
         }
         let sql = match entity {
             "sites" => "SELECT project_id FROM sites WHERE id = $1",
@@ -728,7 +730,7 @@ async fn resolve_scope_project(
             None => ScopeOutcome::Unresolved("Calibration create must specify sensor_id".to_string()),
         },
         "standard_curves" => match fk("sensor_id") {
-            Some(sensor) => require_any(
+            Some(sensor) => require_any_or_unbound(
                 distinct_projects(
                     db,
                     "SELECT DISTINCT s.project_id FROM sensor_deployments d \
@@ -774,6 +776,26 @@ fn require_all(projects: Vec<Uuid>) -> ScopeOutcome {
 fn require_any(projects: Vec<Uuid>, what: &str) -> ScopeOutcome {
     if projects.is_empty() {
         ScopeOutcome::Unresolved(format!("This {what} is not within your project access"))
+    } else {
+        ScopeOutcome::RequireAny(projects)
+    }
+}
+
+/// As [`require_any`], but treating "resolves to no project" as no project dimension rather than as
+/// a failed resolution.
+///
+/// Deployment-derived scope answers "which sites has this instrument stood at", and for a lab
+/// instrument the answer is none: it is bench equipment shared across projects and is never
+/// deployed. Failing closed there would make the entity uncreatable for exactly the population it
+/// describes, rather than protecting a boundary, because an instrument bound to no project has no
+/// boundary to cross. `sensors` itself is already global catalog for the same reason. A project
+/// scoped token is still refused, and the caller's role still governs, so the level split between a
+/// curve and the windowed calibration beside it is unaffected.
+fn require_any_or_unbound(projects: Vec<Uuid>, what: &str) -> ScopeOutcome {
+    if projects.is_empty() {
+        ScopeOutcome::Global(format!(
+            "Project-scoped token cannot create a {what} on an instrument bound to no project"
+        ))
     } else {
         ScopeOutcome::RequireAny(projects)
     }
