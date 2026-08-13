@@ -572,6 +572,71 @@ pub async fn assign_roles(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
+/// Outcome of the startup realm check. `Missing` is authoritative (Keycloak answered, and the
+/// roles are not there); `Unavailable` means the realm could not be asked, which is retryable.
+#[derive(Debug)]
+pub enum RealmRoleCheck {
+    Satisfied,
+    Missing(Vec<&'static str>),
+    Unavailable(String),
+}
+
+/// The `RIVER_ROLE_NAMES` absent from a realm's role list.
+fn missing_role_names(present: &[String]) -> Vec<&'static str> {
+    RIVER_ROLE_NAMES
+        .into_iter()
+        .filter(|want| !present.iter().any(|have| have == want))
+        .collect()
+}
+
+/// Ask the realm which roles exist. Every level in `RIVER_ROLE_NAMES` must be present, otherwise
+/// users of that level authenticate but resolve to level 0 and are refused at the door, and the
+/// role picker silently offers fewer levels than the authorization matrix defines. Neither
+/// failure is visible from inside a running API, so it is checked once at startup.
+pub async fn check_realm_roles(state: &AppState) -> RealmRoleCheck {
+    let token = match get_admin_token(state).await {
+        Ok(t) => t,
+        Err(e) => return RealmRoleCheck::Unavailable(format!("admin token request failed: {e}")),
+    };
+    let (client, base) = match (admin_client(state), admin_base_url(state)) {
+        (Ok(c), Ok(b)) => (c, b),
+        _ => return RealmRoleCheck::Unavailable("Keycloak admin not configured".to_string()),
+    };
+
+    let resp = match client
+        .http_client
+        .get(format!("{base}/roles"))
+        .bearer_auth(&token)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return RealmRoleCheck::Unavailable(format!("realm roles request failed: {e}")),
+    };
+
+    // A 403 here means the service account lacks `view-realm`. That is a misconfiguration rather
+    // than an outage, but it is reported as unavailable because the roles themselves are unknown:
+    // refusing to start on an unverifiable realm is the same call either way.
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return RealmRoleCheck::Unavailable(format!(
+            "realm roles request failed ({status}): {body}"
+        ));
+    }
+
+    let roles: Vec<KeycloakRole> = match resp.json().await {
+        Ok(r) => r,
+        Err(e) => return RealmRoleCheck::Unavailable(format!("failed to parse realm roles: {e}")),
+    };
+
+    let present: Vec<String> = roles.into_iter().map(|r| r.name).collect();
+    match missing_role_names(&present) {
+        m if m.is_empty() => RealmRoleCheck::Satisfied,
+        m => RealmRoleCheck::Missing(m),
+    }
+}
+
 /// List the Keycloak riverdata access roles (`riverdata-admin` / `-manager` / `-river` / `-intern`).
 /// Used by the UI's role-assignment picker. Requires `require_admin`.
 #[utoipa::path(
@@ -919,4 +984,42 @@ pub fn router() -> Router<AppState> {
         .route("/{id}", get(get_user).put(update_user).delete(delete_user))
         .route("/{id}/roles", axum::routing::post(assign_roles))
         .route("/{id}/grants", get(list_user_grants).put(set_user_grants))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::missing_role_names;
+
+    fn owned(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn full_realm_is_satisfied() {
+        let present = owned(&[
+            "riverdata-admin",
+            "riverdata-manager",
+            "riverdata-river",
+            "riverdata-intern",
+        ]);
+        assert!(missing_role_names(&present).is_empty());
+    }
+
+    /// Scenario: the RIVER realm predating the four access levels, carrying the retired
+    /// `riverdata-user` role.
+    /// Expected behaviour: the three levels it never had are reported, and `riverdata-user`
+    /// does not stand in for any of them.
+    #[test]
+    fn legacy_two_role_realm_reports_the_three_absent_levels() {
+        let present = owned(&["riverdata-admin", "riverdata-user", "admin"]);
+        assert_eq!(
+            missing_role_names(&present),
+            vec!["riverdata-manager", "riverdata-river", "riverdata-intern"]
+        );
+    }
+
+    #[test]
+    fn empty_realm_reports_every_level() {
+        assert_eq!(missing_role_names(&[]).len(), 4);
+    }
 }

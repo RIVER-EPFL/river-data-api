@@ -52,6 +52,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Database connection pool established"
     );
 
+    // Preflight. Every external service this process depends on is proven reachable and correctly
+    // configured here, before the first thing that mutates state. The database is proven by the
+    // pool above; Keycloak is proven below. Migrations run only once both are good, so a
+    // deployment that cannot possibly serve does not leave schema changes behind on its way out.
+
+    // Initialize Keycloak authentication (optional in dev, required in prod)
+    let keycloak_instance =
+        if let (Some(url), Some(realm)) = (&config.keycloak_url, &config.keycloak_realm) {
+            tracing::info!(url = %url, realm = %realm, "Initializing Keycloak authentication");
+            Some(Arc::new(KeycloakAuthInstance::new(
+                KeycloakConfig::builder()
+                    .server(Url::parse(url).expect("Invalid KEYCLOAK_URL"))
+                    .realm(realm.clone())
+                    .build(),
+            )))
+        } else {
+            if matches!(config.deployment, Deployment::Prod) {
+                panic!(
+                    "SECURITY ERROR: Keycloak authentication is required in production. \
+                 Configure KEYCLOAK_URL and KEYCLOAK_REALM environment variables."
+                );
+            }
+            tracing::warn!("Keycloak authentication NOT configured, admin routes unprotected");
+            None
+        };
+
+    let state = AppState::new(db.clone(), config.clone(), keycloak_instance);
+
+    verify_keycloak_realm_roles(&state).await;
+
     use sea_orm::ConnectionTrait;
 
     // Run migrations under a cross-replica advisory lock. With 2-3 replicas booting together,
@@ -104,29 +134,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(n) => tracing::info!(reclaimed = n, "Reaped orphaned in-process jobs on startup"),
         Err(e) => tracing::warn!(error = %e, "Startup orphaned-job reconcile failed"),
     }
-
-    // Initialize Keycloak authentication (optional in dev, required in prod)
-    let keycloak_instance =
-        if let (Some(url), Some(realm)) = (&config.keycloak_url, &config.keycloak_realm) {
-            tracing::info!(url = %url, realm = %realm, "Initializing Keycloak authentication");
-            Some(Arc::new(KeycloakAuthInstance::new(
-                KeycloakConfig::builder()
-                    .server(Url::parse(url).expect("Invalid KEYCLOAK_URL"))
-                    .realm(realm.clone())
-                    .build(),
-            )))
-        } else {
-            if matches!(config.deployment, Deployment::Prod) {
-                panic!(
-                    "SECURITY ERROR: Keycloak authentication is required in production. \
-                 Configure KEYCLOAK_URL and KEYCLOAK_REALM environment variables."
-                );
-            }
-            tracing::warn!("Keycloak authentication NOT configured, admin routes unprotected");
-            None
-        };
-
-    let state = AppState::new(db.clone(), config.clone(), keycloak_instance);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
@@ -270,6 +277,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Server shut down gracefully");
     Ok(())
+}
+
+/// How long to keep asking an unreachable realm before giving up. Keycloak is an external service
+/// that can boot after this process (or be briefly unreachable), so the check tolerates silence for
+/// a while; it does not tolerate an answer.
+const REALM_CHECK_ATTEMPTS: u32 = 12;
+const REALM_CHECK_DELAY: Duration = Duration::from_secs(5);
+
+/// Refuse to serve unless the realm carries every `riverdata-*` access level.
+///
+/// The API cannot authenticate anyone without Keycloak, so starting while the realm is unusable
+/// only converts a clear startup failure into per-request failures later. A realm missing a level
+/// is worse than unreachable: it is silent. Users of that level authenticate and resolve to level
+/// 0, and `list_roles` filters the absent names out of the picker, so nothing in a running system
+/// reports the gap.
+async fn verify_keycloak_realm_roles(state: &AppState) {
+    use river_db::routes::private::admin::users::{RealmRoleCheck, check_realm_roles};
+
+    if state.config.keycloak_url.is_none() || state.config.keycloak_realm.is_none() {
+        return;
+    }
+    // The admin proxy is optional (`KEYCLOAK_ADMIN_CLIENT_ID`/`_SECRET`), and listing realm roles
+    // needs it. Opting out of user management is a deployment choice, not Keycloak failing, so it
+    // skips the check rather than blocking startup.
+    if state.keycloak_admin.is_none() {
+        tracing::warn!(
+            "Keycloak admin client not configured; skipping realm role verification. Set \
+             KEYCLOAK_ADMIN_CLIENT_ID and KEYCLOAK_ADMIN_CLIENT_SECRET to enable it."
+        );
+        return;
+    }
+
+    let realm = state.config.keycloak_realm.as_deref().unwrap_or_default();
+
+    for attempt in 1..=REALM_CHECK_ATTEMPTS {
+        match check_realm_roles(state).await {
+            RealmRoleCheck::Satisfied => {
+                tracing::info!(realm, "Keycloak realm roles verified");
+                return;
+            }
+            RealmRoleCheck::Missing(missing) => {
+                panic!(
+                    "CONFIGURATION ERROR: Keycloak realm '{realm}' is missing required riverdata \
+                     roles: {}. Create them as realm roles, otherwise users at those levels are \
+                     refused at login.",
+                    missing.join(", ")
+                );
+            }
+            RealmRoleCheck::Unavailable(reason) if attempt < REALM_CHECK_ATTEMPTS => {
+                tracing::warn!(
+                    realm,
+                    attempt,
+                    of = REALM_CHECK_ATTEMPTS,
+                    reason,
+                    "Could not verify Keycloak realm roles, retrying"
+                );
+                tokio::time::sleep(REALM_CHECK_DELAY).await;
+            }
+            RealmRoleCheck::Unavailable(reason) => {
+                panic!(
+                    "STARTUP ERROR: could not verify Keycloak realm '{realm}' after \
+                     {REALM_CHECK_ATTEMPTS} attempts: {reason}. The API cannot authenticate \
+                     without Keycloak, so it will not serve."
+                );
+            }
+        }
+    }
 }
 
 async fn shutdown_signal() {
