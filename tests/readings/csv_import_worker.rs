@@ -625,3 +625,256 @@ async fn an_imported_grab_uses_the_slot_calibration_it_records() {
         "an import picks no lab curve; that is an operator's choice per measurement"
     );
 }
+
+// ============================================================================
+// Overwrite corrects the measurement, not the correction
+// ============================================================================
+
+const CSV_DO_AT: &str = "DateTime,Dissolved_O2\n2025-06-01 00:00:00,250\n";
+const CSV_DO_CORRECTED: &str = "DateTime,Dissolved_O2\n2025-06-01 00:00:00,400\n";
+
+/// `(raw_value, calibrated_value, calibration_id, standard_curve_id)` at one slot.
+async fn row_at(
+    db: &DatabaseConnection,
+    parameter_id: &str,
+    time: &str,
+) -> (f64, Option<f64>, Option<Uuid>, Option<Uuid>) {
+    let row = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT raw_value, calibrated_value, calibration_id, standard_curve_id \
+                 FROM readings WHERE site_id = '{}' AND parameter_id = '{parameter_id}' \
+                 AND time = '{time}'",
+                crate::common::SITE1_ID
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the slot holds a reading");
+    (
+        row.try_get("", "raw_value").unwrap(),
+        row.try_get("", "calibrated_value").unwrap(),
+        row.try_get("", "calibration_id").unwrap(),
+        row.try_get("", "standard_curve_id").unwrap(),
+    )
+}
+
+async fn import_csv(
+    app: &axum::Router,
+    token: &str,
+    body: &serde_json::Value,
+) -> serde_json::Value {
+    let (status, resp) =
+        crate::common::post_json_parse_with_token(app, "/api/readings/import_csv", body, token)
+            .await;
+    assert_eq!(status, 200, "import ({status}): {resp}");
+    resp
+}
+
+/// Expected behaviour: the corrected measurement is put back through the calibration the row
+/// already carries, even once no deployment covers that instant any more. An import never re-decides
+/// which curve applies, so the reference and the value beside it stay in agreement.
+#[tokio::test]
+#[serial]
+async fn an_overwrite_recomputes_from_the_calibration_the_row_carries() {
+    let (db, app, token) = setup().await;
+
+    let sensor = crate::common::sensor_lifecycle::create_sensor(
+        &db,
+        "Overwrite-probe-01",
+        crate::common::GLOBAL_PARAM_DO_ID,
+    )
+    .await;
+    let calibration = crate::common::sensor_lifecycle::add_calibration(
+        &db,
+        sensor.id,
+        2.0,
+        1.0,
+        crate::common::sensor_lifecycle::dt("2025-01-01T00:00:00Z"),
+    )
+    .await;
+    let deployment = crate::common::sensor_lifecycle::deploy_sensor(
+        &db,
+        sensor.id,
+        crate::common::SITE1_ID,
+        crate::common::sensor_lifecycle::dt("2025-01-01T00:00:00Z"),
+    )
+    .await;
+
+    import_csv(
+        &app,
+        &token,
+        &serde_json::json!({ "site": crate::common::SITE1_ID, "csv": CSV_DO_AT }),
+    )
+    .await;
+    poll_count(
+        &db,
+        &format!(
+            "SELECT count(*) AS n FROM readings WHERE site_id = '{}' \
+             AND parameter_id = '{}' AND time = '2025-06-01T00:00:00Z'",
+            crate::common::SITE1_ID,
+            crate::common::GLOBAL_PARAM_DO_ID
+        ),
+        1,
+        10,
+    )
+    .await;
+
+    let (raw, calibrated, stored_calibration, _) = row_at(
+        &db,
+        crate::common::GLOBAL_PARAM_DO_ID,
+        "2025-06-01T00:00:00Z",
+    )
+    .await;
+    assert_eq!(raw, 250.0);
+    assert_eq!(calibrated, Some(501.0), "2 * 250 + 1");
+    assert_eq!(stored_calibration, Some(calibration));
+
+    // The instrument is recalled before the correction arrives, so window resolution no longer
+    // reaches this instant.
+    crate::common::sensor_lifecycle::end_deployment(
+        &db,
+        deployment,
+        crate::common::sensor_lifecycle::dt("2025-02-01T00:00:00Z"),
+    )
+    .await;
+
+    import_csv(
+        &app,
+        &token,
+        &serde_json::json!({
+            "site": crate::common::SITE1_ID,
+            "csv": CSV_DO_CORRECTED,
+            "conflict": "overwrite",
+        }),
+    )
+    .await;
+    poll_count(
+        &db,
+        &format!(
+            "SELECT count(*) AS n FROM readings WHERE site_id = '{}' \
+             AND parameter_id = '{}' AND time = '2025-06-01T00:00:00Z' AND raw_value = 400",
+            crate::common::SITE1_ID,
+            crate::common::GLOBAL_PARAM_DO_ID
+        ),
+        1,
+        10,
+    )
+    .await;
+
+    let (raw, calibrated, stored_calibration, _) = row_at(
+        &db,
+        crate::common::GLOBAL_PARAM_DO_ID,
+        "2025-06-01T00:00:00Z",
+    )
+    .await;
+    assert_eq!(raw, 400.0, "the correction replaced the measurement");
+    assert_eq!(
+        stored_calibration,
+        Some(calibration),
+        "and left the calibration the row was corrected by"
+    );
+    assert_eq!(
+        calibrated,
+        Some(801.0),
+        "2 * 400 + 1: the corrected value comes from that same calibration"
+    );
+}
+
+/// Expected behaviour: a lab curve is chosen by hand and no window query can recover it, so
+/// correcting the measurement it explains keeps it and recomputes through it.
+#[tokio::test]
+#[serial]
+async fn an_overwritten_grab_keeps_the_lab_curve_it_was_measured_against() {
+    let (db, app, token) = setup().await;
+
+    let sensor_id = "00000000-0000-4000-c000-0000000000a1";
+    let curve_id = "00000000-0000-4000-c000-0000000000b1";
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO sensors (id, name, is_active, is_lab_instrument, created_at) \
+             VALUES ('{sensor_id}', 'Microplate reader', true, true, now())"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO standard_curves (id, sensor_id, slope, intercept, name) \
+             VALUES ('{curve_id}', '{sensor_id}', 3.0, 0.5, 'Plate A')"
+        ),
+    )
+    .await;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID,
+            "readings": [{
+                "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID,
+                "sensor_id": sensor_id,
+                "standard_curve_id": curve_id,
+                "value": 10.0,
+                "time": "2025-07-01T09:00:00Z",
+            }]
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "grab with a lab curve: {body}");
+
+    let (raw, calibrated, _, stored_curve) = row_at(
+        &db,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        "2025-07-01T09:00:00Z",
+    )
+    .await;
+    assert_eq!(raw, 10.0);
+    assert_eq!(calibrated, Some(30.5), "3 * 10 + 0.5");
+    assert_eq!(stored_curve, Some(curve_id.parse::<Uuid>().unwrap()));
+
+    import_csv(
+        &app,
+        &token,
+        &serde_json::json!({
+            "site": crate::common::SITE1_ID,
+            "csv": "DateTime,DO_Temperature\n2025-07-01 09:00:00,20\n",
+            "conflict": "overwrite",
+            "measurement_type": "spot",
+        }),
+    )
+    .await;
+    poll_count(
+        &db,
+        &format!(
+            "SELECT count(*) AS n FROM readings WHERE site_id = '{}' \
+             AND parameter_id = '{}' AND time = '2025-07-01T09:00:00Z' AND raw_value = 20",
+            crate::common::SITE1_ID,
+            crate::common::GLOBAL_PARAM_TEMP_ID
+        ),
+        1,
+        10,
+    )
+    .await;
+
+    let (raw, calibrated, _, stored_curve) = row_at(
+        &db,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        "2025-07-01T09:00:00Z",
+    )
+    .await;
+    assert_eq!(raw, 20.0, "the correction replaced the measurement");
+    assert_eq!(
+        stored_curve,
+        Some(curve_id.parse::<Uuid>().unwrap()),
+        "the operator's curve survives an import that never picked one"
+    );
+    assert_eq!(
+        calibrated,
+        Some(60.5),
+        "3 * 20 + 0.5: recomputed through that curve"
+    );
+}

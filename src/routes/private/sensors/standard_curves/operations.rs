@@ -44,6 +44,20 @@ impl CRUDOperations for StandardCurveOperations {
         Ok(())
     }
 
+    /// One row at a time, through the single-row path, so a bulk edit still meets the rule that a
+    /// curve a reading references is frozen.
+    async fn update_many(
+        &self,
+        db: &DatabaseConnection,
+        updates: Vec<(Uuid, <StandardCurve as crudcrate::CRUDResource>::UpdateModel)>,
+    ) -> Result<Vec<StandardCurve>, ApiError> {
+        let mut updated = Vec::with_capacity(updates.len());
+        for (id, data) in updates {
+            updated.push(self.update(db, id, data).await?);
+        }
+        Ok(updated)
+    }
+
     async fn before_update(
         &self,
         db: &DatabaseConnection,

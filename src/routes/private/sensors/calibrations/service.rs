@@ -153,6 +153,19 @@ pub async fn recompose_spot_readings<C: ConnectionTrait>(
     scope_sql: &str,
     params: Vec<sea_orm::Value>,
 ) -> Result<u64, sea_orm::DbErr> {
+    recompose_from_own_curves(db, "r.measurement_type = 'spot'", scope_sql, params).await
+}
+
+/// Rewrite `calibrated_value` from the curves each row itself names, for a corrected measurement.
+///
+/// `rows_sql` narrows which readings qualify and `scope_sql` selects them as `r` against `params`.
+/// Idempotent, so a scope wider than the rows that changed is safe.
+pub async fn recompose_from_own_curves<C: ConnectionTrait>(
+    db: &C,
+    rows_sql: &str,
+    scope_sql: &str,
+    params: Vec<sea_orm::Value>,
+) -> Result<u64, sea_orm::DbErr> {
     let value = recomposed_value_sql(
         "tgt.raw_value",
         &CurveColumns {
@@ -175,7 +188,7 @@ pub async fn recompose_spot_readings<C: ConnectionTrait>(
           WHERE tgt.stream_id = r.stream_id
             AND tgt.time = r.time
             AND tgt.replicate_index = r.replicate_index
-            AND r.measurement_type = 'spot'
+            AND ({rows_sql})
             AND NOT ({orphaned})
             AND ({scope_sql})",
         orphaned = orphaned_correction_rows("r"),
@@ -188,6 +201,93 @@ pub async fn recompose_spot_readings<C: ConnectionTrait>(
         ))
         .await?;
     Ok(result.rows_affected())
+}
+
+/// Rows a curve-drift sweep can judge: the value is a claim about curves the row names, so a row
+/// naming neither carries nothing to check against.
+#[must_use]
+pub fn corrected_rows(alias: &str) -> String {
+    format!("({alias}.calibration_id IS NOT NULL OR {alias}.standard_curve_id IS NOT NULL)")
+}
+
+/// What a curve-drift sweep moved: the row count and the span those rows cover.
+pub struct CurveDrift {
+    pub moved: u64,
+    pub span: Option<(DateTime<Utc>, DateTime<Utc>)>,
+}
+
+/// Rewrite every corrected reading whose stored value is not what its own curves produce.
+///
+/// Answers self-consistency only, so it needs no window resolution and reaches grabs. A row
+/// attributed to the wrong curve for its timestamp is consistent by this measure and is the
+/// reprocess engines' subject, not this one's. The span is returned for the caller's aggregate
+/// refresh, since a rewritten value leaves the rollups holding the old one.
+pub async fn sweep_curve_drift(db: &DatabaseConnection) -> Result<CurveDrift, sea_orm::DbErr> {
+    let value = recomposed_value_sql(
+        "tgt.raw_value",
+        &CurveColumns {
+            id: "c.id",
+            slope: "c.slope",
+            intercept: "c.intercept",
+        },
+        &CurveColumns {
+            id: "sc.id",
+            slope: "sc.slope",
+            intercept: "sc.intercept",
+        },
+    );
+    let sql = format!(
+        r"WITH drift AS (
+            UPDATE readings tgt
+            SET calibrated_value = {value}
+            FROM readings r
+            LEFT JOIN sensor_calibrations c ON c.id = r.calibration_id
+            LEFT JOIN standard_curves sc ON sc.id = r.standard_curve_id
+            WHERE tgt.stream_id = r.stream_id
+              AND tgt.time = r.time
+              AND tgt.replicate_index = r.replicate_index
+              AND {corrected}
+              AND NOT ({orphaned})
+              AND tgt.calibrated_value IS DISTINCT FROM ({value})
+            RETURNING tgt.time
+          )
+          SELECT count(*) AS moved, min(time) AS lo, max(time) AS hi FROM drift",
+        corrected = corrected_rows("r"),
+        orphaned = orphaned_correction_rows("r"),
+    );
+
+    // Drift in a chunk past the compression policy has to decompress, and the per-statement cap
+    // refuses that outside a transaction lifting it.
+    let txn = <DatabaseConnection as sea_orm::TransactionTrait>::begin(db).await?;
+    txn.execute_unprepared("SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0")
+        .await?;
+    let row = txn
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+        ))
+        .await?;
+    txn.commit().await?;
+
+    let Some(row) = row else {
+        return Ok(CurveDrift {
+            moved: 0,
+            span: None,
+        });
+    };
+    let moved = u64::try_from(row.try_get::<i64>("", "moved").unwrap_or(0)).unwrap_or(0);
+    let lo = row
+        .try_get::<Option<DateTime<Utc>>>("", "lo")
+        .ok()
+        .flatten();
+    let hi = row
+        .try_get::<Option<DateTime<Utc>>>("", "hi")
+        .ok()
+        .flatten();
+    Ok(CurveDrift {
+        moved,
+        span: lo.zip(hi),
+    })
 }
 
 pub fn evaluate_formula(formula: &str, variables: &HashMap<String, f64>) -> Result<f64, String> {

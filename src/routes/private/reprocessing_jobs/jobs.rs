@@ -1006,6 +1006,34 @@ impl CsvImport {
             }
         }
 
+        // An overwrite replaces the measurement, not the correction: an import never decides which
+        // curve applies, so the corrected raw value goes back through the curves already on the row.
+        if conflict == ConflictMode::Overwrite
+            && overlapping > 0
+            && let (Some(first), Some(last)) = (distinct_ts.first(), distinct_ts.last())
+        {
+            let mut stream_ids: Vec<Uuid> = models.iter().map(|m| *m.stream_id.as_ref()).collect();
+            stream_ids.sort_unstable();
+            stream_ids.dedup();
+            let recomposed =
+                crate::routes::private::sensors::calibrations::service::recompose_from_own_curves(
+                    ctx.db(),
+                    "TRUE",
+                    "r.stream_id = ANY($1) AND r.time >= $2 AND r.time <= $3",
+                    vec![
+                        stream_ids.into(),
+                        sea_orm::prelude::DateTimeWithTimeZone::from(*first).into(),
+                        sea_orm::prelude::DateTimeWithTimeZone::from(*last).into(),
+                    ],
+                )
+                .await?;
+            tracing::info!(
+                site = %site_name,
+                recomposed,
+                "CSV overwrite recomposed corrected values from the curves already on the rows"
+            );
+        }
+
         // Samples are found-or-created and stamped after the insert, by the one materialiser, over
         // the streams and the time span this import touched. Scoping it that way rather than to the
         // rows this run inserted is deliberate: a reading already present at a group's slot is part
@@ -1352,7 +1380,39 @@ impl Job for JanitorRun {
             tracing::warn!(error = %e, "Derived janitor: run failed");
         }
 
-        // 2. A full continuous-aggregate refresh opens each `full_refresh_seconds` period and an
+        // 2. Repair corrected readings whose stored value is no longer what their own curves
+        //    produce, whichever route moved them apart. Hooks make that repair immediate; this makes
+        //    it eventual, so a hook that never fired costs staleness rather than a wrong number.
+        //    Refreshed over the span it moved, before the rollups below settle for this tick.
+        let mut recomposed = 0u64;
+        match crate::routes::private::sensors::calibrations::service::sweep_curve_drift(db).await {
+            Ok(drift) if drift.moved > 0 => {
+                recomposed = drift.moved;
+                tracing::info!(moved = drift.moved, "Janitor: recomposed drifted curve values");
+                ctx.log(
+                    "info",
+                    &format!(
+                        "recomposed {} readings whose value had drifted from their curves",
+                        drift.moved
+                    ),
+                    serde_json::json!({}),
+                )
+                .await;
+                if let Some((lo, hi)) = drift.span
+                    && let Err(e) = crate::common::aggregates::refresh(
+                        db,
+                        crate::common::aggregates::Window::Range(lo, hi),
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "Janitor: refresh after curve drift failed");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "Janitor: curve drift sweep failed"),
+        }
+
+        // 3. A full continuous-aggregate refresh opens each `full_refresh_seconds` period and an
         //    incremental one runs otherwise. The tick that carries it is the one whose scheduled
         //    slot falls in the first cadence window of the period, and the cadence is the
         //    `schedules` row's, not the process's: the scheduler stamps both the slot and the
@@ -1397,6 +1457,13 @@ impl Job for JanitorRun {
             operator_retention_days,
             self.maintenance_max_rows,
         )
+        .await;
+
+        // What this tick actually changed, so a run's effect is readable per job rather than only
+        // in its logs.
+        ctx.set_detail(serde_json::json!({
+            "counts": { "recomposed": recomposed, "pruned": pruned, "full_refresh": do_full },
+        }))
         .await;
         Ok(pruned as i64)
     }

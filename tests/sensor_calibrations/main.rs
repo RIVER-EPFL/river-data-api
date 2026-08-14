@@ -7,6 +7,8 @@
 mod common;
 
 mod application_gaps;
+mod bulk_edit_hooks;
+mod curve_drift_sweep;
 mod formula_evaluation;
 mod forward_new_data;
 mod grab_recomposition;
