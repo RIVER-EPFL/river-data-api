@@ -1462,7 +1462,8 @@ impl Job for JanitorRun {
         // What this tick actually changed, so a run's effect is readable per job rather than only
         // in its logs.
         ctx.set_detail(serde_json::json!({
-            "counts": { "recomposed": recomposed, "pruned": pruned, "full_refresh": do_full },
+            "scope": { "full_refresh": do_full },
+            "counts": { "recomposed": recomposed, "pruned": pruned },
         }))
         .await;
         Ok(pruned as i64)

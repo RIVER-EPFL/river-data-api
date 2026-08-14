@@ -754,7 +754,8 @@ async fn an_overwrite_recomputes_from_the_calibration_the_row_carries() {
         &db,
         &format!(
             "SELECT count(*) AS n FROM readings WHERE site_id = '{}' \
-             AND parameter_id = '{}' AND time = '2025-06-01T00:00:00Z' AND raw_value = 400",
+             AND parameter_id = '{}' AND time = '2025-06-01T00:00:00Z' \
+             AND raw_value = 400 AND calibrated_value = 801",
             crate::common::SITE1_ID,
             crate::common::GLOBAL_PARAM_DO_ID
         ),
@@ -851,7 +852,8 @@ async fn an_overwritten_grab_keeps_the_lab_curve_it_was_measured_against() {
         &db,
         &format!(
             "SELECT count(*) AS n FROM readings WHERE site_id = '{}' \
-             AND parameter_id = '{}' AND time = '2025-07-01T09:00:00Z' AND raw_value = 20",
+             AND parameter_id = '{}' AND time = '2025-07-01T09:00:00Z' \
+             AND raw_value = 20 AND calibrated_value = 60.5",
             crate::common::SITE1_ID,
             crate::common::GLOBAL_PARAM_TEMP_ID
         ),

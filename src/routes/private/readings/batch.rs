@@ -475,9 +475,9 @@ pub enum Replace {
     /// The measurement and its classification, ie. an operator or source correction.
     Values,
     /// The measurement plus the row's attribution, ie. a sync re-send that also re-resolves which
-    /// site, parameter, sensor, calibration, standard curve and deployment the row belongs to. The
-    /// standard curve is operator-chosen, so only this mode replaces it; a value-only correction
-    /// leaves it standing.
+    /// site, parameter, sensor, calibration and deployment the row belongs to. The standard curve
+    /// is never among them: it is chosen by hand per measurement and no query can recover it, so a
+    /// re-send that names none leaves the stored one standing.
     ValuesAndAttribution,
 }
 
@@ -520,9 +520,15 @@ pub(crate) fn readings_upsert(replace: Replace) -> sea_orm::sea_query::OnConflic
                     readings::Column::ParameterId,
                     readings::Column::SensorId,
                     readings::Column::CalibrationId,
-                    readings::Column::StandardCurveId,
                     readings::Column::DeploymentId,
                 ]);
+                // A hand-picked curve outlives any correction that does not name one of its own.
+                clause.value(
+                    readings::Column::StandardCurveId,
+                    sea_orm::sea_query::Expr::cust(
+                        r#"COALESCE(EXCLUDED.standard_curve_id, "readings"."standard_curve_id")"#,
+                    ),
+                );
             }
             clause.value(
                 readings::Column::SampleId,
@@ -571,12 +577,26 @@ pub async fn insert_batch_readings(
 
     // Collect unique (site_id, parameter_id) pairs and resolve stream_ids
     let mut stream_cache: HashMap<(Uuid, Uuid), Uuid> = HashMap::new();
+    // Whether each pair names a slot that exists. A reading is attributed by the pairing, never by
+    // the request alone: a caller naming a parameter the site has not been assigned would otherwise
+    // mint attribution no `site_parameters` row backs, which every later resolution reads as wrong.
+    let mut slot_exists: HashMap<(Uuid, Uuid), bool> = HashMap::new();
 
     for r in &payload.readings {
         let key = (r.site_id, r.parameter_id);
         if let std::collections::hash_map::Entry::Vacant(entry) = stream_cache.entry(key) {
             let stream_id = get_or_create_api_stream(&state.db, r.site_id, r.parameter_id).await?;
             entry.insert(stream_id);
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) = slot_exists.entry(key) {
+            let paired = crate::routes::private::data_streams::service::site_parameter_of(
+                &state.db,
+                r.site_id,
+                r.parameter_id,
+            )
+            .await?
+            .is_some();
+            entry.insert(paired);
         }
     }
 
@@ -752,6 +772,10 @@ pub async fn insert_batch_readings(
                 measurement_type,
             } = res;
             let calibration_id = r.calibration_id.or(owner.calibration_id);
+            let attributed = slot_exists
+                .get(&(r.site_id, r.parameter_id))
+                .copied()
+                .unwrap_or(false);
             let standard = r.standard_curve_id.map(|id| {
                 let c = &standard_curve_models[&id];
                 calibrations::service::Curve {
@@ -771,8 +795,8 @@ pub async fn insert_batch_readings(
             readings::ActiveModel {
                 standard_curve_id: Set(r.standard_curve_id),
                 stream_id: Set(stream_id),
-                site_id: Set(Some(r.site_id)),
-                parameter_id: Set(Some(r.parameter_id)),
+                site_id: Set(attributed.then_some(r.site_id)),
+                parameter_id: Set(attributed.then_some(r.parameter_id)),
                 time: Set(r.time.into()),
                 replicate_index: Set(r.replicate_index.unwrap_or(0)),
                 raw_value: Set(r.raw_value),
@@ -835,7 +859,7 @@ pub async fn insert_batch_readings(
     })
     .await?;
 
-    tracing::info!(
+    tracing::debug!(
         total,
         inserted,
         overwritten,
@@ -1002,4 +1026,76 @@ async fn count_existing<C: ConnectionTrait>(
         .unwrap_or(0);
 
     Ok(usize::try_from(count).unwrap_or(0))
+}
+
+#[cfg(test)]
+mod upsert_rules {
+    use super::{Replace, readings, readings_upsert};
+    use sea_orm::{EntityTrait, QueryTrait, Set};
+
+    /// The `ON CONFLICT` tail of the statement each mode builds.
+    fn on_conflict_sql(replace: Replace) -> String {
+        let model = readings::ActiveModel {
+            stream_id: Set(uuid::Uuid::nil()),
+            time: Set(chrono::Utc::now().into()),
+            replicate_index: Set(0),
+            raw_value: Set(1.0),
+            ..Default::default()
+        };
+        let sql = readings::Entity::insert(model)
+            .on_conflict(readings_upsert(replace))
+            .build(sea_orm::DatabaseBackend::Postgres)
+            .to_string();
+        sql.split_once("ON CONFLICT")
+            .map(|(_, tail)| tail.to_string())
+            .unwrap_or_default()
+    }
+
+    /// A curve chosen by hand cannot be recovered by any query, so no upsert may clear it. Every
+    /// mode either leaves the column alone or preserves the stored one when the incoming row names
+    /// none.
+    #[test]
+    fn no_upsert_clears_a_hand_picked_curve() {
+        for replace in [
+            Replace::Nothing,
+            Replace::Values,
+            Replace::ValuesAndAttribution,
+        ] {
+            let tail = on_conflict_sql(replace);
+            let assigns_directly = tail.contains(r#""standard_curve_id" = "excluded"."standard_curve_id""#);
+            assert!(
+                !assigns_directly,
+                "{replace:?} would overwrite a hand-picked curve with the incoming row's: {tail}"
+            );
+        }
+    }
+
+    /// The sample link survives a correction that carries none, or the samples trigger deletes the
+    /// row's group along with its label and notes.
+    #[test]
+    fn a_correction_keeps_the_sample_it_belongs_to() {
+        for replace in [Replace::Values, Replace::ValuesAndAttribution] {
+            let tail = on_conflict_sql(replace);
+            assert!(
+                tail.contains("COALESCE") && tail.contains("sample_id"),
+                "{replace:?} must preserve the stored sample link: {tail}"
+            );
+        }
+    }
+
+    /// Operator state is never a source's to overwrite.
+    #[test]
+    fn no_upsert_touches_flag_state() {
+        for replace in [
+            Replace::Nothing,
+            Replace::Values,
+            Replace::ValuesAndAttribution,
+        ] {
+            let tail = on_conflict_sql(replace);
+            assert!(
+                !tail.contains("is_flagged") && !tail.contains("flag_reason"),
+                "{replace:?} must leave flag state alone: {tail}"
+            );
+        }
+    }
 }

@@ -393,10 +393,26 @@ pub async fn ingest_readings(
         // not turn a successful write into a 500 that replays the same batch forever. The rollups
         // converge on the next scheduled refresh.
         let times = payload.readings.iter().map(|r| r.time);
-        if let (Some(lo), Some(hi)) = (times.clone().min(), times.max())
-            && let Err(e) = aggregates::refresh(&state.db, Window::Range(lo, hi)).await
-        {
-            tracing::warn!(error = %e, %lo, %hi, "aggregate refresh after overwrite failed");
+        if let (Some(lo), Some(hi)) = (times.clone().min(), times.max()) {
+            // The upsert leaves a hand-picked curve standing, and this correction resolved only a
+            // base, so the value is recomposed from whichever curves the row ends up carrying.
+            if let Err(e) = calibrations::service::recompose_from_own_curves(
+                &state.db,
+                "TRUE",
+                "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
+                vec![
+                    payload.stream_id.into(),
+                    sea_orm::prelude::DateTimeWithTimeZone::from(lo).into(),
+                    sea_orm::prelude::DateTimeWithTimeZone::from(hi).into(),
+                ],
+            )
+            .await
+            {
+                tracing::warn!(error = %e, "recompose after overwrite failed");
+            }
+            if let Err(e) = aggregates::refresh(&state.db, Window::Range(lo, hi)).await {
+                tracing::warn!(error = %e, %lo, %hi, "aggregate refresh after overwrite failed");
+            }
         }
     }
 
@@ -482,7 +498,7 @@ pub async fn ingest_readings(
     }
 
     let outcome = ingest_outcome(payload.stream_id, paired, submitted, inserted, &counts);
-    tracing::info!(total, inserted, skipped = outcome.skipped, stream_id = %payload.stream_id, paired, "Ingest complete");
+    tracing::debug!(total, inserted, skipped = outcome.skipped, stream_id = %payload.stream_id, paired, "Ingest complete");
     Ok(Json(outcome))
 }
 
@@ -660,7 +676,7 @@ pub async fn ingest_status_events(
         }
     }
 
-    tracing::info!(total, inserted, skipped, stream_id = %payload.stream_id, paired, "Status events ingest complete");
+    tracing::debug!(total, inserted, skipped, stream_id = %payload.stream_id, paired, "Status events ingest complete");
     Ok(Json(IngestStatusEventsResponse {
         inserted,
         skipped,
