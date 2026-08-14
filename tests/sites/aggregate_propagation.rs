@@ -187,9 +187,6 @@ async fn write_readings(app: &Router, jwt: &str, rows: Vec<Value>) {
 // Database-side helpers (verification only, never provisioning)
 // ============================================================================
 
-/// Materialise all four views over one window. `refresh_continuous_aggregate` cannot run inside a
-/// transaction, so this goes through the autocommit `exec`. The window must span at least one
-/// monthly bucket for the monthly view to accept it.
 /// The stream already holding a slot's reading, ie. the one a source-side correction arrives on.
 async fn stream_holding(
     db: &DatabaseConnection,
@@ -212,6 +209,9 @@ async fn stream_holding(
     .expect("stream_id")
 }
 
+/// Materialise all four views over one window. `refresh_continuous_aggregate` cannot run inside a
+/// transaction, so this goes through the autocommit `exec`. The window must span at least one
+/// monthly bucket for the monthly view to accept it.
 async fn refresh_views(db: &DatabaseConnection, from: &str, to: &str) {
     for view in [
         "readings_hourly",
@@ -1361,7 +1361,7 @@ async fn continuous_aggregates_apply_their_filter_algebra_exactly() {
 #[tokio::test]
 #[serial]
 async fn editing_a_stored_raw_value_reaches_the_served_aggregate() {
-    let Some((db, app, admin, track)) = onboard("raw_value_edit_reaches_aggregate").await else {
+    let Some((db, app, _admin, track)) = onboard("raw_value_edit_reaches_aggregate").await else {
         return;
     };
     let river = member(&db, &track.project_id, RIVER.0, RIVER.1).await;
@@ -1428,37 +1428,9 @@ async fn editing_a_stored_raw_value_reaches_the_served_aggregate() {
     );
 
     // The correction arrives the way a source-side correction does, on the stream that already
-    // holds the slot. That stream is paired first: `/readings/batch` creates its `api` stream
-    // unpaired, and an ingest resolving no slot writes the attribution it resolved, ie. none.
+    // holds the slot. That stream carries the pairing the readings were attributed by, so the
+    // correction resolves the same slot rather than clearing it.
     let stream_id = stream_holding(&db, &site1, &flow, "2025-12-10T08:00:00Z").await;
-    let site_parameter: Uuid = db
-        .query_one(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT id FROM site_parameters \
-                 WHERE site_id = '{site1}' AND parameter_id = '{flow}'"
-            ),
-        ))
-        .await
-        .expect("query site_parameters")
-        .expect("the slot is provisioned")
-        .try_get("", "id")
-        .expect("site_parameter id");
-    let (status, paired) = crate::common::post_json_parse_with_token(
-        &app,
-        &format!("/api/streams/{stream_id}/pair"),
-        &json!({ "site_parameter_id": site_parameter }),
-        &admin,
-    )
-    .await;
-    assert!(
-        (200..300).contains(&status),
-        "pair the stream the readings landed on ({status}): {paired}"
-    );
-    assert!(
-        jobs_settled(&db, 60).await,
-        "pairing's follow-on jobs settle before the correction"
-    );
 
     let (sync_token, _service_id) = crate::common::seed_sync_session_token(&db).await;
     let (status, body) = crate::common::post_json_parse_with_token(
