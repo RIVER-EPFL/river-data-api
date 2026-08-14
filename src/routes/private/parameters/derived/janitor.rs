@@ -202,4 +202,3 @@ async fn run_delete(db: &DatabaseConnection, sql: String, label: &str) -> u64 {
         }
     }
 }
-

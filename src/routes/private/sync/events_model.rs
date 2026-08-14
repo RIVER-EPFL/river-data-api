@@ -22,6 +22,9 @@ pub struct Model {
     #[crudcrate(filterable)]
     pub status: String,
     pub readings_synced: i64,
+    /// Readings the cycle sent that ingest admission dropped.
+    #[crudcrate(on_create = 0)]
+    pub readings_skipped: i64,
     pub status_events_synced: i64,
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub errors: Option<serde_json::Value>,

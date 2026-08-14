@@ -5,15 +5,21 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 
+/// Why this classification is not admissible, or `None` when it is. Callers that refuse the whole
+/// request raise it as a 400; callers that skip the offending reading need the reason as a value.
+pub fn measurement_type_rejection(value: Option<&str>) -> Option<String> {
+    match value {
+        None | Some("continuous" | "spot" | "derived") => None,
+        Some(other) => Some(format!(
+            "invalid measurement_type '{other}' (expected continuous, spot, or derived)"
+        )),
+    }
+}
+
 /// Reject anything outside the readings.measurement_type vocabulary with a clean 400 (the DB has
 /// no CHECK on readings.measurement_type, so bad values would otherwise persist silently).
 pub fn validate_measurement_type(value: Option<&str>) -> Result<(), AppError> {
-    match value {
-        None | Some("continuous" | "spot" | "derived") => Ok(()),
-        Some(other) => Err(AppError::BadRequest(format!(
-            "invalid measurement_type '{other}' (expected continuous, spot, or derived)"
-        ))),
-    }
+    measurement_type_rejection(value).map_or(Ok(()), |reason| Err(AppError::BadRequest(reason)))
 }
 
 /// Map each sensor to the measurement_type its `data_frequency` implies: 'low' → 'spot'

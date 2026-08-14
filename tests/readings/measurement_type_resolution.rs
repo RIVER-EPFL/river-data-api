@@ -143,13 +143,15 @@ async fn ingest_resolution_chain_override_stream_sensor_fallback() {
 
 #[tokio::test]
 #[serial]
-async fn ingest_rejects_invalid_measurement_type() {
+async fn ingest_skips_invalid_measurement_type_but_registration_refuses_it() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     let token = crate::common::seed_token_full(&db).await;
     let app = crate::common::build_test_app(db.clone());
     let stream = register_stream(&app, &token, "bad", None).await;
 
+    // A reading is skipped rather than refused: the sync service replaying it cannot correct the
+    // payload, and refusing would stall its cursor on this batch forever.
     let (status, body) = crate::common::post_json_parse_with_token(
         &app,
         "/api/ingest",
@@ -159,7 +161,12 @@ async fn ingest_rejects_invalid_measurement_type() {
         &token,
     )
     .await;
-    assert_eq!(status, 400, "invalid measurement_type ({status}): {body}");
+    assert_eq!(status, 200, "invalid measurement_type ({status}): {body}");
+    assert_eq!(body["inserted"], 0, "nothing lands: {body}");
+    assert_eq!(body["skipped"], 1, "the reading is counted: {body}");
+
+    // Registration is a declaration, not a replay: it is refused, so a bad classification cannot
+    // become the stream's default and silently misclassify everything that follows.
 
     let (status, body) = crate::common::post_json_parse_with_token(
         &app,

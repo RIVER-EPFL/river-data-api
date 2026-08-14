@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::common::aggregates::{self, Window};
 use crate::common::middleware::{IsSyncService, ProjectScope, enforce_project_scope_for_sites};
 use crate::common::{AppEvent, AppState};
 use crate::error::{AppError, AppResult};
@@ -51,6 +52,15 @@ pub struct IngestReading {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct IngestResponse {
     pub inserted: usize,
+    /// Readings dropped by admission (out-of-window timestamp, non-finite value, unknown
+    /// measurement_type, unknown calibration_id). Reported rather than raised so a cursor-driven
+    /// caller can advance past them, and counted so the loss is never silent.
+    #[serde(default)]
+    pub skipped: usize,
+    /// One entry per kind of rejection with its count, never one per reading, so the response
+    /// stays a fixed size however large the batch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_reasons: Vec<String>,
     pub stream_id: Uuid,
     pub paired: bool,
 }
@@ -103,8 +113,7 @@ async fn insert_reading_chunks<C: ConnectionTrait>(
     path = "/ingest",
     request_body = IngestReadingsRequest,
     responses(
-        (status = 200, description = "Inserted count and pairing state", body = IngestResponse),
-        (status = 400, description = "Timestamp outside [-10 years, +1 day] window, non-finite value, or unknown calibration_id"),
+        (status = 200, description = "Inserted count and pairing state. Inadmissible readings (out-of-window timestamp, non-finite value, unknown measurement_type, unknown calibration_id) are skipped and counted in `skipped`, not refused", body = IngestResponse),
         (status = 404, description = "Stream not found"),
     ),
     tag = "ingestion"
@@ -113,7 +122,7 @@ pub async fn ingest_readings(
     State(state): State<AppState>,
     ProjectScope(scope): ProjectScope,
     IsSyncService(is_sync_service): IsSyncService,
-    Json(payload): Json<IngestReadingsRequest>,
+    Json(mut payload): Json<IngestReadingsRequest>,
 ) -> AppResult<Json<IngestResponse>> {
     if payload.overwrite && !is_sync_service {
         return Err(AppError::Forbidden(
@@ -124,6 +133,8 @@ pub async fn ingest_readings(
     if payload.readings.is_empty() {
         return Ok(Json(IngestResponse {
             inserted: 0,
+            skipped: 0,
+            skipped_reasons: Vec::new(),
             stream_id: payload.stream_id,
             paired: false,
         }));
@@ -144,12 +155,34 @@ pub async fn ingest_readings(
     // An unpaired stream has no project, so a scoped token is rejected outright.
     enforce_ingest_scope(&state.db, &scope, site_id).await?;
 
-    // The same admission rules /readings/batch applies. An out-of-window timestamp is refused
-    // before anything is written and before the stream cursor is touched: `last_data_time` only
-    // ever moves forward, so one future timestamp would stall this stream's incremental sync
-    // until wall-clock caught up.
-    for r in &payload.readings {
-        admission::admit(r.time, r.raw_value, r.measurement_type.as_deref())?;
+    // Admission is per reading here, not per request: the caller replays from `last_data_time`,
+    // which only advances on success, so refusing a batch for one bad row stalls the stream.
+    // The cursor is taken from the survivors, so a future timestamp cannot latch it.
+    // Tallied by kind because the per-reading messages carry the offending value and cannot group.
+    let submitted = payload.readings.len();
+    let mut counts: Vec<(admission::RejectionKind, usize)> = Vec::new();
+    let now = Utc::now();
+    payload.readings.retain(|r| {
+        match admission::rejection_kind_at(now, r.time, r.raw_value, r.measurement_type.as_deref())
+        {
+            None => true,
+            Some(kind) => {
+                record_rejection(&mut counts, kind);
+                false
+            }
+        }
+    });
+
+    // Everything downstream reads `payload.readings`, so a batch that is entirely inadmissible has
+    // no work left: return before the window-resolution queries rather than run them over nothing.
+    if payload.readings.is_empty() {
+        return Ok(Json(ingest_outcome(
+            payload.stream_id,
+            paired,
+            submitted,
+            0,
+            &counts,
+        )));
     }
 
     // Window-aware attribution: resolve calibration/deployment/site per reading TIME from the
@@ -200,8 +233,7 @@ pub async fn ingest_readings(
     // A caller that names its own calibration is taken at its word about which curve applies, but
     // the stored value is still computed from that curve's coefficients rather than trusted or left
     // empty. Reference and value come from one curve on every reading, so nothing can store a
-    // correction its `calibration_id` did not produce. An id that names no row is refused here
-    // rather than left to the foreign key.
+    // correction its `calibration_id` did not produce.
     let declared_curves: HashMap<Uuid, Curve> = {
         let mut ids: Vec<Uuid> = payload
             .readings
@@ -213,8 +245,8 @@ pub async fn ingest_readings(
         if ids.is_empty() {
             HashMap::new()
         } else {
-            let found: HashMap<Uuid, Curve> = calibrations::Entity::find()
-                .filter(calibrations::Column::Id.is_in(ids.clone()))
+            calibrations::Entity::find()
+                .filter(calibrations::Column::Id.is_in(ids))
                 .all(db)
                 .await?
                 .into_iter()
@@ -228,15 +260,28 @@ pub async fn ingest_readings(
                         },
                     )
                 })
-                .collect();
-            if let Some(missing) = ids.iter().find(|id| !found.contains_key(id)) {
-                return Err(AppError::BadRequest(format!(
-                    "Calibration {missing} not found"
-                )));
-            }
-            found
+                .collect()
         }
     };
+
+    // A deleted calibration never reappears, so refusing the request here would stall the cursor
+    // permanently. Second pass because deciding it needs the calibration rows queried above.
+    payload.readings.retain(|r| match r.calibration_id {
+        Some(id) if !declared_curves.contains_key(&id) => {
+            record_rejection(&mut counts, admission::RejectionKind::UnknownCalibration);
+            false
+        }
+        _ => true,
+    });
+    if payload.readings.is_empty() {
+        return Ok(Json(ingest_outcome(
+            payload.stream_id,
+            paired,
+            submitted,
+            0,
+            &counts,
+        )));
+    }
 
     // Sensor-frequency defaults for every sensor a reading could resolve to (explicit, stream, or
     // slot owner), fetched in one query. Applied when neither the reading nor the stream declares
@@ -338,9 +383,21 @@ pub async fn ingest_readings(
         insert_reading_chunks(db, &models, false).await?
     };
 
-    // Corrections rewrite history that bounded queries may have cached.
+    // Corrections rewrite history that bounded queries may have cached, and replace values the
+    // rollups have already materialised.
     if payload.overwrite && inserted > 0 {
         state.response_cache.invalidate_all();
+
+        // Best-effort, like the alarm reconstruction below it: the rows are committed and the
+        // cursor is about to advance past them, so a refresh that loses a lock to the janitor must
+        // not turn a successful write into a 500 that replays the same batch forever. The rollups
+        // converge on the next scheduled refresh.
+        let times = payload.readings.iter().map(|r| r.time);
+        if let (Some(lo), Some(hi)) = (times.clone().min(), times.max())
+            && let Err(e) = aggregates::refresh(&state.db, Window::Range(lo, hi)).await
+        {
+            tracing::warn!(error = %e, %lo, %hi, "aggregate refresh after overwrite failed");
+        }
     }
 
     // Emit ingestion event
@@ -424,12 +481,52 @@ pub async fn ingest_readings(
         .await?;
     }
 
-    tracing::info!(total, inserted, stream_id = %payload.stream_id, paired, "Ingest complete");
-    Ok(Json(IngestResponse {
+    let outcome = ingest_outcome(payload.stream_id, paired, submitted, inserted, &counts);
+    tracing::info!(total, inserted, skipped = outcome.skipped, stream_id = %payload.stream_id, paired, "Ingest complete");
+    Ok(Json(outcome))
+}
+
+/// Add one rejection to the per-kind tally.
+fn record_rejection(
+    counts: &mut Vec<(admission::RejectionKind, usize)>,
+    kind: admission::RejectionKind,
+) {
+    match counts.iter_mut().find(|(seen, _)| *seen == kind) {
+        Some((_, n)) => *n += 1,
+        None => counts.push((kind, 1)),
+    }
+}
+
+/// The response, with the skipped tally logged on the way out. Every return path builds it here so
+/// a dropped reading is reported to the caller and to the operator by the same code.
+fn ingest_outcome(
+    stream_id: Uuid,
+    paired: bool,
+    submitted: usize,
+    inserted: usize,
+    counts: &[(admission::RejectionKind, usize)],
+) -> IngestResponse {
+    let skipped: usize = counts.iter().map(|(_, n)| n).sum();
+    let skipped_reasons: Vec<String> = counts
+        .iter()
+        .map(|(kind, n)| format!("{} ({n})", kind.as_str()))
+        .collect();
+    if skipped > 0 {
+        tracing::warn!(
+            %stream_id,
+            skipped,
+            submitted,
+            reasons = ?skipped_reasons,
+            "Skipped inadmissible readings"
+        );
+    }
+    IngestResponse {
         inserted,
-        stream_id: payload.stream_id,
+        skipped,
+        skipped_reasons,
+        stream_id,
         paired,
-    }))
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -448,6 +545,10 @@ pub struct IngestStatusEvent {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct IngestStatusEventsResponse {
     pub inserted: usize,
+    /// Events dropped because their timestamp is outside the admissible window. Counted rather
+    /// than raised, for the same reason `/ingest` counts its skipped readings.
+    #[serde(default)]
+    pub skipped: usize,
     pub stream_id: Uuid,
     pub paired: bool,
 }
@@ -459,7 +560,7 @@ pub struct IngestStatusEventsResponse {
     path = "/ingest/status_events",
     request_body = IngestStatusEventsRequest,
     responses(
-        (status = 200, description = "Inserted count and pairing state", body = IngestStatusEventsResponse),
+        (status = 200, description = "Inserted count and pairing state. Events outside the admissible timestamp window are skipped and counted in `skipped`", body = IngestStatusEventsResponse),
         (status = 404, description = "Stream not found"),
     ),
     tag = "ingestion"
@@ -467,11 +568,12 @@ pub struct IngestStatusEventsResponse {
 pub async fn ingest_status_events(
     State(state): State<AppState>,
     ProjectScope(scope): ProjectScope,
-    Json(payload): Json<IngestStatusEventsRequest>,
+    Json(mut payload): Json<IngestStatusEventsRequest>,
 ) -> AppResult<Json<IngestStatusEventsResponse>> {
     if payload.events.is_empty() {
         return Ok(Json(IngestStatusEventsResponse {
             inserted: 0,
+            skipped: 0,
             stream_id: payload.stream_id,
             paired: false,
         }));
@@ -488,6 +590,33 @@ pub async fn ingest_status_events(
     let paired = site_id.is_some();
 
     enforce_ingest_scope(&state.db, &scope, site_id).await?;
+
+    // A status event carries no numeric value, so the timestamp bound is the whole of admission
+    // for it. Applied per event and counted, as on `/ingest`: an unbounded timestamp would open a
+    // hypertable chunk far outside the data range, and refusing the request would stall the
+    // stream that sent it.
+    let submitted = payload.events.len();
+    let now = Utc::now();
+    payload
+        .events
+        .retain(|e| admission::time_rejection_at(now, e.time).is_none());
+    let skipped = submitted - payload.events.len();
+    if skipped > 0 {
+        tracing::warn!(
+            stream_id = %payload.stream_id,
+            skipped,
+            submitted,
+            "Skipped status events outside the admissible timestamp window"
+        );
+    }
+    if payload.events.is_empty() {
+        return Ok(Json(IngestStatusEventsResponse {
+            inserted: 0,
+            skipped,
+            stream_id: payload.stream_id,
+            paired,
+        }));
+    }
 
     let models: Vec<status_events::ActiveModel> = payload
         .events
@@ -531,9 +660,10 @@ pub async fn ingest_status_events(
         }
     }
 
-    tracing::info!(total, inserted, stream_id = %payload.stream_id, paired, "Status events ingest complete");
+    tracing::info!(total, inserted, skipped, stream_id = %payload.stream_id, paired, "Status events ingest complete");
     Ok(Json(IngestStatusEventsResponse {
         inserted,
+        skipped,
         stream_id: payload.stream_id,
         paired,
     }))

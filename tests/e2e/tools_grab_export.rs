@@ -25,7 +25,7 @@ const PORTAL_CURVES: &str = include_str!("../fixtures/portal_standard_curves_met
 
 /// The day the synthetic sensor-vs-grab fixtures sit on. Past-dated on purpose: any window the
 /// export resolves is bounded by the data, and past timestamps also satisfy the batch endpoint's
-/// [-10 years, +1 day] guard.
+/// admission window (an absolute floor, one day of lead).
 const DAY: &str = "2025-06-05";
 
 // ---------------------------------------------------------------------------------------------

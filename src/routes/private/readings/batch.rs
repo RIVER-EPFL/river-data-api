@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::common::aggregates::{self, Window};
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::common::{AppEvent, AppState};
 use crate::error::{AppError, AppResult};
@@ -28,14 +29,15 @@ use crate::routes::private::sensors::standard_curves;
 /// missing-value sentinel was recognised by its spelling in one branch of one importer.
 pub mod admission {
     use chrono::{DateTime, Duration, Utc};
+    use std::sync::LazyLock;
 
     use crate::error::{AppError, AppResult};
-    use crate::routes::private::readings::measurement::validate_measurement_type;
+    use crate::routes::private::readings::measurement::measurement_type_rejection;
 
-    /// How far back a stored timestamp may reach (archive imports) and how far forward (logger
-    /// clock skew). Outside this window the timestamp is a source-side error, and on `/ingest` it
-    /// would also latch the stream's forward-only `last_data_time` cursor.
-    const MAX_AGE_DAYS: i64 = 365 * 10;
+    /// Absolute, so an archive series does not age out of admissibility as the clock moves.
+    const MIN_READING_TIME: &str = "2000-01-01T00:00:00Z";
+    /// Logger clock skew. `last_data_time` only moves forward, so a far-future timestamp admitted
+    /// here would latch a stream's cursor until wall-clock caught up.
     const MAX_LEAD_DAYS: i64 = 1;
 
     /// Missing-value marker the loggers and the portal exports write in place of a measurement.
@@ -43,18 +45,26 @@ pub mod admission {
     pub const MISSING_SENTINEL: f64 = -9999.0;
     const SENTINEL_TOLERANCE: f64 = 1e-9;
 
-    /// The window a reading's timestamp must fall in, evaluated against `now`.
+    /// The floor, parsed once. It is a compile-time literal, so parsing it per reading is pure
+    /// overhead on a thousand-reading batch.
+    static MIN_TIME: LazyLock<DateTime<Utc>> = LazyLock::new(|| {
+        DateTime::parse_from_rfc3339(MIN_READING_TIME)
+            .expect("MIN_READING_TIME is a literal RFC 3339 timestamp")
+            .with_timezone(&Utc)
+    });
+
+    /// The window a reading's timestamp must fall in. Only the upper bound moves with `now`.
     pub fn window(now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
-        (
-            now - Duration::days(MAX_AGE_DAYS),
-            now + Duration::days(MAX_LEAD_DAYS),
-        )
+        (*MIN_TIME, now + Duration::days(MAX_LEAD_DAYS))
     }
 
-    /// Why this timestamp is not admissible, or `None` when it is. Callers that reject a whole
-    /// request raise it as a 400; the CSV importer reports it against the offending row.
-    pub fn time_rejection(time: DateTime<Utc>) -> Option<String> {
-        let (min_time, max_time) = window(Utc::now());
+    /// Why this timestamp is not admissible against a caller-supplied `now`, or `None` when it is.
+    ///
+    /// The `_at` variants exist so a caller filtering a whole batch reads the clock once and every
+    /// reading in that batch is judged against the same window: two readings a microsecond apart
+    /// cannot land on opposite sides of a moving bound.
+    pub fn time_rejection_at(now: DateTime<Utc>, time: DateTime<Utc>) -> Option<String> {
+        let (min_time, max_time) = window(now);
         if time >= min_time && time <= max_time {
             return None;
         }
@@ -64,6 +74,12 @@ pub mod admission {
             min_time.to_rfc3339(),
             max_time.to_rfc3339(),
         ))
+    }
+
+    /// Why this timestamp is not admissible, or `None` when it is. Callers that reject a whole
+    /// request raise it as a 400; the CSV importer reports it against the offending row.
+    pub fn time_rejection(time: DateTime<Utc>) -> Option<String> {
+        time_rejection_at(Utc::now(), time)
     }
 
     /// Why this value is not admissible, or `None` when it is. `NaN` and the infinities have no
@@ -85,6 +101,79 @@ pub mod admission {
         })
     }
 
+    /// Why this reading is not admissible, or `None` when it is. The rules [`admit`] enforces,
+    /// reported as a value for the callers that skip the reading rather than refuse the request.
+    pub fn rejection(
+        time: DateTime<Utc>,
+        raw_value: f64,
+        measurement_type: Option<&str>,
+    ) -> Option<String> {
+        rejection_at(Utc::now(), time, raw_value, measurement_type)
+    }
+
+    /// [`rejection`] against a caller-supplied `now`.
+    pub fn rejection_at(
+        now: DateTime<Utc>,
+        time: DateTime<Utc>,
+        raw_value: f64,
+        measurement_type: Option<&str>,
+    ) -> Option<String> {
+        measurement_type_rejection(measurement_type)
+            .or_else(|| time_rejection_at(now, time))
+            .or_else(|| value_rejection(raw_value).map(|reason| format!("Reading value {reason}")))
+    }
+
+    /// Why a reading cannot be stored, as a closed set. The messages [`rejection`] returns carry
+    /// the offending value and so cannot be grouped; a caller summarising a batch wants the kind.
+    ///
+    /// `UnknownCalibration` needs the calibration rows, so [`rejection_kind`] cannot decide it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum RejectionKind {
+        OutOfWindow,
+        NonFinite,
+        UnknownMeasurementType,
+        UnknownCalibration,
+    }
+
+    impl RejectionKind {
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::OutOfWindow => "timestamp outside the admissible window",
+                Self::NonFinite => "value is not a finite number",
+                Self::UnknownMeasurementType => "measurement_type outside the vocabulary",
+                Self::UnknownCalibration => "calibration_id names no calibration",
+            }
+        }
+    }
+
+    /// Which kind of rejection applies, or `None` when the reading is admissible. Same order of
+    /// precedence as [`rejection`].
+    pub fn rejection_kind(
+        time: DateTime<Utc>,
+        raw_value: f64,
+        measurement_type: Option<&str>,
+    ) -> Option<RejectionKind> {
+        rejection_kind_at(Utc::now(), time, raw_value, measurement_type)
+    }
+
+    /// [`rejection_kind`] against a caller-supplied `now`.
+    pub fn rejection_kind_at(
+        now: DateTime<Utc>,
+        time: DateTime<Utc>,
+        raw_value: f64,
+        measurement_type: Option<&str>,
+    ) -> Option<RejectionKind> {
+        if measurement_type_rejection(measurement_type).is_some() {
+            Some(RejectionKind::UnknownMeasurementType)
+        } else if time_rejection_at(now, time).is_some() {
+            Some(RejectionKind::OutOfWindow)
+        } else if value_rejection(raw_value).is_some() {
+            Some(RejectionKind::NonFinite)
+        } else {
+            None
+        }
+    }
+
     /// The full admission check for one reading: classification vocabulary, timestamp bound,
     /// finite value.
     pub fn admit(
@@ -92,9 +181,8 @@ pub mod admission {
         raw_value: f64,
         measurement_type: Option<&str>,
     ) -> AppResult<()> {
-        validate_measurement_type(measurement_type)?;
-        admit_time(time)?;
-        admit_value(raw_value)
+        rejection(time, raw_value, measurement_type)
+            .map_or(Ok(()), |reason| Err(AppError::BadRequest(reason)))
     }
 
     pub fn is_missing_sentinel(value: f64) -> bool {
@@ -200,6 +288,40 @@ pub mod admission {
             assert!(admit_time(max_time - Duration::minutes(1)).is_ok());
             assert!(admit_time(min_time - Duration::days(1)).is_err());
             assert!(admit_time(max_time + Duration::days(1)).is_err());
+        }
+
+        /// Expected behaviour: the floor is a fixed date, so a decade-old archive series stays
+        /// ingestible indefinitely. A relative floor would make the same reading admissible today
+        /// and refused later, which is what stalls a portal backfill.
+        #[test]
+        fn the_backward_bound_does_not_move_with_the_clock() {
+            let (early, _) = window("2020-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap());
+            let (late, _) = window("2099-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap());
+            assert_eq!(early, late);
+
+            let archive = "2016-08-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+            assert!(admit_time(archive).is_ok());
+        }
+
+        /// Expected behaviour: `rejection` and `admit` are one implementation, so the reason a
+        /// reading is skipped on `/ingest` is the reason it would be refused elsewhere.
+        #[test]
+        fn rejection_reports_what_admit_raises() {
+            let now = Utc::now();
+            let (_, max_time) = window(now);
+
+            assert_eq!(rejection(now, 1.0, None), None);
+            assert_eq!(rejection(now, MISSING_SENTINEL, Some("spot")), None);
+
+            for (time, value, declared) in [
+                (max_time + Duration::days(2), 1.0, None),
+                (now, f64::NAN, None),
+                (now, 1.0, Some("grab")),
+            ] {
+                let reason = rejection(time, value, declared);
+                assert!(reason.is_some(), "expected a reason for {declared:?}");
+                assert!(admit(time, value, declared).is_err());
+            }
         }
 
         #[test]
@@ -426,7 +548,7 @@ pub(crate) fn readings_on_conflict(mode: ConflictMode) -> sea_orm::sea_query::On
     request_body = BatchReadingsRequest,
     responses(
         (status = 200, description = "Inserted count", body = BatchReadingsResponse),
-        (status = 400, description = "Timestamp outside [-10 years, +1 day] window, or non-finite value"),
+        (status = 400, description = "Timestamp outside the admissible window, or non-finite value"),
         (status = 413, description = "Body exceeds 10MB limit"),
     ),
     tag = "ingestion"
@@ -752,6 +874,16 @@ pub async fn insert_batch_readings(
             .flatten()
             .max()
             .copied();
+
+        // An overwrite replaced values the rollups have already materialised. Best-effort: the
+        // rows are committed, so a refresh losing a lock to the janitor must not report a write
+        // that happened as one that did not. The rollups converge on the next scheduled refresh.
+        if overwritten > 0
+            && let (Some(lo), Some(hi)) = (earliest, latest)
+            && let Err(e) = aggregates::refresh(&state.db, Window::Range(lo, hi)).await
+        {
+            tracing::warn!(error = %e, %lo, %hi, "aggregate refresh after overwrite failed");
+        }
 
         // Auto-compute derived values for affected sites, tracked as a job. Spawn-guard: keep only
         // sites with an active derived parameter, others would compute nothing.

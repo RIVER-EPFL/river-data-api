@@ -56,6 +56,7 @@ mod m20260813_000005_sample_trigger_predicate;
 mod m20260813_000006_readings_calibration_id_index;
 mod m20260813_000007_retire_identity_calibrations;
 mod m20260814_000001_reprocessing_jobs_autovacuum;
+mod m20260814_000002_sync_event_readings_skipped;
 
 pub struct Migrator;
 
@@ -120,6 +121,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260813_000006_readings_calibration_id_index::Migration),
             Box::new(m20260813_000007_retire_identity_calibrations::Migration),
             Box::new(m20260814_000001_reprocessing_jobs_autovacuum::Migration),
+            Box::new(m20260814_000002_sync_event_readings_skipped::Migration),
         ]
     }
 }

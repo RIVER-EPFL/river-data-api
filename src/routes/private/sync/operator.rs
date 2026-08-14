@@ -167,6 +167,7 @@ pub struct SyncEventResponse {
     pub event_type: String,
     pub status: String,
     pub readings_synced: i64,
+    pub readings_skipped: i64,
     pub status_events_synced: i64,
     #[schema(value_type = Object)]
     pub errors: Option<serde_json::Value>,
@@ -185,6 +186,7 @@ fn sync_event_to_response(e: sync_events::Model) -> SyncEventResponse {
         event_type: e.event_type,
         status: e.status,
         readings_synced: e.readings_synced,
+        readings_skipped: e.readings_skipped,
         status_events_synced: e.status_events_synced,
         errors: e.errors,
         log: e.log,

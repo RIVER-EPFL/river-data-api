@@ -23,6 +23,9 @@ pub struct CreateSyncEventRequest {
 pub struct UpdateSyncEventRequest {
     pub status: Option<String>,
     pub readings_synced: Option<i64>,
+    /// Connectors on river-data-core 0.5.0 do not send this; absent leaves the stored count alone.
+    #[serde(default)]
+    pub readings_skipped: Option<i64>,
     pub status_events_synced: Option<i64>,
     #[schema(value_type = Object)]
     pub errors: Option<serde_json::Value>,
@@ -90,6 +93,7 @@ pub async fn create_sync_event(
             .status
             .unwrap_or_else(|| SyncEventStatus::Running.as_str().to_string())),
         readings_synced: Set(0),
+        readings_skipped: Set(0),
         status_events_synced: Set(0),
         errors: Set(None),
         log: Set(None),
@@ -152,6 +156,9 @@ pub async fn update_sync_event(
     }
     if let Some(readings) = req.readings_synced {
         active.readings_synced = Set(readings);
+    }
+    if let Some(skipped) = req.readings_skipped {
+        active.readings_skipped = Set(skipped);
     }
     if let Some(status_events) = req.status_events_synced {
         active.status_events_synced = Set(status_events);

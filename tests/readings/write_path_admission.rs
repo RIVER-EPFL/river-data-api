@@ -61,24 +61,30 @@ async fn import(app: &axum::Router, token: &str, body: &serde_json::Value) -> se
     resp
 }
 
-/// Every JSON write path refuses the same window, and refuses it before storing anything.
+/// Scenario: the same reading is offered to every JSON write path.
+///
+/// Expected behaviour: they agree on which timestamps are admissible, and disagree on what to do
+/// about an inadmissible one. `/readings/batch` and `/grab_samples` refuse the request, because
+/// their caller can correct it and resubmit. `/ingest` skips the reading and reports it, because
+/// its caller replays from a cursor that only advances on success: refusing would block the head
+/// of that queue forever.
+///
+/// The past bound is an absolute instant, not `now - N years`. The floor itself is absolute, and a
+/// relative literal here would re-encode the moving bound the floor exists to avoid.
 #[tokio::test]
 #[serial]
-async fn the_timestamp_window_is_the_same_on_ingest_batch_and_grab_samples() {
+async fn ingest_skips_what_batch_and_grab_samples_refuse() {
     let (db, app, token) = setup().await;
     let stream = register_stream(&app, &token, "window").await;
 
     let now = chrono::Utc::now();
     let outside = [
         ("future", seconds_rfc3339(now + chrono::Duration::days(30))),
-        (
-            "past",
-            seconds_rfc3339(now - chrono::Duration::days(365 * 11)),
-        ),
+        ("past", "1999-12-31T23:59:59Z".to_string()),
     ];
 
     for (label, at) in &outside {
-        let (status, body) = crate::common::post_json_with_token(
+        let (status, body) = crate::common::post_json_parse_with_token(
             &app,
             "/api/ingest",
             &json!({ "stream_id": stream, "readings": [{ "time": at, "raw_value": 42.0 }] }),
@@ -86,9 +92,11 @@ async fn the_timestamp_window_is_the_same_on_ingest_batch_and_grab_samples() {
         )
         .await;
         assert_eq!(
-            status, 400,
-            "/ingest refuses a {label} timestamp ({status}): {body}"
+            status, 200,
+            "/ingest accepts the request and skips a {label} timestamp ({status}): {body}"
         );
+        assert_eq!(body["inserted"], 0, "nothing lands for {label}: {body}");
+        assert_eq!(body["skipped"], 1, "the {label} reading is counted: {body}");
 
         let (status, body) = crate::common::post_json_with_token(
             &app,
@@ -133,7 +141,10 @@ async fn the_timestamp_window_is_the_same_on_ingest_batch_and_grab_samples() {
             &format!("SELECT count(*) FROM readings WHERE time = '{at}'"),
         )
         .await;
-        assert_eq!(stored, 0, "a refused {label} timestamp stores nothing");
+        assert_eq!(
+            stored, 0,
+            "an inadmissible {label} timestamp stores nothing"
+        );
     }
 
     let (status, stream_row) =
@@ -142,7 +153,41 @@ async fn the_timestamp_window_is_the_same_on_ingest_batch_and_grab_samples() {
     assert_eq!(status, 200, "read the stream back ({status}): {stream_row}");
     assert!(
         stream_row["last_data_time"].is_null(),
-        "a refused ingest leaves the incremental-sync cursor where it was: {stream_row}"
+        "the cursor is computed from surviving readings, so an all-skipped ingest does not move \
+         it, and a future timestamp in particular cannot latch it: {stream_row}"
+    );
+
+    // The point of skipping rather than refusing: one bad reading must not cost the good ones it
+    // shared a batch with, and the cursor must land on the newest survivor.
+    let good_early = seconds_rfc3339(now - chrono::Duration::hours(2));
+    let good_late = seconds_rfc3339(now - chrono::Duration::hours(1));
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/ingest",
+        &json!({
+            "stream_id": stream,
+            "readings": [
+                { "time": "1999-01-01T00:00:00Z", "raw_value": 1.0 },
+                { "time": good_early, "raw_value": 2.0 },
+                { "time": good_late, "raw_value": 3.0 },
+            ],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "a mixed batch is accepted ({status}): {body}");
+    assert_eq!(body["inserted"], 2, "both admissible readings land: {body}");
+    assert_eq!(body["skipped"], 1, "only the bad one is dropped: {body}");
+
+    let (_, stream_row) =
+        crate::common::get_json_with_token(&app, &format!("/api/data_streams/{stream}"), &token)
+            .await;
+    assert_eq!(
+        stream_row["last_data_time"]
+            .as_str()
+            .map(|t| t.parse::<chrono::DateTime<chrono::Utc>>().unwrap()),
+        Some(good_late.parse::<chrono::DateTime<chrono::Utc>>().unwrap()),
+        "the cursor advances to the newest surviving reading: {stream_row}"
     );
 
     // One second inside the window is inside it: the bound refuses only what falls outside.
@@ -169,7 +214,7 @@ async fn a_csv_row_outside_the_window_is_a_row_error_and_the_file_still_imports(
 
     let csv = "DateTime,Dissolved_O2\n\
                2025-07-01 00:00:00,250\n\
-               2005-07-01 00:00:00,260\n\
+               1995-07-01 00:00:00,260\n\
                2025-07-01 00:10:00,270\n";
 
     let resp = import(

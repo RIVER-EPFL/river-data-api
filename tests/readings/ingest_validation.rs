@@ -470,7 +470,8 @@ async fn ingest_refuses_timestamps_outside_the_window_batch_already_enforces() {
 
     let now = chrono::Utc::now();
     let far_future = seconds_rfc3339(now + chrono::Duration::days(30));
-    let far_past = seconds_rfc3339(now - chrono::Duration::days(365 * 11));
+    // Absolute, because the floor is absolute: `now - N years` would drift back over the bound.
+    let far_past = "1999-12-31T23:59:59Z".to_string();
 
     // The sibling write path is the source of intent: it refuses both ends of the same window.
     for (label, at) in [("future", &far_future), ("past", &far_past)] {
@@ -494,8 +495,11 @@ async fn ingest_refuses_timestamps_outside_the_window_batch_already_enforces() {
         );
     }
 
+    // Same window, different disposition: /ingest skips the reading and reports it rather than
+    // refusing the request, because its caller replays from a cursor that only advances on
+    // success and would otherwise resubmit this batch forever.
     for (label, at) in [("future", &far_future), ("past", &far_past)] {
-        let (status, accepted) = crate::common::post_json_with_token(
+        let (status, accepted) = crate::common::post_json_parse_with_token(
             &app,
             "/api/ingest",
             &json!({
@@ -506,9 +510,12 @@ async fn ingest_refuses_timestamps_outside_the_window_batch_already_enforces() {
         )
         .await;
         assert_eq!(
-            status, 400,
-            "/ingest refuses a {label} timestamp on the same window as /readings/batch \
-             ({status}): {accepted}"
+            status, 200,
+            "/ingest accepts the request and skips a {label} timestamp ({status}): {accepted}"
+        );
+        assert_eq!(
+            accepted["skipped"], 1,
+            "the {label} reading is counted rather than stored: {accepted}"
         );
     }
 
