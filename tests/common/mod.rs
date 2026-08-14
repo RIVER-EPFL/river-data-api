@@ -92,6 +92,7 @@ fn test_config() -> Config {
         // Off by default in tests (keeps token-authed test requests from writing audit rows); the
         // dedicated audit test flips it on against a fresh AppState.
         audit_api_token_use: false,
+        request_summary_seconds: 0,
         janitor_interval_seconds: 3600,
         janitor_full_refresh_seconds: 86_400,
         janitor_retention_days: 180,

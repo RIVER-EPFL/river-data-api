@@ -631,7 +631,7 @@ pub fn build_router(state: AppState) -> Router {
             TraceLayer::new_for_http()
                 .make_span_with(
                     DefaultMakeSpan::new()
-                        .level(Level::INFO)
+                        .level(Level::DEBUG)
                         .include_headers(false),
                 )
                 .on_request(|req: &axum::http::Request<_>, _span: &tracing::Span| {
@@ -640,7 +640,7 @@ pub fn build_router(state: AppState) -> Router {
                         .get("x-request-id")
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("-");
-                    tracing::info!(request_id = %request_id, "--> {} {}", req.method(), req.uri().path());
+                    tracing::debug!(request_id = %request_id, "--> {} {}", req.method(), req.uri().path());
                 })
                 .on_response(
                     |res: &axum::http::Response<_>,
@@ -648,12 +648,18 @@ pub fn build_router(state: AppState) -> Router {
                      _span: &tracing::Span| {
                         let status = res.status();
                         let ms = latency.as_millis();
+                        crate::common::request_metrics::record(
+                            status.as_u16(),
+                            u64::try_from(ms).unwrap_or(u64::MAX),
+                        );
+                        // A request that went wrong keeps its own line; the rest are counted and
+                        // reported per interval by `request_metrics`.
                         if status.is_server_error() {
                             tracing::error!("<-- {} {ms}ms", status);
                         } else if status.is_client_error() {
                             tracing::warn!("<-- {} {ms}ms", status);
                         } else {
-                            tracing::info!("<-- {} {ms}ms", status);
+                            tracing::debug!("<-- {} {ms}ms", status);
                         }
                     },
                 ),

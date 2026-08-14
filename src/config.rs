@@ -105,6 +105,10 @@ pub struct Config {
     // for the public-facing key surface; best-effort and fire-and-forget so it never blocks a request.
     pub audit_api_token_use: bool,
 
+    /// How often served-request volume is summarised into one log line. 0 logs no summary, leaving
+    /// only the DEBUG line each request already writes.
+    pub request_summary_seconds: u64,
+
     // Derived-parameter janitor
     pub janitor_interval_seconds: u64,
     pub janitor_full_refresh_seconds: u64,
@@ -351,6 +355,11 @@ impl Config {
                 .unwrap_or_else(|_| "true".to_string())
                 .parse()
                 .unwrap_or(true),
+
+            request_summary_seconds: env::var("REQUEST_SUMMARY_SECONDS")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()
+                .unwrap_or(30),
 
             // Derived-parameter janitor
             janitor_interval_seconds: env::var("JANITOR_INTERVAL_SECONDS")

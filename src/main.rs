@@ -224,6 +224,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     tracing::info!("Spawned recurring-service scheduler");
 
+    if config.request_summary_seconds > 0 {
+        let interval = std::time::Duration::from_secs(config.request_summary_seconds);
+        tokio::spawn(river_db::common::request_metrics::report_every(interval));
+    }
+
     // Preserve the low-latency reaction the dispatcher and sweeper had to live alarm-state changes:
     // the scheduled cadence is only the fallback. On every `AlarmStateChanged` broadcast (raised by
     // event-driven reconciles on ingest / config change / job completion), immediately enqueue an
