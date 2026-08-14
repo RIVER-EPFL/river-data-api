@@ -558,7 +558,19 @@ pub async fn pair_stream(
     // a real deployment timeline is attributed by window, not by the single frozen sensor context,
     // resolves each reading's calibration and corrected value from the window covering its own time,
     // and refreshes continuous aggregates + cascades derived params.
-    if backfilled > 0 {
+    // Gated on the stream holding readings at all, not on the backfill having moved rows: a stream
+    // re-paired after an unpair, or one whose readings arrived already attributed, backfills nothing
+    // and still needs its window resolved against the slot it now feeds.
+    let has_readings = state
+        .db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT 1 AS one FROM readings WHERE stream_id = $1 LIMIT 1",
+            [stream_id.into()],
+        ))
+        .await?
+        .is_some();
+    if backfilled > 0 || has_readings {
         let slot_site = sp_site_id;
         let slot_param = sp_parameter_id;
         crate::routes::private::reprocessing_jobs::worker::enqueue(

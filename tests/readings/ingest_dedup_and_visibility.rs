@@ -162,6 +162,9 @@ async fn batch_reading_conflict_skip_then_overwrite() {
     let project = e2e::create_project(&app, &token, "Batch P", "batch-p", false).await;
     let site = e2e::create_site(&app, &token, &project, "Batch Site", "batch-site").await;
     let param = e2e::create_parameter(&app, &token, "batchcond", "Conductivity", "uS/cm").await;
+    // The slot the readings belong to: attribution comes from the pairing, so a parameter the site
+    // has not been assigned would store its readings unattributed.
+    e2e::assign_site_parameter_minimal(&app, &token, &site, &param).await;
     let t = "2025-01-15T00:00:00Z";
 
     let body = serde_json::json!({"readings": [
@@ -343,4 +346,95 @@ async fn ingest_overwrite_updates_values_and_is_sync_only() {
         &token,
     ).await;
     assert_eq!(status, 403, "overwrite is refused for API tokens");
+}
+
+/// A standard curve is chosen by hand per measurement and no query can recover it, so a source-side
+/// correction must leave it standing and the value it serves must come back through it.
+#[tokio::test]
+#[serial]
+async fn ingest_overwrite_keeps_a_hand_picked_curve_and_recomposes_through_it() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let (sync_token, _service_id) = crate::common::seed_sync_session_token(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+    let stream = register_stream(&app, &token, "curve-survives").await;
+
+    let t = "2025-01-15T00:00:00Z";
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/ingest",
+        &serde_json::json!({"stream_id": stream, "readings": [{"time": t, "raw_value": 10.0}]}),
+        &sync_token,
+    )
+    .await;
+    assert_eq!(status, 200, "first ingest ({status}): {body}");
+
+    let sensor_id = "00000000-0000-4000-c000-0000000000c1";
+    let curve_id = "00000000-0000-4000-c000-0000000000d1";
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO sensors (id, name, is_active, is_lab_instrument, created_at) \
+             VALUES ('{sensor_id}', 'Bench reader', true, true, now())"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO standard_curves (id, sensor_id, slope, intercept, name) \
+             VALUES ('{curve_id}', '{sensor_id}', 3.0, 0.5, 'Plate A')"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE readings SET standard_curve_id = '{curve_id}', calibrated_value = 30.5 \
+             WHERE stream_id = '{stream}' AND time = '{t}'"
+        ),
+    )
+    .await;
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/ingest",
+        &serde_json::json!({
+            "stream_id": stream, "overwrite": true,
+            "readings": [{"time": t, "raw_value": 42.5}]
+        }),
+        &sync_token,
+    )
+    .await;
+    assert_eq!(status, 200, "the correction is accepted ({status}): {body}");
+
+    let row = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT raw_value, calibrated_value, standard_curve_id FROM readings \
+                 WHERE stream_id = '{stream}' AND time = '{t}'"
+            ),
+        ))
+        .await
+        .expect("query")
+        .expect("the corrected reading is stored");
+    assert_eq!(
+        row.try_get::<f64>("", "raw_value").unwrap(),
+        42.5,
+        "the correction replaced the measurement"
+    );
+    assert_eq!(
+        row.try_get::<Option<uuid::Uuid>>("", "standard_curve_id")
+            .unwrap()
+            .map(|id| id.to_string()),
+        Some(curve_id.to_string()),
+        "a re-send naming no curve leaves the operator's standing"
+    );
+    assert_eq!(
+        row.try_get::<Option<f64>>("", "calibrated_value").unwrap(),
+        Some(128.0),
+        "3 * 42.5 + 0.5: the served value comes back through that curve"
+    );
 }
