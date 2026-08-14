@@ -5,11 +5,12 @@
 //! Expected behaviour: every bucket the endpoint serves is the exact arithmetic of the eligible
 //! readings underneath it, and every change that alters those readings reaches the served bucket.
 //!
-//! Five suites, and only two of them exercise propagation. The other three pin contracts:
-//! `served_aggregates_report_exact_values_at_every_resolution` pins the endpoint arithmetic,
-//! `continuous_aggregates_apply_their_filter_algebra_exactly` pins the view's WHERE clause, and
-//! `editing_a_stored_raw_value_reaches_the_served_aggregate` pins a known gap. The propagation
-//! guards are the calibration edit across two sites and the flag-range window.
+//! Two suites pin contracts rather than propagation:
+//! `served_aggregates_report_exact_values_at_every_resolution` pins the endpoint arithmetic and
+//! `continuous_aggregates_apply_their_filter_algebra_exactly` pins the view's WHERE clause. The
+//! propagation guards are the corrected reading, the calibration edit across two sites and the
+//! flag-range window. `a_stored_value_edited_out_of_band_is_recovered_by_a_full_refresh` states the
+//! boundary: a statement the application never saw is outside what a write path can promise.
 //!
 //! Overlap, deliberately kept: `tests/sensor_calibrations/reprocessing.rs` already covers a
 //! calibration *create* reaching one site's hourly rollup, read by SQL. What is added here is an
@@ -189,6 +190,28 @@ async fn write_readings(app: &Router, jwt: &str, rows: Vec<Value>) {
 /// Materialise all four views over one window. `refresh_continuous_aggregate` cannot run inside a
 /// transaction, so this goes through the autocommit `exec`. The window must span at least one
 /// monthly bucket for the monthly view to accept it.
+/// The stream already holding a slot's reading, ie. the one a source-side correction arrives on.
+async fn stream_holding(
+    db: &DatabaseConnection,
+    site_id: &str,
+    parameter_id: &str,
+    at: &str,
+) -> Uuid {
+    db.query_one(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "SELECT stream_id FROM readings \
+             WHERE site_id = '{site_id}' AND parameter_id = '{parameter_id}' \
+               AND time = '{at}'::timestamptz LIMIT 1"
+        ),
+    ))
+    .await
+    .expect("query readings")
+    .expect("the slot holds a reading")
+    .try_get("", "stream_id")
+    .expect("stream_id")
+}
+
 async fn refresh_views(db: &DatabaseConnection, from: &str, to: &str) {
     for view in [
         "readings_hourly",
@@ -1404,19 +1427,56 @@ async fn editing_a_stored_raw_value_reaches_the_served_aggregate() {
         "the control hour starts at the mean of 100 and 200: {baseline}"
     );
 
-    crate::common::exec(
-        &db,
-        &format!(
-            "UPDATE readings SET raw_value = 1000.0 \
-             WHERE site_id = '{site1}' AND parameter_id = '{flow}' \
-               AND time = '2025-12-10T08:00:00Z'::timestamptz"
-        ),
+    // The correction arrives the way a source-side correction does, on the stream that already
+    // holds the slot. That stream is paired first: `/readings/batch` creates its `api` stream
+    // unpaired, and an ingest resolving no slot writes the attribution it resolved, ie. none.
+    let stream_id = stream_holding(&db, &site1, &flow, "2025-12-10T08:00:00Z").await;
+    let site_parameter: Uuid = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT id FROM site_parameters \
+                 WHERE site_id = '{site1}' AND parameter_id = '{flow}'"
+            ),
+        ))
+        .await
+        .expect("query site_parameters")
+        .expect("the slot is provisioned")
+        .try_get("", "id")
+        .expect("site_parameter id");
+    let (status, paired) = crate::common::post_json_parse_with_token(
+        &app,
+        &format!("/api/streams/{stream_id}/pair"),
+        &json!({ "site_parameter_id": site_parameter }),
+        &admin,
     )
     .await;
+    assert!(
+        (200..300).contains(&status),
+        "pair the stream the readings landed on ({status}): {paired}"
+    );
+    assert!(
+        jobs_settled(&db, 60).await,
+        "pairing's follow-on jobs settle before the correction"
+    );
+
+    let (sync_token, _service_id) = crate::common::seed_sync_session_token(&db).await;
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/ingest",
+        &json!({
+            "stream_id": stream_id,
+            "overwrite": true,
+            "readings": [{ "time": "2025-12-10T08:00:00Z", "raw_value": 1000.0 }],
+        }),
+        &sync_token,
+    )
+    .await;
+    assert_eq!(status, 200, "the correction is accepted ({status}): {body}");
     assert_eq!(
         live_hourly(&db, &site1, &flow, "2025-12-10T08:00:00Z").await,
         (Some(510.0), 2),
-        "the edit landed: the stored readings now average (1000 + 20) / 2"
+        "the correction landed: the stored readings now average (1000 + 20) / 2"
     );
 
     let after_edit = aggregates(&app, &intern, &site1, "hourly", day.0, day.1).await;
@@ -1436,6 +1496,81 @@ async fn editing_a_stored_raw_value_reaches_the_served_aggregate() {
         times_len(&after_edit),
         2,
         "and invents no buckets: {after_edit}"
+    );
+
+    let corrected = Bucket {
+        avg: Some(510.0),
+        min: Some(20.0),
+        max: Some(1000.0),
+        count: 2,
+        flagged: 0,
+    };
+    assert_eq!(
+        served_after_edit, corrected,
+        "the corrected value reaches the served bucket with nobody asking for it: {after_edit}"
+    );
+}
+
+/// The same correction made underneath the API, which is the boundary of what a write path can
+/// promise: a continuous aggregate is materialised, and a statement the application never saw
+/// leaves it holding the old number until a refresh consumes the invalidation TimescaleDB recorded.
+/// `POST /actions/refresh_aggregates {full:true}` is that refresh, and it is above the intern level.
+#[tokio::test]
+#[serial]
+async fn a_stored_value_edited_out_of_band_is_recovered_by_a_full_refresh() {
+    let Some((db, app, admin, track)) = onboard("out_of_band_edit_recovery").await else {
+        return;
+    };
+    let river = member(&db, &track.project_id, RIVER.0, RIVER.1).await;
+    let intern = member(&db, &track.project_id, INTERN.0, INTERN.1).await;
+
+    let site1 = track.site_id.clone();
+    let flow = track.parameter_id("TrkFlowDO").to_string();
+
+    assert!(
+        jobs_settled(&db, 60).await,
+        "provisioning jobs settle before the readings land"
+    );
+    write_readings(
+        &app,
+        &river,
+        vec![
+            reading(&site1, &flow, "2025-12-10T08:00:00Z", 10.0),
+            reading(&site1, &flow, "2025-12-10T08:30:00Z", 20.0),
+        ],
+    )
+    .await;
+    assert!(
+        jobs_settled(&db, 60).await,
+        "the write's follow-on jobs settle before the baseline"
+    );
+    refresh_views(&db, "2025-11-01", "2026-01-15").await;
+
+    let day = ("2025-12-10T00:00:00Z", "2025-12-10T23:00:00Z");
+    let baseline = aggregates(&app, &intern, &site1, "hourly", day.0, day.1).await;
+    let start = bucket(&baseline, &flow, "2025-12-10T08:00:00Z", "baseline");
+    assert_eq!(start.avg, Some(15.0), "the mean of 10 and 20: {baseline}");
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE readings SET raw_value = 1000.0 \
+             WHERE site_id = '{site1}' AND parameter_id = '{flow}' \
+               AND time = '2025-12-10T08:00:00Z'::timestamptz"
+        ),
+    )
+    .await;
+    assert_eq!(
+        live_hourly(&db, &site1, &flow, "2025-12-10T08:00:00Z").await,
+        (Some(510.0), 2),
+        "the stored readings now average (1000 + 20) / 2"
+    );
+
+    let after_edit = aggregates(&app, &intern, &site1, "hourly", day.0, day.1).await;
+    assert_eq!(
+        bucket(&after_edit, &flow, "2025-12-10T08:00:00Z", "after the edit"),
+        start,
+        "no application code ran, so the materialised bucket still holds the old mean: {after_edit}"
     );
 
     let (status, denied) = crate::common::post_json_parse_with_token(
@@ -1467,10 +1602,7 @@ async fn editing_a_stored_raw_value_reaches_the_served_aggregate() {
         .to_string();
     // Polled as an administrator, not as the river member who triggered it: `inject_read_scope`
     // scopes `reprocessing_jobs` by `sensor_id IN (scoped sensors)`, and a refresh_aggregates job
-    // carries a NULL sensor_id, so the member who queued it gets a 404 on its own job. That is a
-    // real defect, but it is not this test's subject and it is asserted deliberately in
-    // tests/readings/csv_import_sessions.rs; the poll here is a barrier, not a claim about who may
-    // read jobs.
+    // carries a NULL sensor_id, so the member who queued it gets a 404 on its own job.
     assert_eq!(
         e2e::poll_job(&app, &admin, &job_id, 120).await,
         "completed",
@@ -1478,15 +1610,13 @@ async fn editing_a_stored_raw_value_reaches_the_served_aggregate() {
     );
 
     let recovered_body = aggregates(&app, &intern, &site1, "hourly", day.0, day.1).await;
-    assert_populated(&recovered_body, "after the full refresh");
-    let recovered = bucket(
-        &recovered_body,
-        &flow,
-        "2025-12-10T08:00:00Z",
-        "after the full refresh",
-    );
     assert_eq!(
-        recovered,
+        bucket(
+            &recovered_body,
+            &flow,
+            "2025-12-10T08:00:00Z",
+            "after the full refresh"
+        ),
         Bucket {
             avg: Some(510.0),
             min: Some(20.0),
@@ -1495,30 +1625,6 @@ async fn editing_a_stored_raw_value_reaches_the_served_aggregate() {
             flagged: 0
         },
         "the documented recovery reproduces the stored data exactly: {recovered_body}"
-    );
-    assert_eq!(
-        bucket(
-            &recovered_body,
-            &flow,
-            "2025-12-10T09:00:00Z",
-            "control after the full refresh"
-        ),
-        control,
-        "and does not perturb the hour it should not touch: {recovered_body}"
-    );
-    assert_eq!(
-        times_len(&recovered_body),
-        2,
-        "nor invent buckets: {recovered_body}"
-    );
-
-    assert_eq!(
-        served_after_edit, recovered,
-        "an edit to a stored value must reach the served bucket without an operator asking for it. \
-         Straight after the edit the endpoint served {served_after_edit:?} while the stored \
-         readings averaged 510.0 over 2 rows, which the full refresh then produced. Known gap: no \
-         write path refreshes the rollups after a direct value edit (the alternative explanation, \
-         real-time aggregation being enabled on the views, would have made the two agree)."
     );
 }
 

@@ -649,21 +649,9 @@ async fn backdating_the_move_pulls_the_earlier_reading_downstream() {
     );
 }
 
-/// EXPECTED TO FAIL against the current API, and kept failing on purpose.
-///
-/// `recompute_deployed_until` (`sensors/calibrations/service.rs`) sets
-/// `deployed_until = LEAST(existing, LEAD(deployed_from))`, so it can only ever SHORTEN a window.
-/// Pushing the downstream start forward therefore does not carry the upstream deployment's end
-/// with it: `[09:30, 09:45)` becomes a deployment gap, and the per-sensor recall pass NULL-clears
-/// the reading inside it (the slot pass does not, its guard is
-/// `time >= MIN(deployed_from) WHERE site_id = downstream`, which now sits after the gap). The
-/// reading drops out of both sites' rollups instead of returning upstream.
-///
-/// The expectation asserted here is the operator-intuitive one, and it is inferred rather than
-/// documented: correcting a mistyped move date forward should hand the readings back to where the
-/// instrument actually was, exactly as correcting it backwards hands them forward. Closing the gap
-/// is a product decision, not a test fix; weakening this test would record the current behaviour as
-/// correct forever.
+/// Correcting a mistyped move date forward hands the readings back to the site the instrument was
+/// actually at, exactly as correcting it backwards hands them forward. The corrected move leaves no
+/// deployment gap for a reading to fall into.
 #[tokio::test]
 #[serial]
 async fn moving_the_move_date_forward_returns_readings_to_the_previous_site() {

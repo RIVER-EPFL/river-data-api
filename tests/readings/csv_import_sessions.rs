@@ -603,13 +603,27 @@ async fn dry_run_previews_overlap_diff_then_overwrite_applies_exactly_those_rows
         value(
             &fx.db,
             &format!(
-                "SELECT calibrated_value AS v FROM readings \
+                "SELECT COALESCE(calibrated_value, raw_value) AS v FROM readings \
                  WHERE site_id = '{site}' AND parameter_id = '{depth_id}' AND time = '2025-09-10T00:00:00Z'"
             )
         )
         .await,
         Some(155.0),
         "and the served value with it, not only the raw column"
+    );
+    // No instrument stands behind a CSV slot on this track, so no curve resolves and the column
+    // stays null: a stored correction is a claim that some curve produced it.
+    assert_eq!(
+        value(
+            &fx.db,
+            &format!(
+                "SELECT calibrated_value AS v FROM readings \
+                 WHERE site_id = '{site}' AND parameter_id = '{depth_id}' AND time = '2025-09-10T00:00:00Z'"
+            )
+        )
+        .await,
+        None,
+        "and the overwrite invents no correction on the way through"
     );
     assert_eq!(
         count(
