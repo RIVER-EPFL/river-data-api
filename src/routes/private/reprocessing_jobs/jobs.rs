@@ -1346,9 +1346,9 @@ impl Job for JanitorRun {
             .filter(|&n| n >= 1)
             .unwrap_or(self.operator_retention_days);
 
-        // 1. Fill derived gaps (this itself opens its own tracked `janitor_run` row + refreshes
-        //    aggregates back to the earliest filled timestamp).
-        if let Err(e) = janitor::run_once(db).await {
+        // 1. Fill derived gaps, reporting into this job and refreshing aggregates back to the
+        //    earliest filled timestamp.
+        if let Err(e) = janitor::run_once(db, Some(&ctx)).await {
             tracing::warn!(error = %e, "Derived janitor: run failed");
         }
 

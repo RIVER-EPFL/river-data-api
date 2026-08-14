@@ -2,9 +2,6 @@
 //! SMTP connection test, or Graph token fetch) and upserts `notification_channel_health`; the admin
 //! endpoint reads the latest persisted state so the dashboard shows reachability + a last-checked time.
 
-use std::sync::Arc;
-use std::time::Duration;
-
 use axum::{Json, extract::State};
 use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
@@ -54,17 +51,6 @@ pub async fn probe_once(db: &DatabaseConnection, config: &Config) {
         if let Err(e) = res {
             tracing::warn!(error = %e, channel = ch.name(), "failed to upsert channel health");
         }
-    }
-}
-
-/// Background loop: probe on startup, then every `notify_health_interval_seconds` (min 30s).
-pub async fn periodic(db: DatabaseConnection, config: Arc<Config>) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(
-        config.notify_health_interval_seconds.max(30),
-    ));
-    loop {
-        ticker.tick().await;
-        probe_once(&db, &config).await;
     }
 }
 

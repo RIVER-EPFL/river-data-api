@@ -12,7 +12,6 @@
 //! never under `build_test_app`).
 
 use std::collections::HashSet;
-use std::time::Duration;
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
@@ -281,42 +280,4 @@ async fn reconcile_cadence(
     stats.resolved = resolved;
 
     Ok(stats)
-}
-
-/// Long-running task: sweep once on startup, then every `interval`. Emits an `AlarmStateChanged` SSE
-/// event whenever a tick opens or resolves something, so the dashboard can refresh reactively.
-pub async fn periodic(db: DatabaseConnection, interval: Duration, events: EventSender) {
-    tracing::info!(
-        interval_secs = interval.as_secs(),
-        "Alarm sweeper: starting"
-    );
-
-    let tick = async |db: &DatabaseConnection, events: &EventSender| match evaluate_alarm_events(db)
-        .await
-    {
-        Ok(stats) => {
-            if stats.opened > 0 || stats.resolved > 0 {
-                tracing::info!(
-                    opened = stats.opened,
-                    updated = stats.updated,
-                    resolved = stats.resolved,
-                    "Alarm sweeper: state changed"
-                );
-                let _ = events.send(AppEvent::AlarmStateChanged {
-                    opened: stats.opened,
-                    resolved: stats.resolved,
-                });
-            }
-        }
-        Err(e) => tracing::warn!(error = %e, "Alarm sweeper: tick failed"),
-    };
-
-    tick(&db, &events).await;
-
-    let mut ticker = tokio::time::interval(interval);
-    ticker.tick().await;
-    loop {
-        ticker.tick().await;
-        tick(&db, &events).await;
-    }
 }

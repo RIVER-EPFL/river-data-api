@@ -42,7 +42,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_connections(config.db_max_connections)
         .min_connections(config.db_min_connections)
         .connect_timeout(Duration::from_secs(5))
-        .idle_timeout(Duration::from_secs(300))
+        // A backend's first query against the readings hypertable plans in ~240ms while it loads
+        // TimescaleDB's chunk metadata, and ~5ms after. Long enough that the warm set survives a
+        // quiet period rather than being recycled into cold connections.
+        .idle_timeout(Duration::from_secs(1800))
         .sqlx_logging(false)
         .set_schema_search_path("public");
     let db = Database::connect(db_opts).await?;

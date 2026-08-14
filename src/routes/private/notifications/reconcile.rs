@@ -6,8 +6,6 @@
 //! TTL; an alert-only user would otherwise keep receiving alerts indefinitely). Keycloak-unavailable
 //! resolutions are skipped, never deactivated, so an outage can't mass-unlink.
 
-use std::time::Duration;
-
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
@@ -17,26 +15,8 @@ use super::authz::RoleResolution;
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
 
-pub async fn periodic(state: AppState, interval: Duration) {
-    tracing::info!(
-        interval_secs = interval.as_secs(),
-        "Identity reconciliation: starting"
-    );
-    loop {
-        match sweep(&state).await {
-            Ok(0) => {}
-            Ok(n) => tracing::warn!(
-                count = n,
-                "Identity reconciliation: deactivated revoked links"
-            ),
-            Err(e) => tracing::warn!(error = %e, "Identity reconciliation: sweep failed"),
-        }
-        tokio::time::sleep(interval).await;
-    }
-}
-
-/// One reconciliation pass. Returns how many identities were deactivated. Exposed `pub` so tests can
-/// drive it deterministically.
+/// One reconciliation pass, driven by the scheduled `identity_reconcile` job. Returns how many
+/// identities were deactivated.
 pub async fn sweep(state: &AppState) -> Result<usize, sea_orm::DbErr> {
     let rows = state
         .db

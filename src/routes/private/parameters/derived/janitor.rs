@@ -1,5 +1,5 @@
+use crate::routes::private::reprocessing_jobs::lifecycle::JobContext;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
-use std::time::Duration;
 use uuid::Uuid;
 
 const MAX_GAPS_PER_RUN: usize = 50_000;
@@ -30,113 +30,104 @@ pub async fn site_has_active_derived(
 /// was down, derived parameters assigned after historical source data already
 /// existed, and any other inconsistency between source and derived readings.
 ///
-/// Runs through the shared synchronous tracked-job lifecycle ([`run_tracked_job`]) so it persists a
-/// `reprocessing_jobs` row with `trigger_type='janitor_run'` and reports live progress like every
-/// other job. After filling any gaps, refreshes continuous aggregates back to the earliest filled
-/// timestamp so the hourly/daily/weekly/monthly rollups reflect the newly written derived values.
-pub async fn run_once(db: &DatabaseConnection) -> Result<usize, sea_orm::DbErr> {
+/// After filling any gaps, refreshes continuous aggregates back to the earliest filled timestamp so
+/// the hourly/daily/weekly/monthly rollups reflect the newly written derived values.
+///
+/// Reports progress into the caller's job rather than opening one of its own: the janitor always
+/// runs as a step of the worker-pool `janitor_run` job, and a second row opened from inside that
+/// job would carry no lease, so nothing could ever reclaim it.
+pub async fn run_once(
+    db: &DatabaseConnection,
+    ctx: Option<&JobContext>,
+) -> Result<usize, sea_orm::DbErr> {
     let started = std::time::Instant::now();
-    // Same global-sender pattern as the CrudCrate hooks: real SSE stream in prod, a detached
-    // throwaway channel under tests where no AppState was constructed.
-    let events = crate::common::global_event_sender()
-        .unwrap_or_else(|| tokio::sync::broadcast::channel(1).0);
 
-    let filled = crate::routes::private::reprocessing_jobs::lifecycle::run_tracked_job(
-        db,
-        None,
-        "janitor_run",
-        None,
-        events,
-        |ctx| async move {
-            let rows = ctx
-                .db()
-                .query_all(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    r"SELECT DISTINCT r.site_id, r.time
-                      FROM readings r
-                      JOIN site_parameters sp
-                        ON sp.site_id = r.site_id
-                       AND sp.is_derived = true
-                       AND COALESCE(sp.is_active, true) = true
-                      JOIN derived_parameter_sources dps
-                        ON dps.derived_definition_id = sp.derived_definition_id
-                       AND dps.parameter_id = r.parameter_id
-                      WHERE NOT EXISTS (
-                          SELECT 1 FROM readings r2
-                          WHERE r2.site_id = r.site_id
-                            AND r2.parameter_id = sp.parameter_id
-                            AND r2.time = r.time
-                      )
-                      ORDER BY r.site_id, r.time
-                      LIMIT $1",
-                    [(MAX_GAPS_PER_RUN as i64).into()],
-                ))
-                .await?;
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT DISTINCT r.site_id, r.time
+              FROM readings r
+              JOIN site_parameters sp
+                ON sp.site_id = r.site_id
+               AND sp.is_derived = true
+               AND COALESCE(sp.is_active, true) = true
+              JOIN derived_parameter_sources dps
+                ON dps.derived_definition_id = sp.derived_definition_id
+               AND dps.parameter_id = r.parameter_id
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM readings r2
+                  WHERE r2.site_id = r.site_id
+                    AND r2.parameter_id = sp.parameter_id
+                    AND r2.time = r.time
+              )
+              ORDER BY r.site_id, r.time
+              LIMIT $1",
+            [(MAX_GAPS_PER_RUN as i64).into()],
+        ))
+        .await?;
 
-            let total = i32::try_from(rows.len()).unwrap_or(i32::MAX);
-            ctx.set_progress(0, Some(total)).await;
-            if rows.is_empty() {
-                tracing::info!("Derived janitor: no gaps found");
-                return Ok(0);
+    let total = i32::try_from(rows.len()).unwrap_or(i32::MAX);
+    if let Some(ctx) = ctx {
+        ctx.set_progress(0, Some(total)).await;
+    }
+    if rows.is_empty() {
+        tracing::info!("Derived janitor: no gaps found");
+        return Ok(0);
+    }
+    tracing::info!(gaps = total, "Derived janitor: filling gaps");
+
+    let mut filled: i64 = 0;
+    let mut min_filled: Option<chrono::DateTime<chrono::Utc>> = None;
+    for (i, row) in rows.iter().enumerate() {
+        if ctx.is_some_and(JobContext::is_cancelled) {
+            break;
+        }
+        let site_id: Uuid = row.try_get("", "site_id")?;
+        let time: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
+        let utc_time = time.with_timezone(&chrono::Utc);
+        match crate::routes::private::sensors::calibrations::service::recalculate_derived_at_timestamp(
+            db, site_id, utc_time,
+        )
+        .await
+        {
+            Ok(()) => {
+                filled += 1;
+                min_filled = Some(min_filled.map_or(utc_time, |m| m.min(utc_time)));
             }
-            tracing::info!(gaps = total, "Derived janitor: filling gaps");
+            Err(e) => tracing::warn!(error = %e, site_id = %site_id, time = %utc_time, "Janitor failed to fill derived gap"),
+        }
+        if (i + 1) % 1000 == 0
+            && let Some(ctx) = ctx
+        {
+            ctx.set_progress(i as i32 + 1, Some(total)).await;
+        }
+    }
 
-            let mut filled: i64 = 0;
-            let mut min_filled: Option<chrono::DateTime<chrono::Utc>> = None;
-            for (i, row) in rows.iter().enumerate() {
-                if ctx.is_cancelled() {
-                    break;
-                }
-                let site_id: Uuid = row.try_get("", "site_id")?;
-                let time: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
-                let utc_time = time.with_timezone(&chrono::Utc);
-                match crate::routes::private::sensors::calibrations::service::recalculate_derived_at_timestamp(
-                    ctx.db(), site_id, utc_time,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        filled += 1;
-                        min_filled = Some(min_filled.map_or(utc_time, |m| m.min(utc_time)));
-                    }
-                    Err(e) => tracing::warn!(error = %e, site_id = %site_id, time = %utc_time, "Janitor failed to fill derived gap"),
-                }
-                if (i + 1) % 1000 == 0 {
-                    ctx.set_progress(i as i32 + 1, Some(total)).await;
-                }
-            }
-
-            if let Some(since) = min_filled {
-                tracing::info!(%since, filled, "Derived janitor: refreshing continuous aggregates after backfill");
-                crate::common::sync_state::refresh_continuous_aggregates(ctx.db(), Some(since))
-                    .await
-                    .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
-            }
-            ctx.set_progress(total, Some(total)).await;
-            ctx.set_detail(serde_json::json!({
-                "counts": { "gaps_found": total, "filled": filled },
-                "time_range": { "earliest_filled": min_filled },
-                "capped_at_limit": total as usize >= MAX_GAPS_PER_RUN,
-            }))
+    if let Some(since) = min_filled {
+        tracing::info!(%since, filled, "Derived janitor: refreshing continuous aggregates after backfill");
+        crate::common::sync_state::refresh_continuous_aggregates(db, Some(since))
+            .await
+            .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
+    }
+    if let Some(ctx) = ctx {
+        ctx.set_progress(total, Some(total)).await;
+        ctx.set_detail(serde_json::json!({
+            "counts": { "gaps_found": total, "filled": filled },
+            "time_range": { "earliest_filled": min_filled },
+            "capped_at_limit": total as usize >= MAX_GAPS_PER_RUN,
+        }))
+        .await;
+        ctx.info(&format!("Filled {filled} of {total} derived gaps"))
             .await;
-            ctx.info(&format!("Filled {filled} of {total} derived gaps")).await;
-            tracing::info!(
-                filled,
-                total,
-                capped_at_limit = total as usize >= MAX_GAPS_PER_RUN,
-                "Derived janitor: gap fill complete"
-            );
-            Ok(filled)
-        },
-    )
-    .await?;
-
+    }
     tracing::info!(
         filled,
+        total,
+        capped_at_limit = total as usize >= MAX_GAPS_PER_RUN,
         elapsed_ms = started.elapsed().as_millis() as u64,
-        "Derived janitor: complete"
+        "Derived janitor: gap fill complete"
     );
-    Ok(filled as usize)
+    Ok(usize::try_from(filled).unwrap_or(0))
 }
 
 /// Tiered retention for `reprocessing_jobs` (logs cascade-delete with their job). Three layers:
@@ -212,87 +203,3 @@ async fn run_delete(db: &DatabaseConnection, sql: String, label: &str) -> u64 {
     }
 }
 
-/// Long-running task: run the janitor once on startup, then every `interval`.
-///
-/// On every tick:
-///   1. `run_once` fills any missing derived readings (and refreshes aggregates
-///      scoped to the earliest backfilled timestamp), persisting a
-///      `reprocessing_jobs` row visible on the `/jobs` UI page.
-///   2. An incremental refresh of the last 24h hourly / 7d daily windows runs
-///      unconditionally, so aggregates stay in sync with regular ingestion
-///      even when no derived gaps were found.
-///   3. Once every `full_refresh_interval`, a full refresh of all continuous
-///      aggregates runs, catching any historical drift older than 7d without
-///      needing a manual `POST /actions/refresh_aggregates {full: true}`.
-///   4. Once every ~24h, [`prune_tracked_jobs`] enforces tiered job-row retention
-///      (maintenance rows age out fast, operator/metadata slowly, plus a maintenance count cap).
-///
-/// Spawned from main.rs with durations/retention sourced from `Config`.
-pub async fn periodic(
-    db: DatabaseConnection,
-    interval: Duration,
-    full_refresh_interval: Duration,
-    maintenance_retention_days: u32,
-    operator_retention_days: u32,
-    maintenance_max_rows: u64,
-) {
-    tracing::info!(
-        interval_secs = interval.as_secs(),
-        full_refresh_secs = full_refresh_interval.as_secs(),
-        maintenance_retention_days,
-        operator_retention_days,
-        maintenance_max_rows,
-        "Derived janitor: starting"
-    );
-
-    const PRUNE_EVERY: Duration = Duration::from_secs(86_400);
-    let mut last_full_refresh: Option<std::time::Instant> = None;
-    let mut last_prune: Option<std::time::Instant> = None;
-
-    let tick = async |db: &DatabaseConnection,
-                      last_full_refresh: &mut Option<std::time::Instant>,
-                      last_prune: &mut Option<std::time::Instant>| {
-        if let Err(e) = run_once(db).await {
-            tracing::warn!(error = %e, "Derived janitor: run failed");
-        }
-
-        let now = std::time::Instant::now();
-        let due_full =
-            last_full_refresh.is_none_or(|t| now.duration_since(t) >= full_refresh_interval);
-        if due_full {
-            tracing::info!("Derived janitor: running scheduled full continuous aggregate refresh");
-            // The background tick has no caller to answer to, so a failed refresh is logged and
-            // the next tick retries it.
-            if let Err(e) = crate::common::sync_state::refresh_continuous_aggregates_full(db).await
-            {
-                tracing::warn!(error = %e, "Derived janitor: full aggregate refresh failed");
-            }
-            *last_full_refresh = Some(now);
-        } else if let Err(e) =
-            crate::common::sync_state::refresh_continuous_aggregates(db, None).await
-        {
-            tracing::warn!(error = %e, "Derived janitor: incremental aggregate refresh failed");
-        }
-
-        let due_prune = last_prune.is_none_or(|t| now.duration_since(t) >= PRUNE_EVERY);
-        if due_prune {
-            prune_tracked_jobs(
-                db,
-                maintenance_retention_days,
-                operator_retention_days,
-                maintenance_max_rows,
-            )
-            .await;
-            *last_prune = Some(now);
-        }
-    };
-
-    tick(&db, &mut last_full_refresh, &mut last_prune).await;
-
-    let mut ticker = tokio::time::interval(interval);
-    ticker.tick().await;
-    loop {
-        ticker.tick().await;
-        tick(&db, &mut last_full_refresh, &mut last_prune).await;
-    }
-}

@@ -36,6 +36,20 @@ struct ParameterExtent {
     continuous_count: i64,
 }
 
+fn min_opt(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (some, None) | (None, some) => some,
+    }
+}
+
+fn max_opt(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (some, None) | (None, some) => some,
+    }
+}
+
 async fn parameter_extents(
     db: &sea_orm::DatabaseConnection,
     site_id: Uuid,
@@ -228,13 +242,6 @@ pub async fn list_site_parameters(
     Ok(Json(response))
 }
 
-#[derive(Debug, FromQueryResult)]
-struct DataRangeRow {
-    min_time: Option<DateTime<Utc>>,
-    max_time: Option<DateTime<Utc>>,
-    count: i64,
-}
-
 /// Get detailed site information including project, parameters, and data range
 #[utoipa::path(
     get,
@@ -280,21 +287,18 @@ pub async fn get_site_detail(
         .map(|p| build_parameter_response(p, &globals, &extents, &declared))
         .collect();
 
-    // Query data range from readings
-    let stmt = Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "SELECT MIN(time) AS min_time, MAX(time) AS max_time, COUNT(*) AS count FROM readings WHERE site_id = $1",
-        [site.id.into()],
+    // The extents cover the same rows this range spans (`WHERE site_id = $1`), so folding them is
+    // the ungrouped aggregate without scanning the hypertable again.
+    let (data_start, data_end, reading_count) = extents.values().fold(
+        (None, None, 0i64),
+        |(start, end, count): (Option<DateTime<Utc>>, Option<DateTime<Utc>>, i64), e| {
+            (
+                min_opt(start, e.data_start),
+                max_opt(end, e.data_end),
+                count + e.reading_count,
+            )
+        },
     );
-
-    let range = state
-        .db
-        .query_one(stmt)
-        .await?
-        .and_then(|row| DataRangeRow::from_query_result(&row, "").ok());
-
-    let (data_start, data_end, reading_count) =
-        range.map_or((None, None, 0), |r| (r.min_time, r.max_time, r.count));
 
     Ok(Json(SiteDetailResponse {
         id: site.id,
