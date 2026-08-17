@@ -116,6 +116,8 @@ pub struct PlotSpec {
     pub gap_seconds: i64,
     pub width: u32,
     pub height: u32,
+    /// Panel styling for a grid cell: smaller type, no stats box.
+    pub compact: bool,
 }
 
 impl PlotSpec {
@@ -133,7 +135,15 @@ impl PlotSpec {
             gap_seconds: i64::MAX,
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
+            compact: false,
         }
+    }
+
+    /// The same spec drawn as a grid panel.
+    #[must_use]
+    pub fn into_panel(mut self) -> Self {
+        self.compact = true;
+        self
     }
 }
 
@@ -204,7 +214,49 @@ fn threshold_in_view(value: f64, lo: f64, hi: f64) -> bool {
 /// runtime (the bot poller handles updates serially).
 pub fn render_png(spec: &PlotSpec) -> Result<Vec<u8>, PlotError> {
     ensure_fonts().map_err(PlotError::Render)?;
+    let mut buf = vec![0u8; (spec.width * spec.height * 3) as usize];
+    {
+        let root =
+            BitMapBackend::with_buffer(&mut buf, (spec.width, spec.height)).into_drawing_area();
+        root.fill(&C_SURFACE).map_err(render_err)?;
+        draw_chart(&root.margin(12, 12, 12, 12), spec)?;
+        root.present().map_err(render_err)?;
+    }
+    encode_png(&buf, spec.width, spec.height)
+}
 
+/// Render several specs as a grid of panels in one image, two columns wide.
+///
+/// A panel per parameter is how a site answers "show me everything" in one message. Specs with no
+/// drawable points must be filtered out by the caller: an empty panel says less than its absence.
+pub fn render_grid_png(specs: &[PlotSpec], width: u32, height: u32) -> Result<Vec<u8>, PlotError> {
+    ensure_fonts().map_err(PlotError::Render)?;
+    if specs.is_empty() {
+        return Err(PlotError::NoData);
+    }
+    let cols = if specs.len() == 1 { 1 } else { 2 };
+    let rows = specs.len().div_ceil(cols);
+    let mut buf = vec![0u8; (width * height * 3) as usize];
+    {
+        let root = BitMapBackend::with_buffer(&mut buf, (width, height)).into_drawing_area();
+        root.fill(&C_SURFACE).map_err(render_err)?;
+        let panels = root.margin(8, 8, 8, 8).split_evenly((rows, cols));
+        for (area, spec) in panels.iter().zip(specs) {
+            draw_chart(&area.margin(6, 6, 6, 6), spec)?;
+        }
+        root.present().map_err(render_err)?;
+    }
+    encode_png(&buf, width, height)
+}
+
+/// Draw one chart into an already-filled area.
+fn draw_chart<DB: DrawingBackend>(
+    area: &DrawingArea<DB, plotters::coord::Shift>,
+    spec: &PlotSpec,
+) -> Result<(), PlotError>
+where
+    DB::ErrorType: 'static,
+{
     let finite: Vec<(DateTime<Utc>, f64)> = spec
         .points
         .iter()
@@ -247,49 +299,57 @@ pub fn render_png(spec: &PlotSpec) -> Result<Vec<u8>, PlotError> {
     }
     let (y_lo, y_hi) = y_range(data_lo, data_hi);
 
-    let mut buf = vec![0u8; (spec.width * spec.height * 3) as usize];
     {
-        let root =
-            BitMapBackend::with_buffer(&mut buf, (spec.width, spec.height)).into_drawing_area();
-        root.fill(&C_SURFACE).map_err(render_err)?;
-
-        let root = root.margin(12, 12, 12, 12);
-        let (header, body) = root.split_vertically(64);
+        let (header, body) = area.split_vertically(if spec.compact { 34 } else { 64 });
 
         header
             .draw_text(
                 &spec.title,
-                &(FONT_FAMILY, 26, FontStyle::Bold).into_text_style(&header).color(&C_TEXT),
-                (4, 4),
+                &(
+                    FONT_FAMILY,
+                    if spec.compact { 16 } else { 26 },
+                    FontStyle::Bold,
+                )
+                    .into_text_style(&header)
+                    .color(&C_TEXT),
+                (4, 2),
             )
             .map_err(render_err)?;
         header
             .draw_text(
                 &spec.subtitle,
-                &(FONT_FAMILY, 15).into_text_style(&header).color(&C_MUTED),
-                (4, 38),
+                &(FONT_FAMILY, if spec.compact { 11 } else { 15 })
+                    .into_text_style(&header)
+                    .color(&C_MUTED),
+                (4, if spec.compact { 20 } else { 38 }),
             )
             .map_err(render_err)?;
 
         let mut chart = ChartBuilder::on(&body)
             .margin_right(16)
-            .x_label_area_size(44)
-            .y_label_area_size(72)
+            .x_label_area_size(if spec.compact { 30 } else { 44 })
+            .y_label_area_size(if spec.compact { 54 } else { 72 })
             .build_cartesian_2d(x_min..x_max, y_lo..y_hi)
             .map_err(render_err)?;
 
-        chart
-            .configure_mesh()
-            .light_line_style(C_GRID.mix(0.55))
+        let label_style = (FONT_FAMILY, if spec.compact { 10 } else { 12 })
+            .into_font()
+            .color(&C_MUTED);
+        let tick = |t: &DateTime<Utc>| format_tick(*t, x_min, x_max);
+        let mut mesh = chart.configure_mesh();
+        mesh.light_line_style(C_GRID.mix(0.55))
             .bold_line_style(C_GRID)
             .axis_style(C_DIVIDER)
-            .label_style((FONT_FAMILY, 12).into_font().color(&C_MUTED))
-            .y_desc(&spec.y_label)
-            .x_labels(8)
-            .y_labels(6)
-            .x_label_formatter(&|t: &DateTime<Utc>| format_tick(*t, x_min, x_max))
-            .draw()
-            .map_err(render_err)?;
+            .label_style(label_style)
+            .x_labels(if spec.compact { 4 } else { 8 })
+            .y_labels(if spec.compact { 4 } else { 6 })
+            .x_label_formatter(&tick);
+        // An empty label leaves the axis bare: a panel carries its units in the title instead, where
+        // there is room for them.
+        if !spec.y_label.is_empty() {
+            mesh.y_desc(&spec.y_label);
+        }
+        mesh.draw().map_err(render_err)?;
 
         // Annotation bands sit behind everything: they are context, not data.
         for band in spec.annotations.iter().take(MAX_ANNOTATION_BANDS) {
@@ -373,12 +433,11 @@ pub fn render_png(spec: &PlotSpec) -> Result<Vec<u8>, PlotError> {
                 .map_err(render_err)?;
         }
 
-        draw_stats_box(&body, &finite).map_err(render_err)?;
-
-        root.present().map_err(render_err)?;
+        if !spec.compact {
+            draw_stats_box(&body, &finite).map_err(render_err)?;
+        }
     }
-
-    encode_png(&buf, spec.width, spec.height)
+    Ok(())
 }
 
 /// Current / Mean / Min / Max / n, kept from the legacy bot because it is the part people read.
@@ -581,6 +640,29 @@ mod tests {
             (decoded.width(), decoded.height()),
             (DEFAULT_WIDTH, DEFAULT_HEIGHT)
         );
+    }
+
+    #[test]
+    fn renders_a_grid_of_panels() {
+        let specs: Vec<PlotSpec> = (0..5)
+            .map(|i| {
+                let mut s = spec_with(series(60 + i * 10));
+                s.title = format!("Parameter {i}");
+                s.into_panel()
+            })
+            .collect();
+        let png = render_grid_png(&specs, DEFAULT_WIDTH, 1020).expect("render");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        let decoded = image::load_from_memory(&png).expect("decodable");
+        assert_eq!((decoded.width(), decoded.height()), (DEFAULT_WIDTH, 1020));
+    }
+
+    #[test]
+    fn a_grid_of_nothing_is_no_data() {
+        assert!(matches!(
+            render_grid_png(&[], DEFAULT_WIDTH, 400),
+            Err(PlotError::NoData)
+        ));
     }
 
     #[test]
