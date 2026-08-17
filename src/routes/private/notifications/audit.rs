@@ -28,6 +28,10 @@ pub enum Outcome {
     Revoked,
     /// Keycloak could not be reached, so the command was refused without a verdict.
     Unavailable,
+    /// The message came from a different Telegram account than the one that claimed the link.
+    WrongAccount,
+    /// Refused for sending too fast.
+    RateLimited,
 }
 
 impl Outcome {
@@ -40,6 +44,8 @@ impl Outcome {
             Outcome::Inactive => "inactive",
             Outcome::Revoked => "revoked",
             Outcome::Unavailable => "unavailable",
+            Outcome::WrongAccount => "wrong_account",
+            Outcome::RateLimited => "rate_limited",
         }
     }
 }

@@ -198,8 +198,10 @@ pub struct SubscriberRow {
     pub is_active: bool,
     /// `unlinked` | `pending` | `linked`.
     pub telegram_status: String,
-    /// Held open against idle expiry. Never shields a revoked user.
+    /// Held open against idle expiry. Never shields a revoked user, and never excuses attestation.
     pub expiry_exempt: bool,
+    /// When this link lapses unless its owner signs in to the dashboard again.
+    pub attested_until: Option<DateTime<Utc>>,
     pub subscription_overrides: i64,
 }
 
@@ -214,6 +216,7 @@ pub struct SubscriberRow {
 pub async fn list_subscribers(
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<SubscriberRow>>> {
+    let attest_days = state.config.telegram_link_attest_days;
     let rows = state
         .db
         .query_all(Statement::from_string(
@@ -230,11 +233,12 @@ pub async fn list_subscribers(
                 (SELECT COUNT(*) FROM notification_subscriptions nsub \
                    WHERE nsub.keycloak_sub = s.keycloak_sub) AS overrides, \
                 ti.telegram_chat_id, ti.link_code, ti.link_code_expires_at, \
-                COALESCE(ti.expiry_exempt, false) AS expiry_exempt \
+                COALESCE(ti.expiry_exempt, false) AS expiry_exempt, ti.last_attested_at \
              FROM subs s \
              LEFT JOIN notification_subscribers ns ON ns.keycloak_sub = s.keycloak_sub \
              LEFT JOIN LATERAL ( \
-                SELECT telegram_chat_id, link_code, link_code_expires_at, expiry_exempt \
+                SELECT telegram_chat_id, link_code, link_code_expires_at, expiry_exempt, \
+                       last_attested_at \
                 FROM telegram_identities ti2 \
                 WHERE ti2.linked_keycloak_sub = s.keycloak_sub ORDER BY ti2.created_at DESC LIMIT 1 \
              ) ti ON true \
@@ -263,6 +267,12 @@ pub async fn list_subscribers(
             is_active: r.try_get("", "is_active")?,
             telegram_status: telegram_status.to_string(),
             expiry_exempt: r.try_get("", "expiry_exempt").unwrap_or(false),
+            attested_until: r
+                .try_get::<Option<DateTime<Utc>>>("", "last_attested_at")
+                .ok()
+                .flatten()
+                .filter(|_| attest_days > 0)
+                .map(|t| t + chrono::Duration::days(attest_days)),
             subscription_overrides: r.try_get("", "overrides")?,
         });
     }

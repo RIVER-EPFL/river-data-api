@@ -31,6 +31,9 @@ const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
 /// `notification_state.kind` for the "your link is about to expire" claim, so the warning is sent
 /// once rather than on every five-minute tick for a week.
 const WARN_KIND: &str = "telegram_link_idle";
+/// Dedup key for the attestation warning, kept separate from the idle one so a link can be warned
+/// about each clock independently.
+const ATTEST_WARN_KIND: &str = "telegram_link_attest";
 
 /// What a sweep did, for the job's `detail.counts`.
 #[derive(Debug, Default, Clone, Copy)]
@@ -39,6 +42,8 @@ pub struct SweepOutcome {
     pub warned: usize,
     pub expired: usize,
     pub purged: usize,
+    /// Links deactivated for going too long without an authenticated portal request.
+    pub unattested: usize,
     /// Audit rows dropped past their retention window.
     pub audit_pruned: usize,
 }
@@ -47,7 +52,12 @@ impl SweepOutcome {
     /// The headline number the job worker persists as `readings_updated`.
     #[must_use]
     pub fn total(self) -> usize {
-        self.revoked + self.warned + self.expired + self.purged + self.audit_pruned
+        self.revoked
+            + self.warned
+            + self.expired
+            + self.purged
+            + self.unattested
+            + self.audit_pruned
     }
 }
 
@@ -80,6 +90,16 @@ pub async fn sweep(state: &AppState) -> Result<SweepOutcome, sea_orm::DbErr> {
         outcome.warned = warn_expiring(state, idle_days).await?;
         outcome.expired = expire_idle(state, idle_days).await?;
     }
+    // 3. Attestation. Telegram activity cannot reset this clock, so a link cannot renew itself off
+    // the back of the alerts we send it. `expiry_exempt` is deliberately not consulted: a pin holds
+    // a link open against idleness, never against its owner having stopped proving they hold the
+    // account.
+    let attest_days = state.config.telegram_link_attest_days;
+    if attest_days > 0 {
+        warn_unattested(state, attest_days).await?;
+        outcome.unattested = expire_unattested(state, attest_days).await?;
+    }
+
     let purge_days = state.config.telegram_link_purge_days;
     if purge_days > 0 {
         outcome.purged = purge(&state.db, purge_days).await?;
@@ -135,7 +155,7 @@ async fn warn_expiring(state: &AppState, idle_days: i64) -> Result<usize, sea_or
             continue;
         }
 
-        if !claim_warning(&state.db, id).await? {
+        if !claim_warning(&state.db, WARN_KIND, id).await? {
             continue;
         }
 
@@ -151,7 +171,7 @@ async fn warn_expiring(state: &AppState, idle_days: i64) -> Result<usize, sea_or
         // would reset the very clock this message is warning about and the link would never lapse.
         if let Err(e) = client.send_message(chat_id, &msg).await {
             tracing::warn!(error = %e, "telegram: idle-link warning failed");
-            release_warning(&state.db, id).await?;
+            release_warning(&state.db, WARN_KIND, id).await?;
             continue;
         }
         warned += 1;
@@ -184,7 +204,7 @@ async fn expire_idle(state: &AppState, idle_days: i64) -> Result<usize, sea_orm:
         let chat_id: Option<i64> = row.try_get("", "telegram_chat_id").ok();
 
         deactivate(&state.db, id).await?;
-        clear_warning(&state.db, id).await?;
+        clear_warning(&state.db, WARN_KIND, id).await?;
         expired += 1;
 
         let still_authorized = !matches!(
@@ -213,6 +233,119 @@ async fn expire_idle(state: &AppState, idle_days: i64) -> Result<usize, sea_orm:
     Ok(expired)
 }
 
+/// Warn before attestation lapses, pointing at the one action that renews it.
+async fn warn_unattested(state: &AppState, attest_days: i64) -> Result<usize, sea_orm::DbErr> {
+    let warn_days = state.config.telegram_link_attest_warn_days;
+    if warn_days <= 0 || warn_days >= attest_days {
+        return Ok(0);
+    }
+    let Some(client) = telegram_client(state) else {
+        return Ok(0);
+    };
+
+    let rows = state
+        .db
+        .query_all(Statement::from_sql_and_values(
+            PG,
+            "SELECT id, linked_keycloak_sub, telegram_chat_id, last_attested_at \
+             FROM telegram_identities \
+             WHERE is_active AND telegram_chat_id IS NOT NULL AND last_attested_at IS NOT NULL \
+               AND last_attested_at < NOW() - ($1 || ' days')::interval",
+            [(attest_days - warn_days).into()],
+        ))
+        .await?;
+
+    let mut warned = 0;
+    for row in rows {
+        let id: Uuid = row.try_get("", "id")?;
+        let sub: String = row.try_get("", "linked_keycloak_sub")?;
+        let chat_id: i64 = row.try_get("", "telegram_chat_id")?;
+        let last: Option<DateTime<Utc>> = row.try_get("", "last_attested_at").ok();
+
+        if matches!(
+            state.authorizer.resolve(state, &sub).await,
+            Some(RoleResolution::Revoked) | None
+        ) {
+            continue;
+        }
+        if !claim_warning(&state.db, ATTEST_WARN_KIND, id).await? {
+            continue;
+        }
+
+        let days_left = last.map_or(warn_days, |t| {
+            (attest_days - (Utc::now() - t).num_days()).max(0)
+        });
+        let msg = format!(
+            "This Telegram link expires in {} day{} unless you sign in to River Data.\n\
+             Opening {} is enough, there is nothing to click.",
+            days_left,
+            if days_left == 1 { "" } else { "s" },
+            dashboard_url(state)
+        );
+        // Direct send, like every other lifecycle notice: delivering through the channel would
+        // stamp Telegram activity, which is exactly the signal this clock refuses to accept.
+        if let Err(e) = client.send_message(chat_id, &msg).await {
+            tracing::warn!(error = %e, "telegram: attestation warning failed");
+            release_warning(&state.db, ATTEST_WARN_KIND, id).await?;
+            continue;
+        }
+        warned += 1;
+    }
+    Ok(warned)
+}
+
+/// Deactivate links whose owner has not signed in within the window.
+async fn expire_unattested(state: &AppState, attest_days: i64) -> Result<usize, sea_orm::DbErr> {
+    let rows = state
+        .db
+        .query_all(Statement::from_sql_and_values(
+            PG,
+            "SELECT id, linked_keycloak_sub, telegram_chat_id FROM telegram_identities \
+             WHERE is_active AND telegram_chat_id IS NOT NULL AND last_attested_at IS NOT NULL \
+               AND last_attested_at < NOW() - ($1 || ' days')::interval",
+            [attest_days.into()],
+        ))
+        .await?;
+
+    let client = telegram_client(state);
+    let mut expired = 0;
+    for row in rows {
+        let id: Uuid = row.try_get("", "id")?;
+        let sub: String = row.try_get("", "linked_keycloak_sub")?;
+        let chat_id: Option<i64> = row.try_get("", "telegram_chat_id").ok();
+
+        deactivate(&state.db, id).await?;
+        clear_warning(&state.db, ATTEST_WARN_KIND, id).await?;
+        expired += 1;
+
+        let still_authorized = !matches!(
+            state.authorizer.resolve(state, &sub).await,
+            Some(RoleResolution::Revoked) | None
+        );
+        if let (Some(client), Some(chat_id), true) = (client.as_ref(), chat_id, still_authorized) {
+            let msg = format!(
+                "This Telegram link has expired: it has been {attest_days} days since anyone \
+                 signed in to River Data with the account behind it.\n\
+                 Re-link from {} to start receiving alerts here again.",
+                format_args!("{}/settings", dashboard_url(state))
+            );
+            if let Err(e) = client.send_message(chat_id, &msg).await {
+                tracing::warn!(error = %e, "telegram: attestation expiry notice failed");
+            }
+        }
+    }
+    Ok(expired)
+}
+
+/// The dashboard address to point someone at, or a description when none is configured.
+fn dashboard_url(state: &AppState) -> String {
+    state
+        .config
+        .dashboard_base_url
+        .clone()
+        .unwrap_or_else(|| "your River Data dashboard".to_string())
+}
+
 /// Delete rows long past expiry. No message: the user was told at the warning and at expiry.
 async fn purge(db: &DatabaseConnection, purge_days: i64) -> Result<usize, sea_orm::DbErr> {
     let res = db
@@ -236,28 +369,40 @@ fn telegram_client(state: &AppState) -> Option<TelegramClient> {
 }
 
 /// Claim the one-per-lapse warning. False when it was already sent.
-async fn claim_warning(db: &DatabaseConnection, id: Uuid) -> Result<bool, sea_orm::DbErr> {
+async fn claim_warning(
+    db: &DatabaseConnection,
+    kind: &str,
+    id: Uuid,
+) -> Result<bool, sea_orm::DbErr> {
     let res = db
         .execute(Statement::from_sql_and_values(
             PG,
             "INSERT INTO notification_state (kind, subject_key, state, last_notified_at) \
              VALUES ($1, $2, 'warned', NOW()) ON CONFLICT (kind, subject_key) DO NOTHING",
-            [WARN_KIND.into(), id.to_string().into()],
+            [kind.into(), id.to_string().into()],
         ))
         .await?;
     Ok(res.rows_affected() > 0)
 }
 
-async fn release_warning(db: &DatabaseConnection, id: Uuid) -> Result<(), sea_orm::DbErr> {
-    clear_warning(db, id).await
+async fn release_warning(
+    db: &DatabaseConnection,
+    kind: &str,
+    id: Uuid,
+) -> Result<(), sea_orm::DbErr> {
+    clear_warning(db, kind, id).await
 }
 
 /// Drop the warning claim so a link that lapses again warns again.
-pub async fn clear_warning(db: &DatabaseConnection, id: Uuid) -> Result<(), sea_orm::DbErr> {
+pub async fn clear_warning(
+    db: &DatabaseConnection,
+    kind: &str,
+    id: Uuid,
+) -> Result<(), sea_orm::DbErr> {
     db.execute(Statement::from_sql_and_values(
         PG,
         "DELETE FROM notification_state WHERE kind = $1 AND subject_key = $2",
-        [WARN_KIND.into(), id.to_string().into()],
+        [kind.into(), id.to_string().into()],
     ))
     .await?;
     Ok(())

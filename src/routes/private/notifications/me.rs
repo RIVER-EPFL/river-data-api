@@ -35,6 +35,16 @@ pub struct TelegramLink {
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code_expires_at: Option<DateTime<Utc>>,
+    /// When the chat was claimed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linked_at: Option<DateTime<Utc>>,
+    /// Last Telegram activity, sent or received.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<DateTime<Utc>>,
+    /// When the link lapses unless its owner signs in to the dashboard again. Renewal is passive,
+    /// so this moves forward on its own for anyone who uses the portal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attested_until: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -98,7 +108,8 @@ async fn load(state: &AppState, auth: &AuthContext, sub: &str) -> AppResult<MyNo
         .db
         .query_one(Statement::from_sql_and_values(
             PG,
-            "SELECT telegram_chat_id, link_code, link_code_expires_at, expiry_exempt \
+            "SELECT telegram_chat_id, link_code, link_code_expires_at, expiry_exempt, \
+                    created_at, last_verified_at, last_attested_at \
              FROM telegram_identities \
              WHERE linked_keycloak_sub = $1 ORDER BY created_at DESC LIMIT 1",
             [sub.into()],
@@ -113,26 +124,45 @@ async fn load(state: &AppState, auth: &AuthContext, sub: &str) -> AppResult<MyNo
             let chat_id: Option<i64> = r.try_get("", "telegram_chat_id").ok().flatten();
             let expires: Option<DateTime<Utc>> =
                 r.try_get("", "link_code_expires_at").ok().flatten();
+            let attest_days = state.config.telegram_link_attest_days;
+            let attested_until = r
+                .try_get::<Option<DateTime<Utc>>>("", "last_attested_at")
+                .ok()
+                .flatten()
+                .filter(|_| attest_days > 0)
+                .map(|t| t + chrono::Duration::days(attest_days));
             if chat_id.is_some() {
                 TelegramLink {
                     status: "linked",
                     code_expires_at: None,
+                    linked_at: r.try_get("", "created_at").ok(),
+                    last_used_at: r.try_get("", "last_verified_at").ok().flatten(),
+                    attested_until,
                 }
             } else if expires.is_some_and(|e| e > Utc::now()) {
                 TelegramLink {
                     status: "pending",
                     code_expires_at: expires,
+                    linked_at: None,
+                    last_used_at: None,
+                    attested_until: None,
                 }
             } else {
                 TelegramLink {
                     status: "unlinked",
                     code_expires_at: None,
+                    linked_at: None,
+                    last_used_at: None,
+                    attested_until: None,
                 }
             }
         }
         None => TelegramLink {
             status: "unlinked",
             code_expires_at: None,
+            linked_at: None,
+            last_used_at: None,
+            attested_until: None,
         },
     };
 

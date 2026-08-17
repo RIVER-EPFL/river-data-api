@@ -195,6 +195,10 @@ pub struct Config {
     pub telegram_link_purge_days: i64,
     // Days of Telegram command history kept in telegram_command_audit. 0 keeps it forever.
     pub telegram_audit_retention_days: i64,
+    // Days a link may go without its owner making an authenticated portal request. 0 disables.
+    pub telegram_link_attest_days: i64,
+    // How many days before attestation lapses the holder is warned.
+    pub telegram_link_attest_warn_days: i64,
     // Dashboard base URL used to build deep links in notification messages.
     pub dashboard_base_url: Option<String>,
 }
@@ -519,6 +523,14 @@ impl Config {
                 .unwrap_or_else(|_| "365".to_string())
                 .parse()
                 .unwrap_or(365),
+            telegram_link_attest_days: env::var("TELEGRAM_LINK_ATTEST_DAYS")
+                .unwrap_or_else(|_| "90".to_string())
+                .parse()
+                .unwrap_or(90),
+            telegram_link_attest_warn_days: env::var("TELEGRAM_LINK_ATTEST_WARN_DAYS")
+                .unwrap_or_else(|_| "14".to_string())
+                .parse()
+                .unwrap_or(14),
             dashboard_base_url: env::var("DASHBOARD_BASE_URL")
                 .ok()
                 .filter(|s| !s.is_empty()),

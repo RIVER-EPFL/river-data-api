@@ -38,6 +38,15 @@ pub struct Model {
     pub link_code_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     #[crudcrate(exclude(create, update))]
     pub last_verified_at: Option<chrono::DateTime<chrono::Utc>>,
+    // The second clock. Telegram activity (sent or received) moves `last_verified_at`, which an
+    // alert stream keeps alive on its own; only an authenticated portal request moves this one, so
+    // a link cannot outlive proof that its owner still holds the Keycloak account.
+    #[crudcrate(exclude(create, update))]
+    pub last_attested_at: Option<chrono::DateTime<chrono::Utc>>,
+    // The Telegram account that claimed the link. An inbound message whose sender disagrees is
+    // refused, so the binding is to a person rather than only to a chat.
+    #[crudcrate(exclude(create, update))]
+    pub telegram_user_id: Option<i64>,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: chrono::DateTime<chrono::Utc>,
     #[crudcrate(exclude(create, update))]
