@@ -58,6 +58,13 @@ fn parse_update(r: &serde_json::Value) -> Update {
     }
 }
 
+/// Telegram carries the bot token in the request *path*, and `reqwest::Error`'s Display appends the
+/// URL it failed on, so the raw error text of any transport failure is a secret. Stripping the URL
+/// is what keeps the token out of the logs.
+fn redact(e: reqwest::Error) -> String {
+    e.without_url().to_string()
+}
+
 #[derive(Clone)]
 pub struct TelegramClient {
     http: reqwest::Client,
@@ -88,11 +95,11 @@ impl TelegramClient {
             .timeout(Duration::from_secs(u64::from(timeout_secs) + 10))
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(redact)?;
         if !resp.status().is_success() {
             return Err(format!("telegram getUpdates {}", resp.status()));
         }
-        let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let json: serde_json::Value = resp.json().await.map_err(redact)?;
         let results = json["result"].as_array().cloned().unwrap_or_default();
         Ok(results.iter().map(parse_update).collect())
     }
@@ -105,13 +112,13 @@ impl TelegramClient {
             .get(&url)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(redact)?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("telegram getMe {status}: {body}"));
         }
-        let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let json: serde_json::Value = resp.json().await.map_err(redact)?;
         let username = json["result"]["username"].as_str().unwrap_or("?");
         Ok(format!("bot @{username} reachable"))
     }
@@ -131,7 +138,7 @@ impl TelegramClient {
         let part = reqwest::multipart::Part::bytes(png)
             .file_name("plot.png")
             .mime_str("image/png")
-            .map_err(|e| e.to_string())?;
+            .map_err(redact)?;
         let mut form = reqwest::multipart::Form::new()
             .text("chat_id", chat_id.to_string())
             .text("caption", truncate_caption(caption))
@@ -157,7 +164,7 @@ impl TelegramClient {
         let part = reqwest::multipart::Part::bytes(png)
             .file_name("plot.png")
             .mime_str("image/png")
-            .map_err(|e| e.to_string())?;
+            .map_err(redact)?;
         let media = serde_json::json!({
             "type": "photo",
             "media": "attach://photo",
@@ -186,7 +193,7 @@ impl TelegramClient {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(redact)?;
         if resp.status().is_success() {
             Ok(())
         } else {
@@ -251,7 +258,7 @@ impl TelegramClient {
             .json(body)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(redact)?;
         if resp.status().is_success() {
             Ok(())
         } else {
@@ -436,5 +443,41 @@ impl NotificationChannel for TelegramChannel {
             });
         }
         results
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bot token lives in the request path, so an error that carries its URL is a leaked
+    /// secret. This asserts the property against the real `reqwest::Error` rather than trusting
+    /// its Display to stay URL-free.
+    #[tokio::test]
+    async fn test_transport_errors_do_not_carry_the_bot_token() {
+        // Port 1 on loopback refuses immediately: the failure is deterministic and no request
+        // leaves the machine.
+        let error = reqwest::Client::new()
+            .get("http://127.0.0.1:1/bot123456:SECRET-TOKEN-VALUE/getMe")
+            .send()
+            .await
+            .expect_err("a refused connection must fail");
+
+        assert!(
+            error.to_string().contains("SECRET-TOKEN-VALUE"),
+            "the raw error is expected to carry the URL, which is why redact exists"
+        );
+        assert!(
+            !redact(error).contains("SECRET-TOKEN-VALUE"),
+            "a redacted error must not carry the token"
+        );
+    }
+
+    #[test]
+    fn test_truncate_caption_stays_under_the_telegram_limit() {
+        let long = "a".repeat(2000);
+        let out = truncate_caption(&long);
+        assert!(out.chars().count() <= 900);
+        assert_eq!(truncate_caption("short"), "short");
     }
 }
