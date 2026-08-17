@@ -155,9 +155,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // dedicated single-replica task; it is NOT a scheduled Service.
     if state.config.telegram_bot_token.is_some() {
         if state.config.enable_telegram_bot {
-            tokio::spawn(river_db::routes::private::notifications::bot::run(
-                state.clone(),
-            ));
+            // Supervised: a panic inside the poller kills only its task, which would leave the
+            // bot silently unresponsive while the API carries on serving.
+            let bot_state = state.clone();
+            tokio::spawn(async move {
+                loop {
+                    let attempt = std::panic::AssertUnwindSafe(
+                        river_db::routes::private::notifications::bot::run(bot_state.clone()),
+                    );
+                    match futures::FutureExt::catch_unwind(attempt).await {
+                        Ok(()) => tracing::error!("Telegram bot poller exited, restarting"),
+                        Err(_) => tracing::error!("Telegram bot poller panicked, restarting"),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                }
+            });
             tracing::info!("Spawned Telegram bot poller");
         } else {
             tracing::info!(
