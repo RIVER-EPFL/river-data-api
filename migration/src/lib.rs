@@ -60,6 +60,8 @@ mod m20260814_000002_sync_event_readings_skipped;
 mod m20260814_000003_pair_api_streams;
 mod m20260814_000004_telegram_link_expiry;
 mod m20260817_000001_telegram_command_audit;
+mod m20260817_000002_scrub_telegram_urls;
+mod m20260817_000003_telegram_attestation;
 
 pub struct Migrator;
 
@@ -128,6 +130,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260814_000003_pair_api_streams::Migration),
             Box::new(m20260814_000004_telegram_link_expiry::Migration),
             Box::new(m20260817_000001_telegram_command_audit::Migration),
+            Box::new(m20260817_000002_scrub_telegram_urls::Migration),
+            Box::new(m20260817_000003_telegram_attestation::Migration),
         ]
     }
 }
