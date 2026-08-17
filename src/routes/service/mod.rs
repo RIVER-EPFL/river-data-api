@@ -526,6 +526,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
                 "/notifications/subscribers",
                 get(notif_views::list_subscribers),
             )
+            .route(
+                "/notifications/telegram_activity",
+                get(notif_views::list_telegram_activity),
+            )
             .layer(middleware::from_fn(require_admin))
             .with_state(state.clone())
     };

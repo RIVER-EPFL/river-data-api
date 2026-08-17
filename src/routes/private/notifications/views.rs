@@ -1,6 +1,6 @@
 //! Admin HTTP handlers for the notification layer (link-code minting).
 
-use axum::{Json, extract::State};
+use axum::{Json, extract::Query, extract::State};
 use chrono::{DateTime, Utc};
 use rand::Rng;
 use sea_orm::{ConnectionTrait, Statement};
@@ -264,6 +264,68 @@ pub async fn list_subscribers(
             telegram_status: telegram_status.to_string(),
             expiry_exempt: r.try_get("", "expiry_exempt").unwrap_or(false),
             subscription_overrides: r.try_get("", "overrides")?,
+        });
+    }
+    Ok(Json(out))
+}
+
+#[derive(Debug, Deserialize, ToSchema, utoipa::IntoParams)]
+pub struct ActivityQuery {
+    /// Confine the listing to one Keycloak user.
+    pub keycloak_sub: Option<String>,
+    /// Rows to return, newest first. Capped at 500.
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ActivityRow {
+    pub chat_id: i64,
+    pub chat_type: Option<String>,
+    pub keycloak_sub: Option<String>,
+    /// From a fixed vocabulary. An unrecognised command is recorded as `unknown`.
+    pub command: String,
+    /// `ok` | `denied` | `unlinked` | `inactive` | `revoked` | `unavailable`.
+    pub outcome: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Inbound Telegram command history: who used the bot, when, and whether they were allowed to.
+///
+/// No message body is stored, so this answers "who did what" without keeping what people typed.
+/// Admin-only, like the rest of the oversight surface.
+#[utoipa::path(
+    get,
+    path = "/notifications/telegram_activity",
+    params(ActivityQuery),
+    responses((status = 200, description = "Inbound command history", body = [ActivityRow])),
+    tag = "notifications"
+)]
+pub async fn list_telegram_activity(
+    State(state): State<AppState>,
+    Query(query): Query<ActivityQuery>,
+) -> AppResult<Json<Vec<ActivityRow>>> {
+    let limit = i64::from(query.limit.unwrap_or(100).clamp(1, 500));
+    let rows = state
+        .db
+        .query_all(Statement::from_sql_and_values(
+            PG,
+            "SELECT chat_id, chat_type, keycloak_sub, command, outcome, created_at \
+             FROM telegram_command_audit \
+             WHERE ($1::text IS NULL OR keycloak_sub = $1) \
+             ORDER BY created_at DESC LIMIT $2",
+            [query.keycloak_sub.into(), limit.into()],
+        ))
+        .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        out.push(ActivityRow {
+            chat_id: r.try_get("", "chat_id")?,
+            chat_type: r.try_get("", "chat_type")?,
+            keycloak_sub: r.try_get("", "keycloak_sub")?,
+            command: r.try_get("", "command")?,
+            outcome: r.try_get("", "outcome")?,
+            created_at: r.try_get("", "created_at")?,
         });
     }
     Ok(Json(out))

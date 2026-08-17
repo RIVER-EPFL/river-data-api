@@ -1608,6 +1608,7 @@ impl Job for IdentityReconcile {
                     warned = o.warned,
                     expired = o.expired,
                     purged = o.purged,
+                    audit_pruned = o.audit_pruned,
                     "Identity reconciliation: links changed"
                 );
                 Ok(o.total() as i64)

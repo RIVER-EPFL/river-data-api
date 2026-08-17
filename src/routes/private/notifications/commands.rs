@@ -795,14 +795,19 @@ pub async fn muted(db: &DatabaseConnection) -> String {
     format!("Active mutes:\n{}", lines.join("\n"))
 }
 
+/// Claim a link code. Returns `(claimed, reply)`: the flag is what the audit trail records, since
+/// a failed claim on a live code is the signal worth keeping.
 pub async fn start(
     db: &DatabaseConnection,
     chat_id: i64,
     _username: Option<&str>,
     code: &str,
-) -> String {
+) -> (bool, String) {
     if code.is_empty() {
-        return "Send /start <code> with the link code from your account settings.".to_string();
+        return (
+            false,
+            "Send /start <code> with the link code from your account settings.".to_string(),
+        );
     }
     let res = db
         .query_one(Statement::from_sql_and_values(
@@ -817,12 +822,16 @@ pub async fn start(
         ))
         .await;
     match res {
-        Ok(Some(_)) => {
-            "✅ Linked. You'll receive alerts and can use commands, try /help.".to_string()
-        }
-        Ok(None) => "Invalid or expired code.".to_string(),
+        Ok(Some(_)) => (
+            true,
+            "✅ Linked. You'll receive alerts and can use commands, try /help.".to_string(),
+        ),
+        Ok(None) => (false, "Invalid or expired code.".to_string()),
         // Most likely the chat is already linked to another identity (unique constraint).
-        Err(_) => "This chat is already linked, or the code is invalid.".to_string(),
+        Err(_) => (
+            false,
+            "This chat is already linked, or the code is invalid.".to_string(),
+        ),
     }
 }
 

@@ -8,6 +8,7 @@ mod common;
 mod access_test;
 mod admin_test;
 mod anti_backdoor_test;
+mod audit_test;
 mod capabilities_test;
 mod command_scope_test;
 mod dispatcher_test;

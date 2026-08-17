@@ -39,13 +39,15 @@ pub struct SweepOutcome {
     pub warned: usize,
     pub expired: usize,
     pub purged: usize,
+    /// Audit rows dropped past their retention window.
+    pub audit_pruned: usize,
 }
 
 impl SweepOutcome {
     /// The headline number the job worker persists as `readings_updated`.
     #[must_use]
     pub fn total(self) -> usize {
-        self.revoked + self.warned + self.expired + self.purged
+        self.revoked + self.warned + self.expired + self.purged + self.audit_pruned
     }
 }
 
@@ -82,6 +84,12 @@ pub async fn sweep(state: &AppState) -> Result<SweepOutcome, sea_orm::DbErr> {
     if purge_days > 0 {
         outcome.purged = purge(&state.db, purge_days).await?;
     }
+
+    // 3. Audit retention. Same cadence, same table family, no new schedule.
+    outcome.audit_pruned = usize::try_from(
+        super::audit::prune(&state.db, state.config.telegram_audit_retention_days).await?,
+    )
+    .unwrap_or(0);
 
     Ok(outcome)
 }

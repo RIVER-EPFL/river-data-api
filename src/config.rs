@@ -193,6 +193,8 @@ pub struct Config {
     pub telegram_link_warn_days: i64,
     // Days after which a deactivated link's row is deleted outright. 0 disables.
     pub telegram_link_purge_days: i64,
+    // Days of Telegram command history kept in telegram_command_audit. 0 keeps it forever.
+    pub telegram_audit_retention_days: i64,
     // Dashboard base URL used to build deep links in notification messages.
     pub dashboard_base_url: Option<String>,
 }
@@ -513,6 +515,10 @@ impl Config {
                 .unwrap_or_else(|_| "90".to_string())
                 .parse()
                 .unwrap_or(90),
+            telegram_audit_retention_days: env::var("TELEGRAM_AUDIT_RETENTION_DAYS")
+                .unwrap_or_else(|_| "365".to_string())
+                .parse()
+                .unwrap_or(365),
             dashboard_base_url: env::var("DASHBOARD_BASE_URL")
                 .ok()
                 .filter(|s| !s.is_empty()),

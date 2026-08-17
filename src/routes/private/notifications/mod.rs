@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 
 pub mod access;
+pub mod audit;
 pub mod authz;
 pub mod bot;
 pub mod commands;

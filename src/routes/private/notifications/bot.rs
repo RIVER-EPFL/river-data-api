@@ -10,6 +10,7 @@ use crate::common::AppState;
 use crate::common::authz::{AccessScope, Role};
 
 use super::access::accessible_project_ids;
+use super::audit;
 use super::authz::RoleResolution;
 use super::commands;
 use super::keyboard;
@@ -137,6 +138,7 @@ async fn handle_update(
     if let Some(reply) = route(
         state,
         chat_id,
+        u.chat_type.as_deref(),
         is_private,
         u.username.as_deref(),
         &cmd,
@@ -166,15 +168,37 @@ async fn handle_callback(
             .await;
         return;
     };
-    let scope = match authorize(state, chat_id).await {
-        Ok(ctx) => ctx.scope,
+    let ctx = match authorize(state, chat_id).await {
+        Ok(ctx) => ctx,
         Err(refusal) => {
-            client.answer_callback(callback_id, Some(&toast(&refusal))).await;
+            audit::record(
+                &state.db,
+                chat_id,
+                u.chat_type.as_deref(),
+                None,
+                None,
+                "callback",
+                refusal.outcome,
+            )
+            .await;
+            client
+                .answer_callback(callback_id, Some(&toast(&refusal.message)))
+                .await;
             return;
         }
     };
+    audit::record(
+        &state.db,
+        chat_id,
+        u.chat_type.as_deref(),
+        Some(ctx.identity_id),
+        Some(&ctx.sub),
+        "callback",
+        audit::Outcome::Ok,
+    )
+    .await;
     client.answer_callback(callback_id, None).await;
-    let reply = commands::callback(state, &scope, action).await;
+    let reply = commands::callback(state, &ctx.scope, action).await;
     // A chart is replaced in place, so changing window doesn't stack images down the chat. Anything
     // else (a picker, an error) is a new message: a photo can't be edited into text.
     let edit = if u.has_photo && matches!(reply, Reply::Photo { .. }) {
@@ -248,9 +272,12 @@ fn parse_command(text: &str) -> (String, &str) {
     (cmd, rest)
 }
 
-async fn route(
+/// Route one inbound command. Public for the integration tests, which drive it directly to assert
+/// the authorization and audit behaviour a live chat would get.
+pub async fn route(
     state: &AppState,
     chat_id: i64,
+    chat_type: Option<&str>,
     is_private: bool,
     username: Option<&str>,
     cmd: &str,
@@ -258,7 +285,47 @@ async fn route(
 ) -> Option<Reply> {
     // /start is the only command reachable before a chat is linked.
     if cmd == "start" {
-        return Some(commands::start(&state.db, chat_id, username, args).await.into());
+        // Claiming a code binds THIS chat to the user's authority, so a group chat would hand every
+        // member that user's project access, including people with no account at all.
+        if !is_private {
+            audit::record(
+                &state.db,
+                chat_id,
+                chat_type,
+                None,
+                None,
+                cmd,
+                audit::Outcome::Denied,
+            )
+            .await;
+            return Some(
+                "Linking only works in a direct (1:1) chat with the bot. Open a chat with me and \
+                 send /start <code> there."
+                    .into(),
+            );
+        }
+        let (claimed, reply) = commands::start(&state.db, chat_id, username, args).await;
+        // A claim is the moment a chat gains an identity, so the row names who it became.
+        let identity = if claimed {
+            lookup_identity(&state.db, chat_id).await
+        } else {
+            None
+        };
+        audit::record(
+            &state.db,
+            chat_id,
+            chat_type,
+            identity.as_ref().map(|i| i.id),
+            identity.as_ref().map(|i| i.sub.as_str()),
+            cmd,
+            if claimed {
+                audit::Outcome::Ok
+            } else {
+                audit::Outcome::Denied
+            },
+        )
+        .await;
+        return Some(reply.into());
     }
 
     // A write/state-changing command in a group chat can't be attributed to an individual, refuse
@@ -271,44 +338,87 @@ async fn route(
         );
     }
 
-    let (role, scope) = match authorize(state, chat_id).await {
-        Ok(ctx) => (ctx.role, ctx.scope),
-        Err(refusal) => return Some(Reply::Text(refusal)),
+    let ctx = match authorize(state, chat_id).await {
+        Ok(ctx) => ctx,
+        Err(refusal) => {
+            audit::record(
+                &state.db,
+                chat_id,
+                chat_type,
+                None,
+                None,
+                cmd,
+                refusal.outcome,
+            )
+            .await;
+            return Some(Reply::Text(refusal.message));
+        }
     };
+    let (role, scope) = (ctx.role, ctx.scope);
 
     // Commands that answer with an image or a keyboard sit outside the text-only match below.
     // Placed after identity, role and scope resolution so they inherit every gate rather than
     // re-implementing one, and `scope` confines site resolution exactly as it does for /latest.
-    if plot_args::is_plot_command(cmd) {
-        return Some(commands::plot(state, &scope, cmd, args).await);
-    }
-    if cmd == "stations" {
-        return Some(commands::stations(&state.db, &scope).await);
-    }
+    // A refusal below sets `outcome`, so one message produces exactly one audit row.
+    let mut outcome = audit::Outcome::Ok;
+    let reply = if plot_args::is_plot_command(cmd) {
+        commands::plot(state, &scope, cmd, args).await
+    } else if cmd == "stations" {
+        commands::stations(&state.db, &scope).await
+    } else {
+        Reply::Text(text_command(state, &scope, &role, username, chat_id, cmd, args, &mut outcome).await)
+    };
+    audit::record(
+        &state.db,
+        chat_id,
+        chat_type,
+        Some(ctx.identity_id),
+        Some(&ctx.sub),
+        cmd,
+        outcome,
+    )
+    .await;
+    Some(reply)
+}
 
+/// The commands that answer with text. `outcome` is set to `Denied` where a role gate refuses, so
+/// the audit trail distinguishes "ran it" from "tried it".
+#[allow(clippy::too_many_arguments)]
+async fn text_command(
+    state: &AppState,
+    scope: &AccessScope,
+    role: &RoleResolution,
+    username: Option<&str>,
+    chat_id: i64,
+    cmd: &str,
+    args: &str,
+    outcome: &mut audit::Outcome,
+) -> String {
     let cutoff = state.config.battery_cutoff_volts;
-    let reply = match cmd {
+    match cmd {
         "help" => commands::help(),
         "ping" => commands::ping(),
-        "status" => commands::status(&state.db, &scope).await,
-        "alarms" => commands::alarms(&state.db, &scope).await,
-        "latest" => commands::latest(&state.db, &scope, args).await,
-        "thresholds" => commands::thresholds(&state.db, &scope, args).await,
+        "status" => commands::status(&state.db, scope).await,
+        "alarms" => commands::alarms(&state.db, scope).await,
+        "latest" => commands::latest(&state.db, scope, args).await,
+        "thresholds" => commands::thresholds(&state.db, scope, args).await,
         // Sync-service internals (endpoints, last_error) are operational data, Administrators only.
         "server" => {
             if role.allows_admin() {
                 commands::server(&state.db).await
             } else {
+                *outcome = audit::Outcome::Denied;
                 "This command requires an administrator role.".to_string()
             }
         }
-        "battery" => commands::battery(&state.db, &scope, args, cutoff).await,
+        "battery" => commands::battery(&state.db, scope, args, cutoff).await,
         // Grab-sample submission is a data write: require the same River level as HTTP `/grab_samples`
         // (interns are read-only) and confine the site to the caller's scope.
         "grab" => {
             if role.allows_level(&Role::River) {
-                commands::grab(state, &scope, args, username, chat_id).await
+                commands::grab(state, scope, args, username, chat_id).await
             } else {
+                *outcome = audit::Outcome::Denied;
                 "Submitting grab samples requires at least the River role.".to_string()
             }
         }
@@ -324,18 +434,35 @@ async fn route(
                     _ => commands::muted(&state.db).await,
                 }
             } else {
+                *outcome = audit::Outcome::Denied;
                 "This command requires an administrator role.".to_string()
             }
         }
         other => format!("Unknown command /{other}. Try /help."),
-    };
-    Some(Reply::Text(reply))
+    }
 }
 
 /// What a chat is allowed to do, resolved fresh.
 struct Context {
+    identity_id: Uuid,
+    sub: String,
     role: RoleResolution,
     scope: AccessScope,
+}
+
+/// A refused message: what to tell the user, and what to record.
+struct Refusal {
+    message: String,
+    outcome: audit::Outcome,
+}
+
+impl Refusal {
+    fn new(outcome: audit::Outcome, message: &str) -> Self {
+        Self {
+            message: message.to_string(),
+            outcome,
+        }
+    }
 }
 
 /// Resolve the chat's linked user, their current role and their project confinement.
@@ -343,24 +470,33 @@ struct Context {
 /// Anti-backdoor: this runs on every inbound message and every button tap. A role revoked in
 /// Keycloak deactivates the identity here; an unreachable authorization service refuses rather than
 /// falling back to a cached answer. `Err` carries the refusal to show the user.
-async fn authorize(state: &AppState, chat_id: i64) -> Result<Context, String> {
+async fn authorize(state: &AppState, chat_id: i64) -> Result<Context, Refusal> {
     let Some(identity) = lookup_identity(&state.db, chat_id).await else {
-        return Err(
-            "This chat isn't linked. Ask an administrator for a code, then send /start <code>."
-                .to_string(),
-        );
+        return Err(Refusal::new(
+            audit::Outcome::Unlinked,
+            "This chat isn't linked. Ask an administrator for a code, then send /start <code>.",
+        ));
     };
     if !identity.is_active {
-        return Err(
-            "This chat's access has been revoked. Ask an administrator to re-link.".to_string(),
-        );
+        return Err(Refusal::new(
+            audit::Outcome::Inactive,
+            "This chat's access has been revoked. Ask an administrator to re-link.",
+        ));
     }
     let role = match state.authorizer.resolve(state, &identity.sub).await {
         Some(RoleResolution::Revoked) => {
             deactivate(&state.db, identity.id).await;
-            return Err("Your access has been revoked.".to_string());
+            return Err(Refusal::new(
+                audit::Outcome::Revoked,
+                "Your access has been revoked.",
+            ));
         }
-        None => return Err("Authorization service is unavailable. Try again shortly.".to_string()),
+        None => {
+            return Err(Refusal::new(
+                audit::Outcome::Unavailable,
+                "Authorization service is unavailable. Try again shortly.",
+            ));
+        }
         Some(role) => role,
     };
     stamp_verified(&state.db, identity.id).await;
@@ -372,7 +508,12 @@ async fn authorize(state: &AppState, chat_id: i64) -> Result<Context, String> {
         None => AccessScope::Unrestricted,
         Some(projects) => AccessScope::Projects(std::sync::Arc::new(projects)),
     };
-    Ok(Context { role, scope })
+    Ok(Context {
+        identity_id: identity.id,
+        sub: identity.sub,
+        role,
+        scope,
+    })
 }
 
 async fn lookup_identity(db: &DatabaseConnection, chat_id: i64) -> Option<Identity> {

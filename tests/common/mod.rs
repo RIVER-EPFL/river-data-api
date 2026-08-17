@@ -136,6 +136,7 @@ fn test_config() -> Config {
         telegram_link_idle_days: 30,
         telegram_link_warn_days: 7,
         telegram_link_purge_days: 90,
+        telegram_audit_retention_days: 365,
         dashboard_base_url: None,
     }
 }
