@@ -59,6 +59,21 @@ crudcrate = { version = "0.9.2", features = ["postgresql", "derive"] }
 # HTTP client (Keycloak admin proxy, Telegram, Microsoft Graph)
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 
+# Chart rendering (Telegram plot replies). `default-features = false` is load-bearing: the default
+# `ttf` feature pulls font-kit -> fontconfig/freetype, which exist in neither the builder nor the
+# debian-slim runtime image. `ab_glyph` keeps the text path pure Rust against an embedded font.
+# PNG encoding of the rendered buffer. Pinned to the same 0.24 line plotters-bitmap already
+# depends on, so this shares one compiled copy rather than adding a second.
+image = { version = "0.24", default-features = false, features = ["png"] }
+plotters = { version = "0.3.7", default-features = false, features = [
+    "bitmap_backend",
+    "bitmap_encoder",
+    "ab_glyph",
+    "line_series",
+    "area_series",
+    "chrono",
+] }
+
 # Email (SMTP submission for notifications)
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
 
