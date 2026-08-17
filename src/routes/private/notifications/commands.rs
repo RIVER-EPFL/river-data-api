@@ -159,7 +159,10 @@ async fn site_buttons(
             PG,
             "SELECT id, name FROM sites \
              WHERE ($1::uuid[] IS NULL OR project_id = ANY($1)) ORDER BY name LIMIT $2",
-            [scope_projects_bind(scope), i64::from(MAX_SITE_BUTTONS).into()],
+            [
+                scope_projects_bind(scope),
+                i64::from(MAX_SITE_BUTTONS).into(),
+            ],
         ))
         .await?;
     Ok(rows
@@ -258,9 +261,9 @@ pub async fn sites_menu(db: &DatabaseConnection, scope: &AccessScope, lead: &str
 /// A parameter picker for one site. Answers "no parameter matches" with the ones that do.
 pub async fn parameters_menu(db: &DatabaseConnection, site_id: Uuid, lead: &str) -> Reply {
     match parameter_buttons(db, site_id).await {
-        Ok(buttons) if buttons.is_empty() => Reply::Text(format!(
-            "{lead}\nThis site has no parameters configured."
-        )),
+        Ok(buttons) if buttons.is_empty() => {
+            Reply::Text(format!("{lead}\nThis site has no parameters configured."))
+        }
         Ok(buttons) => {
             let mut keys = keyboard::rows(buttons, 2);
             keys.push(vec![Button {
@@ -825,11 +828,19 @@ pub async fn start(
     chat_id: i64,
     from_id: Option<i64>,
     code: &str,
+    dashboard: Option<&str>,
 ) -> (bool, String) {
+    // A dead end names where to get a code, for anyone who found the bot before the dashboard.
+    let where_to_get_one = match dashboard {
+        Some(base) => format!("Get one from {}/settings.", base.trim_end_matches('/')),
+        None => "Get one from Settings in the River Data dashboard.".to_string(),
+    };
     if code.is_empty() {
         return (
             false,
-            "Send /start <code> with the link code from your account settings.".to_string(),
+            format!(
+                "To connect this chat, send /start followed by your link code. {where_to_get_one}"
+            ),
         );
     }
     let res = db
@@ -849,11 +860,14 @@ pub async fn start(
             true,
             "✅ Linked. You'll receive alerts and can use commands, try /help.".to_string(),
         ),
-        Ok(None) => (false, "Invalid or expired code.".to_string()),
+        Ok(None) => (
+            false,
+            format!("That code is invalid or has expired. {where_to_get_one}"),
+        ),
         // Most likely the chat is already linked to another identity (unique constraint).
         Err(_) => (
             false,
-            "This chat is already linked, or the code is invalid.".to_string(),
+            format!("This chat is already linked, or the code is invalid. {where_to_get_one}"),
         ),
     }
 }
@@ -862,12 +876,7 @@ pub async fn start(
 /// the field. Reuses the full grab-sample insert path (stream creation, sample aggregation, alarm
 /// reconciliation). When `TELEGRAM_GRAB_FLAG_FOR_REVIEW` is set, the readings are flagged on insert
 /// so they're held out of aggregates until a curator reviews them.
-pub async fn grab(
-    state: &AppState,
-    scope: &AccessScope,
-    args: &str,
-    sub: &str,
-) -> String {
+pub async fn grab(state: &AppState, scope: &AccessScope, args: &str, sub: &str) -> String {
     let toks: Vec<&str> = args.split_whitespace().collect();
     if toks.len() < 3 {
         return "Usage: /grab <site> <param> <value> [more values…]".to_string();
@@ -950,7 +959,11 @@ async fn flag_for_review(db: &DatabaseConnection, sample_ids: &[Uuid]) {
     let ids = sea_orm::Value::Array(
         sea_orm::sea_query::ArrayType::Uuid,
         Some(Box::new(
-            sample_ids.iter().copied().map(sea_orm::Value::from).collect(),
+            sample_ids
+                .iter()
+                .copied()
+                .map(sea_orm::Value::from)
+                .collect(),
         )),
     );
     let res = db
@@ -1075,7 +1088,11 @@ async fn parameter_units(
             [parameter_id.into()],
         ))
         .await?;
-    Ok(row.and_then(|r| r.try_get::<Option<String>>("", "default_units").ok().flatten()))
+    Ok(row.and_then(|r| {
+        r.try_get::<Option<String>>("", "default_units")
+            .ok()
+            .flatten()
+    }))
 }
 
 /// Time-ranged notes overlapping the window.
@@ -1133,7 +1150,11 @@ pub async fn plot(state: &AppState, scope: &AccessScope, cmd: &str, args: &str) 
 
     // A window can be given without a target, so it is split off before anything is resolved.
     let mut tokens = plot_args::tokenize(args);
-    let trailing_window = if tokens.len() > 1 && tokens.last().is_some_and(|t| plot_args::looks_like_window(t)) {
+    let trailing_window = if tokens.len() > 1
+        && tokens
+            .last()
+            .is_some_and(|t| plot_args::looks_like_window(t))
+    {
         tokens.last().cloned()
     } else if tokens.len() == 1 && plot_args::looks_like_window(&tokens[0]) {
         tokens.pop()
@@ -1232,11 +1253,7 @@ async fn render_slot(state: &AppState, target: &PlotTarget, window: Duration) ->
                 target.site_name,
                 humanize(window)
             ),
-            keyboard: chart_keyboard(
-                target.site_id,
-                target.parameter_id,
-                &window_label(window),
-            ),
+            keyboard: chart_keyboard(target.site_id, target.parameter_id, &window_label(window)),
         };
     }
 
@@ -1289,11 +1306,15 @@ async fn render_slot(state: &AppState, target: &PlotTarget, window: Duration) ->
         }
         Ok(Err(e)) => {
             tracing::error!(error = %e, "plot render failed");
-            return Reply::Text("Couldn't draw that plot, it's been logged for the team.".to_string());
+            return Reply::Text(
+                "Couldn't draw that plot, it's been logged for the team.".to_string(),
+            );
         }
         Err(e) => {
             tracing::error!(error = %e, "plot render task panicked");
-            return Reply::Text("Couldn't draw that plot, it's been logged for the team.".to_string());
+            return Reply::Text(
+                "Couldn't draw that plot, it's been logged for the team.".to_string(),
+            );
         }
     };
 
@@ -1342,15 +1363,14 @@ async fn slot_thresholds(
             None
         }
     };
-    let lines = resolved.as_ref().map_or_else(
-        plot::ThresholdLines::default,
-        |t| plot::ThresholdLines {
+    let lines = resolved
+        .as_ref()
+        .map_or_else(plot::ThresholdLines::default, |t| plot::ThresholdLines {
             warning_min: t.warning_min,
             warning_max: t.warning_max,
             alarm_min: t.alarm_min,
             alarm_max: t.alarm_max,
-        },
-    );
+        });
     (lines, resolved)
 }
 
@@ -1368,7 +1388,11 @@ fn point_severities(
     points
         .iter()
         .map(|p| {
-            let severity = severity_of_range(Some(p.min.unwrap_or(p.value)), Some(p.max.unwrap_or(p.value)), t);
+            let severity = severity_of_range(
+                Some(p.min.unwrap_or(p.value)),
+                Some(p.max.unwrap_or(p.value)),
+                t,
+            );
             u8::try_from(severity).unwrap_or(0)
         })
         .collect()
@@ -1403,16 +1427,15 @@ async fn site_overview(
     let tier = series_query::tier_for(window);
     let mut specs = Vec::new();
     for (parameter_id, name, units) in &parameters {
-        let series = match series_query::fetch_series(db, site_id, *parameter_id, start, end, tier)
-            .await
-        {
-            Ok(s) if !s.is_empty() => s,
-            Ok(_) => continue,
-            Err(e) => {
-                tracing::warn!(error = %e, "overview: series fetch failed");
-                continue;
-            }
-        };
+        let series =
+            match series_query::fetch_series(db, site_id, *parameter_id, start, end, tier).await {
+                Ok(s) if !s.is_empty() => s,
+                Ok(_) => continue,
+                Err(e) => {
+                    tracing::warn!(error = %e, "overview: series fetch failed");
+                    continue;
+                }
+            };
         let points = series_query::decimate(series.points, series_query::MAX_POINTS);
         let units_suffix = units
             .as_deref()
@@ -1461,11 +1484,15 @@ async fn site_overview(
         Ok(Ok(png)) => png,
         Ok(Err(e)) => {
             tracing::error!(error = %e, "overview render failed");
-            return Reply::Text("Couldn't draw that overview, it's been logged for the team.".to_string());
+            return Reply::Text(
+                "Couldn't draw that overview, it's been logged for the team.".to_string(),
+            );
         }
         Err(e) => {
             tracing::error!(error = %e, "overview render task panicked");
-            return Reply::Text("Couldn't draw that overview, it's been logged for the team.".to_string());
+            return Reply::Text(
+                "Couldn't draw that overview, it's been logged for the team.".to_string(),
+            );
         }
     };
 
@@ -1607,7 +1634,11 @@ async fn latest_reading_time(
     .await
     .ok()
     .flatten()
-    .and_then(|r| r.try_get::<Option<chrono::DateTime<Utc>>>("", "t").ok().flatten())
+    .and_then(|r| {
+        r.try_get::<Option<chrono::DateTime<Utc>>>("", "t")
+            .ok()
+            .flatten()
+    })
 }
 
 /// A window as a short phrase for a title and caption.
@@ -1693,8 +1724,7 @@ pub async fn slot_plot_png(
     spec.points = points.iter().map(|p| (p.time, p.value)).collect();
     spec.envelope = envelope;
     spec.thresholds = thresholds;
-    spec.annotations =
-        plot_annotations(db, site_id, parameter_id, start, end).await;
+    spec.annotations = plot_annotations(db, site_id, parameter_id, start, end).await;
 
     let _slot = RENDER_SLOTS.acquire().await;
     tokio::task::spawn_blocking(move || plot::render_png(&spec))

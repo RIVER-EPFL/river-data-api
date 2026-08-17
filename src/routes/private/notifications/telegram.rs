@@ -68,6 +68,44 @@ fn redact(e: reqwest::Error) -> String {
     e.without_url().to_string()
 }
 
+/// The configured bot's identity, cached for an hour and re-resolved after a failure.
+pub async fn cached_identity(token: &str) -> Option<BotIdentity> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<moka::future::Cache<String, BotIdentity>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| {
+        moka::future::Cache::builder()
+            .max_capacity(4)
+            .time_to_live(Duration::from_secs(3600))
+            .build()
+    });
+    if let Some(hit) = cache.get(token).await {
+        return Some(hit);
+    }
+    match TelegramClient::new(token.to_string())
+        .fetch_identity()
+        .await
+    {
+        Ok(id) => {
+            cache.insert(token.to_string(), id.clone()).await;
+            Some(id)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "telegram: could not resolve bot identity");
+            None
+        }
+    }
+}
+
+/// The bot behind the configured token, as Telegram reports it.
+#[derive(Debug, Clone)]
+pub struct BotIdentity {
+    /// Without the leading `@`.
+    pub username: String,
+    /// The display name shown in chat lists (`first_name` in the API).
+    pub name: Option<String>,
+    pub description: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct TelegramClient {
     http: reqwest::Client,
@@ -109,21 +147,39 @@ impl TelegramClient {
 
     /// Liveness + token validity check. `getMe` returns the bot's identity when the token is valid.
     pub async fn get_me(&self) -> Result<String, String> {
-        let url = format!("{API_BASE}/bot{}/getMe", self.token);
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(redact)?;
+        let id = self.fetch_identity().await?;
+        Ok(format!("bot @{} reachable", id.username))
+    }
+
+    /// The bot this token belongs to, so config cannot name a different one.
+    pub async fn fetch_identity(&self) -> Result<BotIdentity, String> {
+        let json: serde_json::Value = self.get_json("getMe").await?;
+        let result = &json["result"];
+        let Some(username) = result["username"].as_str() else {
+            return Err("telegram getMe returned no username".to_string());
+        };
+        Ok(BotIdentity {
+            username: username.to_string(),
+            name: result["first_name"].as_str().map(str::to_string),
+            // Absent until set with @BotFather's /setdescription.
+            description: self
+                .get_json("getMyDescription")
+                .await
+                .ok()
+                .and_then(|d| d["result"]["description"].as_str().map(str::to_string))
+                .filter(|s| !s.is_empty()),
+        })
+    }
+
+    async fn get_json(&self, method: &str) -> Result<serde_json::Value, String> {
+        let url = format!("{API_BASE}/bot{}/{method}", self.token);
+        let resp = self.http.get(&url).send().await.map_err(redact)?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("telegram getMe {status}: {body}"));
+            return Err(format!("telegram {method} {status}: {body}"));
         }
-        let json: serde_json::Value = resp.json().await.map_err(redact)?;
-        let username = json["result"]["username"].as_str().unwrap_or("?");
-        Ok(format!("bot @{username} reachable"))
+        resp.json().await.map_err(redact)
     }
 
     /// Send a PNG with a caption and an optional keyboard.
@@ -244,10 +300,12 @@ impl TelegramClient {
     pub async fn set_my_commands(&self, commands: &[(&str, &str)]) -> Result<(), String> {
         let list: Vec<serde_json::Value> = commands
             .iter()
-            .map(|(command, description)| serde_json::json!({
-                "command": command,
-                "description": description,
-            }))
+            .map(|(command, description)| {
+                serde_json::json!({
+                    "command": command,
+                    "description": description,
+                })
+            })
             .collect();
         self.post_json("setMyCommands", &serde_json::json!({ "commands": list }))
             .await
@@ -271,7 +329,6 @@ impl TelegramClient {
         }
     }
 }
-
 
 /// Mark a chat as active because an alert reached it.
 ///
@@ -366,7 +423,6 @@ pub async fn slot_recipients(
     }
     Ok(out)
 }
-
 
 impl TelegramChannel {
     /// A chart of the breaching slot, when `TELEGRAM_ALARM_PLOTS` is on.

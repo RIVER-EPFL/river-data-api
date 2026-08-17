@@ -220,7 +220,8 @@ async fn handle_update(
     let Some(chat_id) = u.chat_id else {
         return;
     };
-    if let (Some(callback_id), Some(data)) = (u.callback_id.as_deref(), u.callback_data.as_deref()) {
+    if let (Some(callback_id), Some(data)) = (u.callback_id.as_deref(), u.callback_data.as_deref())
+    {
         handle_callback(state, client, limits, chat_id, &u, callback_id, data).await;
         return;
     }
@@ -242,7 +243,14 @@ async fn handle_update(
         return;
     }
     let (cmd, args) = parse_command(text);
-    if let Some(reply) = route(state, limits, &Inbound::from_update(&u, chat_id), &cmd, args).await
+    if let Some(reply) = route(
+        state,
+        limits,
+        &Inbound::from_update(&u, chat_id),
+        &cmd,
+        args,
+    )
+    .await
     {
         deliver(client, chat_id, reply, None).await;
     }
@@ -441,7 +449,14 @@ pub async fn route(
             .await;
             return Some(Reply::Text(group_link_refusal(state, voided)));
         }
-        let (claimed, reply) = commands::start(&state.db, chat_id, from_id, args).await;
+        let (claimed, reply) = commands::start(
+            &state.db,
+            chat_id,
+            from_id,
+            args,
+            state.config.dashboard_base_url.as_deref(),
+        )
+        .await;
         // A claim is the moment a chat gains an identity, so the row names who it became.
         let identity = if claimed {
             lookup_identity(&state.db, chat_id).await

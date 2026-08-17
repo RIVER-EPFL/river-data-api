@@ -43,9 +43,16 @@ pub struct NotificationsConfig {
 #[serde(rename_all = "camelCase")]
 pub struct TelegramCapability {
     pub available: bool,
-    /// Public bot username (no `@`), for building the `t.me/<bot>?start=<code>` link. `None` if unset.
+    /// Public bot username (no `@`), for building the `t.me/<bot>?start=<code>` link. `None` if
+    /// unset and Telegram could not be reached.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bot_username: Option<String>,
+    /// The bot's display name, as shown in a Telegram chat list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_name: Option<String>,
+    /// The bot's @BotFather description, when one is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_description: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -59,10 +66,22 @@ pub struct EmailCapability {
 /// all-disabled state is valid); never returns 404 and never leaks credentials.
 pub async fn get_notifications_config(State(state): State<AppState>) -> impl IntoResponse {
     let config = &state.config;
+    // TELEGRAM_BOT_USERNAME is the fallback for when Telegram is unreachable.
+    let identity = match &config.telegram_bot_token {
+        Some(token) => {
+            crate::routes::private::notifications::telegram::cached_identity(token).await
+        }
+        None => None,
+    };
     Json(NotificationsConfig {
         telegram: TelegramCapability {
             available: config.telegram_configured(),
-            bot_username: config.telegram_bot_username.clone(),
+            bot_username: identity
+                .as_ref()
+                .map(|i| i.username.clone())
+                .or_else(|| config.telegram_bot_username.clone()),
+            bot_name: identity.as_ref().and_then(|i| i.name.clone()),
+            bot_description: identity.as_ref().and_then(|i| i.description.clone()),
         },
         email: EmailCapability {
             available: config.email_configured(),
