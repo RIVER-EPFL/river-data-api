@@ -1388,7 +1388,10 @@ impl Job for JanitorRun {
         match crate::routes::private::sensors::calibrations::service::sweep_curve_drift(db).await {
             Ok(drift) if drift.moved > 0 => {
                 recomposed = drift.moved;
-                tracing::info!(moved = drift.moved, "Janitor: recomposed drifted curve values");
+                tracing::info!(
+                    moved = drift.moved,
+                    "Janitor: recomposed drifted curve values"
+                );
                 ctx.log(
                     "info",
                     &format!(

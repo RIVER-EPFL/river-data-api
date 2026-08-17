@@ -53,8 +53,22 @@ impl Outcome {
 /// Every command the bot answers. An inbound token outside this list is recorded as `unknown`
 /// rather than stored, which is what keeps user-authored text out of the table.
 const KNOWN_COMMANDS: [&str; 16] = [
-    "start", "help", "ping", "status", "alarms", "stations", "latest", "thresholds", "server",
-    "battery", "grab", "mute", "unmute", "muted", "plot", "callback",
+    "start",
+    "help",
+    "ping",
+    "status",
+    "alarms",
+    "stations",
+    "latest",
+    "thresholds",
+    "server",
+    "battery",
+    "grab",
+    "mute",
+    "unmute",
+    "muted",
+    "plot",
+    "callback",
 ];
 
 /// Map an inbound command to its audit vocabulary.

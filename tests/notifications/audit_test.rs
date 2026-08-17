@@ -52,7 +52,14 @@ async fn an_unlinked_chat_is_recorded() {
     crate::common::seed_test_data(&db).await;
     let (_app, state) = crate::common::build_test_app_with_state(db.clone());
 
-    bot::route(&state, &bot::Limits::new(), &bot::Inbound::private(424_242, None), "status", "").await;
+    bot::route(
+        &state,
+        &bot::Limits::new(),
+        &bot::Inbound::private(424_242, None),
+        "status",
+        "",
+    )
+    .await;
 
     let recorded = rows(&db).await;
     assert_eq!(recorded.len(), 1, "one message, one row: {recorded:?}");
@@ -70,11 +77,21 @@ async fn a_deactivated_link_is_recorded_as_inactive() {
     link(&db, 424_243, false).await;
     let (_app, state) = crate::common::build_test_app_with_state(db.clone());
 
-    bot::route(&state, &bot::Limits::new(), &bot::Inbound::private(424_243, None), "alarms", "").await;
+    bot::route(
+        &state,
+        &bot::Limits::new(),
+        &bot::Inbound::private(424_243, None),
+        "alarms",
+        "",
+    )
+    .await;
 
     let recorded = rows(&db).await;
     assert_eq!(recorded.len(), 1);
-    assert_eq!((recorded[0].0.as_str(), recorded[0].1.as_str()), ("alarms", "inactive"));
+    assert_eq!(
+        (recorded[0].0.as_str(), recorded[0].1.as_str()),
+        ("alarms", "inactive")
+    );
 }
 
 /// No Keycloak in this suite, so an active link cannot be resolved. That is the fail-closed path,
@@ -88,7 +105,14 @@ async fn an_unresolvable_user_is_recorded_as_unavailable() {
     link(&db, 424_244, true).await;
     let (_app, state) = crate::common::build_test_app_with_state(db.clone());
 
-    bot::route(&state, &bot::Limits::new(), &bot::Inbound::private(424_244, None), "latest", "").await;
+    bot::route(
+        &state,
+        &bot::Limits::new(),
+        &bot::Inbound::private(424_244, None),
+        "latest",
+        "",
+    )
+    .await;
 
     let recorded = rows(&db).await;
     assert_eq!(recorded.len(), 1);
@@ -131,7 +155,10 @@ async fn a_link_claim_is_recorded_against_the_user_it_created() {
 
     let recorded = rows(&db).await;
     assert_eq!(recorded.len(), 1);
-    assert_eq!((recorded[0].0.as_str(), recorded[0].1.as_str()), ("start", "ok"));
+    assert_eq!(
+        (recorded[0].0.as_str(), recorded[0].1.as_str()),
+        ("start", "ok")
+    );
     assert_eq!(recorded[0].2.as_deref(), Some(SUB));
 }
 
@@ -198,7 +225,10 @@ async fn a_link_code_cannot_be_claimed_in_a_group() {
 
     let recorded = rows(&db).await;
     assert_eq!(recorded.len(), 1);
-    assert_eq!((recorded[0].0.as_str(), recorded[0].1.as_str()), ("start", "denied"));
+    assert_eq!(
+        (recorded[0].0.as_str(), recorded[0].1.as_str()),
+        ("start", "denied")
+    );
 }
 
 /// Data minimisation: whatever someone types, only our own vocabulary is stored.
@@ -221,7 +251,10 @@ async fn a_message_body_is_never_stored() {
 
     let recorded = rows(&db).await;
     assert_eq!(recorded.len(), 1);
-    assert_eq!(recorded[0].0, "unknown", "unknown input is not stored verbatim");
+    assert_eq!(
+        recorded[0].0, "unknown",
+        "unknown input is not stored verbatim"
+    );
 
     let dump: String = db
         .query_one(Statement::from_string(

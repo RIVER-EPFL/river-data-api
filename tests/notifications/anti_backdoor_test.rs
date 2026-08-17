@@ -200,7 +200,10 @@ async fn a_pinned_link_is_still_revoked() {
     .await;
 
     let outcome = reconcile::sweep(&state).await.unwrap();
-    assert_eq!(outcome.revoked, 1, "a pinned link is not exempt from revocation");
+    assert_eq!(
+        outcome.revoked, 1,
+        "a pinned link is not exempt from revocation"
+    );
     assert!(
         !is_active(&db, "disabled-user").await,
         "a revoked user's link is deactivated even when pinned against idle expiry"

@@ -26,8 +26,7 @@ use super::aggregates::Resolution;
 pub const VALUE_EXPR: &str = "COALESCE(smp.mean, r.calibrated_value, r.raw_value)";
 
 /// The predicates that make a raw read agree with the continuous aggregates.
-pub const CAGG_PARITY_FILTERS: &str =
-    "r.replicate_index = 0 AND r.is_flagged IS NOT TRUE AND r.measurement_type IS DISTINCT FROM 'spot'";
+pub const CAGG_PARITY_FILTERS: &str = "r.replicate_index = 0 AND r.is_flagged IS NOT TRUE AND r.measurement_type IS DISTINCT FROM 'spot'";
 
 /// Above this, a series is decimated before rendering. Roughly 4/3 of the widest plot area we
 /// draw, so there is at least one point per pixel column and no more than two.
@@ -329,7 +328,10 @@ mod tests {
             tier_for(Duration::hours(49)),
             Tier::Rollup(Resolution::Hourly)
         );
-        assert_eq!(tier_for(Duration::days(7)), Tier::Rollup(Resolution::Hourly));
+        assert_eq!(
+            tier_for(Duration::days(7)),
+            Tier::Rollup(Resolution::Hourly)
+        );
         assert_eq!(
             tier_for(Duration::days(30)),
             Tier::Rollup(Resolution::Hourly)
@@ -338,7 +340,10 @@ mod tests {
             tier_for(Duration::days(45)),
             Tier::Rollup(Resolution::Hourly)
         );
-        assert_eq!(tier_for(Duration::days(46)), Tier::Rollup(Resolution::Daily));
+        assert_eq!(
+            tier_for(Duration::days(46)),
+            Tier::Rollup(Resolution::Daily)
+        );
         assert_eq!(
             tier_for(Duration::days(400)),
             Tier::Rollup(Resolution::Daily)

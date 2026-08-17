@@ -31,7 +31,10 @@ async fn insert_identity(db: &DatabaseConnection, chat_id: i64, idle_days: i64, 
     .await;
 }
 
-async fn row(db: &DatabaseConnection, chat_id: i64) -> (bool, Option<chrono::DateTime<chrono::Utc>>) {
+async fn row(
+    db: &DatabaseConnection,
+    chat_id: i64,
+) -> (bool, Option<chrono::DateTime<chrono::Utc>>) {
     let r = db
         .query_one(Statement::from_string(
             PG,
@@ -176,7 +179,10 @@ async fn a_deactivated_link_inside_the_grace_period_is_kept() {
     let (_app, state) = crate::common::build_test_app_with_state(db.clone());
 
     let outcome = reconcile::sweep(&state).await.expect("sweep");
-    assert_eq!(outcome.purged, 0, "40 days is inside the 90-day grace period");
+    assert_eq!(
+        outcome.purged, 0,
+        "40 days is inside the 90-day grace period"
+    );
     assert_eq!(count(&db, 900_006).await, 1);
 }
 

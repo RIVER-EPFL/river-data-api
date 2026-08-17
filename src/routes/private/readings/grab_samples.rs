@@ -223,7 +223,13 @@ async fn auto_create_samples(
     created_by: Option<&str>,
     label: Option<&str>,
     notes: Option<&str>,
-) -> Result<(HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Uuid>, Vec<Uuid>), AppError> {
+) -> Result<
+    (
+        HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Uuid>,
+        Vec<Uuid>,
+    ),
+    AppError,
+> {
     let mut groups: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), usize> = HashMap::new();
     for r in readings {
         *groups.entry((r.parameter_id, r.time)).or_default() += 1;

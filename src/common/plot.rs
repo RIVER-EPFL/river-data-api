@@ -447,10 +447,7 @@ where
             let colour = severity_colour(run.severity);
             chart
                 .draw_series(std::iter::once(Rectangle::new(
-                    [
-                        (start.max(x_min), y_lo),
-                        (end.min(x_max), y_hi),
-                    ],
+                    [(start.max(x_min), y_lo), (end.min(x_max), y_hi)],
                     colour.mix(0.13).filled(),
                 )))
                 .map_err(render_err)?;
@@ -512,10 +509,10 @@ where
                 .draw_series(std::iter::once(Text::new(
                     format!("{label} {}", trim_number(value)),
                     (x_min, value),
-                    (FONT_FAMILY, 11).into_font().color(&colour).pos(Pos::new(
-                        HPos::Left,
-                        VPos::Bottom,
-                    )),
+                    (FONT_FAMILY, 11)
+                        .into_font()
+                        .color(&colour)
+                        .pos(Pos::new(HPos::Left, VPos::Bottom)),
                 )))
                 .map_err(render_err)?;
         }
@@ -692,16 +689,28 @@ mod tests {
 
     #[test]
     fn embedded_fonts_are_not_empty() {
-        assert!(FONT_REGULAR.len() > 100_000, "DejaVuSans.ttf looks truncated");
-        assert!(FONT_BOLD.len() > 100_000, "DejaVuSans-Bold.ttf looks truncated");
+        assert!(
+            FONT_REGULAR.len() > 100_000,
+            "DejaVuSans.ttf looks truncated"
+        );
+        assert!(
+            FONT_BOLD.len() > 100_000,
+            "DejaVuSans-Bold.ttf looks truncated"
+        );
     }
 
     // The legacy `c(min * 0.95, max * 1.05)` is wrong in three distinct ways; each gets a test.
     #[test]
     fn y_range_does_not_invert_on_negative_series() {
         let (lo, hi) = y_range(-10.0, -2.0);
-        assert!(lo < -10.0, "lower bound must sit below the minimum, got {lo}");
-        assert!(hi > -2.0, "upper bound must sit above the maximum, got {hi}");
+        assert!(
+            lo < -10.0,
+            "lower bound must sit below the minimum, got {lo}"
+        );
+        assert!(
+            hi > -2.0,
+            "upper bound must sit above the maximum, got {hi}"
+        );
     }
 
     #[test]
@@ -747,11 +756,7 @@ mod tests {
     #[test]
     fn renders_a_png_of_the_expected_size() {
         let png = render_png(&spec_with(series(500))).expect("render");
-        assert_eq!(
-            &png[..8],
-            b"\x89PNG\r\n\x1a\n",
-            "output must be a real PNG"
-        );
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "output must be a real PNG");
         assert!(png.len() > 1_000, "suspiciously small: {} bytes", png.len());
         assert!(
             png.len() < 10 * 1024 * 1024,
@@ -830,7 +835,10 @@ mod tests {
             .iter()
             .map(|&(_, v)| u8::from(v > 110.0) + u8::from(v > 115.0))
             .collect();
-        assert!(spec.severities.iter().any(|&s| s > 0), "test needs breaches");
+        assert!(
+            spec.severities.iter().any(|&s| s > 0),
+            "test needs breaches"
+        );
         let png = render_png(&spec).expect("render");
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
     }
@@ -927,7 +935,10 @@ mod tests {
     fn all_non_finite_is_no_data() {
         let t0 = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let pts = vec![(t0, f64::NAN), (t0 + Duration::minutes(5), f64::NAN)];
-        assert!(matches!(render_png(&spec_with(pts)), Err(PlotError::NoData)));
+        assert!(matches!(
+            render_png(&spec_with(pts)),
+            Err(PlotError::NoData)
+        ));
     }
 
     #[test]

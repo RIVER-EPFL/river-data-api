@@ -1062,7 +1062,8 @@ mod upsert_rules {
             Replace::ValuesAndAttribution,
         ] {
             let tail = on_conflict_sql(replace);
-            let assigns_directly = tail.contains(r#""standard_curve_id" = "excluded"."standard_curve_id""#);
+            let assigns_directly =
+                tail.contains(r#""standard_curve_id" = "excluded"."standard_curve_id""#);
             assert!(
                 !assigns_directly,
                 "{replace:?} would overwrite a hand-picked curve with the incoming row's: {tail}"

@@ -30,10 +30,8 @@ impl MigrationTrait for Migration {
         // `annotations.category` is nullable in the schema but non-optional in the SeaORM model, so
         // any NULL row fails to deserialize on read. No rows carry NULL today, which is why this has
         // gone unnoticed; the plot overlay reads this table, so close it now.
-        db.execute_unprepared(
-            "UPDATE annotations SET category = 'general' WHERE category IS NULL",
-        )
-        .await?;
+        db.execute_unprepared("UPDATE annotations SET category = 'general' WHERE category IS NULL")
+            .await?;
         db.execute_unprepared(
             "ALTER TABLE annotations
              ALTER COLUMN category SET DEFAULT 'general',

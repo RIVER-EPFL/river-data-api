@@ -50,7 +50,10 @@ async fn deployed_lab_sensor(db: &DatabaseConnection, slope: f64, intercept: f64
     let sensor = create_sensor(db, "Drift-probe-01", GLOBAL_PARAM_DO_ID).await;
     crate::common::exec(
         db,
-        &format!("UPDATE sensors SET is_lab_instrument = true WHERE id = '{}'", sensor.id),
+        &format!(
+            "UPDATE sensors SET is_lab_instrument = true WHERE id = '{}'",
+            sensor.id
+        ),
     )
     .await;
     let calibration =
@@ -148,7 +151,10 @@ async fn the_sweep_composes_the_standard_curve_over_the_windowed_calibration() {
     )
     .await;
     let drift = sweep_curve_drift(&db).await.expect("sweep runs");
-    assert_eq!(drift.moved, 1, "the lab curve moved, so the grab follows it");
+    assert_eq!(
+        drift.moved, 1,
+        "the lab curve moved, so the grab follows it"
+    );
     assert_eq!(
         stored(&db).await,
         (10.0, Some(84.5)),
@@ -229,7 +235,10 @@ async fn the_sweep_moves_nothing_on_clean_data() {
     let value_before = stored(&db).await;
 
     let drift = sweep_curve_drift(&db).await.expect("sweep runs");
-    assert_eq!(drift.moved, 0, "nothing had drifted, so nothing is rewritten");
+    assert_eq!(
+        drift.moved, 0,
+        "nothing had drifted, so nothing is rewritten"
+    );
     assert!(drift.span.is_none(), "and there is no span to refresh");
     assert_eq!(
         stored(&db).await,
@@ -274,6 +283,13 @@ async fn the_sweep_leaves_a_correction_no_curve_accounts_for() {
     .await;
 
     let drift = sweep_curve_drift(&db).await.expect("sweep runs");
-    assert_eq!(drift.moved, 0, "it names no curve, so there is nothing to recompose from");
-    assert_eq!(stored(&db).await.1, Some(99.0), "and the number is untouched");
+    assert_eq!(
+        drift.moved, 0,
+        "it names no curve, so there is nothing to recompose from"
+    );
+    assert_eq!(
+        stored(&db).await.1,
+        Some(99.0),
+        "and the number is untouched"
+    );
 }

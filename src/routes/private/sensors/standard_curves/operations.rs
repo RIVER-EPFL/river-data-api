@@ -49,7 +49,10 @@ impl CRUDOperations for StandardCurveOperations {
     async fn update_many(
         &self,
         db: &DatabaseConnection,
-        updates: Vec<(Uuid, <StandardCurve as crudcrate::CRUDResource>::UpdateModel)>,
+        updates: Vec<(
+            Uuid,
+            <StandardCurve as crudcrate::CRUDResource>::UpdateModel,
+        )>,
     ) -> Result<Vec<StandardCurve>, ApiError> {
         let mut updated = Vec::with_capacity(updates.len());
         for (id, data) in updates {

@@ -25,7 +25,7 @@ const MULTIWORD_SITE: &str = "00000000-0000-4000-c000-0000000000b3";
 
 fn scope_a() -> AccessScope {
     AccessScope::Projects(Arc::new(HashSet::from([
-        Uuid::parse_str(PROJECT_ID).unwrap(),
+        Uuid::parse_str(PROJECT_ID).unwrap()
     ])))
 }
 
@@ -92,7 +92,11 @@ async fn plot_returns_a_png_for_a_seeded_series() {
 
     let reply = commands::plot(&state, &AccessScope::Unrestricted, "6h", "Upstream depth").await;
     let png = png_bytes(&reply);
-    assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "reply must carry a real PNG");
+    assert_eq!(
+        &png[..8],
+        b"\x89PNG\r\n\x1a\n",
+        "reply must carry a real PNG"
+    );
     assert!(png.len() > 1_000, "suspiciously small chart: {}", png.len());
 
     match &reply {
@@ -424,7 +428,13 @@ async fn an_unknown_parameter_offers_the_ones_the_site_has() {
     crate::common::seed_test_data(&db).await;
     let (_app, state) = crate::common::build_test_app_with_state(db.clone());
 
-    let reply = commands::plot(&state, &AccessScope::Unrestricted, "plot", "Upstream nonsense").await;
+    let reply = commands::plot(
+        &state,
+        &AccessScope::Unrestricted,
+        "plot",
+        "Upstream nonsense",
+    )
+    .await;
     let labels = button_labels(&reply);
     assert!(
         labels.iter().any(|l| l.contains("Depth")),

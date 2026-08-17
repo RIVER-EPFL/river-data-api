@@ -113,7 +113,8 @@ pub fn window_of_command(cmd: &str) -> Option<Duration> {
 /// Whether `cmd` is one of the plot commands.
 #[must_use]
 pub fn is_plot_command(cmd: &str) -> bool {
-    cmd == "plot" || (parse_window(cmd).is_some() && cmd.chars().next().is_some_and(|c| c.is_ascii_digit()))
+    cmd == "plot"
+        || (parse_window(cmd).is_some() && cmd.chars().next().is_some_and(|c| c.is_ascii_digit()))
 }
 
 /// Split on whitespace, honouring double quotes so a site can be pinned explicitly.
@@ -284,14 +285,21 @@ mod tests {
 
     #[test]
     fn candidate_order_prefers_a_one_word_parameter() {
-        let tokens = vec!["Depth".to_string(), "Station".to_string(), "depth".to_string()];
+        let tokens = vec![
+            "Depth".to_string(),
+            "Station".to_string(),
+            "depth".to_string(),
+        ];
         let splits = candidate_splits(&tokens);
         assert_eq!(
             splits[0],
             ("Depth Station".to_string(), "depth".to_string()),
             "a site whose name contains a parameter word must still resolve"
         );
-        assert_eq!(splits[1], ("Depth".to_string(), "Station depth".to_string()));
+        assert_eq!(
+            splits[1],
+            ("Depth".to_string(), "Station depth".to_string())
+        );
     }
 
     #[test]
