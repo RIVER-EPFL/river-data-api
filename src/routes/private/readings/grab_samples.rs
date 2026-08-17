@@ -55,6 +55,11 @@ pub struct GrabSampleReading {
 pub struct GrabSampleResponse {
     pub inserted: usize,
     pub samples_created: usize,
+    /// The samples this request created, as opposed to reused. A caller that wants to act on
+    /// exactly the rows it just wrote (the bot flags field submissions for review) can key on these
+    /// rather than re-selecting by slot and time, which would also catch a concurrent write.
+    #[serde(default)]
+    pub created_sample_ids: Vec<Uuid>,
 }
 
 /// Get or create a "grab_sample" stream for a given (site_id, parameter_id) pair.
@@ -218,14 +223,14 @@ async fn auto_create_samples(
     created_by: Option<&str>,
     label: Option<&str>,
     notes: Option<&str>,
-) -> Result<(HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Uuid>, usize), AppError> {
+) -> Result<(HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Uuid>, Vec<Uuid>), AppError> {
     let mut groups: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), usize> = HashMap::new();
     for r in readings {
         *groups.entry((r.parameter_id, r.time)).or_default() += 1;
     }
 
     let mut sample_map = HashMap::new();
-    let mut created = 0usize;
+    let mut created: Vec<Uuid> = Vec::new();
     for ((parameter_id, time), count) in groups {
         // A grab request is an operator recording a collection event, so every group is a sample
         // whether or not it was measured twice. Views that read grabs, the sensor-vs-grab export
@@ -240,7 +245,7 @@ async fn auto_create_samples(
                 .await?;
         sample_map.insert((parameter_id, time), sample_id);
         if is_new {
-            created += 1;
+            created.push(sample_id);
         }
     }
 
@@ -322,7 +327,7 @@ pub async fn insert_grab_samples(
     let txn = state.db.begin().await?;
 
     // One samples row per (parameter, time) group in the request.
-    let (sample_map, samples_created) = auto_create_samples(
+    let (sample_map, created_sample_ids) = auto_create_samples(
         &txn,
         &payload.readings,
         payload.site_id,
@@ -547,9 +552,11 @@ pub async fn insert_grab_samples(
         crate::common::cache::invalidate_prefix(&state, &format!("aggregates:{site_id}")).await;
     }
 
+    let samples_created = created_sample_ids.len();
     tracing::info!(total, inserted, samples_created, site = %site.name, "Grab samples inserted");
     Ok(Json(GrabSampleResponse {
         inserted,
         samples_created,
+        created_sample_ids,
     }))
 }
