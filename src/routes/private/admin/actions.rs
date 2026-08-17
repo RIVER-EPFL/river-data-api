@@ -1647,3 +1647,189 @@ pub async fn backfill_calibrations(
         estimated_readings,
     }))
 }
+
+// ---------------------------------------------------------------------------
+// Duplicate slots
+// ---------------------------------------------------------------------------
+
+// Nothing in the write path can see this shape. Deduplication is keyed on the readings primary key,
+// `(stream_id, time, replicate_index)`, which is per channel, while the rollups group by
+// `(site_id, parameter_id)`, which is per slot. Two channels paired to one slot therefore both
+// ingest cleanly and both land in the same bucket, so an average over the period is taken over two
+// populations at once.
+//
+// Read-only, and it stays that way. Which of two disagreeing copies is the measurement is a
+// question about where each came from, which lives outside the database, so this reports the
+// disagreement and its size and leaves the decision to an operator.
+
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
+pub struct DuplicateSlotStream {
+    pub stream_id: Uuid,
+    pub source_system: String,
+    pub source_key: String,
+    /// Instants this stream contributes to the slot's overlap.
+    pub instants: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema, Clone)]
+pub struct DuplicateSlot {
+    pub site_id: Uuid,
+    pub parameter_id: Uuid,
+    /// Instants at this slot served by more than one stream.
+    pub overlapping_instants: i64,
+    /// Of those, the instants whose served values are not all equal. An instant where the copies
+    /// agree is redundant rather than contradictory, and an average over it is still right.
+    pub disagreeing_instants: i64,
+    /// Largest and mean spread between the served values at one instant, over the disagreeing
+    /// instants alone. A spread the size of the parameter's rounding step reads as one channel
+    /// carrying fewer decimals than the other; a large one is two different measurements.
+    pub max_difference: Option<f64>,
+    pub mean_difference: Option<f64>,
+    pub first_time: chrono::DateTime<chrono::Utc>,
+    pub last_time: chrono::DateTime<chrono::Utc>,
+    /// Every stream feeding the overlap, busiest first.
+    pub streams: Vec<DuplicateSlotStream>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DuplicateSlotsResponse {
+    pub total_slots: usize,
+    pub total_overlapping_instants: i64,
+    pub total_disagreeing_instants: i64,
+    pub slots: Vec<DuplicateSlot>,
+    /// The earliest reading this report read, on the same terms as
+    /// `/actions/calibration_candidates`: every count is a floor for that window alone.
+    pub scanned_from: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Slots where one instant is served by more than one stream, with the size of the disagreement.
+///
+/// The served value is `COALESCE(calibrated_value, raw_value)`, the number the rollups average, so
+/// the spread reported here is the spread that reaches a chart. Flagged readings are excluded for
+/// the same reason: the aggregates already leave them out, so a flagged copy is not a second
+/// population. `replicate_index` is part of the instant, so a stream's own replicates are not an
+/// overlap.
+///
+/// Confined to the caller's projects through the reading's own site.
+async fn fetch_duplicate_slots(
+    db: &sea_orm::DatabaseConnection,
+    scope: &AccessScope,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> AppResult<Vec<DuplicateSlot>> {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    let time_filter = scan_floor_sql(since, &mut values);
+    let project_filter = project_filter_sql(scope, "s.project_id", &mut values)
+        .map(|predicate| {
+            format!("AND EXISTS (SELECT 1 FROM sites s WHERE s.id = r.site_id AND {predicate})")
+        })
+        .unwrap_or_default();
+    // `overlap` is read twice, which is what keeps the hypertable read to one pass: Postgres
+    // materialises a CTE with more than one reference rather than inlining it into both.
+    let sql = format!(
+        r"WITH overlap AS (
+              SELECT r.site_id, r.parameter_id, r.time,
+                     array_agg(DISTINCT r.stream_id) AS streams,
+                     MAX(COALESCE(r.calibrated_value, r.raw_value))
+                       - MIN(COALESCE(r.calibrated_value, r.raw_value)) AS spread
+              FROM readings r
+              WHERE r.site_id IS NOT NULL AND r.parameter_id IS NOT NULL
+                AND r.is_flagged IS NOT TRUE
+                {time_filter}
+                {project_filter}
+              GROUP BY r.site_id, r.parameter_id, r.time, r.replicate_index
+              HAVING COUNT(DISTINCT r.stream_id) > 1
+          ),
+          per_stream AS (
+              SELECT o.site_id, o.parameter_id, e AS stream_id, COUNT(*) AS instants
+              FROM overlap o, unnest(o.streams) AS e
+              GROUP BY o.site_id, o.parameter_id, e
+          )
+          SELECT a.site_id, a.parameter_id, a.overlapping_instants, a.disagreeing_instants,
+                 a.max_difference, a.mean_difference, a.first_time, a.last_time,
+                 COALESCE((
+                     SELECT jsonb_agg(jsonb_build_object(
+                                'stream_id', p.stream_id,
+                                'source_system', d.source_system,
+                                'source_key', d.source_key,
+                                'instants', p.instants)
+                            ORDER BY p.instants DESC, d.source_system)
+                     FROM per_stream p
+                     JOIN data_streams d ON d.id = p.stream_id
+                     WHERE p.site_id = a.site_id AND p.parameter_id = a.parameter_id
+                 ), '[]'::jsonb) AS streams
+          FROM (
+              SELECT site_id, parameter_id,
+                     COUNT(*) AS overlapping_instants,
+                     COUNT(*) FILTER (WHERE spread > 0) AS disagreeing_instants,
+                     MAX(spread) FILTER (WHERE spread > 0) AS max_difference,
+                     AVG(spread) FILTER (WHERE spread > 0) AS mean_difference,
+                     MIN(time) AS first_time, MAX(time) AS last_time
+              FROM overlap
+              GROUP BY site_id, parameter_id
+          ) a
+          ORDER BY a.overlapping_instants DESC"
+    );
+
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            values,
+        ))
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+
+    rows.iter()
+        .map(|row| {
+            let first: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "first_time")?;
+            let last: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "last_time")?;
+            let streams: serde_json::Value = row.try_get("", "streams")?;
+            let streams: Vec<DuplicateSlotStream> = serde_json::from_value(streams)
+                .map_err(|e| AppError::Internal(format!("malformed stream summary: {e}")))?;
+            Ok(DuplicateSlot {
+                site_id: row.try_get("", "site_id")?,
+                parameter_id: row.try_get("", "parameter_id")?,
+                overlapping_instants: row.try_get("", "overlapping_instants")?,
+                disagreeing_instants: row.try_get("", "disagreeing_instants")?,
+                max_difference: row.try_get("", "max_difference")?,
+                mean_difference: row.try_get("", "mean_difference")?,
+                first_time: first.with_timezone(&chrono::Utc),
+                last_time: last.with_timezone(&chrono::Utc),
+                streams,
+            })
+        })
+        .collect()
+}
+
+/// List slots fed by more than one stream at the same instant. Requires `read_metadata`.
+///
+/// Reads the readings hypertable with no index behind it, so it covers the most recent 90 days
+/// unless `since` names an earlier floor, and `scanned_from` reports which was used.
+#[utoipa::path(
+    get,
+    path = "/actions/duplicate_slots",
+    params(CalibrationCandidatesQuery),
+    responses((status = 200, description = "Slots served by more than one stream", body = DuplicateSlotsResponse)),
+    tag = "actions"
+)]
+pub async fn duplicate_slots(
+    State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+    _: DenyScoped,
+    Query(query): Query<CalibrationCandidatesQuery>,
+) -> AppResult<Json<DuplicateSlotsResponse>> {
+    let scanned_from = match query.since {
+        Some(since) => Some(since),
+        None => default_scan_floor(&app_state.db).await?,
+    };
+    let slots = fetch_duplicate_slots(&app_state.db, &scope, scanned_from).await?;
+    Ok(Json(DuplicateSlotsResponse {
+        total_slots: slots.len(),
+        total_overlapping_instants: slots.iter().map(|s| s.overlapping_instants).sum(),
+        total_disagreeing_instants: slots.iter().map(|s| s.disagreeing_instants).sum(),
+        slots,
+        scanned_from,
+    }))
+}

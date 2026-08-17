@@ -11,6 +11,7 @@ mod batch_standard_curve;
 mod csv_import_column_resolution;
 mod csv_import_sessions;
 mod csv_import_worker;
+mod duplicate_slots;
 mod grab_samples_insertion;
 mod guarded_bulk_write;
 mod ingest_dedup_and_visibility;

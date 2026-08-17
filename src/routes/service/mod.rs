@@ -398,6 +398,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
             "/actions/calibration_candidates",
             get(actions::calibration_candidates),
         )
+        .route("/actions/duplicate_slots", get(actions::duplicate_slots))
         .route(
             "/schedules",
             get(crate::routes::private::reprocessing_jobs::schedule_routes::list_schedules),
