@@ -58,6 +58,7 @@ mod m20260813_000007_retire_identity_calibrations;
 mod m20260814_000001_reprocessing_jobs_autovacuum;
 mod m20260814_000002_sync_event_readings_skipped;
 mod m20260814_000003_pair_api_streams;
+mod m20260814_000004_telegram_link_expiry;
 
 pub struct Migrator;
 
@@ -124,6 +125,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260814_000001_reprocessing_jobs_autovacuum::Migration),
             Box::new(m20260814_000002_sync_event_readings_skipped::Migration),
             Box::new(m20260814_000003_pair_api_streams::Migration),
+            Box::new(m20260814_000004_telegram_link_expiry::Migration),
         ]
     }
 }

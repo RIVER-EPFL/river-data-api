@@ -198,6 +198,8 @@ pub struct SubscriberRow {
     pub is_active: bool,
     /// `unlinked` | `pending` | `linked`.
     pub telegram_status: String,
+    /// Held open against idle expiry. Never shields a revoked user.
+    pub expiry_exempt: bool,
     pub subscription_overrides: i64,
 }
 
@@ -227,11 +229,13 @@ pub async fn list_subscribers(
                 COALESCE(ns.is_active, true) AS is_active, \
                 (SELECT COUNT(*) FROM notification_subscriptions nsub \
                    WHERE nsub.keycloak_sub = s.keycloak_sub) AS overrides, \
-                ti.telegram_chat_id, ti.link_code, ti.link_code_expires_at \
+                ti.telegram_chat_id, ti.link_code, ti.link_code_expires_at, \
+                COALESCE(ti.expiry_exempt, false) AS expiry_exempt \
              FROM subs s \
              LEFT JOIN notification_subscribers ns ON ns.keycloak_sub = s.keycloak_sub \
              LEFT JOIN LATERAL ( \
-                SELECT telegram_chat_id, link_code, link_code_expires_at FROM telegram_identities ti2 \
+                SELECT telegram_chat_id, link_code, link_code_expires_at, expiry_exempt \
+                FROM telegram_identities ti2 \
                 WHERE ti2.linked_keycloak_sub = s.keycloak_sub ORDER BY ti2.created_at DESC LIMIT 1 \
              ) ti ON true \
              ORDER BY s.keycloak_sub"
@@ -258,6 +262,7 @@ pub async fn list_subscribers(
             telegram_enabled: r.try_get("", "telegram_enabled")?,
             is_active: r.try_get("", "is_active")?,
             telegram_status: telegram_status.to_string(),
+            expiry_exempt: r.try_get("", "expiry_exempt").unwrap_or(false),
             subscription_overrides: r.try_get("", "overrides")?,
         });
     }

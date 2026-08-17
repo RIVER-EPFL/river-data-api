@@ -56,6 +56,8 @@ pub struct MyNotifications {
     pub email_enabled: bool,
     pub telegram_enabled: bool,
     pub telegram: TelegramLink,
+    /// Whether this link is held open against idle expiry. Administrator-settable only.
+    pub expiry_exempt: bool,
     /// Explicit scope overrides; absence of a more-specific override means subscribed (default on).
     pub subscriptions: Vec<SubscriptionScope>,
 }
@@ -96,11 +98,16 @@ async fn load(state: &AppState, auth: &AuthContext, sub: &str) -> AppResult<MyNo
         .db
         .query_one(Statement::from_sql_and_values(
             PG,
-            "SELECT telegram_chat_id, link_code, link_code_expires_at FROM telegram_identities \
+            "SELECT telegram_chat_id, link_code, link_code_expires_at, expiry_exempt \
+             FROM telegram_identities \
              WHERE linked_keycloak_sub = $1 ORDER BY created_at DESC LIMIT 1",
             [sub.into()],
         ))
         .await?;
+    let expiry_exempt = tg_row
+        .as_ref()
+        .and_then(|r| r.try_get::<bool>("", "expiry_exempt").ok())
+        .unwrap_or(false);
     let telegram = match tg_row {
         Some(r) => {
             let chat_id: Option<i64> = r.try_get("", "telegram_chat_id").ok().flatten();
@@ -154,6 +161,7 @@ async fn load(state: &AppState, auth: &AuthContext, sub: &str) -> AppResult<MyNo
         email_enabled,
         telegram_enabled,
         telegram,
+        expiry_exempt,
         subscriptions,
     })
 }
@@ -178,6 +186,9 @@ pub async fn get_my_notifications(
 pub struct UpdatePrefsRequest {
     pub email_enabled: Option<bool>,
     pub telegram_enabled: Option<bool>,
+    /// Hold this Telegram link open against idle expiry. Administrators only: a self-service
+    /// opt-out available to everyone would mean nothing ever expires.
+    pub expiry_exempt: Option<bool>,
 }
 
 /// `PATCH /api/notifications/me`, toggle the caller's channels. Email can only be enabled when the
@@ -199,6 +210,24 @@ pub async fn update_my_notifications(
         return Err(AppError::BadRequest(
             "a verified email address is required to enable email alerts".to_string(),
         ));
+    }
+    if let Some(exempt) = req.expiry_exempt {
+        // Rejected rather than silently ignored: a user who thinks they have pinned their link and
+        // has not is worse off than one who is told no.
+        if !auth.is_admin() {
+            return Err(AppError::Forbidden(
+                "only an administrator can exempt a Telegram link from expiry".to_string(),
+            ));
+        }
+        state
+            .db
+            .execute(Statement::from_sql_and_values(
+                PG,
+                "UPDATE telegram_identities SET expiry_exempt = $2, updated_at = NOW() \
+                 WHERE linked_keycloak_sub = $1",
+                [sub.clone().into(), exempt.into()],
+            ))
+            .await?;
     }
     ensure_subscriber(&state, &sub).await?;
     state

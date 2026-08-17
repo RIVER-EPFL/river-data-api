@@ -1601,13 +1601,16 @@ impl Job for IdentityReconcile {
             return Ok(0);
         };
         match crate::routes::private::notifications::reconcile::sweep(&state).await {
-            Ok(0) => Ok(0),
-            Ok(n) => {
+            Ok(o) if o.total() == 0 => Ok(0),
+            Ok(o) => {
                 tracing::warn!(
-                    count = n,
-                    "Identity reconciliation: deactivated revoked links"
+                    revoked = o.revoked,
+                    warned = o.warned,
+                    expired = o.expired,
+                    purged = o.purged,
+                    "Identity reconciliation: links changed"
                 );
-                Ok(n as i64)
+                Ok(o.total() as i64)
             }
             Err(e) => Err(e),
         }

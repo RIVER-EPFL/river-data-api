@@ -151,7 +151,7 @@ async fn reconcile_deactivates_revoked_links_only() {
     insert_identity(&db, "no-role-user", 2).await;
     insert_identity(&db, "disabled-user", 3).await;
 
-    let deactivated = reconcile::sweep(&state).await.unwrap();
+    let deactivated = reconcile::sweep(&state).await.unwrap().revoked;
     assert_eq!(
         deactivated, 2,
         "the no-role and disabled users are deactivated"
@@ -173,10 +173,36 @@ async fn reconcile_keeps_links_when_keycloak_unavailable() {
     let state = state_with_keycloak(db.clone(), "http://127.0.0.1:1");
 
     insert_identity(&db, "regular-user", 1).await;
-    let deactivated = reconcile::sweep(&state).await.unwrap();
+    let deactivated = reconcile::sweep(&state).await.unwrap().revoked;
     assert_eq!(deactivated, 0, "an outage must not mass-deactivate");
     assert!(
         is_active(&db, "regular-user").await,
         "link survives the outage"
+    );
+}
+
+/// `expiry_exempt` holds a link open against *inactivity*. It must never shield a user whose
+/// Keycloak account is gone: the revocation pass runs first and unconditionally.
+#[tokio::test]
+#[serial]
+async fn a_pinned_link_is_still_revoked() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let base = spawn_mock_keycloak().await;
+    let state = state_with_keycloak(db.clone(), &base);
+
+    crate::common::exec(
+        &db,
+        "INSERT INTO telegram_identities \
+         (linked_keycloak_sub, telegram_chat_id, is_active, expiry_exempt, last_verified_at) \
+         VALUES ('disabled-user', 4242, TRUE, TRUE, NOW())",
+    )
+    .await;
+
+    let outcome = reconcile::sweep(&state).await.unwrap();
+    assert_eq!(outcome.revoked, 1, "a pinned link is not exempt from revocation");
+    assert!(
+        !is_active(&db, "disabled-user").await,
+        "a revoked user's link is deactivated even when pinned against idle expiry"
     );
 }

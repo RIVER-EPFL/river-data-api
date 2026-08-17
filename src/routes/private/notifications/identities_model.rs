@@ -26,6 +26,11 @@ pub struct Model {
     pub receive_alerts: bool,
     #[crudcrate(filterable, on_create = true)]
     pub is_active: bool,
+    // Holds the link open against *inactivity only* (a shared operations chat, a dormant field
+    // season). Never shields a revoked Keycloak user: reconcile::sweep deactivates those before it
+    // consults this. Administrator-only, enforced in the /notifications/me handler.
+    #[crudcrate(filterable, on_create = false)]
+    pub expiry_exempt: bool,
     // Server-managed: set by the link endpoint, cleared on claim. Not client-writable.
     #[crudcrate(exclude(create, update))]
     pub link_code: Option<String>,

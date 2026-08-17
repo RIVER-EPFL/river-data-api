@@ -13,6 +13,7 @@ mod command_scope_test;
 mod dispatcher_test;
 mod fanout_test;
 mod grab_test;
+mod link_expiry_test;
 mod link_flow_test;
 mod me_test;
 mod mute_gate;
