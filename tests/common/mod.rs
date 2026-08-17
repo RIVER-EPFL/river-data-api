@@ -132,7 +132,7 @@ fn test_config() -> Config {
         stale_data_threshold_hours: 6,
         telegram_grab_flag_for_review: false,
         telegram_alarm_plots: false,
-        telegram_alarm_plot_hours: 24,
+        telegram_alarm_plot_hours: 3,
         telegram_link_idle_days: 30,
         telegram_link_warn_days: 7,
         telegram_link_purge_days: 90,

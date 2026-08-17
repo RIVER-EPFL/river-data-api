@@ -183,8 +183,7 @@ pub struct Config {
     pub stale_data_threshold_hours: i64,
     // When true, grab samples submitted via the bot are flagged for review on insert.
     pub telegram_grab_flag_for_review: bool,
-    // When true, a Telegram alert is followed by a chart of the breaching slot. Off by default:
-    // it doubles the outbound calls per alert and costs a render per message.
+    // When true, a Telegram alert is followed by a chart of the breaching slot.
     pub telegram_alarm_plots: bool,
     // The window an alarm chart covers, in hours.
     pub telegram_alarm_plot_hours: i64,
@@ -495,13 +494,13 @@ impl Config {
                 .parse()
                 .unwrap_or(false),
             telegram_alarm_plots: env::var("TELEGRAM_ALARM_PLOTS")
-                .unwrap_or_else(|_| "false".to_string())
+                .unwrap_or_else(|_| "true".to_string())
                 .parse()
-                .unwrap_or(false),
+                .unwrap_or(true),
             telegram_alarm_plot_hours: env::var("TELEGRAM_ALARM_PLOT_HOURS")
-                .unwrap_or_else(|_| "24".to_string())
+                .unwrap_or_else(|_| "3".to_string())
                 .parse()
-                .unwrap_or(24),
+                .unwrap_or(3),
             telegram_link_idle_days: env::var("TELEGRAM_LINK_IDLE_DAYS")
                 .unwrap_or_else(|_| "30".to_string())
                 .parse()
