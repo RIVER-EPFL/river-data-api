@@ -108,6 +108,10 @@ pub struct PlotSpec {
     /// e.g. "Depth (mm)"
     pub y_label: String,
     pub points: Vec<(DateTime<Utc>, f64)>,
+    /// Per-point severity (0 ok, 1 warning, 2 alarm), parallel to `points`. Empty leaves the series
+    /// one colour. The ladder belongs to `alarms::thresholds`, so it is classified by the caller
+    /// rather than re-derived here from `thresholds`.
+    pub severities: Vec<u8>,
     /// Per-bucket extrema drawn as a soft band under the line. Empty at the raw tier.
     pub envelope: Vec<(DateTime<Utc>, f64, f64)>,
     pub thresholds: ThresholdLines,
@@ -129,6 +133,7 @@ impl PlotSpec {
             subtitle,
             y_label,
             points: Vec::new(),
+            severities: Vec::new(),
             envelope: Vec::new(),
             thresholds: ThresholdLines::default(),
             annotations: Vec::new(),
@@ -198,6 +203,84 @@ fn segments(points: &[(DateTime<Utc>, f64)], gap_seconds: i64) -> Vec<Vec<(DateT
     out
 }
 
+/// The colour a severity is drawn in: the same amber and red as its threshold line.
+fn severity_colour(severity: u8) -> RGBColor {
+    match severity {
+        0 => C_SERIES,
+        1 => C_WARNING,
+        _ => C_ALARM,
+    }
+}
+
+/// A stretch of consecutive breaching points, carrying the worst severity in it.
+#[derive(Debug, PartialEq, Eq)]
+struct BreachRun {
+    start: usize,
+    end: usize,
+    severity: u8,
+}
+
+/// Group breaching points into stretches, so an episode is shaded once rather than per point.
+///
+/// A run ends where the series returns to normal or where the data gaps: shading across an outage
+/// would claim an alarm nobody measured. A run that rises from warning to alarm stays one run and
+/// takes the worse severity, because it is one episode.
+fn breach_runs(points: &[(DateTime<Utc>, f64, u8)], gap_seconds: i64) -> Vec<BreachRun> {
+    let mut runs: Vec<BreachRun> = Vec::new();
+    let mut current: Option<BreachRun> = None;
+    for (i, &(t, _, severity)) in points.iter().enumerate() {
+        let gapped = i > 0 && (t - points[i - 1].0).num_seconds() > gap_seconds;
+        if severity == 0 || gapped {
+            runs.extend(current.take());
+        }
+        if severity == 0 {
+            continue;
+        }
+        match &mut current {
+            Some(run) => {
+                run.end = i;
+                run.severity = run.severity.max(severity);
+            }
+            None => {
+                current = Some(BreachRun {
+                    start: i,
+                    end: i,
+                    severity,
+                });
+            }
+        }
+    }
+    runs.extend(current);
+    runs
+}
+
+/// The time span a run's band covers: out to the midpoint of the neighbouring readings, so a single
+/// breaching point still shades a visible width instead of a zero-width line.
+fn band_span(
+    points: &[(DateTime<Utc>, f64, u8)],
+    run: &BreachRun,
+    pad: chrono::Duration,
+) -> (DateTime<Utc>, DateTime<Utc>) {
+    let midpoint = |a: DateTime<Utc>, b: DateTime<Utc>| a + (b - a) / 2;
+    let first = points[run.start].0;
+    let last = points[run.end].0;
+    let mut start = if run.start > 0 {
+        midpoint(points[run.start - 1].0, first)
+    } else {
+        first
+    };
+    let mut end = if run.end + 1 < points.len() {
+        midpoint(last, points[run.end + 1].0)
+    } else {
+        last
+    };
+    if end - start < pad {
+        start -= pad / 2;
+        end += pad / 2;
+    }
+    (start, end)
+}
+
 /// Whether a threshold is close enough to the data to be worth drawing.
 ///
 /// Depth alarms at 2000 mm while a healthy series sits at 0-100. Including that bound in the
@@ -257,15 +340,19 @@ fn draw_chart<DB: DrawingBackend>(
 where
     DB::ErrorType: 'static,
 {
-    let finite: Vec<(DateTime<Utc>, f64)> = spec
+    // Severity rides along with the point it belongs to: dropping non-finite values otherwise shifts
+    // the two lists apart. A short or absent severity list reads as "not classified".
+    let classified: Vec<(DateTime<Utc>, f64, u8)> = spec
         .points
         .iter()
-        .filter(|(_, v)| v.is_finite())
-        .copied()
+        .enumerate()
+        .filter(|(_, (_, v))| v.is_finite())
+        .map(|(i, (t, v))| (*t, *v, spec.severities.get(i).copied().unwrap_or(0)))
         .collect();
-    if finite.is_empty() {
+    if classified.is_empty() {
         return Err(PlotError::NoData);
     }
+    let finite: Vec<(DateTime<Utc>, f64)> = classified.iter().map(|&(t, v, _)| (t, v)).collect();
 
     let x_min = finite.first().map(|p| p.0).unwrap_or_else(Utc::now);
     let x_max = finite.last().map(|p| p.0).unwrap_or(x_min);
@@ -351,6 +438,24 @@ where
         }
         mesh.draw().map_err(render_err)?;
 
+        // Breach bands sit behind the data: the alarmed period should be readable as a period, not
+        // inferred from where the line crosses a limit.
+        let runs = breach_runs(&classified, spec.gap_seconds);
+        let band_pad = (x_max - x_min) / 200;
+        for run in &runs {
+            let (start, end) = band_span(&classified, run, band_pad);
+            let colour = severity_colour(run.severity);
+            chart
+                .draw_series(std::iter::once(Rectangle::new(
+                    [
+                        (start.max(x_min), y_lo),
+                        (end.min(x_max), y_hi),
+                    ],
+                    colour.mix(0.13).filled(),
+                )))
+                .map_err(render_err)?;
+        }
+
         // Annotation bands sit behind everything: they are context, not data.
         for band in spec.annotations.iter().take(MAX_ANNOTATION_BANDS) {
             let start = band.start.max(x_min);
@@ -423,13 +528,31 @@ where
                 ))
                 .map_err(render_err)?;
         }
+        // The breaching stretch redrawn in its severity colour, over the blue line. Each run reaches
+        // one point past its ends where the neighbour is not across a gap, so the colour meets the
+        // rest of the series instead of floating above it.
+        for run in &runs {
+            let from = run.start.saturating_sub(1);
+            let to = (run.end + 1).min(classified.len() - 1);
+            let stretch: Vec<(DateTime<Utc>, f64)> = classified[from..=to]
+                .iter()
+                .map(|&(t, v, _)| (t, v))
+                .collect();
+            for segment in segments(&stretch, spec.gap_seconds) {
+                chart
+                    .draw_series(LineSeries::new(
+                        segment,
+                        severity_colour(run.severity).stroke_width(2),
+                    ))
+                    .map_err(render_err)?;
+            }
+        }
+
         if finite.len() <= MARKER_LIMIT {
             chart
-                .draw_series(
-                    finite
-                        .iter()
-                        .map(|&(t, v)| Circle::new((t, v), 2, C_SERIES.filled())),
-                )
+                .draw_series(classified.iter().map(|&(t, v, severity)| {
+                    Circle::new((t, v), 2, severity_colour(severity).filled())
+                }))
                 .map_err(render_err)?;
         }
 
@@ -640,6 +763,86 @@ mod tests {
             (decoded.width(), decoded.height()),
             (DEFAULT_WIDTH, DEFAULT_HEIGHT)
         );
+    }
+
+    fn classified(severities: &[u8], minutes_apart: i64) -> Vec<(DateTime<Utc>, f64, u8)> {
+        let t0 = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        severities
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| (t0 + Duration::minutes(i as i64 * minutes_apart), 10.0, s))
+            .collect()
+    }
+
+    #[test]
+    fn test_breach_runs_groups_consecutive_points() {
+        let runs = breach_runs(&classified(&[0, 0, 1, 1, 1, 0, 2, 0], 5), 3600);
+        assert_eq!(runs.len(), 2);
+        assert_eq!((runs[0].start, runs[0].end, runs[0].severity), (2, 4, 1));
+        assert_eq!((runs[1].start, runs[1].end, runs[1].severity), (6, 6, 2));
+    }
+
+    #[test]
+    fn test_breach_run_takes_the_worst_severity_in_it() {
+        // One episode that deepens from warning to alarm and eases off is one run, drawn red.
+        let runs = breach_runs(&classified(&[1, 2, 1], 5), 3600);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].severity, 2);
+    }
+
+    /// Shading across an outage would claim an alarm through a period nobody measured.
+    #[test]
+    fn test_a_gap_splits_a_breach_run() {
+        let runs = breach_runs(&classified(&[2, 2, 2], 120), 3600);
+        assert_eq!(runs.len(), 3, "two-hour gaps break a one-hour-gap series");
+    }
+
+    #[test]
+    fn test_unclassified_points_produce_no_runs() {
+        assert!(breach_runs(&classified(&[0, 0, 0], 5), 3600).is_empty());
+    }
+
+    /// A lone breaching point still needs a band wide enough to see.
+    #[test]
+    fn test_band_span_widens_a_single_point() {
+        let points = classified(&[0, 2, 0], 5);
+        let run = BreachRun {
+            start: 1,
+            end: 1,
+            severity: 2,
+        };
+        let pad = Duration::minutes(1);
+        let (start, end) = band_span(&points, &run, pad);
+        assert!(end > start, "a band must have width");
+        assert!(start > points[0].0 && end < points[2].0, "and stay local");
+    }
+
+    #[test]
+    fn renders_a_breaching_series() {
+        let mut spec = spec_with(series(120));
+        spec.thresholds = ThresholdLines {
+            warning_max: Some(110.0),
+            alarm_max: Some(115.0),
+            ..ThresholdLines::default()
+        };
+        spec.severities = spec
+            .points
+            .iter()
+            .map(|&(_, v)| u8::from(v > 110.0) + u8::from(v > 115.0))
+            .collect();
+        assert!(spec.severities.iter().any(|&s| s > 0), "test needs breaches");
+        let png = render_png(&spec).expect("render");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    /// A severity list shorter than the series must not shift colours onto the wrong points.
+    #[test]
+    fn a_short_severity_list_is_padded_not_misaligned() {
+        let mut spec = spec_with(series(50));
+        spec.points[0].1 = f64::NAN;
+        spec.severities = vec![0, 2];
+        let png = render_png(&spec).expect("render");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
     }
 
     #[test]

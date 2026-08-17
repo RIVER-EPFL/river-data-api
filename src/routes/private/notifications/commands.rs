@@ -16,7 +16,9 @@ use crate::routes::private::readings::grab_samples::{
     GrabSampleReading, GrabSampleRequest, insert_grab_samples,
 };
 
-use crate::routes::private::alarms::thresholds::resolve_thresholds_sql;
+use crate::routes::private::alarms::thresholds::{
+    ResolvedThreshold, resolve_thresholds_sql, severity_of_range,
+};
 
 use super::keyboard::{self, Action, Button};
 use super::messages::severity_label;
@@ -1198,26 +1200,7 @@ async fn render_slot(state: &AppState, target: &PlotTarget, window: Duration) ->
         };
     }
 
-    let thresholds = match crate::routes::private::alarms::thresholds::resolve_threshold(
-        db,
-        target.site_id,
-        target.parameter_id,
-    )
-    .await
-    {
-        Ok(Some(t)) => plot::ThresholdLines {
-            warning_min: t.warning_min,
-            warning_max: t.warning_max,
-            alarm_min: t.alarm_min,
-            alarm_max: t.alarm_max,
-        },
-        Ok(None) => plot::ThresholdLines::default(),
-        Err(e) => {
-            tracing::warn!(error = %e, "plot: threshold lookup failed");
-            plot::ThresholdLines::default()
-        }
-    };
-
+    let (thresholds, resolved) = slot_thresholds(db, target.site_id, target.parameter_id).await;
     let annotations = plot_annotations(db, target.site_id, target.parameter_id, start, end).await;
 
     let raw_count = series.points.len();
@@ -1245,6 +1228,7 @@ async fn render_slot(state: &AppState, target: &PlotTarget, window: Duration) ->
         format!("{}{units_suffix}", target.parameter_name),
     );
     spec.gap_seconds = tier.gap_seconds();
+    spec.severities = point_severities(&points, resolved.as_ref());
     spec.points = points.iter().map(|p| (p.time, p.value)).collect();
     spec.envelope = envelope;
     spec.thresholds = thresholds;
@@ -1294,6 +1278,59 @@ async fn render_slot(state: &AppState, target: &PlotTarget, window: Duration) ->
             &window_label(window),
         )),
     }
+}
+
+/// A slot's thresholds, as chart limit lines and as the classifier behind them.
+///
+/// A lookup failure degrades to no thresholds: an overlay must never cost the chart.
+async fn slot_thresholds(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+    parameter_id: Uuid,
+) -> (plot::ThresholdLines, Option<ResolvedThreshold>) {
+    let resolved = match crate::routes::private::alarms::thresholds::resolve_threshold(
+        db,
+        site_id,
+        parameter_id,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "plot: threshold lookup failed");
+            None
+        }
+    };
+    let lines = resolved.as_ref().map_or_else(
+        plot::ThresholdLines::default,
+        |t| plot::ThresholdLines {
+            warning_min: t.warning_min,
+            warning_max: t.warning_max,
+            alarm_min: t.alarm_min,
+            alarm_max: t.alarm_max,
+        },
+    );
+    (lines, resolved)
+}
+
+/// Per-point severity for the chart, from the same ladder the alarm pipeline evaluates.
+///
+/// A rollup bucket is classified by its extremes rather than its mean, matching `/alarms`: an hour
+/// whose peak breached is an alarmed hour even where the average sits inside the limits.
+fn point_severities(
+    points: &[series_query::SeriesPoint],
+    threshold: Option<&ResolvedThreshold>,
+) -> Vec<u8> {
+    let Some(t) = threshold else {
+        return Vec::new();
+    };
+    points
+        .iter()
+        .map(|p| {
+            let severity = severity_of_range(Some(p.min.unwrap_or(p.value)), Some(p.max.unwrap_or(p.value)), t);
+            u8::try_from(severity).unwrap_or(0)
+        })
+        .collect()
 }
 
 /// The button label matching a window, so the switcher can mark the one in view.
@@ -1346,7 +1383,11 @@ async fn site_overview(
             String::new(),
         )
         .into_panel();
+        // A panel is classified but carries no limit lines: at a sixth of the width they would
+        // crowd the data, and the coloured stretch already says which parameter to look at.
+        let (_, resolved) = slot_thresholds(db, site_id, *parameter_id).await;
         spec.gap_seconds = tier.gap_seconds();
+        spec.severities = point_severities(&points, resolved.as_ref());
         spec.envelope = points
             .iter()
             .filter_map(|p| Some((p.time, p.min?, p.max?)))
@@ -1583,21 +1624,7 @@ pub async fn slot_plot_png(
     let param_name: String = names.try_get("", "param").ok()?;
     let units: Option<String> = names.try_get("", "units").ok().flatten();
 
-    let thresholds = match crate::routes::private::alarms::thresholds::resolve_threshold(
-        db,
-        site_id,
-        parameter_id,
-    )
-    .await
-    {
-        Ok(Some(t)) => plot::ThresholdLines {
-            warning_min: t.warning_min,
-            warning_max: t.warning_max,
-            alarm_min: t.alarm_min,
-            alarm_max: t.alarm_max,
-        },
-        _ => plot::ThresholdLines::default(),
-    };
+    let (thresholds, resolved) = slot_thresholds(db, site_id, parameter_id).await;
 
     let raw_count = series.points.len();
     let points = series_query::decimate(series.points, series_query::MAX_POINTS);
@@ -1620,6 +1647,7 @@ pub async fn slot_plot_png(
         format!("{param_name}{units_suffix}"),
     );
     spec.gap_seconds = tier.gap_seconds();
+    spec.severities = point_severities(&points, resolved.as_ref());
     spec.points = points.iter().map(|p| (p.time, p.value)).collect();
     spec.envelope = envelope;
     spec.thresholds = thresholds;

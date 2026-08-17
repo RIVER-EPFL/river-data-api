@@ -560,3 +560,54 @@ fn flatten(reply: &Reply) -> Vec<Button> {
 fn button_labels(reply: &Reply) -> Vec<String> {
     flatten(reply).into_iter().map(|b| b.text).collect()
 }
+
+/// Scenario: an alarm alert carries a chart of the slot that breached.
+///
+/// Expected behaviour: the same readings render differently once a threshold makes them a breach,
+/// which is what proves the severity classification reaches the renderer rather than stopping at
+/// the limit lines.
+#[tokio::test]
+#[serial]
+async fn an_alarm_chart_marks_the_breaching_stretch() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    seed_recent_readings(&db, SITE1_ID, 6).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    let site = Uuid::parse_str(SITE1_ID).unwrap();
+    let parameter = Uuid::parse_str(GLOBAL_PARAM_DEPTH_ID).unwrap();
+    let window = chrono::Duration::hours(6);
+
+    // Seeded depth sits around 400, so these bounds are nowhere near it.
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO alarm_thresholds \
+             (id, parameter_id, site_id, warning_min, warning_max, alarm_min, alarm_max) \
+             VALUES (gen_random_uuid(), '{GLOBAL_PARAM_DEPTH_ID}', '{SITE1_ID}', 0, 10000, -1, 20000)"
+        ),
+    )
+    .await;
+    let calm = commands::slot_plot_png(&state, site, parameter, window)
+        .await
+        .expect("a chart with no breach");
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE alarm_thresholds SET alarm_max = 100, warning_max = 50 \
+             WHERE site_id = '{SITE1_ID}' AND parameter_id = '{GLOBAL_PARAM_DEPTH_ID}'"
+        ),
+    )
+    .await;
+    let breaching = commands::slot_plot_png(&state, site, parameter, window)
+        .await
+        .expect("a chart with a breach");
+
+    assert_eq!(&breaching[..8], b"\x89PNG\r\n\x1a\n");
+    assert_ne!(
+        calm, breaching,
+        "the same readings must draw differently once they breach"
+    );
+}
