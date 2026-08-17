@@ -2890,6 +2890,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-keycloak-auth",
+ "base64",
  "chrono",
  "crudcrate",
  "csv",

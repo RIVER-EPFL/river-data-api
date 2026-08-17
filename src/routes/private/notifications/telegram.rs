@@ -8,13 +8,17 @@ use std::time::Duration;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 
 use super::access::{accessible_project_ids, project_allowed};
+use super::keyboard::{self, Keyboard};
 use super::{DeliveryResult, NotificationChannel, OutgoingMessage, Slot};
 use crate::common::AppState;
 
 const API_BASE: &str = "https://api.telegram.org";
 
 /// A parsed inbound update (only the fields the bot uses).
-#[derive(Debug, Clone)]
+///
+/// Covers both a message and a button tap: a tap arrives as a `callback_query` carrying the message
+/// its keyboard is attached to, which is what lets a chart be replaced in place.
+#[derive(Debug, Clone, Default)]
 pub struct Update {
     pub update_id: i64,
     pub chat_id: Option<i64>,
@@ -23,6 +27,35 @@ pub struct Update {
     pub chat_type: Option<String>,
     pub username: Option<String>,
     pub text: Option<String>,
+    /// Set when this update is a button tap. Must be answered, or the client spins.
+    pub callback_id: Option<String>,
+    /// The tapped button's payload. Untrusted: it is whatever was sent back to us.
+    pub callback_data: Option<String>,
+    /// The message the tapped keyboard belongs to.
+    pub message_id: Option<i64>,
+    /// Whether that message is a photo, and so can be edited in place rather than replaced.
+    pub has_photo: bool,
+}
+
+fn parse_update(r: &serde_json::Value) -> Update {
+    let update_id = r["update_id"].as_i64().unwrap_or(0);
+    let callback = &r["callback_query"];
+    let (msg, from) = if callback.is_object() {
+        (&callback["message"], &callback["from"])
+    } else {
+        (&r["message"], &r["message"]["from"])
+    };
+    Update {
+        update_id,
+        chat_id: msg["chat"]["id"].as_i64(),
+        chat_type: msg["chat"]["type"].as_str().map(String::from),
+        username: from["username"].as_str().map(String::from),
+        text: r["message"]["text"].as_str().map(String::from),
+        callback_id: callback["id"].as_str().map(String::from),
+        callback_data: callback["data"].as_str().map(String::from),
+        message_id: msg["message_id"].as_i64(),
+        has_photo: msg["photo"].as_array().is_some_and(|p| !p.is_empty()),
+    }
 }
 
 #[derive(Clone)]
@@ -61,20 +94,7 @@ impl TelegramClient {
         }
         let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
         let results = json["result"].as_array().cloned().unwrap_or_default();
-        let updates = results
-            .iter()
-            .map(|r| {
-                let msg = &r["message"];
-                Update {
-                    update_id: r["update_id"].as_i64().unwrap_or(0),
-                    chat_id: msg["chat"]["id"].as_i64(),
-                    chat_type: msg["chat"]["type"].as_str().map(String::from),
-                    username: msg["from"]["username"].as_str().map(String::from),
-                    text: msg["text"].as_str().map(String::from),
-                }
-            })
-            .collect();
-        Ok(updates)
+        Ok(results.iter().map(parse_update).collect())
     }
 
     /// Liveness + token validity check. `getMe` returns the bot's identity when the token is valid.
@@ -96,7 +116,7 @@ impl TelegramClient {
         Ok(format!("bot @{username} reachable"))
     }
 
-    /// Send a PNG with a caption.
+    /// Send a PNG with a caption and an optional keyboard.
     ///
     /// `multipart` is already enabled on reqwest for this crate, so the upload needs no new
     /// dependency. Telegram caps a caption at 1024 UTF-16 code units and a photo at 10MB, and
@@ -106,16 +126,60 @@ impl TelegramClient {
         chat_id: i64,
         png: Vec<u8>,
         caption: &str,
+        keyboard: Option<&Keyboard>,
     ) -> Result<(), String> {
-        let url = format!("{API_BASE}/bot{}/sendPhoto", self.token);
         let part = reqwest::multipart::Part::bytes(png)
             .file_name("plot.png")
             .mime_str("image/png")
             .map_err(|e| e.to_string())?;
-        let form = reqwest::multipart::Form::new()
+        let mut form = reqwest::multipart::Form::new()
             .text("chat_id", chat_id.to_string())
             .text("caption", truncate_caption(caption))
             .part("photo", part);
+        if let Some(kb) = keyboard {
+            form = form.text("reply_markup", keyboard::markup(kb).to_string());
+        }
+        self.post_multipart("sendPhoto", form).await
+    }
+
+    /// Replace the photo of a message already in the chat.
+    ///
+    /// Flipping the window on a chart edits it in place instead of stacking a new image under the
+    /// last one. A failure here is recoverable by sending a fresh photo, so the caller falls back.
+    pub async fn edit_photo(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        png: Vec<u8>,
+        caption: &str,
+        keyboard: Option<&Keyboard>,
+    ) -> Result<(), String> {
+        let part = reqwest::multipart::Part::bytes(png)
+            .file_name("plot.png")
+            .mime_str("image/png")
+            .map_err(|e| e.to_string())?;
+        let media = serde_json::json!({
+            "type": "photo",
+            "media": "attach://photo",
+            "caption": truncate_caption(caption),
+        });
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .text("message_id", message_id.to_string())
+            .text("media", media.to_string())
+            .part("photo", part);
+        if let Some(kb) = keyboard {
+            form = form.text("reply_markup", keyboard::markup(kb).to_string());
+        }
+        self.post_multipart("editMessageMedia", form).await
+    }
+
+    async fn post_multipart(
+        &self,
+        method: &str,
+        form: reqwest::multipart::Form,
+    ) -> Result<(), String> {
+        let url = format!("{API_BASE}/bot{}/{method}", self.token);
         let resp = self
             .http
             .post(&url)
@@ -134,11 +198,57 @@ impl TelegramClient {
 
     /// Send a plain-text message to one chat. Returns the Telegram error description on failure.
     pub async fn send_message(&self, chat_id: i64, text: &str) -> Result<(), String> {
-        let url = format!("{API_BASE}/bot{}/sendMessage", self.token);
+        self.send_text(chat_id, text, None).await
+    }
+
+    /// Send text with an optional keyboard under it.
+    pub async fn send_text(
+        &self,
+        chat_id: i64,
+        text: &str,
+        keyboard: Option<&Keyboard>,
+    ) -> Result<(), String> {
+        let mut body = serde_json::json!({ "chat_id": chat_id, "text": text });
+        if let Some(kb) = keyboard {
+            body["reply_markup"] = keyboard::markup(kb);
+        }
+        self.post_json("sendMessage", &body).await
+    }
+
+    /// Acknowledge a button tap. Telegram spins the client until this lands, so it is sent for every
+    /// callback including refusals.
+    pub async fn answer_callback(&self, callback_id: &str, text: Option<&str>) {
+        let mut body = serde_json::json!({ "callback_query_id": callback_id });
+        if let Some(t) = text {
+            body["text"] = serde_json::json!(t);
+        }
+        if let Err(e) = self.post_json("answerCallbackQuery", &body).await {
+            tracing::debug!(error = %e, "telegram answerCallbackQuery failed");
+        }
+    }
+
+    /// Publish the command list clients offer as autocomplete after `/`.
+    ///
+    /// Telegram only accepts `[a-z0-9_]{1,32}`, so the legacy window commands (`/7d`) cannot appear
+    /// here; they still work when typed and `/help` lists them.
+    pub async fn set_my_commands(&self, commands: &[(&str, &str)]) -> Result<(), String> {
+        let list: Vec<serde_json::Value> = commands
+            .iter()
+            .map(|(command, description)| serde_json::json!({
+                "command": command,
+                "description": description,
+            }))
+            .collect();
+        self.post_json("setMyCommands", &serde_json::json!({ "commands": list }))
+            .await
+    }
+
+    async fn post_json(&self, method: &str, body: &serde_json::Value) -> Result<(), String> {
+        let url = format!("{API_BASE}/bot{}/{method}", self.token);
         let resp = self
             .http
             .post(&url)
-            .json(&serde_json::json!({ "chat_id": chat_id, "text": text }))
+            .json(body)
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -146,8 +256,8 @@ impl TelegramClient {
             Ok(())
         } else {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            Err(format!("telegram {status}: {body}"))
+            let text = resp.text().await.unwrap_or_default();
+            Err(format!("telegram {status}: {text}"))
         }
     }
 }
@@ -316,7 +426,7 @@ impl NotificationChannel for TelegramChannel {
             // the alert undelivered.
             if outcome.is_ok()
                 && let Some(png) = plot.as_ref()
-                && let Err(e) = self.client.send_photo(chat_id, png.clone(), "").await
+                && let Err(e) = self.client.send_photo(chat_id, png.clone(), "", None).await
             {
                 tracing::warn!(error = %e, "telegram: alarm plot upload failed");
             }

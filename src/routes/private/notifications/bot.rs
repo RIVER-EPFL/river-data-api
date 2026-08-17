@@ -12,11 +12,30 @@ use crate::common::authz::{AccessScope, Role};
 use super::access::accessible_project_ids;
 use super::authz::RoleResolution;
 use super::commands;
+use super::keyboard;
 use super::telegram::{TelegramClient, Update};
 use super::{Reply, plot_args};
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
 const POLL_TIMEOUT_SECS: u32 = 25;
+
+/// Published to clients as the autocomplete list behind `/`.
+///
+/// Read-only commands only: the privileged ones still work when typed and are listed by `/help`,
+/// but offering everyone a menu entry they will be refused is noise.
+const MENU_COMMANDS: [(&str, &str); 11] = [
+    ("plot", "Chart a site or one parameter"),
+    ("latest", "Latest reading per parameter at a site"),
+    ("stations", "Sites you can see"),
+    ("status", "Alarm summary"),
+    ("alarms", "Open alarms"),
+    ("thresholds", "Configured thresholds"),
+    ("battery", "Voltage and depletion forecast"),
+    ("muted", "Active alert mutes"),
+    ("ping", "Liveness check"),
+    ("help", "Everything I can do"),
+    ("start", "Link this chat to your account"),
+];
 
 struct Identity {
     id: Uuid,
@@ -32,6 +51,9 @@ pub async fn run(state: AppState) {
     let client = TelegramClient::new(token);
     let nudged = NudgeGate::new();
     tracing::info!("Telegram bot poller: starting");
+    if let Err(e) = client.set_my_commands(&MENU_COMMANDS).await {
+        tracing::warn!(error = %e, "telegram setMyCommands failed");
+    }
     let mut offset = 0i64;
     loop {
         match client.get_updates(offset, POLL_TIMEOUT_SECS).await {
@@ -87,7 +109,14 @@ async fn handle_update(
     nudged: &NudgeGate,
     u: Update,
 ) {
-    let (Some(chat_id), Some(text)) = (u.chat_id, u.text) else {
+    let Some(chat_id) = u.chat_id else {
+        return;
+    };
+    if let (Some(callback_id), Some(data)) = (u.callback_id.as_deref(), u.callback_data.as_deref()) {
+        handle_callback(state, client, chat_id, &u, callback_id, data).await;
+        return;
+    }
+    let Some(text) = u.text.as_deref() else {
         return;
     };
     let text = text.trim();
@@ -115,22 +144,90 @@ async fn handle_update(
     )
     .await
     {
-        let sent = match reply {
-            Reply::Text(t) => client.send_message(chat_id, &t).await,
-            Reply::Photo { png, caption } => {
-                match client.send_photo(chat_id, png, &caption).await {
-                    Ok(()) => Ok(()),
-                    Err(e) => {
-                        // A Telegram-side image failure should still deliver the answer.
-                        tracing::warn!(error = %e, "telegram sendPhoto failed, falling back to text");
-                        client.send_message(chat_id, &caption).await
+        deliver(client, chat_id, reply, None).await;
+    }
+}
+
+/// A tapped button.
+///
+/// Runs the same identity, role and scope resolution a typed command does: `callback_data` is
+/// client-supplied and the button may have been sent before the tapper's access changed.
+async fn handle_callback(
+    state: &AppState,
+    client: &TelegramClient,
+    chat_id: i64,
+    u: &Update,
+    callback_id: &str,
+    data: &str,
+) {
+    let Some(action) = keyboard::Action::parse(data) else {
+        client
+            .answer_callback(callback_id, Some("That button is out of date."))
+            .await;
+        return;
+    };
+    let scope = match authorize(state, chat_id).await {
+        Ok(ctx) => ctx.scope,
+        Err(refusal) => {
+            client.answer_callback(callback_id, Some(&toast(&refusal))).await;
+            return;
+        }
+    };
+    client.answer_callback(callback_id, None).await;
+    let reply = commands::callback(state, &scope, action).await;
+    // A chart is replaced in place, so changing window doesn't stack images down the chat. Anything
+    // else (a picker, an error) is a new message: a photo can't be edited into text.
+    let edit = if u.has_photo && matches!(reply, Reply::Photo { .. }) {
+        u.message_id
+    } else {
+        None
+    };
+    deliver(client, chat_id, reply, edit).await;
+}
+
+/// Telegram truncates a callback toast at 200 characters.
+fn toast(text: &str) -> String {
+    text.chars().take(190).collect()
+}
+
+/// Send a reply, editing `edit` in place when the reply is a chart replacing one.
+async fn deliver(client: &TelegramClient, chat_id: i64, reply: Reply, edit: Option<i64>) {
+    let sent = match reply {
+        Reply::Text(t) => client.send_message(chat_id, &t).await,
+        Reply::Menu { text, keyboard } => client.send_text(chat_id, &text, Some(&keyboard)).await,
+        Reply::Photo {
+            png,
+            caption,
+            keyboard,
+        } => {
+            let kb = keyboard.as_ref();
+            let attempt = match edit {
+                Some(message_id) => {
+                    match client
+                        .edit_photo(chat_id, message_id, png.clone(), &caption, kb)
+                        .await
+                    {
+                        Ok(()) => Ok(()),
+                        Err(e) => {
+                            tracing::debug!(error = %e, "telegram editMessageMedia failed, sending a new photo");
+                            client.send_photo(chat_id, png, &caption, kb).await
+                        }
                     }
                 }
+                None => client.send_photo(chat_id, png, &caption, kb).await,
+            };
+            match attempt {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // A Telegram-side image failure should still deliver the answer.
+                    tracing::warn!(error = %e, "telegram sendPhoto failed, falling back to text");
+                    client.send_text(chat_id, &caption, kb).await
+                }
             }
-        };
-        if let Err(e) = sent {
-            tracing::warn!(error = %e, "telegram send failed");
         }
+    };
+    if let Err(e) = sent {
+        tracing::warn!(error = %e, "telegram send failed");
     }
 }
 
@@ -174,42 +271,19 @@ async fn route(
         );
     }
 
-    let Some(identity) = lookup_identity(&state.db, chat_id).await else {
-        return Some(
-            "This chat isn't linked. Ask an administrator for a code, then send /start <code>."
-                .into(),
-        );
-    };
-    if !identity.is_active {
-        return Some("This chat's access has been revoked. Ask an administrator to re-link.".into());
-    }
-
-    // Anti-backdoor: resolve the linked user's CURRENT role on every command.
-    let role = match state.authorizer.resolve(state, &identity.sub).await {
-        Some(RoleResolution::Revoked) => {
-            deactivate(&state.db, identity.id).await;
-            return Some("Your access has been revoked.".into());
-        }
-        None => {
-            return Some("Authorization service is unavailable. Try again shortly.".into());
-        }
-        Some(role) => role,
-    };
-    stamp_verified(&state.db, identity.id).await;
-
-    // The linked user's project confinement, the same set that gates HTTP reads and alert delivery.
-    // `None` (administrator) means unrestricted; a member is confined to their granted projects so a
-    // bot read can't surface data they can't see in the portal.
-    let scope = match accessible_project_ids(state, &identity.sub).await {
-        None => AccessScope::Unrestricted,
-        Some(projects) => AccessScope::Projects(std::sync::Arc::new(projects)),
+    let (role, scope) = match authorize(state, chat_id).await {
+        Ok(ctx) => (ctx.role, ctx.scope),
+        Err(refusal) => return Some(Reply::Text(refusal)),
     };
 
-    // Plot commands answer with an image, so they sit outside the text-only match below. Placed
-    // after identity, role and scope resolution so they inherit every gate rather than
+    // Commands that answer with an image or a keyboard sit outside the text-only match below.
+    // Placed after identity, role and scope resolution so they inherit every gate rather than
     // re-implementing one, and `scope` confines site resolution exactly as it does for /latest.
     if plot_args::is_plot_command(cmd) {
         return Some(commands::plot(state, &scope, cmd, args).await);
+    }
+    if cmd == "stations" {
+        return Some(commands::stations(&state.db, &scope).await);
     }
 
     let cutoff = state.config.battery_cutoff_volts;
@@ -218,7 +292,6 @@ async fn route(
         "ping" => commands::ping(),
         "status" => commands::status(&state.db, &scope).await,
         "alarms" => commands::alarms(&state.db, &scope).await,
-        "stations" => commands::stations(&state.db, &scope).await,
         "latest" => commands::latest(&state.db, &scope, args).await,
         "thresholds" => commands::thresholds(&state.db, &scope, args).await,
         // Sync-service internals (endpoints, last_error) are operational data, Administrators only.
@@ -257,6 +330,49 @@ async fn route(
         other => format!("Unknown command /{other}. Try /help."),
     };
     Some(Reply::Text(reply))
+}
+
+/// What a chat is allowed to do, resolved fresh.
+struct Context {
+    role: RoleResolution,
+    scope: AccessScope,
+}
+
+/// Resolve the chat's linked user, their current role and their project confinement.
+///
+/// Anti-backdoor: this runs on every inbound message and every button tap. A role revoked in
+/// Keycloak deactivates the identity here; an unreachable authorization service refuses rather than
+/// falling back to a cached answer. `Err` carries the refusal to show the user.
+async fn authorize(state: &AppState, chat_id: i64) -> Result<Context, String> {
+    let Some(identity) = lookup_identity(&state.db, chat_id).await else {
+        return Err(
+            "This chat isn't linked. Ask an administrator for a code, then send /start <code>."
+                .to_string(),
+        );
+    };
+    if !identity.is_active {
+        return Err(
+            "This chat's access has been revoked. Ask an administrator to re-link.".to_string(),
+        );
+    }
+    let role = match state.authorizer.resolve(state, &identity.sub).await {
+        Some(RoleResolution::Revoked) => {
+            deactivate(&state.db, identity.id).await;
+            return Err("Your access has been revoked.".to_string());
+        }
+        None => return Err("Authorization service is unavailable. Try again shortly.".to_string()),
+        Some(role) => role,
+    };
+    stamp_verified(&state.db, identity.id).await;
+
+    // The same project set that gates HTTP reads and alert delivery. `None` (administrator) means
+    // unrestricted; a member is confined to their granted projects so a bot read can't surface data
+    // they can't see in the portal.
+    let scope = match accessible_project_ids(state, &identity.sub).await {
+        None => AccessScope::Unrestricted,
+        Some(projects) => AccessScope::Projects(std::sync::Arc::new(projects)),
+    };
+    Ok(Context { role, scope })
 }
 
 async fn lookup_identity(db: &DatabaseConnection, chat_id: i64) -> Option<Identity> {

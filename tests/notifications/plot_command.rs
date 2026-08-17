@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use river_db::common::authz::AccessScope;
+use river_db::routes::private::notifications::keyboard::{self, Action, Button};
 use river_db::routes::private::notifications::{Reply, commands};
 use sea_orm::DatabaseConnection;
 use serial_test::serial;
@@ -69,14 +70,14 @@ async fn seed_project_b(db: &DatabaseConnection) {
 fn png_bytes(reply: &Reply) -> &[u8] {
     match reply {
         Reply::Photo { png, .. } => png,
-        Reply::Text(t) => panic!("expected a chart, got text: {t}"),
+        other => panic!("expected a chart, got text: {}", other.text()),
     }
 }
 
 fn text(reply: &Reply) -> &str {
     match reply {
-        Reply::Text(t) => t,
         Reply::Photo { caption, .. } => panic!("expected text, got a chart captioned: {caption}"),
+        other => other.text(),
     }
 }
 
@@ -99,7 +100,7 @@ async fn plot_returns_a_png_for_a_seeded_series() {
             assert!(caption.contains("Upstream Station"), "caption: {caption}");
             assert!(caption.contains("Water Depth"), "caption: {caption}");
         }
-        Reply::Text(_) => unreachable!(),
+        _ => unreachable!(),
     }
 }
 
@@ -128,9 +129,10 @@ async fn legacy_window_commands_render() {
     for cmd in ["3d", "7d", "30d"] {
         match commands::plot(&state, &AccessScope::Unrestricted, cmd, "Upstream depth").await {
             Reply::Photo { png, .. } => assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n"),
-            Reply::Text(t) => assert!(
-                t.contains("No data"),
-                "/{cmd} must render or report an empty window, got: {t}"
+            other => assert!(
+                other.text().contains("No data"),
+                "/{cmd} must render or report an empty window, got: {}",
+                other.text()
             ),
         }
     }
@@ -295,14 +297,14 @@ async fn plot_draws_thresholds_and_annotations_without_failing() {
 
     let reply = commands::plot(&state, &AccessScope::Unrestricted, "6h", "Upstream depth").await;
     match &reply {
-        Reply::Photo { png, caption } => {
+        Reply::Photo { png, caption, .. } => {
             assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
             assert!(
                 caption.contains("1 note"),
                 "an overlapping annotation should be reported: {caption}"
             );
         }
-        Reply::Text(t) => panic!("expected a chart: {t}"),
+        other => panic!("expected a chart: {}", other.text()),
     }
 }
 
@@ -322,18 +324,6 @@ async fn plot_rejects_a_nonsense_window() {
     )
     .await;
     assert!(text(&reply).contains("isn't a window"), "{}", text(&reply));
-}
-
-#[tokio::test]
-#[serial]
-async fn plot_without_arguments_shows_usage() {
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    crate::common::seed_test_data(&db).await;
-    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
-
-    let reply = commands::plot(&state, &AccessScope::Unrestricted, "plot", "").await;
-    assert!(text(&reply).contains("Usage:"), "{}", text(&reply));
 }
 
 /// `volt` has been the field team's shorthand for years and matches no parameter code or name.
@@ -379,12 +369,194 @@ async fn renders_from_a_real_database() {
     let reply = commands::plot(&state, &AccessScope::Unrestricted, &cmd, &args).await;
 
     match reply {
-        Reply::Photo { png, caption } => {
+        Reply::Photo { png, caption, .. } => {
             let path =
                 std::env::var("RIVER_PLOT_DUMP").unwrap_or_else(|_| "/tmp/real.png".to_string());
             std::fs::write(&path, &png).expect("write");
             eprintln!("wrote {path} ({} bytes) caption: {caption}", png.len());
         }
-        Reply::Text(t) => panic!("expected a chart, got: {t}"),
+        other => panic!("expected a chart, got: {}", other.text()),
     }
+}
+
+/// Scenario: someone types `/plot` with nothing else, or names something that doesn't resolve.
+///
+/// Expected behaviour: the reply carries the choices rather than only naming the failure.
+#[tokio::test]
+#[serial]
+async fn plot_without_arguments_offers_the_sites() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    let reply = commands::plot(&state, &AccessScope::Unrestricted, "plot", "").await;
+    let buttons = flatten(&reply);
+    assert!(
+        buttons.iter().any(|b| b.text.contains("Upstream")),
+        "the site picker must list the seeded site: {:?}",
+        button_labels(&reply)
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn an_unknown_site_offers_the_real_ones() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    let reply = commands::plot(&state, &AccessScope::Unrestricted, "plot", "Atlantis depth").await;
+    assert!(text(&reply).contains("No site matches"), "{}", text(&reply));
+    assert!(
+        button_labels(&reply).iter().any(|l| l.contains("Upstream")),
+        "the reply must offer the sites that do exist: {:?}",
+        button_labels(&reply)
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn an_unknown_parameter_offers_the_ones_the_site_has() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    let reply = commands::plot(&state, &AccessScope::Unrestricted, "plot", "Upstream nonsense").await;
+    let labels = button_labels(&reply);
+    assert!(
+        labels.iter().any(|l| l.contains("Depth")),
+        "a bad parameter must list the site's own parameters: {labels:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_site_on_its_own_draws_every_parameter() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    seed_recent_readings(&db, SITE1_ID, 12).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    let reply = commands::plot(&state, &AccessScope::Unrestricted, "plot", "Upstream").await;
+    assert_eq!(&png_bytes(&reply)[..8], b"\x89PNG\r\n\x1a\n");
+    assert!(
+        reply.text().contains("parameter"),
+        "the caption should say how many panels it drew: {}",
+        reply.text()
+    );
+    assert!(
+        button_labels(&reply).iter().any(|l| l.contains("Depth")),
+        "an overview must offer its parameters: {:?}",
+        button_labels(&reply)
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_chart_carries_a_window_switcher() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    seed_recent_readings(&db, SITE1_ID, 12).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    let reply = commands::plot(&state, &AccessScope::Unrestricted, "6h", "Upstream depth").await;
+    let labels = button_labels(&reply);
+    for window in keyboard::WINDOW_CHOICES {
+        assert!(
+            labels.iter().any(|l| l.contains(window)),
+            "{window} must be one tap away: {labels:?}"
+        );
+    }
+    assert!(
+        labels.iter().any(|l| l == "• 6h"),
+        "the window in view is marked: {labels:?}"
+    );
+}
+
+/// A button is a shortcut, never an authority: its payload is re-resolved against the tapper's
+/// scope, so one captured from an administrator's chat buys a member nothing.
+#[tokio::test]
+#[serial]
+async fn a_button_cannot_reach_an_out_of_scope_site() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    seed_project_b(&db).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    let hidden = keyboard::short(Uuid::parse_str(SITE_B).unwrap());
+    for action in [
+        Action::Overview(hidden.clone()),
+        Action::Parameters(hidden.clone()),
+        Action::View {
+            site: hidden,
+            parameter: keyboard::short(Uuid::parse_str(GLOBAL_PARAM_DEPTH_ID).unwrap()),
+            window: "6h".to_string(),
+        },
+    ] {
+        let reply = commands::callback(&state, &scope_a(), action.clone()).await;
+        assert!(
+            text(&reply).contains("out of date"),
+            "{action:?} must not resolve for a member: {}",
+            text(&reply)
+        );
+    }
+
+    let admin = commands::callback(
+        &state,
+        &AccessScope::Unrestricted,
+        Action::Parameters(keyboard::short(Uuid::parse_str(SITE_B).unwrap())),
+    )
+    .await;
+    assert!(
+        !text(&admin).contains("out of date"),
+        "an administrator resolves the same button: {}",
+        text(&admin)
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_button_round_trips_to_a_chart() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    seed_recent_readings(&db, SITE1_ID, 12).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    let sites = commands::plot(&state, &AccessScope::Unrestricted, "plot", "").await;
+    let tapped = flatten(&sites)
+        .into_iter()
+        .find(|b| b.text.contains("Upstream"))
+        .expect("a site button");
+    let action = Action::parse(&tapped.data).expect("its payload parses");
+    let overview = commands::callback(&state, &AccessScope::Unrestricted, action).await;
+
+    let parameter = flatten(&overview)
+        .into_iter()
+        .find(|b| b.text.contains("Depth"))
+        .expect("a parameter button");
+    let chart = commands::callback(
+        &state,
+        &AccessScope::Unrestricted,
+        Action::parse(&parameter.data).expect("its payload parses"),
+    )
+    .await;
+    assert_eq!(&png_bytes(&chart)[..8], b"\x89PNG\r\n\x1a\n");
+}
+
+fn flatten(reply: &Reply) -> Vec<Button> {
+    reply
+        .keyboard()
+        .map(|k| k.iter().flatten().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn button_labels(reply: &Reply) -> Vec<String> {
+    flatten(reply).into_iter().map(|b| b.text).collect()
 }

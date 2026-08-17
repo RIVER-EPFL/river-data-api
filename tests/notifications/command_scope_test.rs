@@ -48,14 +48,16 @@ async fn stations_hides_ungranted_projects() {
 
     let confined = commands::stations(&db, &scope_a()).await;
     assert!(
-        !confined.contains("HiddenStationB"),
-        "member must not see project B's site: {confined}"
+        !confined.text().contains("HiddenStationB"),
+        "member must not see project B's site: {}",
+        confined.text()
     );
 
     let unrestricted = commands::stations(&db, &AccessScope::Unrestricted).await;
     assert!(
-        unrestricted.contains("HiddenStationB"),
-        "an admin sees every site: {unrestricted}"
+        unrestricted.text().contains("HiddenStationB"),
+        "an admin sees every site: {}",
+        unrestricted.text()
     );
 }
 

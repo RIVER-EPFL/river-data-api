@@ -18,6 +18,7 @@ use crate::routes::private::readings::grab_samples::{
 
 use crate::routes::private::alarms::thresholds::resolve_thresholds_sql;
 
+use super::keyboard::{self, Action, Button};
 use super::messages::severity_label;
 use super::{Reply, plot_args};
 use crate::common::{plot, series_query};
@@ -57,9 +58,12 @@ pub fn help() -> String {
      /help, this list\n\
      \n\
      Charts:\n\
+     /plot, pick a site and parameter from a list\n\
+     /plot <site>, every parameter at that site in one image\n\
      /plot <site> <param> [window], e.g. /plot Saxon turbidity 6h\n\
      /1d /3d /7d /30d <site> <param>, fixed windows\n\
      Windows: 90m, 6h, 2d, 1w, 3mo (up to 3y).\n\
+     Every chart carries buttons to change window or parameter.\n\
      For a site whose name has spaces, separate with commas:\n\
      /plot Les Dailles, depth, 2d\n\
      \n\
@@ -131,7 +135,153 @@ fn ambiguous_reply(kind: &str, names: &[String]) -> String {
     )
 }
 
-pub async fn stations(db: &DatabaseConnection, scope: &AccessScope) -> String {
+/// The window a parameter button opens with, and the one an overview covers.
+const BUTTON_WINDOW: &str = "24h";
+/// At most this many panels in a site overview: past six, each panel is too small to read.
+const MAX_OVERVIEW_PANELS: usize = 6;
+/// Sites and parameters offered as buttons. Telegram renders a long keyboard badly.
+const MAX_SITE_BUTTONS: u32 = 30;
+const MAX_PARAMETER_BUTTONS: u32 = 24;
+
+/// The sites the caller may see, each opening that site's overview.
+async fn site_buttons(
+    db: &DatabaseConnection,
+    scope: &AccessScope,
+) -> Result<Vec<Button>, sea_orm::DbErr> {
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            PG,
+            "SELECT id, name FROM sites \
+             WHERE ($1::uuid[] IS NULL OR project_id = ANY($1)) ORDER BY name LIMIT $2",
+            [scope_projects_bind(scope), i64::from(MAX_SITE_BUTTONS).into()],
+        ))
+        .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let id: Uuid = r.try_get("", "id").ok()?;
+            Some(Button {
+                text: r.try_get("", "name").ok()?,
+                data: Action::Overview(keyboard::short(id)).encode(),
+            })
+        })
+        .collect())
+}
+
+/// `(id, name, units)` for the parameters configured at a site, measurements first.
+async fn site_parameter_list(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+    limit: u32,
+) -> Result<Vec<(Uuid, String, Option<String>)>, sea_orm::DbErr> {
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            PG,
+            "SELECT p.id AS id, p.name AS name, \
+                    COALESCE(NULLIF(sp.display_units, ''), p.default_units) AS units \
+             FROM site_parameters sp JOIN parameters p ON p.id = sp.parameter_id \
+             WHERE sp.site_id = $1 \
+             ORDER BY (p.category = 'measurement') DESC, p.name LIMIT $2",
+            [site_id.into(), i64::from(limit).into()],
+        ))
+        .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            Some((
+                r.try_get("", "id").ok()?,
+                r.try_get("", "name").ok()?,
+                r.try_get::<Option<String>>("", "units").ok().flatten(),
+            ))
+        })
+        .collect())
+}
+
+async fn parameter_buttons(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+) -> Result<Vec<Button>, sea_orm::DbErr> {
+    let site = keyboard::short(site_id);
+    Ok(site_parameter_list(db, site_id, MAX_PARAMETER_BUTTONS)
+        .await?
+        .into_iter()
+        .map(|(id, name, _)| Button {
+            text: name,
+            data: Action::View {
+                site: site.clone(),
+                parameter: keyboard::short(id),
+                window: BUTTON_WINDOW.to_string(),
+            }
+            .encode(),
+        })
+        .collect())
+}
+
+/// The row under a chart: the other windows, then a way back out.
+fn chart_keyboard(site_id: Uuid, parameter_id: Uuid, window: &str) -> keyboard::Keyboard {
+    let site = keyboard::short(site_id);
+    vec![
+        keyboard::window_row(&site, &keyboard::short(parameter_id), window),
+        vec![
+            Button {
+                text: "All parameters".to_string(),
+                data: Action::Parameters(site.clone()).encode(),
+            },
+            Button {
+                text: "Sites".to_string(),
+                data: Action::Sites.encode(),
+            },
+        ],
+    ]
+}
+
+/// A site picker, used when no site was named and when one could not be resolved.
+pub async fn sites_menu(db: &DatabaseConnection, scope: &AccessScope, lead: &str) -> Reply {
+    match site_buttons(db, scope).await {
+        Ok(buttons) if buttons.is_empty() => {
+            Reply::Text("No sites are visible to your account.".to_string())
+        }
+        Ok(buttons) => Reply::Menu {
+            text: lead.to_string(),
+            keyboard: keyboard::rows(buttons, 2),
+        },
+        Err(e) => Reply::Text(db_error(&e)),
+    }
+}
+
+/// A parameter picker for one site. Answers "no parameter matches" with the ones that do.
+pub async fn parameters_menu(db: &DatabaseConnection, site_id: Uuid, lead: &str) -> Reply {
+    match parameter_buttons(db, site_id).await {
+        Ok(buttons) if buttons.is_empty() => Reply::Text(format!(
+            "{lead}\nThis site has no parameters configured."
+        )),
+        Ok(buttons) => {
+            let mut keys = keyboard::rows(buttons, 2);
+            keys.push(vec![Button {
+                text: "Sites".to_string(),
+                data: Action::Sites.encode(),
+            }]);
+            Reply::Menu {
+                text: lead.to_string(),
+                keyboard: keys,
+            }
+        }
+        Err(e) => Reply::Text(db_error(&e)),
+    }
+}
+
+pub async fn stations(db: &DatabaseConnection, scope: &AccessScope) -> Reply {
+    let listing = stations_text(db, scope).await;
+    match site_buttons(db, scope).await {
+        Ok(buttons) if !buttons.is_empty() => Reply::Menu {
+            text: format!("{listing}\n\nTap a site for its charts."),
+            keyboard: keyboard::rows(buttons, 2),
+        },
+        _ => Reply::Text(listing),
+    }
+}
+
+async fn stations_text(db: &DatabaseConnection, scope: &AccessScope) -> String {
     let rows = match db
         .query_all(Statement::from_sql_and_values(
             PG,
@@ -791,6 +941,15 @@ struct PlotTarget {
     units: Option<String>,
 }
 
+/// Why a plot request could not be turned into a slot.
+///
+/// `site` is carried so the reply can offer that site's parameters instead of only naming the
+/// failure: the answer to "no parameter matches" is the list of ones that do.
+struct TargetError {
+    message: String,
+    site: Option<(Uuid, String)>,
+}
+
 /// Walk the candidate splits and take the first where both sides resolve to exactly one row.
 ///
 /// Ordered parameter-shortest-first by `candidate_splits`, so a site whose name contains a
@@ -800,7 +959,7 @@ async fn resolve_plot_target(
     db: &DatabaseConnection,
     scope: &AccessScope,
     parsed: &plot_args::ParsedArgs,
-) -> Result<Result<PlotTarget, String>, sea_orm::DbErr> {
+) -> Result<Result<PlotTarget, TargetError>, sea_orm::DbErr> {
     let mut last_site_err: Option<String> = None;
     let mut last_param_err: Option<String> = None;
     let mut resolved_site: Option<(Uuid, String)> = None;
@@ -847,8 +1006,9 @@ async fn resolve_plot_target(
     }
 
     // Prefer the more specific failure: if a site resolved, the parameter is what went wrong.
-    let msg = if let (Some((_, site_name)), Some(param_err)) = (&resolved_site, &last_param_err) {
-        format!("{param_err}\n(Site resolved as {site_name}.)")
+    let message = if let (Some((_, site_name)), Some(param_err)) = (&resolved_site, &last_param_err)
+    {
+        format!("{param_err}\nSite resolved as {site_name}.")
     } else if let Some(site_err) = last_site_err {
         site_err
     } else if let Some(param_err) = last_param_err {
@@ -856,7 +1016,10 @@ async fn resolve_plot_target(
     } else {
         "Couldn't read that. Try: /plot <site> <parameter> [window]".to_string()
     };
-    Ok(Err(msg))
+    Ok(Err(TargetError {
+        message,
+        site: resolved_site,
+    }))
 }
 
 async fn parameter_units(
@@ -924,17 +1087,21 @@ async fn plot_annotations(
 /// command like `7d`. Returns [`Reply::Text`] for every failure, since the caller has no other way
 /// to explain what went wrong.
 pub async fn plot(state: &AppState, scope: &AccessScope, cmd: &str, args: &str) -> Reply {
-    let usage = "Usage: /plot <site> <parameter> [window]\n\
-                 Examples:\n  \
-                 /plot Saxon turbidity 6h\n  \
-                 /7d Verbier battery\n  \
-                 /plot Les Dailles, depth, 2d  (commas pin a multi-word site)";
+    let db = &state.db;
 
-    let Some(parsed) = plot_args::parse(args) else {
-        return Reply::Text(usage.to_string());
+    // A window can be given without a target, so it is split off before anything is resolved.
+    let mut tokens = plot_args::tokenize(args);
+    let trailing_window = if tokens.len() > 1 && tokens.last().is_some_and(|t| plot_args::looks_like_window(t)) {
+        tokens.last().cloned()
+    } else if tokens.len() == 1 && plot_args::looks_like_window(&tokens[0]) {
+        tokens.pop()
+    } else {
+        None
     };
-
-    let window = match (&parsed.window_token, plot_args::window_of_command(cmd)) {
+    let window = match (
+        trailing_window.as_deref(),
+        plot_args::window_of_command(cmd),
+    ) {
         (Some(tok), _) => match plot_args::parse_window(tok) {
             Some(w) => w,
             None => {
@@ -947,13 +1114,55 @@ pub async fn plot(state: &AppState, scope: &AccessScope, cmd: &str, args: &str) 
         (None, None) => Duration::days(plot_args::DEFAULT_WINDOW_DAYS),
     };
 
-    let db = &state.db;
+    if tokens.is_empty() {
+        return sites_menu(db, scope, "Which site?").await;
+    }
+
+    // A site on its own is a complete request: it answers with every parameter at once. Tried
+    // before the pair split so "Les Dailles" is read as the site it is, not as site + parameter.
+    let named = tokens
+        .iter()
+        .filter(|t| !plot_args::looks_like_window(t))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if let Ok(SiteMatch::One(site_id, site_name)) = resolve_site(db, scope, &named).await {
+        // An overview defaults to the last day rather than the plot default of a week: it answers
+        // "what is happening at this site", and each panel is a sixth of the usual width.
+        let window = if trailing_window.is_some() || plot_args::window_of_command(cmd).is_some() {
+            window
+        } else {
+            Duration::hours(24)
+        };
+        return site_overview(state, site_id, &site_name, window).await;
+    }
+
+    let Some(parsed) = plot_args::parse(args) else {
+        return sites_menu(
+            db,
+            scope,
+            &format!("No site matches \"{named}\". Pick one:"),
+        )
+        .await;
+    };
+
     let target = match resolve_plot_target(db, scope, &parsed).await {
         Ok(Ok(t)) => t,
-        Ok(Err(msg)) => return Reply::Text(msg),
+        Ok(Err(err)) => {
+            return match err.site {
+                Some((site_id, _)) => parameters_menu(db, site_id, &err.message).await,
+                None => sites_menu(db, scope, &format!("{}\nPick a site:", err.message)).await,
+            };
+        }
         Err(e) => return Reply::Text(db_error(&e)),
     };
 
+    render_slot(state, &target, window).await
+}
+
+/// Draw one resolved slot, with the window switcher under it.
+async fn render_slot(state: &AppState, target: &PlotTarget, window: Duration) -> Reply {
+    let db = &state.db;
     let end = Utc::now();
     let start = end - window;
     let tier = series_query::tier_for(window);
@@ -974,12 +1183,19 @@ pub async fn plot(state: &AppState, scope: &AccessScope, cmd: &str, args: &str) 
             || " No readings recorded at all for this pair.".to_string(),
             |t| format!(" Latest reading: {}.", t.format("%Y-%m-%d %H:%M UTC")),
         );
-        return Reply::Text(format!(
-            "No data for {} at {} in the last {}.{tail}",
-            target.parameter_name,
-            target.site_name,
-            humanize(window)
-        ));
+        return Reply::Menu {
+            text: format!(
+                "No data for {} at {} in the last {}.{tail}",
+                target.parameter_name,
+                target.site_name,
+                humanize(window)
+            ),
+            keyboard: chart_keyboard(
+                target.site_id,
+                target.parameter_id,
+                &window_label(window),
+            ),
+        };
     }
 
     let thresholds = match crate::routes::private::alarms::thresholds::resolve_threshold(
@@ -1069,7 +1285,230 @@ pub async fn plot(state: &AppState, scope: &AccessScope, cmd: &str, args: &str) 
         ));
     }
 
-    Reply::Photo { png, caption }
+    Reply::Photo {
+        png,
+        caption,
+        keyboard: Some(chart_keyboard(
+            target.site_id,
+            target.parameter_id,
+            &window_label(window),
+        )),
+    }
+}
+
+/// The button label matching a window, so the switcher can mark the one in view.
+fn window_label(window: Duration) -> String {
+    keyboard::WINDOW_CHOICES
+        .iter()
+        .find(|w| plot_args::parse_window(w) == Some(window))
+        .map_or_else(String::new, |w| (*w).to_string())
+}
+
+/// Every parameter at a site, one panel each, in a single image.
+async fn site_overview(
+    state: &AppState,
+    site_id: Uuid,
+    site_name: &str,
+    window: Duration,
+) -> Reply {
+    let db = &state.db;
+    let parameters = match site_parameter_list(db, site_id, MAX_OVERVIEW_PANELS as u32).await {
+        Ok(p) => p,
+        Err(e) => return Reply::Text(db_error(&e)),
+    };
+    if parameters.is_empty() {
+        return Reply::Text(format!("{site_name} has no parameters configured."));
+    }
+
+    let end = Utc::now();
+    let start = end - window;
+    let tier = series_query::tier_for(window);
+    let mut specs = Vec::new();
+    for (parameter_id, name, units) in &parameters {
+        let series = match series_query::fetch_series(db, site_id, *parameter_id, start, end, tier)
+            .await
+        {
+            Ok(s) if !s.is_empty() => s,
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::warn!(error = %e, "overview: series fetch failed");
+                continue;
+            }
+        };
+        let points = series_query::decimate(series.points, series_query::MAX_POINTS);
+        let units_suffix = units
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .map_or_else(String::new, |u| format!(" ({u})"));
+        let mut spec = plot::PlotSpec::new(
+            format!("{name}{units_suffix}"),
+            format!("{} points", points.len()),
+            String::new(),
+        )
+        .into_panel();
+        spec.gap_seconds = tier.gap_seconds();
+        spec.envelope = points
+            .iter()
+            .filter_map(|p| Some((p.time, p.min?, p.max?)))
+            .collect();
+        spec.points = points.iter().map(|p| (p.time, p.value)).collect();
+        specs.push(spec);
+    }
+
+    if specs.is_empty() {
+        return parameters_menu(
+            db,
+            site_id,
+            &format!(
+                "No data at {site_name} in the last {}. Pick a parameter to look further back:",
+                humanize(window)
+            ),
+        )
+        .await;
+    }
+
+    let panels = specs.len();
+    let grid_rows = panels.div_ceil(2).max(1) as u32;
+    let height = if panels == 1 { 620 } else { grid_rows * 340 };
+    let png = match tokio::task::spawn_blocking(move || {
+        plot::render_grid_png(&specs, plot::DEFAULT_WIDTH, height)
+    })
+    .await
+    {
+        Ok(Ok(png)) => png,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "overview render failed");
+            return Reply::Text("Couldn't draw that overview, it's been logged for the team.".to_string());
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "overview render task panicked");
+            return Reply::Text("Couldn't draw that overview, it's been logged for the team.".to_string());
+        }
+    };
+
+    let mut keys = match parameter_buttons(db, site_id).await {
+        Ok(buttons) => keyboard::rows(buttons, 2),
+        Err(e) => {
+            tracing::warn!(error = %e, "overview: parameter buttons failed");
+            Vec::new()
+        }
+    };
+    keys.push(vec![Button {
+        text: "Sites".to_string(),
+        data: Action::Sites.encode(),
+    }]);
+
+    Reply::Photo {
+        png,
+        caption: format!(
+            "{site_name} · last {} · {panels} parameter{}\nTap one for its own chart.",
+            humanize(window),
+            if panels == 1 { "" } else { "s" }
+        ),
+        keyboard: Some(keys),
+    }
+}
+
+/// Handle a button tap.
+///
+/// `action` is decoded from data the client sent back, so every id is re-resolved here against the
+/// caller's scope: a button is a shortcut, never an authority.
+pub async fn callback(state: &AppState, scope: &AccessScope, action: Action) -> Reply {
+    let db = &state.db;
+    let expired = "That button is out of date. Send /plot to start again.";
+    match action {
+        Action::Sites => sites_menu(db, scope, "Which site?").await,
+        Action::Parameters(prefix) => match resolve_short_site(db, scope, &prefix).await {
+            Ok(Some((site_id, site_name))) => {
+                parameters_menu(db, site_id, &format!("{site_name}. Which parameter?")).await
+            }
+            Ok(None) => Reply::Text(expired.to_string()),
+            Err(e) => Reply::Text(db_error(&e)),
+        },
+        Action::Overview(prefix) => match resolve_short_site(db, scope, &prefix).await {
+            Ok(Some((site_id, site_name))) => {
+                let window =
+                    plot_args::parse_window(BUTTON_WINDOW).unwrap_or_else(|| Duration::hours(24));
+                site_overview(state, site_id, &site_name, window).await
+            }
+            Ok(None) => Reply::Text(expired.to_string()),
+            Err(e) => Reply::Text(db_error(&e)),
+        },
+        Action::View {
+            site,
+            parameter,
+            window,
+        } => {
+            let Some(window) = plot_args::parse_window(&window) else {
+                return Reply::Text(expired.to_string());
+            };
+            let site = match resolve_short_site(db, scope, &site).await {
+                Ok(Some(s)) => s,
+                Ok(None) => return Reply::Text(expired.to_string()),
+                Err(e) => return Reply::Text(db_error(&e)),
+            };
+            let parameter = match resolve_short_parameter(db, &parameter).await {
+                Ok(Some(p)) => p,
+                Ok(None) => return Reply::Text(expired.to_string()),
+                Err(e) => return Reply::Text(db_error(&e)),
+            };
+            let target = PlotTarget {
+                site_id: site.0,
+                site_name: site.1,
+                parameter_id: parameter.0,
+                parameter_name: parameter.1,
+                units: parameter.2,
+            };
+            render_slot(state, &target, window).await
+        }
+    }
+}
+
+/// Resolve a button's site id, confined to the caller's scope exactly as a typed name is.
+async fn resolve_short_site(
+    db: &DatabaseConnection,
+    scope: &AccessScope,
+    encoded: &str,
+) -> Result<Option<(Uuid, String)>, sea_orm::DbErr> {
+    let Some(id) = keyboard::from_short(encoded) else {
+        return Ok(None);
+    };
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            PG,
+            "SELECT id, name FROM sites WHERE id = $1 \
+             AND ($2::uuid[] IS NULL OR project_id = ANY($2))",
+            [id.into(), scope_projects_bind(scope)],
+        ))
+        .await?;
+    match row {
+        Some(r) => Ok(Some((r.try_get("", "id")?, r.try_get("", "name")?))),
+        None => Ok(None),
+    }
+}
+
+async fn resolve_short_parameter(
+    db: &DatabaseConnection,
+    encoded: &str,
+) -> Result<Option<(Uuid, String, Option<String>)>, sea_orm::DbErr> {
+    let Some(id) = keyboard::from_short(encoded) else {
+        return Ok(None);
+    };
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            PG,
+            "SELECT id, name, default_units FROM parameters WHERE id = $1",
+            [id.into()],
+        ))
+        .await?;
+    match row {
+        Some(r) => Ok(Some((
+            r.try_get("", "id")?,
+            r.try_get("", "name")?,
+            r.try_get::<Option<String>>("", "default_units")?,
+        ))),
+        None => Ok(None),
+    }
 }
 
 async fn latest_reading_time(

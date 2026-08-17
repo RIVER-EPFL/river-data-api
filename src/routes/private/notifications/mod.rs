@@ -16,6 +16,7 @@ pub mod dispatcher;
 pub mod email;
 pub mod health;
 pub mod identities_model;
+pub mod keyboard;
 pub mod log_model;
 pub mod me;
 pub mod messages;
@@ -63,7 +64,36 @@ pub struct DeliveryResult {
 /// unchanged and the routing table's arms all still evaluate to `String`.
 pub enum Reply {
     Text(String),
-    Photo { png: Vec<u8>, caption: String },
+    /// Text plus tappable choices, for picking a site or a parameter.
+    Menu {
+        text: String,
+        keyboard: keyboard::Keyboard,
+    },
+    Photo {
+        png: Vec<u8>,
+        caption: String,
+        keyboard: Option<keyboard::Keyboard>,
+    },
+}
+
+impl Reply {
+    /// The words of a reply, whatever form it takes.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        match self {
+            Reply::Text(t) | Reply::Menu { text: t, .. } | Reply::Photo { caption: t, .. } => t,
+        }
+    }
+
+    /// The buttons under a reply, if it has any.
+    #[must_use]
+    pub fn keyboard(&self) -> Option<&keyboard::Keyboard> {
+        match self {
+            Reply::Text(_) => None,
+            Reply::Menu { keyboard, .. } => Some(keyboard),
+            Reply::Photo { keyboard, .. } => keyboard.as_ref(),
+        }
+    }
 }
 
 impl From<String> for Reply {
