@@ -1,7 +1,7 @@
 //! Telegram Bot API client and the alert delivery channel.
 //!
-//! Plain HTTPS calls against `api.telegram.org`, no bot framework. Phase 1 uses `send_message`;
-//! the bot poller (getUpdates) and `send_photo` are added in later phases.
+//! Plain HTTPS calls against `api.telegram.org`, no bot framework: `getUpdates` for the inbound
+//! poller, `sendMessage` for text and `sendPhoto` for rendered charts.
 
 use std::time::Duration;
 
@@ -96,6 +96,42 @@ impl TelegramClient {
         Ok(format!("bot @{username} reachable"))
     }
 
+    /// Send a PNG with a caption.
+    ///
+    /// `multipart` is already enabled on reqwest for this crate, so the upload needs no new
+    /// dependency. Telegram caps a caption at 1024 UTF-16 code units and a photo at 10MB, and
+    /// downscales anything wider than ~1280px.
+    pub async fn send_photo(
+        &self,
+        chat_id: i64,
+        png: Vec<u8>,
+        caption: &str,
+    ) -> Result<(), String> {
+        let url = format!("{API_BASE}/bot{}/sendPhoto", self.token);
+        let part = reqwest::multipart::Part::bytes(png)
+            .file_name("plot.png")
+            .mime_str("image/png")
+            .map_err(|e| e.to_string())?;
+        let form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .text("caption", truncate_caption(caption))
+            .part("photo", part);
+        let resp = self
+            .http
+            .post(&url)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            Err(format!("telegram {status}: {body}"))
+        }
+    }
+
     /// Send a plain-text message to one chat. Returns the Telegram error description on failure.
     pub async fn send_message(&self, chat_id: i64, text: &str) -> Result<(), String> {
         let url = format!("{API_BASE}/bot{}/sendMessage", self.token);
@@ -114,6 +150,33 @@ impl TelegramClient {
             Err(format!("telegram {status}: {body}"))
         }
     }
+}
+
+
+/// Mark a chat as active because an alert reached it.
+///
+/// Best-effort: a failure here only costs a link some idle headroom, never a delivery.
+async fn stamp_delivered(db: &DatabaseConnection, chat_id: i64) {
+    let res = db
+        .execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE telegram_identities SET last_verified_at = NOW(), updated_at = NOW() \
+             WHERE telegram_chat_id = $1 AND is_active",
+            [chat_id.into()],
+        ))
+        .await;
+    if let Err(e) = res {
+        tracing::warn!(error = %e, "telegram: failed to stamp delivery activity");
+    }
+}
+
+/// Telegram counts a caption in UTF-16 code units, capped at 1024. Truncating at 900 *characters*
+/// stays under that for any realistic text and cannot split a code point.
+fn truncate_caption(s: &str) -> String {
+    if s.chars().count() <= 900 {
+        return s.to_string();
+    }
+    s.chars().take(899).collect::<String>() + "\u{2026}"
 }
 
 /// Delivers alerts to every active, alert-subscribed identity that has claimed a chat.
@@ -184,6 +247,27 @@ pub async fn slot_recipients(
     Ok(out)
 }
 
+
+impl TelegramChannel {
+    /// A chart of the breaching slot, when `TELEGRAM_ALARM_PLOTS` is on.
+    ///
+    /// Every failure degrades to `None`: an alert must go out even if the chart cannot be drawn.
+    async fn alarm_plot(&self, state: &AppState, msg: &OutgoingMessage) -> Option<Vec<u8>> {
+        if !state.config.telegram_alarm_plots {
+            return None;
+        }
+        let slot = msg.slot.as_ref()?;
+        let hours = state.config.telegram_alarm_plot_hours.max(1);
+        crate::routes::private::notifications::commands::slot_plot_png(
+            state,
+            slot.site_id,
+            slot.parameter_id,
+            chrono::Duration::hours(hours),
+        )
+        .await
+    }
+}
+
 #[async_trait::async_trait]
 impl NotificationChannel for TelegramChannel {
     fn name(&self) -> &'static str {
@@ -208,6 +292,12 @@ impl NotificationChannel for TelegramChannel {
         // place. A `None` project (system-wide alert) passes for everyone.
         let project = msg.slot.as_ref().and_then(|s| s.project_id);
 
+        // Rendered once for the whole fan-out rather than per recipient. That is only sound
+        // because every recipient reached below has already passed `project_allowed` for THIS
+        // slot's project, so one image cannot leak across projects. If a chart ever spans more
+        // than one slot, this has to move inside the loop.
+        let plot = self.alarm_plot(state, msg).await;
+
         let mut results = Vec::with_capacity(recipients.len());
         for (sub, chat_id) in recipients {
             if let Some(p) = project
@@ -216,6 +306,20 @@ impl NotificationChannel for TelegramChannel {
                 continue;
             }
             let outcome = self.client.send_message(chat_id, &msg.body).await;
+            if outcome.is_ok() {
+                // Receiving an alert counts as using the link. Without this, idle expiry would cut
+                // off precisely the people who linked once and only ever receive alarms.
+                stamp_delivered(db, chat_id).await;
+            }
+            // The chart is a follow-up message, never a replacement: the alert text is not
+            // truncated to a caption, not delayed by rendering, and a failed upload cannot mark
+            // the alert undelivered.
+            if outcome.is_ok()
+                && let Some(png) = plot.as_ref()
+                && let Err(e) = self.client.send_photo(chat_id, png.clone(), "").await
+            {
+                tracing::warn!(error = %e, "telegram: alarm plot upload failed");
+            }
             results.push(DeliveryResult {
                 recipient: chat_id.to_string(),
                 outcome,

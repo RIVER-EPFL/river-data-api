@@ -16,5 +16,6 @@ mod grab_test;
 mod link_flow_test;
 mod me_test;
 mod mute_gate;
+mod plot_command;
 mod thresholds_command;
 mod triggers_test;

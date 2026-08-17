@@ -131,6 +131,11 @@ fn test_config() -> Config {
         battery_forecast_alert_days: 14,
         stale_data_threshold_hours: 6,
         telegram_grab_flag_for_review: false,
+        telegram_alarm_plots: false,
+        telegram_alarm_plot_hours: 24,
+        telegram_link_idle_days: 30,
+        telegram_link_warn_days: 7,
+        telegram_link_purge_days: 90,
         dashboard_base_url: None,
     }
 }

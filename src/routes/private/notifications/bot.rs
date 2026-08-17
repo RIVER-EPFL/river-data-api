@@ -13,6 +13,7 @@ use super::access::accessible_project_ids;
 use super::authz::RoleResolution;
 use super::commands;
 use super::telegram::{TelegramClient, Update};
+use super::{Reply, plot_args};
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
 const POLL_TIMEOUT_SECS: u32 = 25;
@@ -29,6 +30,7 @@ pub async fn run(state: AppState) {
         return;
     };
     let client = TelegramClient::new(token);
+    let nudged = NudgeGate::new();
     tracing::info!("Telegram bot poller: starting");
     let mut offset = 0i64;
     loop {
@@ -36,7 +38,7 @@ pub async fn run(state: AppState) {
             Ok(updates) => {
                 for u in updates {
                     offset = u.update_id + 1;
-                    handle_update(&state, &client, u).await;
+                    handle_update(&state, &client, &nudged, u).await;
                 }
             }
             Err(e) => {
@@ -47,15 +49,61 @@ pub async fn run(state: AppState) {
     }
 }
 
-async fn handle_update(state: &AppState, client: &TelegramClient, u: Update) {
+/// What a private chat gets when it sends something that isn't a command.
+const NUDGE: &str = "I only respond to commands. Send /help to see what I can do.";
+
+/// Remembers which chats were recently nudged, so a pasted multi-line message produces one reply
+/// rather than one per line.
+///
+/// Poller-local rather than in `AppState`: the bot is a single task on a single replica by design
+/// (`ENABLE_TELEGRAM_BOT`), so there is nothing to share it with.
+struct NudgeGate {
+    seen: moka::future::Cache<i64, ()>,
+}
+
+impl NudgeGate {
+    fn new() -> Self {
+        Self {
+            seen: moka::future::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(600))
+                .build(),
+        }
+    }
+
+    /// True at most once per chat per window.
+    async fn allow(&self, chat_id: i64) -> bool {
+        if self.seen.get(&chat_id).await.is_some() {
+            return false;
+        }
+        self.seen.insert(chat_id, ()).await;
+        true
+    }
+}
+
+async fn handle_update(
+    state: &AppState,
+    client: &TelegramClient,
+    nudged: &NudgeGate,
+    u: Update,
+) {
     let (Some(chat_id), Some(text)) = (u.chat_id, u.text) else {
         return;
     };
     let text = text.trim();
+    let is_private = u.chat_type.as_deref() == Some("private");
     if !text.starts_with('/') {
+        // A group must stay silent: a bot that answers every message is unusable in a shared chat,
+        // and unrelated chatter should never reach these servers. In a 1:1 chat silence just reads
+        // as a broken bot, so point at /help, at most once per chat per window.
+        if is_private
+            && nudged.allow(chat_id).await
+            && let Err(e) = client.send_message(chat_id, NUDGE).await
+        {
+            tracing::warn!(error = %e, "telegram nudge failed");
+        }
         return;
     }
-    let is_private = u.chat_type.as_deref() == Some("private");
     let (cmd, args) = parse_command(text);
     if let Some(reply) = route(
         state,
@@ -67,8 +115,21 @@ async fn handle_update(state: &AppState, client: &TelegramClient, u: Update) {
     )
     .await
     {
-        if let Err(e) = client.send_message(chat_id, &reply).await {
-            tracing::warn!(error = %e, "telegram send_message failed");
+        let sent = match reply {
+            Reply::Text(t) => client.send_message(chat_id, &t).await,
+            Reply::Photo { png, caption } => {
+                match client.send_photo(chat_id, png, &caption).await {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        // A Telegram-side image failure should still deliver the answer.
+                        tracing::warn!(error = %e, "telegram sendPhoto failed, falling back to text");
+                        client.send_message(chat_id, &caption).await
+                    }
+                }
+            }
+        };
+        if let Err(e) = sent {
+            tracing::warn!(error = %e, "telegram send failed");
         }
     }
 }
@@ -97,10 +158,10 @@ async fn route(
     username: Option<&str>,
     cmd: &str,
     args: &str,
-) -> Option<String> {
+) -> Option<Reply> {
     // /start is the only command reachable before a chat is linked.
     if cmd == "start" {
-        return Some(commands::start(&state.db, chat_id, username, args).await);
+        return Some(commands::start(&state.db, chat_id, username, args).await.into());
     }
 
     // A write/state-changing command in a group chat can't be attributed to an individual, refuse
@@ -109,30 +170,28 @@ async fn route(
         return Some(
             "This command changes data and only works in a direct (1:1) chat with the bot, \
              not in a group."
-                .to_string(),
+                .into(),
         );
     }
 
     let Some(identity) = lookup_identity(&state.db, chat_id).await else {
         return Some(
             "This chat isn't linked. Ask an administrator for a code, then send /start <code>."
-                .to_string(),
+                .into(),
         );
     };
     if !identity.is_active {
-        return Some(
-            "This chat's access has been revoked. Ask an administrator to re-link.".to_string(),
-        );
+        return Some("This chat's access has been revoked. Ask an administrator to re-link.".into());
     }
 
     // Anti-backdoor: resolve the linked user's CURRENT role on every command.
     let role = match state.authorizer.resolve(state, &identity.sub).await {
         Some(RoleResolution::Revoked) => {
             deactivate(&state.db, identity.id).await;
-            return Some("Your access has been revoked.".to_string());
+            return Some("Your access has been revoked.".into());
         }
         None => {
-            return Some("Authorization service is unavailable. Try again shortly.".to_string());
+            return Some("Authorization service is unavailable. Try again shortly.".into());
         }
         Some(role) => role,
     };
@@ -145,6 +204,13 @@ async fn route(
         None => AccessScope::Unrestricted,
         Some(projects) => AccessScope::Projects(std::sync::Arc::new(projects)),
     };
+
+    // Plot commands answer with an image, so they sit outside the text-only match below. Placed
+    // after identity, role and scope resolution so they inherit every gate rather than
+    // re-implementing one, and `scope` confines site resolution exactly as it does for /latest.
+    if plot_args::is_plot_command(cmd) {
+        return Some(commands::plot(state, &scope, cmd, args).await);
+    }
 
     let cutoff = state.config.battery_cutoff_volts;
     let reply = match cmd {
@@ -190,7 +256,7 @@ async fn route(
         }
         other => format!("Unknown command /{other}. Try /help."),
     };
-    Some(reply)
+    Some(Reply::Text(reply))
 }
 
 async fn lookup_identity(db: &DatabaseConnection, chat_id: i64) -> Option<Identity> {

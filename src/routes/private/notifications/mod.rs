@@ -19,6 +19,7 @@ pub mod identities_model;
 pub mod log_model;
 pub mod me;
 pub mod messages;
+pub mod plot_args;
 pub mod mutes_model;
 pub mod reconcile;
 pub mod telegram;
@@ -54,6 +55,27 @@ pub struct OutgoingMessage {
 pub struct DeliveryResult {
     pub recipient: String,
     pub outcome: Result<(), String>,
+}
+
+/// What a bot command answers with.
+///
+/// Every handler but the plot commands returns text, so `From<String>` keeps their call sites
+/// unchanged and the routing table's arms all still evaluate to `String`.
+pub enum Reply {
+    Text(String),
+    Photo { png: Vec<u8>, caption: String },
+}
+
+impl From<String> for Reply {
+    fn from(s: String) -> Self {
+        Reply::Text(s)
+    }
+}
+
+impl From<&str> for Reply {
+    fn from(s: &str) -> Self {
+        Reply::Text(s.to_string())
+    }
 }
 
 /// A delivery channel (Telegram, email). Each channel resolves its own recipients, so the

@@ -19,6 +19,8 @@ use crate::routes::private::readings::grab_samples::{
 use crate::routes::private::alarms::thresholds::resolve_thresholds_sql;
 
 use super::messages::severity_label;
+use super::{Reply, plot_args};
+use crate::common::{plot, series_query};
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
 
@@ -51,7 +53,18 @@ pub fn help() -> String {
      /mute <site> <param> [days], suppress alerts\n\
      /unmute <site> <param>\n\
      /muted, active mutes\n\
-     /ping, liveness check"
+     /ping, liveness check\n\
+     /help, this list\n\
+     \n\
+     Charts:\n\
+     /plot <site> <param> [window], e.g. /plot Saxon turbidity 6h\n\
+     /1d /3d /7d /30d <site> <param>, fixed windows\n\
+     Windows: 90m, 6h, 2d, 1w, 3mo (up to 3y).\n\
+     For a site whose name has spaces, separate with commas:\n\
+     /plot Les Dailles, depth, 2d\n\
+     \n\
+     Setup:\n\
+     /start <code>, link this chat to your account"
         .to_string()
 }
 
@@ -765,4 +778,419 @@ async fn flag_for_review(
 fn db_error(e: &sea_orm::DbErr) -> String {
     tracing::warn!(error = %e, "bot command query failed");
     "Something went wrong fetching that. Try again shortly.".to_string()
+}
+
+// ── Plot ────────────────────────────────────────────────────────────────────────────────────────
+
+/// A resolved `(site, parameter)` pair plus the display names for the chart.
+struct PlotTarget {
+    site_id: Uuid,
+    site_name: String,
+    parameter_id: Uuid,
+    parameter_name: String,
+    units: Option<String>,
+}
+
+/// Walk the candidate splits and take the first where both sides resolve to exactly one row.
+///
+/// Ordered parameter-shortest-first by `candidate_splits`, so a site whose name contains a
+/// parameter word (`Depth Station`) still resolves correctly. On failure the reply names which
+/// side failed, rather than the legacy bot's single "could not generate plot" for everything.
+async fn resolve_plot_target(
+    db: &DatabaseConnection,
+    scope: &AccessScope,
+    parsed: &plot_args::ParsedArgs,
+) -> Result<Result<PlotTarget, String>, sea_orm::DbErr> {
+    let mut last_site_err: Option<String> = None;
+    let mut last_param_err: Option<String> = None;
+    let mut resolved_site: Option<(Uuid, String)> = None;
+
+    for (site_arg, param_arg) in &parsed.candidates {
+        let site = match resolve_site(db, scope, site_arg).await? {
+            SiteMatch::One(id, name) => (id, name),
+            SiteMatch::NotFound => {
+                last_site_err.get_or_insert(format!("No site matches \"{site_arg}\"."));
+                continue;
+            }
+            SiteMatch::Ambiguous(names) => {
+                last_site_err.get_or_insert(ambiguous_reply("sites", &names));
+                continue;
+            }
+        };
+        resolved_site = Some(site.clone());
+
+        // Try the parameter as typed, then through the legacy alias table. `volt` has been muscle
+        // memory for years and matches no parameter code or name on its own.
+        let direct = resolve_parameter(db, param_arg).await?;
+        let param = match direct {
+            Ok(p) => Ok(p),
+            Err(err) => match plot_args::alias_for(param_arg) {
+                Some(alias) => resolve_parameter(db, alias).await?,
+                None => Err(err),
+            },
+        };
+        match param {
+            Ok((parameter_id, parameter_name)) => {
+                let units = parameter_units(db, parameter_id).await?;
+                return Ok(Ok(PlotTarget {
+                    site_id: site.0,
+                    site_name: site.1,
+                    parameter_id,
+                    parameter_name,
+                    units,
+                }));
+            }
+            Err(err) => {
+                last_param_err.get_or_insert(err);
+            }
+        }
+    }
+
+    // Prefer the more specific failure: if a site resolved, the parameter is what went wrong.
+    let msg = if let (Some((_, site_name)), Some(param_err)) = (&resolved_site, &last_param_err) {
+        format!("{param_err}\n(Site resolved as {site_name}.)")
+    } else if let Some(site_err) = last_site_err {
+        site_err
+    } else if let Some(param_err) = last_param_err {
+        param_err
+    } else {
+        "Couldn't read that. Try: /plot <site> <parameter> [window]".to_string()
+    };
+    Ok(Err(msg))
+}
+
+async fn parameter_units(
+    db: &DatabaseConnection,
+    parameter_id: Uuid,
+) -> Result<Option<String>, sea_orm::DbErr> {
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            PG,
+            "SELECT default_units FROM parameters WHERE id = $1",
+            [parameter_id.into()],
+        ))
+        .await?;
+    Ok(row.and_then(|r| r.try_get::<Option<String>>("", "default_units").ok().flatten()))
+}
+
+/// Time-ranged notes overlapping the window.
+///
+/// Overlap, not containment: a note that began before the window and is still open must shade its
+/// visible portion rather than disappear.
+async fn plot_annotations(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    start: chrono::DateTime<Utc>,
+    end: chrono::DateTime<Utc>,
+) -> Vec<plot::AnnotationBand> {
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            PG,
+            "SELECT start_time, end_time, text FROM annotations \
+             WHERE site_id = $1 AND parameter_id = $2 AND start_time <= $4 AND end_time >= $3 \
+             ORDER BY start_time LIMIT $5",
+            [
+                site_id.into(),
+                parameter_id.into(),
+                start.into(),
+                end.into(),
+                (plot::MAX_ANNOTATION_BANDS as i64).into(),
+            ],
+        ))
+        .await;
+    match rows {
+        Ok(rows) => rows
+            .into_iter()
+            .filter_map(|r| {
+                Some(plot::AnnotationBand {
+                    start: r.try_get("", "start_time").ok()?,
+                    end: r.try_get("", "end_time").ok()?,
+                    text: r.try_get("", "text").unwrap_or_default(),
+                })
+            })
+            .collect(),
+        Err(e) => {
+            // A broken annotations query must not cost the user their chart.
+            tracing::warn!(error = %e, "plot: annotation lookup failed");
+            Vec::new()
+        }
+    }
+}
+
+/// Render a time series as a PNG chart.
+///
+/// `cmd` is either `plot` (window from the arguments, defaulting to a week) or a legacy window
+/// command like `7d`. Returns [`Reply::Text`] for every failure, since the caller has no other way
+/// to explain what went wrong.
+pub async fn plot(state: &AppState, scope: &AccessScope, cmd: &str, args: &str) -> Reply {
+    let usage = "Usage: /plot <site> <parameter> [window]\n\
+                 Examples:\n  \
+                 /plot Saxon turbidity 6h\n  \
+                 /7d Verbier battery\n  \
+                 /plot Les Dailles, depth, 2d  (commas pin a multi-word site)";
+
+    let Some(parsed) = plot_args::parse(args) else {
+        return Reply::Text(usage.to_string());
+    };
+
+    let window = match (&parsed.window_token, plot_args::window_of_command(cmd)) {
+        (Some(tok), _) => match plot_args::parse_window(tok) {
+            Some(w) => w,
+            None => {
+                return Reply::Text(format!(
+                    "\"{tok}\" isn't a window. Try 6h, 2d, 1w or 30d (up to 3y)."
+                ));
+            }
+        },
+        (None, Some(w)) => w,
+        (None, None) => Duration::days(plot_args::DEFAULT_WINDOW_DAYS),
+    };
+
+    let db = &state.db;
+    let target = match resolve_plot_target(db, scope, &parsed).await {
+        Ok(Ok(t)) => t,
+        Ok(Err(msg)) => return Reply::Text(msg),
+        Err(e) => return Reply::Text(db_error(&e)),
+    };
+
+    let end = Utc::now();
+    let start = end - window;
+    let tier = series_query::tier_for(window);
+
+    let series =
+        match series_query::fetch_series(db, target.site_id, target.parameter_id, start, end, tier)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => return Reply::Text(db_error(&e)),
+        };
+
+    if series.is_empty() {
+        // Naming the latest reading answers the obvious follow-up in the same message. The legacy
+        // bot said only "could not generate plot", which conflated this with a typo.
+        let latest = latest_reading_time(db, target.site_id, target.parameter_id).await;
+        let tail = latest.map_or_else(
+            || " No readings recorded at all for this pair.".to_string(),
+            |t| format!(" Latest reading: {}.", t.format("%Y-%m-%d %H:%M UTC")),
+        );
+        return Reply::Text(format!(
+            "No data for {} at {} in the last {}.{tail}",
+            target.parameter_name,
+            target.site_name,
+            humanize(window)
+        ));
+    }
+
+    let thresholds = match crate::routes::private::alarms::thresholds::resolve_threshold(
+        db,
+        target.site_id,
+        target.parameter_id,
+    )
+    .await
+    {
+        Ok(Some(t)) => plot::ThresholdLines {
+            warning_min: t.warning_min,
+            warning_max: t.warning_max,
+            alarm_min: t.alarm_min,
+            alarm_max: t.alarm_max,
+        },
+        Ok(None) => plot::ThresholdLines::default(),
+        Err(e) => {
+            tracing::warn!(error = %e, "plot: threshold lookup failed");
+            plot::ThresholdLines::default()
+        }
+    };
+
+    let annotations = plot_annotations(db, target.site_id, target.parameter_id, start, end).await;
+
+    let raw_count = series.points.len();
+    let points = series_query::decimate(series.points, series_query::MAX_POINTS);
+    let envelope: Vec<_> = points
+        .iter()
+        .filter_map(|p| Some((p.time, p.min?, p.max?)))
+        .collect();
+
+    let units_suffix = target
+        .units
+        .as_deref()
+        .filter(|u| !u.is_empty())
+        .map_or_else(String::new, |u| format!(" ({u})"));
+
+    let mut spec = plot::PlotSpec::new(
+        format!("{}: {}", target.site_name, target.parameter_name),
+        format!(
+            "last {} · {} · {} point{}",
+            humanize(window),
+            tier.label(),
+            raw_count,
+            if raw_count == 1 { "" } else { "s" }
+        ),
+        format!("{}{units_suffix}", target.parameter_name),
+    );
+    spec.gap_seconds = tier.gap_seconds();
+    spec.points = points.iter().map(|p| (p.time, p.value)).collect();
+    spec.envelope = envelope;
+    spec.thresholds = thresholds;
+    spec.annotations = annotations;
+
+    let note_count = spec.annotations.len();
+
+    // The render is CPU-bound and the poller handles updates serially, so it must not run on a
+    // runtime worker.
+    let png = match tokio::task::spawn_blocking(move || plot::render_png(&spec)).await {
+        Ok(Ok(png)) => png,
+        Ok(Err(plot::PlotError::NoData)) => {
+            return Reply::Text(format!(
+                "No usable values for {} at {} in that window.",
+                target.parameter_name, target.site_name
+            ));
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "plot render failed");
+            return Reply::Text("Couldn't draw that plot, it's been logged for the team.".to_string());
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "plot render task panicked");
+            return Reply::Text("Couldn't draw that plot, it's been logged for the team.".to_string());
+        }
+    };
+
+    let mut caption = format!(
+        "{}: {} · last {}",
+        target.site_name,
+        target.parameter_name,
+        humanize(window)
+    );
+    if note_count > 0 {
+        caption.push_str(&format!(
+            " · {note_count} note{}",
+            if note_count == 1 { "" } else { "s" }
+        ));
+    }
+
+    Reply::Photo { png, caption }
+}
+
+async fn latest_reading_time(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+    parameter_id: Uuid,
+) -> Option<chrono::DateTime<Utc>> {
+    db.query_one(Statement::from_sql_and_values(
+        PG,
+        "SELECT MAX(time) AS t FROM readings WHERE site_id = $1 AND parameter_id = $2",
+        [site_id.into(), parameter_id.into()],
+    ))
+    .await
+    .ok()
+    .flatten()
+    .and_then(|r| r.try_get::<Option<chrono::DateTime<Utc>>>("", "t").ok().flatten())
+}
+
+/// A window as a short phrase for a title and caption.
+fn humanize(d: Duration) -> String {
+    let mins = d.num_minutes();
+    if mins < 60 {
+        format!("{mins} min")
+    } else if mins < 60 * 48 {
+        let h = d.num_hours();
+        format!("{h} hour{}", if h == 1 { "" } else { "s" })
+    } else if d.num_days() < 60 {
+        let days = d.num_days();
+        format!("{days} day{}", if days == 1 { "" } else { "s" })
+    } else {
+        let months = d.num_days() / 30;
+        format!("{months} month{}", if months == 1 { "" } else { "s" })
+    }
+}
+
+/// Render a chart for an already-resolved slot, for the alarm path.
+///
+/// Takes ids rather than user text because the caller resolved them from an alarm event, not from
+/// a command. Every failure degrades to `None`: an alert must go out even when its chart cannot.
+/// Scope confinement is the caller's job here: the alert fan-out already applies
+/// `project_allowed` per recipient.
+pub async fn slot_plot_png(
+    state: &AppState,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    window: Duration,
+) -> Option<Vec<u8>> {
+    let db = &state.db;
+    let end = Utc::now();
+    let start = end - window;
+    let tier = series_query::tier_for(window);
+
+    let series = series_query::fetch_series(db, site_id, parameter_id, start, end, tier)
+        .await
+        .map_err(|e| tracing::warn!(error = %e, "alarm plot: series fetch failed"))
+        .ok()?;
+    if series.is_empty() {
+        return None;
+    }
+
+    let names = db
+        .query_one(Statement::from_sql_and_values(
+            PG,
+            "SELECT s.name AS site, p.name AS param, p.default_units AS units \
+             FROM sites s, parameters p WHERE s.id = $1 AND p.id = $2",
+            [site_id.into(), parameter_id.into()],
+        ))
+        .await
+        .ok()
+        .flatten()?;
+    let site_name: String = names.try_get("", "site").ok()?;
+    let param_name: String = names.try_get("", "param").ok()?;
+    let units: Option<String> = names.try_get("", "units").ok().flatten();
+
+    let thresholds = match crate::routes::private::alarms::thresholds::resolve_threshold(
+        db,
+        site_id,
+        parameter_id,
+    )
+    .await
+    {
+        Ok(Some(t)) => plot::ThresholdLines {
+            warning_min: t.warning_min,
+            warning_max: t.warning_max,
+            alarm_min: t.alarm_min,
+            alarm_max: t.alarm_max,
+        },
+        _ => plot::ThresholdLines::default(),
+    };
+
+    let raw_count = series.points.len();
+    let points = series_query::decimate(series.points, series_query::MAX_POINTS);
+    let envelope: Vec<_> = points
+        .iter()
+        .filter_map(|p| Some((p.time, p.min?, p.max?)))
+        .collect();
+    let units_suffix = units
+        .as_deref()
+        .filter(|u| !u.is_empty())
+        .map_or_else(String::new, |u| format!(" ({u})"));
+
+    let mut spec = plot::PlotSpec::new(
+        format!("{site_name}: {param_name}"),
+        format!(
+            "last {} · {} · {raw_count} points",
+            humanize(window),
+            tier.label()
+        ),
+        format!("{param_name}{units_suffix}"),
+    );
+    spec.gap_seconds = tier.gap_seconds();
+    spec.points = points.iter().map(|p| (p.time, p.value)).collect();
+    spec.envelope = envelope;
+    spec.thresholds = thresholds;
+    spec.annotations =
+        plot_annotations(db, site_id, parameter_id, start, end).await;
+
+    tokio::task::spawn_blocking(move || plot::render_png(&spec))
+        .await
+        .map_err(|e| tracing::error!(error = %e, "alarm plot render task panicked"))
+        .ok()?
+        .map_err(|e| tracing::warn!(error = %e, "alarm plot render failed"))
+        .ok()
 }

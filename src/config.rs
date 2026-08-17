@@ -183,6 +183,17 @@ pub struct Config {
     pub stale_data_threshold_hours: i64,
     // When true, grab samples submitted via the bot are flagged for review on insert.
     pub telegram_grab_flag_for_review: bool,
+    // When true, a Telegram alert is followed by a chart of the breaching slot. Off by default:
+    // it doubles the outbound calls per alert and costs a render per message.
+    pub telegram_alarm_plots: bool,
+    // The window an alarm chart covers, in hours.
+    pub telegram_alarm_plot_hours: i64,
+    // Days of inactivity (sent or received) after which a Telegram link is deactivated. 0 disables.
+    pub telegram_link_idle_days: i64,
+    // How many days before expiry the holder is warned. Must be below the idle threshold.
+    pub telegram_link_warn_days: i64,
+    // Days after which a deactivated link's row is deleted outright. 0 disables.
+    pub telegram_link_purge_days: i64,
     // Dashboard base URL used to build deep links in notification messages.
     pub dashboard_base_url: Option<String>,
 }
@@ -483,6 +494,26 @@ impl Config {
                 .unwrap_or_else(|_| "false".to_string())
                 .parse()
                 .unwrap_or(false),
+            telegram_alarm_plots: env::var("TELEGRAM_ALARM_PLOTS")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
+            telegram_alarm_plot_hours: env::var("TELEGRAM_ALARM_PLOT_HOURS")
+                .unwrap_or_else(|_| "24".to_string())
+                .parse()
+                .unwrap_or(24),
+            telegram_link_idle_days: env::var("TELEGRAM_LINK_IDLE_DAYS")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()
+                .unwrap_or(30),
+            telegram_link_warn_days: env::var("TELEGRAM_LINK_WARN_DAYS")
+                .unwrap_or_else(|_| "7".to_string())
+                .parse()
+                .unwrap_or(7),
+            telegram_link_purge_days: env::var("TELEGRAM_LINK_PURGE_DAYS")
+                .unwrap_or_else(|_| "90".to_string())
+                .parse()
+                .unwrap_or(90),
             dashboard_base_url: env::var("DASHBOARD_BASE_URL")
                 .ok()
                 .filter(|s| !s.is_empty()),
