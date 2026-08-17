@@ -1,8 +1,14 @@
 //! Telegram bot poller: long-polls getUpdates, gates each command on the linked user's live
 //! Keycloak role (anti-backdoor), and routes to the command handlers.
 
+use std::num::NonZeroU32;
+use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
+use futures::FutureExt;
+use governor::clock::DefaultClock;
+use governor::state::keyed::DefaultKeyedStateStore;
+use governor::{Quota, RateLimiter};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
@@ -38,10 +44,94 @@ const MENU_COMMANDS: [(&str, &str); 11] = [
     ("start", "Link this chat to your account"),
 ];
 
+/// Per-chat command budget. Generous enough that ordinary use never touches it, tight enough that
+/// one chat cannot occupy a poller that handles updates serially.
+const MEMBER_PER_MINUTE: u32 = 20;
+const MEMBER_BURST: u32 = 10;
+/// Administrators run the operational commands and get more headroom.
+const ADMIN_PER_MINUTE: u32 = 60;
+const ADMIN_BURST: u32 = 20;
+
+type ChatLimiter = RateLimiter<i64, DefaultKeyedStateStore<i64>, DefaultClock>;
+
+/// Two budgets, chosen by role after the caller is authorized. Public alongside [`route`], which
+/// the integration tests drive directly.
+pub struct Limits {
+    member: ChatLimiter,
+    admin: ChatLimiter,
+    /// Keeps the "slow down" notice itself from becoming the flood.
+    notified: NudgeGate,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Limits {
+    #[must_use]
+    pub fn new() -> Self {
+        let quota = |per_minute: u32, burst: u32| {
+            Quota::per_minute(NonZeroU32::new(per_minute.max(1)).unwrap())
+                .allow_burst(NonZeroU32::new(burst.max(1)).unwrap())
+        };
+        Self {
+            member: RateLimiter::keyed(quota(MEMBER_PER_MINUTE, MEMBER_BURST)),
+            admin: RateLimiter::keyed(quota(ADMIN_PER_MINUTE, ADMIN_BURST)),
+            notified: NudgeGate::new(),
+        }
+    }
+
+    /// Whether this chat may act now, given the role it resolved to.
+    #[must_use]
+    fn allow(&self, chat_id: i64, role: &RoleResolution) -> bool {
+        let limiter = if role.allows_admin() {
+            &self.admin
+        } else {
+            &self.member
+        };
+        limiter.check_key(&chat_id).is_ok()
+    }
+}
+
+/// The facts about an inbound message that routing depends on.
+pub struct Inbound {
+    pub chat_id: i64,
+    /// Telegram chat type: `private`, `group`, `supergroup` or `channel`.
+    pub chat_type: Option<String>,
+    pub is_private: bool,
+    /// The Telegram account that sent it, checked against the one that claimed the link.
+    pub from_id: Option<i64>,
+}
+
+impl Inbound {
+    #[must_use]
+    pub fn private(chat_id: i64, from_id: Option<i64>) -> Self {
+        Self {
+            chat_id,
+            chat_type: Some("private".to_string()),
+            is_private: true,
+            from_id,
+        }
+    }
+
+    fn from_update(u: &Update, chat_id: i64) -> Self {
+        Self {
+            chat_id,
+            chat_type: u.chat_type.clone(),
+            is_private: u.chat_type.as_deref() == Some("private"),
+            from_id: u.from_id,
+        }
+    }
+}
+
 struct Identity {
     id: Uuid,
     sub: String,
     is_active: bool,
+    /// The Telegram account that claimed this link. `None` for links claimed before it was recorded.
+    telegram_user_id: Option<i64>,
 }
 
 /// Long-poll loop. No-op (returns) when no bot token is configured.
@@ -51,6 +141,7 @@ pub async fn run(state: AppState) {
     };
     let client = TelegramClient::new(token);
     let nudged = NudgeGate::new();
+    let limits = Limits::new();
     tracing::info!("Telegram bot poller: starting");
     if let Err(e) = client.set_my_commands(&MENU_COMMANDS).await {
         tracing::warn!(error = %e, "telegram setMyCommands failed");
@@ -60,8 +151,20 @@ pub async fn run(state: AppState) {
         match client.get_updates(offset, POLL_TIMEOUT_SECS).await {
             Ok(updates) => {
                 for u in updates {
+                    // Advanced before handling, so an update that panics is skipped rather than
+                    // replayed into a crash loop.
                     offset = u.update_id + 1;
-                    handle_update(&state, &client, &nudged, u).await;
+                    let update_id = u.update_id;
+                    if AssertUnwindSafe(handle_update(&state, &client, &nudged, &limits, u))
+                        .catch_unwind()
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!(
+                            update_id,
+                            "telegram: panic handling an update, skipping it"
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -74,6 +177,9 @@ pub async fn run(state: AppState) {
 
 /// What a private chat gets when it sends something that isn't a command.
 const NUDGE: &str = "I only respond to commands. Send /help to see what I can do.";
+
+/// What a chat gets when it outruns its budget.
+const THROTTLED: &str = "That's a lot of requests at once. Give me a moment and try again.";
 
 /// Remembers which chats were recently nudged, so a pasted multi-line message produces one reply
 /// rather than one per line.
@@ -108,13 +214,14 @@ async fn handle_update(
     state: &AppState,
     client: &TelegramClient,
     nudged: &NudgeGate,
+    limits: &Limits,
     u: Update,
 ) {
     let Some(chat_id) = u.chat_id else {
         return;
     };
     if let (Some(callback_id), Some(data)) = (u.callback_id.as_deref(), u.callback_data.as_deref()) {
-        handle_callback(state, client, chat_id, &u, callback_id, data).await;
+        handle_callback(state, client, limits, chat_id, &u, callback_id, data).await;
         return;
     }
     let Some(text) = u.text.as_deref() else {
@@ -135,16 +242,7 @@ async fn handle_update(
         return;
     }
     let (cmd, args) = parse_command(text);
-    if let Some(reply) = route(
-        state,
-        chat_id,
-        u.chat_type.as_deref(),
-        is_private,
-        u.username.as_deref(),
-        &cmd,
-        args,
-    )
-    .await
+    if let Some(reply) = route(state, limits, &Inbound::from_update(&u, chat_id), &cmd, args).await
     {
         deliver(client, chat_id, reply, None).await;
     }
@@ -157,6 +255,7 @@ async fn handle_update(
 async fn handle_callback(
     state: &AppState,
     client: &TelegramClient,
+    limits: &Limits,
     chat_id: i64,
     u: &Update,
     callback_id: &str,
@@ -168,7 +267,7 @@ async fn handle_callback(
             .await;
         return;
     };
-    let ctx = match authorize(state, chat_id).await {
+    let ctx = match authorize(state, chat_id, u.from_id).await {
         Ok(ctx) => ctx,
         Err(refusal) => {
             audit::record(
@@ -187,6 +286,20 @@ async fn handle_callback(
             return;
         }
     };
+    if !limits.allow(chat_id, &ctx.role) {
+        audit::record(
+            &state.db,
+            chat_id,
+            u.chat_type.as_deref(),
+            Some(ctx.identity_id),
+            Some(&ctx.sub),
+            "callback",
+            audit::Outcome::RateLimited,
+        )
+        .await;
+        client.answer_callback(callback_id, Some(THROTTLED)).await;
+        return;
+    }
     audit::record(
         &state.db,
         chat_id,
@@ -207,6 +320,26 @@ async fn handle_callback(
         None
     };
     deliver(client, chat_id, reply, edit).await;
+}
+
+/// What a group is told when someone pastes a link code into it.
+///
+/// The code is never echoed back, and the reply carries a bare `t.me` link so the reader can open a
+/// private chat by tapping rather than having to know how.
+fn group_link_refusal(state: &AppState, voided: bool) -> String {
+    let mut msg = if voided {
+        "That link code was visible to everyone in this chat, so I've cancelled it. Generate a \
+         new one in your dashboard settings and send it to me in a direct (1:1) chat."
+            .to_string()
+    } else {
+        "Link codes only work in a direct (1:1) chat with me, and anything posted here is visible \
+         to the whole group."
+            .to_string()
+    };
+    if let Some(bot) = state.config.telegram_bot_username.as_deref() {
+        msg.push_str(&format!("\nOpen a private chat: https://t.me/{bot}"));
+    }
+    msg
 }
 
 /// Telegram truncates a callback toast at 200 characters.
@@ -276,18 +409,26 @@ fn parse_command(text: &str) -> (String, &str) {
 /// the authorization and audit behaviour a live chat would get.
 pub async fn route(
     state: &AppState,
-    chat_id: i64,
-    chat_type: Option<&str>,
-    is_private: bool,
-    username: Option<&str>,
+    limits: &Limits,
+    inbound: &Inbound,
     cmd: &str,
     args: &str,
 ) -> Option<Reply> {
+    let Inbound {
+        chat_id,
+        is_private,
+        from_id,
+        ..
+    } = *inbound;
+    let chat_type = inbound.chat_type.as_deref();
     // /start is the only command reachable before a chat is linked.
     if cmd == "start" {
         // Claiming a code binds THIS chat to the user's authority, so a group chat would hand every
         // member that user's project access, including people with no account at all.
         if !is_private {
+            // Everyone in the group has now read the code, so it is burned whether or not it was
+            // ever going to be used here.
+            let voided = commands::void_link_code(&state.db, args).await;
             audit::record(
                 &state.db,
                 chat_id,
@@ -298,13 +439,9 @@ pub async fn route(
                 audit::Outcome::Denied,
             )
             .await;
-            return Some(
-                "Linking only works in a direct (1:1) chat with the bot. Open a chat with me and \
-                 send /start <code> there."
-                    .into(),
-            );
+            return Some(Reply::Text(group_link_refusal(state, voided)));
         }
-        let (claimed, reply) = commands::start(&state.db, chat_id, username, args).await;
+        let (claimed, reply) = commands::start(&state.db, chat_id, from_id, args).await;
         // A claim is the moment a chat gains an identity, so the row names who it became.
         let identity = if claimed {
             lookup_identity(&state.db, chat_id).await
@@ -338,7 +475,7 @@ pub async fn route(
         );
     }
 
-    let ctx = match authorize(state, chat_id).await {
+    let ctx = match authorize(state, chat_id, from_id).await {
         Ok(ctx) => ctx,
         Err(refusal) => {
             audit::record(
@@ -354,7 +491,27 @@ pub async fn route(
             return Some(Reply::Text(refusal.message));
         }
     };
-    let (role, scope) = (ctx.role, ctx.scope);
+    // Budget is applied once the role is known, so an administrator running operational commands
+    // is not held to a field user's pace.
+    if !limits.allow(chat_id, &ctx.role) {
+        audit::record(
+            &state.db,
+            chat_id,
+            chat_type,
+            Some(ctx.identity_id),
+            Some(&ctx.sub),
+            cmd,
+            audit::Outcome::RateLimited,
+        )
+        .await;
+        // The notice is itself gated, or the flood just becomes a flood of notices.
+        return limits
+            .notified
+            .allow(chat_id)
+            .await
+            .then(|| Reply::Text(THROTTLED.to_string()));
+    }
+    let (role, scope) = (ctx.role.clone(), ctx.scope.clone());
 
     // Commands that answer with an image or a keyboard sit outside the text-only match below.
     // Placed after identity, role and scope resolution so they inherit every gate rather than
@@ -366,7 +523,7 @@ pub async fn route(
     } else if cmd == "stations" {
         commands::stations(&state.db, &scope).await
     } else {
-        Reply::Text(text_command(state, &scope, &role, username, chat_id, cmd, args, &mut outcome).await)
+        Reply::Text(text_command(state, &scope, &role, &ctx.sub, cmd, args, &mut outcome).await)
     };
     audit::record(
         &state.db,
@@ -383,13 +540,11 @@ pub async fn route(
 
 /// The commands that answer with text. `outcome` is set to `Denied` where a role gate refuses, so
 /// the audit trail distinguishes "ran it" from "tried it".
-#[allow(clippy::too_many_arguments)]
 async fn text_command(
     state: &AppState,
     scope: &AccessScope,
     role: &RoleResolution,
-    username: Option<&str>,
-    chat_id: i64,
+    sub: &str,
     cmd: &str,
     args: &str,
     outcome: &mut audit::Outcome,
@@ -416,7 +571,7 @@ async fn text_command(
         // (interns are read-only) and confine the site to the caller's scope.
         "grab" => {
             if role.allows_level(&Role::River) {
-                commands::grab(state, scope, args, username, chat_id).await
+                commands::grab(state, scope, args, sub).await
             } else {
                 *outcome = audit::Outcome::Denied;
                 "Submitting grab samples requires at least the River role.".to_string()
@@ -424,10 +579,9 @@ async fn text_command(
         }
         "mute" | "unmute" | "muted" => {
             if role.allows_admin() {
-                let by = username.map_or_else(
-                    || format!("telegram:{chat_id}"),
-                    |u| format!("telegram:{u}"),
-                );
+                // Provenance is the Keycloak identity, never the Telegram handle: a handle can be
+                // changed and reassigned, and it is an address rather than an identity.
+                let by = format!("keycloak:{sub}");
                 match cmd {
                     "mute" => commands::mute(&state.db, args, &by).await,
                     "unmute" => commands::unmute(&state.db, args).await,
@@ -470,7 +624,11 @@ impl Refusal {
 /// Anti-backdoor: this runs on every inbound message and every button tap. A role revoked in
 /// Keycloak deactivates the identity here; an unreachable authorization service refuses rather than
 /// falling back to a cached answer. `Err` carries the refusal to show the user.
-async fn authorize(state: &AppState, chat_id: i64) -> Result<Context, Refusal> {
+async fn authorize(
+    state: &AppState,
+    chat_id: i64,
+    from_id: Option<i64>,
+) -> Result<Context, Refusal> {
     let Some(identity) = lookup_identity(&state.db, chat_id).await else {
         return Err(Refusal::new(
             audit::Outcome::Unlinked,
@@ -482,6 +640,19 @@ async fn authorize(state: &AppState, chat_id: i64) -> Result<Context, Refusal> {
             audit::Outcome::Inactive,
             "This chat's access has been revoked. Ask an administrator to re-link.",
         ));
+    }
+    // The link belongs to the account that claimed it, not merely to the chat it arrived in.
+    match (identity.telegram_user_id, from_id) {
+        (Some(claimed), Some(sender)) if claimed != sender => {
+            return Err(Refusal::new(
+                audit::Outcome::WrongAccount,
+                "This link belongs to a different Telegram account.",
+            ));
+        }
+        // Claimed before the account was recorded: adopt the first sender seen, so the binding
+        // exists from here on without cutting off a working link.
+        (None, Some(sender)) => bind_account(&state.db, identity.id, sender).await,
+        _ => {}
     }
     let role = match state.authorizer.resolve(state, &identity.sub).await {
         Some(RoleResolution::Revoked) => {
@@ -520,8 +691,8 @@ async fn lookup_identity(db: &DatabaseConnection, chat_id: i64) -> Option<Identi
     let row = db
         .query_one(Statement::from_sql_and_values(
             PG,
-            "SELECT id, linked_keycloak_sub, is_active FROM telegram_identities \
-             WHERE telegram_chat_id = $1",
+            "SELECT id, linked_keycloak_sub, is_active, telegram_user_id \
+             FROM telegram_identities WHERE telegram_chat_id = $1",
             [chat_id.into()],
         ))
         .await
@@ -530,6 +701,7 @@ async fn lookup_identity(db: &DatabaseConnection, chat_id: i64) -> Option<Identi
         id: row.try_get("", "id").ok()?,
         sub: row.try_get("", "linked_keycloak_sub").ok()?,
         is_active: row.try_get("", "is_active").ok()?,
+        telegram_user_id: row.try_get("", "telegram_user_id").ok().flatten(),
     })
 }
 
@@ -539,6 +711,18 @@ async fn deactivate(db: &DatabaseConnection, id: Uuid) {
             PG,
             "UPDATE telegram_identities SET is_active = FALSE, updated_at = NOW() WHERE id = $1",
             [id.into()],
+        ))
+        .await;
+}
+
+/// Record the Telegram account behind a link that predates the binding.
+async fn bind_account(db: &DatabaseConnection, id: Uuid, telegram_user_id: i64) {
+    let _ = db
+        .execute(Statement::from_sql_and_values(
+            PG,
+            "UPDATE telegram_identities SET telegram_user_id = $2, updated_at = NOW() \
+             WHERE id = $1 AND telegram_user_id IS NULL",
+            [id.into(), telegram_user_id.into()],
         ))
         .await;
 }

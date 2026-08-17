@@ -35,6 +35,8 @@ pub struct Update {
     pub message_id: Option<i64>,
     /// Whether that message is a photo, and so can be edited in place rather than replaced.
     pub has_photo: bool,
+    /// The Telegram account that sent this, which is the chat id in a 1:1 chat but not in a group.
+    pub from_id: Option<i64>,
 }
 
 fn parse_update(r: &serde_json::Value) -> Update {
@@ -55,6 +57,7 @@ fn parse_update(r: &serde_json::Value) -> Update {
         callback_data: callback["data"].as_str().map(String::from),
         message_id: msg["message_id"].as_i64(),
         has_photo: msg["photo"].as_array().is_some_and(|p| !p.is_empty()),
+        from_id: from["id"].as_i64(),
     }
 }
 

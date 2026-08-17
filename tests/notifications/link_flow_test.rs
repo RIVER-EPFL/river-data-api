@@ -40,7 +40,7 @@ async fn start_claims_a_valid_code() {
     crate::common::cleanup_test_db(&db).await;
     insert_pending(&db, "sub-alice", "abcd2345", "1 hour").await;
 
-    let (claimed, reply) = commands::start(&db, 555, Some("alice"), "abcd2345").await;
+    let (claimed, reply) = commands::start(&db, 555, Some(555), "abcd2345").await;
     assert!(claimed, "reply: {reply}");
     assert!(reply.contains("Linked"), "reply: {reply}");
     assert_eq!(chat_id_for(&db, "sub-alice").await, Some(555));
@@ -67,7 +67,7 @@ async fn start_rejects_expired_code() {
     crate::common::cleanup_test_db(&db).await;
     insert_pending(&db, "sub-bob", "expired99", "-1 hour").await;
 
-    let (claimed, reply) = commands::start(&db, 777, Some("bob"), "expired99").await;
+    let (claimed, reply) = commands::start(&db, 777, Some(777), "expired99").await;
     assert!(!claimed, "an expired code must not link: {reply}");
     assert!(reply.contains("Invalid or expired"), "reply: {reply}");
     assert_eq!(
@@ -84,12 +84,12 @@ async fn start_is_single_use() {
     crate::common::cleanup_test_db(&db).await;
     insert_pending(&db, "sub-carol", "single123", "1 hour").await;
 
-    let (claimed, first) = commands::start(&db, 100, Some("carol"), "single123").await;
+    let (claimed, first) = commands::start(&db, 100, Some(100), "single123").await;
     assert!(claimed, "first: {first}");
     assert!(first.contains("Linked"), "first: {first}");
 
     // The same code can't link a second chat; it was cleared.
-    let (claimed, second) = commands::start(&db, 200, Some("mallory"), "single123").await;
+    let (claimed, second) = commands::start(&db, 200, Some(200), "single123").await;
     assert!(!claimed, "a reused code must not link: {second}");
     assert!(second.contains("Invalid or expired"), "second: {second}");
     assert_eq!(

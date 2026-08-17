@@ -27,6 +27,10 @@ use crate::common::{plot, series_query};
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
 
+/// Concurrent chart renders. Rendering is the one CPU-bound thing the bot does, so a burst of taps
+/// must not occupy every blocking thread the runtime has.
+static RENDER_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 /// A `uuid[]` bind for confining a `sites` query to the caller's scope: SQL NULL when unrestricted
 /// (administrator, no filter), else the granted project ids (an empty array matches nothing). Pair
 /// with a `(... IS NULL OR <site>.project_id = ANY(...))` fragment so one bind serves both cases.
@@ -795,12 +799,31 @@ pub async fn muted(db: &DatabaseConnection) -> String {
     format!("Active mutes:\n{}", lines.join("\n"))
 }
 
+/// Cancel a pending link code, for when it has been exposed.
+///
+/// Only unclaimed rows are touched, so this can never unlink a working chat. Returns whether a
+/// pending code was actually voided, which is the difference between "that code is now cancelled"
+/// and "that code was not valid anyway".
+pub async fn void_link_code(db: &DatabaseConnection, code: &str) -> bool {
+    if code.is_empty() {
+        return false;
+    }
+    db.execute(Statement::from_sql_and_values(
+        PG,
+        "DELETE FROM telegram_identities \
+         WHERE link_code = $1 AND telegram_chat_id IS NULL",
+        [code.into()],
+    ))
+    .await
+    .is_ok_and(|r| r.rows_affected() > 0)
+}
+
 /// Claim a link code. Returns `(claimed, reply)`: the flag is what the audit trail records, since
 /// a failed claim on a live code is the signal worth keeping.
 pub async fn start(
     db: &DatabaseConnection,
     chat_id: i64,
-    _username: Option<&str>,
+    from_id: Option<i64>,
     code: &str,
 ) -> (bool, String) {
     if code.is_empty() {
@@ -813,12 +836,12 @@ pub async fn start(
         .query_one(Statement::from_sql_and_values(
             PG,
             "UPDATE telegram_identities \
-             SET telegram_chat_id = $1, link_code = NULL, \
+             SET telegram_chat_id = $1, telegram_user_id = $3, link_code = NULL, \
                  link_code_expires_at = NULL, is_active = TRUE, last_verified_at = NOW(), \
-                 updated_at = NOW() \
+                 last_attested_at = NOW(), updated_at = NOW() \
              WHERE link_code = $2 AND link_code_expires_at > NOW() AND telegram_chat_id IS NULL \
              RETURNING id",
-            [chat_id.into(), code.into()],
+            [chat_id.into(), code.into(), from_id.into()],
         ))
         .await;
     match res {
@@ -843,8 +866,7 @@ pub async fn grab(
     state: &AppState,
     scope: &AccessScope,
     args: &str,
-    username: Option<&str>,
-    chat_id: i64,
+    sub: &str,
 ) -> String {
     let toks: Vec<&str> = args.split_whitespace().collect();
     if toks.len() < 3 {
@@ -872,10 +894,9 @@ pub async fn grab(
     };
 
     let now = Utc::now();
-    let created_by = username.map_or_else(
-        || format!("telegram:{chat_id}"),
-        |u| format!("telegram:{u}"),
-    );
+    // The Keycloak identity, resolved live for this very message. A Telegram handle is neither
+    // stable nor authoritative, so it never becomes provenance.
+    let created_by = format!("keycloak:{sub}");
     let readings = values
         .iter()
         .map(|&value| GrabSampleReading {
@@ -904,7 +925,7 @@ pub async fn grab(
                 resp.inserted
             );
             if state.config.telegram_grab_flag_for_review {
-                flag_for_review(&state.db, site_id, param_id, now).await;
+                flag_for_review(&state.db, &resp.created_sample_ids).await;
                 reply.push_str(" Flagged for review.");
             }
             reply
@@ -916,19 +937,29 @@ pub async fn grab(
     }
 }
 
-async fn flag_for_review(
-    db: &DatabaseConnection,
-    site_id: Uuid,
-    param_id: Uuid,
-    time: chrono::DateTime<chrono::Utc>,
-) {
+/// Flag exactly the readings this submission created.
+///
+/// Keyed on the samples the insert reports as *new*, never on (site, parameter, time): a predicate
+/// over the slot would also catch a concurrent write landing on the same timestamp, and a bot
+/// command must not modify a row it did not create. A re-posted grab reuses its sample and so
+/// reports no new ids, which correctly flags nothing.
+async fn flag_for_review(db: &DatabaseConnection, sample_ids: &[Uuid]) {
+    if sample_ids.is_empty() {
+        return;
+    }
+    let ids = sea_orm::Value::Array(
+        sea_orm::sea_query::ArrayType::Uuid,
+        Some(Box::new(
+            sample_ids.iter().copied().map(sea_orm::Value::from).collect(),
+        )),
+    );
     let res = db
         .execute(Statement::from_sql_and_values(
             PG,
             "UPDATE readings SET is_flagged = TRUE, \
-                 flag_reason = 'field submission – pending review' \
-             WHERE site_id = $1 AND parameter_id = $2 AND time = $3",
-            [site_id.into(), param_id.into(), time.into()],
+                 flag_reason = 'field submission, pending review' \
+             WHERE sample_id = ANY($1::uuid[])",
+            [ids],
         ))
         .await;
     if let Err(e) = res {
@@ -1247,6 +1278,7 @@ async fn render_slot(state: &AppState, target: &PlotTarget, window: Duration) ->
 
     // The render is CPU-bound and the poller handles updates serially, so it must not run on a
     // runtime worker.
+    let _slot = RENDER_SLOTS.acquire().await;
     let png = match tokio::task::spawn_blocking(move || plot::render_png(&spec)).await {
         Ok(Ok(png)) => png,
         Ok(Err(plot::PlotError::NoData)) => {
@@ -1420,6 +1452,7 @@ async fn site_overview(
     let panels = specs.len();
     let grid_rows = panels.div_ceil(2).max(1) as u32;
     let height = if panels == 1 { 620 } else { grid_rows * 340 };
+    let _slot = RENDER_SLOTS.acquire().await;
     let png = match tokio::task::spawn_blocking(move || {
         plot::render_grid_png(&specs, plot::DEFAULT_WIDTH, height)
     })
@@ -1663,6 +1696,7 @@ pub async fn slot_plot_png(
     spec.annotations =
         plot_annotations(db, site_id, parameter_id, start, end).await;
 
+    let _slot = RENDER_SLOTS.acquire().await;
     tokio::task::spawn_blocking(move || plot::render_png(&spec))
         .await
         .map_err(|e| tracing::error!(error = %e, "alarm plot render task panicked"))

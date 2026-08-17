@@ -52,7 +52,7 @@ async fn an_unlinked_chat_is_recorded() {
     crate::common::seed_test_data(&db).await;
     let (_app, state) = crate::common::build_test_app_with_state(db.clone());
 
-    bot::route(&state, 424_242, Some("private"), true, None, "status", "").await;
+    bot::route(&state, &bot::Limits::new(), &bot::Inbound::private(424_242, None), "status", "").await;
 
     let recorded = rows(&db).await;
     assert_eq!(recorded.len(), 1, "one message, one row: {recorded:?}");
@@ -70,7 +70,7 @@ async fn a_deactivated_link_is_recorded_as_inactive() {
     link(&db, 424_243, false).await;
     let (_app, state) = crate::common::build_test_app_with_state(db.clone());
 
-    bot::route(&state, 424_243, Some("private"), true, None, "alarms", "").await;
+    bot::route(&state, &bot::Limits::new(), &bot::Inbound::private(424_243, None), "alarms", "").await;
 
     let recorded = rows(&db).await;
     assert_eq!(recorded.len(), 1);
@@ -88,7 +88,7 @@ async fn an_unresolvable_user_is_recorded_as_unavailable() {
     link(&db, 424_244, true).await;
     let (_app, state) = crate::common::build_test_app_with_state(db.clone());
 
-    bot::route(&state, 424_244, Some("private"), true, None, "latest", "").await;
+    bot::route(&state, &bot::Limits::new(), &bot::Inbound::private(424_244, None), "latest", "").await;
 
     let recorded = rows(&db).await;
     assert_eq!(recorded.len(), 1);
@@ -122,10 +122,8 @@ async fn a_link_claim_is_recorded_against_the_user_it_created() {
 
     bot::route(
         &state,
-        424_245,
-        Some("private"),
-        true,
-        Some("alice"),
+        &bot::Limits::new(),
+        &bot::Inbound::private(424_245, Some(9_001)),
         "start",
         "goodcode",
     )
@@ -158,34 +156,45 @@ async fn a_link_code_cannot_be_claimed_in_a_group() {
     .await;
     let (_app, state) = crate::common::build_test_app_with_state(db.clone());
 
-    let reply = bot::route(
-        &state,
-        -100_500,
-        Some("supergroup"),
-        false,
-        Some("mallory"),
-        "start",
-        "groupcode",
-    )
-    .await
-    .expect("a refusal");
+    let group = bot::Inbound {
+        chat_id: -100_500,
+        chat_type: Some("supergroup".to_string()),
+        is_private: false,
+        from_id: Some(9_002),
+    };
+    let reply = bot::route(&state, &bot::Limits::new(), &group, "start", "groupcode")
+        .await
+        .expect("a refusal");
     assert!(
         reply.text().contains("1:1"),
         "the refusal must point at a direct chat: {}",
         reply.text()
     );
+    assert!(
+        !reply.text().contains("groupcode"),
+        "and must never echo the code back into the group"
+    );
 
-    let chat: Option<i64> = db
+    // The code was on screen for everyone in the group, so it must be burned rather than left live.
+    let pending: i64 = db
         .query_one(Statement::from_string(
             PG,
-            format!("SELECT telegram_chat_id FROM telegram_identities WHERE linked_keycloak_sub = '{SUB}'"),
+            format!(
+                "SELECT COUNT(*) AS n FROM telegram_identities \
+                 WHERE linked_keycloak_sub = '{SUB}' AND link_code IS NOT NULL"
+            ),
         ))
         .await
         .unwrap()
         .unwrap()
-        .try_get("", "telegram_chat_id")
+        .try_get("", "n")
         .unwrap();
-    assert_eq!(chat, None, "the group must not have been linked");
+    assert_eq!(pending, 0, "the exposed code must be cancelled");
+    assert!(
+        reply.text().contains("cancelled"),
+        "and the group must be told: {}",
+        reply.text()
+    );
 
     let recorded = rows(&db).await;
     assert_eq!(recorded.len(), 1);
@@ -203,10 +212,8 @@ async fn a_message_body_is_never_stored() {
 
     bot::route(
         &state,
-        424_246,
-        Some("private"),
-        true,
-        None,
+        &bot::Limits::new(),
+        &bot::Inbound::private(424_246, None),
         "sekritcommand",
         "my private note about someone",
     )
@@ -259,4 +266,77 @@ async fn retention_drops_only_rows_past_the_window() {
         "zero retention keeps everything"
     );
     assert_eq!(rows(&db).await.len(), 1);
+}
+
+/// The link belongs to the Telegram account that claimed it, not to whoever is in the chat.
+#[tokio::test]
+#[serial]
+async fn a_message_from_another_account_is_refused() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO telegram_identities \
+             (id, linked_keycloak_sub, telegram_chat_id, telegram_user_id, is_active, \
+              created_at, updated_at) \
+             VALUES (gen_random_uuid(), '{SUB}', 424247, 5000, TRUE, NOW(), NOW())"
+        ),
+    )
+    .await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    let reply = bot::route(
+        &state,
+        &bot::Limits::new(),
+        &bot::Inbound::private(424_247, Some(6000)),
+        "status",
+        "",
+    )
+    .await
+    .expect("a refusal");
+    assert!(
+        reply.text().contains("different Telegram account"),
+        "{}",
+        reply.text()
+    );
+
+    let recorded = rows(&db).await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].1, "wrong_account");
+}
+
+/// A link claimed before the account was recorded adopts the first sender it sees, so an existing
+/// link keeps working and gains the binding.
+#[tokio::test]
+#[serial]
+async fn an_unbound_link_adopts_its_sender() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    link(&db, 424_248, true).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    bot::route(
+        &state,
+        &bot::Limits::new(),
+        &bot::Inbound::private(424_248, Some(7000)),
+        "status",
+        "",
+    )
+    .await;
+
+    let bound: Option<i64> = db
+        .query_one(Statement::from_string(
+            PG,
+            "SELECT telegram_user_id FROM telegram_identities WHERE telegram_chat_id = 424248"
+                .to_string(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "telegram_user_id")
+        .unwrap();
+    assert_eq!(bound, Some(7000));
 }
