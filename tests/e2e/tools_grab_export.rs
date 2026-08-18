@@ -1023,14 +1023,35 @@ async fn doc_tool_rejects_malformed_input_and_accounts_for_every_request_key() {
          stored data: {empty}"
     );
 
+    // An unknown field is refused by name, not silently dropped: a misnamed field whose value
+    // silently fell out of the calculation is how a wrong number gets saved without warning.
+    let (status, unknown) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/tools/doc/calculate",
+        &json!({
+            "replicates": [100.0, 104.0],
+            "notes": "plate A",
+        }),
+        &intern,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "an unknown field is a bad request ({status}): {unknown}"
+    );
+    assert!(
+        unknown["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("notes")),
+        "the error names the unknown field: {unknown}"
+    );
+
     let (status, full) = crate::common::post_json_parse_with_token(
         &app,
         "/api/tools/doc/calculate",
         &json!({
             "replicates": [100.0, 104.0],
             "std_curve": { "slope": 2.0, "intercept": 1.0 },
-            "notes": "plate A",
-            "site_id": "ignored",
         }),
         &intern,
     )
@@ -1061,16 +1082,15 @@ async fn doc_tool_rejects_malformed_input_and_accounts_for_every_request_key() {
         "every key the tool consumed is reported: {full}"
     );
 
-    let mut ignored: Vec<&str> = full["inputs_ignored"]
+    let ignored: Vec<&str> = full["inputs_ignored"]
         .as_array()
         .unwrap_or_else(|| panic!("inputs_ignored is an array: {full}"))
         .iter()
         .filter_map(serde_json::Value::as_str)
         .collect();
-    ignored.sort_unstable();
     assert_eq!(
         ignored,
-        ["notes", "site_id"],
-        "and every key it did not, so the caller can see what was dropped: {full}"
+        Vec::<&str>::new(),
+        "nothing sent went unconsumed: {full}"
     );
 }

@@ -1,0 +1,141 @@
+{
+  "tolerance": 1e-9,
+  "cases": [
+    {
+      "name": "acid_typical",
+      "inputs": {
+        "method": "acid",
+        "fluorescence_before": 150.0,
+        "fluorescence_after": 80.0,
+        "slope": 0.25,
+        "intercept": -1.5
+      },
+      "constants": {},
+      "curves": {},
+      "expected": { "Chla_acid_ugL_avg": 16.0 },
+      "absent": ["Chla_noacid_ugL_avg"]
+    },
+    {
+      "name": "noacid_typical",
+      "inputs": {
+        "method": "no_acid",
+        "fluorescence_before": 150.0,
+        "slope": 0.3,
+        "intercept": -2.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": { "Chla_noacid_ugL_avg": 43.0 },
+      "absent": ["Chla_acid_ugL_avg"]
+    },
+    {
+      "name": "acid_no_curve",
+      "inputs": {
+        "method": "acid",
+        "fluorescence_before": 150.0,
+        "fluorescence_after": 80.0,
+        "slope": null,
+        "intercept": null
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["Chla_acid_ugL_avg", "Chla_noacid_ugL_avg"]
+    },
+    {
+      "name": "noacid_no_curve",
+      "inputs": {
+        "method": "no_acid",
+        "fluorescence_before": 150.0,
+        "slope": null,
+        "intercept": null
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["Chla_acid_ugL_avg", "Chla_noacid_ugL_avg"]
+    },
+    {
+      "name": "acid_negative_result",
+      "inputs": {
+        "method": "acid",
+        "fluorescence_before": 122.73783790879,
+        "fluorescence_after": 175.655205892399,
+        "slope": 0.448286275519058,
+        "intercept": -1.45474921166897
+      },
+      "constants": {},
+      "curves": {},
+      "expected": { "Chla_acid_ugL_avg": -25.1768790153127 },
+      "absent": []
+    },
+    {
+      "name": "acid_rand_2",
+      "inputs": {
+        "method": "acid",
+        "fluorescence_before": 265.41885525221,
+        "fluorescence_after": 129.200986595824,
+        "slope": 0.391780674946494,
+        "intercept": 1.08719227882102
+      },
+      "constants": {},
+      "curves": {},
+      "expected": { "Chla_acid_ugL_avg": 54.4547208007927 },
+      "absent": []
+    },
+    {
+      "name": "acid_missing_fluor_before",
+      "inputs": {
+        "method": "acid",
+        "fluorescence_before": null,
+        "fluorescence_after": 133.338392865844,
+        "slope": 0.229171314183623,
+        "intercept": -2.13655478158034
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["Chla_acid_ugL_avg"]
+    },
+    {
+      "name": "acid_missing_fluor_after",
+      "inputs": {
+        "method": "acid",
+        "fluorescence_before": 150.0,
+        "slope": 0.25,
+        "intercept": -1.5
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["Chla_acid_ugL_avg"]
+    },
+    {
+      "name": "noacid_rand_1",
+      "inputs": {
+        "method": "no_acid",
+        "fluorescence_before": 249.313513177913,
+        "slope": 0.54634224998299,
+        "intercept": -2.18163206777535
+      },
+      "constants": {},
+      "curves": {},
+      "expected": { "Chla_noacid_ugL_avg": 134.028873673009 },
+      "absent": []
+    },
+    {
+      "name": "noacid_rand_2",
+      "inputs": {
+        "method": "no_acid",
+        "fluorescence_before": 296.193401631899,
+        "slope": 0.293924817373045,
+        "intercept": -0.791132524143904
+      },
+      "constants": {},
+      "curves": {},
+      "expected": { "Chla_noacid_ugL_avg": 86.267458957613 },
+      "absent": []
+    }
+  ],
+  "notes": "Rust returns HTTP 400 when fluorescence_after is missing for the acid method; the portal's calcChlaAcid resolves the same state to 'KEEP OLD', so the wrapper omits the key instead (case acid_missing_fluor_after). Null slope/intercept follow the portal's no-curve path (NA coefficients, 'KEEP OLD', key omitted). Coefficients arrive as request fields (slope/intercept), not a curve slot; the wrapper stages them as a one-row standard_curves table so the prelude functions resolve them exactly as the portal does."
+}

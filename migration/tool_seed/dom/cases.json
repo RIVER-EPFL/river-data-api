@@ -1,0 +1,94 @@
+{
+  "tolerance": 1e-9,
+  "cases": [
+    {
+      "name": "pinned_full",
+      "inputs": { "a254": 0.15, "doc_avg_ppb": 2500.0, "peak_a": 0.4, "peak_c": 0.2, "peak_m": 0.25, "peak_t": 0.1 },
+      "constants": {},
+      "curves": {},
+      "expected": { "SUVA": 0.06, "A_T": 4.0, "C_A": 0.5, "C_M": 0.8, "C_T": 2.0 },
+      "absent": ["absorbance_ratio"]
+    },
+    {
+      "name": "suva_typical",
+      "inputs": { "a254": 0.15, "doc_avg_ppb": 2500.0 },
+      "constants": {},
+      "curves": {},
+      "expected": { "SUVA": 0.06 },
+      "absent": ["absorbance_ratio", "A_T", "C_A", "C_M", "C_T"]
+    },
+    {
+      "name": "suva_na_a254",
+      "inputs": { "a254": null, "doc_avg_ppb": 2500.0 },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["SUVA", "absorbance_ratio", "A_T", "C_A", "C_M", "C_T"]
+    },
+    {
+      "name": "suva_rand",
+      "inputs": { "a254": 0.431367069631815, "doc_avg_ppb": 1354.24065175466 },
+      "constants": {},
+      "curves": {},
+      "expected": { "SUVA": 0.318530586918138 },
+      "absent": ["absorbance_ratio"]
+    },
+    {
+      "name": "ratio_e2_e3",
+      "inputs": { "abs_numerator": 0.2, "abs_denominator": 0.05 },
+      "constants": {},
+      "curves": {},
+      "expected": { "absorbance_ratio": 4.0 },
+      "absent": ["SUVA", "A_T", "C_A", "C_M", "C_T"]
+    },
+    {
+      "name": "ratio_zero_denominator",
+      "inputs": { "abs_numerator": 0.2, "abs_denominator": 0.0 },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["absorbance_ratio"]
+    },
+    {
+      "name": "ratio_na_numerator",
+      "inputs": { "abs_numerator": null, "abs_denominator": 0.05 },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["absorbance_ratio"]
+    },
+    {
+      "name": "ratio_rand",
+      "inputs": { "abs_numerator": 1.75184462270769, "abs_denominator": 0.707175668321084 },
+      "constants": {},
+      "curves": {},
+      "expected": { "absorbance_ratio": 2.47724108900236 },
+      "absent": ["SUVA"]
+    },
+    {
+      "name": "peaks_partial",
+      "inputs": { "peak_a": 0.4, "peak_t": 0.1 },
+      "constants": {},
+      "curves": {},
+      "expected": { "A_T": 4.0 },
+      "absent": ["SUVA", "absorbance_ratio", "C_A", "C_M", "C_T"]
+    },
+    {
+      "name": "peak_t_zero",
+      "inputs": { "peak_a": 0.4, "peak_c": 0.2, "peak_m": 0.25, "peak_t": 0.0 },
+      "constants": {},
+      "curves": {},
+      "expected": { "C_A": 0.5, "C_M": 0.8 },
+      "absent": ["A_T", "C_T", "SUVA", "absorbance_ratio"]
+    },
+    {
+      "name": "empty",
+      "inputs": {},
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["SUVA", "absorbance_ratio", "A_T", "C_A", "C_M", "C_T"]
+    }
+  ],
+  "notes": "Mirrors the portal dom_tool.R calculate step: calcSUVA on (a254, DOC_avg_ppb) and calcRatio on the peak pairs A/T, C/A, C/M, C/T. absorbance_ratio (abs_numerator/abs_denominator) is a Rust-tool addition with no portal column; computed via calcRatio, so a zero denominator yields NA (omitted), matching the portal's guard rather than emitting Inf. No constants or curves. No portal-vs-Rust math divergence for this tool."
+}

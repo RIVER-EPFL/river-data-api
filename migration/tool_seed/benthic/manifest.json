@@ -1,0 +1,19 @@
+{
+  "label": "Benthic",
+  "description": "Rock surface area, per-m2 normalizations",
+  "params": [
+    { "name": "diameters_cm", "label": "Rock Diameters (cm)", "kind": "array", "units": "cm", "required": true, "default": null, "when": null },
+    { "name": "afdm_g_filter", "label": "AFDM per Filter (g)", "kind": "number", "units": "g", "required": false, "default": null, "when": null },
+    { "name": "chla_ug_l", "label": "Chl-a (ug/L)", "kind": "number", "units": "ug/L", "required": false, "default": null, "when": null },
+    { "name": "volume_filtered_ml", "label": "Volume Filtered (mL)", "kind": "number", "units": "mL", "required": true, "default": null, "when": null },
+    { "name": "total_volume_ml", "label": "Total Volume (mL)", "kind": "number", "units": "mL", "required": true, "default": null, "when": null }
+  ],
+  "outputs": [
+    { "key": "rock_surface_area_m2", "label": "Rock surface area", "units": "m2", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": null },
+    { "key": "benthic_AFDM_avg_gm2", "label": "Benthic AFDM per m2", "units": "g/m2", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "afdm_gm2" },
+    { "key": "Chla_avg_ugm2", "label": "Chl-a per m2", "units": "ug/m2", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "chla_acid_ugm2" }
+  ],
+  "constants": [],
+  "curves": [],
+  "match_keywords": ["benthic", "rock", "surface area", "periphyton"]
+}

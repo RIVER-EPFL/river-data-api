@@ -1,0 +1,81 @@
+{
+  "tolerance": 1e-9,
+  "cases": [
+    {
+      "name": "fills_ph_when_missing",
+      "inputs": { "Alk_meqL": 2.5, "Alk_mgL": 125.1, "Alk_w_weight_g": 50.0, "Alk_init_pH": 8.1 },
+      "constants": {},
+      "curves": {},
+      "expected": { "WTW_pH_1": 8.1, "Alk_meqL": 2.5, "Alk_mgL": 125.1, "Alk_w_weight_g": 50.0, "Alk_init_pH": 8.1 },
+      "absent": ["Alk_dyn_pH", "Alk_dyn_trit", "Alk_temp_degC"]
+    },
+    {
+      "name": "keeps_existing_ph",
+      "inputs": { "Alk_init_pH": 8.1, "WTW_pH_1": 7.6 },
+      "constants": {},
+      "curves": {},
+      "expected": { "WTW_pH_1": 7.6, "Alk_init_pH": 8.1 },
+      "absent": ["Alk_meqL", "Alk_mgL"]
+    },
+    {
+      "name": "echoes_initial_ph",
+      "inputs": { "Alk_meqL": 2.5, "Alk_init_pH": 7.8 },
+      "constants": {},
+      "curves": {},
+      "expected": { "Alk_meqL": 2.5, "Alk_init_pH": 7.8, "WTW_pH_1": 7.8 }
+    },
+    {
+      "name": "both_ph_missing_omits_wtw",
+      "inputs": { "Alk_mgL": 100.2 },
+      "constants": {},
+      "curves": {},
+      "expected": { "Alk_mgL": 100.2 },
+      "absent": ["WTW_pH_1", "Alk_init_pH"]
+    },
+    {
+      "name": "explicit_nulls_omitted",
+      "inputs": { "Alk_meqL": null, "Alk_init_pH": null, "WTW_pH_1": null, "Alk_temp_degC": 12.4 },
+      "constants": {},
+      "curves": {},
+      "expected": { "Alk_temp_degC": 12.4 },
+      "absent": ["Alk_meqL", "Alk_init_pH", "WTW_pH_1"]
+    },
+    {
+      "name": "empty_request_returns_nothing",
+      "inputs": {},
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["Alk_meqL", "Alk_mgL", "Alk_w_weight_g", "Alk_dyn_pH", "Alk_dyn_trit", "Alk_temp_degC", "Alk_init_pH", "WTW_pH_1"]
+    },
+    {
+      "name": "all_fields_echo",
+      "inputs": { "Alk_meqL": 2.5, "Alk_mgL": 125.1, "Alk_w_weight_g": 50.0, "Alk_dyn_pH": 4.3, "Alk_dyn_trit": 1.25, "Alk_temp_degC": 18.2, "Alk_init_pH": 8.1, "WTW_pH_1": 7.9 },
+      "constants": {},
+      "curves": {},
+      "expected": { "Alk_meqL": 2.5, "Alk_mgL": 125.1, "Alk_w_weight_g": 50.0, "Alk_dyn_pH": 4.3, "Alk_dyn_trit": 1.25, "Alk_temp_degC": 18.2, "Alk_init_pH": 8.1, "WTW_pH_1": 7.9 }
+    },
+    {
+      "name": "golden_equals_primary_valid",
+      "inputs": { "WTW_pH_1": 19.6379838977009, "Alk_init_pH": -33.4120524581522 },
+      "constants": {},
+      "curves": {},
+      "expected": { "WTW_pH_1": 19.6379838977009, "Alk_init_pH": -33.4120524581522 }
+    },
+    {
+      "name": "golden_equals_primary_na",
+      "inputs": { "Alk_init_pH": 85.448241699487 },
+      "constants": {},
+      "curves": {},
+      "expected": { "WTW_pH_1": 85.448241699487, "Alk_init_pH": 85.448241699487 }
+    },
+    {
+      "name": "zero_values_still_echo",
+      "inputs": { "Alk_temp_degC": 0.0, "WTW_pH_1": 0.0, "Alk_init_pH": 6.5 },
+      "constants": {},
+      "curves": {},
+      "expected": { "Alk_temp_degC": 0.0, "WTW_pH_1": 0.0, "Alk_init_pH": 6.5 }
+    }
+  ],
+  "notes": "Raw-entry tool: no math beyond calcEquals(WTW_pH_1, Alk_init_pH); portal and Rust agree (Rust equals() mirrors calcEquals). No constants or curves. Echo outputs are omitted when the input is missing or null, matching the API's drop-non-finite behavior. WTW_pH_1 is omitted only when both WTW_pH_1 and Alk_init_pH are missing."
+}

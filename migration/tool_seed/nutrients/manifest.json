@@ -1,0 +1,35 @@
+{
+  "label": "Nutrients",
+  "description": "Nutrient replicates (P, NH4, SRP, NOx, NO2, TDP, TDN): per-species mean and sd, NO3 derived per replicate as NOx - NO2",
+  "params": [
+    { "name": "species", "label": "Species (multi-species map)", "kind": "object", "units": null, "required": false, "default": null, "when": "multi-species mode; keys are species names, values replicate arrays" },
+    { "name": "replicates", "label": "Replicates (single-species)", "kind": "array", "units": null, "required": false, "default": null, "when": "single-species mode; ignored when species is given" },
+    { "name": "nox", "label": "NOx", "kind": "number", "units": null, "required": false, "default": null, "when": "single-species mode only" },
+    { "name": "no2", "label": "NO2", "kind": "number", "units": null, "required": false, "default": null, "when": "single-species mode only" }
+  ],
+  "outputs": [
+    { "key": "NUT_P_avg", "label": "P average", "units": null, "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "NUT_P" },
+    { "key": "NUT_P_sd", "label": "P standard deviation", "units": null, "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": null },
+    { "key": "NUT_NH4_avg", "label": "NH4 average", "units": null, "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "NUT_NH4" },
+    { "key": "NUT_NH4_sd", "label": "NH4 standard deviation", "units": null, "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": null },
+    { "key": "NUT_NOx_avg", "label": "NOx average", "units": null, "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "NUT_NOx" },
+    { "key": "NUT_NOx_sd", "label": "NOx standard deviation", "units": null, "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": null },
+    { "key": "NUT_NO2_avg", "label": "NO2 average", "units": null, "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "NUT_NO2" },
+    { "key": "NUT_NO2_sd", "label": "NO2 standard deviation", "units": null, "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": null },
+    { "key": "NUT_NO3_avg", "label": "NO3 average", "units": null, "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "NUT_NO3" },
+    { "key": "NUT_NO3_sd", "label": "NO3 standard deviation", "units": null, "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": null },
+    { "key": "NUT_TDP_avg", "label": "TDP average", "units": null, "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "NUT_TDP" },
+    { "key": "NUT_TDP_sd", "label": "TDP standard deviation", "units": null, "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": null },
+    { "key": "NUT_TDN_avg", "label": "TDN average", "units": null, "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "NUT_TDN" },
+    { "key": "NUT_TDN_sd", "label": "TDN standard deviation", "units": null, "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": null },
+    { "key": "NH4_avg_ugL", "label": "NH4 average (METALP)", "units": "ug/L", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "NH4" },
+    { "key": "NH4_sd_ugL", "label": "NH4 standard deviation (METALP)", "units": "ug/L", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": null },
+    { "key": "SRP_avg_ugL", "label": "SRP average (METALP)", "units": "ug/L", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "SRP" },
+    { "key": "SRP_sd_ugL", "label": "SRP standard deviation (METALP)", "units": "ug/L", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": null },
+    { "key": "NUT_avg", "label": "Nutrient average (single-species)", "units": null, "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": null },
+    { "key": "NUT_sd", "label": "Nutrient standard deviation (single-species)", "units": null, "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": null }
+  ],
+  "constants": [],
+  "curves": [],
+  "match_keywords": ["po4", "nh4", "srp", "nox", "no2", "no3", "tdp", "tdn", "nutrient", "phosph", "nitrate", "nitrite", "ammonium"]
+}

@@ -1,0 +1,166 @@
+{
+  "tolerance": 1e-9,
+  "cases": [
+    {
+      "name": "rhodamine_cubic_analytic",
+      "inputs": {
+        "tracer": "rhodamine",
+        "times_s": [0.0, 10.0, 20.0, 30.0, 40.0],
+        "values": [0.0, 1.0, 8.0, 27.0, 64.0],
+        "initial_mass_rhodamine_wt_g": 2.0,
+        "concentration_rhodamine_pct": 50.0,
+        "initial_water_temp_c": 25.0,
+        "t_ref_c": 25.0,
+        "n_rhodamine": 0.026,
+        "distance_m": 80.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Q_Ls": 8333.333333333334,
+        "velocity_ms": 2.0,
+        "travel_time_s": 40.0,
+        "peak_concentration": 13.2
+      },
+      "absent": []
+    },
+    {
+      "name": "rhodamine_temperature_defaults_analytic",
+      "inputs": {
+        "tracer": "rhodamine",
+        "times_s": [0.0, 10.0, 20.0, 30.0, 40.0],
+        "values": [0.0, 1.0, 8.0, 27.0, 64.0],
+        "initial_mass_rhodamine_wt_g": 2.0,
+        "concentration_rhodamine_pct": 50.0,
+        "distance_m": 80.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Q_Ls": 14650.339894740155,
+        "velocity_ms": 2.0,
+        "travel_time_s": 40.0,
+        "peak_concentration": 7.508358221742883
+      },
+      "absent": []
+    },
+    {
+      "name": "salt_cubic_analytic",
+      "inputs": {
+        "tracer": "salt",
+        "times_s": [0.0, 10.0, 20.0, 30.0, 40.0],
+        "values": [0.0, 1.0, 8.0, 27.0, 64.0],
+        "initial_mass_salt_g": 2000.0,
+        "slope_conductivity": 2.0,
+        "distance_m": 80.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Q_Ls": 33.333333333333336,
+        "velocity_ms": 2.0,
+        "travel_time_s": 40.0,
+        "peak_concentration": 6.6
+      },
+      "absent": []
+    },
+    {
+      "name": "flat_series_no_discharge",
+      "inputs": {
+        "tracer": "salt",
+        "times_s": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0],
+        "values": [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "travel_time_s": 0.0,
+        "peak_concentration": 0.0
+      },
+      "absent": ["velocity_ms"]
+    },
+    {
+      "name": "degenerate_constant_time_mean_background",
+      "inputs": {
+        "tracer": "rhodamine",
+        "times_s": [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0],
+        "values": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0],
+        "initial_water_temp_c": 25.0,
+        "t_ref_c": 25.0,
+        "initial_mass_rhodamine_wt_g": 2.0,
+        "concentration_rhodamine_pct": 50.0,
+        "distance_m": 80.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "travel_time_s": 0.0,
+        "peak_concentration": 5.045454545454616
+      },
+      "absent": ["Q_Ls", "velocity_ms"]
+    },
+    {
+      "name": "rect_pulse_rhodamine_pin",
+      "inputs": {
+        "tracer": "rhodamine",
+        "times_s": [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0, 130.0, 140.0, 150.0, 160.0, 170.0, 180.0, 190.0, 200.0, 210.0, 220.0, 230.0, 240.0, 250.0, 260.0, 270.0, 280.0, 290.0, 300.0],
+        "values": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "initial_mass_rhodamine_wt_g": 2.0,
+        "concentration_rhodamine_pct": 50.0,
+        "initial_water_temp_c": 25.0,
+        "t_ref_c": 25.0,
+        "distance_m": 80.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Q_Ls": 3406.5326715085257,
+        "velocity_ms": 0.5333333333333333,
+        "travel_time_s": 150.0,
+        "peak_concentration": 5.591669368159436
+      },
+      "absent": []
+    },
+    {
+      "name": "realistic_rhodamine_defaults_pin",
+      "inputs": {
+        "tracer": "rhodamine",
+        "times_s": [0.0, 15.0, 30.0, 45.0, 60.0, 75.0, 90.0, 105.0, 120.0, 135.0, 150.0, 165.0, 180.0, 195.0, 210.0, 225.0, 240.0, 255.0, 270.0, 285.0, 300.0, 315.0, 330.0, 345.0, 360.0, 375.0, 390.0, 405.0, 420.0, 435.0, 450.0, 465.0, 480.0, 495.0, 510.0, 525.0, 540.0, 555.0, 570.0, 585.0],
+        "values": [0.2017, 0.2125, 0.2291, 0.2596, 0.3219, 0.4511, 0.7116, 1.2099, 2.1054, 3.609, 5.9591, 9.3656, 13.9254, 19.5265, 25.7793, 32.0158, 37.3849, 41.0353, 42.335, 41.0503, 37.4149, 32.0608, 25.8393, 19.6015, 14.0154, 9.4706, 6.0791, 3.744, 2.2554, 1.3749, 0.8916, 0.6461, 0.5319, 0.4846, 0.4691, 0.4675, 0.4717, 0.478, 0.4852, 0.4925],
+        "initial_mass_rhodamine_wt_g": 3.38019,
+        "concentration_rhodamine_pct": 23.83,
+        "distance_m": 79.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Q_Ls": 266.6403891358878,
+        "velocity_ms": 0.29259259259259257,
+        "travel_time_s": 270.0,
+        "peak_concentration": 21.436470593739113
+      },
+      "absent": []
+    },
+    {
+      "name": "realistic_salt_defaults_pin",
+      "inputs": {
+        "tracer": "salt",
+        "times_s": [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0, 130.0, 140.0, 150.0, 160.0, 170.0, 180.0, 190.0, 200.0, 210.0, 220.0, 230.0, 240.0, 250.0, 260.0, 270.0, 280.0, 290.0, 300.0, 310.0, 320.0, 330.0, 340.0],
+        "values": [250.354, 250.875, 252.034, 254.444, 259.118, 267.575, 281.824, 304.134, 336.506, 379.861, 433.133, 492.612, 551.936, 602.999, 637.693, 650.0, 637.693, 602.999, 551.936, 492.612, 433.133, 379.861, 336.506, 304.134, 281.824, 267.575, 259.118, 254.444, 252.034, 250.875, 250.354, 250.134, 250.048, 250.016, 250.005],
+        "initial_mass_salt_g": 2000.0,
+        "slope_conductivity": 1951.1,
+        "distance_m": 79.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Q_Ls": 109.22932805953765,
+        "velocity_ms": 0.5266666666666666,
+        "travel_time_s": 150.0,
+        "peak_concentration": 0.1893517348949059
+      },
+      "absent": []
+    }
+  ],
+  "notes": "No Rust tool exists for discharge; the reference is river-data-core/src/toolbox/discharge.rs (verified port) and the portal discharge_tool.R calculation section, which the wrapper contains verbatim (the prelude has no discharge functions). Portal behaviors kept: background lm over first 15 (rhodamine) / 10 (salt) plus last 10 rows with duplicate indices when the series is short; on a constant time regressor lm silently drops the slope and the background is the window mean (degenerate_constant_time case); sgolayfilt(p=3, n=min(11, n)) then negatives clamped to 0; rhodamine AUC divided by 1000 (ppb*s to mg/L*s), salt AUC used directly; first-max peak; zero AUC or zero travel time yield non-finite Q_Ls/velocity_ms, which are omitted. The *_pin cases are regression pins taken from the runner after checking analytic invariants (travel time at the pulse center, AUC near the raw-pulse trapezoid, peak below the raw maximum). On a perfectly flat series (flat_series_no_discharge) R's lm leaves eps-scale residuals, so the clamped AUC is a tiny positive number and Q_Ls comes out as a huge finite value rather than being dropped; the value is floating-noise dependent, so the case asserts travel time and peak only and leaves Q_Ls unchecked (the Rust port computes an exactly zero AUC and reports NaN there)."
+}

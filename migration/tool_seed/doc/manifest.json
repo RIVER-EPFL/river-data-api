@@ -1,0 +1,42 @@
+{
+  "label": "DOC",
+  "description": "Dissolved Organic Carbon (replicate avg/sd with optional standard curve)",
+  "params": [
+    {
+      "name": "replicates",
+      "label": "Replicates (array)",
+      "kind": "array",
+      "units": "ppb",
+      "required": true,
+      "default": null,
+      "when": null
+    }
+  ],
+  "outputs": [
+    {
+      "key": "DOC_avg_ppb",
+      "label": "DOC average",
+      "units": "ppb",
+      "per_replicate": false,
+      "aggregate_of": null,
+      "suggested_parameter_code": "DOC"
+    },
+    {
+      "key": "DOC_sd_ppb",
+      "label": "DOC standard deviation",
+      "units": "ppb",
+      "per_replicate": false,
+      "aggregate_of": null,
+      "suggested_parameter_code": null
+    }
+  ],
+  "constants": [],
+  "curves": [
+    {
+      "name": "std_curve",
+      "label": "Standard curve (DOC corr)",
+      "required": false
+    }
+  ],
+  "match_keywords": ["doc", "organic carbon", "dissolved organic"]
+}

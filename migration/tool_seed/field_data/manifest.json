@@ -1,0 +1,28 @@
+{
+  "label": "Field Data",
+  "description": "Barometric pressure from altitude, pressure selection, CO2 correction, reach depths",
+  "params": [
+    { "name": "elevation_m", "label": "Elevation (m)", "kind": "number", "units": "m", "required": false, "default": null, "when": null },
+    { "name": "temp_c", "label": "Temperature (°C)", "kind": "number", "units": "°C", "required": false, "default": null, "when": null },
+    { "name": "pressure_hpa", "label": "Pressure (hPa, explicit override)", "kind": "number", "units": "hPa", "required": false, "default": null, "when": null },
+    { "name": "field_bp", "label": "Field BP (hPa, used when in 700-1050 range)", "kind": "number", "units": "hPa", "required": false, "default": null, "when": null },
+    { "name": "raw_co2", "label": "Raw CO2 (ppm)", "kind": "number", "units": "ppm", "required": false, "default": null, "when": null },
+    { "name": "raw_co2_min", "label": "Raw CO2 Min (ppm)", "kind": "number", "units": "ppm", "required": false, "default": null, "when": null },
+    { "name": "raw_co2_avg", "label": "Raw CO2 Avg (ppm)", "kind": "number", "units": "ppm", "required": false, "default": null, "when": null },
+    { "name": "raw_co2_max", "label": "Raw CO2 Max (ppm)", "kind": "number", "units": "ppm", "required": false, "default": null, "when": null },
+    { "name": "reach_depths", "label": "Reach Depths (cm)", "kind": "array", "units": "cm", "required": false, "default": null, "when": null }
+  ],
+  "outputs": [
+    { "key": "Field_BP_altitude", "label": "Field BP from altitude", "units": "hPa", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "Field_BP_altitude" },
+    { "key": "Vaisala_CO2_min_corr", "label": "Vaisala CO2 min corrected", "units": "ppm", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "Vaisala_CO2_min_corr" },
+    { "key": "Vaisala_CO2_avg_corr", "label": "Vaisala CO2 avg corrected", "units": "ppm", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "Vaisala_CO2_avg_corr" },
+    { "key": "Vaisala_CO2_max_corr", "label": "Vaisala CO2 max corrected", "units": "ppm", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "Vaisala_CO2_max_corr" },
+    { "key": "Reach_depth_avg_cm", "label": "Reach depth average", "units": "cm", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "Reach_depth" },
+    { "key": "Reach_depth_sd_cm", "label": "Reach depth standard deviation", "units": "cm", "per_replicate": false, "aggregate_of": "Reach_depth_avg_cm", "suggested_parameter_code": null }
+  ],
+  "constants": [],
+  "curves": [
+    { "name": "std_curve", "label": "Vaisala CO2 standard curve", "required": false }
+  ],
+  "match_keywords": ["field", "elevation", "altitude", "baro", "pressure", "co2", "depth", "reach"]
+}

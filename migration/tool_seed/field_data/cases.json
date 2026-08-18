@@ -1,0 +1,106 @@
+{
+  "tolerance": 1e-9,
+  "cases": [
+    {
+      "name": "baro_martigny_470m",
+      "inputs": { "elevation_m": 470.0, "temp_c": 15.0 },
+      "constants": {},
+      "curves": {},
+      "expected": { "Field_BP_altitude": 958.0 },
+      "absent": ["Vaisala_CO2_avg_corr", "Reach_depth_avg_cm"]
+    },
+    {
+      "name": "baro_mont_blanc_4808m",
+      "inputs": { "elevation_m": 4808.0, "temp_c": -10.0 },
+      "constants": {},
+      "curves": {},
+      "expected": { "Field_BP_altitude": 543.0 },
+      "absent": []
+    },
+    {
+      "name": "baro_missing_temp",
+      "inputs": { "elevation_m": 1000.0 },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["Field_BP_altitude", "Vaisala_CO2_avg_corr"]
+    },
+    {
+      "name": "co2_reference_conditions",
+      "inputs": { "raw_co2": 1013.0, "temp_c": 25.0, "pressure_hpa": 1013.0 },
+      "constants": {},
+      "curves": {},
+      "expected": { "Vaisala_CO2_avg_corr": 1013.0 },
+      "absent": ["Field_BP_altitude", "Vaisala_CO2_min_corr", "Vaisala_CO2_max_corr"]
+    },
+    {
+      "name": "field_bp_out_of_range_falls_back_to_altitude",
+      "inputs": { "field_bp": 600.0, "elevation_m": 470.0, "temp_c": 15.0, "raw_co2": 1000.0 },
+      "constants": {},
+      "curves": {},
+      "expected": { "Field_BP_altitude": 958.0, "Vaisala_CO2_avg_corr": 978.5428320719535 },
+      "absent": []
+    },
+    {
+      "name": "field_bp_in_range_wins",
+      "inputs": { "field_bp": 950.0, "elevation_m": 470.0, "temp_c": 15.0, "raw_co2": 1000.0 },
+      "constants": {},
+      "curves": {},
+      "expected": { "Field_BP_altitude": 958.0, "Vaisala_CO2_avg_corr": 970.3712844137326 },
+      "absent": []
+    },
+    {
+      "name": "co2_with_standard_curve",
+      "inputs": { "raw_co2": 2763.41491076164, "temp_c": 10.0056232399074, "pressure_hpa": 1003.09201086638 },
+      "constants": {},
+      "curves": { "std_curve": { "slope": 1.11846002850216, "intercept": 9.88165199756622, "standard_curve_id": null, "label": null } },
+      "expected": { "Vaisala_CO2_avg_corr": 3232.99757925688 },
+      "absent": []
+    },
+    {
+      "name": "co2_min_avg_max_trio",
+      "inputs": { "raw_co2_min": 800.0, "raw_co2_avg": 900.0, "raw_co2_max": 1000.0, "temp_c": 20.0, "pressure_hpa": 1000.0 },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Vaisala_CO2_min_corr": 803.2101452449218,
+        "Vaisala_CO2_avg_corr": 903.611413400537,
+        "Vaisala_CO2_max_corr": 1004.0126815561523
+      },
+      "absent": []
+    },
+    {
+      "name": "co2_missing_temp_yields_nothing",
+      "inputs": { "raw_co2": 500.0, "pressure_hpa": 850.0 },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["Vaisala_CO2_avg_corr", "Field_BP_altitude"]
+    },
+    {
+      "name": "reach_depths_five",
+      "inputs": { "reach_depths": [42.2791988803074, 9.23158912127838, 35.5728250057437, 47.7065041963942, 59.8868433060125] },
+      "constants": {},
+      "curves": {},
+      "expected": { "Reach_depth_avg_cm": 38.9353921019472, "Reach_depth_sd_cm": 18.846083994371 },
+      "absent": ["Field_BP_altitude"]
+    },
+    {
+      "name": "reach_depth_single_has_no_sd",
+      "inputs": { "reach_depths": [36.6300129839219] },
+      "constants": {},
+      "curves": {},
+      "expected": { "Reach_depth_avg_cm": 36.6300129839219 },
+      "absent": ["Reach_depth_sd_cm"]
+    },
+    {
+      "name": "reach_depths_with_null_entry",
+      "inputs": { "reach_depths": [null, 44.3008837071247, 52.5645764148794] },
+      "constants": {},
+      "curves": {},
+      "expected": { "Reach_depth_avg_cm": 48.4327300610021, "Reach_depth_sd_cm": 5.84331315129515 },
+      "absent": []
+    }
+  ],
+  "notes": "Pressure precedence follows the portal's calcCO2corr: an in-range (700-1050 hPa) Field_BP wins, else the altitude-derived pressure. An explicit pressure_hpa is passed through the Field_BP slot, so out-of-band values fall back to the altitude pressure instead of erroring as the Rust impl's validate_pressure_hpa does; in-range values behave identically. The lone raw_co2 field maps to Vaisala_CO2_avg_corr (Rust surface; the portal always computes min/avg/max from its stored columns). No constants; one optional curve slot std_curve (portal 'Vaisala corr' standard curve, a=slope, b=intercept)."
+}

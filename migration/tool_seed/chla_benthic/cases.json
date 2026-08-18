@@ -1,0 +1,471 @@
+{
+  "tolerance": 1e-09,
+  "cases": [
+    {
+      "name": "golden_full_chain",
+      "inputs": {
+        "replicates": [
+          {
+            "fluor_before": 265.574415167794,
+            "fluor_after": 141.826708782464,
+            "vol_total_ml": 308.006711141206,
+            "vol_after_ml": 124.730933833615,
+            "diameters_cm": [
+              12.0199799446855,
+              31.5325166042894,
+              20.1821500435472
+            ],
+            "afdm_g_filter": 0.00878168280725367
+          },
+          {
+            "fluor_before": 279.03967986349,
+            "fluor_after": 130.257661403157,
+            "vol_total_ml": 297.664363693912,
+            "vol_after_ml": 89.2195254856027,
+            "diameters_cm": [
+              23.0023935288191,
+              25.7270285030827,
+              4.50553066353314
+            ],
+            "afdm_g_filter": 0.00130143171176314
+          }
+        ]
+      },
+      "constants": {},
+      "curves": {
+        "chla_acid": {
+          "slope": 0.376772315730341,
+          "intercept": -1.83187033934519
+        },
+        "chla_noacid": {
+          "slope": 0.522898836783133,
+          "intercept": 1.0994464524556
+        }
+      },
+      "expected": {
+        "Chla_acid_ugL_avg": 49.50895742838135,
+        "Chla_acid_ugL_sd": 6.669597848706345,
+        "Chla_noacid_ugL_avg": 143.48848484623412,
+        "Chla_noacid_ugL_sd": 4.978718514438132,
+        "Chla_acid_avg_ugm2": 1.6373311510657265,
+        "Chla_acid_sd_ugm2": 0.38237474117735964,
+        "Chla_noacid_avg_ugm2": 4.721701113970274,
+        "Chla_noacid_sd_ugm2": 0.6367804376555968,
+        "benthic_AFDM_avg_gm2": 0.03137783544720837,
+        "benthic_AFDM_sd_gm2": 0.031424691698911426,
+        "replicates": [
+          {
+            "vol_filtered_ml": 183.275777307591,
+            "Chla_acid_ugL": 44.79283956177389,
+            "Chla_noacid_ugL": 139.9679992230559,
+            "rock_area_m2": 0.2753471850671191,
+            "Chla_acid_ugm2": 1.3669513786247645,
+            "Chla_noacid_ugm2": 4.271429348377064,
+            "benthic_AFDM_gm2": 0.053598448044205244
+          },
+          {
+            "vol_filtered_ml": 208.44483820830928,
+            "Chla_acid_ugL": 54.22507529498882,
+            "Chla_noacid_ugL": 147.00897046941233,
+            "rock_area_m2": 0.20295198376805354,
+            "Chla_acid_ugm2": 1.9077109235066885,
+            "Chla_noacid_ugm2": 5.171972879563484,
+            "benthic_AFDM_gm2": 0.009157222850211488
+          }
+        ]
+      },
+      "absent": []
+    },
+    {
+      "name": "inline_coefficients",
+      "inputs": {
+        "acid_slope": 0.376772315730341,
+        "acid_intercept": -1.83187033934519,
+        "noacid_slope": 0.522898836783133,
+        "noacid_intercept": 1.0994464524556,
+        "replicates": [
+          {
+            "fluor_before": 265.574415167794,
+            "fluor_after": 141.826708782464,
+            "vol_total_ml": 308.006711141206,
+            "vol_after_ml": 124.730933833615,
+            "diameters_cm": [
+              12.0199799446855,
+              31.5325166042894,
+              20.1821500435472
+            ],
+            "afdm_g_filter": 0.00878168280725367
+          },
+          {
+            "fluor_before": 279.03967986349,
+            "fluor_after": 130.257661403157,
+            "vol_total_ml": 297.664363693912,
+            "vol_after_ml": 89.2195254856027,
+            "diameters_cm": [
+              23.0023935288191,
+              25.7270285030827,
+              4.50553066353314
+            ],
+            "afdm_g_filter": 0.00130143171176314
+          }
+        ]
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Chla_acid_ugL_avg": 49.50895742838135,
+        "Chla_acid_ugL_sd": 6.669597848706345,
+        "Chla_noacid_ugL_avg": 143.48848484623412,
+        "Chla_noacid_ugL_sd": 4.978718514438132,
+        "Chla_acid_avg_ugm2": 1.6373311510657265,
+        "Chla_acid_sd_ugm2": 0.38237474117735964,
+        "Chla_noacid_avg_ugm2": 4.721701113970274,
+        "Chla_noacid_sd_ugm2": 0.6367804376555968,
+        "benthic_AFDM_avg_gm2": 0.03137783544720837,
+        "benthic_AFDM_sd_gm2": 0.031424691698911426
+      },
+      "absent": []
+    },
+    {
+      "name": "single_replicate_no_acid",
+      "inputs": {
+        "acid_slope": 0.25,
+        "acid_intercept": -1.5,
+        "noacid_slope": 0.3,
+        "noacid_intercept": -2.0,
+        "replicates": [
+          {
+            "fluor_before": 150.0,
+            "vol_total_ml": 100.0,
+            "vol_after_ml": 40.0,
+            "diameters_cm": [
+              10.0,
+              8.0,
+              6.0
+            ]
+          }
+        ]
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Chla_noacid_ugL_avg": 43.0,
+        "Chla_noacid_avg_ugm2": 8.980708569492675,
+        "replicates": [
+          {
+            "vol_filtered_ml": 60.0,
+            "Chla_noacid_ugL": 43.0,
+            "rock_area_m2": 0.03990034088742017,
+            "Chla_noacid_ugm2": 8.980708569492675
+          }
+        ]
+      },
+      "absent": [
+        "Chla_acid_ugL_avg",
+        "Chla_acid_ugL_sd",
+        "Chla_acid_avg_ugm2",
+        "Chla_acid_sd_ugm2",
+        "benthic_AFDM_avg_gm2",
+        "benthic_AFDM_sd_gm2",
+        "Chla_noacid_ugL_sd",
+        "Chla_noacid_sd_ugm2"
+      ]
+    },
+    {
+      "name": "no_curves_afdm_only",
+      "inputs": {
+        "replicates": [
+          {
+            "vol_total_ml": 100.0,
+            "vol_after_ml": 40.0,
+            "diameters_cm": [
+              10.0,
+              8.0,
+              6.0
+            ],
+            "afdm_g_filter": 0.005
+          },
+          {
+            "vol_total_ml": 120.0,
+            "vol_after_ml": 50.0,
+            "diameters_cm": [
+              12.0,
+              9.0,
+              7.0
+            ],
+            "afdm_g_filter": 0.004
+          }
+        ]
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "benthic_AFDM_avg_gm2": 0.16772732608597363,
+        "benthic_AFDM_sd_gm2": 0.05816145831275357
+      },
+      "absent": [
+        "Chla_acid_ugL_avg",
+        "Chla_noacid_ugL_avg",
+        "Chla_acid_avg_ugm2",
+        "Chla_noacid_avg_ugm2"
+      ]
+    },
+    {
+      "name": "acid_curve_only",
+      "inputs": {
+        "replicates": [
+          {
+            "fluor_before": 265.41885525221,
+            "fluor_after": 129.200986595824,
+            "vol_total_ml": 200.0,
+            "vol_after_ml": 80.0,
+            "diameters_cm": [
+              15.0,
+              12.0,
+              9.0
+            ]
+          },
+          {
+            "fluor_before": 180.0,
+            "fluor_after": 90.0,
+            "vol_total_ml": 210.0,
+            "vol_after_ml": 95.0,
+            "diameters_cm": [
+              14.0,
+              11.0,
+              8.0
+            ]
+          }
+        ]
+      },
+      "constants": {},
+      "curves": {
+        "chla_acid": {
+          "slope": 0.391780674946494,
+          "intercept": 1.08719227882102
+        }
+      },
+      "expected": {
+        "Chla_acid_ugL_avg": 45.40108691239914,
+        "Chla_acid_ugL_sd": 12.803771833726973,
+        "Chla_acid_avg_ugm2": 4.730059402658705,
+        "Chla_acid_sd_ugm2": 0.45910752148270934
+      },
+      "absent": [
+        "Chla_noacid_ugL_avg",
+        "Chla_noacid_ugL_sd",
+        "Chla_noacid_avg_ugm2",
+        "Chla_noacid_sd_ugm2",
+        "benthic_AFDM_avg_gm2"
+      ]
+    },
+    {
+      "name": "two_dims_skip_per_m2",
+      "inputs": {
+        "replicates": [
+          {
+            "fluor_before": 150.0,
+            "vol_total_ml": 100.0,
+            "vol_after_ml": 40.0,
+            "diameters_cm": [
+              12.0,
+              8.0
+            ]
+          }
+        ]
+      },
+      "constants": {},
+      "curves": {
+        "chla_noacid": {
+          "slope": 0.3,
+          "intercept": -2.0
+        }
+      },
+      "expected": {
+        "Chla_noacid_ugL_avg": 43.0,
+        "replicates": [
+          {
+            "vol_filtered_ml": 60.0,
+            "Chla_noacid_ugL": 43.0
+          }
+        ]
+      },
+      "absent": [
+        "Chla_noacid_avg_ugm2",
+        "Chla_noacid_sd_ugm2"
+      ]
+    },
+    {
+      "name": "missing_vol_after",
+      "inputs": {
+        "replicates": [
+          {
+            "fluor_before": 100.0,
+            "vol_total_ml": 100.0,
+            "diameters_cm": [
+              10.0,
+              10.0,
+              10.0
+            ]
+          },
+          {
+            "fluor_before": 120.0,
+            "vol_total_ml": 110.0,
+            "vol_after_ml": 50.0,
+            "diameters_cm": [
+              10.0,
+              10.0,
+              10.0
+            ]
+          }
+        ]
+      },
+      "constants": {},
+      "curves": {
+        "chla_noacid": {
+          "slope": 0.5,
+          "intercept": 1.0
+        }
+      },
+      "expected": {
+        "Chla_noacid_ugL_avg": 56.0,
+        "Chla_noacid_ugL_sd": 7.0710678118654755,
+        "Chla_noacid_avg_ugm2": 8.899413901221813
+      },
+      "absent": [
+        "Chla_noacid_sd_ugm2",
+        "Chla_acid_ugL_avg"
+      ]
+    },
+    {
+      "name": "missing_fluor_before_one_rep",
+      "inputs": {
+        "replicates": [
+          {
+            "fluor_after": 30.0,
+            "vol_total_ml": 100.0,
+            "vol_after_ml": 40.0,
+            "diameters_cm": [
+              10.0,
+              8.0,
+              6.0
+            ],
+            "afdm_g_filter": 0.005
+          },
+          {
+            "fluor_before": 140.0,
+            "fluor_after": 60.0,
+            "vol_total_ml": 100.0,
+            "vol_after_ml": 40.0,
+            "diameters_cm": [
+              10.0,
+              8.0,
+              6.0
+            ],
+            "afdm_g_filter": 0.006
+          }
+        ]
+      },
+      "constants": {},
+      "curves": {
+        "chla_acid": {
+          "slope": 0.25,
+          "intercept": -1.5
+        },
+        "chla_noacid": {
+          "slope": 0.5,
+          "intercept": 1.0
+        }
+      },
+      "expected": {
+        "Chla_acid_ugL_avg": 18.5,
+        "Chla_noacid_ugL_avg": 71.0,
+        "Chla_acid_avg_ugm2": 3.8637932217584763,
+        "Chla_noacid_avg_ugm2": 14.828611824046044,
+        "benthic_AFDM_avg_gm2": 0.22973905642888237,
+        "benthic_AFDM_sd_gm2": 0.029536371764411175
+      },
+      "absent": [
+        "Chla_acid_ugL_sd",
+        "Chla_noacid_ugL_sd",
+        "Chla_acid_sd_ugm2",
+        "Chla_noacid_sd_ugm2"
+      ]
+    },
+    {
+      "name": "five_replicates",
+      "inputs": {
+        "replicates": [
+          {
+            "fluor_before": 100.0,
+            "vol_total_ml": 100.0,
+            "vol_after_ml": 40.0,
+            "diameters_cm": [
+              10.0,
+              8.0,
+              6.0
+            ]
+          },
+          {
+            "fluor_before": 110.0,
+            "vol_total_ml": 100.0,
+            "vol_after_ml": 40.0,
+            "diameters_cm": [
+              10.0,
+              8.0,
+              6.0
+            ]
+          },
+          {
+            "fluor_before": 120.0,
+            "vol_total_ml": 100.0,
+            "vol_after_ml": 40.0,
+            "diameters_cm": [
+              10.0,
+              8.0,
+              6.0
+            ]
+          },
+          {
+            "fluor_before": 130.0,
+            "vol_total_ml": 100.0,
+            "vol_after_ml": 40.0,
+            "diameters_cm": [
+              10.0,
+              8.0,
+              6.0
+            ]
+          },
+          {
+            "fluor_before": 140.0,
+            "vol_total_ml": 100.0,
+            "vol_after_ml": 40.0,
+            "diameters_cm": [
+              10.0,
+              8.0,
+              6.0
+            ]
+          }
+        ]
+      },
+      "constants": {},
+      "curves": {
+        "chla_noacid": {
+          "slope": 0.522898836783133,
+          "intercept": 1.0994464524556
+        }
+      },
+      "expected": {
+        "Chla_noacid_ugL_avg": 63.84730686643155,
+        "Chla_noacid_ugL_sd": 8.267756550436662,
+        "Chla_noacid_avg_ugm2": 13.334745486381172,
+        "Chla_noacid_sd_ugm2": 1.7267514442554819
+      },
+      "absent": [
+        "Chla_acid_ugL_avg",
+        "benthic_AFDM_avg_gm2"
+      ]
+    }
+  ],
+  "notes": "Portal behavior followed where the Rust tool diverged: curve coefficients may arrive as the chla_acid/chla_noacid standard curves (portal selection) with the request's acid_slope/acid_intercept/noacid_slope/noacid_intercept fields as fallback; a missing curve leaves that method at the portal's KEEP OLD (keys omitted) where the Rust request required all four coefficients; the per-m2 chain reads exactly sizeA/B/C, so fewer than 3 diameters omits rock_area_m2 and every per-m2 key (Rust computed the area over any dims) and extra diameters beyond 3 are ignored (Rust used all); a replicate missing fluor_before omits its chla values (Rust required fluor_before). Aggregates skip missing replicate values (calcMean/calcSd na.rm); a lone value has no sd. Replicate outputs travel as the replicates array of objects, omitted keys absent per object."
+}
