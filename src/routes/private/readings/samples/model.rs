@@ -33,6 +33,11 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub notes: Option<String>,
     pub created_by: Option<String>,
+    // Written only by the grab save path; a CRUD edit must not be able to forge or erase the
+    // record of what produced the numbers.
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    #[crudcrate(exclude(create, update))]
+    pub provenance: Option<serde_json::Value>,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     // Aggregate columns, trigger-maintained, read-only to clients.

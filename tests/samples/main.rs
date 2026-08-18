@@ -7,5 +7,6 @@
 mod common;
 
 mod label_notes;
+mod provenance;
 mod replicate_lifecycle;
 mod trigger_aggregates;
