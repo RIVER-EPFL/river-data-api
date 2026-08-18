@@ -293,3 +293,124 @@ async fn the_sweep_leaves_a_correction_no_curve_accounts_for() {
         "and the number is untouched"
     );
 }
+
+/// The sweep also runs inside the tracked janitor job, and a recomposed replicate set carries its
+/// sample statistics with it: `samples.mean` is served as the grab's value, so a repaired reading
+/// with stale statistics would still serve the old number.
+#[tokio::test]
+#[serial]
+async fn the_janitor_job_runs_the_sweep_and_the_sample_stats_follow() {
+    use river_db::routes::private::reprocessing_jobs::{job, worker};
+
+    let (db, app, token) = setup().await;
+    let (sensor, calibration) = deployed_lab_sensor(&db, 2.0, 1.0).await;
+
+    let readings: Vec<serde_json::Value> = [10.0, 20.0]
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "parameter_id": GLOBAL_PARAM_DO_ID,
+                "sensor_id": sensor,
+                "value": v,
+                "time": GRAB_TIME,
+            })
+        })
+        .collect();
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &serde_json::json!({ "site_id": SITE1_ID, "readings": readings }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "replicated grab entry: {body}");
+
+    let sample_stats = |db: &DatabaseConnection| {
+        let db = db.clone();
+        async move {
+            let row = db
+                .query_one(Statement::from_string(
+                    sea_orm::DatabaseBackend::Postgres,
+                    format!(
+                        "SELECT mean, stdev, n FROM samples \
+                         WHERE site_id = '{SITE1_ID}' AND parameter_id = '{GLOBAL_PARAM_DO_ID}'"
+                    ),
+                ))
+                .await
+                .unwrap()
+                .expect("the grab has a samples row");
+            (
+                row.try_get::<Option<f64>>("", "mean").unwrap().unwrap(),
+                row.try_get::<Option<f64>>("", "stdev").unwrap().unwrap(),
+                row.try_get::<i32>("", "n").unwrap(),
+            )
+        }
+    };
+
+    let (mean, _, n) = sample_stats(&db).await;
+    assert!((mean - 31.0).abs() < 1e-9, "(21 + 41) / 2: {mean}");
+    assert_eq!(n, 2);
+
+    crate::common::exec(
+        &db,
+        &format!("UPDATE sensor_calibrations SET slope = 5.0 WHERE id = '{calibration}'"),
+    )
+    .await;
+
+    let mut registry = job::build_registry();
+    job::register_scheduled_services(&mut registry, &crate::common::cached_test_config());
+    let ev: river_db::common::EventSender = tokio::sync::broadcast::channel(64).0;
+    let wid = worker::worker_id();
+    let id = worker::enqueue(&db, "janitor_service", None, None, &serde_json::json!({}), None)
+        .await
+        .unwrap()
+        .expect("enqueue inserts a row");
+    worker::drain(&db, &ev, &registry, &wid).await.unwrap();
+
+    let status_row = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT status FROM reprocessing_jobs WHERE id = '{id}'"),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        status_row.try_get::<String>("", "status").unwrap(),
+        "completed",
+        "the janitor job completes"
+    );
+
+    let recomposed = db
+        .query_all(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT calibrated_value FROM readings \
+                 WHERE site_id = '{SITE1_ID}' AND parameter_id = '{GLOBAL_PARAM_DO_ID}' \
+                   AND measurement_type = 'spot' \
+                 ORDER BY replicate_index"
+            ),
+        ))
+        .await
+        .unwrap();
+    let values: Vec<f64> = recomposed
+        .iter()
+        .map(|r| {
+            r.try_get::<Option<f64>>("", "calibrated_value")
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
+    assert!(
+        (values[0] - 51.0).abs() < 1e-9 && (values[1] - 101.0).abs() < 1e-9,
+        "5 * raw + 1: {values:?}"
+    );
+
+    let (mean, stdev, n) = sample_stats(&db).await;
+    assert!((mean - 76.0).abs() < 1e-9, "(51 + 101) / 2: {mean}");
+    assert!(
+        (stdev - 50.0 / std::f64::consts::SQRT_2).abs() < 1e-9,
+        "stddev_samp of two points 50 apart: {stdev}"
+    );
+    assert_eq!(n, 2);
+}

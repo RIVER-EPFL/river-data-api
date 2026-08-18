@@ -86,6 +86,20 @@ impl CRUDOperations for SensorCalibrationOperations {
         Ok(())
     }
 
+    /// One row at a time, for the same cycle described on [`Self::update_many`]; the loop also
+    /// runs the single-row checks for every item.
+    async fn create_many(
+        &self,
+        db: &DatabaseConnection,
+        data: Vec<<SensorCalibration as CRUDResource>::CreateModel>,
+    ) -> Result<Vec<SensorCalibration>, ApiError> {
+        let mut created = Vec::with_capacity(data.len());
+        for item in data {
+            created.push(self.create(db, item).await?);
+        }
+        Ok(created)
+    }
+
     /// One row at a time, through the single-row path.
     ///
     /// The generated bulk route reaches the resource, which delegates to these operations, whose

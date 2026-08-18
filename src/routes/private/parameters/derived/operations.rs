@@ -330,6 +330,21 @@ pub struct DerivedParameterDefinitionOperations;
 impl CRUDOperations for DerivedParameterDefinitionOperations {
     type Resource = DerivedParameterDefinition;
 
+    /// One row at a time, through the single-row path: the crudcrate default `create_many`
+    /// delegates to the resource, which delegates back here, so the default recurses; the loop
+    /// also runs the single-row hooks for every item.
+    async fn create_many(
+        &self,
+        db: &DatabaseConnection,
+        data: Vec<<DerivedParameterDefinition as CRUDResource>::CreateModel>,
+    ) -> Result<Vec<DerivedParameterDefinition>, ApiError> {
+        let mut created = Vec::with_capacity(data.len());
+        for item in data {
+            created.push(self.create(db, item).await?);
+        }
+        Ok(created)
+    }
+
     async fn before_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<(), ApiError> {
         db.execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
