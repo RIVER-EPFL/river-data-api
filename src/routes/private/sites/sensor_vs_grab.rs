@@ -173,6 +173,8 @@ pub async fn get_sensor_vs_grab(
               AND r.parameter_id = s.parameter_id
               AND r.measurement_type IS DISTINCT FROM 'spot'
               AND r.measurement_type IS DISTINCT FROM 'derived'
+              AND r.is_flagged IS NOT TRUE
+              AND r.replicate_index = 0
               AND r.time >= s.collected_at + ($4 * interval '1 hour')
               AND r.time <= s.collected_at + ($5 * interval '1 hour')
         ) agg ON true

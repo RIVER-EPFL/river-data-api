@@ -880,3 +880,101 @@ async fn an_overwritten_grab_keeps_the_lab_curve_it_was_measured_against() {
         "3 * 20 + 0.5: recomputed through that curve"
     );
 }
+
+const CSV_TRIPLICATE_CORRECTED: &str = "DateTime,Dissolved_O2\n\
+2025-06-02 00:00:00,200\n\
+2025-06-02 00:00:00,300\n";
+
+/// An overwrite of a spot file replaces each replicate set whole: a stored replicate beyond the
+/// incoming count would otherwise survive positionally and keep double-counting the group.
+#[tokio::test]
+#[serial]
+async fn csv_overwrite_replaces_the_whole_replicate_set() {
+    let (db, app, token) = setup().await;
+
+    let (status, resp) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/import_csv",
+        &serde_json::json!({
+            "site": crate::common::SITE1_ID,
+            "csv": CSV_TRIPLICATE,
+            "measurement_type": "spot",
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "import ({status}): {resp}");
+    poll_count(
+        &db,
+        &format!(
+            "SELECT count(*) AS n FROM readings \
+             WHERE site_id = '{}' AND time = '2025-06-02T00:00:00Z'",
+            crate::common::SITE1_ID
+        ),
+        3,
+        10,
+    )
+    .await;
+
+    let (status, plan) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/import_csv",
+        &serde_json::json!({
+            "site": crate::common::SITE1_ID,
+            "csv": CSV_TRIPLICATE_CORRECTED,
+            "measurement_type": "spot",
+            "dry_run": true,
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "plan ({status}): {plan}");
+    assert_eq!(
+        plan["replicate_groups"], 1,
+        "the plan reports the detected replicate group: {plan}"
+    );
+
+    let (status, resp) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/import_csv",
+        &serde_json::json!({
+            "site": crate::common::SITE1_ID,
+            "csv": CSV_TRIPLICATE_CORRECTED,
+            "measurement_type": "spot",
+            "conflict": "overwrite",
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "overwrite import ({status}): {resp}");
+
+    let remaining = poll_count(
+        &db,
+        &format!(
+            "SELECT count(*) AS n FROM readings \
+             WHERE site_id = '{}' AND time = '2025-06-02T00:00:00Z'",
+            crate::common::SITE1_ID
+        ),
+        2,
+        10,
+    )
+    .await;
+    assert_eq!(
+        remaining, 2,
+        "the third stored replicate does not survive the two-row correction"
+    );
+
+    let mean = scalar_f64(
+        &db,
+        &format!(
+            "SELECT mean AS v FROM samples \
+             WHERE site_id = '{}' AND collected_at = '2025-06-02T00:00:00Z'",
+            crate::common::SITE1_ID
+        ),
+    )
+    .await;
+    assert!(
+        (mean - 250.0).abs() < 1e-9,
+        "(200 + 300) / 2 over the replacement set: got {mean}"
+    );
+}

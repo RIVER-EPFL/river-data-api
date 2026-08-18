@@ -20,9 +20,15 @@ pub struct ReadingKey {
     pub site_id: Uuid,
     pub parameter_id: Uuid,
     pub time: DateTime<Utc>,
-    /// One replicate of a grab group. Omit to act on every replicate at that timestamp.
+    /// One replicate of a grab group, which scopes the write to spot rows: a sonde reading sharing
+    /// the grab's snapped timestamp must not be flagged by a replicate key. Omit to act on every
+    /// row at that timestamp.
     #[serde(default)]
     pub replicate_index: Option<i16>,
+    /// Restrict the write to one cadence ('continuous' | 'spot' | 'derived'). 'continuous' also
+    /// covers legacy NULL-typed rows.
+    #[serde(default)]
+    pub measurement_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -90,20 +96,24 @@ async fn apply_flags(
             let mut conditions = Vec::with_capacity(chunk.len());
 
             for (i, key) in chunk.iter().enumerate() {
-                let base = offset + i * 4 + 1;
+                let base = offset + i * 5 + 1;
                 conditions.push(format!(
-                    "(site_id = ${} AND parameter_id = ${} AND time = ${} \
-                      AND (${}::smallint IS NULL OR replicate_index = ${}))",
-                    base,
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 3
+                    "(site_id = ${b0} AND parameter_id = ${b1} AND time = ${b2} \
+                      AND (${b3}::smallint IS NULL \
+                           OR (replicate_index = ${b3} AND measurement_type = 'spot')) \
+                      AND (${b4}::text IS NULL OR measurement_type = ${b4} \
+                           OR (${b4} = 'continuous' AND measurement_type IS NULL)))",
+                    b0 = base,
+                    b1 = base + 1,
+                    b2 = base + 2,
+                    b3 = base + 3,
+                    b4 = base + 4
                 ));
                 values.push(key.site_id.into());
                 values.push(key.parameter_id.into());
                 values.push(key.time.into());
                 values.push(key.replicate_index.into());
+                values.push(key.measurement_type.clone().into());
             }
 
             let sql = format!(

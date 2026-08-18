@@ -21,8 +21,15 @@ use crate::routes::public::service::{PublicProjectConfig, PublicSiteConfig, get_
 
 /// What the public tier treats as this site's data: one canonical row per timestamp, and nothing an
 /// operator has flagged. The site-detail count and the readings query share this predicate so the
-/// count, the series and the rollups cannot disagree about what the site serves.
-const SERVED_READINGS: &str = "r.replicate_index = 0 AND r.is_flagged IS NOT TRUE";
+/// count, the series and the rollups cannot disagree about what the site serves. A spot group
+/// anchors on its lowest unflagged replicate (its served value is the sample mean over the
+/// survivors), so flagging one replicate does not hide the grab; a continuous row anchors on
+/// replicate 0.
+const SERVED_READINGS: &str = "(CASE WHEN r.measurement_type = 'spot' \
+     THEN r.replicate_index = \
+       (SELECT MIN(r2.replicate_index) FROM readings r2 \
+        WHERE r2.stream_id = r.stream_id AND r2.time = r.time AND r2.is_flagged IS NOT TRUE) \
+     ELSE r.replicate_index = 0 AND r.is_flagged IS NOT TRUE END)";
 
 // Time Format
 

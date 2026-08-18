@@ -34,6 +34,12 @@ pub enum AppError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    #[error("Conflict: {message}")]
+    ConflictDetail {
+        message: String,
+        detail: serde_json::Value,
+    },
+
     #[error("Too many requests: {0}")]
     TooManyRequests(String),
 }
@@ -68,6 +74,10 @@ impl IntoResponse for AppError {
             Self::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
             Self::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             Self::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
+            Self::ConflictDetail { message, detail } => {
+                let body = Json(json!({ "error": message, "detail": detail }));
+                return (StatusCode::CONFLICT, body).into_response();
+            }
             Self::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
         };
 

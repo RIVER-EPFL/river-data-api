@@ -72,14 +72,11 @@ async fn label_and_notes_land_on_replicate_sample() {
     assert_eq!(notes.as_deref(), Some("filtered on site"));
     assert_eq!(n, 2);
 
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        "/api/grab_samples",
-        &payload(&[10.0, 12.0], None, Some("corrected note")),
-        &token,
-    )
-    .await;
-    assert_eq!(status, 200, "re-post ({status}): {body}");
+    let mut repost = payload(&[10.0, 12.0], None, Some("corrected note"));
+    repost["mode"] = serde_json::json!("replace");
+    let (status, body) =
+        crate::common::post_json_with_token(&app, "/api/grab_samples", &repost, &token).await;
+    assert_eq!(status, 200, "replace re-post ({status}): {body}");
 
     let (label, notes, _) = sample_row(&db).await.expect("sample row reused");
     assert_eq!(
