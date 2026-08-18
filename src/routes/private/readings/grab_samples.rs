@@ -36,6 +36,13 @@ pub struct GrabSampleRequest {
     /// Compute the preview and report existing groups without writing anything.
     #[serde(default)]
     pub dry_run: bool,
+    /// Provenance of a save made from an analytical tool, stamped verbatim onto every samples
+    /// row this request touches: tool + script version, the raw calculation inputs, resolved
+    /// constants and curve coefficients, the full output map, and which outputs were saved to
+    /// which parameters. A `run_id` is added when absent so the rows of one run stay groupable.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub provenance: Option<serde_json::Value>,
     pub readings: Vec<GrabSampleReading>,
 }
 
@@ -307,6 +314,7 @@ async fn find_or_create_sample(
     created_by: Option<&str>,
     label: Option<&str>,
     notes: Option<&str>,
+    provenance: Option<&serde_json::Value>,
 ) -> Result<(Uuid, bool), AppError> {
     let candidate = samples::ActiveModel {
         id: Set(Uuid::new_v4()),
@@ -316,6 +324,7 @@ async fn find_or_create_sample(
         label: Set(label.map(String::from)),
         notes: Set(notes.map(String::from)),
         created_by: Set(created_by.map(String::from)),
+        provenance: Set(provenance.cloned()),
         created_at: Set(Some(chrono::Utc::now())),
         mean: Set(None),
         stdev: Set(None),
@@ -355,13 +364,18 @@ async fn find_or_create_sample(
         })?;
     let sample_id = existing.id;
 
-    if !inserted && (label.is_some() || notes.is_some()) {
+    if !inserted && (label.is_some() || notes.is_some() || provenance.is_some()) {
         let mut active: samples::ActiveModel = existing.into();
         if let Some(l) = label {
             active.label = Set(Some(l.to_string()));
         }
         if let Some(n) = notes {
             active.notes = Set(Some(n.to_string()));
+        }
+        // A re-post carrying provenance is a new run over this collection event; the blob
+        // follows the numbers being written, never the ones being replaced.
+        if let Some(p) = provenance {
+            active.provenance = Set(Some(p.clone()));
         }
         active.updated_at = Set(Some(chrono::Utc::now()));
         active.update(txn).await?;
@@ -379,6 +393,7 @@ async fn auto_create_samples(
     created_by: Option<&str>,
     label: Option<&str>,
     notes: Option<&str>,
+    provenance: Option<&serde_json::Value>,
 ) -> Result<
     (
         HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Uuid>,
@@ -402,9 +417,17 @@ async fn auto_create_samples(
             continue;
         }
         // Re-posting the same grab must reuse its sample, not accumulate empty duplicates.
-        let (sample_id, is_new) =
-            find_or_create_sample(txn, site_id, parameter_id, time, created_by, label, notes)
-                .await?;
+        let (sample_id, is_new) = find_or_create_sample(
+            txn,
+            site_id,
+            parameter_id,
+            time,
+            created_by,
+            label,
+            notes,
+            provenance,
+        )
+        .await?;
         sample_map.insert((parameter_id, time), sample_id);
         if is_new {
             created.push(sample_id);
@@ -654,6 +677,16 @@ pub async fn insert_grab_samples(
 
     let total = payload.readings.len();
 
+    // The blob is stamped on every samples row this request touches; a run_id groups them back
+    // into one tool run when the caller did not mint one itself.
+    let provenance = payload.provenance.clone().map(|mut p| {
+        if let Some(obj) = p.as_object_mut() {
+            obj.entry("run_id")
+                .or_insert_with(|| serde_json::json!(Uuid::new_v4()));
+        }
+        p
+    });
+
     // One guarded transaction: a replace on a compressed chunk must not fail on the cap, and the
     // delete, the sample rows and the insert land together or not at all.
     let (inserted, replaced, created_sample_ids) =
@@ -720,6 +753,7 @@ pub async fn insert_grab_samples(
                 payload.created_by.as_deref(),
                 payload.label.as_deref(),
                 payload.notes.as_deref(),
+                provenance.as_ref(),
             )
             .await?;
 
