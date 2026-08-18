@@ -213,3 +213,119 @@ async fn a_continuous_row_cannot_name_a_standard_curve() {
         "a refused batch stores nothing"
     );
 }
+
+/// An overwrite replaces the measurement, not the correction: the row keeps its recorded curves,
+/// so the stored value is recomputed from them rather than left as whatever the overwrite carried.
+#[tokio::test]
+#[serial]
+async fn an_overwrite_recomposes_the_value_from_the_rows_own_curves() {
+    let fx = setup().await;
+    let sensor = create_sensor(&fx.db, "Batch-Plate-02", GLOBAL_PARAM_TEMP_ID).await;
+    let curve = create_curve(&fx, sensor.id, "Batch Plate B", 2.0, 1.0).await;
+
+    let (status, body) = post_batch(
+        &fx,
+        json!({
+            "site_id": SITE1_ID,
+            "parameter_id": GLOBAL_PARAM_TEMP_ID,
+            "time": GRAB_TIME,
+            "raw_value": 10.0,
+            "sensor_id": sensor.id,
+            "standard_curve_id": curve,
+            "measurement_type": "spot",
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "initial insert ({status}): {body}");
+
+    let (status, body) = crate::common::post_json_with_token(
+        &fx.app,
+        "/api/readings/batch",
+        &json!({
+            "conflict": "overwrite",
+            "readings": [{
+                "site_id": SITE1_ID,
+                "parameter_id": GLOBAL_PARAM_TEMP_ID,
+                "time": GRAB_TIME,
+                "raw_value": 20.0,
+                "measurement_type": "spot",
+            }],
+        }),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "overwrite ({status}): {body}");
+
+    let (raw, calibrated, stored_curve) = stored_at(&fx.db, GRAB_TIME)
+        .await
+        .expect("the reading is stored");
+    assert!(
+        (raw - 20.0).abs() < 1e-9,
+        "the correction replaced the raw value"
+    );
+    assert_eq!(
+        stored_curve,
+        Some(curve),
+        "the hand-picked curve outlives a correction that names none"
+    );
+    assert!(
+        (calibrated.expect("the row still names a curve") - 41.0).abs() < 1e-9,
+        "recomposed from the row's own curve: 2.0 * 20.0 + 1.0"
+    );
+}
+
+/// A stamped calibration is a curve the stored value went through: a row whose caller supplied no
+/// value gets its named base applied rather than a NULL beside a claimed correction.
+#[tokio::test]
+#[serial]
+async fn a_named_base_calibration_is_applied_not_just_stamped() {
+    let fx = setup().await;
+    let sensor = create_sensor(&fx.db, "Batch-Plate-03", GLOBAL_PARAM_TEMP_ID).await;
+    let calibration = crate::common::sensor_lifecycle::add_calibration(
+        &fx.db,
+        sensor.id,
+        3.0,
+        2.0,
+        crate::common::sensor_lifecycle::dt("2025-01-01T00:00:00Z"),
+    )
+    .await;
+
+    let (status, body) = post_batch(
+        &fx,
+        json!({
+            "site_id": SITE1_ID,
+            "parameter_id": GLOBAL_PARAM_TEMP_ID,
+            "time": GRAB_TIME,
+            "raw_value": 10.0,
+            "sensor_id": sensor.id,
+            "calibration_id": calibration,
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "batch with a named base ({status}): {body}");
+
+    let row = fx
+        .db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT calibrated_value, calibration_id FROM readings \
+                 WHERE parameter_id = '{GLOBAL_PARAM_TEMP_ID}' AND time = '{GRAB_TIME}'"
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the reading is stored");
+    assert_eq!(
+        row.try_get::<Option<Uuid>>("", "calibration_id").unwrap(),
+        Some(calibration)
+    );
+    let calibrated = row
+        .try_get::<Option<f64>>("", "calibrated_value")
+        .unwrap()
+        .expect("the named base is applied");
+    assert!(
+        (calibrated - 32.0).abs() < 1e-9,
+        "3.0 * 10.0 + 2.0: got {calibrated}"
+    );
+}

@@ -140,22 +140,81 @@ async fn delete_sensor_with_calibrations() {
 
     let (status, body) =
         crate::common::delete_with_token(&app, &format!("/api/sensors/{sensor_id}"), &token).await;
+    assert_eq!(
+        status, 400,
+        "a sensor holding calibrations refuses deletion with a stated error, got {status}: {body}"
+    );
+    assert!(
+        body.contains("calibrations"),
+        "the refusal names what blocks it: {body}"
+    );
 
-    if status == 200 || status == 204 {
-        let remaining = count(
-            &db,
-            &format!(
-                "SELECT count(*) AS c FROM sensor_calibrations WHERE sensor_id = '{sensor_id}'"
-            ),
-        )
-        .await;
-        assert_eq!(remaining, 0, "calibrations should be cleaned up");
-    } else {
-        assert!(
-            status == 409 || status == 400 || status == 500,
-            "if delete blocked, should return a clear error, got {status}: {body}"
-        );
-    }
+    let remaining = count(
+        &db,
+        &format!("SELECT count(*) AS c FROM sensor_calibrations WHERE sensor_id = '{sensor_id}'"),
+    )
+    .await;
+    assert_eq!(remaining, 1, "nothing is deleted by a refused delete");
+}
+
+// Scenario: a sensor whose standard curve corrected published grabs.
+// Expected behaviour: the delete is refused with a stated 400, never an FK-violation 500, and the
+// curve and readings stay.
+#[tokio::test]
+#[serial]
+async fn delete_sensor_with_referenced_standard_curve_is_refused() {
+    let (db, app, token) = setup().await;
+
+    let sensor_id = "00000000-0000-4000-d000-000000000098";
+    let curve_id = "00000000-0000-4000-d000-000000000097";
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO sensors (id, serial_number, name, manufacturer, model) \
+             VALUES ('{sensor_id}', 'DEL-TEST-002', 'Delete Test Curves', 'Test', 'T1')"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO standard_curves (id, sensor_id, name, slope, intercept) \
+             VALUES ('{curve_id}', '{sensor_id}', 'Plate D', 2.0, 1.0)"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active) \
+             VALUES ('00000000-0000-4000-d000-000000000096', 'test', 'del-curve', 'x', true)"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO readings (stream_id, time, replicate_index, raw_value, calibrated_value, \
+                                   standard_curve_id, measurement_type) \
+             VALUES ('00000000-0000-4000-d000-000000000096', '2025-06-01T00:00:00Z', 0, 10.0, \
+                     21.0, '{curve_id}', 'spot')"
+        ),
+    )
+    .await;
+
+    let (status, body) =
+        crate::common::delete_with_token(&app, &format!("/api/sensors/{sensor_id}"), &token).await;
+    assert_eq!(
+        status, 400,
+        "a sensor whose curve corrected readings refuses deletion, got {status}: {body}"
+    );
+
+    let curve_remains = count(
+        &db,
+        &format!("SELECT count(*) AS c FROM standard_curves WHERE id = '{curve_id}'"),
+    )
+    .await;
+    assert_eq!(curve_remains, 1, "the curve is untouched");
 }
 
 // Scenario: project has sites, which have site_parameters, readings, etc.
