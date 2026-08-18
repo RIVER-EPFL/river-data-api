@@ -17,6 +17,7 @@ mod grab_test;
 mod link_expiry_test;
 mod link_flow_test;
 mod me_test;
+mod menu_commands;
 mod mute_gate;
 mod plot_command;
 mod thresholds_command;

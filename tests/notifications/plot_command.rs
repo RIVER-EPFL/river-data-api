@@ -509,7 +509,7 @@ async fn a_button_cannot_reach_an_out_of_scope_site() {
             window: "6h".to_string(),
         },
     ] {
-        let reply = commands::callback(&state, &scope_a(), action.clone()).await;
+        let reply = commands::callback(&state, &scope_a(), "sub-test", action.clone()).await;
         assert!(
             text(&reply).contains("out of date"),
             "{action:?} must not resolve for a member: {}",
@@ -520,6 +520,7 @@ async fn a_button_cannot_reach_an_out_of_scope_site() {
     let admin = commands::callback(
         &state,
         &AccessScope::Unrestricted,
+        "sub-test",
         Action::Parameters(keyboard::short(Uuid::parse_str(SITE_B).unwrap())),
     )
     .await;
@@ -545,7 +546,7 @@ async fn a_button_round_trips_to_a_chart() {
         .find(|b| b.text.contains("Upstream"))
         .expect("a site button");
     let action = Action::parse(&tapped.data).expect("its payload parses");
-    let overview = commands::callback(&state, &AccessScope::Unrestricted, action).await;
+    let overview = commands::callback(&state, &AccessScope::Unrestricted, "sub-test", action).await;
 
     let parameter = flatten(&overview)
         .into_iter()
@@ -554,6 +555,7 @@ async fn a_button_round_trips_to_a_chart() {
     let chart = commands::callback(
         &state,
         &AccessScope::Unrestricted,
+        "sub-test",
         Action::parse(&parameter.data).expect("its payload parses"),
     )
     .await;

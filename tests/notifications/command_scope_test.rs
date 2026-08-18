@@ -1,5 +1,5 @@
 //! H4, bot read commands are confined to the caller's project scope. A member scoped to project A
-//! sees only A's stations and cannot resolve a site in project B (it reads as "no match"), so the bot
+//! sees only A's sites and cannot resolve a site in project B (it reads as "no match"), so the bot
 //! never surfaces data the member couldn't see in the portal. Administrators (Unrestricted) see all.
 //!
 //! These drive the command handlers directly with a constructed `AccessScope`, so no Keycloak is
@@ -40,20 +40,20 @@ fn scope_a() -> AccessScope {
 
 #[tokio::test]
 #[serial]
-async fn stations_hides_ungranted_projects() {
+async fn sites_hides_ungranted_projects() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
     seed_project_b(&db).await;
 
-    let confined = commands::stations(&db, &scope_a()).await;
+    let confined = commands::sites(&db, &scope_a()).await;
     assert!(
         !confined.text().contains("HiddenStationB"),
         "member must not see project B's site: {}",
         confined.text()
     );
 
-    let unrestricted = commands::stations(&db, &AccessScope::Unrestricted).await;
+    let unrestricted = commands::sites(&db, &AccessScope::Unrestricted).await;
     assert!(
         unrestricted.text().contains("HiddenStationB"),
         "an admin sees every site: {}",
@@ -70,22 +70,42 @@ async fn latest_cannot_resolve_out_of_scope_site() {
     seed_project_b(&db).await;
 
     // By name and by id, an out-of-scope site is indistinguishable from a non-existent one.
+    // The refusal now offers the sites that do resolve, so the assertion is on the lead text; the
+    // buttons beside it are built from the caller's own scope and are checked below.
     let by_name = commands::latest(&db, &scope_a(), "HiddenStationB").await;
     assert!(
-        by_name.contains("No site matches"),
-        "member cannot target project B by name: {by_name}"
+        by_name.text().contains("No site matches"),
+        "member cannot target project B by name: {}",
+        by_name.text()
     );
 
     let by_id = commands::latest(&db, &scope_a(), SITE_B).await;
     assert!(
-        by_id.contains("No site matches"),
-        "member cannot target project B by id: {by_id}"
+        by_id.text().contains("No site matches"),
+        "member cannot target project B by id: {}",
+        by_id.text()
+    );
+
+    // The picker offered alongside the refusal must not name the site it just refused to resolve.
+    let offered = by_id
+        .keyboard()
+        .map(|k| {
+            k.iter()
+                .flatten()
+                .map(|b| b.text.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assert!(
+        !offered.iter().any(|t| t.contains("HiddenStationB")),
+        "the fallback picker leaked project B: {offered:?}"
     );
 
     // The admin can resolve it (no data seeded, so it reports no readings rather than "no match").
     let admin = commands::latest(&db, &AccessScope::Unrestricted, SITE_B).await;
     assert!(
-        !admin.contains("No site matches"),
-        "an admin resolves the site: {admin}"
+        !admin.text().contains("No site matches"),
+        "an admin resolves the site: {}",
+        admin.text()
     );
 }

@@ -819,7 +819,10 @@ async fn telegram_thresholds_reports_the_parameter_default_tier() {
         "the slot resolves from the parameter-default tier: {resolved}"
     );
 
-    let reply = commands::thresholds(&db, &AccessScope::Unrestricted, &site_id).await;
+    let reply = commands::thresholds(&db, &AccessScope::Unrestricted, &site_id)
+        .await
+        .text()
+        .to_string();
 
     // The site-tier slot proves the command renders thresholds at all.
     assert!(

@@ -52,12 +52,15 @@ impl Outcome {
 
 /// Every command the bot answers. An inbound token outside this list is recorded as `unknown`
 /// rather than stored, which is what keeps user-authored text out of the table.
-const KNOWN_COMMANDS: [&str; 16] = [
+const KNOWN_COMMANDS: [&str; 17] = [
     "start",
     "help",
     "ping",
     "status",
     "alarms",
+    "sites",
+    // The name the site listing shipped under, kept so existing traffic and stored rows stay
+    // recognised rather than collapsing to `unknown`.
     "stations",
     "latest",
     "thresholds",

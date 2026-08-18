@@ -13,7 +13,10 @@ const DEFAULT_TIER_PARAM: &str = "00000000-0000-4000-b000-0000000000d1";
 const DEFAULT_TIER_SLOT: &str = "00000000-0000-4000-a000-0000000000d1";
 
 async fn ask(db: &DatabaseConnection) -> String {
-    commands::thresholds(db, &AccessScope::Unrestricted, crate::common::SITE1_ID).await
+    commands::thresholds(db, &AccessScope::Unrestricted, crate::common::SITE1_ID)
+        .await
+        .text()
+        .to_string()
 }
 
 /// The line the reply devotes to one parameter.

@@ -33,7 +33,7 @@ const POLL_TIMEOUT_SECS: u32 = 25;
 const MENU_COMMANDS: [(&str, &str); 11] = [
     ("plot", "Chart a site or one parameter"),
     ("latest", "Latest reading per parameter at a site"),
-    ("stations", "Sites you can see"),
+    ("sites", "Sites you can see"),
     ("status", "Alarm summary"),
     ("alarms", "Open alarms"),
     ("thresholds", "Configured thresholds"),
@@ -43,6 +43,13 @@ const MENU_COMMANDS: [(&str, &str); 11] = [
     ("help", "Everything I can do"),
     ("start", "Link this chat to your account"),
 ];
+
+/// Shown when a write button is tapped in a group, matching the typed commands' refusal.
+const GROUP_WRITE_REFUSAL: &str =
+    "This changes data and only works in a direct (1:1) chat with the bot.";
+
+/// One wording for the administrator gate, shared by the typed commands and the buttons.
+const ADMIN_ONLY: &str = "This command requires an administrator role.";
 
 /// Per-chat command budget. Generous enough that ordinary use never touches it, tight enough that
 /// one chat cannot occupy a poller that handles updates serially.
@@ -275,6 +282,24 @@ async fn handle_callback(
             .await;
         return;
     };
+    // The same rule the typed write commands follow: in a group every member shares one chat id, so
+    // the act has no individual behind it. A button is not an exemption from that.
+    if action.is_write() && u.chat_type.as_deref() != Some("private") {
+        audit::record(
+            &state.db,
+            chat_id,
+            u.chat_type.as_deref(),
+            None,
+            None,
+            "callback",
+            audit::Outcome::Denied,
+        )
+        .await;
+        client
+            .answer_callback(callback_id, Some(GROUP_WRITE_REFUSAL))
+            .await;
+        return;
+    }
     let ctx = match authorize(state, chat_id, u.from_id).await {
         Ok(ctx) => ctx,
         Err(refusal) => {
@@ -308,6 +333,22 @@ async fn handle_callback(
         client.answer_callback(callback_id, Some(THROTTLED)).await;
         return;
     }
+    // Role is resolved fresh on every tap: the button may have been sent before the tapper lost the
+    // role that produced it, and the payload itself carries no authority.
+    if action.requires_admin() && !ctx.role.allows_admin() {
+        audit::record(
+            &state.db,
+            chat_id,
+            u.chat_type.as_deref(),
+            Some(ctx.identity_id),
+            Some(&ctx.sub),
+            "callback",
+            audit::Outcome::Denied,
+        )
+        .await;
+        client.answer_callback(callback_id, Some(ADMIN_ONLY)).await;
+        return;
+    }
     audit::record(
         &state.db,
         chat_id,
@@ -319,7 +360,7 @@ async fn handle_callback(
     )
     .await;
     client.answer_callback(callback_id, None).await;
-    let reply = commands::callback(state, &ctx.scope, action).await;
+    let reply = commands::callback(state, &ctx.scope, &ctx.sub, action).await;
     // A chart is replaced in place, so changing window doesn't stack images down the chat. Anything
     // else (a picker, an error) is a new message: a photo can't be edited into text.
     let edit = if u.has_photo && matches!(reply, Reply::Photo { .. }) {
@@ -535,10 +576,8 @@ pub async fn route(
     let mut outcome = audit::Outcome::Ok;
     let reply = if plot_args::is_plot_command(cmd) {
         commands::plot(state, &scope, cmd, args).await
-    } else if cmd == "stations" {
-        commands::stations(&state.db, &scope).await
     } else {
-        Reply::Text(text_command(state, &scope, &role, &ctx.sub, cmd, args, &mut outcome).await)
+        text_command(state, &scope, &role, &ctx.sub, cmd, args, &mut outcome).await
     };
     audit::record(
         &state.db,
@@ -553,8 +592,11 @@ pub async fn route(
     Some(reply)
 }
 
-/// The commands that answer with text. `outcome` is set to `Denied` where a role gate refuses, so
-/// the audit trail distinguishes "ran it" from "tried it".
+/// The commands that answer without rendering an image. `outcome` is set to `Denied` where a role
+/// gate refuses, so the audit trail distinguishes "ran it" from "tried it".
+///
+/// Returns a `Reply` rather than a `String` so any of these can offer buttons: a command that has
+/// to be typed exactly is unusable from a phone, and several of them name a site.
 async fn text_command(
     state: &AppState,
     scope: &AccessScope,
@@ -563,22 +605,24 @@ async fn text_command(
     cmd: &str,
     args: &str,
     outcome: &mut audit::Outcome,
-) -> String {
+) -> Reply {
     let cutoff = state.config.battery_cutoff_volts;
     match cmd {
-        "help" => commands::help(),
-        "ping" => commands::ping(),
-        "status" => commands::status(&state.db, scope).await,
-        "alarms" => commands::alarms(&state.db, scope).await,
+        "help" => commands::help().into(),
+        "ping" => commands::ping().into(),
+        "status" => commands::status(&state.db, scope).await.into(),
+        "alarms" => commands::alarms(&state.db, scope).await.into(),
+        // `stations` is the name this listing shipped under; it stays reachable.
+        "sites" | "stations" => commands::sites(&state.db, scope).await,
         "latest" => commands::latest(&state.db, scope, args).await,
         "thresholds" => commands::thresholds(&state.db, scope, args).await,
         // Sync-service internals (endpoints, last_error) are operational data, Administrators only.
         "server" => {
             if role.allows_admin() {
-                commands::server(&state.db).await
+                commands::server(&state.db).await.into()
             } else {
                 *outcome = audit::Outcome::Denied;
-                "This command requires an administrator role.".to_string()
+                ADMIN_ONLY.into()
             }
         }
         "battery" => commands::battery(&state.db, scope, args, cutoff).await,
@@ -586,10 +630,10 @@ async fn text_command(
         // (interns are read-only) and confine the site to the caller's scope.
         "grab" => {
             if role.allows_level(&Role::River) {
-                commands::grab(state, scope, args, sub).await
+                commands::grab(state, scope, args, sub).await.into()
             } else {
                 *outcome = audit::Outcome::Denied;
-                "Submitting grab samples requires at least the River role.".to_string()
+                "Submitting grab samples requires at least the River role.".into()
             }
         }
         "mute" | "unmute" | "muted" => {
@@ -598,16 +642,16 @@ async fn text_command(
                 // changed and reassigned, and it is an address rather than an identity.
                 let by = format!("keycloak:{sub}");
                 match cmd {
-                    "mute" => commands::mute(&state.db, args, &by).await,
-                    "unmute" => commands::unmute(&state.db, args).await,
+                    "mute" => commands::mute(&state.db, scope, args, &by).await,
+                    "unmute" => commands::unmute(&state.db, scope, args).await,
                     _ => commands::muted(&state.db).await,
                 }
             } else {
                 *outcome = audit::Outcome::Denied;
-                "This command requires an administrator role.".to_string()
+                ADMIN_ONLY.into()
             }
         }
-        other => format!("Unknown command /{other}. Try /help."),
+        other => format!("Unknown command /{other}. Try /help.").into(),
     }
 }
 

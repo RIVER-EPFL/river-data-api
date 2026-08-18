@@ -48,18 +48,19 @@ fn scope_projects_bind(scope: &AccessScope) -> sea_orm::Value {
 }
 
 pub fn help() -> String {
-    "River Data bot commands:\n\
+    "River Data bot commands. Send one on its own and I'll show you a list to tap.\n\
+     \n\
      /status, alarm summary\n\
      /alarms, open alarms\n\
-     /stations, sites by project\n\
-     /latest <site>, latest reading per parameter\n\
+     /sites, sites by project\n\
+     /latest [site], latest reading per parameter\n\
      /thresholds [site], configured thresholds\n\
      /server, sync service status\n\
      /battery [site], voltage and depletion forecast\n\
      /grab <site> <param> <value> [more], submit a grab sample\n\
-     /mute <site> <param> [days], suppress alerts\n\
-     /unmute <site> <param>\n\
-     /muted, active mutes\n\
+     /mute [site] [param] [days], suppress alerts\n\
+     /unmute [site] [param]\n\
+     /muted, active mutes, each with a button to lift it\n\
      /ping, liveness check\n\
      /help, this list\n\
      \n\
@@ -72,6 +73,8 @@ pub fn help() -> String {
      Every chart carries buttons to change window or parameter.\n\
      For a site whose name has spaces, separate with commas:\n\
      /plot Les Dailles, depth, 2d\n\
+     \n\
+     /grab is the one command that still needs typing: it carries a number.\n\
      \n\
      Setup:\n\
      /start <code>, link this chat to your account"
@@ -148,11 +151,15 @@ const MAX_OVERVIEW_PANELS: usize = 6;
 /// Sites and parameters offered as buttons. Telegram renders a long keyboard badly.
 const MAX_SITE_BUTTONS: u32 = 30;
 const MAX_PARAMETER_BUTTONS: u32 = 24;
+/// Mutes offered as one-tap undo. Each is a full-width row, so this is lower than the pickers.
+const MAX_MUTE_BUTTONS: usize = 12;
 
-/// The sites the caller may see, each opening that site's overview.
+/// The sites the caller may see. `make` decides what tapping one does, so a single query serves
+/// every picker rather than each command growing its own.
 async fn site_buttons(
     db: &DatabaseConnection,
     scope: &AccessScope,
+    make: impl Fn(String) -> Action,
 ) -> Result<Vec<Button>, sea_orm::DbErr> {
     let rows = db
         .query_all(Statement::from_sql_and_values(
@@ -171,7 +178,7 @@ async fn site_buttons(
             let id: Uuid = r.try_get("", "id").ok()?;
             Some(Button {
                 text: r.try_get("", "name").ok()?,
-                data: Action::Overview(keyboard::short(id)).encode(),
+                data: make(keyboard::short(id)).encode(),
             })
         })
         .collect())
@@ -206,9 +213,11 @@ async fn site_parameter_list(
         .collect())
 }
 
+/// The parameters configured at one site. `make` receives `(site, parameter)` already encoded.
 async fn parameter_buttons(
     db: &DatabaseConnection,
     site_id: Uuid,
+    make: impl Fn(&str, String) -> Action,
 ) -> Result<Vec<Button>, sea_orm::DbErr> {
     let site = keyboard::short(site_id);
     Ok(site_parameter_list(db, site_id, MAX_PARAMETER_BUTTONS)
@@ -216,14 +225,18 @@ async fn parameter_buttons(
         .into_iter()
         .map(|(id, name, _)| Button {
             text: name,
-            data: Action::View {
-                site: site.clone(),
-                parameter: keyboard::short(id),
-                window: BUTTON_WINDOW.to_string(),
-            }
-            .encode(),
+            data: make(&site, keyboard::short(id)).encode(),
         })
         .collect())
+}
+
+/// Tapping a parameter opens its chart. The default for every picker that is not part of muting.
+fn view_at_button_window(site: &str, parameter: String) -> Action {
+    Action::View {
+        site: site.to_string(),
+        parameter,
+        window: BUTTON_WINDOW.to_string(),
+    }
 }
 
 /// The row under a chart: the other windows, then a way back out.
@@ -245,8 +258,13 @@ fn chart_keyboard(site_id: Uuid, parameter_id: Uuid, window: &str) -> keyboard::
 }
 
 /// A site picker, used when no site was named and when one could not be resolved.
-pub async fn sites_menu(db: &DatabaseConnection, scope: &AccessScope, lead: &str) -> Reply {
-    match site_buttons(db, scope).await {
+pub async fn sites_menu(
+    db: &DatabaseConnection,
+    scope: &AccessScope,
+    lead: &str,
+    make: impl Fn(String) -> Action,
+) -> Reply {
+    match site_buttons(db, scope, make).await {
         Ok(buttons) if buttons.is_empty() => {
             Reply::Text("No sites are visible to your account.".to_string())
         }
@@ -259,8 +277,13 @@ pub async fn sites_menu(db: &DatabaseConnection, scope: &AccessScope, lead: &str
 }
 
 /// A parameter picker for one site. Answers "no parameter matches" with the ones that do.
-pub async fn parameters_menu(db: &DatabaseConnection, site_id: Uuid, lead: &str) -> Reply {
-    match parameter_buttons(db, site_id).await {
+pub async fn parameters_menu(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+    lead: &str,
+    make: impl Fn(&str, String) -> Action,
+) -> Reply {
+    match parameter_buttons(db, site_id, make).await {
         Ok(buttons) if buttons.is_empty() => {
             Reply::Text(format!("{lead}\nThis site has no parameters configured."))
         }
@@ -279,9 +302,9 @@ pub async fn parameters_menu(db: &DatabaseConnection, site_id: Uuid, lead: &str)
     }
 }
 
-pub async fn stations(db: &DatabaseConnection, scope: &AccessScope) -> Reply {
-    let listing = stations_text(db, scope).await;
-    match site_buttons(db, scope).await {
+pub async fn sites(db: &DatabaseConnection, scope: &AccessScope) -> Reply {
+    let listing = sites_text(db, scope).await;
+    match site_buttons(db, scope, Action::Overview).await {
         Ok(buttons) if !buttons.is_empty() => Reply::Menu {
             text: format!("{listing}\n\nTap a site for its charts."),
             keyboard: keyboard::rows(buttons, 2),
@@ -290,7 +313,7 @@ pub async fn stations(db: &DatabaseConnection, scope: &AccessScope) -> Reply {
     }
 }
 
-async fn stations_text(db: &DatabaseConnection, scope: &AccessScope) -> String {
+async fn sites_text(db: &DatabaseConnection, scope: &AccessScope) -> String {
     let rows = match db
         .query_all(Statement::from_sql_and_values(
             PG,
@@ -308,7 +331,7 @@ async fn stations_text(db: &DatabaseConnection, scope: &AccessScope) -> String {
     if rows.is_empty() {
         return "No sites configured.".to_string();
     }
-    let mut out = String::from("Stations:\n");
+    let mut out = String::from("Sites:\n");
     let mut current = String::new();
     for r in &rows {
         let project: String = r.try_get("", "project").unwrap_or_default();
@@ -394,16 +417,55 @@ pub async fn status(db: &DatabaseConnection, scope: &AccessScope) -> String {
     }
 }
 
-pub async fn latest(db: &DatabaseConnection, scope: &AccessScope, arg: &str) -> String {
+/// A site named on the command line, or the picker when none was named and when the name given
+/// resolves to something other than exactly one site. Naming a site is a shortcut past the menu,
+/// never the only way through it.
+async fn site_or_picker(
+    db: &DatabaseConnection,
+    scope: &AccessScope,
+    arg: &str,
+    lead: &str,
+    make: impl Fn(String) -> Action,
+) -> Result<(Uuid, String), Reply> {
     if arg.is_empty() {
-        return "Usage: /latest <site>".to_string();
+        return Err(sites_menu(db, scope, lead, make).await);
     }
-    let (site_id, site_name) = match resolve_site(db, scope, arg).await {
-        Ok(SiteMatch::One(id, name)) => (id, name),
-        Ok(SiteMatch::NotFound) => return format!("No site matches \"{arg}\"."),
-        Ok(SiteMatch::Ambiguous(names)) => return ambiguous_reply("sites", &names),
-        Err(e) => return db_error(&e),
-    };
+    match resolve_site(db, scope, arg).await {
+        Ok(SiteMatch::One(id, name)) => Ok((id, name)),
+        Ok(SiteMatch::NotFound) => Err(sites_menu(
+            db,
+            scope,
+            &format!("No site matches \"{arg}\". Pick one:"),
+            make,
+        )
+        .await),
+        Ok(SiteMatch::Ambiguous(names)) => Err(sites_menu(
+            db,
+            scope,
+            &format!("{}\nPick one:", ambiguous_reply("sites", &names)),
+            make,
+        )
+        .await),
+        Err(e) => Err(Reply::Text(db_error(&e))),
+    }
+}
+
+pub async fn latest(db: &DatabaseConnection, scope: &AccessScope, arg: &str) -> Reply {
+    match site_or_picker(
+        db,
+        scope,
+        arg,
+        "Latest readings at which site?",
+        Action::Latest,
+    )
+    .await
+    {
+        Ok((site_id, site_name)) => Reply::Text(latest_at(db, site_id, &site_name).await),
+        Err(reply) => reply,
+    }
+}
+
+async fn latest_at(db: &DatabaseConnection, site_id: Uuid, site_name: &str) -> String {
     let rows = match db
         .query_all(Statement::from_sql_and_values(
             PG,
@@ -433,16 +495,38 @@ pub async fn latest(db: &DatabaseConnection, scope: &AccessScope, arg: &str) -> 
     out.trim_end().to_string()
 }
 
-pub async fn thresholds(db: &DatabaseConnection, scope: &AccessScope, arg: &str) -> String {
-    let (site_filter, header) = if arg.is_empty() {
-        (None, "Global default thresholds:".to_string())
-    } else {
-        match resolve_site(db, scope, arg).await {
-            Ok(SiteMatch::One(id, name)) => (Some(id), format!("Thresholds at {name}:")),
-            Ok(SiteMatch::NotFound) => return format!("No site matches \"{arg}\"."),
-            Ok(SiteMatch::Ambiguous(names)) => return ambiguous_reply("sites", &names),
-            Err(e) => return db_error(&e),
-        }
+/// With no site, the global defaults, and a picker to reach any one site's resolved thresholds.
+/// The no-argument listing is kept rather than replaced: the global tier is not reachable any other
+/// way.
+pub async fn thresholds(db: &DatabaseConnection, scope: &AccessScope, arg: &str) -> Reply {
+    if arg.is_empty() {
+        let listing = thresholds_at(db, None).await;
+        return match site_buttons(db, scope, Action::Thresholds).await {
+            Ok(buttons) if !buttons.is_empty() => Reply::Menu {
+                text: format!("{listing}\n\nTap a site for the thresholds in force there."),
+                keyboard: keyboard::rows(buttons, 2),
+            },
+            _ => Reply::Text(listing),
+        };
+    }
+    match site_or_picker(
+        db,
+        scope,
+        arg,
+        "Thresholds at which site?",
+        Action::Thresholds,
+    )
+    .await
+    {
+        Ok(site) => Reply::Text(thresholds_at(db, Some(site)).await),
+        Err(reply) => reply,
+    }
+}
+
+async fn thresholds_at(db: &DatabaseConnection, site: Option<(Uuid, String)>) -> String {
+    let (site_filter, header) = match &site {
+        Some((id, name)) => (Some(*id), format!("Thresholds at {name}:")),
+        None => (None, "Global default thresholds:".to_string()),
     };
     let stmt = match site_filter {
         // Site branch: the same three-tier resolution `GET /api/alarms/thresholds` reports, so a
@@ -540,10 +624,27 @@ pub async fn server(db: &DatabaseConnection) -> String {
     out.trim_end().to_string()
 }
 
+/// With no site, every site the caller can see, which is the view worth having. A named site that
+/// does not resolve falls back to the picker.
 pub async fn battery(
     db: &DatabaseConnection,
     scope: &AccessScope,
     arg: &str,
+    cutoff_volts: f64,
+) -> Reply {
+    if arg.is_empty() {
+        return Reply::Text(battery_at(db, scope, None, cutoff_volts).await);
+    }
+    match site_or_picker(db, scope, arg, "Battery at which site?", Action::Battery).await {
+        Ok(site) => Reply::Text(battery_at(db, scope, Some(site), cutoff_volts).await),
+        Err(reply) => reply,
+    }
+}
+
+async fn battery_at(
+    db: &DatabaseConnection,
+    scope: &AccessScope,
+    site: Option<(Uuid, String)>,
     cutoff_volts: f64,
 ) -> String {
     let battery_param = match db
@@ -564,16 +665,7 @@ pub async fn battery(
         Err(e) => return db_error(&e),
     };
 
-    let site_filter = if arg.is_empty() {
-        None
-    } else {
-        match resolve_site(db, scope, arg).await {
-            Ok(SiteMatch::One(id, _)) => Some(id),
-            Ok(SiteMatch::NotFound) => return format!("No site matches \"{arg}\"."),
-            Ok(SiteMatch::Ambiguous(names)) => return ambiguous_reply("sites", &names),
-            Err(e) => return db_error(&e),
-        }
-    };
+    let site_filter = site.map(|(id, _)| id);
 
     let rows = match db
         .query_all(Statement::from_sql_and_values(
@@ -655,6 +747,7 @@ async fn resolve_parameter(
 /// Resolve `<site> <param> [days]` for the mute commands.
 async fn resolve_mute_target(
     db: &DatabaseConnection,
+    scope: &AccessScope,
     args: &str,
 ) -> Result<Result<(Uuid, String, Uuid, String, Option<i64>), String>, sea_orm::DbErr> {
     let mut toks: Vec<&str> = args.split_whitespace().collect();
@@ -663,10 +756,13 @@ async fn resolve_mute_target(
         toks.pop();
     }
     if toks.len() != 2 {
-        return Ok(Err("Usage: /mute <site> <param> [days]".to_string()));
+        return Ok(Err(
+            "Usage: /mute <site> <param> [days], or send /mute on its own to pick one.".to_string(),
+        ));
     }
-    // Mute commands are Administrator-only (unrestricted scope), resolved against all sites.
-    let (site_id, site_name) = match resolve_site(db, &AccessScope::Unrestricted, toks[0]).await? {
+    // Administrator-only, so this scope is unrestricted today. Threading it anyway keeps the
+    // confinement on the same footing as every other command, rather than on the role gate alone.
+    let (site_id, site_name) = match resolve_site(db, scope, toks[0]).await? {
         SiteMatch::One(id, name) => (id, name),
         SiteMatch::NotFound => return Ok(Err(format!("No site matches \"{}\".", toks[0]))),
         SiteMatch::Ambiguous(names) => return Ok(Err(ambiguous_reply("sites", &names))),
@@ -678,13 +774,42 @@ async fn resolve_mute_target(
     Ok(Ok((site_id, site_name, param_id, param_name, days)))
 }
 
-pub async fn mute(db: &DatabaseConnection, args: &str, created_by: &str) -> String {
-    let (site_id, site_name, param_id, param_name, days) = match resolve_mute_target(db, args).await
-    {
-        Ok(Ok(t)) => t,
-        Ok(Err(msg)) => return msg,
-        Err(e) => return db_error(&e),
-    };
+pub async fn mute(
+    db: &DatabaseConnection,
+    scope: &AccessScope,
+    args: &str,
+    created_by: &str,
+) -> Reply {
+    if args.is_empty() {
+        return sites_menu(db, scope, "Mute alerts at which site?", Action::MuteParams).await;
+    }
+    let (site_id, site_name, param_id, param_name, days) =
+        match resolve_mute_target(db, scope, args).await {
+            Ok(Ok(t)) => t,
+            Ok(Err(msg)) => return Reply::Text(msg),
+            Err(e) => return Reply::Text(db_error(&e)),
+        };
+    apply_mute(
+        db,
+        (site_id, &site_name),
+        (param_id, &param_name),
+        days,
+        created_by,
+    )
+    .await
+}
+
+/// Write one mute and answer with its undo. Shared by the typed command and the button, so both
+/// record the same provenance and offer the same way back.
+async fn apply_mute(
+    db: &DatabaseConnection,
+    site: (Uuid, &str),
+    parameter: (Uuid, &str),
+    days: Option<i64>,
+    created_by: &str,
+) -> Reply {
+    let (site_id, site_name) = site;
+    let (param_id, param_name) = parameter;
     let expires_at = days.map(|d| Utc::now() + Duration::days(d));
     let res = db
         .execute(Statement::from_sql_and_values(
@@ -702,31 +827,94 @@ pub async fn mute(db: &DatabaseConnection, args: &str, created_by: &str) -> Stri
         ))
         .await;
     if let Err(e) = res {
-        return db_error(&e);
+        return Reply::Text(db_error(&e));
     }
     let window = match days {
         Some(d) => format!("for {d} day(s)"),
         None => "until unmuted".to_string(),
     };
-    format!("🔕 Muted {site_name} / {param_name} {window}.")
+    Reply::Menu {
+        text: format!("🔕 Muted {site_name} / {param_name} {window}."),
+        keyboard: vec![vec![Button {
+            text: "Unmute".to_string(),
+            data: Action::UnmuteSet {
+                site: keyboard::short(site_id),
+                parameter: keyboard::short(param_id),
+            }
+            .encode(),
+        }]],
+    }
 }
 
-pub async fn unmute(db: &DatabaseConnection, args: &str) -> String {
+/// The last tap of the mute flow. Ids are re-resolved against the caller's scope, so a stale button
+/// cannot reach a site the tapper has since lost.
+async fn mute_by_button(
+    db: &DatabaseConnection,
+    scope: &AccessScope,
+    site: &str,
+    parameter: &str,
+    days: i64,
+    created_by: &str,
+    expired: &str,
+) -> Reply {
+    let (site_id, site_name) = match resolve_short_site(db, scope, site).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return Reply::Text(expired.to_string()),
+        Err(e) => return Reply::Text(db_error(&e)),
+    };
+    let (param_id, param_name) = match resolve_short_parameter(db, parameter).await {
+        Ok(Some((id, name, _))) => (id, name),
+        Ok(None) => return Reply::Text(expired.to_string()),
+        Err(e) => return Reply::Text(db_error(&e)),
+    };
+    // Zero is the no-expiry choice, not a zero-day mute.
+    let days = (days > 0).then_some(days);
+    apply_mute(
+        db,
+        (site_id, &site_name),
+        (param_id, &param_name),
+        days,
+        created_by,
+    )
+    .await
+}
+
+/// With no arguments this is the mute listing, whose every line carries its own Unmute button:
+/// choosing what to lift from what is actually muted beats naming it from memory.
+pub async fn unmute(db: &DatabaseConnection, scope: &AccessScope, args: &str) -> Reply {
+    if args.is_empty() {
+        return muted(db).await;
+    }
     let toks: Vec<&str> = args.split_whitespace().collect();
     if toks.len() != 2 {
-        return "Usage: /unmute <site> <param>".to_string();
+        return Reply::Text(
+            "Usage: /unmute <site> <param>, or send /unmute on its own to pick one.".to_string(),
+        );
     }
-    let (site_id, site_name) = match resolve_site(db, &AccessScope::Unrestricted, toks[0]).await {
+    let (site_id, site_name) = match resolve_site(db, scope, toks[0]).await {
         Ok(SiteMatch::One(id, name)) => (id, name),
-        Ok(SiteMatch::NotFound) => return format!("No site matches \"{}\".", toks[0]),
-        Ok(SiteMatch::Ambiguous(names)) => return ambiguous_reply("sites", &names),
-        Err(e) => return db_error(&e),
+        Ok(SiteMatch::NotFound) => {
+            return Reply::Text(format!("No site matches \"{}\".", toks[0]));
+        }
+        Ok(SiteMatch::Ambiguous(names)) => return Reply::Text(ambiguous_reply("sites", &names)),
+        Err(e) => return Reply::Text(db_error(&e)),
     };
     let (param_id, param_name) = match resolve_parameter(db, toks[1]).await {
         Ok(Ok(p)) => p,
-        Ok(Err(msg)) => return msg,
-        Err(e) => return db_error(&e),
+        Ok(Err(msg)) => return Reply::Text(msg),
+        Err(e) => return Reply::Text(db_error(&e)),
     };
+    Reply::Text(apply_unmute(db, (site_id, &site_name), (param_id, &param_name)).await)
+}
+
+/// Lift exactly one mute, keyed on the pair the caller chose.
+async fn apply_unmute(
+    db: &DatabaseConnection,
+    site: (Uuid, &str),
+    parameter: (Uuid, &str),
+) -> String {
+    let (site_id, site_name) = site;
+    let (param_id, param_name) = parameter;
     let res = db
         .execute(Statement::from_sql_and_values(
             PG,
@@ -772,22 +960,23 @@ async fn mute_slot_names(
 
 /// The mutes currently suppressing delivery, read through the same `in_force` predicate the
 /// delivery gate uses, so the listing can never disagree with what is actually muted.
-pub async fn muted(db: &DatabaseConnection) -> String {
+/// Every mute in force, each with the button that lifts it.
+pub async fn muted(db: &DatabaseConnection) -> Reply {
     let mutes = match super::mutes_model::in_force_all(db).await {
         Ok(m) => m,
-        Err(e) => return db_error(&e),
+        Err(e) => return Reply::Text(db_error(&e)),
     };
     if mutes.is_empty() {
-        return "No active mutes.".to_string();
+        return Reply::Text("No active mutes.".to_string());
     }
 
     let (site_names, param_names) = match mute_slot_names(db, &mutes).await {
         Ok(names) => names,
-        Err(e) => return db_error(&e),
+        Err(e) => return Reply::Text(db_error(&e)),
     };
 
     let unknown = "(unknown)".to_string();
-    let mut lines: Vec<String> = mutes
+    let mut rows: Vec<(String, Button)> = mutes
         .iter()
         .map(|m| {
             let site = site_names.get(&m.site_id).unwrap_or(&unknown);
@@ -795,11 +984,62 @@ pub async fn muted(db: &DatabaseConnection) -> String {
             let until = m.expires_at.map_or("permanent".to_string(), |e| {
                 e.format("until %Y-%m-%d %H:%M UTC").to_string()
             });
-            format!("{site} / {param} ({until})")
+            (
+                format!("{site} / {param} ({until})"),
+                Button {
+                    text: format!("Unmute {site} / {param}"),
+                    data: Action::UnmuteSet {
+                        site: keyboard::short(m.site_id),
+                        parameter: keyboard::short(m.parameter_id),
+                    }
+                    .encode(),
+                },
+            )
         })
         .collect();
-    lines.sort();
-    format!("Active mutes:\n{}", lines.join("\n"))
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // A long keyboard renders badly, and a silent cut would read as "that is all of them".
+    let total = rows.len();
+    let shown = rows.len().min(MAX_MUTE_BUTTONS);
+    let mut text = format!(
+        "Active mutes:\n{}",
+        rows.iter()
+            .map(|(line, _)| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    if total > shown {
+        text.push_str(&format!(
+            "\n\nButtons for the first {shown} of {total}; use /unmute <site> <param> for the rest."
+        ));
+    }
+    Reply::Menu {
+        text,
+        keyboard: keyboard::rows(rows.into_iter().take(shown).map(|(_, b)| b).collect(), 1),
+    }
+}
+
+/// Lift a mute from its own button. The pair is re-resolved against the caller's scope, so the
+/// delete can only ever name a slot the tapper can still see.
+async fn unmute_by_button(
+    db: &DatabaseConnection,
+    scope: &AccessScope,
+    site: &str,
+    parameter: &str,
+    expired: &str,
+) -> Reply {
+    let (site_id, site_name) = match resolve_short_site(db, scope, site).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return Reply::Text(expired.to_string()),
+        Err(e) => return Reply::Text(db_error(&e)),
+    };
+    let (param_id, param_name) = match resolve_short_parameter(db, parameter).await {
+        Ok(Some((id, name, _))) => (id, name),
+        Ok(None) => return Reply::Text(expired.to_string()),
+        Err(e) => return Reply::Text(db_error(&e)),
+    };
+    Reply::Text(apply_unmute(db, (site_id, &site_name), (param_id, &param_name)).await)
 }
 
 /// Cancel a pending link code, for when it has been exposed.
@@ -879,7 +1119,8 @@ pub async fn start(
 pub async fn grab(state: &AppState, scope: &AccessScope, args: &str, sub: &str) -> String {
     let toks: Vec<&str> = args.split_whitespace().collect();
     if toks.len() < 3 {
-        return "Usage: /grab <site> <param> <value> [more values…]".to_string();
+        return "Usage: /grab <site> <param> <value> [more values…]\nSend /sites for the site names."
+            .to_string();
     }
     let (site_arg, param_arg) = (toks[0], toks[1]);
     let mut values = Vec::with_capacity(toks.len() - 2);
@@ -1178,7 +1419,7 @@ pub async fn plot(state: &AppState, scope: &AccessScope, cmd: &str, args: &str) 
     };
 
     if tokens.is_empty() {
-        return sites_menu(db, scope, "Which site?").await;
+        return sites_menu(db, scope, "Which site?", Action::Overview).await;
     }
 
     // A site on its own is a complete request: it answers with every parameter at once. Tried
@@ -1205,6 +1446,7 @@ pub async fn plot(state: &AppState, scope: &AccessScope, cmd: &str, args: &str) 
             db,
             scope,
             &format!("No site matches \"{named}\". Pick one:"),
+            Action::Overview,
         )
         .await;
     };
@@ -1213,8 +1455,18 @@ pub async fn plot(state: &AppState, scope: &AccessScope, cmd: &str, args: &str) 
         Ok(Ok(t)) => t,
         Ok(Err(err)) => {
             return match err.site {
-                Some((site_id, _)) => parameters_menu(db, site_id, &err.message).await,
-                None => sites_menu(db, scope, &format!("{}\nPick a site:", err.message)).await,
+                Some((site_id, _)) => {
+                    parameters_menu(db, site_id, &err.message, view_at_button_window).await
+                }
+                None => {
+                    sites_menu(
+                        db,
+                        scope,
+                        &format!("{}\nPick a site:", err.message),
+                        Action::Overview,
+                    )
+                    .await
+                }
             };
         }
         Err(e) => return Reply::Text(db_error(&e)),
@@ -1468,6 +1720,7 @@ async fn site_overview(
                 "No data at {site_name} in the last {}. Pick a parameter to look further back:",
                 humanize(window)
             ),
+            view_at_button_window,
         )
         .await;
     }
@@ -1496,7 +1749,7 @@ async fn site_overview(
         }
     };
 
-    let mut keys = match parameter_buttons(db, site_id).await {
+    let mut keys = match parameter_buttons(db, site_id, view_at_button_window).await {
         Ok(buttons) => keyboard::rows(buttons, 2),
         Err(e) => {
             tracing::warn!(error = %e, "overview: parameter buttons failed");
@@ -1523,14 +1776,20 @@ async fn site_overview(
 ///
 /// `action` is decoded from data the client sent back, so every id is re-resolved here against the
 /// caller's scope: a button is a shortcut, never an authority.
-pub async fn callback(state: &AppState, scope: &AccessScope, action: Action) -> Reply {
+pub async fn callback(state: &AppState, scope: &AccessScope, sub: &str, action: Action) -> Reply {
     let db = &state.db;
     let expired = "That button is out of date. Send /plot to start again.";
     match action {
-        Action::Sites => sites_menu(db, scope, "Which site?").await,
+        Action::Sites => sites_menu(db, scope, "Which site?", Action::Overview).await,
         Action::Parameters(prefix) => match resolve_short_site(db, scope, &prefix).await {
             Ok(Some((site_id, site_name))) => {
-                parameters_menu(db, site_id, &format!("{site_name}. Which parameter?")).await
+                parameters_menu(
+                    db,
+                    site_id,
+                    &format!("{site_name}. Which parameter?"),
+                    view_at_button_window,
+                )
+                .await
             }
             Ok(None) => Reply::Text(expired.to_string()),
             Err(e) => Reply::Text(db_error(&e)),
@@ -1570,6 +1829,77 @@ pub async fn callback(state: &AppState, scope: &AccessScope, action: Action) -> 
                 units: parameter.2,
             };
             render_slot(state, &target, window).await
+        }
+        Action::LatestSites => sites_menu(db, scope, "Which site?", Action::Latest).await,
+        Action::Latest(site) => match resolve_short_site(db, scope, &site).await {
+            Ok(Some((site_id, site_name))) => Reply::Text(latest_at(db, site_id, &site_name).await),
+            Ok(None) => Reply::Text(expired.to_string()),
+            Err(e) => Reply::Text(db_error(&e)),
+        },
+        Action::ThresholdSites => sites_menu(db, scope, "Which site?", Action::Thresholds).await,
+        Action::Thresholds(site) => match resolve_short_site(db, scope, &site).await {
+            Ok(Some((site_id, site_name))) => {
+                Reply::Text(thresholds_at(db, Some((site_id, site_name))).await)
+            }
+            Ok(None) => Reply::Text(expired.to_string()),
+            Err(e) => Reply::Text(db_error(&e)),
+        },
+        Action::BatterySites => sites_menu(db, scope, "Which site?", Action::Battery).await,
+        Action::Battery(site) => match resolve_short_site(db, scope, &site).await {
+            Ok(Some((site_id, site_name))) => Reply::Text(
+                battery_at(
+                    db,
+                    scope,
+                    Some((site_id, site_name)),
+                    state.config.battery_cutoff_volts,
+                )
+                .await,
+            ),
+            Ok(None) => Reply::Text(expired.to_string()),
+            Err(e) => Reply::Text(db_error(&e)),
+        },
+        Action::MuteSites => {
+            sites_menu(db, scope, "Mute alerts at which site?", Action::MuteParams).await
+        }
+        Action::MuteParams(site) => match resolve_short_site(db, scope, &site).await {
+            Ok(Some((site_id, site_name))) => {
+                parameters_menu(
+                    db,
+                    site_id,
+                    &format!("{site_name}. Mute which parameter?"),
+                    |site, parameter| Action::MuteWhen {
+                        site: site.to_string(),
+                        parameter,
+                    },
+                )
+                .await
+            }
+            Ok(None) => Reply::Text(expired.to_string()),
+            Err(e) => Reply::Text(db_error(&e)),
+        },
+        Action::MuteWhen { site, parameter } => {
+            // Choosing a parameter must not itself mute anything: the length has not been picked.
+            match resolve_short_site(db, scope, &site).await {
+                Ok(Some((_, site_name))) => match resolve_short_parameter(db, &parameter).await {
+                    Ok(Some((_, param_name, _))) => Reply::Menu {
+                        text: format!("Mute {site_name} / {param_name} for how long?"),
+                        keyboard: vec![keyboard::mute_duration_row(&site, &parameter)],
+                    },
+                    Ok(None) => Reply::Text(expired.to_string()),
+                    Err(e) => Reply::Text(db_error(&e)),
+                },
+                Ok(None) => Reply::Text(expired.to_string()),
+                Err(e) => Reply::Text(db_error(&e)),
+            }
+        }
+        Action::MuteSet {
+            site,
+            parameter,
+            days,
+        } => mute_by_button(db, scope, &site, &parameter, days, sub, expired).await,
+        Action::Muted => muted(db).await,
+        Action::UnmuteSet { site, parameter } => {
+            unmute_by_button(db, scope, &site, &parameter, expired).await
         }
     }
 }
