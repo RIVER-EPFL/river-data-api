@@ -1,0 +1,78 @@
+{
+  "tolerance": 1e-9,
+  "cases": [
+    {
+      "name": "pinned_tss_only",
+      "inputs": { "wgt_dried_g": 0.1005, "wgt_prefilt_g": 0.1, "vol_filtered_ml": 500.0 },
+      "constants": {},
+      "curves": {},
+      "expected": { "TSS_dry_weight_mgL": 1.0 },
+      "absent": ["AFDM_mgL"]
+    },
+    {
+      "name": "pinned_both",
+      "inputs": { "wgt_dried_g": 0.1025, "wgt_prefilt_g": 0.1, "wgt_ashed_g": 0.1005, "vol_filtered_ml": 500.0 },
+      "constants": {},
+      "curves": {},
+      "expected": { "TSS_dry_weight_mgL": 4.99999999999998, "AFDM_mgL": 3.99999999999998 },
+      "absent": []
+    },
+    {
+      "name": "golden_tss_rand_1_no_ashed",
+      "inputs": { "wgt_dried_g": 0.115681016497547, "wgt_prefilt_g": 0.110389905027114, "vol_filtered_ml": 155.84172771778 },
+      "constants": {},
+      "curves": {},
+      "expected": { "TSS_dry_weight_mgL": 33.9518275876334 },
+      "absent": ["AFDM_mgL"]
+    },
+    {
+      "name": "golden_tss_rand_2_with_ashed",
+      "inputs": { "wgt_dried_g": 0.151032709116116, "wgt_prefilt_g": 0.127429908537306, "wgt_ashed_g": 0.14, "vol_filtered_ml": 346.19040886173 },
+      "constants": {},
+      "curves": {},
+      "expected": { "TSS_dry_weight_mgL": 68.1786669261462, "AFDM_mgL": 31.868904607702436 },
+      "absent": []
+    },
+    {
+      "name": "golden_afdm_rand_1",
+      "inputs": { "wgt_dried_g": 0.0908244268037379, "wgt_prefilt_g": 0.08, "wgt_ashed_g": 0.0783912686963595, "vol_filtered_ml": 391.6349425097 },
+      "constants": {},
+      "curves": {},
+      "expected": { "TSS_dry_weight_mgL": 27.639073097952167, "AFDM_mgL": 31.7468048885104 },
+      "absent": []
+    },
+    {
+      "name": "null_ashed_drops_afdm",
+      "inputs": { "wgt_dried_g": 0.1025, "wgt_prefilt_g": 0.1, "wgt_ashed_g": null, "vol_filtered_ml": 500.0 },
+      "constants": {},
+      "curves": {},
+      "expected": { "TSS_dry_weight_mgL": 4.99999999999998 },
+      "absent": ["AFDM_mgL"]
+    },
+    {
+      "name": "null_dried_drops_both",
+      "inputs": { "wgt_dried_g": null, "wgt_prefilt_g": 0.1, "wgt_ashed_g": 0.1005, "vol_filtered_ml": 500.0 },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["TSS_dry_weight_mgL", "AFDM_mgL"]
+    },
+    {
+      "name": "null_vol_drops_both",
+      "inputs": { "wgt_dried_g": 0.136781689664349, "wgt_prefilt_g": 0.12, "wgt_ashed_g": 0.12847616165699, "vol_filtered_ml": null },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["TSS_dry_weight_mgL", "AFDM_mgL"]
+    },
+    {
+      "name": "zero_vol_drops_both",
+      "inputs": { "wgt_dried_g": 0.1025, "wgt_prefilt_g": 0.1, "wgt_ashed_g": 0.1005, "vol_filtered_ml": 0.0 },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["TSS_dry_weight_mgL", "AFDM_mgL"]
+    }
+  ],
+  "notes": "Mirrors the portal's calcTSS/calcAFDM exactly; no Rust-vs-portal divergence exists for this tool. Portal 'KEEP OLD' (any NA input) and non-finite results (vol_filtered_ml = 0 gives Inf) are emitted as absent keys. No constants or curves. Golden fixtures pin tss_mg_l and afdm_mg_l separately; combined cases add the missing weight and pin the second output at the same arithmetic."
+}

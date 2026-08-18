@@ -1,0 +1,226 @@
+{
+  "tolerance": 1e-09,
+  "cases": [
+    {
+      "name": "golden_chla_rand_1",
+      "inputs": {
+        "diameters_cm": [
+          31.3737962753512,
+          16.7972950891126,
+          23.5402561039664
+        ],
+        "chla_ug_l": 77.4592630893458,
+        "volume_filtered_ml": 194.788764184341,
+        "total_volume_ml": 61.203697801102
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Chla_avg_ugm2": 0.343097523192094,
+        "rock_surface_area_m2": 0.35468232140315437
+      },
+      "absent": [
+        "benthic_AFDM_avg_gm2"
+      ]
+    },
+    {
+      "name": "golden_chla_rand_2",
+      "inputs": {
+        "diameters_cm": [
+          37.155242549954,
+          13.4442908929195,
+          15.4160052591469
+        ],
+        "chla_ug_l": 24.0487174773589,
+        "volume_filtered_ml": 36.2823412730359,
+        "total_volume_ml": 311.806459608488
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Chla_avg_ugm2": 3.69777503252905,
+        "rock_surface_area_m2": 0.27945458728051736
+      },
+      "absent": [
+        "benthic_AFDM_avg_gm2"
+      ]
+    },
+    {
+      "name": "golden_afdm_rand_1",
+      "inputs": {
+        "diameters_cm": [
+          22.226826878963,
+          5.00566918659024,
+          48.5712060821243
+        ],
+        "afdm_g_filter": 0.00229464557324536,
+        "volume_filtered_ml": 147.766697539482,
+        "total_volume_ml": 75.3042248194106
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "benthic_AFDM_avg_gm2": 0.00318747879129481,
+        "rock_surface_area_m2": 0.366869059108562
+      },
+      "absent": [
+        "Chla_avg_ugm2"
+      ]
+    },
+    {
+      "name": "golden_afdm_rand_2",
+      "inputs": {
+        "diameters_cm": [
+          7.73285673442297,
+          20.6494135616813,
+          23.4249059106223
+        ],
+        "afdm_g_filter": 0.0082647586283274,
+        "volume_filtered_ml": 31.7129641422071,
+        "total_volume_ml": 407.572058553342
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "benthic_AFDM_avg_gm2": 0.567925308726755,
+        "rock_surface_area_m2": 0.18702795197709526
+      },
+      "absent": [
+        "Chla_avg_ugm2"
+      ]
+    },
+    {
+      "name": "afdm_and_chla_together",
+      "inputs": {
+        "diameters_cm": [
+          22.226826878963,
+          5.00566918659024,
+          48.5712060821243
+        ],
+        "afdm_g_filter": 0.00229464557324536,
+        "chla_ug_l": 12.5,
+        "volume_filtered_ml": 147.766697539482,
+        "total_volume_ml": 75.3042248194106
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "benthic_AFDM_avg_gm2": 0.00318747879129481,
+        "Chla_avg_ugm2": 0.08681838571443044,
+        "rock_surface_area_m2": 0.366869059108562
+      },
+      "absent": []
+    },
+    {
+      "name": "golden_sphere_area_only",
+      "inputs": {
+        "diameters_cm": [
+          10,
+          10,
+          10
+        ],
+        "volume_filtered_ml": 50.0,
+        "total_volume_ml": 100.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "rock_surface_area_m2": 0.0628318530717959
+      },
+      "absent": [
+        "benthic_AFDM_avg_gm2",
+        "Chla_avg_ugm2"
+      ]
+    },
+    {
+      "name": "golden_na_afdm_null_inputs",
+      "inputs": {
+        "diameters_cm": [
+          10,
+          8,
+          6
+        ],
+        "afdm_g_filter": null,
+        "chla_ug_l": null,
+        "volume_filtered_ml": 50.0,
+        "total_volume_ml": 100.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "rock_surface_area_m2": 0.03990034088742017
+      },
+      "absent": [
+        "benthic_AFDM_avg_gm2",
+        "Chla_avg_ugm2"
+      ]
+    },
+    {
+      "name": "golden_two_dims_no_conversion",
+      "inputs": {
+        "diameters_cm": [
+          12,
+          8
+        ],
+        "afdm_g_filter": 0.005,
+        "volume_filtered_ml": 50.0,
+        "total_volume_ml": 100.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "rock_surface_area_m2": 0.060318578948924
+      },
+      "absent": [
+        "benthic_AFDM_avg_gm2",
+        "Chla_avg_ugm2"
+      ]
+    },
+    {
+      "name": "zero_volume_filtered_omits_conversions",
+      "inputs": {
+        "diameters_cm": [
+          10,
+          8,
+          6
+        ],
+        "afdm_g_filter": 0.005,
+        "chla_ug_l": 15.0,
+        "volume_filtered_ml": 0.0,
+        "total_volume_ml": 100.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "rock_surface_area_m2": 0.03990034088742017
+      },
+      "absent": [
+        "benthic_AFDM_avg_gm2",
+        "Chla_avg_ugm2"
+      ]
+    },
+    {
+      "name": "null_diameter_omits_everything",
+      "inputs": {
+        "diameters_cm": [
+          10,
+          null,
+          6
+        ],
+        "afdm_g_filter": 0.005,
+        "chla_ug_l": 15.0,
+        "volume_filtered_ml": 50.0,
+        "total_volume_ml": 100.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": [
+        "rock_surface_area_m2",
+        "benthic_AFDM_avg_gm2",
+        "Chla_avg_ugm2"
+      ]
+    }
+  ],
+  "notes": "Single-replicate per-m2 conversions via the portal's calcBenthicAFDM/calcChlaPerM2 on a one-row frame; rock_surface_area_m2 is derived from convertToUnitPerM2(1, d, 1, 1) so the area formula stays the prelude's. Divergence from the Rust impl, portal followed: the portal requires all three sizeA/B/C dimensions for a per-m2 conversion, so two-diameter input yields the area but no AFDM/Chla conversion (Rust converts with any >= 2 diameters). The chla_ug_l input is mapped to the portal's chla_acid_ugL column; the tool does not distinguish acid/noacid, so chla_acid_ugm2 is the suggested code for the per-m2 output."
+}

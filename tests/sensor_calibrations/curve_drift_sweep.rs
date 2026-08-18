@@ -361,10 +361,17 @@ async fn the_janitor_job_runs_the_sweep_and_the_sample_stats_follow() {
     job::register_scheduled_services(&mut registry, &crate::common::cached_test_config());
     let ev: river_db::common::EventSender = tokio::sync::broadcast::channel(64).0;
     let wid = worker::worker_id();
-    let id = worker::enqueue(&db, "janitor_service", None, None, &serde_json::json!({}), None)
-        .await
-        .unwrap()
-        .expect("enqueue inserts a row");
+    let id = worker::enqueue(
+        &db,
+        "janitor_service",
+        None,
+        None,
+        &serde_json::json!({}),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("enqueue inserts a row");
     worker::drain(&db, &ev, &registry, &wid).await.unwrap();
 
     let status_row = db

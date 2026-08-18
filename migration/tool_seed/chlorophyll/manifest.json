@@ -1,0 +1,72 @@
+{
+  "label": "Chlorophyll-a",
+  "description": "Chlorophyll-a (acid and no-acid methods)",
+  "params": [
+    {
+      "name": "method",
+      "label": "Method (acid/no_acid)",
+      "kind": "enum:acid|no_acid",
+      "units": null,
+      "required": true,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "fluorescence_before",
+      "label": "Fluorescence Before",
+      "kind": "number",
+      "units": null,
+      "required": true,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "fluorescence_after",
+      "label": "Fluorescence After",
+      "kind": "number",
+      "units": null,
+      "required": false,
+      "default": null,
+      "when": "method=acid"
+    },
+    {
+      "name": "slope",
+      "label": "Slope",
+      "kind": "number",
+      "units": null,
+      "required": true,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "intercept",
+      "label": "Intercept",
+      "kind": "number",
+      "units": null,
+      "required": true,
+      "default": null,
+      "when": null
+    }
+  ],
+  "outputs": [
+    {
+      "key": "Chla_acid_ugL_avg",
+      "label": "Chlorophyll-a (acid)",
+      "units": "ug/L",
+      "per_replicate": false,
+      "aggregate_of": null,
+      "suggested_parameter_code": "chla_acid_ugL"
+    },
+    {
+      "key": "Chla_noacid_ugL_avg",
+      "label": "Chlorophyll-a (no acid)",
+      "units": "ug/L",
+      "per_replicate": false,
+      "aggregate_of": null,
+      "suggested_parameter_code": "chla_noacid_ugL"
+    }
+  ],
+  "constants": [],
+  "curves": [],
+  "match_keywords": ["chlorophyll", "chla", "chl"]
+}

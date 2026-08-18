@@ -1,0 +1,94 @@
+{
+  "tolerance": 1e-9,
+  "cases": [
+    {
+      "name": "rust_pin_with_curve",
+      "inputs": { "replicates": [120.0, 125.0, 118.0] },
+      "constants": {},
+      "curves": { "std_curve": { "slope": 1.05, "intercept": -2.0 } },
+      "expected": { "DOC_avg_ppb": 125.05, "DOC_sd_ppb": 3.78582883923719 },
+      "absent": []
+    },
+    {
+      "name": "golden_no_curve",
+      "inputs": { "replicates": [120.0, 125.0, 118.0] },
+      "constants": {},
+      "curves": {},
+      "expected": { "DOC_avg_ppb": 121.0, "DOC_sd_ppb": 3.60555127546399 },
+      "absent": []
+    },
+    {
+      "name": "single_replicate_omits_sd",
+      "inputs": { "replicates": [120.0] },
+      "constants": {},
+      "curves": {},
+      "expected": { "DOC_avg_ppb": 120.0 },
+      "absent": ["DOC_sd_ppb"]
+    },
+    {
+      "name": "all_null_omits_both",
+      "inputs": { "replicates": [null, null, null] },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["DOC_avg_ppb", "DOC_sd_ppb"]
+    },
+    {
+      "name": "one_null_no_curve",
+      "inputs": { "replicates": [120.0, null, 118.0] },
+      "constants": {},
+      "curves": {},
+      "expected": { "DOC_avg_ppb": 119.0, "DOC_sd_ppb": 1.4142135623731 },
+      "absent": []
+    },
+    {
+      "name": "golden_avg_rand_1",
+      "inputs": { "replicates": [190.671224833932, 245.170278369915, 230.796007509343] },
+      "constants": {},
+      "curves": { "std_curve": { "slope": 0.961278225202113, "intercept": -0.97404258325696 } },
+      "expected": { "DOC_avg_ppb": 212.633998467253 },
+      "absent": []
+    },
+    {
+      "name": "golden_avg_rand_9_null_with_curve",
+      "inputs": { "replicates": [null, 467.760288110003, 472.654093289748] },
+      "constants": {},
+      "curves": { "std_curve": { "slope": 1.10074498825707, "intercept": 2.28358845226467 } },
+      "expected": { "DOC_avg_ppb": 519.861797057587 },
+      "absent": []
+    },
+    {
+      "name": "golden_sd_rand_1_with_curve",
+      "inputs": { "replicates": [108.206150960177, 429.328132607043, 410.717265773565] },
+      "constants": {},
+      "curves": { "std_curve": { "slope": 0.932979776454158, "intercept": -3.29249400179833 } },
+      "expected": { "DOC_sd_ppb": 168.186120201977 },
+      "absent": []
+    },
+    {
+      "name": "golden_sd_rand_2_no_curve",
+      "inputs": { "replicates": [74.2234499659389, 429.851801227778, 476.666156097781] },
+      "constants": {},
+      "curves": {},
+      "expected": { "DOC_sd_ppb": 220.084544270995 },
+      "absent": []
+    },
+    {
+      "name": "empty_replicates_omits_both",
+      "inputs": { "replicates": [] },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["DOC_avg_ppb", "DOC_sd_ppb"]
+    },
+    {
+      "name": "two_replicates_padded",
+      "inputs": { "replicates": [271.935691975523, 399.443094816525] },
+      "constants": {},
+      "curves": { "std_curve": { "slope": 1.01862098516431, "intercept": -4.9273814773187 } },
+      "expected": { "DOC_avg_ppb": 337.012879132948 },
+      "absent": []
+    }
+  ],
+  "notes": "No portal-vs-Rust divergence for this tool: both average the curve-corrected replicates and take their sd (na.rm). The wrapper pads the replicates array to the portal's three DOC_rep columns with NA; more than three replicates is not representable in the portal row shape and yields no result (calcDOC ncol check). A lone replicate yields an average and no sd (portal sd is 'KEEP OLD', key omitted), matching the pinned Rust behavior."
+}

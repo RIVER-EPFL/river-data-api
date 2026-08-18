@@ -66,7 +66,7 @@ async fn test_list_tools_excludes_removed() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 12, "should have 12 tools, got {names:?}");
+    assert_eq!(names.len(), 13, "should have 13 tools, got {names:?}");
     for expected in [
         "doc",
         "tss_afdm",
@@ -80,6 +80,7 @@ async fn test_list_tools_excludes_removed() {
         "co2_air",
         "benthic",
         "chla_benthic",
+        "discharge",
     ] {
         assert!(names.contains(&expected), "missing tool {expected}");
     }

@@ -8,3 +8,4 @@ mod common;
 
 mod calculators;
 mod constants_parity;
+mod scripts_lifecycle;

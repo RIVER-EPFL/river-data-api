@@ -63,6 +63,10 @@ mod m20260817_000001_telegram_command_audit;
 mod m20260817_000002_scrub_telegram_urls;
 mod m20260817_000003_telegram_attestation;
 mod m20260818_000002_ch4_in_sa_units;
+mod m20260818_000003_tool_scripts;
+mod m20260818_000004_sample_provenance;
+mod m20260818_000005_seed_tool_scripts;
+mod m20260818_000006_analyte_catalog;
 
 pub struct Migrator;
 
@@ -134,6 +138,10 @@ impl MigratorTrait for Migrator {
             Box::new(m20260817_000002_scrub_telegram_urls::Migration),
             Box::new(m20260817_000003_telegram_attestation::Migration),
             Box::new(m20260818_000002_ch4_in_sa_units::Migration),
+            Box::new(m20260818_000003_tool_scripts::Migration),
+            Box::new(m20260818_000004_sample_provenance::Migration),
+            Box::new(m20260818_000005_seed_tool_scripts::Migration),
+            Box::new(m20260818_000006_analyte_catalog::Migration),
         ]
     }
 }

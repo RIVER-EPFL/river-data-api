@@ -98,8 +98,8 @@ async-trait = "0.1"
 # Migration support
 migration = { path = "migration" }
 
-# Core library (sync control plane + hydrochemistry toolbox)
-river-data-core = { version = "0.5.0", features = ["openapi", "toolbox"] }
+# Core library (sync control plane)
+river-data-core = { version = "0.5.0", features = ["openapi"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }

@@ -504,6 +504,40 @@ pub fn api_router(state: &AppState) -> Router<()> {
             .with_state(state.clone())
     });
 
+    // Tool script authoring: versioned R code executed by the runner. Administrator only, it is
+    // remote code authorship; execution of the ACTIVE version stays open via /tools.
+    let tool_script_routes = {
+        use crate::routes::private::tools::scripts;
+        Router::new()
+            .route(
+                "/tool_scripts",
+                get(scripts::list_scripts).post(scripts::create_script),
+            )
+            .route(
+                "/tool_scripts/{id}",
+                get(scripts::get_script).patch(scripts::update_script),
+            )
+            .route("/tool_scripts/{id}/versions", post(scripts::create_version))
+            .route(
+                "/tool_scripts/{id}/versions/{version_id}",
+                get(scripts::get_version),
+            )
+            .route(
+                "/tool_scripts/{id}/versions/{version_id}/validate",
+                post(scripts::validate_version),
+            )
+            .route(
+                "/tool_scripts/{id}/versions/{version_id}/activate",
+                post(scripts::activate_version),
+            )
+            .route(
+                "/tool_scripts/{id}/activations",
+                get(scripts::list_activations),
+            )
+            .layer(middleware::from_fn(require_admin))
+            .with_state(state.clone())
+    };
+
     // Telegram identity link-code minting. Admin-only, it grants a chat the linked user's role.
     let telegram_admin_routes = Router::new()
         .route(
@@ -587,6 +621,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .merge(entity_router)
         .merge(token_admin_routes)
         .merge(telegram_admin_routes)
+        .merge(tool_script_routes)
         .merge(notifications_admin_routes)
         .merge(notifications_me_routes)
         .merge(me_route)

@@ -1,0 +1,203 @@
+{
+  "label": "Chlorophyll-a benthic (replicates)",
+  "description": "Acid and no-acid chlorophyll-a per replicate with rock surface area, per-m2 conversion, and benthic AFDM, following the portal Chl a tool chain.",
+  "params": [
+    {
+      "name": "replicates",
+      "label": "Replicates (fluor_before, fluor_after, vol_total_ml, vol_after_ml, diameters_cm, afdm_g_filter)",
+      "kind": "replicate_grid",
+      "units": null,
+      "required": true,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "acid_slope",
+      "label": "Acid slope",
+      "kind": "number",
+      "units": null,
+      "required": false,
+      "default": null,
+      "when": "fallback when the chla_acid curve is not selected"
+    },
+    {
+      "name": "acid_intercept",
+      "label": "Acid intercept",
+      "kind": "number",
+      "units": null,
+      "required": false,
+      "default": null,
+      "when": "fallback when the chla_acid curve is not selected"
+    },
+    {
+      "name": "noacid_slope",
+      "label": "No-acid slope",
+      "kind": "number",
+      "units": null,
+      "required": false,
+      "default": null,
+      "when": "fallback when the chla_noacid curve is not selected"
+    },
+    {
+      "name": "noacid_intercept",
+      "label": "No-acid intercept",
+      "kind": "number",
+      "units": null,
+      "required": false,
+      "default": null,
+      "when": "fallback when the chla_noacid curve is not selected"
+    }
+  ],
+  "outputs": [
+    {
+      "key": "Chla_acid_ugL_avg",
+      "label": "Chl-a acid average",
+      "units": "ug/L",
+      "per_replicate": false,
+      "aggregate_of": "Chla_acid_ugL",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_acid_ugL_sd",
+      "label": "Chl-a acid SD",
+      "units": "ug/L",
+      "per_replicate": false,
+      "aggregate_of": "Chla_acid_ugL",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_noacid_ugL_avg",
+      "label": "Chl-a no-acid average",
+      "units": "ug/L",
+      "per_replicate": false,
+      "aggregate_of": "Chla_noacid_ugL",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_noacid_ugL_sd",
+      "label": "Chl-a no-acid SD",
+      "units": "ug/L",
+      "per_replicate": false,
+      "aggregate_of": "Chla_noacid_ugL",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_acid_avg_ugm2",
+      "label": "Chl-a acid per m2 average",
+      "units": "ug/m2",
+      "per_replicate": false,
+      "aggregate_of": "Chla_acid_ugm2",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_acid_sd_ugm2",
+      "label": "Chl-a acid per m2 SD",
+      "units": "ug/m2",
+      "per_replicate": false,
+      "aggregate_of": "Chla_acid_ugm2",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_noacid_avg_ugm2",
+      "label": "Chl-a no-acid per m2 average",
+      "units": "ug/m2",
+      "per_replicate": false,
+      "aggregate_of": "Chla_noacid_ugm2",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_noacid_sd_ugm2",
+      "label": "Chl-a no-acid per m2 SD",
+      "units": "ug/m2",
+      "per_replicate": false,
+      "aggregate_of": "Chla_noacid_ugm2",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "benthic_AFDM_avg_gm2",
+      "label": "Benthic AFDM average",
+      "units": "g/m2",
+      "per_replicate": false,
+      "aggregate_of": "benthic_AFDM_gm2",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "benthic_AFDM_sd_gm2",
+      "label": "Benthic AFDM SD",
+      "units": "g/m2",
+      "per_replicate": false,
+      "aggregate_of": "benthic_AFDM_gm2",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "vol_filtered_ml",
+      "label": "Volume filtered",
+      "units": "mL",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_acid_ugL",
+      "label": "Chl-a acid",
+      "units": "ug/L",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": "chla_acid_ugL"
+    },
+    {
+      "key": "Chla_noacid_ugL",
+      "label": "Chl-a no-acid",
+      "units": "ug/L",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": "chla_noacid_ugL"
+    },
+    {
+      "key": "rock_area_m2",
+      "label": "Rock surface area",
+      "units": "m2",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_acid_ugm2",
+      "label": "Chl-a acid per m2",
+      "units": "ug/m2",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": "chla_acid_ugm2"
+    },
+    {
+      "key": "Chla_noacid_ugm2",
+      "label": "Chl-a no-acid per m2",
+      "units": "ug/m2",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": "chla_noacid_ugm2"
+    },
+    {
+      "key": "benthic_AFDM_gm2",
+      "label": "Benthic AFDM per m2",
+      "units": "g/m2",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": "afdm_gm2"
+    }
+  ],
+  "constants": [],
+  "curves": [
+    {
+      "name": "chla_acid",
+      "label": "Chla acid standard curve",
+      "required": false
+    },
+    {
+      "name": "chla_noacid",
+      "label": "Chla noacid standard curve",
+      "required": false
+    }
+  ],
+  "match_keywords": ["chla_benthic", "chlorophyll", "benthic", "afdm"]
+}
