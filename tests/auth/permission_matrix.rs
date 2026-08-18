@@ -246,6 +246,14 @@ async fn permission_matrix_covers_every_boundary() {
             allow_non_200_when_authorized: false,
         },
         Probe {
+            label: "tools-calculate",
+            method: "POST",
+            path: "/api/tools/field_data/calculate".to_string(),
+            body: Some(serde_json::json!({ "inputs": {} })),
+            boundary: Boundary::ReadData,
+            allow_non_200_when_authorized: true,
+        },
+        Probe {
             label: "site-readings",
             method: "GET",
             path: format!("/api/sites/{site_id}/readings?start={start}&end={end}"),

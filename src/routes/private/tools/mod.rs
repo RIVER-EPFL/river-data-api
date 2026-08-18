@@ -51,6 +51,21 @@ fn require_field(val: Option<f64>, name: &str) -> AppResult<f64> {
     })
 }
 
+/// The portal's plausibility band for an entered barometric pressure (calcCO2corr). An entry in
+/// the wrong unit (atm where hPa is expected) lands far outside it, so this is what stops a
+/// silently ~1000x wrong result.
+const PRESSURE_HPA_MIN: f64 = 700.0;
+const PRESSURE_HPA_MAX: f64 = 1050.0;
+
+fn validate_pressure_hpa(value: f64, what: &str) -> AppResult<()> {
+    if !(PRESSURE_HPA_MIN..=PRESSURE_HPA_MAX).contains(&value) {
+        return Err(AppError::BadRequest(format!(
+            "{what} {value} hPa is outside the plausible {PRESSURE_HPA_MIN}-{PRESSURE_HPA_MAX} hPa band"
+        )));
+    }
+    Ok(())
+}
+
 type ResultMap = serde_json::Map<String, serde_json::Value>;
 
 /// Inserts a numeric result, omitting non-finite values. This encodes the
@@ -178,20 +193,24 @@ pub async fn calculate_tool(
         .unwrap_or_default();
 
     let known_names: Vec<&str> = tool_info.params.iter().map(|p| p.name).collect();
-    let inputs_used: Vec<String> = input_keys
-        .iter()
-        .filter(|k| known_names.contains(&k.as_str()))
-        .cloned()
-        .collect();
-    let inputs_ignored: Vec<String> = input_keys
-        .iter()
-        .filter(|k| !known_names.contains(&k.as_str()))
-        .cloned()
-        .collect();
 
     let mut result = tool.calculate(&body, &state.db).await?;
-    result.inputs_used = inputs_used;
-    result.inputs_ignored = inputs_ignored;
+    // A tool that reports what its chosen mode actually consumed is the authority; the schema
+    // intersection is the fallback for tools that read every declared input.
+    if result.inputs_used.is_empty() {
+        result.inputs_used = input_keys
+            .iter()
+            .filter(|k| known_names.contains(&k.as_str()))
+            .cloned()
+            .collect();
+    } else {
+        result.inputs_used.retain(|k| input_keys.contains(k));
+    }
+    result.inputs_ignored = input_keys
+        .iter()
+        .filter(|k| !result.inputs_used.contains(k))
+        .cloned()
+        .collect();
 
     Ok(Json(result))
 }
@@ -570,6 +589,7 @@ impl AnalyticalTool for AlkalinityTool {
         insert_opt(&mut results, "Alk_dyn_pH", payload.alk_dyn_ph);
         insert_opt(&mut results, "Alk_dyn_trit", payload.alk_dyn_trit);
         insert_opt(&mut results, "Alk_temp_degC", payload.alk_temp_deg_c);
+        insert_opt(&mut results, "Alk_init_pH", payload.alk_init_ph);
 
         let ph = river_data_core::toolbox::equals(
             payload.wtw_ph_1.unwrap_or(f64::NAN),
@@ -612,7 +632,9 @@ pub struct Pco2Request {
     pub ch4_ppm: Option<f64>,
     pub d13co2_permil: Option<f64>,
     pub lab_temp_c: Option<f64>,
-    pub lab_pressure_atm: Option<f64>,
+    /// Lab pressure as the portal stores it, in hPa; converted to atm inside the calculation.
+    /// Left blank, the `lab_press_avg_atm` constant applies, already in atm.
+    pub lab_pressure_hpa: Option<f64>,
     pub vol_sa_ml: Option<f64>,
     pub vol_water_ml: Option<f64>,
     pub replicate_b: Option<Pco2ReplicateBInput>,
@@ -687,8 +709,8 @@ impl AnalyticalTool for Pco2Tool {
                     required: false,
                 },
                 ToolParamInfo {
-                    name: "lab_pressure_atm",
-                    label: "Lab Pressure (atm)",
+                    name: "lab_pressure_hpa",
+                    label: "Lab Pressure (hPa, blank = lab average)",
                     required: false,
                 },
                 ToolParamInfo {
@@ -759,22 +781,51 @@ impl AnalyticalTool for Pco2Tool {
                 };
                 let mut results = ResultMap::new();
                 insert_num(&mut results, key, pco2);
-                Ok(ToolResult::new("pco2", results))
+                // Simple mode reads nothing else: a supplied replicate_b or lab entry is
+                // discarded, and reporting it as used would misstate the calculation.
+                let mut result = ToolResult::new("pco2", results);
+                result.inputs_used = ["mode", "variant", "co2_aq_umol", "water_temp_c"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+                if matches!(payload.variant, Pco2Variant::P1 | Pco2Variant::P2) {
+                    result.inputs_used.push("pressure_hpa".to_string());
+                }
+                Ok(result)
             }
 
             Pco2Mode::FullPipeline => {
                 let co2_ppm = require_field(payload.co2_ppm, "co2_ppm")?;
                 let h2o_percent = require_field(payload.h2o_percent, "h2o_percent")?;
                 let ch4_ppm = require_field(payload.ch4_ppm, "ch4_ppm")?;
-                let lab_temp_c = require_field(payload.lab_temp_c, "lab_temp_c")?;
-                let lab_pressure_atm = require_field(payload.lab_pressure_atm, "lab_pressure_atm")?;
-                let vol_sa_ml = require_field(payload.vol_sa_ml, "vol_sa_ml")?;
-                let vol_water_ml = require_field(payload.vol_water_ml, "vol_water_ml")?;
+                // Blank lab conditions fall back to the constants table, exactly as the portal's
+                // calcCO2 does: an entered pressure is hPa and converts here; the constant is
+                // already atm and does not.
+                let lab_temp_c = match payload.lab_temp_c {
+                    Some(v) => v,
+                    None => get_constant(db, "lab_temp_avg_degC", 22.5).await?,
+                };
+                let lab_pressure_atm = match payload.lab_pressure_hpa {
+                    Some(hpa) => {
+                        validate_pressure_hpa(hpa, "lab pressure")?;
+                        hpa / 1013.25
+                    }
+                    None => get_constant(db, "lab_press_avg_atm", 0.957237).await?,
+                };
+                let vol_sa_ml = match payload.vol_sa_ml {
+                    Some(v) => v,
+                    None => get_constant(db, "vol_sa", 0.03).await?,
+                };
+                let vol_water_ml = match payload.vol_water_ml {
+                    Some(v) => v,
+                    None => get_constant(db, "vol_water", 0.03).await?,
+                };
                 let field_pressure_hpa = payload.pressure_hpa.ok_or_else(|| {
                     AppError::BadRequest(
                         "pressure_hpa is required for full_pipeline mode".to_string(),
                     )
                 })?;
+                validate_pressure_hpa(field_pressure_hpa, "pressure_hpa")?;
 
                 let input_a = river_data_core::toolbox::Pco2FullInput {
                     co2_ppm,
@@ -843,7 +894,31 @@ impl AnalyticalTool for Pco2Tool {
                     insert_num(&mut results, "CH4_umol_L_avg", r.ch4_dissolved_umol);
                 }
 
-                Ok(ToolResult::new("pco2", results))
+                let mut result = ToolResult::new("pco2", results);
+                result.inputs_used = [
+                    "mode",
+                    "co2_ppm",
+                    "h2o_percent",
+                    "ch4_ppm",
+                    "water_temp_c",
+                    "pressure_hpa",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect();
+                for (name, present) in [
+                    ("d13co2_permil", payload.d13co2_permil.is_some()),
+                    ("lab_temp_c", payload.lab_temp_c.is_some()),
+                    ("lab_pressure_hpa", payload.lab_pressure_hpa.is_some()),
+                    ("vol_sa_ml", payload.vol_sa_ml.is_some()),
+                    ("vol_water_ml", payload.vol_water_ml.is_some()),
+                    ("replicate_b", payload.replicate_b.is_some()),
+                ] {
+                    if present {
+                        result.inputs_used.push(name.to_string());
+                    }
+                }
+                Ok(result)
             }
         }
     }
@@ -1249,7 +1324,11 @@ impl AnalyticalTool for FieldDataTool {
         insert_opt(&mut results, "Field_BP_altitude", alt_bp);
 
         // Portal pressure rule: field BP wins when within 700-1050 hPa, else the
-        // altitude-derived BP. An explicit pressure_hpa overrides both.
+        // altitude-derived BP. An explicit pressure_hpa overrides both, but only inside the same
+        // band the rule enforces on the field entry.
+        if let Some(p) = payload.pressure_hpa {
+            validate_pressure_hpa(p, "pressure_hpa")?;
+        }
         let pressure = payload
             .pressure_hpa
             .or_else(|| river_data_core::toolbox::select_pressure(payload.field_bp, alt_bp));
@@ -1307,6 +1386,13 @@ impl AnalyticalTool for FieldDataTool {
 pub struct Co2AirRequest {
     pub ch4_wet: f64,
     pub h2o_percent: f64,
+    /// Lab CO2 reading (ppm); when present the dissolved headspace CO2 is computed too.
+    pub co2_ppm: Option<f64>,
+    pub lab_temp_c: Option<f64>,
+    /// Lab pressure in hPa; blank falls back to the `lab_press_avg_atm` constant (already atm).
+    pub lab_pressure_hpa: Option<f64>,
+    pub vol_sa_ml: Option<f64>,
+    pub vol_water_ml: Option<f64>,
 }
 
 struct Co2AirTool;
@@ -1329,19 +1415,82 @@ impl AnalyticalTool for Co2AirTool {
                     label: "H2O (%)",
                     required: true,
                 },
+                ToolParamInfo {
+                    name: "co2_ppm",
+                    label: "Lab CO2 (ppm)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "lab_temp_c",
+                    label: "Lab Temp (°C, blank = lab average)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "lab_pressure_hpa",
+                    label: "Lab Pressure (hPa, blank = lab average)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "vol_sa_ml",
+                    label: "Vol SA (mL, blank = constant)",
+                    required: false,
+                },
+                ToolParamInfo {
+                    name: "vol_water_ml",
+                    label: "Vol Water (mL, blank = constant)",
+                    required: false,
+                },
             ],
-            match_keywords: &["co2_air", "ch4", "methane"],
+            match_keywords: &["co2_air", "ch4", "methane", "headspace"],
         };
         &INFO
     }
 
-    async fn calculate(&self, body: &[u8], _db: &DatabaseConnection) -> AppResult<ToolResult> {
+    async fn calculate(&self, body: &[u8], db: &DatabaseConnection) -> AppResult<ToolResult> {
         let payload: Co2AirRequest = parse_body(body)?;
         let ch4 =
             river_data_core::toolbox::co2_air::ch4_dry_air(payload.ch4_wet, payload.h2o_percent);
 
         let mut results = ResultMap::new();
         insert_num(&mut results, "lab_co2air_ch4_dry", ch4);
+
+        // The portal's lab CO2 entry runs calcCO2 on the same sheet: blank lab conditions fall
+        // back to the constants table, and an entered pressure is hPa.
+        if let Some(co2_ppm) = payload.co2_ppm {
+            let lab_temp_c = match payload.lab_temp_c {
+                Some(v) => v,
+                None => get_constant(db, "lab_temp_avg_degC", 22.5).await?,
+            };
+            let lab_pressure_atm = match payload.lab_pressure_hpa {
+                Some(hpa) => {
+                    validate_pressure_hpa(hpa, "lab pressure")?;
+                    hpa / 1013.25
+                }
+                None => get_constant(db, "lab_press_avg_atm", 0.957237).await?,
+            };
+            let vol_sa_ml = match payload.vol_sa_ml {
+                Some(v) => v,
+                None => get_constant(db, "vol_sa", 0.03).await?,
+            };
+            let vol_water_ml = match payload.vol_water_ml {
+                Some(v) => v,
+                None => get_constant(db, "vol_water", 0.03).await?,
+            };
+            let constants = load_gas_constants(db).await?;
+            insert_num(
+                &mut results,
+                "CO2_HS_Um",
+                river_data_core::toolbox::co2_air::co2_headspace(
+                    co2_ppm,
+                    lab_temp_c,
+                    lab_pressure_atm,
+                    vol_sa_ml,
+                    vol_water_ml,
+                    &constants,
+                ),
+            );
+        }
+
         Ok(ToolResult::new("co2_air", results))
     }
 }
@@ -1417,7 +1566,7 @@ impl AnalyticalTool for BenthicTool {
         if let Some(chla) = payload.chla_ug_l {
             insert_num(
                 &mut results,
-                "chla_per_m2",
+                "Chla_avg_ugm2",
                 river_data_core::toolbox::benthic_chla_per_m2(
                     chla,
                     &payload.diameters_cm,
@@ -1544,6 +1693,30 @@ impl AnalyticalTool for ChlaBenthicTool {
         );
         insert_opt(&mut results, "benthic_AFDM_avg_gm2", result.afdm_g_m2_avg);
         insert_opt(&mut results, "benthic_AFDM_sd_gm2", result.afdm_g_m2_sd);
+
+        // Replicates are rows, not columns: a replicate set lives behind one catalog parameter,
+        // so the per-replicate outputs travel as an array the save flow fans into replicate rows.
+        // The portal's rep_A..rep_E columns are its columnar storage, not part of this platform's
+        // vocabulary.
+        let replicates: Vec<serde_json::Value> = result
+            .replicates
+            .iter()
+            .map(|rep| {
+                serde_json::json!({
+                    "vol_filtered_ml": rep.vol_filtered_ml,
+                    "Chla_acid_ugL": rep.chla_acid_ug_l,
+                    "Chla_noacid_ugL": rep.chla_noacid_ug_l,
+                    "rock_area_m2": rep.rock_area_m2,
+                    "Chla_acid_ugm2": rep.chla_acid_ug_m2,
+                    "Chla_noacid_ugm2": rep.chla_noacid_ug_m2,
+                    "benthic_AFDM_gm2": rep.afdm_g_m2,
+                })
+            })
+            .collect();
+        results.insert(
+            "replicates".to_string(),
+            serde_json::Value::Array(replicates),
+        );
 
         Ok(ToolResult::new("chla_benthic", results))
     }

@@ -21,6 +21,8 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
         "SELECT remove_continuous_aggregate_policy('readings_weekly', if_not_exists => true)",
         "SELECT remove_continuous_aggregate_policy('readings_daily', if_not_exists => true)",
         "SELECT remove_continuous_aggregate_policy('readings_hourly', if_not_exists => true)",
+        // `constants` is migration-seeded reference data; truncating it cannot be undone by
+        // seed_test_data, so it is deliberately absent from this list.
         "TRUNCATE readings, status_events, samples, \
          sync_service_tokens, sync_events, sync_commands, sync_services, sync_service_credentials, \
          pairing_plans, data_streams, \
@@ -32,7 +34,6 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
          notification_subscribers, notification_subscriptions, notification_channel_health, \
          sensor_calibrations, sensor_deployments, sensors, \
          derived_parameter_sources, derived_parameter_definitions, \
-         constants, \
          user_project_grants, \
          site_parameters, parameters, sites, subprojects, projects CASCADE",
     ];

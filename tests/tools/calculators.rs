@@ -435,7 +435,7 @@ async fn test_pco2_full_chain_replicates() {
             "h2o_percent": 3.04813831089996,
             "ch4_ppm": 476.103632267332,
             "lab_temp_c": 17.0519462262746,
-            "lab_pressure_atm": 0.999341356277,
+            "lab_pressure_hpa": 1012.5826292476703, // 0.999341356277 atm, the fixture's value
             "vol_sa_ml": 0.0489402941428125,
             "vol_water_ml": 0.0271797092910856,
             "replicate_b": {
@@ -626,7 +626,7 @@ async fn test_benthic() {
         &token,
     )
     .await;
-    assert_value(&json, "chla_per_m2", 0.343097523192094);
+    assert_value(&json, "Chla_avg_ugm2", 0.343097523192094);
     assert_absent(&json, "benthic_AFDM_avg_gm2");
 
     let json = calculate(
@@ -767,4 +767,140 @@ async fn test_alkalinity_keeps_existing_ph() {
     .await;
 
     assert_value(&json, "WTW_pH_1", 7.6);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_pco2_lab_conditions_fall_back_to_constants() {
+    // Blank lab entries resolve from the seeded constants (lab_temp_avg_degC 22.5,
+    // lab_press_avg_atm 0.957237, vol_sa/vol_water 0.03), the portal's calcCO2 defaults.
+    let (app, token) = setup().await;
+
+    let json = calculate(
+        &app,
+        "pco2",
+        serde_json::json!({
+            "mode": "full_pipeline",
+            "water_temp_c": 20.0,
+            "pressure_hpa": 1013.0,
+            "co2_ppm": 3000.0,
+            "h2o_percent": 3.0,
+            "ch4_ppm": 400.0,
+        }),
+        &token,
+    )
+    .await;
+
+    assert!(
+        json["results"]["CO2_HS_Um_avg"].as_f64().is_some(),
+        "the run resolves its lab conditions from constants: {json}"
+    );
+    let used = json["inputs_used"].as_array().unwrap();
+    assert!(
+        !used.iter().any(|k| k == "lab_pressure_hpa"),
+        "an input that was not sent is not reported as used: {used:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_pco2_rejects_an_atm_style_lab_pressure() {
+    // 0.96 is a plausible atm entry and an impossible hPa one; without the band the result is
+    // silently ~1000x wrong.
+    let (app, token) = setup().await;
+
+    let (status, json) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/tools/pco2/calculate",
+        &serde_json::json!({
+            "mode": "full_pipeline",
+            "water_temp_c": 20.0,
+            "pressure_hpa": 1013.0,
+            "co2_ppm": 3000.0,
+            "h2o_percent": 3.0,
+            "ch4_ppm": 400.0,
+            "lab_pressure_hpa": 0.96,
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 400, "out-of-band lab pressure is refused: {json:?}");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_pco2_simple_mode_reports_a_discarded_replicate() {
+    let (app, token) = setup().await;
+
+    let json = calculate(
+        &app,
+        "pco2",
+        serde_json::json!({
+            "mode": "simple",
+            "co2_aq_umol": 100.0,
+            "water_temp_c": 15.0,
+            "replicate_b": { "co2_ppm": 1.0, "h2o_percent": 1.0, "ch4_ppm": 1.0 },
+        }),
+        &token,
+    )
+    .await;
+
+    let ignored = json["inputs_ignored"].as_array().unwrap();
+    assert!(
+        ignored.iter().any(|k| k == "replicate_b"),
+        "simple mode discards replicate_b and says so: {json}"
+    );
+    let used = json["inputs_used"].as_array().unwrap();
+    assert!(
+        !used.iter().any(|k| k == "replicate_b"),
+        "a discarded input is not reported as used: {used:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_alkalinity_echoes_initial_ph() {
+    let (app, token) = setup().await;
+
+    let json = calculate(
+        &app,
+        "alkalinity",
+        serde_json::json!({ "Alk_meqL": 2.5, "Alk_init_pH": 7.8 }),
+        &token,
+    )
+    .await;
+    assert_value(&json, "Alk_init_pH", 7.8);
+    assert_value(&json, "WTW_pH_1", 7.8);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_co2_air_headspace_from_lab_entry() {
+    // calcCO2 with explicit lab conditions: 3000 ppm at 0.999 atm equivalent, 20 degC lab,
+    // 0.03/0.03 volumes. Expected value computed from the R formula:
+    // exponent = exp(2400 * (1/293.15 - 1/298.15)) = exp(0.13727...) -> 1.147137...
+    // CO2 = 3000 * P_atm * (0.03 + 0.034 * exponent * 0.03 * 0.0820574 * 293.15)
+    //       / (0.0820574 * 0.03 * 293.15)
+    let (app, token) = setup().await;
+
+    let json = calculate(
+        &app,
+        "co2_air",
+        serde_json::json!({
+            "ch4_wet": 400.0,
+            "h2o_percent": 3.0,
+            "co2_ppm": 3000.0,
+            "lab_temp_c": 20.0,
+            "lab_pressure_hpa": 1013.25,
+            "vol_sa_ml": 0.03,
+            "vol_water_ml": 0.03,
+        }),
+        &token,
+    )
+    .await;
+
+    let exponent = (2400.0f64 * (1.0 / 293.15 - 1.0 / 298.15)).exp();
+    let expected = 3000.0 * 1.0 * (0.03 + 0.034 * exponent * 0.03 * 0.0820574 * 293.15)
+        / (0.0820574 * 0.03 * 293.15);
+    assert_value(&json, "CO2_HS_Um", expected);
 }
