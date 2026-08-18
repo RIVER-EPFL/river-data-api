@@ -62,6 +62,7 @@ mod m20260814_000004_telegram_link_expiry;
 mod m20260817_000001_telegram_command_audit;
 mod m20260817_000002_scrub_telegram_urls;
 mod m20260817_000003_telegram_attestation;
+mod m20260818_000002_ch4_in_sa_units;
 
 pub struct Migrator;
 
@@ -132,6 +133,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260817_000001_telegram_command_audit::Migration),
             Box::new(m20260817_000002_scrub_telegram_urls::Migration),
             Box::new(m20260817_000003_telegram_attestation::Migration),
+            Box::new(m20260818_000002_ch4_in_sa_units::Migration),
         ]
     }
 }
