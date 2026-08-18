@@ -108,15 +108,19 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let names: Vec<String> = SEEDS.iter().map(|s| s.name.to_string()).collect();
-        manager
-            .get_connection()
-            .execute(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"UPDATE tool_scripts SET active_version_id = NULL WHERE name = ANY($1);
-                  DELETE FROM tool_scripts WHERE name = ANY($1)",
-                [names.into()],
-            ))
-            .await?;
+        let db = manager.get_connection();
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE tool_scripts SET active_version_id = NULL WHERE name = ANY($1)",
+            [names.clone().into()],
+        ))
+        .await?;
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "DELETE FROM tool_scripts WHERE name = ANY($1)",
+            [names.into()],
+        ))
+        .await?;
         Ok(())
     }
 }
