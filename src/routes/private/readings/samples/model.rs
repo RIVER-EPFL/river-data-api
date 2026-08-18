@@ -19,11 +19,14 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
     pub id: Uuid,
-    #[crudcrate(filterable)]
+    // Identity columns are create-only: the readings a sample groups are keyed on
+    // (site, parameter, collected_at), so editing them here would detach the sample
+    // from its replicates while the trigger keeps refreshing the old key.
+    #[crudcrate(filterable, exclude(update))]
     pub site_id: Uuid,
-    #[crudcrate(filterable)]
+    #[crudcrate(filterable, exclude(update))]
     pub parameter_id: Uuid,
-    #[crudcrate(filterable, sortable)]
+    #[crudcrate(filterable, sortable, exclude(update))]
     pub collected_at: chrono::DateTime<chrono::Utc>,
     #[crudcrate(fulltext, sortable)]
     pub label: Option<String>,

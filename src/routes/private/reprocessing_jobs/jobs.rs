@@ -978,6 +978,44 @@ impl CsvImport {
         let total = i32::try_from(models.len()).unwrap_or(i32::MAX);
         ctx.set_progress(0, Some(total)).await;
 
+        // An overwrite replaces the whole replicate set, not the Nth row by the Nth: stored spot
+        // replicates beyond the incoming count would survive a positional upsert and keep
+        // double-counting the group, so the tail is dropped before the insert.
+        if conflict == ConflictMode::Overwrite {
+            let mut spot_group_sizes: std::collections::HashMap<
+                (Uuid, chrono::DateTime<chrono::Utc>),
+                i16,
+            > = std::collections::HashMap::new();
+            for m in &models {
+                if m.measurement_type.as_ref().as_deref() == Some(sample_groups::SPOT) {
+                    *spot_group_sizes
+                        .entry((
+                            *m.stream_id.as_ref(),
+                            m.time.as_ref().with_timezone(&chrono::Utc),
+                        ))
+                        .or_default() += 1;
+                }
+            }
+            for ((stream_id, time), count) in spot_group_sizes {
+                crate::common::bulk_write::guarded_mutation(
+                    ctx.db(),
+                    Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        "DELETE FROM readings \
+                         WHERE stream_id = $1 AND time = $2 AND replicate_index >= $3 \
+                           AND measurement_type = 'spot'",
+                        [
+                            stream_id.into(),
+                            sea_orm::prelude::DateTimeWithTimeZone::from(time).into(),
+                            count.into(),
+                        ],
+                    ),
+                )
+                .await
+                .map_err(as_db_err)?;
+            }
+        }
+
         // Phase 1: insert readings.
         let mut affected_total = 0usize;
         let mut inserted_so_far = 0usize;

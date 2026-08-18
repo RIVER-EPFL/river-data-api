@@ -572,10 +572,23 @@ pub async fn get_site_readings(
         " AND (r.is_flagged IS NOT TRUE)"
     };
 
+    // Collapsed reads anchor a replicate group on one row per (stream, time). Spot groups anchor
+    // on their lowest surviving replicate, so a flagged replicate 0 does not hide the grab: the
+    // served value is the sample mean over the unflagged replicates, and the grab disappears only
+    // when every replicate is flagged. Continuous rows keep the replicate-0 anchor.
     let replicate_condition = if include_replicates {
         ""
+    } else if annotations.flagged {
+        " AND (CASE WHEN r.measurement_type = 'spot' THEN r.replicate_index = \
+           (SELECT MIN(r2.replicate_index) FROM readings r2 \
+            WHERE r2.stream_id = r.stream_id AND r2.time = r.time) \
+           ELSE r.replicate_index = 0 END)"
     } else {
-        " AND r.replicate_index = 0"
+        " AND (CASE WHEN r.measurement_type = 'spot' THEN r.replicate_index = \
+           (SELECT MIN(r2.replicate_index) FROM readings r2 \
+            WHERE r2.stream_id = r.stream_id AND r2.time = r.time \
+              AND r2.is_flagged IS NOT TRUE) \
+           ELSE r.replicate_index = 0 END)"
     };
 
     let sample_id_condition = if let Some(sid) = query.sample_id {
