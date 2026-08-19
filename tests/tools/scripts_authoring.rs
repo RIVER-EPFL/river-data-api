@@ -920,10 +920,14 @@ async fn an_authored_hash_recomputes_from_the_stored_version() {
     )
     .await;
     assert_eq!(status, 200, "version fetched: {stored}");
+    // The renormalisation under test is textual and happens inside Postgres (`1e-9` is stored and
+    // re-rendered as `0.000000001`), so it is invisible here: serde parses either spelling to the
+    // same number. What can be asserted is that the value survived; the two assertions below are
+    // the property itself.
     assert_eq!(
-        stored["test_cases"]["tolerance"].to_string(),
-        "0.000000001",
-        "the case that makes the request body and the stored row differ: {stored}"
+        stored["test_cases"]["tolerance"].as_f64(),
+        Some(1e-9),
+        "the tolerance survives the round trip: {stored}"
     );
     assert_eq!(
         river_db::routes::private::tools::scripts::version_content_hash(
