@@ -56,7 +56,11 @@ tool <- function(inputs, constants, curves) {
   velocity <- distance / travel_time
 
   out <- list()
-  keep <- function(v) is.numeric(v) && length(v) == 1 && is.finite(v)
+  # The portal prints all four metrics whatever they come out as, so only a genuine NA is
+  # dropped here: NaN and Inf are values it displays and are emitted alike.
+  keep <- function(v) {
+    is.numeric(v) && length(v) == 1 && (!is.na(v) || is.nan(v))
+  }
   if (keep(discharge)) out$Q_Ls <- discharge
   if (keep(velocity)) out$velocity_ms <- velocity
   if (keep(travel_time)) out$travel_time_s <- travel_time

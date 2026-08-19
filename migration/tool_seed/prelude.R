@@ -2,8 +2,9 @@
 # File: app/utils/calculation_functions.R
 # Lines: 221-240
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcAFDM <- function(df, ...) {
   # Check for the presence of the correct columns
@@ -30,8 +31,9 @@ calcAFDM <- function(df, ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 87-105
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcAlt2BP <- function(df, pool, ...) {
   # Check for the presence of the correct columns
@@ -57,8 +59,9 @@ calcAlt2BP <- function(df, pool, ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 469-511
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcBenthicAFDM <- function(df, ...) {
   # Check for the presence of the correct columns
@@ -108,8 +111,9 @@ calcBenthicAFDM <- function(df, ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 688-789
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcCH4 <- function(df, pool, labTemp = 'default', labPa = 'default', ...) {
   # labTemp and labPa values c('default', 'cst', 'db')
@@ -218,8 +222,9 @@ calcCH4 <- function(df, pool, labTemp = 'default', labPa = 'default', ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 654-683
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcCH4dry <- function(df, ...) {
   # Check for the presence of the correct columns
@@ -256,8 +261,9 @@ calcCH4dry <- function(df, ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 564-605
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcChlaAcid <- function(df, pool, ...) {
   # Check for the presence of the correct columns
@@ -306,8 +312,9 @@ calcChlaAcid <- function(df, pool, ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 610-649
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcChlaNoAcid <- function(df, pool, ...) {
   # Check for the presence of the correct columns
@@ -354,8 +361,9 @@ calcChlaNoAcid <- function(df, pool, ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 516-558
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcChlaPerM2 <- function(df, ...) {
   # Check for the presence of the correct columns
@@ -405,8 +413,9 @@ calcChlaPerM2 <- function(df, ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 794-883
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcCO2 <- function(df, pool, labTemp = 'default', labPa = 'default', ...) {
   # labTemp and labPa values c('default', 'cst', 'db')
@@ -503,8 +512,9 @@ calcCO2 <- function(df, pool, labTemp = 'default', labPa = 'default', ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 110-145
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcCO2corr <- function(df, pool, ...) {
   # Check for the presence of the correct columns
@@ -547,8 +557,9 @@ calcCO2corr <- function(df, pool, ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 372-450
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcd13DIC <- function(df, pool, labTemp = 'default', labPressure = 'default', ...) {
   # labTemp values c('default', 'cst', 'db')
@@ -634,8 +645,9 @@ calcd13DIC <- function(df, pool, labTemp = 'default', labPressure = 'default', .
 # File: app/utils/calculation_functions.R
 # Lines: 287-368
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcDIC <- function(df, pool, labTemp = 'default', labPressure = 'default', ...) {
   # labTemp values c('default', 'cst', 'db')
@@ -724,8 +736,9 @@ calcDIC <- function(df, pool, labTemp = 'default', labPressure = 'default', ...)
 # File: app/utils/calculation_functions.R
 # Lines: 149-180
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcDOC <- function(df, func, pool) {
   # Check for the presence of the correct columns
@@ -764,8 +777,9 @@ calcDOC <- function(df, func, pool) {
 # File: app/utils/calculation_functions.R
 # Lines: 185-187
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcDOCavg <- function(df, pool, ...) {
   calcDOC(df, calcMean, pool)
@@ -775,8 +789,9 @@ calcDOCavg <- function(df, pool, ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 191-193
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcDOCsd <- function(df, pool, ...) {
   calcDOC(df, calcSd, pool)
@@ -786,8 +801,9 @@ calcDOCsd <- function(df, pool, ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 64-82
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcEquals <- function(df, ...) {
   # Check that df has only one row and one column
@@ -813,8 +829,9 @@ calcEquals <- function(df, ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 35-46
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcMean <- function(df, ...) {
   # Check that df has only one row
@@ -833,8 +850,9 @@ calcMean <- function(df, ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 14-31
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcMinus <- function(df, ...) {
   # Check that the df has only 2 columns 1 row
@@ -859,8 +877,9 @@ calcMinus <- function(df, ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 888-932
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcpCO2 <- function(df, pool, ...) {
   # Check for the presence of the correct columns
@@ -912,8 +931,9 @@ calcpCO2 <- function(df, pool, ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 937-993
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcpCO2P1 <- function(df, pool, ...) {
   # Check for the presence of the correct columns
@@ -977,8 +997,9 @@ calcpCO2P1 <- function(df, pool, ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 999-1055
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcpCO2P2 <- function(df, pool, ...) {
   # Check for the presence of the correct columns
@@ -1042,8 +1063,9 @@ calcpCO2P2 <- function(df, pool, ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 266-282
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcRatio <- function(df, ...) {
   # Check for the presence of the correct columns
@@ -1067,8 +1089,9 @@ calcRatio <- function(df, ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 50-61
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcSd <- function(df, ...) {
   # Check that df has only one row
@@ -1087,8 +1110,9 @@ calcSd <- function(df, ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 245-261
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcSUVA <- function(df, ...) {
   # Check for the presence of the correct columns
@@ -1112,8 +1136,9 @@ calcSUVA <- function(df, ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 198-217
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 calcTSS <- function(df, ...) {
   # Check for the presence of the correct columns
@@ -1140,8 +1165,9 @@ calcTSS <- function(df, ...) {
 # File: app/utils/calculation_functions.R
 # Lines: 455-465
 #
-# Verbatim copy — do not modify. See generate_fixtures.R for the
-# standalone version used to produce golden test values.
+# Verbatim copy, do not modify. The expected values in each tool's
+# cases.json are what this code produces: every case was run against the
+# tools runner before the seed shipped.
 
 convertToUnitPerM2 <- function(s, d, vf, vt) {
   # Convert sample value (s) to a sample unit/m2

@@ -3,11 +3,29 @@
   "description": "Dissolved Organic Carbon (replicate avg/sd with optional standard curve)",
   "params": [
     {
-      "name": "replicates",
-      "label": "Replicates (array)",
-      "kind": "array",
+      "name": "DOC_rep_1",
+      "label": "DOC (replicate 1)",
+      "kind": "number",
       "units": "ppb",
-      "required": true,
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "DOC_rep_2",
+      "label": "DOC (replicate 2)",
+      "kind": "number",
+      "units": "ppb",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "DOC_rep_3",
+      "label": "DOC (replicate 3)",
+      "kind": "number",
+      "units": "ppb",
+      "required": false,
       "default": null,
       "when": null
     }
@@ -26,7 +44,7 @@
       "label": "DOC standard deviation",
       "units": "ppb",
       "per_replicate": false,
-      "aggregate_of": null,
+      "aggregate_of": "DOC_avg_ppb",
       "suggested_parameter_code": null
     }
   ],

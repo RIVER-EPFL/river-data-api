@@ -7,19 +7,22 @@ getRows <- function(pool, table, ...) {
 }
 
 tool <- function(inputs, constants, curves) {
-  reps <- inputs$replicates
-  vals <- vapply(seq_len(3), function(i) {
-    v <- if (i <= length(reps)) reps[[i]] else NULL
-    if (is.null(v) || length(v) == 0L || is.na(v)) NA_real_ else as.numeric(v)
-  }, numeric(1))
+  # Each replicate is read by the portal's own column name, so a replicate entered alone stays
+  # on its own number instead of shifting to the first free slot.
+  num <- function(key) {
+    v <- inputs[[key]]
+    if (is.null(v) || length(v) == 0L) return(NA_real_)
+    v <- suppressWarnings(as.numeric(v[[1L]]))
+    if (length(v) == 0L) NA_real_ else v
+  }
 
   curve <- riverdata.tools::curve_df(curves$std_curve)
   pool <- list(standard_curves = curve)
 
   df <- data.frame(
-    DOC_rep_1 = vals[1],
-    DOC_rep_2 = vals[2],
-    DOC_rep_3 = vals[3],
+    DOC_rep_1 = num('DOC_rep_1'),
+    DOC_rep_2 = num('DOC_rep_2'),
+    DOC_rep_3 = num('DOC_rep_3'),
     doc_std_curve_id = if (is.null(curve)) NA_real_ else 1
   )
 
@@ -27,7 +30,17 @@ tool <- function(inputs, constants, curves) {
   stdev <- calcDOCsd(df, pool)
 
   out <- list()
-  if (is.numeric(avg) && length(avg) == 1L && is.finite(avg)) out$DOC_avg_ppb <- avg
-  if (is.numeric(stdev) && length(stdev) == 1L && is.finite(stdev)) out$DOC_sd_ppb <- stdev
+  # calcMean/calcSd return 'KEEP OLD' to leave the portal cell unchanged; this tool is
+  # stateless, so the key is omitted instead. The sentinel is tested before coercion because
+  # as.numeric('KEEP OLD') is NA and would be indistinguishable from a computed NaN. Nothing
+  # else is filtered: NaN and Inf are values the portal displays, so they are emitted.
+  emit <- function(key, value) {
+    if (identical(value, 'KEEP OLD')) return(invisible(NULL))
+    if (is.numeric(value) && length(value) == 1L && (is.nan(value) || !is.na(value))) {
+      out[[key]] <<- value
+    }
+  }
+  emit('DOC_avg_ppb', avg)
+  emit('DOC_sd_ppb', stdev)
   out
 }

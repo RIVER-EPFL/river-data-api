@@ -1,20 +1,14 @@
 {
   "label": "CO2 Air",
-  "description": "CH4 dry concentration from wet measurement",
+  "description": "Dry CH4 concentration from the wet CH4 and H2O readings of the CO2_air row",
   "params": [
-    { "name": "ch4_wet", "label": "CH4 Wet (ppm)", "kind": "number", "units": "ppm", "required": true, "default": null, "when": null },
-    { "name": "h2o_percent", "label": "H2O (%)", "kind": "number", "units": "%", "required": true, "default": null, "when": null },
-    { "name": "co2_ppm", "label": "Lab CO2 (ppm)", "kind": "number", "units": "ppm", "required": false, "default": null, "when": null },
-    { "name": "lab_temp_c", "label": "Lab Temp (°C, blank = lab average)", "kind": "number", "units": "degC", "required": false, "default": null, "when": null },
-    { "name": "lab_pressure_hpa", "label": "Lab Pressure (hPa, blank = lab average)", "kind": "number", "units": "hPa", "required": false, "default": null, "when": null },
-    { "name": "vol_sa_ml", "label": "Vol SA (mL, blank = constant)", "kind": "number", "units": "mL", "required": false, "default": null, "when": null },
-    { "name": "vol_water_ml", "label": "Vol Water (mL, blank = constant)", "kind": "number", "units": "mL", "required": false, "default": null, "when": null }
+    { "name": "ch4_wet", "label": "CH4 (lab_co2air_ch4, ppm)", "kind": "number", "units": "ppm", "required": false, "default": null, "when": null },
+    { "name": "h2o_percent", "label": "H2O (lab_co2air_h2o, %)", "kind": "number", "units": "%", "required": false, "default": null, "when": null }
   ],
   "outputs": [
-    { "key": "lab_co2air_ch4_dry", "label": "CH4 dry", "units": "ppm", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "lab_co2air_ch4_dry" },
-    { "key": "CO2_HS_Um", "label": "Headspace CO2", "units": "uM", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "CO2_HS_Um" }
+    { "key": "lab_co2air_ch4_dry", "label": "CH4 dry", "units": "ppm", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "lab_co2air_ch4_dry" }
   ],
-  "constants": ["lab_temp_avg_degC", "lab_press_avg_atm", "vol_sa", "vol_water", "c_const", "gas_const_r_atm"],
+  "constants": [],
   "curves": [],
-  "match_keywords": ["co2_air", "ch4", "methane", "headspace"]
+  "match_keywords": ["co2_air", "ch4", "methane", "dry"]
 }

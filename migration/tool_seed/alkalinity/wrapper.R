@@ -9,6 +9,10 @@ tool <- function(inputs, constants, curves) {
     if (length(v) == 0) NA_real_ else v
   }
 
+  # Only a genuine NA is a blank cell. NaN and Inf are values the portal displays,
+  # so they are emitted rather than filtered.
+  emit <- function(x) is.numeric(x) && length(x) == 1L && (!is.na(x) || is.nan(x))
+
   out <- list()
   echo_fields <- c(
     'Alk_meqL', 'Alk_mgL', 'Alk_w_weight_g', 'Alk_dyn_pH',
@@ -16,14 +20,14 @@ tool <- function(inputs, constants, curves) {
   )
   for (field in echo_fields) {
     v <- num(inputs[[field]])
-    if (is.finite(v)) out[[field]] <- v
+    if (emit(v)) out[[field]] <- v
   }
 
   ph <- calcEquals(data.frame(
     WTW_pH_1 = num(inputs[['WTW_pH_1']]),
     Alk_init_pH = num(inputs[['Alk_init_pH']])
   ))
-  if (is.numeric(ph) && length(ph) == 1 && is.finite(ph)) {
+  if (emit(ph)) {
     out[['WTW_pH_1']] <- ph
   }
 
