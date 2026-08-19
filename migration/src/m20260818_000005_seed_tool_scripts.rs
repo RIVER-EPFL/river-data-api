@@ -1,7 +1,7 @@
 use sea_orm::Statement;
 use sea_orm_migration::prelude::*;
 
-/// Seeds the 13 portal-lineage tools as version 1 of each script: the vendored CNET/METALP
+/// Seeds the 12 portal-lineage tools as version 1 of each script: the vendored CNET/METALP
 /// calculation functions this tool reaches (verbatim, see [`crate::tool_prelude`]) plus a thin
 /// wrapper per tool, with the manifest and the golden-derived test cases authored under
 /// `migration/tool_seed/`. Versions land
@@ -33,7 +33,6 @@ macro_rules! seed {
 const SEEDS: &[Seed] = &[
     seed!("alkalinity"),
     seed!("benthic"),
-    seed!("chla_benthic"),
     seed!("chlorophyll"),
     seed!("co2_air"),
     seed!("dic"),

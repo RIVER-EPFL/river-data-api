@@ -212,10 +212,6 @@ c <- function() 99
             ),
             ("benthic", include_str!("../tool_seed/benthic/wrapper.R")),
             (
-                "chla_benthic",
-                include_str!("../tool_seed/chla_benthic/wrapper.R"),
-            ),
-            (
                 "chlorophyll",
                 include_str!("../tool_seed/chlorophyll/wrapper.R"),
             ),

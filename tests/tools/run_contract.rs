@@ -347,7 +347,33 @@ async fn a_structured_param_is_checked_against_its_declaration() {
     {
         return;
     }
-    let (_db, app, token) = setup().await;
+    let (db, app, token) = setup().await;
+
+    // No seeded tool declares a structured param, so the probe carries one: a grid whose fields
+    // include a fixed-arity cell and an entry-only (send: false) column.
+    install_probe_tool(
+        &db,
+        &json!({
+            "label": "Probe",
+            "params": [
+                { "name": "replicates", "label": "Replicates", "kind": "replicate_grid",
+                  "required": false,
+                  "structure": { "rows": 5, "fields": [
+                      { "name": "fluor_before", "label": "Fluor 1", "required": true },
+                      { "name": "vol_total_ml", "label": "Vol total", "units": "mL" },
+                      { "name": "vol_after_ml", "label": "Vol after", "units": "mL" },
+                      { "name": "diameters_cm", "label": "Rock diameters", "units": "cm",
+                        "values": 3 },
+                      { "name": "wgt_dried_g", "label": "Filter dried", "units": "g",
+                        "send": false }
+                  ] } }
+            ],
+            "outputs": [
+                { "key": "verbose_seen", "label": "Verbose seen", "per_replicate": false }
+            ]
+        }),
+    )
+    .await;
 
     let row = |extra: serde_json::Value| {
         let mut base = json!({
@@ -361,28 +387,10 @@ async fn a_structured_param_is_checked_against_its_declaration() {
         json!({ "replicates": [base] })
     };
 
-    let declared = calculate(&app, "chla_benthic", row(json!({})), &token).await;
-    let undeclared = calculate(
-        &app,
-        "chla_benthic",
-        row(json!({ "fluor_middle": 12.0 })),
-        &token,
-    )
-    .await;
-    let entry_only = calculate(
-        &app,
-        "chla_benthic",
-        row(json!({ "wgt_dried_g": 0.02 })),
-        &token,
-    )
-    .await;
-    let wrong_arity = calculate(
-        &app,
-        "chla_benthic",
-        row(json!({ "diameters_cm": 10.0 })),
-        &token,
-    )
-    .await;
+    let declared = calculate(&app, PROBE, row(json!({})), &token).await;
+    let undeclared = calculate(&app, PROBE, row(json!({ "fluor_middle": 12.0 })), &token).await;
+    let entry_only = calculate(&app, PROBE, row(json!({ "wgt_dried_g": 0.02 })), &token).await;
+    let wrong_arity = calculate(&app, PROBE, row(json!({ "diameters_cm": 10.0 })), &token).await;
     // A flat replicate family is checked the same way: the declared cell is a number of its own,
     // and a list where a number is declared is refused rather than reaching the script.
     let flat_cell = calculate(&app, "nutrients", json!({ "NUT_TDP_rep_A": 7.0 }), &token).await;
@@ -408,6 +416,7 @@ async fn a_structured_param_is_checked_against_its_declaration() {
     }
     assert_eq!(flat_cell.0, 200, "{}", flat_cell.1);
     assert_eq!(flat_cell_wrong_arity.0, 400, "{}", flat_cell_wrong_arity.1);
+    remove_probe_tool(&db).await;
 }
 
 /// Expected behaviour: the `kind` vocabulary is closed, so a manifest naming an unknown kind is

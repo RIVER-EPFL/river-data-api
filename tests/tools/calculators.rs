@@ -82,13 +82,14 @@ async fn test_list_tools_excludes_removed() {
         "field_data",
         "co2_air",
         "benthic",
-        "chla_benthic",
         "discharge",
     ] {
         assert!(names.contains(&expected), "missing tool {expected}");
     }
     assert!(!names.contains(&"ions"));
     assert!(!names.contains(&"isotopes"));
+    // Retired: the portal has one Chl a tool, and chlorophyll is it.
+    assert!(!names.contains(&"chla_benthic"));
 }
 
 #[tokio::test]
@@ -106,6 +107,7 @@ async fn test_removed_tools_return_404() {
         "co2_dry",
         "spectral_slope",
         "percent_organic",
+        "chla_benthic",
     ] {
         let (status, _) = crate::common::post_json_parse_with_token(
             &app,
@@ -786,97 +788,6 @@ async fn test_benthic() {
     )
     .await;
     assert_value(&json, "benthic_AFDM_avg_gm2", 0.00318747879129481);
-}
-
-#[tokio::test]
-#[serial]
-async fn test_chla_benthic_full_chain() {
-    if !crate::common::tools_runner::require_runner_or_skip("test_chla_benthic_full_chain").await {
-        return;
-    }
-    let (app, token) = setup().await;
-
-    let json = calculate(
-        &app,
-        "chla_benthic",
-        serde_json::json!({
-            "acid_slope": 0.376772315730341,
-            "acid_intercept": -1.83187033934519,
-            "noacid_slope": 0.522898836783133,
-            "noacid_intercept": 1.0994464524556,
-            "replicates": [
-                {
-                    "fluor_before": 265.574415167794,
-                    "fluor_after": 141.826708782464,
-                    "vol_total_ml": 308.006711141206,
-                    "vol_after_ml": 124.730933833615,
-                    "diameters_cm": [12.0199799446855, 31.5325166042894, 20.1821500435472],
-                    "afdm_g_filter": 0.00878168280725367
-                },
-                {
-                    "fluor_before": 279.03967986349,
-                    "fluor_after": 130.257661403157,
-                    "vol_total_ml": 297.664363693912,
-                    "vol_after_ml": 89.2195254856027,
-                    "diameters_cm": [23.0023935288191, 25.7270285030827, 4.50553066353314],
-                    "afdm_g_filter": 0.00130143171176314
-                }
-            ]
-        }),
-        &token,
-    )
-    .await;
-
-    assert_value(&json, "Chla_noacid_ugL_avg", 143.488484846234);
-    assert_value(&json, "Chla_noacid_ugL_sd", 4.97871851443831);
-    assert_value(&json, "Chla_noacid_avg_ugm2", 4.72170111397028);
-    assert_value(&json, "Chla_noacid_sd_ugm2", 0.636780437655608);
-    assert_value(&json, "Chla_acid_ugL_avg", 49.5089574283813);
-    assert_value(&json, "Chla_acid_ugL_sd", 6.6695978487066);
-    assert_value(&json, "Chla_acid_avg_ugm2", 1.63733115106572);
-    assert_value(&json, "Chla_acid_sd_ugm2", 0.38237474117737);
-    assert_value(&json, "benthic_AFDM_avg_gm2", 0.0313778354472084);
-    assert_value(&json, "benthic_AFDM_sd_gm2", 0.0314246916989114);
-}
-
-#[tokio::test]
-#[serial]
-async fn test_chla_benthic_no_acid_omits_acid_keys() {
-    if !crate::common::tools_runner::require_runner_or_skip(
-        "test_chla_benthic_no_acid_omits_acid_keys",
-    )
-    .await
-    {
-        return;
-    }
-    let (app, token) = setup().await;
-
-    let json = calculate(
-        &app,
-        "chla_benthic",
-        serde_json::json!({
-            "acid_slope": 0.25,
-            "acid_intercept": -1.5,
-            "noacid_slope": 0.3,
-            "noacid_intercept": -2.0,
-            "replicates": [
-                {
-                    "fluor_before": 150.0,
-                    "vol_total_ml": 100.0,
-                    "vol_after_ml": 40.0,
-                    "diameters_cm": [10.0, 8.0, 6.0]
-                }
-            ]
-        }),
-        &token,
-    )
-    .await;
-
-    assert_value(&json, "Chla_noacid_ugL_avg", 43.0);
-    assert_absent(&json, "Chla_acid_ugL_avg");
-    assert_absent(&json, "benthic_AFDM_avg_gm2");
-    // Single replicate: SD is not computable, so it must be omitted.
-    assert_absent(&json, "Chla_noacid_ugL_sd");
 }
 
 #[tokio::test]
