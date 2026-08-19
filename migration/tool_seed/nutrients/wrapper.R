@@ -1,73 +1,96 @@
 tool <- function(inputs, constants, curves) {
   results <- list()
 
-  one_row_df <- function(vals) {
-    as.data.frame(as.list(stats::setNames(vals, paste0("r", seq_along(vals)))))
+  # The portal's replicate letters (nutrients_tool.R:202)
+  reps <- c('A', 'B', 'C')
+
+  # One cell. The input name IS the portal column, so a replicate a caller did
+  # not supply stays NA at its own letter and cannot be shifted onto another.
+  cell <- function(name) {
+    v <- suppressWarnings(as.numeric(unlist(inputs[[name]])))
+    if (length(v) == 0) NA_real_ else v[1]
   }
 
-  add_avg_sd <- function(vals, avg_key, sd_key) {
-    df <- one_row_df(vals)
-    avg <- calcMean(df)
-    if (is.numeric(avg) && !is.na(avg)) results[[avg_key]] <<- avg
-    stdev <- calcSd(df)
-    if (is.numeric(stdev) && !is.na(stdev)) results[[sd_key]] <<- stdev
+  rep_df <- function(param) {
+    cols <- paste0(param, '_rep_', reps)
+    stats::setNames(as.data.frame(lapply(cols, cell)), cols)
   }
 
-  # Pad or truncate to the portal's replicate letters A, B, C
-  reps_abc <- function(v) {
-    x <- rep(NA_real_, 3)
-    v <- suppressWarnings(as.numeric(unlist(v)))
-    n <- min(length(v), 3)
-    if (n > 0) x[seq_len(n)] <- v[seq_len(n)]
-    x
+  # nutrients_tool.R:100-101 -- the editable raw table is the NUT_* replicates
+  # WITHOUT the NUT_NO3 replicates, so a supplied NO3 replicate can never
+  # reach the calculation. The portal's column set is whatever the
+  # grab_param_categories rows for Nutrients / Old Nutrients hold (:69-79); the
+  # six below are the NUT_ bases the calculation loop at :237 names.
+  rawData <- dplyr::bind_cols(lapply(
+    c('NUT_P', 'NUT_NH4', 'NUT_NOx', 'NUT_NO2', 'NUT_TDP', 'NUT_TDN'),
+    rep_df
+  ))
+
+  # nutrients_tool.R:115 -- the Old Nutrients table
+  oldNut <- dplyr::bind_cols(lapply(c('NH4', 'SRP'), rep_df))
+
+  # Calculate NO3 (nutrients_tool.R:198-228)
+  no3 <- NULL
+  for (rep in reps) {
+    repName <- paste0('NUT_NO3_rep_', rep)
+    newCols <- stats::setNames(
+      data.frame(
+        repName = calcMinus(
+          select(
+            rawData,
+            (starts_with('NUT_NOx_rep_') | starts_with('NUT_NO2_rep_')) & ends_with(rep)
+          )
+        )
+      ),
+      repName
+    )
+    if (is.null(no3)) {
+      no3 <- newCols
+    } else {
+      no3 <- bind_cols(no3, newCols)
+    }
   }
 
-  species <- inputs$species
-  if (!is.null(species)) {
-    for (name in names(species)) {
-      vals <- suppressWarnings(as.numeric(unlist(species[[name]])))
-      if (length(vals) == 0) next
-      if (name == "NH4") {
-        avg_key <- "NH4_avg_ugL"
-        sd_key <- "NH4_sd_ugL"
-      } else if (name == "SRP") {
-        avg_key <- "SRP_avg_ugL"
-        sd_key <- "SRP_sd_ugL"
+  # The derived NO3 replicates are portal columns in their own right: the tool's
+  # returned df carries no3Updated() (nutrients_tool.R:328) and entry_layout.R:401-407
+  # writes every non-NA column of it back to the data table. The portal's own drop
+  # is is.na() (entry_layout.R:407), which also removes NaN, so the test here
+  # matches it rather than testing a sentinel: calcMinus returns numeric NA, never
+  # 'KEEP OLD' (calculation_functions.R:14-32).
+  for (rep in reps) {
+    repName <- paste0('NUT_NO3_rep_', rep)
+    v <- no3[[repName]]
+    if (!is.na(v)) results[[repName]] <- as.numeric(v)
+  }
+
+  # Calculate nutrients avg and sd (nutrients_tool.R:230-299)
+  oldNutrients <- c('NH4', 'SRP')
+
+  for (param in c('NUT_P', 'NUT_NH4', 'NUT_NOx', 'NUT_NO2', 'NUT_NO3', 'NUT_TDP', 'NUT_TDN', 'NH4', 'SRP')) {
+    if (param == 'NUT_NO3') {
+      df <- no3
+    } else {
+      if (param %in% oldNutrients) {
+        df <- oldNut %>% select(starts_with(param))
       } else {
-        base <- sub("^NUT_", "", name)
-        avg_key <- paste0("NUT_", base, "_avg")
-        sd_key <- paste0("NUT_", base, "_sd")
+        df <- rawData %>% select(starts_with(param))
       }
-      add_avg_sd(vals, avg_key, sd_key)
     }
 
-    # NO3 per replicate letter: calcMinus(NOx_rep, NO2_rep), NA propagates
-    keys <- names(species)
-    base_lower <- tolower(sub("^NUT_", "", keys))
-    nox_i <- match("nox", base_lower)
-    no2_i <- match("no2", base_lower)
-    if (!is.na(nox_i) && !is.na(no2_i)) {
-      nox <- reps_abc(species[[keys[nox_i]]])
-      no2 <- reps_abc(species[[keys[no2_i]]])
-      no3 <- vapply(
-        1:3,
-        function(i) calcMinus(data.frame(a = nox[i], b = no2[i])),
-        numeric(1)
-      )
-      add_avg_sd(no3, "NUT_NO3_avg", "NUT_NO3_sd")
+    newMean <- calcMean(df)
+    newSd <- calcSd(df)
+    if (param %in% oldNutrients) {
+      meanCol <- paste0(param, '_avg_ugL')
+      sdCol <- paste0(param, '_sd_ugL')
+    } else {
+      meanCol <- paste0(param, '_avg')
+      sdCol <- paste0(param, '_sd')
     }
-  } else if (!is.null(inputs$replicates)) {
-    vals <- suppressWarnings(as.numeric(unlist(inputs$replicates)))
-    if (length(vals) > 0) {
-      add_avg_sd(vals, "NUT_avg", "NUT_sd")
-    }
-    if (!is.null(inputs$nox) && !is.null(inputs$no2)) {
-      no3 <- calcMinus(data.frame(
-        a = suppressWarnings(as.numeric(inputs$nox)),
-        b = suppressWarnings(as.numeric(inputs$no2))
-      ))
-      if (!is.na(no3)) results[["NUT_NO3_avg"]] <- no3
-    }
+
+    # 'KEEP OLD' carries the stored value forward in the portal; this tool is
+    # stateless, so the key is omitted instead.
+    if (!identical(newMean, 'KEEP OLD')) results[[meanCol]] <- as.numeric(newMean)
+    if (!identical(newSd, 'KEEP OLD')) results[[sdCol]] <- as.numeric(newSd)
   }
 
   results

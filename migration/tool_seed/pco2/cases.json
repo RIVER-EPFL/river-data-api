@@ -2,10 +2,18 @@
   "tolerance": 1e-09,
   "cases": [
     {
-      "name": "simple_ref_25c",
+      "name": "full_chain_replicates",
       "inputs": {
-        "co2_aq_umol": 50.0,
-        "water_temp_c": 25.0
+        "water_temp_c": 20.6511107342085,
+        "pressure_hpa": 1038.70408887742,
+        "lab_co2_co2ppm_rep_A": 3774.31004084647,
+        "lab_co2_co2ppm_rep_B": 4934.01614744216,
+        "lab_co2_h2o_rep_A": 3.04813831089996,
+        "lab_co2_h2o_rep_B": 3.24556990689598,
+        "lab_co2_ch4_rep_A": 476.103632267332,
+        "lab_co2_ch4_rep_B": 24.531420403393,
+        "lab_temp_c": 17.0519462262746,
+        "lab_pressure_hpa": 1012.5826292476703
       },
       "constants": {
         "c_const": 2400.0,
@@ -20,125 +28,47 @@
       },
       "curves": {},
       "expected": {
-        "pCO2_HS_uatm_avg": 1470.58823529412
-      }
-    },
-    {
-      "name": "simple_rand",
-      "inputs": {
-        "mode": "simple",
-        "variant": "simple",
-        "co2_aq_umol": 98.7105750234332,
-        "water_temp_c": 16.121560754953
+        "lab_co2_ch4_dry_A": 494.0143479802389,
+        "CH4_calc_umol_L_A": 21305.10261632701,
+        "CO2_HS_Um_A": 318.26554063262745,
+        "pCO2_HS_uatm_A": 8309.284807103812,
+        "pCO2_HS_P1_uatm_A": 8518.024283035533,
+        "pCO2_HS_P2_uatm_A": 8105.660621685999,
+        "lab_co2_ch4_dry_B": 25.51407677730517,
+        "CH4_calc_umol_L_B": 1100.331608306882,
+        "CO2_HS_Um_B": 416.0567890982303,
+        "pCO2_HS_uatm_B": 10862.4212023534,
+        "pCO2_HS_P1_uatm_B": 11135.298611392309,
+        "pCO2_HS_P2_uatm_B": 10596.230823717751,
+        "CO2_HS_Um_avg": 367.1611648654289,
+        "CO2_HS_Um_sd": 69.14885493072633,
+        "pCO2_HS_uatm_avg": 9585.853004728606,
+        "pCO2_HS_uatm_sd": 1805.3400583751616,
+        "pCO2_HS_P1_uatm_avg": 9826.66144721392,
+        "pCO2_HS_P1_uatm_sd": 1850.692425806543,
+        "pCO2_HS_P2_uatm_avg": 9350.945722701876,
+        "pCO2_HS_P2_uatm_sd": 1761.0990788778015,
+        "CH4_umol_L_avg": 11202.717112316946,
+        "CH4_umol_L_sd": 14286.930592092389
       },
-      "constants": {
-        "c_const": 2400.0,
-        "gas_const_r_atm": 0.0820574,
-        "gas_const_r_mol": 8.31446,
-        "h_ch4_29815k": 0.00213,
-        "ch4_in_sa": 2e-06,
-        "lab_temp_avg_degC": 22.5,
-        "lab_press_avg_atm": 0.957237,
-        "vol_sa": 0.03,
-        "vol_water": 0.03
-      },
-      "curves": {},
-      "expected": {
-        "pCO2_HS_uatm_avg": 2267.70608075372
-      }
-    },
-    {
-      "name": "simple_p1",
-      "inputs": {
-        "mode": "simple",
-        "variant": "p1",
-        "co2_aq_umol": 91.7222944833338,
-        "water_temp_c": 17.1143137903418,
-        "pressure_hpa": 762.549967609812
-      },
-      "constants": {
-        "c_const": 2400.0,
-        "gas_const_r_atm": 0.0820574,
-        "gas_const_r_mol": 8.31446,
-        "h_ch4_29815k": 0.00213,
-        "ch4_in_sa": 2e-06,
-        "lab_temp_avg_degC": 22.5,
-        "lab_press_avg_atm": 0.957237,
-        "vol_sa": 0.03,
-        "vol_water": 0.03
-      },
-      "curves": {},
-      "expected": {
-        "pCO2_HS_P1_uatm_avg": 1631.44817309937
-      }
-    },
-    {
-      "name": "simple_p2",
-      "inputs": {
-        "mode": "simple",
-        "variant": "p2",
-        "co2_aq_umol": 428.630126288626,
-        "water_temp_c": 10.2541278962744,
-        "pressure_hpa": 949.228653381579
-      },
-      "constants": {
-        "c_const": 2400.0,
-        "gas_const_r_atm": 0.0820574,
-        "gas_const_r_mol": 8.31446,
-        "h_ch4_29815k": 0.00213,
-        "ch4_in_sa": 2e-06,
-        "lab_temp_avg_degC": 22.5,
-        "lab_press_avg_atm": 0.957237,
-        "vol_sa": 0.03,
-        "vol_water": 0.03
-      },
-      "curves": {},
-      "expected": {
-        "pCO2_HS_P2_uatm_avg": 8852.23144290214
-      }
-    },
-    {
-      "name": "simple_null_co2aq",
-      "inputs": {
-        "mode": "simple",
-        "co2_aq_umol": null,
-        "water_temp_c": 15.0
-      },
-      "constants": {
-        "c_const": 2400.0,
-        "gas_const_r_atm": 0.0820574,
-        "gas_const_r_mol": 8.31446,
-        "h_ch4_29815k": 0.00213,
-        "ch4_in_sa": 2e-06,
-        "lab_temp_avg_degC": 22.5,
-        "lab_press_avg_atm": 0.957237,
-        "vol_sa": 0.03,
-        "vol_water": 0.03
-      },
-      "curves": {},
-      "expected": {},
       "absent": [
-        "pCO2_HS_uatm_avg"
+        "d13C_CO2_avg",
+        "d13C_CO2_sd"
       ]
     },
     {
-      "name": "full_chain_replicates",
+      "name": "full_water_temp_at_reference_pco2_is_co2_over_0034",
       "inputs": {
-        "mode": "full_pipeline",
-        "water_temp_c": 20.6511107342085,
+        "water_temp_c": 25.0,
         "pressure_hpa": 1038.70408887742,
-        "co2_ppm": 3774.31004084647,
-        "h2o_percent": 3.04813831089996,
-        "ch4_ppm": 476.103632267332,
+        "lab_co2_co2ppm_rep_A": 3774.31004084647,
+        "lab_co2_co2ppm_rep_B": 4934.01614744216,
+        "lab_co2_h2o_rep_A": 3.04813831089996,
+        "lab_co2_h2o_rep_B": 3.24556990689598,
+        "lab_co2_ch4_rep_A": 476.103632267332,
+        "lab_co2_ch4_rep_B": 24.531420403393,
         "lab_temp_c": 17.0519462262746,
-        "lab_pressure_hpa": 1012.5826292476703,
-        "vol_sa_ml": 0.0489402941428125,
-        "vol_water_ml": 0.0271797092910856,
-        "replicate_b": {
-          "co2_ppm": 4934.01614744216,
-          "h2o_percent": 3.24556990689598,
-          "ch4_ppm": 24.531420403393
-        }
+        "lab_pressure_hpa": 1012.5826292476703
       },
       "constants": {
         "c_const": 2400.0,
@@ -153,28 +83,528 @@
       },
       "curves": {},
       "expected": {
-        "CO2_HS_Um_A": 445.077179799069,
-        "CO2_HS_Um_B": 581.832962374793,
-        "CO2_HS_Um_avg": 513.455071086931,
-        "CO2_HS_Um_sd": 96.7009412257675,
-        "pCO2_HS_uatm_A": 11620.086298824,
-        "pCO2_HS_uatm_B": 15190.5097388902,
-        "pCO2_HS_uatm_avg": 13405.2980188571,
-        "pCO2_HS_uatm_sd": 2524.67062617817,
-        "pCO2_HS_P1_uatm_A": 11911.9971889435,
-        "pCO2_HS_P1_uatm_B": 15572.1140665359,
-        "pCO2_HS_P1_uatm_avg": 13742.0556277397,
-        "pCO2_HS_P1_uatm_sd": 2588.09346408091,
-        "pCO2_HS_P2_uatm_A": 11335.3288663841,
-        "pCO2_HS_P2_uatm_B": 14818.2568623227,
-        "pCO2_HS_P2_uatm_avg": 13076.7928643534,
-        "pCO2_HS_P2_uatm_sd": 2462.80200431262,
-        "lab_co2_ch4_dry_A": 494.014347980239,
-        "lab_co2_ch4_dry_B": 25.5140767773052,
-        "CH4_calc_umol_L_A": 21305.102616327,
-        "CH4_calc_umol_L_B": 1100.33160830688,
-        "CH4_umol_L_avg": 11202.7171123169,
-        "CH4_umol_L_sd": 14286.9305920924
+        "lab_co2_ch4_dry_A": 494.0143479802389,
+        "CH4_calc_umol_L_A": 21322.624195572876,
+        "CO2_HS_Um_A": 318.26554063262745,
+        "pCO2_HS_uatm_A": 9360.751195077277,
+        "pCO2_HS_P1_uatm_A": 9595.904802655774,
+        "pCO2_HS_P2_uatm_A": 9131.360172715538,
+        "lab_co2_ch4_dry_B": 25.51407677730517,
+        "CH4_calc_umol_L_B": 1101.2365470631337,
+        "CO2_HS_Um_B": 416.0567890982303,
+        "pCO2_HS_uatm_B": 12236.964385242067,
+        "pCO2_HS_P1_uatm_B": 12544.372013223092,
+        "pCO2_HS_P2_uatm_B": 11937.089972127542,
+        "CO2_HS_Um_avg": 367.1611648654289,
+        "CO2_HS_Um_sd": 69.14885493072633,
+        "pCO2_HS_uatm_avg": 10798.857790159673,
+        "pCO2_HS_uatm_sd": 2033.789850903716,
+        "pCO2_HS_P1_uatm_avg": 11070.138407939434,
+        "pCO2_HS_P1_uatm_sd": 2084.8811586983347,
+        "pCO2_HS_P2_uatm_avg": 10534.225072421541,
+        "pCO2_HS_P2_uatm_sd": 1983.9505673413994,
+        "CH4_umol_L_avg": 11211.930371318005,
+        "CH4_umol_L_sd": 14298.680331263133
+      },
+      "absent": [
+        "d13C_CO2_avg",
+        "d13C_CO2_sd"
+      ]
+    },
+    {
+      "name": "full_no_water_temp_still_yields_headspace_co2",
+      "inputs": {
+        "water_temp_c": null,
+        "pressure_hpa": 1038.70408887742,
+        "lab_co2_co2ppm_rep_A": 3774.31004084647,
+        "lab_co2_co2ppm_rep_B": 4934.01614744216,
+        "lab_co2_h2o_rep_A": 3.04813831089996,
+        "lab_co2_h2o_rep_B": 3.24556990689598,
+        "lab_co2_ch4_rep_A": 476.103632267332,
+        "lab_co2_ch4_rep_B": 24.531420403393,
+        "lab_temp_c": 17.0519462262746,
+        "lab_pressure_hpa": 1012.5826292476703
+      },
+      "constants": {
+        "c_const": 2400.0,
+        "gas_const_r_atm": 0.0820574,
+        "gas_const_r_mol": 8.31446,
+        "h_ch4_29815k": 0.00213,
+        "ch4_in_sa": 2e-06,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237,
+        "vol_sa": 0.03,
+        "vol_water": 0.03
+      },
+      "curves": {},
+      "expected": {
+        "lab_co2_ch4_dry_A": 494.0143479802389,
+        "CO2_HS_Um_A": 318.26554063262745,
+        "lab_co2_ch4_dry_B": 25.51407677730517,
+        "CO2_HS_Um_B": 416.0567890982303,
+        "CO2_HS_Um_avg": 367.1611648654289,
+        "CO2_HS_Um_sd": 69.14885493072633
+      },
+      "absent": [
+        "CH4_calc_umol_L_A",
+        "pCO2_HS_uatm_A",
+        "pCO2_HS_P1_uatm_A",
+        "pCO2_HS_P2_uatm_A",
+        "CH4_calc_umol_L_B",
+        "pCO2_HS_uatm_B",
+        "pCO2_HS_P1_uatm_B",
+        "pCO2_HS_P2_uatm_B",
+        "pCO2_HS_uatm_avg",
+        "pCO2_HS_uatm_sd",
+        "pCO2_HS_P1_uatm_avg",
+        "pCO2_HS_P1_uatm_sd",
+        "pCO2_HS_P2_uatm_avg",
+        "pCO2_HS_P2_uatm_sd",
+        "d13C_CO2_avg",
+        "d13C_CO2_sd",
+        "CH4_umol_L_avg",
+        "CH4_umol_L_sd"
+      ]
+    },
+    {
+      "name": "full_field_pressure_out_of_band_uses_altitude",
+      "inputs": {
+        "water_temp_c": 20.6511107342085,
+        "pressure_hpa": 1120.0,
+        "lab_co2_co2ppm_rep_A": 3774.31004084647,
+        "lab_co2_co2ppm_rep_B": 4934.01614744216,
+        "lab_co2_h2o_rep_A": 3.04813831089996,
+        "lab_co2_h2o_rep_B": 3.24556990689598,
+        "lab_co2_ch4_rep_A": 476.103632267332,
+        "lab_co2_ch4_rep_B": 24.531420403393,
+        "lab_temp_c": 17.0519462262746,
+        "lab_pressure_hpa": 1012.5826292476703,
+        "pressure_altitude_hpa": 863.0
+      },
+      "constants": {
+        "c_const": 2400.0,
+        "gas_const_r_atm": 0.0820574,
+        "gas_const_r_mol": 8.31446,
+        "h_ch4_29815k": 0.00213,
+        "ch4_in_sa": 2e-06,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237,
+        "vol_sa": 0.03,
+        "vol_water": 0.03
+      },
+      "curves": {},
+      "expected": {
+        "lab_co2_ch4_dry_A": 494.0143479802389,
+        "CH4_calc_umol_L_A": 21546.103899725214,
+        "CO2_HS_Um_A": 318.26554063262745,
+        "pCO2_HS_uatm_A": 8309.284807103812,
+        "pCO2_HS_P1_uatm_A": 7077.140674592242,
+        "pCO2_HS_P2_uatm_A": 9755.947660252536,
+        "lab_co2_ch4_dry_B": 25.51407677730517,
+        "CH4_calc_umol_L_B": 1112.778600320793,
+        "CO2_HS_Um_B": 416.0567890982303,
+        "pCO2_HS_uatm_B": 10862.4212023534,
+        "pCO2_HS_P1_uatm_B": 9251.684675678247,
+        "pCO2_HS_P2_uatm_B": 12753.590131268345,
+        "CO2_HS_Um_avg": 367.1611648654289,
+        "CO2_HS_Um_sd": 69.14885493072633,
+        "pCO2_HS_uatm_avg": 9585.853004728606,
+        "pCO2_HS_uatm_sd": 1805.3400583751616,
+        "pCO2_HS_P1_uatm_avg": 8164.412675135245,
+        "pCO2_HS_P1_uatm_sd": 1537.6348091564412,
+        "pCO2_HS_P2_uatm_avg": 11254.76889576044,
+        "pCO2_HS_P2_uatm_sd": 2119.6533188280778,
+        "CH4_umol_L_avg": 11329.441250023003,
+        "CH4_umol_L_sd": 14448.542881399508
+      },
+      "absent": [
+        "d13C_CO2_avg",
+        "d13C_CO2_sd"
+      ]
+    },
+    {
+      "name": "full_no_field_pressure_no_altitude",
+      "inputs": {
+        "water_temp_c": 20.6511107342085,
+        "pressure_hpa": null,
+        "lab_co2_co2ppm_rep_A": 3774.31004084647,
+        "lab_co2_co2ppm_rep_B": 4934.01614744216,
+        "lab_co2_h2o_rep_A": 3.04813831089996,
+        "lab_co2_h2o_rep_B": 3.24556990689598,
+        "lab_co2_ch4_rep_A": 476.103632267332,
+        "lab_co2_ch4_rep_B": 24.531420403393,
+        "lab_temp_c": 17.0519462262746,
+        "lab_pressure_hpa": 1012.5826292476703
+      },
+      "constants": {
+        "c_const": 2400.0,
+        "gas_const_r_atm": 0.0820574,
+        "gas_const_r_mol": 8.31446,
+        "h_ch4_29815k": 0.00213,
+        "ch4_in_sa": 2e-06,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237,
+        "vol_sa": 0.03,
+        "vol_water": 0.03
+      },
+      "curves": {},
+      "expected": {
+        "lab_co2_ch4_dry_A": 494.0143479802389,
+        "CO2_HS_Um_A": 318.26554063262745,
+        "pCO2_HS_uatm_A": 8309.284807103812,
+        "lab_co2_ch4_dry_B": 25.51407677730517,
+        "CO2_HS_Um_B": 416.0567890982303,
+        "pCO2_HS_uatm_B": 10862.4212023534,
+        "CO2_HS_Um_avg": 367.1611648654289,
+        "CO2_HS_Um_sd": 69.14885493072633,
+        "pCO2_HS_uatm_avg": 9585.853004728606,
+        "pCO2_HS_uatm_sd": 1805.3400583751616
+      },
+      "absent": [
+        "pCO2_HS_P1_uatm_A",
+        "pCO2_HS_P1_uatm_B",
+        "pCO2_HS_P1_uatm_avg",
+        "pCO2_HS_P1_uatm_sd",
+        "pCO2_HS_P2_uatm_A",
+        "pCO2_HS_P2_uatm_B",
+        "pCO2_HS_P2_uatm_avg",
+        "pCO2_HS_P2_uatm_sd",
+        "CH4_calc_umol_L_A",
+        "CH4_calc_umol_L_B",
+        "CH4_umol_L_avg",
+        "CH4_umol_L_sd",
+        "d13C_CO2_avg",
+        "d13C_CO2_sd"
+      ]
+    },
+    {
+      "name": "full_lab_temp_cst",
+      "inputs": {
+        "water_temp_c": 20.6511107342085,
+        "pressure_hpa": 1038.70408887742,
+        "lab_co2_co2ppm_rep_A": 3774.31004084647,
+        "lab_co2_co2ppm_rep_B": 4934.01614744216,
+        "lab_co2_h2o_rep_A": 3.04813831089996,
+        "lab_co2_h2o_rep_B": 3.24556990689598,
+        "lab_co2_ch4_rep_A": 476.103632267332,
+        "lab_co2_ch4_rep_B": 24.531420403393,
+        "lab_temp_c": null,
+        "lab_pressure_hpa": 1012.5826292476703,
+        "lab_temp_mode": "cst"
+      },
+      "constants": {
+        "c_const": 2400.0,
+        "gas_const_r_atm": 0.0820574,
+        "gas_const_r_mol": 8.31446,
+        "h_ch4_29815k": 0.00213,
+        "ch4_in_sa": 2e-06,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237,
+        "vol_sa": 0.03,
+        "vol_water": 0.03
+      },
+      "curves": {},
+      "expected": {
+        "lab_co2_ch4_dry_A": 494.0143479802389,
+        "CH4_calc_umol_L_A": 20790.30714997137,
+        "CO2_HS_Um_A": 292.74834118582396,
+        "pCO2_HS_uatm_A": 7643.081116746058,
+        "pCO2_HS_P1_uatm_A": 7835.084734849176,
+        "pCO2_HS_P2_uatm_A": 7455.782666565465,
+        "lab_co2_ch4_dry_B": 25.51407677730517,
+        "CH4_calc_umol_L_B": 1073.7442659719122,
+        "CO2_HS_Um_B": 382.6990965013089,
+        "pCO2_HS_uatm_B": 9991.517717971517,
+        "pCO2_HS_P1_uatm_B": 10242.516958053988,
+        "pCO2_HS_P2_uatm_B": 9746.66937017265,
+        "CO2_HS_Um_avg": 337.7237188435664,
+        "CO2_HS_Um_sd": 63.604789056431265,
+        "pCO2_HS_uatm_avg": 8817.299417358787,
+        "pCO2_HS_uatm_sd": 1660.5954459132104,
+        "pCO2_HS_P1_uatm_avg": 9038.800846451582,
+        "pCO2_HS_P1_uatm_sd": 1702.3116502751284,
+        "pCO2_HS_P2_uatm_avg": 8601.226018369058,
+        "pCO2_HS_P2_uatm_sd": 1619.9015230507375,
+        "CH4_umol_L_avg": 10932.025707971641,
+        "CH4_umol_L_sd": 13941.71531696701
+      },
+      "absent": [
+        "d13C_CO2_avg",
+        "d13C_CO2_sd"
+      ]
+    },
+    {
+      "name": "full_lab_pressure_cst",
+      "inputs": {
+        "water_temp_c": 20.6511107342085,
+        "pressure_hpa": 1038.70408887742,
+        "lab_co2_co2ppm_rep_A": 3774.31004084647,
+        "lab_co2_co2ppm_rep_B": 4934.01614744216,
+        "lab_co2_h2o_rep_A": 3.04813831089996,
+        "lab_co2_h2o_rep_B": 3.24556990689598,
+        "lab_co2_ch4_rep_A": 476.103632267332,
+        "lab_co2_ch4_rep_B": 24.531420403393,
+        "lab_temp_c": 17.0519462262746,
+        "lab_pressure_hpa": null,
+        "lab_pressure_mode": "cst"
+      },
+      "constants": {
+        "c_const": 2400.0,
+        "gas_const_r_atm": 0.0820574,
+        "gas_const_r_mol": 8.31446,
+        "h_ch4_29815k": 0.00213,
+        "ch4_in_sa": 2e-06,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237,
+        "vol_sa": 0.03,
+        "vol_water": 0.03
+      },
+      "curves": {},
+      "expected": {
+        "lab_co2_ch4_dry_A": 494.0143479802389,
+        "CH4_calc_umol_L_A": 21305.10261632701,
+        "CO2_HS_Um_A": 304.85634303531134,
+        "pCO2_HS_uatm_A": 7959.197136131464,
+        "pCO2_HS_P1_uatm_A": 8159.141978269136,
+        "pCO2_HS_P2_uatm_A": 7764.152066543887,
+        "lab_co2_ch4_dry_B": 25.51407677730517,
+        "CH4_calc_umol_L_B": 1100.331608306882,
+        "CO2_HS_Um_B": 398.52744022296883,
+        "pCO2_HS_uatm_B": 10404.764517315785,
+        "pCO2_HS_P1_uatm_B": 10666.145026343549,
+        "pCO2_HS_P2_uatm_B": 10149.789300015338,
+        "CO2_HS_Um_avg": 351.69189162914006,
+        "CO2_HS_Um_sd": 66.23546802257675,
+        "pCO2_HS_uatm_avg": 9181.980826723624,
+        "pCO2_HS_uatm_sd": 1729.2772790840602,
+        "pCO2_HS_P1_uatm_avg": 9412.643502306342,
+        "pCO2_HS_P1_uatm_sd": 1772.7188557487614,
+        "pCO2_HS_P2_uatm_avg": 8956.970683279613,
+        "pCO2_HS_P2_uatm_sd": 1686.9002652387783,
+        "CH4_umol_L_avg": 11202.717112316946,
+        "CH4_umol_L_sd": 14286.930592092389
+      },
+      "absent": [
+        "d13C_CO2_avg",
+        "d13C_CO2_sd"
+      ]
+    },
+    {
+      "name": "full_both_cst",
+      "inputs": {
+        "water_temp_c": 20.6511107342085,
+        "pressure_hpa": 1038.70408887742,
+        "lab_co2_co2ppm_rep_A": 3774.31004084647,
+        "lab_co2_co2ppm_rep_B": 4934.01614744216,
+        "lab_co2_h2o_rep_A": 3.04813831089996,
+        "lab_co2_h2o_rep_B": 3.24556990689598,
+        "lab_co2_ch4_rep_A": 476.103632267332,
+        "lab_co2_ch4_rep_B": 24.531420403393,
+        "lab_temp_c": null,
+        "lab_pressure_hpa": null,
+        "lab_temp_mode": "cst",
+        "lab_pressure_mode": "cst"
+      },
+      "constants": {
+        "c_const": 2400.0,
+        "gas_const_r_atm": 0.0820574,
+        "gas_const_r_mol": 8.31446,
+        "h_ch4_29815k": 0.00213,
+        "ch4_in_sa": 2e-06,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237,
+        "vol_sa": 0.03,
+        "vol_water": 0.03
+      },
+      "curves": {},
+      "expected": {
+        "lab_co2_ch4_dry_A": 494.0143479802389,
+        "CH4_calc_umol_L_A": 20790.30714997137,
+        "CO2_HS_Um_A": 280.41423694870065,
+        "pCO2_HS_uatm_A": 7321.062010489548,
+        "pCO2_HS_P1_uatm_A": 7504.976111740082,
+        "pCO2_HS_P2_uatm_A": 7141.654838526354,
+        "lab_co2_ch4_dry_B": 25.51407677730517,
+        "CH4_calc_umol_L_B": 1073.7442659719122,
+        "CO2_HS_Um_B": 366.57517747727644,
+        "pCO2_HS_uatm_B": 9570.554031136142,
+        "pCO2_HS_P1_uatm_B": 9810.978144548124,
+        "pCO2_HS_P2_uatm_B": 9336.021659960083,
+        "CO2_HS_Um_avg": 323.49470721298854,
+        "CO2_HS_Um_sd": 60.92498532116678,
+        "pCO2_HS_uatm_avg": 8445.808020812845,
+        "pCO2_HS_uatm_sd": 1590.631062024236,
+        "pCO2_HS_P1_uatm_avg": 8657.977128144103,
+        "pCO2_HS_P1_uatm_sd": 1630.5896748285297,
+        "pCO2_HS_P2_uatm_avg": 8238.838249243217,
+        "pCO2_HS_P2_uatm_sd": 1551.6516598465594,
+        "CH4_umol_L_avg": 10932.025707971641,
+        "CH4_umol_L_sd": 13941.71531696701
+      },
+      "absent": [
+        "d13C_CO2_avg",
+        "d13C_CO2_sd"
+      ]
+    },
+    {
+      "name": "full_lab_temp_db_missing_computes_nothing",
+      "inputs": {
+        "water_temp_c": 20.6511107342085,
+        "pressure_hpa": 1038.70408887742,
+        "lab_co2_co2ppm_rep_A": 3774.31004084647,
+        "lab_co2_co2ppm_rep_B": 4934.01614744216,
+        "lab_co2_h2o_rep_A": 3.04813831089996,
+        "lab_co2_h2o_rep_B": 3.24556990689598,
+        "lab_co2_ch4_rep_A": 476.103632267332,
+        "lab_co2_ch4_rep_B": 24.531420403393,
+        "lab_temp_c": null,
+        "lab_pressure_hpa": 1012.5826292476703
+      },
+      "constants": {
+        "c_const": 2400.0,
+        "gas_const_r_atm": 0.0820574,
+        "gas_const_r_mol": 8.31446,
+        "h_ch4_29815k": 0.00213,
+        "ch4_in_sa": 2e-06,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237,
+        "vol_sa": 0.03,
+        "vol_water": 0.03
+      },
+      "curves": {},
+      "expected": {
+        "lab_co2_ch4_dry_A": 494.0143479802389,
+        "lab_co2_ch4_dry_B": 25.51407677730517
+      },
+      "absent": [
+        "CO2_HS_Um_A",
+        "CO2_HS_Um_B",
+        "CO2_HS_Um_avg",
+        "CO2_HS_Um_sd",
+        "pCO2_HS_uatm_A",
+        "pCO2_HS_uatm_B",
+        "pCO2_HS_uatm_avg",
+        "pCO2_HS_uatm_sd",
+        "pCO2_HS_P1_uatm_A",
+        "pCO2_HS_P1_uatm_B",
+        "pCO2_HS_P1_uatm_avg",
+        "pCO2_HS_P1_uatm_sd",
+        "pCO2_HS_P2_uatm_A",
+        "pCO2_HS_P2_uatm_B",
+        "pCO2_HS_P2_uatm_avg",
+        "pCO2_HS_P2_uatm_sd",
+        "CH4_calc_umol_L_A",
+        "CH4_calc_umol_L_B",
+        "CH4_umol_L_avg",
+        "CH4_umol_L_sd",
+        "d13C_CO2_avg",
+        "d13C_CO2_sd"
+      ]
+    },
+    {
+      "name": "full_lab_pressure_db_missing_computes_nothing",
+      "inputs": {
+        "water_temp_c": 20.6511107342085,
+        "pressure_hpa": 1038.70408887742,
+        "lab_co2_co2ppm_rep_A": 3774.31004084647,
+        "lab_co2_co2ppm_rep_B": 4934.01614744216,
+        "lab_co2_h2o_rep_A": 3.04813831089996,
+        "lab_co2_h2o_rep_B": 3.24556990689598,
+        "lab_co2_ch4_rep_A": 476.103632267332,
+        "lab_co2_ch4_rep_B": 24.531420403393,
+        "lab_temp_c": 17.0519462262746,
+        "lab_pressure_hpa": null
+      },
+      "constants": {
+        "c_const": 2400.0,
+        "gas_const_r_atm": 0.0820574,
+        "gas_const_r_mol": 8.31446,
+        "h_ch4_29815k": 0.00213,
+        "ch4_in_sa": 2e-06,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237,
+        "vol_sa": 0.03,
+        "vol_water": 0.03
+      },
+      "curves": {},
+      "expected": {
+        "lab_co2_ch4_dry_A": 494.0143479802389,
+        "lab_co2_ch4_dry_B": 25.51407677730517
+      },
+      "absent": [
+        "CH4_calc_umol_L_A",
+        "CO2_HS_Um_A",
+        "pCO2_HS_uatm_A",
+        "pCO2_HS_P1_uatm_A",
+        "pCO2_HS_P2_uatm_A",
+        "CH4_calc_umol_L_B",
+        "CO2_HS_Um_B",
+        "pCO2_HS_uatm_B",
+        "pCO2_HS_P1_uatm_B",
+        "pCO2_HS_P2_uatm_B",
+        "CO2_HS_Um_avg",
+        "CO2_HS_Um_sd",
+        "pCO2_HS_uatm_avg",
+        "pCO2_HS_uatm_sd",
+        "pCO2_HS_P1_uatm_avg",
+        "pCO2_HS_P1_uatm_sd",
+        "pCO2_HS_P2_uatm_avg",
+        "pCO2_HS_P2_uatm_sd",
+        "d13C_CO2_avg",
+        "d13C_CO2_sd",
+        "CH4_umol_L_avg",
+        "CH4_umol_L_sd"
+      ]
+    },
+    {
+      "name": "full_lab_pressure_above_1050_still_computes",
+      "inputs": {
+        "water_temp_c": 20.6511107342085,
+        "pressure_hpa": 1038.70408887742,
+        "lab_co2_co2ppm_rep_A": 3774.31004084647,
+        "lab_co2_co2ppm_rep_B": 4934.01614744216,
+        "lab_co2_h2o_rep_A": 3.04813831089996,
+        "lab_co2_h2o_rep_B": 3.24556990689598,
+        "lab_co2_ch4_rep_A": 476.103632267332,
+        "lab_co2_ch4_rep_B": 24.531420403393,
+        "lab_temp_c": 17.0519462262746,
+        "lab_pressure_hpa": 1100.0
+      },
+      "constants": {
+        "c_const": 2400.0,
+        "gas_const_r_atm": 0.0820574,
+        "gas_const_r_mol": 8.31446,
+        "h_ch4_29815k": 0.00213,
+        "ch4_in_sa": 2e-06,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237,
+        "vol_sa": 0.03,
+        "vol_water": 0.03
+      },
+      "curves": {},
+      "expected": {
+        "lab_co2_ch4_dry_A": 494.0143479802389,
+        "CH4_calc_umol_L_A": 21305.10261632701,
+        "CO2_HS_Um_A": 345.7417543850244,
+        "pCO2_HS_uatm_A": 9026.634492639085,
+        "pCO2_HS_P1_uatm_A": 9253.394676838068,
+        "pCO2_HS_P2_uatm_A": 8805.43120760346,
+        "lab_co2_ch4_dry_B": 25.51407677730517,
+        "CH4_calc_umol_L_B": 1100.331608306882,
+        "CO2_HS_Um_B": 451.9754287589231,
+        "pCO2_HS_uatm_B": 11800.185957630314,
+        "pCO2_HS_P1_uatm_B": 12096.62117316015,
+        "pCO2_HS_P2_uatm_B": 11511.01507118447,
+        "CO2_HS_Um_avg": 398.85859157197376,
+        "CO2_HS_Um_sd": 75.11855154014732,
+        "pCO2_HS_uatm_avg": 10413.4102251347,
+        "pCO2_HS_uatm_sd": 1961.1970488651814,
+        "pCO2_HS_P1_uatm_avg": 10675.00792499911,
+        "pCO2_HS_P1_uatm_sd": 2010.464735998613,
+        "pCO2_HS_P2_uatm_avg": 10158.223139393966,
+        "pCO2_HS_P2_uatm_sd": 1913.1366970070314,
+        "CH4_umol_L_avg": 11202.717112316946,
+        "CH4_umol_L_sd": 14286.930592092389
       },
       "absent": [
         "d13C_CO2_avg",
@@ -184,16 +614,13 @@
     {
       "name": "full_single_replicate",
       "inputs": {
-        "mode": "full_pipeline",
-        "co2_ppm": 1948.85404438246,
-        "h2o_percent": 0.735638707876205,
-        "ch4_ppm": 460.312546770787,
-        "water_temp_c": 21.2557258531451,
-        "pressure_hpa": 701.397235167678,
-        "lab_temp_c": 25.3489387768786,
-        "lab_pressure_hpa": 1012.0665925456998,
-        "vol_sa_ml": 0.0618785464856774,
-        "vol_water_ml": 0.0312846276443452
+        "water_temp_c": 20.6511107342085,
+        "pressure_hpa": 1038.70408887742,
+        "lab_co2_co2ppm_rep_A": 3774.31004084647,
+        "lab_co2_h2o_rep_A": 3.04813831089996,
+        "lab_co2_ch4_rep_A": 476.103632267332,
+        "lab_temp_c": 17.0519462262746,
+        "lab_pressure_hpa": 1012.5826292476703
       },
       "constants": {
         "c_const": 2400.0,
@@ -208,49 +635,44 @@
       },
       "curves": {},
       "expected": {
-        "CO2_HS_Um_A": 222.752143856327,
-        "CO2_HS_Um_avg": 222.752143856327,
-        "pCO2_HS_uatm_A": 5914.00488118328,
-        "pCO2_HS_uatm_avg": 5914.00488118328,
-        "pCO2_HS_P1_uatm_A": 4093.82351091054,
-        "pCO2_HS_P1_uatm_avg": 4093.82351091054,
-        "pCO2_HS_P2_uatm_A": 8543.46887242348,
-        "pCO2_HS_P2_uatm_avg": 8543.46887242348,
-        "lab_co2_ch4_dry_A": 464.486168928859,
-        "CH4_calc_umol_L_A": 19750.7234756919,
-        "CH4_umol_L_avg": 19750.7234756919
+        "lab_co2_ch4_dry_A": 494.0143479802389,
+        "CH4_calc_umol_L_A": 21305.10261632701,
+        "CO2_HS_Um_A": 318.26554063262745,
+        "pCO2_HS_uatm_A": 8309.284807103812,
+        "pCO2_HS_P1_uatm_A": 8518.024283035533,
+        "pCO2_HS_P2_uatm_A": 8105.660621685999,
+        "CO2_HS_Um_avg": 318.26554063262745,
+        "pCO2_HS_uatm_avg": 8309.284807103812,
+        "pCO2_HS_P1_uatm_avg": 8518.024283035533,
+        "pCO2_HS_P2_uatm_avg": 8105.660621685999,
+        "CH4_umol_L_avg": 21305.10261632701
       },
       "absent": [
         "CO2_HS_Um_B",
         "CO2_HS_Um_sd",
+        "pCO2_HS_uatm_B",
         "pCO2_HS_uatm_sd",
+        "pCO2_HS_P1_uatm_B",
         "pCO2_HS_P1_uatm_sd",
+        "pCO2_HS_P2_uatm_B",
         "pCO2_HS_P2_uatm_sd",
-        "CH4_umol_L_sd",
         "lab_co2_ch4_dry_B",
         "CH4_calc_umol_L_B",
+        "CH4_umol_L_sd",
         "d13C_CO2_avg",
         "d13C_CO2_sd"
       ]
     },
     {
-      "name": "replicates_b_ch4_null",
+      "name": "replicate_b_measured_alone_lands_on_b",
       "inputs": {
-        "mode": "full_pipeline",
-        "co2_ppm": 8263.05160177872,
-        "h2o_percent": 0.787222562707029,
-        "ch4_ppm": 207.219911463093,
-        "water_temp_c": 3.04996281699277,
-        "pressure_hpa": 916.916371730622,
-        "lab_temp_c": 19.0539715520572,
-        "lab_pressure_hpa": 1023.4268931891035,
-        "vol_sa_ml": 0.0318444831157103,
-        "vol_water_ml": 0.0555050109233707,
-        "replicate_b": {
-          "co2_ppm": 5472.87488330621,
-          "h2o_percent": 2.82327316619921,
-          "ch4_ppm": null
-        }
+        "water_temp_c": 20.6511107342085,
+        "pressure_hpa": 1038.70408887742,
+        "lab_co2_co2ppm_rep_B": 4934.01614744216,
+        "lab_co2_h2o_rep_B": 3.24556990689598,
+        "lab_co2_ch4_rep_B": 24.531420403393,
+        "lab_temp_c": 17.0519462262746,
+        "lab_pressure_hpa": 1012.5826292476703
       },
       "constants": {
         "c_const": 2400.0,
@@ -265,82 +687,47 @@
       },
       "curves": {},
       "expected": {
-        "CO2_HS_Um_A": 533.970491512567,
-        "CO2_HS_Um_B": 353.665187180573,
-        "CO2_HS_Um_avg": 443.81783934657,
-        "CO2_HS_Um_sd": 127.495103377057,
-        "pCO2_HS_uatm_avg": 6884.93998844392,
-        "pCO2_HS_uatm_sd": 1977.82977102468,
-        "pCO2_HS_P1_uatm_avg": 6230.36189863022,
-        "pCO2_HS_P1_uatm_sd": 1789.789782925,
-        "pCO2_HS_P2_uatm_avg": 7608.28976161013,
-        "pCO2_HS_P2_uatm_sd": 2185.62573128481,
-        "CH4_umol_L_avg": 8972.44385343201
+        "lab_co2_ch4_dry_B": 25.51407677730517,
+        "CH4_calc_umol_L_B": 1100.331608306882,
+        "CO2_HS_Um_B": 416.0567890982303,
+        "pCO2_HS_uatm_B": 10862.4212023534,
+        "pCO2_HS_P1_uatm_B": 11135.298611392309,
+        "pCO2_HS_P2_uatm_B": 10596.230823717751,
+        "CO2_HS_Um_avg": 416.0567890982303,
+        "pCO2_HS_uatm_avg": 10862.4212023534,
+        "pCO2_HS_P1_uatm_avg": 11135.298611392309,
+        "pCO2_HS_P2_uatm_avg": 10596.230823717751,
+        "CH4_umol_L_avg": 1100.331608306882
       },
       "absent": [
-        "CH4_umol_L_sd",
-        "lab_co2_ch4_dry_B",
-        "CH4_calc_umol_L_B"
-      ]
-    },
-    {
-      "name": "replicates_b_co2_null",
-      "inputs": {
-        "mode": "full_pipeline",
-        "co2_ppm": 4957.4859023327,
-        "h2o_percent": 0.611183129600249,
-        "ch4_ppm": 443.824193796143,
-        "water_temp_c": 15.4784172986401,
-        "pressure_hpa": 859.631423722021,
-        "lab_temp_c": 16.7667456460185,
-        "lab_pressure_hpa": 951.2829171833986,
-        "vol_sa_ml": 0.0306493385694921,
-        "vol_water_ml": 0.0558977861050516,
-        "replicate_b": {
-          "co2_ppm": null,
-          "h2o_percent": 0.446297154412605,
-          "ch4_ppm": 12.9821120002307
-        }
-      },
-      "constants": {
-        "c_const": 2400.0,
-        "gas_const_r_atm": 0.0820574,
-        "gas_const_r_mol": 8.31446,
-        "h_ch4_29815k": 0.00213,
-        "ch4_in_sa": 2e-06,
-        "lab_temp_avg_degC": 22.5,
-        "lab_press_avg_atm": 0.957237,
-        "vol_sa": 0.03,
-        "vol_water": 0.03
-      },
-      "curves": {},
-      "expected": {
-        "CO2_HS_Um_A": 306.162855094443,
-        "CO2_HS_Um_avg": 306.162855094443,
-        "pCO2_HS_uatm_avg": 6904.72895708478,
-        "pCO2_HS_P1_uatm_avg": 5857.90474591015,
-        "pCO2_HS_P2_uatm_avg": 8138.62362717503,
-        "CH4_umol_L_avg": 10040.7199425829,
-        "CH4_umol_L_sd": 13394.2157982225
-      },
-      "absent": [
-        "CO2_HS_Um_B",
+        "lab_co2_ch4_dry_A",
+        "CH4_calc_umol_L_A",
+        "CO2_HS_Um_A",
+        "pCO2_HS_uatm_A",
+        "pCO2_HS_P1_uatm_A",
+        "pCO2_HS_P2_uatm_A",
         "CO2_HS_Um_sd",
         "pCO2_HS_uatm_sd",
         "pCO2_HS_P1_uatm_sd",
         "pCO2_HS_P2_uatm_sd",
-        "pCO2_HS_uatm_B"
+        "CH4_umol_L_sd",
+        "d13C_CO2_avg",
+        "d13C_CO2_sd"
       ]
     },
     {
-      "name": "lab_conditions_from_constants",
+      "name": "full_replicate_b_ch4_null",
       "inputs": {
-        "mode": "full_pipeline",
-        "water_temp_c": 20.0,
-        "pressure_hpa": 1013.0,
-        "co2_ppm": 3000.0,
-        "h2o_percent": 3.0,
-        "ch4_ppm": 400.0
+        "water_temp_c": 20.6511107342085,
+        "pressure_hpa": 1038.70408887742,
+        "lab_co2_co2ppm_rep_A": 3774.31004084647,
+        "lab_co2_co2ppm_rep_B": 4934.01614744216,
+        "lab_co2_h2o_rep_A": 3.04813831089996,
+        "lab_co2_h2o_rep_B": 3.24556990689598,
+        "lab_co2_ch4_rep_A": 476.103632267332,
+        "lab_co2_ch4_rep_B": null,
+        "lab_temp_c": 17.0519462262746,
+        "lab_pressure_hpa": 1012.5826292476703
       },
       "constants": {
         "c_const": 2400.0,
@@ -355,34 +742,49 @@
       },
       "curves": {},
       "expected": {
-        "CO2_HS_Um_avg": 222.88648832289235,
-        "pCO2_HS_uatm_avg": 5714.498393938127,
-        "pCO2_HS_P1_uatm_avg": 5713.08845108248,
-        "pCO2_HS_P2_uatm_avg": 5715.90868475598,
-        "lab_co2_ch4_dry_A": 414.81,
-        "CH4_umol_L_avg": 17477.20618308861
+        "lab_co2_ch4_dry_A": 494.0143479802389,
+        "CH4_calc_umol_L_A": 21305.10261632701,
+        "CO2_HS_Um_A": 318.26554063262745,
+        "pCO2_HS_uatm_A": 8309.284807103812,
+        "pCO2_HS_P1_uatm_A": 8518.024283035533,
+        "pCO2_HS_P2_uatm_A": 8105.660621685999,
+        "CO2_HS_Um_B": 416.0567890982303,
+        "pCO2_HS_uatm_B": 10862.4212023534,
+        "pCO2_HS_P1_uatm_B": 11135.298611392309,
+        "pCO2_HS_P2_uatm_B": 10596.230823717751,
+        "CO2_HS_Um_avg": 367.1611648654289,
+        "CO2_HS_Um_sd": 69.14885493072633,
+        "pCO2_HS_uatm_avg": 9585.853004728606,
+        "pCO2_HS_uatm_sd": 1805.3400583751616,
+        "pCO2_HS_P1_uatm_avg": 9826.66144721392,
+        "pCO2_HS_P1_uatm_sd": 1850.692425806543,
+        "pCO2_HS_P2_uatm_avg": 9350.945722701876,
+        "pCO2_HS_P2_uatm_sd": 1761.0990788778015,
+        "CH4_umol_L_avg": 21305.10261632701
       },
       "absent": [
-        "CO2_HS_Um_B",
-        "CO2_HS_Um_sd"
+        "lab_co2_ch4_dry_B",
+        "CH4_calc_umol_L_B",
+        "CH4_umol_L_sd",
+        "d13C_CO2_avg",
+        "d13C_CO2_sd"
       ]
     },
     {
-      "name": "d13c_both_replicates",
+      "name": "full_d13c_both_replicates",
       "inputs": {
-        "mode": "full_pipeline",
-        "water_temp_c": 20.0,
-        "pressure_hpa": 1013.0,
-        "co2_ppm": 3000.0,
-        "h2o_percent": 3.0,
-        "ch4_ppm": 400.0,
-        "d13co2_permil": -12.5,
-        "replicate_b": {
-          "co2_ppm": 3100.0,
-          "h2o_percent": 2.9,
-          "ch4_ppm": 410.0,
-          "d13co2_permil": -13.1
-        }
+        "water_temp_c": 20.6511107342085,
+        "pressure_hpa": 1038.70408887742,
+        "lab_co2_co2ppm_rep_A": 3774.31004084647,
+        "lab_co2_co2ppm_rep_B": 4934.01614744216,
+        "lab_co2_h2o_rep_A": 3.04813831089996,
+        "lab_co2_h2o_rep_B": 3.24556990689598,
+        "lab_co2_ch4_rep_A": 476.103632267332,
+        "lab_co2_ch4_rep_B": 24.531420403393,
+        "lab_temp_c": 17.0519462262746,
+        "lab_pressure_hpa": 1012.5826292476703,
+        "lab_co2_ico2_rep_A": -12.5,
+        "lab_co2_ico2_rep_B": -13.1
       },
       "constants": {
         "c_const": 2400.0,
@@ -397,25 +799,47 @@
       },
       "curves": {},
       "expected": {
+        "lab_co2_ch4_dry_A": 494.0143479802389,
+        "CH4_calc_umol_L_A": 21305.10261632701,
+        "CO2_HS_Um_A": 318.26554063262745,
+        "pCO2_HS_uatm_A": 8309.284807103812,
+        "pCO2_HS_P1_uatm_A": 8518.024283035533,
+        "pCO2_HS_P2_uatm_A": 8105.660621685999,
+        "lab_co2_ch4_dry_B": 25.51407677730517,
+        "CH4_calc_umol_L_B": 1100.331608306882,
+        "CO2_HS_Um_B": 416.0567890982303,
+        "pCO2_HS_uatm_B": 10862.4212023534,
+        "pCO2_HS_P1_uatm_B": 11135.298611392309,
+        "pCO2_HS_P2_uatm_B": 10596.230823717751,
+        "CO2_HS_Um_avg": 367.1611648654289,
+        "CO2_HS_Um_sd": 69.14885493072633,
+        "pCO2_HS_uatm_avg": 9585.853004728606,
+        "pCO2_HS_uatm_sd": 1805.3400583751616,
+        "pCO2_HS_P1_uatm_avg": 9826.66144721392,
+        "pCO2_HS_P1_uatm_sd": 1850.692425806543,
+        "pCO2_HS_P2_uatm_avg": 9350.945722701876,
+        "pCO2_HS_P2_uatm_sd": 1761.0990788778015,
         "d13C_CO2_avg": -12.8,
-        "d13C_CO2_sd": 0.4242640687119285
-      }
+        "d13C_CO2_sd": 0.42426406871192823,
+        "CH4_umol_L_avg": 11202.717112316946,
+        "CH4_umol_L_sd": 14286.930592092389
+      },
+      "absent": []
     },
     {
-      "name": "d13c_one_sided",
+      "name": "full_d13c_one_sided",
       "inputs": {
-        "mode": "full_pipeline",
-        "water_temp_c": 20.0,
-        "pressure_hpa": 1013.0,
-        "co2_ppm": 3000.0,
-        "h2o_percent": 3.0,
-        "ch4_ppm": 400.0,
-        "d13co2_permil": -12.5,
-        "replicate_b": {
-          "co2_ppm": 3100.0,
-          "h2o_percent": 2.9,
-          "ch4_ppm": 410.0
-        }
+        "water_temp_c": 20.6511107342085,
+        "pressure_hpa": 1038.70408887742,
+        "lab_co2_co2ppm_rep_A": 3774.31004084647,
+        "lab_co2_co2ppm_rep_B": 4934.01614744216,
+        "lab_co2_h2o_rep_A": 3.04813831089996,
+        "lab_co2_h2o_rep_B": 3.24556990689598,
+        "lab_co2_ch4_rep_A": 476.103632267332,
+        "lab_co2_ch4_rep_B": 24.531420403393,
+        "lab_temp_c": 17.0519462262746,
+        "lab_pressure_hpa": 1012.5826292476703,
+        "lab_co2_ico2_rep_A": -12.5
       },
       "constants": {
         "c_const": 2400.0,
@@ -430,12 +854,34 @@
       },
       "curves": {},
       "expected": {
-        "d13C_CO2_avg": -12.5
+        "lab_co2_ch4_dry_A": 494.0143479802389,
+        "CH4_calc_umol_L_A": 21305.10261632701,
+        "CO2_HS_Um_A": 318.26554063262745,
+        "pCO2_HS_uatm_A": 8309.284807103812,
+        "pCO2_HS_P1_uatm_A": 8518.024283035533,
+        "pCO2_HS_P2_uatm_A": 8105.660621685999,
+        "lab_co2_ch4_dry_B": 25.51407677730517,
+        "CH4_calc_umol_L_B": 1100.331608306882,
+        "CO2_HS_Um_B": 416.0567890982303,
+        "pCO2_HS_uatm_B": 10862.4212023534,
+        "pCO2_HS_P1_uatm_B": 11135.298611392309,
+        "pCO2_HS_P2_uatm_B": 10596.230823717751,
+        "CO2_HS_Um_avg": 367.1611648654289,
+        "CO2_HS_Um_sd": 69.14885493072633,
+        "pCO2_HS_uatm_avg": 9585.853004728606,
+        "pCO2_HS_uatm_sd": 1805.3400583751616,
+        "pCO2_HS_P1_uatm_avg": 9826.66144721392,
+        "pCO2_HS_P1_uatm_sd": 1850.692425806543,
+        "pCO2_HS_P2_uatm_avg": 9350.945722701876,
+        "pCO2_HS_P2_uatm_sd": 1761.0990788778015,
+        "d13C_CO2_avg": -12.5,
+        "CH4_umol_L_avg": 11202.717112316946,
+        "CH4_umol_L_sd": 14286.930592092389
       },
       "absent": [
         "d13C_CO2_sd"
       ]
     }
   ],
-  "notes": "Follows the portal orchestration (pco2_tool.R): both replicate slots always run through calcCH4dry -> calcCO2 -> calcpCO2/P1/P2 -> calcCH4, so a single-replicate full_pipeline run emits the _A keys alongside the _avg keys, where the Rust impl emitted only _avg (full_single_replicate, lab_conditions_from_constants). d13C avg/sd come from calcMean/calcSd over the A/B pair (na.rm), so a one-sided d13C yields the lone value as avg with sd absent, matching the Rust pco2 behavior. Simple mode with a missing co2_aq_umol returns the key absent (portal NA) where the Rust impl returned 400; simple-mode P1/P2 pass pressure_hpa through the portal Field_BP band check (700-1050 hPa, fallback altitude NA), so an out-of-band pressure omits the key rather than computing with it. An entered lab_pressure_hpa outside 700-1050 hPa raises an error, mirroring the Rust guard against atm-style entries. vol_sa_ml/vol_water_ml request overrides are substituted into the constants frame because the portal calcCO2 reads volumes from the constants table only. Gas constants used: c_const, gas_const_r_atm, gas_const_r_mol, h_ch4_29815k, ch4_in_sa; lab fallbacks: lab_temp_avg_degC, lab_press_avg_atm (atm, applied without conversion), vol_sa, vol_water. calcCH4 uses the portal's 0.957237 atm literal, not the entered lab pressure. No curves."
+  "notes": "Strict 1:1 with the portal pCO2 tool (modules/tools_tab/tools/pco2_tool.R). The portal has a single control flow: pco2_tool.R:207 loops for rep in c('A','B') unconditionally, calling calcCH4dry -> calcCO2 -> calcCH4/calcpCO2/calcpCO2P1/calcpCO2P2 (:224-260), then :280-297 takes calcMean/calcSd over the A/B pair for CO2_HS_Um, pCO2_HS_uatm, pCO2_HS_P1_uatm, pCO2_HS_P2_uatm, d13C_CO2 and CH4 (the CH4 pair is spelled CH4_umol_L_avg/_sd, :291-296). There is no single-value entry point in the portal, so the tool has no mode selector and no co2_aq_umol input: every case is the replicate chain.\n\nThe four measured columns are declared one param per replicate cell, named for the portal's own columns with the entry grid's _rep_ marker: lab_co2_co2ppm_rep_A/B, lab_co2_h2o_rep_A/B, lab_co2_ch4_rep_A/B and lab_co2_ico2_rep_A/B (pco2_tool.R:209-210 selects lab_co2_co2ppm/h2o/ch4 by their trailing letter, :283 reads lab_co2_ico2 for the d13C pair). The letter therefore travels in the field name. replicate_b_measured_alone_lands_on_b pins what that buys: a sample measured only in B yields the B keys and the B values, byte for byte those of full_chain_replicates, with the A keys absent and the _sd keys absent. Under a positional declaration that request could not be expressed, because the entry form drops a blank cell rather than sending a hole, so a lone B arrived as A and was computed and filed under the wrong letter.\n\nNo input is required. calcCO2 (calculation_functions.R:794-883) has no water-temperature term, so a row with no field temperature still yields the CH4-dry and headspace-CO2 columns; full_no_water_temp_still_yields_headspace_co2 pins that. The portal likewise computes with whatever the row holds and leaves the rest blank.\n\nLab temperature and lab pressure are the portal's two checkboxes (pco2_tool.R:28-29 for the UI, 194-204 for the mapping to 'cst'/'db'), modelled here as the explicit enums lab_temp_mode and lab_pressure_mode, both defaulting to 'db' because both checkboxes default to FALSE. The portal never passes calcCO2/calcCH4 the 'default' mode, so 'db' with a blank entry yields NA rather than falling back to the constant: full_lab_temp_db_missing_computes_nothing and full_lab_pressure_db_missing_computes_nothing pin that (only the two lab_co2_ch4_dry keys survive). calcCO2 converts a db lab pressure hPa->atm and uses lab_press_avg_atm as-is in cst mode; calcCH4 uses the 0.957237 atm literal in the formula and reads labPa only for its NA check, so the lab pressure mode moves CO2 but not CH4 (full_lab_pressure_cst leaves the CH4 keys equal to full_chain_replicates).\n\nField barometric pressure comes from the row's Field_BP with Field_BP_altitude as the fallback (pco2_tool.R:191 selects both into fieldData). calcCH4, calcpCO2P1 and calcpCO2P2 take Field_BP when it is present and within 700-1050 hPa and drop to Field_BP_altitude otherwise; both are declared inputs (pressure_hpa, pressure_altitude_hpa) so the fallback path is reachable. full_field_pressure_out_of_band_uses_altitude pins it; full_no_field_pressure_no_altitude pins that with neither pressure the P1/P2 and CH4 keys are absent while CO2_HS_Um and pCO2_HS_uatm still compute.\n\nThe portal applies no bound to lab_co2_lab_press; the 700-1050 hPa band exists only for field pressure, and there the portal falls back silently rather than failing. full_lab_pressure_above_1050_still_computes pins that a 1100 hPa lab pressure computes instead of raising.\n\nVolumes are constants only: calcCO2 reads vol_sa/vol_water from the constants table and the tool tab offers no control for them (its two editable tables are rawData at :104 and labCst at :119-124), so there are no vol_sa_ml/vol_water_ml request overrides. All cases use the constants-table values (vol_sa = vol_water = 0.03).\n\nThe portal's 'KEEP OLD' carry-forward (pco2_tool.R:301-315, which re-reads the stored row when calcMean/calcSd have nothing to average) is deliberately not emulated: these tools are stateless and have no stored row to fall back to. calcMean/calcSd return the character 'KEEP OLD' in that case and the wrapper omits the key, which is also how a portal tools-tab NA displays. full_single_replicate, replicate_b_measured_alone_lands_on_b, full_replicate_b_ch4_null and full_d13c_one_sided pin the omissions (a lone value still yields _avg; _sd is absent).\n\nfull_water_temp_at_reference_pco2_is_co2_over_0034 is the hand-checkable case: at 25 degC the van't Hoff exponential in calcpCO2 (calculation_functions.R:888-932) is 1, so pCO2_HS_uatm_{rep} is exactly CO2_HS_Um_{rep} / 0.034 (318.26554063262745 / 0.034 = 9360.751195077277).\n\nExpected values were derived from the portal formulas independently (a python transcription of calcCH4dry/calcCO2/calcCH4/calcpCO2/calcpCO2P1/calcpCO2P2/calcMean/calcSd) and then confirmed against the live OpenCPU runner at digits=17.\n\nOmission follows the portal exactly: a key is dropped when calcMean/calcSd return the 'KEEP OLD' sentinel (tested before coercion, since as.numeric('KEEP OLD') is NA) or when a prelude function returns as.numeric(NA) for a row it cannot compute. Nothing else is filtered. NaN and Inf are values the portal displays, so the wrapper emits them; they serialise to JSON null and the API drops nulls, so a case that produced one would list the key under absent with that reason. No case in this file reaches either."
 }

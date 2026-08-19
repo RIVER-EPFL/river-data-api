@@ -3,7 +3,7 @@
   "cases": [
     {
       "name": "rust_pin_with_curve",
-      "inputs": { "replicates": [120.0, 125.0, 118.0] },
+      "inputs": { "DOC_rep_1": 120.0, "DOC_rep_2": 125.0, "DOC_rep_3": 118.0 },
       "constants": {},
       "curves": { "std_curve": { "slope": 1.05, "intercept": -2.0 } },
       "expected": { "DOC_avg_ppb": 125.05, "DOC_sd_ppb": 3.78582883923719 },
@@ -11,7 +11,7 @@
     },
     {
       "name": "golden_no_curve",
-      "inputs": { "replicates": [120.0, 125.0, 118.0] },
+      "inputs": { "DOC_rep_1": 120.0, "DOC_rep_2": 125.0, "DOC_rep_3": 118.0 },
       "constants": {},
       "curves": {},
       "expected": { "DOC_avg_ppb": 121.0, "DOC_sd_ppb": 3.60555127546399 },
@@ -19,7 +19,15 @@
     },
     {
       "name": "single_replicate_omits_sd",
-      "inputs": { "replicates": [120.0] },
+      "inputs": { "DOC_rep_1": 120.0 },
+      "constants": {},
+      "curves": {},
+      "expected": { "DOC_avg_ppb": 120.0 },
+      "absent": ["DOC_sd_ppb"]
+    },
+    {
+      "name": "lone_second_replicate_stays_on_its_own_number",
+      "inputs": { "DOC_rep_2": 120.0 },
       "constants": {},
       "curves": {},
       "expected": { "DOC_avg_ppb": 120.0 },
@@ -27,7 +35,7 @@
     },
     {
       "name": "all_null_omits_both",
-      "inputs": { "replicates": [null, null, null] },
+      "inputs": { "DOC_rep_1": null, "DOC_rep_2": null, "DOC_rep_3": null },
       "constants": {},
       "curves": {},
       "expected": {},
@@ -35,7 +43,7 @@
     },
     {
       "name": "one_null_no_curve",
-      "inputs": { "replicates": [120.0, null, 118.0] },
+      "inputs": { "DOC_rep_1": 120.0, "DOC_rep_2": null, "DOC_rep_3": 118.0 },
       "constants": {},
       "curves": {},
       "expected": { "DOC_avg_ppb": 119.0, "DOC_sd_ppb": 1.4142135623731 },
@@ -43,52 +51,52 @@
     },
     {
       "name": "golden_avg_rand_1",
-      "inputs": { "replicates": [190.671224833932, 245.170278369915, 230.796007509343] },
+      "inputs": { "DOC_rep_1": 190.671224833932, "DOC_rep_2": 245.170278369915, "DOC_rep_3": 230.796007509343 },
       "constants": {},
       "curves": { "std_curve": { "slope": 0.961278225202113, "intercept": -0.97404258325696 } },
-      "expected": { "DOC_avg_ppb": 212.633998467253 },
+      "expected": { "DOC_avg_ppb": 212.633998467253, "DOC_sd_ppb": 27.1515432188154 },
       "absent": []
     },
     {
       "name": "golden_avg_rand_9_null_with_curve",
-      "inputs": { "replicates": [null, 467.760288110003, 472.654093289748] },
+      "inputs": { "DOC_rep_1": null, "DOC_rep_2": 467.760288110003, "DOC_rep_3": 472.654093289748 },
       "constants": {},
       "curves": { "std_curve": { "slope": 1.10074498825707, "intercept": 2.28358845226467 } },
-      "expected": { "DOC_avg_ppb": 519.861797057587 },
+      "expected": { "DOC_avg_ppb": 519.861797057587, "DOC_sd_ppb": 3.80906510051530 },
       "absent": []
     },
     {
       "name": "golden_sd_rand_1_with_curve",
-      "inputs": { "replicates": [108.206150960177, 429.328132607043, 410.717265773565] },
+      "inputs": { "DOC_rep_1": 108.206150960177, "DOC_rep_2": 429.328132607043, "DOC_rep_3": 410.717265773565 },
       "constants": {},
       "curves": { "std_curve": { "slope": 0.932979776454158, "intercept": -3.29249400179833 } },
-      "expected": { "DOC_sd_ppb": 168.186120201977 },
+      "expected": { "DOC_avg_ppb": 291.607345506960, "DOC_sd_ppb": 168.186120201977 },
       "absent": []
     },
     {
       "name": "golden_sd_rand_2_no_curve",
-      "inputs": { "replicates": [74.2234499659389, 429.851801227778, 476.666156097781] },
+      "inputs": { "DOC_rep_1": 74.2234499659389, "DOC_rep_2": 429.851801227778, "DOC_rep_3": 476.666156097781 },
       "constants": {},
       "curves": {},
-      "expected": { "DOC_sd_ppb": 220.084544270995 },
+      "expected": { "DOC_avg_ppb": 326.913802430499, "DOC_sd_ppb": 220.084544270995 },
       "absent": []
     },
     {
-      "name": "empty_replicates_omits_both",
-      "inputs": { "replicates": [] },
+      "name": "no_replicates_omits_both",
+      "inputs": {},
       "constants": {},
       "curves": {},
       "expected": {},
       "absent": ["DOC_avg_ppb", "DOC_sd_ppb"]
     },
     {
-      "name": "two_replicates_padded",
-      "inputs": { "replicates": [271.935691975523, 399.443094816525] },
+      "name": "two_replicates_third_absent",
+      "inputs": { "DOC_rep_1": 271.935691975523, "DOC_rep_2": 399.443094816525 },
       "constants": {},
       "curves": { "std_curve": { "slope": 1.01862098516431, "intercept": -4.9273814773187 } },
-      "expected": { "DOC_avg_ppb": 337.012879132948 },
+      "expected": { "DOC_avg_ppb": 337.012879132948, "DOC_sd_ppb": 91.8402423462114 },
       "absent": []
     }
   ],
-  "notes": "No portal-vs-Rust divergence for this tool: both average the curve-corrected replicates and take their sd (na.rm). The wrapper pads the replicates array to the portal's three DOC_rep columns with NA; more than three replicates is not representable in the portal row shape and yields no result (calcDOC ncol check). A lone replicate yields an average and no sd (portal sd is 'KEEP OLD', key omitted), matching the pinned Rust behavior."
+  "notes": "No portal-vs-Rust divergence for this tool: both average the curve-corrected replicates and take their sd (na.rm). The three replicates are declared as the portal's own columns DOC_rep_1/2/3 and read by name, so a replicate entered alone keeps its number (lone_second_replicate_stays_on_its_own_number); an absent replicate is NA in the row the portal builds. A lone replicate yields an average and no sd: calcSd returns the 'KEEP OLD' sentinel, which carries the stored value forward in the portal, and this tool is stateless, so the key is omitted. The sentinel is the only omission; no plausibility filter is applied, so a NaN or Inf would be emitted as the portal displays it. calcMean and calcSd over finite replicates reach neither, so no case pins one."
 }

@@ -2,12 +2,20 @@
   "tolerance": 1e-9,
   "cases": [
     {
-      "name": "pinned_full",
+      "name": "portal_full_row",
       "inputs": { "a254": 0.15, "doc_avg_ppb": 2500.0, "peak_a": 0.4, "peak_c": 0.2, "peak_m": 0.25, "peak_t": 0.1 },
       "constants": {},
       "curves": {},
       "expected": { "SUVA": 0.06, "A_T": 4.0, "C_A": 0.5, "C_M": 0.8, "C_T": 2.0 },
-      "absent": ["absorbance_ratio"]
+      "absent": []
+    },
+    {
+      "name": "ratio_orders_are_asymmetric",
+      "inputs": { "peak_a": 2.0, "peak_c": 8.0, "peak_m": 4.0, "peak_t": 0.5 },
+      "constants": {},
+      "curves": {},
+      "expected": { "A_T": 4.0, "C_A": 4.0, "C_M": 2.0, "C_T": 16.0 },
+      "absent": ["SUVA"]
     },
     {
       "name": "suva_typical",
@@ -15,71 +23,92 @@
       "constants": {},
       "curves": {},
       "expected": { "SUVA": 0.06 },
-      "absent": ["absorbance_ratio", "A_T", "C_A", "C_M", "C_T"]
-    },
-    {
-      "name": "suva_na_a254",
-      "inputs": { "a254": null, "doc_avg_ppb": 2500.0 },
-      "constants": {},
-      "curves": {},
-      "expected": {},
-      "absent": ["SUVA", "absorbance_ratio", "A_T", "C_A", "C_M", "C_T"]
+      "absent": ["A_T", "C_A", "C_M", "C_T"]
     },
     {
       "name": "suva_rand",
       "inputs": { "a254": 0.431367069631815, "doc_avg_ppb": 1354.24065175466 },
       "constants": {},
       "curves": {},
-      "expected": { "SUVA": 0.318530586918138 },
-      "absent": ["absorbance_ratio"]
+      "expected": { "SUVA": 0.318530586918139 },
+      "absent": ["A_T", "C_A", "C_M", "C_T"]
     },
     {
-      "name": "ratio_e2_e3",
-      "inputs": { "abs_numerator": 0.2, "abs_denominator": 0.05 },
+      "name": "suva_missing_a254",
+      "inputs": { "a254": null, "doc_avg_ppb": 2500.0 },
       "constants": {},
       "curves": {},
-      "expected": { "absorbance_ratio": 4.0 },
+      "expected": {},
       "absent": ["SUVA", "A_T", "C_A", "C_M", "C_T"]
     },
     {
-      "name": "ratio_zero_denominator",
-      "inputs": { "abs_numerator": 0.2, "abs_denominator": 0.0 },
+      "name": "suva_missing_doc",
+      "inputs": { "a254": 0.15 },
       "constants": {},
       "curves": {},
       "expected": {},
-      "absent": ["absorbance_ratio"]
+      "absent": ["SUVA", "A_T", "C_A", "C_M", "C_T"]
     },
     {
-      "name": "ratio_na_numerator",
-      "inputs": { "abs_numerator": null, "abs_denominator": 0.05 },
+      "name": "suva_zero_a254",
+      "inputs": { "a254": 0.0, "doc_avg_ppb": 2500.0 },
+      "constants": {},
+      "curves": {},
+      "expected": { "SUVA": 0.0 },
+      "absent": ["A_T", "C_A", "C_M", "C_T"]
+    },
+    {
+      "name": "suva_zero_doc_is_infinite",
+      "inputs": { "a254": 0.15, "doc_avg_ppb": 0.0 },
       "constants": {},
       "curves": {},
       "expected": {},
-      "absent": ["absorbance_ratio"]
+      "absent": ["SUVA", "A_T", "C_A", "C_M", "C_T"]
     },
     {
-      "name": "ratio_rand",
-      "inputs": { "abs_numerator": 1.75184462270769, "abs_denominator": 0.707175668321084 },
+      "name": "suva_zero_over_zero_is_nan",
+      "inputs": { "a254": 0.0, "doc_avg_ppb": 0.0 },
       "constants": {},
       "curves": {},
-      "expected": { "absorbance_ratio": 2.47724108900236 },
-      "absent": ["SUVA"]
+      "expected": {},
+      "absent": ["SUVA", "A_T", "C_A", "C_M", "C_T"]
     },
     {
-      "name": "peaks_partial",
+      "name": "peaks_partial_only_a_and_t",
       "inputs": { "peak_a": 0.4, "peak_t": 0.1 },
       "constants": {},
       "curves": {},
       "expected": { "A_T": 4.0 },
-      "absent": ["SUVA", "absorbance_ratio", "C_A", "C_M", "C_T"]
+      "absent": ["SUVA", "C_A", "C_M", "C_T"]
     },
     {
-      "name": "peak_t_zero",
+      "name": "peak_t_zero_divisor",
       "inputs": { "peak_a": 0.4, "peak_c": 0.2, "peak_m": 0.25, "peak_t": 0.0 },
       "constants": {},
       "curves": {},
       "expected": { "C_A": 0.5, "C_M": 0.8 },
-      "absent": ["A_T", "C_T", "SUVA", "absorbance_ratio"]
+      "absent": ["A_T", "C_T", "SUVA"]
+    },
+    {
+      "name": "peak_a_zero_divisor",
+      "inputs": { "peak_a": 0.0, "peak_c": 0.2, "peak_m": 0.25, "peak_t": 0.1 },
+      "constants": {},
+      "curves": {},
+      "expected": { "A_T": 0.0, "C_M": 0.8, "C_T": 2.0 },
+      "absent": ["C_A", "SUVA"]
+    },
+    {
+      "name": "peaks_rand",
+      "inputs": { "peak_a": 1.75184462270769, "peak_c": 0.707175668321084, "peak_m": 2.31048239012394, "peak_t": 0.413698455011117 },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "A_T": 4.234593099122437,
+        "C_A": 0.4036748802688092,
+        "C_M": 0.30607273673405894,
+        "C_T": 1.7093988622753755
+      },
+      "absent": ["SUVA"]
     },
     {
       "name": "empty",
@@ -87,8 +116,8 @@
       "constants": {},
       "curves": {},
       "expected": {},
-      "absent": ["SUVA", "absorbance_ratio", "A_T", "C_A", "C_M", "C_T"]
+      "absent": ["SUVA", "A_T", "C_A", "C_M", "C_T"]
     }
   ],
-  "notes": "Mirrors the portal dom_tool.R calculate step: calcSUVA on (a254, DOC_avg_ppb) and calcRatio on the peak pairs A/T, C/A, C/M, C/T. absorbance_ratio (abs_numerator/abs_denominator) is a Rust-tool addition with no portal column; computed via calcRatio, so a zero denominator yields NA (omitted), matching the portal's guard rather than emitting Inf. No constants or curves. No portal-vs-Rust math divergence for this tool."
+  "notes": "Strict 1:1 with the portal DOM tab (app/modules/tools_tab/tools/dom_tool.R:153-164), which computes exactly five columns in this order: SUVA = calcSUVA(a254, DOC_avg_ppb), then calcRatio on (A,T), (C,A), (C,M), (C,T). The absorbance_ratio output and its abs_numerator/abs_denominator params were dropped: the portal has no such column, and the earlier seed itself described them as a Rust-tool addition. Nothing pins their absence, because a pin may only name a declared output key. The portal DOM tab computes no spectral slope, E2:E3, BIX, HIX or FI columns (grep over the portal source finds no such identifier anywhere), so nothing is missing from the output set beyond the ratio orders, which are verified asymmetric by ratio_orders_are_asymmetric. calcSUVA (calculation_functions.R:245-258) returns NA unless both a254 and DOC_avg_ppb are present, and guards nothing else; calcRatio (:266-283) returns NA if either operand is missing or the divisor is 0. NA is omitted rather than returned, matching the portal tools tab dropping NAs. suva_zero_doc_is_infinite and suva_zero_over_zero_is_nan: the portal displays Inf and NaN respectively, and the wrapper emits both, but neither has a JSON representation - the runner serialises them as null and the API drops null results, so the key is absent end to end. That is a transport limit, not a filter in the wrapper. doc_avg_ppb is declared as an input although a portal user never types it in this tab (dom_tool.R:103 excludes DOC_avg_ppb from the editable grid and :157 reads it from the stored row): it is an upstream measurement this stateless tool must be handed, not a caller override of a constants-table value. No constants or curves: the portal reads no constants table value in this tab and offers no cst/db control. KEEP OLD carry-forward (the portal's useCalculated()/row() fallback to previously stored SUVA/A_T/C_A/C_M/C_T when Calculate has not been pressed) is out of scope: this tool is stateless and always computes."
 }

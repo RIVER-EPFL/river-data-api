@@ -66,13 +66,32 @@
       "absent": ["TSS_dry_weight_mgL", "AFDM_mgL"]
     },
     {
-      "name": "zero_vol_drops_both",
+      "name": "missing_vol_field_drops_both",
+      "inputs": { "wgt_dried_g": 0.1025, "wgt_prefilt_g": 0.1, "wgt_ashed_g": 0.1005 },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["TSS_dry_weight_mgL", "AFDM_mgL"],
+      "note": "No param is required, so an absent field is a legal request and reaches calcTSS/calcAFDM as NA, which is the portal's 'KEEP OLD'."
+    },
+    {
+      "name": "zero_vol_infinite_both",
       "inputs": { "wgt_dried_g": 0.1025, "wgt_prefilt_g": 0.1, "wgt_ashed_g": 0.1005, "vol_filtered_ml": 0.0 },
       "constants": {},
       "curves": {},
       "expected": {},
-      "absent": ["TSS_dry_weight_mgL", "AFDM_mgL"]
+      "absent": ["TSS_dry_weight_mgL", "AFDM_mgL"],
+      "note": "The portal displays Inf here (1000000 * 0.0025 / 0 and 1000000 * 0.002 / 0); the wrapper emits it, and Inf serialises to JSON null, which the API drops."
+    },
+    {
+      "name": "zero_difference_zero_vol_nan_both",
+      "inputs": { "wgt_dried_g": 0.1, "wgt_prefilt_g": 0.1, "wgt_ashed_g": 0.1, "vol_filtered_ml": 0.0 },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["TSS_dry_weight_mgL", "AFDM_mgL"],
+      "note": "The portal displays NaN here (0 / 0); the wrapper emits it, and NaN serialises to JSON null, which the API drops. Pins that NaN is not confused with the 'KEEP OLD' sentinel."
     }
   ],
-  "notes": "Mirrors the portal's calcTSS/calcAFDM exactly; no Rust-vs-portal divergence exists for this tool. Portal 'KEEP OLD' (any NA input) and non-finite results (vol_filtered_ml = 0 gives Inf) are emitted as absent keys. No constants or curves. Golden fixtures pin tss_mg_l and afdm_mg_l separately; combined cases add the missing weight and pin the second output at the same arithmetic."
+  "notes": "Mirrors the portal's calcTSS/calcAFDM exactly; no Rust-vs-portal divergence exists for this tool. A key is omitted only for the portal's 'KEEP OLD' (any NA input); NaN and Inf are emitted and reach the caller as absent keys through null serialisation, so no is.finite filter is applied. No constants or curves. Golden fixtures pin tss_mg_l and afdm_mg_l separately; combined cases add the missing weight and pin the second output at the same arithmetic."
 }

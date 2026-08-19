@@ -2,23 +2,23 @@
   "label": "Discharge",
   "description": "Slug-injection discharge from a rhodamine (ppb) or salt (uS/cm) tracer series: background correction, Savitzky-Golay smoothing, trapezoidal AUC",
   "params": [
-    { "name": "tracer", "label": "Tracer", "kind": "enum:rhodamine|salt", "units": null, "required": true, "default": "rhodamine", "when": null },
+    { "name": "tracer", "label": "Tracer", "kind": "enum:rhodamine|salt", "units": null, "required": false, "default": "rhodamine", "when": null },
     { "name": "times_s", "label": "Sample times", "kind": "array", "units": "s", "required": true, "default": null, "when": null },
-    { "name": "values", "label": "Tracer series", "kind": "array", "units": "ppb (rhodamine) or uS/cm (salt)", "required": true, "default": null, "when": null },
+    { "name": "values", "label": "Tracer series, in ppb for rhodamine and uS/cm for salt", "kind": "array", "units": null, "required": true, "default": null, "when": null },
     { "name": "distance_m", "label": "Distance", "kind": "number", "units": "m", "required": false, "default": 79.0, "when": null },
     { "name": "initial_mass_rhodamine_wt_g", "label": "Initial Mass Rhodamine", "kind": "number", "units": "g", "required": false, "default": 3.38019, "when": "tracer=rhodamine" },
     { "name": "concentration_rhodamine_pct", "label": "Rhodamine Concentration", "kind": "number", "units": "%", "required": false, "default": 23.83, "when": "tracer=rhodamine" },
-    { "name": "initial_water_temp_c", "label": "Initial Water Temperature", "kind": "number", "units": "degC", "required": false, "default": 3.3, "when": "tracer=rhodamine" },
+    { "name": "initial_water_temp_c", "label": "Initial Water Temperature", "kind": "number", "units": "°C", "required": false, "default": 3.3, "when": "tracer=rhodamine" },
     { "name": "n_rhodamine", "label": "Temperature Correction Factor", "kind": "number", "units": null, "required": false, "default": 0.026, "when": "tracer=rhodamine" },
-    { "name": "t_ref_c", "label": "Reference Temperature", "kind": "number", "units": "degC", "required": false, "default": 25.0, "when": "tracer=rhodamine" },
+    { "name": "t_ref_c", "label": "Reference Temperature", "kind": "number", "units": "°C", "required": false, "default": 25.0, "when": "tracer=rhodamine" },
     { "name": "initial_mass_salt_g", "label": "Initial Mass Salt", "kind": "number", "units": "g", "required": false, "default": 2000.0, "when": "tracer=salt" },
     { "name": "slope_conductivity", "label": "Conductivity Slope", "kind": "number", "units": "(uS/cm)/(g/L)", "required": false, "default": 1951.1, "when": "tracer=salt" }
   ],
   "outputs": [
     { "key": "Q_Ls", "label": "Discharge", "units": "L/s", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "Q_Ls" },
-    { "key": "velocity_ms", "label": "Velocity", "units": "m/s", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": null },
-    { "key": "travel_time_s", "label": "Travel time", "units": "s", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": null },
-    { "key": "peak_concentration", "label": "Peak concentration", "units": "ppb (rhodamine) or g/L (salt)", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": null }
+    { "key": "velocity_ms", "label": "Velocity", "units": "m/s", "per_replicate": false, "aggregate_of": "distance_m", "suggested_parameter_code": null },
+    { "key": "travel_time_s", "label": "Travel time", "units": "s", "per_replicate": false, "aggregate_of": "times_s", "suggested_parameter_code": null },
+    { "key": "peak_concentration", "label": "Peak concentration, in ppb for rhodamine and g/L for salt", "units": null, "per_replicate": false, "aggregate_of": "values", "suggested_parameter_code": null }
   ],
   "constants": [],
   "curves": [],

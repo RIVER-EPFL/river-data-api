@@ -77,5 +77,5 @@
       "expected": { "Alk_temp_degC": 0.0, "WTW_pH_1": 0.0, "Alk_init_pH": 6.5 }
     }
   ],
-  "notes": "Raw-entry tool: no math beyond calcEquals(WTW_pH_1, Alk_init_pH); portal and Rust agree (Rust equals() mirrors calcEquals). No constants or curves. Echo outputs are omitted when the input is missing or null, matching the API's drop-non-finite behavior. WTW_pH_1 is omitted only when both WTW_pH_1 and Alk_init_pH are missing."
+  "notes": "Raw-entry tool: no math beyond calcEquals(WTW_pH_1, Alk_init_pH); portal and Rust agree (Rust equals() mirrors calcEquals). No constants or curves. Echo outputs are omitted only when the input is missing or null, which is the blank cell the portal leaves unchanged; no plausibility filter is applied. WTW_pH_1 is omitted only when both WTW_pH_1 and Alk_init_pH are missing. JSON carries no NaN or Inf literal, so neither can be sent as an input and neither can be pinned here."
 }

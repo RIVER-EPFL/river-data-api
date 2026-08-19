@@ -4,99 +4,179 @@
     {
       "name": "multi_species_full",
       "inputs": {
-        "species": {
-          "TDN": [11.642790355254, 29.6550577834714, 43.6351132337004],
-          "NOx": [156.276927627623, 178.205307442695, 264.759755562991],
-          "NO2": [4.18003580882214, 7.53685696562752, 9.09055079799145]
-        }
+        "NUT_TDN_rep_A": 11.642790355254,
+        "NUT_TDN_rep_B": 29.6550577834714,
+        "NUT_TDN_rep_C": 43.6351132337004,
+        "NUT_NOx_rep_A": 156.276927627623,
+        "NUT_NOx_rep_B": 178.205307442695,
+        "NUT_NOx_rep_C": 264.759755562991,
+        "NUT_NO2_rep_A": 4.18003580882214,
+        "NUT_NO2_rep_B": 7.53685696562752,
+        "NUT_NO2_rep_C": 9.09055079799145
       },
       "constants": {},
       "curves": {},
       "expected": {
-        "NUT_TDN_avg": 28.3109871241419,
-        "NUT_TDN_sd": 16.0384561365065,
+        "NUT_TDN_avg": 28.310987124141935,
+        "NUT_TDN_sd": 16.038456136506532,
         "NUT_NOx_avg": 199.747330211103,
-        "NUT_NOx_sd": 57.3600474889065,
-        "NUT_NO2_avg": 6.93581452414704,
-        "NUT_NO2_sd": 2.50982636392635,
-        "NUT_NO3_avg": 192.811515686956,
-        "NUT_NO3_sd": 55.2226629647951
+        "NUT_NOx_sd": 57.36004748890662,
+        "NUT_NO2_avg": 6.935814524147037,
+        "NUT_NO2_sd": 2.5098263639263436,
+        "NUT_NO3_rep_A": 152.09689181880086,
+        "NUT_NO3_rep_B": 170.66845047706747,
+        "NUT_NO3_rep_C": 255.66920476499956,
+        "NUT_NO3_avg": 192.81151568695597,
+        "NUT_NO3_sd": 55.22266296479518
       },
-      "absent": ["NUT_NOX_avg", "NUT_avg", "NUT_sd"]
+      "absent": ["NUT_P_avg", "NUT_NH4_avg", "NUT_TDP_avg", "NH4_avg_ugL", "SRP_avg_ugL"]
+    },
+    {
+      "name": "no3_lands_on_the_replicate_that_was_measured",
+      "inputs": {
+        "NUT_NOx_rep_A": 100.0,
+        "NUT_NOx_rep_B": 200.0,
+        "NUT_NOx_rep_C": 300.0,
+        "NUT_NO2_rep_B": 20.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "NUT_NOx_avg": 200.0,
+        "NUT_NOx_sd": 100.0,
+        "NUT_NO2_avg": 20.0,
+        "NUT_NO3_rep_B": 180.0,
+        "NUT_NO3_avg": 180.0
+      },
+      "absent": ["NUT_NO3_rep_A", "NUT_NO3_rep_C", "NUT_NO2_sd", "NUT_NO3_sd"]
     },
     {
       "name": "no2_null_replicate_drops_that_no3_pair",
       "inputs": {
-        "species": {
-          "NOx": [54.2193515133113, 202.948912726715, 97.6966312620789],
-          "NO2": [1.30150220845826, 8.87617435283028, null]
-        }
+        "NUT_NOx_rep_A": 54.2193515133113,
+        "NUT_NOx_rep_B": 202.948912726715,
+        "NUT_NOx_rep_C": 97.6966312620789,
+        "NUT_NO2_rep_A": 1.30150220845826,
+        "NUT_NO2_rep_B": 8.87617435283028,
+        "NUT_NO2_rep_C": null
       },
       "constants": {},
       "curves": {},
       "expected": {
-        "NUT_NOx_avg": 118.288298500702,
-        "NUT_NOx_sd": 76.4730878442381,
+        "NUT_NOx_avg": 118.28829850070173,
+        "NUT_NOx_sd": 76.47308784423792,
         "NUT_NO2_avg": 5.08883828064427,
-        "NUT_NO2_sd": 5.3561020385503,
-        "NUT_NO3_avg": 123.495293839369,
-        "NUT_NO3_sd": 99.8115792583473
+        "NUT_NO2_sd": 5.356102038550302,
+        "NUT_NO3_rep_A": 52.91784930485304,
+        "NUT_NO3_rep_B": 194.07273837388473,
+        "NUT_NO3_avg": 123.49529383936888,
+        "NUT_NO3_sd": 99.81157925834718
       },
-      "absent": []
+      "absent": ["NUT_NO3_rep_C"]
     },
     {
       "name": "nox_null_replicate_drops_that_no3_pair",
       "inputs": {
-        "species": {
-          "TDN": [3.17789176525548, 150.522120741662, 89.834665437229],
-          "NOx": [163.772682817653, null, 120.020357398316],
-          "NO2": [13.663094019983, 4.37098467035685, 11.7953121144092]
-        }
+        "NUT_TDN_rep_A": 3.17789176525548,
+        "NUT_TDN_rep_B": 150.522120741662,
+        "NUT_TDN_rep_C": 89.834665437229,
+        "NUT_NOx_rep_A": 163.772682817653,
+        "NUT_NOx_rep_B": null,
+        "NUT_NOx_rep_C": 120.020357398316,
+        "NUT_NO2_rep_A": 13.663094019983,
+        "NUT_NO2_rep_B": 4.37098467035685,
+        "NUT_NO2_rep_C": 11.7953121144092
       },
       "constants": {},
       "curves": {},
       "expected": {
-        "NUT_TDN_avg": 81.178225981382,
-        "NUT_TDN_sd": 74.0525550619454,
-        "NUT_NOx_avg": 141.896520107985,
-        "NUT_NOx_sd": 30.9375659966934,
-        "NUT_NO2_avg": 9.94313026824966,
-        "NUT_NO2_sd": 4.91515587085338,
-        "NUT_NO3_avg": 129.167317040788,
-        "NUT_NO3_sd": 29.6168447454847
+        "NUT_TDN_avg": 81.17822598138217,
+        "NUT_TDN_sd": 74.05255506194561,
+        "NUT_NOx_avg": 141.8965201079845,
+        "NUT_NOx_sd": 30.93756599669375,
+        "NUT_NO2_avg": 9.943130268249684,
+        "NUT_NO2_sd": 4.915155870853393,
+        "NUT_NO3_rep_A": 150.10958879767,
+        "NUT_NO3_rep_C": 108.2250452839068,
+        "NUT_NO3_avg": 129.1673170407884,
+        "NUT_NO3_sd": 29.616844745484986
       },
-      "absent": []
+      "absent": ["NUT_NO3_rep_B"]
     },
     {
-      "name": "p_species",
+      "name": "p_replicates",
       "inputs": {
-        "species": {
-          "P": [56.6238215770572, 66.0898544881493, 2.60811081202701],
-          "NOx": [68.0889071058482, 42.1721666865051, 198.934926288202],
-          "NO2": [7.70713424356654, 8.86055849690456, 5.63646702945698]
-        }
+        "NUT_P_rep_A": 56.6238215770572,
+        "NUT_P_rep_B": 66.0898544881493,
+        "NUT_P_rep_C": 2.60811081202701,
+        "NUT_NOx_rep_A": 68.0889071058482,
+        "NUT_NOx_rep_B": 42.1721666865051,
+        "NUT_NOx_rep_C": 198.934926288202,
+        "NUT_NO2_rep_A": 7.70713424356654,
+        "NUT_NO2_rep_B": 8.86055849690456,
+        "NUT_NO2_rep_C": 5.63646702945698
       },
       "constants": {},
       "curves": {},
       "expected": {
-        "NUT_P_avg": 41.7739289590778,
-        "NUT_P_sd": 34.2472251155384,
-        "NUT_NOx_avg": 103.065333360185,
-        "NUT_NOx_sd": 84.0306699641785,
-        "NUT_NO2_avg": 7.40138658997603,
-        "NUT_NO2_sd": 1.63364704522554,
-        "NUT_NO3_avg": 95.6639467702092,
-        "NUT_NO3_sd": 85.6304383704014
+        "NUT_P_avg": 41.773928959077836,
+        "NUT_P_sd": 34.24722511553836,
+        "NUT_NOx_avg": 103.0653333601851,
+        "NUT_NOx_sd": 84.03066996417829,
+        "NUT_NO2_avg": 7.401386589976027,
+        "NUT_NO2_sd": 1.633647045225544,
+        "NUT_NO3_rep_A": 60.38177286228165,
+        "NUT_NO3_rep_B": 33.31160818960054,
+        "NUT_NO3_rep_C": 193.29845925874503,
+        "NUT_NO3_avg": 95.66394677020907,
+        "NUT_NO3_sd": 85.63043837040121
       },
       "absent": []
     },
     {
-      "name": "legacy_species_map_to_metalp_columns",
+      "name": "all_nine_portal_parameters",
       "inputs": {
-        "species": {
-          "NH4": [10.0, 12.0, 11.0],
-          "SRP": [3.0, 4.0, 5.0]
-        }
+        "NUT_P_rep_A": 1.0, "NUT_P_rep_B": 2.0, "NUT_P_rep_C": 3.0,
+        "NUT_NH4_rep_A": 4.0, "NUT_NH4_rep_B": 5.0, "NUT_NH4_rep_C": 6.0,
+        "NUT_NOx_rep_A": 100.0, "NUT_NOx_rep_B": 110.0, "NUT_NOx_rep_C": 120.0,
+        "NUT_NO2_rep_A": 10.0, "NUT_NO2_rep_B": 11.0, "NUT_NO2_rep_C": 12.0,
+        "NUT_TDP_rep_A": 7.0, "NUT_TDP_rep_B": 8.0, "NUT_TDP_rep_C": 9.0,
+        "NUT_TDN_rep_A": 200.0, "NUT_TDN_rep_B": 210.0, "NUT_TDN_rep_C": 220.0,
+        "NH4_rep_A": 10.0, "NH4_rep_B": 12.0, "NH4_rep_C": 11.0,
+        "SRP_rep_A": 3.0, "SRP_rep_B": 4.0, "SRP_rep_C": 5.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "NUT_P_avg": 2.0,
+        "NUT_P_sd": 1.0,
+        "NUT_NH4_avg": 5.0,
+        "NUT_NH4_sd": 1.0,
+        "NUT_NOx_avg": 110.0,
+        "NUT_NOx_sd": 10.0,
+        "NUT_NO2_avg": 11.0,
+        "NUT_NO2_sd": 1.0,
+        "NUT_TDP_avg": 8.0,
+        "NUT_TDP_sd": 1.0,
+        "NUT_TDN_avg": 210.0,
+        "NUT_TDN_sd": 10.0,
+        "NUT_NO3_rep_A": 90.0,
+        "NUT_NO3_rep_B": 99.0,
+        "NUT_NO3_rep_C": 108.0,
+        "NUT_NO3_avg": 99.0,
+        "NUT_NO3_sd": 9.0,
+        "NH4_avg_ugL": 11.0,
+        "NH4_sd_ugL": 1.0,
+        "SRP_avg_ugL": 4.0,
+        "SRP_sd_ugL": 1.0
+      },
+      "absent": []
+    },
+    {
+      "name": "old_nutrients_use_ugL_column_names",
+      "inputs": {
+        "NH4_rep_A": 10.0, "NH4_rep_B": 12.0, "NH4_rep_C": 11.0,
+        "SRP_rep_A": 3.0, "SRP_rep_B": 4.0, "SRP_rep_C": 5.0
       },
       "constants": {},
       "curves": {},
@@ -106,82 +186,115 @@
         "SRP_avg_ugL": 4.0,
         "SRP_sd_ugL": 1.0
       },
-      "absent": ["NUT_NH4_avg", "NUT_SRP_avg"]
+      "absent": ["NUT_NH4_avg", "NUT_NH4_sd", "NUT_NO3_rep_A", "NUT_NO3_rep_B", "NUT_NO3_rep_C"]
     },
     {
-      "name": "nut_prefixed_species_map_to_current_columns",
+      "name": "nut_nh4_is_distinct_from_old_nh4",
       "inputs": {
-        "species": {
-          "NUT_NH4": [10.0, 12.0, 11.0],
-          "NUT_SRP": [3.0, 4.0, 5.0]
-        }
+        "NUT_NH4_rep_A": 1.0, "NUT_NH4_rep_B": 2.0, "NUT_NH4_rep_C": 3.0,
+        "NH4_rep_A": 10.0, "NH4_rep_B": 12.0, "NH4_rep_C": 11.0
       },
       "constants": {},
       "curves": {},
       "expected": {
-        "NUT_NH4_avg": 11.0,
+        "NUT_NH4_avg": 2.0,
         "NUT_NH4_sd": 1.0,
-        "NUT_SRP_avg": 4.0,
-        "NUT_SRP_sd": 1.0
+        "NH4_avg_ugL": 11.0,
+        "NH4_sd_ugL": 1.0
       },
-      "absent": ["NH4_avg_ugL", "SRP_avg_ugL", "NUT_NUT_NH4_avg"]
+      "absent": ["SRP_avg_ugL", "SRP_sd_ugL", "NUT_NO3_rep_A"]
     },
     {
-      "name": "species_single_replicate_omits_sd",
-      "inputs": { "species": { "TDN": [42.0] } },
+      "name": "no3_is_derived_never_measured",
+      "inputs": {
+        "NUT_NOx_rep_A": 100.0, "NUT_NOx_rep_B": 110.0, "NUT_NOx_rep_C": 120.0,
+        "NUT_NO2_rep_A": 10.0, "NUT_NO2_rep_B": 11.0, "NUT_NO2_rep_C": 12.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "NUT_NOx_avg": 110.0,
+        "NUT_NOx_sd": 10.0,
+        "NUT_NO2_avg": 11.0,
+        "NUT_NO2_sd": 1.0,
+        "NUT_NO3_rep_A": 90.0,
+        "NUT_NO3_rep_B": 99.0,
+        "NUT_NO3_rep_C": 108.0,
+        "NUT_NO3_avg": 99.0,
+        "NUT_NO3_sd": 9.0
+      },
+      "absent": []
+    },
+    {
+      "name": "per_letter_no3_disagrees_with_scalar_shortcut",
+      "inputs": {
+        "NUT_NOx_rep_A": 10.0, "NUT_NOx_rep_B": null, "NUT_NOx_rep_C": 30.0,
+        "NUT_NO2_rep_A": null, "NUT_NO2_rep_B": 2.0, "NUT_NO2_rep_C": 5.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "NUT_NOx_avg": 20.0,
+        "NUT_NOx_sd": 14.142135623730951,
+        "NUT_NO2_avg": 3.5,
+        "NUT_NO2_sd": 2.1213203435596424,
+        "NUT_NO3_rep_C": 25.0,
+        "NUT_NO3_avg": 25.0
+      },
+      "absent": ["NUT_NO3_sd", "NUT_NO3_rep_A", "NUT_NO3_rep_B"]
+    },
+    {
+      "name": "two_no3_pairs_emit_no3_sd",
+      "inputs": {
+        "NUT_NOx_rep_A": 10.0, "NUT_NOx_rep_B": 20.0, "NUT_NOx_rep_C": null,
+        "NUT_NO2_rep_A": 1.0, "NUT_NO2_rep_B": 2.0, "NUT_NO2_rep_C": 3.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "NUT_NOx_avg": 15.0,
+        "NUT_NOx_sd": 7.0710678118654755,
+        "NUT_NO2_avg": 2.0,
+        "NUT_NO2_sd": 1.0,
+        "NUT_NO3_rep_A": 9.0,
+        "NUT_NO3_rep_B": 18.0,
+        "NUT_NO3_avg": 13.5,
+        "NUT_NO3_sd": 6.363961030678928
+      },
+      "absent": ["NUT_NO3_rep_C"]
+    },
+    {
+      "name": "single_replicate_omits_sd",
+      "inputs": { "NUT_TDN_rep_A": 42.0 },
       "constants": {},
       "curves": {},
       "expected": { "NUT_TDN_avg": 42.0 },
       "absent": ["NUT_TDN_sd"]
     },
     {
-      "name": "species_all_null_omits_keys",
-      "inputs": { "species": { "TDN": [null, null, null] } },
+      "name": "all_null_replicates_omit_keys",
+      "inputs": { "NUT_TDN_rep_A": null, "NUT_TDN_rep_B": null, "NUT_TDN_rep_C": null },
       "constants": {},
       "curves": {},
       "expected": {},
       "absent": ["NUT_TDN_avg", "NUT_TDN_sd"]
     },
     {
-      "name": "species_nox_without_no2_no_no3",
-      "inputs": { "species": { "NOx": [50.0, 52.0, 54.0] } },
+      "name": "nox_without_no2_yields_no_no3",
+      "inputs": { "NUT_NOx_rep_A": 50.0, "NUT_NOx_rep_B": 52.0, "NUT_NOx_rep_C": 54.0 },
       "constants": {},
       "curves": {},
       "expected": { "NUT_NOx_avg": 52.0, "NUT_NOx_sd": 2.0 },
-      "absent": ["NUT_NO3_avg", "NUT_NO3_sd"]
+      "absent": ["NUT_NO3_avg", "NUT_NO3_sd", "NUT_NO3_rep_A", "NUT_NO3_rep_B", "NUT_NO3_rep_C"]
     },
     {
-      "name": "single_species_replicates_with_nox_no2",
-      "inputs": { "replicates": [10.0, 12.0, 11.0], "nox": 50.0, "no2": 3.0 },
+      "name": "empty_request_returns_nothing",
+      "inputs": {},
       "constants": {},
       "curves": {},
-      "expected": { "NUT_avg": 11.0, "NUT_sd": 1.0, "NUT_NO3_avg": 47.0 },
-      "absent": ["NUT_NO3_sd"]
-    },
-    {
-      "name": "single_species_single_replicate_omits_sd",
-      "inputs": { "replicates": [42.0] },
-      "constants": {},
-      "curves": {},
-      "expected": { "NUT_avg": 42.0 },
-      "absent": ["NUT_sd", "NUT_NO3_avg"]
-    },
-    {
-      "name": "single_species_replicates_golden",
-      "inputs": { "replicates": [222.785579724936, 10.2365160880145, 149.955370938173, 110.286272454308] },
-      "constants": {},
-      "curves": {},
-      "expected": { "NUT_avg": 123.315934801358, "NUT_sd": 88.620157331418 },
-      "absent": []
-    },
-    {
-      "name": "single_species_nox_without_no2_no_no3",
-      "inputs": { "replicates": [10.0, 12.0, 11.0], "nox": 50.0 },
-      "constants": {},
-      "curves": {},
-      "expected": { "NUT_avg": 11.0, "NUT_sd": 1.0 },
-      "absent": ["NUT_NO3_avg"]
+      "expected": {},
+      "absent": ["NUT_P_avg", "NUT_NH4_avg", "NUT_NOx_avg", "NUT_NO2_avg", "NUT_NO3_avg", "NUT_TDP_avg", "NUT_TDN_avg", "NH4_avg_ugL", "SRP_avg_ugL", "NUT_NO3_rep_A", "NUT_NO3_rep_B", "NUT_NO3_rep_C"]
     }
   ],
-  "notes": "Portal semantics followed where the Rust impl diverged: NO3 is computed per replicate letter (A/B/C) with calcMinus, so a null NOx or NO2 replicate yields an NA NO3 for that letter and the NO3 mean/sd run na.rm over the remaining pairs (cases no2_null_replicate_* and nox_null_replicate_*). The Rust toolbox pairs positionally over min(len) and its request type (Vec<f64>) cannot represent null replicates at all. NO3 detection accepts both bare and NUT_-prefixed NOx/NO2 species names (case-insensitive on the stripped base); the emitted key is always NUT_NO3_avg/_sd, matching the portal columns. All-NA mean/sd is the portal's KEEP OLD, emitted as an absent key. No constants or curves are used."
+  "notes": "Follows nutrients_tool.R:198-299. The parameter set is the portal's fixed nine (NUT_P, NUT_NH4, NUT_NOx, NUT_NO2, NUT_NO3, NUT_TDP, NUT_TDN, NH4, SRP) named at :237; NH4/SRP are the Old Nutrients columns and are written as {param}_avg_ugL/_sd_ugL (:252-258), everything else as {param}_avg/_sd. Units are ug/L on every output, which is what the portal's tool_nut_info.html states for all nutrients.\n\nInputs are one param per replicate cell, named as the portal names the column ({param}_rep_{A,B,C}, nutrients_tool.R:348). The replicate letter travels in the field name, so an unmeasured cell is simply absent and the cells that were measured keep their letters. The earlier shape sent each parameter as a positional list under a 'species' object, which the entry form compacted by dropping blanks: a parameter measured only in B arrived as if it were A, and NOx [100, 200, 300] against NO2 [20] produced NUT_NO3_rep_A = 80 instead of NUT_NO3_rep_B = 180. no3_lands_on_the_replicate_that_was_measured pins that pairing.\n\nNO3 is always derived, never measured: nutrients_tool.R:100-101 excludes NUT_NO3_rep_* from the editable raw table and :239-240 forces the NO3 frame to the calculated one. No NUT_NO3_rep_* param is declared, so a caller cannot send one at all and the manifest carries the exclusion the portal's column filter carries. NO3 is computed per replicate letter with calcMinus and only then averaged (:202-228 then :237-250), so a missing NOx or NO2 replicate drops that letter's pair and the mean/sd run over the remaining pairs. per_letter_no3_disagrees_with_scalar_shortcut pins that: NOx [10, NA, 30] / NO2 [NA, 2, 5] gives 25 per letter, where the scalar shortcut (mean NOx - mean NO2) would give 16.5.\n\nThe three derived replicates are outputs, not intermediates: nutrients_tool.R:328 returns no3Updated() as part of the row df and entry_layout.R:401-407 writes every column of that df back to the data table, dropping the ones is.na() reports (which also removes NaN). NUT_NO3_rep_A/B/C are therefore emitted whenever calcMinus resolves that letter's pair (multi_species_full, two_no3_pairs_emit_no3_sd for the partial case) and omitted otherwise. NO3 is the one analyte this tool measures per replicate, so the NUT_NO3_rep_{rep} family carries the NUT_NO3 code and NUT_NO3_avg/_sd are display-only summaries of it.\n\nOperand order is not a hazard: tidyselect unions in operand order, not data-frame order, so (starts_with('NUT_NOx_rep_') | starts_with('NUT_NO2_rep_')) puts NOx first whatever order the frame carries, and calcMinus (positional, first minus second) is unconditionally NOx - NO2.\n\ncalcMean/calcSd return 'KEEP OLD' when every replicate is NA (a single replicate for sd), which the portal replaces with the value already stored on the row. This tool is stateless, so KEEP OLD becomes an omitted key (all_null_replicates_omit_keys, single_replicate_omits_sd, per_letter_no3_disagrees_with_scalar_shortcut for NUT_NO3_sd); the carry-forward is deliberately not emulated. No constants and no curves are used.\n\nOne residual divergence, unverifiable from the portal repo: the portal builds its raw table from whatever grab_param_categories holds under Nutrients / Old Nutrients (:69-79), then selects each parameter's replicates with starts_with(param) (:245). If that table ever holds a nutrient whose name extends one of the six NUT_ bases as a prefix, the portal folds its replicates into that base's mean and this wrapper, which enumerates the six, does not. Grepping the portal app yields only the seven known bases and the repo carries no schema dump, so the risk is recorded rather than closed."
 }

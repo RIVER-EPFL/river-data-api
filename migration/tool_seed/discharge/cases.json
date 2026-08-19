@@ -45,6 +45,28 @@
       "absent": []
     },
     {
+      "name": "tracer_omitted_uses_rhodamine_default",
+      "inputs": {
+        "times_s": [0.0, 10.0, 20.0, 30.0, 40.0],
+        "values": [0.0, 1.0, 8.0, 27.0, 64.0],
+        "initial_mass_rhodamine_wt_g": 2.0,
+        "concentration_rhodamine_pct": 50.0,
+        "initial_water_temp_c": 25.0,
+        "t_ref_c": 25.0,
+        "n_rhodamine": 0.026,
+        "distance_m": 80.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Q_Ls": 8333.333333333334,
+        "velocity_ms": 2.0,
+        "travel_time_s": 40.0,
+        "peak_concentration": 13.2
+      },
+      "absent": []
+    },
+    {
       "name": "salt_cubic_analytic",
       "inputs": {
         "tracer": "salt",
@@ -162,5 +184,5 @@
       "absent": []
     }
   ],
-  "notes": "No Rust tool exists for discharge; the reference is river-data-core/src/toolbox/discharge.rs (verified port) and the portal discharge_tool.R calculation section, which the wrapper contains verbatim (the prelude has no discharge functions). Portal behaviors kept: background lm over first 15 (rhodamine) / 10 (salt) plus last 10 rows with duplicate indices when the series is short; on a constant time regressor lm silently drops the slope and the background is the window mean (degenerate_constant_time case); sgolayfilt(p=3, n=min(11, n)) then negatives clamped to 0; rhodamine AUC divided by 1000 (ppb*s to mg/L*s), salt AUC used directly; first-max peak; zero AUC or zero travel time yield non-finite Q_Ls/velocity_ms, which are omitted. The *_pin cases are regression pins taken from the runner after checking analytic invariants (travel time at the pulse center, AUC near the raw-pulse trapezoid, peak below the raw maximum). On a perfectly flat series (flat_series_no_discharge) R's lm leaves eps-scale residuals, so the clamped AUC is a tiny positive number and Q_Ls comes out as a huge finite value rather than being dropped; the value is floating-noise dependent, so the case asserts travel time and peak only and leaves Q_Ls unchecked (the Rust port computes an exactly zero AUC and reports NaN there)."
+  "notes": "No Rust tool exists for discharge; the reference is river-data-core/src/toolbox/discharge.rs (verified port) and the portal discharge_tool.R calculation section, which the wrapper contains verbatim (the prelude has no discharge functions). Portal behaviors kept: background lm over first 15 (rhodamine) / 10 (salt) plus last 10 rows with duplicate indices when the series is short; on a constant time regressor lm silently drops the slope and the background is the window mean (degenerate_constant_time case); sgolayfilt(p=3, n=min(11, n)) then negatives clamped to 0; rhodamine AUC divided by 1000 (ppb*s to mg/L*s), salt AUC used directly; first-max peak; zero AUC or zero travel time yield an infinite Q_Ls/velocity_ms, which the portal prints as Inf and the wrapper emits unfiltered, so it serialises to JSON null and the API drops it: that is why degenerate_constant_time_mean_background and flat_series_no_discharge list those keys as absent. tracer_omitted_uses_rhodamine_default pins that omitting the optional tracer takes the rhodamine branch, so it repeats rhodamine_cubic_analytic's values exactly. The *_pin cases are regression pins taken from the runner after checking analytic invariants (travel time at the pulse center, AUC near the raw-pulse trapezoid, peak below the raw maximum). On a perfectly flat series (flat_series_no_discharge) R's lm leaves eps-scale residuals, so the clamped AUC is a tiny positive number and Q_Ls comes out as a huge finite value rather than being dropped; the value is floating-noise dependent, so the case asserts travel time and peak only and leaves Q_Ls unchecked (the Rust port computes an exactly zero AUC and reports NaN there)."
 }
