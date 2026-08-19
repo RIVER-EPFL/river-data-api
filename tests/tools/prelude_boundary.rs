@@ -20,10 +20,6 @@ const WRAPPERS: &[(&str, &str)] = &[
         include_str!("../../migration/tool_seed/benthic/wrapper.R"),
     ),
     (
-        "chla_benthic",
-        include_str!("../../migration/tool_seed/chla_benthic/wrapper.R"),
-    ),
-    (
         "chlorophyll",
         include_str!("../../migration/tool_seed/chlorophyll/wrapper.R"),
     ),

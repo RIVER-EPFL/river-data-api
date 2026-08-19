@@ -110,7 +110,7 @@ async fn every_seeded_hash_recomputes_from_the_row_it_identifies() {
         ))
         .await
         .expect("read the seeded versions");
-    assert_eq!(rows.len(), 13, "every shipped tool was seeded");
+    assert_eq!(rows.len(), 12, "every shipped tool was seeded");
 
     for row in &rows {
         let name: String = row.try_get("", "name").expect("name");
