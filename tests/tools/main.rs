@@ -8,4 +8,12 @@ mod common;
 
 mod calculators;
 mod constants_parity;
+mod draft_run;
+mod output_parameters;
+mod prelude_boundary;
+mod run_contract;
+mod runner_absent;
+mod script_inspection;
+mod scripts_authoring;
 mod scripts_lifecycle;
+mod seeded_cases;

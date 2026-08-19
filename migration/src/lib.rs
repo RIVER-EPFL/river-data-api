@@ -1,5 +1,7 @@
 pub use sea_orm_migration::prelude::*;
 
+pub mod tool_hash;
+
 mod m20260325_000001_init;
 mod m20260420_000001_samples;
 mod m20260420_000002_seed_constants;
@@ -67,6 +69,8 @@ mod m20260818_000003_tool_scripts;
 mod m20260818_000004_sample_provenance;
 mod m20260818_000005_seed_tool_scripts;
 mod m20260818_000006_analyte_catalog;
+mod m20260818_000007_tool_script_version_note;
+mod m20260818_000008_tool_output_analytes;
 
 pub struct Migrator;
 
@@ -142,6 +146,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260818_000004_sample_provenance::Migration),
             Box::new(m20260818_000005_seed_tool_scripts::Migration),
             Box::new(m20260818_000006_analyte_catalog::Migration),
+            Box::new(m20260818_000007_tool_script_version_note::Migration),
+            Box::new(m20260818_000008_tool_output_analytes::Migration),
         ]
     }
 }

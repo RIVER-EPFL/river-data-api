@@ -518,6 +518,8 @@ pub fn api_router(state: &AppState) -> Router<()> {
                 "/tool_scripts/{id}",
                 get(scripts::get_script).patch(scripts::update_script),
             )
+            .route("/tool_scripts/draft_run", post(scripts::draft_run))
+            .route("/tool_scripts/inspect", post(scripts::inspect_script))
             .route("/tool_scripts/{id}/versions", post(scripts::create_version))
             .route(
                 "/tool_scripts/{id}/versions/{version_id}",
