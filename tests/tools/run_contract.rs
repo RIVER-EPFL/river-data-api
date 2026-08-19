@@ -132,7 +132,7 @@ async fn a_result_carries_the_constants_and_curves_the_server_resolved() {
         &app,
         "doc",
         json!({
-            "replicates": [120.0, 125.0, 118.0],
+            "DOC_rep_1": 120.0, "DOC_rep_2": 125.0, "DOC_rep_3": 118.0,
             "std_curve": { "slope": 1.05, "intercept": -2.0, "label": "bench curve" }
         }),
         &token,
@@ -152,9 +152,9 @@ async fn a_result_carries_the_constants_and_curves_the_server_resolved() {
         "pco2",
         json!({
             "water_temp_c": 25.0,
-            "co2_ppm": 3774.31004084647,
-            "h2o_percent": 3.04813831089996,
-            "ch4_ppm": 476.103632267332,
+            "lab_co2_co2ppm_rep_A": 3774.31004084647,
+            "lab_co2_h2o_rep_A": 3.04813831089996,
+            "lab_co2_ch4_rep_A": 476.103632267332,
             "lab_temp_c": 17.0519462262746,
             "lab_pressure_hpa": 1012.5826292476703
         }),
@@ -197,7 +197,7 @@ async fn a_result_pins_the_runner_that_executed_it() {
     }
     let (_db, app, token) = setup().await;
 
-    let (status, json) = calculate(&app, "doc", json!({ "replicates": [120.0] }), &token).await;
+    let (status, json) = calculate(&app, "doc", json!({ "DOC_rep_1": 120.0 }), &token).await;
     assert_eq!(status, 200, "{json}");
 
     let version = &json["tool_version"];

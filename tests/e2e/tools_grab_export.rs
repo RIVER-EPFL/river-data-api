@@ -231,7 +231,9 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
         &app,
         "/api/tools/doc/calculate",
         &json!({
-            "replicates": doc.replicates,
+            "DOC_rep_1": doc.replicates[0],
+            "DOC_rep_2": doc.replicates[1],
+            "DOC_rep_3": doc.replicates[2],
             "std_curve": { "slope": slope, "intercept": intercept },
         }),
         &intern,
@@ -977,7 +979,7 @@ async fn doc_tool_rejects_malformed_input_and_accounts_for_every_request_key() {
     let (status, wrong_type) = crate::common::post_json_parse_with_token(
         &app,
         "/api/tools/doc/calculate",
-        &json!({ "replicates": "not-an-array" }),
+        &json!({ "DOC_rep_1": "not-a-number" }),
         &intern,
     )
     .await;
@@ -992,9 +994,9 @@ async fn doc_tool_rejects_malformed_input_and_accounts_for_every_request_key() {
         "the error names the body as the problem: {wrong_type}"
     );
 
-    // `required` is reserved for fields without which the tool cannot run. Omitting the doc
-    // replicates reaches the wrapper as an absent series, which is the same uncomputable case as
-    // an empty one, so it answers like one rather than being refused.
+    // `required` is reserved for fields without which the tool cannot run. Omitting every doc
+    // replicate reaches the wrapper as an absent series, which is the same uncomputable case as
+    // all-null cells, so it answers like one rather than being refused.
     let (status, absent) = crate::common::post_json_parse_with_token(
         &app,
         "/api/tools/doc/calculate",
@@ -1036,7 +1038,7 @@ async fn doc_tool_rejects_malformed_input_and_accounts_for_every_request_key() {
     let (status, empty) = crate::common::post_json_parse_with_token(
         &app,
         "/api/tools/doc/calculate",
-        &json!({ "replicates": [] }),
+        &json!({ "DOC_rep_1": null, "DOC_rep_2": null, "DOC_rep_3": null }),
         &intern,
     )
     .await;
@@ -1058,7 +1060,7 @@ async fn doc_tool_rejects_malformed_input_and_accounts_for_every_request_key() {
         &app,
         "/api/tools/doc/calculate",
         &json!({
-            "replicates": [100.0, 104.0],
+            "DOC_rep_1": 100.0, "DOC_rep_2": 104.0,
             "notes": "plate A",
         }),
         &intern,
@@ -1079,7 +1081,7 @@ async fn doc_tool_rejects_malformed_input_and_accounts_for_every_request_key() {
         &app,
         "/api/tools/doc/calculate",
         &json!({
-            "replicates": [100.0, 104.0],
+            "DOC_rep_1": 100.0, "DOC_rep_2": 104.0,
             "std_curve": { "slope": 2.0, "intercept": 1.0 },
         }),
         &intern,
@@ -1107,7 +1109,7 @@ async fn doc_tool_rejects_malformed_input_and_accounts_for_every_request_key() {
     used.sort_unstable();
     assert_eq!(
         used,
-        ["replicates", "std_curve"],
+        ["DOC_rep_1", "DOC_rep_2", "std_curve"],
         "every key the tool consumed is reported: {full}"
     );
 
