@@ -9,4 +9,5 @@ mod common;
 mod label_notes;
 mod provenance;
 mod replicate_lifecycle;
+mod tool_statistics_parity;
 mod trigger_aggregates;

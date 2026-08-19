@@ -24,13 +24,23 @@ pub struct ToolResult {
     pub results: serde_json::Value,
     pub inputs_used: Vec<String>,
     pub inputs_ignored: Vec<String>,
-    /// The exact script version that produced these numbers; goes into the provenance blob on
-    /// save.
+    /// The constant values the server resolved and passed to the runner, by name.
+    #[schema(value_type = Object)]
+    pub constants: serde_json::Value,
+    /// The curves the server resolved, as the runner received them.
+    #[schema(value_type = Vec<Object>)]
+    pub curves: Vec<serde_json::Value>,
+    /// The exact script version and runtime that produced these numbers; goes into the
+    /// provenance blob on save.
     pub tool_version: ToolVersionRef,
 }
 
 /// List the active analytical tools with their full input/output manifests.
-/// Requires `read_data`.
+///
+/// Each output carries its declaration plus `parameter`, the catalog row it resolves to here:
+/// `parameter_id` first, then `suggested_parameter_code` case-insensitively, null when neither
+/// names a row this database holds. `dangling_parameter_id` on the resolved parameter says the id
+/// named a row that has since gone and the code carried the output instead. Requires `read_data`.
 #[utoipa::path(
     get,
     path = "/tools",
@@ -41,8 +51,10 @@ pub struct ToolResult {
 )]
 pub async fn list_tools(State(state): State<AppState>) -> AppResult<Json<Vec<ToolDescriptor>>> {
     let tools = engine::list_active_tools(&state.db).await?;
+    let catalog =
+        engine::load_parameter_catalog(&state.db, tools.iter().map(|tool| &tool.manifest)).await?;
     Ok(Json(
-        tools.iter().map(engine::ActiveTool::descriptor).collect(),
+        tools.iter().map(|tool| tool.descriptor(&catalog)).collect(),
     ))
 }
 
@@ -68,11 +80,14 @@ pub async fn calculate_tool(
 ) -> AppResult<Json<ToolResult>> {
     let tool = engine::find_active_tool(&state.db, &tool_name).await?;
     let outcome = engine::run_active_tool(&state, &tool, &body).await?;
+    let runtime = engine::runner_runtime(&state).await;
     Ok(Json(ToolResult {
         tool: tool.name.clone(),
         results: serde_json::Value::Object(outcome.results),
         inputs_used: outcome.inputs_used,
         inputs_ignored: outcome.inputs_ignored,
-        tool_version: tool.version_ref(),
+        constants: serde_json::Value::Object(outcome.constants),
+        curves: outcome.curves,
+        tool_version: tool.version_ref(runtime.as_ref()),
     }))
 }

@@ -36,12 +36,27 @@ async fn no_api_token_reaches_the_authoring_surface() {
 #[tokio::test]
 #[serial]
 async fn a_version_lives_through_lint_validate_activate_and_rollback() {
+    if !crate::common::tools_runner::require_runner_or_skip(
+        "a_version_lives_through_lint_validate_activate_and_rollback",
+    )
+    .await
+    {
+        return;
+    }
     if !kc::require_keycloak_or_skip("tool_script_lifecycle").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
+    // `tool_scripts` holds the seeded tools, so it outlives the truncation and a rerun would
+    // otherwise meet its own leftovers.
+    for sql in [
+        "UPDATE tool_scripts SET active_version_id = NULL WHERE name = 'double_up'",
+        "DELETE FROM tool_scripts WHERE name = 'double_up'",
+    ] {
+        crate::common::exec(&db, sql).await;
+    }
     let app = kc::build_test_app_with_keycloak(db).await;
     kc::ensure_realm_user("scriptadmin", "scriptadmin", &["riverdata-admin"]).await;
     let admin = kc::get_keycloak_jwt("scriptadmin", "scriptadmin").await;

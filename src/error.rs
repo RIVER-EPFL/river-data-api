@@ -40,6 +40,15 @@ pub enum AppError {
         detail: serde_json::Value,
     },
 
+    /// A failure raised inside a tool script, kept structured so the script editor can render
+    /// the message, the call and the traceback separately.
+    #[error("tool script error: {message}")]
+    ToolScriptError {
+        message: String,
+        call: Option<String>,
+        traceback: Vec<String>,
+    },
+
     #[error("Too many requests: {0}")]
     TooManyRequests(String),
 }
@@ -77,6 +86,19 @@ impl IntoResponse for AppError {
             Self::ConflictDetail { message, detail } => {
                 let body = Json(json!({ "error": message, "detail": detail }));
                 return (StatusCode::CONFLICT, body).into_response();
+            }
+            Self::ToolScriptError {
+                message,
+                call,
+                traceback,
+            } => {
+                let body = Json(json!({
+                    "error": format!("tool script error: {message}"),
+                    "message": message,
+                    "call": call,
+                    "traceback": traceback,
+                }));
+                return (StatusCode::BAD_REQUEST, body).into_response();
             }
             Self::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
         };

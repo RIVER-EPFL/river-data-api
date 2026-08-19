@@ -6,6 +6,7 @@ pub mod fixtures;
 pub mod keycloak;
 pub mod seed;
 pub mod sensor_lifecycle;
+pub mod tools_runner;
 pub mod tracks;
 
 use river_db::common::{AppState, EventSender};

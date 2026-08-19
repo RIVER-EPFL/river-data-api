@@ -992,7 +992,10 @@ async fn doc_tool_rejects_malformed_input_and_accounts_for_every_request_key() {
         "the error names the body as the problem: {wrong_type}"
     );
 
-    let (status, incomplete) = crate::common::post_json_parse_with_token(
+    // `required` is reserved for fields without which the tool cannot run. Omitting the doc
+    // replicates reaches the wrapper as an absent series, which is the same uncomputable case as
+    // an empty one, so it answers like one rather than being refused.
+    let (status, absent) = crate::common::post_json_parse_with_token(
         &app,
         "/api/tools/doc/calculate",
         &json!({}),
@@ -1000,8 +1003,34 @@ async fn doc_tool_rejects_malformed_input_and_accounts_for_every_request_key() {
     )
     .await;
     assert_eq!(
+        status, 200,
+        "an omitted optional series is the uncomputable case, not a bad request ({status}): \
+         {absent}"
+    );
+    assert_eq!(
+        absent["results"].as_object().map(|results| results.len()),
+        Some(0),
+        "an uncomputable result is omitted rather than serialized: {absent}"
+    );
+
+    // Discharge keeps its series required because an empty one makes the underlying lm() fail,
+    // so the refusal that doc no longer owes is still pinned on a tool that owes it.
+    let (status, incomplete) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/tools/discharge/calculate",
+        &json!({ "tracer": "salt", "values": [1.0, 2.0] }),
+        &intern,
+    )
+    .await;
+    assert_eq!(
         status, 400,
-        "a body missing the tool's required field is a bad request ({status}): {incomplete}"
+        "a body missing a genuinely required field is a bad request ({status}): {incomplete}"
+    );
+    assert!(
+        incomplete["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("times_s")),
+        "the error names the missing field: {incomplete}"
     );
 
     let (status, empty) = crate::common::post_json_parse_with_token(
