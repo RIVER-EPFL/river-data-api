@@ -1,6 +1,7 @@
 pub use sea_orm_migration::prelude::*;
 
 pub mod tool_hash;
+pub mod tool_prelude;
 
 mod m20260325_000001_init;
 mod m20260420_000001_samples;

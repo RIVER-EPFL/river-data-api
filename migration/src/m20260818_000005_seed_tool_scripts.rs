@@ -2,8 +2,9 @@ use sea_orm::Statement;
 use sea_orm_migration::prelude::*;
 
 /// Seeds the 13 portal-lineage tools as version 1 of each script: the vendored CNET/METALP
-/// calculation functions (verbatim) plus a thin wrapper per tool, with the manifest and the
-/// golden-derived test cases authored under `migration/tool_seed/`. Versions land
+/// calculation functions this tool reaches (verbatim, see [`crate::tool_prelude`]) plus a thin
+/// wrapper per tool, with the manifest and the golden-derived test cases authored under
+/// `migration/tool_seed/`. Versions land
 /// pre-validated (every case passed against the runner before shipping) and active.
 /// Idempotent: a script whose name already exists is left alone entirely.
 #[derive(DeriveMigrationName)]
@@ -50,7 +51,23 @@ impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
         for seed in SEEDS {
-            let script = format!("{PRELUDE}\n{}", seed.wrapper);
+            let script = crate::tool_prelude::script_for(PRELUDE, seed.wrapper);
+            // The same bundle hash the authoring path computes, so one rule identifies a version
+            // however it was created and a manifest edit over one script is a distinct identity.
+            // Taken over the jsonb form and stored as that form, so the hash on the seeded row is
+            // recomputable from the row rather than from the files under `tool_seed/`.
+            let manifest: serde_json::Value = serde_json::from_str(seed.manifest).map_err(|e| {
+                DbErr::Custom(format!(
+                    "tool seed {}: manifest is not JSON: {e}",
+                    seed.name
+                ))
+            })?;
+            let cases: serde_json::Value = serde_json::from_str(seed.cases).map_err(|e| {
+                DbErr::Custom(format!("tool seed {}: cases are not JSON: {e}", seed.name))
+            })?;
+            let stored =
+                crate::tool_hash::stored_version_content(db, &script, "tool", &manifest, &cases)
+                    .await?;
 
             db.execute(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
@@ -67,7 +84,7 @@ impl MigrationTrait for Migration {
                 r"INSERT INTO tool_script_versions
                       (tool_script_id, version_no, script, entry_function, manifest, test_cases,
                        content_hash, created_by, validated_at)
-                  SELECT s.id, 1, $2, 'tool', $3::jsonb, $4::jsonb, md5($2), 'seed', now()
+                  SELECT s.id, 1, $2, 'tool', $3::jsonb, $4::jsonb, $5, 'seed', now()
                   FROM tool_scripts s
                   WHERE LOWER(s.name) = LOWER($1)
                     AND NOT EXISTS (SELECT 1 FROM tool_script_versions v
@@ -75,8 +92,9 @@ impl MigrationTrait for Migration {
                 [
                     seed.name.into(),
                     script.into(),
-                    seed.manifest.into(),
-                    seed.cases.into(),
+                    stored.manifest.into(),
+                    stored.test_cases.into(),
+                    stored.content_hash.into(),
                 ],
             ))
             .await?;
