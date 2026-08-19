@@ -279,8 +279,8 @@ async fn alarm_thresholds_confines_slots_to_the_callers_projects() {
 }
 
 /// `merge_parameters` hard-deletes a global catalog row and `merge_site_parameters` takes
-/// any project's ids, both at Manager level; the equivalent destruction through CRUD is
-/// Administrator-only and project-confined.
+/// any project's ids; the equivalent destruction through CRUD is Administrator-only and
+/// project-confined, and both merges hold that gate.
 #[tokio::test]
 #[serial]
 async fn parameter_merges_hold_the_administrator_and_project_gates() {
@@ -450,6 +450,115 @@ async fn parameter_merges_hold_the_administrator_and_project_gates() {
         status, 404,
         "the merge deletes the source catalog row: {body}"
     );
+}
+
+/// A slot merge moves readings and deletes the source slot, so the gate is the role rather than
+/// the grant: a manager is refused even where the grant covers both slots.
+#[tokio::test]
+#[serial]
+async fn slot_merge_holds_the_administrator_gate_inside_a_granted_project() {
+    if !kc::require_keycloak_or_skip(
+        "slot_merge_holds_the_administrator_gate_inside_a_granted_project",
+    )
+    .await
+    {
+        return;
+    }
+    let db = fresh_db().await;
+    let app = kc::build_test_app_with_keycloak(db.clone()).await;
+    let admin = kc::get_keycloak_jwt("admin", "admin").await;
+    let scene = provision_two_projects(&app, &admin).await;
+    let manager = member(&db, &scene.project_a, "manager1", "riverdata-manager").await;
+
+    let absorbed =
+        e2e::create_parameter(&app, &admin, "RdSlotMergeSrc", "Slot Merge", "degC").await;
+    let source_slot =
+        e2e::assign_site_parameter_minimal(&app, &admin, &scene.site_a, &absorbed).await;
+    let target_slot = {
+        let (status, body) =
+            crate::common::get_json_with_token(&app, "/api/site_parameters", &admin).await;
+        assert_eq!(status, 200, "{body}");
+        let row = body
+            .as_array()
+            .unwrap_or_else(|| panic!("site_parameters list is an array: {body}"))
+            .iter()
+            .find(|sp| {
+                sp["site_id"] == scene.site_a.as_str()
+                    && sp["parameter_id"] == scene.parameter.as_str()
+            })
+            .unwrap_or_else(|| panic!("site A carries the shared parameter: {body}"))
+            .clone();
+        e2e::id_of(&row)
+    };
+    let payload = json!({
+        "source_site_parameter_id": source_slot.as_str(),
+        "target_site_parameter_id": target_slot.as_str(),
+    });
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/actions/merge_site_parameters",
+        &payload,
+        &manager,
+    )
+    .await;
+    assert_eq!(
+        status, 403,
+        "both slots are in the manager's own project and the merge is still refused: {body}"
+    );
+
+    let scoped_write_token = mint_token(
+        &app,
+        &admin,
+        "scope-a-slot-merger",
+        json!({
+            "read_metadata": true,
+            "read_data": true,
+            "write_metadata": true,
+            "write_data": true,
+        }),
+        Some(&scene.project_a),
+    )
+    .await;
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/actions/merge_site_parameters",
+        &payload,
+        &scoped_write_token,
+    )
+    .await;
+    assert_eq!(
+        status, 403,
+        "a project-scoped token cannot merge slots at all: {body}"
+    );
+
+    let (status, body) =
+        crate::common::get_with_token(&app, &format!("/api/site_parameters/{source_slot}"), &admin)
+            .await;
+    assert_eq!(
+        status, 200,
+        "the refused merges left the slot intact: {body}"
+    );
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/actions/merge_site_parameters",
+        &payload,
+        &admin,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "an administrator may merge the slot ({status}): {body}"
+    );
+    assert!(
+        e2e::wait_for_jobs_by_trigger(&db, "merge_site_parameters", 60).await,
+        "the administrator's merge job runs to completion"
+    );
+    let (status, body) =
+        crate::common::get_with_token(&app, &format!("/api/site_parameters/{source_slot}"), &admin)
+            .await;
+    assert_eq!(status, 404, "the merge deletes the source slot: {body}");
 }
 
 /// `POST /api/actions/rollback_deployment` deletes a `sensor_deployments` row, so it must

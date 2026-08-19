@@ -433,10 +433,6 @@ pub fn api_router(state: &AppState) -> Router<()> {
             post(public_config::invalidate_public_config),
         )
         .route(
-            "/actions/merge_site_parameters",
-            post(merge::merge_site_parameters_handler),
-        )
-        .route(
             "/reprocessing_jobs/{id}/rerun",
             post(crate::routes::private::reprocessing_jobs::routes::rerun_job),
         )
@@ -457,14 +453,19 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .layer(middleware::from_fn(require_manage_sensors))
         .with_state(state.clone());
 
-    // A catalog merge hard-deletes a `parameters` row, so it holds the same Administrator gate as
-    // DELETE /parameters/{id} rather than the MANAGER gate the other operator actions carry. The
-    // write_metadata token bit is preserved for automation; scoped tokens are still denied, a
-    // per-project key has no business destroying a global catalog entry.
+    // A merge destroys rows across projects: the catalog merge hard-deletes a `parameters` row and
+    // the slot merge moves and deletes readings at any site named by id. Both hold the same
+    // Administrator gate as DELETE /parameters/{id} rather than the MANAGER gate the other
+    // operator actions carry. The write_metadata token bit is preserved for automation; scoped
+    // tokens are still denied, a per-project key has no business destroying another project's data.
     let catalog_merge_routes = Router::new()
         .route(
             "/actions/merge_parameters",
             post(merge::merge_parameters_handler),
+        )
+        .route(
+            "/actions/merge_site_parameters",
+            post(merge::merge_site_parameters_handler),
         )
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(middleware::from_fn(deny_scoped_token))

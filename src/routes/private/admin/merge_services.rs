@@ -433,10 +433,11 @@ async fn reassign_parameter_references(
     // sites that never had one, so the source parameter can be deleted.
     let swept = move_slot_rows(txn, MoveScope::EverySite, source_id, target_id).await?;
 
-    // Merge aliases: target gets source's aliases + source's name as a new alias
+    // Merge aliases: target gets source's aliases + source's name as a new alias.
+    // `needs_review` clears with it: a merge is the adjudication that flag waits for.
     txn.execute(Statement::from_sql_and_values(
         pg,
-        r#"UPDATE parameters SET aliases = (
+        r#"UPDATE parameters SET needs_review = false, aliases = (
             SELECT array_agg(DISTINCT a)
             FROM unnest(
                 (SELECT aliases FROM parameters WHERE id = $1)
