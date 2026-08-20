@@ -1036,13 +1036,12 @@ async fn fetch_readings(
     if let Some(e) = end {
         query.and_where(Expr::col((r.clone(), Alias::new("time"))).lte(e));
     }
-    // Same semantics as the private readings filter: 'continuous' includes legacy NULL rows.
+    // Same semantics as the private readings filter: 'continuous' means everything that is
+    // not a grab (derived and legacy NULL rows included), matching the continuous aggregates.
     match measurement_type {
         "" => {}
         "continuous" => {
-            query.and_where(Expr::cust(
-                "(r.measurement_type = 'continuous' OR r.measurement_type IS NULL)",
-            ));
+            query.and_where(Expr::cust("(r.measurement_type IS DISTINCT FROM 'spot')"));
         }
         other => {
             query.and_where(Expr::col((r.clone(), Alias::new("measurement_type"))).eq(other));

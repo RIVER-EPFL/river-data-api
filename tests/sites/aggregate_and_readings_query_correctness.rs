@@ -204,9 +204,10 @@ async fn readings_time_range_boundaries_accepted() {
     assert_eq!(status, 200);
 }
 
-/// `measurement_type=continuous` covers both explicit continuous rows and legacy rows written
-/// before the column existed (NULL), while `spot` returns only grab samples. This is the query
-/// contract the High/Low frequency toggle relies on.
+/// `measurement_type=continuous` covers everything that is not a grab: explicit continuous rows,
+/// derived rows (which roll up like continuous in the aggregates), and legacy rows written before
+/// the column existed (NULL). `spot` returns only grab samples. This is the query contract the
+/// High/Low frequency toggle relies on.
 #[tokio::test]
 #[serial]
 async fn measurement_type_continuous_includes_legacy_null_rows() {
@@ -262,15 +263,18 @@ async fn measurement_type_continuous_includes_legacy_null_rows() {
     .await;
 
     let base = "2025-07-01T12:00:00Z";
-    // 3 legacy rows (measurement_type NULL) + 2 explicit continuous + 2 spot, at distinct minutes.
-    let rows: [(i64, &str); 7] = [
+    // 3 legacy rows (measurement_type NULL) + 2 explicit continuous + 2 derived + 2 spot,
+    // at distinct minutes.
+    let rows: [(i64, &str); 9] = [
         (0, "NULL"),
         (1, "NULL"),
         (2, "NULL"),
         (3, "'continuous'"),
         (4, "'continuous'"),
-        (5, "'spot'"),
-        (6, "'spot'"),
+        (5, "'derived'"),
+        (6, "'derived'"),
+        (7, "'spot'"),
+        (8, "'spot'"),
     ];
     for (i, mt) in &rows {
         crate::common::db::exec(
@@ -305,8 +309,8 @@ async fn measurement_type_continuous_includes_legacy_null_rows() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         count_times(&body),
-        5,
-        "continuous should include the 3 NULL + 2 continuous rows: {body}"
+        7,
+        "continuous should include the 3 NULL + 2 continuous + 2 derived rows: {body}"
     );
 
     let (status, body) = crate::common::get_json_with_token(
@@ -332,5 +336,5 @@ async fn measurement_type_continuous_includes_legacy_null_rows() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(count_times(&body), 7, "no filter returns all rows: {body}");
+    assert_eq!(count_times(&body), 9, "no filter returns all rows: {body}");
 }
