@@ -432,6 +432,18 @@ pub async fn build_test_app_with_keycloak_and_cache(db: DatabaseConnection) -> a
     build_test_app_with_keycloak_inner(db, false, super::cached_test_config()).await
 }
 
+/// Like [`build_test_app_with_keycloak`] with the tool runner pointed where the caller says, for
+/// the Administrator-only tool routes under a runner that is absent.
+pub async fn build_test_app_with_keycloak_and_runner(
+    db: DatabaseConnection,
+    runner_url: Option<String>,
+) -> axum::Router {
+    let mut config = super::test_config();
+    config.tools_runner_url = runner_url;
+    config.tools_runner_timeout_seconds = 5;
+    build_test_app_with_keycloak_inner(db, false, config).await
+}
+
 async fn build_test_app_with_keycloak_inner(
     db: DatabaseConnection,
     with_admin_proxy: bool,

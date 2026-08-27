@@ -68,6 +68,21 @@ pub struct SiteParameterOperations;
 impl CRUDOperations for SiteParameterOperations {
     type Resource = SiteParameter;
 
+    /// One row at a time, through the single-row path: the crudcrate default `create_many`
+    /// delegates to the resource, which delegates back here, so the default recurses; the loop
+    /// also runs the single-row hooks for every item.
+    async fn create_many(
+        &self,
+        db: &DatabaseConnection,
+        data: Vec<<SiteParameter as CRUDResource>::CreateModel>,
+    ) -> Result<Vec<SiteParameter>, ApiError> {
+        let mut created = Vec::with_capacity(data.len());
+        for item in data {
+            created.push(self.create(db, item).await?);
+        }
+        Ok(created)
+    }
+
     async fn fetch_one(
         &self,
         db: &DatabaseConnection,

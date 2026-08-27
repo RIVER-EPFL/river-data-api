@@ -109,6 +109,11 @@ pub struct Config {
     /// only the DEBUG line each request already writes.
     pub request_summary_seconds: u64,
 
+    /// Base URL of the R tool runner (OpenCPU), e.g. `http://river-tools-r/ocpu`. Unset leaves
+    /// the tool endpoints answering 503.
+    pub tools_runner_url: Option<String>,
+    pub tools_runner_timeout_seconds: u64,
+
     // Derived-parameter janitor
     pub janitor_interval_seconds: u64,
     pub janitor_full_refresh_seconds: u64,
@@ -376,6 +381,15 @@ impl Config {
                 .unwrap_or_else(|_| "30".to_string())
                 .parse()
                 .unwrap_or(30),
+
+            tools_runner_url: env::var("TOOLS_RUNNER_URL")
+                .ok()
+                .map(|u| u.trim_end_matches('/').to_string())
+                .filter(|u| !u.is_empty()),
+            tools_runner_timeout_seconds: env::var("TOOLS_RUNNER_TIMEOUT_SECONDS")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()
+                .unwrap_or(60),
 
             // Derived-parameter janitor
             janitor_interval_seconds: env::var("JANITOR_INTERVAL_SECONDS")

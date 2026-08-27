@@ -13,6 +13,7 @@ mod aggregate_sensor_split;
 mod data_endpoints;
 mod parameter_frequency;
 mod refresh_gaps;
+mod sensor_vs_grab_filters;
 mod series_export_edges;
 mod status_event_page_order;
 mod subprojects;

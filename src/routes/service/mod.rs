@@ -437,10 +437,6 @@ pub fn api_router(state: &AppState) -> Router<()> {
             post(public_config::invalidate_public_config),
         )
         .route(
-            "/actions/merge_site_parameters",
-            post(merge::merge_site_parameters_handler),
-        )
-        .route(
             "/reprocessing_jobs/{id}/rerun",
             post(crate::routes::private::reprocessing_jobs::routes::rerun_job),
         )
@@ -461,14 +457,19 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .layer(middleware::from_fn(require_manage_sensors))
         .with_state(state.clone());
 
-    // A catalog merge hard-deletes a `parameters` row, so it holds the same Administrator gate as
-    // DELETE /parameters/{id} rather than the MANAGER gate the other operator actions carry. The
-    // write_metadata token bit is preserved for automation; scoped tokens are still denied, a
-    // per-project key has no business destroying a global catalog entry.
+    // A merge destroys rows across projects: the catalog merge hard-deletes a `parameters` row and
+    // the slot merge moves and deletes readings at any site named by id. Both hold the same
+    // Administrator gate as DELETE /parameters/{id} rather than the MANAGER gate the other
+    // operator actions carry. The write_metadata token bit is preserved for automation; scoped
+    // tokens are still denied, a per-project key has no business destroying another project's data.
     let catalog_merge_routes = Router::new()
         .route(
             "/actions/merge_parameters",
             post(merge::merge_parameters_handler),
+        )
+        .route(
+            "/actions/merge_site_parameters",
+            post(merge::merge_site_parameters_handler),
         )
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(middleware::from_fn(deny_scoped_token))
@@ -525,6 +526,42 @@ pub fn api_router(state: &AppState) -> Router<()> {
             .layer(middleware::from_fn(require_admin))
             .with_state(state.clone())
     });
+
+    // Tool script authoring: versioned R code executed by the runner. Administrator only, it is
+    // remote code authorship; execution of the ACTIVE version stays open via /tools.
+    let tool_script_routes = {
+        use crate::routes::private::tools::scripts;
+        Router::new()
+            .route(
+                "/tool_scripts",
+                get(scripts::list_scripts).post(scripts::create_script),
+            )
+            .route(
+                "/tool_scripts/{id}",
+                get(scripts::get_script).patch(scripts::update_script),
+            )
+            .route("/tool_scripts/draft_run", post(scripts::draft_run))
+            .route("/tool_scripts/inspect", post(scripts::inspect_script))
+            .route("/tool_scripts/{id}/versions", post(scripts::create_version))
+            .route(
+                "/tool_scripts/{id}/versions/{version_id}",
+                get(scripts::get_version),
+            )
+            .route(
+                "/tool_scripts/{id}/versions/{version_id}/validate",
+                post(scripts::validate_version),
+            )
+            .route(
+                "/tool_scripts/{id}/versions/{version_id}/activate",
+                post(scripts::activate_version),
+            )
+            .route(
+                "/tool_scripts/{id}/activations",
+                get(scripts::list_activations),
+            )
+            .layer(middleware::from_fn(require_admin))
+            .with_state(state.clone())
+    };
 
     // Telegram identity link-code minting. Admin-only, it grants a chat the linked user's role.
     let telegram_admin_routes = Router::new()
@@ -609,6 +646,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .merge(entity_router)
         .merge(token_admin_routes)
         .merge(telegram_admin_routes)
+        .merge(tool_script_routes)
         .merge(notifications_admin_routes)
         .merge(notifications_me_routes)
         .merge(me_route)

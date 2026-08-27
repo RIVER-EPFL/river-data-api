@@ -1,0 +1,441 @@
+{
+  "tolerance": 1e-09,
+  "cases": [
+    {
+      "name": "bp_from_site_elevation_470m",
+      "inputs": {
+        "elevation_m": 470.0,
+        "temp_c": 15.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Field_BP_altitude": 958.0
+      },
+      "absent": [
+        "Reach_depth_avg_cm",
+        "Reach_depth_sd_cm",
+        "Vaisala_CO2_min_corr",
+        "Vaisala_CO2_avg_corr",
+        "Vaisala_CO2_max_corr"
+      ]
+    },
+    {
+      "name": "bp_from_site_elevation_4808m",
+      "inputs": {
+        "elevation_m": 4808.0,
+        "temp_c": -10.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Field_BP_altitude": 543.0
+      },
+      "absent": [
+        "Reach_depth_avg_cm",
+        "Reach_depth_sd_cm",
+        "Vaisala_CO2_min_corr",
+        "Vaisala_CO2_avg_corr",
+        "Vaisala_CO2_max_corr"
+      ]
+    },
+    {
+      "name": "bp_omitted_without_temp",
+      "inputs": {
+        "elevation_m": 1000.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": [
+        "Reach_depth_avg_cm",
+        "Reach_depth_sd_cm",
+        "Field_BP_altitude",
+        "Vaisala_CO2_min_corr",
+        "Vaisala_CO2_avg_corr",
+        "Vaisala_CO2_max_corr"
+      ]
+    },
+    {
+      "name": "co2_trio_field_bp_in_range_wins",
+      "inputs": {
+        "elevation_m": 470.0,
+        "temp_c": 20.0,
+        "field_bp": 1000.0,
+        "raw_co2_min": 800.0,
+        "raw_co2_avg": 900.0,
+        "raw_co2_max": 1000.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Field_BP_altitude": 959.0,
+        "Vaisala_CO2_min_corr": 803.2101452449218,
+        "Vaisala_CO2_avg_corr": 903.611413400537,
+        "Vaisala_CO2_max_corr": 1004.0126815561523
+      },
+      "absent": [
+        "Reach_depth_avg_cm",
+        "Reach_depth_sd_cm"
+      ]
+    },
+    {
+      "name": "co2_trio_field_bp_out_of_range_uses_altitude",
+      "inputs": {
+        "elevation_m": 470.0,
+        "temp_c": 15.0,
+        "field_bp": 600.0,
+        "raw_co2_min": 900.0,
+        "raw_co2_avg": 1000.0,
+        "raw_co2_max": 1100.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Field_BP_altitude": 958.0,
+        "Vaisala_CO2_min_corr": 880.6885488647581,
+        "Vaisala_CO2_avg_corr": 978.5428320719535,
+        "Vaisala_CO2_max_corr": 1076.397115279149
+      },
+      "absent": [
+        "Reach_depth_avg_cm",
+        "Reach_depth_sd_cm"
+      ]
+    },
+    {
+      "name": "co2_no_field_bp_uses_altitude",
+      "inputs": {
+        "elevation_m": 470.0,
+        "temp_c": 15.0,
+        "raw_co2_avg": 1000.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Field_BP_altitude": 958.0,
+        "Vaisala_CO2_avg_corr": 978.5428320719535
+      },
+      "absent": [
+        "Reach_depth_avg_cm",
+        "Reach_depth_sd_cm",
+        "Vaisala_CO2_min_corr",
+        "Vaisala_CO2_max_corr"
+      ]
+    },
+    {
+      "name": "co2_std_curve_applies_to_all_three",
+      "inputs": {
+        "elevation_m": 470.0,
+        "temp_c": 10.0056232399074,
+        "field_bp": 1003.09201086638,
+        "raw_co2_min": 2500.0,
+        "raw_co2_avg": 2763.41491076164,
+        "raw_co2_max": 3000.0
+      },
+      "constants": {},
+      "curves": {
+        "std_curve": {
+          "slope": 1.11846002850216,
+          "intercept": 9.88165199756622,
+          "standard_curve_id": null,
+          "label": null
+        }
+      },
+      "expected": {
+        "Field_BP_altitude": 957.0,
+        "Vaisala_CO2_min_corr": 2925.803141376736,
+        "Vaisala_CO2_avg_corr": 3232.9975792568644,
+        "Vaisala_CO2_max_corr": 3508.9030824391143
+      },
+      "absent": [
+        "Reach_depth_avg_cm",
+        "Reach_depth_sd_cm"
+      ]
+    },
+    {
+      "name": "co2_std_curve_off_leaves_raw",
+      "inputs": {
+        "elevation_m": 470.0,
+        "temp_c": 10.0056232399074,
+        "field_bp": 1003.09201086638,
+        "raw_co2_avg": 2763.41491076164
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Field_BP_altitude": 957.0,
+        "Vaisala_CO2_avg_corr": 2881.367291692886
+      },
+      "absent": [
+        "Reach_depth_avg_cm",
+        "Reach_depth_sd_cm",
+        "Vaisala_CO2_min_corr",
+        "Vaisala_CO2_max_corr"
+      ]
+    },
+    {
+      "name": "co2_omitted_without_temp",
+      "inputs": {
+        "elevation_m": 470.0,
+        "field_bp": 1000.0,
+        "raw_co2_min": 800.0,
+        "raw_co2_avg": 900.0,
+        "raw_co2_max": 1000.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": [
+        "Reach_depth_avg_cm",
+        "Reach_depth_sd_cm",
+        "Field_BP_altitude",
+        "Vaisala_CO2_min_corr",
+        "Vaisala_CO2_avg_corr",
+        "Vaisala_CO2_max_corr"
+      ]
+    },
+    {
+      "name": "reach_depths_five_replicates",
+      "inputs": {
+        "elevation_m": 470.0,
+        "Reach_depth_rep_1": 42.2791988803074,
+        "Reach_depth_rep_2": 9.23158912127838,
+        "Reach_depth_rep_3": 35.5728250057437,
+        "Reach_depth_rep_4": 47.7065041963942,
+        "Reach_depth_rep_5": 59.8868433060125
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Reach_depth_avg_cm": 38.93539210194724,
+        "Reach_depth_sd_cm": 18.84608399437103
+      },
+      "absent": [
+        "Field_BP_altitude",
+        "Vaisala_CO2_min_corr",
+        "Vaisala_CO2_avg_corr",
+        "Vaisala_CO2_max_corr"
+      ]
+    },
+    {
+      "name": "reach_depths_ten_replicates",
+      "inputs": {
+        "elevation_m": 470.0,
+        "Reach_depth_rep_1": 12.5,
+        "Reach_depth_rep_2": 14.0,
+        "Reach_depth_rep_3": 11.25,
+        "Reach_depth_rep_4": 18.75,
+        "Reach_depth_rep_5": 9.5,
+        "Reach_depth_rep_6": 21.0,
+        "Reach_depth_rep_7": 16.5,
+        "Reach_depth_rep_8": 13.25,
+        "Reach_depth_rep_9": 10.0,
+        "Reach_depth_rep_10": 17.75
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Reach_depth_avg_cm": 14.45,
+        "Reach_depth_sd_cm": 3.8940838317746693
+      },
+      "absent": [
+        "Field_BP_altitude",
+        "Vaisala_CO2_min_corr",
+        "Vaisala_CO2_avg_corr",
+        "Vaisala_CO2_max_corr"
+      ]
+    },
+    {
+      "name": "reach_depth_single_has_no_sd",
+      "inputs": {
+        "elevation_m": 470.0,
+        "Reach_depth_rep_1": 36.6300129839219
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Reach_depth_avg_cm": 36.6300129839219
+      },
+      "absent": [
+        "Reach_depth_sd_cm",
+        "Field_BP_altitude",
+        "Vaisala_CO2_min_corr",
+        "Vaisala_CO2_avg_corr",
+        "Vaisala_CO2_max_corr"
+      ]
+    },
+    {
+      "name": "reach_depths_gap_in_the_middle",
+      "inputs": {
+        "elevation_m": 470.0,
+        "Reach_depth_rep_2": 44.3008837071247,
+        "Reach_depth_rep_3": 52.5645764148794
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Reach_depth_avg_cm": 48.43273006100205,
+        "Reach_depth_sd_cm": 5.843313151295171
+      },
+      "absent": [
+        "Field_BP_altitude",
+        "Vaisala_CO2_min_corr",
+        "Vaisala_CO2_avg_corr",
+        "Vaisala_CO2_max_corr"
+      ]
+    },
+    {
+      "name": "reach_depth_rep_7_measured_alone",
+      "inputs": {
+        "elevation_m": 470.0,
+        "Reach_depth_rep_7": 27.4185220913744
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Reach_depth_avg_cm": 27.4185220913744
+      },
+      "absent": [
+        "Reach_depth_sd_cm",
+        "Field_BP_altitude",
+        "Vaisala_CO2_min_corr",
+        "Vaisala_CO2_avg_corr",
+        "Vaisala_CO2_max_corr"
+      ],
+      "note": "The measurement was taken at replicate 7 and reaches the wrapper as Reach_depth_rep_7, so it occupies column 7 of the portal's row. As an array the form would have sent [27.4185220913744] and the wrapper would have filed it under Reach_depth_rep_1, a slot in which nothing was measured."
+    },
+    {
+      "name": "reach_depths_none_supplied_omits_both",
+      "inputs": {
+        "elevation_m": 470.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": [
+        "Reach_depth_avg_cm",
+        "Reach_depth_sd_cm",
+        "Field_BP_altitude",
+        "Vaisala_CO2_min_corr",
+        "Vaisala_CO2_avg_corr",
+        "Vaisala_CO2_max_corr"
+      ]
+    },
+    {
+      "name": "full_row_all_outputs",
+      "inputs": {
+        "elevation_m": 1230.0,
+        "temp_c": 7.5,
+        "field_bp": 875.0,
+        "raw_co2_min": 1150.0,
+        "raw_co2_avg": 1320.5,
+        "raw_co2_max": 1580.25,
+        "Reach_depth_rep_1": 22.0,
+        "Reach_depth_rep_2": 25.5,
+        "Reach_depth_rep_3": 19.75,
+        "Reach_depth_rep_4": 30.0
+      },
+      "constants": {},
+      "curves": {
+        "std_curve": {
+          "slope": 1.02,
+          "intercept": -12.5,
+          "standard_curve_id": null,
+          "label": null
+        }
+      },
+      "expected": {
+        "Reach_depth_avg_cm": 24.3125,
+        "Reach_depth_sd_cm": 4.469223459767181,
+        "Field_BP_altitude": 872.0,
+        "Vaisala_CO2_min_corr": 1064.9449315757893,
+        "Vaisala_CO2_avg_corr": 1224.5352573408436,
+        "Vaisala_CO2_max_corr": 1467.664800551828
+      },
+      "absent": []
+    },
+    {
+      "name": "no_elevation_and_out_of_range_field_bp_omits_co2",
+      "inputs": {
+        "temp_c": 20.0,
+        "field_bp": 600.0,
+        "raw_co2_avg": 900.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": [
+        "Reach_depth_avg_cm",
+        "Reach_depth_sd_cm",
+        "Field_BP_altitude",
+        "Vaisala_CO2_min_corr",
+        "Vaisala_CO2_avg_corr",
+        "Vaisala_CO2_max_corr"
+      ]
+    },
+    {
+      "name": "no_elevation_in_range_field_bp_still_corrects",
+      "inputs": {
+        "temp_c": 20.0,
+        "field_bp": 1000.0,
+        "raw_co2_avg": 900.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Vaisala_CO2_avg_corr": 903.611413400537
+      },
+      "absent": [
+        "Reach_depth_avg_cm",
+        "Reach_depth_sd_cm",
+        "Field_BP_altitude",
+        "Vaisala_CO2_min_corr",
+        "Vaisala_CO2_max_corr"
+      ]
+    },
+    {
+      "name": "co2_infinite_at_absolute_zero",
+      "inputs": {
+        "elevation_m": 470.0,
+        "temp_c": -273.0,
+        "field_bp": 1000.0,
+        "raw_co2_avg": 900.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Field_BP_altitude": 0.0
+      },
+      "absent": [
+        "Reach_depth_avg_cm",
+        "Reach_depth_sd_cm",
+        "Vaisala_CO2_min_corr",
+        "Vaisala_CO2_avg_corr",
+        "Vaisala_CO2_max_corr"
+      ],
+      "note": "temp_c = -273 makes calcCO2corr's 273 + temp zero, so the portal displays Inf for the correction (calculation_functions.R:530). The wrapper emits it; Inf serialises to JSON null under na=null and the API drops nulls, so it reaches the caller as an absent key. Field_BP_altitude is 0 because bigleaf::pressure.from.elevation at 0.15 K rounds to zero, which the portal writes as 0."
+    },
+    {
+      "name": "co2_nan_at_absolute_zero_without_field_bp",
+      "inputs": {
+        "elevation_m": 470.0,
+        "temp_c": -273.0,
+        "raw_co2_avg": 900.0
+      },
+      "constants": {},
+      "curves": {},
+      "expected": {
+        "Field_BP_altitude": 0.0
+      },
+      "absent": [
+        "Reach_depth_avg_cm",
+        "Reach_depth_sd_cm",
+        "Vaisala_CO2_min_corr",
+        "Vaisala_CO2_avg_corr",
+        "Vaisala_CO2_max_corr"
+      ],
+      "note": "Same temperature with no Field_BP: the altitude branch divides 0 by 0, so the portal displays NaN. NaN and Inf are treated alike, both serialise to null and are dropped."
+    }
+  ],
+  "notes": "Strict 1:1 with field_data_tool.R:287-338. Elevation is the site's elevation: the portal reads it from the stations table (calculation_functions.R:93, getRows(pool, 'stations', name == station, columns = c('order','elevation'))). stations.elevation is nullable and calculation_functions.R:96 guards on !any(is.na(c(elev, temp))), so elevation_m is optional: without it Field_BP_altitude is not computed and calcCO2corr can still correct through an in-range Field_BP (`no_elevation_in_range_field_bp_still_corrects`) or return NA (`no_elevation_and_out_of_range_field_bp_omits_co2`). river-data has no site elevation attribute to resolve it from, so the operator types it; that is the tool's one input with no portal-side counterpart. No constants are consumed. Pressure precedence is calcCO2corr's own (calculation_functions.R:126-141): an in-range Field_BP (700-1050 hPa) wins, otherwise Field_BP_altitude; `co2_trio_field_bp_in_range_wins` pins the first branch (its altitude pressure is 959, distinct from the 1000 used) and `co2_trio_field_bp_out_of_range_uses_altitude` the second. The standard curve is the portal's 'Vaisala std curve corr?' checkbox plus curve selector (field_data_tool.R:29,36-51,157-172): present curve => raw * a + b applied to all three columns before the pressure/temperature correction. The portal also writes vaisala_std_curve_id back onto the row (field_data_tool.R:365); that is provenance, which river-data records on the sample instead, so it is not a tool output and carries no pin. The portal's 'KEEP OLD' carry-forward (field_data_tool.R:293-304, reusing the stored Reach_depth_avg_cm/sd when the new value is uncomputable) is out of scope: these tools are stateless, so an uncomputable value is omitted instead, which `reach_depth_single_has_no_sd` and `reach_depths_none_supplied_omits_both` pin. Reach depth replicates are the portal's fixed Reach_depth_rep_1..10 family (tool_field_info.html:17), one param per column, so the replicate a measurement belongs to travels in the field name (`reach_depth_rep_7_measured_alone`) and an unfilled cell is a hole rather than a shift (`reach_depths_gap_in_the_middle`). calcMean/calcSd use na.rm = TRUE, so unfilled replicates drop out of both statistics. There is no eleventh replicate to reject: a name outside the family is refused by the engine as an undeclared param."
+}

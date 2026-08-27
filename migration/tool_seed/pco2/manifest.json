@@ -1,0 +1,305 @@
+{
+  "label": "pCO2",
+  "description": "Portal pCO2 tool: the A/B Picarro replicate chain (headspace CO2, pCO2 and its P1/P2 pressure variants, dry and dissolved CH4) with the replicate mean and stdev",
+  "params": [
+    {
+      "name": "water_temp_c",
+      "label": "Water Temp (°C)",
+      "kind": "number",
+      "units": "°C",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "pressure_hpa",
+      "label": "Field barometric pressure (hPa)",
+      "kind": "number",
+      "units": "hPa",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "pressure_altitude_hpa",
+      "label": "Altitude-derived barometric pressure (hPa, used when field pressure is missing or outside 700-1050 hPa)",
+      "kind": "number",
+      "units": "hPa",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_co2_co2ppm_rep_A",
+      "label": "CO2 (replicate A)",
+      "kind": "number",
+      "units": "ppm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_co2_co2ppm_rep_B",
+      "label": "CO2 (replicate B)",
+      "kind": "number",
+      "units": "ppm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_co2_h2o_rep_A",
+      "label": "H2O (replicate A)",
+      "kind": "number",
+      "units": "%",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_co2_h2o_rep_B",
+      "label": "H2O (replicate B)",
+      "kind": "number",
+      "units": "%",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_co2_ch4_rep_A",
+      "label": "CH4 (replicate A)",
+      "kind": "number",
+      "units": "ppm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_co2_ch4_rep_B",
+      "label": "CH4 (replicate B)",
+      "kind": "number",
+      "units": "ppm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_co2_ico2_rep_A",
+      "label": "d13C-CO2 (replicate A)",
+      "kind": "number",
+      "units": "permil",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_co2_ico2_rep_B",
+      "label": "d13C-CO2 (replicate B)",
+      "kind": "number",
+      "units": "permil",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_temp_mode",
+      "label": "Use lab temp constant (cst) or entered value (db)",
+      "kind": "enum:db|cst",
+      "units": null,
+      "required": false,
+      "default": "db",
+      "when": null
+    },
+    {
+      "name": "lab_temp_c",
+      "label": "Lab Temp (°C)",
+      "kind": "number",
+      "units": "°C",
+      "required": false,
+      "default": null,
+      "when": "lab_temp_mode=db"
+    },
+    {
+      "name": "lab_pressure_mode",
+      "label": "Use lab pressure constant (cst) or entered value (db)",
+      "kind": "enum:db|cst",
+      "units": null,
+      "required": false,
+      "default": "db",
+      "when": null
+    },
+    {
+      "name": "lab_pressure_hpa",
+      "label": "Lab Pressure (hPa)",
+      "kind": "number",
+      "units": "hPa",
+      "required": false,
+      "default": null,
+      "when": "lab_pressure_mode=db"
+    }
+  ],
+  "outputs": [
+    {
+      "key": "CO2_HS_Um_{rep}",
+      "label": "CO2 headspace",
+      "units": "uM",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": "CO2_HS_Um"
+    },
+    {
+      "key": "CO2_HS_Um_avg",
+      "label": "CO2 headspace average",
+      "units": "uM",
+      "per_replicate": false,
+      "aggregate_of": "CO2_HS_Um_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "CO2_HS_Um_sd",
+      "label": "CO2 headspace stdev",
+      "units": "uM",
+      "per_replicate": false,
+      "aggregate_of": "CO2_HS_Um_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "pCO2_HS_uatm_{rep}",
+      "label": "pCO2",
+      "units": "uatm",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": "pCO2_HS_uatm"
+    },
+    {
+      "key": "pCO2_HS_uatm_avg",
+      "label": "pCO2 average",
+      "units": "uatm",
+      "per_replicate": false,
+      "aggregate_of": "pCO2_HS_uatm_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "pCO2_HS_uatm_sd",
+      "label": "pCO2 stdev",
+      "units": "uatm",
+      "per_replicate": false,
+      "aggregate_of": "pCO2_HS_uatm_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "pCO2_HS_P1_uatm_{rep}",
+      "label": "pCO2 P1",
+      "units": "uatm",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": "pCO2_HS_P1_uatm"
+    },
+    {
+      "key": "pCO2_HS_P1_uatm_avg",
+      "label": "pCO2 P1 average",
+      "units": "uatm",
+      "per_replicate": false,
+      "aggregate_of": "pCO2_HS_P1_uatm_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "pCO2_HS_P1_uatm_sd",
+      "label": "pCO2 P1 stdev",
+      "units": "uatm",
+      "per_replicate": false,
+      "aggregate_of": "pCO2_HS_P1_uatm_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "pCO2_HS_P2_uatm_{rep}",
+      "label": "pCO2 P2",
+      "units": "uatm",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": "pCO2_HS_P2_uatm"
+    },
+    {
+      "key": "pCO2_HS_P2_uatm_avg",
+      "label": "pCO2 P2 average",
+      "units": "uatm",
+      "per_replicate": false,
+      "aggregate_of": "pCO2_HS_P2_uatm_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "pCO2_HS_P2_uatm_sd",
+      "label": "pCO2 P2 stdev",
+      "units": "uatm",
+      "per_replicate": false,
+      "aggregate_of": "pCO2_HS_P2_uatm_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "lab_co2_ch4_dry_{rep}",
+      "label": "CH4 dry",
+      "units": "ppm",
+      "per_replicate": true,
+      "aggregate_of": "CH4_calc_umol_L_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "CH4_calc_umol_L_{rep}",
+      "label": "Dissolved CH4",
+      "units": "uM",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": "CH4_umol_L"
+    },
+    {
+      "key": "CH4_umol_L_avg",
+      "label": "Dissolved CH4 average",
+      "units": "uM",
+      "per_replicate": false,
+      "aggregate_of": "CH4_calc_umol_L_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "CH4_umol_L_sd",
+      "label": "Dissolved CH4 stdev",
+      "units": "uM",
+      "per_replicate": false,
+      "aggregate_of": "CH4_calc_umol_L_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "d13C_CO2_avg",
+      "label": "d13C-CO2 average",
+      "units": "permil",
+      "per_replicate": false,
+      "aggregate_of": null,
+      "suggested_parameter_code": "d13C_CO2"
+    },
+    {
+      "key": "d13C_CO2_sd",
+      "label": "d13C-CO2 stdev",
+      "units": "permil",
+      "per_replicate": false,
+      "aggregate_of": "d13C_CO2_avg",
+      "suggested_parameter_code": null
+    }
+  ],
+  "constants": [
+    "c_const",
+    "gas_const_r_atm",
+    "gas_const_r_mol",
+    "h_ch4_29815k",
+    "ch4_in_sa",
+    "lab_temp_avg_degC",
+    "lab_press_avg_atm",
+    "vol_sa",
+    "vol_water"
+  ],
+  "curves": [],
+  "match_keywords": [
+    "co2",
+    "pco2",
+    "headspace",
+    "carbon dioxide"
+  ]
+}

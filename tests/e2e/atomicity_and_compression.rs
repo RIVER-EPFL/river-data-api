@@ -749,7 +749,7 @@ async fn merging_site_parameters_applies_every_step_or_none() {
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
     let track = tracks::onboard_sensor_flow_track(&app, &admin).await;
-    let (manager, river) = operator_jwts(&db, &track.project_id).await;
+    let (_manager, river) = operator_jwts(&db, &track.project_id).await;
     let site = track.site_id.clone();
     let stream = track.stream_ids[0].clone();
     let source_slot = track.site_parameter_ids[0].clone();
@@ -825,7 +825,7 @@ async fn merging_site_parameters_applies_every_step_or_none() {
             "source_site_parameter_id": source_slot,
             "target_site_parameter_id": target_slot,
         }),
-        &manager,
+        &admin,
     )
     .await;
     assert_eq!(status, 200, "the merge is accepted and queued: {queued}");

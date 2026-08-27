@@ -31,6 +31,21 @@ async fn curve_is_used(db: &DatabaseConnection, id: Uuid) -> Result<bool, ApiErr
 impl CRUDOperations for StandardCurveOperations {
     type Resource = StandardCurve;
 
+    /// One row at a time, through the single-row path: the crudcrate default `create_many`
+    /// delegates to the resource, which delegates back here, so the default recurses; the loop
+    /// also runs the single-row hooks for every item.
+    async fn create_many(
+        &self,
+        db: &DatabaseConnection,
+        data: Vec<<StandardCurve as crudcrate::CRUDResource>::CreateModel>,
+    ) -> Result<Vec<StandardCurve>, ApiError> {
+        let mut created = Vec::with_capacity(data.len());
+        for item in data {
+            created.push(self.create(db, item).await?);
+        }
+        Ok(created)
+    }
+
     async fn before_create(
         &self,
         _db: &DatabaseConnection,

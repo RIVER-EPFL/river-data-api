@@ -1,0 +1,567 @@
+{
+  "label": "Chlorophyll-a",
+  "description": "The portal Chl a tool tab: acid and no-acid chlorophyll-a for replicates A-E, volume filtrated, AFDM on filter, the per-m2 conversions, and the avg/sd of each family.",
+  "params": [
+    {
+      "name": "lab_chla_sizeA_rep_A",
+      "label": "Rock size A (replicate A)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeA_rep_B",
+      "label": "Rock size A (replicate B)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeA_rep_C",
+      "label": "Rock size A (replicate C)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeA_rep_D",
+      "label": "Rock size A (replicate D)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeA_rep_E",
+      "label": "Rock size A (replicate E)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeB_rep_A",
+      "label": "Rock size B (replicate A)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeB_rep_B",
+      "label": "Rock size B (replicate B)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeB_rep_C",
+      "label": "Rock size B (replicate C)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeB_rep_D",
+      "label": "Rock size B (replicate D)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeB_rep_E",
+      "label": "Rock size B (replicate E)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeC_rep_A",
+      "label": "Rock size C (replicate A)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeC_rep_B",
+      "label": "Rock size C (replicate B)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeC_rep_C",
+      "label": "Rock size C (replicate C)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeC_rep_D",
+      "label": "Rock size C (replicate D)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeC_rep_E",
+      "label": "Rock size C (replicate E)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_tot_vol_rep_A",
+      "label": "Total volume (replicate A)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_tot_vol_rep_B",
+      "label": "Total volume (replicate B)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_tot_vol_rep_C",
+      "label": "Total volume (replicate C)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_tot_vol_rep_D",
+      "label": "Total volume (replicate D)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_tot_vol_rep_E",
+      "label": "Total volume (replicate E)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_vol_after_rep_A",
+      "label": "Volume after filtration (replicate A)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_vol_after_rep_B",
+      "label": "Volume after filtration (replicate B)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_vol_after_rep_C",
+      "label": "Volume after filtration (replicate C)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_vol_after_rep_D",
+      "label": "Volume after filtration (replicate D)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_vol_after_rep_E",
+      "label": "Volume after filtration (replicate E)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_fluor_1_rep_A",
+      "label": "Fluorescence before acidification (replicate A)",
+      "kind": "number",
+      "units": "nm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_fluor_1_rep_B",
+      "label": "Fluorescence before acidification (replicate B)",
+      "kind": "number",
+      "units": "nm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_fluor_1_rep_C",
+      "label": "Fluorescence before acidification (replicate C)",
+      "kind": "number",
+      "units": "nm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_fluor_1_rep_D",
+      "label": "Fluorescence before acidification (replicate D)",
+      "kind": "number",
+      "units": "nm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_fluor_1_rep_E",
+      "label": "Fluorescence before acidification (replicate E)",
+      "kind": "number",
+      "units": "nm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_fluor_2_rep_A",
+      "label": "Fluorescence after acidification (replicate A)",
+      "kind": "number",
+      "units": "nm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_fluor_2_rep_B",
+      "label": "Fluorescence after acidification (replicate B)",
+      "kind": "number",
+      "units": "nm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_fluor_2_rep_C",
+      "label": "Fluorescence after acidification (replicate C)",
+      "kind": "number",
+      "units": "nm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_fluor_2_rep_D",
+      "label": "Fluorescence after acidification (replicate D)",
+      "kind": "number",
+      "units": "nm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_fluor_2_rep_E",
+      "label": "Fluorescence after acidification (replicate E)",
+      "kind": "number",
+      "units": "nm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_wgt_1_rep_A",
+      "label": "Filter weight before ashing (replicate A)",
+      "kind": "number",
+      "units": "g",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_wgt_1_rep_B",
+      "label": "Filter weight before ashing (replicate B)",
+      "kind": "number",
+      "units": "g",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_wgt_1_rep_C",
+      "label": "Filter weight before ashing (replicate C)",
+      "kind": "number",
+      "units": "g",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_wgt_1_rep_D",
+      "label": "Filter weight before ashing (replicate D)",
+      "kind": "number",
+      "units": "g",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_wgt_1_rep_E",
+      "label": "Filter weight before ashing (replicate E)",
+      "kind": "number",
+      "units": "g",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_wgt_2_rep_A",
+      "label": "Filter weight after ashing (replicate A)",
+      "kind": "number",
+      "units": "g",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_wgt_2_rep_B",
+      "label": "Filter weight after ashing (replicate B)",
+      "kind": "number",
+      "units": "g",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_wgt_2_rep_C",
+      "label": "Filter weight after ashing (replicate C)",
+      "kind": "number",
+      "units": "g",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_wgt_2_rep_D",
+      "label": "Filter weight after ashing (replicate D)",
+      "kind": "number",
+      "units": "g",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_wgt_2_rep_E",
+      "label": "Filter weight after ashing (replicate E)",
+      "kind": "number",
+      "units": "g",
+      "required": false,
+      "default": null,
+      "when": null
+    }
+  ],
+  "outputs": [
+    {
+      "key": "Chla_acid_avg_ugm2",
+      "label": "Chl-a acid per m2 average",
+      "units": "ug/m2",
+      "per_replicate": false,
+      "aggregate_of": "chla_acid_ugm2_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_acid_sd_ugm2",
+      "label": "Chl-a acid per m2 SD",
+      "units": "ug/m2",
+      "per_replicate": false,
+      "aggregate_of": "chla_acid_ugm2_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_noacid_avg_ugm2",
+      "label": "Chl-a no-acid per m2 average",
+      "units": "ug/m2",
+      "per_replicate": false,
+      "aggregate_of": "chla_noacid_ugm2_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_noacid_sd_ugm2",
+      "label": "Chl-a no-acid per m2 SD",
+      "units": "ug/m2",
+      "per_replicate": false,
+      "aggregate_of": "chla_noacid_ugm2_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_acid_ugL_avg",
+      "label": "Chl-a acid average",
+      "units": "ug/L",
+      "per_replicate": false,
+      "aggregate_of": "chla_acid_ugL_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_acid_ugL_sd",
+      "label": "Chl-a acid SD",
+      "units": "ug/L",
+      "per_replicate": false,
+      "aggregate_of": "chla_acid_ugL_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_noacid_ugL_avg",
+      "label": "Chl-a no-acid average",
+      "units": "ug/L",
+      "per_replicate": false,
+      "aggregate_of": "chla_noacid_ugL_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_noacid_ugL_sd",
+      "label": "Chl-a no-acid SD",
+      "units": "ug/L",
+      "per_replicate": false,
+      "aggregate_of": "chla_noacid_ugL_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "benthic_AFDM_avg_gm2",
+      "label": "Benthic AFDM average",
+      "units": "g/m2",
+      "per_replicate": false,
+      "aggregate_of": "afdm_gm2_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "benthic_AFDM_sd_gm2",
+      "label": "Benthic AFDM SD",
+      "units": "g/m2",
+      "per_replicate": false,
+      "aggregate_of": "afdm_gm2_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "lab_chla_vol_filtrated_rep_{rep}",
+      "label": "Volume filtrated",
+      "units": "mL",
+      "per_replicate": true,
+      "aggregate_of": "chla_acid_ugm2_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "chla_acid_ugL_rep_{rep}",
+      "label": "Chl-a acid",
+      "units": "ug/L",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": "chla_acid_ugL"
+    },
+    {
+      "key": "chla_acid_ugm2_rep_{rep}",
+      "label": "Chl-a acid per m2",
+      "units": "ug/m2",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": "chla_acid_ugm2"
+    },
+    {
+      "key": "chla_noacid_ugL_rep_{rep}",
+      "label": "Chl-a no-acid",
+      "units": "ug/L",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": "chla_noacid_ugL"
+    },
+    {
+      "key": "chla_noacid_ugm2_rep_{rep}",
+      "label": "Chl-a no-acid per m2",
+      "units": "ug/m2",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": "chla_noacid_ugm2"
+    },
+    {
+      "key": "afdm_g_filter_rep_{rep}",
+      "label": "AFDM on filter",
+      "units": "g",
+      "per_replicate": true,
+      "aggregate_of": "afdm_gm2_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "afdm_gm2_rep_{rep}",
+      "label": "AFDM per m2",
+      "units": "g/m2",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": "afdm_gm2"
+    }
+  ],
+  "constants": [],
+  "curves": [
+    {
+      "name": "chla_acid",
+      "label": "Chla acid standard curve",
+      "required": false
+    },
+    {
+      "name": "chla_noacid",
+      "label": "Chla noacid standard curve",
+      "required": false
+    }
+  ],
+  "match_keywords": [
+    "chlorophyll",
+    "chla",
+    "chl"
+  ]
+}

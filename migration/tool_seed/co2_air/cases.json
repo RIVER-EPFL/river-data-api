@@ -1,0 +1,94 @@
+{
+  "tolerance": 1e-9,
+  "cases": [
+    {
+      "name": "ch4_typical",
+      "inputs": { "ch4_wet": 2000.0, "h2o_percent": 1.5 },
+      "constants": {},
+      "curves": {},
+      "expected": { "lab_co2air_ch4_dry": 2037.009 },
+      "absent": []
+    },
+    {
+      "name": "ch4_zero_h2o",
+      "inputs": { "ch4_wet": 2000.0, "h2o_percent": 0.0 },
+      "constants": {},
+      "curves": {},
+      "expected": { "lab_co2air_ch4_dry": 1999.968 },
+      "absent": []
+    },
+    {
+      "name": "ch4_golden_rand",
+      "inputs": { "ch4_wet": 251.696910978528, "h2o_percent": 2.39112802280579 },
+      "constants": {},
+      "curves": {},
+      "expected": { "lab_co2air_ch4_dry": 259.12379659245704 },
+      "absent": []
+    },
+    {
+      "name": "ch4_zero_wet_still_emitted",
+      "inputs": { "ch4_wet": 0.0, "h2o_percent": 1.0 },
+      "constants": {},
+      "curves": {},
+      "expected": { "lab_co2air_ch4_dry": 0.0 },
+      "absent": []
+    },
+    {
+      "name": "ch4_high_h2o_low_ppm",
+      "inputs": { "ch4_wet": 1.8, "h2o_percent": 5.0 },
+      "constants": {},
+      "curves": {},
+      "expected": { "lab_co2air_ch4_dry": 1.9110942 },
+      "absent": []
+    },
+    {
+      "name": "ch4_negative_h2o_no_plausibility_band",
+      "inputs": { "ch4_wet": 1000.0, "h2o_percent": -0.5 },
+      "constants": {},
+      "curves": {},
+      "expected": { "lab_co2air_ch4_dry": 993.8105 },
+      "absent": []
+    },
+    {
+      "name": "ch4_dry_below_wet_when_h2o_under_intercept",
+      "inputs": { "ch4_wet": 1500.0, "h2o_percent": 0.0005 },
+      "constants": {},
+      "curves": {},
+      "expected": { "lab_co2air_ch4_dry": 1499.98526025 },
+      "absent": []
+    },
+    {
+      "name": "ch4_no_constants_or_curves_resolved",
+      "inputs": { "ch4_wet": 400.0, "h2o_percent": 3.0 },
+      "constants": {},
+      "curves": {},
+      "expected": { "lab_co2air_ch4_dry": 414.81 },
+      "absent": []
+    },
+    {
+      "name": "ch4_wet_null_omits",
+      "inputs": { "ch4_wet": null, "h2o_percent": 1.5 },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["lab_co2air_ch4_dry"]
+    },
+    {
+      "name": "h2o_null_omits",
+      "inputs": { "ch4_wet": 2000.0, "h2o_percent": null },
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["lab_co2air_ch4_dry"]
+    },
+    {
+      "name": "both_inputs_absent_omits",
+      "inputs": {},
+      "constants": {},
+      "curves": {},
+      "expected": {},
+      "absent": ["lab_co2air_ch4_dry"]
+    }
+  ],
+  "notes": "The portal CO2-air tab (modules/tools_tab/tools/co2_air_tool.R:145-155) computes one column, lab_co2air_ch4_dry = calcCH4dry(select(rawData, lab_co2air_h2o, lab_co2air_ch4)) (utils/calculation_functions.R:654-683). calcCO2 is called only from pco2_tool.R and its column gate (utils/calculation_functions.R:805-807) requires lab_co2_lab_temp/lab_co2_lab_press/lab_co2_co2ppm, columns the CO2_air category does not have (html_components/tool_co2air_info.html:4-9), so the earlier CO2_HS_Um output, its co2_ppm/lab_temp_c/lab_pressure_hpa inputs and the vol_sa_ml/vol_water_ml constants-overriding inputs are all gone; the tool declares no constants and no curves. Nothing pins CO2_HS_Um absent any more because absent keys must be declared output keys: the manifest not declaring it, plus the API's unknown-field rejection of a body naming co2_ppm, is what holds it removed. Everything else the tab shows (lab_co2air_ch4, lab_co2air_ich4, lab_co2air_co2ppm, lab_co2air_co2_dry_ppm, lab_co2air_ico2, lab_co2air_h2o, per the CO2_air grab_param_categories rows and html_components/tool_co2air_info.html) is raw entry echoed back unedited, not calculated, so it is not an output here. Neither param is required: the portal's Calculate button (co2_air_tool.R:145) runs unconditionally on whatever the raw table holds, calcCH4dry returns as.numeric(NA) when either value is NA (utils/calculation_functions.R:673, 682), and the tab then shows NA, which the ch4_wet_null_omits / h2o_null_omits / both_inputs_absent_omits cases pin as an omitted key. The portal's 'KEEP OLD' carry-forward belongs to calcChla, not calcCH4dry, so no sentinel test applies here. A NaN result is emitted rather than filtered, but no case can pin it: calcCH4dry's own is.na guard (line 673) sends NaN inputs down the NA branch, and Inf, the only other way to reach a NaN result, is not expressible in a JSON request body. calcCH4dry applies no plausibility band to h2o or ch4 and the wrapper adds none; ch4_dry_below_wet_when_h2o_under_intercept pins that the -0.0016 intercept is allowed to drive the dry value below the wet value."
+}

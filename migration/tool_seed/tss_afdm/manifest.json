@@ -1,0 +1,17 @@
+{
+  "label": "TSS & AFDM",
+  "description": "Total Suspended Solids & Ash-Free Dry Mass",
+  "params": [
+    { "name": "wgt_dried_g", "label": "Dried Weight (g)", "kind": "number", "units": "g", "required": false, "default": null, "when": null },
+    { "name": "wgt_prefilt_g", "label": "Pre-filter Weight (g)", "kind": "number", "units": "g", "required": false, "default": null, "when": null },
+    { "name": "wgt_ashed_g", "label": "Ashed Weight (g)", "kind": "number", "units": "g", "required": false, "default": null, "when": null },
+    { "name": "vol_filtered_ml", "label": "Volume Filtered (mL)", "kind": "number", "units": "mL", "required": false, "default": null, "when": null }
+  ],
+  "outputs": [
+    { "key": "TSS_dry_weight_mgL", "label": "TSS dry weight", "units": "mg/L", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "TSS" },
+    { "key": "AFDM_mgL", "label": "AFDM", "units": "mg/L", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "AFDM" }
+  ],
+  "constants": [],
+  "curves": [],
+  "match_keywords": ["tss", "afdm", "suspended solid", "dry mass"]
+}

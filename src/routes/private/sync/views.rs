@@ -732,6 +732,8 @@ async fn resolve_or_create_parameter<C: ConnectionTrait>(
         name: Set(name),
         default_units: Set(cp.default_units.clone()),
         category: Set(cp.category.clone()),
+        // Mechanically created from a sync source; a manager confirms or merges it later.
+        needs_review: Set(true),
         description: Set(None),
         aliases: Set(vec![]),
         default_warning_min: Set(None),
@@ -1305,6 +1307,8 @@ pub async fn bulk_pair(
                     name: Set(p.name.clone()),
                     default_units: Set(p.units.clone()),
                     category: Set("measurement".to_string()),
+                    // Mechanically created from a sync source; a manager confirms or merges it later.
+                    needs_review: Set(true),
                     description: Set(None),
                     aliases: Set(vec![]),
                     default_warning_min: Set(None),

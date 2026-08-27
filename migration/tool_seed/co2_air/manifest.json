@@ -1,0 +1,14 @@
+{
+  "label": "CO2 Air",
+  "description": "Dry CH4 concentration from the wet CH4 and H2O readings of the CO2_air row",
+  "params": [
+    { "name": "ch4_wet", "label": "CH4 (lab_co2air_ch4, ppm)", "kind": "number", "units": "ppm", "required": false, "default": null, "when": null },
+    { "name": "h2o_percent", "label": "H2O (lab_co2air_h2o, %)", "kind": "number", "units": "%", "required": false, "default": null, "when": null }
+  ],
+  "outputs": [
+    { "key": "lab_co2air_ch4_dry", "label": "CH4 dry", "units": "ppm", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "lab_co2air_ch4_dry" }
+  ],
+  "constants": [],
+  "curves": [],
+  "match_keywords": ["co2_air", "ch4", "methane", "dry"]
+}

@@ -1,0 +1,482 @@
+{
+  "label": "Benthic per-m2 conversion",
+  "description": "Converts measured chlorophyll-a (acid and no-acid, ug/L) and AFDM (g per filter) to areal loads using the rock's three dimensions and the filtered/total volumes, with the portal mean and SD summaries. One param per replicate cell, named as the portal names the column; a cell left out leaves that letter blank.",
+  "params": [
+    {
+      "name": "lab_chla_sizeA_rep_A",
+      "label": "Rock size A (replicate A)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeA_rep_B",
+      "label": "Rock size A (replicate B)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeA_rep_C",
+      "label": "Rock size A (replicate C)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeA_rep_D",
+      "label": "Rock size A (replicate D)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeA_rep_E",
+      "label": "Rock size A (replicate E)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeB_rep_A",
+      "label": "Rock size B (replicate A)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeB_rep_B",
+      "label": "Rock size B (replicate B)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeB_rep_C",
+      "label": "Rock size B (replicate C)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeB_rep_D",
+      "label": "Rock size B (replicate D)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeB_rep_E",
+      "label": "Rock size B (replicate E)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeC_rep_A",
+      "label": "Rock size C (replicate A)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeC_rep_B",
+      "label": "Rock size C (replicate B)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeC_rep_C",
+      "label": "Rock size C (replicate C)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeC_rep_D",
+      "label": "Rock size C (replicate D)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_sizeC_rep_E",
+      "label": "Rock size C (replicate E)",
+      "kind": "number",
+      "units": "cm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_tot_vol_rep_A",
+      "label": "Total volume (replicate A)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_tot_vol_rep_B",
+      "label": "Total volume (replicate B)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_tot_vol_rep_C",
+      "label": "Total volume (replicate C)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_tot_vol_rep_D",
+      "label": "Total volume (replicate D)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_tot_vol_rep_E",
+      "label": "Total volume (replicate E)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_vol_filtrated_rep_A",
+      "label": "Volume filtrated (replicate A)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_vol_filtrated_rep_B",
+      "label": "Volume filtrated (replicate B)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_vol_filtrated_rep_C",
+      "label": "Volume filtrated (replicate C)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_vol_filtrated_rep_D",
+      "label": "Volume filtrated (replicate D)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_chla_vol_filtrated_rep_E",
+      "label": "Volume filtrated (replicate E)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "chla_acid_ugL_rep_A",
+      "label": "Chl-a acid (replicate A)",
+      "kind": "number",
+      "units": "ug/L",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "chla_acid_ugL_rep_B",
+      "label": "Chl-a acid (replicate B)",
+      "kind": "number",
+      "units": "ug/L",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "chla_acid_ugL_rep_C",
+      "label": "Chl-a acid (replicate C)",
+      "kind": "number",
+      "units": "ug/L",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "chla_acid_ugL_rep_D",
+      "label": "Chl-a acid (replicate D)",
+      "kind": "number",
+      "units": "ug/L",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "chla_acid_ugL_rep_E",
+      "label": "Chl-a acid (replicate E)",
+      "kind": "number",
+      "units": "ug/L",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "chla_noacid_ugL_rep_A",
+      "label": "Chl-a no-acid (replicate A)",
+      "kind": "number",
+      "units": "ug/L",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "chla_noacid_ugL_rep_B",
+      "label": "Chl-a no-acid (replicate B)",
+      "kind": "number",
+      "units": "ug/L",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "chla_noacid_ugL_rep_C",
+      "label": "Chl-a no-acid (replicate C)",
+      "kind": "number",
+      "units": "ug/L",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "chla_noacid_ugL_rep_D",
+      "label": "Chl-a no-acid (replicate D)",
+      "kind": "number",
+      "units": "ug/L",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "chla_noacid_ugL_rep_E",
+      "label": "Chl-a no-acid (replicate E)",
+      "kind": "number",
+      "units": "ug/L",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "afdm_g_filter_rep_A",
+      "label": "AFDM on filter (replicate A)",
+      "kind": "number",
+      "units": "g",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "afdm_g_filter_rep_B",
+      "label": "AFDM on filter (replicate B)",
+      "kind": "number",
+      "units": "g",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "afdm_g_filter_rep_C",
+      "label": "AFDM on filter (replicate C)",
+      "kind": "number",
+      "units": "g",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "afdm_g_filter_rep_D",
+      "label": "AFDM on filter (replicate D)",
+      "kind": "number",
+      "units": "g",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "afdm_g_filter_rep_E",
+      "label": "AFDM on filter (replicate E)",
+      "kind": "number",
+      "units": "g",
+      "required": false,
+      "default": null,
+      "when": null
+    }
+  ],
+  "outputs": [
+    {
+      "key": "chla_acid_ugm2_rep_{rep}",
+      "label": "Chl-a acid per m2",
+      "units": "ug/m2",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": "chla_acid_ugm2"
+    },
+    {
+      "key": "chla_noacid_ugm2_rep_{rep}",
+      "label": "Chl-a no-acid per m2",
+      "units": "ug/m2",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": "chla_noacid_ugm2"
+    },
+    {
+      "key": "afdm_gm2_rep_{rep}",
+      "label": "Benthic AFDM per m2",
+      "units": "g/m2",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": "afdm_gm2"
+    },
+    {
+      "key": "Chla_acid_avg_ugm2",
+      "label": "Chl-a acid per m2 average",
+      "units": "ug/m2",
+      "per_replicate": false,
+      "aggregate_of": "chla_acid_ugm2_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_acid_sd_ugm2",
+      "label": "Chl-a acid per m2 SD",
+      "units": "ug/m2",
+      "per_replicate": false,
+      "aggregate_of": "chla_acid_ugm2_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_noacid_avg_ugm2",
+      "label": "Chl-a no-acid per m2 average",
+      "units": "ug/m2",
+      "per_replicate": false,
+      "aggregate_of": "chla_noacid_ugm2_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_noacid_sd_ugm2",
+      "label": "Chl-a no-acid per m2 SD",
+      "units": "ug/m2",
+      "per_replicate": false,
+      "aggregate_of": "chla_noacid_ugm2_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_acid_ugL_avg",
+      "label": "Chl-a acid average (over the supplied replicates)",
+      "units": "ug/L",
+      "per_replicate": false,
+      "aggregate_of": "chla_acid_ugL_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_acid_ugL_sd",
+      "label": "Chl-a acid SD (over the supplied replicates)",
+      "units": "ug/L",
+      "per_replicate": false,
+      "aggregate_of": "chla_acid_ugL_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_noacid_ugL_avg",
+      "label": "Chl-a no-acid average (over the supplied replicates)",
+      "units": "ug/L",
+      "per_replicate": false,
+      "aggregate_of": "chla_noacid_ugL_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "Chla_noacid_ugL_sd",
+      "label": "Chl-a no-acid SD (over the supplied replicates)",
+      "units": "ug/L",
+      "per_replicate": false,
+      "aggregate_of": "chla_noacid_ugL_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "benthic_AFDM_avg_gm2",
+      "label": "Benthic AFDM average",
+      "units": "g/m2",
+      "per_replicate": false,
+      "aggregate_of": "afdm_gm2_rep_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "benthic_AFDM_sd_gm2",
+      "label": "Benthic AFDM SD",
+      "units": "g/m2",
+      "per_replicate": false,
+      "aggregate_of": "afdm_gm2_rep_{rep}",
+      "suggested_parameter_code": null
+    }
+  ],
+  "constants": [],
+  "curves": [],
+  "match_keywords": [
+    "benthic",
+    "rock",
+    "surface area",
+    "periphyton",
+    "afdm",
+    "per m2"
+  ]
+}

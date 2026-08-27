@@ -425,3 +425,73 @@ async fn test_http_round_trip() {
     .await;
     assert_eq!(get_status, 404, "source parameter should be gone");
 }
+
+async fn needs_review(db: &DatabaseConnection, param_id: &str) -> bool {
+    use sea_orm::{ConnectionTrait, Statement};
+    db.query_one(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT needs_review FROM parameters WHERE id = $1",
+        [uuid::Uuid::parse_str(param_id).unwrap().into()],
+    ))
+    .await
+    .ok()
+    .flatten()
+    .and_then(|r| r.try_get::<bool>("", "needs_review").ok())
+    .expect("parameter exists")
+}
+
+// Expected behaviour: merging adjudicates the survivor, so its needs_review flag clears.
+#[tokio::test]
+#[serial]
+async fn test_merge_clears_needs_review_on_survivor() {
+    let (db, _, _) = setup().await;
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE parameters SET needs_review = true WHERE id = '{}'",
+            crate::common::GLOBAL_PARAM_TEMP_ID
+        ),
+    )
+    .await;
+
+    merge_parameters(
+        &db,
+        &merge_req(
+            crate::common::GLOBAL_PARAM_DO_ID,
+            crate::common::GLOBAL_PARAM_TEMP_ID,
+        ),
+    )
+    .await
+    .expect("merge succeeds");
+
+    assert!(!needs_review(&db, crate::common::GLOBAL_PARAM_TEMP_ID).await);
+}
+
+// Expected behaviour: confirming a mechanically created parameter clears the flag through the
+// CRUD update, without a merge.
+#[tokio::test]
+#[serial]
+async fn test_needs_review_clears_through_update() {
+    let (db, app, token) = setup().await;
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE parameters SET needs_review = true WHERE id = '{}'",
+            crate::common::GLOBAL_PARAM_TEMP_ID
+        ),
+    )
+    .await;
+
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &format!("/api/parameters/{}", crate::common::GLOBAL_PARAM_TEMP_ID),
+        &serde_json::json!({ "needs_review": false }),
+        &token,
+    )
+    .await;
+
+    assert_eq!(status, 200, "update needs_review: {body}");
+    assert!(!needs_review(&db, crate::common::GLOBAL_PARAM_TEMP_ID).await);
+}

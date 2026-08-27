@@ -1,0 +1,196 @@
+{
+  "label": "DIC",
+  "description": "DIC concentration and d13C-DIC from acid digestion",
+  "params": [
+    {
+      "name": "lab_temp_mode",
+      "label": "Use lab temp constant",
+      "kind": "enum:cst|db",
+      "units": null,
+      "required": false,
+      "default": "db",
+      "when": null
+    },
+    {
+      "name": "lab_temp_c",
+      "label": "Lab Air Temp (°C)",
+      "kind": "number",
+      "units": "°C",
+      "required": false,
+      "default": null,
+      "when": "lab_temp_mode=db"
+    },
+    {
+      "name": "lab_dic_acid_sample_wght_rep_A",
+      "label": "Acid+sample weight (replicate A)",
+      "kind": "number",
+      "units": "g",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_dic_acid_sample_wght_rep_B",
+      "label": "Acid+sample weight (replicate B)",
+      "kind": "number",
+      "units": "g",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_dic_acid_wght_rep_A",
+      "label": "Acid weight (replicate A)",
+      "kind": "number",
+      "units": "g",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_dic_acid_wght_rep_B",
+      "label": "Acid weight (replicate B)",
+      "kind": "number",
+      "units": "g",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_dic_vol_overpressure_rep_A",
+      "label": "Vol overpressure (replicate A)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_dic_vol_overpressure_rep_B",
+      "label": "Vol overpressure (replicate B)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_dic_SA_added_rep_A",
+      "label": "SA added (replicate A)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_dic_SA_added_rep_B",
+      "label": "SA added (replicate B)",
+      "kind": "number",
+      "units": "mL",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_dic_co2_dry_rep_A",
+      "label": "CO2 dry (replicate A)",
+      "kind": "number",
+      "units": "ppm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_dic_co2_dry_rep_B",
+      "label": "CO2 dry (replicate B)",
+      "kind": "number",
+      "units": "ppm",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_dic_delta_13co2_rep_A",
+      "label": "d13CO2 (replicate A)",
+      "kind": "number",
+      "units": "permil",
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "lab_dic_delta_13co2_rep_B",
+      "label": "d13CO2 (replicate B)",
+      "kind": "number",
+      "units": "permil",
+      "required": false,
+      "default": null,
+      "when": null
+    }
+  ],
+  "outputs": [
+    {
+      "key": "DIC_{rep}",
+      "label": "DIC replicate",
+      "units": "uM",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": "DIC"
+    },
+    {
+      "key": "DIC_avg",
+      "label": "DIC average",
+      "units": "uM",
+      "per_replicate": false,
+      "aggregate_of": "DIC_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "DIC_std",
+      "label": "DIC standard deviation",
+      "units": "uM",
+      "per_replicate": false,
+      "aggregate_of": "DIC_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "d13C_DIC_{rep}",
+      "label": "d13C-DIC replicate",
+      "units": "permil",
+      "per_replicate": true,
+      "aggregate_of": null,
+      "suggested_parameter_code": "d13C_DIC"
+    },
+    {
+      "key": "d13C_DIC_avg",
+      "label": "d13C-DIC average",
+      "units": "permil",
+      "per_replicate": false,
+      "aggregate_of": "d13C_DIC_{rep}",
+      "suggested_parameter_code": null
+    },
+    {
+      "key": "d13C_DIC_std",
+      "label": "d13C-DIC standard deviation",
+      "units": "permil",
+      "per_replicate": false,
+      "aggregate_of": "d13C_DIC_{rep}",
+      "suggested_parameter_code": null
+    }
+  ],
+  "constants": [
+    "h_co2_29815k",
+    "gas_const_r_mol",
+    "vial_volume",
+    "h3po4_added",
+    "lab_temp_avg_degC",
+    "lab_press_avg_atm"
+  ],
+  "curves": [],
+  "match_keywords": [
+    "dic",
+    "d13c",
+    "inorganic carbon"
+  ]
+}

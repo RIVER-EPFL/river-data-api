@@ -78,7 +78,11 @@ async fn grab_replicates_aggregate_then_tool_result_saved_to_station() {
     let (status, doc) = crate::common::post_json_parse_with_token(
         &app,
         "/api/tools/doc/calculate",
-        &serde_json::json!({ "replicates": vals }),
+        // Each replicate is named, so a missing one leaves a gap rather than shifting the
+        // remaining values onto the wrong replicate.
+        &serde_json::json!({
+            "DOC_rep_1": vals[0], "DOC_rep_2": vals[1], "DOC_rep_3": vals[2],
+        }),
         &token,
     )
     .await;

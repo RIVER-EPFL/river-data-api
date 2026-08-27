@@ -19,17 +19,25 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
     pub id: Uuid,
-    #[crudcrate(filterable)]
+    // Identity columns are create-only: the readings a sample groups are keyed on
+    // (site, parameter, collected_at), so editing them here would detach the sample
+    // from its replicates while the trigger keeps refreshing the old key.
+    #[crudcrate(filterable, exclude(update))]
     pub site_id: Uuid,
-    #[crudcrate(filterable)]
+    #[crudcrate(filterable, exclude(update))]
     pub parameter_id: Uuid,
-    #[crudcrate(filterable, sortable)]
+    #[crudcrate(filterable, sortable, exclude(update))]
     pub collected_at: chrono::DateTime<chrono::Utc>,
     #[crudcrate(fulltext, sortable)]
     pub label: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub notes: Option<String>,
     pub created_by: Option<String>,
+    // Written only by the grab save path; a CRUD edit must not be able to forge or erase the
+    // record of what produced the numbers.
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    #[crudcrate(exclude(create, update))]
+    pub provenance: Option<serde_json::Value>,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     // Aggregate columns, trigger-maintained, read-only to clients.

@@ -736,13 +736,15 @@ pub async fn insert_batch_readings(
     let standard_curve_models = admit_standard_curves(&state.db, &claims).await?;
 
     // The base calibrations those rows sit on, so the stored value is the one the pair of recorded
-    // curves produces: instrument correction first, hand-picked curve on its result.
+    // curves produces: instrument correction first, hand-picked curve on its result. Rows whose
+    // caller supplied no value need their base too: stamping the id while leaving the value
+    // uncorrected would claim a calibration the number never went through.
     let base_calibrations: HashMap<Uuid, calibrations::service::Curve> = {
         let mut ids: Vec<Uuid> = payload
             .readings
             .iter()
             .zip(&resolved)
-            .filter(|(r, _)| r.standard_curve_id.is_some())
+            .filter(|(r, _)| r.standard_curve_id.is_some() || r.calibrated_value.is_none())
             .filter_map(|(r, res)| r.calibration_id.or(res.owner.calibration_id))
             .collect();
         ids.sort_unstable();
@@ -792,13 +794,18 @@ pub async fn insert_batch_readings(
                     intercept: c.intercept,
                 }
             });
-            let calibrated_value = match standard {
-                Some(curve) => Some(calibrations::service::apply_curves(
+            let base = calibration_id.and_then(|id| base_calibrations.get(&id).copied());
+            // A curve claim is computed here; a caller-supplied value is kept as claimed; a row
+            // with neither gets its resolved base applied, so the stamped calibration_id is always
+            // a curve the stored value went through.
+            let calibrated_value = match (standard, r.calibrated_value) {
+                (Some(curve), _) => Some(calibrations::service::apply_curves(
                     r.raw_value,
-                    calibration_id.and_then(|id| base_calibrations.get(&id).copied()),
+                    base,
                     Some(curve),
                 )),
-                None => r.calibrated_value,
+                (None, Some(value)) => Some(value),
+                (None, None) => base.map(|c| c.apply(r.raw_value)),
             };
             readings::ActiveModel {
                 standard_curve_id: Set(r.standard_curve_id),
@@ -866,6 +873,28 @@ pub async fn insert_batch_readings(
         Ok((inserted, overwritten))
     })
     .await?;
+
+    // An overwrite replaces the measurement, not the correction: the write keeps the stored curve
+    // references, so the value is recomputed from exactly those curves, the same as the CSV
+    // overwrite path. Without this the row carries a value its recorded curves did not produce
+    // until the janitor sweep catches it.
+    if conflict == ConflictMode::Overwrite && overwritten > 0 {
+        let mut stream_ids: Vec<Uuid> = models.iter().map(|m| *m.stream_id.as_ref()).collect();
+        stream_ids.sort_unstable();
+        stream_ids.dedup();
+        let times: Vec<chrono::DateTime<chrono::FixedOffset>> =
+            models.iter().map(|m| *m.time.as_ref()).collect();
+        if let (Some(first), Some(last)) = (times.iter().min(), times.iter().max()) {
+            calibrations::service::recompose_from_own_curves(
+                &state.db,
+                "TRUE",
+                "r.stream_id = ANY($1) AND r.time >= $2 AND r.time <= $3",
+                vec![stream_ids.into(), (*first).into(), (*last).into()],
+            )
+            .await
+            .map_err(AppError::Database)?;
+        }
+    }
 
     tracing::debug!(
         total,

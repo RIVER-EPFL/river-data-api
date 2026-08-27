@@ -1,7 +1,5 @@
 use axum::{Json, extract::State};
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, TransactionTrait,
-};
+use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
@@ -31,7 +29,27 @@ pub struct GrabSampleRequest {
     /// Stamped onto the samples rows this request creates or reuses.
     pub label: Option<String>,
     pub notes: Option<String>,
+    /// `replace` atomically rewrites every replicate group this request names. Without it, a
+    /// group that is already stored refuses the write with a 409 describing what is there.
+    #[serde(default)]
+    pub mode: Option<GrabWriteMode>,
+    /// Compute the preview and report existing groups without writing anything.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Provenance of a save made from an analytical tool, stamped verbatim onto every samples
+    /// row this request touches: tool + script version, the raw calculation inputs, resolved
+    /// constants and curve coefficients, the full output map, and which outputs were saved to
+    /// which parameters. A `run_id` is added when absent so the rows of one run stay groupable.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub provenance: Option<serde_json::Value>,
     pub readings: Vec<GrabSampleReading>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum GrabWriteMode {
+    Replace,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -60,6 +78,152 @@ pub struct GrabSampleResponse {
     /// rather than re-selecting by slot and time, which would also catch a concurrent write.
     #[serde(default)]
     pub created_sample_ids: Vec<Uuid>,
+    /// True when nothing was written.
+    pub dry_run: bool,
+    /// Rows removed by `mode: replace` before the insert.
+    pub replaced: usize,
+    /// What each reading stores: the measured value, the curves that apply and the value they
+    /// produce together, computed by the code the write itself uses.
+    pub preview: Vec<GrabPreview>,
+    /// Replicate groups already stored at the requested (parameter, time) keys, as found before
+    /// this request wrote anything.
+    pub existing_groups: Vec<ExistingGroup>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CurveApplication {
+    pub id: Uuid,
+    pub name: Option<String>,
+    pub slope: f64,
+    pub intercept: f64,
+    pub equation: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GrabPreview {
+    pub parameter_id: Uuid,
+    pub time: chrono::DateTime<chrono::Utc>,
+    pub replicate_index: i16,
+    pub raw_value: f64,
+    /// The instrument's windowed calibration covering `time`, applied first.
+    pub base_calibration: Option<CurveApplication>,
+    /// The operator's hand-picked curve, applied to the base's output.
+    pub standard_curve: Option<CurveApplication>,
+    /// Both curves folded into one line, present when both apply.
+    pub composed_equation: Option<String>,
+    pub calibrated_value: Option<f64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ExistingReplicate {
+    pub replicate_index: i16,
+    pub raw_value: f64,
+    pub calibrated_value: Option<f64>,
+    pub standard_curve_id: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ExistingGroup {
+    pub parameter_id: Uuid,
+    pub time: chrono::DateTime<chrono::Utc>,
+    pub replicates: Vec<ExistingReplicate>,
+}
+
+/// The line as the operator reads it, sign folded into the operator: `y = 2x - 3`.
+fn equation(slope: f64, intercept: f64) -> String {
+    if intercept < 0.0 {
+        format!("y = {slope}x - {}", -intercept)
+    } else {
+        format!("y = {slope}x + {intercept}")
+    }
+}
+
+/// Replicate indices per (parameter, time) group: either every index in a group is explicit and
+/// unique, or none is and the group numbers from 0. A mix would renumber around the explicit rows
+/// and a duplicate would silently drop a measurement, so both are refused. Once written an index
+/// is never renumbered.
+fn assign_replicate_indices(readings: &[GrabSampleReading]) -> Result<Vec<i16>, AppError> {
+    let mut groups: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Vec<usize>> = HashMap::new();
+    for (i, r) in readings.iter().enumerate() {
+        groups.entry((r.parameter_id, r.time)).or_default().push(i);
+    }
+
+    let mut indices = vec![0i16; readings.len()];
+    for ((parameter_id, time), members) in groups {
+        let explicit: Vec<Option<i16>> = members
+            .iter()
+            .map(|&i| readings[i].replicate_index)
+            .collect();
+        if explicit.iter().all(Option::is_some) {
+            let mut seen = std::collections::HashSet::new();
+            for (&i, idx) in members.iter().zip(&explicit) {
+                let idx = idx.expect("all explicit");
+                if !seen.insert(idx) {
+                    return Err(AppError::Conflict(format!(
+                        "Replicate index {idx} appears twice for parameter {parameter_id} at {time}"
+                    )));
+                }
+                indices[i] = idx;
+            }
+        } else if explicit.iter().all(Option::is_none) {
+            for (n, &i) in members.iter().enumerate() {
+                indices[i] = i16::try_from(n).map_err(|_| {
+                    AppError::BadRequest(format!(
+                        "Too many replicates for parameter {parameter_id} at {time}"
+                    ))
+                })?;
+            }
+        } else {
+            return Err(AppError::BadRequest(format!(
+                "Replicate indices for parameter {parameter_id} at {time} mix explicit and \
+                 automatic; send all of them or none"
+            )));
+        }
+    }
+    Ok(indices)
+}
+
+/// The spot rows already stored at each requested (parameter, time), across every stream feeding
+/// the slot, so a CSV-imported grab and a hand-entered one count as the same group.
+async fn fetch_existing_groups(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    groups: &[(Uuid, chrono::DateTime<chrono::Utc>)],
+) -> Result<Vec<ExistingGroup>, AppError> {
+    let mut out = Vec::new();
+    for (parameter_id, time) in groups {
+        let rows = db
+            .query_all(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r"SELECT replicate_index, raw_value, calibrated_value, standard_curve_id
+                  FROM readings
+                  WHERE site_id = $1 AND parameter_id = $2 AND time = $3
+                    AND measurement_type = 'spot'
+                  ORDER BY replicate_index",
+                [site_id.into(), (*parameter_id).into(), (*time).into()],
+            ))
+            .await?;
+        if rows.is_empty() {
+            continue;
+        }
+        let replicates = rows
+            .iter()
+            .map(|row| {
+                Ok(ExistingReplicate {
+                    replicate_index: row.try_get("", "replicate_index")?,
+                    raw_value: row.try_get("", "raw_value")?,
+                    calibrated_value: row.try_get("", "calibrated_value")?,
+                    standard_curve_id: row.try_get("", "standard_curve_id")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sea_orm::DbErr>>()?;
+        out.push(ExistingGroup {
+            parameter_id: *parameter_id,
+            time: *time,
+            replicates,
+        });
+    }
+    Ok(out)
 }
 
 /// Get or create a "grab_sample" stream for a given (site_id, parameter_id) pair.
@@ -151,6 +315,7 @@ async fn find_or_create_sample(
     created_by: Option<&str>,
     label: Option<&str>,
     notes: Option<&str>,
+    provenance: Option<&serde_json::Value>,
 ) -> Result<(Uuid, bool), AppError> {
     let candidate = samples::ActiveModel {
         id: Set(Uuid::new_v4()),
@@ -160,6 +325,7 @@ async fn find_or_create_sample(
         label: Set(label.map(String::from)),
         notes: Set(notes.map(String::from)),
         created_by: Set(created_by.map(String::from)),
+        provenance: Set(provenance.cloned()),
         created_at: Set(Some(chrono::Utc::now())),
         mean: Set(None),
         stdev: Set(None),
@@ -199,13 +365,18 @@ async fn find_or_create_sample(
         })?;
     let sample_id = existing.id;
 
-    if !inserted && (label.is_some() || notes.is_some()) {
+    if !inserted && (label.is_some() || notes.is_some() || provenance.is_some()) {
         let mut active: samples::ActiveModel = existing.into();
         if let Some(l) = label {
             active.label = Set(Some(l.to_string()));
         }
         if let Some(n) = notes {
             active.notes = Set(Some(n.to_string()));
+        }
+        // A re-post carrying provenance is a new run over this collection event; the blob
+        // follows the numbers being written, never the ones being replaced.
+        if let Some(p) = provenance {
+            active.provenance = Set(Some(p.clone()));
         }
         active.updated_at = Set(Some(chrono::Utc::now()));
         active.update(txn).await?;
@@ -223,6 +394,7 @@ async fn auto_create_samples(
     created_by: Option<&str>,
     label: Option<&str>,
     notes: Option<&str>,
+    provenance: Option<&serde_json::Value>,
 ) -> Result<
     (
         HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Uuid>,
@@ -246,9 +418,17 @@ async fn auto_create_samples(
             continue;
         }
         // Re-posting the same grab must reuse its sample, not accumulate empty duplicates.
-        let (sample_id, is_new) =
-            find_or_create_sample(txn, site_id, parameter_id, time, created_by, label, notes)
-                .await?;
+        let (sample_id, is_new) = find_or_create_sample(
+            txn,
+            site_id,
+            parameter_id,
+            time,
+            created_by,
+            label,
+            notes,
+            provenance,
+        )
+        .await?;
         sample_map.insert((parameter_id, time), sample_id);
         if is_new {
             created.push(sample_id);
@@ -317,6 +497,131 @@ pub async fn insert_grab_samples(
         }
     }
 
+    // Replicate indices, both curves and the served value are computed before anything is
+    // written, so the same numbers serve the dry-run preview, the conflict report and the write.
+    let indices = assign_replicate_indices(&payload.readings)?;
+
+    // The chosen standard curves, admitted by the one rule every writer of `standard_curve_id`
+    // uses. A grab is spot by construction, so the only claims this path can be refused for are an
+    // unknown id, a curve fitted on another instrument, and a curve on a grab that names no
+    // instrument at all.
+    let claims: Vec<CurveClaim<'_>> = payload
+        .readings
+        .iter()
+        .filter_map(|r| {
+            r.standard_curve_id.map(|id| CurveClaim {
+                standard_curve_id: id,
+                sensor_id: r.sensor_id,
+                measurement_type: GRAB_MEASUREMENT_TYPE,
+            })
+        })
+        .collect();
+    let standard_curves = admit_standard_curves(&state.db, &claims).await?;
+
+    // The base calibration covering each grab that names an instrument, ranked by the one resolver
+    // the ingest and reprocess paths use. Resolving it here is what lets the row carry both the id
+    // and the value that id produced: a stamped calibration the stored value was never corrected by
+    // is provenance that reads as true and is not.
+    let base_curves = {
+        let requests: Vec<(Uuid, Option<Uuid>, chrono::DateTime<chrono::Utc>)> = payload
+            .readings
+            .iter()
+            .filter_map(|r| r.sensor_id.map(|sid| (sid, Some(r.parameter_id), r.time)))
+            .collect();
+        calibrations::resolver::resolve_many(&state.db, &requests).await?
+    };
+
+    let preview: Vec<GrabPreview> = payload
+        .readings
+        .iter()
+        .zip(&indices)
+        .map(|(r, &replicate_index)| {
+            let base = r
+                .sensor_id
+                .and_then(|sid| base_curves.get(&(sid, Some(r.parameter_id), r.time)))
+                .copied();
+            let standard = r.standard_curve_id.map(|cid| {
+                let c = &standard_curves[&cid];
+                calibrations::service::Curve {
+                    id: c.id,
+                    slope: c.slope,
+                    intercept: c.intercept,
+                }
+            });
+            // Both corrections, in the one order the arithmetic is defined in: the instrument's
+            // base calibration, then the operator's standard curve on that result. A grab that
+            // resolves neither is stored uncorrected, and `calibrated_value` stays NULL so a null
+            // still means "no curve was applied" rather than "a curve happened to be identity".
+            let calibrated_value = (base.is_some() || standard.is_some())
+                .then(|| calibrations::service::apply_curves(r.value, base, standard));
+            let composed_equation = match (base, standard) {
+                (Some(b), Some(s)) => Some(equation(
+                    s.slope * b.slope,
+                    s.slope * b.intercept + s.intercept,
+                )),
+                _ => None,
+            };
+            GrabPreview {
+                parameter_id: r.parameter_id,
+                time: r.time,
+                replicate_index,
+                raw_value: r.value,
+                base_calibration: base.map(|c| CurveApplication {
+                    id: c.id,
+                    name: None,
+                    slope: c.slope,
+                    intercept: c.intercept,
+                    equation: equation(c.slope, c.intercept),
+                }),
+                standard_curve: standard.map(|c| CurveApplication {
+                    id: c.id,
+                    name: standard_curves[&c.id].name.clone(),
+                    slope: c.slope,
+                    intercept: c.intercept,
+                    equation: equation(c.slope, c.intercept),
+                }),
+                composed_equation,
+                calibrated_value,
+            }
+        })
+        .collect();
+
+    let groups: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> = {
+        let mut seen = std::collections::HashSet::new();
+        payload
+            .readings
+            .iter()
+            .filter(|r| seen.insert((r.parameter_id, r.time)))
+            .map(|r| (r.parameter_id, r.time))
+            .collect()
+    };
+    let existing_groups = fetch_existing_groups(&state.db, payload.site_id, &groups).await?;
+
+    if payload.dry_run {
+        return Ok(Json(GrabSampleResponse {
+            inserted: 0,
+            samples_created: 0,
+            created_sample_ids: vec![],
+            dry_run: true,
+            replaced: 0,
+            preview,
+            existing_groups,
+        }));
+    }
+
+    if !existing_groups.is_empty() && payload.mode != Some(GrabWriteMode::Replace) {
+        let detail = serde_json::to_value(&existing_groups)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        return Err(AppError::ConflictDetail {
+            message: format!(
+                "{} replicate group(s) are already stored at the requested times; pass mode \
+                 \"replace\" to rewrite them",
+                existing_groups.len()
+            ),
+            detail,
+        });
+    }
+
     // Resolve stream_ids for each unique (site_id, parameter_id)
     let mut stream_cache: HashMap<Uuid, Uuid> = HashMap::new();
     for r in &payload.readings {
@@ -329,19 +634,6 @@ pub async fn insert_grab_samples(
             entry.insert(stream_id);
         }
     }
-
-    let txn = state.db.begin().await?;
-
-    // One samples row per (parameter, time) group in the request.
-    let (sample_map, created_sample_ids) = auto_create_samples(
-        &txn,
-        &payload.readings,
-        payload.site_id,
-        payload.created_by.as_deref(),
-        payload.label.as_deref(),
-        payload.notes.as_deref(),
-    )
-    .await?;
 
     // Window-aware attribution for grabs that name a sensor: which deployment the instrument was on
     // at the grab time (site-fixed to payload.site_id), instead of writing NULL. Grabs without a
@@ -369,8 +661,7 @@ pub async fn insert_grab_samples(
         slots
     };
 
-    // Per-parameter time windows for the alarm episode reconstruction below (computed up front
-    // because the readings vec is consumed building the insert models).
+    // Per-parameter time windows for the alarm episode reconstruction below.
     let mut alarm_windows: HashMap<
         Uuid,
         (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
@@ -385,147 +676,179 @@ pub async fn insert_grab_samples(
             .or_insert((r.time, r.time));
     }
 
-    // The chosen standard curves, admitted by the one rule every writer of `standard_curve_id`
-    // uses, so the correction can be applied server-side below. A grab is spot by construction, so
-    // the only claims this path can be refused for are an unknown id, a curve fitted on another
-    // instrument, and a curve on a grab that names no instrument at all.
-    let claims: Vec<CurveClaim<'_>> = payload
-        .readings
-        .iter()
-        .filter_map(|r| {
-            r.standard_curve_id.map(|id| CurveClaim {
-                standard_curve_id: id,
-                sensor_id: r.sensor_id,
-                measurement_type: GRAB_MEASUREMENT_TYPE,
-            })
-        })
-        .collect();
-    let standard_curves = admit_standard_curves(&state.db, &claims).await?;
+    let total = payload.readings.len();
 
-    // The base calibration covering each grab that names an instrument, ranked by the one resolver
-    // the ingest and reprocess paths use. Resolving it here is what lets the row carry both the id
-    // and the value that id produced: a stamped calibration the stored value was never corrected by
-    // is provenance that reads as true and is not.
-    let base_curves = {
-        let requests: Vec<(Uuid, Option<Uuid>, chrono::DateTime<chrono::Utc>)> = payload
-            .readings
-            .iter()
-            .filter_map(|r| r.sensor_id.map(|sid| (sid, Some(r.parameter_id), r.time)))
-            .collect();
-        calibrations::resolver::resolve_many(&state.db, &requests).await?
-    };
+    // The blob is stamped on every samples row this request touches; a run_id groups them back
+    // into one tool run when the caller did not mint one itself.
+    let provenance = payload.provenance.clone().map(|mut p| {
+        if let Some(obj) = p.as_object_mut() {
+            obj.entry("run_id")
+                .or_insert_with(|| serde_json::json!(Uuid::new_v4()));
+        }
+        p
+    });
 
-    // Track replicate_index per (parameter_id, time) group for auto-assignment
-    let mut index_counters: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), i16> = HashMap::new();
-
-    let models: Vec<readings::ActiveModel> = payload
-        .readings
-        .into_iter()
-        .map(|r| {
-            let stream_id = stream_cache[&r.parameter_id];
-            let group_key = (r.parameter_id, r.time);
-
-            let sample_id = sample_map.get(&group_key).copied();
-
-            // A grab has no source column position, so the index is minted here: from 0 within
-            // the (parameter, time) group, in submission order. Once written it is never
-            // renumbered.
-            let replicate_index = if let Some(idx) = r.replicate_index {
-                idx
+    // One guarded transaction: a replace on a compressed chunk must not fail on the cap, and the
+    // delete, the sample rows and the insert land together or not at all.
+    let (inserted, replaced, created_sample_ids) =
+        crate::common::bulk_write::guarded(&state.db, async |txn| {
+            // Deleting a group's last replicate reaps its samples row through the trigger, so the
+            // row's label, notes and authorship are captured first and restored onto the recreated
+            // row wherever the request does not carry its own.
+            let mut prior_samples: HashMap<
+                (Uuid, chrono::DateTime<chrono::Utc>),
+                (Option<String>, Option<String>, Option<String>),
+            > = HashMap::new();
+            let replaced: usize = if payload.mode == Some(GrabWriteMode::Replace) {
+                for (parameter_id, time) in &groups {
+                    if let Some(row) = txn
+                        .query_one(sea_orm::Statement::from_sql_and_values(
+                            sea_orm::DatabaseBackend::Postgres,
+                            r"SELECT label, notes, created_by FROM samples
+                              WHERE site_id = $1 AND parameter_id = $2 AND collected_at = $3",
+                            [
+                                payload.site_id.into(),
+                                (*parameter_id).into(),
+                                (*time).into(),
+                            ],
+                        ))
+                        .await?
+                    {
+                        prior_samples.insert(
+                            (*parameter_id, *time),
+                            (
+                                row.try_get("", "label").unwrap_or(None),
+                                row.try_get("", "notes").unwrap_or(None),
+                                row.try_get("", "created_by").unwrap_or(None),
+                            ),
+                        );
+                    }
+                }
+                let mut removed: u64 = 0;
+                for (parameter_id, time) in &groups {
+                    let res = txn
+                        .execute(sea_orm::Statement::from_sql_and_values(
+                            sea_orm::DatabaseBackend::Postgres,
+                            r"DELETE FROM readings
+                              WHERE site_id = $1 AND parameter_id = $2 AND time = $3
+                                AND measurement_type = 'spot'",
+                            [
+                                payload.site_id.into(),
+                                (*parameter_id).into(),
+                                (*time).into(),
+                            ],
+                        ))
+                        .await?;
+                    removed += res.rows_affected();
+                }
+                usize::try_from(removed).unwrap_or(usize::MAX)
             } else {
-                let counter = index_counters.entry(group_key).or_insert(0);
-                let idx = *counter;
-                *counter += 1;
-                idx
+                0
             };
 
-            // Both corrections, in the one order the arithmetic is defined in: the instrument's
-            // base calibration, then the operator's standard curve on that result. A grab that
-            // resolves neither is stored uncorrected, and `calibrated_value` stays NULL so a null
-            // still means "no curve was applied" rather than "a curve happened to be identity".
-            let base = r
-                .sensor_id
-                .and_then(|sid| base_curves.get(&(sid, Some(r.parameter_id), r.time)))
-                .copied();
-            let standard = r.standard_curve_id.map(|cid| {
-                let c = &standard_curves[&cid];
-                calibrations::service::Curve {
-                    id: c.id,
-                    slope: c.slope,
-                    intercept: c.intercept,
+            // One samples row per (parameter, time) group in the request.
+            let (sample_map, created_sample_ids) = auto_create_samples(
+                txn,
+                &payload.readings,
+                payload.site_id,
+                payload.created_by.as_deref(),
+                payload.label.as_deref(),
+                payload.notes.as_deref(),
+                provenance.as_ref(),
+            )
+            .await?;
+
+            for (group, sample_id) in &sample_map {
+                let Some((label, notes, created_by)) = prior_samples.get(group) else {
+                    continue;
+                };
+                txn.execute(sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    r"UPDATE samples SET label = COALESCE(label, $2),
+                                         notes = COALESCE(notes, $3),
+                                         created_by = COALESCE(created_by, $4)
+                      WHERE id = $1",
+                    [
+                        (*sample_id).into(),
+                        label.clone().into(),
+                        notes.clone().into(),
+                        created_by.clone().into(),
+                    ],
+                ))
+                .await?;
+            }
+
+            let models: Vec<readings::ActiveModel> = payload
+                .readings
+                .iter()
+                .zip(&preview)
+                .map(|(r, p)| readings::ActiveModel {
+                    standard_curve_id: Set(p.standard_curve.as_ref().map(|c| c.id)),
+                    stream_id: Set(stream_cache[&r.parameter_id]),
+                    site_id: Set(Some(payload.site_id)),
+                    parameter_id: Set(Some(r.parameter_id)),
+                    time: Set(r.time.into()),
+                    replicate_index: Set(p.replicate_index),
+                    raw_value: Set(r.value),
+                    calibrated_value: Set(p.calibrated_value),
+                    sensor_id: Set(r.sensor_id),
+                    calibration_id: Set(p.base_calibration.as_ref().map(|c| c.id)),
+                    deployment_id: Set(r.sensor_id.and_then(|sid| {
+                        grab_slots.get(&(sid, r.time)).and_then(|s| s.deployment_id)
+                    })),
+                    logged: Set(Some(true)),
+                    measurement_type: Set(Some(GRAB_MEASUREMENT_TYPE.to_string())),
+                    is_flagged: Set(Some(false)),
+                    flag_reason: Set(None),
+                    sample_id: Set(sample_map.get(&(r.parameter_id, r.time)).copied()),
+                })
+                .collect();
+
+            let inserted = match readings::Entity::insert_many(models)
+                .on_conflict(readings_upsert(Replace::Nothing))
+                .exec_without_returning(txn)
+                .await
+            {
+                Ok(rows) => rows as usize,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("None of the records") {
+                        0
+                    } else {
+                        return Err(AppError::Database(e));
+                    }
                 }
-            });
-            let calibrated_value = (base.is_some() || standard.is_some())
-                .then(|| calibrations::service::apply_curves(r.value, base, standard));
+            };
 
-            readings::ActiveModel {
-                standard_curve_id: Set(standard.map(|c| c.id)),
-                stream_id: Set(stream_id),
-                site_id: Set(Some(payload.site_id)),
-                parameter_id: Set(Some(r.parameter_id)),
-                time: Set(r.time.into()),
-                replicate_index: Set(replicate_index),
-                raw_value: Set(r.value),
-                calibrated_value: Set(calibrated_value),
-                sensor_id: Set(r.sensor_id),
-                calibration_id: Set(base.map(|c| c.id)),
-                deployment_id: Set(r
-                    .sensor_id
-                    .and_then(|sid| grab_slots.get(&(sid, r.time)).and_then(|s| s.deployment_id))),
-                logged: Set(Some(true)),
-                measurement_type: Set(Some(GRAB_MEASUREMENT_TYPE.to_string())),
-                is_flagged: Set(Some(false)),
-                flag_reason: Set(None),
-                sample_id: Set(sample_id),
+            // Readings the insert skipped on conflict still belong to the group's sample; linking
+            // them fires the aggregate trigger so the stats cover every replicate. Scoped to spot
+            // readings: a sonde reading sharing the grab's snapped timestamp must not be adopted
+            // into the sample, or the trigger folds sensor data into the grab statistics.
+            for ((parameter_id, time), sample_id) in &sample_map {
+                txn.execute(sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    r"UPDATE readings SET sample_id = $1
+                      WHERE site_id = $2 AND parameter_id = $3 AND time = $4 AND sample_id IS NULL
+                        AND measurement_type = 'spot'",
+                    [
+                        (*sample_id).into(),
+                        payload.site_id.into(),
+                        (*parameter_id).into(),
+                        (*time).into(),
+                    ],
+                ))
+                .await?;
             }
+
+            Ok((inserted, replaced, created_sample_ids))
         })
-        .collect();
-
-    let total = models.len();
-
-    let inserted = match readings::Entity::insert_many(models)
-        .on_conflict(readings_upsert(Replace::Nothing))
-        .exec_without_returning(&txn)
-        .await
-    {
-        Ok(rows) => rows as usize,
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("None of the records") {
-                0
-            } else {
-                return Err(AppError::Database(e));
-            }
-        }
-    };
-
-    // Readings the insert skipped on conflict still belong to the group's sample; linking them
-    // fires the aggregate trigger so the stats cover every replicate. Scoped to spot readings:
-    // a sonde reading sharing the grab's snapped timestamp must not be adopted into the sample,
-    // or the trigger folds sensor data into the grab statistics.
-    for ((parameter_id, time), sample_id) in &sample_map {
-        txn.execute(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings SET sample_id = $1
-              WHERE site_id = $2 AND parameter_id = $3 AND time = $4 AND sample_id IS NULL
-                AND measurement_type = 'spot'",
-            [
-                (*sample_id).into(),
-                payload.site_id.into(),
-                (*parameter_id).into(),
-                (*time).into(),
-            ],
-        ))
         .await?;
-    }
-
-    txn.commit().await?;
 
     // Event-driven open-alarm reconcile for the sampled slots (error-safe; backstop covers it),
     // plus historical episode reconstruction per slot so back-dated grabs land in alarm_events
     // like the batch/import paths. Inline rather than a tracked job to avoid one
     // reprocessing_jobs row per field campaign entry.
-    if inserted > 0 {
+    if inserted > 0 || replaced > 0 {
         let alarm_slots: Vec<(Uuid, Uuid)> = stream_cache
             .keys()
             .map(|pid| (payload.site_id, *pid))
@@ -552,17 +875,21 @@ pub async fn insert_grab_samples(
         }
     }
 
-    if inserted > 0 {
+    if inserted > 0 || replaced > 0 {
         let site_id = payload.site_id;
         crate::common::cache::invalidate_prefix(&state, &format!("readings:{site_id}")).await;
         crate::common::cache::invalidate_prefix(&state, &format!("aggregates:{site_id}")).await;
     }
 
     let samples_created = created_sample_ids.len();
-    tracing::info!(total, inserted, samples_created, site = %site.name, "Grab samples inserted");
+    tracing::info!(total, inserted, replaced, samples_created, site = %site.name, "Grab samples inserted");
     Ok(Json(GrabSampleResponse {
         inserted,
         samples_created,
         created_sample_ids,
+        dry_run: false,
+        replaced,
+        preview,
+        existing_groups,
     }))
 }

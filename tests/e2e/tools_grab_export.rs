@@ -231,7 +231,9 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
         &app,
         "/api/tools/doc/calculate",
         &json!({
-            "replicates": doc.replicates,
+            "DOC_rep_1": doc.replicates[0],
+            "DOC_rep_2": doc.replicates[1],
+            "DOC_rep_3": doc.replicates[2],
             "std_curve": { "slope": slope, "intercept": intercept },
         }),
         &intern,
@@ -977,7 +979,7 @@ async fn doc_tool_rejects_malformed_input_and_accounts_for_every_request_key() {
     let (status, wrong_type) = crate::common::post_json_parse_with_token(
         &app,
         "/api/tools/doc/calculate",
-        &json!({ "replicates": "not-an-array" }),
+        &json!({ "DOC_rep_1": "not-a-number" }),
         &intern,
     )
     .await;
@@ -992,7 +994,10 @@ async fn doc_tool_rejects_malformed_input_and_accounts_for_every_request_key() {
         "the error names the body as the problem: {wrong_type}"
     );
 
-    let (status, incomplete) = crate::common::post_json_parse_with_token(
+    // `required` is reserved for fields without which the tool cannot run. Omitting every doc
+    // replicate reaches the wrapper as an absent series, which is the same uncomputable case as
+    // all-null cells, so it answers like one rather than being refused.
+    let (status, absent) = crate::common::post_json_parse_with_token(
         &app,
         "/api/tools/doc/calculate",
         &json!({}),
@@ -1000,14 +1005,40 @@ async fn doc_tool_rejects_malformed_input_and_accounts_for_every_request_key() {
     )
     .await;
     assert_eq!(
+        status, 200,
+        "an omitted optional series is the uncomputable case, not a bad request ({status}): \
+         {absent}"
+    );
+    assert_eq!(
+        absent["results"].as_object().map(|results| results.len()),
+        Some(0),
+        "an uncomputable result is omitted rather than serialized: {absent}"
+    );
+
+    // Discharge keeps its series required because an empty one makes the underlying lm() fail,
+    // so the refusal that doc no longer owes is still pinned on a tool that owes it.
+    let (status, incomplete) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/tools/discharge/calculate",
+        &json!({ "tracer": "salt", "values": [1.0, 2.0] }),
+        &intern,
+    )
+    .await;
+    assert_eq!(
         status, 400,
-        "a body missing the tool's required field is a bad request ({status}): {incomplete}"
+        "a body missing a genuinely required field is a bad request ({status}): {incomplete}"
+    );
+    assert!(
+        incomplete["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("times_s")),
+        "the error names the missing field: {incomplete}"
     );
 
     let (status, empty) = crate::common::post_json_parse_with_token(
         &app,
         "/api/tools/doc/calculate",
-        &json!({ "replicates": [] }),
+        &json!({ "DOC_rep_1": null, "DOC_rep_2": null, "DOC_rep_3": null }),
         &intern,
     )
     .await;
@@ -1023,14 +1054,35 @@ async fn doc_tool_rejects_malformed_input_and_accounts_for_every_request_key() {
          stored data: {empty}"
     );
 
+    // An unknown field is refused by name, not silently dropped: a misnamed field whose value
+    // silently fell out of the calculation is how a wrong number gets saved without warning.
+    let (status, unknown) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/tools/doc/calculate",
+        &json!({
+            "DOC_rep_1": 100.0, "DOC_rep_2": 104.0,
+            "notes": "plate A",
+        }),
+        &intern,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "an unknown field is a bad request ({status}): {unknown}"
+    );
+    assert!(
+        unknown["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("notes")),
+        "the error names the unknown field: {unknown}"
+    );
+
     let (status, full) = crate::common::post_json_parse_with_token(
         &app,
         "/api/tools/doc/calculate",
         &json!({
-            "replicates": [100.0, 104.0],
+            "DOC_rep_1": 100.0, "DOC_rep_2": 104.0,
             "std_curve": { "slope": 2.0, "intercept": 1.0 },
-            "notes": "plate A",
-            "site_id": "ignored",
         }),
         &intern,
     )
@@ -1057,20 +1109,19 @@ async fn doc_tool_rejects_malformed_input_and_accounts_for_every_request_key() {
     used.sort_unstable();
     assert_eq!(
         used,
-        ["replicates", "std_curve"],
+        ["DOC_rep_1", "DOC_rep_2", "std_curve"],
         "every key the tool consumed is reported: {full}"
     );
 
-    let mut ignored: Vec<&str> = full["inputs_ignored"]
+    let ignored: Vec<&str> = full["inputs_ignored"]
         .as_array()
         .unwrap_or_else(|| panic!("inputs_ignored is an array: {full}"))
         .iter()
         .filter_map(serde_json::Value::as_str)
         .collect();
-    ignored.sort_unstable();
     assert_eq!(
         ignored,
-        ["notes", "site_id"],
-        "and every key it did not, so the caller can see what was dropped: {full}"
+        Vec::<&str>::new(),
+        "nothing sent went unconsumed: {full}"
     );
 }

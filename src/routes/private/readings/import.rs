@@ -78,6 +78,9 @@ pub struct ImportCsvResponse {
     pub warnings: Vec<String>,
     /// Data rows parsed from the CSV.
     pub row_count: usize,
+    /// (parameter, timestamp) groups holding more than one value in a 'spot' file; each is stored
+    /// as one replicate set behind a single served point.
+    pub replicate_groups: usize,
     /// Readings inserted (0 for `dry_run`).
     pub inserted_total: usize,
     pub earliest: Option<chrono::DateTime<chrono::Utc>>,
@@ -560,6 +563,16 @@ pub async fn import_csv(
     }
     let overlap = overlap;
 
+    let replicate_groups = if req.measurement_type.as_deref() == Some("spot") {
+        let mut group_sizes: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), usize> = HashMap::new();
+        for (pid, t, _, _) in &rows {
+            *group_sizes.entry((*pid, *t)).or_default() += 1;
+        }
+        group_sizes.values().filter(|n| **n > 1).count()
+    } else {
+        0
+    };
+
     // Dry run: report the plan and overlap diff without writing.
     if req.dry_run {
         return Ok(Json(ImportCsvResponse {
@@ -572,6 +585,7 @@ pub async fn import_csv(
             unmapped_columns,
             warnings,
             row_count,
+            replicate_groups,
             inserted_total: 0,
             earliest,
             latest,
@@ -740,6 +754,7 @@ pub async fn import_csv(
         unmapped_columns,
         warnings,
         row_count,
+        replicate_groups,
         inserted_total,
         earliest,
         latest,

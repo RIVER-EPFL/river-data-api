@@ -33,6 +33,10 @@ pub struct Model {
     pub description: Option<String>,
     #[crudcrate(filterable)]
     pub aliases: Vec<String>,
+    /// Set on catalog entries created mechanically (the analyte seed); cleared by a manager
+    /// confirming or merging the parameter.
+    #[crudcrate(filterable, on_create = false)]
+    pub needs_review: bool,
     pub default_warning_min: Option<f64>,
     pub default_warning_max: Option<f64>,
     pub default_alarm_min: Option<f64>,

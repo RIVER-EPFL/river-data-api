@@ -1165,6 +1165,9 @@ pub async fn grab(state: &AppState, scope: &AccessScope, args: &str, sub: &str) 
         created_by: Some(created_by),
         label: None,
         notes: None,
+        mode: None,
+        dry_run: false,
+        provenance: None,
         readings,
     };
 

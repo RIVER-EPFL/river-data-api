@@ -1,0 +1,597 @@
+{
+  "tolerance": 1e-09,
+  "cases": [
+    {
+      "name": "two_replicates_db_temp",
+      "inputs": {
+        "lab_temp_mode": "db",
+        "lab_temp_c": 16.6193622106221,
+        "lab_dic_acid_sample_wght_rep_A": 11.2234638555674,
+        "lab_dic_acid_wght_rep_A": 8.44720867276192,
+        "lab_dic_vol_overpressure_rep_A": 0.572314724791795,
+        "lab_dic_SA_added_rep_A": 0.215206453308929,
+        "lab_dic_co2_dry_rep_A": 7777.55566677079,
+        "lab_dic_delta_13co2_rep_A": -17.0359188667499,
+        "lab_dic_acid_sample_wght_rep_B": 9.90769812220242,
+        "lab_dic_acid_wght_rep_B": 8.03407381242141,
+        "lab_dic_vol_overpressure_rep_B": 1.5697415038012,
+        "lab_dic_SA_added_rep_B": 0.264786635583732,
+        "lab_dic_co2_dry_rep_B": 3729.14041790646,
+        "lab_dic_delta_13co2_rep_B": -0.847890549339354
+      },
+      "constants": {
+        "h_co2_29815k": 0.034733,
+        "gas_const_r_mol": 8.31446,
+        "vial_volume": 12.168,
+        "h3po4_added": 0.3,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237
+      },
+      "curves": {},
+      "expected": {
+        "DIC_A": 1.51226461877731,
+        "DIC_B": 1.15725491348659,
+        "DIC_avg": 1.33475976613195,
+        "DIC_std": 0.25102976999811,
+        "d13C_DIC_A": -17.2886319943196,
+        "d13C_DIC_B": -1.00632845904531,
+        "d13C_DIC_avg": -9.14748022668244,
+        "d13C_DIC_std": 11.5133272431301
+      },
+      "absent": []
+    },
+    {
+      "name": "single_replicate_emits_A_and_average",
+      "inputs": {
+        "lab_temp_mode": "db",
+        "lab_temp_c": 24.7059715376236,
+        "lab_dic_acid_sample_wght_rep_A": 9.10853801143821,
+        "lab_dic_acid_wght_rep_A": 8.34043501829728,
+        "lab_dic_vol_overpressure_rep_A": 0.871189606841654,
+        "lab_dic_SA_added_rep_A": 0.276490138308145,
+        "lab_dic_co2_dry_rep_A": 281.4223873429,
+        "lab_dic_delta_13co2_rep_A": -23.8076771516353
+      },
+      "constants": {
+        "h_co2_29815k": 0.034733,
+        "gas_const_r_mol": 8.31446,
+        "vial_volume": 12.168,
+        "h3po4_added": 0.3,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237
+      },
+      "curves": {},
+      "expected": {
+        "DIC_A": 0.193676958821648,
+        "DIC_avg": 0.193676958821648,
+        "d13C_DIC_A": -23.8629638399124,
+        "d13C_DIC_avg": -23.8629638399124
+      },
+      "absent": [
+        "DIC_B",
+        "DIC_std",
+        "d13C_DIC_B",
+        "d13C_DIC_std"
+      ]
+    },
+    {
+      "name": "lone_replicate_b_stays_on_b",
+      "inputs": {
+        "lab_temp_mode": "db",
+        "lab_temp_c": 24.7059715376236,
+        "lab_dic_acid_sample_wght_rep_B": 9.10853801143821,
+        "lab_dic_acid_wght_rep_B": 8.34043501829728,
+        "lab_dic_vol_overpressure_rep_B": 0.871189606841654,
+        "lab_dic_SA_added_rep_B": 0.276490138308145,
+        "lab_dic_co2_dry_rep_B": 281.4223873429,
+        "lab_dic_delta_13co2_rep_B": -23.8076771516353
+      },
+      "constants": {
+        "h_co2_29815k": 0.034733,
+        "gas_const_r_mol": 8.31446,
+        "vial_volume": 12.168,
+        "h3po4_added": 0.3,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237
+      },
+      "curves": {},
+      "expected": {
+        "DIC_B": 0.193676958821648,
+        "DIC_avg": 0.193676958821648,
+        "d13C_DIC_B": -23.8629638399124,
+        "d13C_DIC_avg": -23.8629638399124
+      },
+      "absent": [
+        "DIC_A",
+        "DIC_std",
+        "d13C_DIC_A",
+        "d13C_DIC_std"
+      ]
+    },
+    {
+      "name": "cst_mode_ignores_entered_lab_temp",
+      "inputs": {
+        "lab_temp_mode": "cst",
+        "lab_temp_c": 5.0,
+        "lab_dic_acid_sample_wght_rep_A": 9.10853801143821,
+        "lab_dic_acid_wght_rep_A": 8.34043501829728,
+        "lab_dic_vol_overpressure_rep_A": 0.871189606841654,
+        "lab_dic_SA_added_rep_A": 0.276490138308145,
+        "lab_dic_co2_dry_rep_A": 281.4223873429,
+        "lab_dic_delta_13co2_rep_A": -23.8076771516353
+      },
+      "constants": {
+        "h_co2_29815k": 0.034733,
+        "gas_const_r_mol": 8.31446,
+        "vial_volume": 12.168,
+        "h3po4_added": 0.3,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237
+      },
+      "curves": {},
+      "expected": {
+        "DIC_A": 0.19566954589410054,
+        "DIC_avg": 0.19566954589410054,
+        "d13C_DIC_A": -23.866292483100167,
+        "d13C_DIC_avg": -23.866292483100167
+      },
+      "absent": [
+        "DIC_B",
+        "DIC_std",
+        "d13C_DIC_B",
+        "d13C_DIC_std"
+      ]
+    },
+    {
+      "name": "cst_mode_with_no_lab_temp_cell",
+      "inputs": {
+        "lab_temp_mode": "cst",
+        "lab_dic_acid_sample_wght_rep_A": 9.10853801143821,
+        "lab_dic_acid_wght_rep_A": 8.34043501829728,
+        "lab_dic_vol_overpressure_rep_A": 0.871189606841654,
+        "lab_dic_SA_added_rep_A": 0.276490138308145,
+        "lab_dic_co2_dry_rep_A": 281.4223873429,
+        "lab_dic_delta_13co2_rep_A": -23.8076771516353
+      },
+      "constants": {
+        "h_co2_29815k": 0.034733,
+        "gas_const_r_mol": 8.31446,
+        "vial_volume": 12.168,
+        "h3po4_added": 0.3,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237
+      },
+      "curves": {},
+      "expected": {
+        "DIC_A": 0.19566954589410054,
+        "DIC_avg": 0.19566954589410054,
+        "d13C_DIC_A": -23.866292483100167,
+        "d13C_DIC_avg": -23.866292483100167
+      },
+      "absent": [
+        "DIC_B",
+        "DIC_std",
+        "d13C_DIC_B",
+        "d13C_DIC_std"
+      ]
+    },
+    {
+      "name": "db_mode_with_blank_lab_temp_yields_nothing",
+      "inputs": {
+        "lab_temp_mode": "db",
+        "lab_dic_acid_sample_wght_rep_A": 9.10853801143821,
+        "lab_dic_acid_wght_rep_A": 8.34043501829728,
+        "lab_dic_vol_overpressure_rep_A": 0.871189606841654,
+        "lab_dic_SA_added_rep_A": 0.276490138308145,
+        "lab_dic_co2_dry_rep_A": 281.4223873429,
+        "lab_dic_delta_13co2_rep_A": -23.8076771516353
+      },
+      "constants": {
+        "h_co2_29815k": 0.034733,
+        "gas_const_r_mol": 8.31446,
+        "vial_volume": 12.168,
+        "h3po4_added": 0.3,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237
+      },
+      "curves": {},
+      "expected": {},
+      "absent": [
+        "DIC_A",
+        "DIC_B",
+        "DIC_avg",
+        "DIC_std",
+        "d13C_DIC_A",
+        "d13C_DIC_B",
+        "d13C_DIC_avg",
+        "d13C_DIC_std"
+      ]
+    },
+    {
+      "name": "mode_omitted_defaults_to_db",
+      "inputs": {
+        "lab_temp_c": 24.7059715376236,
+        "lab_dic_acid_sample_wght_rep_A": 9.10853801143821,
+        "lab_dic_acid_wght_rep_A": 8.34043501829728,
+        "lab_dic_vol_overpressure_rep_A": 0.871189606841654,
+        "lab_dic_SA_added_rep_A": 0.276490138308145,
+        "lab_dic_co2_dry_rep_A": 281.4223873429,
+        "lab_dic_delta_13co2_rep_A": -23.8076771516353
+      },
+      "constants": {
+        "h_co2_29815k": 0.034733,
+        "gas_const_r_mol": 8.31446,
+        "vial_volume": 12.168,
+        "h3po4_added": 0.3,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237
+      },
+      "curves": {},
+      "expected": {
+        "DIC_A": 0.193676958821648,
+        "DIC_avg": 0.193676958821648,
+        "d13C_DIC_A": -23.8629638399124,
+        "d13C_DIC_avg": -23.8629638399124
+      },
+      "absent": [
+        "DIC_B",
+        "DIC_std",
+        "d13C_DIC_B",
+        "d13C_DIC_std"
+      ]
+    },
+    {
+      "name": "constants_come_from_the_table_only",
+      "inputs": {
+        "lab_temp_mode": "db",
+        "lab_temp_c": 24.7059715376236,
+        "lab_dic_acid_sample_wght_rep_A": 9.10853801143821,
+        "lab_dic_acid_wght_rep_A": 8.34043501829728,
+        "lab_dic_vol_overpressure_rep_A": 0.871189606841654,
+        "lab_dic_SA_added_rep_A": 0.276490138308145,
+        "lab_dic_co2_dry_rep_A": 281.4223873429,
+        "lab_dic_delta_13co2_rep_A": -23.8076771516353
+      },
+      "constants": {
+        "h_co2_29815k": 0.034733,
+        "gas_const_r_mol": 8.31446,
+        "vial_volume": 20.0,
+        "h3po4_added": 0.5,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237
+      },
+      "curves": {},
+      "expected": {
+        "DIC_A": 0.3079956820607182,
+        "DIC_avg": 0.3079956820607182,
+        "d13C_DIC_A": -23.842137525389873,
+        "d13C_DIC_avg": -23.842137525389873
+      },
+      "absent": [
+        "DIC_B",
+        "DIC_std",
+        "d13C_DIC_B",
+        "d13C_DIC_std"
+      ]
+    },
+    {
+      "name": "one_sided_d13c",
+      "inputs": {
+        "lab_temp_mode": "db",
+        "lab_temp_c": 18.3749413141049,
+        "lab_dic_acid_sample_wght_rep_A": 10.6416302296566,
+        "lab_dic_acid_wght_rep_A": 8.66986041236669,
+        "lab_dic_vol_overpressure_rep_A": 0.842094927094877,
+        "lab_dic_SA_added_rep_A": 0.145115649409126,
+        "lab_dic_co2_dry_rep_A": 932.157209748402,
+        "lab_dic_delta_13co2_rep_A": -2.83887458965182,
+        "lab_dic_acid_sample_wght_rep_B": 11.488270245376,
+        "lab_dic_acid_wght_rep_B": 8.79411679599434,
+        "lab_dic_vol_overpressure_rep_B": 0.754869975149632,
+        "lab_dic_SA_added_rep_B": 0.291004249593243,
+        "lab_dic_co2_dry_rep_B": 6300.5260466598,
+        "lab_dic_delta_13co2_rep_B": null
+      },
+      "constants": {
+        "h_co2_29815k": 0.034733,
+        "gas_const_r_mol": 8.31446,
+        "vial_volume": 12.168,
+        "h3po4_added": 0.3,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237
+      },
+      "curves": {},
+      "expected": {
+        "DIC_A": 0.254462561921927,
+        "DIC_B": 1.26939834758569,
+        "DIC_avg": 0.76193045475381,
+        "DIC_std": 0.717667976511745,
+        "d13C_DIC_A": -3.00747793410495,
+        "d13C_DIC_avg": -3.00747793410495
+      },
+      "absent": [
+        "d13C_DIC_B",
+        "d13C_DIC_std"
+      ]
+    },
+    {
+      "name": "missing_co2_on_replicate_a",
+      "inputs": {
+        "lab_temp_mode": "db",
+        "lab_temp_c": 23.0471819126979,
+        "lab_dic_acid_sample_wght_rep_A": 11.9475039949175,
+        "lab_dic_acid_wght_rep_A": 9.84659829502925,
+        "lab_dic_vol_overpressure_rep_A": 1.74157440196723,
+        "lab_dic_SA_added_rep_A": 0.142183388629928,
+        "lab_dic_co2_dry_rep_A": null,
+        "lab_dic_delta_13co2_rep_A": -12.0260858652182,
+        "lab_dic_acid_sample_wght_rep_B": 9.90140461118426,
+        "lab_dic_acid_wght_rep_B": 8.35368860373273,
+        "lab_dic_vol_overpressure_rep_B": 1.86105145933107,
+        "lab_dic_SA_added_rep_B": 0.340288063697517,
+        "lab_dic_co2_dry_rep_B": 827.530179684982,
+        "lab_dic_delta_13co2_rep_B": -9.15025342721492
+      },
+      "constants": {
+        "h_co2_29815k": 0.034733,
+        "gas_const_r_mol": 8.31446,
+        "vial_volume": 12.168,
+        "h3po4_added": 0.3,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237
+      },
+      "curves": {},
+      "expected": {
+        "DIC_B": 0.306608640601637,
+        "DIC_avg": 0.306608640601637,
+        "d13C_DIC_A": -12.1755421772357,
+        "d13C_DIC_B": -9.25889233844716,
+        "d13C_DIC_avg": -10.7172172578414,
+        "d13C_DIC_std": 2.06238287935401
+      },
+      "absent": [
+        "DIC_A",
+        "DIC_std"
+      ]
+    },
+    {
+      "name": "zero_sample_volume_divisor",
+      "inputs": {
+        "lab_temp_mode": "db",
+        "lab_temp_c": 22.0,
+        "lab_dic_acid_sample_wght_rep_A": 9.5,
+        "lab_dic_acid_wght_rep_A": 9.5,
+        "lab_dic_vol_overpressure_rep_A": 0.5,
+        "lab_dic_SA_added_rep_A": 0.3,
+        "lab_dic_co2_dry_rep_A": 2000.0
+      },
+      "constants": {
+        "h_co2_29815k": 0.034733,
+        "gas_const_r_mol": 8.31446,
+        "vial_volume": 12.168,
+        "h3po4_added": 0.3,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237
+      },
+      "curves": {},
+      "expected": {},
+      "absent": [
+        "DIC_A",
+        "DIC_B",
+        "DIC_avg",
+        "DIC_std",
+        "d13C_DIC_A",
+        "d13C_DIC_B",
+        "d13C_DIC_avg",
+        "d13C_DIC_std"
+      ]
+    },
+    {
+      "name": "no_d13co2_entered",
+      "inputs": {
+        "lab_temp_mode": "db",
+        "lab_temp_c": 19.7082879266236,
+        "lab_dic_acid_sample_wght_rep_A": 9.20548303762916,
+        "lab_dic_acid_wght_rep_A": 8.47218421986327,
+        "lab_dic_vol_overpressure_rep_A": 0.349860809743404,
+        "lab_dic_SA_added_rep_A": 0.164803219167516,
+        "lab_dic_co2_dry_rep_A": 8444.94084164035
+      },
+      "constants": {
+        "h_co2_29815k": 0.034733,
+        "gas_const_r_mol": 8.31446,
+        "vial_volume": 12.168,
+        "h3po4_added": 0.3,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237
+      },
+      "curves": {},
+      "expected": {
+        "DIC_A": 5.9266419091279,
+        "DIC_avg": 5.9266419091279
+      },
+      "absent": [
+        "DIC_B",
+        "DIC_std",
+        "d13C_DIC_A",
+        "d13C_DIC_B",
+        "d13C_DIC_avg",
+        "d13C_DIC_std"
+      ]
+    },
+    {
+      "name": "d13c_only_no_co2_or_sa",
+      "inputs": {
+        "lab_temp_mode": "db",
+        "lab_temp_c": 16.7630662105512,
+        "lab_dic_acid_sample_wght_rep_A": 11.7561734255869,
+        "lab_dic_acid_wght_rep_A": 8.99482189817354,
+        "lab_dic_vol_overpressure_rep_A": 0.563328131102026,
+        "lab_dic_SA_added_rep_A": null,
+        "lab_dic_co2_dry_rep_A": null,
+        "lab_dic_delta_13co2_rep_A": -14.667057201732
+      },
+      "constants": {
+        "h_co2_29815k": 0.034733,
+        "gas_const_r_mol": 8.31446,
+        "vial_volume": 12.168,
+        "h3po4_added": 0.3,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237
+      },
+      "curves": {},
+      "expected": {
+        "d13C_DIC_A": -14.9177635132524,
+        "d13C_DIC_avg": -14.9177635132524
+      },
+      "absent": [
+        "DIC_A",
+        "DIC_B",
+        "DIC_avg",
+        "DIC_std",
+        "d13C_DIC_B",
+        "d13C_DIC_std"
+      ]
+    },
+    {
+      "name": "blank_weights_are_accepted_and_yield_nothing",
+      "inputs": {
+        "lab_temp_mode": "db",
+        "lab_temp_c": 20.0,
+        "lab_dic_co2_dry_rep_A": 2000.0,
+        "lab_dic_delta_13co2_rep_A": -10.0
+      },
+      "constants": {
+        "h_co2_29815k": 0.034733,
+        "gas_const_r_mol": 8.31446,
+        "vial_volume": 12.168,
+        "h3po4_added": 0.3,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237
+      },
+      "curves": {},
+      "expected": {},
+      "absent": [
+        "DIC_A",
+        "DIC_B",
+        "DIC_avg",
+        "DIC_std",
+        "d13C_DIC_A",
+        "d13C_DIC_B",
+        "d13C_DIC_avg",
+        "d13C_DIC_std"
+      ]
+    },
+    {
+      "name": "overflowing_co2_gives_an_infinite_dic",
+      "inputs": {
+        "lab_temp_mode": "db",
+        "lab_temp_c": 24.7059715376236,
+        "lab_dic_acid_sample_wght_rep_A": 9.10853801143821,
+        "lab_dic_acid_wght_rep_A": 8.34043501829728,
+        "lab_dic_vol_overpressure_rep_A": 0.871189606841654,
+        "lab_dic_SA_added_rep_A": 0.276490138308145,
+        "lab_dic_co2_dry_rep_A": 1e+307,
+        "lab_dic_delta_13co2_rep_A": -23.8076771516353
+      },
+      "constants": {
+        "h_co2_29815k": 0.034733,
+        "gas_const_r_mol": 8.31446,
+        "vial_volume": 12.168,
+        "h3po4_added": 0.3,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237
+      },
+      "curves": {},
+      "expected": {
+        "d13C_DIC_A": -23.862963839912435,
+        "d13C_DIC_avg": -23.862963839912435
+      },
+      "absent": [
+        "DIC_A",
+        "DIC_B",
+        "DIC_avg",
+        "DIC_std",
+        "d13C_DIC_B",
+        "d13C_DIC_std"
+      ]
+    },
+    {
+      "name": "unbounded_headspace_gives_a_nan_replicate",
+      "inputs": {
+        "lab_temp_mode": "db",
+        "lab_temp_c": 24.7059715376236,
+        "lab_dic_acid_sample_wght_rep_A": 9.10853801143821,
+        "lab_dic_acid_wght_rep_A": 8.34043501829728,
+        "lab_dic_vol_overpressure_rep_A": 1e+308,
+        "lab_dic_SA_added_rep_A": 0.276490138308145,
+        "lab_dic_co2_dry_rep_A": 281.4223873429,
+        "lab_dic_delta_13co2_rep_A": -23.8076771516353,
+        "lab_dic_acid_sample_wght_rep_B": 9.90769812220242,
+        "lab_dic_acid_wght_rep_B": 8.03407381242141,
+        "lab_dic_vol_overpressure_rep_B": 1.5697415038012,
+        "lab_dic_SA_added_rep_B": 0.264786635583732,
+        "lab_dic_co2_dry_rep_B": 3729.14041790646,
+        "lab_dic_delta_13co2_rep_B": -0.847890549339354
+      },
+      "constants": {
+        "h_co2_29815k": 0.034733,
+        "gas_const_r_mol": 8.31446,
+        "vial_volume": 12.168,
+        "h3po4_added": 0.3,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237
+      },
+      "curves": {},
+      "expected": {
+        "DIC_B": 1.096811468637194,
+        "DIC_avg": 1.096811468637194,
+        "d13C_DIC_B": -0.9772303132755613,
+        "d13C_DIC_avg": -0.9772303132755613
+      },
+      "absent": [
+        "DIC_A",
+        "DIC_std",
+        "d13C_DIC_A",
+        "d13C_DIC_std"
+      ]
+    },
+    {
+      "name": "replicate_b_blank_weights_are_treated_like_a",
+      "inputs": {
+        "lab_temp_mode": "db",
+        "lab_temp_c": 24.7059715376236,
+        "lab_dic_acid_sample_wght_rep_A": 9.10853801143821,
+        "lab_dic_acid_wght_rep_A": 8.34043501829728,
+        "lab_dic_vol_overpressure_rep_A": 0.871189606841654,
+        "lab_dic_SA_added_rep_A": 0.276490138308145,
+        "lab_dic_co2_dry_rep_A": 281.4223873429,
+        "lab_dic_delta_13co2_rep_A": -23.8076771516353,
+        "lab_dic_co2_dry_rep_B": 1000.0,
+        "lab_dic_delta_13co2_rep_B": -12.0
+      },
+      "constants": {
+        "h_co2_29815k": 0.034733,
+        "gas_const_r_mol": 8.31446,
+        "vial_volume": 12.168,
+        "h3po4_added": 0.3,
+        "lab_temp_avg_degC": 22.5,
+        "lab_press_avg_atm": 0.957237
+      },
+      "curves": {},
+      "expected": {
+        "DIC_A": 0.19367695882164712,
+        "DIC_avg": 0.19367695882164712,
+        "d13C_DIC_A": -23.862963839912435,
+        "d13C_DIC_avg": -23.862963839912435
+      },
+      "absent": [
+        "DIC_B",
+        "DIC_std",
+        "d13C_DIC_B",
+        "d13C_DIC_std"
+      ]
+    }
+  ],
+  "notes": "Strict 1:1 with the portal DIC tool (modules/tools_tab/tools/dic_tool.R). All constants come from the constants table; the request carries no override for h_co2_29815k / gas_const_r_mol / vial_volume / h3po4_added, because the portal has none (constants_come_from_the_table_only pins that a perturbed table value moves the result, and that the caller cannot override it). lab_temp_mode is the portal's 'Use lab temp constant' checkbox (dic_tool.R:187-191): 'cst' reads lab_temp_avg_degC and ignores the entered cell, 'db' reads the cell and yields nothing when it is blank; the functions' unreachable 'default' fallback mode is not offered. Each replicate cell is its own param, named '{portal column}_rep_{A|B}' after the portal's own lab_dic_*_A / lab_dic_*_B columns, so the letter travels in the field name and a blank cell cannot move a value onto another replicate (lone_replicate_b_stays_on_b sends the cells of single_replicate_emits_A_and_average on B and gets the same numbers under DIC_B / d13C_DIC_B). Replicates A and B are looped unconditionally (dic_tool.R:194-227), so a single entry still emits DIC_A / d13C_DIC_A alongside the average. No input is required: a blank cell reaches calcDIC/calcd13DIC, which return NA (calculation_functions.R:367, :449), and the portal simply shows an empty row (blank_weights_are_accepted_and_yield_nothing, replicate_b_blank_weights_are_treated_like_a). calcMean/calcSd use na.rm, so with one d13co2 value the average is that value and the sd is 'KEEP OLD' (one_sided_d13c); the portal would carry the stored value forward for 'KEEP OLD', but this tool is stateless, so the key is omitted instead. Every case lists every key it does not expect, so a regression that starts emitting an extra replicate or std is caught. NaN and Inf are values the portal writes to the table (calcDIC:357-362 guards only is.na and divisor != 0), so the wrapper emits them: overflowing_co2_gives_an_infinite_dic produces DIC_A = Inf and DIC_avg = Inf, unbounded_headspace_gives_a_nan_replicate produces DIC_A = NaN and d13C_DIC_A = NaN. Both serialise to JSON null and the API drops nulls, so they are listed as absent even though the portal would display them; the NaN case also pins that calcMean's na.rm drops a NaN replicate, leaving the average equal to replicate B. An unrecognised lab_temp_mode is normalised to the 'db' default in the wrapper, so the functions' 'default' branch cannot run; no case exercises it because the enum gate rejects any other value before the script is reached. Golden values cross-checked against an independent implementation of calcDIC:335-364 / calcd13DIC:430-444 as well as the live runner."
+}

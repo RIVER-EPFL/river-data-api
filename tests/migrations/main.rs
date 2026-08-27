@@ -15,3 +15,5 @@ mod support;
 
 mod identity_retirement;
 mod standard_curve_split;
+mod tool_output_analytes;
+mod tool_seed_idempotency;

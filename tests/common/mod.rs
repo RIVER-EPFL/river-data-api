@@ -6,6 +6,7 @@ pub mod fixtures;
 pub mod keycloak;
 pub mod seed;
 pub mod sensor_lifecycle;
+pub mod tools_runner;
 pub mod tracks;
 
 use river_db::common::{AppState, EventSender};
@@ -61,7 +62,7 @@ pub fn build_test_app_with_events(db: DatabaseConnection) -> (axum::Router, Even
     (river_db::routes::build_router(state), events)
 }
 
-fn test_config() -> Config {
+pub fn test_config() -> Config {
     Config {
         database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
         api_host: "127.0.0.1".to_string(),
@@ -89,6 +90,11 @@ fn test_config() -> Config {
         // limiter is what rate_limit_test exercises); most tests also disable rate limiting entirely.
         auth_rate_limit_per_second: 100_000,
         auth_rate_limit_burst: 100_000,
+        // The runner container from the compose test profile; unreachable hosts answer 503.
+        tools_runner_url: std::env::var("TOOLS_RUNNER_URL")
+            .ok()
+            .or_else(|| Some("http://localhost:8006/ocpu".to_string())),
+        tools_runner_timeout_seconds: 60,
         // Off by default in tests (keeps token-authed test requests from writing audit rows); the
         // dedicated audit test flips it on against a fresh AppState.
         audit_api_token_use: false,

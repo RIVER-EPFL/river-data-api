@@ -1331,6 +1331,8 @@ async fn resolve_or_create_param(
             .unwrap_or_else(|| param_ref.name.clone())),
         default_units: Set(param_ref.units.clone()),
         category: Set(category),
+        // Mechanically created from a sync source; a manager confirms or merges it later.
+        needs_review: Set(true),
         description: Set(None),
         aliases: Set(aliases),
         default_warning_min: Set(None),

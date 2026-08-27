@@ -55,6 +55,59 @@ impl CRUDOperations for SensorOperations {
         Ok(())
     }
 
+    /// One row at a time, through the single-row path: the crudcrate default `create_many`
+    /// delegates to the resource, which delegates back here, so the default recurses; the loop
+    /// also runs the single-row hooks for every item.
+    async fn create_many(
+        &self,
+        db: &DatabaseConnection,
+        data: Vec<<Sensor as CRUDResource>::CreateModel>,
+    ) -> Result<Vec<Sensor>, ApiError> {
+        let mut created = Vec::with_capacity(data.len());
+        for item in data {
+            created.push(self.create(db, item).await?);
+        }
+        Ok(created)
+    }
+
+    /// The dependent tables all reference sensors without ON DELETE, so the constraint would
+    /// refuse this anyway; the check turns that into a stated 400 instead of an internal error.
+    async fn before_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<(), ApiError> {
+        let blocking = db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT \
+                   EXISTS(SELECT 1 FROM readings WHERE sensor_id = $1) AS readings, \
+                   EXISTS(SELECT 1 FROM standard_curves WHERE sensor_id = $1) AS curves, \
+                   EXISTS(SELECT 1 FROM sensor_calibrations WHERE sensor_id = $1) AS calibrations, \
+                   EXISTS(SELECT 1 FROM sensor_deployments WHERE sensor_id = $1) AS deployments",
+                [id.into()],
+            ))
+            .await
+            .map_err(ApiError::database)?;
+        if let Some(row) = blocking {
+            let mut held: Vec<&str> = Vec::new();
+            for (col, label) in [
+                ("readings", "readings"),
+                ("curves", "standard curves"),
+                ("calibrations", "calibrations"),
+                ("deployments", "deployments"),
+            ] {
+                if row.try_get::<bool>("", col).unwrap_or(false) {
+                    held.push(label);
+                }
+            }
+            if !held.is_empty() {
+                return Err(ApiError::bad_request(format!(
+                    "Sensor {id} still holds {}. Remove or reassign them first; readings and \
+                     applied curves are provenance and keep the instrument on record.",
+                    held.join(", ")
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// One row at a time, through the single-row path, so a bulk edit meets the same guard.
     async fn update_many(
         &self,
@@ -66,6 +119,17 @@ impl CRUDOperations for SensorOperations {
             updated.push(self.update(db, id, data).await?);
         }
         Ok(updated)
+    }
+
+    async fn before_delete_many(
+        &self,
+        db: &DatabaseConnection,
+        ids: &[Uuid],
+    ) -> Result<(), ApiError> {
+        for id in ids {
+            self.before_delete(db, *id).await?;
+        }
+        Ok(())
     }
 
     async fn after_get_one(
