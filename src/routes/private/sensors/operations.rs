@@ -29,6 +29,45 @@ fn uuid_values(ids: &[Uuid]) -> Vec<sea_orm::Value> {
 impl CRUDOperations for SensorOperations {
     type Resource = Sensor;
 
+    /// Mirrors `/sensors/retag_frequency`: a sensor reaching a replicate-family stream cannot be
+    /// classified high-frequency through entity CRUD either, so the two routes to the same column
+    /// hold the same rule.
+    async fn before_update(
+        &self,
+        db: &DatabaseConnection,
+        id: Uuid,
+        data: &<Sensor as CRUDResource>::UpdateModel,
+    ) -> Result<(), crudcrate::ApiError> {
+        if data.data_frequency.as_ref().and_then(|v| v.as_deref()) == Some("high") {
+            let families =
+                crate::routes::private::data_streams::replicates::family_keys_for_sensors(
+                    db,
+                    &[id],
+                )
+                .await
+                .map_err(|e| crudcrate::ApiError::internal(e.to_string(), None))?;
+            crate::routes::private::data_streams::replicates::refuse_family_retag(
+                &families,
+                "continuous",
+            )
+            .map_err(|e| crudcrate::ApiError::bad_request(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// One row at a time, through the single-row path, so a bulk edit meets the same guard.
+    async fn update_many(
+        &self,
+        db: &DatabaseConnection,
+        updates: Vec<(Uuid, <Sensor as CRUDResource>::UpdateModel)>,
+    ) -> Result<Vec<Sensor>, crudcrate::ApiError> {
+        let mut updated = Vec::with_capacity(updates.len());
+        for (id, data) in updates {
+            updated.push(self.update(db, id, data).await?);
+        }
+        Ok(updated)
+    }
+
     async fn after_get_one(
         &self,
         db: &DatabaseConnection,

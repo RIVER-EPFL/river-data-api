@@ -4,7 +4,6 @@ pub mod lifecycle;
 pub mod model;
 pub mod reconcile;
 pub mod registry;
-pub mod replicate_reindex;
 pub mod routes;
 pub mod schedule;
 pub mod schedule_routes;

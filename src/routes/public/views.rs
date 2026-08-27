@@ -4,7 +4,6 @@ use axum::{
     response::Response,
 };
 use chrono::{DateTime, NaiveDateTime, Utc};
-use sea_orm::sea_query::{Alias, Expr, Order, PostgresQueryBuilder, Query as SeaQuery};
 use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -19,14 +18,19 @@ use crate::error::{AppError, AppResult};
 use crate::routes::private::sites::aggregates::resolution_of;
 use crate::routes::public::service::{PublicProjectConfig, PublicSiteConfig, get_public_config};
 
-/// What the public tier treats as this site's data: one row per instant, taken at the lowest
-/// unflagged replicate index, and nothing an operator has flagged. Flagging a replicate therefore
-/// never removes an instant from serving, and which replicate was flagged never changes whether the
-/// instant is served. The instant is `(stream_id, time)`, the readings primary key minus the
-/// replicate index. This predicate and that grouping are shared by the site-detail count and the
-/// readings query so the count, the series and the rollups cannot disagree about what the site
-/// serves.
-const SERVED_READINGS: &str = "r.is_flagged IS NOT TRUE";
+/// What the public tier treats as this site's data, split by cadence so each half keeps its fast
+/// plan. Continuous and derived rows are written at `replicate_index = 0` by every continuous
+/// writer, so the plain equality is exact and keeps ordered-append scans and hash aggregation.
+/// Spot instants are replicate groups: the instant is `(stream_id, time)`, the readings primary
+/// key minus the replicate index, valued at the trigger-maintained sample mean over the group's
+/// unflagged replicates, with the lowest unflagged replicate's own value as the fallback when no
+/// sample row exists (unpaired stream, or not yet materialised). A fully flagged group serves
+/// nothing; flagging one replicate moves the served value rather than removing the instant or
+/// handing it to a different replicate. Both predicates are shared by the site-detail count and
+/// the readings query so the count and the series cannot disagree about what the site serves.
+const SERVED_CONTINUOUS: &str = "r.measurement_type IS DISTINCT FROM 'spot' \
+     AND r.replicate_index = 0 AND r.is_flagged IS NOT TRUE";
+const SERVED_SPOT: &str = "r.measurement_type = 'spot' AND r.is_flagged IS NOT TRUE";
 
 // Time Format
 
@@ -264,12 +268,22 @@ pub async fn get_site(
         }
         let placeholders = placeholders_parts.join(", ");
 
+        // The composite DISTINCT is confined to the spot subset, whose row counts are tiny; the
+        // continuous half stays a plain parallel aggregate with no sort.
         let sql = format!(
-            "SELECT MIN(r.time) AS min_time, MAX(r.time) AS max_time, \
-                    COUNT(DISTINCT (r.stream_id, r.time)) AS count \
-             FROM readings r \
-             WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
-               AND {SERVED_READINGS}"
+            "SELECT LEAST(c.min_time, sp.min_time) AS min_time, \
+                    GREATEST(c.max_time, sp.max_time) AS max_time, \
+                    c.count + sp.count AS count \
+             FROM (SELECT MIN(r.time) AS min_time, MAX(r.time) AS max_time, COUNT(*) AS count \
+                   FROM readings r \
+                   WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
+                     AND {SERVED_CONTINUOUS}) c \
+             CROSS JOIN \
+                  (SELECT MIN(r.time) AS min_time, MAX(r.time) AS max_time, \
+                          COUNT(DISTINCT (r.stream_id, r.time)) AS count \
+                   FROM readings r \
+                   WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
+                     AND {SERVED_SPOT}) sp"
         );
 
         let mut values: Vec<sea_orm::Value> = vec![site.site_id.into()];
@@ -997,69 +1011,67 @@ async fn fetch_readings(
         .map(|rp| rp.site_id)
         .ok_or_else(|| AppError::NotFound("No resolved parameters found".to_string()))?;
 
-    let r = Alias::new("r");
-    let p = Alias::new("p");
+    let mut values: Vec<sea_orm::Value> = vec![site_id.into()];
+    let placeholders: Vec<String> = param_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("${}", i + 2))
+        .collect();
+    values.extend(param_ids.iter().map(|id| (*id).into()));
+    let placeholders = placeholders.join(",");
 
-    let mut query = SeaQuery::select();
-    query
-        .expr_as(
-            Expr::col((p.clone(), Alias::new("id"))).cast_as(Alias::new("TEXT")),
-            Alias::new("param_id"),
-        )
-        .column((r.clone(), Alias::new("time")))
-        .expr_as(
-            // A replicate group is served as its sample mean (same as the private endpoint),
-            // so a replicated timestamp yields one deterministic value.
-            Expr::cust("COALESCE(smp.mean, r.calibrated_value, r.raw_value)"),
-            Alias::new("value"),
-        )
-        .column((r.clone(), Alias::new("measurement_type")))
-        .from_as(Alias::new("readings"), r.clone())
-        .join_as(
-            sea_orm::sea_query::JoinType::Join,
-            Alias::new("parameters"),
-            p.clone(),
-            Expr::col((r.clone(), Alias::new("parameter_id")))
-                .equals((p.clone(), Alias::new("id"))),
-        )
-        .join_as(
-            sea_orm::sea_query::JoinType::LeftJoin,
-            Alias::new("samples"),
-            Alias::new("smp"),
-            Expr::col((Alias::new("smp"), Alias::new("id")))
-                .equals((r.clone(), Alias::new("sample_id"))),
-        )
-        .and_where(Expr::col((r.clone(), Alias::new("site_id"))).eq(site_id))
-        .and_where(Expr::cust(SERVED_READINGS))
-        .and_where(Expr::col((p.clone(), Alias::new("id"))).is_in(param_ids.clone()))
-        .distinct_on([
-            (r.clone(), Alias::new("stream_id")),
-            (r.clone(), Alias::new("time")),
-        ])
-        .order_by((r.clone(), Alias::new("stream_id")), Order::Asc)
-        .order_by((r.clone(), Alias::new("time")), Order::Asc)
-        .order_by((r.clone(), Alias::new("replicate_index")), Order::Asc);
-
+    let mut time_cond = String::new();
     if let Some(s) = start {
-        query.and_where(Expr::col((r.clone(), Alias::new("time"))).gte(s));
+        values.push(s.into());
+        time_cond.push_str(&format!(" AND r.time >= ${}", values.len()));
     }
     if let Some(e) = end {
-        query.and_where(Expr::col((r.clone(), Alias::new("time"))).lte(e));
-    }
-    // Same semantics as the private readings filter: 'continuous' means everything that is
-    // not a grab (derived and legacy NULL rows included), matching the continuous aggregates.
-    match measurement_type {
-        "" => {}
-        "continuous" => {
-            query.and_where(Expr::cust("(r.measurement_type IS DISTINCT FROM 'spot')"));
-        }
-        other => {
-            query.and_where(Expr::col((r.clone(), Alias::new("measurement_type"))).eq(other));
-        }
+        values.push(e.into());
+        time_cond.push_str(&format!(" AND r.time <= ${}", values.len()));
     }
 
-    let (sql, values) = query.build(PostgresQueryBuilder);
-    let stmt = Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values.0);
+    // Same semantics as the private readings filter: 'continuous' means everything that is
+    // not a grab (derived and legacy NULL rows included), matching the continuous aggregates.
+    // The filter selects which arms are built: 'spot' and 'continuous' each keep one, any other
+    // named type is continuous-shaped and narrows the continuous arm.
+    let continuous_extra = match measurement_type {
+        "" | "continuous" => Some(String::new()),
+        "spot" => None,
+        other => {
+            values.push(other.into());
+            Some(format!(" AND r.measurement_type = ${}", values.len()))
+        }
+    };
+    let include_spot = matches!(measurement_type, "" | "spot");
+
+    let mut arms: Vec<String> = Vec::new();
+    if let Some(extra) = continuous_extra {
+        arms.push(format!(
+            "SELECT r.parameter_id::TEXT AS param_id, r.time, \
+                    COALESCE(r.calibrated_value, r.raw_value) AS value, r.measurement_type \
+             FROM readings r \
+             WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
+               AND {SERVED_CONTINUOUS}{time_cond}{extra}"
+        ));
+    }
+    if include_spot {
+        arms.push(format!(
+            "SELECT sp.param_id, sp.time, sp.value, sp.measurement_type FROM ( \
+                SELECT DISTINCT ON (r.stream_id, r.time) \
+                       r.parameter_id::TEXT AS param_id, r.time, \
+                       COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value, \
+                       r.measurement_type \
+                FROM readings r \
+                LEFT JOIN samples smp ON smp.id = r.sample_id \
+                WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
+                  AND {SERVED_SPOT}{time_cond} \
+                ORDER BY r.stream_id, r.time, r.replicate_index \
+             ) sp"
+        ));
+    }
+
+    let sql = arms.join(" UNION ALL ");
+    let stmt = Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values);
 
     let rows: Vec<ReadingRow> = state
         .db

@@ -487,54 +487,34 @@ pub async fn get_site_readings(
         .collect();
     values.extend(param_ids.iter().map(|id| (*id).into()));
 
-    // Replicate groups serve their sample mean unless the caller asks for replicates.
-    let value_expr = if include_replicates {
-        "COALESCE(r.calibrated_value, r.raw_value)"
-    } else {
-        "COALESCE(smp.mean, r.calibrated_value, r.raw_value)"
-    };
-    let samples_join = if include_replicates {
-        ""
-    } else {
-        " LEFT JOIN samples smp ON smp.id = r.sample_id"
-    };
-
     // One row shape either way: severity is selected as NULL when the caller did not ask for it,
     // so the projection below has a single collection loop rather than one per select.
-    let severity_expr = if annotations.alarms {
-        // Severity from the one shared ladder (alarms engine). NULL when the slot has no threshold
-        // at any tier (no `t` row); otherwise the ladder treats all-NULL bounds as 0 (disabled).
-        let sev = crate::routes::private::alarms::thresholds::severity_case(
-            value_expr,
-            "t.warning_min",
-            "t.warning_max",
-            "t.alarm_min",
-            "t.alarm_max",
-        );
-        format!("CASE WHEN t.parameter_id IS NULL THEN NULL ELSE ({sev})::smallint END")
-    } else {
-        "NULL::smallint".to_string()
+    // Severity comes from the one shared ladder (alarms engine). NULL when the slot has no
+    // threshold at any tier (no `t` row); otherwise the ladder treats all-NULL bounds as 0
+    // (disabled).
+    let severity_expr = |value_expr: &str| -> String {
+        if annotations.alarms {
+            let sev = crate::routes::private::alarms::thresholds::severity_case(
+                value_expr,
+                "t.warning_min",
+                "t.warning_max",
+                "t.alarm_min",
+                "t.alarm_max",
+            );
+            format!("CASE WHEN t.parameter_id IS NULL THEN NULL ELSE ({sev})::smallint END")
+        } else {
+            "NULL::smallint".to_string()
+        }
     };
-    let select_clause = format!(
-        "r.parameter_id, r.time, {value_expr} AS value, {severity_expr} AS severity, \
-         r.is_flagged, r.flag_reason, r.measurement_type, r.sample_id, \
-         r.calibration_id, r.standard_curve_id"
-    );
-
-    let from_clause: String = if annotations.alarms {
-        // Resolve the 3-tier threshold per slot via the single engine definition (site → global →
-        // parameter default), scoped to this site, and LEFT JOIN it, so a parameter with only
-        // defaults still gets a severity (the old direct join to alarm_thresholds did not).
-        let cte = crate::routes::private::alarms::thresholds::resolve_thresholds_sql(
+    // The 3-tier threshold per slot via the single engine definition (site → global → parameter
+    // default), scoped to this site and LEFT JOINed, so a parameter with only defaults still gets
+    // a severity (the old direct join to alarm_thresholds did not).
+    let threshold_cte = annotations.alarms.then(|| {
+        crate::routes::private::alarms::thresholds::resolve_thresholds_sql(
             Some(site.id),
             Some(param_ids.clone()),
-        );
-        format!(
-            "readings r{samples_join} LEFT JOIN ({cte}) t ON t.parameter_id = r.parameter_id AND t.site_id = r.site_id"
         )
-    } else {
-        format!("readings r{samples_join}")
-    };
+    });
 
     let next_param = param_ids.len() + 2;
     let time_conditions = match effective_end {
@@ -555,19 +535,6 @@ pub async fn get_site_readings(
         }
     };
 
-    let measurement_type_condition = if measurement_type_filter.is_empty() {
-        String::new()
-    } else if measurement_type_filter == "continuous" {
-        // "continuous" means everything that is not a grab: derived rows plot on the
-        // continuous line (matching the continuous aggregates, which exclude only 'spot'),
-        // and legacy NULL rows predate the measurement_type column.
-        " AND (r.measurement_type IS DISTINCT FROM 'spot')".to_string()
-    } else {
-        let idx = values.len() + 1;
-        values.push(measurement_type_filter.to_string().into());
-        format!(" AND r.measurement_type = ${idx}")
-    };
-
     let flagged_condition = if annotations.flagged {
         ""
     } else {
@@ -582,22 +549,102 @@ pub async fn get_site_readings(
         String::new()
     };
 
-    // Unless the caller asked for replicates, a group is collapsed to a single served row at the
-    // lowest unflagged replicate index. `(stream_id, time)` is the group: the readings primary key
-    // minus the index. Nothing renumbers `replicate_index`, so a group need not contain index 0.
-    let (distinct_clause, order_clause) = if include_replicates {
-        ("", "ORDER BY r.parameter_id, r.time, r.replicate_index")
+    let placeholders = placeholders.join(",");
+    let sql = if include_replicates {
+        // Every stored row, one per replicate; the caller reconstructs the groups.
+        // "continuous" means everything that is not a grab: derived rows plot on the continuous
+        // line (matching the continuous aggregates, which exclude only 'spot'), and legacy NULL
+        // rows predate the measurement_type column.
+        let measurement_type_condition = match measurement_type_filter {
+            "" => String::new(),
+            "continuous" => " AND (r.measurement_type IS DISTINCT FROM 'spot')".to_string(),
+            other => {
+                let idx = values.len() + 1;
+                values.push(other.to_string().into());
+                format!(" AND r.measurement_type = ${idx}")
+            }
+        };
+        let severity = severity_expr("COALESCE(r.calibrated_value, r.raw_value)");
+        let select_clause = format!(
+            "r.parameter_id, r.time, COALESCE(r.calibrated_value, r.raw_value) AS value, \
+             {severity} AS severity, r.is_flagged, r.flag_reason, r.measurement_type, \
+             r.sample_id, r.calibration_id, r.standard_curve_id"
+        );
+        let from_clause = match &threshold_cte {
+            Some(cte) => format!(
+                "readings r LEFT JOIN ({cte}) t \
+                 ON t.parameter_id = r.parameter_id AND t.site_id = r.site_id"
+            ),
+            None => "readings r".to_string(),
+        };
+        format!(
+            "SELECT {select_clause} FROM {from_clause} \
+             WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders})\
+             {time_conditions}{measurement_type_condition}{flagged_condition}{sample_id_condition} \
+             ORDER BY r.parameter_id, r.time, r.replicate_index"
+        )
     } else {
-        (
-            "DISTINCT ON (r.stream_id, r.time) ",
-            "ORDER BY r.stream_id, r.time, (r.is_flagged IS TRUE), r.replicate_index",
+        // Continuous and derived rows live at replicate_index 0 (every continuous writer defaults
+        // to it), so the plain equality keeps the ordered scan. A spot instant is the replicate
+        // group `(stream_id, time)`, served at the sample mean over its unflagged replicates with
+        // the lowest unflagged replicate's own value as the no-sample fallback; the DISTINCT ON
+        // is confined to the spot subset, whose row counts are small. "continuous" folds in
+        // derived and legacy NULL rows (matching the continuous aggregates, which exclude only
+        // 'spot'); any other named type is continuous-shaped and narrows the continuous arm.
+        let (include_continuous_arm, include_spot_arm, continuous_extra) =
+            match measurement_type_filter {
+                "" => (true, true, String::new()),
+                "continuous" => (true, false, String::new()),
+                "spot" => (false, true, String::new()),
+                other => {
+                    let idx = values.len() + 1;
+                    values.push(other.to_string().into());
+                    (true, false, format!(" AND r.measurement_type = ${idx}"))
+                }
+            };
+        let base_cols = "r.parameter_id, r.time, r.site_id, r.is_flagged, r.flag_reason, \
+             r.measurement_type, r.sample_id, r.calibration_id, r.standard_curve_id";
+        let mut arms: Vec<String> = Vec::new();
+        if include_continuous_arm {
+            arms.push(format!(
+                "SELECT COALESCE(r.calibrated_value, r.raw_value) AS value, {base_cols} \
+                 FROM readings r \
+                 WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
+                   AND r.replicate_index = 0 AND r.measurement_type IS DISTINCT FROM 'spot'\
+                 {time_conditions}{continuous_extra}{flagged_condition}{sample_id_condition}"
+            ));
+        }
+        if include_spot_arm {
+            arms.push(format!(
+                "SELECT sp.* FROM ( \
+                    SELECT DISTINCT ON (r.stream_id, r.time) \
+                           COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value, \
+                           {base_cols} \
+                    FROM readings r LEFT JOIN samples smp ON smp.id = r.sample_id \
+                    WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
+                      AND r.measurement_type = 'spot'\
+                    {time_conditions}{flagged_condition}{sample_id_condition} \
+                    ORDER BY r.stream_id, r.time, (r.is_flagged IS TRUE), r.replicate_index \
+                 ) sp"
+            ));
+        }
+        let inner = arms.join(" UNION ALL ");
+        let severity = severity_expr("sv.value");
+        let threshold_join = match &threshold_cte {
+            Some(cte) => format!(
+                " LEFT JOIN ({cte}) t \
+                 ON t.parameter_id = sv.parameter_id AND t.site_id = sv.site_id"
+            ),
+            None => String::new(),
+        };
+        format!(
+            "SELECT sv.parameter_id, sv.time, sv.value, {severity} AS severity, \
+                    sv.is_flagged, sv.flag_reason, sv.measurement_type, sv.sample_id, \
+                    sv.calibration_id, sv.standard_curve_id \
+             FROM ({inner}) sv{threshold_join} \
+             ORDER BY sv.parameter_id, sv.time"
         )
     };
-
-    let sql = format!(
-        "SELECT {distinct_clause}{select_clause} FROM {from_clause} WHERE r.site_id = $1 AND r.parameter_id IN ({}){time_conditions}{measurement_type_condition}{flagged_condition}{sample_id_condition} {order_clause}",
-        placeholders.join(",")
-    );
 
     let query_result = state
         .db

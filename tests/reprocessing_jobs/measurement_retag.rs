@@ -152,6 +152,138 @@ async fn retag_job_moves_scope_out_of_aggregates_and_reruns_idempotently() {
     assert_eq!(job_status(&db, rerun).await, "completed");
 }
 
+/// The family guard holds inside the job body: a stored `measurement_retag` row replayed by
+/// rerun (or enqueued by any route the guard does not cover) is refused before it rewrites a
+/// replicate family's readings off 'spot'.
+#[tokio::test]
+#[serial]
+async fn a_stored_retag_row_cannot_move_a_family_off_spot() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let ev = events();
+    let registry = job::build_registry();
+    let wid = worker::worker_id();
+
+    let family = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO data_streams \
+                (id, source_system, source_key, is_active, measurement_type, metadata) \
+             VALUES ('{family}', 'famsrc', 'STA:doc_avg:reps', true, 'spot', \
+                     '{{\"replicates\": {{\"source_columns\": [\"doc_1\", \"doc_2\"]}}}}')"
+        ),
+    )
+    .await;
+    for (index, value) in [(0, 10.0), (1, 20.0)] {
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO readings \
+                    (stream_id, site_id, parameter_id, time, replicate_index, raw_value, \
+                     logged, measurement_type, is_flagged) \
+                 VALUES ('{family}', '{site}', '{param}', '2025-03-05T00:00:00Z', {index}, \
+                         {value}, true, 'spot', false)",
+                site = crate::common::SITE1_ID,
+                param = crate::common::GLOBAL_PARAM_TURB_ID,
+            ),
+        )
+        .await;
+    }
+
+    let id = worker::enqueue(
+        &db,
+        "measurement_retag",
+        None,
+        None,
+        &serde_json::json!({ "stream_ids": [family], "target": "continuous" }),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("enqueue inserts a row");
+    worker::drain(&db, &ev, &registry, &wid).await.unwrap();
+
+    let row = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT status, error_message FROM reprocessing_jobs WHERE id = '{id}'"),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let status: String = row.try_get("", "status").unwrap();
+    let error: Option<String> = row.try_get("", "error_message").unwrap();
+    assert_ne!(status, "completed", "the run is refused, not applied");
+    assert!(
+        error.as_deref().unwrap_or("").contains("STA:doc_avg:reps"),
+        "the refusal names the family: {error:?}"
+    );
+    assert_eq!(
+        count_where(
+            &db,
+            &format!("readings WHERE stream_id = '{family}' AND measurement_type = 'spot'")
+        )
+        .await,
+        2,
+        "the family's readings stay spot"
+    );
+}
+
+/// The guard reaches a family whose `data_streams.sensor_id` is NULL but whose readings carry
+/// the sensor directly, the state attribution backfill creates.
+#[tokio::test]
+#[serial]
+async fn a_readings_carried_sensor_still_reaches_the_family_guard() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let sensor_id = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!("INSERT INTO sensors (id, name) VALUES ('{sensor_id}', 'lab dev')"),
+    )
+    .await;
+    let family = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO data_streams \
+                (id, source_system, source_key, is_active, measurement_type, metadata) \
+             VALUES ('{family}', 'famsrc2', 'STB:doc_avg:reps', true, 'spot', \
+                     '{{\"replicates\": {{\"source_columns\": [\"doc_1\", \"doc_2\"]}}}}')"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO readings \
+                (stream_id, site_id, parameter_id, time, replicate_index, raw_value, \
+                 sensor_id, logged, measurement_type, is_flagged) \
+             VALUES ('{family}', '{site}', '{param}', '2025-03-06T00:00:00Z', 0, 1.0, \
+                     '{sensor_id}', true, 'spot', false)",
+            site = crate::common::SITE1_ID,
+            param = crate::common::GLOBAL_PARAM_TURB_ID,
+        ),
+    )
+    .await;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/sensors/retag_frequency",
+        &serde_json::json!({"sensor_ids": [sensor_id], "data_frequency": "high"}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 400, "retag_frequency ({status}): {body}");
+    assert!(body.contains("STB:doc_avg:reps"), "{body}");
+}
+
 #[tokio::test]
 #[serial]
 async fn sensors_retag_frequency_endpoint_updates_and_enqueues() {

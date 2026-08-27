@@ -1707,8 +1707,10 @@ pub struct DuplicateSlotsResponse {
 /// The served value is `COALESCE(calibrated_value, raw_value)`, the number the rollups average, so
 /// the spread reported here is the spread that reaches a chart. Flagged readings are excluded for
 /// the same reason: the aggregates already leave them out, so a flagged copy is not a second
-/// population. `replicate_index` is part of the instant, so a stream's own replicates are not an
-/// overlap.
+/// population. A stream contributes ONE served value per instant, the mean over its unflagged
+/// replicates: indexes are the source's column positions and need not align between streams, so a
+/// replicate family overlapping another stream at an instant is an overlap of the values each
+/// would serve, never a per-index comparison. A stream's own replicates are not an overlap.
 ///
 /// Confined to the caller's projects through the reading's own site.
 async fn fetch_duplicate_slots(
@@ -1728,18 +1730,23 @@ async fn fetch_duplicate_slots(
     // `overlap` is read twice, which is what keeps the hypertable read to one pass: Postgres
     // materialises a CTE with more than one reference rather than inlining it into both.
     let sql = format!(
-        r"WITH overlap AS (
-              SELECT r.site_id, r.parameter_id, r.time,
-                     array_agg(DISTINCT r.stream_id) AS streams,
-                     MAX(COALESCE(r.calibrated_value, r.raw_value))
-                       - MIN(COALESCE(r.calibrated_value, r.raw_value)) AS spread
+        r"WITH stream_instant AS (
+              SELECT r.site_id, r.parameter_id, r.time, r.stream_id,
+                     AVG(COALESCE(r.calibrated_value, r.raw_value)) AS v
               FROM readings r
               WHERE r.site_id IS NOT NULL AND r.parameter_id IS NOT NULL
                 AND r.is_flagged IS NOT TRUE
                 {time_filter}
                 {project_filter}
-              GROUP BY r.site_id, r.parameter_id, r.time, r.replicate_index
-              HAVING COUNT(DISTINCT r.stream_id) > 1
+              GROUP BY r.site_id, r.parameter_id, r.time, r.stream_id
+          ),
+          overlap AS (
+              SELECT site_id, parameter_id, time,
+                     array_agg(stream_id) AS streams,
+                     MAX(v) - MIN(v) AS spread
+              FROM stream_instant
+              GROUP BY site_id, parameter_id, time
+              HAVING COUNT(*) > 1
           ),
           per_stream AS (
               SELECT o.site_id, o.parameter_id, e AS stream_id, COUNT(*) AS instants

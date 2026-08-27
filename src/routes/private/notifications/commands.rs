@@ -673,10 +673,12 @@ async fn battery_at(
             "SELECT s.name AS site, \
                 (SELECT COALESCE(r2.calibrated_value, r2.raw_value) FROM readings r2 \
                    WHERE r2.site_id = s.id AND r2.parameter_id = $1 AND r2.replicate_index = 0 \
+                     AND r2.measurement_type IS DISTINCT FROM 'spot' \
                    ORDER BY r2.time DESC LIMIT 1) AS latest, \
                 (SELECT regr_slope(COALESCE(r3.calibrated_value, r3.raw_value), \
                                    EXTRACT(EPOCH FROM r3.time) / 86400.0) FROM readings r3 \
                    WHERE r3.site_id = s.id AND r3.parameter_id = $1 AND r3.replicate_index = 0 \
+                     AND r3.measurement_type IS DISTINCT FROM 'spot' \
                      AND r3.time > NOW() - INTERVAL '7 days' \
                      AND EXTRACT(HOUR FROM r3.time) BETWEEN 2 AND 4) AS slope \
              FROM sites s \

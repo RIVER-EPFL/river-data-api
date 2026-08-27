@@ -36,9 +36,11 @@ use axum::routing::patch;
 /// - `read_routes`: list/get operations, fine for any read_metadata caller.
 /// - `write_routes`: operator actions such as issuing sync commands and pairing workflows.
 ///   Same gate as other entity mutations (Keycloak admin or write_metadata token).
-/// - `manage_routes`: the replicate audit review surface and reconciliation. Manager-level
-///   humans and above (or a write_metadata token); interns and plain members never see the
-///   audit backlog.
+/// - `manage_routes`: the replicate audit review surface and non-destructive reconciliation.
+///   Manager-level humans and above (or a write_metadata token); interns and plain members never
+///   see the audit backlog.
+/// - `destructive_routes`: the reconciliation delete job, which removes streams and readings, so
+///   it takes the same gate as stream deletion on CRUD (Keycloak admin or write_metadata token).
 /// - `admin_routes`: credential listing, creation and revoke, these mint full-permission
 ///   sync session tokens, so they're Keycloak-admin only (no API token can pass). The listing
 ///   is admin-gated alongside them, matching `sync_service_credentials` CRUD, so a leaked token
@@ -100,14 +102,16 @@ pub fn manage_routes() -> Router<AppState> {
             "/replicate_reconciliation",
             post(super::replicate_reconciliation::start_reconciliation),
         )
-        .route(
-            "/replicate_reconciliation/delete",
-            post(super::replicate_reconciliation::start_reconciliation_delete),
-        )
-        .route(
-            "/replicate_reindex_repair",
-            post(super::replicate_reindex::start_reindex_repair),
-        )
+}
+
+/// Destructive reconciliation: the delete job removes obsolete streams and their readings, so it
+/// sits behind the same gate as stream deletion on CRUD (Keycloak Administrator or a
+/// write_metadata token), not the manager review layer the non-destructive endpoints use.
+pub fn destructive_routes() -> Router<AppState> {
+    Router::new().route(
+        "/replicate_reconciliation/delete",
+        post(super::replicate_reconciliation::start_reconciliation_delete),
+    )
 }
 
 pub fn admin_routes() -> Router<AppState> {

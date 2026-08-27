@@ -793,7 +793,7 @@ impl CsvImport {
         ctx.set_site(site_id).await;
 
         // Read the staged rows back and rebuild the readings, re-applying the constant fields.
-        let staged = ctx
+        let mut staged = ctx
             .db()
             .query_all(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
@@ -803,6 +803,44 @@ impl CsvImport {
                 [import_token.into()],
             ))
             .await?;
+
+        // The import handler refuses rows targeting a replicate-family stream before staging, and
+        // the same rule holds here so no staging row, however it got there, mints replicate
+        // indexes onto a family (a reading's index is the source's column position).
+        {
+            let mut staged_streams: Vec<Uuid> = staged
+                .iter()
+                .filter_map(|row| row.try_get::<Uuid>("", "stream_id").ok())
+                .collect();
+            staged_streams.sort_unstable();
+            staged_streams.dedup();
+            let family_ids: std::collections::HashSet<Uuid> = ctx
+                .db()
+                .query_all(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT id FROM data_streams \
+                     WHERE id = ANY($1) AND metadata -> 'replicates' IS NOT NULL",
+                    [staged_streams.into()],
+                ))
+                .await?
+                .iter()
+                .filter_map(|row| row.try_get::<Uuid>("", "id").ok())
+                .collect();
+            if !family_ids.is_empty() {
+                let before = staged.len();
+                staged.retain(|row| {
+                    row.try_get::<Uuid>("", "stream_id")
+                        .is_ok_and(|id| !family_ids.contains(&id))
+                });
+                ctx.log(
+                    "warn",
+                    "Staged rows targeting replicate-family streams were dropped; family \
+                     replicates sync from the source and cannot be written by CSV import",
+                    serde_json::json!({ "rows_dropped": before - staged.len() }),
+                )
+                .await;
+            }
+        }
 
         // Staging carries the calibration each row resolved at upload time. The coefficients are
         // read back here so the stored value is the one that calibration produces: a row that names
@@ -1731,6 +1769,26 @@ impl Job for MeasurementRetag {
             return Err(DbErr::Custom(
                 "measurement_retag needs sensor_ids, stream_ids, or source_system".to_string(),
             ));
+        }
+
+        // The family guard holds here, not only on the HTTP routes: a stored job row is replayed
+        // by rerun with its params verbatim, so a route-only guard is bypassed by replaying a row
+        // that predates it. 'spot' is what a family already is, and 'declared' realigns readings
+        // with the stream's own declaration, which every write path holds at 'spot'.
+        if matches!(target.as_str(), "continuous" | "derived") {
+            let families =
+                crate::routes::private::data_streams::replicates::family_keys_in_retag_scope(
+                    ctx.db(),
+                    &sensor_ids,
+                    &stream_ids,
+                    source_system.as_deref(),
+                )
+                .await
+                .map_err(|e| DbErr::Custom(e.to_string()))?;
+            crate::routes::private::data_streams::replicates::refuse_family_retag(
+                &families, &target,
+            )
+            .map_err(|e| DbErr::Custom(e.to_string()))?;
         }
 
         // 'declared' joins each reading to its stream in both the window probe and the rewrite and

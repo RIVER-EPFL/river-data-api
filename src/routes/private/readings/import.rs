@@ -406,7 +406,7 @@ pub async fn import_csv(
     // --- Parse rows ---------------------------------------------------------------------------
     // Bad rows/cells are skipped and recorded in `errors` (non-fatal), so a partially-malformed
     // file still imports its good rows and the operator gets a list to fix and re-import.
-    let mut rows: Vec<(Uuid, chrono::DateTime<chrono::Utc>, f64)> = Vec::new();
+    let mut rows: Vec<(Uuid, chrono::DateTime<chrono::Utc>, f64, usize)> = Vec::new();
     let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut latest: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut row_count = 0usize;
@@ -495,13 +495,70 @@ pub async fn import_csv(
                 );
                 continue;
             }
-            rows.push((m.parameter_id, time, stored));
+            rows.push((m.parameter_id, time, stored, line));
         }
     }
 
     // Overlap diff: bucket incoming rows against what's already stored for this site, so the UI
     // can preview what a re-import or overwrite would touch.
-    let overlap = compute_overlaps(&state.db, site_id, &rows, earliest, latest).await?;
+    let mut overlap = compute_overlaps(&state.db, site_id, &rows, earliest, latest).await?;
+
+    // A slot instant owned by a replicate-family stream refuses CSV rows by name: a reading's
+    // replicate_index is the source's column position, so an import minting indexes from 0 onto
+    // the family would fabricate replicates, and routing beside it would double-serve the
+    // instant. The family's members sync from the source; corrections happen there.
+    {
+        let mut owning_ids: Vec<Uuid> = overlap.owning_stream.values().copied().collect();
+        owning_ids.sort_unstable();
+        owning_ids.dedup();
+        let mut family_keys: HashMap<Uuid, String> = HashMap::new();
+        if !owning_ids.is_empty() {
+            for row in state
+                .db
+                .query_all(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT id, source_key FROM data_streams \
+                     WHERE id = ANY($1) AND metadata -> 'replicates' IS NOT NULL",
+                    [owning_ids.into()],
+                ))
+                .await?
+            {
+                family_keys.insert(row.try_get("", "id")?, row.try_get("", "source_key")?);
+            }
+        }
+        if !family_keys.is_empty() {
+            let header_of: HashMap<Uuid, String> = mappings
+                .iter()
+                .map(|m| (m.parameter_id, m.header.clone()))
+                .collect();
+            let before = rows.len();
+            rows.retain(|(pid, time, _, line)| {
+                let family = overlap
+                    .owning_stream
+                    .get(&(*pid, *time))
+                    .and_then(|sid| family_keys.get(sid));
+                let Some(key) = family else {
+                    return true;
+                };
+                record_error(
+                    *line,
+                    format!(
+                        "Column '{}': {} is served by replicate family stream '{key}'; its \
+                         replicates sync from the source and cannot be written by CSV import",
+                        header_of.get(pid).map_or("?", String::as_str),
+                        time.to_rfc3339()
+                    ),
+                    &mut errors,
+                    &mut error_count,
+                );
+                false
+            });
+            if rows.len() != before {
+                overlap = compute_overlaps(&state.db, site_id, &rows, earliest, latest).await?;
+            }
+        }
+    }
+    let overlap = overlap;
 
     // Dry run: report the plan and overlap diff without writing.
     if req.dry_run {
@@ -552,7 +609,7 @@ pub async fn import_csv(
         HashMap::new();
     {
         let mut times_by_param: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = HashMap::new();
-        for (pid, t, _) in &rows {
+        for (pid, t, _, _) in &rows {
             times_by_param.entry(*pid).or_default().push(*t);
         }
         for (pid, ts) in &times_by_param {
@@ -593,7 +650,7 @@ pub async fn import_csv(
 
     let staged: Vec<StagedRow> = rows
         .iter()
-        .map(|(parameter_id, time, value)| {
+        .map(|(parameter_id, time, value, _)| {
             let owner = owner_map
                 .get(&(*parameter_id, *time))
                 .cloned()
@@ -612,7 +669,7 @@ pub async fn import_csv(
         .collect();
 
     let mut distinct_ts: Vec<chrono::DateTime<chrono::Utc>> =
-        rows.iter().map(|(_, t, _)| *t).collect();
+        rows.iter().map(|(_, t, _, _)| *t).collect();
     distinct_ts.sort_unstable();
     distinct_ts.dedup();
     let derived_timestamps = distinct_ts.len();
@@ -786,7 +843,7 @@ const OVERLAP_EPSILON: f64 = 1e-9;
 async fn compute_overlaps(
     db: &sea_orm::DatabaseConnection,
     site_id: Uuid,
-    rows: &[(Uuid, chrono::DateTime<chrono::Utc>, f64)],
+    rows: &[(Uuid, chrono::DateTime<chrono::Utc>, f64, usize)],
     earliest: Option<chrono::DateTime<chrono::Utc>>,
     latest: Option<chrono::DateTime<chrono::Utc>>,
 ) -> AppResult<OverlapReport> {
@@ -814,7 +871,7 @@ async fn compute_overlaps(
 
     let param_ids: Vec<Uuid> = rows
         .iter()
-        .map(|(pid, _, _)| *pid)
+        .map(|(pid, _, _, _)| *pid)
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
@@ -857,7 +914,7 @@ async fn compute_overlaps(
     }
 
     let mut occurrence: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), usize> = HashMap::new();
-    for (pid, time, incoming) in rows {
+    for (pid, time, incoming, _) in rows {
         let key = (*pid, *time);
         let idx = occurrence.entry(key).or_insert(0);
         let slot = *idx;

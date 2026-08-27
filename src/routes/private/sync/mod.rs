@@ -5,7 +5,6 @@ pub mod events_model;
 pub mod operator;
 pub mod replicate_audit;
 pub mod replicate_reconciliation;
-pub mod replicate_reindex;
 pub mod service;
 pub mod services_model;
 pub mod tokens_model;

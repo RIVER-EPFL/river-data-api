@@ -240,6 +240,34 @@ async fn migrate_verify_happy_path() {
     );
 }
 
+/// The portals store aggregate cells rounded to 2 decimals, so an avg reading off the true mean
+/// by less than half that quantum is the portal's own storage, not a disagreement. The verifier
+/// shares the audit's quantum floor and migrates cleanly.
+#[tokio::test]
+#[serial]
+async fn a_sub_quantum_avg_delta_verifies_clean() {
+    let (db, family) = setup().await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE readings SET raw_value = 8.0033 \
+             WHERE stream_id = '{}' AND time = '{T3}'",
+            family.old_id
+        ),
+    )
+    .await;
+
+    let id = run_job(&db, "replicate_reconciliation", false).await;
+    let (status, detail) = job_outcome(&db, id).await;
+    assert_eq!(status, "completed", "{detail}");
+    assert_eq!(
+        family_status(&detail),
+        "migrated",
+        "a 2dp-quantised portal cell is within tolerance: {detail}"
+    );
+    assert!(family_is_paired(&db, &family).await);
+}
+
 #[tokio::test]
 #[serial]
 async fn preverify_mismatch_aborts_untouched() {

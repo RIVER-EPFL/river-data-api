@@ -76,6 +76,5 @@ pub fn is_cancellable(trigger_type: &str) -> bool {
             | "janitor_run"
             | "replicate_reconciliation"
             | "replicate_reconciliation_delete"
-            | "replicate_reindex_repair"
     )
 }

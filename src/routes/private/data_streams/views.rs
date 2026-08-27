@@ -137,9 +137,12 @@ pub struct RegisterStreamRequest {
     /// stops pairing minting a second, serial-less instrument alongside the real one.
     #[serde(default)]
     pub sensor_id: Option<Uuid>,
-    /// Declares this stream a replicate family: its readings arrive as replicate_index 0..n-1 per
-    /// instant, one per source column, and form `samples` rows. Validated here (two or more
-    /// unique members, spot classification) and stored under `metadata["replicates"]`.
+    /// Declares this stream a replicate family: each reading carries the replicate index the
+    /// stored column-to-index mapping assigns to its source column (a group can be sparse and
+    /// need not include index 0), and groups form `samples` rows. Validated here (two or more
+    /// unique members, spot classification) and stored under `metadata["replicates"]`. The
+    /// mapping is pinned append-only across re-registrations; the response's `replicates` field
+    /// is the authoritative mapping to assign indexes from.
     #[serde(default)]
     pub replicates: Option<super::replicates::ReplicateSpec>,
 }
@@ -164,11 +167,18 @@ pub struct StreamResponse {
     pub discovered_at: chrono::DateTime<Utc>,
     pub paired_at: Option<chrono::DateTime<Utc>>,
     pub last_data_time: Option<chrono::DateTime<Utc>>,
+    /// The authoritative replicate column-to-index mapping, ordered by index, when this stream
+    /// declares a replicate family. Sync services assign each value's `replicate_index` from it;
+    /// a retired entry keeps its index reserved for the readings already stored under it.
+    pub replicates: Option<Vec<super::replicates::ColumnAssignment>>,
 }
 
 impl From<data_streams::Model> for StreamResponse {
     fn from(m: data_streams::Model) -> Self {
+        let replicates = super::replicates::ReplicateSpec::from_metadata(&m.metadata)
+            .map(|spec| spec.column_assignments());
         Self {
+            replicates,
             id: m.id,
             source_system: m.source_system,
             source_key: m.source_key,
@@ -209,8 +219,20 @@ pub async fn register_stream(
             "invalid measurement_type '{mt}' (expected continuous, spot, or derived)"
         )));
     }
-    if let Some(spec) = &payload.replicates {
+    if let Some(spec) = payload.replicates.as_mut() {
         spec.validate(payload.measurement_type.as_deref())?;
+        // The stored column-to-index mapping is authoritative and append-only: readings carry
+        // their index for life, so a re-registration keeps every known column's index, appends
+        // genuinely new columns, and retires absent ones without reusing their indexes. The
+        // caller's own `assignments`, if any, are ignored; only the register path authors them.
+        let prior = data_streams::Entity::find()
+            .filter(data_streams::Column::SourceSystem.eq(&payload.source_system))
+            .filter(data_streams::Column::SourceKey.eq(&payload.source_key))
+            .one(&state.db)
+            .await?
+            .and_then(|s| super::replicates::ReplicateSpec::from_metadata(&s.metadata));
+        spec.assignments =
+            super::replicates::pin_assignments(prior.as_ref(), &spec.source_columns)?;
         spec.embed(&mut payload.metadata)?;
     }
     if let Some(sensor_id) = payload.sensor_id {

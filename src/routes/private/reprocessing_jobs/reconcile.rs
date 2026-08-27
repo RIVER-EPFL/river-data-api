@@ -71,10 +71,10 @@ pub async fn family_pairs<C: ConnectionTrait>(
         .collect()
 }
 
-/// SQL for the tolerance bound between two value expressions: relative with an absolute floor,
-/// matching the sync-time audit's `stats_agree`.
+/// The tolerance bound between two value expressions, shared with the sync-time audit's
+/// `stats_agree` (same relative form, absolute floor, and portal quantum floor).
 fn bound_sql(a: &str, b: &str, rel_bind: &str) -> String {
-    format!("GREATEST({rel_bind} * GREATEST(abs({a}), abs({b})), {DEFAULT_ABS_TOL})")
+    crate::routes::private::sync::replicate_audit::bound_sql(a, b, rel_bind, DEFAULT_ABS_TOL)
 }
 
 #[derive(Debug, Clone, Copy, Default)]

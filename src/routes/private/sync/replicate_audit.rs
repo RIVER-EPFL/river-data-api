@@ -23,7 +23,8 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::common::middleware::AuthContext;
+use crate::common::authz::AccessScope;
+use crate::common::middleware::{AuthContext, ProjectScope, enforce_project_scope_for_sites};
 use crate::error::{AppError, AppResult};
 
 /// Best-effort actor identity for the `acknowledged_by` audit field, as on alarm acknowledge.
@@ -32,6 +33,40 @@ fn actor_label(auth: &AuthContext) -> String {
         AuthContext::Keycloak { email: Some(e), .. } => e.clone(),
         AuthContext::Keycloak { .. } => "keycloak".to_string(),
         AuthContext::ApiToken { token_id, .. } => format!("token:{token_id}"),
+    }
+}
+
+/// Confine a hold action to the caller's projects, resolved through the stream's paired site,
+/// as the readings flag handlers do. An unpaired stream's hold (deferred) belongs to no project,
+/// so it is actionable only by a caller without project restriction.
+async fn enforce_hold_scope(
+    db: &sea_orm::DatabaseConnection,
+    scope: &AccessScope,
+    hold_id: Uuid,
+) -> AppResult<()> {
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT sp.site_id FROM replicate_audit_holds h
+             JOIN data_streams ds ON ds.id = h.stream_id
+             LEFT JOIN site_parameters sp ON sp.id = ds.site_parameter_id
+             WHERE h.id = $1",
+            [hold_id.into()],
+        ))
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("no replicate audit hold {hold_id}")))?;
+    match row.try_get::<Option<Uuid>>("", "site_id")? {
+        Some(site_id) => enforce_project_scope_for_sites(db, scope, &[site_id]).await,
+        None => {
+            if scope.is_restricted() {
+                return Err(AppError::Forbidden(
+                    "This hold's stream is unpaired, so it belongs to no project; only a caller \
+                     without project restriction can act on it"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -50,6 +85,24 @@ pub const SD_ABS_TOL: f64 = 1e-3;
 /// The portals round aggregate cells to 2 decimals before storing, so a disagreement below half
 /// the stored quantum is not auditable: the portal's own cell cannot represent it.
 pub const PORTAL_QUANTUM: f64 = 0.005;
+/// The floor under every tolerance bound, [`PORTAL_QUANTUM`] plus an epsilon so a delta of
+/// exactly half the quantum stays inside. Shared by [`stats_agree_with`] and [`bound_sql`] so the
+/// in-process comparison and the SQL one cannot drift apart.
+pub const QUANTUM_FLOOR: f64 = PORTAL_QUANTUM + 1e-9;
+
+/// The tolerance bound between two statistics: relative to the larger magnitude, with an absolute
+/// floor, never below [`QUANTUM_FLOOR`].
+#[must_use]
+pub fn tolerance_bound(e: f64, c: f64, rel_tol: f64, abs_tol: f64) -> f64 {
+    f64::max(rel_tol * f64::max(e.abs(), c.abs()), abs_tol).max(QUANTUM_FLOOR)
+}
+
+/// SQL for the same bound between two value expressions, with the relative tolerance bound as
+/// `rel_bind`. The one producer of the tolerance in SQL form; the reconciliation verifier uses it.
+#[must_use]
+pub fn bound_sql(a: &str, b: &str, rel_bind: &str, abs_tol: f64) -> String {
+    format!("GREATEST({rel_bind} * GREATEST(abs({a}), abs({b})), {abs_tol}, {QUANTUM_FLOOR})")
+}
 
 /// One replicate group's expectation, as the portal stored it.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -117,11 +170,7 @@ pub fn stats_agree_with(
     abs_tol: f64,
 ) -> bool {
     match (expected, computed) {
-        (Some(e), Some(c)) => {
-            let bound =
-                f64::max(rel_tol * f64::max(e.abs(), c.abs()), abs_tol).max(PORTAL_QUANTUM + 1e-9);
-            (e - c).abs() <= bound
-        }
+        (Some(e), Some(c)) => (e - c).abs() <= tolerance_bound(e, c, rel_tol, abs_tol),
         _ => true,
     }
 }
@@ -191,6 +240,34 @@ pub struct LatestHold {
     pub time: DateTime<Utc>,
     pub status: String,
     pub id: Uuid,
+    /// The portal expectation the hold was recorded against, for [`expected_changed`].
+    pub expected: serde_json::Value,
+}
+
+/// Whether an incoming audit claim differs from the expectation a hold recorded, under the same
+/// tolerances detection uses. A terminal decision stands against re-detection of the SAME
+/// disagreement; a cycle whose expected statistics have moved is new evidence and opens a fresh
+/// hold.
+#[must_use]
+pub fn expected_changed(recorded: &serde_json::Value, audit: &GroupAudit) -> bool {
+    fn side_changed(a: Option<f64>, b: Option<f64>, rel_tol: f64, abs_tol: f64) -> bool {
+        match (a, b) {
+            (Some(_), Some(_)) => !stats_agree_with(a, b, rel_tol, abs_tol),
+            (None, None) => false,
+            _ => true,
+        }
+    }
+    side_changed(
+        f64_at(recorded, "mean"),
+        audit.expected_mean,
+        DEFAULT_REL_TOL,
+        DEFAULT_ABS_TOL,
+    ) || side_changed(
+        f64_at(recorded, "sd"),
+        audit.expected_sd,
+        SD_REL_TOL,
+        SD_ABS_TOL,
+    ) || recorded.get("n").and_then(serde_json::Value::as_i64) != audit.expected_n
 }
 
 /// The most recent hold per group for a stream at the given instants, any status.
@@ -208,7 +285,7 @@ pub async fn latest_holds<C: ConnectionTrait>(
     let rows = conn
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT DISTINCT ON (group_time) id, group_time, status
+            "SELECT DISTINCT ON (group_time) id, group_time, status, expected
              FROM replicate_audit_holds
              WHERE stream_id = $1 AND group_time >= $2 AND group_time <= $3
              ORDER BY group_time, created_at DESC, id DESC",
@@ -228,6 +305,7 @@ pub async fn latest_holds<C: ConnectionTrait>(
                         .with_timezone(&Utc),
                     status: r.try_get::<String>("", "status")?,
                     id: r.try_get::<Uuid>("", "id")?,
+                    expected: r.try_get::<serde_json::Value>("", "expected")?,
                 })
             })();
             match entry {
@@ -333,9 +411,12 @@ pub fn classify(expected: &serde_json::Value, computed: &serde_json::Value) -> &
     let expected_sd = f64_at(expected, "sd");
     let computed_mean = f64_at(computed, "mean");
     let computed_sd = f64_at(computed, "sd");
-    // A population-divisor sd relates to the sample one by sqrt((n-1)/n).
+    // A population-divisor sd relates to the sample one by sqrt((n-1)/n). The signature claims
+    // the sd is the ONLY disagreement, so it requires the means to agree: a wrong mean with a
+    // coincidentally population-shaped sd is not explained by the divisor.
     if let (Some(esd), Some(csd), Some(n)) = (expected_sd, computed_sd, computed_n)
         && n >= 2
+        && stats_agree(expected_mean, computed_mean, DEFAULT_REL_TOL)
     {
         #[allow(clippy::cast_precision_loss)]
         let population = csd * (((n - 1) as f64) / n as f64).sqrt();
@@ -359,26 +440,18 @@ pub fn classify(expected: &serde_json::Value, computed: &serde_json::Value) -> &
             }
         }
     }
-    let mean_delta = match (expected_mean, computed_mean) {
-        (Some(e), Some(c)) => (e - c).abs(),
-        _ => 0.0,
-    };
-    let sd_delta = match (expected_sd, computed_sd) {
-        (Some(e), Some(c)) => (e - c).abs(),
-        _ => 0.0,
-    };
-    if mean_delta <= PORTAL_QUANTUM + 1e-9 && sd_delta <= PORTAL_QUANTUM + 1e-9 {
-        return "quantization";
-    }
     "unexplained"
 }
 
-/// The next resolution object, with the previous one appended under `history` so the decision
-/// trail survives reopen and re-resolve cycles.
+/// The next resolution object, stamped with the acting identity and time, with the previous one
+/// appended under `history` so the decision trail survives reopen and re-resolve cycles.
 fn merged_resolution(
     prev: Option<serde_json::Value>,
     mut next: serde_json::Value,
+    by: &str,
 ) -> serde_json::Value {
+    next["by"] = by.into();
+    next["at"] = Utc::now().to_rfc3339().into();
     if let Some(prev) = prev {
         let mut history = prev
             .get("history")
@@ -485,8 +558,7 @@ pub struct HoldRow {
     pub delta: serde_json::Value,
     pub status: String,
     /// Signature of the disagreement: `n_mismatch` | `population_sd` | `stale_subset` |
-    /// `quantization` | `unexplained`. Computed from the stored expectation and recompute,
-    /// never persisted.
+    /// `unexplained`. Computed from the stored expectation and recompute, never persisted.
     pub classification: String,
     /// The decision record: latest action plus prior actions under `history`.
     #[schema(value_type = Object)]
@@ -534,10 +606,21 @@ pub struct ListHoldsResponse {
 )]
 pub async fn list_holds(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Query(query): Query<ListHoldsQuery>,
 ) -> AppResult<Json<ListHoldsResponse>> {
     let mut conditions = vec!["TRUE".to_string()];
     let mut binds: Vec<sea_orm::Value> = Vec::new();
+    // A restricted caller sees only holds whose stream is paired into their projects; unpaired
+    // (deferred) holds belong to no project and are visible only without project restriction.
+    if let Some(projects) = scope.sql_project_array() {
+        binds.push(projects);
+        conditions.push(format!(
+            "EXISTS (SELECT 1 FROM site_parameters sp JOIN sites st ON st.id = sp.site_id \
+             WHERE sp.id = ds.site_parameter_id AND st.project_id = ANY(${}))",
+            binds.len()
+        ));
+    }
     if let Some(stream_id) = query.stream_id {
         binds.push(stream_id.into());
         conditions.push(format!("h.stream_id = ${}", binds.len()));
@@ -658,20 +741,21 @@ pub async fn list_holds(
     }))
 }
 
-/// SQL fragment producing the accept-ours resolution object while preserving any prior actions
-/// under `history` (a reopened hold can be re-resolved). Shared by single and bulk acknowledge.
-const ACCEPT_OURS_RESOLUTION_SQL: &str = "CASE
-    WHEN h.resolution IS NULL THEN jsonb_build_object('action', 'accept_ours')
-    ELSE jsonb_build_object('action', 'accept_ours', 'history',
+/// SQL fragment producing the accept-ours resolution object (actor and time stamped on the
+/// entry) while preserving any prior actions under `history` (a reopened hold can be
+/// re-resolved). Shared by single and bulk acknowledge; `by_bind` is the placeholder carrying
+/// the actor label.
+fn accept_ours_resolution_sql(by_bind: &str) -> String {
+    format!(
+        "CASE
+    WHEN h.resolution IS NULL
+        THEN jsonb_build_object('action', 'accept_ours', 'by', {by_bind}::text, 'at', NOW())
+    ELSE jsonb_build_object('action', 'accept_ours', 'by', {by_bind}::text, 'at', NOW(),
+         'history',
          COALESCE(h.resolution->'history', '[]'::jsonb)
              || jsonb_build_array(h.resolution - 'history'))
-    END";
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct AcknowledgeRequest {
-    /// Recorded on the hold; defaults to the caller's auth identity when omitted.
-    #[serde(default)]
-    pub acknowledged_by: Option<String>,
+    END"
+    )
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -681,10 +765,10 @@ pub struct AcknowledgeResponse {
 
 /// Acknowledge one pending hold: the operator confirms the statistics recomputed from the stored
 /// replicates. Terminal; re-detection of the same disagreement leaves the decision standing.
+/// The acting identity is taken from the caller's authentication, never from the request.
 #[utoipa::path(
     post,
     path = "/sync/replicate_audit_holds/{id}/acknowledge",
-    request_body = AcknowledgeRequest,
     responses(
         (status = 200, body = AcknowledgeResponse),
         (status = 404, description = "No pending hold with this id"),
@@ -694,19 +778,19 @@ pub struct AcknowledgeResponse {
 pub async fn acknowledge_hold(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    ProjectScope(scope): ProjectScope,
     axum::Extension(auth): axum::Extension<AuthContext>,
-    Json(payload): Json<AcknowledgeRequest>,
 ) -> AppResult<Json<AcknowledgeResponse>> {
-    let by = payload
-        .acknowledged_by
-        .unwrap_or_else(|| actor_label(&auth));
+    enforce_hold_scope(&state.db, &scope, id).await?;
+    let by = actor_label(&auth);
+    let resolution_sql = accept_ours_resolution_sql("$2");
     let updated = state
         .db
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "UPDATE replicate_audit_holds AS h
-                 SET status = 'acknowledged', resolution = {ACCEPT_OURS_RESOLUTION_SQL},
+                 SET status = 'acknowledged', resolution = {resolution_sql},
                      acknowledged_by = $2, acknowledged_at = NOW()
                  WHERE id = $1 AND status = 'pending'"
             ),
@@ -727,7 +811,8 @@ pub struct ResolveHoldRequest {
     /// `ours` (accept the recomputed statistics; identical to acknowledge) | `flag` (flag the
     /// named replicates so the sample statistics recompute over the rest).
     pub mode: String,
-    /// The replicate indexes to flag; required for `flag`.
+    /// The replicate indexes to flag; required for `flag`. Each must be among the values the
+    /// hold recorded and unflagged, and at least one unflagged replicate must remain after.
     #[serde(default)]
     pub replicate_indexes: Option<Vec<i16>>,
     /// Recorded as the readings' flag_reason; defaults to a reference to this hold.
@@ -750,7 +835,10 @@ pub struct ResolveHoldResponse {
     request_body = ResolveHoldRequest,
     responses(
         (status = 200, body = ResolveHoldResponse),
-        (status = 400, description = "Unknown mode, no replicate indexes, or nothing to flag"),
+        (status = 400, description = "Unknown mode, no replicate indexes, an index the hold does \
+                                      not name or the group does not hold, an already-flagged \
+                                      index, a flag that would leave no unflagged replicate, or \
+                                      a legacy hold recorded without indexes"),
         (status = 404, description = "No pending hold with this id"),
     ),
     tag = "sync"
@@ -758,19 +846,22 @@ pub struct ResolveHoldResponse {
 pub async fn resolve_hold(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    ProjectScope(scope): ProjectScope,
     axum::Extension(auth): axum::Extension<AuthContext>,
     Json(payload): Json<ResolveHoldRequest>,
 ) -> AppResult<Json<ResolveHoldResponse>> {
+    enforce_hold_scope(&state.db, &scope, id).await?;
     let by = actor_label(&auth);
     match payload.mode.as_str() {
         "ours" => {
+            let resolution_sql = accept_ours_resolution_sql("$2");
             let updated = state
                 .db
                 .execute(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     format!(
                         "UPDATE replicate_audit_holds AS h
-                         SET status = 'acknowledged', resolution = {ACCEPT_OURS_RESOLUTION_SQL},
+                         SET status = 'acknowledged', resolution = {resolution_sql},
                              acknowledged_by = $2, acknowledged_at = NOW()
                          WHERE id = $1 AND status = 'pending'"
                     ),
@@ -816,7 +907,8 @@ pub async fn resolve_hold(
                 let hold = txn
                     .query_one(Statement::from_sql_and_values(
                         sea_orm::DatabaseBackend::Postgres,
-                        "SELECT stream_id, group_time, resolution FROM replicate_audit_holds
+                        "SELECT stream_id, group_time, resolution, computed
+                         FROM replicate_audit_holds
                          WHERE id = $1 AND status = 'pending' FOR UPDATE",
                         [id.into()],
                     ))
@@ -828,6 +920,91 @@ pub async fn resolve_hold(
                 let group_time =
                     hold.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "group_time")?;
                 let prev: Option<serde_json::Value> = hold.try_get("", "resolution")?;
+                let computed: serde_json::Value = hold.try_get("", "computed")?;
+
+                // A flag resolution may only touch the replicates the hold was recorded over: the
+                // operator's decision is about those values, and any other index in the group is
+                // evidence this hold never showed them.
+                let recorded = stored_values(&computed);
+                let recorded_indexes: Vec<i16> = recorded.iter().filter_map(|(i, _)| *i).collect();
+                if recorded.is_empty() || recorded_indexes.len() != recorded.len() {
+                    return Err(AppError::BadRequest(format!(
+                        "replicate audit hold {id} predates index recording, so its values cannot \
+                         be addressed by replicate index; flag the readings through the readings \
+                         flag endpoints instead"
+                    )));
+                }
+                let out_of_hold: Vec<String> = indexes
+                    .iter()
+                    .filter(|i| !recorded_indexes.contains(i))
+                    .map(i16::to_string)
+                    .collect();
+                if !out_of_hold.is_empty() {
+                    return Err(AppError::BadRequest(format!(
+                        "replicate index {} is not named by this hold (it records indexes {}); \
+                         nothing was flagged",
+                        out_of_hold.join(", "),
+                        recorded_indexes
+                            .iter()
+                            .map(i16::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+
+                let group_rows = txn
+                    .query_all(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        "SELECT replicate_index, is_flagged IS TRUE AS flagged FROM readings
+                         WHERE stream_id = $1 AND time = $2",
+                        [stream_id.into(), group_time.into()],
+                    ))
+                    .await?;
+                let mut existing: Vec<i16> = Vec::with_capacity(group_rows.len());
+                let mut already_flagged: Vec<i16> = Vec::new();
+                for row in &group_rows {
+                    let index: i16 = row.try_get("", "replicate_index")?;
+                    existing.push(index);
+                    if row.try_get::<bool>("", "flagged")? {
+                        already_flagged.push(index);
+                    }
+                }
+                let absent: Vec<String> = indexes
+                    .iter()
+                    .filter(|i| !existing.contains(i))
+                    .map(i16::to_string)
+                    .collect();
+                if !absent.is_empty() {
+                    return Err(AppError::BadRequest(format!(
+                        "no reading at replicate index {} in this group; nothing was flagged",
+                        absent.join(", ")
+                    )));
+                }
+                let re_flagged: Vec<String> = indexes
+                    .iter()
+                    .filter(|i| already_flagged.contains(i))
+                    .map(i16::to_string)
+                    .collect();
+                if !re_flagged.is_empty() {
+                    return Err(AppError::BadRequest(format!(
+                        "replicate index {} is already flagged; nothing was flagged",
+                        re_flagged.join(", ")
+                    )));
+                }
+                // Flagging the whole group would leave the sample trigger with n = 0 and the
+                // instant would vanish from serving; a group that bad is retracted at source or
+                // through the readings endpoints, not resolved here.
+                let survivors = existing
+                    .iter()
+                    .filter(|i| !already_flagged.contains(i) && !indexes.contains(i))
+                    .count();
+                if survivors == 0 {
+                    return Err(AppError::BadRequest(
+                        "at least one unflagged replicate must remain in the group; nothing was \
+                         flagged"
+                            .to_string(),
+                    ));
+                }
 
                 let flagged: Vec<i16> = txn
                     .query_all(Statement::from_sql_and_values(
@@ -845,16 +1022,10 @@ pub async fn resolve_hold(
                     .iter()
                     .map(|row| row.try_get::<i16>("", "replicate_index"))
                     .collect::<Result<_, _>>()?;
-                let missing: Vec<String> = indexes
-                    .iter()
-                    .filter(|i| !flagged.contains(i))
-                    .map(i16::to_string)
-                    .collect();
-                if !missing.is_empty() {
-                    return Err(AppError::BadRequest(format!(
-                        "no unflagged reading at replicate index {} in this group; nothing was \
-                         flagged",
-                        missing.join(", ")
+                if flagged.len() != indexes.len() {
+                    return Err(AppError::Conflict(format!(
+                        "the replicate group changed under this request; nothing was flagged \
+                         (hold {id})"
                     )));
                 }
 
@@ -865,6 +1036,7 @@ pub async fn resolve_hold(
                         "replicate_indexes": &indexes,
                         "reason": reason,
                     }),
+                    &by,
                 );
                 let decided = txn
                     .execute(Statement::from_sql_and_values(
@@ -913,8 +1085,10 @@ pub async fn resolve_hold(
 pub async fn reopen_hold(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    ProjectScope(scope): ProjectScope,
     axum::Extension(auth): axum::Extension<AuthContext>,
 ) -> AppResult<Json<ResolveHoldResponse>> {
+    enforce_hold_scope(&state.db, &scope, id).await?;
     let by = actor_label(&auth);
     let reopened = crate::common::bulk_write::guarded(&state.db, async |txn| {
         let hold = txn
@@ -959,8 +1133,7 @@ pub async fn reopen_hold(
         });
 
         let reopened = if paired { "pending" } else { "deferred" };
-        let resolution =
-            merged_resolution(prev, serde_json::json!({"action": "reopened", "by": by}));
+        let resolution = merged_resolution(prev, serde_json::json!({"action": "reopened"}), &by);
         if status == "remediated"
             && let Some((index_list, reason)) = &flagged
             && !index_list.is_empty()
@@ -1025,8 +1198,6 @@ pub struct BulkAcknowledgeRequest {
     /// Ceiling on `sd_relative_delta`. ANDs with the other ceilings.
     #[serde(default)]
     pub max_sd_relative_delta: Option<f64>,
-    #[serde(default)]
-    pub acknowledged_by: Option<String>,
 }
 
 /// Acknowledge pending holds in bulk: one stream or a whole source, optionally bounded by a time
@@ -1041,14 +1212,23 @@ pub struct BulkAcknowledgeRequest {
 )]
 pub async fn acknowledge_holds_bulk(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     axum::Extension(auth): axum::Extension<AuthContext>,
     Json(payload): Json<BulkAcknowledgeRequest>,
 ) -> AppResult<Json<AcknowledgeResponse>> {
-    let by = payload
-        .acknowledged_by
-        .unwrap_or_else(|| actor_label(&auth));
+    let by = actor_label(&auth);
     let mut binds: Vec<sea_orm::Value> = vec![by.into()];
     let mut bounds = String::new();
+    // A restricted caller acknowledges only holds whose stream is paired to a site in their
+    // projects; unpaired (deferred) holds belong to no project and stay out of their reach.
+    if let Some(projects) = scope.sql_project_array() {
+        binds.push(projects);
+        bounds.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM site_parameters sp JOIN sites st ON st.id = sp.site_id \
+             WHERE sp.id = ds.site_parameter_id AND st.project_id = ANY(${}))",
+            binds.len()
+        ));
+    }
     if let Some(stream_id) = payload.stream_id {
         binds.push(stream_id.into());
         bounds.push_str(&format!(" AND h.stream_id = ${}", binds.len()));
@@ -1080,13 +1260,14 @@ pub async fn acknowledge_holds_bulk(
         binds.push(ceiling.into());
         bounds.push_str(&format!(" AND {SD_RELATIVE_DELTA_SQL} <= ${}", binds.len()));
     }
+    let resolution_sql = accept_ours_resolution_sql("$1");
     let acknowledged = state
         .db
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "UPDATE replicate_audit_holds AS h
-                 SET status = 'acknowledged', resolution = {ACCEPT_OURS_RESOLUTION_SQL},
+                 SET status = 'acknowledged', resolution = {resolution_sql},
                      acknowledged_by = $1, acknowledged_at = NOW()
                  FROM data_streams ds
                  WHERE ds.id = h.stream_id AND h.status = 'pending'{bounds}"
@@ -1234,14 +1415,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_quantization_and_unexplained() {
-        assert_eq!(
-            classify_case(
-                serde_json::json!({"mean": 147.33, "n": 3}),
-                serde_json::json!({"mean": 147.3333, "n": 3, "values": [147.0, 147.5, 147.5]}),
-            ),
-            "quantization"
-        );
+    fn classify_unexplained() {
         assert_eq!(
             classify_case(
                 serde_json::json!({"mean": 50.0, "n": 3}),
@@ -1252,20 +1426,69 @@ mod tests {
     }
 
     #[test]
-    fn resolution_history_is_preserved() {
-        let first = merged_resolution(None, serde_json::json!({"action": "accept_ours"}));
-        assert!(first.get("history").is_none());
-        let second = merged_resolution(
-            Some(first),
-            serde_json::json!({"action": "reopened", "by": "x"}),
+    fn a_population_shaped_sd_with_a_disagreeing_mean_is_not_population_sd() {
+        assert_eq!(
+            classify_case(
+                serde_json::json!({"mean": 60.0, "sd": 4.99, "n": 3}),
+                serde_json::json!({"mean": 80.3333, "sd": 6.1101, "n": 3,
+                                   "values": [75.0, 79.0, 87.0]}),
+            ),
+            "unexplained"
         );
+    }
+
+    #[test]
+    fn resolution_history_is_preserved() {
+        let first = merged_resolution(None, serde_json::json!({"action": "accept_ours"}), "a");
+        assert!(first.get("history").is_none());
+        assert_eq!(first["by"], "a");
+        assert!(first.get("at").is_some());
+        let second = merged_resolution(Some(first), serde_json::json!({"action": "reopened"}), "x");
         assert_eq!(second["history"][0]["action"], "accept_ours");
+        assert_eq!(second["by"], "x");
         let third = merged_resolution(
             Some(second),
             serde_json::json!({"action": "flag_replicates", "replicate_indexes": [2]}),
+            "y",
         );
         assert_eq!(third["action"], "flag_replicates");
+        assert_eq!(third["by"], "y");
         assert_eq!(third["history"][0]["action"], "accept_ours");
         assert_eq!(third["history"][1]["action"], "reopened");
+        assert_eq!(third["history"][1]["by"], "x");
+    }
+
+    #[test]
+    fn changed_expectations_reopen_terminal_holds() {
+        let recorded = serde_json::json!({"mean": 25.0, "sd": 10.0});
+        let same = GroupAudit {
+            time: chrono::Utc::now(),
+            expected_mean: Some(25.0),
+            expected_sd: Some(10.0),
+            expected_n: None,
+        };
+        assert!(!expected_changed(&recorded, &same));
+        let moved = GroupAudit {
+            expected_mean: Some(26.0),
+            ..same.clone()
+        };
+        assert!(expected_changed(&recorded, &moved));
+        let gained_n = GroupAudit {
+            expected_n: Some(3),
+            ..same.clone()
+        };
+        assert!(expected_changed(&recorded, &gained_n));
+        let lost_sd = GroupAudit {
+            expected_sd: None,
+            ..same
+        };
+        assert!(expected_changed(&recorded, &lost_sd));
+    }
+
+    #[test]
+    fn bound_sql_carries_the_quantum_floor() {
+        let sql = bound_sql("a.v", "b.v", "$3", DEFAULT_ABS_TOL);
+        assert!(sql.contains(&QUANTUM_FLOOR.to_string()), "{sql}");
+        assert!(sql.contains(&DEFAULT_ABS_TOL.to_string()), "{sql}");
     }
 }

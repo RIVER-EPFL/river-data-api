@@ -500,6 +500,15 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .layer(middleware::from_fn(require_manage_sensors))
         .with_state(state.clone());
 
+    // Destructive reconciliation deletes streams and their readings, so it takes the same gate
+    // as stream deletion on CRUD rather than the manager review layer.
+    let sync_admin_destructive = Router::new()
+        .nest("/sync", sync_views::destructive_routes())
+        .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
+        .layer(middleware::from_fn(deny_scoped_token))
+        .layer(middleware::from_fn(require_admin_or_token_write_metadata))
+        .with_state(state.clone());
+
     let sync_admin_admin = Router::new()
         .nest("/sync", sync_views::admin_routes())
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
@@ -617,6 +626,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .merge(sync_admin_read)
         .merge(sync_admin_write)
         .merge(sync_admin_manage)
+        .merge(sync_admin_destructive)
         .merge(sync_admin_admin);
 
     if let Some(routes) = user_routes {

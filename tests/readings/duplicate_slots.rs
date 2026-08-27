@@ -220,6 +220,69 @@ async fn a_project_scoped_token_cannot_read_the_report() {
     assert_eq!(status, 403, "a scoped token is refused ({status}): {body}");
 }
 
+/// A replicate family's indexes are the source's column positions and need not align with
+/// another stream's, so overlap is detected on what each stream would serve at an instant (the
+/// mean over its unflagged replicates), never per index. Grouping by index would silently miss
+/// exactly this shape: the family holds indexes 1 and 2, the other channel index 0.
+#[tokio::test]
+#[serial]
+async fn a_replicate_family_overlapping_another_stream_is_reported() {
+    let slot = slot_fed_by_one_stream("dup-family").await;
+
+    let family = uuid::Uuid::new_v4();
+    crate::common::exec(
+        &slot.db,
+        &format!(
+            "INSERT INTO data_streams \
+                (id, source_system, source_key, is_active, measurement_type, metadata) \
+             VALUES ('{family}', 'portal', 'DUP:cond_avg:reps', true, 'spot', \
+                     '{{\"replicates\": {{\"source_columns\": [\"cond_1\", \"cond_2\"]}}}}')"
+        ),
+    )
+    .await;
+    // TIMES[0]: family mean 100.0 agrees with the synced 100.0 (redundant).
+    // TIMES[1]: family mean 104.0 against the synced 101.0 (disagreeing by 3).
+    for (time, index, value) in [
+        (TIMES[0], 1, 99.0),
+        (TIMES[0], 2, 101.0),
+        (TIMES[1], 1, 103.0),
+        (TIMES[1], 2, 105.0),
+    ] {
+        crate::common::exec(
+            &slot.db,
+            &format!(
+                "INSERT INTO readings \
+                    (stream_id, site_id, parameter_id, time, replicate_index, raw_value, \
+                     logged, measurement_type, is_flagged) \
+                 VALUES ('{family}', '{site}', '{param}', '{time}', {index}, {value}, \
+                         true, 'spot', false)",
+                site = slot.site,
+                param = slot.parameter,
+            ),
+        )
+        .await;
+    }
+
+    let (_, found) = report_for(&slot).await;
+    let found = found.expect("the family overlap is reported");
+    assert_eq!(found["overlapping_instants"], 2, "{found}");
+    assert_eq!(
+        found["disagreeing_instants"], 1,
+        "the instant where the family's served mean matches is redundant: {found}"
+    );
+    assert!(
+        (found["max_difference"].as_f64().expect("max_difference") - 3.0).abs() < 1e-9,
+        "spread between served values, not raw replicates: {found}"
+    );
+    let systems: Vec<&str> = found["streams"]
+        .as_array()
+        .expect("streams")
+        .iter()
+        .map(|s| s["source_key"].as_str().unwrap())
+        .collect();
+    assert!(systems.contains(&"DUP:cond_avg:reps"), "{found}");
+}
+
 /// A flagged copy is already out of every rollup, so an instant it leaves single-sourced is no
 /// longer a disagreement anything averages over.
 #[tokio::test]

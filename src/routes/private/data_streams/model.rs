@@ -2,6 +2,8 @@ use crudcrate::{CRUDResource, EntityToModels};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use super::operations::DataStreamOperations;
+
 #[derive(
     Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize, EntityToModels,
 )]
@@ -10,7 +12,8 @@ use serde::{Deserialize, Serialize};
     api_struct = "DataStream",
     name_singular = "data_stream",
     name_plural = "data_streams",
-    generate_router
+    generate_router,
+    operations = DataStreamOperations
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]

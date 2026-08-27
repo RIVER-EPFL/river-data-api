@@ -178,11 +178,13 @@ async fn load_public_config(
         api_description: project
             .public_api_description
             .unwrap_or_else(|| "Public sensor data API.".to_string()),
-        // 2.2.0: flagged readings are excluded from the served series, so the site count and the
-        // readings a caller receives now agree.
+        // 2.3.0: spot instants are served as sample statistics (the unflagged replicate mean, with
+        // the lowest unflagged replicate as the no-sample fallback), so which replicate index
+        // exists or is flagged no longer decides whether an instant is served or which value it
+        // carries.
         api_version: project
             .public_api_version
-            .unwrap_or_else(|| "2.2.0".to_string()),
+            .unwrap_or_else(|| "2.3.0".to_string()),
         contact_email: project.public_contact_email,
         sites: site_configs,
         exposed_params: exposed_configs,

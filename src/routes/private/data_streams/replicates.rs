@@ -17,10 +17,28 @@ use crate::error::{AppError, AppResult};
 /// The metadata key the spec is stored under.
 pub const METADATA_KEY: &str = "replicates";
 
+/// One source column's permanent replicate index. The mapping is append-only: a column keeps its
+/// index for the life of the stream, a new column appends after the highest index ever assigned,
+/// and a column the source stops sending is retired with its index never reused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ColumnAssignment {
+    pub column: String,
+    pub index: i16,
+    /// The source no longer sends this column. Its readings keep the index; nothing new lands on it.
+    #[serde(default)]
+    pub retired: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReplicateSpec {
-    /// Source columns in order; position is the replicate_index the member's readings carry.
+    /// Source columns as the source currently declares them. Ordering is provenance only: the
+    /// authoritative column-to-index mapping is `assignments`, pinned at registration.
     pub source_columns: Vec<String>,
+    /// The authoritative column-to-index mapping, authored by the register path (never by the
+    /// caller) via [`pin_assignments`]. Readings carry these indexes for life, so re-registration
+    /// preserves them: see [`ColumnAssignment`].
+    #[serde(default)]
+    pub assignments: Vec<ColumnAssignment>,
     /// The portal's precomputed mean column. Audited at sync time, never a stream.
     #[serde(default)]
     pub portal_mean_column: Option<String>,
@@ -96,6 +114,85 @@ impl ReplicateSpec {
     pub fn from_metadata(metadata: &serde_json::Value) -> Option<Self> {
         serde_json::from_value(metadata.get(METADATA_KEY)?.clone()).ok()
     }
+
+    /// The authoritative mapping, ordered by index. A spec stored before pinning derives it from
+    /// its column positions, which were the indexes at the time.
+    #[must_use]
+    pub fn column_assignments(&self) -> Vec<ColumnAssignment> {
+        let mut assignments = if self.assignments.is_empty() {
+            self.source_columns
+                .iter()
+                .enumerate()
+                .map(|(i, column)| ColumnAssignment {
+                    column: column.clone(),
+                    index: i16::try_from(i).unwrap_or(i16::MAX),
+                    retired: false,
+                })
+                .collect()
+        } else {
+            self.assignments.clone()
+        };
+        assignments.sort_by_key(|a| a.index);
+        assignments
+    }
+}
+
+/// Merge an incoming column declaration onto the stored authoritative mapping.
+///
+/// A known column keeps its stored index regardless of incoming order, so an upstream reorder is
+/// a no-op. A genuinely new column appends after the highest index ever assigned. A column absent
+/// from the incoming declaration is retired in place, its index never reused; a retired column
+/// that reappears reactivates at its stored index (its identity was never lost). A registration
+/// that removes an active column and introduces an unknown one in the same step is refused: a
+/// rename is indistinguishable from remove-plus-add, and guessing either way silently re-indexes
+/// stored readings, so the conflict is surfaced for operator action instead.
+pub fn pin_assignments(
+    prior: Option<&ReplicateSpec>,
+    incoming: &[String],
+) -> AppResult<Vec<ColumnAssignment>> {
+    let mut stored = prior
+        .map(ReplicateSpec::column_assignments)
+        .unwrap_or_default();
+    let incoming_set: std::collections::HashSet<&str> =
+        incoming.iter().map(String::as_str).collect();
+    let known: std::collections::HashSet<&str> = stored.iter().map(|a| a.column.as_str()).collect();
+
+    let added: Vec<&String> = incoming
+        .iter()
+        .filter(|c| !known.contains(c.as_str()))
+        .collect();
+    let removed: Vec<&str> = stored
+        .iter()
+        .filter(|a| !a.retired && !incoming_set.contains(a.column.as_str()))
+        .map(|a| a.column.as_str())
+        .collect();
+    if !added.is_empty() && !removed.is_empty() {
+        return Err(AppError::Conflict(format!(
+            "ambiguous replicate re-registration: column(s) {} disappeared while {} appeared in \
+             the same step. A rename is indistinguishable from remove-plus-add, and either guess \
+             would re-index stored readings. Register the removal and the addition separately, \
+             or resolve the rename by hand",
+            removed.join(", "),
+            added
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+
+    for assignment in &mut stored {
+        assignment.retired = !incoming_set.contains(assignment.column.as_str());
+    }
+    let base = stored.iter().map(|a| a.index).max().map_or(0, |m| m + 1);
+    for (offset, column) in added.into_iter().enumerate() {
+        stored.push(ColumnAssignment {
+            column: column.clone(),
+            index: base.saturating_add(i16::try_from(offset).unwrap_or(i16::MAX)),
+            retired: false,
+        });
+    }
+    Ok(stored)
 }
 
 /// The `source_key`s of the replicate families in a stream selection, matching the selection
@@ -125,7 +222,9 @@ pub async fn family_keys_in_streams<C: ConnectionTrait>(
         .collect())
 }
 
-/// The `source_key`s of the replicate families owned by these sensors.
+/// The `source_key`s of the replicate families these sensors reach: streams the sensor owns, and
+/// streams whose readings carry the sensor_id directly (attribution backfill sets it without
+/// touching `data_streams.sensor_id`), matching the retag job's own scope.
 pub async fn family_keys_for_sensors<C: ConnectionTrait>(
     db: &C,
     sensor_ids: &[Uuid],
@@ -133,10 +232,47 @@ pub async fn family_keys_for_sensors<C: ConnectionTrait>(
     let rows = db
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT source_key FROM data_streams \
-             WHERE sensor_id = ANY($1) AND metadata -> $2 IS NOT NULL \
+            "SELECT source_key FROM data_streams s \
+             WHERE s.metadata -> $2 IS NOT NULL \
+               AND (s.sensor_id = ANY($1) \
+                    OR EXISTS (SELECT 1 FROM readings r \
+                               WHERE r.stream_id = s.id AND r.sensor_id = ANY($1))) \
              ORDER BY source_key",
             [sensor_ids.to_vec().into(), METADATA_KEY.into()],
+        ))
+        .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| r.try_get::<String>("", "source_key").ok())
+        .collect())
+}
+
+/// The `source_key`s of the replicate families a `measurement_retag` scope reaches, mirroring the
+/// job's own readings predicate: streams named directly, streams of the source system, streams
+/// the sensors own, and streams whose readings carry a scoped sensor_id.
+pub async fn family_keys_in_retag_scope<C: ConnectionTrait>(
+    db: &C,
+    sensor_ids: &[Uuid],
+    stream_ids: &[Uuid],
+    source_system: Option<&str>,
+) -> AppResult<Vec<String>> {
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT source_key FROM data_streams s \
+             WHERE s.metadata -> $4 IS NOT NULL \
+               AND (s.id = ANY($2) \
+                    OR s.sensor_id = ANY($1) \
+                    OR ($3::text IS NOT NULL AND s.source_system = $3) \
+                    OR EXISTS (SELECT 1 FROM readings r \
+                               WHERE r.stream_id = s.id AND r.sensor_id = ANY($1))) \
+             ORDER BY source_key",
+            [
+                sensor_ids.to_vec().into(),
+                stream_ids.to_vec().into(),
+                source_system.map(ToString::to_string).into(),
+                METADATA_KEY.into(),
+            ],
         ))
         .await?;
     Ok(rows
@@ -167,6 +303,7 @@ mod tests {
     fn spec(columns: &[&str]) -> ReplicateSpec {
         ReplicateSpec {
             source_columns: columns.iter().map(ToString::to_string).collect(),
+            assignments: Vec::new(),
             portal_mean_column: Some("DOC_avg_ppb".to_string()),
             portal_sd_column: Some("DOC_sd_ppb".to_string()),
             curve_ref_column: Some("doc_std_curve_id".to_string()),

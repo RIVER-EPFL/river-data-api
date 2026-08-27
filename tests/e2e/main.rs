@@ -28,4 +28,5 @@ mod sensor_ui_lifecycle;
 mod site_parameter_merge_flag_alarm;
 mod status_search_export_comparison;
 mod stream_discovery_pairing;
+mod sync_parity;
 mod tools_grab_export;

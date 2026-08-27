@@ -814,6 +814,252 @@ async fn classification_reads_the_disagreement_signature() {
     assert_eq!(holds["holds"][0]["classification"], "population_sd");
 }
 
+/// An index that exists in the group but is not among the values the hold recorded cannot be
+/// flagged through the hold: the operator's decision is about the values the hold showed.
+#[tokio::test]
+#[serial]
+async fn an_index_outside_the_holds_recorded_values_is_refused() {
+    let fx = setup("audit-outside").await;
+    let audit = json!([{"time": T1, "expected_mean": 15.0}]);
+    ingest_audited(&fx, group(T1, &[10.0, 20.0, 30.0]), audit).await;
+    let hold_id = pending_hold_id(&fx).await;
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &fx.app,
+        "/api/ingest",
+        &json!({
+            "stream_id": fx.stream,
+            "readings": [{"time": T1, "raw_value": 40.0, "replicate_index": 5}],
+        }),
+        &fx.sync_token,
+    )
+    .await;
+    assert_eq!(status, 200, "late replicate ingests ({status}): {body}");
+    assert_eq!(readings_at(&fx, T1).await, 4);
+
+    let (status, body) = resolve(
+        &fx,
+        &hold_id,
+        &json!({"mode": "flag", "replicate_indexes": [5]}),
+    )
+    .await;
+    assert_eq!(status, 400, "resolve ({status}): {body}");
+    assert!(
+        body.to_string().contains("not named by this hold"),
+        "the refusal says the hold never showed that index: {body}"
+    );
+    assert_eq!(flagged_at(&fx, T1).await, 0);
+    assert_eq!(hold_status(&fx.db, &hold_id).await, "pending");
+}
+
+/// A hold written before indexes travelled with the values holds bare numbers whose indexes are
+/// unrecoverable, so the flag mode is refused outright rather than guessed at.
+#[tokio::test]
+#[serial]
+async fn a_legacy_bare_array_hold_refuses_the_flag_mode() {
+    let fx = setup("audit-legacy").await;
+    let audit = json!([{"time": T1, "expected_mean": 15.0}]);
+    ingest_audited(&fx, group(T1, &[10.0, 20.0, 999.0]), audit).await;
+    let hold_id = pending_hold_id(&fx).await;
+    fx.db
+        .execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "UPDATE replicate_audit_holds \
+                 SET computed = jsonb_set(computed, '{{values}}', '[10.0, 20.0, 999.0]') \
+                 WHERE id = '{hold_id}'"
+            ),
+        ))
+        .await
+        .unwrap();
+
+    let (status, body) = resolve(
+        &fx,
+        &hold_id,
+        &json!({"mode": "flag", "replicate_indexes": [2]}),
+    )
+    .await;
+    assert_eq!(status, 400, "resolve ({status}): {body}");
+    assert!(
+        body.to_string().contains("predates index recording"),
+        "the refusal explains the hold's shape and points elsewhere: {body}"
+    );
+    assert!(
+        body.to_string().contains("readings flag endpoints"),
+        "{body}"
+    );
+    assert_eq!(flagged_at(&fx, T1).await, 0);
+    assert_eq!(hold_status(&fx.db, &hold_id).await, "pending");
+}
+
+/// Flagging every replicate would leave the sample trigger with n = 0 and the instant would
+/// vanish from serving.
+#[tokio::test]
+#[serial]
+async fn at_least_one_unflagged_replicate_must_remain() {
+    let fx = setup("audit-allflag").await;
+    let audit = json!([{"time": T1, "expected_mean": 15.0}]);
+    ingest_audited(&fx, group(T1, &[10.0, 20.0, 999.0]), audit).await;
+    let hold_id = pending_hold_id(&fx).await;
+
+    let (status, body) = resolve(
+        &fx,
+        &hold_id,
+        &json!({"mode": "flag", "replicate_indexes": [0, 1, 2]}),
+    )
+    .await;
+    assert_eq!(status, 400, "resolve ({status}): {body}");
+    assert!(
+        body.to_string()
+            .contains("at least one unflagged replicate must remain"),
+        "{body}"
+    );
+    assert_eq!(flagged_at(&fx, T1).await, 0);
+    assert_eq!(hold_status(&fx.db, &hold_id).await, "pending");
+
+    let (mean, _, n) = sample_stats(&fx, T1).await.expect("sample");
+    assert!(
+        (mean - 343.0).abs() < 1e-9,
+        "still serving all three: {mean}"
+    );
+    assert_eq!(n, 3);
+}
+
+/// An index that exists but is already flagged is refused with a message that says so, not one
+/// that reads as "that index does not exist".
+#[tokio::test]
+#[serial]
+async fn an_already_flagged_index_is_distinguished_from_an_absent_one() {
+    let fx = setup("audit-preflagged").await;
+    let audit = json!([{"time": T1, "expected_mean": 15.0}]);
+    ingest_audited(&fx, group(T1, &[10.0, 20.0, 999.0]), audit).await;
+    let hold_id = pending_hold_id(&fx).await;
+
+    let (status, body) = crate::common::patch_json_with_token(
+        &fx.app,
+        "/api/readings/flag",
+        &json!({
+            "reason": "field note",
+            "readings": [{
+                "site_id": crate::common::SITE1_ID,
+                "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID,
+                "time": T1,
+                "replicate_index": 2,
+            }],
+        }),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "pre-flag ({status}): {body}");
+
+    let (status, body) = resolve(
+        &fx,
+        &hold_id,
+        &json!({"mode": "flag", "replicate_indexes": [2]}),
+    )
+    .await;
+    assert_eq!(status, 400, "resolve ({status}): {body}");
+    assert!(
+        body.to_string().contains("already flagged"),
+        "the operator learns the true state: {body}"
+    );
+    assert_eq!(hold_status(&fx.db, &hold_id).await, "pending");
+}
+
+/// A terminal decision stands against re-detection of the same disagreement, but a cycle whose
+/// expected statistics moved is new evidence the decision never covered.
+#[tokio::test]
+#[serial]
+async fn a_changed_expectation_opens_a_fresh_hold_beside_the_terminal_one() {
+    let fx = setup("audit-redetect").await;
+    let batch = group(T1, &[10.0, 20.0, 30.0]);
+    ingest_audited(
+        &fx,
+        batch.clone(),
+        json!([{"time": T1, "expected_mean": 25.0, "expected_sd": 10.0}]),
+    )
+    .await;
+    let hold_id = pending_hold_id(&fx).await;
+    let (status, body) = resolve(&fx, &hold_id, &json!({"mode": "ours"})).await;
+    assert_eq!(status, 200, "resolve ({status}): {body}");
+
+    let holds_for_stream = || async {
+        count(
+            &fx.db,
+            &format!(
+                "SELECT COUNT(*) FROM replicate_audit_holds WHERE stream_id = '{}'",
+                fx.stream
+            ),
+        )
+        .await
+    };
+
+    ingest_audited(
+        &fx,
+        batch.clone(),
+        json!([{"time": T1, "expected_mean": 25.0, "expected_sd": 10.0}]),
+    )
+    .await;
+    assert_eq!(
+        holds_for_stream().await,
+        1,
+        "the same disagreement does not reopen the decided hold"
+    );
+
+    ingest_audited(
+        &fx,
+        batch,
+        json!([{"time": T1, "expected_mean": 27.0, "expected_sd": 10.0}]),
+    )
+    .await;
+    assert_eq!(
+        holds_for_stream().await,
+        2,
+        "a moved expectation is new evidence and opens a fresh hold"
+    );
+    let review = list_holds(&fx, "").await;
+    assert_eq!(review["pending"], 1);
+    assert_eq!(review["holds"][0]["expected"]["mean"], 27.0);
+    assert_eq!(hold_status(&fx.db, &hold_id).await, "acknowledged");
+}
+
+/// The recorded actor comes from the caller's authentication; a caller-supplied name is ignored,
+/// and every resolution entry carries who acted and when.
+#[tokio::test]
+#[serial]
+async fn the_acting_identity_comes_from_auth_and_is_recorded_on_the_resolution() {
+    let fx = setup("audit-actor").await;
+    ingest_audited(
+        &fx,
+        group(T1, &[10.0, 20.0, 30.0]),
+        json!([{"time": T1, "expected_mean": 25.0}]),
+    )
+    .await;
+    let hold_id = pending_hold_id(&fx).await;
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &fx.app,
+        &format!("/api/sync/replicate_audit_holds/{hold_id}/acknowledge"),
+        &json!({"acknowledged_by": "mallory"}),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "acknowledge ({status}): {body}");
+
+    let resolved = list_holds(&fx, "&status=resolved").await;
+    let hold = &resolved["holds"][0];
+    let by = hold["acknowledged_by"].as_str().unwrap();
+    assert!(
+        by.starts_with("token:"),
+        "the actor is the authenticated caller, not the payload: {by}"
+    );
+    assert_eq!(hold["resolution"]["by"].as_str().unwrap(), by);
+    assert!(
+        hold["resolution"]["at"].as_str().is_some(),
+        "the entry records when: {hold}"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn audit_review_requires_manager_capability() {
@@ -834,4 +1080,178 @@ async fn audit_review_requires_manager_capability() {
         status, 200,
         "a write_metadata token passes the manager gate"
     );
+}
+
+/// The reconciliation delete removes streams and readings, so it takes the stream-deletion gate
+/// (administrator or write_metadata token), not the manager review layer: a manager who can
+/// resolve holds and start the non-destructive migration cannot start the delete.
+#[tokio::test]
+#[serial]
+async fn the_destructive_reconciliation_delete_refuses_a_manager() {
+    if !crate::common::keycloak::keycloak_reachable().await {
+        eprintln!("SKIP: keycloak unreachable (start the dev stack, or set TEST_KEYCLOAK_URL)");
+        return;
+    }
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let app = crate::common::keycloak::build_test_app_with_keycloak(db.clone()).await;
+
+    let sub = crate::common::keycloak::keycloak_user_id("manager1").await;
+    crate::common::keycloak::grant_project(&db, &sub, crate::common::PROJECT_ID).await;
+    let manager = crate::common::keycloak::get_keycloak_jwt("manager1", "manager1").await;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/sync/replicate_reconciliation/delete",
+        &json!({"source_system": "cnet"}),
+        &manager,
+    )
+    .await;
+    assert_eq!(status, 403, "delete gate ({status}): {body}");
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/sync/replicate_reconciliation",
+        &json!({"source_system": "cnet"}),
+        &manager,
+    )
+    .await;
+    assert_ne!(
+        status, 403,
+        "the non-destructive migration stays manager-level ({status}): {body}"
+    );
+
+    let admin = crate::common::keycloak::get_keycloak_jwt("admin", "admin").await;
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/sync/replicate_reconciliation/delete",
+        &json!({"source_system": "cnet"}),
+        &admin,
+    )
+    .await;
+    assert_ne!(status, 403, "an administrator passes ({status}): {body}");
+}
+
+/// A manager granted only another project neither sees nor acts on a hold whose stream is paired
+/// into this one, and an unpaired (deferred) hold is out of every restricted caller's reach.
+#[tokio::test]
+#[serial]
+async fn hold_review_is_confined_to_the_callers_projects() {
+    if !crate::common::keycloak::keycloak_reachable().await {
+        eprintln!("SKIP: keycloak unreachable (start the dev stack, or set TEST_KEYCLOAK_URL)");
+        return;
+    }
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let (sync_token, _service_id) = crate::common::seed_sync_session_token(&db).await;
+    let app = crate::common::keycloak::build_test_app_with_keycloak(db.clone()).await;
+
+    let other_project = "00000000-0000-4000-a000-0000000000c1";
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO projects (id, name, description, data_source) VALUES \
+             ('{other_project}', 'Elsewhere', 'scope check', 'other')"
+        ),
+    )
+    .await;
+
+    let (status, stream) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/streams/register",
+        &json!({"source_system": "scopesrc", "source_key": "scoped", "measurement_type": "spot"}),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "register: {stream}");
+    let stream = crate::common::e2e::id_of(&stream);
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/streams/{stream}/pair"),
+        &json!({"site_parameter_id": crate::common::PARAM_S1_TEMP_ID}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "pair ({status}): {body}");
+
+    let readings: Vec<serde_json::Value> = [(0i16, 10.0), (1, 20.0), (2, 30.0)]
+        .iter()
+        .map(|(i, v)| json!({"time": T1, "raw_value": v, "replicate_index": i}))
+        .collect();
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/ingest",
+        &json!({
+            "stream_id": stream,
+            "readings": readings,
+            "audit": [{"time": T1, "expected_mean": 25.0}],
+        }),
+        &sync_token,
+    )
+    .await;
+    assert_eq!(status, 200, "audited ingest ({status}): {body}");
+    let (status, holds) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/sync/replicate_audit_holds?stream_id={stream}"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "list ({status}): {holds}");
+    let hold_id = holds["holds"][0]["id"].as_str().unwrap().to_string();
+
+    // manager1 holds the manager capability globally but is granted only the other project.
+    let sub = crate::common::keycloak::keycloak_user_id("manager1").await;
+    crate::common::keycloak::grant_project(&db, &sub, other_project).await;
+    let jwt = crate::common::keycloak::get_keycloak_jwt("manager1", "manager1").await;
+
+    let (status, body) =
+        crate::common::get_json_with_token(&app, "/api/sync/replicate_audit_holds", &jwt).await;
+    assert_eq!(status, 200, "list ({status}): {body}");
+    assert_eq!(
+        body["total"], 0,
+        "the other project's hold is invisible: {body}"
+    );
+    assert_eq!(body["pending"], 0, "{body}");
+
+    for path in [
+        format!("/api/sync/replicate_audit_holds/{hold_id}/acknowledge"),
+        format!("/api/sync/replicate_audit_holds/{hold_id}/resolve"),
+        format!("/api/sync/replicate_audit_holds/{hold_id}/reopen"),
+    ] {
+        let (status, body) =
+            crate::common::post_json_with_token(&app, &path, &json!({"mode": "ours"}), &jwt).await;
+        assert_eq!(status, 403, "{path} ({status}): {body}");
+    }
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sync/replicate_audit_holds/acknowledge_bulk",
+        &json!({"stream_id": stream}),
+        &jwt,
+    )
+    .await;
+    assert_eq!(status, 200, "bulk acknowledge ({status}): {body}");
+    assert_eq!(
+        body["acknowledged"], 0,
+        "bulk acknowledge cannot reach the other project's holds: {body}"
+    );
+
+    // Granted the hold's own project, the same manager sees and resolves it. The grants cache
+    // TTL is 1s in the test config; wait it out so the new grant is read.
+    crate::common::keycloak::grant_project(&db, &sub, crate::common::PROJECT_ID).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (status, body) =
+        crate::common::get_json_with_token(&app, "/api/sync/replicate_audit_holds", &jwt).await;
+    assert_eq!(status, 200, "list ({status}): {body}");
+    assert_eq!(body["total"], 1, "{body}");
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/sync/replicate_audit_holds/{hold_id}/resolve"),
+        &json!({"mode": "ours"}),
+        &jwt,
+    )
+    .await;
+    assert_eq!(status, 200, "resolve in scope ({status}): {body}");
 }

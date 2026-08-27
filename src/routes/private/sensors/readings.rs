@@ -265,51 +265,95 @@ pub async fn get_sensor_readings(
         )
     } else {
         String::from(
-            r"SELECT DISTINCT ON (stream_id, time) time, raw_value, calibrated_value, site_id
+            r"SELECT time, raw_value, calibrated_value, site_id
               FROM readings
               WHERE sensor_id = $1",
         )
     };
+    let mut shared_conditions = String::new();
     if bucket.is_none()
         && let Some(mt) = query.measurement_type.as_deref().filter(|m| !m.is_empty())
     {
         values.push(mt.into());
-        sql.push_str(&format!(
+        shared_conditions.push_str(&format!(
             " AND (measurement_type = ${} OR (${} = 'continuous' AND measurement_type IS NULL))",
             values.len(),
             values.len()
         ));
     }
-    sql.push_str(&scope_filter(&mut values, "site_id"));
-    sql.push_str(&param_filter(&mut values, "parameter_id"));
+    shared_conditions.push_str(&scope_filter(&mut values, "site_id"));
+    shared_conditions.push_str(&param_filter(&mut values, "parameter_id"));
     if let Some(start) = query.start {
         values.push(start.into());
-        sql.push_str(&format!(" AND time >= ${}", values.len()));
+        shared_conditions.push_str(&format!(" AND time >= ${}", values.len()));
     }
     if let Some(end) = query.end {
         values.push(end.into());
-        sql.push_str(&format!(" AND time <= ${}", values.len()));
+        shared_conditions.push_str(&format!(" AND time <= ${}", values.len()));
     }
+    sql.push_str(&shared_conditions);
+    // The raw mode runs a second statement for the spot subset; both are time-ascending and are
+    // merged below, so the continuous statement keeps the chunk-ordered scan a single UNION with
+    // an outer sort would forfeit.
+    let mut spot_sql = None;
     if bucket.is_some() {
         sql.push_str(" GROUP BY 1 ORDER BY 1 ASC");
     } else {
-        // The raw arm serves one row per instant, so the DISTINCT ON ordering is the channel's,
-        // not the series'. `(stream_id, time)` is the readings primary key minus the replicate
-        // index; nothing renumbers that index, so a group need not contain index 0. The wrapper
-        // restores the time-ascending order the series is drawn in.
-        sql.push_str(" ORDER BY stream_id, time, (is_flagged IS TRUE), replicate_index");
-        sql = format!(
-            "SELECT time, raw_value, calibrated_value, site_id FROM ({sql}) s ORDER BY time ASC"
-        );
+        // Continuous and derived rows live at replicate_index 0, so a plain equality keeps the
+        // chunk-ordered scan. A spot instant is the replicate group `(stream_id, time)`, collapsed
+        // to its lowest unflagged replicate (flagged-only groups surface their flagged row: this
+        // is the instrument diagnostic view, which keeps flagged points visible). The DISTINCT ON
+        // is confined to the spot subset, whose row counts are small.
+        sql.push_str(" AND replicate_index = 0 AND measurement_type IS DISTINCT FROM 'spot'");
+        sql.push_str(" ORDER BY time ASC");
+        spot_sql = Some(format!(
+            "SELECT time, raw_value, calibrated_value, site_id FROM ( \
+                SELECT DISTINCT ON (stream_id, time) time, raw_value, calibrated_value, site_id \
+                FROM readings \
+                WHERE sensor_id = $1 AND measurement_type = 'spot'{shared_conditions} \
+                ORDER BY stream_id, time, (is_flagged IS TRUE), replicate_index \
+             ) sp ORDER BY time ASC"
+        ));
     }
 
-    let rows = db
+    let mut rows = db
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
-            values,
+            values.clone(),
         ))
         .await?;
+    if let Some(spot_sql) = spot_sql {
+        let spot_rows = db
+            .query_all(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                &spot_sql,
+                values,
+            ))
+            .await?;
+        if !spot_rows.is_empty() {
+            // Merge the two time-ascending statements into one time-ascending series.
+            let mut merged = Vec::with_capacity(rows.len() + spot_rows.len());
+            let time_of = |row: &sea_orm::QueryResult| {
+                row.try_get::<DateTime<chrono::FixedOffset>>("", "time")
+                    .map(|t| t.with_timezone(&Utc))
+            };
+            let (mut a, mut b) = (
+                rows.into_iter().peekable(),
+                spot_rows.into_iter().peekable(),
+            );
+            while let (Some(x), Some(y)) = (a.peek(), b.peek()) {
+                if time_of(x)? <= time_of(y)? {
+                    merged.push(a.next().unwrap());
+                } else {
+                    merged.push(b.next().unwrap());
+                }
+            }
+            merged.extend(a);
+            merged.extend(b);
+            rows = merged;
+        }
+    }
 
     let aggregated = bucket.is_some();
     let mut times = Vec::with_capacity(rows.len());

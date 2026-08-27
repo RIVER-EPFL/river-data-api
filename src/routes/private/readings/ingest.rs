@@ -484,7 +484,8 @@ pub async fn ingest_readings(
     // portal's aggregate cells, not the data, and withholding would only hide measurements from
     // the people waiting on them. A mismatch records a hold for review (pending when paired,
     // deferred until pairing); a group that matches again at source supersedes its open hold; a
-    // group an operator already ruled on (acknowledged or remediated) is left alone.
+    // group an operator already ruled on (acknowledged or remediated) is left alone unless the
+    // portal's expected statistics have moved since the ruling, which opens a fresh hold.
     if let Some(audits) = payload.audit.as_deref().filter(|a| !a.is_empty()) {
         use crate::routes::private::sync::replicate_audit as audit;
 
@@ -534,32 +535,34 @@ pub async fn ingest_readings(
                 )
                 && a.expected_n
                     .is_none_or(|expected| i64::try_from(stats.n) == Ok(expected));
+            let mismatch = audit::GroupMismatch {
+                time: a.time,
+                expected_mean: a.expected_mean,
+                expected_sd: a.expected_sd,
+                expected_n: a.expected_n,
+                computed_mean: stats.mean,
+                computed_sd: stats.sd,
+                n: stats.n,
+                values: values.to_vec(),
+            };
+            let hold_status = if paired { "pending" } else { "deferred" };
             match (agree, holds_by_time.get(&a.time)) {
                 (true, Some(hold)) if matches!(hold.status.as_str(), "pending" | "deferred") => {
                     audit::close_hold(db, hold.id, "superseded").await?;
                 }
                 (true, _) => {}
-                // The operator's decision on this group stands; re-detecting the same
-                // disagreement does not reopen it.
+                // The operator's decision stands against re-detection of the SAME disagreement.
+                // A cycle whose expected statistics moved is new evidence the decision never
+                // covered, so it opens a fresh hold beside the terminal one.
                 (false, Some(hold))
-                    if matches!(hold.status.as_str(), "acknowledged" | "remediated") => {}
+                    if matches!(hold.status.as_str(), "acknowledged" | "remediated") =>
+                {
+                    if audit::expected_changed(&hold.expected, a) {
+                        audit::upsert_hold(db, payload.stream_id, &mismatch, hold_status).await?;
+                    }
+                }
                 (false, _) => {
-                    audit::upsert_hold(
-                        db,
-                        payload.stream_id,
-                        &audit::GroupMismatch {
-                            time: a.time,
-                            expected_mean: a.expected_mean,
-                            expected_sd: a.expected_sd,
-                            expected_n: a.expected_n,
-                            computed_mean: stats.mean,
-                            computed_sd: stats.sd,
-                            n: stats.n,
-                            values: values.to_vec(),
-                        },
-                        if paired { "pending" } else { "deferred" },
-                    )
-                    .await?;
+                    audit::upsert_hold(db, payload.stream_id, &mismatch, hold_status).await?;
                 }
             }
         }

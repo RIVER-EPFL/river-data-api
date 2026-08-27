@@ -99,25 +99,37 @@ pub async fn get_calibration_window(
         None => sea_orm::Value::ChronoDateTimeWithTimeZone(None),
     };
 
-    // The window is [valid_from, COALESCE(valid_until, 'infinity')). Both the count and the points
-    // are per instant: `(stream_id, time)` is the readings primary key minus the replicate index,
-    // and nothing renumbers that index, so a group need not contain index 0.
+    // The window is [valid_from, COALESCE(valid_until, 'infinity')). The count is per instant:
+    // continuous and derived rows live at replicate_index 0, so their count is a plain COUNT(*)
+    // with no sort; a spot instant is the replicate group `(stream_id, time)`, and the composite
+    // DISTINCT is confined to that small subset.
     let mut count_vals: Vec<sea_orm::Value> = vec![sensor_id.into(), vf.clone(), vu.clone()];
     let count_scope = scope_clause(&mut count_vals);
     let count_row = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &format!(
-                r"SELECT COUNT(DISTINCT (stream_id, time)) AS c FROM readings
-                  WHERE sensor_id = $1
-                    AND time >= $2
-                    AND time < COALESCE($3, 'infinity'::timestamptz){count_scope}"
+                r"SELECT (SELECT COUNT(*) FROM readings
+                          WHERE sensor_id = $1
+                            AND time >= $2
+                            AND time < COALESCE($3, 'infinity'::timestamptz)
+                            AND replicate_index = 0
+                            AND measurement_type IS DISTINCT FROM 'spot'{count_scope})
+                       + (SELECT COUNT(DISTINCT (stream_id, time)) FROM readings
+                          WHERE sensor_id = $1
+                            AND time >= $2
+                            AND time < COALESCE($3, 'infinity'::timestamptz)
+                            AND measurement_type = 'spot'{count_scope}) AS c"
             ),
             count_vals,
         ))
         .await?;
     let point_count: i64 = count_row.and_then(|r| r.try_get("", "c").ok()).unwrap_or(0);
 
+    // Each arm carries its own LIMIT so the continuous arm keeps the index-backed early stop; the
+    // outer sort then orders at most twice the cap. The spot arm collapses a replicate group to
+    // its lowest unflagged replicate (a flagged-only group surfaces its flagged row: the editor
+    // shows flagged points).
     let mut point_vals: Vec<sea_orm::Value> = vec![sensor_id.into(), vf, vu];
     let point_scope = scope_clause(&mut point_vals);
     point_vals.push(MAX_POINTS.into());
@@ -127,14 +139,30 @@ pub async fn get_calibration_window(
             sea_orm::DatabaseBackend::Postgres,
             &format!(
                 r"SELECT time, raw_value, calibrated_value, is_flagged FROM (
-                      SELECT DISTINCT ON (stream_id, time)
-                             time, raw_value, calibrated_value,
-                             COALESCE(is_flagged, false) AS is_flagged
-                      FROM readings
-                      WHERE sensor_id = $1
-                        AND time >= $2
-                        AND time < COALESCE($3, 'infinity'::timestamptz){point_scope}
-                      ORDER BY stream_id, time, (is_flagged IS TRUE), replicate_index
+                      (SELECT time, raw_value, calibrated_value,
+                              COALESCE(is_flagged, false) AS is_flagged
+                       FROM readings
+                       WHERE sensor_id = $1
+                         AND time >= $2
+                         AND time < COALESCE($3, 'infinity'::timestamptz)
+                         AND replicate_index = 0
+                         AND measurement_type IS DISTINCT FROM 'spot'{point_scope}
+                       ORDER BY time DESC
+                       LIMIT ${limit_idx})
+                      UNION ALL
+                      (SELECT time, raw_value, calibrated_value, is_flagged FROM (
+                          SELECT DISTINCT ON (stream_id, time)
+                                 time, raw_value, calibrated_value,
+                                 COALESCE(is_flagged, false) AS is_flagged
+                          FROM readings
+                          WHERE sensor_id = $1
+                            AND time >= $2
+                            AND time < COALESCE($3, 'infinity'::timestamptz)
+                            AND measurement_type = 'spot'{point_scope}
+                          ORDER BY stream_id, time, (is_flagged IS TRUE), replicate_index
+                       ) sp
+                       ORDER BY time DESC
+                       LIMIT ${limit_idx})
                   ) w
                   ORDER BY time DESC
                   LIMIT ${limit_idx}"

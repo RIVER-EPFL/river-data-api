@@ -11,4 +11,5 @@ mod pair_replicate_samples;
 mod register_declares_instrument;
 mod register_pair_stats;
 mod replicate_retag_guard;
+mod replicate_spec_pinning;
 mod slot_retirement;

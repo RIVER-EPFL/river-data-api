@@ -9,6 +9,7 @@ mod common;
 mod aggregate_refresh_on_flag;
 mod batch_standard_curve;
 mod csv_import_column_resolution;
+mod csv_import_family_guard;
 mod csv_import_sessions;
 mod csv_import_worker;
 mod duplicate_slots;

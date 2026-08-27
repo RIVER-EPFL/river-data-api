@@ -131,7 +131,6 @@ async fn reconcile_cadence(
     spot: bool,
 ) -> AppResult<SweepStats> {
     let cadence = super::views::cadence_label(spot);
-    let cadence_pred = super::views::cadence_predicate(spot);
 
     let breaches = fetch_active_alarm_rows(
         db,
@@ -257,16 +256,14 @@ async fn reconcile_cadence(
             pairs.join(",")
         )
     };
+    // The latest served value under the same per-cadence rule the breach set uses, wrapped to a
+    // single column for the scalar assignment.
+    let latest = super::views::latest_served_sql(spot, "ae.site_id", "ae.parameter_id");
     let resolve_sql = format!(
         "UPDATE alarm_events ae \
          SET resolved_at = NOW(), \
              updated_at = NOW(), \
-             resolved_value = (SELECT COALESCE(smp.mean, r.calibrated_value, r.raw_value) FROM readings r \
-                               LEFT JOIN samples smp ON smp.id = r.sample_id \
-                               WHERE r.site_id = ae.site_id AND r.parameter_id = ae.parameter_id \
-                                 AND {cadence_pred} \
-                               ORDER BY r.time DESC, (r.is_flagged IS TRUE), \
-                                        r.replicate_index LIMIT 1) \
+             resolved_value = (SELECT lv.value FROM ({latest}) lv) \
          WHERE ae.resolved_at IS NULL AND ae.measurement_type = '{cadence}'{scope_clause}{not_in_clause}"
     );
     let resolved = db

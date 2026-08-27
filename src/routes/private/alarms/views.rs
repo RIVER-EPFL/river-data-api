@@ -179,23 +179,30 @@ pub async fn get_site_alarms(
     let alarm_param_ids: Vec<uuid::Uuid> = params_with_thresholds.iter().map(|p| p.id).collect();
 
     let min_severity = query.severity.unwrap_or(1);
-    let val_expr = "sv.value";
 
-    let violation_condition = super::thresholds::violation_condition(
-        val_expr,
-        "t.warning_min",
-        "t.warning_max",
-        "t.alarm_min",
-        "t.alarm_max",
-        min_severity,
-    );
-    let sev_case = super::thresholds::severity_case(
-        val_expr,
-        "t.warning_min",
-        "t.warning_max",
-        "t.alarm_min",
-        "t.alarm_max",
-    );
+    // The violation filter and severity ladder are spliced into each cadence arm over that arm's
+    // own value expression, so the filter stays inside the index scan rather than above the union.
+    let arm_predicates = |val_expr: &str| {
+        (
+            super::thresholds::violation_condition(
+                val_expr,
+                "t.warning_min",
+                "t.warning_max",
+                "t.alarm_min",
+                "t.alarm_max",
+                min_severity,
+            ),
+            super::thresholds::severity_case(
+                val_expr,
+                "t.warning_min",
+                "t.warning_max",
+                "t.alarm_min",
+                "t.alarm_max",
+            ),
+        )
+    };
+    let (violation_cont, sev_cont) = arm_predicates("COALESCE(r.calibrated_value, r.raw_value)");
+    let (violation_spot, sev_spot) = arm_predicates("sp.value");
 
     // The single resolution definition (site → global → parameter default), scoped to this site and
     // spliced as the threshold CTE. Param ids are inlined in the rendered CTE, so the outer query
@@ -203,35 +210,49 @@ pub async fn get_site_alarms(
     let resolved_cte =
         super::thresholds::resolve_thresholds_sql(Some(site.id), Some(alarm_param_ids));
 
-    // `served` collapses a replicate group to the one row the site serves at that instant.
-    // `(stream_id, time)` is the readings primary key minus the replicate index, and nothing
-    // renumbers that index, so a group need not contain index 0. Flagged rows are kept: an
-    // out-of-range value should keep alerting after someone flags it, and they are ordered last
-    // only so that flagging one replicate cannot change which row the instant is served by.
+    // Each arm is what the site serves for that cadence, filtered to violations inside the arm.
+    // Continuous and derived rows live at replicate_index 0, kept when flagged: an out-of-range
+    // value should keep alerting after someone flags it. A spot instant is the replicate group
+    // `(stream_id, time)`, evaluated at the sample mean over its unflagged replicates (fallback:
+    // the lowest unflagged replicate's own value when no sample row exists), so flagging a bad
+    // replicate moves the evaluated value instead of hiding the instant or handing it to a
+    // different replicate. A fully flagged group is not evaluated.
     let sql = format!(
         r"
-        WITH resolved_thresholds AS ({resolved_cte}),
-        served AS (
-            SELECT DISTINCT ON (r.stream_id, r.time)
-                r.parameter_id,
-                r.time,
-                COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value
+        WITH resolved_thresholds AS ({resolved_cte})
+        SELECT sv.parameter_id, sv.time, sv.value, sv.severity FROM (
+            SELECT r.parameter_id, r.time,
+                   COALESCE(r.calibrated_value, r.raw_value) AS value,
+                   ({sev_cont})::smallint AS severity
             FROM readings r
-            LEFT JOIN samples smp ON smp.id = r.sample_id
+            JOIN resolved_thresholds t ON r.parameter_id = t.parameter_id
             WHERE r.site_id = $1
               AND r.time >= $2
               AND r.time <= $3
-              AND r.parameter_id IN (SELECT parameter_id FROM resolved_thresholds)
-            ORDER BY r.stream_id, r.time, (r.is_flagged IS TRUE), r.replicate_index
-        )
-        SELECT
-            sv.parameter_id,
-            sv.time,
-            sv.value AS value,
-            ({sev_case})::smallint as severity
-        FROM served sv
-        JOIN resolved_thresholds t ON sv.parameter_id = t.parameter_id
-        WHERE {violation_condition}
+              AND r.measurement_type IS DISTINCT FROM 'spot'
+              AND r.replicate_index = 0
+              AND {violation_cont}
+            UNION ALL
+            SELECT sp.parameter_id, sp.time, sp.value,
+                   ({sev_spot})::smallint AS severity
+            FROM (
+                SELECT DISTINCT ON (r.stream_id, r.time)
+                    r.parameter_id,
+                    r.time,
+                    COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value
+                FROM readings r
+                LEFT JOIN samples smp ON smp.id = r.sample_id
+                WHERE r.site_id = $1
+                  AND r.time >= $2
+                  AND r.time <= $3
+                  AND r.parameter_id IN (SELECT parameter_id FROM resolved_thresholds)
+                  AND r.measurement_type = 'spot'
+                  AND r.is_flagged IS NOT TRUE
+                ORDER BY r.stream_id, r.time, r.replicate_index
+            ) sp
+            JOIN resolved_thresholds t ON sp.parameter_id = t.parameter_id
+            WHERE {violation_spot}
+        ) sv
         ORDER BY sv.time, sv.parameter_id
         "
     );
@@ -349,18 +370,34 @@ async fn empty_violations(
     .await
 }
 
-/// Cadence lens for readings queries: the grab (spot) series or everything else
-/// (continuous and derived; NULL reads as continuous).
-pub(crate) fn cadence_predicate(spot: bool) -> &'static str {
-    if spot {
-        "r.measurement_type = 'spot'"
-    } else {
-        "r.measurement_type IS DISTINCT FROM 'spot'"
-    }
-}
-
 pub(crate) fn cadence_label(spot: bool) -> &'static str {
     if spot { "spot" } else { "continuous" }
+}
+
+/// Correlated subquery body for the latest served value at one slot, columns `value` and `time`.
+/// Continuous and derived rows live at replicate_index 0 and stay when flagged: an out-of-range
+/// value keeps alerting after someone flags it. A spot instant is evaluated at the sample mean
+/// over its unflagged replicates (fallback: the lowest unflagged replicate's own value when no
+/// sample row exists), so flagging a bad replicate moves the evaluated value instead of hiding
+/// the instant or handing it to a different replicate; a fully flagged group is skipped.
+pub(crate) fn latest_served_sql(spot: bool, site_col: &str, param_col: &str) -> String {
+    if spot {
+        format!(
+            "SELECT COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value, r.time \
+             FROM readings r LEFT JOIN samples smp ON smp.id = r.sample_id \
+             WHERE r.site_id = {site_col} AND r.parameter_id = {param_col} \
+               AND r.measurement_type = 'spot' AND r.is_flagged IS NOT TRUE \
+             ORDER BY r.time DESC, r.replicate_index LIMIT 1"
+        )
+    } else {
+        format!(
+            "SELECT COALESCE(r.calibrated_value, r.raw_value) AS value, r.time \
+             FROM readings r \
+             WHERE r.site_id = {site_col} AND r.parameter_id = {param_col} \
+               AND r.measurement_type IS DISTINCT FROM 'spot' AND r.replicate_index = 0 \
+             ORDER BY r.time DESC LIMIT 1"
+        )
+    }
 }
 
 /// Row from the active alarms query
@@ -413,8 +450,6 @@ pub(crate) async fn fetch_active_alarm_rows(
     // The single resolution definition across all active slots (no scope), spliced as the CTE.
     let resolved_cte = super::thresholds::resolve_thresholds_sql(None, None);
 
-    let cadence = cadence_predicate(spot);
-
     // Bind params are appended in order: optional project scope, then optional (site, parameter)
     // slot pairs. `next` tracks the next `$N` placeholder.
     let mut values: Vec<sea_orm::Value> = Vec::new();
@@ -439,14 +474,9 @@ pub(crate) async fn fetch_active_alarm_rows(
 
     // Loose index scan: one `ORDER BY time DESC LIMIT 1` per active slot via
     // `idx_readings_site_param_time`, instead of a `DISTINCT ON` over the whole hypertable. Cost is
-    // O(active slots), independent of history depth.
-    //
-    // Ordering by replicate index keeps the "latest value" deterministic when grab replicates share
-    // a timestamp, matching episodes. It is a tie-break, not a filter: nothing renumbers
-    // `replicate_index`, so a group need not contain index 0. Flagged readings deliberately still
-    // drive alarms (divergent from aggregates/samples, which exclude them): an out-of-range value
-    // should keep alerting even after someone flags it, and they sort last only so that flagging
-    // one replicate cannot change which row the instant is served by.
+    // O(active slots), independent of history depth. The lateral body carries the per-cadence
+    // serving rule (see `latest_served_sql`).
+    let latest = latest_served_sql(spot, "rt.site_id", "rt.parameter_id");
     let sql = format!(
         r"
         WITH resolved_thresholds AS ({resolved_cte})
@@ -468,15 +498,7 @@ pub(crate) async fn fetch_active_alarm_rows(
             ON sp.site_id = rt.site_id
             AND sp.parameter_id = rt.parameter_id
             AND sp.is_active = true
-        CROSS JOIN LATERAL (
-            SELECT COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value, r.time
-            FROM readings r
-            LEFT JOIN samples smp ON smp.id = r.sample_id
-            WHERE r.site_id = rt.site_id AND r.parameter_id = rt.parameter_id
-              AND {cadence}
-            ORDER BY r.time DESC, (r.is_flagged IS TRUE), r.replicate_index
-            LIMIT 1
-        ) lr
+        CROSS JOIN LATERAL ({latest}) lr
         WHERE {violation}
         {project_filter}
         {slot_filter}

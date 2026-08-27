@@ -48,7 +48,7 @@ pub async fn evaluate_alarm_episodes(
     }
 
     let sev_case = severity_case(
-        "COALESCE(smp.mean, r.calibrated_value, r.raw_value)",
+        "v",
         "$5::double precision",
         "$6::double precision",
         "$7::double precision",
@@ -132,29 +132,43 @@ async fn fetch_episodes(
     sev_case: &str,
     spot: bool,
 ) -> Result<Vec<EpisodeRow>, sea_orm::DbErr> {
-    let cadence_pred = super::views::cadence_predicate(spot);
-
-    // Per-instant severity, then gaps-and-islands. `ordered` collapses a replicate group to one
-    // row at its lowest replicate index; `(stream_id, time)` is the readings primary key minus
-    // that index, and nothing renumbers it, so a group need not contain index 0. `marked` computes
-    // the LAG/LEAD neighbours;
+    // Per-instant severity, then gaps-and-islands. `ordered` is the served series for the
+    // cadence: continuous and derived rows live at replicate_index 0 and stay when flagged (an
+    // out-of-range value keeps alerting); a spot instant is the replicate group `(stream_id,
+    // time)`, evaluated at the sample mean over its unflagged replicates (fallback: the lowest
+    // unflagged replicate's own value when no sample row exists), so a fully flagged group is
+    // skipped. `scored` applies the severity ladder; `marked` computes the LAG/LEAD neighbours;
     // `runs` then cumulatively sums the run-start flag (a window function can't be nested inside
     // another, so these must be separate CTEs). `run_id` increments at each breach that follows a
     // non-breach, so all consecutive breaching readings share one id. `next_t`/`next_v` from the
     // run's last row is the following in-range reading (NULL when the run reaches the window edge).
+    let ordered = if spot {
+        r"SELECT sp.t, sp.v FROM (
+              SELECT DISTINCT ON (r.stream_id, r.time)
+                     r.time AS t,
+                     COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS v
+              FROM readings r
+              LEFT JOIN samples smp ON smp.id = r.sample_id
+              WHERE r.site_id = $1 AND r.parameter_id = $2
+                AND r.time >= $3 AND r.time <= $4
+                AND r.measurement_type = 'spot'
+                AND r.is_flagged IS NOT TRUE
+              ORDER BY r.stream_id, r.time, r.replicate_index
+          ) sp"
+    } else {
+        r"SELECT r.time AS t,
+                 COALESCE(r.calibrated_value, r.raw_value) AS v
+          FROM readings r
+          WHERE r.site_id = $1 AND r.parameter_id = $2
+            AND r.time >= $3 AND r.time <= $4
+            AND r.measurement_type IS DISTINCT FROM 'spot'
+            AND r.replicate_index = 0"
+    };
     let sql = format!(
         r"
-        WITH ordered AS (
-            SELECT DISTINCT ON (r.stream_id, r.time)
-                   r.time AS t,
-                   COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS v,
-                   {sev_case} AS sev
-            FROM readings r
-            LEFT JOIN samples smp ON smp.id = r.sample_id
-            WHERE r.site_id = $1 AND r.parameter_id = $2
-              AND r.time >= $3 AND r.time <= $4
-              AND {cadence_pred}
-            ORDER BY r.stream_id, r.time, (r.is_flagged IS TRUE), r.replicate_index
+        WITH ordered AS ({ordered}),
+        scored AS (
+            SELECT t, v, {sev_case} AS sev FROM ordered
         ),
         marked AS (
             SELECT t, v, sev,
@@ -162,7 +176,7 @@ async fn fetch_episodes(
                    CASE WHEN sev > 0 AND COALESCE(LAG(sev) OVER w, 0) = 0 THEN 1 ELSE 0 END AS run_start,
                    LEAD(t) OVER w AS next_t,
                    LEAD(v) OVER w AS next_v
-            FROM ordered
+            FROM scored
             WINDOW w AS (ORDER BY t)
         ),
         runs AS (
