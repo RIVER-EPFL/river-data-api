@@ -106,6 +106,7 @@ pub fn bound_sql(a: &str, b: &str, rel_bind: &str, abs_tol: f64) -> String {
 
 /// One replicate group's expectation, as the portal stored it.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GroupAudit {
     pub time: DateTime<Utc>,
     /// The portal's precomputed mean for this instant. NULL portal cell = None: nothing to check.

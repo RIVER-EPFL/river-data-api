@@ -281,7 +281,6 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
             json!({
                 "parameter_id": parameter_id,
                 "sensor_id": sensor_id,
-                "calibration_id": curve_id,
                 "time": at,
                 "value": value,
                 "replicate_index": i as i16,

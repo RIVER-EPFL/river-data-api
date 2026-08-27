@@ -24,6 +24,7 @@ use crate::routes::private::sensors::standard_curves;
 use crate::routes::private::{data_streams, readings, readings::status_events};
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IngestReadingsRequest {
     pub stream_id: Uuid,
     pub readings: Vec<IngestReading>,
@@ -47,6 +48,7 @@ pub struct IngestReadingsRequest {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IngestReading {
     pub time: chrono::DateTime<Utc>,
     pub raw_value: f64,
@@ -799,12 +801,14 @@ fn ingest_outcome(
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IngestStatusEventsRequest {
     pub stream_id: Uuid,
     pub events: Vec<IngestStatusEvent>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IngestStatusEvent {
     pub time: chrono::DateTime<Utc>,
     pub value: String,

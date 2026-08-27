@@ -8,12 +8,15 @@ pub mod engine;
 pub mod scripts;
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, State},
 };
+use sea_orm::ConnectionTrait;
 use serde::Serialize;
+use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::middleware::AuthContext;
 use crate::error::AppResult;
 use engine::{ToolDescriptor, ToolVersionRef};
 
@@ -33,6 +36,9 @@ pub struct ToolResult {
     /// The exact script version and runtime that produced these numbers; goes into the
     /// provenance blob on save.
     pub tool_version: ToolVersionRef,
+    /// The stored `tool_runs` row for this calculation. A grab save names it as `tool_run_id`
+    /// and the server builds the provenance blob from that row, never from the client.
+    pub run_id: Uuid,
 }
 
 /// List the active analytical tools with their full input/output manifests.
@@ -75,19 +81,54 @@ pub async fn list_tools(State(state): State<AppState>) -> AppResult<Json<Vec<Too
 )]
 pub async fn calculate_tool(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(tool_name): Path<String>,
     body: axum::body::Bytes,
 ) -> AppResult<Json<ToolResult>> {
     let tool = engine::find_active_tool(&state.db, &tool_name).await?;
     let outcome = engine::run_active_tool(&state, &tool, &body).await?;
     let runtime = engine::runner_runtime(&state).await;
+    let tool_version = tool.version_ref(runtime.as_ref());
+    let results = serde_json::Value::Object(outcome.results);
+    let constants = serde_json::Value::Object(outcome.constants);
+
+    // The run row is written before the results are handed out: a save references the row, the
+    // provenance blob is built from it, and every claim in the blob predates the save. The stored
+    // inputs are the request as validated (the engine has already refused unknown fields).
+    let inputs: serde_json::Value = serde_json::from_slice(&body)
+        .ok()
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let run_id = Uuid::new_v4();
+    state
+        .db
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO tool_runs (id, tool_name, tool_version, inputs, constants, curves, \
+             outputs, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            [
+                run_id.into(),
+                tool.name.clone().into(),
+                serde_json::to_value(&tool_version)
+                    .unwrap_or(serde_json::Value::Null)
+                    .into(),
+                inputs.into(),
+                constants.clone().into(),
+                serde_json::Value::Array(outcome.curves.clone()).into(),
+                results.clone().into(),
+                scripts::actor_label(&auth).into(),
+            ],
+        ))
+        .await?;
+
     Ok(Json(ToolResult {
         tool: tool.name.clone(),
-        results: serde_json::Value::Object(outcome.results),
+        results,
         inputs_used: outcome.inputs_used,
         inputs_ignored: outcome.inputs_ignored,
-        constants: serde_json::Value::Object(outcome.constants),
+        constants,
         curves: outcome.curves,
-        tool_version: tool.version_ref(runtime.as_ref()),
+        tool_version,
+        run_id,
     }))
 }

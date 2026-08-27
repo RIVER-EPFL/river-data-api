@@ -10,6 +10,13 @@ use serial_test::serial;
 #[tokio::test]
 #[serial]
 async fn grab_replicates_aggregate_then_tool_result_saved_to_station() {
+    if !crate::common::tools_runner::require_runner_or_skip(
+        "grab_replicates_aggregate_then_tool_result_saved_to_station",
+    )
+    .await
+    {
+        return;
+    }
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;

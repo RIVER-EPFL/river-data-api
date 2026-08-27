@@ -1158,6 +1158,7 @@ pub async fn grab(state: &AppState, scope: &AccessScope, args: &str, sub: &str) 
             time: now,
             replicate_index: None,
             standard_curve_id: None,
+            output: None,
         })
         .collect();
     let req = GrabSampleRequest {
@@ -1167,13 +1168,30 @@ pub async fn grab(state: &AppState, scope: &AccessScope, args: &str, sub: &str) 
         notes: None,
         mode: None,
         dry_run: false,
-        provenance: None,
+        tool_run_id: None,
         readings,
+    };
+
+    // The same live-resolved identity, in AuthContext form for the handler's actor stamping. The
+    // bot never saves tool runs, so only the identity matters here.
+    let auth = crate::common::middleware::AuthContext::Keycloak {
+        roles: Vec::new(),
+        sub: sub.to_string(),
+        email: None,
+        email_verified: false,
+        grants: std::sync::Arc::new(std::collections::HashSet::new()),
     };
 
     // The Telegram user's authority was resolved live (anti-backdoor) and gated to River level in the
     // router; the write is confined to the caller's project scope, exactly like HTTP `/grab_samples`.
-    match insert_grab_samples(State(state.clone()), ProjectScope(scope.clone()), Json(req)).await {
+    match insert_grab_samples(
+        State(state.clone()),
+        axum::Extension(auth),
+        ProjectScope(scope.clone()),
+        Json(req),
+    )
+    .await
+    {
         Ok(Json(resp)) => {
             let mut reply = format!(
                 "✅ Recorded {} value(s) for {site_name} / {param_name}.",

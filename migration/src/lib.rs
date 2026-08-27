@@ -78,6 +78,7 @@ mod m20260820_000003_audit_hold_resolutions;
 mod m20260821_000001_audit_hold_deferred;
 mod m20260821_000002_audit_hold_resolution;
 mod m20260827_000001_spot_partial_indexes;
+mod m20260827_000002_tool_runs;
 
 pub struct Migrator;
 
@@ -161,6 +162,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260821_000001_audit_hold_deferred::Migration),
             Box::new(m20260821_000002_audit_hold_resolution::Migration),
             Box::new(m20260827_000001_spot_partial_indexes::Migration),
+            Box::new(m20260827_000002_tool_runs::Migration),
         ]
     }
 }

@@ -27,7 +27,24 @@ use crate::routes::private::readings::batch::{ConflictMode, admission};
 use crate::routes::private::sensors::operations::{ResolvedOwner, resolve_slot_owner_for_times};
 use crate::routes::resolve_site_with_project;
 
+/// What the file's numbers are, deciding whether the import may claim a correction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CsvValueState {
+    /// Uncorrected instrument output: the deployment's calibration covering each row's time is
+    /// stamped and applied, exactly as if the rows had arrived through `/ingest`.
+    Raw,
+    /// Already-processed numbers (a result sheet, a portal export). Stored as served: no
+    /// calibration id is stamped and nothing recomputes them, because a stored calibration id
+    /// claims `raw_value` is the uncorrected input, which these rows are not. The default:
+    /// an uncorrected import left uncorrected is visible and repairable, a corrected import
+    /// corrected again is silent corruption.
+    #[default]
+    Corrected,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ImportCsvRequest {
     /// Target site, by UUID or case-insensitive name.
     pub site: String,
@@ -58,6 +75,10 @@ pub struct ImportCsvRequest {
     /// declaration, then the owning sensor's data_frequency.
     #[serde(default)]
     pub measurement_type: Option<String>,
+    /// Whether the file holds raw instrument output or already-processed values. Defaults to
+    /// `corrected`: no calibration is stamped or applied unless the caller declares the rows raw.
+    #[serde(default)]
+    pub values: CsvValueState,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -675,8 +696,14 @@ pub async fn import_csv(
                 parameter_id: *parameter_id,
                 time: *time,
                 raw_value: *value,
+                // Sensor and deployment are physical facts about the slot at that time and stay
+                // stamped either way; the calibration is a claim the row's value is uncorrected
+                // input, which only a declared-raw import may make.
                 sensor_id: owner.sensor_id,
-                calibration_id: owner.calibration_id,
+                calibration_id: match req.values {
+                    CsvValueState::Raw => owner.calibration_id,
+                    CsvValueState::Corrected => None,
+                },
                 deployment_id: owner.deployment_id,
             }
         })

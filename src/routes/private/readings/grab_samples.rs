@@ -1,5 +1,5 @@
 use axum::{Json, extract::State};
-use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
@@ -23,6 +23,7 @@ const GRAB_MEASUREMENT_TYPE: &str = "spot";
 const GRAB_IS_A_COLLECTION_EVENT: bool = true;
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GrabSampleRequest {
     pub site_id: Uuid,
     pub created_by: Option<String>,
@@ -36,13 +37,13 @@ pub struct GrabSampleRequest {
     /// Compute the preview and report existing groups without writing anything.
     #[serde(default)]
     pub dry_run: bool,
-    /// Provenance of a save made from an analytical tool, stamped verbatim onto every samples
-    /// row this request touches: tool + script version, the raw calculation inputs, resolved
-    /// constants and curve coefficients, the full output map, and which outputs were saved to
-    /// which parameters. A `run_id` is added when absent so the rows of one run stay groupable.
+    /// The `tool_runs` row these readings came from (returned by `/tools/{name}/calculate` as
+    /// `run_id`). The server builds the provenance blob from that row, so the blob's inputs,
+    /// constants, curves and outputs are what the engine resolved, its actor is the calculating
+    /// user, and a save cannot claim a run it did not make: every reading must name one of the
+    /// run's outputs and carry that output's value.
     #[serde(default)]
-    #[schema(value_type = Object)]
-    pub provenance: Option<serde_json::Value>,
+    pub tool_run_id: Option<Uuid>,
     pub readings: Vec<GrabSampleReading>,
 }
 
@@ -53,6 +54,7 @@ pub enum GrabWriteMode {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GrabSampleReading {
     pub parameter_id: Uuid,
     pub sensor_id: Option<Uuid>,
@@ -60,6 +62,11 @@ pub struct GrabSampleReading {
     pub time: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub replicate_index: Option<i16>,
+    /// The named output of the referenced tool run this reading stores. Required on every reading
+    /// when the request carries `tool_run_id`, refused otherwise; the reading's `value` must be
+    /// the run's value for that output.
+    #[serde(default)]
+    pub output: Option<String>,
     /// The standard curve the operator fitted for this measurement, typically per microplate. It is
     /// applied on top of the instrument's base calibration, which the server resolves from the
     /// sensor's windows at `time`. The stored row carries the measured `raw_value`, both curve
@@ -438,6 +445,125 @@ async fn auto_create_samples(
     Ok((sample_map, created))
 }
 
+/// Whether `value` is the output's value: the scalar itself, or one of the numeric leaves of a
+/// replicate-shaped output. Exact equality on purpose: the numbers travelled through JSON at full
+/// precision, so an edited value is a different number and the tool link it claims is not true.
+fn output_carries_value(output: &serde_json::Value, value: f64) -> bool {
+    match output {
+        serde_json::Value::Number(n) => n.as_f64() == Some(value),
+        serde_json::Value::Array(items) => items.iter().any(|v| output_carries_value(v, value)),
+        serde_json::Value::Object(map) => map.values().any(|v| output_carries_value(v, value)),
+        _ => false,
+    }
+}
+
+/// The server-built provenance blob for a save that names a tool run, `None` for a manual entry.
+///
+/// The blob is constructed from the stored `tool_runs` row, never from the request: the run's
+/// inputs, constants, curves and outputs are what the engine resolved at calculate time, the
+/// calculating actor and timestamp were stamped then, and the saving actor is the caller here.
+/// Fail-closed on the link itself: every reading must name one of the run's outputs and carry
+/// that output's value, so a save cannot claim a run it did not use. A run that consumed a
+/// standard curve produced corrected outputs, so any reading carrying `standard_curve_id` is
+/// refused (ADR 0003: a stored curve id means raw in, curve out — stamping one here would apply
+/// the correction twice).
+async fn resolve_tool_run_provenance(
+    db: &DatabaseConnection,
+    tool_run_id: Option<Uuid>,
+    readings: &[GrabSampleReading],
+    saved_by: &str,
+) -> Result<Option<serde_json::Value>, AppError> {
+    let Some(run_id) = tool_run_id else {
+        if let Some(r) = readings.iter().find(|r| r.output.is_some()) {
+            return Err(AppError::BadRequest(format!(
+                "Reading for parameter {} names tool output '{}' but the request carries no \
+                 tool_run_id",
+                r.parameter_id,
+                r.output.as_deref().unwrap_or_default()
+            )));
+        }
+        return Ok(None);
+    };
+
+    let row = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT tool_name, tool_version, inputs, constants, curves, outputs, created_by, \
+             created_at FROM tool_runs WHERE id = $1",
+            [run_id.into()],
+        ))
+        .await?
+        .ok_or_else(|| AppError::BadRequest(format!("Tool run {run_id} does not exist")))?;
+
+    let tool_name: String = row.try_get("", "tool_name").map_err(AppError::Database)?;
+    let tool_version: serde_json::Value =
+        row.try_get("", "tool_version").map_err(AppError::Database)?;
+    let inputs: serde_json::Value = row.try_get("", "inputs").map_err(AppError::Database)?;
+    let constants: serde_json::Value = row.try_get("", "constants").map_err(AppError::Database)?;
+    let curves: serde_json::Value = row.try_get("", "curves").map_err(AppError::Database)?;
+    let outputs: serde_json::Value = row.try_get("", "outputs").map_err(AppError::Database)?;
+    let calculated_by: String = row.try_get("", "created_by").map_err(AppError::Database)?;
+    let calculated_at: chrono::DateTime<chrono::Utc> = row
+        .try_get::<chrono::DateTime<chrono::FixedOffset>>("", "created_at")
+        .map_err(AppError::Database)?
+        .with_timezone(&chrono::Utc);
+
+    let run_applied_curves = curves.as_array().is_some_and(|c| !c.is_empty());
+    let mut saved: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    for r in readings {
+        let Some(output) = r.output.as_deref() else {
+            return Err(AppError::BadRequest(format!(
+                "Reading for parameter {} at {} does not name the tool output it stores; every \
+                 reading of a tool-run save must",
+                r.parameter_id, r.time
+            )));
+        };
+        let Some(output_value) = outputs.get(output) else {
+            return Err(AppError::BadRequest(format!(
+                "'{output}' is not an output of this {tool_name} run"
+            )));
+        };
+        if !output_carries_value(output_value, r.value) {
+            return Err(AppError::BadRequest(format!(
+                "Value {} is not what this {tool_name} run produced for '{output}'; the \
+                 provenance would claim a number the tool did not compute",
+                r.value
+            )));
+        }
+        if run_applied_curves && r.standard_curve_id.is_some() {
+            return Err(AppError::BadRequest(format!(
+                "'{output}' was computed with a standard curve already applied; stamping \
+                 standard_curve_id would have the correction applied twice"
+            )));
+        }
+        match saved.get(output) {
+            Some(existing) if existing != &serde_json::json!(r.parameter_id) => {
+                return Err(AppError::BadRequest(format!(
+                    "Output '{output}' is saved to two different parameters in one request"
+                )));
+            }
+            _ => {
+                saved.insert(output.to_string(), serde_json::json!(r.parameter_id));
+            }
+        }
+    }
+
+    Ok(Some(serde_json::json!({
+        "tool": tool_name,
+        "tool_version": tool_version,
+        "inputs": inputs,
+        "constants": constants,
+        "curves": curves,
+        "outputs": outputs,
+        "saved": saved,
+        "run_id": run_id,
+        "calculated_by": calculated_by,
+        "calculated_at": calculated_at,
+        "saved_by": saved_by,
+        "saved_at": chrono::Utc::now(),
+    })))
+}
+
 /// Insert field-collected grab sample readings (manual measurements with replicate sets).
 /// Each request creates one Sample aggregate per parameter and uses dedicated "grab_sample"
 /// streams. Requires `write_data`.
@@ -453,6 +579,7 @@ async fn auto_create_samples(
 )]
 pub async fn insert_grab_samples(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     ProjectScope(scope): ProjectScope,
     Json(payload): Json<GrabSampleRequest>,
 ) -> AppResult<Json<GrabSampleResponse>> {
@@ -500,6 +627,14 @@ pub async fn insert_grab_samples(
     // Replicate indices, both curves and the served value are computed before anything is
     // written, so the same numbers serve the dry-run preview, the conflict report and the write.
     let indices = assign_replicate_indices(&payload.readings)?;
+
+    let provenance = resolve_tool_run_provenance(
+        &state.db,
+        payload.tool_run_id,
+        &payload.readings,
+        &crate::routes::private::tools::scripts::actor_label(&auth),
+    )
+    .await?;
 
     // The chosen standard curves, admitted by the one rule every writer of `standard_curve_id`
     // uses. A grab is spot by construction, so the only claims this path can be refused for are an
@@ -680,13 +815,6 @@ pub async fn insert_grab_samples(
 
     // The blob is stamped on every samples row this request touches; a run_id groups them back
     // into one tool run when the caller did not mint one itself.
-    let provenance = payload.provenance.clone().map(|mut p| {
-        if let Some(obj) = p.as_object_mut() {
-            obj.entry("run_id")
-                .or_insert_with(|| serde_json::json!(Uuid::new_v4()));
-        }
-        p
-    });
 
     // One guarded transaction: a replace on a compressed chunk must not fail on the cap, and the
     // delete, the sample rows and the insert land together or not at all.

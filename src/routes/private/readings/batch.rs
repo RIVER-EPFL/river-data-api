@@ -433,6 +433,7 @@ pub enum ConflictMode {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BatchReadingsRequest {
     pub readings: Vec<ReadingInput>,
     /// Behaviour on (stream_id, time, replicate_index) collisions. Defaults to `skip`.
@@ -441,6 +442,7 @@ pub struct BatchReadingsRequest {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReadingInput {
     pub site_id: Uuid,
     pub parameter_id: Uuid,

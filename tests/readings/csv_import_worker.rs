@@ -520,6 +520,7 @@ async fn grab_row(db: &DatabaseConnection) -> (Option<f64>, Option<Uuid>, Option
     )
 }
 
+/// Declared raw: these tests are about what the slot's calibration does to uncorrected input.
 async fn import_grab_csv(app: &axum::Router, token: &str) {
     let (status, resp) = crate::common::post_json_parse_with_token(
         app,
@@ -528,6 +529,7 @@ async fn import_grab_csv(app: &axum::Router, token: &str) {
             "site": crate::common::SITE1_ID,
             "csv": CSV_GRAB,
             "measurement_type": "spot",
+            "values": "raw",
         }),
         token,
     )
@@ -705,7 +707,7 @@ async fn an_overwrite_recomputes_from_the_calibration_the_row_carries() {
     import_csv(
         &app,
         &token,
-        &serde_json::json!({ "site": crate::common::SITE1_ID, "csv": CSV_DO_AT }),
+        &serde_json::json!({ "site": crate::common::SITE1_ID, "csv": CSV_DO_AT, "values": "raw" }),
     )
     .await;
     poll_count(

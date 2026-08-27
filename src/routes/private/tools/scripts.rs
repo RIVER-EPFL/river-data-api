@@ -25,7 +25,7 @@ use crate::error::{AppError, AppResult};
 /// Who the audit columns record. Taken from the authenticated caller, never from the request:
 /// a self-asserted author or activator is not a trail. These routes are Administrator-only, so
 /// the token arm exists for exhaustiveness rather than for a caller that can arrive here.
-fn actor_label(auth: &AuthContext) -> String {
+pub(crate) fn actor_label(auth: &AuthContext) -> String {
     match auth {
         AuthContext::Keycloak { email: Some(e), .. } => e.clone(),
         AuthContext::Keycloak { sub, .. } => sub.clone(),
