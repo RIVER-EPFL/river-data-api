@@ -13,4 +13,6 @@ mod pagination;
 mod pagination_bounds;
 mod pairing_plan_apply;
 mod pairing_plan_hardening;
+mod replicate_audit;
+mod replicate_flag_indexes;
 mod routes_surface;

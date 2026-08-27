@@ -62,6 +62,11 @@ mod m20260814_000004_telegram_link_expiry;
 mod m20260817_000001_telegram_command_audit;
 mod m20260817_000002_scrub_telegram_urls;
 mod m20260817_000003_telegram_attestation;
+mod m20260820_000001_standard_curve_provenance;
+mod m20260820_000002_replicate_audit_holds;
+mod m20260820_000003_audit_hold_resolutions;
+mod m20260821_000001_audit_hold_deferred;
+mod m20260821_000002_audit_hold_resolution;
 
 pub struct Migrator;
 
@@ -132,6 +137,11 @@ impl MigratorTrait for Migrator {
             Box::new(m20260817_000001_telegram_command_audit::Migration),
             Box::new(m20260817_000002_scrub_telegram_urls::Migration),
             Box::new(m20260817_000003_telegram_attestation::Migration),
+            Box::new(m20260820_000001_standard_curve_provenance::Migration),
+            Box::new(m20260820_000002_replicate_audit_holds::Migration),
+            Box::new(m20260820_000003_audit_hold_resolutions::Migration),
+            Box::new(m20260821_000001_audit_hold_deferred::Migration),
+            Box::new(m20260821_000002_audit_hold_resolution::Migration),
         ]
     }
 }

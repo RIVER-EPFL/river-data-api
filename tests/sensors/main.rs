@@ -9,4 +9,5 @@ mod common;
 mod import_adopt_swap_lifecycle;
 mod multi_parameter_channel;
 mod read_endpoints;
+mod standard_curve_register;
 mod swap_reattributes;

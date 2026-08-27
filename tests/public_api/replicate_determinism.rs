@@ -1,6 +1,6 @@
-//! Public readings must serve one deterministic value for a replicated timestamp: only
-//! replicate_index 0 rows are selected and a replicate group's point value is its sample mean,
-//! matching the private endpoint.
+//! Public readings must serve one deterministic value for a replicated timestamp: one row per
+//! instant is selected and a replicate group's point value is its sample mean, matching the
+//! private endpoint.
 //!
 //! Run: cargo test --test public_api -- --test-threads=1
 

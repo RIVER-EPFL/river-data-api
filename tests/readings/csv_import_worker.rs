@@ -371,7 +371,7 @@ async fn csv_import_triplicate_rows_form_sample_and_reimport_is_idempotent() {
         ),
     )
     .await;
-    assert_eq!(readings_after, 3, "no renumbered duplicates on re-import");
+    assert_eq!(readings_after, 3, "no duplicate rows on re-import");
 
     let samples_after = scalar_i64(
         &db,

@@ -134,7 +134,10 @@ async fn fetch_episodes(
 ) -> Result<Vec<EpisodeRow>, sea_orm::DbErr> {
     let cadence_pred = super::views::cadence_predicate(spot);
 
-    // Per-reading severity, then gaps-and-islands. `marked` computes the LAG/LEAD neighbours;
+    // Per-instant severity, then gaps-and-islands. `ordered` collapses a replicate group to one
+    // row at its lowest replicate index; `(stream_id, time)` is the readings primary key minus
+    // that index, and nothing renumbers it, so a group need not contain index 0. `marked` computes
+    // the LAG/LEAD neighbours;
     // `runs` then cumulatively sums the run-start flag (a window function can't be nested inside
     // another, so these must be separate CTEs). `run_id` increments at each breach that follows a
     // non-breach, so all consecutive breaching readings share one id. `next_t`/`next_v` from the
@@ -142,14 +145,16 @@ async fn fetch_episodes(
     let sql = format!(
         r"
         WITH ordered AS (
-            SELECT r.time AS t,
+            SELECT DISTINCT ON (r.stream_id, r.time)
+                   r.time AS t,
                    COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS v,
                    {sev_case} AS sev
             FROM readings r
             LEFT JOIN samples smp ON smp.id = r.sample_id
-            WHERE r.site_id = $1 AND r.parameter_id = $2 AND r.replicate_index = 0
+            WHERE r.site_id = $1 AND r.parameter_id = $2
               AND r.time >= $3 AND r.time <= $4
               AND {cadence_pred}
+            ORDER BY r.stream_id, r.time, (r.is_flagged IS TRUE), r.replicate_index
         ),
         marked AS (
             SELECT t, v, sev,
@@ -256,7 +261,7 @@ pub async fn rebuild_alarm_events(
                 .query_one(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "SELECT MIN(time) AS lo, MAX(time) AS hi FROM readings \
-                     WHERE site_id = $1 AND parameter_id = $2 AND replicate_index = 0",
+                     WHERE site_id = $1 AND parameter_id = $2",
                     [s.into(), p.into()],
                 ))
                 .await?;

@@ -99,15 +99,17 @@ pub async fn get_calibration_window(
         None => sea_orm::Value::ChronoDateTimeWithTimeZone(None),
     };
 
-    // The window is [valid_from, COALESCE(valid_until, 'infinity')).
+    // The window is [valid_from, COALESCE(valid_until, 'infinity')). Both the count and the points
+    // are per instant: `(stream_id, time)` is the readings primary key minus the replicate index,
+    // and nothing renumbers that index, so a group need not contain index 0.
     let mut count_vals: Vec<sea_orm::Value> = vec![sensor_id.into(), vf.clone(), vu.clone()];
     let count_scope = scope_clause(&mut count_vals);
     let count_row = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &format!(
-                r"SELECT COUNT(*) AS c FROM readings
-                  WHERE sensor_id = $1 AND replicate_index = 0
+                r"SELECT COUNT(DISTINCT (stream_id, time)) AS c FROM readings
+                  WHERE sensor_id = $1
                     AND time >= $2
                     AND time < COALESCE($3, 'infinity'::timestamptz){count_scope}"
             ),
@@ -124,11 +126,16 @@ pub async fn get_calibration_window(
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &format!(
-                r"SELECT time, raw_value, calibrated_value, COALESCE(is_flagged, false) AS is_flagged
-                  FROM readings
-                  WHERE sensor_id = $1 AND replicate_index = 0
-                    AND time >= $2
-                    AND time < COALESCE($3, 'infinity'::timestamptz){point_scope}
+                r"SELECT time, raw_value, calibrated_value, is_flagged FROM (
+                      SELECT DISTINCT ON (stream_id, time)
+                             time, raw_value, calibrated_value,
+                             COALESCE(is_flagged, false) AS is_flagged
+                      FROM readings
+                      WHERE sensor_id = $1
+                        AND time >= $2
+                        AND time < COALESCE($3, 'infinity'::timestamptz){point_scope}
+                      ORDER BY stream_id, time, (is_flagged IS TRUE), replicate_index
+                  ) w
                   ORDER BY time DESC
                   LIMIT ${limit_idx}"
             ),

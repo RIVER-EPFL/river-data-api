@@ -137,6 +137,11 @@ pub struct RegisterStreamRequest {
     /// stops pairing minting a second, serial-less instrument alongside the real one.
     #[serde(default)]
     pub sensor_id: Option<Uuid>,
+    /// Declares this stream a replicate family: its readings arrive as replicate_index 0..n-1 per
+    /// instant, one per source column, and form `samples` rows. Validated here (two or more
+    /// unique members, spot classification) and stored under `metadata["replicates"]`.
+    #[serde(default)]
+    pub replicates: Option<super::replicates::ReplicateSpec>,
 }
 
 fn default_metadata() -> serde_json::Value {
@@ -195,7 +200,7 @@ impl From<data_streams::Model> for StreamResponse {
 pub async fn register_stream(
     State(state): State<AppState>,
     ProjectScope(scope): ProjectScope,
-    Json(payload): Json<RegisterStreamRequest>,
+    Json(mut payload): Json<RegisterStreamRequest>,
 ) -> AppResult<Json<StreamResponse>> {
     if let Some(mt) = payload.measurement_type.as_deref()
         && !matches!(mt, "continuous" | "spot" | "derived")
@@ -203,6 +208,10 @@ pub async fn register_stream(
         return Err(AppError::BadRequest(format!(
             "invalid measurement_type '{mt}' (expected continuous, spot, or derived)"
         )));
+    }
+    if let Some(spec) = &payload.replicates {
+        spec.validate(payload.measurement_type.as_deref())?;
+        spec.embed(&mut payload.metadata)?;
     }
     if let Some(sensor_id) = payload.sensor_id {
         validate_declared_sensor(&state.db, &scope, sensor_id, &payload.metadata).await?;
@@ -521,9 +530,6 @@ pub async fn pair_stream(
         .await?
         .rows;
 
-        crate::routes::private::readings::replicates::densify_stream_replicates(txn, &[stream_id])
-            .await?;
-
         // Replicate groups on the newly paired stream (2+ spot readings sharing a timestamp, e.g.
         // migrated NOMIS A/B/C rows) form samples at pairing time. The row-level triggers populate
         // the sample statistics.
@@ -546,6 +552,16 @@ pub async fn pair_stream(
                 stream_id.into(),
                 sensor_ctx.sensor_id.into(),
             ],
+        ))
+        .await?;
+
+        // Audit mismatches recorded while the stream was unpaired become reviewable now that the
+        // data serves a slot.
+        txn.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE replicate_audit_holds SET status = 'pending'
+             WHERE stream_id = $1 AND status = 'deferred'",
+            [stream_id.into()],
         ))
         .await?;
 
@@ -652,6 +668,16 @@ pub async fn unpair_stream(
     // as a tracked job. The slot itself survives; only this stream stops feeding it.
     let cleared = retire_slot(db, SlotScope::Stream(stream_id)).await?.rows;
 
+    // Open reviews lose their reviewer along with the slot; they wait as deferred until the
+    // stream is paired again.
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "UPDATE replicate_audit_holds SET status = 'deferred'
+         WHERE stream_id = $1 AND status = 'pending'",
+        [stream_id.into()],
+    ))
+    .await?;
+
     let updated = data_streams::Entity::find_by_id(stream_id)
         .one(db)
         .await?
@@ -719,9 +745,21 @@ pub async fn retag_streams(
         )));
     }
 
+    // "declared" writes nothing to `data_streams`; it aligns each reading with its own stream's
+    // declaration, which for a family stream is already spot.
     let streams_updated = if req.measurement_type == "declared" {
         0
     } else {
+        if req.measurement_type != "spot" {
+            let families = super::replicates::family_keys_in_streams(
+                &state.db,
+                &req.stream_ids,
+                req.source_system.as_deref(),
+            )
+            .await?;
+            super::replicates::refuse_family_retag(&families, &req.measurement_type)?;
+        }
+
         state
             .db
             .execute(sea_orm::Statement::from_sql_and_values(

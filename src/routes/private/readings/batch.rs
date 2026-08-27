@@ -133,6 +133,11 @@ pub mod admission {
         NonFinite,
         UnknownMeasurementType,
         UnknownCalibration,
+        /// The named standard curve does not exist, was fitted on another instrument, or the
+        /// reading is not a spot measurement. Skipped rather than refused on the cursor-driven
+        /// paths, like `UnknownCalibration`: the claim is wrong for this reading and a retry
+        /// cannot make it right.
+        InvalidStandardCurve,
     }
 
     impl RejectionKind {
@@ -142,6 +147,9 @@ pub mod admission {
                 Self::NonFinite => "value is not a finite number",
                 Self::UnknownMeasurementType => "measurement_type outside the vocabulary",
                 Self::UnknownCalibration => "calibration_id names no calibration",
+                Self::InvalidStandardCurve => {
+                    "standard_curve_id names no curve admissible for this reading"
+                }
             }
         }
     }

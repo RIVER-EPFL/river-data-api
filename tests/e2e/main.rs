@@ -21,6 +21,7 @@ mod pairing_plan_lifecycle;
 mod pairing_wizard_patch_apply;
 mod portal_migration_wizard;
 mod provision_to_public;
+mod replicate_sync_flow;
 mod sensor_backfill_attribution;
 mod sensor_deploy_move_recall;
 mod sensor_ui_lifecycle;

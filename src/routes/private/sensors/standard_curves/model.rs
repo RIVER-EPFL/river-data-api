@@ -37,6 +37,14 @@ pub struct Model {
     /// Who fitted the curve, supplied by the caller as on notes, annotations, samples and pairing
     /// plans. Writable, otherwise the column could never hold anything.
     pub created_by: Option<String>,
+    /// Sync provenance: the source a replicated curve came from (e.g. "cnet"). NULL on
+    /// hand-entered curves. Written only by `/standard_curves/register`, never through CRUD.
+    #[crudcrate(exclude(create, update), filterable)]
+    pub source_system: Option<String>,
+    /// The curve's identity within its source (e.g. "standard_curves:17"); the upsert key of
+    /// `/standard_curves/register` together with `source_system`.
+    #[crudcrate(exclude(create, update), filterable)]
+    pub source_key: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

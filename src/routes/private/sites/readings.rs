@@ -179,7 +179,8 @@ pub struct SiteReadingsQuery {
     /// export. JSON carries the flag arrays whenever `include_flagged` is on, which is the
     /// default, so the export columns need their own opt-in to keep the default header stable.
     pub include_flags: Option<bool>,
-    /// Include replicate readings (default: false). When false, only returns replicate_index = 0.
+    /// Include replicate readings (default: false). When false, a replicate group is returned as
+    /// one row at its lowest unflagged replicate index, carrying the group's sample mean.
     pub include_replicates: Option<bool>,
     /// Filter by sample ID to retrieve replicates for a specific sample.
     pub sample_id: Option<Uuid>,
@@ -573,12 +574,6 @@ pub async fn get_site_readings(
         " AND (r.is_flagged IS NOT TRUE)"
     };
 
-    let replicate_condition = if include_replicates {
-        ""
-    } else {
-        " AND r.replicate_index = 0"
-    };
-
     let sample_id_condition = if let Some(sid) = query.sample_id {
         let idx = values.len() + 1;
         values.push(sid.into());
@@ -587,14 +582,20 @@ pub async fn get_site_readings(
         String::new()
     };
 
-    let order_clause = if include_replicates {
-        "ORDER BY r.parameter_id, r.time, r.replicate_index"
+    // Unless the caller asked for replicates, a group is collapsed to a single served row at the
+    // lowest unflagged replicate index. `(stream_id, time)` is the group: the readings primary key
+    // minus the index. Nothing renumbers `replicate_index`, so a group need not contain index 0.
+    let (distinct_clause, order_clause) = if include_replicates {
+        ("", "ORDER BY r.parameter_id, r.time, r.replicate_index")
     } else {
-        "ORDER BY r.parameter_id, r.time"
+        (
+            "DISTINCT ON (r.stream_id, r.time) ",
+            "ORDER BY r.stream_id, r.time, (r.is_flagged IS TRUE), r.replicate_index",
+        )
     };
 
     let sql = format!(
-        "SELECT {select_clause} FROM {from_clause} WHERE r.site_id = $1 AND r.parameter_id IN ({}){time_conditions}{measurement_type_condition}{flagged_condition}{replicate_condition}{sample_id_condition} {order_clause}",
+        "SELECT {distinct_clause}{select_clause} FROM {from_clause} WHERE r.site_id = $1 AND r.parameter_id IN ({}){time_conditions}{measurement_type_condition}{flagged_condition}{sample_id_condition} {order_clause}",
         placeholders.join(",")
     );
 

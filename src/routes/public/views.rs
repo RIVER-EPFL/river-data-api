@@ -19,10 +19,14 @@ use crate::error::{AppError, AppResult};
 use crate::routes::private::sites::aggregates::resolution_of;
 use crate::routes::public::service::{PublicProjectConfig, PublicSiteConfig, get_public_config};
 
-/// What the public tier treats as this site's data: one canonical row per timestamp, and nothing an
-/// operator has flagged. The site-detail count and the readings query share this predicate so the
-/// count, the series and the rollups cannot disagree about what the site serves.
-const SERVED_READINGS: &str = "r.replicate_index = 0 AND r.is_flagged IS NOT TRUE";
+/// What the public tier treats as this site's data: one row per instant, taken at the lowest
+/// unflagged replicate index, and nothing an operator has flagged. Flagging a replicate therefore
+/// never removes an instant from serving, and which replicate was flagged never changes whether the
+/// instant is served. The instant is `(stream_id, time)`, the readings primary key minus the
+/// replicate index. This predicate and that grouping are shared by the site-detail count and the
+/// readings query so the count, the series and the rollups cannot disagree about what the site
+/// serves.
+const SERVED_READINGS: &str = "r.is_flagged IS NOT TRUE";
 
 // Time Format
 
@@ -261,7 +265,8 @@ pub async fn get_site(
         let placeholders = placeholders_parts.join(", ");
 
         let sql = format!(
-            "SELECT MIN(r.time) AS min_time, MAX(r.time) AS max_time, COUNT(*) AS count \
+            "SELECT MIN(r.time) AS min_time, MAX(r.time) AS max_time, \
+                    COUNT(DISTINCT (r.stream_id, r.time)) AS count \
              FROM readings r \
              WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
                AND {SERVED_READINGS}"
@@ -1027,8 +1032,13 @@ async fn fetch_readings(
         .and_where(Expr::col((r.clone(), Alias::new("site_id"))).eq(site_id))
         .and_where(Expr::cust(SERVED_READINGS))
         .and_where(Expr::col((p.clone(), Alias::new("id"))).is_in(param_ids.clone()))
+        .distinct_on([
+            (r.clone(), Alias::new("stream_id")),
+            (r.clone(), Alias::new("time")),
+        ])
+        .order_by((r.clone(), Alias::new("stream_id")), Order::Asc)
         .order_by((r.clone(), Alias::new("time")), Order::Asc)
-        .order_by((p.clone(), Alias::new("code")), Order::Asc);
+        .order_by((r.clone(), Alias::new("replicate_index")), Order::Asc);
 
     if let Some(s) = start {
         query.and_where(Expr::col((r.clone(), Alias::new("time"))).gte(s));

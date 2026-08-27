@@ -842,8 +842,8 @@ pub async fn preview_derived(
                   FROM readings r
                   LEFT JOIN samples smp ON smp.id = r.sample_id
                   WHERE r.parameter_id = $1 AND r.site_id = $2 AND r.time >= $3 AND r.time <= $4
-                    AND r.replicate_index = 0
-                  ORDER BY r.time ASC, (r.measurement_type IS NOT DISTINCT FROM 'spot') ASC, r.stream_id",
+                  ORDER BY r.time ASC, (r.measurement_type IS NOT DISTINCT FROM 'spot') ASC,
+                           r.stream_id, (r.is_flagged IS TRUE), r.replicate_index",
                 [
                     (*parameter_id).into(),
                     payload.site_id.into(),

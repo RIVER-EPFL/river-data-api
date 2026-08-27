@@ -2,7 +2,6 @@ use axum::{Json, extract::State};
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, Statement,
-    TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -21,6 +20,7 @@ use crate::routes::private::sensors::calibrations::{
 use crate::routes::private::sensors::operations::{
     resolve_slot_owner_for_times, resolve_windows_for_times,
 };
+use crate::routes::private::sensors::standard_curves;
 use crate::routes::private::{data_streams, readings, readings::status_events};
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -32,6 +32,18 @@ pub struct IngestReadingsRequest {
     /// flag state and sample links on the existing row are preserved.
     #[serde(default)]
     pub overwrite: bool,
+    /// The writer declaring these readings collection events: spot replicate groups sharing an
+    /// instant form a `samples` row from the first reading, like `/grab_samples`. Sync-service
+    /// callers only; without it a group still forms a sample once it carries two replicates.
+    #[serde(default)]
+    pub collection: bool,
+    /// Per-instant expectations from the source portal's own precomputed statistics. Each audited
+    /// group's mean/sd is recomputed over the values about to be stored and compared; a
+    /// disagreeing group is admitted and recorded as a `replicate_audit_holds` row for review
+    /// (`pending` when the stream is paired, `deferred` until pairing otherwise). Sync-service
+    /// callers only.
+    #[serde(default)]
+    pub audit: Option<Vec<crate::routes::private::sync::replicate_audit::GroupAudit>>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -47,6 +59,12 @@ pub struct IngestReading {
     /// stream's measurement_type, then the owning sensor's data_frequency.
     #[serde(default)]
     pub measurement_type: Option<String>,
+    /// The lab standard curve that corrects this reading, for sync services replaying portal
+    /// measurements that carried one. Held to the grab rules: the reading must be a spot
+    /// measurement on the instrument the curve was fitted on, and the stored value is recomputed
+    /// from the curve's coefficients. An inadmissible claim skips the reading and is counted.
+    #[serde(default)]
+    pub standard_curve_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -61,6 +79,10 @@ pub struct IngestResponse {
     /// stays a fixed size however large the batch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped_reasons: Vec<String>,
+    /// Always 0: the replicate audit admits every group and records disagreements for review.
+    /// Retained because the sync protocol (`river-data-core`) reports a held count per cycle.
+    #[serde(default)]
+    pub held: usize,
     pub stream_id: Uuid,
     pub paired: bool,
 }
@@ -69,7 +91,9 @@ const BATCH_SIZE: usize = 1000;
 
 /// Batched insert. With `overwrite`, conflicting rows are updated in place on the value
 /// and attribution columns; operator state (is_flagged, flag_reason, sample_id) is never
-/// touched so a correction cannot clear a flag or unlink a sample.
+/// touched so a correction cannot clear a flag or unlink a sample. Without it the conflict is
+/// `Replace::Nothing`, so a resync of the same rows is a no-op: `replicate_index` is the source's
+/// column position and nothing renumbers it, so a replayed reading carries the same primary key.
 async fn insert_reading_chunks<C: ConnectionTrait>(
     conn: &C,
     models: &[readings::ActiveModel],
@@ -129,12 +153,24 @@ pub async fn ingest_readings(
             "overwrite is restricted to sync services".to_string(),
         ));
     }
+    if payload.collection && !is_sync_service {
+        return Err(AppError::Forbidden(
+            "collection is restricted to sync services; grab entry goes through /grab_samples"
+                .to_string(),
+        ));
+    }
+    if payload.audit.is_some() && !is_sync_service {
+        return Err(AppError::Forbidden(
+            "audit is restricted to sync services".to_string(),
+        ));
+    }
 
     if payload.readings.is_empty() {
         return Ok(Json(IngestResponse {
             inserted: 0,
             skipped: 0,
             skipped_reasons: Vec::new(),
+            held: 0,
             stream_id: payload.stream_id,
             paired: false,
         }));
@@ -303,6 +339,74 @@ pub async fn ingest_readings(
         .await?
     };
 
+    // Standard curve claims, held to the grab rules (fitted on the reading's instrument, spot
+    // measurement) but skipped-and-counted rather than refused: a wrong claim stays wrong on
+    // every retry, and refusing the batch would stall the stream's cursor behind it.
+    let standard_curves_by_id: HashMap<Uuid, Curve> = {
+        let mut ids: Vec<Uuid> = payload
+            .readings
+            .iter()
+            .filter_map(|r| r.standard_curve_id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            HashMap::new()
+        } else {
+            let rows = standard_curves::Entity::find()
+                .filter(standard_curves::Column::Id.is_in(ids))
+                .all(db)
+                .await?;
+            let by_id: HashMap<Uuid, &standard_curves::Model> =
+                rows.iter().map(|c| (c.id, c)).collect();
+            payload.readings.retain(|r| {
+                let Some(id) = r.standard_curve_id else {
+                    return true;
+                };
+                let sensor_id = r
+                    .sensor_id
+                    .or(stream.sensor_id)
+                    .or_else(|| slot_owner.get(&r.time).and_then(|o| o.sensor_id));
+                let measurement_type =
+                    crate::routes::private::readings::measurement::resolve_measurement_type(
+                        r.measurement_type.as_deref(),
+                        stream.measurement_type.as_deref(),
+                        sensor_id,
+                        &sensor_types,
+                    );
+                let admissible = by_id
+                    .get(&id)
+                    .is_some_and(|c| Some(c.sensor_id) == sensor_id)
+                    && measurement_type == readings::sample_groups::SPOT;
+                if !admissible {
+                    record_rejection(&mut counts, admission::RejectionKind::InvalidStandardCurve);
+                }
+                admissible
+            });
+            rows.into_iter()
+                .map(|c| {
+                    (
+                        c.id,
+                        Curve {
+                            id: c.id,
+                            slope: c.slope,
+                            intercept: c.intercept,
+                        },
+                    )
+                })
+                .collect()
+        }
+    };
+    if payload.readings.is_empty() {
+        return Ok(Json(ingest_outcome(
+            payload.stream_id,
+            paired,
+            submitted,
+            0,
+            &counts,
+        )));
+    }
+
     // Build reading models
     let models: Vec<readings::ActiveModel> = payload
         .readings
@@ -330,9 +434,14 @@ pub async fn ingest_readings(
                 .or_else(|| {
                     sensor_id.and_then(|s| curves.get(&(s, parameter_id, r.time)).copied())
                 });
+            // A hand-picked lab curve composes on top of whatever base calibration covers the
+            // reading, as on /readings/batch and /grab_samples: instrument correction first, the
+            // curve on its result. Reference and value still move together.
+            let standard = r
+                .standard_curve_id
+                .and_then(|id| standard_curves_by_id.get(&id).copied());
             readings::ActiveModel {
-                // Sync ingestion never picks a lab curve; grabs are the only writer that does.
-                standard_curve_id: Set(None),
+                standard_curve_id: Set(standard.map(|c| c.id)),
                 stream_id: Set(payload.stream_id),
                 time: Set(r.time.into()),
                 replicate_index: Set(r.replicate_index),
@@ -343,7 +452,10 @@ pub async fn ingest_readings(
                 site_id: Set(site_id.map(|paired| slot.and_then(|s| s.site_id).unwrap_or(paired))),
                 parameter_id: Set(parameter_id),
                 raw_value: Set(r.raw_value),
-                calibrated_value: Set(curve.map(|c| apply_curves(r.raw_value, Some(c), None))),
+                calibrated_value: Set(match (curve, standard) {
+                    (None, None) => None,
+                    (base, standard) => Some(apply_curves(r.raw_value, base, standard)),
+                }),
                 sensor_id: Set(sensor_id),
                 calibration_id: Set(curve.map(|c| c.id)),
                 deployment_id: Set(r
@@ -366,22 +478,158 @@ pub async fn ingest_readings(
         })
         .collect();
 
+    // The replicate audit: recompute each audited group's statistics over the values about to be
+    // stored, compare against the portal's claim, and admit the group either way. Served
+    // statistics are trigger-computed from the stored replicates, so a disagreement questions the
+    // portal's aggregate cells, not the data, and withholding would only hide measurements from
+    // the people waiting on them. A mismatch records a hold for review (pending when paired,
+    // deferred until pairing); a group that matches again at source supersedes its open hold; a
+    // group an operator already ruled on (acknowledged or remediated) is left alone.
+    if let Some(audits) = payload.audit.as_deref().filter(|a| !a.is_empty()) {
+        use crate::routes::private::sync::replicate_audit as audit;
+
+        let mut group_values: HashMap<chrono::DateTime<Utc>, Vec<audit::ReplicateValue>> =
+            HashMap::new();
+        for m in &models {
+            if let (
+                sea_orm::ActiveValue::Set(time),
+                sea_orm::ActiveValue::Set(raw),
+                sea_orm::ActiveValue::Set(index),
+            ) = (&m.time, &m.raw_value, &m.replicate_index)
+            {
+                let value = match &m.calibrated_value {
+                    sea_orm::ActiveValue::Set(Some(v)) => *v,
+                    _ => *raw,
+                };
+                group_values
+                    .entry(time.with_timezone(&Utc))
+                    .or_default()
+                    .push(audit::ReplicateValue {
+                        index: *index,
+                        value,
+                    });
+            }
+        }
+
+        let audit_times: Vec<chrono::DateTime<Utc>> = audits.iter().map(|a| a.time).collect();
+        let holds_by_time: HashMap<chrono::DateTime<Utc>, audit::LatestHold> =
+            audit::latest_holds(db, payload.stream_id, &audit_times)
+                .await?
+                .into_iter()
+                .map(|h| (h.time, h))
+                .collect();
+
+        for a in audits {
+            let values = group_values
+                .get(&a.time)
+                .map_or(&[] as &[audit::ReplicateValue], Vec::as_slice);
+            let numbers: Vec<f64> = values.iter().map(|v| v.value).collect();
+            let stats = audit::group_stats(&numbers);
+            let agree = audit::stats_agree(a.expected_mean, stats.mean, audit::DEFAULT_REL_TOL)
+                && audit::stats_agree_with(
+                    a.expected_sd,
+                    stats.sd,
+                    audit::SD_REL_TOL,
+                    audit::SD_ABS_TOL,
+                )
+                && a.expected_n
+                    .is_none_or(|expected| i64::try_from(stats.n) == Ok(expected));
+            match (agree, holds_by_time.get(&a.time)) {
+                (true, Some(hold)) if matches!(hold.status.as_str(), "pending" | "deferred") => {
+                    audit::close_hold(db, hold.id, "superseded").await?;
+                }
+                (true, _) => {}
+                // The operator's decision on this group stands; re-detecting the same
+                // disagreement does not reopen it.
+                (false, Some(hold))
+                    if matches!(hold.status.as_str(), "acknowledged" | "remediated") => {}
+                (false, _) => {
+                    audit::upsert_hold(
+                        db,
+                        payload.stream_id,
+                        &audit::GroupMismatch {
+                            time: a.time,
+                            expected_mean: a.expected_mean,
+                            expected_sd: a.expected_sd,
+                            expected_n: a.expected_n,
+                            computed_mean: stats.mean,
+                            computed_sd: stats.sd,
+                            n: stats.n,
+                            values: values.to_vec(),
+                        },
+                        if paired { "pending" } else { "deferred" },
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
+    if payload.readings.is_empty() {
+        return Ok(Json(ingest_outcome(
+            payload.stream_id,
+            paired,
+            submitted,
+            0,
+            &counts,
+        )));
+    }
+
     let total = models.len();
 
-    // Overwrite updates existing rows, which may live in compressed chunks; run inside a
-    // transaction with the decompression cap lifted, like every other back-dated write path.
-    let inserted = if payload.overwrite {
-        let txn = db.begin().await?;
-        txn.execute_unprepared(
-            "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0",
-        )
-        .await?;
-        let n = insert_reading_chunks(&txn, &models, true).await?;
-        txn.commit().await?;
-        n
+    // Spot readings on a paired stream can form samples: replicate groups sharing an instant get
+    // a `samples` row (mean/stdev/n maintained by the readings triggers), which is what the
+    // serving paths and the UI whiskers read. A group needs no index-0 row: `replicate_index` is
+    // the source's column position and is never renumbered. Scoped to this batch's time window;
+    // identity of a collection event is (site, parameter, instant), so pre-existing rows at the
+    // slot join the group. Unpaired streams skip this (site_id is NULL, the pairing backfill
+    // materialises).
+    let sample_window = if paired {
+        let spot_times = models
+            .iter()
+            .filter_map(|m| match (&m.measurement_type, &m.time) {
+                (sea_orm::ActiveValue::Set(Some(t)), sea_orm::ActiveValue::Set(time))
+                    if t == readings::sample_groups::SPOT =>
+                {
+                    Some(time.with_timezone(&Utc))
+                }
+                _ => None,
+            });
+        spot_times.clone().min().zip(spot_times.max())
+    } else {
+        None
+    };
+
+    // Overwrite updates existing rows, and the sample stamping UPDATE reaches back-dated groups;
+    // both can touch compressed chunks, so they run inside one transaction with the decompression
+    // cap lifted, like every other back-dated write path.
+    let inserted = if payload.overwrite || sample_window.is_some() {
+        crate::common::bulk_write::guarded(db, async |txn| {
+            let n = insert_reading_chunks(txn, &models, payload.overwrite).await?;
+            if let Some((lo, hi)) = sample_window {
+                readings::sample_groups::materialise_samples(
+                    txn,
+                    "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
+                    vec![
+                        payload.stream_id.into(),
+                        sea_orm::prelude::DateTimeWithTimeZone::from(lo).into(),
+                        sea_orm::prelude::DateTimeWithTimeZone::from(hi).into(),
+                    ],
+                    payload.collection,
+                )
+                .await?;
+            }
+            Ok(n)
+        })
+        .await?
     } else {
         insert_reading_chunks(db, &models, false).await?
     };
+
+    // Sample formation retroactively changes served historical points (the group's mean replaces
+    // the lone value), so bounded cached responses cannot be left to expire on TTL.
+    if sample_window.is_some() && inserted > 0 {
+        state.response_cache.invalidate_all();
+    }
 
     // Corrections rewrite history that bounded queries may have cached, and replace values the
     // rollups have already materialised.
@@ -449,7 +697,8 @@ pub async fn ingest_readings(
         }
     }
 
-    // Update last_data_time on the stream
+    // Update last_data_time on the stream. Every group is admitted (audit disagreements are
+    // review records, not gates), so the cursor always advances to the batch's newest instant.
     if let Some(max_time) = payload.readings.iter().map(|r| r.time).max() {
         let should_update = stream
             .last_data_time
@@ -540,6 +789,7 @@ fn ingest_outcome(
         inserted,
         skipped,
         skipped_reasons,
+        held: 0,
         stream_id,
         paired,
     }

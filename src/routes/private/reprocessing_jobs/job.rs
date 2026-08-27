@@ -156,6 +156,9 @@ pub fn build_registry() -> JobRegistry {
     registry.register(Arc::new(super::jobs::MergeParameters));
     registry.register(Arc::new(super::jobs::PlanApply));
     registry.register(Arc::new(super::jobs::PlanRevert));
+    registry.register(Arc::new(super::reconcile::ReplicateReconciliation));
+    registry.register(Arc::new(super::reconcile::ReplicateReconciliationDelete));
+    registry.register(Arc::new(super::replicate_reindex::ReplicateReindexRepair));
     registry
 }
 

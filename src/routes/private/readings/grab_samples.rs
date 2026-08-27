@@ -427,9 +427,9 @@ pub async fn insert_grab_samples(
 
             let sample_id = sample_map.get(&group_key).copied();
 
-            // Auto-assign replicate_index from 0 within the (parameter, time) group so every
-            // group has an index-0 row and default (replicate_index = 0) queries see one point
-            // per grab.
+            // A grab has no source column position, so the index is minted here: from 0 within
+            // the (parameter, time) group, in submission order. Once written it is never
+            // renumbered.
             let replicate_index = if let Some(idx) = r.replicate_index {
                 idx
             } else {

@@ -264,9 +264,9 @@ async fn reconcile_cadence(
              resolved_value = (SELECT COALESCE(smp.mean, r.calibrated_value, r.raw_value) FROM readings r \
                                LEFT JOIN samples smp ON smp.id = r.sample_id \
                                WHERE r.site_id = ae.site_id AND r.parameter_id = ae.parameter_id \
-                                 AND r.replicate_index = 0 \
                                  AND {cadence_pred} \
-                               ORDER BY r.time DESC LIMIT 1) \
+                               ORDER BY r.time DESC, (r.is_flagged IS TRUE), \
+                                        r.replicate_index LIMIT 1) \
          WHERE ae.resolved_at IS NULL AND ae.measurement_type = '{cadence}'{scope_clause}{not_in_clause}"
     );
     let resolved = db

@@ -179,7 +179,7 @@ pub async fn get_site_alarms(
     let alarm_param_ids: Vec<uuid::Uuid> = params_with_thresholds.iter().map(|p| p.id).collect();
 
     let min_severity = query.severity.unwrap_or(1);
-    let val_expr = "COALESCE(smp.mean, r.calibrated_value, r.raw_value)";
+    let val_expr = "sv.value";
 
     let violation_condition = super::thresholds::violation_condition(
         val_expr,
@@ -203,23 +203,36 @@ pub async fn get_site_alarms(
     let resolved_cte =
         super::thresholds::resolve_thresholds_sql(Some(site.id), Some(alarm_param_ids));
 
+    // `served` collapses a replicate group to the one row the site serves at that instant.
+    // `(stream_id, time)` is the readings primary key minus the replicate index, and nothing
+    // renumbers that index, so a group need not contain index 0. Flagged rows are kept: an
+    // out-of-range value should keep alerting after someone flags it, and they are ordered last
+    // only so that flagging one replicate cannot change which row the instant is served by.
     let sql = format!(
         r"
-        WITH resolved_thresholds AS ({resolved_cte})
+        WITH resolved_thresholds AS ({resolved_cte}),
+        served AS (
+            SELECT DISTINCT ON (r.stream_id, r.time)
+                r.parameter_id,
+                r.time,
+                COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value
+            FROM readings r
+            LEFT JOIN samples smp ON smp.id = r.sample_id
+            WHERE r.site_id = $1
+              AND r.time >= $2
+              AND r.time <= $3
+              AND r.parameter_id IN (SELECT parameter_id FROM resolved_thresholds)
+            ORDER BY r.stream_id, r.time, (r.is_flagged IS TRUE), r.replicate_index
+        )
         SELECT
-            r.parameter_id,
-            r.time,
-            COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value,
+            sv.parameter_id,
+            sv.time,
+            sv.value AS value,
             ({sev_case})::smallint as severity
-        FROM readings r
-        LEFT JOIN samples smp ON smp.id = r.sample_id
-        JOIN resolved_thresholds t ON r.parameter_id = t.parameter_id
-        WHERE r.site_id = $1
-          AND r.time >= $2
-          AND r.time <= $3
-          AND r.replicate_index = 0
-          AND {violation_condition}
-        ORDER BY r.time, r.parameter_id
+        FROM served sv
+        JOIN resolved_thresholds t ON sv.parameter_id = t.parameter_id
+        WHERE {violation_condition}
+        ORDER BY sv.time, sv.parameter_id
         "
     );
 
@@ -428,10 +441,12 @@ pub(crate) async fn fetch_active_alarm_rows(
     // `idx_readings_site_param_time`, instead of a `DISTINCT ON` over the whole hypertable. Cost is
     // O(active slots), independent of history depth.
     //
-    // `replicate_index = 0` keeps the "latest value" deterministic when grab replicates share a
-    // timestamp, matching episodes and the continuous aggregates. Flagged readings deliberately
-    // still drive alarms (divergent from aggregates/samples, which exclude them): an out-of-range
-    // value should keep alerting even after someone flags it.
+    // Ordering by replicate index keeps the "latest value" deterministic when grab replicates share
+    // a timestamp, matching episodes. It is a tie-break, not a filter: nothing renumbers
+    // `replicate_index`, so a group need not contain index 0. Flagged readings deliberately still
+    // drive alarms (divergent from aggregates/samples, which exclude them): an out-of-range value
+    // should keep alerting even after someone flags it, and they sort last only so that flagging
+    // one replicate cannot change which row the instant is served by.
     let sql = format!(
         r"
         WITH resolved_thresholds AS ({resolved_cte})
@@ -458,9 +473,8 @@ pub(crate) async fn fetch_active_alarm_rows(
             FROM readings r
             LEFT JOIN samples smp ON smp.id = r.sample_id
             WHERE r.site_id = rt.site_id AND r.parameter_id = rt.parameter_id
-              AND r.replicate_index = 0
               AND {cadence}
-            ORDER BY r.time DESC
+            ORDER BY r.time DESC, (r.is_flagged IS TRUE), r.replicate_index
             LIMIT 1
         ) lr
         WHERE {violation}

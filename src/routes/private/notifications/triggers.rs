@@ -204,13 +204,13 @@ async fn stale_data(
                      ORDER BY r.time DESC LIMIT 1) AS last_continuous, \
                    (SELECT r.time FROM readings r \
                      WHERE r.site_id = sp.site_id AND r.parameter_id = sp.parameter_id \
-                       AND r.replicate_index = 0 AND r.measurement_type = 'spot' \
+                       AND r.measurement_type = 'spot' \
                      ORDER BY r.time DESC LIMIT 1) AS last_spot, \
                    (SELECT EXTRACT(EPOCH FROM MAX(g.gap))::float8 FROM ( \
                       SELECT s.t - LAG(s.t) OVER (ORDER BY s.t) AS gap FROM ( \
-                        SELECT r.time AS t FROM readings r \
+                        SELECT DISTINCT r.time AS t FROM readings r \
                         WHERE r.site_id = sp.site_id AND r.parameter_id = sp.parameter_id \
-                          AND r.replicate_index = 0 AND r.measurement_type = 'spot' \
+                          AND r.measurement_type = 'spot' \
                         ORDER BY r.time DESC LIMIT 5) s \
                     ) g) AS spot_max_gap_seconds \
              ) agg ON TRUE \

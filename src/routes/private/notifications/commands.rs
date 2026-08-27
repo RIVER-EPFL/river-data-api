@@ -473,8 +473,8 @@ async fn latest_at(db: &DatabaseConnection, site_id: Uuid, site_name: &str) -> S
                     COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value, r.time AS time \
              FROM readings r JOIN parameters p ON p.id = r.parameter_id \
              LEFT JOIN samples smp ON smp.id = r.sample_id \
-             WHERE r.site_id = $1 AND r.replicate_index = 0 \
-             ORDER BY p.id, r.time DESC",
+             WHERE r.site_id = $1 \
+             ORDER BY p.id, r.time DESC, (r.is_flagged IS TRUE), r.replicate_index",
             [site_id.into()],
         ))
         .await

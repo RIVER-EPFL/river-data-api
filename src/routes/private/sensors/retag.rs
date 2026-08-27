@@ -70,6 +70,20 @@ pub async fn retag_frequency(
         )));
     }
 
+    // `retag_existing` on "high" enqueues a `measurement_retag` whose scope reaches every stream
+    // these sensors own, a replicate family included.
+    if req.data_frequency == "high" {
+        let families = crate::routes::private::data_streams::replicates::family_keys_for_sensors(
+            &state.db,
+            &req.sensor_ids,
+        )
+        .await?;
+        crate::routes::private::data_streams::replicates::refuse_family_retag(
+            &families,
+            "continuous",
+        )?;
+    }
+
     let sensors_updated = state
         .db
         .execute(Statement::from_sql_and_values(

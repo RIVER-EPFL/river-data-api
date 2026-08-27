@@ -19,6 +19,10 @@ pub struct StreamHierarchy {
     pub project: String,
     pub site: String,
     pub parameter: String,
+    /// Human-readable label for the parameter (the portal's dropdown text). The `parameter`
+    /// field itself is the source's machine identity (its DB column name), which is what a
+    /// scientist looking at the portal's own tables recognises.
+    pub parameter_label: Option<String>,
     pub units: String,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
@@ -51,6 +55,16 @@ pub fn extract_hierarchy(stream: &data_streams::Model) -> StreamHierarchy {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let parameter_label = h
+            .get("parameter_label")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                meta.get("parameter")
+                    .and_then(|p| p.get("display_name"))
+                    .and_then(|v| v.as_str())
+            })
+            .filter(|l| !l.is_empty() && *l != parameter)
+            .map(ToString::to_string);
         let units = meta
             .get("units")
             .and_then(|v| v.as_str())
@@ -73,6 +87,7 @@ pub fn extract_hierarchy(stream: &data_streams::Model) -> StreamHierarchy {
                 project,
                 site,
                 parameter,
+                parameter_label,
                 units,
                 latitude: lat,
                 longitude: lon,
@@ -97,6 +112,7 @@ pub fn extract_hierarchy(stream: &data_streams::Model) -> StreamHierarchy {
             project,
             site,
             parameter,
+            parameter_label: None,
             units,
             latitude: None,
             longitude: None,
@@ -122,6 +138,7 @@ pub fn extract_hierarchy(stream: &data_streams::Model) -> StreamHierarchy {
         project: stream.source_system.to_uppercase(),
         site: String::new(),
         parameter,
+        parameter_label: None,
         units,
         latitude: None,
         longitude: None,
@@ -143,6 +160,32 @@ pub struct PlanEntry {
     pub warnings: Vec<String>,
     #[serde(default)]
     pub original_parameter_name: Option<String>,
+    /// Present when the stream is a replicate family: what is being paired is the group of
+    /// member columns, not the portal's average.
+    #[serde(default)]
+    pub replicates: Option<PlanReplicates>,
+}
+
+/// Replicate-family summary carried on a plan entry, from the stream's registered spec.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanReplicates {
+    pub n: usize,
+    pub member_columns: Vec<String>,
+    pub curve_ref_column: Option<String>,
+    pub portal_mean_column: Option<String>,
+    pub portal_sd_column: Option<String>,
+}
+
+fn plan_replicates(metadata: &serde_json::Value) -> Option<PlanReplicates> {
+    let spec =
+        crate::routes::private::data_streams::replicates::ReplicateSpec::from_metadata(metadata)?;
+    Some(PlanReplicates {
+        n: spec.source_columns.len(),
+        member_columns: spec.source_columns,
+        curve_ref_column: spec.curve_ref_column,
+        portal_mean_column: spec.portal_mean_column,
+        portal_sd_column: spec.portal_sd_column,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,7 +208,12 @@ pub struct PlanSiteRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanParamRef {
     pub id: Option<Uuid>,
+    /// The parameter identity: the source's own column name (matches what the portal DB shows).
     pub name: String,
+    /// Human-readable label carried alongside; becomes `parameters.name` when the apply creates
+    /// the parameter, while `name` becomes its `code`.
+    #[serde(default)]
+    pub label: Option<String>,
     pub create: bool,
     pub units: String,
     #[serde(default)]
@@ -233,6 +281,28 @@ pub async fn create_plan(
         .all(db)
         .await?;
 
+    // A stream superseded by a replicate family (another stream at `source_key || ':reps'`) is a
+    // retired legacy single whose stale metadata still carries the old label identity; planning it
+    // would seed duplicate parameter rows. One query for the whole superseded set.
+    let superseded: std::collections::HashSet<String> = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT ds.source_key FROM data_streams ds
+             WHERE ds.source_system = $1
+               AND EXISTS (SELECT 1 FROM data_streams fam
+                           WHERE fam.source_system = ds.source_system
+                             AND fam.source_key = ds.source_key || ':reps')",
+            [source_system.to_string().into()],
+        ))
+        .await?
+        .iter()
+        .filter_map(|r| r.try_get::<String>("", "source_key").ok())
+        .collect();
+    let streams: Vec<data_streams::Model> = streams
+        .into_iter()
+        .filter(|s| !superseded.contains(&s.source_key))
+        .collect();
+
     if streams.is_empty() {
         return Err(AppError::BadRequest(format!(
             "No unpaired streams found for source_system '{source_system}'"
@@ -274,6 +344,7 @@ pub async fn create_plan(
             parameter: PlanParamRef {
                 id: None,
                 name: h.parameter.clone(),
+                label: h.parameter_label.clone(),
                 create: false,
                 units: h.units,
                 group_key: None,
@@ -282,6 +353,7 @@ pub async fn create_plan(
             confidence: "none".to_string(),
             warnings: vec![],
             original_parameter_name: Some(h.parameter),
+            replicates: plan_replicates(&stream.metadata),
         };
         reclassify_entry(&mut entry, &catalog);
         entries.push(entry);
@@ -459,6 +531,16 @@ pub async fn apply_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> AppR
     }
 
     let readings_backfilled = backfill_plan_readings(&txn, plan_id).await?;
+    // Audit mismatches recorded while these streams were unpaired become reviewable with the
+    // pairing they just gained.
+    txn.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "UPDATE replicate_audit_holds h SET status = 'pending'
+         FROM data_streams ds
+         WHERE ds.id = h.stream_id AND ds.pairing_plan_id = $1 AND h.status = 'deferred'",
+        [plan_id.into()],
+    ))
+    .await?;
     finalize_plan(&txn, plan_id, &counters, readings_backfilled).await?;
     txn.commit().await?;
 
@@ -714,22 +796,8 @@ async fn backfill_plan_readings<C: ConnectionTrait>(txn: &C, plan_id: Uuid) -> A
         ))
         .await?;
 
-    let plan_streams: Vec<Uuid> = txn
-        .query_all(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id FROM data_streams WHERE pairing_plan_id = $1",
-            [plan_id.into()],
-        ))
-        .await?
-        .iter()
-        .filter_map(|row| row.try_get::<Uuid>("", "id").ok())
-        .collect();
-    crate::routes::private::readings::replicates::densify_stream_replicates(txn, &plan_streams)
-        .await?;
-
     // Replicate groups on the newly paired streams (2+ spot readings sharing a slot and timestamp,
-    // e.g. migrated NOMIS A/B/C rows mapped to replicate_index 0/1/2) form samples. The row-level
-    // triggers populate the statistics.
+    // e.g. migrated NOMIS A/B/C rows) form samples. The row-level triggers populate the statistics.
     crate::routes::private::readings::sample_groups::materialise_backfilled_samples(
         txn,
         "ds.pairing_plan_id = $1",
@@ -837,6 +905,16 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
         r"UPDATE readings r SET site_id = NULL, parameter_id = NULL, sample_id = NULL
           FROM data_streams ds
           WHERE r.stream_id = ds.id AND ds.pairing_plan_id = $1",
+        [plan_id.into()],
+    ))
+    .await?;
+
+    // Reverting the pairing takes the reviewer away again; open reviews wait as deferred.
+    txn.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "UPDATE replicate_audit_holds h SET status = 'deferred'
+         FROM data_streams ds
+         WHERE ds.id = h.stream_id AND ds.pairing_plan_id = $1 AND h.status = 'pending'",
         [plan_id.into()],
     ))
     .await?;
@@ -1229,12 +1307,15 @@ async fn resolve_or_create_param(
         param_names.entry(matched.id).or_insert(matched.name);
         return Ok(matched.id);
     }
-    // No match: create, seeding aliases from the source names so future plans resolve them
+    // No match: create. The column name is the code (the stable machine id a scientist can match
+    // against the portal's own tables), the label is the human name, and both plus the source
+    // names seed the aliases so future plans resolve any of them.
     let mut aliases: Vec<String> = param_ref
         .original_names
         .iter()
         .cloned()
         .chain(original_parameter_name.map(str::to_string))
+        .chain(param_ref.label.clone())
         .filter(|a| !a.trim().is_empty() && a.to_lowercase() != key)
         .collect();
     aliases.sort();
@@ -1244,7 +1325,10 @@ async fn resolve_or_create_param(
     parameters::ActiveModel {
         id: Set(id),
         code: Set(param_ref.name.clone()),
-        name: Set(param_ref.name.clone()),
+        name: Set(param_ref
+            .label
+            .clone()
+            .unwrap_or_else(|| param_ref.name.clone())),
         default_units: Set(param_ref.units.clone()),
         category: Set(category),
         description: Set(None),

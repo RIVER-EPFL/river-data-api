@@ -36,6 +36,9 @@ use axum::routing::patch;
 /// - `read_routes`: list/get operations, fine for any read_metadata caller.
 /// - `write_routes`: operator actions such as issuing sync commands and pairing workflows.
 ///   Same gate as other entity mutations (Keycloak admin or write_metadata token).
+/// - `manage_routes`: the replicate audit review surface and reconciliation. Manager-level
+///   humans and above (or a write_metadata token); interns and plain members never see the
+///   audit backlog.
 /// - `admin_routes`: credential listing, creation and revoke, these mint full-permission
 ///   sync session tokens, so they're Keycloak-admin only (no API token can pass). The listing
 ///   is admin-gated alongside them, matching `sync_service_credentials` CRUD, so a leaked token
@@ -45,6 +48,7 @@ pub fn read_routes() -> Router<AppState> {
         .route("/services", get(operator::list_services))
         .route("/services/{id}", get(operator::get_service))
         .route("/commands", get(operator::list_commands))
+        .route("/commands/{id}", get(operator::get_command))
         .route("/events", get(operator::list_sync_events))
         .route("/discovery", get(get_discovery))
         .route("/pairing-plans", get(list_pairing_plans))
@@ -64,6 +68,46 @@ pub fn write_routes() -> Router<AppState> {
         .route("/pairing-plans/{id}", patch(update_pairing_plan))
         .route("/pairing-plans/{id}/apply", post(apply_pairing_plan))
         .route("/pairing-plans/{id}/revert", post(revert_pairing_plan))
+}
+
+pub fn manage_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/replicate_audit_holds",
+            get(super::replicate_audit::list_holds),
+        )
+        .route(
+            "/replicate_audit_holds/{id}/acknowledge",
+            post(super::replicate_audit::acknowledge_hold),
+        )
+        .route(
+            "/replicate_audit_holds/{id}/resolve",
+            post(super::replicate_audit::resolve_hold),
+        )
+        .route(
+            "/replicate_audit_holds/{id}/reopen",
+            post(super::replicate_audit::reopen_hold),
+        )
+        .route(
+            "/replicate_audit_holds/acknowledge_bulk",
+            post(super::replicate_audit::acknowledge_holds_bulk),
+        )
+        .route(
+            "/replicate_reconciliation/candidates",
+            get(super::replicate_reconciliation::reconciliation_candidates),
+        )
+        .route(
+            "/replicate_reconciliation",
+            post(super::replicate_reconciliation::start_reconciliation),
+        )
+        .route(
+            "/replicate_reconciliation/delete",
+            post(super::replicate_reconciliation::start_reconciliation_delete),
+        )
+        .route(
+            "/replicate_reindex_repair",
+            post(super::replicate_reindex::start_reindex_repair),
+        )
 }
 
 pub fn admin_routes() -> Router<AppState> {
@@ -1398,12 +1442,6 @@ pub async fn bulk_pair(
         }
     }
 
-    // Every stream considered, not only the paired ones: densification is idempotent per stream
-    // and a stream skipped this run may still carry a group that starts above index 0.
-    let considered_ids: Vec<Uuid> = streams.iter().map(|s| s.id).collect();
-    crate::routes::private::readings::replicates::densify_stream_replicates(&txn, &considered_ids)
-        .await?;
-
     txn.commit().await?;
 
     enqueue_slot_reprocess(db, &backfilled_slots).await?;
@@ -1528,6 +1566,10 @@ struct PlanEntryUpdate {
     parameter_name: Option<String>,
     #[serde(default)]
     parameter_units: Option<String>,
+    /// Human display label for the parameter. Takes effect only when apply creates the
+    /// parameter (`create: true`); a matched existing parameter keeps its own name.
+    #[serde(default)]
+    parameter_label: Option<String>,
 }
 
 /// Edit a draft pairing plan (only `draft` status allows updates). Requires `write_metadata`.
@@ -1581,6 +1623,9 @@ pub async fn update_pairing_plan(
             }
             if let Some(ref units) = update.parameter_units {
                 entry.parameter.units = units.clone();
+            }
+            if let Some(ref label) = update.parameter_label {
+                entry.parameter.label = Some(label.trim().to_string()).filter(|l| !l.is_empty());
             }
             crate::routes::private::sync::service::reclassify_entry(entry, &catalog);
             // A renamed entry that resolves to an existing site must not carry the stream's

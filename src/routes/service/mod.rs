@@ -278,6 +278,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
 
     let stream_write_routes = Router::new()
         .route("/streams/register", post(stream_views::register_stream))
+        .route(
+            "/standard_curves/register",
+            post(crate::routes::private::sensors::standard_curves::views::register_standard_curve),
+        )
         .route("/streams/retag", post(stream_views::retag_streams))
         .route("/streams/{id}/import", post(stream_views::import_stream))
         .route("/streams/{id}/pair", post(stream_views::pair_stream))
@@ -487,6 +491,15 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .layer(middleware::from_fn(require_admin_or_token_write_metadata))
         .with_state(state.clone());
 
+    // The replicate audit backlog and reconciliation are review surfaces for managers and
+    // administrators; sync-service session tokens pass on their write_metadata bit.
+    let sync_admin_manage = Router::new()
+        .nest("/sync", sync_views::manage_routes())
+        .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
+        .layer(middleware::from_fn(deny_scoped_token))
+        .layer(middleware::from_fn(require_manage_sensors))
+        .with_state(state.clone());
+
     let sync_admin_admin = Router::new()
         .nest("/sync", sync_views::admin_routes())
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
@@ -603,6 +616,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .merge(catalog_merge_routes)
         .merge(sync_admin_read)
         .merge(sync_admin_write)
+        .merge(sync_admin_manage)
         .merge(sync_admin_admin);
 
     if let Some(routes) = user_routes {

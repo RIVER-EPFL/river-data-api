@@ -10,4 +10,5 @@ mod measurement_classification;
 mod pair_replicate_samples;
 mod register_declares_instrument;
 mod register_pair_stats;
+mod replicate_retag_guard;
 mod slot_retirement;

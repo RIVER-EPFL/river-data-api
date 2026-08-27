@@ -57,7 +57,7 @@ async fn seed_stream_with_replicates(db: &DatabaseConnection) -> Uuid {
 
 #[tokio::test]
 #[serial]
-async fn pairing_densifies_groups_that_start_above_zero() {
+async fn pairing_preserves_source_replicate_indexes() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
@@ -102,7 +102,7 @@ async fn pairing_densifies_groups_that_start_above_zero() {
         ),
     )
     .await;
-    assert_eq!(indices, 0, "the group is renumbered from 0 so it is served");
+    assert_eq!(indices, 1, "the source's column positions are left alone");
 
     let sample_n = scalar_i64(
         &db,

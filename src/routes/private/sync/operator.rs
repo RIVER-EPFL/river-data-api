@@ -397,6 +397,28 @@ pub async fn list_commands(
     Ok((StatusCode::OK, headers, Json(commands)))
 }
 
+/// One command's current state, for polling a command just issued. Requires `read_metadata`.
+#[utoipa::path(
+    get,
+    path = "/commands/{id}",
+    params(("id" = Uuid, Path, description = "Command UUID")),
+    responses(
+        (status = 200, body = SyncCommandResponse),
+        (status = 404, description = "Command not found"),
+    ),
+    tag = "sync"
+)]
+pub async fn get_command(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<SyncCommandResponse>> {
+    let command = sync_commands::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Command not found".to_string()))?;
+    Ok(Json(command_to_response(command)))
+}
+
 /// Mint a new enrollment credential (client_id + client_secret). The `client_secret` is
 /// returned in plaintext exactly ONCE, only the SHA-256 hash is stored. Used to bootstrap
 /// a new sync service instance. Gated by `require_admin` upstream (Keycloak Administrator

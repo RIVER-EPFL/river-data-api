@@ -200,7 +200,7 @@ pub async fn get_sensor_readings(
             sea_orm::DatabaseBackend::Postgres,
             &format!(
                 r"SELECT MIN(time) AS data_start, MAX(time) AS data_end
-                  FROM readings WHERE sensor_id = $1 AND replicate_index = 0{extent_scope}{extent_param}"
+                  FROM readings WHERE sensor_id = $1{extent_scope}{extent_param}"
             ),
             extent_vals,
         ))
@@ -234,8 +234,7 @@ pub async fn get_sensor_readings(
                   FROM readings r
                   JOIN sensor_deployments d
                     ON d.sensor_id = $1 AND d.deployed_until IS NULL
-                  WHERE r.site_id = d.site_id AND r.parameter_id = d.parameter_id
-                    AND r.replicate_index = 0{slot_scope}{slot_param}"
+                  WHERE r.site_id = d.site_id AND r.parameter_id = d.parameter_id{slot_scope}{slot_param}"
             ),
             slot_vals,
         ))
@@ -266,9 +265,9 @@ pub async fn get_sensor_readings(
         )
     } else {
         String::from(
-            r"SELECT time, raw_value, calibrated_value, site_id
+            r"SELECT DISTINCT ON (stream_id, time) time, raw_value, calibrated_value, site_id
               FROM readings
-              WHERE sensor_id = $1 AND replicate_index = 0",
+              WHERE sensor_id = $1",
         )
     };
     if bucket.is_none()
@@ -294,7 +293,14 @@ pub async fn get_sensor_readings(
     if bucket.is_some() {
         sql.push_str(" GROUP BY 1 ORDER BY 1 ASC");
     } else {
-        sql.push_str(" ORDER BY time ASC");
+        // The raw arm serves one row per instant, so the DISTINCT ON ordering is the channel's,
+        // not the series'. `(stream_id, time)` is the readings primary key minus the replicate
+        // index; nothing renumbers that index, so a group need not contain index 0. The wrapper
+        // restores the time-ascending order the series is drawn in.
+        sql.push_str(" ORDER BY stream_id, time, (is_flagged IS TRUE), replicate_index");
+        sql = format!(
+            "SELECT time, raw_value, calibrated_value, site_id FROM ({sql}) s ORDER BY time ASC"
+        );
     }
 
     let rows = db
