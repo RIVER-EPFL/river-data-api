@@ -1,6 +1,6 @@
 //! Self-service notification preferences. Every handler acts strictly on the caller's own Keycloak
 //! `sub` (taken from the JWT, never from the request body), so a user can only ever read or change
-//! their own subscription, link their own Telegram chat, and toggle their own channels.
+//! their own subscription state and push subscriptions.
 
 use axum::{Extension, Json, extract::State, http::StatusCode};
 use chrono::{DateTime, Utc};
@@ -17,34 +17,13 @@ use crate::common::middleware::AuthContext;
 use crate::error::{AppError, AppResult};
 
 use super::access::project_allowed;
-use super::views::{LinkCodeResponse, generate_code};
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
-const LINK_CODE_TTL_MINUTES: i64 = 60;
 
-/// The caller's Keycloak `sub`, or 403 for API tokens (which have no personal identity to manage).
 fn require_sub(auth: &AuthContext) -> AppResult<String> {
     auth.keycloak_sub().map(str::to_string).ok_or_else(|| {
         AppError::Forbidden("notification preferences require a Keycloak login".to_string())
     })
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct TelegramLink {
-    /// `unlinked` | `pending` | `linked`.
-    pub status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code_expires_at: Option<DateTime<Utc>>,
-    /// When the chat was claimed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub linked_at: Option<DateTime<Utc>>,
-    /// Last Telegram activity, sent or received.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_used_at: Option<DateTime<Utc>>,
-    /// When the link lapses unless its owner signs in to the dashboard again. Renewal is passive,
-    /// so this moves forward on its own for anyone who uses the portal.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub attested_until: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -59,20 +38,13 @@ pub struct SubscriptionScope {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct MyNotifications {
-    /// The caller's verified Keycloak email, shown read-only (resolved live from the token).
-    pub email: Option<String>,
-    pub email_verified: bool,
-    pub email_enabled: bool,
-    pub telegram_enabled: bool,
-    pub telegram: TelegramLink,
-    /// Whether this link is held open against idle expiry. Administrator-settable only.
-    pub expiry_exempt: bool,
-    /// Explicit scope overrides; absence of a more-specific override means subscribed (default on).
+    pub web_push_enabled: bool,
+    pub push_subscription_count: i64,
     pub subscriptions: Vec<SubscriptionScope>,
 }
 
-/// Create the subscriber row for this user if it doesn't exist yet (idempotent).
 async fn ensure_subscriber(state: &AppState, sub: &str) -> AppResult<()> {
     state
         .db
@@ -86,85 +58,31 @@ async fn ensure_subscriber(state: &AppState, sub: &str) -> AppResult<()> {
     Ok(())
 }
 
-async fn load(state: &AppState, auth: &AuthContext, sub: &str) -> AppResult<MyNotifications> {
+async fn load(state: &AppState, sub: &str) -> AppResult<MyNotifications> {
     let row = state
         .db
         .query_one(Statement::from_sql_and_values(
             PG,
-            "SELECT email_enabled, telegram_enabled FROM notification_subscribers \
-             WHERE keycloak_sub = $1",
+            "SELECT COALESCE(ns.web_push_enabled, true) AS web_push_enabled \
+             FROM notification_subscribers ns WHERE ns.keycloak_sub = $1",
             [sub.into()],
         ))
         .await?;
-    let (email_enabled, telegram_enabled) = match row {
-        Some(r) => (
-            r.try_get::<bool>("", "email_enabled").unwrap_or(false),
-            r.try_get::<bool>("", "telegram_enabled").unwrap_or(true),
-        ),
-        None => (false, true),
-    };
+    let web_push_enabled = row
+        .as_ref()
+        .and_then(|r| r.try_get::<bool>("", "web_push_enabled").ok())
+        .unwrap_or(true);
 
-    let tg_row = state
+    let push_count = state
         .db
         .query_one(Statement::from_sql_and_values(
             PG,
-            "SELECT telegram_chat_id, link_code, link_code_expires_at, expiry_exempt, \
-                    created_at, last_verified_at, last_attested_at \
-             FROM telegram_identities \
-             WHERE linked_keycloak_sub = $1 ORDER BY created_at DESC LIMIT 1",
+            "SELECT COUNT(*) AS cnt FROM web_push_subscriptions WHERE keycloak_sub = $1",
             [sub.into()],
         ))
-        .await?;
-    let expiry_exempt = tg_row
-        .as_ref()
-        .and_then(|r| r.try_get::<bool>("", "expiry_exempt").ok())
-        .unwrap_or(false);
-    let telegram = match tg_row {
-        Some(r) => {
-            let chat_id: Option<i64> = r.try_get("", "telegram_chat_id").ok().flatten();
-            let expires: Option<DateTime<Utc>> =
-                r.try_get("", "link_code_expires_at").ok().flatten();
-            let attest_days = state.config.telegram_link_attest_days;
-            let attested_until = r
-                .try_get::<Option<DateTime<Utc>>>("", "last_attested_at")
-                .ok()
-                .flatten()
-                .filter(|_| attest_days > 0)
-                .map(|t| t + chrono::Duration::days(attest_days));
-            if chat_id.is_some() {
-                TelegramLink {
-                    status: "linked",
-                    code_expires_at: None,
-                    linked_at: r.try_get("", "created_at").ok(),
-                    last_used_at: r.try_get("", "last_verified_at").ok().flatten(),
-                    attested_until,
-                }
-            } else if expires.is_some_and(|e| e > Utc::now()) {
-                TelegramLink {
-                    status: "pending",
-                    code_expires_at: expires,
-                    linked_at: None,
-                    last_used_at: None,
-                    attested_until: None,
-                }
-            } else {
-                TelegramLink {
-                    status: "unlinked",
-                    code_expires_at: None,
-                    linked_at: None,
-                    last_used_at: None,
-                    attested_until: None,
-                }
-            }
-        }
-        None => TelegramLink {
-            status: "unlinked",
-            code_expires_at: None,
-            linked_at: None,
-            last_used_at: None,
-            attested_until: None,
-        },
-    };
+        .await?
+        .and_then(|r| r.try_get::<i64>("", "cnt").ok())
+        .unwrap_or(0);
 
     let sub_rows = state
         .db
@@ -186,17 +104,12 @@ async fn load(state: &AppState, auth: &AuthContext, sub: &str) -> AppResult<MyNo
         .collect();
 
     Ok(MyNotifications {
-        email: auth.email().map(str::to_string),
-        email_verified: auth.email_verified(),
-        email_enabled,
-        telegram_enabled,
-        telegram,
-        expiry_exempt,
+        web_push_enabled,
+        push_subscription_count: push_count,
         subscriptions,
     })
 }
 
-/// `GET /api/notifications/me`, the caller's own preferences, link state, and subscriptions.
 #[utoipa::path(
     get,
     path = "/notifications/me",
@@ -209,20 +122,14 @@ pub async fn get_my_notifications(
 ) -> AppResult<Json<MyNotifications>> {
     let sub = require_sub(&auth)?;
     ensure_subscriber(&state, &sub).await?;
-    Ok(Json(load(&state, &auth, &sub).await?))
+    Ok(Json(load(&state, &sub).await?))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdatePrefsRequest {
-    pub email_enabled: Option<bool>,
-    pub telegram_enabled: Option<bool>,
-    /// Hold this Telegram link open against idle expiry. Administrators only: a self-service
-    /// opt-out available to everyone would mean nothing ever expires.
-    pub expiry_exempt: Option<bool>,
+    pub web_push_enabled: Option<bool>,
 }
 
-/// `PATCH /api/notifications/me`, toggle the caller's channels. Email can only be enabled when the
-/// caller has a verified email claim.
 #[utoipa::path(
     patch,
     path = "/notifications/me",
@@ -236,47 +143,19 @@ pub async fn update_my_notifications(
     Json(req): Json<UpdatePrefsRequest>,
 ) -> AppResult<Json<MyNotifications>> {
     let sub = require_sub(&auth)?;
-    if req.email_enabled == Some(true) && !(auth.email_verified() && auth.email().is_some()) {
-        return Err(AppError::BadRequest(
-            "a verified email address is required to enable email alerts".to_string(),
-        ));
-    }
-    if let Some(exempt) = req.expiry_exempt {
-        // Rejected rather than silently ignored: a user who thinks they have pinned their link and
-        // has not is worse off than one who is told no.
-        if !auth.is_admin() {
-            return Err(AppError::Forbidden(
-                "only an administrator can exempt a Telegram link from expiry".to_string(),
-            ));
-        }
-        state
-            .db
-            .execute(Statement::from_sql_and_values(
-                PG,
-                "UPDATE telegram_identities SET expiry_exempt = $2, updated_at = NOW() \
-                 WHERE linked_keycloak_sub = $1",
-                [sub.clone().into(), exempt.into()],
-            ))
-            .await?;
-    }
     ensure_subscriber(&state, &sub).await?;
     state
         .db
         .execute(Statement::from_sql_and_values(
             PG,
             "UPDATE notification_subscribers \
-             SET email_enabled = COALESCE($2, email_enabled), \
-                 telegram_enabled = COALESCE($3, telegram_enabled), \
+             SET web_push_enabled = COALESCE($2, web_push_enabled), \
                  updated_at = NOW() \
              WHERE keycloak_sub = $1",
-            [
-                sub.clone().into(),
-                req.email_enabled.into(),
-                req.telegram_enabled.into(),
-            ],
+            [sub.clone().into(), req.web_push_enabled.into()],
         ))
         .await?;
-    Ok(Json(load(&state, &auth, &sub).await?))
+    Ok(Json(load(&state, &sub).await?))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -284,9 +163,6 @@ pub struct SetSubscriptionsRequest {
     pub subscriptions: Vec<SubscriptionScope>,
 }
 
-/// `PUT /api/notifications/me/subscriptions`, replace the caller's scope overrides. Each override
-/// must target a project, a site, or a site+parameter, and (once project access is role-scoped) lie
-/// within the projects the caller can access.
 #[utoipa::path(
     put,
     path = "/notifications/me/subscriptions",
@@ -301,39 +177,22 @@ pub async fn set_my_subscriptions(
 ) -> AppResult<Json<MyNotifications>> {
     let sub = require_sub(&auth)?;
 
-    for s in &req.subscriptions {
-        if s.project_id.is_none() && s.site_id.is_none() {
-            return Err(AppError::BadRequest(
-                "each subscription must target a project or a site".to_string(),
-            ));
-        }
-        if s.parameter_id.is_some() && s.site_id.is_none() {
-            return Err(AppError::BadRequest(
-                "a parameter-scoped subscription must also name its site".to_string(),
-            ));
-        }
-    }
-
-    // Project-access guard: a member may only subscribe to projects in their grant set. The live
-    // request's scope is authoritative, so derive it from the auth context rather than re-resolving.
-    let accessible: Option<HashSet<Uuid>> = match auth.access_scope() {
+    let scope = auth.access_scope();
+    let accessible: Option<HashSet<Uuid>> = match &scope {
         AccessScope::Unrestricted => None,
-        AccessScope::Projects(set) => Some((*set).clone()),
+        AccessScope::Projects(projects) => Some((**projects).clone()),
     };
-    if accessible.is_some() {
-        for s in &req.subscriptions {
-            let project = resolve_project(&state, s).await?;
-            if let Some(p) = project
-                && !project_allowed(&accessible, p)
-            {
-                return Err(AppError::Forbidden(
-                    "subscription references a project you cannot access".to_string(),
-                ));
-            }
+
+    for s in &req.subscriptions {
+        if let Some(pid) = s.project_id
+            && !project_allowed(&accessible, pid)
+        {
+            return Err(AppError::Forbidden(format!(
+                "project {pid} is not in your grant set"
+            )));
         }
     }
 
-    ensure_subscriber(&state, &sub).await?;
     let txn = state.db.begin().await?;
     txn.execute(Statement::from_sql_and_values(
         PG,
@@ -359,98 +218,215 @@ pub async fn set_my_subscriptions(
     }
     txn.commit().await?;
 
-    Ok(Json(load(&state, &auth, &sub).await?))
+    Ok(Json(load(&state, &sub).await?))
 }
 
-/// Resolve the project a subscription scope falls under (for the access guard). `None` when it can't
-/// be determined (e.g. an unknown site id), which the caller treats as "skip".
-async fn resolve_project(state: &AppState, s: &SubscriptionScope) -> AppResult<Option<Uuid>> {
-    if let Some(p) = s.project_id {
-        return Ok(Some(p));
-    }
-    if let Some(site) = s.site_id {
-        let row = state
-            .db
-            .query_one(Statement::from_sql_and_values(
-                PG,
-                "SELECT project_id FROM sites WHERE id = $1",
-                [site.into()],
-            ))
-            .await?;
-        return Ok(row.and_then(|r| r.try_get::<Uuid>("", "project_id").ok()));
-    }
-    Ok(None)
+// ---------------------------------------------------------------------------
+// Web Push subscription CRUD
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, ToSchema)]
+pub struct RegisterPushRequest {
+    pub endpoint: String,
+    pub p256dh: String,
+    pub auth: String,
+    pub user_agent: Option<String>,
 }
 
-/// `POST /api/notifications/me/link_code`, mint a one-time code bound to the caller's own sub. The
-/// user sends `/start <code>` to the bot to claim it. Any prior unclaimed code for this user is
-/// dropped, so there is at most one pending code.
-#[utoipa::path(
-    post,
-    path = "/notifications/me/link_code",
-    responses((status = 200, description = "Link code minted", body = LinkCodeResponse)),
-    tag = "notifications"
-)]
-pub async fn mint_my_link_code(
+#[derive(Serialize, ToSchema)]
+pub struct PushSubscriptionRow {
+    pub id: Uuid,
+    pub endpoint: String,
+    pub user_agent: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_success_at: Option<DateTime<Utc>>,
+}
+
+#[utoipa::path(post, path = "/api/notifications/me/push", tag = "notifications")]
+pub async fn register_push_subscription(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
-) -> AppResult<Json<LinkCodeResponse>> {
+    Json(body): Json<RegisterPushRequest>,
+) -> AppResult<Json<PushSubscriptionRow>> {
     let sub = require_sub(&auth)?;
-    let code = generate_code();
-
-    state
-        .db
-        .execute(Statement::from_sql_and_values(
-            PG,
-            "DELETE FROM telegram_identities \
-             WHERE linked_keycloak_sub = $1 AND telegram_chat_id IS NULL",
-            [sub.clone().into()],
-        ))
-        .await?;
-
     let row = state
         .db
         .query_one(Statement::from_sql_and_values(
             PG,
-            "INSERT INTO telegram_identities \
-                (linked_keycloak_sub, link_code, link_code_expires_at, is_active) \
-             VALUES ($1, $2, NOW() + ($3 || ' minutes')::interval, TRUE) \
-             RETURNING link_code_expires_at",
+            "INSERT INTO web_push_subscriptions (keycloak_sub, endpoint, p256dh, auth, user_agent) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (endpoint) DO UPDATE SET \
+                 keycloak_sub = EXCLUDED.keycloak_sub, \
+                 p256dh = EXCLUDED.p256dh, \
+                 auth = EXCLUDED.auth, \
+                 user_agent = EXCLUDED.user_agent \
+             RETURNING id, endpoint, user_agent, created_at, last_success_at",
             [
                 sub.into(),
-                code.clone().into(),
-                LINK_CODE_TTL_MINUTES.to_string().into(),
+                body.endpoint.into(),
+                body.p256dh.into(),
+                body.auth.into(),
+                body.user_agent.into(),
             ],
         ))
         .await?
-        .ok_or_else(|| AppError::Internal("no row returned minting link code".to_string()))?;
-    let expires_at: DateTime<Utc> = row
-        .try_get("", "link_code_expires_at")
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+        .ok_or_else(|| AppError::NotFound("subscription".to_string()))?;
 
-    Ok(Json(LinkCodeResponse { code, expires_at }))
+    Ok(Json(PushSubscriptionRow {
+        id: row.try_get("", "id")?,
+        endpoint: row.try_get("", "endpoint")?,
+        user_agent: row.try_get("", "user_agent")?,
+        created_at: row.try_get("", "created_at")?,
+        last_success_at: row.try_get("", "last_success_at")?,
+    }))
 }
 
-/// `DELETE /api/notifications/me/telegram`, unlink the caller's Telegram chat (removes the link rows
-/// for their sub). Re-linking requires a fresh code.
-#[utoipa::path(
-    delete,
-    path = "/notifications/me/telegram",
-    responses((status = 204, description = "Unlinked")),
-    tag = "notifications"
-)]
-pub async fn unlink_my_telegram(
+#[utoipa::path(get, path = "/api/notifications/me/push", tag = "notifications")]
+pub async fn list_push_subscriptions(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
+) -> AppResult<Json<Vec<PushSubscriptionRow>>> {
+    let sub = require_sub(&auth)?;
+    let rows = state
+        .db
+        .query_all(Statement::from_sql_and_values(
+            PG,
+            "SELECT id, endpoint, user_agent, created_at, last_success_at \
+             FROM web_push_subscriptions WHERE keycloak_sub = $1 ORDER BY created_at DESC",
+            [sub.into()],
+        ))
+        .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(PushSubscriptionRow {
+            id: row.try_get("", "id")?,
+            endpoint: row.try_get("", "endpoint")?,
+            user_agent: row.try_get("", "user_agent")?,
+            created_at: row.try_get("", "created_at")?,
+            last_success_at: row.try_get("", "last_success_at")?,
+        });
+    }
+    Ok(Json(out))
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct DeletePushRequest {
+    pub endpoint: String,
+}
+
+#[utoipa::path(delete, path = "/api/notifications/me/push", tag = "notifications")]
+pub async fn delete_push_subscription(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(body): Json<DeletePushRequest>,
 ) -> AppResult<StatusCode> {
     let sub = require_sub(&auth)?;
     state
         .db
         .execute(Statement::from_sql_and_values(
             PG,
-            "DELETE FROM telegram_identities WHERE linked_keycloak_sub = $1",
-            [sub.into()],
+            "DELETE FROM web_push_subscriptions WHERE keycloak_sub = $1 AND endpoint = $2",
+            [sub.into(), body.endpoint.into()],
         ))
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Self-service test + timed ping
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, ToSchema)]
+pub struct PingRequest {
+    #[serde(default = "default_ping_seconds")]
+    pub seconds: u64,
+}
+
+fn default_ping_seconds() -> u64 {
+    10
+}
+
+#[utoipa::path(post, path = "/api/notifications/me/push/test", tag = "notifications")]
+pub async fn test_push(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> AppResult<StatusCode> {
+    let sub = require_sub(&auth)?;
+    send_to_user(&state, &sub, "Test notification", "Push notifications are working.").await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(post, path = "/api/notifications/me/push/ping", tag = "notifications")]
+pub async fn schedule_ping(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(body): Json<PingRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let sub = require_sub(&auth)?;
+    let seconds = body.seconds.clamp(5, 3600);
+    let owned_sub = sub.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+        let _ = send_to_user(&state, &owned_sub, "Ping", &format!("Your {seconds}-second ping.")).await;
+    });
+    Ok(Json(serde_json::json!({ "seconds": seconds })))
+}
+
+async fn send_to_user(state: &AppState, keycloak_sub: &str, title: &str, body: &str) -> AppResult<()> {
+    let rows = state
+        .db
+        .query_all(Statement::from_sql_and_values(
+            PG,
+            "SELECT id, endpoint, p256dh, auth FROM web_push_subscriptions WHERE keycloak_sub = $1",
+            [keycloak_sub.into()],
+        ))
+        .await?;
+
+    if rows.is_empty() {
+        return Err(AppError::BadRequest("no push subscriptions registered".to_string()));
+    }
+
+    let Some(pem) = &state.config.vapid_private_key_pem else {
+        return Err(AppError::Internal("VAPID not configured".to_string()));
+    };
+    let Some(vapid_subject) = &state.config.vapid_subject else {
+        return Err(AppError::Internal("VAPID subject not configured".to_string()));
+    };
+
+    let payload = serde_json::json!({
+        "title": title,
+        "body": body,
+        "tag": "test",
+    })
+    .to_string();
+
+    let client = reqwest::Client::new();
+    for row in rows {
+        let endpoint: String = row.try_get("", "endpoint")?;
+        let p256dh: String = row.try_get("", "p256dh")?;
+        let auth_key: String = row.try_get("", "auth")?;
+        let id: Uuid = row.try_get("", "id")?;
+
+        let sub = super::web_push::Subscription {
+            id,
+            keycloak_sub: keycloak_sub.to_string(),
+            endpoint,
+            p256dh,
+            auth: auth_key,
+        };
+
+        if let Err(e) = super::web_push::send_push(
+            &client,
+            pem.as_bytes(),
+            vapid_subject,
+            &sub,
+            payload.as_bytes(),
+        )
+        .await
+        {
+            tracing::warn!(error = %e, "test push failed");
+        }
+    }
+    Ok(())
 }

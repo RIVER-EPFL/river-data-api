@@ -33,6 +33,9 @@ pub struct Model {
     /// re-asserts the row clears the stamp. Spot rows only (DB CHECK); never a delete.
     pub withdrawn_at: Option<DateTimeWithTimeZone>,
     pub withdrawn_reason: Option<String>,
+    /// When the stored value arrived (DB default on insert, re-stamped when an overwrite changes
+    /// the value). NULL on rows that predate tracking.
+    pub ingested_at: Option<DateTimeWithTimeZone>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

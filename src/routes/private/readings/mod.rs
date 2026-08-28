@@ -6,6 +6,7 @@ pub mod import;
 pub mod ingest;
 pub mod measurement;
 pub mod model;
+pub mod provenance;
 pub mod reconcile;
 pub mod sample_groups;
 pub mod samples;

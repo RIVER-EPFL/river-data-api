@@ -81,6 +81,10 @@ mod m20260827_000001_spot_partial_indexes;
 mod m20260827_000002_tool_runs;
 mod m20260828_000001_collection_events;
 mod m20260828_000002_windowed_diff;
+mod m20260828_000003_ingested_at;
+mod m20260829_000001_web_push_subscriptions;
+mod m20260829_000002_notification_subscribers_web_push;
+mod m20260829_000003_drop_telegram_tables;
 
 pub struct Migrator;
 
@@ -167,6 +171,10 @@ impl MigratorTrait for Migrator {
             Box::new(m20260827_000002_tool_runs::Migration),
             Box::new(m20260828_000001_collection_events::Migration),
             Box::new(m20260828_000002_windowed_diff::Migration),
+            Box::new(m20260828_000003_ingested_at::Migration),
+            Box::new(m20260829_000001_web_push_subscriptions::Migration),
+            Box::new(m20260829_000002_notification_subscribers_web_push::Migration),
+            Box::new(m20260829_000003_drop_telegram_tables::Migration),
         ]
     }
 }

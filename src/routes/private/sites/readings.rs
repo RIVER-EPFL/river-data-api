@@ -64,6 +64,7 @@ struct Annotations {
     measurement_type: bool,
     sample_stats: bool,
     curves: bool,
+    origin: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -122,6 +123,18 @@ pub struct ParameterData {
     /// point is not a replicate group). Only present when `include_sample_stats=true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub samples: Option<Vec<Option<SampleStatOut>>>,
+    /// The streams paired into this slot (series-level; per-point exactness is
+    /// `/readings/provenance`'s job). Only present when `include_origin=true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origins: Option<Vec<OriginRef>>,
+}
+
+/// One ingestion channel serving a slot.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OriginRef {
+    pub stream_id: Uuid,
+    pub source_system: String,
+    pub source_key: String,
 }
 
 /// One replicate behind a grab-sample point.
@@ -192,6 +205,8 @@ pub struct SiteReadingsQuery {
     /// Attach per-point sample statistics (n, mean, stdev, min, max) and the individual
     /// replicate values behind each grab point. Spot data only; one batched lookup.
     pub include_sample_stats: Option<bool>,
+    /// Attach each parameter's ingestion origins (the streams paired into the slot).
+    pub include_origin: Option<bool>,
 }
 
 /// Everything that shapes a readings body. The query is flattened in whole, so a field added to
@@ -232,6 +247,22 @@ fn readings_table(times: &[DateTime<Utc>], params: &[ParameterData], include_fla
                 format!("{}_measurement_type", p.code),
                 Cells::Text(p.measurement_types.clone().unwrap_or_default()),
             );
+        }
+    }
+    if params.iter().any(|p| p.origins.is_some()) {
+        for p in params {
+            let sources = p
+                .origins
+                .as_ref()
+                .map(|o| {
+                    let mut systems: Vec<&str> =
+                        o.iter().map(|r| r.source_system.as_str()).collect();
+                    systems.sort_unstable();
+                    systems.dedup();
+                    systems.join("+")
+                })
+                .unwrap_or_default();
+            table.column(format!("{}_source_system", p.code), Cells::Constant(sources));
         }
     }
     if params.iter().any(|p| p.calibration_ids.is_some()) {
@@ -424,6 +455,7 @@ pub async fn get_site_readings(
         measurement_type: query.include_measurement_type.unwrap_or(false),
         sample_stats: query.include_sample_stats.unwrap_or(false) && !include_replicates,
         curves: query.include_curves.unwrap_or(false),
+        origin: query.include_origin.unwrap_or(false),
     };
     let include_flags = query.include_flags.unwrap_or(false);
 
@@ -709,6 +741,28 @@ pub async fn get_site_readings(
         HashMap::new()
     };
 
+    let origin_map: HashMap<Uuid, Vec<OriginRef>> = if annotations.origin {
+        use crate::routes::private::data_streams;
+        let sp_ids: Vec<Uuid> = params_list.iter().map(|sp| sp.id).collect();
+        let mut map: HashMap<Uuid, Vec<OriginRef>> = HashMap::new();
+        for stream in data_streams::Entity::find()
+            .filter(data_streams::Column::SiteParameterId.is_in(sp_ids))
+            .all(&state.db)
+            .await?
+        {
+            if let Some(sp_id) = stream.site_parameter_id {
+                map.entry(sp_id).or_default().push(OriginRef {
+                    stream_id: stream.id,
+                    source_system: stream.source_system,
+                    source_key: stream.source_key,
+                });
+            }
+        }
+        map
+    } else {
+        HashMap::new()
+    };
+
     let param_data: Vec<ParameterData> = params_list
         .iter()
         .map(|sp| {
@@ -775,6 +829,9 @@ pub async fn get_site_readings(
                 calibration_ids,
                 standard_curve_ids,
                 samples,
+                origins: annotations
+                    .origin
+                    .then(|| origin_map.get(&sp.id).cloned().unwrap_or_default()),
             }
         })
         .collect();

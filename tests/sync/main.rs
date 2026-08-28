@@ -9,6 +9,7 @@ mod common;
 mod control_plane;
 mod credential_listing_gate;
 mod credentials;
+mod hold_kinds;
 mod pagination;
 mod pagination_bounds;
 mod pairing_plan_apply;

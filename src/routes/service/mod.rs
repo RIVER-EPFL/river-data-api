@@ -26,7 +26,7 @@ use crate::routes::private::{
     data_streams::DataStream,
     data_streams::pairing_plans::PairingPlan,
     notes::Note,
-    notifications::{NotificationLog, NotificationMute, TelegramIdentity},
+    notifications::{NotificationLog, NotificationMute},
     parameters::Parameter,
     parameters::derived::definition_model::DerivedParameterDefinition,
     parameters::derived::source_model::DerivedParameterSource,
@@ -208,10 +208,6 @@ pub fn api_router(state: &AppState) -> Router<()> {
         )
         .nest("/notes", field_crud(Note::router(db)))
         .nest(
-            "/telegram_identities",
-            admin_only_crud(TelegramIdentity::router(db)),
-        )
-        .nest(
             "/notification_mutes",
             catalog_crud(NotificationMute::router(db)),
         )
@@ -261,6 +257,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
 
     let stream_read_routes = Router::new()
         .route("/streams/{id}/stats", get(stream_views::stream_stats))
+        .route("/streams/{id}/receipts", get(stream_views::stream_receipts))
         .layer(middleware::from_fn(require_read_metadata))
         .with_state(state.clone());
 
@@ -408,6 +405,18 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route(
             "/actions/event_audit_findings",
             get(crate::routes::private::collection_events::list_event_audit_findings),
+        )
+        .route(
+            "/readings/provenance",
+            get(crate::routes::private::readings::provenance::get_reading_provenance),
+        )
+        .route(
+            "/sites/{id}/visits",
+            get(crate::routes::private::collection_events::visits::list_site_visits),
+        )
+        .route(
+            "/collection_events/{id}/detail",
+            get(crate::routes::private::collection_events::visits::get_event_detail),
         )
         .layer(middleware::from_fn(require_read_data))
         .with_state(state.clone());
@@ -584,16 +593,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
             .with_state(state.clone())
     };
 
-    // Telegram identity link-code minting. Admin-only, it grants a chat the linked user's role.
-    let telegram_admin_routes = Router::new()
-        .route(
-            "/telegram_identities/link_code",
-            post(crate::routes::private::notifications::views::generate_link_code),
-        )
-        .layer(middleware::from_fn(require_admin))
-        .with_state(state.clone());
-
-    // Admin notification oversight: per-channel health probe, one-off test send, subscriber roster.
+        // Admin notification oversight: per-channel health probe, one-off test send, subscriber roster.
     let notifications_admin_routes = {
         use crate::routes::private::notifications::{health, views as notif_views};
         Router::new()
@@ -606,10 +606,6 @@ pub fn api_router(state: &AppState) -> Router<()> {
             .route(
                 "/notifications/subscribers",
                 get(notif_views::list_subscribers),
-            )
-            .route(
-                "/notifications/telegram_activity",
-                get(notif_views::list_telegram_activity),
             )
             .layer(middleware::from_fn(require_admin))
             .with_state(state.clone())
@@ -628,8 +624,14 @@ pub fn api_router(state: &AppState) -> Router<()> {
                 "/notifications/me/subscriptions",
                 put(me::set_my_subscriptions),
             )
-            .route("/notifications/me/link_code", post(me::mint_my_link_code))
-            .route("/notifications/me/telegram", delete(me::unlink_my_telegram))
+            .route(
+                "/notifications/me/push",
+                post(me::register_push_subscription)
+                    .get(me::list_push_subscriptions)
+                    .delete(me::delete_push_subscription),
+            )
+            .route("/notifications/me/push/test", post(me::test_push))
+            .route("/notifications/me/push/ping", post(me::schedule_ping))
             .layer(middleware::from_fn(require_read_data))
             .with_state(state.clone())
     };
@@ -666,7 +668,6 @@ pub fn api_router(state: &AppState) -> Router<()> {
     let mut router = Router::new()
         .merge(entity_router)
         .merge(token_admin_routes)
-        .merge(telegram_admin_routes)
         .merge(tool_script_routes)
         .merge(notifications_admin_routes)
         .merge(notifications_me_routes)

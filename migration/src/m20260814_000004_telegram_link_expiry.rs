@@ -46,8 +46,13 @@ impl MigrationTrait for Migration {
         let db = manager.get_connection();
         db.execute_unprepared("DROP INDEX IF EXISTS idx_telegram_identities_last_verified")
             .await?;
+        // m20260829_000003 drops the table outright, so a rollback path may find it gone.
         db.execute_unprepared(
-            "ALTER TABLE telegram_identities DROP COLUMN IF EXISTS expiry_exempt",
+            "DO $$ BEGIN
+                IF to_regclass('telegram_identities') IS NOT NULL THEN
+                    ALTER TABLE telegram_identities DROP COLUMN IF EXISTS expiry_exempt;
+                END IF;
+            END $$",
         )
         .await?;
         db.execute_unprepared(

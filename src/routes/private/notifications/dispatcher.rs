@@ -12,9 +12,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::config::Config;
 
-use super::email::{self, EmailChannel};
 use super::messages::{self, PendingEvent};
-use super::telegram::{TelegramChannel, TelegramClient};
 use super::{NotificationChannel, OutgoingMessage, Slot, mutes_model};
 
 struct Row {
@@ -28,21 +26,9 @@ struct Row {
 /// without notifications, the dispatcher then just stamps the outbox and sends nothing).
 pub fn build_channels(config: &Config) -> Vec<Box<dyn NotificationChannel>> {
     let mut channels: Vec<Box<dyn NotificationChannel>> = Vec::new();
-    if let Some(token) = &config.telegram_bot_token {
-        channels.push(Box::new(TelegramChannel::new(TelegramClient::new(
-            token.clone(),
-        ))));
-        tracing::info!("Notifications: Telegram channel enabled");
-    }
-    match (email::build_mailer(config), config.alert_email_to.clone()) {
-        (Some(mailer), Some(to)) => {
-            channels.push(Box::new(EmailChannel::new(mailer, to)));
-            tracing::info!("Notifications: email channel enabled");
-        }
-        (Some(_), None) => {
-            tracing::warn!("Email backend configured but ALERT_EMAIL_TO unset, email disabled");
-        }
-        _ => {}
+    if let Some(ch) = super::web_push::WebPushChannel::new(config) {
+        channels.push(Box::new(ch));
+        tracing::info!("Notifications: Web Push channel enabled");
     }
     channels
 }

@@ -27,6 +27,8 @@ use crate::routes::private::{data_streams, sites::parameters as site_parameters}
 pub struct StreamStatsResponse {
     pub stream_id: Uuid,
     pub reading_count: i64,
+    /// Rows stamped withdrawn by windowed reconciliation (included in `reading_count`).
+    pub withdrawn_count: i64,
     pub min_time: Option<chrono::DateTime<Utc>>,
     pub max_time: Option<chrono::DateTime<Utc>>,
     pub latest_value: Option<f64>,
@@ -79,24 +81,26 @@ pub async fn stream_stats(
     let row = state.db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT COUNT(*) as count, MIN(time) as min_time, MAX(time) as max_time FROM readings WHERE stream_id = $1",
+            "SELECT COUNT(*) as count, COUNT(*) FILTER (WHERE withdrawn_at IS NOT NULL) as withdrawn, MIN(time) as min_time, MAX(time) as max_time FROM readings WHERE stream_id = $1",
             [id.into()],
         ))
         .await?;
 
-    let (count, min_time, max_time) = if let Some(row) = row {
+    let (count, withdrawn, min_time, max_time) = if let Some(row) = row {
         let count: i64 = row.try_get("", "count").unwrap_or(0);
+        let withdrawn: i64 = row.try_get("", "withdrawn").unwrap_or(0);
         let min_time: Option<chrono::DateTime<chrono::FixedOffset>> =
             row.try_get("", "min_time").ok();
         let max_time: Option<chrono::DateTime<chrono::FixedOffset>> =
             row.try_get("", "max_time").ok();
         (
             count,
+            withdrawn,
             min_time.map(|t| t.with_timezone(&Utc)),
             max_time.map(|t| t.with_timezone(&Utc)),
         )
     } else {
-        (0, None, None)
+        (0, 0, None, None)
     };
 
     // Get latest value
@@ -113,9 +117,144 @@ pub async fn stream_stats(
     Ok(Json(StreamStatsResponse {
         stream_id: id,
         reading_count: count,
+        withdrawn_count: withdrawn,
         min_time,
         max_time,
         latest_value,
+    }))
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct ReceiptsQuery {
+    /// 1-based page, default 1.
+    #[serde(default)]
+    pub page: Option<u64>,
+    /// Rows per page, default 50, max 200.
+    #[serde(default)]
+    pub page_size: Option<u64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReceiptRow {
+    pub id: Uuid,
+    pub at: chrono::DateTime<Utc>,
+    pub window_from: Option<chrono::DateTime<Utc>>,
+    pub window_to: Option<chrono::DateTime<Utc>>,
+    pub submitted: i32,
+    pub new_rows: i32,
+    pub changed: i32,
+    pub unchanged: i32,
+    pub retained: i32,
+    pub rejected_total: i32,
+    pub dropped: i32,
+    pub withdrawn: i32,
+    pub braked: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReceiptsResponse {
+    pub stream_id: Uuid,
+    pub total: u64,
+    pub receipts: Vec<ReceiptRow>,
+}
+
+/// The stream's windowed-ingest ledger: one row per reconciliation pass, newest first.
+/// Requires `read_metadata`.
+#[utoipa::path(
+    get,
+    path = "/streams/{id}/receipts",
+    params(("id" = Uuid, Path, description = "Stream UUID"), ReceiptsQuery),
+    responses(
+        (status = 200, description = "Ingest receipts", body = ReceiptsResponse),
+        (status = 404, description = "Stream not found"),
+    ),
+    tag = "streams"
+)]
+pub async fn stream_receipts(
+    State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+    Path(id): Path<Uuid>,
+    axum::extract::Query(q): axum::extract::Query<ReceiptsQuery>,
+) -> AppResult<Json<ReceiptsResponse>> {
+    let stream = data_streams::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
+    if scope.is_restricted() {
+        let stream_project = match stream.site_parameter_id {
+            Some(sp_id) => state
+                .db
+                .query_one(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT s.project_id FROM site_parameters sp JOIN sites s ON s.id = sp.site_id WHERE sp.id = $1",
+                    [sp_id.into()],
+                ))
+                .await?
+                .and_then(|r| r.try_get::<Uuid>("", "project_id").ok()),
+            None => None,
+        };
+        if !scope.allows_project_opt(stream_project) {
+            return Err(AppError::NotFound("Stream not found".to_string()));
+        }
+    }
+
+    let page = q.page.unwrap_or(1).max(1);
+    let page_size = q.page_size.unwrap_or(50).clamp(1, 200);
+    let total: i64 = state
+        .db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT COUNT(*) AS n FROM ingest_receipts WHERE stream_id = $1",
+            [id.into()],
+        ))
+        .await?
+        .map(|r| r.try_get("", "n").unwrap_or(0))
+        .unwrap_or(0);
+    let rows = state
+        .db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id, at, window_from, window_to, submitted, new_rows, changed, unchanged, \
+                    retained, rejected_total, dropped, withdrawn, braked \
+             FROM ingest_receipts WHERE stream_id = $1 \
+             ORDER BY at DESC LIMIT $2 OFFSET $3",
+            [
+                id.into(),
+                (page_size as i64).into(),
+                (((page - 1) * page_size) as i64).into(),
+            ],
+        ))
+        .await?;
+    let mut receipts = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let fixed = |name: &str| -> Option<chrono::DateTime<Utc>> {
+            r.try_get::<Option<chrono::DateTime<chrono::FixedOffset>>>("", name)
+                .ok()
+                .flatten()
+                .map(|t| t.with_timezone(&Utc))
+        };
+        receipts.push(ReceiptRow {
+            id: r.try_get("", "id")?,
+            at: r
+                .try_get::<chrono::DateTime<chrono::FixedOffset>>("", "at")?
+                .with_timezone(&Utc),
+            window_from: fixed("window_from"),
+            window_to: fixed("window_to"),
+            submitted: r.try_get("", "submitted")?,
+            new_rows: r.try_get("", "new_rows")?,
+            changed: r.try_get("", "changed")?,
+            unchanged: r.try_get("", "unchanged")?,
+            retained: r.try_get("", "retained")?,
+            rejected_total: r.try_get("", "rejected_total")?,
+            dropped: r.try_get("", "dropped")?,
+            withdrawn: r.try_get("", "withdrawn")?,
+            braked: r.try_get("", "braked")?,
+        });
+    }
+    Ok(Json(ReceiptsResponse {
+        stream_id: id,
+        total: u64::try_from(total).unwrap_or(0),
+        receipts,
     }))
 }
 

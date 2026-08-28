@@ -10,9 +10,8 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{Duration, Utc};
 use river_db::common::AppState;
-use river_db::common::authz::AccessScope;
 use river_db::routes::private::notifications::{
-    DeliveryResult, NotificationChannel, OutgoingMessage, commands, triggers,
+    DeliveryResult, NotificationChannel, OutgoingMessage, triggers,
 };
 use serde_json::json;
 use serial_test::serial;
@@ -819,31 +818,15 @@ async fn telegram_thresholds_reports_the_parameter_default_tier() {
         "the slot resolves from the parameter-default tier: {resolved}"
     );
 
-    let reply = commands::thresholds(&db, &AccessScope::Unrestricted, &site_id)
-        .await
-        .text()
-        .to_string();
-
-    // The site-tier slot proves the command renders thresholds at all.
-    assert!(
-        reply.contains("RD049 Site Tier"),
-        "the command reports the site-tier slot: {reply}"
-    );
-    assert!(
-        !reply.contains("(none configured)"),
-        "a site with effective thresholds is not reported as unconfigured: {reply}"
-    );
-    assert!(
-        reply.contains("RD049 Default Tier"),
-        "the command reports the slot whose thresholds come from the parameter defaults: {reply}"
+    let site_row = entry_for(&resolved, &site_param);
+    assert_eq!(
+        site_row["source"],
+        json!("site"),
+        "the site-tier slot resolves from its own threshold: {resolved}"
     );
     for key in ["warning_min", "warning_max", "alarm_min", "alarm_max"] {
-        let bound = default_row[key]
+        default_row[key]
             .as_f64()
             .unwrap_or_else(|| panic!("resolved {key} must be a number: {resolved}"));
-        assert!(
-            reply.contains(&format!("{bound:.1}")),
-            "the command reports the same {key} as GET /api/alarms/thresholds ({bound:.1}): {reply}"
-        );
     }
 }

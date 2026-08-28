@@ -956,6 +956,7 @@ impl CsvImport {
                 collection_event_id: Set(None),
                 withdrawn_at: Set(None),
                 withdrawn_reason: Set(None),
+                ingested_at: sea_orm::ActiveValue::NotSet,
                 stream_id: Set(stream_id),
                 site_id: Set(row_site_id),
                 parameter_id: Set(parameter_id),
@@ -1660,15 +1661,12 @@ pub async fn sweep_stale_sync_events(
     Ok(res.rows_affected())
 }
 
-/// Re-resolve every active linked Telegram identity against Keycloak and deactivate any whose user
-/// is gone/disabled/role-revoked, the anti-backdoor identity reconciliation. Wraps
-/// [`reconcile::sweep`]. Needs the live `AppState` (Keycloak admin proxy + the shared `Authorizer`
-/// cache), read from the process global; a no-op when no `AppState` was built (some test contexts).
-pub struct IdentityReconcile {
+/// Prune Web Push subscriptions for users whose Keycloak account is revoked or disabled.
+pub struct PushSubscriptionReconcile {
     interval_seconds: u64,
 }
 
-impl IdentityReconcile {
+impl PushSubscriptionReconcile {
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
         Self {
@@ -1678,7 +1676,7 @@ impl IdentityReconcile {
 }
 
 #[async_trait]
-impl Job for IdentityReconcile {
+impl Job for PushSubscriptionReconcile {
     fn name(&self) -> &'static str {
         "identity_reconcile"
     }
@@ -1689,20 +1687,16 @@ impl Job for IdentityReconcile {
 
     async fn run(&self, _ctx: JobContext) -> Result<i64, DbErr> {
         let Some(state) = crate::common::global_app_state() else {
-            tracing::debug!("identity_reconcile: no AppState in process; skipping");
+            tracing::debug!("push_subscription_reconcile: no AppState in process; skipping");
             return Ok(0);
         };
         match crate::routes::private::notifications::reconcile::sweep(&state).await {
             Ok(o) if o.total() == 0 => Ok(0),
             Ok(o) => {
-                tracing::warn!(
+                tracing::info!(
                     revoked = o.revoked,
-                    warned = o.warned,
-                    expired = o.expired,
-                    purged = o.purged,
-                    unattested = o.unattested,
-                    audit_pruned = o.audit_pruned,
-                    "Identity reconciliation: links changed"
+                    deactivated = o.deactivated,
+                    "Push subscription reconciliation: users pruned"
                 );
                 Ok(o.total() as i64)
             }

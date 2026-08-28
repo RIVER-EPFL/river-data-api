@@ -169,10 +169,6 @@ pub async fn service_auth_middleware(
                 } else {
                     crate::common::grants::load_grants(&state.db, &state.grants_cache, &sub).await
                 };
-                // A Keycloak-authenticated request is the proof that renews a Telegram link, so
-                // opening the dashboard is all the attestation anyone has to do. Rate-limited
-                // internally to one write per user per hour.
-                crate::routes::private::notifications::attest::stamp(&state.db, &sub).await;
                 request.extensions_mut().insert(AuthContext::Keycloak {
                     roles,
                     sub,

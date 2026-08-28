@@ -151,34 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    // The Telegram bot long-polls a global feed (not a competing-consumer queue), so it stays a
-    // dedicated single-replica task; it is NOT a scheduled Service.
-    if state.config.telegram_bot_token.is_some() {
-        if state.config.enable_telegram_bot {
-            // Supervised: a panic inside the poller kills only its task, which would leave the
-            // bot silently unresponsive while the API carries on serving.
-            let bot_state = state.clone();
-            tokio::spawn(async move {
-                loop {
-                    let attempt = std::panic::AssertUnwindSafe(
-                        river_db::routes::private::notifications::bot::run(bot_state.clone()),
-                    );
-                    match futures::FutureExt::catch_unwind(attempt).await {
-                        Ok(()) => tracing::error!("Telegram bot poller exited, restarting"),
-                        Err(_) => tracing::error!("Telegram bot poller panicked, restarting"),
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                }
-            });
-            tracing::info!("Spawned Telegram bot poller");
-        } else {
-            tracing::info!(
-                "Telegram bot poller disabled on this replica (ENABLE_TELEGRAM_BOT=false)"
-            );
-        }
-    }
-
-    // The five former background loops (derived janitor, alarm sweeper, notification dispatcher,
+    // The background loops (derived janitor, alarm sweeper, notification dispatcher,
     // identity reconciliation, channel health) are now recurring Services run through the DB-backed
     // scheduler: each fires as a Job claimed by exactly one replica per scheduled tick, so they no
     // longer double-fire at 2-3 k8s replicas. The registry carries their cadence from Config; the

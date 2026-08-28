@@ -1,8 +1,6 @@
 //! `GET /api/config/notifications` reports which channels the deployment has configured (env-gated)
-//! so the frontend can grey out unavailable ones. It answers without auth and leaks no secrets, the
-//! payload is exactly availability booleans + the email backend kind + an optional public bot username.
-//!
-//! Run: cargo test --test notifications -- --test-threads=1
+//! so the frontend can enable/disable the push subscription UI. It answers without auth and leaks
+//! no secrets, the payload carries only an availability boolean and the public VAPID key.
 
 use serial_test::serial;
 
@@ -18,20 +16,14 @@ async fn capabilities_report_disabled_and_leak_no_secrets() {
         "capabilities endpoint answers (no auth, no 404)"
     );
 
-    assert_eq!(body["telegram"]["available"], false);
-    assert_eq!(body["email"]["available"], false);
-    assert_eq!(body["email"]["backend"], "disabled");
+    assert_eq!(body["webPush"]["available"], false);
 
-    // Exact key shape, guards against any credential field ever leaking into the payload.
     let obj = body.as_object().expect("object payload");
-    assert_eq!(obj.len(), 2, "only telegram + email");
-    let tg = body["telegram"].as_object().unwrap();
+    assert_eq!(obj.len(), 1, "only webPush");
+    let wp = body["webPush"].as_object().unwrap();
     assert!(
-        tg.keys().all(|k| k == "available" || k == "botUsername"),
-        "telegram keys limited to available/botUsername, got {:?}",
-        tg.keys().collect::<Vec<_>>()
+        wp.keys().all(|k| k == "available" || k == "vapidPublicKey"),
+        "webPush keys limited to available/vapidPublicKey, got {:?}",
+        wp.keys().collect::<Vec<_>>()
     );
-    let em = body["email"].as_object().unwrap();
-    assert_eq!(em.len(), 2, "email keys are exactly available + backend");
-    assert!(em.contains_key("available") && em.contains_key("backend"));
 }

@@ -1,33 +1,29 @@
-//! Per-user Telegram fan-out: an alert reaches only the linked chats whose subscriber has Telegram
-//! enabled AND is subscribed to that slot. A chat with no subscriber row defaults to enabled +
-//! subscribed (so chats linked before opting in still receive alerts). A site-level "off" override
-//! suppresses that site only; a system-wide alert (no slot) ignores per-slot overrides.
-//!
-//! Exercises the recipient resolver directly so no real Telegram API call is made.
-//!
-//! Run: cargo test --test notifications -- --test-threads=1
+//! Per-user Web Push fan-out: an alert reaches only push subscriptions whose subscriber has
+//! web_push enabled AND is subscribed to that slot. A subscription with no subscriber row defaults
+//! to enabled + subscribed. A site-level "off" override suppresses that site only; a system-wide
+//! alert (no slot) ignores per-slot overrides.
 
-use river_db::routes::private::notifications::{Slot, telegram::slot_recipients};
+use river_db::routes::private::notifications::{Slot, web_push::slot_subscriptions};
 use sea_orm::DatabaseConnection;
 use serial_test::serial;
 
-async fn link_chat(db: &DatabaseConnection, sub: &str, chat_id: i64) {
+async fn push_sub(db: &DatabaseConnection, sub: &str, endpoint: &str) {
     crate::common::exec(
         db,
         &format!(
-            "INSERT INTO telegram_identities (linked_keycloak_sub, telegram_chat_id, is_active) \
-             VALUES ('{sub}', {chat_id}, TRUE)"
+            "INSERT INTO web_push_subscriptions (keycloak_sub, endpoint, p256dh, auth) \
+             VALUES ('{sub}', '{endpoint}', 'key', 'auth')"
         ),
     )
     .await;
 }
 
-async fn subscriber(db: &DatabaseConnection, sub: &str, telegram_enabled: bool) {
+async fn subscriber(db: &DatabaseConnection, sub: &str, web_push_enabled: bool) {
     crate::common::exec(
         db,
         &format!(
-            "INSERT INTO notification_subscribers (keycloak_sub, telegram_enabled) \
-             VALUES ('{sub}', {telegram_enabled})"
+            "INSERT INTO notification_subscribers (keycloak_sub, web_push_enabled) \
+             VALUES ('{sub}', {web_push_enabled})"
         ),
     )
     .await;
@@ -45,27 +41,27 @@ async fn mute_site(db: &DatabaseConnection, sub: &str) {
     .await;
 }
 
-fn chat_ids(recips: &[(String, i64)]) -> Vec<i64> {
-    let mut ids: Vec<i64> = recips.iter().map(|(_, c)| *c).collect();
-    ids.sort_unstable();
-    ids
+fn endpoints(subs: &[river_db::routes::private::notifications::web_push::Subscription]) -> Vec<String> {
+    let mut eps: Vec<String> = subs.iter().map(|s| s.endpoint.clone()).collect();
+    eps.sort();
+    eps
 }
 
 #[tokio::test]
 #[serial]
-async fn telegram_fanout_respects_subscription_and_channel_toggle() {
+async fn web_push_fanout_respects_subscription_and_channel_toggle() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
 
-    // A: linked, no subscriber row → default enabled + subscribed.
-    link_chat(&db, "sub-a", 111).await;
-    // B: linked, telegram on, but muted this site.
-    link_chat(&db, "sub-b", 222).await;
+    // A: subscribed, no subscriber row → default enabled.
+    push_sub(&db, "sub-a", "https://push.example.com/a").await;
+    // B: subscribed, push on, but muted this site.
+    push_sub(&db, "sub-b", "https://push.example.com/b").await;
     subscriber(&db, "sub-b", true).await;
     mute_site(&db, "sub-b").await;
-    // C: linked, telegram disabled.
-    link_chat(&db, "sub-c", 333).await;
+    // C: subscribed, push disabled.
+    push_sub(&db, "sub-c", "https://push.example.com/c").await;
     subscriber(&db, "sub-c", false).await;
 
     let slot = Slot {
@@ -74,46 +70,17 @@ async fn telegram_fanout_respects_subscription_and_channel_toggle() {
         parameter_id: crate::common::GLOBAL_PARAM_TURB_ID.parse().unwrap(),
     };
 
-    // Slot-scoped: A only, B muted this site, C disabled Telegram.
-    let scoped = slot_recipients(&db, &Some(slot)).await.unwrap();
+    let scoped = slot_subscriptions(&db, &Some(slot)).await.unwrap();
     assert_eq!(
-        chat_ids(&scoped),
-        vec![111],
-        "only the subscribed, telegram-enabled chat"
+        endpoints(&scoped),
+        vec!["https://push.example.com/a"],
+        "only the subscribed, push-enabled endpoint"
     );
 
-    // System-wide (no slot): B's per-site mute doesn't apply, so A and B; C still off.
-    let all = slot_recipients(&db, &None).await.unwrap();
+    let all = slot_subscriptions(&db, &None).await.unwrap();
     assert_eq!(
-        chat_ids(&all),
-        vec![111, 222],
+        endpoints(&all),
+        vec!["https://push.example.com/a", "https://push.example.com/b"],
         "system-wide ignores per-slot overrides"
     );
-}
-
-#[tokio::test]
-#[serial]
-async fn telegram_fanout_excludes_inactive_and_unlinked() {
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    crate::common::seed_test_data(&db).await;
-
-    link_chat(&db, "sub-active", 444).await;
-    // Deactivated by the anti-backdoor sweep, must never receive alerts.
-    crate::common::exec(
-        &db,
-        "INSERT INTO telegram_identities (linked_keycloak_sub, telegram_chat_id, is_active) \
-         VALUES ('sub-revoked', 555, FALSE)",
-    )
-    .await;
-    // Pending link (no chat_id yet), not a deliverable recipient.
-    crate::common::exec(
-        &db,
-        "INSERT INTO telegram_identities (linked_keycloak_sub, link_code, is_active) \
-         VALUES ('sub-pending', 'abc23456', TRUE)",
-    )
-    .await;
-
-    let all = slot_recipients(&db, &None).await.unwrap();
-    assert_eq!(chat_ids(&all), vec![444], "only the active, claimed chat");
 }

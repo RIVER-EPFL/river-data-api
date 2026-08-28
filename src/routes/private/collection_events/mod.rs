@@ -4,6 +4,7 @@
 
 pub mod attach;
 pub mod model;
+pub mod visits;
 pub use model::*;
 
 use axum::{Json, extract::Path, extract::State};

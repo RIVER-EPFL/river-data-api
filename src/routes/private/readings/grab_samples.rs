@@ -1024,6 +1024,7 @@ pub async fn insert_grab_samples(
                     collection_event_id: Set(None),
                 withdrawn_at: Set(None),
                 withdrawn_reason: Set(None),
+                ingested_at: sea_orm::ActiveValue::NotSet,
                     stream_id: Set(stream_cache[&r.parameter_id]),
                     site_id: Set(Some(payload.site_id)),
                     parameter_id: Set(Some(r.parameter_id)),

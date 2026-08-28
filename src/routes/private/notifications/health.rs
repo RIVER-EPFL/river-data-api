@@ -56,8 +56,7 @@ pub async fn probe_once(db: &DatabaseConnection, config: &Config) {
 
 async fn read_health(db: &DatabaseConnection, config: &Config) -> NotificationHealth {
     let known = [
-        ("telegram", config.telegram_configured()),
-        ("email", config.email_configured()),
+        ("web_push", config.web_push_configured()),
     ];
     let mut channels = Vec::with_capacity(known.len());
     for (name, available) in known {

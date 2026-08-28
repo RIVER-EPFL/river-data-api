@@ -551,6 +551,17 @@ pub(crate) fn readings_upsert(replace: Replace) -> sea_orm::sea_query::OnConflic
                     r#"COALESCE(EXCLUDED.sample_id, "readings"."sample_id")"#,
                 ),
             );
+            // Arrival time follows the value: an overwrite that changes nothing keeps the
+            // original stamp, so a full-content re-assert pass does not claim every row
+            // arrived today.
+            clause.value(
+                readings::Column::IngestedAt,
+                sea_orm::sea_query::Expr::cust(
+                    r#"CASE WHEN "readings"."raw_value" IS DISTINCT FROM EXCLUDED.raw_value
+                        OR "readings"."calibrated_value" IS DISTINCT FROM EXCLUDED.calibrated_value
+                        THEN NOW() ELSE "readings"."ingested_at" END"#,
+                ),
+            );
         }
     }
     clause.to_owned()
@@ -819,6 +830,7 @@ pub async fn insert_batch_readings(
                 collection_event_id: Set(None),
                 withdrawn_at: Set(None),
                 withdrawn_reason: Set(None),
+                ingested_at: sea_orm::ActiveValue::NotSet,
                 stream_id: Set(stream_id),
                 site_id: Set(attributed.then_some(r.site_id)),
                 parameter_id: Set(attributed.then_some(r.parameter_id)),
@@ -1156,6 +1168,24 @@ mod upsert_rules {
                 "{replace:?} must preserve the stored sample link: {tail}"
             );
         }
+    }
+
+    /// Arrival time moves only with the value: an unchanged re-assert keeps the stored stamp,
+    /// a changed value takes a fresh one.
+    #[test]
+    fn arrival_stamp_follows_a_value_change() {
+        for replace in [Replace::Values, Replace::ValuesAndAttribution] {
+            let tail = on_conflict_sql(replace);
+            assert!(
+                tail.contains("ingested_at") && tail.contains("IS DISTINCT FROM"),
+                "{replace:?} must re-stamp ingested_at only on a value change: {tail}"
+            );
+        }
+        let tail = on_conflict_sql(Replace::Nothing);
+        assert!(
+            !tail.contains("ingested_at"),
+            "Replace::Nothing must not touch ingested_at: {tail}"
+        );
     }
 
     /// Operator state is never a source's to overwrite.

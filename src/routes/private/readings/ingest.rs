@@ -534,6 +534,7 @@ pub async fn ingest_readings(
                 collection_event_id: Set(None),
                 withdrawn_at: Set(None),
                 withdrawn_reason: Set(None),
+                ingested_at: sea_orm::ActiveValue::NotSet,
                 stream_id: Set(payload.stream_id),
                 time: Set(r.time.into()),
                 replicate_index: Set(r.replicate_index),

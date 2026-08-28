@@ -30,62 +30,26 @@ pub async fn get_keycloak_config(State(state): State<AppState>) -> impl IntoResp
     }
 }
 
-/// Which notification channels the deployment has configured (driven by env vars). The frontend uses
-/// this to enable or grey-out each channel. Carries no secrets, only availability booleans, the
-/// email backend kind, and the public bot username.
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NotificationsConfig {
-    pub telegram: TelegramCapability,
-    pub email: EmailCapability,
+    pub web_push: WebPushCapability,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TelegramCapability {
+pub struct WebPushCapability {
     pub available: bool,
-    /// Public bot username (no `@`), for building the `t.me/<bot>?start=<code>` link. `None` if
-    /// unset and Telegram could not be reached.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bot_username: Option<String>,
-    /// The bot's display name, as shown in a Telegram chat list.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bot_name: Option<String>,
-    /// The bot's @BotFather description, when one is set.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bot_description: Option<String>,
+    pub vapid_public_key: Option<String>,
 }
 
-#[derive(Serialize)]
-pub struct EmailCapability {
-    pub available: bool,
-    /// `smtp` | `graph` | `disabled`.
-    pub backend: String,
-}
-
-/// Notification channel capabilities for the frontend. Always answers (unlike Keycloak config, an
-/// all-disabled state is valid); never returns 404 and never leaks credentials.
 pub async fn get_notifications_config(State(state): State<AppState>) -> impl IntoResponse {
     let config = &state.config;
-    // TELEGRAM_BOT_USERNAME is the fallback for when Telegram is unreachable.
-    let identity = match &config.telegram_bot_token {
-        Some(token) => {
-            crate::routes::private::notifications::telegram::cached_identity(token).await
-        }
-        None => None,
-    };
     Json(NotificationsConfig {
-        telegram: TelegramCapability {
-            available: config.telegram_configured(),
-            bot_username: identity
-                .as_ref()
-                .map(|i| i.username.clone())
-                .or_else(|| config.telegram_bot_username.clone()),
-            bot_name: identity.as_ref().and_then(|i| i.name.clone()),
-            bot_description: identity.as_ref().and_then(|i| i.description.clone()),
-        },
-        email: EmailCapability {
-            available: config.email_configured(),
-            backend: config.email_backend_str().to_string(),
+        web_push: WebPushCapability {
+            available: config.web_push_configured(),
+            vapid_public_key: config.vapid_public_key.clone(),
         },
     })
 }

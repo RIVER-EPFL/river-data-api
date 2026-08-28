@@ -12,7 +12,7 @@ pub type ImportStagingCache = Cache<String, Arc<String>>;
 use super::bulk::{BulkSemaphore, new_bulk_semaphore};
 use crate::config::Config;
 use crate::routes::private::api_tokens::service::TokenCache;
-use crate::routes::private::notifications::authz::Authorizer;
+use crate::routes::private::notifications::access::Authorizer;
 use crate::routes::public::service::{PublicConfigCache, new_public_config_cache};
 
 /// Per-token request limiters, keyed by token id. Each entry holds the configured

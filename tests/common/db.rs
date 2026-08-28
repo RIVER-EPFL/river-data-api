@@ -30,7 +30,7 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
          reprocessing_jobs, schedules, schedule_audit, csv_import_staging, \
          annotations, notes, \
          alarm_thresholds, alarm_events, api_tokens, \
-         telegram_identities, telegram_command_audit, \
+         web_push_subscriptions, \
          notification_mutes, notification_log, notification_state, \
          notification_subscribers, notification_subscriptions, notification_channel_health, \
          sensor_calibrations, sensor_deployments, sensors, \

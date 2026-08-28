@@ -22,27 +22,6 @@ impl std::str::FromStr for Deployment {
     }
 }
 
-/// Email delivery backend. SMTP submits via `lettre`; Graph posts to Microsoft Graph `sendMail`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum EmailBackend {
-    #[default]
-    Disabled,
-    Smtp,
-    Graph,
-}
-
-impl std::str::FromStr for EmailBackend {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "smtp" => Ok(Self::Smtp),
-            "graph" => Ok(Self::Graph),
-            "disabled" | "none" | "" => Ok(Self::Disabled),
-            _ => Err(()),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -149,33 +128,8 @@ pub struct Config {
     pub job_max_retries: u32,
     pub job_retry_backoff_seconds: u64,
 
-    // Notifications (Telegram bot + email). Every channel is optional, an unset token or a
-    // disabled/incomplete email backend is simply skipped, so the API runs identically without them.
-    pub telegram_bot_token: Option<String>,
-    // Public bot username (no @, e.g. `riverdata_bot`). Optional, only used to build the
-    // `t.me/<bot>?start=<code>` self-service deep link; not a secret.
-    pub telegram_bot_username: Option<String>,
-    // Whether THIS replica runs the Telegram bot poller. The bot long-polls getUpdates (a global
-    // feed, not a competing-consumer queue), so at >1 replica it must run on exactly one, set false
-    // on every replica except the single bot replica. Default true (single-replica behaviour).
-    pub enable_telegram_bot: bool,
-    pub email_backend: EmailBackend,
-    // SMTP submission (lettre), used when email_backend = Smtp.
-    pub smtp_host: Option<String>,
-    pub smtp_port: u16,
-    pub smtp_username: Option<String>,
-    pub smtp_password: Option<String>,
-    pub smtp_from: Option<String>,
-    // Microsoft Graph sendMail, used when email_backend = Graph.
-    pub graph_tenant_id: Option<String>,
-    pub graph_client_id: Option<String>,
-    pub graph_client_secret: Option<String>,
-    pub graph_sender: Option<String>,
-    // Where alarm emails are delivered (e.g. an EPFL group distribution address). The list server
-    // handles per-recipient fan-out, so this is a single address.
-    pub alert_email_to: Option<String>,
-    // Dispatcher poll cadence (the broadcast wakeup is primary; this bounds a missed event) and the
-    // identity reconciliation sweep cadence (anti-backdoor).
+    // Notifications. Web Push is the only channel; dispatcher poll cadence (the broadcast wakeup is
+    // primary; this bounds a missed event) and the push subscription reconciliation sweep cadence.
     pub notify_poll_interval_seconds: u64,
     pub identity_reconcile_interval_seconds: u64,
     // How often the background health probe checks each configured channel (getMe / SMTP NOOP /
@@ -186,60 +140,21 @@ pub struct Config {
     pub battery_forecast_alert_days: i64,
     // A paired slot with no reading newer than this many hours raises a stale-data alert.
     pub stale_data_threshold_hours: i64,
-    // When true, grab samples submitted via the bot are flagged for review on insert.
-    pub telegram_grab_flag_for_review: bool,
-    // When true, a Telegram alert is followed by a chart of the breaching slot.
-    pub telegram_alarm_plots: bool,
-    // The window an alarm chart covers, in hours.
-    pub telegram_alarm_plot_hours: i64,
-    // Days of inactivity (sent or received) after which a Telegram link is deactivated. 0 disables.
-    pub telegram_link_idle_days: i64,
-    // How many days before expiry the holder is warned. Must be below the idle threshold.
-    pub telegram_link_warn_days: i64,
-    // Days after which a deactivated link's row is deleted outright. 0 disables.
-    pub telegram_link_purge_days: i64,
-    // Days of Telegram command history kept in telegram_command_audit. 0 keeps it forever.
-    pub telegram_audit_retention_days: i64,
-    // Days a link may go without its owner making an authenticated portal request. 0 disables.
-    pub telegram_link_attest_days: i64,
-    // How many days before attestation lapses the holder is warned.
-    pub telegram_link_attest_warn_days: i64,
     // Dashboard base URL used to build deep links in notification messages.
     pub dashboard_base_url: Option<String>,
+
+    // Web Push (VAPID). The private key PEM signs each push; the public key goes to browsers at
+    // subscription time; the subject is a mailto: or https: contact for the push service operator.
+    pub vapid_private_key_pem: Option<String>,
+    pub vapid_public_key: Option<String>,
+    pub vapid_subject: Option<String>,
 }
 
 impl Config {
-    /// Whether the Telegram channel is configured (a bot token is present). Pure check, no I/O.
+    /// Whether Web Push is configured (a VAPID private key and subject are present).
     #[must_use]
-    pub fn telegram_configured(&self) -> bool {
-        self.telegram_bot_token.is_some()
-    }
-
-    /// Whether the email transport is fully configured for the selected backend. Mirrors the gating
-    /// in `notifications::email::build_mailer` without constructing a transport or logging, so it is
-    /// safe to call on the public capabilities endpoint.
-    #[must_use]
-    pub fn email_configured(&self) -> bool {
-        match self.email_backend {
-            EmailBackend::Disabled => false,
-            EmailBackend::Smtp => self.smtp_host.is_some() && self.smtp_from.is_some(),
-            EmailBackend::Graph => {
-                self.graph_tenant_id.is_some()
-                    && self.graph_client_id.is_some()
-                    && self.graph_client_secret.is_some()
-                    && self.graph_sender.is_some()
-            }
-        }
-    }
-
-    /// The email backend as the lowercase string the frontend expects (`smtp`/`graph`/`disabled`).
-    #[must_use]
-    pub fn email_backend_str(&self) -> &'static str {
-        match self.email_backend {
-            EmailBackend::Disabled => "disabled",
-            EmailBackend::Smtp => "smtp",
-            EmailBackend::Graph => "graph",
-        }
+    pub fn web_push_configured(&self) -> bool {
+        self.vapid_private_key_pem.is_some() && self.vapid_subject.is_some()
     }
 
     /// Load configuration from environment variables.
@@ -455,36 +370,6 @@ impl Config {
                 .parse()
                 .unwrap_or(60),
 
-            telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            telegram_bot_username: env::var("TELEGRAM_BOT_USERNAME")
-                .ok()
-                .map(|s| s.trim().trim_start_matches('@').to_string())
-                .filter(|s| !s.is_empty()),
-            enable_telegram_bot: env::var("ENABLE_TELEGRAM_BOT")
-                .unwrap_or_else(|_| "true".to_string())
-                .parse()
-                .unwrap_or(true),
-            email_backend: env::var("EMAIL_BACKEND")
-                .unwrap_or_default()
-                .parse()
-                .unwrap_or(EmailBackend::Disabled),
-            smtp_host: env::var("SMTP_HOST").ok().filter(|s| !s.is_empty()),
-            smtp_port: env::var("SMTP_PORT")
-                .unwrap_or_else(|_| "587".to_string())
-                .parse()
-                .unwrap_or(587),
-            smtp_username: env::var("SMTP_USERNAME").ok().filter(|s| !s.is_empty()),
-            smtp_password: env::var("SMTP_PASSWORD").ok().filter(|s| !s.is_empty()),
-            smtp_from: env::var("SMTP_FROM").ok().filter(|s| !s.is_empty()),
-            graph_tenant_id: env::var("GRAPH_TENANT_ID").ok().filter(|s| !s.is_empty()),
-            graph_client_id: env::var("GRAPH_CLIENT_ID").ok().filter(|s| !s.is_empty()),
-            graph_client_secret: env::var("GRAPH_CLIENT_SECRET")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            graph_sender: env::var("GRAPH_SENDER").ok().filter(|s| !s.is_empty()),
-            alert_email_to: env::var("ALERT_EMAIL_TO").ok().filter(|s| !s.is_empty()),
             notify_poll_interval_seconds: env::var("NOTIFY_POLL_INTERVAL_SECONDS")
                 .unwrap_or_else(|_| "60".to_string())
                 .parse()
@@ -509,43 +394,17 @@ impl Config {
                 .unwrap_or_else(|_| "6".to_string())
                 .parse()
                 .unwrap_or(6),
-            telegram_grab_flag_for_review: env::var("TELEGRAM_GRAB_FLAG_FOR_REVIEW")
-                .unwrap_or_else(|_| "false".to_string())
-                .parse()
-                .unwrap_or(false),
-            telegram_alarm_plots: env::var("TELEGRAM_ALARM_PLOTS")
-                .unwrap_or_else(|_| "true".to_string())
-                .parse()
-                .unwrap_or(true),
-            telegram_alarm_plot_hours: env::var("TELEGRAM_ALARM_PLOT_HOURS")
-                .unwrap_or_else(|_| "3".to_string())
-                .parse()
-                .unwrap_or(3),
-            telegram_link_idle_days: env::var("TELEGRAM_LINK_IDLE_DAYS")
-                .unwrap_or_else(|_| "30".to_string())
-                .parse()
-                .unwrap_or(30),
-            telegram_link_warn_days: env::var("TELEGRAM_LINK_WARN_DAYS")
-                .unwrap_or_else(|_| "7".to_string())
-                .parse()
-                .unwrap_or(7),
-            telegram_link_purge_days: env::var("TELEGRAM_LINK_PURGE_DAYS")
-                .unwrap_or_else(|_| "90".to_string())
-                .parse()
-                .unwrap_or(90),
-            telegram_audit_retention_days: env::var("TELEGRAM_AUDIT_RETENTION_DAYS")
-                .unwrap_or_else(|_| "365".to_string())
-                .parse()
-                .unwrap_or(365),
-            telegram_link_attest_days: env::var("TELEGRAM_LINK_ATTEST_DAYS")
-                .unwrap_or_else(|_| "90".to_string())
-                .parse()
-                .unwrap_or(90),
-            telegram_link_attest_warn_days: env::var("TELEGRAM_LINK_ATTEST_WARN_DAYS")
-                .unwrap_or_else(|_| "14".to_string())
-                .parse()
-                .unwrap_or(14),
             dashboard_base_url: env::var("DASHBOARD_BASE_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            vapid_private_key_pem: env::var("VAPID_PRIVATE_KEY_PEM")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.replace("\\n", "\n")),
+            vapid_public_key: env::var("VAPID_PUBLIC_KEY")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            vapid_subject: env::var("VAPID_SUBJECT")
                 .ok()
                 .filter(|s| !s.is_empty()),
         })

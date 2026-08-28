@@ -47,8 +47,8 @@ async fn enforce_hold_scope(
     let row = db
         .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT sp.site_id FROM replicate_audit_holds h
-             JOIN data_streams ds ON ds.id = h.stream_id
+            "SELECT COALESCE(sp.site_id, h.site_id) AS site_id FROM replicate_audit_holds h
+             LEFT JOIN data_streams ds ON ds.id = h.stream_id
              LEFT JOIN site_parameters sp ON sp.id = ds.site_parameter_id
              WHERE h.id = $1",
             [hold_id.into()],
@@ -540,15 +540,21 @@ const RELATIVE_DELTA_SQL: &str = concat!(
 #[derive(Debug, Serialize, FromQueryResult, ToSchema)]
 pub struct HoldRow {
     pub id: Uuid,
-    pub stream_id: Uuid,
-    pub source_system: String,
-    pub source_key: String,
+    /// NULL on event-audit findings, which are keyed on (site, parameter, instant) instead.
+    pub stream_id: Option<Uuid>,
+    /// `replicate_stats` | `source_modified` | `brake_fired` | `missing_output` | `stale_output`.
+    pub kind: String,
+    pub source_system: Option<String>,
+    pub source_key: Option<String>,
     /// The stream's human name as registered by the source.
     pub source_name: Option<String>,
-    /// Site and parameter of the paired slot; NULL while the stream is unpaired.
+    /// Site and parameter of the paired slot (or of the event finding itself); NULL while the
+    /// stream is unpaired.
     pub site_name: Option<String>,
     pub parameter_name: Option<String>,
     pub parameter_code: Option<String>,
+    /// The tool an event finding names.
+    pub tool: Option<String>,
     pub paired: bool,
     pub group_time: DateTime<Utc>,
     #[schema(value_type = Object)]
@@ -617,9 +623,11 @@ pub async fn list_holds(
     if let Some(projects) = scope.sql_project_array() {
         binds.push(projects);
         conditions.push(format!(
-            "EXISTS (SELECT 1 FROM site_parameters sp JOIN sites st ON st.id = sp.site_id \
-             WHERE sp.id = ds.site_parameter_id AND st.project_id = ANY(${}))",
-            binds.len()
+            "(EXISTS (SELECT 1 FROM site_parameters sp JOIN sites st ON st.id = sp.site_id \
+              WHERE sp.id = ds.site_parameter_id AND st.project_id = ANY(${n})) \
+              OR EXISTS (SELECT 1 FROM sites st WHERE st.id = h.site_id \
+              AND st.project_id = ANY(${n})))",
+            n = binds.len()
         ));
     }
     if let Some(stream_id) = query.stream_id {
@@ -693,7 +701,7 @@ pub async fn list_holds(
                         COUNT(*) FILTER (WHERE h.status = 'pending')::bigint AS pending,
                         COUNT(*) FILTER (WHERE h.status = 'deferred')::bigint AS deferred
                  FROM replicate_audit_holds h
-                 JOIN data_streams ds ON ds.id = h.stream_id
+                 LEFT JOIN data_streams ds ON ds.id = h.stream_id
                  WHERE {base_clause}"
             ),
             binds.clone(),
@@ -707,9 +715,12 @@ pub async fn list_holds(
     let mut rows = HoldRow::find_by_statement(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         format!(
-            "SELECT h.id, h.stream_id, ds.source_system, ds.source_key, ds.source_name,
-                    s.name AS site_name, p.name AS parameter_name, p.code AS parameter_code,
-                    (ds.site_parameter_id IS NOT NULL) AS paired,
+            "SELECT h.id, h.stream_id, h.kind, ds.source_system, ds.source_key, ds.source_name,
+                    COALESCE(s.name, es.name) AS site_name,
+                    COALESCE(p.name, ep.name) AS parameter_name,
+                    COALESCE(p.code, ep.code) AS parameter_code,
+                    h.tool,
+                    COALESCE(ds.site_parameter_id IS NOT NULL, FALSE) AS paired,
                     h.group_time,
                     h.expected, h.computed, h.delta, h.status,
                     ''::text AS classification, h.resolution,
@@ -718,10 +729,12 @@ pub async fn list_holds(
                     {MEAN_RELATIVE_DELTA_SQL} AS mean_relative_delta,
                     {SD_RELATIVE_DELTA_SQL} AS sd_relative_delta
              FROM replicate_audit_holds h
-             JOIN data_streams ds ON ds.id = h.stream_id
+             LEFT JOIN data_streams ds ON ds.id = h.stream_id
              LEFT JOIN site_parameters sp ON sp.id = ds.site_parameter_id
              LEFT JOIN sites s ON s.id = sp.site_id
              LEFT JOIN parameters p ON p.id = sp.parameter_id
+             LEFT JOIN sites es ON es.id = h.site_id
+             LEFT JOIN parameters ep ON ep.id = h.parameter_id
              WHERE {where_clause}
              ORDER BY {order_by}
              LIMIT {page_size} OFFSET {offset}"
@@ -731,7 +744,11 @@ pub async fn list_holds(
     .all(&state.db)
     .await?;
     for row in &mut rows {
-        row.classification = classify(&row.expected, &row.computed).to_string();
+        // The disagreement signature is a replicate-statistics concept; other kinds carry their
+        // meaning in `kind` itself.
+        if row.kind == "replicate_stats" {
+            row.classification = classify(&row.expected, &row.computed).to_string();
+        }
     }
 
     Ok(Json(ListHoldsResponse {
