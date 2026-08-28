@@ -198,6 +198,7 @@ pub fn validate_optional_time_range(
         private::readings::provenance::get_reading_provenance,
         private::readings::status_events::batch::insert_batch_status_events,
         private::data_streams::views::stream_stats,
+        private::data_streams::views::stream_preview,
         private::data_streams::views::stream_receipts,
         private::data_streams::views::register_stream,
         private::sensors::standard_curves::views::register_standard_curve,

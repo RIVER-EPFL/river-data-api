@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
 };
 use chrono::Utc;
 use sea_orm::{
@@ -34,6 +34,186 @@ pub struct StreamStatsResponse {
     pub latest_value: Option<f64>,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PreviewReplicate {
+    pub replicate_index: i16,
+    /// The source column this index is pinned to, when the stream declares a replicate spec.
+    pub column: Option<String>,
+    pub value: Option<f64>,
+    pub is_flagged: bool,
+    pub withdrawn: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PreviewInstant {
+    pub time: chrono::DateTime<Utc>,
+    pub replicates: Vec<PreviewReplicate>,
+    /// Recomputed here from the served replicates, which is what `samples` holds for a paired
+    /// stream. Shown so the review can see the statistics the pairing will produce before it
+    /// produces them.
+    pub mean: Option<f64>,
+    pub sd: Option<f64>,
+    pub n: usize,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StreamPreviewResponse {
+    pub stream_id: Uuid,
+    pub source_key: String,
+    pub instants: Vec<PreviewInstant>,
+}
+
+/// The most recent instants a stream holds, as the replicate rows they will be served as.
+///
+/// The routing block tells an operator which column becomes which replicate index; this shows the
+/// same thing with the stream's own values in it, which is the difference between reading a
+/// mapping and seeing what pairing will do. Readings exist before pairing (an unpaired stream
+/// stores its data unattributed), so this works at review time. Requires `read_metadata`.
+#[utoipa::path(
+    get,
+    path = "/streams/{id}/preview",
+    params(
+        ("id" = Uuid, Path, description = "Stream UUID"),
+        ("limit" = Option<u32>, Query, description = "Instants to return (default 3, max 20)"),
+    ),
+    responses(
+        (status = 200, description = "Recent instants as replicate rows", body = StreamPreviewResponse),
+        (status = 404, description = "Stream not found"),
+    ),
+    tag = "streams"
+)]
+pub async fn stream_preview(
+    State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+    Path(id): Path<Uuid>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> AppResult<Json<StreamPreviewResponse>> {
+    let stream = data_streams::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
+    guard_stream_scope(&state, &stream, &scope).await?;
+
+    let limit: i64 = params
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(3)
+        .clamp(1, 20);
+
+    // The pinned column-to-index mapping, so an index is labelled with the column it came from
+    // rather than left as a bare number.
+    let columns: std::collections::HashMap<i16, String> =
+        super::replicates::ReplicateSpec::from_metadata(&stream.metadata)
+            .map(|spec| {
+                spec.assignments
+                    .into_iter()
+                    .map(|a| (a.index, a.column))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+    // The newest `limit` instants, then every replicate at those instants.
+    let rows = state
+        .db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT r.time, r.replicate_index,
+                    COALESCE(r.calibrated_value, r.raw_value) AS value,
+                    COALESCE(r.is_flagged, false) AS is_flagged,
+                    r.withdrawn_at IS NOT NULL AS withdrawn
+             FROM readings r
+             JOIN (
+                 SELECT DISTINCT time FROM readings WHERE stream_id = $1
+                 ORDER BY time DESC LIMIT $2
+             ) t ON t.time = r.time
+             WHERE r.stream_id = $1
+             ORDER BY r.time DESC, r.replicate_index",
+            [id.into(), limit.into()],
+        ))
+        .await?;
+
+    let mut instants: Vec<PreviewInstant> = Vec::new();
+    for row in &rows {
+        let time: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
+        let time = time.with_timezone(&Utc);
+        let replicate_index: i16 = row.try_get("", "replicate_index").unwrap_or(0);
+        let replicate = PreviewReplicate {
+            replicate_index,
+            column: columns.get(&replicate_index).cloned(),
+            value: row.try_get("", "value").ok(),
+            is_flagged: row.try_get("", "is_flagged").unwrap_or(false),
+            withdrawn: row.try_get("", "withdrawn").unwrap_or(false),
+        };
+        match instants.last_mut() {
+            Some(last) if last.time == time => last.replicates.push(replicate),
+            _ => instants.push(PreviewInstant {
+                time,
+                replicates: vec![replicate],
+                mean: None,
+                sd: None,
+                n: 0,
+            }),
+        }
+    }
+
+    // Statistics over the replicates that would be served: flagged and withdrawn rows are excluded
+    // from `samples`, so excluding them here is what makes the preview match the outcome.
+    for instant in &mut instants {
+        let values: Vec<f64> = instant
+            .replicates
+            .iter()
+            .filter(|r| !r.is_flagged && !r.withdrawn)
+            .filter_map(|r| r.value)
+            .collect();
+        instant.n = values.len();
+        if values.is_empty() {
+            continue;
+        }
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        instant.mean = Some(mean);
+        if values.len() > 1 {
+            let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+                / (values.len() - 1) as f64;
+            instant.sd = Some(variance.sqrt());
+        }
+    }
+
+    Ok(Json(StreamPreviewResponse {
+        stream_id: id,
+        source_key: stream.source_key,
+        instants,
+    }))
+}
+
+/// A project-scoped key may only inspect a stream paired into its own project. An unpaired or
+/// cross-project stream is reported as not-found (rather than 403) so a scoped key cannot even
+/// confirm the existence of another project's streams.
+async fn guard_stream_scope(
+    state: &AppState,
+    stream: &data_streams::Model,
+    scope: &crate::common::authz::AccessScope,
+) -> AppResult<()> {
+    if !scope.is_restricted() {
+        return Ok(());
+    }
+    let stream_project = match stream.site_parameter_id {
+        Some(sp_id) => state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT s.project_id FROM site_parameters sp JOIN sites s ON s.id = sp.site_id WHERE sp.id = $1",
+                [sp_id.into()],
+            ))
+            .await?
+            .and_then(|r| r.try_get::<Uuid>("", "project_id").ok()),
+        None => None,
+    };
+    if !scope.allows_project_opt(stream_project) {
+        return Err(AppError::NotFound("Stream not found".to_string()));
+    }
+    Ok(())
+}
+
 /// Reading statistics for a single data stream: count, time range, latest value.
 /// Requires `read_metadata`.
 #[utoipa::path(
@@ -57,26 +237,7 @@ pub async fn stream_stats(
         .await?
         .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
 
-    // A project-scoped key may only inspect a stream paired into its own project. An unpaired or
-    // cross-project stream is reported as not-found (rather than 403) so a scoped key can't even
-    // confirm the existence of another project's streams.
-    if scope.is_restricted() {
-        let stream_project = match stream.site_parameter_id {
-            Some(sp_id) => state
-                .db
-                .query_one(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "SELECT s.project_id FROM site_parameters sp JOIN sites s ON s.id = sp.site_id WHERE sp.id = $1",
-                    [sp_id.into()],
-                ))
-                .await?
-                .and_then(|r| r.try_get::<Uuid>("", "project_id").ok()),
-            None => None,
-        };
-        if !scope.allows_project_opt(stream_project) {
-            return Err(AppError::NotFound("Stream not found".to_string()));
-        }
-    }
+    guard_stream_scope(&state, &stream, &scope).await?;
 
     let row = state.db
         .query_one(Statement::from_sql_and_values(

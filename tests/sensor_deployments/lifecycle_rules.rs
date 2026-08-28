@@ -305,8 +305,8 @@ async fn auto_deploy_skipped_when_slot_occupied() {
     let sensor_a = create_sensor(&db, "Incumbent-A", GLOBAL_PARAM_TEMP_ID).await;
     deploy_sensor(&db, sensor_a.id, SITE1_ID, dt("2025-01-01T00:00:00Z")).await;
 
-    // A second, unpaired stream (NULL serial → a distinct sensor B is created on pair) with readings.
-    let stream = create_unpaired_stream(&db, "occupied-slot").await;
+    // A second, unpaired stream naming its own device, so pairing creates a distinct sensor B.
+    let stream = create_unpaired_stream_with_device(&db, "occupied-slot", "OCCUPIED-B").await;
     insert_unpaired_readings(
         &db,
         stream,
@@ -354,8 +354,8 @@ async fn auto_deploy_skipped_when_slot_occupied() {
         "readings re-attributed to the incumbent sensor A with its deployment"
     );
 
-    // Sensor B was created for the stream (linked via data_streams.sensor_id) but has no
-    // deployment, the slot was occupied. It stays available for an explicit adopt later.
+    // Sensor B was created from the stream's own serial (linked via data_streams.sensor_id) but has
+    // no deployment, the slot was occupied. It stays available for an explicit adopt later.
     let stream_sensor = count(
         &db,
         &format!(

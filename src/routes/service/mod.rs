@@ -257,6 +257,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
 
     let stream_read_routes = Router::new()
         .route("/streams/{id}/stats", get(stream_views::stream_stats))
+        .route("/streams/{id}/preview", get(stream_views::stream_preview))
         .route("/streams/{id}/receipts", get(stream_views::stream_receipts))
         .layer(middleware::from_fn(require_read_metadata))
         .with_state(state.clone());

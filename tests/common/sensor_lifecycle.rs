@@ -414,6 +414,26 @@ pub async fn create_unpaired_stream(db: &DatabaseConnection, source_key: &str) -
     id
 }
 
+/// An unpaired stream whose metadata names a device serial, so pairing creates an instrument for
+/// it. Without a serial there is no identity to deduplicate on and pairing attributes none.
+pub async fn create_unpaired_stream_with_device(
+    db: &DatabaseConnection,
+    source_key: &str,
+    serial: &str,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    exec(
+        db,
+        &format!(
+            "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active, metadata) \
+             VALUES ('{id}', 'test', '{source_key}', 'Test {source_key}', true, \
+                     '{{\"device\": {{\"logger_serial\": \"{serial}\"}}}}'::jsonb)"
+        ),
+    )
+    .await;
+    id
+}
+
 /// Query all readings for a stream, ordered by time.
 pub async fn get_readings(db: &DatabaseConnection, stream_id: Uuid) -> Vec<ReadingRow> {
     let rows = db
