@@ -62,25 +62,44 @@ async fn curve_is_used<C: ConnectionTrait>(conn: &C, id: Uuid) -> AppResult<bool
 }
 
 /// Find or create the lab instrument a source's curves attach to, one per
-/// (source_system, instrument_label). Serial is the deterministic identity, so re-registration
-/// resolves the same instrument instead of minting one per cycle.
-async fn resolve_lab_instrument(
+/// (source_system, instrument_label). `(source_system, source_key)` is the identity, so
+/// re-registration resolves the same instrument instead of minting one per cycle.
+///
+/// The serial lookup is the fallback for an instrument minted before provenance existed whose
+/// curve registration never landed, so the migration's curve-join backfill could not reach it;
+/// resolving it that way stamps the provenance it was missing.
+pub(crate) async fn resolve_lab_instrument(
     state: &AppState,
     source_system: &str,
     instrument_label: &str,
 ) -> AppResult<Uuid> {
-    let serial = format!("{source_system}:{instrument_label}");
+    let source_key = format!("{source_system}:{instrument_label}");
     if let Some(existing) = sensors::Entity::find()
-        .filter(sensors::Column::SerialNumber.eq(serial.clone()))
+        .filter(sensors::Column::SourceSystem.eq(source_system))
+        .filter(sensors::Column::SourceKey.eq(source_key.clone()))
         .one(&state.db)
         .await?
     {
         return Ok(existing.id);
     }
+    if let Some(existing) = sensors::Entity::find()
+        .filter(sensors::Column::SerialNumber.eq(source_key.clone()))
+        .one(&state.db)
+        .await?
+    {
+        let id = existing.id;
+        let mut active: sensors::ActiveModel = existing.into();
+        active.source_system = Set(Some(source_system.to_string()));
+        active.source_key = Set(Some(source_key));
+        active.update(&state.db).await?;
+        return Ok(id);
+    }
     let id = Uuid::new_v4();
     sensors::ActiveModel {
         id: Set(id),
-        serial_number: Set(Some(serial)),
+        serial_number: Set(Some(source_key.clone())),
+        source_system: Set(Some(source_system.to_string())),
+        source_key: Set(Some(source_key)),
         name: Set(Some(format!("{instrument_label} ({source_system})"))),
         is_active: Set(Some(true)),
         is_lab_instrument: Set(Some(true)),

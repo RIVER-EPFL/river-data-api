@@ -85,6 +85,7 @@ mod m20260828_000003_ingested_at;
 mod m20260829_000001_web_push_subscriptions;
 mod m20260829_000002_notification_subscribers_web_push;
 mod m20260829_000003_drop_telegram_tables;
+mod m20260830_000001_sensor_provenance;
 
 pub struct Migrator;
 
@@ -175,6 +176,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260829_000001_web_push_subscriptions::Migration),
             Box::new(m20260829_000002_notification_subscribers_web_push::Migration),
             Box::new(m20260829_000003_drop_telegram_tables::Migration),
+            Box::new(m20260830_000001_sensor_provenance::Migration),
         ]
     }
 }

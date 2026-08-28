@@ -28,6 +28,14 @@ pub struct Model {
     pub is_active: Option<bool>,
     #[crudcrate(filterable)]
     pub is_lab_instrument: Option<bool>,
+    /// Sync provenance: the source a replicated lab instrument came from (e.g. "cnet"). NULL on
+    /// devices registered by serial. Written only by the sync paths, never through CRUD.
+    #[crudcrate(exclude(create, update), filterable)]
+    pub source_system: Option<String>,
+    /// The instrument's identity within its source (e.g. "cnet:DOC corr"); the lookup key
+    /// together with `source_system`.
+    #[crudcrate(exclude(create, update), filterable)]
+    pub source_key: Option<String>,
     /// Cadence classification: 'high' (field stream → continuous readings) or 'low'
     /// (lab/campaign → spot readings). Resolved at ingest for streams owned by this sensor.
     #[crudcrate(filterable, sortable, on_create = "high".to_string())]
