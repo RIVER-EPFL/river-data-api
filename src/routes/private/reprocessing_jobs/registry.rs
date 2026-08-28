@@ -59,6 +59,8 @@ pub fn is_rerunnable(trigger_type: &str) -> bool {
             | "refresh_aggregates_full"
             | "derived_recompute"
             | "measurement_retag"
+            | "event_recompute"
+            | "event_audit"
     )
 }
 
@@ -76,5 +78,6 @@ pub fn is_cancellable(trigger_type: &str) -> bool {
             | "janitor_run"
             | "replicate_reconciliation"
             | "replicate_reconciliation_delete"
+            | "event_audit"
     )
 }

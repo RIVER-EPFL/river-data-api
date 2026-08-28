@@ -138,6 +138,10 @@ pub mod admission {
         /// paths, like `UnknownCalibration`: the claim is wrong for this reading and a retry
         /// cannot make it right.
         InvalidStandardCurve,
+        /// Two payload rows at one (time, replicate_index) key under a completeness window. The
+        /// last occurrence wins (the backends emit source-id order, so last is deterministic);
+        /// the losers are counted here so the receipt arithmetic still closes.
+        DuplicateKey,
     }
 
     impl RejectionKind {
@@ -150,6 +154,7 @@ pub mod admission {
                 Self::InvalidStandardCurve => {
                     "standard_curve_id names no curve admissible for this reading"
                 }
+                Self::DuplicateKey => "duplicate (time, replicate_index) key in one payload",
             }
         }
     }
@@ -811,6 +816,9 @@ pub async fn insert_batch_readings(
             };
             readings::ActiveModel {
                 standard_curve_id: Set(r.standard_curve_id),
+                collection_event_id: Set(None),
+                withdrawn_at: Set(None),
+                withdrawn_reason: Set(None),
                 stream_id: Set(stream_id),
                 site_id: Set(attributed.then_some(r.site_id)),
                 parameter_id: Set(attributed.then_some(r.parameter_id)),
@@ -872,6 +880,33 @@ pub async fn insert_batch_readings(
                 }
             }
         }
+        // Attributed spot rows this batch landed belong to collection events (D7). A batch caller
+        // is a person or a script acting for one, so the events are manual.
+        let spot_times: Vec<chrono::DateTime<chrono::FixedOffset>> = models
+            .iter()
+            .filter(|m| {
+                matches!(&m.measurement_type,
+                    sea_orm::ActiveValue::Set(Some(t)) if t == readings::sample_groups::SPOT)
+            })
+            .map(|m| *m.time.as_ref())
+            .collect();
+        if let (Some(first), Some(last)) = (
+            spot_times.iter().min().copied(),
+            spot_times.iter().max().copied(),
+        ) {
+            let mut stream_ids: Vec<Uuid> =
+                models.iter().map(|m| *m.stream_id.as_ref()).collect();
+            stream_ids.sort_unstable();
+            stream_ids.dedup();
+            crate::routes::private::collection_events::attach::attach_collection_events(
+                txn,
+                "r.stream_id = ANY($1) AND r.time >= $2 AND r.time <= $3",
+                vec![stream_ids.into(), first.into(), last.into()],
+                crate::routes::private::collection_events::attach::EventSource::Manual,
+            )
+            .await?;
+        }
+
         Ok((inserted, overwritten))
     })
     .await?;

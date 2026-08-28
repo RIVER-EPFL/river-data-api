@@ -310,7 +310,7 @@ pub async fn get_sensor_readings(
             "SELECT time, raw_value, calibrated_value, site_id FROM ( \
                 SELECT DISTINCT ON (stream_id, time) time, raw_value, calibrated_value, site_id \
                 FROM readings \
-                WHERE sensor_id = $1 AND measurement_type = 'spot'{shared_conditions} \
+                WHERE sensor_id = $1 AND measurement_type = 'spot' AND withdrawn_at IS NULL{shared_conditions} \
                 ORDER BY stream_id, time, (is_flagged IS TRUE), replicate_index \
              ) sp ORDER BY time ASC"
         ));

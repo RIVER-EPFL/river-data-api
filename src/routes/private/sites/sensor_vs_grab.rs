@@ -178,7 +178,8 @@ pub async fn get_sensor_vs_grab(
               AND r.time >= s.collected_at + ($4 * interval '1 hour')
               AND r.time <= s.collected_at + ($5 * interval '1 hour')
         ) agg ON true
-        WHERE s.site_id = $1 AND s.parameter_id = $2 AND s.collected_at >= $3{end_condition}
+        WHERE s.site_id = $1 AND s.parameter_id = $2 AND s.n > 0
+          AND s.collected_at >= $3{end_condition}
         ORDER BY s.collected_at
         "#,
     );

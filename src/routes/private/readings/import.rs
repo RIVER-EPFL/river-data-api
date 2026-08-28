@@ -79,6 +79,12 @@ pub struct ImportCsvRequest {
     /// `corrected`: no calibration is stamped or applied unless the caller declares the rows raw.
     #[serde(default)]
     pub values: CsvValueState,
+    /// Import the file as tool entry (S4a): each row's columns are inputs of this tool, the tool
+    /// runs over every row, and the outputs are saved through the grab write path with the same
+    /// server-built provenance a typed entry gets (`source: csv_import`). Without it, columns are
+    /// catalog parameters and values import as-is.
+    #[serde(default)]
+    pub tool: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -129,6 +135,10 @@ pub struct ImportCsvResponse {
     pub errors: Vec<RowError>,
     /// Total number of row problems (may exceed `errors.len()` when the list is truncated).
     pub error_count: usize,
+    /// `tool_runs` rows minted by a tool-entry import (one per data row that ran). Always 0 for a
+    /// plain import.
+    #[serde(default)]
+    pub tool_runs_created: usize,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -197,6 +207,7 @@ fn parse_datetime(s: &str, tz_offset: chrono::Duration) -> Option<chrono::DateTi
 )]
 pub async fn import_csv(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     ProjectScope(scope): ProjectScope,
     Json(req): Json<ImportCsvRequest>,
 ) -> AppResult<Json<ImportCsvResponse>> {
@@ -238,6 +249,16 @@ pub async fn import_csv(
 
     // A project-scoped token may only import into a site within its project.
     enforce_project_scope_for_sites(&state.db, &scope, &[site_id]).await?;
+
+    // Tool entry: the file's columns are tool inputs, not catalog parameters. Same write path as
+    // typing the rows into the tool (D15).
+    if let Some(tool_name) = req.tool.as_deref() {
+        let response = import_tool_csv(
+            &state, &auth, &scope, &req, tool_name, &csv_text, session_id, &site, tz_offset,
+        )
+        .await?;
+        return Ok(Json(response));
+    }
 
     // --- Resolution tables (site_parameter-first) ---------------------------------------------
 
@@ -619,6 +640,7 @@ pub async fn import_csv(
             overlap_sample: overlap.sample,
             errors,
             error_count,
+            tool_runs_created: 0,
         }));
     }
 
@@ -794,6 +816,7 @@ pub async fn import_csv(
         overlap_sample: overlap.sample,
         errors,
         error_count,
+        tool_runs_created: 0,
     }))
 }
 
@@ -984,5 +1007,273 @@ async fn compute_overlaps(
         differing,
         sample,
         owning_stream,
+    })
+}
+
+/// Ceiling on tool-entry rows per request: each row is one runner execution plus one grab save,
+/// and a campaign result sheet is tens of rows, not thousands.
+const TOOL_IMPORT_ROW_CAP: usize = 500;
+
+/// The tool-entry import: one tool run per data row, outputs saved through the grab write path.
+///
+/// Columns map to the tool's manifest params (case-insensitive, exact otherwise); the `DateTime`
+/// column is the row's collection instant and travels to the engine as `collected_at`, so
+/// station and event inputs resolve exactly as they would for a typed entry. Each row's run is
+/// stored with `source = 'csv_import'` and its save builds the ordinary server-side blob.
+#[allow(clippy::too_many_arguments)]
+async fn import_tool_csv(
+    state: &AppState,
+    auth: &crate::common::middleware::AuthContext,
+    scope: &crate::common::authz::AccessScope,
+    req: &ImportCsvRequest,
+    tool_name: &str,
+    csv_text: &str,
+    session_id: Uuid,
+    site: &crate::routes::private::sites::Model,
+    tz_offset: chrono::Duration,
+) -> AppResult<ImportCsvResponse> {
+    use crate::routes::private::readings::grab_samples::{
+        GrabSampleReading, GrabSampleRequest, GrabWriteMode, insert_grab_samples,
+    };
+    use crate::routes::private::tools::{engine, execute_and_store_run};
+
+    let tool = engine::find_active_tool(&state.db, tool_name).await?;
+
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .trim(csv::Trim::All)
+        .flexible(true)
+        .from_reader(csv_text.as_bytes());
+    let headers = reader
+        .headers()
+        .map_err(|e| AppError::BadRequest(format!("Failed to read CSV header: {e}")))?
+        .clone();
+    let datetime_idx = headers
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case("datetime") || h.eq_ignore_ascii_case("time"))
+        .unwrap_or(0);
+
+    let mut mapped_columns: HashMap<String, String> = HashMap::new();
+    let mut unmapped_columns: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut column_params: Vec<(usize, String)> = Vec::new();
+    for (idx, header) in headers.iter().enumerate() {
+        if idx == datetime_idx {
+            continue;
+        }
+        match tool
+            .manifest
+            .params
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(header))
+        {
+            Some(p) => {
+                mapped_columns.insert(header.to_string(), p.name.clone());
+                column_params.push((idx, p.name.clone()));
+            }
+            None => {
+                unmapped_columns.push(header.to_string());
+                warnings.push(format!(
+                    "Column '{header}' is not an input of tool '{}' and is ignored",
+                    tool.name
+                ));
+            }
+        }
+    }
+    if column_params.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "No CSV columns match inputs of tool '{}'",
+            tool.name
+        )));
+    }
+
+    let mut errors: Vec<RowError> = Vec::new();
+    let mut error_count = 0usize;
+    let record_error =
+        |row: usize, message: String, errors: &mut Vec<RowError>, count: &mut usize| {
+            *count += 1;
+            if errors.len() < MAX_ERRORS {
+                errors.push(RowError { row, message });
+            }
+        };
+
+    // Parse every row up front so the plan (and dry_run) reports the whole file before anything
+    // runs.
+    let mut rows: Vec<(usize, chrono::DateTime<chrono::Utc>, serde_json::Map<String, serde_json::Value>)> =
+        Vec::new();
+    let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut latest: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut line = 1usize;
+    for record in reader.records() {
+        line += 1;
+        let record = match record {
+            Ok(r) => r,
+            Err(e) => {
+                record_error(line, format!("CSV parse error: {e}"), &mut errors, &mut error_count);
+                continue;
+            }
+        };
+        let dt_cell = record.get(datetime_idx).unwrap_or("");
+        let Some(time) = parse_datetime(dt_cell, tz_offset) else {
+            record_error(
+                line,
+                format!("Unparseable DateTime '{dt_cell}'"),
+                &mut errors,
+                &mut error_count,
+            );
+            continue;
+        };
+        if let Some(reason) = admission::time_rejection(time) {
+            record_error(line, reason, &mut errors, &mut error_count);
+            continue;
+        }
+        let mut body = serde_json::Map::new();
+        let mut bad_cell = false;
+        for (idx, param) in &column_params {
+            match admission::classify_cell(record.get(*idx).unwrap_or("")) {
+                admission::Cell::Missing => {}
+                admission::Cell::Invalid(reason) => {
+                    record_error(
+                        line,
+                        format!("Column '{param}': {reason}"),
+                        &mut errors,
+                        &mut error_count,
+                    );
+                    bad_cell = true;
+                }
+                admission::Cell::Value(v) => {
+                    body.insert(param.clone(), serde_json::json!(v));
+                }
+            }
+        }
+        if bad_cell || body.is_empty() {
+            continue;
+        }
+        earliest = Some(earliest.map_or(time, |e| e.min(time)));
+        latest = Some(latest.map_or(time, |l| l.max(time)));
+        rows.push((line, time, body));
+    }
+    if rows.len() > TOOL_IMPORT_ROW_CAP {
+        return Err(AppError::BadRequest(format!(
+            "Tool-entry import takes at most {TOOL_IMPORT_ROW_CAP} rows per file; this file has {}",
+            rows.len()
+        )));
+    }
+
+    let saved_outputs: Vec<(String, Uuid)> = {
+        let catalog =
+            engine::load_parameter_catalog(&state.db, std::iter::once(&tool.manifest)).await?;
+        tool.manifest
+            .outputs
+            .iter()
+            .filter_map(|o| catalog.resolve(o).map(|p| (o.key.clone(), p.id)))
+            .collect()
+    };
+    if saved_outputs.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "No output of tool '{}' resolves to a catalog parameter; nothing could be saved",
+            tool.name
+        )));
+    }
+
+    let row_count = rows.len();
+    let mut inserted_total = 0usize;
+    let mut tool_runs_created = 0usize;
+    if !req.dry_run {
+        let actor = crate::routes::private::tools::scripts::actor_label(auth);
+        for (line, time, mut body) in rows {
+            body.insert("site_id".into(), serde_json::json!(site.id));
+            body.insert(
+                "collected_at".into(),
+                serde_json::json!(time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            );
+            let body_bytes = serde_json::to_vec(&serde_json::Value::Object(body))
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let result =
+                match execute_and_store_run(state, &tool, &body_bytes, &actor, "csv_import").await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        record_error(line, e.to_string(), &mut errors, &mut error_count);
+                        continue;
+                    }
+                };
+            tool_runs_created += 1;
+
+            let readings: Vec<GrabSampleReading> = saved_outputs
+                .iter()
+                .filter_map(|(key, parameter_id)| {
+                    result
+                        .results
+                        .get(key)
+                        .and_then(serde_json::Value::as_f64)
+                        .map(|value| GrabSampleReading {
+                            parameter_id: *parameter_id,
+                            sensor_id: None,
+                            value,
+                            time,
+                            replicate_index: None,
+                            output: Some(key.clone()),
+                            standard_curve_id: None,
+                        })
+                })
+                .collect();
+            if readings.is_empty() {
+                record_error(
+                    line,
+                    "the run produced no savable output for this row".to_string(),
+                    &mut errors,
+                    &mut error_count,
+                );
+                continue;
+            }
+            let request = GrabSampleRequest {
+                site_id: site.id,
+                created_by: Some(actor.clone()),
+                label: None,
+                notes: None,
+                mode: (req.conflict == ConflictMode::Overwrite).then_some(GrabWriteMode::Replace),
+                dry_run: false,
+                tool_run_id: Some(result.run_id),
+                check_id: None,
+                readings,
+            };
+            match insert_grab_samples(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth.clone()),
+                crate::common::middleware::ProjectScope(scope.clone()),
+                axum::Json(request),
+            )
+            .await
+            {
+                Ok(axum::Json(resp)) => inserted_total += resp.inserted,
+                Err(e) => record_error(line, e.to_string(), &mut errors, &mut error_count),
+            }
+        }
+    }
+
+    Ok(ImportCsvResponse {
+        site_id: site.id,
+        site_name: site.name.clone(),
+        dry_run: req.dry_run,
+        session_id: Some(session_id),
+        mapped_columns,
+        skipped_columns: Vec::new(),
+        unmapped_columns,
+        warnings,
+        row_count,
+        replicate_groups: 0,
+        inserted_total,
+        earliest,
+        latest,
+        derived_job_id: None,
+        derived_timestamps: 0,
+        duplicates: 0,
+        overlaps_identical: 0,
+        overlaps_differing: 0,
+        overwritten: 0,
+        overlap_sample: Vec::new(),
+        errors,
+        error_count,
+        tool_runs_created,
     })
 }

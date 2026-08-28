@@ -360,3 +360,59 @@ pub async fn set_site_parameter_public(db: &sea_orm::DatabaseConnection, sp_id: 
     .await
     .expect("mark site_parameter public");
 }
+
+/// Author, validate and activate one tool version as `admin`. Runner-backed: validation runs
+/// the stored cases.
+pub async fn author_tool(
+    app: &Router,
+    admin: &str,
+    name: &str,
+    script: &str,
+    manifest: serde_json::Value,
+    case: serde_json::Value,
+) {
+    let (status, created) = crate::common::client::post_json_parse_with_token(
+        app,
+        "/api/tool_scripts",
+        &json!({ "name": name, "label": name }),
+        admin,
+    )
+    .await;
+    assert!((200..300).contains(&status), "create {name} ({status}): {created}");
+    let script_id = id_of(&created);
+
+    let (status, version) = crate::common::client::post_json_parse_with_token(
+        app,
+        &format!("/api/tool_scripts/{script_id}/versions"),
+        &json!({
+            "script": script,
+            "manifest": manifest,
+            "test_cases": { "cases": [case] },
+        }),
+        admin,
+    )
+    .await;
+    assert!((200..300).contains(&status), "version {name} ({status}): {version}");
+    let version_id = id_of(&version["version"]);
+
+    let (status, validated) = crate::common::client::post_json_parse_with_token(
+        app,
+        &format!("/api/tool_scripts/{script_id}/versions/{version_id}/validate"),
+        &json!({}),
+        admin,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status) && validated["passed"] == true,
+        "validate {name} ({status}): {validated}"
+    );
+
+    let (status, activated) = crate::common::client::post_json_parse_with_token(
+        app,
+        &format!("/api/tool_scripts/{script_id}/versions/{version_id}/activate"),
+        &json!({}),
+        admin,
+    )
+    .await;
+    assert!((200..300).contains(&status), "activate {name} ({status}): {activated}");
+}

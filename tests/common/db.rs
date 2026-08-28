@@ -24,6 +24,7 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
         // `constants` is migration-seeded reference data; truncating it cannot be undone by
         // seed_test_data, so it is deliberately absent from this list.
         "TRUNCATE readings, status_events, samples, \
+         tool_runs, seasonal_checks, collection_events, \
          sync_service_tokens, sync_events, sync_commands, sync_services, sync_service_credentials, \
          pairing_plans, data_streams, \
          reprocessing_jobs, schedules, schedule_audit, csv_import_staging, \

@@ -21,6 +21,7 @@ use crate::routes::private::{
     annotations::Annotation,
     api_tokens::ApiToken,
     api_tokens::audit_log::ApiTokenAuditLog,
+    collection_events::CollectionEvent,
     constants::Constant,
     data_streams::DataStream,
     data_streams::pairing_plans::PairingPlan,
@@ -222,6 +223,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .nest("/constants", catalog_crud(Constant::router(db)))
         .nest("/samples", field_data_crud(Sample::router(db)))
         .nest(
+            "/collection_events",
+            field_data_crud(CollectionEvent::router(db)),
+        )
+        .nest(
             "/reprocessing_jobs",
             admin_write_crud(ReprocessingJob::router(db)),
         )
@@ -338,6 +343,14 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route("/readings/import_csv", post(readings_import::import_csv))
         .layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT))
         .route("/grab_samples", post(grab_samples::insert_grab_samples))
+        .route(
+            "/collection_events/{id}/recompute",
+            post(crate::routes::private::collection_events::recompute_collection_event),
+        )
+        .route(
+            "/actions/event_audit",
+            post(crate::routes::private::collection_events::run_event_audit),
+        )
         .route("/readings/flag", patch(flags::flag_readings))
         .route("/readings/unflag", patch(flags::unflag_readings))
         .route("/readings/flag_range", patch(flags::flag_range))
@@ -388,6 +401,14 @@ pub fn api_router(state: &AppState) -> Router<()> {
         )
         .route("/tools", get(tools::list_tools))
         .route("/tools/{tool_name}/calculate", post(tools::calculate_tool))
+        .route(
+            "/readings/seasonal_check",
+            post(crate::routes::private::readings::checks::seasonal_check),
+        )
+        .route(
+            "/actions/event_audit_findings",
+            get(crate::routes::private::collection_events::list_event_audit_findings),
+        )
         .layer(middleware::from_fn(require_read_data))
         .with_state(state.clone());
 
@@ -683,8 +704,6 @@ pub fn sync_control_router(_state: &AppState) -> Router<AppState> {
     use std::sync::Arc;
     use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
-    let service_routes = crate::routes::private::sync::control::routes();
-
     let enroll_limiter = GovernorConfigBuilder::default()
         .key_extractor(FallbackIpKeyExtractor)
         .per_second(3)
@@ -692,9 +711,13 @@ pub fn sync_control_router(_state: &AppState) -> Router<AppState> {
         .finish()
         .expect("Failed to create enroll rate limiter");
 
-    Router::new()
-        .nest("/sync", service_routes)
-        .layer(GovernorLayer {
-            config: Arc::new(enroll_limiter),
-        })
+    // Only enrollment is throttled (credential brute force). The session-token routes carry the
+    // services' own observability records and four services booting at once behind one ingress
+    // IP were observed to 429 a cycle-record write, so they bypass the limiter entirely.
+    let enroll = crate::routes::private::sync::control::enroll_routes().layer(GovernorLayer {
+        config: Arc::new(enroll_limiter),
+    });
+    let session = crate::routes::private::sync::control::session_routes();
+
+    Router::new().nest("/sync", enroll.merge(session))
 }

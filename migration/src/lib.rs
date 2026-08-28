@@ -79,6 +79,8 @@ mod m20260821_000001_audit_hold_deferred;
 mod m20260821_000002_audit_hold_resolution;
 mod m20260827_000001_spot_partial_indexes;
 mod m20260827_000002_tool_runs;
+mod m20260828_000001_collection_events;
+mod m20260828_000002_windowed_diff;
 
 pub struct Migrator;
 
@@ -163,6 +165,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260821_000002_audit_hold_resolution::Migration),
             Box::new(m20260827_000001_spot_partial_indexes::Migration),
             Box::new(m20260827_000002_tool_runs::Migration),
+            Box::new(m20260828_000001_collection_events::Migration),
+            Box::new(m20260828_000002_windowed_diff::Migration),
         ]
     }
 }

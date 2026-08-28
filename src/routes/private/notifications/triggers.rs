@@ -33,6 +33,9 @@ pub async fn run(state: &AppState, channels: &[Box<dyn NotificationChannel>]) {
     if let Err(e) = sync_failures(state, channels).await {
         tracing::warn!(error = %e, "sync-failure trigger failed");
     }
+    if let Err(e) = sync_staleness(state, channels).await {
+        tracing::warn!(error = %e, "sync-staleness trigger failed");
+    }
 }
 
 async fn state_get(
@@ -204,13 +207,13 @@ async fn stale_data(
                      ORDER BY r.time DESC LIMIT 1) AS last_continuous, \
                    (SELECT r.time FROM readings r \
                      WHERE r.site_id = sp.site_id AND r.parameter_id = sp.parameter_id \
-                       AND r.measurement_type = 'spot' \
+                       AND r.measurement_type = 'spot' AND r.withdrawn_at IS NULL \
                      ORDER BY r.time DESC LIMIT 1) AS last_spot, \
                    (SELECT EXTRACT(EPOCH FROM MAX(g.gap))::float8 FROM ( \
                       SELECT s.t - LAG(s.t) OVER (ORDER BY s.t) AS gap FROM ( \
                         SELECT DISTINCT r.time AS t FROM readings r \
                         WHERE r.site_id = sp.site_id AND r.parameter_id = sp.parameter_id \
-                          AND r.measurement_type = 'spot' \
+                          AND r.measurement_type = 'spot' AND r.withdrawn_at IS NULL \
                         ORDER BY r.time DESC LIMIT 5) s \
                     ) g) AS spot_max_gap_seconds \
              ) agg ON TRUE \
@@ -374,6 +377,61 @@ async fn battery_forecast(
                 site_id,
                 parameter_id: battery_param,
             }),
+        };
+        let _ = deliver(state, channels, &msg, None).await;
+    }
+    Ok(())
+}
+
+/// Hours between repeat alerts while a sync service stays heartbeat-dead.
+const SYNC_STALE_RENOTIFY_HOURS: i64 = 12;
+
+/// A sync service whose heartbeat has stopped. `sync_failures` cannot see this — it counts
+/// `sync_events` rows and a dead service writes none (the three portal services were once
+/// heartbeat-dead for two days with zero notifications) — so the expectation is judged from the
+/// heartbeat itself, with the same thresholds the operator health view uses.
+async fn sync_staleness(
+    state: &AppState,
+    channels: &[Box<dyn NotificationChannel>],
+) -> Result<(), DbErr> {
+    let db = &state.db;
+    let stale_after = state.config.sync_health_warning_secs;
+    let services = db
+        .query_all(Statement::from_string(
+            PG,
+            "SELECT instance_id, service_type, last_heartbeat FROM sync_services              WHERE paused IS NOT TRUE"
+                .to_string(),
+        ))
+        .await?;
+
+    for svc in &services {
+        let instance: String = svc.try_get("", "instance_id")?;
+        let service_type: String = svc.try_get("", "service_type")?;
+        let last_heartbeat: Option<chrono::DateTime<chrono::FixedOffset>> =
+            svc.try_get("", "last_heartbeat")?;
+        let Some(hb) = last_heartbeat else {
+            // Never enrolled to the point of a heartbeat: the enrollment path's problem, and
+            // alerting on it forever would drown the signal this trigger exists for.
+            continue;
+        };
+        let age = Utc::now() - hb.with_timezone(&Utc);
+        if age.num_seconds() <= stale_after {
+            continue;
+        }
+        let key = instance.clone();
+        if !claim_renotify(db, "sync_stale", &key, SYNC_STALE_RENOTIFY_HOURS).await? {
+            continue;
+        }
+        let msg = OutgoingMessage {
+            kind: "sync_stale",
+            subject: format!("River Data: {service_type} sync service is silent"),
+            body: format!(
+                "🔌 {service_type}/{instance} last heartbeat {} ({} hours ago). Its source is                  not being synced; check the service.",
+                hb.to_rfc3339(),
+                age.num_hours()
+            ),
+            // System-wide infrastructure alert, no per-site scope.
+            slot: None,
         };
         let _ = deliver(state, channels, &msg, None).await;
     }

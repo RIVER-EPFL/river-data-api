@@ -30,7 +30,8 @@ use crate::routes::public::service::{PublicProjectConfig, PublicSiteConfig, get_
 /// the readings query so the count and the series cannot disagree about what the site serves.
 const SERVED_CONTINUOUS: &str = "r.measurement_type IS DISTINCT FROM 'spot' \
      AND r.replicate_index = 0 AND r.is_flagged IS NOT TRUE";
-const SERVED_SPOT: &str = "r.measurement_type = 'spot' AND r.is_flagged IS NOT TRUE";
+const SERVED_SPOT: &str =
+    "r.measurement_type = 'spot' AND r.is_flagged IS NOT TRUE AND r.withdrawn_at IS NULL";
 
 // Time Format
 

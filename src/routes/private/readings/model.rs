@@ -25,6 +25,14 @@ pub struct Model {
     pub is_flagged: Option<bool>,
     pub flag_reason: Option<String>,
     pub sample_id: Option<Uuid>,
+    /// The collection event (site visit) an attributed spot reading belongs to. Stamped by
+    /// `collection_events::attach` after the write; NULL on continuous and derived rows.
+    pub collection_event_id: Option<Uuid>,
+    /// Retraction stamp: the source's claimed window no longer contains this reading. A withdrawn
+    /// reading is excluded from serving, statistics and alarms, and a later honest window that
+    /// re-asserts the row clears the stamp. Spot rows only (DB CHECK); never a delete.
+    pub withdrawn_at: Option<DateTimeWithTimeZone>,
+    pub withdrawn_reason: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -78,6 +86,13 @@ pub enum Relation {
         on_delete = "SetNull"
     )]
     Sample,
+    #[sea_orm(
+        belongs_to = "crate::routes::private::collection_events::Entity",
+        from = "Column::CollectionEventId",
+        to = "crate::routes::private::collection_events::Column::Id",
+        on_delete = "SetNull"
+    )]
+    CollectionEvent,
 }
 
 impl Related<crate::routes::private::data_streams::Entity> for Entity {

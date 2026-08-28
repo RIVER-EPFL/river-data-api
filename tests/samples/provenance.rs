@@ -278,6 +278,110 @@ async fn a_replace_carries_the_new_runs_blob_and_a_plain_save_none() {
     }
 }
 
+/// Expected behaviour: a verified tool save provisions the site_parameter its output lands on
+/// (`needs_review`), because the output's identity is the run's; a manual save to the same
+/// unconfigured parameter stays refused, and a parameter the catalog does not hold refuses even
+/// the tool save.
+#[tokio::test]
+#[serial]
+async fn a_tool_save_provisions_its_slot_and_a_manual_one_is_refused() {
+    let (db, app, token) = setup().await;
+    crate::common::exec(
+        &db,
+        "INSERT INTO parameters (id, code, name, category) \
+         VALUES ('00000000-0000-4000-b000-0000000000aa', 'FreshAnalyte', 'Fresh analyte', 'measurement')",
+    )
+    .await;
+    let fresh = "00000000-0000-4000-b000-0000000000aa";
+
+    let (status, resp) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({
+            "site_id": SITE1_ID,
+            "readings": [{ "parameter_id": fresh, "value": 1.0, "time": GRAB_TIME }],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 400, "a manual save cannot mint a slot: {resp}");
+
+    let run_id = mint_run(&db, "doc", json!({ "Fresh": 3.25 }), json!([])).await;
+    let (status, resp) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({
+            "site_id": SITE1_ID,
+            "tool_run_id": run_id,
+            "readings": [{ "parameter_id": fresh, "value": 3.25, "time": GRAB_TIME, "output": "Fresh" }],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "the verified save provisions the slot: {resp}");
+
+    let row = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT needs_review, name FROM site_parameters \
+                 WHERE site_id = '{SITE1_ID}' AND parameter_id = '{fresh}'"
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the site_parameter was minted");
+    assert!(row.try_get::<bool>("", "needs_review").unwrap());
+    assert_eq!(row.try_get::<String>("", "name").unwrap(), "Fresh analyte");
+
+    // The second save reuses the provisioned slot.
+    let run2 = mint_run(&db, "doc", json!({ "Fresh": 4.0 }), json!([])).await;
+    let (status, resp) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({
+            "site_id": SITE1_ID,
+            "tool_run_id": run2,
+            "mode": "replace",
+            "readings": [{ "parameter_id": fresh, "value": 4.0, "time": GRAB_TIME, "output": "Fresh" }],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{resp}");
+    let count = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT COUNT(*)::bigint AS n FROM site_parameters \
+                 WHERE site_id = '{SITE1_ID}' AND parameter_id = '{fresh}'"
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    assert_eq!(count, 1);
+
+    // A parameter the catalog does not hold refuses even a tool save.
+    let ghost = Uuid::new_v4();
+    let run3 = mint_run(&db, "doc", json!({ "Ghost": 1.0 }), json!([])).await;
+    let (status, resp) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({
+            "site_id": SITE1_ID,
+            "tool_run_id": run3,
+            "readings": [{ "parameter_id": ghost, "value": 1.0, "time": GRAB_TIME, "output": "Ghost" }],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 400, "{resp}");
+    assert!(resp.contains("catalog"), "{resp}");
+}
+
 #[tokio::test]
 #[serial]
 async fn the_blob_is_not_editable_through_samples_crud() {

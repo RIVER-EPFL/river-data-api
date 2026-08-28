@@ -562,6 +562,16 @@ pub async fn pair_stream(
         )
         .await?;
 
+        // Attribution arriving is what makes these spot readings addressable as visits: attach
+        // their collection events now, deriving the source from where the stream came from.
+        crate::routes::private::collection_events::attach::attach_collection_events(
+            txn,
+            "r.stream_id = $1",
+            vec![stream_id.into()],
+            crate::routes::private::collection_events::attach::EventSource::ByStreamOrigin,
+        )
+        .await?;
+
         // Also backfill status_events
         txn.execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,

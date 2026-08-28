@@ -1,10 +1,12 @@
 pub mod batch;
+pub mod checks;
 pub mod flags;
 pub mod grab_samples;
 pub mod import;
 pub mod ingest;
 pub mod measurement;
 pub mod model;
+pub mod reconcile;
 pub mod sample_groups;
 pub mod samples;
 pub mod status_events;

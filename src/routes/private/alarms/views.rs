@@ -247,6 +247,7 @@ pub async fn get_site_alarms(
                   AND r.time <= $3
                   AND r.parameter_id IN (SELECT parameter_id FROM resolved_thresholds)
                   AND r.measurement_type = 'spot'
+                  AND r.withdrawn_at IS NULL
                   AND r.is_flagged IS NOT TRUE
                 ORDER BY r.stream_id, r.time, r.replicate_index
             ) sp
@@ -386,7 +387,8 @@ pub(crate) fn latest_served_sql(spot: bool, site_col: &str, param_col: &str) -> 
             "SELECT COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value, r.time \
              FROM readings r LEFT JOIN samples smp ON smp.id = r.sample_id \
              WHERE r.site_id = {site_col} AND r.parameter_id = {param_col} \
-               AND r.measurement_type = 'spot' AND r.is_flagged IS NOT TRUE \
+               AND r.measurement_type = 'spot' AND r.withdrawn_at IS NULL \
+               AND r.is_flagged IS NOT TRUE \
              ORDER BY r.time DESC, r.replicate_index LIMIT 1"
         )
     } else {

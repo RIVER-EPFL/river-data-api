@@ -158,6 +158,8 @@ pub fn build_registry() -> JobRegistry {
     registry.register(Arc::new(super::jobs::PlanRevert));
     registry.register(Arc::new(super::reconcile::ReplicateReconciliation));
     registry.register(Arc::new(super::reconcile::ReplicateReconciliationDelete));
+    registry.register(Arc::new(crate::routes::private::tools::chain::EventRecompute));
+    registry.register(Arc::new(crate::routes::private::tools::chain::EventAudit));
     registry
 }
 

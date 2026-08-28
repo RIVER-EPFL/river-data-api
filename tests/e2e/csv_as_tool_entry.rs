@@ -175,11 +175,119 @@ async fn an_unknown_import_field_is_refused_not_dropped() {
 /// row and server-built provenance blob as a typed entry, source recorded as the import.
 #[tokio::test]
 #[serial]
-#[ignore = "BLOCKED: CSV-as-tool-entry (run the tool over imported inputs) lands with Phase 3"]
 async fn an_import_of_raw_inputs_runs_the_tool_and_carries_its_provenance() {
-    unimplemented!(
-        "import a CSV of DOC replicates declared as inputs of the doc tool -> one tool_runs row \
-         per data row, readings via the grab write path, samples rows carrying the server-built \
-         blob with source csv_import"
-    );
+    if !crate::common::tools_runner::require_runner_or_skip(
+        "an_import_of_raw_inputs_runs_the_tool_and_carries_its_provenance",
+    )
+    .await
+    {
+        return;
+    }
+    let (db, app, token) = setup().await;
+    // The catalog parameter doc's DOC_avg_ppb output resolves to; deliberately not assigned to
+    // the site, so the import also exercises first-save auto-provisioning.
+    crate::common::exec(
+        &db,
+        "INSERT INTO parameters (id, code, name, category) \
+         VALUES ('00000000-0000-4000-b000-0000000000d0', 'DOC', 'DOC', 'measurement')",
+    )
+    .await;
+    let doc_param = "00000000-0000-4000-b000-0000000000d0";
+
+    let csv = "DateTime,DOC_rep_1,DOC_rep_2,DOC_rep_3,DOC_rep_9\n\
+               2025-06-01 10:00:00,120,125,118,\n\
+               2025-06-02 10:00:00,130,131,129,\n";
+
+    // The plan first: columns map to tool inputs, the stray column is named, nothing runs.
+    let (status, plan) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/import_csv",
+        &serde_json::json!({
+            "site": crate::common::SITE1_ID,
+            "csv": csv,
+            "tool": "doc",
+            "dry_run": true,
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "plan ({status}): {plan}");
+    assert_eq!(plan["mapped_columns"]["DOC_rep_1"], "DOC_rep_1");
+    assert_eq!(plan["unmapped_columns"][0], "DOC_rep_9", "{plan}");
+    assert_eq!(plan["row_count"], 2);
+    assert_eq!(plan["tool_runs_created"], 0);
+
+    let (status, resp) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/import_csv",
+        &serde_json::json!({
+            "site": crate::common::SITE1_ID,
+            "csv": csv,
+            "tool": "doc",
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "import ({status}): {resp}");
+    assert_eq!(resp["tool_runs_created"], 2, "{resp}");
+    assert_eq!(resp["error_count"], 0, "{resp}");
+
+    // One run per row, minted by the import path.
+    let runs = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT COUNT(*)::bigint AS n FROM tool_runs \
+             WHERE tool_name = 'doc' AND source = 'csv_import'"
+                .to_string(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    assert_eq!(runs, 2);
+
+    // Each row's outputs went through the grab write path: samples with the server-built blob,
+    // source csv_import, on the auto-provisioned slot, attached to a collection event.
+    for (time, expected) in [
+        ("2025-06-01T10:00:00Z", (120.0 + 125.0 + 118.0) / 3.0),
+        ("2025-06-02T10:00:00Z", 130.0),
+    ] {
+        let row = db
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT s.provenance ->> 'source' AS source, s.provenance ->> 'tool' AS tool, \
+                            s.mean, \
+                            (SELECT COUNT(*)::bigint FROM readings r \
+                              WHERE r.sample_id = s.id AND r.collection_event_id IS NOT NULL) AS attached \
+                     FROM samples s \
+                     WHERE s.site_id = '{}' AND s.parameter_id = '{doc_param}' \
+                       AND s.collected_at = '{time}'",
+                    crate::common::SITE1_ID
+                ),
+            ))
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("sample at {time} exists"));
+        assert_eq!(row.try_get::<String>("", "source").unwrap(), "csv_import");
+        assert_eq!(row.try_get::<String>("", "tool").unwrap(), "doc");
+        let mean = row.try_get::<Option<f64>>("", "mean").unwrap().unwrap();
+        assert!((mean - expected).abs() < 1e-9, "served {mean}, portal math {expected}");
+        assert_eq!(row.try_get::<i64>("", "attached").unwrap(), 1);
+    }
+
+    let provisioned = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT needs_review FROM site_parameters \
+                 WHERE site_id = '{}' AND parameter_id = '{doc_param}'",
+                crate::common::SITE1_ID
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the import provisioned the slot");
+    assert!(provisioned.try_get::<bool>("", "needs_review").unwrap());
 }

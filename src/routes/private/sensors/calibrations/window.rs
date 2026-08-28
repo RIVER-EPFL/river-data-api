@@ -119,7 +119,7 @@ pub async fn get_calibration_window(
                           WHERE sensor_id = $1
                             AND time >= $2
                             AND time < COALESCE($3, 'infinity'::timestamptz)
-                            AND measurement_type = 'spot'{count_scope}) AS c"
+                            AND measurement_type = 'spot' AND withdrawn_at IS NULL{count_scope}) AS c"
             ),
             count_vals,
         ))
@@ -158,7 +158,7 @@ pub async fn get_calibration_window(
                           WHERE sensor_id = $1
                             AND time >= $2
                             AND time < COALESCE($3, 'infinity'::timestamptz)
-                            AND measurement_type = 'spot'{point_scope}
+                            AND measurement_type = 'spot' AND withdrawn_at IS NULL{point_scope}
                           ORDER BY stream_id, time, (is_flagged IS TRUE), replicate_index
                        ) sp
                        ORDER BY time DESC

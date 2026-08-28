@@ -622,7 +622,7 @@ pub async fn get_site_readings(
                            {base_cols} \
                     FROM readings r LEFT JOIN samples smp ON smp.id = r.sample_id \
                     WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
-                      AND r.measurement_type = 'spot'\
+                      AND r.measurement_type = 'spot' AND r.withdrawn_at IS NULL\
                     {time_conditions}{flagged_condition}{sample_id_condition} \
                     ORDER BY r.stream_id, r.time, (r.is_flagged IS TRUE), r.replicate_index \
                  ) sp"

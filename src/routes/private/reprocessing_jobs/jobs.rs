@@ -953,6 +953,9 @@ impl CsvImport {
             let calibrated_value = base.map(|c| apply_curves(raw_value, Some(c), None));
             models.push(readings::ActiveModel {
                 standard_curve_id: Set(None),
+                collection_event_id: Set(None),
+                withdrawn_at: Set(None),
+                withdrawn_reason: Set(None),
                 stream_id: Set(stream_id),
                 site_id: Set(row_site_id),
                 parameter_id: Set(parameter_id),
@@ -1128,8 +1131,18 @@ impl CsvImport {
             sample_groups::materialise_samples(
                 ctx.db(),
                 &row_predicate,
-                vec![stream_ids.into()],
+                vec![stream_ids.clone().into()],
                 declared_collection,
+            )
+            .await
+            .map_err(as_db_err)?;
+
+            // A CSV import is a person entering visits after the fact: manual collection events.
+            crate::routes::private::collection_events::attach::attach_collection_events(
+                ctx.db(),
+                &row_predicate,
+                vec![stream_ids.into()],
+                crate::routes::private::collection_events::attach::EventSource::Manual,
             )
             .await
             .map_err(as_db_err)?;

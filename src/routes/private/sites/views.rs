@@ -64,7 +64,7 @@ async fn parameter_extents(
         sea_orm::DatabaseBackend::Postgres,
         "SELECT parameter_id, MIN(time) AS min_time, MAX(time) AS max_time, COUNT(*) AS count, \
                 COUNT(*) FILTER (WHERE measurement_type = 'spot' \
-                                   AND is_flagged IS NOT TRUE) AS spot_count, \
+                                   AND is_flagged IS NOT TRUE AND withdrawn_at IS NULL) AS spot_count, \
                 COUNT(*) FILTER (WHERE measurement_type IS DISTINCT FROM 'spot' \
                                    AND replicate_index = 0 AND is_flagged IS NOT TRUE) AS continuous_count \
          FROM readings WHERE site_id = $1 GROUP BY parameter_id",

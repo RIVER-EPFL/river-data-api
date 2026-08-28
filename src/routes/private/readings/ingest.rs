@@ -45,6 +45,13 @@ pub struct IngestReadingsRequest {
     /// callers only.
     #[serde(default)]
     pub audit: Option<Vec<crate::routes::private::sync::replicate_audit::GroupAudit>>,
+    /// A completeness claim: these readings are the source's complete content for this stream
+    /// over `[from, to)`. The server diffs stored content against the payload and converges —
+    /// new rows insert, changed values correct in place, rows absent at source are stamped
+    /// withdrawn (never deleted). Sync-service callers only; spot streams only. Without it the
+    /// request is a bare append, exactly the old semantics.
+    #[serde(default)]
+    pub window: Option<crate::routes::private::readings::reconcile::SourceWindow>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -85,6 +92,22 @@ pub struct IngestResponse {
     /// Retained because the sync protocol (`river-data-core`) reports a held count per cycle.
     #[serde(default)]
     pub held: usize,
+    /// Windowed diff: stored rows whose source value changed, corrected in place.
+    #[serde(default)]
+    pub changed: usize,
+    /// Windowed diff: stored rows absent from the claimed window, stamped withdrawn.
+    #[serde(default)]
+    pub withdrawn: usize,
+    /// Windowed diff: stored rows the payload re-sent unchanged.
+    #[serde(default)]
+    pub unchanged: usize,
+    /// Windowed diff: stored rows the funnel refused or the backend dropped, left untouched.
+    #[serde(default)]
+    pub retained: usize,
+    /// The window the server accepted, echoed so a connector can detect an API image that
+    /// silently ignored the claim (which would downgrade the source to append mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted_window: Option<crate::routes::private::readings::reconcile::SourceWindow>,
     pub stream_id: Uuid,
     pub paired: bool,
 }
@@ -99,13 +122,10 @@ const BATCH_SIZE: usize = 1000;
 async fn insert_reading_chunks<C: ConnectionTrait>(
     conn: &C,
     models: &[readings::ActiveModel],
-    overwrite: bool,
+    replace: Replace,
 ) -> Result<usize, AppError> {
-    let conflict = readings_upsert(if overwrite {
-        Replace::ValuesAndAttribution
-    } else {
-        Replace::Nothing
-    });
+    let overwrite = replace != Replace::Nothing;
+    let conflict = readings_upsert(replace);
 
     let mut inserted = 0usize;
     for chunk in models.chunks(BATCH_SIZE) {
@@ -166,13 +186,32 @@ pub async fn ingest_readings(
             "audit is restricted to sync services".to_string(),
         ));
     }
+    if payload.window.is_some() && !is_sync_service {
+        return Err(AppError::Forbidden(
+            "window is restricted to sync services".to_string(),
+        ));
+    }
+    if let Some(window) = &payload.window
+        && window.from >= window.to
+    {
+        return Err(AppError::BadRequest(
+            "window.from must be before window.to".to_string(),
+        ));
+    }
 
-    if payload.readings.is_empty() {
+    // An empty payload without a claim is nothing to do. With a window it is a claim the source
+    // holds nothing there, which the diff must judge against what is stored.
+    if payload.readings.is_empty() && payload.window.is_none() {
         return Ok(Json(IngestResponse {
             inserted: 0,
             skipped: 0,
             skipped_reasons: Vec::new(),
             held: 0,
+            changed: 0,
+            withdrawn: 0,
+            unchanged: 0,
+            retained: 0,
+            accepted_window: None,
             stream_id: payload.stream_id,
             paired: false,
         }));
@@ -189,6 +228,17 @@ pub async fn ingest_readings(
     let (site_id, parameter_id) = resolve_stream_slot(db, stream.site_parameter_id).await?;
     let paired = site_id.is_some();
 
+    // Withdrawal is confined to spot rows by a database CHECK; the continuous aggregates exclude
+    // spot, which is what keeps a retraction structurally unreachable by a rollup. A window on a
+    // non-spot stream is therefore refused rather than half-honoured.
+    if payload.window.is_some() && stream.measurement_type.as_deref() != Some("spot") {
+        return Err(AppError::BadRequest(
+            "A completeness window is only accepted for streams declared measurement_type \
+             'spot'; continuous sources stay append-only"
+                .to_string(),
+        ));
+    }
+
     // A project-scoped token may only ingest into a stream paired to a site within its project.
     // An unpaired stream has no project, so a scoped token is rejected outright.
     enforce_ingest_scope(&state.db, &scope, site_id).await?;
@@ -199,6 +249,11 @@ pub async fn ingest_readings(
     // Tallied by kind because the per-reading messages carry the offending value and cannot group.
     let submitted = payload.readings.len();
     let mut counts: Vec<(admission::RejectionKind, usize)> = Vec::new();
+    // Keys the funnel refused, remembered so the diff classifies them `retained` rather than
+    // withdrawn: a key the request carried and the funnel refused is not absent at source.
+    let mut rejected_keys: std::collections::HashSet<(chrono::DateTime<Utc>, i16)> =
+        std::collections::HashSet::new();
+    let track_rejections = payload.window.is_some();
     let now = Utc::now();
     payload.readings.retain(|r| {
         match admission::rejection_kind_at(now, r.time, r.raw_value, r.measurement_type.as_deref())
@@ -206,14 +261,40 @@ pub async fn ingest_readings(
             None => true,
             Some(kind) => {
                 record_rejection(&mut counts, kind);
+                if track_rejections {
+                    rejected_keys.insert((r.time, r.replicate_index));
+                }
                 false
             }
         }
     });
 
+    // Under a completeness claim, two payload rows at one key would classify one submitted row
+    // twice. The last occurrence wins (backends emit source-id order, so last is deterministic);
+    // the losers are counted so the receipt arithmetic closes.
+    if payload.window.is_some() {
+        let mut seen: std::collections::HashSet<(chrono::DateTime<Utc>, i16)> =
+            std::collections::HashSet::new();
+        let mut keep = vec![false; payload.readings.len()];
+        for (i, r) in payload.readings.iter().enumerate().rev() {
+            keep[i] = seen.insert((r.time, r.replicate_index));
+        }
+        if keep.iter().any(|k| !k) {
+            let mut i = 0;
+            payload.readings.retain(|_| {
+                let kept = keep[i];
+                i += 1;
+                if !kept {
+                    record_rejection(&mut counts, admission::RejectionKind::DuplicateKey);
+                }
+                kept
+            });
+        }
+    }
+
     // Everything downstream reads `payload.readings`, so a batch that is entirely inadmissible has
     // no work left: return before the window-resolution queries rather than run them over nothing.
-    if payload.readings.is_empty() {
+    if payload.readings.is_empty() && payload.window.is_none() {
         return Ok(Json(ingest_outcome(
             payload.stream_id,
             paired,
@@ -307,11 +388,14 @@ pub async fn ingest_readings(
     payload.readings.retain(|r| match r.calibration_id {
         Some(id) if !declared_curves.contains_key(&id) => {
             record_rejection(&mut counts, admission::RejectionKind::UnknownCalibration);
+            if track_rejections {
+                rejected_keys.insert((r.time, r.replicate_index));
+            }
             false
         }
         _ => true,
     });
-    if payload.readings.is_empty() {
+    if payload.readings.is_empty() && payload.window.is_none() {
         return Ok(Json(ingest_outcome(
             payload.stream_id,
             paired,
@@ -382,6 +466,9 @@ pub async fn ingest_readings(
                     && measurement_type == readings::sample_groups::SPOT;
                 if !admissible {
                     record_rejection(&mut counts, admission::RejectionKind::InvalidStandardCurve);
+                    if track_rejections {
+                        rejected_keys.insert((r.time, r.replicate_index));
+                    }
                 }
                 admissible
             });
@@ -399,7 +486,7 @@ pub async fn ingest_readings(
                 .collect()
         }
     };
-    if payload.readings.is_empty() {
+    if payload.readings.is_empty() && payload.window.is_none() {
         return Ok(Json(ingest_outcome(
             payload.stream_id,
             paired,
@@ -444,6 +531,9 @@ pub async fn ingest_readings(
                 .and_then(|id| standard_curves_by_id.get(&id).copied());
             readings::ActiveModel {
                 standard_curve_id: Set(standard.map(|c| c.id)),
+                collection_event_id: Set(None),
+                withdrawn_at: Set(None),
+                withdrawn_reason: Set(None),
                 stream_id: Set(payload.stream_id),
                 time: Set(r.time.into()),
                 replicate_index: Set(r.replicate_index),
@@ -569,7 +659,7 @@ pub async fn ingest_readings(
             }
         }
     }
-    if payload.readings.is_empty() {
+    if payload.readings.is_empty() && payload.window.is_none() {
         return Ok(Json(ingest_outcome(
             payload.stream_id,
             paired,
@@ -604,41 +694,118 @@ pub async fn ingest_readings(
         None
     };
 
-    // Overwrite updates existing rows, and the sample stamping UPDATE reaches back-dated groups;
-    // both can touch compressed chunks, so they run inside one transaction with the decompression
-    // cap lifted, like every other back-dated write path.
-    let inserted = if payload.overwrite || sample_window.is_some() {
-        crate::common::bulk_write::guarded(db, async |txn| {
-            let n = insert_reading_chunks(txn, &models, payload.overwrite).await?;
+    // Overwrite updates existing rows, the windowed diff corrects and withdraws, and the sample
+    // stamping UPDATE reaches back-dated groups; all can touch compressed chunks, so they run
+    // inside one transaction with the decompression cap lifted, like every other back-dated
+    // write path. The diff, the writes and the receipt commit together or not at all.
+    let mut diff_outcome: Option<crate::routes::private::readings::reconcile::DiffOutcome> = None;
+    let inserted = if payload.overwrite || sample_window.is_some() || payload.window.is_some() {
+        let (n, diff) = crate::common::bulk_write::guarded(db, async |txn| {
+            use crate::routes::private::readings::reconcile;
+            let diff = match &payload.window {
+                Some(window) => {
+                    let admitted: Vec<reconcile::AdmittedRow> = payload
+                        .readings
+                        .iter()
+                        .map(|r| ((r.time, r.replicate_index), r.raw_value, r.standard_curve_id))
+                        .collect();
+                    Some(
+                        reconcile::run_windowed_diff(
+                            txn,
+                            payload.stream_id,
+                            window,
+                            &admitted,
+                            &rejected_keys,
+                        )
+                        .await?,
+                    )
+                }
+                None => None,
+            };
+            let replace = if payload.overwrite {
+                Replace::ValuesAndAttribution
+            } else if diff.as_ref().is_some_and(|d| d.apply_changed) {
+                // The windowed path retires Replace::Nothing: a differing value is a correction
+                // and it is applied, through the clause that never touches flags or sample links.
+                Replace::ValuesAndAttribution
+            } else {
+                Replace::Nothing
+            };
+            let n = insert_reading_chunks(txn, &models, replace).await?;
             if let Some((lo, hi)) = sample_window {
+                let binds: Vec<sea_orm::Value> = vec![
+                    payload.stream_id.into(),
+                    sea_orm::prelude::DateTimeWithTimeZone::from(lo).into(),
+                    sea_orm::prelude::DateTimeWithTimeZone::from(hi).into(),
+                ];
                 readings::sample_groups::materialise_samples(
                     txn,
                     "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
-                    vec![
-                        payload.stream_id.into(),
-                        sea_orm::prelude::DateTimeWithTimeZone::from(lo).into(),
-                        sea_orm::prelude::DateTimeWithTimeZone::from(hi).into(),
-                    ],
+                    binds.clone(),
                     payload.collection,
                 )
                 .await?;
+                // Each source row maps onto one collection event (D7). A sync service replaying
+                // a portal row writes a portal_sync event; any other writer is a person.
+                crate::routes::private::collection_events::attach::attach_collection_events(
+                    txn,
+                    "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
+                    binds,
+                    if is_sync_service {
+                        crate::routes::private::collection_events::attach::EventSource::PortalSync
+                    } else {
+                        crate::routes::private::collection_events::attach::EventSource::Manual
+                    },
+                )
+                .await?;
             }
-            Ok(n)
+            if let (Some(window), Some(d)) = (&payload.window, &diff) {
+                let rejected_total: usize = counts.iter().map(|(_, n)| n).sum();
+                let rejected_json = serde_json::Value::Object(
+                    counts
+                        .iter()
+                        .map(|(k, n)| (k.as_str().to_string(), serde_json::json!(n)))
+                        .collect(),
+                );
+                reconcile::write_receipt(
+                    txn,
+                    payload.stream_id,
+                    window,
+                    submitted,
+                    d,
+                    rejected_total,
+                    &rejected_json,
+                )
+                .await?;
+            }
+            Ok((n, diff))
         })
-        .await?
+        .await?;
+        diff_outcome = diff;
+        n
     } else {
-        insert_reading_chunks(db, &models, false).await?
+        insert_reading_chunks(db, &models, Replace::Nothing).await?
     };
 
+    let diff_changed = diff_outcome.as_ref().map_or(0, |d| d.changed);
+    let diff_withdrawn = diff_outcome.as_ref().map_or(0, |d| d.withdrawn);
+    let diff_reinstated = diff_outcome.as_ref().map_or(0, |d| d.reinstated);
+    // What this pass did to served content, the gate every post-write side effect reads: a
+    // correction or a withdrawal with `inserted == 0` still rewrote history.
+    let effect =
+        inserted > 0 || diff_changed > 0 || diff_withdrawn > 0 || diff_reinstated > 0;
+
     // Sample formation retroactively changes served historical points (the group's mean replaces
-    // the lone value), so bounded cached responses cannot be left to expire on TTL.
-    if sample_window.is_some() && inserted > 0 {
+    // the lone value), so bounded cached responses cannot be left to expire on TTL. Withdrawals
+    // and reinstatements rewrite served history the same way.
+    if effect && (sample_window.is_some() || payload.window.is_some()) {
         state.response_cache.invalidate_all();
     }
 
     // Corrections rewrite history that bounded queries may have cached, and replace values the
-    // rollups have already materialised.
-    if payload.overwrite && inserted > 0 {
+    // rollups have already materialised. A windowed pass that corrected values did exactly what
+    // an overwrite does, whatever `inserted` says.
+    if (payload.overwrite && inserted > 0) || diff_changed > 0 {
         state.response_cache.invalidate_all();
 
         // Best-effort, like the alarm reconstruction below it: the rows are committed and the
@@ -670,7 +837,7 @@ pub async fn ingest_readings(
     }
 
     // Emit ingestion event
-    if inserted > 0 {
+    if effect {
         let _ = state.events.send(AppEvent::DataIngested {
             site_id,
             parameter_id,
@@ -724,7 +891,7 @@ pub async fn ingest_readings(
     // Spawn-guard: skip entirely when the site has no active derived parameter, the job would
     // compute nothing, and this is the dominant source of empty `ingest_derived` jobs.
     if paired
-        && inserted > 0
+        && effect
         && let Some(sid) = site_id
         && crate::routes::private::parameters::derived::janitor::site_has_active_derived(db, sid)
             .await
@@ -751,8 +918,21 @@ pub async fn ingest_readings(
         .await?;
     }
 
-    let outcome = ingest_outcome(payload.stream_id, paired, submitted, inserted, &counts);
-    tracing::debug!(total, inserted, skipped = outcome.skipped, stream_id = %payload.stream_id, paired, "Ingest complete");
+    let mut outcome = ingest_outcome(payload.stream_id, paired, submitted, inserted, &counts);
+    if let Some(d) = &diff_outcome {
+        // Under a diff, `inserted` from the upsert counts updates too; the classification is the
+        // accurate account.
+        outcome.inserted = d.new_rows;
+        outcome.changed = d.changed;
+        outcome.withdrawn = d.withdrawn;
+        outcome.unchanged = d.unchanged;
+        outcome.retained = d.retained;
+        outcome.accepted_window = payload.window.clone();
+        if d.braked {
+            tracing::warn!(stream_id = %payload.stream_id, changed = d.changed, withdrawn = d.withdrawn, "Windowed pass braked; corrections and withdrawals held for review");
+        }
+    }
+    tracing::debug!(total, inserted = outcome.inserted, skipped = outcome.skipped, changed = outcome.changed, withdrawn = outcome.withdrawn, stream_id = %payload.stream_id, paired, "Ingest complete");
     Ok(Json(outcome))
 }
 
@@ -795,6 +975,11 @@ fn ingest_outcome(
         skipped,
         skipped_reasons,
         held: 0,
+        changed: 0,
+        withdrawn: 0,
+        unchanged: 0,
+        retained: 0,
+        accepted_window: None,
         stream_id,
         paired,
     }

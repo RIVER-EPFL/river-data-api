@@ -4,6 +4,7 @@
 //! surface (versions, validation, activation). The portal calculation functions themselves live
 //! inside the seeded scripts, verbatim.
 
+pub mod chain;
 pub mod engine;
 pub mod scripts;
 
@@ -33,6 +34,15 @@ pub struct ToolResult {
     /// The curves the server resolved, as the runner received them.
     #[schema(value_type = Vec<Object>)]
     pub curves: Vec<serde_json::Value>,
+    /// Station properties resolved from the site named by `site_id`, as `{property, param, value}`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[schema(value_type = Vec<Object>)]
+    pub station_inputs: Vec<serde_json::Value>,
+    /// Same-event parameter values resolved at `(site_id, collected_at)`, as
+    /// `{param, parameter_code, parameter_id, value}`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[schema(value_type = Vec<Object>)]
+    pub event_inputs: Vec<serde_json::Value>,
     /// The exact script version and runtime that produced these numbers; goes into the
     /// provenance blob on save.
     pub tool_version: ToolVersionRef,
@@ -86,49 +96,79 @@ pub async fn calculate_tool(
     body: axum::body::Bytes,
 ) -> AppResult<Json<ToolResult>> {
     let tool = engine::find_active_tool(&state.db, &tool_name).await?;
-    let outcome = engine::run_active_tool(&state, &tool, &body).await?;
-    let runtime = engine::runner_runtime(&state).await;
+    let result = execute_and_store_run(&state, &tool, &body, &scripts::actor_label(&auth), "interactive").await?;
+    Ok(Json(result))
+}
+
+/// Run a tool and store the `tool_runs` row that a later save references. Every path that
+/// executes a tool for keeps goes through here — the interactive calculate endpoint, the CSV
+/// tool-entry import, the chain executor — so the stored record has one shape.
+///
+/// The run row is written before the results are handed out: a save references the row, the
+/// provenance blob is built from it, and every claim in the blob predates the save. The stored
+/// inputs are the effective inputs the runner received (request values plus defaults and the
+/// resolved station/event inputs), and `context` records where each resolved value came from.
+pub async fn execute_and_store_run(
+    state: &AppState,
+    tool: &engine::ActiveTool,
+    body: &[u8],
+    actor: &str,
+    source: &str,
+) -> AppResult<ToolResult> {
+    let outcome = engine::run_active_tool(state, tool, body).await?;
+    let runtime = engine::runner_runtime(state).await;
     let tool_version = tool.version_ref(runtime.as_ref());
     let results = serde_json::Value::Object(outcome.results);
     let constants = serde_json::Value::Object(outcome.constants);
 
-    // The run row is written before the results are handed out: a save references the row, the
-    // provenance blob is built from it, and every claim in the blob predates the save. The stored
-    // inputs are the request as validated (the engine has already refused unknown fields).
-    let inputs: serde_json::Value = serde_json::from_slice(&body)
-        .ok()
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
+    let context = if outcome.site_id.is_some()
+        || !outcome.station_inputs.is_empty()
+        || !outcome.event_inputs.is_empty()
+    {
+        serde_json::json!({
+            "site_id": outcome.site_id,
+            "collected_at": outcome.collected_at,
+            "station_inputs": outcome.station_inputs,
+            "event_inputs": outcome.event_inputs,
+        })
+    } else {
+        serde_json::Value::Null
+    };
+
     let run_id = Uuid::new_v4();
     state
         .db
         .execute(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "INSERT INTO tool_runs (id, tool_name, tool_version, inputs, constants, curves, \
-             outputs, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             outputs, created_by, context, source) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
             [
                 run_id.into(),
                 tool.name.clone().into(),
                 serde_json::to_value(&tool_version)
                     .unwrap_or(serde_json::Value::Null)
                     .into(),
-                inputs.into(),
+                serde_json::Value::Object(outcome.inputs).into(),
                 constants.clone().into(),
                 serde_json::Value::Array(outcome.curves.clone()).into(),
                 results.clone().into(),
-                scripts::actor_label(&auth).into(),
+                actor.into(),
+                context.into(),
+                source.into(),
             ],
         ))
         .await?;
 
-    Ok(Json(ToolResult {
+    Ok(ToolResult {
         tool: tool.name.clone(),
         results,
         inputs_used: outcome.inputs_used,
         inputs_ignored: outcome.inputs_ignored,
         constants,
         curves: outcome.curves,
+        station_inputs: outcome.station_inputs,
+        event_inputs: outcome.event_inputs,
         tool_version,
         run_id,
-    }))
+    })
 }

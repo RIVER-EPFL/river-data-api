@@ -509,6 +509,44 @@ pub struct ManifestCurve {
     pub required: bool,
 }
 
+const fn default_true() -> bool {
+    true
+}
+
+/// A station property the tool reads (elevation, latitude, ...), resolved from the `sites` row at
+/// calculate time and recorded with its resolved value in the run. Fill-if-missing: a value the
+/// request carries wins, so an operator can override the stored property exactly as the portal's
+/// forms allow. A required property the site does not hold refuses the run naming it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ManifestStationInput {
+    /// Column of the `sites` row, e.g. `altitude_m`.
+    pub property: String,
+    /// The manifest param the resolved value fills. Defaults to the property name.
+    #[serde(default)]
+    pub param: Option<String>,
+    #[serde(default = "default_true")]
+    pub required: bool,
+}
+
+impl ManifestStationInput {
+    #[must_use]
+    pub fn target(&self) -> &str {
+        self.param.as_deref().unwrap_or(&self.property)
+    }
+}
+
+/// A same-event parameter read: when the request does not carry `param`, its value is resolved
+/// from the collection event's stored readings (the served spot value: the sample mean, else the
+/// lowest unflagged replicate). This is the portal's cross-tool prefill — pCO2 pulling field
+/// temperature, DOM pulling the DOC average — as a declaration instead of R code.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ManifestEventInput {
+    /// The manifest param this fills.
+    pub param: String,
+    /// Catalog parameter code (`parameters.code`) read at the event.
+    pub parameter_code: String,
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Manifest {
     pub label: String,
@@ -517,6 +555,14 @@ pub struct Manifest {
     pub outputs: Vec<ManifestOutput>,
     pub constants: Vec<String>,
     pub curves: Vec<ManifestCurve>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub station_inputs: Vec<ManifestStationInput>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub event_inputs: Vec<ManifestEventInput>,
+    /// QC declarations (replicate pooling, check exclusions), read by the seasonal check and the
+    /// event audit. Stored as declared; the shape is an object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qc: Option<serde_json::Value>,
     pub match_keywords: Vec<String>,
 }
 
@@ -533,6 +579,12 @@ struct ManifestRaw {
     constants: Vec<String>,
     #[serde(default)]
     curves: Vec<ManifestCurve>,
+    #[serde(default)]
+    station_inputs: Vec<ManifestStationInput>,
+    #[serde(default)]
+    event_inputs: Vec<ManifestEventInput>,
+    #[serde(default)]
+    qc: Option<serde_json::Value>,
     #[serde(default)]
     match_keywords: Vec<String>,
 }
@@ -552,6 +604,30 @@ impl<'de> Deserialize<'de> for Manifest {
                 )));
             }
         }
+        // A resolved value reaches the runner as an input, so the field it fills has to be a
+        // declared param: an undeclared target would be refused as an unknown field at call time.
+        for s in &raw.station_inputs {
+            let target = s.target();
+            if !raw.params.iter().any(|p| p.name == target) {
+                return Err(D::Error::custom(format!(
+                    "station_input '{}': fills param '{target}', which the manifest does not declare",
+                    s.property
+                )));
+            }
+        }
+        for e in &raw.event_inputs {
+            if !raw.params.iter().any(|p| p.name == e.param) {
+                return Err(D::Error::custom(format!(
+                    "event_input '{}': fills param '{}', which the manifest does not declare",
+                    e.parameter_code, e.param
+                )));
+            }
+        }
+        if let Some(qc) = &raw.qc
+            && !qc.is_object()
+        {
+            return Err(D::Error::custom("qc must be an object"));
+        }
         Ok(Self {
             label: raw.label,
             description: raw.description,
@@ -559,6 +635,9 @@ impl<'de> Deserialize<'de> for Manifest {
             outputs: raw.outputs,
             constants: raw.constants,
             curves: raw.curves,
+            station_inputs: raw.station_inputs,
+            event_inputs: raw.event_inputs,
+            qc: raw.qc,
             match_keywords: raw.match_keywords,
         })
     }
@@ -861,6 +940,12 @@ pub struct ToolDescriptor {
     pub outputs: Vec<ToolOutput>,
     pub constants: Vec<String>,
     pub curves: Vec<ManifestCurve>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub station_inputs: Vec<ManifestStationInput>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub event_inputs: Vec<ManifestEventInput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qc: Option<serde_json::Value>,
     pub match_keywords: Vec<String>,
     pub script_version_id: Uuid,
     pub version_no: i32,
@@ -1051,6 +1136,9 @@ impl ActiveTool {
                 .collect(),
             constants: self.manifest.constants.clone(),
             curves: self.manifest.curves.clone(),
+            station_inputs: self.manifest.station_inputs.clone(),
+            event_inputs: self.manifest.event_inputs.clone(),
+            qc: self.manifest.qc.clone(),
             match_keywords: self.manifest.match_keywords.clone(),
             script_version_id: self.version_id,
             version_no: self.version_no,
@@ -1206,6 +1294,168 @@ pub struct RunOutcome {
     pub inputs_ignored: Vec<String>,
     pub curves: Vec<serde_json::Value>,
     pub constants: serde_json::Map<String, serde_json::Value>,
+    /// The inputs exactly as the runner received them: request values, plus defaults and the
+    /// resolved station/event inputs, minus the curves. This is what the stored run records, so a
+    /// recompute replays what actually ran rather than what the client happened to type.
+    pub inputs: serde_json::Map<String, serde_json::Value>,
+    /// Station properties resolved from the site, as `{property, param, value}`.
+    pub station_inputs: Vec<serde_json::Value>,
+    /// Same-event parameter reads, as `{param, parameter_code, parameter_id, value}`.
+    pub event_inputs: Vec<serde_json::Value>,
+    /// The calculation context the request declared, echoed for the stored run.
+    pub site_id: Option<Uuid>,
+    pub collected_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Pop the reserved context fields off a request body. They are calculation context, not tool
+/// inputs: every tool accepts them and none receives them.
+fn take_context(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+) -> AppResult<(Option<Uuid>, Option<chrono::DateTime<chrono::Utc>>)> {
+    let site_id = match body.remove("site_id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .and_then(|s| s.parse::<Uuid>().ok())
+                .ok_or_else(|| AppError::BadRequest("site_id must be a UUID".to_string()))?,
+        ),
+    };
+    let collected_at = match body.remove("collected_at") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .ok_or_else(|| {
+                    AppError::BadRequest("collected_at must be an RFC 3339 timestamp".to_string())
+                })?,
+        ),
+    };
+    Ok((site_id, collected_at))
+}
+
+/// Fill the params the manifest's `station_inputs` declare from the `sites` row, where the request
+/// did not carry them. Any column of the row is resolvable (D13); a required property the site
+/// does not hold refuses the run naming it.
+pub async fn resolve_station_inputs(
+    db: &DatabaseConnection,
+    tool_name: &str,
+    manifest: &Manifest,
+    site_id: Option<Uuid>,
+    body: &mut serde_json::Map<String, serde_json::Value>,
+) -> AppResult<Vec<serde_json::Value>> {
+    let pending: Vec<&ManifestStationInput> = manifest
+        .station_inputs
+        .iter()
+        .filter(|s| body.get(s.target()).is_none_or(serde_json::Value::is_null))
+        .collect();
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(site_id) = site_id else {
+        if let Some(required) = pending.iter().find(|s| s.required) {
+            return Err(AppError::BadRequest(format!(
+                "tool '{tool_name}' reads station property '{}'; pass site_id so it can be \
+                 resolved, or supply '{}' directly",
+                required.property,
+                required.target()
+            )));
+        }
+        return Ok(Vec::new());
+    };
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT name, to_jsonb(s) AS site FROM sites s WHERE id = $1",
+            [site_id.into()],
+        ))
+        .await?
+        .ok_or_else(|| AppError::BadRequest(format!("Site {site_id} not found")))?;
+    let site_name: String = row.try_get("", "name")?;
+    let site: serde_json::Value = row.try_get("", "site")?;
+
+    let mut resolved = Vec::new();
+    for s in pending {
+        match site.get(&s.property) {
+            Some(value) if !value.is_null() => {
+                body.insert(s.target().to_string(), value.clone());
+                resolved.push(serde_json::json!({
+                    "property": s.property,
+                    "param": s.target(),
+                    "value": value,
+                }));
+            }
+            _ if s.required => {
+                return Err(AppError::BadRequest(format!(
+                    "site '{site_name}' has no value for station property '{}', which tool \
+                     '{tool_name}' requires",
+                    s.property
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(resolved)
+}
+
+/// Fill the params the manifest's `event_inputs` declare from the collection event's stored
+/// readings, where the request did not carry them. The value is the served spot value: the sample
+/// mean, else the lowest unflagged replicate. Absence is not an error here — the param's own
+/// requiredness decides whether the run can proceed without it.
+pub async fn resolve_event_inputs(
+    db: &DatabaseConnection,
+    manifest: &Manifest,
+    site_id: Option<Uuid>,
+    collected_at: Option<chrono::DateTime<chrono::Utc>>,
+    body: &mut serde_json::Map<String, serde_json::Value>,
+) -> AppResult<Vec<serde_json::Value>> {
+    let pending: Vec<&ManifestEventInput> = manifest
+        .event_inputs
+        .iter()
+        .filter(|e| body.get(&e.param).is_none_or(serde_json::Value::is_null))
+        .collect();
+    let (Some(site_id), Some(collected_at)) = (site_id, collected_at) else {
+        return Ok(Vec::new());
+    };
+    let mut resolved = Vec::new();
+    for e in pending {
+        let Some(row) = db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT p.id AS parameter_id, COALESCE(
+                    (SELECT smp.mean FROM samples smp
+                      WHERE smp.site_id = $1 AND smp.parameter_id = p.id
+                        AND smp.collected_at = $3),
+                    (SELECT COALESCE(r.calibrated_value, r.raw_value) FROM readings r
+                      WHERE r.site_id = $1 AND r.parameter_id = p.id AND r.time = $3
+                        AND r.measurement_type = 'spot' AND r.is_flagged IS NOT TRUE
+                        AND r.withdrawn_at IS NULL
+                      ORDER BY r.replicate_index LIMIT 1)
+                 ) AS value
+                 FROM parameters p WHERE LOWER(p.code) = LOWER($2)",
+                [
+                    site_id.into(),
+                    e.parameter_code.clone().into(),
+                    sea_orm::prelude::DateTimeWithTimeZone::from(collected_at).into(),
+                ],
+            ))
+            .await?
+        else {
+            continue;
+        };
+        let parameter_id: Uuid = row.try_get("", "parameter_id")?;
+        let Some(value) = row.try_get::<Option<f64>>("", "value")? else {
+            continue;
+        };
+        body.insert(e.param.clone(), serde_json::json!(value));
+        resolved.push(serde_json::json!({
+            "param": e.param,
+            "parameter_code": e.parameter_code,
+            "parameter_id": parameter_id,
+            "value": value,
+        }));
+    }
+    Ok(resolved)
 }
 
 /// Validate a request body against the tool's manifest, resolve its constants and curves, and
@@ -1241,6 +1491,8 @@ pub async fn run_tool_body(
         }
     };
 
+    let (site_id, collected_at) = take_context(&mut body)?;
+
     let manifest = &tool.manifest;
     let param_names: Vec<&str> = manifest.params.iter().map(|p| p.name.as_str()).collect();
     let curve_names: Vec<&str> = manifest.curves.iter().map(|c| c.name.as_str()).collect();
@@ -1272,6 +1524,13 @@ pub async fn run_tool_body(
             })?;
         }
     }
+    // Resolved context values land before defaults and requiredness: a typed value wins, a
+    // resolved one fills the gap, and a manifest default is the last resort.
+    let station_inputs =
+        resolve_station_inputs(&state.db, &tool.name, manifest, site_id, &mut body).await?;
+    let event_inputs =
+        resolve_event_inputs(&state.db, manifest, site_id, collected_at, &mut body).await?;
+
     // Defaults land before requiredness so a condition reads the same values the runner will,
     // whatever order the params are declared in.
     for p in &manifest.params {
@@ -1335,6 +1594,7 @@ pub async fn run_tool_body(
         None => resolve_constants(&state.db, &manifest.constants, missing_constant).await?,
     };
     let provided: Vec<String> = body.keys().cloned().collect();
+    let effective_inputs = body.clone();
 
     let raw = execute_script(
         state,
@@ -1389,6 +1649,11 @@ pub async fn run_tool_body(
         inputs_ignored,
         curves: curve_snapshots,
         constants,
+        inputs: effective_inputs,
+        station_inputs,
+        event_inputs,
+        site_id,
+        collected_at,
     })
 }
 

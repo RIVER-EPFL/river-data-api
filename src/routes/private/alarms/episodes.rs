@@ -152,6 +152,7 @@ async fn fetch_episodes(
               WHERE r.site_id = $1 AND r.parameter_id = $2
                 AND r.time >= $3 AND r.time <= $4
                 AND r.measurement_type = 'spot'
+                AND r.withdrawn_at IS NULL
                 AND r.is_flagged IS NOT TRUE
               ORDER BY r.stream_id, r.time, r.replicate_index
           ) sp"

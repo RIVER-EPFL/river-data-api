@@ -44,6 +44,12 @@ pub struct GrabSampleRequest {
     /// run's outputs and carry that output's value.
     #[serde(default)]
     pub tool_run_id: Option<Uuid>,
+    /// A `seasonal_checks` row (from `/readings/seasonal_check`) covering this save's values.
+    /// When present, every reading's (parameter, value) must have been screened by that check —
+    /// the portal's "any edit resets Check", enforced server-side. The check itself is advisory;
+    /// naming a check that does not cover the values is refused.
+    #[serde(default)]
+    pub check_id: Option<Uuid>,
     pub readings: Vec<GrabSampleReading>,
 }
 
@@ -489,13 +495,16 @@ async fn resolve_tool_run_provenance(
         .query_one(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT tool_name, tool_version, inputs, constants, curves, outputs, created_by, \
-             created_at FROM tool_runs WHERE id = $1",
+             created_at, context, source FROM tool_runs WHERE id = $1",
             [run_id.into()],
         ))
         .await?
         .ok_or_else(|| AppError::BadRequest(format!("Tool run {run_id} does not exist")))?;
 
     let tool_name: String = row.try_get("", "tool_name").map_err(AppError::Database)?;
+    let run_source: String = row.try_get("", "source").map_err(AppError::Database)?;
+    let run_context: Option<serde_json::Value> =
+        row.try_get("", "context").map_err(AppError::Database)?;
     let tool_version: serde_json::Value =
         row.try_get("", "tool_version").map_err(AppError::Database)?;
     let inputs: serde_json::Value = row.try_get("", "inputs").map_err(AppError::Database)?;
@@ -548,7 +557,7 @@ async fn resolve_tool_run_provenance(
         }
     }
 
-    Ok(Some(serde_json::json!({
+    let mut blob = serde_json::json!({
         "tool": tool_name,
         "tool_version": tool_version,
         "inputs": inputs,
@@ -557,11 +566,79 @@ async fn resolve_tool_run_provenance(
         "outputs": outputs,
         "saved": saved,
         "run_id": run_id,
+        // D15: which path the numbers travelled. A tool linked here always actually ran; a CSV
+        // that carried already-computed values gets no blob at all.
+        "source": if run_source == "csv_import" { "csv_import" } else { "tool_run" },
         "calculated_by": calculated_by,
         "calculated_at": calculated_at,
         "saved_by": saved_by,
         "saved_at": chrono::Utc::now(),
-    })))
+    });
+    // The run's resolved calculation context (station properties, same-event reads) travels into
+    // the blob, so an auditor reads where each resolved value came from without the run row.
+    if let Some(context) = run_context
+        && !context.is_null()
+        && let Some(map) = blob.as_object_mut()
+    {
+        map.insert("context".to_string(), context);
+    }
+    Ok(Some(blob))
+}
+
+/// Mint the site_parameter row a verified tool save lands on, `needs_review = TRUE`. The global
+/// catalog parameter must exist; that is what keeps auto-provisioning from minting identity out
+/// of a typo. Returns the new (or concurrently created) row's id.
+///
+/// A raw insert rather than the CRUD path: the CRUD hooks' auto-threshold guard would find no
+/// default thresholds on a fresh analyte anyway, and a mechanical row must never fail the save
+/// that provisions it.
+async fn provision_site_parameter(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    site_name: &str,
+) -> Result<Uuid, AppError> {
+    let parameter = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT name FROM parameters WHERE id = $1",
+            [parameter_id.into()],
+        ))
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "Parameter {parameter_id} is not configured for site {site_name} and is not in \
+                 the parameter catalog; create the catalog parameter first"
+            ))
+        })?;
+    let name: String = parameter.try_get("", "name").unwrap_or_default();
+
+    db.execute(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, is_active, \
+         is_public, needs_review, created_at)
+         VALUES ($1, $2, $3, $4, '', TRUE, FALSE, TRUE, NOW())
+         ON CONFLICT DO NOTHING",
+        [
+            Uuid::new_v4().into(),
+            site_id.into(),
+            parameter_id.into(),
+            name.into(),
+        ],
+    ))
+    .await?;
+
+    let row = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM site_parameters WHERE site_id = $1 AND parameter_id = $2",
+            [site_id.into(), parameter_id.into()],
+        ))
+        .await?
+        .ok_or_else(|| {
+            AppError::Internal("Failed to provision the site parameter for this save".to_string())
+        })?;
+    row.try_get("", "id").map_err(AppError::Database)
 }
 
 /// Insert field-collected grab sample readings (manual measurements with replicate sets).
@@ -608,12 +685,33 @@ pub async fn insert_grab_samples(
         .all(&state.db)
         .await?;
 
-    let valid_param_ids: std::collections::HashSet<Uuid> =
+    let mut valid_param_ids: std::collections::HashSet<Uuid> =
         site_params.iter().map(|sp| sp.parameter_id).collect();
-    let sp_lookup: HashMap<Uuid, Uuid> = site_params
+    let mut sp_lookup: HashMap<Uuid, Uuid> = site_params
         .iter()
         .map(|sp| (sp.parameter_id, sp.id))
         .collect();
+
+    // A verified tool save provisions the slot it lands on (D10): the output's identity is the
+    // run's, not the client's, so a catalog parameter the site does not carry yet gets its
+    // site_parameter minted here, flagged needs_review for an operator's look. The global
+    // parameter must already exist; a save naming an unknown parameter stays refused.
+    if payload.tool_run_id.is_some() {
+        let missing: Vec<Uuid> = param_ids
+            .iter()
+            .filter(|pid| !valid_param_ids.contains(pid))
+            .copied()
+            .collect();
+        for pid in missing {
+            if valid_param_ids.contains(&pid) {
+                continue;
+            }
+            let sp_id =
+                provision_site_parameter(&state.db, site.id, pid, &site.name).await?;
+            valid_param_ids.insert(pid);
+            sp_lookup.insert(pid, sp_id);
+        }
+    }
 
     for r in &payload.readings {
         if !valid_param_ids.contains(&r.parameter_id) {
@@ -622,6 +720,17 @@ pub async fn insert_grab_samples(
                 r.parameter_id, site.name
             )));
         }
+    }
+
+    // A save that names a seasonal check is held to it: every (parameter, value) pair must have
+    // been screened by exactly that check.
+    if let Some(check_id) = payload.check_id {
+        let pairs: Vec<(Uuid, f64)> = payload
+            .readings
+            .iter()
+            .map(|r| (r.parameter_id, r.value))
+            .collect();
+        readings::checks::validate_check_claim(&state.db, check_id, site.id, &pairs).await?;
     }
 
     // Replicate indices, both curves and the served value are computed before anything is
@@ -912,6 +1021,9 @@ pub async fn insert_grab_samples(
                 .zip(&preview)
                 .map(|(r, p)| readings::ActiveModel {
                     standard_curve_id: Set(p.standard_curve.as_ref().map(|c| c.id)),
+                    collection_event_id: Set(None),
+                withdrawn_at: Set(None),
+                withdrawn_reason: Set(None),
                     stream_id: Set(stream_cache[&r.parameter_id]),
                     site_id: Set(Some(payload.site_id)),
                     parameter_id: Set(Some(r.parameter_id)),
@@ -965,6 +1077,25 @@ pub async fn insert_grab_samples(
                         (*time).into(),
                     ],
                 ))
+                .await?;
+            }
+
+            // Every attributed spot instant this request touched belongs to a collection event
+            // (D7); a hand-entered grab is a manual visit.
+            if let (Some(lo), Some(hi)) = (
+                groups.iter().map(|(_, t)| *t).min(),
+                groups.iter().map(|(_, t)| *t).max(),
+            ) {
+                crate::routes::private::collection_events::attach::attach_collection_events(
+                    txn,
+                    "r.site_id = $1 AND r.time >= $2 AND r.time <= $3",
+                    vec![
+                        payload.site_id.into(),
+                        sea_orm::prelude::DateTimeWithTimeZone::from(lo).into(),
+                        sea_orm::prelude::DateTimeWithTimeZone::from(hi).into(),
+                    ],
+                    crate::routes::private::collection_events::attach::EventSource::Manual,
+                )
                 .await?;
             }
 
