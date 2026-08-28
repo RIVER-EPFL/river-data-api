@@ -341,6 +341,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT))
         .route("/grab_samples", post(grab_samples::insert_grab_samples))
         .route(
+            "/collection_events/stage",
+            post(crate::routes::private::collection_events::stage_collection_event),
+        )
+        .route(
             "/collection_events/{id}/recompute",
             post(crate::routes::private::collection_events::recompute_collection_event),
         )

@@ -7,6 +7,7 @@
 
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serde_json::json;
+use uuid::Uuid;
 use serial_test::serial;
 
 use crate::common::{GLOBAL_PARAM_DO_ID, GLOBAL_PARAM_TEMP_ID, SITE1_ID};
@@ -267,6 +268,52 @@ async fn the_staging_endpoint_creates_a_manual_event() {
     )
     .await;
     assert!(status >= 400, "a duplicate staging is refused: {body}");
+
+    // Which is why staging goes through its own endpoint: it is find-or-create, so a second tool
+    // entering the same visit joins it instead of colliding with the unique key.
+    let (status, staged) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/collection_events/stage",
+        &json!({ "site_id": SITE1_ID, "collected_at": T1, "notes": "ignored, the visit stands" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{staged}");
+    assert_eq!(staged["id"], event["id"]);
+    assert_eq!(staged["created"], false);
+    assert_eq!(staged["notes"], "spring campaign");
+}
+
+/// Staging a visit nobody has entered yet creates it, stamped with the caller and `manual`.
+#[tokio::test]
+#[serial]
+async fn staging_a_new_instant_creates_the_visit() {
+    let (db, app, token) = setup().await;
+
+    let (status, staged) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/collection_events/stage",
+        &json!({ "site_id": SITE1_ID, "collected_at": T1 }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{staged}");
+    assert_eq!(staged["created"], true);
+    assert_eq!(staged["source"], "manual");
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) AS n FROM collection_events").await,
+        1
+    );
+
+    // An unknown site is refused rather than minting a visit nothing backs.
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/collection_events/stage",
+        &json!({ "site_id": Uuid::new_v4(), "collected_at": T1 }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
 }
 
 #[tokio::test]

@@ -189,6 +189,7 @@ pub fn validate_optional_time_range(
         private::readings::batch::insert_batch_readings,
         private::readings::grab_samples::insert_grab_samples,
         private::readings::checks::seasonal_check,
+        private::collection_events::stage_collection_event,
         private::collection_events::recompute_collection_event,
         private::collection_events::run_event_audit,
         private::collection_events::list_event_audit_findings,

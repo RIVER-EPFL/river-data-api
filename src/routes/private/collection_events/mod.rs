@@ -60,6 +60,95 @@ pub async fn recompute_collection_event(
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
+pub struct StageEventRequest {
+    pub site_id: Uuid,
+    pub collected_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StagedEvent {
+    pub id: Uuid,
+    pub site_id: Uuid,
+    pub collected_at: chrono::DateTime<chrono::Utc>,
+    pub source: String,
+    pub created_by: Option<String>,
+    pub notes: Option<String>,
+    /// False when the visit already stood at this instant, so a second tool joins it.
+    pub created: bool,
+}
+
+/// Stage a field visit: the portal's New Entry, made idempotent. A visit already standing at
+/// `(site_id, collected_at)` is returned as it is, so two tools entering the same visit land on
+/// one row instead of racing the unique key. Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/collection_events/stage",
+    request_body = StageEventRequest,
+    responses(
+        (status = 200, description = "The staged visit", body = StagedEvent),
+        (status = 404, description = "Unknown site"),
+    ),
+    tag = "collection_events"
+)]
+pub async fn stage_collection_event(
+    State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
+    Json(req): Json<StageEventRequest>,
+) -> AppResult<Json<StagedEvent>> {
+    use sea_orm::ConnectionTrait;
+
+    if crate::routes::private::sites::Entity::find_by_id(req.site_id)
+        .one(&state.db)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::NotFound(format!("Site {} not found", req.site_id)));
+    }
+
+    let actor = crate::routes::private::tools::scripts::actor_label(&auth);
+    let collected_at = sea_orm::prelude::DateTimeWithTimeZone::from(req.collected_at);
+    let row = state
+        .db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "WITH staged AS (
+                 INSERT INTO collection_events (site_id, collected_at, source, created_by, notes)
+                 VALUES ($1, $2, 'manual', $3, $4)
+                 ON CONFLICT (site_id, collected_at) DO NOTHING
+                 RETURNING id, site_id, collected_at, source, created_by, notes, true AS created
+             )
+             SELECT * FROM staged
+             UNION ALL
+             SELECT id, site_id, collected_at, source, created_by, notes, false AS created
+             FROM collection_events
+             WHERE site_id = $1 AND collected_at = $2 AND NOT EXISTS (SELECT 1 FROM staged)",
+            vec![
+                req.site_id.into(),
+                collected_at.into(),
+                actor.into(),
+                req.notes.into(),
+            ],
+        ))
+        .await?
+        .ok_or_else(|| AppError::Internal("Staging returned no visit".to_string()))?;
+
+    Ok(Json(StagedEvent {
+        id: row.try_get("", "id")?,
+        site_id: row.try_get("", "site_id")?,
+        collected_at: row
+            .try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "collected_at")?
+            .with_timezone(&chrono::Utc),
+        source: row.try_get("", "source")?,
+        created_by: row.try_get("", "created_by")?,
+        notes: row.try_get("", "notes")?,
+        created: row.try_get("", "created")?,
+    }))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EventAuditRequest {
     /// Audit every event at this site. Omit both fields to audit every site.
     #[serde(default)]
