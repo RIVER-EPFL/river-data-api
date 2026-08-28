@@ -1061,8 +1061,9 @@ async fn bulk_pair_creates_only_what_is_missing_and_skips_unlisted_sites() {
             "SELECT count(*) AS c FROM data_streams WHERE source_system = 'bulkwiz' AND sensor_id IS NOT NULL"
         )
         .await,
-        3,
-        "pairing creates a sensor per paired stream"
+        0,
+        "none of these streams names a device serial, and a serial is what an instrument is \
+         deduplicated on, so pairing attributes no instrument rather than minting one each"
     );
     assert_eq!(
         count(
@@ -1137,6 +1138,7 @@ async fn apply_discovery_rolls_back_only_the_failing_action() {
             "hierarchy": { "project": "Disc New Project", "site": "Disc New Site", "parameter": "Disc New Param" },
             "units": "mg/L",
             "coordinates": { "latitude": 45.1, "longitude": 6.2, "altitude_m": 1500.0 },
+            "device": { "logger_serial": "DISC-001" },
         }),
     )
     .await;
@@ -1232,8 +1234,9 @@ async fn apply_discovery_rolls_back_only_the_failing_action() {
         "the second action pairs to an existing slot, so it creates none: {resp}"
     );
     assert_eq!(
-        resp["sensors_created"], 2,
-        "one sensor per stream that pairs: {resp}"
+        resp["sensors_created"], 1,
+        "only the stream whose metadata names a device serial; a serial is what an instrument is \
+         deduplicated on, so pairing never mints one for a stream that has none: {resp}"
     );
     assert_eq!(
         resp["streams_paired"], 2,
@@ -1350,8 +1353,8 @@ async fn apply_discovery_rolls_back_only_the_failing_action() {
             )
         )
         .await,
-        2,
-        "both paired streams carry the sensor pairing created for them"
+        1,
+        "only the stream whose metadata names a device serial carries an instrument"
     );
 
     assert!(

@@ -649,9 +649,12 @@ pub async fn pair_stream(
             ));
         }
 
-        // Create/reuse the sensor, then re-read the stream: it may have gained a sensor_id.
+        // Create/reuse the sensor, then re-read the stream: it may have gained a sensor_id. A
+        // stream carrying no device identity keeps NULL attribution rather than minting one.
         let sensor_ctx =
             create_sensor_for_stream(txn, &stream, sp.parameter_id, sp.site_id).await?;
+        let sensor_id = sensor_ctx.as_ref().map(|c| c.sensor_id);
+        let deployment_id = sensor_ctx.as_ref().and_then(|c| c.deployment_id);
         let stream = data_streams::Entity::find_by_id(stream_id)
             .one(txn)
             .await?
@@ -682,8 +685,8 @@ pub async fn pair_stream(
                     sp.site_id.into(),
                     sp.parameter_id.into(),
                     stream_id.into(),
-                    sensor_ctx.sensor_id.into(),
-                    sensor_ctx.deployment_id.into(),
+                    sensor_id.into(),
+                    deployment_id.into(),
                     stream_measurement_type.into(),
                 ],
             ),
@@ -721,7 +724,7 @@ pub async fn pair_stream(
                 sp.site_id.into(),
                 sp.parameter_id.into(),
                 stream_id.into(),
-                sensor_ctx.sensor_id.into(),
+                sensor_id.into(),
             ],
         ))
         .await?;

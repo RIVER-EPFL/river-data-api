@@ -21,6 +21,7 @@ mod instrument_grab_alongside_sensor;
 mod onboarding_tracks;
 mod pairing_plan_lifecycle;
 mod pairing_wizard_patch_apply;
+mod portal_curve_instrument;
 mod portal_migration_wizard;
 mod provision_to_public;
 mod replicate_sync_flow;

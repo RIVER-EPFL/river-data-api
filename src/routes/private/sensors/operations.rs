@@ -446,25 +446,36 @@ async fn insert_or_get_sensor<C: ConnectionTrait>(
     Ok(existing.id)
 }
 
-/// Create or reuse a sensor for a data stream being paired.
+/// Create or reuse a sensor for a data stream being paired, when the stream carries a device
+/// identity to create one from.
 ///
-/// If the stream already has a `sensor_id`, reuses that sensor (ensures deployment exists for the target site).
-/// Otherwise creates a new sensor and deployment; no calibration is created, the context carries
-/// whichever curve the sensor already has, if any.
-/// Updates `data_streams.sensor_id` to link the stream to the sensor.
+/// If the stream already has a `sensor_id`, reuses that sensor and ensures a deployment exists for
+/// the target site. Otherwise a sensor is created only when the stream's metadata names a device
+/// serial; no calibration is created, and the context carries whichever curve the sensor already
+/// has. Updates `data_streams.sensor_id` to link the stream to the sensor.
+///
+/// `None` when neither holds. A serial is what makes a sensor an identity: `insert_or_get_sensor`
+/// deduplicates on it, and its `ON CONFLICT` is partial, so a serial-less insert conflicts with
+/// nothing and mints a fresh row every call. Portal streams carry no device serial, so creating
+/// one here would mean a distinct instrument per stream, thousands of them for one source, none of
+/// them a device. A portal instrument comes from its curves instead (`resolve_lab_instrument`),
+/// chosen in the pairing plan; an operator who wants one anyway has `POST /streams/{id}/import`.
 pub async fn create_sensor_for_stream<C: ConnectionTrait>(
     db: &C,
     stream: &data_streams::Model,
     parameter_id: Uuid,
     site_id: Uuid,
-) -> AppResult<SensorContext> {
+) -> AppResult<Option<SensorContext>> {
+    if stream.sensor_id.is_none() && extract_vaisala_device_serial(&stream.metadata).is_none() {
+        return Ok(None);
+    }
     let ctx = import_sensor_for_stream(db, stream).await?;
     // Ensure active deployment exists for this sensor+site+parameter (None if the slot is occupied).
     let deployment_id = find_or_create_deployment(db, ctx.sensor_id, site_id, parameter_id).await?;
-    Ok(SensorContext {
+    Ok(Some(SensorContext {
         deployment_id,
         ..ctx
-    })
+    }))
 }
 
 /// Import-only: create or reuse a sensor for a stream and resolve its latest calibration, WITHOUT

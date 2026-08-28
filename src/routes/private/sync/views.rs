@@ -17,7 +17,7 @@ use crate::routes::private::sensors::operations::{
     create_sensor_for_stream, extract_vaisala_device_serial,
 };
 use crate::routes::private::{
-    data_streams, parameters, projects, sites, sites::parameters as site_parameters,
+    data_streams, parameters, projects, sensors, sites, sites::parameters as site_parameters,
 };
 
 /// Per-site info: (glacier_name, count, lat, lon, alt).
@@ -823,10 +823,12 @@ async fn pair_and_backfill<C: ConnectionTrait>(
         .map_err(|e| e.to_string())?
         .ok_or("Site parameter not found")?;
 
-    let sensors_created = if stream.sensor_id.is_none() { 1u32 } else { 0 };
     let sensor_ctx = create_sensor_for_stream(db, &stream, sp.parameter_id, sp.site_id)
         .await
         .map_err(|e| e.to_string())?;
+    let sensors_created = u32::from(stream.sensor_id.is_none() && sensor_ctx.is_some());
+    let sensor_id = sensor_ctx.as_ref().map(|c| c.sensor_id);
+    let deployment_id = sensor_ctx.as_ref().and_then(|c| c.deployment_id);
 
     // Re-fetch stream (sensor_id may have been updated by create_sensor_for_stream)
     let stream = data_streams::Entity::find_by_id(stream_id)
@@ -861,8 +863,8 @@ async fn pair_and_backfill<C: ConnectionTrait>(
                 sp.site_id.into(),
                 sp.parameter_id.into(),
                 stream_id.into(),
-                sensor_ctx.sensor_id.into(),
-                sensor_ctx.deployment_id.into(),
+                sensor_id.into(),
+                deployment_id.into(),
             ],
         ))
         .await
@@ -878,7 +880,7 @@ async fn pair_and_backfill<C: ConnectionTrait>(
             sp.site_id.into(),
             sp.parameter_id.into(),
             stream_id.into(),
-            sensor_ctx.sensor_id.into(),
+            sensor_id.into(),
         ],
     ))
     .await
@@ -1578,6 +1580,96 @@ struct PlanEntryUpdate {
     /// parameter (`create: true`); a matched existing parameter keeps its own name.
     #[serde(default)]
     parameter_label: Option<String>,
+    /// Point this entry's curve references at an existing lab instrument instead of the resolved
+    /// one. Applies to every entry sharing the same curve column, since one column is one
+    /// instrument across the source.
+    #[serde(default)]
+    instrument_id: Option<Uuid>,
+    /// Rename an instrument the plan will create. Ignored once it resolves to an existing one.
+    #[serde(default)]
+    instrument_name: Option<String>,
+    /// Agree to creating the proposed instrument. Apply refuses while any remain unconfirmed.
+    #[serde(default)]
+    instrument_confirmed: Option<bool>,
+}
+
+/// Apply the instrument half of a plan edit.
+///
+/// Kept apart from the per-entry loop because an instrument decision is per curve column, not per
+/// stream: one column resolves to one instrument across the whole source, so confirming or
+/// repointing it on any one entry settles every entry that shares it. Doing it per entry would
+/// leave 30 of 31 DOC streams still asking.
+async fn apply_instrument_updates(
+    state: &AppState,
+    entries: &mut [crate::routes::private::sync::service::PlanEntry],
+    updates: &[PlanEntryUpdate],
+) -> AppResult<()> {
+    for update in updates {
+        if update.instrument_id.is_none()
+            && update.instrument_name.is_none()
+            && update.instrument_confirmed.is_none()
+        {
+            continue;
+        }
+        let Some(column) = entries
+            .iter()
+            .find(|e| e.stream_id == update.stream_id)
+            .and_then(|e| e.instrument.as_ref())
+            .and_then(|i| i.curve_column.clone())
+        else {
+            continue;
+        };
+
+        // A repoint has to name an instrument that exists; otherwise the plan would carry an id
+        // the apply cannot resolve.
+        let repointed = match update.instrument_id {
+            Some(id) => Some(
+                sensors::Entity::find_by_id(id)
+                    .one(&state.db)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::BadRequest(format!("Instrument {id} does not exist"))
+                    })?,
+            ),
+            None => None,
+        };
+
+        for entry in entries
+            .iter_mut()
+            .filter(|e| {
+                e.instrument
+                    .as_ref()
+                    .and_then(|i| i.curve_column.as_deref())
+                    == Some(column.as_str())
+            })
+        {
+            let Some(instrument) = entry.instrument.as_mut() else {
+                continue;
+            };
+            if let Some(sensor) = &repointed {
+                instrument.id = Some(sensor.id);
+                instrument.name = sensor
+                    .name
+                    .clone()
+                    .or_else(|| sensor.serial_number.clone())
+                    .unwrap_or_else(|| sensor.id.to_string());
+                instrument.source_key = sensor.source_key.clone().unwrap_or_default();
+                instrument.resolved_by = "manual".to_string();
+                instrument.create = false;
+                instrument.confirmed = true;
+            }
+            if let Some(name) = &update.instrument_name
+                && instrument.create
+                && !name.trim().is_empty()
+            {
+                instrument.name = name.trim().to_string();
+            }
+            if let Some(confirmed) = update.instrument_confirmed {
+                instrument.confirmed = confirmed;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Edit a draft pairing plan (only `draft` status allows updates). Requires `write_metadata`.
@@ -1647,12 +1739,14 @@ pub async fn update_pairing_plan(
                 && (entry.site.name.trim().is_empty() || entry.parameter.name.trim().is_empty())
             {
                 entry.action = "skip".to_string();
-                entry
-                    .warnings
-                    .push("site or parameter name is empty".to_string());
+                entry.warnings.push(
+                    crate::routes::private::sync::service::PlanWarning::empty_name(),
+                );
             }
         }
     }
+
+    apply_instrument_updates(&state, &mut entries, &req.updates).await?;
 
     let summary = serde_json::to_value(crate::routes::private::sync::service::compute_summary_pub(
         &entries,
@@ -1693,6 +1787,18 @@ pub async fn apply_pairing_plan(
             "Plan is '{status}', can only apply 'draft' plans"
         )));
     }
+    // Unconfirmed instruments are the operator's decision, so the refusal belongs in the response
+    // rather than in a failed job they have to go and read. `apply_plan` checks again: the job is
+    // reachable on its own.
+    let plan = crate::routes::private::data_streams::pairing_plans::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
+    let entries: Vec<crate::routes::private::sync::service::PlanEntry> =
+        serde_json::from_value(plan.entries)
+            .map_err(|e| AppError::Internal(format!("Failed to parse entries: {e}")))?;
+    crate::routes::private::sync::service::refuse_unconfirmed_instruments(&entries)?;
+
     let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
         &state.db,
         "plan_apply",

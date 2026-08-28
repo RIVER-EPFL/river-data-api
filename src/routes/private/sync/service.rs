@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::operations::create_sensor_for_stream;
 use crate::routes::private::{
-    data_streams, data_streams::pairing_plans, parameters, projects, sites,
-    sites::parameters as site_parameters,
+    data_streams, data_streams::pairing_plans, parameters, projects, sensors,
+    sensors::standard_curves, sites, sites::parameters as site_parameters,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,13 +157,125 @@ pub struct PlanEntry {
     pub parameter: PlanParamRef,
     pub confidence: String, // "exact" | "fuzzy" | "none"
     #[serde(default)]
-    pub warnings: Vec<String>,
+    pub warnings: Vec<PlanWarning>,
     #[serde(default)]
     pub original_parameter_name: Option<String>,
     /// Present when the stream is a replicate family: what is being paired is the group of
     /// member columns, not the portal's average.
     #[serde(default)]
     pub replicates: Option<PlanReplicates>,
+    /// The lab instrument this stream's standard curves belong to. Present when the stream names
+    /// an instrument already, or when its replicate spec names a curve column, and absent
+    /// otherwise. A curve is fitted on one instrument, so a reading naming a curve must name that
+    /// instrument too; a stream that will carry curve references and resolves to no instrument has
+    /// its readings refused (`/readings/batch`) or dropped (`/ingest`), which is what makes this a
+    /// decision the plan has to settle rather than report.
+    #[serde(default)]
+    pub instrument: Option<PlanInstrumentRef>,
+}
+
+/// A catalog parameter a plan entry collides with, and what already depends on it. "Exists" on its
+/// own does not say where or whether anything uses it, which is the question an operator has to
+/// answer to resolve a units conflict.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExistingParamRef {
+    pub id: Uuid,
+    pub code: String,
+    pub name: String,
+    pub units: String,
+    pub category: String,
+    pub site_parameter_count: i64,
+    pub reading_count: i64,
+}
+
+/// Something the review has to decide about, carried as data rather than a sentence so the UI can
+/// offer the resolutions instead of only naming the problem. `message` is the rendered form, kept
+/// so a warning always reads as something even where the structure is not used.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanWarning {
+    /// `units_mismatch` | `empty_name`.
+    pub kind: String,
+    pub message: String,
+    #[serde(default)]
+    pub parameter: Option<String>,
+    #[serde(default)]
+    pub existing: Option<ExistingParamRef>,
+    /// The units this source declares, against `existing.units`.
+    #[serde(default)]
+    pub source_units: Option<String>,
+}
+
+impl PlanWarning {
+    pub fn units_mismatch(parameter: &str, existing: &CatalogParam, source_units: &str) -> Self {
+        Self {
+            kind: "units_mismatch".to_string(),
+            message: format!(
+                "Parameter '{parameter}' exists in the catalog with units '{}' but this source \
+                 uses '{source_units}'",
+                existing.units
+            ),
+            parameter: Some(parameter.to_string()),
+            existing: Some(ExistingParamRef {
+                id: existing.id,
+                code: existing.code.clone(),
+                name: existing.name.clone(),
+                units: existing.units.clone(),
+                category: existing.category.clone(),
+                site_parameter_count: existing.site_parameter_count,
+                reading_count: existing.reading_count,
+            }),
+            source_units: Some(source_units.to_string()),
+        }
+    }
+
+    pub fn empty_name() -> Self {
+        Self {
+            kind: "empty_name".to_string(),
+            message: "site or parameter name is empty".to_string(),
+            parameter: None,
+            existing: None,
+            source_units: None,
+        }
+    }
+}
+
+/// One of an instrument's standard curves, carried so the review can show what a save would
+/// correct with.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanCurveRef {
+    pub id: Uuid,
+    pub name: Option<String>,
+    pub slope: f64,
+    pub intercept: f64,
+}
+
+/// The instrument a plan entry's curve references resolve to, and how that was decided.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanInstrumentRef {
+    /// The source column naming a curve per reading, e.g. `doc_std_curve_id`. Absent when the
+    /// instrument came from the stream and no column names a curve (the chla families, corrected
+    /// upstream).
+    #[serde(default)]
+    pub curve_column: Option<String>,
+    /// The resolved instrument, or None when one has to be created.
+    pub id: Option<Uuid>,
+    pub name: String,
+    /// `(source_system, source_key)` is an instrument's identity, so a later rename cannot break
+    /// the mapping.
+    pub source_key: String,
+    /// `stream` (already attributed), `curve_label` (matched against the source's own curve
+    /// labels), `manual` (repointed in the review), or `placeholder` (nothing matched).
+    pub resolved_by: String,
+    pub create: bool,
+    /// A creation an operator has agreed to. Apply refuses a plan holding an unconfirmed one.
+    #[serde(default)]
+    pub confirmed: bool,
+    /// True when each reading stores a `standard_curve_id` (the family's own calculation names
+    /// the curve, members are raw). False when the curve was applied upstream and only the
+    /// instrument is attributed, where stamping would correct the value a second time.
+    pub stamps_readings: bool,
+    #[serde(default)]
+    pub curves: Vec<PlanCurveRef>,
 }
 
 /// Replicate-family summary carried on a plan entry, from the stream's registered spec.
@@ -174,6 +286,167 @@ pub struct PlanReplicates {
     pub curve_ref_column: Option<String>,
     pub portal_mean_column: Option<String>,
     pub portal_sd_column: Option<String>,
+}
+
+/// The instruments a source has registered, with their curves, plus any instrument the plan's
+/// streams already name (which may belong to no source, e.g. a device registered by serial).
+pub struct InstrumentCatalog {
+    /// Instrument id -> (display name, source_key).
+    by_id: HashMap<Uuid, (String, Option<String>)>,
+    /// The source's own instruments, as (normalised label, id), for curve-column matching.
+    labels: Vec<(String, Uuid)>,
+    curves: HashMap<Uuid, Vec<PlanCurveRef>>,
+}
+
+/// A curve column's stem, normalised for comparison against an instrument label:
+/// `doc_std_curve_id` -> `doc`, `chla_acid_std_curve_id` -> `chla acid`.
+fn curve_column_stem(column: &str) -> String {
+    column
+        .to_lowercase()
+        .trim_end_matches("_std_curve_id")
+        .replace('_', " ")
+        .trim()
+        .to_string()
+}
+
+/// An instrument's label, normalised the same way. The source prefix is dropped because it is
+/// already the thing being matched within.
+fn instrument_label(source_key: &str, source_system: &str) -> String {
+    source_key
+        .strip_prefix(&format!("{source_system}:"))
+        .unwrap_or(source_key)
+        .to_lowercase()
+        .replace('_', " ")
+        .trim()
+        .to_string()
+}
+
+pub async fn load_instrument_catalog(
+    db: &impl ConnectionTrait,
+    source_system: &str,
+    named_ids: &[Uuid],
+) -> AppResult<InstrumentCatalog> {
+    let rows = sensors::Entity::find()
+        .filter(
+            Condition::any()
+                .add(sensors::Column::SourceSystem.eq(source_system))
+                .add(sensors::Column::Id.is_in(named_ids.to_vec())),
+        )
+        .all(db)
+        .await?;
+
+    let mut by_id = HashMap::new();
+    let mut labels = Vec::new();
+    for row in &rows {
+        let name = row
+            .name
+            .clone()
+            .or_else(|| row.serial_number.clone())
+            .unwrap_or_else(|| row.id.to_string());
+        if row.source_system.as_deref() == Some(source_system)
+            && let Some(key) = &row.source_key
+        {
+            labels.push((instrument_label(key, source_system), row.id));
+        }
+        by_id.insert(row.id, (name, row.source_key.clone()));
+    }
+
+    let ids: Vec<Uuid> = by_id.keys().copied().collect();
+    let mut curves: HashMap<Uuid, Vec<PlanCurveRef>> = HashMap::new();
+    if !ids.is_empty() {
+        for c in standard_curves::Entity::find()
+            .filter(standard_curves::Column::SensorId.is_in(ids))
+            .all(db)
+            .await?
+        {
+            curves.entry(c.sensor_id).or_default().push(PlanCurveRef {
+                id: c.id,
+                name: c.name.clone(),
+                slope: c.slope,
+                intercept: c.intercept,
+            });
+        }
+    }
+
+    Ok(InstrumentCatalog {
+        by_id,
+        labels,
+        curves,
+    })
+}
+
+/// Which instrument a stream's curve references belong to, most specific first: the instrument the
+/// stream already names, then the source's own curve labels matched against the curve column, then
+/// a placeholder for an operator to confirm.
+///
+/// The label match is what lets a portal whose curve column is empty in the data still resolve: the
+/// curve catalog is replicated independently of the readings, so the instrument is knowable even
+/// when no row has yet named a curve. It is a heuristic, so it is reported as one, and an
+/// ambiguous stem resolves to nothing rather than to a guess.
+pub fn resolve_instrument(
+    stream_sensor_id: Option<Uuid>,
+    curve_column: Option<&str>,
+    source_system: &str,
+    catalog: &InstrumentCatalog,
+) -> Option<PlanInstrumentRef> {
+    let stamps_readings = curve_column.is_some();
+    let curve_column = curve_column.map(str::to_string);
+
+    if let Some(id) = stream_sensor_id {
+        let (name, source_key) = catalog
+            .by_id
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| (id.to_string(), None));
+        return Some(PlanInstrumentRef {
+            curve_column,
+            id: Some(id),
+            name,
+            source_key: source_key.unwrap_or_default(),
+            resolved_by: "stream".to_string(),
+            create: false,
+            confirmed: true,
+            stamps_readings,
+            curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
+        });
+    }
+
+    let column = curve_column.clone()?;
+    let stem = curve_column_stem(&column);
+
+    let matches: Vec<Uuid> = catalog
+        .labels
+        .iter()
+        .filter(|(label, _)| *label == stem || label.starts_with(&format!("{stem} ")))
+        .map(|(_, id)| *id)
+        .collect();
+
+    if let [id] = matches[..] {
+        let (name, source_key) = catalog.by_id.get(&id).cloned().unwrap_or_default();
+        return Some(PlanInstrumentRef {
+            curve_column,
+            id: Some(id),
+            name,
+            source_key: source_key.unwrap_or_default(),
+            resolved_by: "curve_label".to_string(),
+            create: false,
+            confirmed: true,
+            stamps_readings,
+            curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
+        });
+    }
+
+    Some(PlanInstrumentRef {
+        curve_column: Some(column.clone()),
+        id: None,
+        name: format!("{stem} ({source_system} portal)"),
+        source_key: format!("{source_system}:{column}"),
+        resolved_by: "placeholder".to_string(),
+        create: true,
+        confirmed: false,
+        stamps_readings,
+        curves: vec![],
+    })
 }
 
 fn plan_replicates(metadata: &serde_json::Value) -> Option<PlanReplicates> {
@@ -230,6 +503,12 @@ pub struct PlanSummary {
     pub projects_to_create: usize,
     pub sites_to_create: usize,
     pub parameters_to_create: usize,
+    /// Distinct lab instruments the apply would create, and how many of those an operator has
+    /// not yet agreed to. Apply refuses while the second is non-zero.
+    #[serde(default)]
+    pub instruments_to_create: usize,
+    #[serde(default)]
+    pub instruments_unconfirmed: usize,
     pub unique_projects: usize,
     pub unique_sites: usize,
     pub unique_parameters: usize,
@@ -310,6 +589,8 @@ pub async fn create_plan(
     }
 
     let catalog = load_entity_catalog(db).await?;
+    let named_instruments: Vec<Uuid> = streams.iter().filter_map(|s| s.sensor_id).collect();
+    let instruments = load_instrument_catalog(db, source_system, &named_instruments).await?;
 
     // Build entries
     let mut entries: Vec<PlanEntry> = Vec::with_capacity(streams.len());
@@ -354,6 +635,14 @@ pub async fn create_plan(
             warnings: vec![],
             original_parameter_name: Some(h.parameter),
             replicates: plan_replicates(&stream.metadata),
+            instrument: resolve_instrument(
+                stream.sensor_id,
+                plan_replicates(&stream.metadata)
+                    .and_then(|r| r.curve_ref_column)
+                    .as_deref(),
+                source_system,
+                &instruments,
+            ),
         };
         reclassify_entry(&mut entry, &catalog);
         entries.push(entry);
@@ -408,6 +697,8 @@ pub struct ApplyResult {
     pub streams_paired: u32,
     #[serde(default)]
     pub streams_skipped: u32,
+    #[serde(default)]
+    pub instruments_created: u32,
     pub readings_backfilled: u64,
 }
 
@@ -426,6 +717,42 @@ struct ApplyCounters {
     sp_created: u32,
     streams_paired: u32,
     streams_skipped: u32,
+    instruments_created: u32,
+}
+
+/// The streams whose curve references resolve to an instrument nobody has agreed to create.
+pub fn unconfirmed_instruments(entries: &[PlanEntry]) -> Vec<&str> {
+    entries
+        .iter()
+        .filter(|e| e.action == "pair")
+        .filter(|e| {
+            e.instrument
+                .as_ref()
+                .is_some_and(|i| i.create && !i.confirmed)
+        })
+        .map(|e| e.source_key.as_str())
+        .collect()
+}
+
+/// An instrument nobody agreed to is not created silently. Refusing rather than pairing anyway is
+/// the point: a stream that will carry curve references and names no instrument has those readings
+/// refused by `/readings/batch` and dropped by `/ingest`, so pairing it in that state builds the
+/// failure in.
+pub fn refuse_unconfirmed_instruments(entries: &[PlanEntry]) -> AppResult<()> {
+    let unconfirmed = unconfirmed_instruments(entries);
+    if unconfirmed.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::BadRequest(format!(
+        "{} stream(s) need an instrument for their standard curves before they can pair: {}",
+        unconfirmed.len(),
+        unconfirmed
+            .iter()
+            .take(5)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", "),
+    )))
 }
 
 /// Apply a pairing plan: create entities, pair streams, backfill readings.
@@ -444,6 +771,8 @@ pub async fn apply_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> AppR
 
     let entries: Vec<PlanEntry> = serde_json::from_value(plan.entries.clone())
         .map_err(|e| AppError::Internal(format!("Failed to parse plan entries: {e}")))?;
+
+    refuse_unconfirmed_instruments(&entries)?;
 
     let txn = db.begin().await?;
 
@@ -489,7 +818,11 @@ pub async fn apply_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> AppR
         sp_created: 0,
         streams_paired: 0,
         streams_skipped: 0,
+        instruments_created: 0,
     };
+
+    let minted = mint_plan_instruments(&txn, &plan.source_system, &entries).await?;
+    counters.instruments_created = minted.len() as u32;
 
     for entry in entries.iter().filter(|e| e.action == "pair") {
         if (entry.site.id.is_none() && entry.site.name.trim().is_empty())
@@ -526,7 +859,19 @@ pub async fn apply_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> AppR
         let (site_parameter_id, parameter_id) =
             resolve_plan_entry(&txn, entry, &plan.source_system, &mut caches, &mut counters)
                 .await?;
-        pair_entry_stream(&txn, stream, plan_id, site_parameter_id, parameter_id).await?;
+        let instrument_id = entry
+            .instrument
+            .as_ref()
+            .and_then(|i| i.id.or_else(|| minted.get(&i.source_key).copied()));
+        pair_entry_stream(
+            &txn,
+            stream,
+            plan_id,
+            site_parameter_id,
+            parameter_id,
+            instrument_id,
+        )
+        .await?;
         counters.streams_paired += 1;
     }
 
@@ -599,6 +944,7 @@ pub async fn apply_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> AppR
         site_parameters_created: counters.sp_created,
         streams_paired: counters.streams_paired,
         streams_skipped: counters.streams_skipped,
+        instruments_created: counters.instruments_created,
         readings_backfilled,
     };
 
@@ -747,14 +1093,68 @@ async fn resolve_or_create_site_param<C: ConnectionTrait>(
     Ok(id)
 }
 
+/// Create the lab instruments a plan's confirmed entries ask for, one per `source_key` however
+/// many streams share it, and return them by that key. Find-or-create, so re-running an apply
+/// after a partial failure resolves the same rows.
+async fn mint_plan_instruments<C: ConnectionTrait>(
+    txn: &C,
+    source_system: &str,
+    entries: &[PlanEntry],
+) -> AppResult<HashMap<String, Uuid>> {
+    let mut wanted: HashMap<&str, &PlanInstrumentRef> = HashMap::new();
+    for entry in entries.iter().filter(|e| e.action == "pair") {
+        if let Some(i) = &entry.instrument
+            && i.create
+            && i.id.is_none()
+        {
+            wanted.entry(i.source_key.as_str()).or_insert(i);
+        }
+    }
+
+    let mut minted = HashMap::new();
+    for (source_key, want) in wanted {
+        if let Some(existing) = sensors::Entity::find()
+            .filter(sensors::Column::SourceSystem.eq(source_system))
+            .filter(sensors::Column::SourceKey.eq(source_key))
+            .one(txn)
+            .await?
+        {
+            minted.insert(source_key.to_string(), existing.id);
+            continue;
+        }
+        let id = Uuid::new_v4();
+        sensors::ActiveModel {
+            id: Set(id),
+            name: Set(Some(want.name.clone())),
+            source_system: Set(Some(source_system.to_string())),
+            source_key: Set(Some(source_key.to_string())),
+            is_active: Set(Some(true)),
+            is_lab_instrument: Set(Some(true)),
+            data_frequency: Set("low".to_string()),
+            created_at: Set(Some(Utc::now())),
+            ..Default::default()
+        }
+        .insert(txn)
+        .await?;
+        minted.insert(source_key.to_string(), id);
+    }
+    Ok(minted)
+}
+
 async fn pair_entry_stream<C: ConnectionTrait>(
     txn: &C,
     stream: data_streams::Model,
     plan_id: Uuid,
     site_parameter_id: Uuid,
     parameter_id: Uuid,
+    instrument_id: Option<Uuid>,
 ) -> AppResult<()> {
-    if stream.sensor_id.is_none() {
+    // The plan's instrument, when the stream does not already name one. Deliberately no
+    // deployment: a lab instrument corrects a grab, it is not stationed at the site, and the
+    // "attributed but not deployed" state is the one `import_sensor_for_stream` documents.
+    let from_plan = stream.sensor_id.is_none().then_some(instrument_id).flatten();
+
+    if stream.sensor_id.is_none() && from_plan.is_none() {
         let site_id = site_parameters::Entity::find_by_id(site_parameter_id)
             .one(txn)
             .await?
@@ -773,6 +1173,11 @@ async fn pair_entry_stream<C: ConnectionTrait>(
 
     let now = Utc::now();
     let mut active: data_streams::ActiveModel = stream.into();
+    // Only assign when the plan resolved it. `create_sensor_for_stream` links the stream itself,
+    // and this model predates that write, so setting the field unconditionally would clobber it.
+    if let Some(id) = from_plan {
+        active.sensor_id = Set(Some(id));
+    }
     active.site_parameter_id = Set(Some(site_parameter_id));
     active.pairing_plan_id = Set(Some(plan_id));
     active.paired_at = Set(Some(now.into()));
@@ -833,6 +1238,7 @@ async fn finalize_plan<C: ConnectionTrait>(
         site_parameters_created: counters.sp_created,
         streams_paired: counters.streams_paired,
         streams_skipped: counters.streams_skipped,
+        instruments_created: counters.instruments_created,
         readings_backfilled,
     };
 
@@ -1011,6 +1417,25 @@ fn compute_summary(entries: &[PlanEntry]) -> PlanSummary {
         .collect::<std::collections::HashSet<_>>()
         .len();
 
+    // Instruments are counted by identity, not by entry: one curve column serves every station in
+    // the source, so 31 DOC streams create at most one instrument.
+    let instruments_to_create = entries
+        .iter()
+        .filter(|e| e.action == "pair")
+        .filter_map(|e| e.instrument.as_ref())
+        .filter(|i| i.create)
+        .map(|i| &i.source_key)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let instruments_unconfirmed = entries
+        .iter()
+        .filter(|e| e.action == "pair")
+        .filter_map(|e| e.instrument.as_ref())
+        .filter(|i| i.create && !i.confirmed)
+        .map(|i| &i.source_key)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+
     PlanSummary {
         total_streams: entries.len(),
         will_pair,
@@ -1018,6 +1443,8 @@ fn compute_summary(entries: &[PlanEntry]) -> PlanSummary {
         projects_to_create,
         sites_to_create,
         parameters_to_create: params_to_create,
+        instruments_to_create,
+        instruments_unconfirmed,
         unique_projects: unique_projects.len(),
         unique_sites: unique_sites.len(),
         unique_parameters: unique_params.len(),
@@ -1075,6 +1502,12 @@ pub struct CatalogParam {
     pub name: String,
     pub aliases: Vec<String>,
     pub units: String,
+    pub category: String,
+    /// What already depends on this parameter. A catalog entry nothing uses is a different
+    /// proposition from one carrying years of readings, and a units conflict cannot be judged
+    /// without knowing which it is.
+    pub site_parameter_count: i64,
+    pub reading_count: i64,
 }
 
 pub struct EntityCatalog {
@@ -1096,16 +1529,48 @@ pub async fn load_entity_catalog(db: &impl ConnectionTrait) -> AppResult<EntityC
         .into_iter()
         .map(|s| (s.id, s.name))
         .collect();
+    // Usage per parameter in one pass. `readings.parameter_id` is indexed and the group-by is over
+    // the slots, not the hypertable's rows, so this stays a catalog-sized query.
+    let mut usage: HashMap<Uuid, (i64, i64)> = HashMap::new();
+    for row in db
+        .query_all(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT sp.parameter_id AS parameter_id,
+                    COUNT(*) AS slots,
+                    COALESCE(SUM(r.n), 0) AS readings
+             FROM site_parameters sp
+             LEFT JOIN (
+                 SELECT site_id, parameter_id, COUNT(*) AS n
+                 FROM readings WHERE parameter_id IS NOT NULL
+                 GROUP BY site_id, parameter_id
+             ) r ON r.parameter_id = sp.parameter_id AND r.site_id = sp.site_id
+             GROUP BY sp.parameter_id"
+                .to_owned(),
+        ))
+        .await?
+    {
+        let id: Uuid = row.try_get("", "parameter_id")?;
+        let slots: i64 = row.try_get("", "slots").unwrap_or(0);
+        let readings: i64 = row.try_get("", "readings").unwrap_or(0);
+        usage.insert(id, (slots, readings));
+    }
+
     let params = parameters::Entity::find()
         .all(db)
         .await?
         .into_iter()
-        .map(|p| CatalogParam {
-            id: p.id,
-            code: p.code,
-            name: p.name,
-            aliases: p.aliases,
-            units: p.default_units,
+        .map(|p| {
+            let (slots, readings) = usage.get(&p.id).copied().unwrap_or((0, 0));
+            CatalogParam {
+                id: p.id,
+                code: p.code,
+                name: p.name,
+                aliases: p.aliases,
+                units: p.default_units,
+                category: p.category,
+                site_parameter_count: slots,
+                reading_count: readings,
+            }
         })
         .collect();
     Ok(EntityCatalog {
@@ -1138,9 +1603,10 @@ pub fn reclassify_entry(entry: &mut PlanEntry, catalog: &EntityCatalog) {
         && !entry.parameter.units.is_empty()
         && p.units.to_lowercase() != entry.parameter.units.to_lowercase()
     {
-        entry.warnings.push(format!(
-            "Parameter '{}' exists with units '{}' but this source uses '{}'",
-            entry.parameter.name, p.units, entry.parameter.units
+        entry.warnings.push(PlanWarning::units_mismatch(
+            &entry.parameter.name,
+            p,
+            &entry.parameter.units,
         ));
     }
 
