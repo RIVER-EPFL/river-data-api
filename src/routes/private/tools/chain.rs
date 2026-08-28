@@ -476,6 +476,7 @@ async fn inputs_exist(
     }
     engine::resolve_event_inputs(
         &state.db,
+        &tool.name,
         &tool.manifest,
         Some(event.site_id),
         Some(event.collected_at),

@@ -343,4 +343,69 @@ async fn a_bulk_reshape_is_braked_and_new_rows_still_apply() {
     )
     .await;
     assert_eq!(braked, 1);
+
+    // The release path: the operator acknowledges the brake hold, ruling the reshape
+    // legitimate; the next identical pass applies in full and consumes the ruling.
+    let hold_id = fx
+        .db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT id::text AS id FROM replicate_audit_holds \
+                 WHERE stream_id = '{}' AND kind = 'brake_fired'",
+                fx.stream_id
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "id")
+        .unwrap();
+    let (status, body) = crate::common::post_json_with_token(
+        &fx.app,
+        &format!("/api/sync/replicate_audit_holds/{hold_id}/acknowledge"),
+        &json!({}),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "acknowledge the brake: {body}");
+
+    let (status, resp) = windowed_ingest(
+        &fx,
+        vec![
+            json!({ "time": "2025-06-01T00:00:00Z", "raw_value": 10.0, "replicate_index": 0 }),
+            json!({ "time": "2025-06-01T01:00:00Z", "raw_value": 11.0, "replicate_index": 0 }),
+            json!({ "time": "2025-06-01T12:00:00Z", "raw_value": 99.0, "replicate_index": 0 }),
+        ],
+        3,
+    )
+    .await;
+    assert_eq!(status, 200, "{resp}");
+    assert_eq!(resp["withdrawn"], 8, "the acknowledged reshape applies: {resp}");
+    let intact = crate::common::e2e::count(
+        &fx.db,
+        &format!(
+            "SELECT COUNT(*)::bigint FROM readings \
+             WHERE stream_id = '{}' AND withdrawn_at IS NULL",
+            fx.stream_id
+        ),
+    )
+    .await;
+    assert_eq!(intact, 3, "only the asserted content stays served");
+
+    // The ruling is consumed: the hold is terminal and a fresh reshape would brake anew.
+    let remediated = fx
+        .db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT status FROM replicate_audit_holds WHERE id = '{hold_id}'"
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "status")
+        .unwrap();
+    assert_eq!(remediated, "remediated");
 }

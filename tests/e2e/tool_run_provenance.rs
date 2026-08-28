@@ -244,22 +244,22 @@ async fn a_station_input_resolves_from_the_site_and_a_missing_property_is_refuse
     crate::common::cleanup_test_db(&db).await;
     crate::common::exec(
         &db,
-        "UPDATE tool_scripts SET active_version_id = NULL WHERE name = 'station_echo'",
+        "UPDATE tool_scripts SET active_version_id = NULL WHERE name LIKE 'station_%'",
     )
     .await;
     crate::common::exec(
         &db,
         "DELETE FROM tool_script_activations WHERE tool_script_id IN \
-         (SELECT id FROM tool_scripts WHERE name = 'station_echo')",
+         (SELECT id FROM tool_scripts WHERE name LIKE 'station_%')",
     )
     .await;
     crate::common::exec(
         &db,
         "DELETE FROM tool_script_versions WHERE tool_script_id IN \
-         (SELECT id FROM tool_scripts WHERE name = 'station_echo')",
+         (SELECT id FROM tool_scripts WHERE name LIKE 'station_%')",
     )
     .await;
-    crate::common::exec(&db, "DELETE FROM tool_scripts WHERE name = 'station_echo'").await;
+    crate::common::exec(&db, "DELETE FROM tool_scripts WHERE name LIKE 'station_%'").await;
     let app = kc::build_test_app_with_keycloak(db.clone()).await;
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
@@ -373,6 +373,36 @@ async fn a_station_input_resolves_from_the_site_and_a_missing_property_is_refuse
     assert_eq!(status, 200, "{tool}");
     assert_eq!(tool["results"]["alt_echo"], 300.0);
     assert!(tool["station_inputs"].as_array().is_none_or(Vec::is_empty), "{tool}");
+
+    // A resolved value is kind-checked exactly like a typed one: a manifest wiring a text
+    // property (the site's name) into a number param is refused naming the mismatch, never
+    // handed to the runner.
+    crate::common::e2e::author_tool(
+        &app,
+        &admin,
+        "station_name_echo",
+        "tool <- function(inputs, constants, curves) list(out = inputs$alt)",
+        json!({
+            "label": "Station name echo",
+            "params": [{ "name": "alt", "label": "Alt", "kind": "number", "required": true }],
+            "station_inputs": [{ "property": "name", "param": "alt" }],
+            "outputs": [],
+        }),
+        json!({ "name": "echoes", "inputs": { "alt": 1.0 }, "expected": { "out": 1.0 } }),
+    )
+    .await;
+    let (status, resp) = crate::common::post_json_with_token(
+        &app,
+        "/api/tools/station_name_echo/calculate",
+        &json!({ "site_id": track.site_id }),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 400, "{resp}");
+    assert!(
+        resp.contains("is not a number") && resp.contains("'name'"),
+        "the mismatch is named: {resp}"
+    );
 }
 
 /// S1's Phase 3 half: a first save to a catalog parameter the site does not carry provisions the

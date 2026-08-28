@@ -331,19 +331,50 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
             })
     };
     if over_fraction || over_index_fraction {
-        outcome.braked = true;
-        outcome.apply_changed = false;
-        upsert_brake_hold(
-            conn,
-            stream_id,
-            window,
-            outcome.changed,
-            to_withdraw.len() + withdraw_touched.len(),
-            stored.len(),
-        )
-        .await?;
-        outcome.holds_raised += 1;
-        return Ok(outcome);
+        // The release path: an operator who acknowledged this stream's brake_fired hold has
+        // ruled that the reshape is legitimate, so exactly one braked-scale pass applies and the
+        // ruling is consumed (hold -> remediated). The source re-asserts the same window every
+        // cycle, so "acknowledge, then let the next cycle through" is the whole workflow; a
+        // later reshape brakes afresh with a new hold.
+        let release = conn
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT id FROM replicate_audit_holds
+                 WHERE stream_id = $1 AND kind = 'brake_fired' AND status = 'acknowledged'
+                 ORDER BY created_at DESC LIMIT 1",
+                [stream_id.into()],
+            ))
+            .await?;
+        match release {
+            Some(row) => {
+                let hold_id: Uuid = row.try_get("", "id")?;
+                conn.execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "UPDATE replicate_audit_holds SET status = 'remediated'
+                     WHERE id = $1 AND status = 'acknowledged'",
+                    [hold_id.into()],
+                ))
+                .await?;
+                tracing::info!(%stream_id, changed = outcome.changed,
+                    withdrawn = to_withdraw.len() + withdraw_touched.len(),
+                    "acknowledged brake released; reshape applies once");
+            }
+            None => {
+                outcome.braked = true;
+                outcome.apply_changed = false;
+                upsert_brake_hold(
+                    conn,
+                    stream_id,
+                    window,
+                    outcome.changed,
+                    to_withdraw.len() + withdraw_touched.len(),
+                    stored.len(),
+                )
+                .await?;
+                outcome.holds_raised += 1;
+                return Ok(outcome);
+            }
+        }
     }
 
     // Curated rows never change servedness without a person: the withdrawal is not stamped and

@@ -1378,6 +1378,17 @@ pub async fn resolve_station_inputs(
     for s in pending {
         match site.get(&s.property) {
             Some(value) if !value.is_null() => {
+                // The kind/structure checks ran before resolution, so a resolved value is
+                // validated here or not at all: a text property filling a number param must be
+                // refused, never handed to the runner.
+                if let Some(param) = manifest.params.iter().find(|p| p.name == s.target())
+                    && !kind_accepts(&param.kind, value)
+                {
+                    return Err(AppError::BadRequest(format!(
+                        "station property '{}' of site '{site_name}' resolved to {value}, which                          is not a {} for input '{}' of tool '{tool_name}'",
+                        s.property, param.kind, s.target()
+                    )));
+                }
                 body.insert(s.target().to_string(), value.clone());
                 resolved.push(serde_json::json!({
                     "property": s.property,
@@ -1404,6 +1415,7 @@ pub async fn resolve_station_inputs(
 /// requiredness decides whether the run can proceed without it.
 pub async fn resolve_event_inputs(
     db: &DatabaseConnection,
+    tool_name: &str,
     manifest: &Manifest,
     site_id: Option<Uuid>,
     collected_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -1447,6 +1459,14 @@ pub async fn resolve_event_inputs(
         let Some(value) = row.try_get::<Option<f64>>("", "value")? else {
             continue;
         };
+        if let Some(param) = manifest.params.iter().find(|p| p.name == e.param)
+            && !kind_accepts(&param.kind, &serde_json::json!(value))
+        {
+            return Err(AppError::BadRequest(format!(
+                "event input '{}' resolved to the number {value}, which is not a {} for input                  '{}' of tool '{tool_name}'",
+                e.parameter_code, param.kind, e.param
+            )));
+        }
         body.insert(e.param.clone(), serde_json::json!(value));
         resolved.push(serde_json::json!({
             "param": e.param,
@@ -1529,7 +1549,8 @@ pub async fn run_tool_body(
     let station_inputs =
         resolve_station_inputs(&state.db, &tool.name, manifest, site_id, &mut body).await?;
     let event_inputs =
-        resolve_event_inputs(&state.db, manifest, site_id, collected_at, &mut body).await?;
+        resolve_event_inputs(&state.db, &tool.name, manifest, site_id, collected_at, &mut body)
+            .await?;
 
     // Defaults land before requiredness so a condition reads the same values the runner will,
     // whatever order the params are declared in.
