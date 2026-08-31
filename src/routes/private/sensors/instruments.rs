@@ -138,7 +138,7 @@ pub async fn get_instruments_overview(
             });
     }
     for curves in curves_by_sensor.values_mut() {
-        curves.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        curves.sort_by_key(|c| std::cmp::Reverse(c.created_at));
     }
 
     // Streams naming an instrument, with the paired slot's names resolved in the same pass.
@@ -265,7 +265,7 @@ pub async fn get_curve_usage(
     let points = db
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &format!(
+            format!(
                 "SELECT r.time, r.replicate_index, r.raw_value, r.calibrated_value,
                         COALESCE(r.is_flagged, false) AS is_flagged,
                         s.name AS site_name, p.code AS parameter_code
