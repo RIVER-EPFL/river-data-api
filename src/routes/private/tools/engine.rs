@@ -564,6 +564,12 @@ pub struct ManifestOutput {
     /// aggregated, not the calculation.
     #[serde(default)]
     pub sd_estimator: Option<String>,
+    /// `mean` or `sd`: the engine computes this output over the curve-applied values of the
+    /// `replicates` param `aggregate_of` names, so the preview a technician sees is the number
+    /// the database will later serve, divisor included. The script never computes it; a script
+    /// value under the same key is discarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -582,6 +588,8 @@ struct ManifestOutputRaw {
     suggested_parameter_code: Option<String>,
     #[serde(default)]
     sd_estimator: Option<String>,
+    #[serde(default)]
+    aggregate: Option<String>,
 }
 
 // Hand-written for the same reason `ManifestParam`'s is: the check runs wherever a manifest is
@@ -599,6 +607,20 @@ impl<'de> Deserialize<'de> for ManifestOutput {
                 raw.key
             )));
         }
+        if let Some(agg) = raw.aggregate.as_deref() {
+            if !matches!(agg, "mean" | "sd") {
+                return Err(D::Error::custom(format!(
+                    "output '{}': aggregate '{agg}' is not 'mean' or 'sd'",
+                    raw.key
+                )));
+            }
+            if raw.aggregate_of.is_none() {
+                return Err(D::Error::custom(format!(
+                    "output '{}': aggregate needs aggregate_of naming the replicates it reduces",
+                    raw.key
+                )));
+            }
+        }
         Ok(Self {
             key: raw.key,
             label: raw.label,
@@ -608,6 +630,7 @@ impl<'de> Deserialize<'de> for ManifestOutput {
             parameter_id: raw.parameter_id,
             suggested_parameter_code: raw.suggested_parameter_code,
             sd_estimator: raw.sd_estimator,
+            aggregate: raw.aggregate,
         })
     }
 }
@@ -765,6 +788,23 @@ impl<'de> Deserialize<'de> for Manifest {
                 return Err(D::Error::custom(format!(
                     "param '{}': when references unknown param '{}'",
                     p.name, c.param
+                )));
+            }
+        }
+        // An engine-computed aggregate reduces a replicates param, so `aggregate_of` has to name
+        // one; the plain display marker (aggregate_of without aggregate) stays free-form.
+        for o in &raw.outputs {
+            if o.aggregate.is_some()
+                && let Some(source) = o.aggregate_of.as_deref()
+                && !raw
+                    .params
+                    .iter()
+                    .any(|p| p.name == source && p.kind == "replicates")
+            {
+                return Err(D::Error::custom(format!(
+                    "output '{}': aggregate_of '{source}' names no replicates param of the \
+                     manifest",
+                    o.key
                 )));
             }
         }
@@ -1846,6 +1886,16 @@ pub async fn run_tool_body(
     // NA outputs arrive as null; absent is the contract for an uncomputable value.
     results.retain(|_, v| !v.is_null());
 
+    apply_manifest_aggregates(
+        &state.db,
+        manifest,
+        &effective_inputs,
+        &curve_snapshots,
+        site_id,
+        &mut results,
+    )
+    .await?;
+
     let declared_used: Vec<String> = results
         .remove("inputs_used")
         .and_then(|v| serde_json::from_value(v).ok())
@@ -1882,6 +1932,106 @@ pub async fn run_tool_body(
         site_id,
         collected_at,
     })
+}
+
+/// Compute the manifest's `aggregate` outputs over the curve-applied replicate values, replacing
+/// anything the script emitted under the same keys. The preview must be the number the database
+/// will serve after the save: same curve, same divisor. The divisor is the output's fixed
+/// declaration, else the slot's (when the run carries a site), else sample, matching the grab
+/// write path's resolution.
+async fn apply_manifest_aggregates(
+    db: &DatabaseConnection,
+    manifest: &Manifest,
+    inputs: &serde_json::Map<String, serde_json::Value>,
+    curve_snapshots: &[serde_json::Value],
+    site_id: Option<Uuid>,
+    results: &mut serde_json::Map<String, serde_json::Value>,
+) -> AppResult<()> {
+    for output in &manifest.outputs {
+        let (Some(kind), Some(source)) = (output.aggregate.as_deref(), output.aggregate_of.as_deref())
+        else {
+            continue;
+        };
+        let Some(param) = manifest.params.iter().find(|p| p.name == source) else {
+            continue;
+        };
+        let Some(cells) = inputs.get(source).and_then(serde_json::Value::as_array) else {
+            results.remove(&output.key);
+            continue;
+        };
+
+        // The same linear application storage performs; a slot the request did not fill leaves
+        // the values raw, exactly as the save would.
+        let (slope, intercept) = param
+            .curve
+            .as_deref()
+            .and_then(|slot| {
+                curve_snapshots.iter().find_map(|s| {
+                    (s.get("name")?.as_str()? == slot).then(|| {
+                        let c = s.get("curve")?;
+                        Some((c.get("slope")?.as_f64()?, c.get("intercept")?.as_f64()?))
+                    })?
+                })
+            })
+            .unwrap_or((1.0, 0.0));
+        let values: Vec<f64> = cells
+            .iter()
+            .filter_map(serde_json::Value::as_f64)
+            .map(|v| v * slope + intercept)
+            .collect();
+
+        let computed = match kind {
+            "mean" if !values.is_empty() => {
+                Some(values.iter().sum::<f64>() / values.len() as f64)
+            }
+            "sd" if values.len() >= 2 => {
+                let n = values.len() as f64;
+                let mean = values.iter().sum::<f64>() / n;
+                let ss: f64 = values.iter().map(|v| (v - mean).powi(2)).sum();
+                let divisor = match output.fixed_sd_estimator() {
+                    Some("population") => n,
+                    Some(_) => n - 1.0,
+                    None => match slot_sd_estimator(db, site_id, param).await?.as_deref() {
+                        Some("population") => n,
+                        _ => n - 1.0,
+                    },
+                };
+                Some((ss / divisor).sqrt())
+            }
+            _ => None,
+        };
+        match computed {
+            Some(v) => {
+                results.insert(output.key.clone(), serde_json::json!(v));
+            }
+            None => {
+                results.remove(&output.key);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The declaration of the slot a replicates param's readings will land on, reachable only when
+/// the run carries a site and the param names a catalog code.
+async fn slot_sd_estimator(
+    db: &DatabaseConnection,
+    site_id: Option<Uuid>,
+    param: &ManifestParam,
+) -> AppResult<Option<String>> {
+    let (Some(site), Some(code)) = (site_id, param.parameter_code.as_deref()) else {
+        return Ok(None);
+    };
+    let row = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT sp.sd_estimator FROM site_parameters sp
+             JOIN parameters p ON p.id = sp.parameter_id
+             WHERE sp.site_id = $1 AND LOWER(p.code) = LOWER($2)",
+            [site.into(), code.into()],
+        ))
+        .await?;
+    Ok(row.and_then(|r| r.try_get::<Option<String>>("", "sd_estimator").ok().flatten()))
 }
 
 /// Where a script failed to parse. `line`/`column` are absent when R's message carries no
@@ -2512,6 +2662,57 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("unknown kind 'colour'"), "{err}");
+    }
+
+    #[test]
+    fn an_aggregate_outside_mean_and_sd_is_refused() {
+        let raw = serde_json::json!({
+            "label": "T",
+            "params": [{ "name": "reps", "label": "Reps", "kind": "replicates",
+                         "parameter_code": "X" }],
+            "outputs": [{ "key": "med", "label": "Median", "aggregate_of": "reps",
+                          "aggregate": "median" }]
+        });
+        let err = serde_json::from_value::<Manifest>(raw)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'median' is not 'mean' or 'sd'"), "{err}");
+    }
+
+    #[test]
+    fn an_aggregate_without_a_source_is_refused() {
+        let raw = serde_json::json!({
+            "label": "T",
+            "outputs": [{ "key": "avg", "label": "Avg", "aggregate": "mean" }]
+        });
+        let err = serde_json::from_value::<Manifest>(raw)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs aggregate_of"), "{err}");
+    }
+
+    #[test]
+    fn an_aggregate_over_a_non_replicates_param_is_refused() {
+        let raw = serde_json::json!({
+            "label": "T",
+            "params": [{ "name": "temp", "label": "Temp", "kind": "number" }],
+            "outputs": [{ "key": "avg", "label": "Avg", "aggregate_of": "temp",
+                          "aggregate": "mean" }]
+        });
+        let err = serde_json::from_value::<Manifest>(raw)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("names no replicates param"), "{err}");
+    }
+
+    #[test]
+    fn a_display_marker_without_aggregate_stays_free_form() {
+        let raw = serde_json::json!({
+            "label": "T",
+            "params": [{ "name": "x", "label": "X", "kind": "number" }],
+            "outputs": [{ "key": "x_avg", "label": "Avg", "aggregate_of": "x_family" }]
+        });
+        assert!(serde_json::from_value::<Manifest>(raw).is_ok());
     }
 
     #[test]

@@ -1,7 +1,12 @@
 {
   "label": "DOC",
   "description": "Dissolved organic carbon: the analyser replicates are stored as readings, corrected through the chosen standard curve, and their mean and standard deviation are the served DOC.",
-  "sections": [{ "key": "lab", "label": "Lab measurements" }],
+  "sections": [
+    {
+      "key": "lab",
+      "label": "Lab measurements"
+    }
+  ],
   "params": [
     {
       "name": "DOC",
@@ -25,7 +30,8 @@
       "units": "ppb",
       "per_replicate": false,
       "aggregate_of": "DOC",
-      "suggested_parameter_code": null
+      "suggested_parameter_code": null,
+      "aggregate": "mean"
     },
     {
       "key": "DOC_sd_ppb",
@@ -33,7 +39,8 @@
       "units": "ppb",
       "per_replicate": false,
       "aggregate_of": "DOC",
-      "suggested_parameter_code": null
+      "suggested_parameter_code": null,
+      "aggregate": "sd"
     }
   ],
   "constants": [],
@@ -45,5 +52,9 @@
       "description": "Applied to every replicate before averaging: corrected = slope * measured + intercept."
     }
   ],
-  "match_keywords": ["doc", "organic carbon", "dissolved organic"]
+  "match_keywords": [
+    "doc",
+    "organic carbon",
+    "dissolved organic"
+  ]
 }
