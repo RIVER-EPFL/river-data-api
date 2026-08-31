@@ -148,8 +148,31 @@ pub async fn refresh(db: &DatabaseConnection, window: Window) -> AppResult<()> {
     let mut first_error = None;
     let mut failed = 0;
 
+    // A view recreated WITH NO DATA holds only what the rolling window has touched since, and
+    // materialized-only reads serve that absence as data. The scheduled Recent refresh is where
+    // that state gets noticed: any view whose earliest bucket does not reach the earliest
+    // qualifying reading escalates to a full refresh here, so a rebuilt rollup heals on the next
+    // tick. A failed probe refreshes normally rather than blocking.
+    let escalated: Vec<Resolution> = if matches!(window, Window::Recent) {
+        match views_missing_history(db).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "Aggregate coverage probe failed; refreshing the rolling window only");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     for resolution in Resolution::ALL {
-        let statement = refresh_statement(resolution, window, now);
+        let view_window = if escalated.contains(&resolution) {
+            tracing::warn!(view = resolution.view(), "Rollup is missing its history; running a full refresh");
+            Window::Full
+        } else {
+            window
+        };
+        let statement = refresh_statement(resolution, view_window, now);
         match db.execute(statement).await {
             Ok(_) => tracing::debug!(view = resolution.view(), "Continuous aggregate refreshed"),
             Err(e) => {
@@ -169,6 +192,51 @@ pub async fn refresh(db: &DatabaseConnection, window: Window) -> AppResult<()> {
             Err(e.into())
         }
     }
+}
+
+/// The rollups whose earliest bucket does not reach the earliest reading their shared population
+/// filter admits. Empty when every view covers its history (the steady state, two cheap MIN
+/// probes per tick).
+async fn views_missing_history(db: &DatabaseConnection) -> AppResult<Vec<Resolution>> {
+    let earliest = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT MIN(time) AS t FROM readings
+             WHERE site_id IS NOT NULL AND replicate_index = 0
+               AND is_flagged IS NOT TRUE AND measurement_type IS DISTINCT FROM 'spot'"
+                .to_string(),
+        ))
+        .await?
+        .and_then(|row| {
+            row.try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "t")
+                .ok()
+                .flatten()
+        });
+    let Some(earliest) = earliest else {
+        return Ok(Vec::new());
+    };
+    let earliest: DateTime<Utc> = earliest.with_timezone(&Utc);
+
+    let mut missing = Vec::new();
+    for resolution in Resolution::ALL {
+        let min_bucket = db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("SELECT MIN(bucket) AS b FROM {}", resolution.view()),
+            ))
+            .await?
+            .and_then(|row| {
+                row.try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "b")
+                    .ok()
+                    .flatten()
+            });
+        let covered = min_bucket
+            .is_some_and(|b| b.with_timezone(&Utc) <= resolution.floor(earliest));
+        if !covered {
+            missing.push(resolution);
+        }
+    }
+    Ok(missing)
 }
 
 /// The `CALL` for one view, with the window aligned to that view's buckets.
