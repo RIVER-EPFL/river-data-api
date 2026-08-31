@@ -276,6 +276,7 @@ pub async fn recompute_event(
             .filter_map(|(key, parameter_id)| {
                 result.results.get(key).and_then(serde_json::Value::as_f64).map(|value| {
                     GrabSampleReading {
+                        input: None,
                         parameter_id: *parameter_id,
                         sensor_id: None,
                         value,
@@ -308,8 +309,11 @@ pub async fn recompute_event(
             notes: None,
             mode: Some(GrabWriteMode::Replace),
             dry_run: false,
-            tool_run_id: Some(result.run_id),
+                tool_run_id: Some(result.run_id),
             check_id: None,
+            // The tool's manifest is read by the save path itself; nothing here overrides
+            // the slot's declaration.
+            sd_estimator: None,
             readings,
         };
         let saved = insert_grab_samples(

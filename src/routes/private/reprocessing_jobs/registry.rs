@@ -59,6 +59,7 @@ pub fn is_rerunnable(trigger_type: &str) -> bool {
             | "refresh_aggregates_full"
             | "derived_recompute"
             | "measurement_retag"
+            | "sd_estimator_retag"
             | "event_recompute"
             | "event_audit"
     )

@@ -56,7 +56,7 @@ async fn a_calculation_is_a_stored_run_and_the_save_carries_its_blob() {
     let (status, tool) = crate::common::post_json_parse_with_token(
         &app,
         "/api/tools/doc/calculate",
-        &json!({ "DOC_rep_1": 120.0, "DOC_rep_2": 125.0, "DOC_rep_3": 118.0 }),
+        &json!({ "DOC": [120.0, 125.0, 118.0] }),
         &river,
     )
     .await;
@@ -129,7 +129,7 @@ async fn a_calculation_is_a_stored_run_and_the_save_carries_its_blob() {
         blob["saved_by"], calculated_by,
         "the same member calculated and saved"
     );
-    assert_eq!(blob["inputs"]["DOC_rep_1"], 120.0);
+    assert_eq!(blob["inputs"]["DOC"][0], 120.0);
     assert_eq!(blob["outputs"]["DOC_avg_ppb"], doc_avg);
     assert_eq!(blob["saved"]["DOC_avg_ppb"], parameter_id);
     assert!(
@@ -174,7 +174,7 @@ async fn a_forged_or_edited_tool_link_is_refused_at_the_gate() {
     let (status, tool) = crate::common::post_json_parse_with_token(
         &app,
         "/api/tools/doc/calculate",
-        &json!({ "DOC_rep_1": 120.0, "DOC_rep_2": 125.0, "DOC_rep_3": 118.0 }),
+        &json!({ "DOC": [120.0, 125.0, 118.0] }),
         &river,
     )
     .await;
@@ -433,7 +433,7 @@ async fn a_first_save_provisions_the_site_parameter() {
     let (status, tool) = crate::common::post_json_parse_with_token(
         &app,
         "/api/tools/doc/calculate",
-        &json!({ "DOC_rep_1": 120.0, "DOC_rep_2": 125.0, "DOC_rep_3": 118.0 }),
+        &json!({ "DOC": [120.0, 125.0, 118.0] }),
         &river,
     )
     .await;

@@ -439,6 +439,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
         )
         .route("/actions/duplicate_slots", get(actions::duplicate_slots))
         .route(
+            "/actions/undeclared_sd_estimators",
+            get(actions::undeclared_sd_estimators),
+        )
+        .route(
             "/schedules",
             get(crate::routes::private::reprocessing_jobs::schedule_routes::list_schedules),
         )

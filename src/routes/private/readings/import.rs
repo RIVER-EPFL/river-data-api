@@ -1014,6 +1014,24 @@ async fn compute_overlaps(
 /// and a campaign result sheet is tens of rows, not thousands.
 const TOOL_IMPORT_ROW_CAP: usize = 500;
 
+/// A header of the form `{name}_rep_{k}` or `{name}_{k}` (k from 1) naming position k-1 of a
+/// `replicates` param.
+fn replicate_column(
+    params: &[crate::routes::private::tools::engine::ManifestParam],
+    header: &str,
+) -> Option<(String, Option<usize>)> {
+    let lower = header.to_ascii_lowercase();
+    params
+        .iter()
+        .filter(|p| p.kind == "replicates")
+        .find_map(|p| {
+            let rest = lower.strip_prefix(&format!("{}_", p.name.to_ascii_lowercase()))?;
+            let rest = rest.strip_prefix("rep_").unwrap_or(rest);
+            let k: usize = rest.parse().ok().filter(|k| *k >= 1)?;
+            Some((p.name.clone(), Some(k - 1)))
+        })
+}
+
 /// The tool-entry import: one tool run per data row, outputs saved through the grab write path.
 ///
 /// Columns map to the tool's manifest params (case-insensitive, exact otherwise); the `DateTime`
@@ -1056,20 +1074,23 @@ async fn import_tool_csv(
     let mut mapped_columns: HashMap<String, String> = HashMap::new();
     let mut unmapped_columns: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
-    let mut column_params: Vec<(usize, String)> = Vec::new();
+    // (column index, param name, position within a replicates param)
+    let mut column_params: Vec<(usize, String, Option<usize>)> = Vec::new();
     for (idx, header) in headers.iter().enumerate() {
         if idx == datetime_idx {
             continue;
         }
-        match tool
+        let hit = tool
             .manifest
             .params
             .iter()
             .find(|p| p.name.eq_ignore_ascii_case(header))
-        {
-            Some(p) => {
-                mapped_columns.insert(header.to_string(), p.name.clone());
-                column_params.push((idx, p.name.clone()));
+            .map(|p| (p.name.clone(), None))
+            .or_else(|| replicate_column(&tool.manifest.params, header));
+        match hit {
+            Some((name, position)) => {
+                mapped_columns.insert(header.to_string(), name.clone());
+                column_params.push((idx, name, position));
             }
             None => {
                 unmapped_columns.push(header.to_string());
@@ -1129,7 +1150,7 @@ async fn import_tool_csv(
         }
         let mut body = serde_json::Map::new();
         let mut bad_cell = false;
-        for (idx, param) in &column_params {
+        for (idx, param, position) in &column_params {
             match admission::classify_cell(record.get(*idx).unwrap_or("")) {
                 admission::Cell::Missing => {}
                 admission::Cell::Invalid(reason) => {
@@ -1141,9 +1162,23 @@ async fn import_tool_csv(
                     );
                     bad_cell = true;
                 }
-                admission::Cell::Value(v) => {
-                    body.insert(param.clone(), serde_json::json!(v));
-                }
+                admission::Cell::Value(v) => match position {
+                    None => {
+                        body.insert(param.clone(), serde_json::json!(v));
+                    }
+                    // A replicate column lands at its own position; a blank column before it
+                    // stays a null so the replicate keeps its index.
+                    Some(pos) => {
+                        let list = body
+                            .entry(param.clone())
+                            .or_insert_with(|| serde_json::json!([]));
+                        let list = list.as_array_mut().expect("replicate columns build a list");
+                        while list.len() <= *pos {
+                            list.push(serde_json::Value::Null);
+                        }
+                        list[*pos] = serde_json::json!(v);
+                    }
+                },
             }
         }
         if bad_cell || body.is_empty() {
@@ -1160,18 +1195,29 @@ async fn import_tool_csv(
         )));
     }
 
-    let saved_outputs: Vec<(String, Uuid)> = {
-        let catalog =
-            engine::load_parameter_catalog(&state.db, std::iter::once(&tool.manifest)).await?;
-        tool.manifest
-            .outputs
-            .iter()
-            .filter_map(|o| catalog.resolve(o).map(|p| (o.key.clone(), p.id)))
-            .collect()
-    };
-    if saved_outputs.is_empty() {
+    let catalog =
+        engine::load_parameter_catalog(&state.db, std::iter::once(&tool.manifest)).await?;
+    let saved_outputs: Vec<(String, Uuid)> = tool
+        .manifest
+        .outputs
+        .iter()
+        .filter_map(|o| catalog.resolve(o).map(|p| (o.key.clone(), p.id)))
+        .collect();
+    // The replicates a row enters are readings of their own parameter, stored raw.
+    let saved_inputs: Vec<(String, Uuid)> = tool
+        .manifest
+        .params
+        .iter()
+        .filter(|p| p.kind == "replicates")
+        .filter_map(|p| {
+            catalog
+                .resolve_code(p.parameter_code.as_deref()?)
+                .map(|row| (p.name.clone(), row.id))
+        })
+        .collect();
+    if saved_outputs.is_empty() && saved_inputs.is_empty() {
         return Err(AppError::BadRequest(format!(
-            "No output of tool '{}' resolves to a catalog parameter; nothing could be saved",
+            "Nothing of tool '{}' resolves to a catalog parameter; nothing could be saved",
             tool.name
         )));
     }
@@ -1187,8 +1233,9 @@ async fn import_tool_csv(
                 "collected_at".into(),
                 serde_json::json!(time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
             );
-            let body_bytes = serde_json::to_vec(&serde_json::Value::Object(body))
-                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let body = serde_json::Value::Object(body);
+            let body_bytes =
+                serde_json::to_vec(&body).map_err(|e| AppError::Internal(e.to_string()))?;
             let result =
                 match execute_and_store_run(state, &tool, &body_bytes, &actor, "csv_import").await {
                     Ok(result) => result,
@@ -1199,7 +1246,7 @@ async fn import_tool_csv(
                 };
             tool_runs_created += 1;
 
-            let readings: Vec<GrabSampleReading> = saved_outputs
+            let mut readings: Vec<GrabSampleReading> = saved_outputs
                 .iter()
                 .filter_map(|(key, parameter_id)| {
                     result
@@ -1213,10 +1260,33 @@ async fn import_tool_csv(
                             time,
                             replicate_index: None,
                             output: Some(key.clone()),
+                            input: None,
                             standard_curve_id: None,
                         })
                 })
                 .collect();
+            for (name, parameter_id) in &saved_inputs {
+                let Some(values) = body.get(name).and_then(serde_json::Value::as_array) else {
+                    continue;
+                };
+                for (position, cell) in values.iter().enumerate() {
+                    let (Some(value), Ok(replicate_index)) =
+                        (cell.as_f64(), i16::try_from(position))
+                    else {
+                        continue;
+                    };
+                    readings.push(GrabSampleReading {
+                        parameter_id: *parameter_id,
+                        sensor_id: None,
+                        value,
+                        time,
+                        replicate_index: Some(replicate_index),
+                        output: None,
+                        input: Some(name.clone()),
+                        standard_curve_id: None,
+                    });
+                }
+            }
             if readings.is_empty() {
                 record_error(
                     line,
@@ -1235,6 +1305,9 @@ async fn import_tool_csv(
                 dry_run: false,
                 tool_run_id: Some(result.run_id),
                 check_id: None,
+                // The tool's manifest is read by the save path itself; nothing here overrides
+                // the slot's declaration.
+                sd_estimator: None,
                 readings,
             };
             match insert_grab_samples(

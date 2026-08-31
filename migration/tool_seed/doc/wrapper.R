@@ -1,33 +1,19 @@
-# DOC tool wrapper. Mirrors the portal doc_tool.R orchestration: three DOC_rep columns
-# plus doc_std_curve_id feed calcDOCavg/calcDOCsd; the standard curve is served to
-# calcDOC through a local pool shim.
-
-getRows <- function(pool, table, ...) {
-  pool[[table]]
-}
+# DOC tool wrapper. The replicates arrive as one vector (a blank vial is NA at its own
+# position), the standard curve corrects each one, and calcMean/calcSd summarise them for
+# display. The stored DOC is the replicates themselves: the database applies the same curve
+# per reading and derives the same mean and sd.
 
 tool <- function(inputs, constants, curves) {
-  # Each replicate is read by the portal's own column name, so a replicate entered alone stays
-  # on its own number instead of shifting to the first free slot.
-  num <- function(key) {
-    v <- inputs[[key]]
-    if (is.null(v) || length(v) == 0L) return(NA_real_)
-    v <- suppressWarnings(as.numeric(v[[1L]]))
-    if (length(v) == 0L) NA_real_ else v
-  }
+  reps <- suppressWarnings(as.numeric(unlist(inputs[['DOC']])))
+  if (length(reps) == 0L || all(is.na(reps))) return(list())
 
+  # calcDOC's correction, applied to however many replicates there are.
   curve <- riverdata.tools::curve_df(curves$std_curve)
-  pool <- list(standard_curves = curve)
+  if (!is.null(curve)) reps <- reps * curve$a + curve$b
 
-  df <- data.frame(
-    DOC_rep_1 = num('DOC_rep_1'),
-    DOC_rep_2 = num('DOC_rep_2'),
-    DOC_rep_3 = num('DOC_rep_3'),
-    doc_std_curve_id = if (is.null(curve)) NA_real_ else 1
-  )
-
-  avg <- calcDOCavg(df, pool)
-  stdev <- calcDOCsd(df, pool)
+  df <- as.data.frame(as.list(reps))
+  avg <- calcMean(df)
+  stdev <- calcSd(df)
 
   out <- list()
   # calcMean/calcSd return 'KEEP OLD' to leave the portal cell unchanged; this tool is

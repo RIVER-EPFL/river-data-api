@@ -126,8 +126,28 @@ pub struct GroupAudit {
 pub struct GroupStats {
     pub n: usize,
     pub mean: Option<f64>,
-    /// Sample standard deviation (n-1), matching the portals' R `sd()`. None below n=2.
+    /// The standard deviation under the slot's declared divisor, sample (n-1) by default. None
+    /// below n=2 under either.
     pub sd: Option<f64>,
+}
+
+impl GroupStats {
+    /// The same group under the population divisor: `s * sqrt((n-1)/n)`.
+    ///
+    /// The audit compares against whichever divisor the slot declares, so a slot that has declared
+    /// `population` stops holding these groups instead of holding every one of them forever.
+    #[must_use]
+    pub fn under(self, estimator: &str) -> Self {
+        if estimator != "population" || self.n < 2 {
+            return self;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let factor = (((self.n - 1) as f64) / self.n as f64).sqrt();
+        Self {
+            sd: self.sd.map(|sd| sd * factor),
+            ..self
+        }
+    }
 }
 
 #[must_use]
@@ -496,6 +516,15 @@ pub struct ListHoldsQuery {
     /// scale is what lets an operator triage the whole backlog largest-first across pages.
     #[serde(default)]
     pub sort: Option<String>,
+    /// Restrict to one disagreement signature. Only `population_sd` is filterable: it is the one
+    /// signature with a SQL spelling ([`POPULATION_SD_SQL`]), so it filters and pages honestly
+    /// rather than dropping rows out of an already-counted page.
+    #[serde(default)]
+    pub classification: Option<String>,
+    /// Restrict to holds whose slot has, or has not, declared an sd estimator. `false` is the
+    /// set the gate blocks from plain acknowledgement.
+    #[serde(default)]
+    pub estimator_declared: Option<bool>,
     #[serde(default)]
     pub page: Option<u64>,
     #[serde(default)]
@@ -536,6 +565,47 @@ const RELATIVE_DELTA_SQL: &str = concat!(
     ) / ",
     scale_sql!()
 );
+
+/// The population-divisor signature, in SQL, over the alias `h` (`replicate_audit_holds`).
+///
+/// It reproduces exactly the arm [`classify`] returns `population_sd` from: the replicate counts
+/// agree (so `n_mismatch` cannot preempt it), the means agree, and the source's sd is our sd under
+/// the other divisor, `s * sqrt((n-1)/n)`. The prefix search behind `stale_subset` has no SQL
+/// spelling, but it is tested after this arm, so a row matching here is `population_sd` in both.
+/// `the_sql_signature_and_classify_agree` pins that.
+///
+/// Built from [`bound_sql`] and the same tolerance constants the in-process comparison uses, so
+/// the two spellings cannot drift. One producer: the list filter, the resolution gate, the bulk
+/// skip and the declaration counts all read this, so what the UI counts and what the gate blocks
+/// can never disagree.
+pub static POPULATION_SD_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let expected_mean = "(h.expected->>'mean')::float8";
+    let computed_mean = "(h.computed->>'mean')::float8";
+    let expected_sd = "(h.expected->>'sd')::float8";
+    let population_sd = "((h.computed->>'sd')::float8 \
+                         * sqrt(((h.computed->>'n')::float8 - 1) / (h.computed->>'n')::float8))";
+    let mean_bound = bound_sql(
+        expected_mean,
+        computed_mean,
+        &DEFAULT_REL_TOL.to_string(),
+        DEFAULT_ABS_TOL,
+    );
+    let sd_bound = bound_sql(
+        expected_sd,
+        population_sd,
+        &SD_REL_TOL.to_string(),
+        SD_ABS_TOL,
+    );
+    format!(
+        "((h.expected->>'n') IS NULL \
+           OR (h.expected->>'n')::int = (h.computed->>'n')::int) \
+         AND (h.computed->>'n')::int >= 2 \
+         AND (h.expected->>'mean') IS NOT NULL AND (h.computed->>'mean') IS NOT NULL \
+         AND abs({expected_mean} - {computed_mean}) <= {mean_bound} \
+         AND (h.expected->>'sd') IS NOT NULL AND (h.computed->>'sd') IS NOT NULL \
+         AND abs({expected_sd} - {population_sd}) <= {sd_bound}"
+    )
+});
 
 #[derive(Debug, Serialize, FromQueryResult, ToSchema)]
 pub struct HoldRow {
@@ -662,6 +732,23 @@ pub async fn list_holds(
         binds.push(ceiling.into());
         conditions.push(format!("{SD_RELATIVE_DELTA_SQL} <= ${}", binds.len()));
     }
+    match query.classification.as_deref() {
+        Some("population_sd") => {
+            conditions.push(format!("h.kind = 'replicate_stats' AND ({})", *POPULATION_SD_SQL));
+        }
+        Some(other) => {
+            return Err(AppError::BadRequest(format!(
+                "classification '{other}' has no filter; only 'population_sd' is filterable"
+            )));
+        }
+        None => {}
+    }
+    if let Some(declared) = query.estimator_declared {
+        let negate = if declared { "" } else { "NOT " };
+        conditions.push(format!(
+            "{negate}EXISTS (SELECT 1 FROM site_parameters sp              WHERE sp.id = ds.site_parameter_id AND sp.sd_estimator IS NOT NULL)"
+        ));
+    }
     // The status view is kept out of the count statement's WHERE so `pending`/`deferred` report
     // the whole backlog under the other filters, whichever view the page shows. Status values
     // come from the allowlist below, so inlining them is safe.
@@ -776,9 +863,165 @@ fn accept_ours_resolution_sql(by_bind: &str) -> String {
     )
 }
 
+/// The audit annotation category. Minted server-side only; the annotate dialog does not offer it.
+const AUDIT_ANNOTATION_CATEGORY: &str = "audit";
+
+/// Put an audit decision on the charts for the instant it concerns.
+///
+/// A hold lives in a queue nobody reads while looking at a plot, so a decision about a value is
+/// invisible exactly where the value is. This mints a point annotation at the group's instant on
+/// the slot the hold sits on, carrying both numbers and what was decided, and the existing chart
+/// band, tooltip and chip machinery renders it with no further wiring.
+///
+/// Best-effort by design: an unpaired stream resolves to no slot, and a decision must not fail
+/// because it could not also be drawn. Failures are logged, never returned.
+async fn mint_audit_annotation<C: ConnectionTrait>(conn: &C, hold_id: Uuid, text: &str, by: &str) {
+    let result = conn
+        .execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO annotations
+                 (site_id, parameter_id, start_time, end_time, text, category,
+                  created_by, audit_hold_id)
+             SELECT COALESCE(sp.site_id, h.site_id), COALESCE(sp.parameter_id, h.parameter_id),
+                    h.group_time, h.group_time, $2, $3, $4, h.id
+             FROM replicate_audit_holds h
+             LEFT JOIN data_streams ds ON ds.id = h.stream_id
+             LEFT JOIN site_parameters sp ON sp.id = ds.site_parameter_id
+             WHERE h.id = $1
+               AND COALESCE(sp.site_id, h.site_id) IS NOT NULL
+               AND COALESCE(sp.parameter_id, h.parameter_id) IS NOT NULL",
+            [
+                hold_id.into(),
+                text.to_string().into(),
+                AUDIT_ANNOTATION_CATEGORY.into(),
+                by.to_string().into(),
+            ],
+        ))
+        .await;
+    if let Err(e) = result {
+        tracing::warn!("could not annotate audit hold {hold_id}: {e}");
+    }
+}
+
+/// Remove the annotations a hold's decisions minted. Runs on reopen, inside its transaction: the
+/// note said a decision had been taken, and it has not any more.
+async fn delete_audit_annotations<C: ConnectionTrait>(conn: &C, hold_id: Uuid) -> AppResult<()> {
+    conn.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "DELETE FROM annotations WHERE audit_hold_id = $1",
+        [hold_id.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// The numbers a hold disagrees over, phrased for an annotation: what the source stored against
+/// what the replicates produce.
+fn disagreement_phrase(expected: &serde_json::Value, computed: &serde_json::Value) -> String {
+    let fmt = |v: Option<f64>| v.map_or_else(|| "none".to_string(), |v| format!("{v:.4}"));
+    format!(
+        "source mean {} sd {}, recomputed mean {} sd {} over {} replicates",
+        fmt(f64_at(expected, "mean")),
+        fmt(f64_at(expected, "sd")),
+        fmt(f64_at(computed, "mean")),
+        fmt(f64_at(computed, "sd")),
+        computed
+            .get("n")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0),
+    )
+}
+
+/// The `expected`/`computed` blobs of one hold, for the annotation text.
+async fn hold_numbers<C: ConnectionTrait>(
+    conn: &C,
+    hold_id: Uuid,
+) -> (serde_json::Value, serde_json::Value) {
+    let row = conn
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT expected, computed FROM replicate_audit_holds WHERE id = $1",
+            [hold_id.into()],
+        ))
+        .await
+        .ok()
+        .flatten();
+    row.map_or_else(
+        || (serde_json::Value::Null, serde_json::Value::Null),
+        |row| {
+            (
+                row.try_get("", "expected").unwrap_or(serde_json::Value::Null),
+                row.try_get("", "computed").unwrap_or(serde_json::Value::Null),
+            )
+        },
+    )
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AcknowledgeResponse {
     pub acknowledged: u64,
+    /// Holds this call deliberately left pending: their disagreement is the population-divisor
+    /// signature on a slot that has not declared an estimator, so accepting them would record a
+    /// decision about which formula this slot publishes without anyone having made one.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub skipped_undeclared_estimator: u64,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// Refuse to let a population-divisor disagreement be accepted on a slot that has not declared
+/// which divisor it publishes.
+///
+/// The classification is evidence about the source, not a decision: the sources used both formulas
+/// over the years, so "their sd is ours under the other divisor" says the convention is unstated
+/// here, not which one is right. Accepting would file that under "our number stands" and lose the
+/// question. `flag` is not gated (a bad replicate is a separate judgement), nor is any hold on a
+/// slot that has declared (a remaining disagreement there is a genuine finding).
+async fn refuse_undeclared_estimator(
+    db: &sea_orm::DatabaseConnection,
+    hold_id: Uuid,
+) -> AppResult<()> {
+    let population_sd = &*POPULATION_SD_SQL;
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT (h.expected->>'sd')::float8 AS expected_sd,
+                        (h.computed->>'sd')::float8 AS computed_sd,
+                        st.name AS site_name, p.name AS parameter_name
+                 FROM replicate_audit_holds h
+                 JOIN data_streams ds ON ds.id = h.stream_id
+                 JOIN site_parameters sp ON sp.id = ds.site_parameter_id
+                 JOIN sites st ON st.id = sp.site_id
+                 JOIN parameters p ON p.id = sp.parameter_id
+                 WHERE h.id = $1 AND h.kind = 'replicate_stats'
+                   AND sp.sd_estimator IS NULL AND ({population_sd})"
+            ),
+            [hold_id.into()],
+        ))
+        .await?;
+    let Some(row) = row else { return Ok(()) };
+    let expected_sd: Option<f64> = row.try_get("", "expected_sd")?;
+    let computed_sd: Option<f64> = row.try_get("", "computed_sd")?;
+    let site_name: Option<String> = row.try_get("", "site_name")?;
+    let parameter_name: Option<String> = row.try_get("", "parameter_name")?;
+    let slot = format!(
+        "{} / {}",
+        site_name.as_deref().unwrap_or("this site"),
+        parameter_name.as_deref().unwrap_or("this parameter"),
+    );
+    Err(AppError::Conflict(format!(
+        "This disagreement cannot be accepted yet. The source's sd ({}) is this group's sd under \
+         the population formula (divisor n); ours ({}) uses the sample formula (divisor n-1). \
+         {slot} has not declared which one it publishes, so accepting would leave that unrecorded. \
+         Resolve with mode 'estimator' naming 'sample' or 'population', scoped to the parameter or \
+         to this instant, or flag the replicates instead.",
+        expected_sd.map_or_else(|| "none".to_string(), |v| format!("{v:.4}")),
+        computed_sd.map_or_else(|| "none".to_string(), |v| format!("{v:.4}")),
+    )))
 }
 
 /// Acknowledge one pending hold: the operator confirms the statistics recomputed from the stored
@@ -800,6 +1043,7 @@ pub async fn acknowledge_hold(
     axum::Extension(auth): axum::Extension<AuthContext>,
 ) -> AppResult<Json<AcknowledgeResponse>> {
     enforce_hold_scope(&state.db, &scope, id).await?;
+    refuse_undeclared_estimator(&state.db, id).await?;
     let by = actor_label(&auth);
     let resolution_sql = accept_ours_resolution_sql("$2");
     let updated = state
@@ -812,7 +1056,7 @@ pub async fn acknowledge_hold(
                      acknowledged_by = $2, acknowledged_at = NOW()
                  WHERE id = $1 AND status = 'pending'"
             ),
-            [id.into(), by.into()],
+            [id.into(), by.clone().into()],
         ))
         .await?
         .rows_affected();
@@ -821,13 +1065,29 @@ pub async fn acknowledge_hold(
             "no pending replicate audit hold {id}"
         )));
     }
-    Ok(Json(AcknowledgeResponse { acknowledged: 1 }))
+    let (expected, computed) = hold_numbers(&state.db, id).await;
+    mint_audit_annotation(
+        &state.db,
+        id,
+        &format!(
+            "Audit accepted: the statistics computed here stand ({}). Accepted by {by}.",
+            disagreement_phrase(&expected, &computed)
+        ),
+        &by,
+    )
+    .await;
+    Ok(Json(AcknowledgeResponse {
+        acknowledged: 1,
+        skipped_undeclared_estimator: 0,
+    }))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ResolveHoldRequest {
     /// `ours` (accept the recomputed statistics; identical to acknowledge) | `flag` (flag the
-    /// named replicates so the sample statistics recompute over the rest).
+    /// named replicates so the sample statistics recompute over the rest) | `estimator` (declare
+    /// which standard-deviation divisor this slot, or this one instant, publishes).
     pub mode: String,
     /// The replicate indexes to flag; required for `flag`. Each must be among the values the
     /// hold recorded and unflagged, and at least one unflagged replicate must remain after.
@@ -836,12 +1096,29 @@ pub struct ResolveHoldRequest {
     /// Recorded as the readings' flag_reason; defaults to a reference to this hold.
     #[serde(default)]
     pub reason: Option<String>,
+    /// `estimator` mode: the divisor to declare, `sample` (n-1) or `population` (n). Either is a
+    /// real answer; declaring `sample` states that ours is the number this slot publishes even
+    /// though the source computed the other one.
+    #[serde(default)]
+    pub estimator: Option<String>,
+    /// `estimator` mode: `slot` declares it for the parameter at this site and recomputes its
+    /// existing samples; `instant` sets it for this one collection group and leaves the parameter
+    /// undeclared. Defaults to `slot`.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ResolveHoldResponse {
     /// The status the hold moved to: `acknowledged` | `remediated`.
     pub status: String,
+    /// `estimator` mode: the tracked `sd_estimator_retag` recomputing the slot's samples.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<Uuid>,
+    /// `estimator` mode: samples this declaration changed, counted before the job for `slot`
+    /// scope and exactly one for `instant`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub samples_affected: Option<i64>,
 }
 
 /// Resolve one pending hold. Statistics are never written directly: `ours` accepts the
@@ -872,6 +1149,7 @@ pub async fn resolve_hold(
     let by = actor_label(&auth);
     match payload.mode.as_str() {
         "ours" => {
+            refuse_undeclared_estimator(&state.db, id).await?;
             let resolution_sql = accept_ours_resolution_sql("$2");
             let updated = state
                 .db
@@ -883,7 +1161,7 @@ pub async fn resolve_hold(
                              acknowledged_by = $2, acknowledged_at = NOW()
                          WHERE id = $1 AND status = 'pending'"
                     ),
-                    [id.into(), by.into()],
+                    [id.into(), by.clone().into()],
                 ))
                 .await?
                 .rows_affected();
@@ -892,8 +1170,21 @@ pub async fn resolve_hold(
                     "no pending replicate audit hold {id}"
                 )));
             }
+            let (expected, computed) = hold_numbers(&state.db, id).await;
+            mint_audit_annotation(
+                &state.db,
+                id,
+                &format!(
+                    "Audit accepted: the statistics computed here stand ({}). Accepted by {by}.",
+                    disagreement_phrase(&expected, &computed)
+                ),
+                &by,
+            )
+            .await;
             Ok(Json(ResolveHoldResponse {
                 status: "acknowledged".to_string(),
+                job_id: None,
+                samples_affected: None,
             }))
         }
         "flag" => {
@@ -1078,14 +1369,212 @@ pub async fn resolve_hold(
             .await?;
             // The sample trigger recomputed the served statistics for this instant.
             state.response_cache.invalidate_all();
+            mint_audit_annotation(
+                &state.db,
+                id,
+                &format!(
+                    "Audit remediated: replicate(s) {index_list} flagged, so the mean and sd \
+                     recompute over the rest. Reason: {reason}. Flagged by {by}."
+                ),
+                &by,
+            )
+            .await;
             Ok(Json(ResolveHoldResponse {
                 status: "remediated".to_string(),
+                job_id: None,
+                samples_affected: None,
             }))
         }
+        "estimator" => declare_estimator(&state, id, &payload, &by).await,
         other => Err(AppError::BadRequest(format!(
             "unknown resolve mode '{other}'"
         ))),
     }
+}
+
+/// Declare which standard-deviation divisor a slot, or one collection group, publishes.
+///
+/// This is the resolution the gate points at. It changes a specification, not a statistic: the
+/// samples trigger still computes every number from the stored replicates, and all this decides is
+/// which of the two divisors it uses. `slot` scope declares it for the parameter at this site and
+/// enqueues the retag that brings its existing samples into line; `instant` scope sets it for this
+/// one group and leaves the parameter undeclared, so the slot's other holds stay gated.
+///
+/// Reversible: the previous value is recorded on the resolution, and reopen restores it.
+async fn declare_estimator(
+    state: &AppState,
+    id: Uuid,
+    payload: &ResolveHoldRequest,
+    by: &str,
+) -> AppResult<Json<ResolveHoldResponse>> {
+    use crate::routes::private::readings::sd_estimator;
+
+    let estimator = sd_estimator::parse(payload.estimator.as_deref().ok_or_else(|| {
+        AppError::BadRequest(
+            "an estimator resolution must name 'sample' or 'population'".to_string(),
+        )
+    })?)?;
+    let scope = payload.scope.as_deref().unwrap_or("slot");
+    if !matches!(scope, "slot" | "instant") {
+        return Err(AppError::BadRequest(format!(
+            "unknown estimator scope '{scope}'; expected 'slot' or 'instant'"
+        )));
+    }
+
+    let (site_parameter_id, affected) =
+        crate::common::bulk_write::guarded(&state.db, async |txn| {
+            let hold = txn
+                .query_one(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT h.group_time, h.resolution, sp.id AS site_parameter_id,
+                            sp.site_id, sp.parameter_id, sp.sd_estimator AS previous
+                     FROM replicate_audit_holds h
+                     JOIN data_streams ds ON ds.id = h.stream_id
+                     JOIN site_parameters sp ON sp.id = ds.site_parameter_id
+                     WHERE h.id = $1 AND h.status = 'pending'
+                     FOR UPDATE OF h",
+                    [id.into()],
+                ))
+                .await?
+                .ok_or_else(|| {
+                    AppError::NotFound(format!(
+                        "no pending replicate audit hold {id} on a paired slot; an estimator is \
+                         declared for a slot, so an unpaired stream's hold has none to declare"
+                    ))
+                })?;
+            let group_time =
+                hold.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "group_time")?;
+            let site_parameter_id: Uuid = hold.try_get("", "site_parameter_id")?;
+            let site_id: Uuid = hold.try_get("", "site_id")?;
+            let parameter_id: Uuid = hold.try_get("", "parameter_id")?;
+            let previous: Option<String> = hold.try_get("", "previous")?;
+            let prev_resolution: Option<serde_json::Value> = hold.try_get("", "resolution")?;
+
+            let affected = if scope == "slot" {
+                txn.execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "UPDATE site_parameters SET sd_estimator = $2 WHERE id = $1",
+                    [site_parameter_id.into(), estimator.into()],
+                ))
+                .await?;
+                // Counted here, inside the same transaction the declaration lands in, so the
+                // number reported is the one the retag will act on.
+                txn.query_one(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT COUNT(*)::bigint AS n FROM samples
+                     WHERE site_id = $1 AND parameter_id = $2
+                       AND sd_estimator IS DISTINCT FROM $3
+                       AND sd_estimator_source <> 'sample'",
+                    [site_id.into(), parameter_id.into(), estimator.into()],
+                ))
+                .await?
+                .map_or(Ok(0_i64), |row| row.try_get::<i64>("", "n"))?
+            } else {
+                // One group: set it and refresh that row alone. `sample` as the source is what
+                // keeps a later slot-level retag from overwriting this decision.
+                let rows = txn
+                    .execute(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        "UPDATE samples
+                         SET sd_estimator = $3, sd_estimator_source = 'sample'
+                         WHERE site_id = $1 AND parameter_id = $2 AND collected_at = $4",
+                        [
+                            site_id.into(),
+                            parameter_id.into(),
+                            estimator.into(),
+                            group_time.into(),
+                        ],
+                    ))
+                    .await?
+                    .rows_affected();
+                txn.execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT refresh_sample_aggregate(id) FROM samples
+                     WHERE site_id = $1 AND parameter_id = $2 AND collected_at = $3",
+                    [site_id.into(), parameter_id.into(), group_time.into()],
+                ))
+                .await?;
+                i64::try_from(rows).unwrap_or(0)
+            };
+
+            let resolution = merged_resolution(
+                prev_resolution,
+                serde_json::json!({
+                    "action": "declare_estimator",
+                    "estimator": estimator,
+                    "scope": scope,
+                    "previous_estimator": previous,
+                }),
+                by,
+            );
+            let updated = txn
+                .execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "UPDATE replicate_audit_holds
+                     SET status = 'remediated', resolution = $2,
+                         acknowledged_by = $3, acknowledged_at = NOW()
+                     WHERE id = $1 AND status = 'pending'",
+                    [id.into(), resolution.into(), by.to_string().into()],
+                ))
+                .await?
+                .rows_affected();
+            if updated != 1 {
+                return Err(AppError::Conflict(format!(
+                    "replicate audit hold {id} was resolved by another request; no estimator was \
+                     declared"
+                )));
+            }
+            Ok((site_parameter_id, affected))
+        })
+        .await?;
+
+    // The slot's existing samples are brought into line by the tracked job, so a long history is
+    // visible and rerunnable rather than held open in this request.
+    let job_id = if scope == "slot" && affected > 0 {
+        crate::routes::private::reprocessing_jobs::worker::enqueue(
+            &state.db,
+            "sd_estimator_retag",
+            None,
+            None,
+            &serde_json::json!({
+                "estimator": estimator,
+                "site_parameter_ids": [site_parameter_id],
+            }),
+            None,
+        )
+        .await?
+    } else {
+        None
+    };
+
+    let (expected, computed) = hold_numbers(&state.db, id).await;
+    let where_ = if scope == "slot" {
+        "this parameter"
+    } else {
+        "this collection group only"
+    };
+    let divisor = if estimator == "population" {
+        "population (divisor n)"
+    } else {
+        "sample (divisor n-1)"
+    };
+    mint_audit_annotation(
+        &state.db,
+        id,
+        &format!(
+            "Audit resolved by declaration: {where_} publishes its standard deviation with the \
+             {divisor} formula ({}). Declared by {by}.",
+            disagreement_phrase(&expected, &computed)
+        ),
+        by,
+    )
+    .await;
+    state.response_cache.invalidate_all();
+    Ok(Json(ResolveHoldResponse {
+        status: "remediated".to_string(),
+        job_id,
+        samples_affected: Some(affected),
+    }))
 }
 
 /// Revert a decision: a remediation's flags are removed (only the readings that resolution
@@ -1113,9 +1602,11 @@ pub async fn reopen_hold(
             .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT h.stream_id, h.group_time, h.status, h.resolution,
-                        (ds.site_parameter_id IS NOT NULL) AS paired
+                        (ds.site_parameter_id IS NOT NULL) AS paired,
+                        ds.site_parameter_id, sp.site_id, sp.parameter_id
                  FROM replicate_audit_holds h
                  JOIN data_streams ds ON ds.id = h.stream_id
+                 LEFT JOIN site_parameters sp ON sp.id = ds.site_parameter_id
                  WHERE h.id = $1 AND h.status IN ('acknowledged', 'remediated')
                  FOR UPDATE OF h",
                 [id.into()],
@@ -1150,6 +1641,26 @@ pub async fn reopen_hold(
             })
         });
 
+        // An estimator declaration is reverted to exactly what it replaced, which is usually
+        // "undeclared" and must go back to NULL rather than to a divisor nobody chose.
+        let declared = prev.as_ref().and_then(|r| {
+            (r.get("action")? == "declare_estimator").then(|| {
+                (
+                    r.get("scope")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("slot")
+                        .to_string(),
+                    r.get("previous_estimator")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    r.get("estimator")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+        });
+
         let reopened = if paired { "pending" } else { "deferred" };
         let resolution = merged_resolution(prev, serde_json::json!({"action": "reopened"}), &by);
         if status == "remediated"
@@ -1170,6 +1681,69 @@ pub async fn reopen_hold(
             ))
             .await?;
         }
+        if status == "remediated"
+            && let Some((decl_scope, previous, _)) = &declared
+        {
+            let site_parameter_id: Option<Uuid> = hold.try_get("", "site_parameter_id")?;
+            let site_id: Option<Uuid> = hold.try_get("", "site_id")?;
+            let parameter_id: Option<Uuid> = hold.try_get("", "parameter_id")?;
+            if decl_scope == "slot" {
+                if let Some(sp_id) = site_parameter_id {
+                    txn.execute(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        "UPDATE site_parameters SET sd_estimator = $2 WHERE id = $1",
+                        [sp_id.into(), previous.clone().into()],
+                    ))
+                    .await?;
+                    // The samples this declaration moved go back with it. A row whose estimator
+                    // was chosen for its own instant is not one of them.
+                    txn.execute(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        "UPDATE samples s
+                         SET sd_estimator = COALESCE($3, 'sample'),
+                             sd_estimator_source = CASE WHEN $3::text IS NULL
+                                                        THEN 'default' ELSE 'slot' END
+                         FROM site_parameters sp
+                         WHERE sp.id = $1 AND s.site_id = sp.site_id
+                           AND s.parameter_id = sp.parameter_id
+                           AND s.sd_estimator_source <> 'sample'",
+                        [sp_id.into(), previous.clone().into(), previous.clone().into()],
+                    ))
+                    .await?;
+                    txn.execute(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        "SELECT refresh_sample_aggregate(s.id) FROM samples s
+                         JOIN site_parameters sp
+                           ON sp.site_id = s.site_id AND sp.parameter_id = s.parameter_id
+                         WHERE sp.id = $1 AND s.sd_estimator_source <> 'sample'",
+                        [sp_id.into()],
+                    ))
+                    .await?;
+                }
+            } else if let (Some(site_id), Some(parameter_id)) = (site_id, parameter_id) {
+                // The instant goes back to whatever its slot says, which is the state it would
+                // have been created in.
+                txn.execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "UPDATE samples s
+                     SET sd_estimator = COALESCE(sp.sd_estimator, 'sample'),
+                         sd_estimator_source = CASE WHEN sp.sd_estimator IS NULL
+                                                    THEN 'default' ELSE 'slot' END
+                     FROM site_parameters sp
+                     WHERE sp.site_id = s.site_id AND sp.parameter_id = s.parameter_id
+                       AND s.site_id = $1 AND s.parameter_id = $2 AND s.collected_at = $3",
+                    [site_id.into(), parameter_id.into(), group_time.into()],
+                ))
+                .await?;
+                txn.execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT refresh_sample_aggregate(id) FROM samples
+                     WHERE site_id = $1 AND parameter_id = $2 AND collected_at = $3",
+                    [site_id.into(), parameter_id.into(), group_time.into()],
+                ))
+                .await?;
+            }
+        }
         let restored = txn
             .execute(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
@@ -1185,11 +1759,17 @@ pub async fn reopen_hold(
                 "replicate audit hold {id} changed under this request; no flag was reverted"
             )));
         }
+        // The note said a decision had been taken here, and it has not any more.
+        delete_audit_annotations(txn, id).await?;
         Ok(reopened.to_string())
     })
     .await?;
     state.response_cache.invalidate_all();
-    Ok(Json(ResolveHoldResponse { status: reopened }))
+    Ok(Json(ResolveHoldResponse {
+        status: reopened,
+        job_id: None,
+        samples_affected: None,
+    }))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1235,7 +1815,7 @@ pub async fn acknowledge_holds_bulk(
     Json(payload): Json<BulkAcknowledgeRequest>,
 ) -> AppResult<Json<AcknowledgeResponse>> {
     let by = actor_label(&auth);
-    let mut binds: Vec<sea_orm::Value> = vec![by.into()];
+    let mut binds: Vec<sea_orm::Value> = vec![by.clone().into()];
     let mut bounds = String::new();
     // A restricted caller acknowledges only holds whose stream is paired to a site in their
     // projects; unpaired (deferred) holds belong to no project and stay out of their reach.
@@ -1278,6 +1858,29 @@ pub async fn acknowledge_holds_bulk(
         binds.push(ceiling.into());
         bounds.push_str(&format!(" AND {SD_RELATIVE_DELTA_SQL} <= ${}", binds.len()));
     }
+    // The same gate the single acknowledge applies, so a threshold sweep cannot drive around it:
+    // at n = 10 the divisor offset is only ~5%, well inside a plausible ceiling.
+    let population_sd = &*POPULATION_SD_SQL;
+    let undeclared_gate = format!(
+        "(({population_sd}) AND h.kind = 'replicate_stats' \
+          AND EXISTS (SELECT 1 FROM site_parameters sp \
+                      WHERE sp.id = ds.site_parameter_id AND sp.sd_estimator IS NULL))"
+    );
+    let skipped = state
+        .db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT COUNT(*)::bigint AS n
+                 FROM replicate_audit_holds h
+                 JOIN data_streams ds ON ds.id = h.stream_id
+                 WHERE h.status = 'pending' AND {undeclared_gate}{bounds}"
+            ),
+            binds.clone(),
+        ))
+        .await?
+        .map_or(Ok(0_i64), |row| row.try_get::<i64>("", "n"))?;
+
     let resolution_sql = accept_ours_resolution_sql("$1");
     let acknowledged = state
         .db
@@ -1288,13 +1891,51 @@ pub async fn acknowledge_holds_bulk(
                  SET status = 'acknowledged', resolution = {resolution_sql},
                      acknowledged_by = $1, acknowledged_at = NOW()
                  FROM data_streams ds
-                 WHERE ds.id = h.stream_id AND h.status = 'pending'{bounds}"
+                 WHERE ds.id = h.stream_id AND h.status = 'pending'
+                   AND NOT {undeclared_gate}{bounds}"
             ),
             binds,
         ))
         .await?
         .rows_affected();
-    Ok(Json(AcknowledgeResponse { acknowledged }))
+    // One note per instant, as the single acknowledge writes: a sweep is many decisions, and each
+    // one is about a value somebody may later look at on a chart. The insert reads the holds this
+    // call just decided, identified by the actor and timestamp it stamped on them.
+    if acknowledged > 0 {
+        let annotated = state
+            .db
+            .execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "INSERT INTO annotations
+                     (site_id, parameter_id, start_time, end_time, text, category,
+                      created_by, audit_hold_id)
+                 SELECT sp.site_id, sp.parameter_id, h.group_time, h.group_time,
+                        'Audit accepted in bulk: the statistics computed here stand (source mean '
+                          || COALESCE(round((h.expected->>'mean')::numeric, 4)::text, 'none')
+                          || ' sd ' || COALESCE(round((h.expected->>'sd')::numeric, 4)::text, 'none')
+                          || ', recomputed mean '
+                          || COALESCE(round((h.computed->>'mean')::numeric, 4)::text, 'none')
+                          || ' sd ' || COALESCE(round((h.computed->>'sd')::numeric, 4)::text, 'none')
+                          || ' over ' || COALESCE(h.computed->>'n', '0')
+                          || ' replicates). Accepted by ' || $1 || '.',
+                        $2, $1, h.id
+                 FROM replicate_audit_holds h
+                 JOIN data_streams ds ON ds.id = h.stream_id
+                 JOIN site_parameters sp ON sp.id = ds.site_parameter_id
+                 WHERE h.status = 'acknowledged' AND h.acknowledged_by = $1
+                   AND h.acknowledged_at > NOW() - INTERVAL '1 minute'
+                   AND NOT EXISTS (SELECT 1 FROM annotations a WHERE a.audit_hold_id = h.id)",
+                [by.into(), AUDIT_ANNOTATION_CATEGORY.into()],
+            ))
+            .await;
+        if let Err(e) = annotated {
+            tracing::warn!("could not annotate bulk-acknowledged holds: {e}");
+        }
+    }
+    Ok(Json(AcknowledgeResponse {
+        acknowledged,
+        skipped_undeclared_estimator: u64::try_from(skipped).unwrap_or(0),
+    }))
 }
 
 #[cfg(test)]

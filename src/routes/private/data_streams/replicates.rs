@@ -53,6 +53,13 @@ pub struct ReplicateSpec {
     /// (e.g. `calcMean`, `calcDOCavg`). Recorded for provenance and for the audit's semantics.
     #[serde(default)]
     pub calc: Option<String>,
+    /// Which divisor this source computes its standard deviation with: `sample` (n-1) or
+    /// `population` (n). Absent means the source has not said, which is the honest answer for the
+    /// portals that used both over the years; the slot's declaration then decides, and absent that
+    /// the samples are recorded undeclared and their audit disagreements are held for a decision.
+    /// Nothing infers this from the data.
+    #[serde(default)]
+    pub sd_estimator: Option<String>,
 }
 
 impl ReplicateSpec {
@@ -308,6 +315,7 @@ mod tests {
             portal_sd_column: Some("DOC_sd_ppb".to_string()),
             curve_ref_column: Some("doc_std_curve_id".to_string()),
             calc: Some("calcDOCavg".to_string()),
+            sd_estimator: None,
         }
     }
 

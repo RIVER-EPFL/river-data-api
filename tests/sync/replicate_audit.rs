@@ -1255,3 +1255,100 @@ async fn hold_review_is_confined_to_the_callers_projects() {
     .await;
     assert_eq!(status, 200, "resolve in scope ({status}): {body}");
 }
+
+/// Scenario: the population-divisor signature has two spellings, `classify()` in Rust and
+/// `POPULATION_SD_SQL` in the list filter, gate and bulk skip.
+///
+/// Expected behaviour: they agree on every case, so what the UI counts and what the gate blocks
+/// can never disagree. Driven through the list endpoint's `classification` filter, which is the
+/// SQL spelling, against the classification each hold reports, which is the Rust one.
+#[tokio::test]
+#[serial]
+async fn the_sql_signature_and_classify_agree() {
+    let fx = setup("sqlsig").await;
+
+    // Population-shaped: mean agrees, the source's sd is ours under the divisor n.
+    // 10, 12, 14 -> sample sd 2, population sd 1.632993161855452.
+    ingest_audited(
+        &fx,
+        group(T1, &[10.0, 12.0, 14.0]),
+        json!([{"time": T1, "expected_mean": 12.0, "expected_sd": 1.632_993_161_855_452,
+                "expected_n": 3}]),
+    )
+    .await;
+    // Not the divisor: the mean disagrees too.
+    ingest_audited(
+        &fx,
+        group(T2, &[10.0, 12.0, 14.0]),
+        json!([{"time": T2, "expected_mean": 40.0, "expected_sd": 1.632_993_161_855_452,
+                "expected_n": 3}]),
+    )
+    .await;
+
+    let all = list_holds(&fx, "&page_size=100").await;
+    let by_classify: Vec<&str> = all["holds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|h| h["classification"] == "population_sd")
+        .map(|h| h["group_time"].as_str().unwrap())
+        .collect();
+    assert_eq!(by_classify.len(), 1, "classify() finds exactly one: {all}");
+
+    let filtered = list_holds(&fx, "&page_size=100&classification=population_sd").await;
+    let by_sql: Vec<&str> = filtered["holds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["group_time"].as_str().unwrap())
+        .collect();
+    assert_eq!(by_sql, by_classify, "the SQL spelling agrees: {filtered}");
+    assert_eq!(filtered["total"], 1, "and the count pages honestly: {filtered}");
+}
+
+/// Scenario: a bulk accept on a slot whose estimator IS declared.
+///
+/// Expected behaviour: the gate does not apply, and every accepted instant gets its own audit
+/// annotation so a sweep is as visible on the charts as a single decision.
+#[tokio::test]
+#[serial]
+async fn a_bulk_accept_annotates_every_instant_it_decides() {
+    let fx = setup("bulkann").await;
+    fx.db
+        .execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "UPDATE site_parameters SET sd_estimator = 'sample' WHERE id = '{}'",
+                crate::common::PARAM_S1_TEMP_ID
+            ),
+        ))
+        .await
+        .unwrap();
+
+    for t in [T1, T2] {
+        ingest_audited(
+            &fx,
+            group(t, &[10.0, 12.0, 14.0]),
+            json!([{"time": t, "expected_mean": 40.0, "expected_sd": 2.0, "expected_n": 3}]),
+        )
+        .await;
+    }
+    assert_eq!(list_holds(&fx, "").await["total"], 2);
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &fx.app,
+        "/api/sync/replicate_audit_holds/acknowledge_bulk",
+        &json!({"stream_id": fx.stream}),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "bulk ({status}): {body}");
+    assert_eq!(body["acknowledged"], 2, "{body}");
+
+    let annotations = count(
+        &fx.db,
+        "SELECT COUNT(*) FROM annotations WHERE category = 'audit' AND audit_hold_id IS NOT NULL",
+    )
+    .await;
+    assert_eq!(annotations, 2, "one note per instant the sweep decided");
+}

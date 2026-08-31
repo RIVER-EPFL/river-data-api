@@ -28,6 +28,11 @@ pub struct Model {
     #[crudcrate(filterable)]
     pub category: String,
     pub created_by: Option<String>,
+    /// The replicate-audit hold whose resolution minted this annotation, when one did. Written
+    /// only by that resolution and cleared by its reopen, so a CRUD caller cannot dress an
+    /// annotation up as an audit decision. An admin may still delete the row itself.
+    #[crudcrate(exclude(create, update), filterable)]
+    pub audit_hold_id: Option<Uuid>,
     #[crudcrate(exclude(create, update))]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }

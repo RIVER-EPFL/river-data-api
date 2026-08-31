@@ -48,6 +48,12 @@ pub struct Model {
     pub is_active: Option<bool>,
     #[crudcrate(filterable, on_create = false)]
     pub is_public: Option<bool>,
+    /// How this slot's replicate standard deviation is defined: 'sample' (divisor n-1) or
+    /// 'population' (divisor n). NULL is UNDECLARED, not a synonym for 'sample': the sources use
+    /// both conventions and which one a slot publishes is a decision, so an undeclared slot is
+    /// reported and its population-signature audit holds cannot be waved through.
+    #[crudcrate(filterable)]
+    pub sd_estimator: Option<String>,
     #[crudcrate(filterable)]
     pub is_derived: Option<bool>,
     #[crudcrate(filterable)]

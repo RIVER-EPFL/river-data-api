@@ -246,6 +246,7 @@ pub fn validate_optional_time_range(
         private::admin::actions::rollback_deployment,
         private::admin::actions::calibration_candidates,
         private::admin::actions::duplicate_slots,
+        private::admin::actions::undeclared_sd_estimators,
         private::admin::actions::backfill_calibrations,
         private::admin::actions::preview_derived,
         private::admin::calibrations::recalculate_calibration,

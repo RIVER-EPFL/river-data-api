@@ -132,7 +132,7 @@ async fn a_result_carries_the_constants_and_curves_the_server_resolved() {
         &app,
         "doc",
         json!({
-            "DOC_rep_1": 120.0, "DOC_rep_2": 125.0, "DOC_rep_3": 118.0,
+            "DOC": [120.0, 125.0, 118.0],
             "std_curve": { "slope": 1.05, "intercept": -2.0, "label": "bench curve" }
         }),
         &token,
@@ -197,7 +197,7 @@ async fn a_result_pins_the_runner_that_executed_it() {
     }
     let (_db, app, token) = setup().await;
 
-    let (status, json) = calculate(&app, "doc", json!({ "DOC_rep_1": 120.0 }), &token).await;
+    let (status, json) = calculate(&app, "doc", json!({ "DOC": [120.0] }), &token).await;
     assert_eq!(status, 200, "{json}");
 
     let version = &json["tool_version"];

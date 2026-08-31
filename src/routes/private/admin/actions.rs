@@ -1840,3 +1840,128 @@ pub async fn duplicate_slots(
         scanned_from,
     }))
 }
+
+// ---------------------------------------------------------------------------
+// Undeclared sd estimators
+
+#[derive(Debug, Serialize, ToSchema, sea_orm::FromQueryResult)]
+pub struct UndeclaredEstimatorSlot {
+    pub site_id: Uuid,
+    pub parameter_id: Uuid,
+    pub site_name: String,
+    pub parameter_name: String,
+    pub parameter_code: String,
+    pub site_parameter_id: Uuid,
+    /// Samples at this slot computed under no declaration, ie. `sd_estimator_source = 'default'`.
+    pub undeclared_samples: i64,
+    /// Whether any stream feeding the slot ships a precomputed sd column. A slot whose source
+    /// states an sd is one whose convention is answerable from the evidence; one that does not is
+    /// a choice about what this lab publishes.
+    pub source_reports_sd: bool,
+    /// Every stream feeding the slot, as `source_system/source_key`.
+    pub streams: serde_json::Value,
+    /// Open holds at this slot, and how many carry the population-divisor signature. That second
+    /// number is the evidence for the decision; this report states it and rules on nothing.
+    pub open_holds: i64,
+    pub population_signature_holds: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UndeclaredEstimatorsResponse {
+    pub total_slots: usize,
+    pub total_undeclared_samples: i64,
+    /// Open holds across these slots that the population divisor would explain. Every one of them
+    /// is blocked from plain acknowledgement until its slot declares an estimator.
+    pub total_population_signature_holds: i64,
+    pub slots: Vec<UndeclaredEstimatorSlot>,
+}
+
+/// Slots serving replicate statistics under no declared sd estimator.
+///
+/// The sources stored both divisors over the years, row by row within one stream, so the
+/// convention cannot be inferred and is declared per slot instead. Until a slot declares one, its
+/// samples are computed with the sample divisor and stamped `default`, which is what this lists.
+/// No write path can notice this shape on its own: every ingest is individually valid, and the gap
+/// is in what nobody stated.
+///
+/// Read-only. Which divisor a slot publishes is a question about this lab's practice and the
+/// source's, so nothing here decides one.
+#[utoipa::path(
+    get,
+    path = "/actions/undeclared_sd_estimators",
+    responses((status = 200, description = "Slots with no declared sd estimator", body = UndeclaredEstimatorsResponse)),
+    tag = "actions"
+)]
+pub async fn undeclared_sd_estimators(
+    State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+) -> AppResult<Json<UndeclaredEstimatorsResponse>> {
+    use sea_orm::{FromQueryResult, Statement};
+
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    let project_filter = project_filter_sql(&scope, "st.project_id", &mut values)
+        .map(|predicate| format!(" AND {predicate}"))
+        .unwrap_or_default();
+    let population_sd =
+        &*crate::routes::private::sync::replicate_audit::POPULATION_SD_SQL;
+
+    let sql = format!(
+        r"SELECT sp.site_id, sp.parameter_id, sp.id AS site_parameter_id,
+                 st.name AS site_name, p.name AS parameter_name, p.code AS parameter_code,
+                 u.undeclared_samples,
+                 COALESCE(s.source_reports_sd, false) AS source_reports_sd,
+                 COALESCE(s.streams, '[]'::jsonb) AS streams,
+                 COALESCE(h.open_holds, 0) AS open_holds,
+                 COALESCE(h.population_signature_holds, 0) AS population_signature_holds
+          FROM site_parameters sp
+          JOIN sites st ON st.id = sp.site_id
+          JOIN parameters p ON p.id = sp.parameter_id
+          JOIN LATERAL (
+              SELECT COUNT(*)::bigint AS undeclared_samples
+              FROM samples sm
+              WHERE sm.site_id = sp.site_id AND sm.parameter_id = sp.parameter_id
+                AND sm.sd_estimator_source = 'default'
+          ) u ON u.undeclared_samples > 0
+          LEFT JOIN LATERAL (
+              SELECT bool_or(ds.metadata #>> '{{replicates,portal_sd_column}}' IS NOT NULL)
+                         AS source_reports_sd,
+                     jsonb_agg(jsonb_build_object(
+                         'stream_id', ds.id,
+                         'source_system', ds.source_system,
+                         'source_key', ds.source_key)) AS streams
+              FROM data_streams ds
+              WHERE ds.site_parameter_id = sp.id
+          ) s ON true
+          LEFT JOIN LATERAL (
+              SELECT COUNT(*)::bigint AS open_holds,
+                     COUNT(*) FILTER (WHERE {population_sd})::bigint
+                         AS population_signature_holds
+              FROM replicate_audit_holds h
+              JOIN data_streams ds2 ON ds2.id = h.stream_id
+              WHERE ds2.site_parameter_id = sp.id
+                AND h.kind = 'replicate_stats'
+                AND h.status IN ('pending', 'deferred')
+          ) h ON true
+          WHERE sp.sd_estimator IS NULL{project_filter}
+          ORDER BY COALESCE(h.population_signature_holds, 0) DESC,
+                   u.undeclared_samples DESC"
+    );
+
+    let slots = UndeclaredEstimatorSlot::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        sql,
+        values,
+    ))
+    .all(&app_state.db)
+    .await?;
+
+    Ok(Json(UndeclaredEstimatorsResponse {
+        total_slots: slots.len(),
+        total_undeclared_samples: slots.iter().map(|s| s.undeclared_samples).sum(),
+        total_population_signature_holds: slots
+            .iter()
+            .map(|s| s.population_signature_holds)
+            .sum(),
+        slots,
+    }))
+}

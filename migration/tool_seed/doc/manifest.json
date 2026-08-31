@@ -1,33 +1,21 @@
 {
   "label": "DOC",
-  "description": "Dissolved Organic Carbon (replicate avg/sd with optional standard curve)",
+  "description": "Dissolved organic carbon: the analyser replicates are stored as readings, corrected through the chosen standard curve, and their mean and standard deviation are the served DOC.",
+  "sections": [{ "key": "lab", "label": "Lab measurements" }],
   "params": [
     {
-      "name": "DOC_rep_1",
-      "label": "DOC (replicate 1)",
-      "kind": "number",
+      "name": "DOC",
+      "label": "DOC",
+      "kind": "replicates",
       "units": "ppb",
       "required": false,
       "default": null,
-      "when": null
-    },
-    {
-      "name": "DOC_rep_2",
-      "label": "DOC (replicate 2)",
-      "kind": "number",
-      "units": "ppb",
-      "required": false,
-      "default": null,
-      "when": null
-    },
-    {
-      "name": "DOC_rep_3",
-      "label": "DOC (replicate 3)",
-      "kind": "number",
-      "units": "ppb",
-      "required": false,
-      "default": null,
-      "when": null
+      "when": null,
+      "section": "lab",
+      "parameter_code": "DOC",
+      "suggested": 3,
+      "curve": "std_curve",
+      "description": "One value per analyser vial, in run order. Add or remove vials as measured; a blank vial is a gap, never a shift."
     }
   ],
   "outputs": [
@@ -36,15 +24,15 @@
       "label": "DOC average",
       "units": "ppb",
       "per_replicate": false,
-      "aggregate_of": null,
-      "suggested_parameter_code": "DOC"
+      "aggregate_of": "DOC",
+      "suggested_parameter_code": null
     },
     {
       "key": "DOC_sd_ppb",
       "label": "DOC standard deviation",
       "units": "ppb",
       "per_replicate": false,
-      "aggregate_of": "DOC_avg_ppb",
+      "aggregate_of": "DOC",
       "suggested_parameter_code": null
     }
   ],
@@ -53,7 +41,8 @@
     {
       "name": "std_curve",
       "label": "Standard curve (DOC corr)",
-      "required": false
+      "required": false,
+      "description": "Applied to every replicate before averaging: corrected = slope * measured + intercept."
     }
   ],
   "match_keywords": ["doc", "organic carbon", "dissolved organic"]

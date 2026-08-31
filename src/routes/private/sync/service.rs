@@ -172,6 +172,11 @@ pub struct PlanEntry {
     /// decision the plan has to settle rather than report.
     #[serde(default)]
     pub instrument: Option<PlanInstrumentRef>,
+    /// The divisor this slot will publish its replicate standard deviation with, chosen in the
+    /// review. Applied to the `site_parameters` row when the plan is applied; left unset, the slot
+    /// stays undeclared and its audit disagreements are held for a decision instead.
+    #[serde(default)]
+    pub sd_estimator: Option<String>,
 }
 
 /// A catalog parameter a plan entry collides with, and what already depends on it. "Exists" on its
@@ -233,6 +238,24 @@ impl PlanWarning {
             kind: "empty_name".to_string(),
             message: "site or parameter name is empty".to_string(),
             parameter: None,
+            existing: None,
+            source_units: None,
+        }
+    }
+
+    /// This source ships its own precomputed standard deviation and nothing says which divisor it
+    /// used. The pairing is where that can first be asked, so it is asked here; leaving it unset
+    /// is allowed and the audit gate is then the backstop.
+    pub fn sd_estimator_undeclared(parameter: &str) -> Self {
+        Self {
+            kind: "sd_estimator_undeclared".to_string(),
+            message: format!(
+                "This source reports its own standard deviation for '{parameter}' and has not \
+                 said which divisor it uses. Until one is declared, statistics use the sample \
+                 formula (n-1) and disagreements matching the population divisor are held for a \
+                 decision."
+            ),
+            parameter: Some(parameter.to_string()),
             existing: None,
             source_units: None,
         }
@@ -643,6 +666,9 @@ pub async fn create_plan(
                 source_system,
                 &instruments,
             ),
+            // Never guessed from the data: the source reported both conventions over the years,
+            // so the review asks and the audit gate is the backstop if it is left unset.
+            sd_estimator: None,
         };
         reclassify_entry(&mut entry, &catalog);
         entries.push(entry);
@@ -999,9 +1025,9 @@ async fn resolve_plan_entry<C: ConnectionTrait>(
         site_id,
         parameter_id,
         &entry.parameter.units,
-        &caches.param_names,
-        &mut caches.site_params,
+        caches,
         &mut counters.sp_created,
+        entry.sd_estimator.as_deref(),
     )
     .await?;
     Ok((site_parameter_id, parameter_id))
@@ -1012,12 +1038,16 @@ async fn resolve_or_create_site_param<C: ConnectionTrait>(
     site_id: Uuid,
     parameter_id: Uuid,
     units: &str,
-    param_names: &HashMap<Uuid, String>,
-    sp_cache: &mut HashMap<(Uuid, Uuid), Uuid>,
+    caches: &mut EntityCaches,
     sp_created: &mut u32,
+    sd_estimator: Option<&str>,
 ) -> AppResult<Uuid> {
+    // Refused rather than defaulted: the review chose this, and an unrecognised value is a bug in
+    // the caller, not a licence to pick a divisor.
+    let sd_estimator =
+        crate::routes::private::readings::sd_estimator::parse_opt(sd_estimator)?;
     let key = (site_id, parameter_id);
-    if let Some(&id) = sp_cache.get(&key) {
+    if let Some(&id) = caches.site_params.get(&key) {
         return Ok(id);
     }
 
@@ -1031,10 +1061,20 @@ async fn resolve_or_create_site_param<C: ConnectionTrait>(
         .await?;
 
     let id = if let Some(existing) = existing {
+        // The review's choice reaches a slot that already exists too: pairing into an established
+        // slot is exactly when its convention gets settled. An entry that chose nothing leaves
+        // whatever the slot already declares.
+        if let Some(declared) = sd_estimator
+            && existing.sd_estimator.as_deref() != Some(declared)
+        {
+            let mut active: site_parameters::ActiveModel = existing.clone().into();
+            active.sd_estimator = Set(Some(declared.to_string()));
+            active.update(txn).await?;
+        }
         existing.id
     } else {
         let id = Uuid::new_v4();
-        let mut param_name_val = param_names.get(&parameter_id).cloned().unwrap_or_default();
+        let mut param_name_val = caches.param_names.get(&parameter_id).cloned().unwrap_or_default();
         // (site_id, name) is unique; a clash here means the name belongs to a different
         // parameter's slot, so suffix with units (or the parameter code) to disambiguate.
         let name_taken = site_parameters::Entity::find()
@@ -1068,6 +1108,7 @@ async fn resolve_or_create_site_param<C: ConnectionTrait>(
             parameter_id: Set(parameter_id),
             name: Set(param_name_val),
             sensor_type: Set(String::new()),
+            sd_estimator: Set(sd_estimator.map(str::to_string)),
             display_units: Set(units_val.clone()),
             units_name: Set(units_val),
             units_min: Set(None),
@@ -1089,7 +1130,7 @@ async fn resolve_or_create_site_param<C: ConnectionTrait>(
         *sp_created += 1;
         id
     };
-    sp_cache.insert(key, id);
+    caches.site_params.insert(key, id);
     Ok(id)
 }
 
@@ -1608,6 +1649,19 @@ pub fn reclassify_entry(entry: &mut PlanEntry, catalog: &EntityCatalog) {
             p,
             &entry.parameter.units,
         ));
+    }
+    // A family whose source reports an sd, on a slot that has not declared a divisor. `catalog`
+    // has no slot rows, so this reads the plan's own declaration: an entry that has already been
+    // patched with one is settled.
+    if entry.sd_estimator.is_none()
+        && entry
+            .replicates
+            .as_ref()
+            .is_some_and(|r| r.portal_sd_column.is_some())
+    {
+        entry
+            .warnings
+            .push(PlanWarning::sd_estimator_undeclared(&entry.parameter.name));
     }
 
     entry.confidence = if proj_id.is_some() && site_id.is_some() && param_id.is_some() {

@@ -52,6 +52,21 @@ pub async fn materialise_samples<C: ConnectionTrait>(
     binds: Vec<sea_orm::Value>,
     declared_collection: bool,
 ) -> AppResult<()> {
+    materialise_samples_with_estimator(conn, row_predicate, binds, declared_collection, None).await
+}
+
+/// [`materialise_samples`] for a caller that knows the stream's declared sd estimator.
+///
+/// The estimator is resolved per group rather than per call: one predicate can span several slots,
+/// and each carries its own declaration. `stream_spec` is the stream's own declaration, which wins
+/// over the slot's; absent it, the slot decides, and absent that the group is recorded undeclared.
+pub async fn materialise_samples_with_estimator<C: ConnectionTrait>(
+    conn: &C,
+    row_predicate: &str,
+    binds: Vec<sea_orm::Value>,
+    declared_collection: bool,
+    stream_spec: Option<&str>,
+) -> AppResult<()> {
     let minimum = min_replicates(declared_collection);
     let group_select = format!(
         "SELECT r.site_id, r.parameter_id, r.time
@@ -66,11 +81,27 @@ pub async fn materialise_samples<C: ConnectionTrait>(
          HAVING COUNT(*) >= {minimum}"
     );
 
+    // The estimator each new row is computed with, and what chose it, decided in the insert so a
+    // group can never exist without both recorded. A stream declaration outranks the slot's; with
+    // neither, the row is stamped `default`, which is the undeclared state the report lists and
+    // the audit gate reads. The stream's value is a stored spec field, so it goes through
+    // `sd_estimator::parse` and reaches the SQL as one of two literals, never as caller text.
+    let declared_by_stream = super::sd_estimator::parse_opt(stream_spec)?;
+    let estimator_sql = match declared_by_stream {
+        Some(declared) => format!("'{declared}', 'stream'"),
+        None => "COALESCE(sp.sd_estimator, 'sample'), \
+                 CASE WHEN sp.sd_estimator IS NULL THEN 'default' ELSE 'slot' END"
+            .to_string(),
+    };
     conn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         format!(
-            "INSERT INTO samples (site_id, parameter_id, collected_at)
-             {group_select}
+            "INSERT INTO samples (site_id, parameter_id, collected_at,
+                                  sd_estimator, sd_estimator_source)
+             SELECT g.site_id, g.parameter_id, g.time, {estimator_sql}
+             FROM ({group_select}) g
+             LEFT JOIN site_parameters sp
+               ON sp.site_id = g.site_id AND sp.parameter_id = g.parameter_id
              ON CONFLICT (site_id, parameter_id, collected_at) DO NOTHING"
         ),
         binds.clone(),

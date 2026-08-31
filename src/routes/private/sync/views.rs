@@ -789,7 +789,8 @@ async fn resolve_or_create_site_parameter<C: ConnectionTrait>(
         sample_interval_sec: Set(create.and_then(|c| c.sample_interval_sec)),
         is_active: Set(Some(true)),
         is_public: Set(Some(false)),
-        is_derived: Set(Some(false)),
+        sd_estimator: Set(None),
+            is_derived: Set(Some(false)),
         derived_definition_id: Set(None),
         variable_mappings: Set(None),
         created_at: Set(Some(Utc::now())),
@@ -1401,7 +1402,8 @@ pub async fn bulk_pair(
                 sample_interval_sec: Set(None),
                 is_active: Set(Some(true)),
                 is_public: Set(Some(false)),
-                is_derived: Set(Some(false)),
+                sd_estimator: Set(None),
+            is_derived: Set(Some(false)),
                 derived_definition_id: Set(None),
                 variable_mappings: Set(None),
                 created_at: Set(Some(Utc::now())),
@@ -1591,6 +1593,11 @@ struct PlanEntryUpdate {
     /// Agree to creating the proposed instrument. Apply refuses while any remain unconfirmed.
     #[serde(default)]
     instrument_confirmed: Option<bool>,
+    /// Declare which divisor this slot publishes its replicate standard deviation with,
+    /// `sample` or `population`. Applied to the `site_parameters` row when the plan is applied.
+    /// Never inferred: absent leaves the slot undeclared and the audit gate asks later.
+    #[serde(default)]
+    sd_estimator: Option<String>,
 }
 
 /// Apply the instrument half of a plan edit.
@@ -1726,6 +1733,18 @@ pub async fn update_pairing_plan(
             }
             if let Some(ref label) = update.parameter_label {
                 entry.parameter.label = Some(label.trim().to_string()).filter(|l| !l.is_empty());
+            }
+            if let Some(ref declared) = update.sd_estimator {
+                // An empty string clears the choice, which is how the review says "leave it
+                // undeclared" rather than being unable to take a decision back.
+                entry.sd_estimator = if declared.trim().is_empty() {
+                    None
+                } else {
+                    Some(
+                        crate::routes::private::readings::sd_estimator::parse(declared)?
+                            .to_string(),
+                    )
+                };
             }
             crate::routes::private::sync::service::reclassify_entry(entry, &catalog);
             // A renamed entry that resolves to an existing site must not carry the stream's

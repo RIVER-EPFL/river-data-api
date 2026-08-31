@@ -132,7 +132,7 @@ async fn test_doc_with_std_curve() {
         &app,
         "doc",
         serde_json::json!({
-            "DOC_rep_1": 120.0, "DOC_rep_2": 125.0, "DOC_rep_3": 118.0,
+            "DOC": [120.0, 125.0, 118.0],
             "std_curve": { "slope": 1.05, "intercept": -2.0 }
         }),
         &token,
@@ -157,7 +157,7 @@ async fn test_doc_single_replicate_omits_sd() {
         &app,
         "doc",
         serde_json::json!({
-            "DOC_rep_1": 120.0
+            "DOC": [120.0]
         }),
         &token,
     )

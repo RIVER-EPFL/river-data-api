@@ -130,6 +130,7 @@ mod tests {
             parameter_id: Uuid::from_u128(3),
             name: "Slot name".to_string(),
             sensor_type: "sonde".to_string(),
+            sd_estimator: None,
             display_units: None,
             units_name: None,
             units_min: None,

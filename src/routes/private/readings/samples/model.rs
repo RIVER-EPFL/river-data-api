@@ -53,6 +53,15 @@ pub struct Model {
     pub max_value: Option<f64>,
     #[crudcrate(exclude(create, update))]
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    // Which divisor produced `stdev` ('sample' = n-1, 'population' = n) and where that decision
+    // came from. Set by the write paths and the retag job from the slot's declaration; a CRUD edit
+    // must not be able to restate what a stored number was computed with. `sd_estimator_source`
+    // 'default' means nothing was declared and the fallback applied, which is what the undeclared
+    // report and the audit gate look for.
+    #[crudcrate(exclude(create, update), filterable)]
+    pub sd_estimator: String,
+    #[crudcrate(exclude(create, update), filterable)]
+    pub sd_estimator_source: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

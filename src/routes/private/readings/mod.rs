@@ -10,5 +10,6 @@ pub mod provenance;
 pub mod reconcile;
 pub mod sample_groups;
 pub mod samples;
+pub mod sd_estimator;
 pub mod status_events;
 pub use model::*;

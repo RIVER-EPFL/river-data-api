@@ -236,7 +236,7 @@ async fn patch_rename_reclassifies_entry_and_recomputes_warnings() {
     assert!(
         warnings
             .iter()
-            .any(|w| w.as_str().unwrap().contains("units")),
+            .any(|w| w["kind"] == "units_mismatch"),
         "unit mismatch warning expected, got {warnings:?}"
     );
 
@@ -312,7 +312,7 @@ async fn pair_action_on_empty_parameter_name_is_rejected() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|w| w.as_str().unwrap().contains("empty")),
+            .any(|w| w["kind"] == "empty_name"),
         "empty-name warning expected"
     );
 

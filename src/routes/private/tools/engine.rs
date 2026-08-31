@@ -18,7 +18,7 @@ use crate::error::{AppError, AppResult};
 const RUNNER_JSON_ARGS: &str = "auto_unbox=true&digits=17&na=null";
 
 /// The closed `kind` vocabulary. `enum:` carries its variants after the colon.
-const KINDS: [&str; 7] = [
+const KINDS: [&str; 8] = [
     "number",
     "integer",
     "string",
@@ -26,6 +26,7 @@ const KINDS: [&str; 7] = [
     "array",
     "object",
     "replicate_grid",
+    "replicates",
 ];
 
 fn check_kind(kind: &str) -> Result<(), String> {
@@ -413,6 +414,27 @@ pub struct ManifestParam {
     /// whose columns nothing has declared yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structure: Option<ManifestStructure>,
+    /// Help text shown beside the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Key of the manifest section the field renders under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    /// `replicates` only: the catalog parameter (`parameters.code`) the entered replicates are
+    /// readings of. The save stores each position as that parameter's reading at its index.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameter_code: Option<String>,
+    /// `replicates` only: how many rows the form opens with. The count is never a limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested: Option<u32>,
+    /// `replicates` only: the curve slot whose chosen curve corrects the stored replicates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub curve: Option<String>,
+    /// The catalog parameter `parameter_code` resolves to, filled by `GET /tools` against the
+    /// database serving the request. Never authored, and never stored: a manifest travels between
+    /// databases, so the resolution belongs to the response rather than to the declaration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameter: Option<ResolvedParameter>,
 }
 
 #[derive(Deserialize)]
@@ -430,6 +452,16 @@ struct ManifestParamRaw {
     when: Option<ParamWhen>,
     #[serde(default)]
     structure: Option<ManifestStructureRaw>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    section: Option<String>,
+    #[serde(default)]
+    parameter_code: Option<String>,
+    #[serde(default)]
+    suggested: Option<u32>,
+    #[serde(default)]
+    curve: Option<String>,
 }
 
 // Hand-written so the checks run wherever a manifest is read, authoring included, rather than
@@ -440,6 +472,25 @@ impl<'de> Deserialize<'de> for ManifestParam {
         let raw = ManifestParamRaw::deserialize(de)?;
         check_kind(&raw.kind)
             .map_err(|e| D::Error::custom(format!("param '{}': {e}", raw.name)))?;
+        if raw.kind == "replicates" {
+            if raw.parameter_code.as_deref().is_none_or(str::is_empty) {
+                return Err(D::Error::custom(format!(
+                    "param '{}': replicates must name the parameter_code they are readings of",
+                    raw.name
+                )));
+            }
+            if raw.suggested == Some(0) {
+                return Err(D::Error::custom(format!(
+                    "param '{}': suggested must be at least 1",
+                    raw.name
+                )));
+            }
+        } else if raw.parameter_code.is_some() || raw.suggested.is_some() || raw.curve.is_some() {
+            return Err(D::Error::custom(format!(
+                "param '{}': parameter_code, suggested and curve belong to a replicates param",
+                raw.name
+            )));
+        }
         if let Some(default) = &raw.default
             && !default.is_null()
             && !kind_accepts(&raw.kind, default)
@@ -474,6 +525,12 @@ impl<'de> Deserialize<'de> for ManifestParam {
             default: raw.default,
             when: raw.when,
             structure,
+            description: raw.description,
+            section: raw.section,
+            parameter_code: raw.parameter_code,
+            suggested: raw.suggested,
+            curve: raw.curve,
+            parameter: None,
         })
     }
 }
@@ -485,7 +542,7 @@ impl<'de> Deserialize<'de> for ManifestParam {
 /// the database it was authored in: the seeded tools are inserted into a fresh database where no
 /// parameter UUID exists yet, and dev and production give the same analyte different UUIDs, so a
 /// code-only output has to keep working exactly as it did.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ManifestOutput {
     pub key: String,
     pub label: String,
@@ -499,6 +556,72 @@ pub struct ManifestOutput {
     pub parameter_id: Option<Uuid>,
     #[serde(default)]
     pub suggested_parameter_code: Option<String>,
+    /// Which divisor the samples saved from this output compute their standard deviation with:
+    /// `sample` (n-1), `population` (n), or `selectable` to let the operator choose per run.
+    /// Absent takes the slot's declaration, which is the usual case: the estimator is a property
+    /// of the parameter, and only a tool that genuinely reports both conventions has cause to
+    /// override it. Never reaches the R runner: it governs how the saved replicates are
+    /// aggregated, not the calculation.
+    #[serde(default)]
+    pub sd_estimator: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ManifestOutputRaw {
+    key: String,
+    label: String,
+    #[serde(default)]
+    units: Option<String>,
+    #[serde(default)]
+    per_replicate: bool,
+    #[serde(default)]
+    aggregate_of: Option<String>,
+    #[serde(default)]
+    parameter_id: Option<Uuid>,
+    #[serde(default)]
+    suggested_parameter_code: Option<String>,
+    #[serde(default)]
+    sd_estimator: Option<String>,
+}
+
+// Hand-written for the same reason `ManifestParam`'s is: the check runs wherever a manifest is
+// read, authoring included, rather than only where a validator is remembered.
+impl<'de> Deserialize<'de> for ManifestOutput {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let raw = ManifestOutputRaw::deserialize(de)?;
+        if let Some(declared) = raw.sd_estimator.as_deref()
+            && !matches!(declared, "sample" | "population" | "selectable")
+        {
+            return Err(D::Error::custom(format!(
+                "output '{}': sd_estimator '{declared}' is not 'sample', 'population' or \
+                 'selectable'",
+                raw.key
+            )));
+        }
+        Ok(Self {
+            key: raw.key,
+            label: raw.label,
+            units: raw.units,
+            per_replicate: raw.per_replicate,
+            aggregate_of: raw.aggregate_of,
+            parameter_id: raw.parameter_id,
+            suggested_parameter_code: raw.suggested_parameter_code,
+            sd_estimator: raw.sd_estimator,
+        })
+    }
+}
+
+impl ManifestOutput {
+    /// The estimator this output fixes, or None when it defers to the slot (absent or
+    /// `selectable`, which is the operator's choice rather than the manifest's).
+    #[must_use]
+    pub fn fixed_sd_estimator(&self) -> Option<&str> {
+        match self.sd_estimator.as_deref() {
+            Some(e @ ("sample" | "population")) => Some(e),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -507,6 +630,34 @@ pub struct ManifestCurve {
     pub label: String,
     #[serde(default)]
     pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// A titled group of fields on the entry form.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ManifestSection {
+    pub key: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Sections are unique by key, and a param's `section` names one of them.
+fn check_sections(raw: &ManifestRaw) -> Result<(), String> {
+    for (i, s) in raw.sections.iter().enumerate() {
+        if raw.sections[..i].iter().any(|other| other.key == s.key) {
+            return Err(format!("section '{}' is declared twice", s.key));
+        }
+    }
+    for p in &raw.params {
+        if let Some(key) = p.section.as_deref()
+            && !raw.sections.iter().any(|s| s.key == key)
+        {
+            return Err(format!("param '{}': section '{key}' is not declared", p.name));
+        }
+    }
+    Ok(())
 }
 
 const fn default_true() -> bool {
@@ -563,6 +714,8 @@ pub struct Manifest {
     /// event audit. Stored as declared; the shape is an object.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qc: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<ManifestSection>,
     pub match_keywords: Vec<String>,
 }
 
@@ -573,6 +726,8 @@ struct ManifestRaw {
     description: Option<String>,
     #[serde(default)]
     params: Vec<ManifestParam>,
+    #[serde(default)]
+    sections: Vec<ManifestSection>,
     #[serde(default)]
     outputs: Vec<ManifestOutput>,
     #[serde(default)]
@@ -593,7 +748,16 @@ impl<'de> Deserialize<'de> for Manifest {
     fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         use serde::de::Error;
         let raw = ManifestRaw::deserialize(de)?;
+        check_sections(&raw).map_err(D::Error::custom)?;
         for p in &raw.params {
+            if let Some(curve) = p.curve.as_deref()
+                && !raw.curves.iter().any(|c| c.name == curve)
+            {
+                return Err(D::Error::custom(format!(
+                    "param '{}': curve '{curve}' names no curve slot of the manifest",
+                    p.name
+                )));
+            }
             let Some(ParamWhen::Condition(c)) = &p.when else {
                 continue;
             };
@@ -638,6 +802,7 @@ impl<'de> Deserialize<'de> for Manifest {
             station_inputs: raw.station_inputs,
             event_inputs: raw.event_inputs,
             qc: raw.qc,
+            sections: raw.sections,
             match_keywords: raw.match_keywords,
         })
     }
@@ -735,6 +900,14 @@ impl ParameterCatalog {
     fn row_by_id(&self, id: Uuid) -> Option<&CatalogRow> {
         self.by_id.get(&id)
     }
+
+    /// The parameter a `replicates` param's `parameter_code` names.
+    #[must_use]
+    pub fn resolve_code(&self, code: &str) -> Option<ResolvedParameter> {
+        self.by_code
+            .get(&code.to_lowercase())
+            .map(|row| row.resolved(ResolvedBy::Code, false))
+    }
 }
 
 /// Read every catalog row the given manifests could name, by id or by code.
@@ -750,6 +923,11 @@ pub async fn load_parameter_catalog<'a>(
                 ids.push(id);
             }
             if let Some(code) = &output.suggested_parameter_code {
+                codes.push(code.to_lowercase());
+            }
+        }
+        for param in &manifest.params {
+            if let Some(code) = &param.parameter_code {
                 codes.push(code.to_lowercase());
             }
         }
@@ -864,6 +1042,17 @@ pub async fn check_manifest_against_catalog(
             ));
         }
     }
+    for param in &manifest.params {
+        if let Some(code) = &param.parameter_code
+            && catalog.resolve_code(code).is_none()
+        {
+            findings.warnings.push(format!(
+                "param '{}': parameter_code '{code}' matches no parameter; saving these \
+                 replicates needs a catalog entry",
+                param.name
+            ));
+        }
+    }
     // The slot an output saves to is the resolved parameter, so a collision is on the id and not
     // on the code: one output can name an id and another the code of that same row.
     let mut claimed: std::collections::HashMap<Uuid, String> = std::collections::HashMap::new();
@@ -946,6 +1135,8 @@ pub struct ToolDescriptor {
     pub event_inputs: Vec<ManifestEventInput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qc: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<ManifestSection>,
     pub match_keywords: Vec<String>,
     pub script_version_id: Uuid,
     pub version_no: i32,
@@ -1124,7 +1315,20 @@ impl ActiveTool {
                 .clone()
                 .or_else(|| self.description.clone()),
             endpoint: format!("/api/tools/{}/calculate", self.name),
-            params: self.manifest.params.clone(),
+            // A replicates param names the catalog parameter its values are stored as, so the
+            // response carries the resolution the same way an output's does.
+            params: self
+                .manifest
+                .params
+                .iter()
+                .map(|p| ManifestParam {
+                    parameter: p
+                        .parameter_code
+                        .as_deref()
+                        .and_then(|code| catalog.resolve_code(code)),
+                    ..p.clone()
+                })
+                .collect(),
             outputs: self
                 .manifest
                 .outputs
@@ -1139,6 +1343,7 @@ impl ActiveTool {
             station_inputs: self.manifest.station_inputs.clone(),
             event_inputs: self.manifest.event_inputs.clone(),
             qc: self.manifest.qc.clone(),
+            sections: self.manifest.sections.clone(),
             match_keywords: self.manifest.match_keywords.clone(),
             script_version_id: self.version_id,
             version_no: self.version_no,
@@ -1171,6 +1376,7 @@ fn kind_accepts(kind: &str, value: &serde_json::Value) -> bool {
         "string" => value.is_string(),
         "boolean" => value.is_boolean(),
         "array" | "replicate_grid" => value.is_array(),
+        "replicates" => is_number_list(value),
         "object" => value.is_object(),
         _ => false,
     }
@@ -2022,6 +2228,146 @@ mod tests {
 
     fn manifest_with(param: serde_json::Value) -> Result<Manifest, serde_json::Error> {
         serde_json::from_value(serde_json::json!({ "label": "T", "params": [param] }))
+    }
+
+    fn manifest(raw: serde_json::Value) -> Result<Manifest, serde_json::Error> {
+        serde_json::from_value(raw)
+    }
+
+    fn doc_replicates(extra: serde_json::Value) -> serde_json::Value {
+        let mut param = serde_json::json!({
+            "name": "DOC", "label": "DOC", "kind": "replicates", "units": "ppb",
+            "parameter_code": "DOC"
+        });
+        if let Some(map) = extra.as_object() {
+            param.as_object_mut().unwrap().extend(map.clone());
+        }
+        param
+    }
+
+    #[test]
+    fn a_replicates_param_takes_a_gapped_list_of_any_length() {
+        let m = manifest(serde_json::json!({
+            "label": "DOC",
+            "params": [doc_replicates(serde_json::json!({ "suggested": 3, "curve": "std_curve" }))],
+            "curves": [{ "name": "std_curve", "label": "Curve" }]
+        }))
+        .unwrap();
+        let p = &m.params[0];
+        assert_eq!(p.parameter_code.as_deref(), Some("DOC"));
+        assert_eq!(p.suggested, Some(3));
+        assert_eq!(p.curve.as_deref(), Some("std_curve"));
+        for value in [
+            serde_json::json!([120.0]),
+            serde_json::json!([120.0, null, 118.0]),
+            serde_json::json!([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+            serde_json::json!([]),
+        ] {
+            assert!(super::kind_accepts(&p.kind, &value), "{value}");
+        }
+        for value in [
+            serde_json::json!(120.0),
+            serde_json::json!(["120"]),
+            serde_json::json!({ "0": 120.0 }),
+        ] {
+            assert!(!super::kind_accepts(&p.kind, &value), "{value}");
+        }
+    }
+
+    #[test]
+    fn a_replicates_param_that_is_not_anchored_is_refused() {
+        for (raw, expected) in [
+            (
+                serde_json::json!({
+                    "label": "T",
+                    "params": [{ "name": "DOC", "label": "DOC", "kind": "replicates" }]
+                }),
+                "must name the parameter_code",
+            ),
+            (
+                serde_json::json!({
+                    "label": "T",
+                    "params": [doc_replicates(serde_json::json!({ "suggested": 0 }))]
+                }),
+                "at least 1",
+            ),
+            (
+                serde_json::json!({
+                    "label": "T",
+                    "params": [doc_replicates(serde_json::json!({ "curve": "nope" }))]
+                }),
+                "names no curve slot",
+            ),
+            (
+                serde_json::json!({
+                    "label": "T",
+                    "params": [{ "name": "a", "label": "A", "kind": "number", "parameter_code": "DOC" }]
+                }),
+                "belong to a replicates param",
+            ),
+        ] {
+            let err = manifest(raw).unwrap_err().to_string();
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_section_must_be_declared_once_and_named_by_key() {
+        let m = manifest(serde_json::json!({
+            "label": "T",
+            "sections": [{ "key": "lab", "label": "Lab" }],
+            "params": [doc_replicates(serde_json::json!({ "section": "lab" }))]
+        }))
+        .unwrap();
+        assert_eq!(m.params[0].section.as_deref(), Some("lab"));
+        assert_eq!(m.sections[0].key, "lab");
+        for (raw, expected) in [
+            (
+                serde_json::json!({
+                    "label": "T",
+                    "params": [doc_replicates(serde_json::json!({ "section": "lab" }))]
+                }),
+                "not declared",
+            ),
+            (
+                serde_json::json!({
+                    "label": "T",
+                    "sections": [{ "key": "lab", "label": "Lab" }, { "key": "lab", "label": "Lab 2" }]
+                }),
+                "declared twice",
+            ),
+        ] {
+            let err = manifest(raw).unwrap_err().to_string();
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_manifest_without_the_new_fields_serializes_as_it_was_read() {
+        let raw = serde_json::json!({
+            "label": "T",
+            "params": [{ "name": "a", "label": "A", "kind": "number", "units": null,
+                         "required": false, "default": null, "when": null }]
+        });
+        let m = manifest(raw.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&m.params).unwrap(), raw["params"]);
+    }
+
+    #[test]
+    fn a_curve_description_is_kept() {
+        let m = manifest(serde_json::json!({
+            "label": "T",
+            "curves": [{ "name": "c", "label": "C", "description": "y = ax + b" }]
+        }))
+        .unwrap();
+        assert_eq!(m.curves[0].description.as_deref(), Some("y = ax + b"));
+        let plain = manifest(serde_json::json!({
+            "label": "T",
+            "curves": [{ "name": "c", "label": "C" }]
+        }))
+        .unwrap();
+        let json = serde_json::to_value(&plain.curves).unwrap();
+        assert!(json[0].get("description").is_none());
     }
 
     fn grid(structure: serde_json::Value) -> Result<Manifest, serde_json::Error> {

@@ -194,7 +194,7 @@ async fn an_import_of_raw_inputs_runs_the_tool_and_carries_its_provenance() {
     .await;
     let doc_param = "00000000-0000-4000-b000-0000000000d0";
 
-    let csv = "DateTime,DOC_rep_1,DOC_rep_2,DOC_rep_3,DOC_rep_9\n\
+    let csv = "DateTime,DOC_rep_1,DOC_rep_2,DOC_rep_3,DOC_notes\n\
                2025-06-01 10:00:00,120,125,118,\n\
                2025-06-02 10:00:00,130,131,129,\n";
 
@@ -212,8 +212,8 @@ async fn an_import_of_raw_inputs_runs_the_tool_and_carries_its_provenance() {
     )
     .await;
     assert_eq!(status, 200, "plan ({status}): {plan}");
-    assert_eq!(plan["mapped_columns"]["DOC_rep_1"], "DOC_rep_1");
-    assert_eq!(plan["unmapped_columns"][0], "DOC_rep_9", "{plan}");
+    assert_eq!(plan["mapped_columns"]["DOC_rep_1"], "DOC");
+    assert_eq!(plan["unmapped_columns"][0], "DOC_notes", "{plan}");
     assert_eq!(plan["row_count"], 2);
     assert_eq!(plan["tool_runs_created"], 0);
 
@@ -247,8 +247,9 @@ async fn an_import_of_raw_inputs_runs_the_tool_and_carries_its_provenance() {
         .unwrap();
     assert_eq!(runs, 2);
 
-    // Each row's outputs went through the grab write path: samples with the server-built blob,
-    // source csv_import, on the auto-provisioned slot, attached to a collection event.
+    // Each row's replicates went through the grab write path as readings of the DOC parameter:
+    // a sample with the server-built blob, source csv_import, on the auto-provisioned slot,
+    // every replicate attached to a collection event, the mean derived by the database.
     for (time, expected) in [
         ("2025-06-01T10:00:00Z", (120.0 + 125.0 + 118.0) / 3.0),
         ("2025-06-02T10:00:00Z", 130.0),
@@ -274,7 +275,7 @@ async fn an_import_of_raw_inputs_runs_the_tool_and_carries_its_provenance() {
         assert_eq!(row.try_get::<String>("", "tool").unwrap(), "doc");
         let mean = row.try_get::<Option<f64>>("", "mean").unwrap().unwrap();
         assert!((mean - expected).abs() < 1e-9, "served {mean}, portal math {expected}");
-        assert_eq!(row.try_get::<i64>("", "attached").unwrap(), 1);
+        assert_eq!(row.try_get::<i64>("", "attached").unwrap(), 3);
     }
 
     let provisioned = db

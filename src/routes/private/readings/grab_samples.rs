@@ -12,8 +12,8 @@ use crate::routes::private::readings::batch::{
     CurveClaim, Replace, admission, admit_standard_curves, readings_upsert,
 };
 use crate::routes::private::{
-    data_streams, readings, readings::sample_groups, readings::samples, sensors::calibrations,
-    sites, sites::parameters as site_parameters,
+    data_streams, readings, readings::sample_groups, readings::samples,
+    readings::sd_estimator, sensors::calibrations, sites, sites::parameters as site_parameters,
 };
 
 /// Grabs are spot measurements by definition: a bottle, not a logger cadence.
@@ -50,6 +50,14 @@ pub struct GrabSampleRequest {
     /// naming a check that does not cover the values is refused.
     #[serde(default)]
     pub check_id: Option<Uuid>,
+    /// Which divisor the samples this request creates compute their standard deviation with:
+    /// `sample` (n-1) or `population` (n). Present when a tool's manifest fixes it or its operator
+    /// chose one; omitted, the slot's declaration decides, and absent that the group is recorded
+    /// undeclared. It never changes a group that already exists: the estimator a stored sample was
+    /// computed with is changed through the audit resolution or the retag job, where the decision
+    /// is recorded.
+    #[serde(default)]
+    pub sd_estimator: Option<String>,
     pub readings: Vec<GrabSampleReading>,
 }
 
@@ -68,11 +76,17 @@ pub struct GrabSampleReading {
     pub time: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub replicate_index: Option<i16>,
-    /// The named output of the referenced tool run this reading stores. Required on every reading
-    /// when the request carries `tool_run_id`, refused otherwise; the reading's `value` must be
-    /// the run's value for that output.
+    /// The named output of the referenced tool run this reading stores. With `tool_run_id` every
+    /// reading names either an `output` or an `input`, and is refused otherwise; the reading's
+    /// `value` must be the run's value for that output.
     #[serde(default)]
     pub output: Option<String>,
+    /// The named `replicates` input of the referenced tool run this reading stores: the measured
+    /// value the run consumed at `replicate_index`, stored raw. A curve the run applied is not a
+    /// correction of this row, so `standard_curve_id` is admitted here and the database applies
+    /// it (ADR 0003).
+    #[serde(default)]
+    pub input: Option<String>,
     /// The standard curve the operator fitted for this measurement, typically per microplate. It is
     /// applied on top of the instrument's base calibration, which the server resolves from the
     /// sensor's windows at `time`. The stored row carries the measured `raw_value`, both curve
@@ -311,6 +325,16 @@ async fn get_or_create_grab_stream(
     Ok(stream.id)
 }
 
+/// What a request puts on the `samples` rows it creates or reuses, as opposed to what identifies
+/// them. Grouped so the two find-or-create helpers take the identity and the contents separately
+/// rather than a dozen positional arguments.
+struct SampleFacts<'a> {
+    created_by: Option<&'a str>,
+    label: Option<&'a str>,
+    notes: Option<&'a str>,
+    provenance: Option<&'a serde_json::Value>,
+}
+
 /// The samples row for this collection event, created if it is not already there, with its label and
 /// notes refreshed when the request carries them.
 ///
@@ -325,11 +349,15 @@ async fn find_or_create_sample(
     site_id: Uuid,
     parameter_id: Uuid,
     time: chrono::DateTime<chrono::Utc>,
-    created_by: Option<&str>,
-    label: Option<&str>,
-    notes: Option<&str>,
-    provenance: Option<&serde_json::Value>,
+    facts: &SampleFacts<'_>,
+    estimator: sd_estimator::Resolved,
 ) -> Result<(Uuid, bool), AppError> {
+    let SampleFacts {
+        created_by,
+        label,
+        notes,
+        provenance,
+    } = *facts;
     let candidate = samples::ActiveModel {
         id: Set(Uuid::new_v4()),
         site_id: Set(site_id),
@@ -346,6 +374,8 @@ async fn find_or_create_sample(
         min_value: Set(None),
         max_value: Set(None),
         updated_at: Set(None),
+        sd_estimator: Set(estimator.estimator.to_string()),
+        sd_estimator_source: Set(estimator.source.as_str().to_string()),
     };
     let inserted = match samples::Entity::insert(candidate)
         .on_conflict(
@@ -404,10 +434,9 @@ async fn auto_create_samples(
     txn: &sea_orm::DatabaseTransaction,
     readings: &[GrabSampleReading],
     site_id: Uuid,
-    created_by: Option<&str>,
-    label: Option<&str>,
-    notes: Option<&str>,
-    provenance: Option<&serde_json::Value>,
+    facts: &SampleFacts<'_>,
+    requested_estimator: Option<&'static str>,
+    fixed_estimators: &HashMap<Uuid, &'static str>,
 ) -> Result<
     (
         HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Uuid>,
@@ -430,18 +459,25 @@ async fn auto_create_samples(
         if !sample_groups::forms_sample(GRAB_IS_A_COLLECTION_EVENT, count) {
             continue;
         }
-        // Re-posting the same grab must reuse its sample, not accumulate empty duplicates.
-        let (sample_id, is_new) = find_or_create_sample(
+        // Each group resolves its own estimator: one request can span several parameters, and the
+        // declaration is per slot. A manifest that fixes one for this output outranks the
+        // request's, which is the operator's choice for a `selectable` output; both are stamped
+        // `tool`, and neither is invented here.
+        let explicit = fixed_estimators
+            .get(&parameter_id)
+            .copied()
+            .or(requested_estimator);
+        let estimator = sd_estimator::resolve(
             txn,
             site_id,
             parameter_id,
-            time,
-            created_by,
-            label,
-            notes,
-            provenance,
+            explicit.map(|e| (e, sd_estimator::Source::Tool)),
+            None,
         )
         .await?;
+        // Re-posting the same grab must reuse its sample, not accumulate empty duplicates.
+        let (sample_id, is_new) =
+            find_or_create_sample(txn, site_id, parameter_id, time, facts, estimator).await?;
         sample_map.insert((parameter_id, time), sample_id);
         if is_new {
             created.push(sample_id);
@@ -473,6 +509,70 @@ fn output_carries_value(output: &serde_json::Value, value: f64) -> bool {
 /// standard curve produced corrected outputs, so any reading carrying `standard_curve_id` is
 /// refused (ADR 0003: a stored curve id means raw in, curve out — stamping one here would apply
 /// the correction twice).
+/// The estimator each output of a run's tool fixes, keyed by the parameter its readings land on.
+///
+/// A manifest that names `sample` or `population` is stating what that output means, so the server
+/// applies it rather than trusting a client to repeat it. `selectable` is the operator's choice and
+/// arrives on the request instead; an output that declares neither takes the slot's declaration.
+///
+/// The manifest read is the run's own pinned version, not the tool's active one: a save records
+/// what the run that produced it meant.
+async fn tool_run_fixed_estimators(
+    db: &DatabaseConnection,
+    tool_run_id: Option<Uuid>,
+    readings: &[GrabSampleReading],
+) -> Result<HashMap<Uuid, &'static str>, AppError> {
+    let Some(run_id) = tool_run_id else {
+        return Ok(HashMap::new());
+    };
+    let row = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT v.manifest FROM tool_runs r
+             JOIN tool_script_versions v
+               ON v.id = (r.tool_version->>'script_version_id')::uuid
+             WHERE r.id = $1",
+            [run_id.into()],
+        ))
+        .await?;
+    let Some(row) = row else {
+        return Ok(HashMap::new());
+    };
+    let manifest: serde_json::Value = row.try_get("", "manifest").map_err(AppError::Database)?;
+    let Ok(manifest) = crate::routes::private::tools::engine::parse_manifest(&manifest) else {
+        // A stored manifest that no longer parses is the tool authoring path's problem, not this
+        // write's: the slot's declaration still applies.
+        return Ok(HashMap::new());
+    };
+    let by_key: HashMap<&str, &'static str> = manifest
+        .outputs
+        .iter()
+        .filter_map(|o| Some((o.key.as_str(), o.fixed_sd_estimator()?)))
+        .map(|(k, e)| {
+            (
+                k,
+                if e == "population" {
+                    sd_estimator::POPULATION
+                } else {
+                    sd_estimator::SAMPLE
+                },
+            )
+        })
+        .collect();
+    if by_key.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut by_parameter: HashMap<Uuid, &'static str> = HashMap::new();
+    for r in readings {
+        if let Some(output) = r.output.as_deref()
+            && let Some(estimator) = by_key.get(output)
+        {
+            by_parameter.insert(r.parameter_id, estimator);
+        }
+    }
+    Ok(by_parameter)
+}
+
 async fn resolve_tool_run_provenance(
     db: &DatabaseConnection,
     tool_run_id: Option<Uuid>,
@@ -480,12 +580,13 @@ async fn resolve_tool_run_provenance(
     saved_by: &str,
 ) -> Result<Option<serde_json::Value>, AppError> {
     let Some(run_id) = tool_run_id else {
-        if let Some(r) = readings.iter().find(|r| r.output.is_some()) {
+        if let Some(r) = readings.iter().find(|r| r.output.is_some() || r.input.is_some()) {
             return Err(AppError::BadRequest(format!(
-                "Reading for parameter {} names tool output '{}' but the request carries no \
+                "Reading for parameter {} names tool {} '{}' but the request carries no \
                  tool_run_id",
                 r.parameter_id,
-                r.output.as_deref().unwrap_or_default()
+                if r.output.is_some() { "output" } else { "input" },
+                r.output.as_deref().or(r.input.as_deref()).unwrap_or_default()
             )));
         }
         return Ok(None);
@@ -519,11 +620,52 @@ async fn resolve_tool_run_provenance(
 
     let run_applied_curves = curves.as_array().is_some_and(|c| !c.is_empty());
     let mut saved: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let mut saved_inputs: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     for r in readings {
+        if let Some(input) = r.input.as_deref() {
+            if r.output.is_some() {
+                return Err(AppError::BadRequest(format!(
+                    "Reading for parameter {} names both an input and an output of the run",
+                    r.parameter_id
+                )));
+            }
+            let Some(index) = r.replicate_index else {
+                return Err(AppError::BadRequest(format!(
+                    "Reading for input '{input}' needs the replicate_index it was entered at"
+                )));
+            };
+            let Some(values) = inputs.get(input).and_then(serde_json::Value::as_array) else {
+                return Err(AppError::BadRequest(format!(
+                    "'{input}' is not a replicates input of this {tool_name} run"
+                )));
+            };
+            let recorded = usize::try_from(index)
+                .ok()
+                .and_then(|i| values.get(i))
+                .and_then(serde_json::Value::as_f64);
+            if recorded != Some(r.value) {
+                return Err(AppError::BadRequest(format!(
+                    "Value {} is not what this {tool_name} run consumed at replicate {index} of \
+                     '{input}'",
+                    r.value
+                )));
+            }
+            match saved_inputs.get(input) {
+                Some(existing) if existing != &serde_json::json!(r.parameter_id) => {
+                    return Err(AppError::BadRequest(format!(
+                        "Input '{input}' is saved to two different parameters in one request"
+                    )));
+                }
+                _ => {
+                    saved_inputs.insert(input.to_string(), serde_json::json!(r.parameter_id));
+                }
+            }
+            continue;
+        }
         let Some(output) = r.output.as_deref() else {
             return Err(AppError::BadRequest(format!(
-                "Reading for parameter {} at {} does not name the tool output it stores; every \
-                 reading of a tool-run save must",
+                "Reading for parameter {} at {} names neither the tool output nor the input it \
+                 stores; every reading of a tool-run save must",
                 r.parameter_id, r.time
             )));
         };
@@ -565,6 +707,7 @@ async fn resolve_tool_run_provenance(
         "curves": curves,
         "outputs": outputs,
         "saved": saved,
+        "saved_inputs": saved_inputs,
         "run_id": run_id,
         // D15: which path the numbers travelled. A tool linked here always actually ran; a CSV
         // that carried already-computed values gets no blob at all.
@@ -671,6 +814,10 @@ pub async fn insert_grab_samples(
         admission::admit(r.time, r.value, Some(GRAB_MEASUREMENT_TYPE))?;
     }
 
+    // Refused at the edge rather than falling back to a divisor: a stored estimator is a
+    // specification, so an unrecognised one is a request to reject, not a value to guess.
+    let requested_estimator = sd_estimator::parse_opt(payload.sd_estimator.as_deref())?;
+
     // Validate site exists
     let site = sites::Entity::find_by_id(payload.site_id)
         .one(&state.db)
@@ -744,6 +891,9 @@ pub async fn insert_grab_samples(
         &crate::routes::private::tools::scripts::actor_label(&auth),
     )
     .await?;
+
+    let fixed_estimators =
+        tool_run_fixed_estimators(&state.db, payload.tool_run_id, &payload.readings).await?;
 
     // The chosen standard curves, admitted by the one rule every writer of `standard_curve_id`
     // uses. A grab is spot by construction, so the only claims this path can be refused for are an
@@ -988,10 +1138,14 @@ pub async fn insert_grab_samples(
                 txn,
                 &payload.readings,
                 payload.site_id,
-                payload.created_by.as_deref(),
-                payload.label.as_deref(),
-                payload.notes.as_deref(),
-                provenance.as_ref(),
+                &SampleFacts {
+                    created_by: payload.created_by.as_deref(),
+                    label: payload.label.as_deref(),
+                    notes: payload.notes.as_deref(),
+                    provenance: provenance.as_ref(),
+                },
+                requested_estimator,
+                &fixed_estimators,
             )
             .await?;
 

@@ -184,6 +184,11 @@ pub struct ComputationInfo {
     /// The run's minting path: 'interactive' | 'csv_import' | 'chain'.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_source: Option<String>,
+    /// Which divisor this group's served standard deviation uses ('sample' = n-1, 'population' =
+    /// n) and what chose it. `sd_estimator_source` 'default' means nothing declared one, so the
+    /// number is served under a convention nobody stated.
+    pub sd_estimator: String,
+    pub sd_estimator_source: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -511,6 +516,8 @@ pub async fn get_reading_provenance(
                     created_by: sample.created_by.clone(),
                     provenance: sample.provenance.clone(),
                     run_source,
+                    sd_estimator: sample.sd_estimator.clone(),
+                    sd_estimator_source: sample.sd_estimator_source.clone(),
                 })
             }
             None => None,

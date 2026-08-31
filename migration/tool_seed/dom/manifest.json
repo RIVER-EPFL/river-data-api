@@ -2,21 +2,117 @@
   "label": "DOM",
   "description": "SUVA and fluorescence peak ratios",
   "params": [
-    { "name": "a254", "label": "Absorbance @254nm", "kind": "number", "units": null, "required": false, "default": null, "when": null },
-    { "name": "doc_avg_ppb", "label": "DOC Avg (ppb)", "kind": "number", "units": "ppb", "required": false, "default": null, "when": null },
-    { "name": "peak_a", "label": "Peak A", "kind": "number", "units": null, "required": false, "default": null, "when": null },
-    { "name": "peak_c", "label": "Peak C", "kind": "number", "units": null, "required": false, "default": null, "when": null },
-    { "name": "peak_m", "label": "Peak M", "kind": "number", "units": null, "required": false, "default": null, "when": null },
-    { "name": "peak_t", "label": "Peak T", "kind": "number", "units": null, "required": false, "default": null, "when": null }
+    {
+      "name": "a254",
+      "label": "Absorbance @254nm",
+      "kind": "number",
+      "units": null,
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "doc_avg_ppb",
+      "label": "DOC Avg (ppb)",
+      "kind": "number",
+      "units": "ppb",
+      "required": false,
+      "default": null,
+      "when": null,
+      "description": "Filled from this visit's DOC (the replicate mean) when left blank."
+    },
+    {
+      "name": "peak_a",
+      "label": "Peak A",
+      "kind": "number",
+      "units": null,
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "peak_c",
+      "label": "Peak C",
+      "kind": "number",
+      "units": null,
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "peak_m",
+      "label": "Peak M",
+      "kind": "number",
+      "units": null,
+      "required": false,
+      "default": null,
+      "when": null
+    },
+    {
+      "name": "peak_t",
+      "label": "Peak T",
+      "kind": "number",
+      "units": null,
+      "required": false,
+      "default": null,
+      "when": null
+    }
   ],
   "outputs": [
-    { "key": "SUVA", "label": "SUVA", "units": "L/(mg*m)", "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "SUVA" },
-    { "key": "A_T", "label": "Peak A / Peak T", "units": null, "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "A_T" },
-    { "key": "C_A", "label": "Peak C / Peak A", "units": null, "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "C_A" },
-    { "key": "C_M", "label": "Peak C / Peak M", "units": null, "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "C_M" },
-    { "key": "C_T", "label": "Peak C / Peak T", "units": null, "per_replicate": false, "aggregate_of": null, "suggested_parameter_code": "C_T" }
+    {
+      "key": "SUVA",
+      "label": "SUVA",
+      "units": "L/(mg*m)",
+      "per_replicate": false,
+      "aggregate_of": null,
+      "suggested_parameter_code": "SUVA"
+    },
+    {
+      "key": "A_T",
+      "label": "Peak A / Peak T",
+      "units": null,
+      "per_replicate": false,
+      "aggregate_of": null,
+      "suggested_parameter_code": "A_T"
+    },
+    {
+      "key": "C_A",
+      "label": "Peak C / Peak A",
+      "units": null,
+      "per_replicate": false,
+      "aggregate_of": null,
+      "suggested_parameter_code": "C_A"
+    },
+    {
+      "key": "C_M",
+      "label": "Peak C / Peak M",
+      "units": null,
+      "per_replicate": false,
+      "aggregate_of": null,
+      "suggested_parameter_code": "C_M"
+    },
+    {
+      "key": "C_T",
+      "label": "Peak C / Peak T",
+      "units": null,
+      "per_replicate": false,
+      "aggregate_of": null,
+      "suggested_parameter_code": "C_T"
+    }
   ],
   "constants": [],
   "curves": [],
-  "match_keywords": ["dom", "suva", "a254", "absorbance", "dissolved organic"]
+  "match_keywords": [
+    "dom",
+    "suva",
+    "a254",
+    "absorbance",
+    "dissolved organic"
+  ],
+  "event_inputs": [
+    {
+      "param": "doc_avg_ppb",
+      "parameter_code": "DOC"
+    }
+  ]
 }

@@ -228,6 +228,12 @@ pub async fn ingest_readings(
     let (site_id, parameter_id) = resolve_stream_slot(db, stream.site_parameter_id).await?;
     let paired = site_id.is_some();
 
+    // What the source says about its own sd divisor, if anything. Absent is the common answer and
+    // is carried through as absent: the slot then decides, and absent that the samples this pass
+    // materialises are recorded undeclared.
+    let stream_sd_estimator = data_streams::replicates::ReplicateSpec::from_metadata(&stream.metadata)
+        .and_then(|spec| spec.sd_estimator.clone());
+
     // Withdrawal is confined to spot rows by a database CHECK; the continuous aggregates exclude
     // spot, which is what keeps a retraction structurally unreachable by a rollup. A window on a
     // non-spot stream is therefore refused rather than half-honoured.
@@ -605,6 +611,17 @@ pub async fn ingest_readings(
             }
         }
 
+        // The slot's declaration, resolved once for the batch: every audited group on this stream
+        // sits on the same slot.
+        let audit_estimator = match (stream_sd_estimator.clone(), site_id, parameter_id) {
+            (Some(declared), _, _) => Some(declared),
+            (None, Some(site_id), Some(parameter_id)) => {
+                readings::sd_estimator::slot_declaration(db, site_id, parameter_id)
+                    .await?
+                    .map(str::to_string)
+            }
+            _ => None,
+        };
         let audit_times: Vec<chrono::DateTime<Utc>> = audits.iter().map(|a| a.time).collect();
         let holds_by_time: HashMap<chrono::DateTime<Utc>, audit::LatestHold> =
             audit::latest_holds(db, payload.stream_id, &audit_times)
@@ -618,7 +635,10 @@ pub async fn ingest_readings(
                 .get(&a.time)
                 .map_or(&[] as &[audit::ReplicateValue], Vec::as_slice);
             let numbers: Vec<f64> = values.iter().map(|v| v.value).collect();
-            let stats = audit::group_stats(&numbers);
+            // Compared under the divisor the slot publishes. An undeclared slot compares as
+            // sample, which is what makes its population-shaped groups disagree and surface for a
+            // decision rather than being quietly reconciled under a convention nobody chose.
+            let stats = audit::group_stats(&numbers).under(audit_estimator.as_deref().unwrap_or("sample"));
             let agree = audit::stats_agree(a.expected_mean, stats.mean, audit::DEFAULT_REL_TOL)
                 && audit::stats_agree_with(
                     a.expected_sd,
@@ -739,11 +759,12 @@ pub async fn ingest_readings(
                     sea_orm::prelude::DateTimeWithTimeZone::from(lo).into(),
                     sea_orm::prelude::DateTimeWithTimeZone::from(hi).into(),
                 ];
-                readings::sample_groups::materialise_samples(
+                readings::sample_groups::materialise_samples_with_estimator(
                     txn,
                     "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
                     binds.clone(),
                     payload.collection,
+                    stream_sd_estimator.as_deref(),
                 )
                 .await?;
                 // Each source row maps onto one collection event (D7). A sync service replaying
