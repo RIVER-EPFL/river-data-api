@@ -61,8 +61,8 @@ pub async fn test_send(
                 .ok_or_else(|| AppError::Internal("failed to build web push channel".to_string()))?;
             let msg = super::OutgoingMessage {
                 kind: "test",
-                subject: "River Data test notification".to_string(),
-                body: "✅ This is a test notification from River Data.".to_string(),
+                subject: "RIVER Data test notification".to_string(),
+                body: "✅ This is a test notification from RIVER Data.".to_string(),
                 slot: None,
             };
             let results = channel.deliver(&state, &msg).await;

@@ -523,7 +523,7 @@ pub fn validate_optional_time_range(
     // `version` is overwritten at serve time from CARGO_PKG_VERSION (see build_router); the literal
     // here is just a placeholder the derive macro requires.
     info(
-        title = "River Data API",
+        title = "RIVER Data API",
         description = "Time-series sensor data API",
         version = "0.0.0"
     )

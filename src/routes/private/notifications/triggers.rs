@@ -268,7 +268,7 @@ async fn stale_data(
                 if claim_insert(db, "stale_data", &key).await? {
                     let msg = OutgoingMessage {
                         kind: "stale_data",
-                        subject: format!("River Data: no {noun} from {site_name}"),
+                        subject: format!("RIVER Data: no {noun} from {site_name}"),
                         body: format!(
                             "⏳ No {noun} from {site_name} / {param_name} for ~{}h (expected within ~{}h).",
                             age.num_hours(),
@@ -285,7 +285,7 @@ async fn stale_data(
                 if claim_clear(db, "stale_data", &key).await? {
                     let msg = OutgoingMessage {
                         kind: "stale_data",
-                        subject: format!("River Data: {noun} resumed from {site_name}"),
+                        subject: format!("RIVER Data: {noun} resumed from {site_name}"),
                         body: format!("✅ {noun} flowing again from {site_name} / {param_name}."),
                         slot,
                     };
@@ -368,7 +368,7 @@ async fn battery_forecast(
         }
         let msg = OutgoingMessage {
             kind: "battery_forecast",
-            subject: format!("River Data: battery low at {site_name}"),
+            subject: format!("RIVER Data: battery low at {site_name}"),
             body: format!(
                 "🔋 {site_name}: {latest:.2}V, trend {slope:+.3}V/day, ~{days:.0}d to {cutoff:.1}V."
             ),
@@ -424,7 +424,7 @@ async fn sync_staleness(
         }
         let msg = OutgoingMessage {
             kind: "sync_stale",
-            subject: format!("River Data: {service_type} sync service is silent"),
+            subject: format!("RIVER Data: {service_type} sync service is silent"),
             body: format!(
                 "🔌 {service_type}/{instance} last heartbeat {} ({} hours ago). Its source is                  not being synced; check the service.",
                 hb.to_rfc3339(),
@@ -506,7 +506,7 @@ async fn sync_failures(
         }
         let msg = OutgoingMessage {
             kind: "sync_failure",
-            subject: format!("River Data: sync failures on {service_type}"),
+            subject: format!("RIVER Data: sync failures on {service_type}"),
             body,
             // System-wide infrastructure alert, no per-site scope, every enabled recipient gets it.
             slot: None,

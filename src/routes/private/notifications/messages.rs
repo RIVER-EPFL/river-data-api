@@ -32,7 +32,7 @@ fn unit_suffix(units: Option<&str>) -> String {
 
 #[must_use]
 pub fn render_opened(events: &[PendingEvent], dashboard_base: Option<&str>) -> OutgoingMessage {
-    let subject = format!("River Data alarm: {} active", events.len());
+    let subject = format!("RIVER Data alarm: {} active", events.len());
     let mut body = format!("🔴 Alarm, {} active\n", events.len());
     for e in events {
         let _ = writeln!(
@@ -58,7 +58,7 @@ pub fn render_opened(events: &[PendingEvent], dashboard_base: Option<&str>) -> O
 
 #[must_use]
 pub fn render_resolved(events: &[PendingEvent], dashboard_base: Option<&str>) -> OutgoingMessage {
-    let subject = format!("River Data resolved: {}", events.len());
+    let subject = format!("RIVER Data resolved: {}", events.len());
     let mut body = format!("✅ Resolved, {}\n", events.len());
     for e in events {
         let _ = writeln!(
@@ -107,7 +107,7 @@ mod tests {
         ];
         let msg = render_opened(&events, Some("https://dash.example/"));
         assert_eq!(msg.kind, "alarm_opened");
-        assert_eq!(msg.subject, "River Data alarm: 2 active");
+        assert_eq!(msg.subject, "RIVER Data alarm: 2 active");
         assert!(msg.body.contains("Martigny / Depth: 2150.00 mm (ALARM)"));
         assert!(msg.body.contains("Saxon / CDOM: 140.00 mm (WARNING)"));
         // Trailing slash on the base is normalized.
