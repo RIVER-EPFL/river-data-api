@@ -93,7 +93,7 @@ pub async fn slot_subscriptions(
     Ok(out)
 }
 
-async fn prune_subscription(db: &DatabaseConnection, id: Uuid) {
+pub(super) async fn prune_subscription(db: &DatabaseConnection, id: Uuid) {
     if let Err(e) = db
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -106,7 +106,7 @@ async fn prune_subscription(db: &DatabaseConnection, id: Uuid) {
     }
 }
 
-async fn stamp_success(db: &DatabaseConnection, id: Uuid) {
+pub(super) async fn stamp_success(db: &DatabaseConnection, id: Uuid) {
     let _ = db
         .execute(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,

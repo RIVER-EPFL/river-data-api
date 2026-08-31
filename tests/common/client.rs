@@ -165,6 +165,28 @@ pub async fn put_json_with_token(
     (status, text)
 }
 
+pub async fn delete_json_with_token(
+    app: &Router,
+    uri: &str,
+    body: &serde_json::Value,
+    token: &str,
+) -> (u16, String) {
+    let req = axum::http::Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::from(body.to_string()))
+        .unwrap();
+
+    let response = app.clone().oneshot(req).await.unwrap();
+    let status = response.status().as_u16();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&body).to_string();
+
+    (status, text)
+}
+
 pub async fn delete_with_token(app: &Router, uri: &str, token: &str) -> (u16, String) {
     let req = axum::http::Request::builder()
         .method("DELETE")

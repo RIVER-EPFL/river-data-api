@@ -77,3 +77,65 @@ async fn me_defaults_then_self_scoped_changes() {
         "admin keeps its own default"
     );
 }
+
+/// Scenario: a device is registered, then removed the way the settings page removes it.
+/// Expected behaviour: the delete is keyed on the endpoint the browser reports, removes exactly
+/// that device, and leaves the user's other devices registered.
+#[tokio::test]
+#[serial]
+async fn push_device_registers_lists_and_deletes_by_endpoint() {
+    require_keycloak!();
+    let app = seeded_app().await;
+    let user = get_keycloak_jwt("user", "user").await;
+
+    let desktop = "https://updates.push.services.mozilla.com/wpush/v2/desktop-endpoint";
+    let phone = "https://updates.push.services.mozilla.com/wpush/v2/phone-endpoint";
+
+    for (endpoint, agent) in [(desktop, "Firefox/Linux"), (phone, "Firefox/Android")] {
+        let (s, body) = crate::common::post_json_with_token(
+            &app,
+            "/api/notifications/me/push",
+            &serde_json::json!({
+                "endpoint": endpoint,
+                "p256dh": "test-p256dh-key",
+                "auth": "test-auth-key",
+                "user_agent": agent,
+            }),
+            &user,
+        )
+        .await;
+        assert_eq!(s, 200, "register {agent}: {body}");
+    }
+
+    let (s, body) =
+        crate::common::get_json_with_token(&app, "/api/notifications/me/push", &user).await;
+    assert_eq!(s, 200);
+    assert_eq!(body.as_array().unwrap().len(), 2, "both devices registered");
+
+    let (s, _) =
+        crate::common::get_json_with_token(&app, "/api/notifications/me", &user).await;
+    assert_eq!(s, 200);
+
+    let (s, body) = crate::common::delete_json_with_token(
+        &app,
+        "/api/notifications/me/push",
+        &serde_json::json!({ "endpoint": phone }),
+        &user,
+    )
+    .await;
+    assert_eq!(s, 204, "delete by endpoint: {body}");
+
+    let (s, body) =
+        crate::common::get_json_with_token(&app, "/api/notifications/me/push", &user).await;
+    assert_eq!(s, 200);
+    let rows = body.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "only the removed device is gone");
+    assert_eq!(rows[0]["endpoint"], desktop);
+
+    let (s, me) = crate::common::get_json_with_token(&app, "/api/notifications/me", &user).await;
+    assert_eq!(s, 200);
+    assert_eq!(
+        me["pushSubscriptionCount"], 1,
+        "the device count follows the delete"
+    );
+}

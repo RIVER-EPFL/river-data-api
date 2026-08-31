@@ -17,6 +17,7 @@ use crate::common::middleware::AuthContext;
 use crate::error::{AppError, AppResult};
 
 use super::access::project_allowed;
+use super::dispatcher::log_delivery;
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
 
@@ -351,10 +352,11 @@ fn default_ping_seconds() -> u64 {
 pub async fn test_push(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
-) -> AppResult<StatusCode> {
+) -> AppResult<Json<Vec<PushAttempt>>> {
     let sub = require_sub(&auth)?;
-    send_to_user(&state, &sub, "Test notification", "Push notifications are working.").await?;
-    Ok(StatusCode::NO_CONTENT)
+    let attempts =
+        send_to_user(&state, &sub, "Test notification", "Push notifications are working.").await?;
+    Ok(Json(attempts))
 }
 
 #[utoipa::path(post, path = "/api/notifications/me/push/ping", tag = "notifications")]
@@ -373,12 +375,36 @@ pub async fn schedule_ping(
     Ok(Json(serde_json::json!({ "seconds": seconds })))
 }
 
-async fn send_to_user(state: &AppState, keycloak_sub: &str, title: &str, body: &str) -> AppResult<()> {
+/// One device's outcome from a self-service push. `endpoint_tail` is the last 12 characters of the
+/// endpoint: enough to tell two devices apart in a log or in the UI, useless as a capability.
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PushAttempt {
+    pub id: Uuid,
+    pub endpoint_tail: String,
+    pub user_agent: Option<String>,
+    pub status: String,
+    pub error: Option<String>,
+    pub pruned: bool,
+}
+
+fn endpoint_tail(endpoint: &str) -> String {
+    let count = endpoint.chars().count();
+    endpoint.chars().skip(count.saturating_sub(12)).collect()
+}
+
+async fn send_to_user(
+    state: &AppState,
+    keycloak_sub: &str,
+    title: &str,
+    body: &str,
+) -> AppResult<Vec<PushAttempt>> {
     let rows = state
         .db
         .query_all(Statement::from_sql_and_values(
             PG,
-            "SELECT id, endpoint, p256dh, auth FROM web_push_subscriptions WHERE keycloak_sub = $1",
+            "SELECT id, endpoint, p256dh, auth, user_agent \
+             FROM web_push_subscriptions WHERE keycloak_sub = $1 ORDER BY created_at",
             [keycloak_sub.into()],
         ))
         .await?;
@@ -402,12 +428,28 @@ async fn send_to_user(state: &AppState, keycloak_sub: &str, title: &str, body: &
     .to_string();
 
     let client = reqwest::Client::new();
-    for row in rows {
-        let endpoint: String = row.try_get("", "endpoint")?;
-        let p256dh: String = row.try_get("", "p256dh")?;
-        let auth_key: String = row.try_get("", "auth")?;
-        let id: Uuid = row.try_get("", "id")?;
+    let mut attempts = Vec::with_capacity(rows.len());
 
+    for row in rows {
+        // A row that will not decode must not silence the devices queued behind it.
+        let decoded = (
+            row.try_get::<Uuid>("", "id"),
+            row.try_get::<String>("", "endpoint"),
+            row.try_get::<String>("", "p256dh"),
+            row.try_get::<String>("", "auth"),
+            row.try_get::<Option<String>>("", "user_agent"),
+        );
+        let (id, endpoint, p256dh, auth_key, user_agent) = match decoded {
+            (Ok(id), Ok(endpoint), Ok(p256dh), Ok(auth_key), Ok(user_agent)) => {
+                (id, endpoint, p256dh, auth_key, user_agent)
+            }
+            _ => {
+                tracing::warn!("push: skipping undecodable subscription row");
+                continue;
+            }
+        };
+
+        let tail = endpoint_tail(&endpoint);
         let sub = super::web_push::Subscription {
             id,
             keycloak_sub: keycloak_sub.to_string(),
@@ -416,7 +458,7 @@ async fn send_to_user(state: &AppState, keycloak_sub: &str, title: &str, body: &
             auth: auth_key,
         };
 
-        if let Err(e) = super::web_push::send_push(
+        let attempt = match super::web_push::send_push(
             &client,
             pem.as_bytes(),
             vapid_subject,
@@ -425,8 +467,49 @@ async fn send_to_user(state: &AppState, keycloak_sub: &str, title: &str, body: &
         )
         .await
         {
-            tracing::warn!(error = %e, "test push failed");
-        }
+            Ok(()) => {
+                super::web_push::stamp_success(&state.db, id).await;
+                PushAttempt {
+                    id,
+                    endpoint_tail: tail.clone(),
+                    user_agent,
+                    status: "sent".to_string(),
+                    error: None,
+                    pruned: false,
+                }
+            }
+            Err(e) => {
+                // 410 and 404 mean the push service has retired the endpoint: it can never
+                // deliver again, so the row goes rather than failing on every future send.
+                let gone = e.contains("EndpointNotValid") || e.contains("EndpointNotFound");
+                if gone {
+                    super::web_push::prune_subscription(&state.db, id).await;
+                }
+                tracing::warn!(error = %e, endpoint_tail = %tail, pruned = gone, "push: delivery failed");
+                PushAttempt {
+                    id,
+                    endpoint_tail: tail.clone(),
+                    user_agent,
+                    status: "failed".to_string(),
+                    error: Some(e),
+                    pruned: gone,
+                }
+            }
+        };
+
+        log_delivery(
+            &state.db,
+            None,
+            "test",
+            "web_push",
+            &tail,
+            &attempt.status,
+            attempt.error.as_deref(),
+        )
+        .await;
+
+        attempts.push(attempt);
     }
-    Ok(())
+
+    Ok(attempts)
 }
