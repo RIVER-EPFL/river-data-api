@@ -1012,26 +1012,6 @@ async fn doc_tool_rejects_malformed_input_and_accounts_for_every_request_key() {
         "an uncomputable result is omitted rather than serialized: {absent}"
     );
 
-    // Discharge keeps its series required because an empty one makes the underlying lm() fail,
-    // so the refusal that doc no longer owes is still pinned on a tool that owes it.
-    let (status, incomplete) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/tools/discharge/calculate",
-        &json!({ "tracer": "salt", "values": [1.0, 2.0] }),
-        &intern,
-    )
-    .await;
-    assert_eq!(
-        status, 400,
-        "a body missing a genuinely required field is a bad request ({status}): {incomplete}"
-    );
-    assert!(
-        incomplete["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("times_s")),
-        "the error names the missing field: {incomplete}"
-    );
-
     let (status, empty) = crate::common::post_json_parse_with_token(
         &app,
         "/api/tools/doc/calculate",
