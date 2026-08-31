@@ -250,17 +250,16 @@ impl PlanWarning {
         }
     }
 
-    /// This source ships its own precomputed standard deviation and nothing says which divisor it
-    /// used. The pairing is where that can first be asked, so it is asked here; leaving it unset
-    /// is allowed and the audit gate is then the backstop.
-    pub fn sd_estimator_undeclared(parameter: &str) -> Self {
+    /// This source ships its own precomputed standard deviation and the open holds say the
+    /// population divisor explains the disagreement. The pairing is where that can first be
+    /// asked, so it is asked here; leaving it unset is allowed and the audit gate is the backstop.
+    pub fn sd_estimator_undeclared(parameter: &str, population_holds: i64) -> Self {
         Self {
             kind: "sd_estimator_undeclared".to_string(),
             message: format!(
-                "This source reports its own standard deviation for '{parameter}' and has not \
-                 said which divisor it uses. Until one is declared, statistics use the sample \
-                 formula (n-1) and disagreements matching the population divisor are held for a \
-                 decision."
+                "{population_holds} incoming standard deviation{} for '{parameter}' match the \
+                 population divisor (n), not ours. Declare which one this source uses.",
+                if population_holds == 1 { "" } else { "s" }
             ),
             parameter: Some(parameter.to_string()),
             existing: None,
@@ -654,6 +653,27 @@ pub async fn create_plan(
         })
         .collect();
 
+    // Slots that already declare a divisor. A declaration is owned by the slot, so the automatic
+    // sample default must never rewrite one: an entry landing on such a slot adopts what it says.
+    let declared_slots: std::collections::HashMap<(Uuid, Uuid), String> = db
+        .query_all(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT site_id, parameter_id, sd_estimator FROM site_parameters \
+             WHERE sd_estimator IS NOT NULL",
+        ))
+        .await?
+        .iter()
+        .filter_map(|r| {
+            Some((
+                (
+                    r.try_get::<Uuid>("", "site_id").ok()?,
+                    r.try_get::<Uuid>("", "parameter_id").ok()?,
+                ),
+                r.try_get::<String>("", "sd_estimator").ok()?,
+            ))
+        })
+        .collect();
+
     // Build entries
     let mut entries: Vec<PlanEntry> = Vec::with_capacity(streams.len());
 
@@ -674,6 +694,21 @@ pub async fn create_plan(
             family_parameter_suggestion(&h.parameter, &catalog.params)
         } else {
             h.parameter.clone()
+        };
+
+        // Sample (n-1) is the presumption, so a family nothing disputes is declared with it and
+        // asks nothing. Population is only ever proposed where the incoming statistics say so:
+        // a family whose open holds carry the population signature is left undeclared, and the
+        // review answers it with that evidence in front of it.
+        let (sd_holds, sd_population_holds) =
+            sd_evidence.get(&stream.id).copied().unwrap_or((0, 0));
+        let reports_sd = replicates
+            .as_ref()
+            .is_some_and(|r| r.portal_sd_column.is_some());
+        let sd_estimator = if reports_sd && sd_population_holds == 0 {
+            Some("sample".to_string())
+        } else {
+            None
         };
 
         let mut entry = PlanEntry {
@@ -716,13 +751,18 @@ pub async fn create_plan(
                 &instruments,
             ),
             replicates,
-            // Never guessed from the data: the source reported both conventions over the years,
-            // so the review asks and the audit gate is the backstop if it is left unset.
-            sd_estimator: None,
-            sd_holds: sd_evidence.get(&stream.id).map_or(0, |e| e.0),
-            sd_population_holds: sd_evidence.get(&stream.id).map_or(0, |e| e.1),
+            sd_estimator,
+            sd_holds,
+            sd_population_holds,
         };
         reclassify_entry(&mut entry, &catalog);
+        if reports_sd
+            && let (Some(site_id), Some(param_id)) = (entry.site.id, entry.parameter.id)
+            && let Some(declared) = declared_slots.get(&(site_id, param_id))
+        {
+            entry.sd_estimator = Some(declared.clone());
+            entry.warnings.retain(|w| w.kind != "sd_estimator_undeclared");
+        }
         entries.push(entry);
     }
 
@@ -1727,18 +1767,20 @@ pub fn reclassify_entry(entry: &mut PlanEntry, catalog: &EntityCatalog) {
             &entry.parameter.units,
         ));
     }
-    // A family whose source reports an sd, on a slot that has not declared a divisor. `catalog`
-    // has no slot rows, so this reads the plan's own declaration: an entry that has already been
-    // patched with one is settled.
+    // A family whose source reports an sd, left undeclared because its open holds carry the
+    // population signature. `catalog` has no slot rows, so this reads the plan's own declaration:
+    // an entry that has already been patched with one is settled.
     if entry.sd_estimator.is_none()
+        && entry.sd_population_holds > 0
         && entry
             .replicates
             .as_ref()
             .is_some_and(|r| r.portal_sd_column.is_some())
     {
-        entry
-            .warnings
-            .push(PlanWarning::sd_estimator_undeclared(&entry.parameter.name));
+        entry.warnings.push(PlanWarning::sd_estimator_undeclared(
+            &entry.parameter.name,
+            entry.sd_population_holds,
+        ));
     }
 
     entry.confidence = if proj_id.is_some() && site_id.is_some() && param_id.is_some() {

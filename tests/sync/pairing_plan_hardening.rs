@@ -720,6 +720,11 @@ async fn a_replicate_family_suggests_the_measurand_and_quotes_divisor_evidence()
             .any(|w| w["kind"] == "sd_estimator_undeclared"),
         "{doc}"
     );
+    assert_eq!(
+        doc["sd_estimator"],
+        serde_json::Value::Null,
+        "population-shaped evidence leaves the divisor for the review to answer: {doc}"
+    );
 
     let other = entry_for(&plan, other_stream);
     assert_eq!(
@@ -728,6 +733,84 @@ async fn a_replicate_family_suggests_the_measurand_and_quotes_divisor_evidence()
         "no catalog match still drops the avg marker: {other}"
     );
     assert_eq!(other["sd_holds"], serde_json::json!(0), "{other}");
+    assert_eq!(
+        other["sd_estimator"],
+        serde_json::json!("sample"),
+        "nothing disputes this family, so it is declared sample and asks nothing: {other}"
+    );
+    assert!(
+        other["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|w| w["kind"] != "sd_estimator_undeclared"),
+        "{other}"
+    );
+
+    crate::common::cleanup_test_db(&db).await;
+}
+
+/// Scenario: a replicate family lands on a slot that has already declared its divisor.
+///
+/// Expected behaviour: the entry adopts the slot's declaration and asks nothing. The automatic
+/// sample default is a presumption about an unanswered question, so it must never rewrite an
+/// answer somebody gave.
+#[tokio::test]
+#[serial]
+async fn a_declared_slot_keeps_its_divisor_through_pairing() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE site_parameters SET sd_estimator = 'population' WHERE id = '{}'",
+            crate::common::PARAM_S1_DEPTH_ID
+        ),
+    )
+    .await;
+
+    let stream = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            r#"INSERT INTO data_streams (id, source_system, source_key, metadata, is_active)
+               VALUES ('{stream}', 'declsrc', 'STA:Depth:reps',
+                       '{{"hierarchy": {{"project": "Test River Project", "site": "Upstream Station", "parameter": "Depth"}},
+                          "units": "mm",
+                          "replicates": {{"source_columns": ["Depth_1", "Depth_2"],
+                                          "portal_mean_column": "Depth", "portal_sd_column": "Depth_sd"}}}}'::jsonb,
+                       true)"#
+        ),
+    )
+    .await;
+
+    let (status, plan) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sync/pairing-plans",
+        &serde_json::json!({ "source_system": "declsrc" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "create plan failed: {plan}");
+
+    let entry = entry_for(&plan, stream);
+    assert_eq!(
+        entry["sd_estimator"],
+        serde_json::json!("population"),
+        "the slot's own declaration survives: {entry}"
+    );
+    assert!(
+        entry["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|w| w["kind"] != "sd_estimator_undeclared"),
+        "{entry}"
+    );
 
     crate::common::cleanup_test_db(&db).await;
 }

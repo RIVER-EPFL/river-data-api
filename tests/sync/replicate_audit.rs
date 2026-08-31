@@ -1304,6 +1304,25 @@ async fn the_sql_signature_and_classify_agree() {
         .collect();
     assert_eq!(by_sql, by_classify, "the SQL spelling agrees: {filtered}");
     assert_eq!(filtered["total"], 1, "and the count pages honestly: {filtered}");
+
+    // The complement is the other half of the same partition: what the divisor does not explain.
+    let rest = list_holds(&fx, "&page_size=100&classification=not_population_sd").await;
+    let rest_times: Vec<&str> = rest["holds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["group_time"].as_str().unwrap())
+        .collect();
+    assert_eq!(rest["total"], 1, "the complement pages honestly too: {rest}");
+    assert!(
+        !rest_times.contains(&by_classify[0]),
+        "the two filters partition the holds: {rest}"
+    );
+    assert_eq!(
+        filtered["total"].as_i64().unwrap() + rest["total"].as_i64().unwrap(),
+        all["total"].as_i64().unwrap(),
+        "and together they account for every hold: {all}"
+    );
 }
 
 /// Scenario: a bulk accept on a slot whose estimator IS declared.

@@ -516,9 +516,11 @@ pub struct ListHoldsQuery {
     /// scale is what lets an operator triage the whole backlog largest-first across pages.
     #[serde(default)]
     pub sort: Option<String>,
-    /// Restrict to one disagreement signature. Only `population_sd` is filterable: it is the one
-    /// signature with a SQL spelling ([`POPULATION_SD_SQL`]), so it filters and pages honestly
-    /// rather than dropping rows out of an already-counted page.
+    /// Restrict to one disagreement signature: `population_sd`, or `not_population_sd` for the
+    /// disagreements it does not explain. Only these two are filterable, because
+    /// [`POPULATION_SD_SQL`] is the one signature with a SQL spelling and its complement is
+    /// exactly as spellable, so both filter and page honestly rather than dropping rows out of an
+    /// already-counted page.
     #[serde(default)]
     pub classification: Option<String>,
     /// Restrict to holds whose slot has, or has not, declared an sd estimator. `false` is the
@@ -736,9 +738,20 @@ pub async fn list_holds(
         Some("population_sd") => {
             conditions.push(format!("h.kind = 'replicate_stats' AND ({})", *POPULATION_SD_SQL));
         }
+        Some("not_population_sd") => {
+            // COALESCE, not a bare NOT: a hold missing a statistic leaves the signature NULL, and
+            // a NULL is not the population signature, so it belongs to the complement. This is
+            // what makes the two filters partition the replicate-stats holds exactly, matching
+            // the `count(*) FILTER (...)` evidence quoted elsewhere.
+            conditions.push(format!(
+                "h.kind = 'replicate_stats' AND NOT COALESCE(({}), false)",
+                *POPULATION_SD_SQL
+            ));
+        }
         Some(other) => {
             return Err(AppError::BadRequest(format!(
-                "classification '{other}' has no filter; only 'population_sd' is filterable"
+                "classification '{other}' has no filter; only 'population_sd' and \
+                 'not_population_sd' are filterable"
             )));
         }
         None => {}
