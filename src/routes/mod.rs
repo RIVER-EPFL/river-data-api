@@ -270,6 +270,7 @@ pub fn validate_optional_time_range(
         private::sync::views::revert_pairing_plan,
         private::sync::views::unpaired_summary,
         private::sync::views::plan_site_metadata,
+        private::sync::views::plan_instruments,
         private::admin::users::list_users,
         private::admin::users::search_users,
         private::admin::users::get_user,

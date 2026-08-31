@@ -34,6 +34,34 @@ fn entry_for<'a>(plan: &'a serde_json::Value, stream_id: &str) -> &'a serde_json
         .unwrap_or_else(|| panic!("entry for stream {stream_id} missing: {plan}"))
 }
 
+/// The curve's id and the lab instrument the registration found or created for its label.
+async fn register_curve_with_instrument(
+    app: &Router,
+    jwt: &str,
+    source_key: &str,
+    label: &str,
+) -> (String, String) {
+    let (status, body) = crate::common::post_json_parse_with_token(
+        app,
+        "/api/standard_curves/register",
+        &json!({
+            "source_system": SOURCE,
+            "source_key": source_key,
+            "instrument_label": label,
+            "slope": 2.0,
+            "intercept": 1.0,
+            "name": format!("{label} 2025-01-01"),
+        }),
+        jwt,
+    )
+    .await;
+    assert_eq!(status, 200, "register curve {label} ({status}): {body}");
+    (
+        body["id"].as_str().expect("curve id").to_string(),
+        body["sensor_id"].as_str().expect("sensor id").to_string(),
+    )
+}
+
 async fn register_curve(app: &Router, jwt: &str, source_key: &str, label: &str) -> String {
     let (status, body) = crate::common::post_json_parse_with_token(
         app,
@@ -84,7 +112,8 @@ async fn register_stream(
         });
     }
     let (status, stream) =
-        crate::common::post_json_parse_with_token(app, "/api/streams/register", &payload, jwt).await;
+        crate::common::post_json_parse_with_token(app, "/api/streams/register", &payload, jwt)
+            .await;
     assert_eq!(status, 200, "register {source_key} ({status}): {stream}");
     e2e::id_of(&stream)
 }
@@ -237,7 +266,9 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
     assert_eq!(
         count(
             &db,
-            &format!("SELECT COUNT(*) FROM data_streams WHERE id = '{plain}' AND sensor_id IS NULL")
+            &format!(
+                "SELECT COUNT(*) FROM data_streams WHERE id = '{plain}' AND sensor_id IS NULL"
+            )
         )
         .await,
         1,
@@ -336,5 +367,121 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
         .await,
         1,
         "the stripped claim is a review-queue hold",
+    );
+}
+
+/// Scenario: a portal that corrects a value upstream names no curve per reading, so the plan
+/// resolves no instrument for those streams. The instrument is still known (its curves are
+/// replicated), it just cannot be inferred.
+///
+/// Expected behaviour: the plan reports the gap rather than hiding it, an operator attaches the
+/// instrument by parameter (settling every station at once, which is how two chla columns reach one
+/// fluorometer), and the apply stores it on the streams without stamping a curve on any reading.
+#[tokio::test]
+#[serial]
+async fn an_instrument_is_attached_to_streams_whose_source_names_no_curve() {
+    if !kc::require_keycloak_or_skip("portal_curve_instrument").await {
+        return;
+    }
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let app = kc::build_test_app_with_keycloak(db.clone()).await;
+    let admin = kc::get_keycloak_jwt("admin", "admin").await;
+
+    let (_, instrument_id) =
+        register_curve_with_instrument(&app, &admin, "standard_curves:1", "Chla fluorometer").await;
+    let acid = register_stream(&app, &admin, "chla_acid", "chla_acid", None).await;
+    let noacid = register_stream(&app, &admin, "chla_noacid", "chla_noacid", None).await;
+    let bix = register_stream(&app, &admin, "bix", "BIX", None).await;
+
+    let plan = create_plan(&app, &admin).await;
+    let plan_id = e2e::id_of(&plan);
+
+    let (status, view) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/sync/pairing-plans/{plan_id}/instruments"),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "instruments view ({status}): {view}");
+    let unassigned = view["unassigned"].as_array().expect("unassigned array");
+    assert_eq!(
+        unassigned.len(),
+        3,
+        "every parameter with no instrument is reported: {view}",
+    );
+    assert!(
+        view["groups"].as_array().is_some_and(Vec::is_empty),
+        "the plan binds no instrument yet, and the inventory is not listed as if it did: {view}",
+    );
+
+    for stream in [&acid, &noacid] {
+        let (status, patched) = crate::common::patch_json_with_token(
+            &app,
+            &format!("/api/sync/pairing-plans/{plan_id}"),
+            &json!({ "updates": [{ "stream_id": stream, "instrument_id": instrument_id }] }),
+            &admin,
+        )
+        .await;
+        assert_eq!(status, 200, "attach ({status}): {patched}");
+    }
+
+    let (_, plan) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &admin,
+    )
+    .await;
+    let attached = &entry_for(&plan, &acid)["instrument"];
+    assert_eq!(attached["resolved_by"], "manual", "{attached}");
+    assert_eq!(
+        attached["stamps_readings"], false,
+        "the value already carries the correction, so nothing is applied a second time: {attached}",
+    );
+    assert_eq!(
+        attached["curves"].as_array().map(Vec::len),
+        Some(1),
+        "the instrument's curves travel with the entry it was attached to: {attached}",
+    );
+
+    // A parameter no registered instrument covers gets one named here rather than left without.
+    let (status, patched) = crate::common::patch_json_with_token(
+        &app,
+        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &json!({ "updates": [{
+            "stream_id": bix,
+            "instrument_name": "BIX instrument (from curvesrc sync)",
+            "instrument_confirmed": true,
+        }] }),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "name a new instrument ({status}): {patched}");
+
+    apply_plan(&app, &admin, &plan_id).await;
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM data_streams \
+                 WHERE id IN ('{acid}', '{noacid}') AND sensor_id = '{instrument_id}'"
+            )
+        )
+        .await,
+        2,
+        "both columns land on the one fluorometer",
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM data_streams ds JOIN sensors s ON s.id = ds.sensor_id \
+                 WHERE ds.id = '{bix}' AND s.name = 'BIX instrument (from curvesrc sync)' \
+                 AND s.is_lab_instrument"
+            )
+        )
+        .await,
+        1,
+        "the named instrument is minted and carried onto its stream",
     );
 }

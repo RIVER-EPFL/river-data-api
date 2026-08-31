@@ -220,7 +220,7 @@ async fn a_parameter_with_no_reading_at_a_timestamp_has_an_empty_cell_not_a_zero
 
 #[tokio::test]
 #[serial]
-async fn the_default_export_header_carries_values_and_parameter_ids_only() {
+async fn the_default_export_header_carries_value_columns_only() {
     let (_db, app, token) = setup().await;
     let site = crate::common::SITE1_ID;
 
@@ -243,15 +243,14 @@ async fn the_default_export_header_carries_values_and_parameter_ids_only() {
     ];
     let mut expected: Vec<String> = vec!["time".to_string()];
     expected.extend(codes.iter().map(|c| (*c).to_string()));
-    expected.extend(codes.iter().map(|c| format!("{c}_parameter_id")));
     expected.sort();
 
     let mut got = header(&body);
     got.sort();
     assert_eq!(
         got, expected,
-        "the default header is the value and parameter-id columns and nothing else, so no opt-in \
-         column can arrive without its opt-in: {body}"
+        "the default header is the value columns and nothing else, so no opt-in column can \
+         arrive without its opt-in: {body}"
     );
 }
 

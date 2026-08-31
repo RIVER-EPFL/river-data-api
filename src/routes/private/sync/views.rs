@@ -56,6 +56,7 @@ pub fn read_routes() -> Router<AppState> {
         .route("/pairing-plans", get(list_pairing_plans))
         .route("/pairing-plans/{id}", get(get_pairing_plan))
         .route("/pairing-plans/{id}/site-metadata", get(plan_site_metadata))
+        .route("/pairing-plans/{id}/instruments", get(plan_instruments))
         .route("/unpaired-summary", get(unpaired_summary))
 }
 
@@ -790,7 +791,7 @@ async fn resolve_or_create_site_parameter<C: ConnectionTrait>(
         is_active: Set(Some(true)),
         is_public: Set(Some(false)),
         sd_estimator: Set(None),
-            is_derived: Set(Some(false)),
+        is_derived: Set(Some(false)),
         derived_definition_id: Set(None),
         variable_mappings: Set(None),
         created_at: Set(Some(Utc::now())),
@@ -1403,7 +1404,7 @@ pub async fn bulk_pair(
                 is_active: Set(Some(true)),
                 is_public: Set(Some(false)),
                 sd_estimator: Set(None),
-            is_derived: Set(Some(false)),
+                is_derived: Set(Some(false)),
                 derived_definition_id: Set(None),
                 variable_mappings: Set(None),
                 created_at: Set(Some(Utc::now())),
@@ -1593,11 +1594,37 @@ struct PlanEntryUpdate {
     /// Agree to creating the proposed instrument. Apply refuses while any remain unconfirmed.
     #[serde(default)]
     instrument_confirmed: Option<bool>,
+    /// Detach the instrument from every entry this one groups with. Attaching is `instrument_id`;
+    /// this is its inverse, since an absent `instrument_id` means "unchanged", not "none".
+    #[serde(default)]
+    instrument_clear: Option<bool>,
     /// Declare which divisor this slot publishes its replicate standard deviation with,
     /// `sample` or `population`. Applied to the `site_parameters` row when the plan is applied.
     /// Never inferred: absent leaves the slot undeclared and the audit gate asks later.
     #[serde(default)]
     sd_estimator: Option<String>,
+}
+
+/// What an instrument decision covers. A curve column is one instrument across the whole source,
+/// so settling it on any one entry settles every entry sharing the column; where no column names a
+/// curve, the source parameter plays that role, so choosing the fluorometer for `chla_acid` covers
+/// all 31 stations rather than one.
+fn instrument_scope(entry: &crate::routes::private::sync::service::PlanEntry) -> String {
+    match entry
+        .instrument
+        .as_ref()
+        .and_then(|i| i.curve_column.as_deref())
+    {
+        Some(column) => format!("column:{column}"),
+        None => format!(
+            "parameter:{}",
+            entry
+                .parameter
+                .group_key
+                .as_deref()
+                .unwrap_or(&entry.parameter.name)
+        ),
+    }
 }
 
 /// Apply the instrument half of a plan edit.
@@ -1608,6 +1635,7 @@ struct PlanEntryUpdate {
 /// leave 30 of 31 DOC streams still asking.
 async fn apply_instrument_updates(
     state: &AppState,
+    source_system: &str,
     entries: &mut [crate::routes::private::sync::service::PlanEntry],
     updates: &[PlanEntryUpdate],
 ) -> AppResult<()> {
@@ -1615,14 +1643,14 @@ async fn apply_instrument_updates(
         if update.instrument_id.is_none()
             && update.instrument_name.is_none()
             && update.instrument_confirmed.is_none()
+            && update.instrument_clear != Some(true)
         {
             continue;
         }
-        let Some(column) = entries
+        let Some(scope) = entries
             .iter()
             .find(|e| e.stream_id == update.stream_id)
-            .and_then(|e| e.instrument.as_ref())
-            .and_then(|i| i.curve_column.clone())
+            .map(instrument_scope)
         else {
             continue;
         };
@@ -1640,16 +1668,64 @@ async fn apply_instrument_updates(
             ),
             None => None,
         };
+        // The chosen instrument's curves travel with the entry, so the review shows what it
+        // corrects with rather than only its name.
+        let repointed_curves = match &repointed {
+            Some(sensor) => crate::routes::private::sensors::standard_curves::Entity::find()
+                .filter(
+                    crate::routes::private::sensors::standard_curves::Column::SensorId
+                        .eq(sensor.id),
+                )
+                .all(&state.db)
+                .await?
+                .into_iter()
+                .map(|c| crate::routes::private::sync::service::PlanCurveRef {
+                    id: c.id,
+                    name: c.name,
+                    slope: c.slope,
+                    intercept: c.intercept,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
 
-        for entry in entries
-            .iter_mut()
-            .filter(|e| {
-                e.instrument
-                    .as_ref()
-                    .and_then(|i| i.curve_column.as_deref())
-                    == Some(column.as_str())
-            })
-        {
+        for entry in entries.iter_mut().filter(|e| instrument_scope(e) == scope) {
+            if update.instrument_clear == Some(true) {
+                entry.instrument = None;
+                continue;
+            }
+            // A stream whose source names no curve per reading has no instrument until someone
+            // says which one corrected it upstream. Attaching an existing one records that, and
+            // naming a new one proposes it; neither stamps, because the value already carries the
+            // correction. The identity is the parameter, so every station moves together.
+            if entry.instrument.is_none() {
+                let proposed = update
+                    .instrument_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty());
+                if repointed.is_some() || proposed.is_some() {
+                    let parameter = entry.parameter.name.clone();
+                    entry.instrument =
+                        Some(crate::routes::private::sync::service::PlanInstrumentRef {
+                            curve_column: None,
+                            id: None,
+                            name: proposed
+                                .map(str::to_string)
+                                .unwrap_or_else(|| parameter.clone()),
+                            source_key: format!("{source_system}:{parameter}"),
+                            resolved_by: if repointed.is_some() {
+                                "manual".to_string()
+                            } else {
+                                "placeholder".to_string()
+                            },
+                            create: repointed.is_none(),
+                            confirmed: repointed.is_some(),
+                            stamps_readings: false,
+                            curves: Vec::new(),
+                        });
+                }
+            }
             let Some(instrument) = entry.instrument.as_mut() else {
                 continue;
             };
@@ -1664,6 +1740,7 @@ async fn apply_instrument_updates(
                 instrument.resolved_by = "manual".to_string();
                 instrument.create = false;
                 instrument.confirmed = true;
+                instrument.curves = repointed_curves.clone();
             }
             if let Some(name) = &update.instrument_name
                 && instrument.create
@@ -1671,6 +1748,7 @@ async fn apply_instrument_updates(
             {
                 instrument.name = name.trim().to_string();
             }
+
             if let Some(confirmed) = update.instrument_confirmed {
                 instrument.confirmed = confirmed;
             }
@@ -1758,14 +1836,14 @@ pub async fn update_pairing_plan(
                 && (entry.site.name.trim().is_empty() || entry.parameter.name.trim().is_empty())
             {
                 entry.action = "skip".to_string();
-                entry.warnings.push(
-                    crate::routes::private::sync::service::PlanWarning::empty_name(),
-                );
+                entry
+                    .warnings
+                    .push(crate::routes::private::sync::service::PlanWarning::empty_name());
             }
         }
     }
 
-    apply_instrument_updates(&state, &mut entries, &req.updates).await?;
+    apply_instrument_updates(&state, &plan.source_system, &mut entries, &req.updates).await?;
 
     let summary = serde_json::to_value(crate::routes::private::sync::service::compute_summary_pub(
         &entries,
@@ -2005,4 +2083,178 @@ pub async fn plan_site_metadata(
     }).collect();
 
     Ok(Json(result))
+}
+
+/// One instrument decision in a pairing plan: the instrument, what it covers, and the curves it
+/// owns. Only instruments the plan actually binds are listed; the rest of the inventory is
+/// reachable through the picker, so this stays a list of decisions rather than a catalog.
+#[derive(Debug, Serialize)]
+pub struct PlanInstrumentGroup {
+    /// The decision's scope: `column:<curve column>` or `parameter:<source parameter>`, matching
+    /// what an update to any member stream settles. Absent for an unbound instrument.
+    pub scope: Option<String>,
+    pub instrument_id: Option<Uuid>,
+    pub name: String,
+    pub source_key: String,
+    /// `stream` | `curve_label` | `manual` | `placeholder`.
+    pub resolved_by: String,
+    pub create: bool,
+    pub confirmed: bool,
+    /// Whether readings under this decision will store a `standard_curve_id`.
+    pub stamps_readings: bool,
+    pub curve_column: Option<String>,
+    pub stream_count: usize,
+    pub parameters: Vec<String>,
+    pub site_count: usize,
+    /// A stream to address an update to; every entry in the same scope moves with it.
+    pub anchor_stream_id: Option<Uuid>,
+    pub curves: Vec<crate::routes::private::sync::service::PlanCurveRef>,
+}
+
+/// The source parameters this plan pairs that no instrument covers, so an operator can attach one
+/// where the portal corrected a value upstream without naming a curve per reading.
+#[derive(Debug, Serialize)]
+pub struct PlanUnassignedParameter {
+    pub scope: String,
+    pub parameter: String,
+    pub stream_count: usize,
+    pub site_count: usize,
+    pub anchor_stream_id: Uuid,
+    /// The name an instrument for this parameter would get, proposed the way a site's or a
+    /// parameter's name is. Accepting it is what creates the instrument; nothing is minted from a
+    /// suggestion alone.
+    pub suggested_name: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PlanInstrumentsResponse {
+    pub groups: Vec<PlanInstrumentGroup>,
+    pub unassigned: Vec<PlanUnassignedParameter>,
+}
+
+/// The instrument picture of a pairing plan: every instrument the plan binds, and the parameters
+/// still without one. Requires `read_metadata`.
+#[utoipa::path(
+    get,
+    path = "/sync/pairing-plans/{id}/instruments",
+    params(("id" = Uuid, Path, description = "Pairing plan UUID")),
+    responses(
+        (status = 200, description = "The plan's instruments and unassigned parameters", body = Object),
+        (status = 404, description = "Plan not found"),
+    ),
+    tag = "sync"
+)]
+pub async fn plan_instruments(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<PlanInstrumentsResponse>> {
+    let plan = crate::routes::private::data_streams::pairing_plans::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
+    let entries: Vec<crate::routes::private::sync::service::PlanEntry> =
+        serde_json::from_value(plan.entries.clone()).unwrap_or_default();
+
+    struct Acc {
+        instrument: crate::routes::private::sync::service::PlanInstrumentRef,
+        anchor: Uuid,
+        streams: usize,
+        parameters: std::collections::BTreeSet<String>,
+        sites: std::collections::BTreeSet<String>,
+    }
+    let mut bound: std::collections::BTreeMap<String, Acc> = std::collections::BTreeMap::new();
+    let mut unassigned: std::collections::BTreeMap<String, PlanUnassignedParameter> =
+        std::collections::BTreeMap::new();
+
+    for entry in entries.iter().filter(|e| e.action == "pair") {
+        let scope = instrument_scope(entry);
+        match &entry.instrument {
+            Some(instrument) => {
+                let acc = bound.entry(scope).or_insert_with(|| Acc {
+                    instrument: instrument.clone(),
+                    anchor: entry.stream_id,
+                    streams: 0,
+                    parameters: std::collections::BTreeSet::new(),
+                    sites: std::collections::BTreeSet::new(),
+                });
+                acc.streams += 1;
+                acc.parameters.insert(entry.parameter.name.clone());
+                acc.sites.insert(entry.site.name.clone());
+            }
+            None => {
+                let e =
+                    unassigned
+                        .entry(scope.clone())
+                        .or_insert_with(|| PlanUnassignedParameter {
+                            scope,
+                            suggested_name: format!(
+                                "{} instrument (from {} sync)",
+                                entry.parameter.name, plan.source_system
+                            ),
+                            parameter: entry.parameter.name.clone(),
+                            stream_count: 0,
+                            site_count: 0,
+                            anchor_stream_id: entry.stream_id,
+                        });
+                e.stream_count += 1;
+            }
+        }
+    }
+    // Site breadth per unassigned parameter, counted the same way as a bound group's.
+    let mut unassigned_sites: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeSet<String>,
+    > = std::collections::BTreeMap::new();
+    for entry in entries.iter().filter(|e| e.action == "pair") {
+        if entry.instrument.is_none() {
+            unassigned_sites
+                .entry(instrument_scope(entry))
+                .or_default()
+                .insert(entry.site.name.clone());
+        }
+    }
+    for (scope, sites) in unassigned_sites {
+        if let Some(u) = unassigned.get_mut(&scope) {
+            u.site_count = sites.len();
+        }
+    }
+
+    let mut groups: Vec<PlanInstrumentGroup> = bound
+        .into_iter()
+        .map(|(scope, acc)| PlanInstrumentGroup {
+            scope: Some(scope),
+            instrument_id: acc.instrument.id,
+            name: acc.instrument.name,
+            source_key: acc.instrument.source_key,
+            resolved_by: acc.instrument.resolved_by,
+            create: acc.instrument.create,
+            confirmed: acc.instrument.confirmed,
+            stamps_readings: acc.instrument.stamps_readings,
+            curve_column: acc.instrument.curve_column,
+            stream_count: acc.streams,
+            parameters: acc.parameters.into_iter().collect(),
+            site_count: acc.sites.len(),
+            anchor_stream_id: Some(acc.anchor),
+            curves: acc.instrument.curves,
+        })
+        .collect();
+
+    // Anything still asking first, then by breadth: the decisions come before the inventory.
+    groups.sort_by(|a, b| {
+        (
+            a.confirmed,
+            std::cmp::Reverse(a.stream_count),
+            a.name.clone(),
+        )
+            .cmp(&(
+                b.confirmed,
+                std::cmp::Reverse(b.stream_count),
+                b.name.clone(),
+            ))
+    });
+
+    Ok(Json(PlanInstrumentsResponse {
+        groups,
+        unassigned: unassigned.into_values().collect(),
+    }))
 }
