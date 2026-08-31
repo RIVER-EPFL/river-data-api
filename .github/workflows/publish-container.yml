@@ -183,7 +183,7 @@ jobs:
           # starts serving as root again must fail the build.
           [ "$(docker exec tools-r id -u)" = 10001 ]
           curl -fsS --json '{"script":"tool <- function(inputs, constants, curves) list(x = inputs$a + inputs$b)","entry":"tool","inputs":{"a":1,"b":2}}' \
-            'http://localhost:8006/ocpu/library/riverdata.tools/R/run_tool/json?auto_unbox=true' | tee /tmp/out
+            'http://localhost:8006/ocpu/library/riverdata.tools/R/run_tool/json?auto_unbox=true' | tr -d ' \n' | tee /tmp/out
           grep -q '"x":3' /tmp/out
           # Inspection is the other half of the surface, and a key built at runtime must come
           # back flagged rather than as a manifest that looks complete.
