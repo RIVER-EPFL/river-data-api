@@ -276,6 +276,14 @@ pub fn api_router(state: &AppState) -> Router<()> {
             "/sensor_calibrations/{id}/window",
             get(crate::routes::private::sensors::calibrations::window::get_calibration_window),
         )
+        .route(
+            "/instruments/overview",
+            get(crate::routes::private::sensors::instruments::get_instruments_overview),
+        )
+        .route(
+            "/standard_curves/{id}/usage",
+            get(crate::routes::private::sensors::instruments::get_curve_usage),
+        )
         .layer(middleware::from_fn(require_read_data))
         .with_state(state.clone());
 
@@ -284,6 +292,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route(
             "/standard_curves/register",
             post(crate::routes::private::sensors::standard_curves::views::register_standard_curve),
+        )
+        .route(
+            "/annotations/register",
+            post(crate::routes::private::annotations::register::register_annotations),
         )
         .route("/streams/retag", post(stream_views::retag_streams))
         .route("/streams/{id}/import", post(stream_views::import_stream))

@@ -6,6 +6,7 @@
 #[allow(dead_code, unused_imports)]
 mod common;
 
+mod annotations_register;
 mod control_plane;
 mod credential_listing_gate;
 mod credentials;

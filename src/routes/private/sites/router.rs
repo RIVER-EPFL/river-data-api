@@ -22,6 +22,7 @@ pub fn service_router(state: &AppState) -> OpenApiRouter {
             crate::routes::private::alarms::views::get_site_alarms
         ))
         .routes(routes!(super::annotations::get_site_annotations))
+        .routes(routes!(super::annotations::get_site_export_summary))
         .routes(routes!(super::sensor_vs_grab::get_sensor_vs_grab))
         .routes(routes!(super::sensor_identity::get_site_sensor_identity))
         .with_state(state.clone())

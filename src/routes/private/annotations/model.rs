@@ -33,6 +33,12 @@ pub struct Model {
     /// annotation up as an audit decision. An admin may still delete the row itself.
     #[crudcrate(exclude(create, update), filterable)]
     pub audit_hold_id: Option<Uuid>,
+    /// Where a source-authored annotation came from, written only by `/annotations/register` so a
+    /// CRUD caller cannot claim sync provenance. NULL on hand-entered annotations.
+    #[crudcrate(exclude(create, update), filterable)]
+    pub source_system: Option<String>,
+    #[crudcrate(exclude(create, update), filterable)]
+    pub source_key: Option<String>,
     #[crudcrate(exclude(create, update))]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }

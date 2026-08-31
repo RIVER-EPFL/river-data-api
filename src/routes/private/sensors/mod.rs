@@ -1,6 +1,7 @@
 pub mod adopt;
 pub mod calibrations;
 pub mod deployments;
+pub mod instruments;
 pub mod model;
 pub mod operations;
 pub mod readings;
