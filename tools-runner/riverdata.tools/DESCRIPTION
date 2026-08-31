@@ -1,0 +1,16 @@
+Package: riverdata.tools
+Type: Package
+Title: Tool Script Runner for the River Data API
+Version: 0.3.0
+Description: Executes analytical tool scripts stored by the River Data API against
+    JSON-shaped inputs. The API posts the script text, an entry function name and the
+    resolved inputs, constants and curves; the result list is returned as JSON.
+    Scripts can also be inspected without being run: parsing alone reports the inputs,
+    constants, curves and outputs a script declares, which is what a tool manifest is
+    written from, a syntax check, and the call structure with line numbers that the
+    API's safety lint applies its policy to.
+License: MIT
+Encoding: UTF-8
+Depends: R (>= 4.0)
+Imports: dplyr, tidyr, magrittr, jsonlite, utils
+Suggests: pracma, signal, bigleaf

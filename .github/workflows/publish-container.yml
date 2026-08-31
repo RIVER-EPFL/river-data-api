@@ -1,7 +1,8 @@
 name: CI
 
-# This workflow builds a docker image and pushes it
-# to the github package registry
+# Builds and publishes two images: the API and the R tools runner it runs beside
+# (tools-runner/). One update-manifest dispatch carries both digests, so the CD
+# pipeline pins them together in enack8s-app-config.
 
 on:
   push:
@@ -15,6 +16,7 @@ env:
   REGISTRY: ghcr.io
   # github.repository as <account>/<repo>
   IMAGE_NAME: ${{ github.repository }}
+  TOOLS_IMAGE_NAME: ${{ github.repository_owner }}/river-data-tools-r
 
 
 jobs:
@@ -104,15 +106,113 @@ jobs:
         run: echo "${{ steps.meta.outputs.tags }}" | xargs -I {} cosign sign --yes {}@${{ steps.build-and-push.outputs.digest }}
 
 
+  build-tools-r:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.build-and-push.outputs.digest }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+        with:
+          cosign-release: 'v2.4.1'
+
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log into registry ${{ env.REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.TOOLS_IMAGE_NAME }}
+
+      - name: Build and push Docker image
+        id: build-and-push
+        uses: docker/build-push-action@v6
+        with:
+          context: tools-runner
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Reported by runtime_info, so a result can be traced to the image that produced it.
+          build-args: |
+            IMAGE_BUILD_SHA=${{ github.sha }}
+          cache-from: type=gha,scope=tools-r
+          cache-to: type=gha,mode=max,scope=tools-r
+
+      # The same check the compose healthcheck runs, plus one real script execution: a build that
+      # resolves packages but cannot execute a tool is a green build of a broken image. It runs
+      # under the same restrictions the deployment applies, so a write that only succeeds on a
+      # writable root filesystem fails here rather than in the cluster. The image is pulled back
+      # by digest; a failure here stops the deploy job, so a broken push is never pinned.
+      - name: Smoke test the image
+        run: |
+          set -euo pipefail
+          image="$(echo "${{ steps.meta.outputs.tags }}" | head -n1 | cut -d: -f1)@${{ steps.build-and-push.outputs.digest }}"
+          docker run -d --name tools-r -p 8006:80 \
+            --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+            --tmpfs /tmp:uid=10001,gid=10001,mode=1777,size=256m \
+            --tmpfs /run/apache2:uid=10001,gid=10001,mode=0750 \
+            --tmpfs /var/lock/apache2:uid=10001,gid=10001,mode=0750 \
+            --tmpfs /var/log/apache2:uid=10001,gid=10001,mode=0750 \
+            --tmpfs /var/log/opencpu:uid=10001,gid=10001,mode=0750 \
+            "$image"
+          for _ in $(seq 1 30); do
+            if curl -fsS -X POST -H 'Content-Type: application/json' -d '{}' \
+                 http://localhost:8006/ocpu/library/riverdata.tools/R/runtime_info/json; then
+              ready=1; break
+            fi
+            sleep 2
+          done
+          [ "${ready:-}" = 1 ] || { docker logs tools-r; exit 1; }
+          # The account is part of the contract, not an implementation detail: a base image that
+          # starts serving as root again must fail the build.
+          [ "$(docker exec tools-r id -u)" = 10001 ]
+          curl -fsS --json '{"script":"tool <- function(inputs, constants, curves) list(x = inputs$a + inputs$b)","entry":"tool","inputs":{"a":1,"b":2}}' \
+            'http://localhost:8006/ocpu/library/riverdata.tools/R/run_tool/json?auto_unbox=true' | tee /tmp/out
+          grep -q '"x":3' /tmp/out
+          # Inspection is the other half of the surface, and a key built at runtime must come
+          # back flagged rather than as a manifest that looks complete.
+          curl -fsS --json '{"script":"tool <- function(inputs, constants, curves) { out <- list(a = inputs$a); out[[paste0(\"b_\", inputs$rep)]] <- 2; out }","entry":"tool"}' \
+            'http://localhost:8006/ocpu/library/riverdata.tools/R/inspect_script/json?auto_unbox=true&na=null' | tr -d ' \n' | tee /tmp/inspect
+          grep -q '"inputs":\["a","rep"\]' /tmp/inspect
+          grep -q '"outputs":\["a"\]' /tmp/inspect
+          grep -q '"dynamic_outputs":{"any":true' /tmp/inspect
+          curl -fsS --json '{"script":"tool <- function(inputs) {"}' \
+            'http://localhost:8006/ocpu/library/riverdata.tools/R/parse_check/json?auto_unbox=true&na=null' | tr -d ' \n' | tee /tmp/parse
+          grep -q '"ok":false' /tmp/parse
+          docker rm -f tools-r
+
+      - name: Sign the published Docker image
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: echo "${{ steps.meta.outputs.tags }}" | xargs -I {} cosign sign --yes {}@${{ steps.build-and-push.outputs.digest }}
+
+
   deploy:
-    needs: build
+    needs: [build, build-tools-r]
     runs-on: ubuntu-latest
     steps:
       # This is used to trigger the correct Gitlab CI pipeline:
       #   push to main: update dev deployment
       #   push a tag: update stage, trigger prod merge req.
+      # Both images are pinned in the same overlay kustomization, matched by name.
       - name: Deploy application to dev
-        if: ${{ github.ref }} == "refs/heads/main"
+        if: github.ref == 'refs/heads/main'
         run: |
           curl -X POST \
           -H "Authorization: Bearer ${{ secrets.CD_TOKEN }}" \
@@ -120,10 +220,14 @@ jobs:
           -d '{
             "event_type": "update-manifest",
             "client_payload": {
-              "digest": "${{ needs.build.outputs.digest }}",
               "repo_name": "${{ secrets.CD_REPO }}",
               "repo_org": "${{ secrets.CD_ORG }}",
-              "branch": "dev"
+              "branch": "dev",
+              "triggered_by": "${{ github.actor }}",
+              "images": [
+                {"name": "ghcr.io/river-epfl/river-data-api", "digest": "${{ needs.build.outputs.digest }}", "ref_name": ""},
+                {"name": "ghcr.io/river-epfl/river-data-tools-r", "digest": "${{ needs.build-tools-r.outputs.digest }}", "ref_name": ""}
+              ]
             }
           }'
 
@@ -136,10 +240,14 @@ jobs:
           -d '{
             "event_type": "update-manifest",
             "client_payload": {
-              "digest": "${{ needs.build.outputs.digest }}",
               "repo_name": "${{ secrets.CD_REPO }}",
               "repo_org": "${{ secrets.CD_ORG }}",
-              "branch": "stage"
+              "branch": "stage",
+              "triggered_by": "${{ github.actor }}",
+              "images": [
+                {"name": "ghcr.io/river-epfl/river-data-api", "digest": "${{ needs.build.outputs.digest }}", "ref_name": "${{ github.ref_name }}"},
+                {"name": "ghcr.io/river-epfl/river-data-tools-r", "digest": "${{ needs.build-tools-r.outputs.digest }}", "ref_name": "${{ github.ref_name }}"}
+              ]
             }
           }'
 
@@ -152,9 +260,13 @@ jobs:
           -d '{
             "event_type": "update-manifest",
             "client_payload": {
-              "digest": "${{ needs.build.outputs.digest }}",
               "repo_name": "${{ secrets.CD_REPO }}",
               "repo_org": "${{ secrets.CD_ORG }}",
-              "branch": "prod"
+              "branch": "prod",
+              "triggered_by": "${{ github.actor }}",
+              "images": [
+                {"name": "ghcr.io/river-epfl/river-data-api", "digest": "${{ needs.build.outputs.digest }}", "ref_name": "${{ github.ref_name }}"},
+                {"name": "ghcr.io/river-epfl/river-data-tools-r", "digest": "${{ needs.build-tools-r.outputs.digest }}", "ref_name": "${{ github.ref_name }}"}
+              ]
             }
           }'
