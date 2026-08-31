@@ -57,6 +57,10 @@ impl MigrationTrait for Migration {
                 FROM _sensor_canon m WHERE ds.sensor_id = m.dup_id;
             UPDATE readings r SET sensor_id = m.canon_id
                 FROM _sensor_canon m WHERE r.sensor_id = m.dup_id;
+            UPDATE status_events se SET sensor_id = m.canon_id
+                FROM _sensor_canon m WHERE se.sensor_id = m.dup_id;
+            UPDATE reprocessing_jobs rj SET sensor_id = m.canon_id
+                FROM _sensor_canon m WHERE rj.sensor_id = m.dup_id;
 
             -- 4. Delete the now-orphaned duplicate sensor rows.
             DELETE FROM sensors s USING _sensor_canon m WHERE s.id = m.dup_id;

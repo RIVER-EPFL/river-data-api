@@ -3,7 +3,7 @@
 //!
 //! These tests need the OpenCPU runner on localhost:8006.
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::DatabaseConnection;
 use serde_json::json;
 use serial_test::serial;
 
@@ -19,22 +19,14 @@ async fn setup() -> (DatabaseConnection, axum::Router, String) {
     (db, app, admin)
 }
 
-/// The R source and entry function of a seeded tool's active version.
-async fn active_script(db: &DatabaseConnection, name: &str) -> (String, String) {
-    let row = db
-        .query_one(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT v.script, v.entry_function
-              FROM tool_scripts s JOIN tool_script_versions v ON v.id = s.active_version_id
-              WHERE s.name = $1",
-            [name.into()],
-        ))
-        .await
-        .expect("query ran")
-        .unwrap_or_else(|| panic!("tool '{name}' is seeded and active"));
+/// The stored form of a seed tool's script, built from its files the way the migration builds
+/// it. Inspection takes script text, not a seeded row, so tools not yet in the seed list stay
+/// covered from their porting sources under `tool_seed/`.
+fn seed_script(wrapper: &str) -> (String, String) {
+    const PRELUDE: &str = include_str!("../../migration/tool_seed/prelude.R");
     (
-        row.try_get("", "script").expect("script"),
-        row.try_get("", "entry_function").expect("entry"),
+        migration::tool_prelude::script_for(PRELUDE, wrapper),
+        "tool".to_string(),
     )
 }
 
@@ -69,9 +61,9 @@ async fn a_seeded_script_reports_the_inputs_and_curve_slots_it_reads() {
     if !kc::require_keycloak_or_skip("tool_script_inspect_seeded").await {
         return;
     }
-    let (db, app, admin) = setup().await;
+    let (_db, app, admin) = setup().await;
 
-    let (script, entry) = active_script(&db, "tss_afdm").await;
+    let (script, entry) = seed_script(include_str!("../../migration/tool_seed/tss_afdm/wrapper.R"));
     let (status, out) = inspect(
         &app,
         &json!({ "script": script, "entry_function": entry }),
@@ -107,7 +99,7 @@ async fn a_seeded_script_reports_the_inputs_and_curve_slots_it_reads() {
         "the prelude functions the entry calls: {prelude_used:?}"
     );
 
-    let (script, entry) = active_script(&db, "chlorophyll").await;
+    let (script, entry) = seed_script(include_str!("../../migration/tool_seed/chlorophyll/wrapper.R"));
     let (status, out) = inspect(
         &app,
         &json!({ "script": script, "entry_function": entry }),
@@ -137,8 +129,8 @@ async fn runtime_built_output_names_are_reported_as_dynamic() {
     if !kc::require_keycloak_or_skip("tool_script_inspect_dynamic").await {
         return;
     }
-    let (db, app, admin) = setup().await;
-    let (script, entry) = active_script(&db, "pco2").await;
+    let (_db, app, admin) = setup().await;
+    let (script, entry) = seed_script(include_str!("../../migration/tool_seed/pco2/wrapper.R"));
 
     let (status, out) = inspect(
         &app,
@@ -215,8 +207,8 @@ async fn a_manifest_is_reconciled_in_both_directions() {
     if !kc::require_keycloak_or_skip("tool_script_inspect_reconcile").await {
         return;
     }
-    let (db, app, admin) = setup().await;
-    let (script, entry) = active_script(&db, "tss_afdm").await;
+    let (_db, app, admin) = setup().await;
+    let (script, entry) = seed_script(include_str!("../../migration/tool_seed/tss_afdm/wrapper.R"));
 
     let manifest = json!({
         "label": "Partial TSS",
@@ -286,8 +278,8 @@ async fn reconciling_a_dynamic_script_reports_its_lists_as_incomplete() {
     if !kc::require_keycloak_or_skip("tool_script_inspect_reconcile_dynamic").await {
         return;
     }
-    let (db, app, admin) = setup().await;
-    let (script, entry) = active_script(&db, "chlorophyll").await;
+    let (_db, app, admin) = setup().await;
+    let (script, entry) = seed_script(include_str!("../../migration/tool_seed/chlorophyll/wrapper.R"));
 
     let (status, out) = inspect(
         &app,

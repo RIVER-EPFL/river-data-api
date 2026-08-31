@@ -71,7 +71,6 @@ mod m20260818_000004_sample_provenance;
 mod m20260818_000005_seed_tool_scripts;
 mod m20260818_000006_analyte_catalog;
 mod m20260818_000007_tool_script_version_note;
-mod m20260818_000008_tool_output_analytes;
 mod m20260820_000001_standard_curve_provenance;
 mod m20260820_000002_replicate_audit_holds;
 mod m20260820_000003_audit_hold_resolutions;
@@ -164,7 +163,6 @@ impl MigratorTrait for Migrator {
             Box::new(m20260818_000005_seed_tool_scripts::Migration),
             Box::new(m20260818_000006_analyte_catalog::Migration),
             Box::new(m20260818_000007_tool_script_version_note::Migration),
-            Box::new(m20260818_000008_tool_output_analytes::Migration),
             Box::new(m20260820_000001_standard_curve_provenance::Migration),
             Box::new(m20260820_000002_replicate_audit_holds::Migration),
             Box::new(m20260820_000003_audit_hold_resolutions::Migration),

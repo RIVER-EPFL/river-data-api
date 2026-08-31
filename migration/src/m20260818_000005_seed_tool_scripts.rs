@@ -30,20 +30,9 @@ macro_rules! seed {
     };
 }
 
-const SEEDS: &[Seed] = &[
-    seed!("alkalinity"),
-    seed!("benthic"),
-    seed!("chlorophyll"),
-    seed!("co2_air"),
-    seed!("dic"),
-    seed!("discharge"),
-    seed!("doc"),
-    seed!("dom"),
-    seed!("field_data"),
-    seed!("nutrients"),
-    seed!("pco2"),
-    seed!("tss_afdm"),
-];
+// Tools enter this list one at a time as they are reworked onto the replicates model;
+// the remaining portal tools live under `tool_seed/` as porting sources until then.
+const SEEDS: &[Seed] = &[seed!("doc")];
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {

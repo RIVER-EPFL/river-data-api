@@ -1,8 +1,8 @@
 //! The statistic a tool displays and the statistic the database derives from the stored
 //! replicates are the same number, which is why only the per-replicate outputs are saved.
 //!
-//! Scenario: a tool run emits a replicate family (`NUT_NO3_rep_A/B/C`) alongside `_avg` and `_sd`
-//! summaries carrying a non-null `aggregate_of`. The portal saves the replicates through
+//! Scenario: a tool takes a `replicates` input (`DOC`) and emits `_avg` and `_sd` summaries
+//! carrying a non-null `aggregate_of`. The portal saves the replicates through
 //! `POST /api/grab_samples` and never the summaries; the `samples` trigger recomputes
 //! AVG / STDDEV_SAMP / COUNT / MIN / MAX over the unflagged replicates.
 //!
@@ -32,28 +32,19 @@ fn close(a: f64, b: f64) -> bool {
 const GRAB_TIME: &str = "2025-04-02T09:00:00Z";
 const OTHER_TIME: &str = "2025-04-02T11:00:00Z";
 
-/// The nutrients case whose NOx and NO2 replicates give three distinct, non-zero NO3 replicates.
+/// Three distinct, non-zero replicates with a meaningful spread.
+const THREE: [f64; 3] = [152.096891818801, 170.668450477067, 255.669204764999];
+
 fn three_replicate_inputs() -> serde_json::Value {
-    json!({
-        "NUT_NOx_rep_A": 156.276927627623,
-        "NUT_NOx_rep_B": 178.205307442695,
-        "NUT_NOx_rep_C": 264.759755562991,
-        "NUT_NO2_rep_A": 4.18003580882214,
-        "NUT_NO2_rep_B": 7.53685696562752,
-        "NUT_NO2_rep_C": 9.09055079799145
-    })
+    json!({ "DOC": THREE })
 }
 
-/// The nutrients case where one NOx replicate is absent, so the wrapper omits `NUT_NO3_rep_B`
-/// and the emitted replicate set is A and C.
+/// The middle vial is a gap: position 1 is null, so the vials keep their positions and the
+/// summaries reduce over the two measured values.
+const GAPPED: [f64; 2] = [150.10958879767, 108.224372683933];
+
 fn gapped_replicate_inputs() -> serde_json::Value {
-    json!({
-        "NUT_NOx_rep_A": 163.772682817653,
-        "NUT_NOx_rep_C": 120.020357398316,
-        "NUT_NO2_rep_A": 13.663094019983,
-        "NUT_NO2_rep_B": 4.37098467035685,
-        "NUT_NO2_rep_C": 11.7953121144092
-    })
+    json!({ "DOC": [GAPPED[0], null, GAPPED[1]] })
 }
 
 struct SampleAggregate {
@@ -182,15 +173,11 @@ async fn stored_sample_statistics_equal_the_tools_own_summaries() {
     }
     let (db, app, token) = setup().await;
 
-    let run = calculate(&app, "nutrients", three_replicate_inputs(), &token).await;
+    let run = calculate(&app, "doc", three_replicate_inputs(), &token).await;
     let results = &run["results"];
-    let replicates = [
-        (0i16, number(results, "NUT_NO3_rep_A")),
-        (1, number(results, "NUT_NO3_rep_B")),
-        (2, number(results, "NUT_NO3_rep_C")),
-    ];
-    let tool_avg = number(results, "NUT_NO3_avg");
-    let tool_sd = number(results, "NUT_NO3_sd");
+    let replicates = [(0i16, THREE[0]), (1, THREE[1]), (2, THREE[2])];
+    let tool_avg = number(results, "DOC_avg_ppb");
+    let tool_sd = number(results, "DOC_sd_ppb");
     assert!(
         tool_sd > 1.0,
         "the inputs must give a meaningful spread, got sd {tool_sd}"
@@ -209,11 +196,11 @@ async fn stored_sample_statistics_equal_the_tools_own_summaries() {
     let (mean, stdev) = (agg.mean.unwrap(), agg.stdev.unwrap());
     assert!(
         close(mean, tool_avg),
-        "stored mean {mean} vs tool NUT_NO3_avg {tool_avg}"
+        "stored mean {mean} vs tool DOC_avg_ppb {tool_avg}"
     );
     assert!(
         close(stdev, tool_sd),
-        "stored stdev {stdev} vs tool NUT_NO3_sd {tool_sd}"
+        "stored stdev {stdev} vs tool DOC_sd_ppb {tool_sd}"
     );
     assert!(close(agg.min_value.unwrap(), lo));
     assert!(close(agg.max_value.unwrap(), hi));
@@ -277,13 +264,11 @@ async fn flagging_a_replicate_moves_the_statistics_off_the_original_run() {
     }
     let (db, app, token) = setup().await;
 
-    let run = calculate(&app, "nutrients", three_replicate_inputs(), &token).await;
+    let run = calculate(&app, "doc", three_replicate_inputs(), &token).await;
     let results = &run["results"];
-    let a = number(results, "NUT_NO3_rep_A");
-    let b = number(results, "NUT_NO3_rep_B");
-    let c = number(results, "NUT_NO3_rep_C");
-    let tool_avg = number(results, "NUT_NO3_avg");
-    let tool_sd = number(results, "NUT_NO3_sd");
+    let [a, b, c] = THREE;
+    let tool_avg = number(results, "DOC_avg_ppb");
+    let tool_sd = number(results, "DOC_sd_ppb");
 
     save_replicates(&app, &token, GRAB_TIME, &[(0, a), (1, b), (2, c)]).await;
 
@@ -324,10 +309,10 @@ async fn flagging_a_replicate_moves_the_statistics_off_the_original_run() {
     );
 }
 
-/// Scenario: a replicate is uncomputable, so the wrapper omits its key and the emitted family is
-/// A and C with no B.
+/// Scenario: the middle vial was not measured, so position 1 is a gap and the measured set is
+/// positions 0 and 2.
 ///
-/// Expected behaviour: sent with explicit indices the letters survive the save (A -> 0, C -> 2)
+/// Expected behaviour: sent with explicit indices the positions survive the save (0 and 2)
 /// and the statistics still match the tool's summaries over the two values. Sent without indices
 /// the group numbers from 0, which collapses C onto index 1: the letter is recoverable only from
 /// an explicit index.
@@ -343,16 +328,11 @@ async fn a_gapped_replicate_set_saves_and_keeps_its_letters_only_when_indices_ar
     }
     let (db, app, token) = setup().await;
 
-    let run = calculate(&app, "nutrients", gapped_replicate_inputs(), &token).await;
+    let run = calculate(&app, "doc", gapped_replicate_inputs(), &token).await;
     let results = &run["results"];
-    assert!(
-        results.get("NUT_NO3_rep_B").is_none(),
-        "the middle replicate is not emitted: {results}"
-    );
-    let a = number(results, "NUT_NO3_rep_A");
-    let c = number(results, "NUT_NO3_rep_C");
-    let tool_avg = number(results, "NUT_NO3_avg");
-    let tool_sd = number(results, "NUT_NO3_sd");
+    let [a, c] = GAPPED;
+    let tool_avg = number(results, "DOC_avg_ppb");
+    let tool_sd = number(results, "DOC_sd_ppb");
 
     save_replicates(&app, &token, GRAB_TIME, &[(0, a), (2, c)]).await;
 
@@ -367,11 +347,11 @@ async fn a_gapped_replicate_set_saves_and_keeps_its_letters_only_when_indices_ar
     let (mean, stdev) = (agg.mean.unwrap(), agg.stdev.unwrap());
     assert!(
         close(mean, tool_avg),
-        "stored mean {mean} vs tool NUT_NO3_avg {tool_avg}"
+        "stored mean {mean} vs tool DOC_avg_ppb {tool_avg}"
     );
     assert!(
         close(stdev, tool_sd),
-        "stored stdev {stdev} vs tool NUT_NO3_sd {tool_sd}"
+        "stored stdev {stdev} vs tool DOC_sd_ppb {tool_sd}"
     );
 
     // The same pair sent without indices: `assign_replicate_indices` numbers the group from 0 in

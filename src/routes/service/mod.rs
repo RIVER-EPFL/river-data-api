@@ -3,7 +3,7 @@ use axum::{
     extract::{Request, State},
     middleware,
     response::Response,
-    routing::{delete, get, patch, post, put},
+    routing::{get, patch, post, put},
 };
 use tower_http::limit::RequestBodyLimitLayer;
 use utoipa_axum::router::OpenApiRouter;

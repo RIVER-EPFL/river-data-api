@@ -110,7 +110,7 @@ async fn every_seeded_hash_recomputes_from_the_row_it_identifies() {
         ))
         .await
         .expect("read the seeded versions");
-    assert_eq!(rows.len(), 12, "every shipped tool was seeded");
+    assert_eq!(rows.len(), 1, "the seed list holds doc alone until each tool is reworked");
 
     for row in &rows {
         let name: String = row.try_get("", "name").expect("name");
@@ -137,14 +137,14 @@ async fn every_seeded_hash_recomputes_from_the_row_it_identifies() {
         );
     }
 
-    let alkalinity_tolerance: Option<String> = scalar(
+    let doc_tolerance: Option<String> = scalar(
         &db,
         "SELECT v.test_cases->>'tolerance' AS v FROM tool_script_versions v \
-         JOIN tool_scripts s ON s.id = v.tool_script_id WHERE s.name = 'alkalinity'",
+         JOIN tool_scripts s ON s.id = v.tool_script_id WHERE s.name = 'doc'",
     )
     .await;
     assert_eq!(
-        alkalinity_tolerance.as_deref(),
+        doc_tolerance.as_deref(),
         Some("0.000000001"),
         "the tolerance the seed file writes as 1e-9 is the one jsonb renormalises"
     );

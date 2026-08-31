@@ -126,7 +126,7 @@ async fn a_result_carries_the_constants_and_curves_the_server_resolved() {
     {
         return;
     }
-    let (_db, app, token) = setup().await;
+    let (db, app, token) = setup().await;
 
     let (status, json) = calculate(
         &app,
@@ -147,34 +147,28 @@ async fn a_result_carries_the_constants_and_curves_the_server_resolved() {
     assert_eq!(curves[0]["curve"]["intercept"], -2.0);
     assert_eq!(curves[0]["curve"]["label"], "bench curve");
 
-    let (status, json) = calculate(
-        &app,
-        "pco2",
-        json!({
-            "water_temp_c": 25.0,
-            "lab_co2_co2ppm_rep_A": 3774.31004084647,
-            "lab_co2_h2o_rep_A": 3.04813831089996,
-            "lab_co2_ch4_rep_A": 476.103632267332,
-            "lab_temp_c": 17.0519462262746,
-            "lab_pressure_hpa": 1012.5826292476703
+    // No seeded tool declares constants yet, so the probe names three from the seeded table.
+    install_probe_tool(
+        &db,
+        &json!({
+            "label": "Probe",
+            "params": [
+                { "name": "verbose", "label": "Verbose", "kind": "boolean", "required": false,
+                  "default": false }
+            ],
+            "constants": ["c_const", "gas_const_r_atm", "gas_const_r_mol"],
+            "outputs": [
+                { "key": "verbose_seen", "label": "Verbose seen", "per_replicate": false }
+            ]
         }),
-        &token,
     )
     .await;
+
+    let (status, json) = calculate(&app, PROBE, json!({}), &token).await;
     assert_eq!(status, 200, "{json}");
 
     let constants = json["constants"].as_object().expect("constants map");
-    for name in [
-        "c_const",
-        "gas_const_r_atm",
-        "gas_const_r_mol",
-        "h_ch4_29815k",
-        "ch4_in_sa",
-        "lab_temp_avg_degC",
-        "lab_press_avg_atm",
-        "vol_sa",
-        "vol_water",
-    ] {
+    for name in ["c_const", "gas_const_r_atm", "gas_const_r_mol"] {
         assert!(
             constants
                 .get(name)
@@ -182,6 +176,7 @@ async fn a_result_carries_the_constants_and_curves_the_server_resolved() {
             "constant {name} missing from {constants:?}"
         );
     }
+    remove_probe_tool(&db).await;
 }
 
 /// Expected behaviour: the runtime that executed the script is part of the result's identity.
@@ -366,7 +361,8 @@ async fn a_structured_param_is_checked_against_its_declaration() {
                         "values": 3 },
                       { "name": "wgt_dried_g", "label": "Filter dried", "units": "g",
                         "send": false }
-                  ] } }
+                  ] } },
+                { "name": "flat", "label": "Flat", "kind": "number", "required": false }
             ],
             "outputs": [
                 { "key": "verbose_seen", "label": "Verbose seen", "per_replicate": false }
@@ -391,16 +387,16 @@ async fn a_structured_param_is_checked_against_its_declaration() {
     let undeclared = calculate(&app, PROBE, row(json!({ "fluor_middle": 12.0 })), &token).await;
     let entry_only = calculate(&app, PROBE, row(json!({ "wgt_dried_g": 0.02 })), &token).await;
     let wrong_arity = calculate(&app, PROBE, row(json!({ "diameters_cm": 10.0 })), &token).await;
-    // A flat replicate family is checked the same way: the declared cell is a number of its own,
-    // and a list where a number is declared is refused rather than reaching the script.
-    let flat_cell = calculate(&app, "nutrients", json!({ "NUT_TDP_rep_A": 7.0 }), &token).await;
-    let flat_cell_wrong_arity = calculate(
-        &app,
-        "nutrients",
-        json!({ "NUT_TDP_rep_A": [7.0, 8.0, 9.0] }),
-        &token,
-    )
-    .await;
+    // A flat cell is checked the same way: the declared value is a number of its own, and a
+    // list where a number is declared is refused rather than reaching the script.
+    let with_flat = |value: serde_json::Value| {
+        let mut body = row(json!({}));
+        body["flat"] = value;
+        body
+    };
+    let flat_cell = calculate(&app, PROBE, with_flat(json!(7.0)), &token).await;
+    let flat_cell_wrong_arity =
+        calculate(&app, PROBE, with_flat(json!([7.0, 8.0, 9.0])), &token).await;
 
     assert_eq!(declared.0, 200, "{}", declared.1);
     for (name, (status, body)) in [

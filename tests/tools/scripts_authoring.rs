@@ -855,8 +855,8 @@ async fn every_shipped_tool_script_passes_the_lint() {
         .await
         .expect("active versions read");
     assert!(
-        rows.len() >= 13,
-        "the seeded tools are present: {}",
+        rows.len() >= 2,
+        "the seeded tool and the created subject are present: {}",
         rows.len()
     );
 
