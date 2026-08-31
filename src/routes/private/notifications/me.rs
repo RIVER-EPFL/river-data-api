@@ -420,10 +420,12 @@ async fn send_to_user(
         return Err(AppError::Internal("VAPID subject not configured".to_string()));
     };
 
+    // A unique tag per send: notifications sharing a tag replace each other, so a fixed
+    // "test" tag makes the second test silently overwrite the first instead of alerting.
     let payload = serde_json::json!({
         "title": title,
         "body": body,
-        "tag": "test",
+        "tag": format!("test-{}", Utc::now().timestamp_millis()),
     })
     .to_string();
 
