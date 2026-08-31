@@ -2126,10 +2126,29 @@ pub struct PlanUnassignedParameter {
     pub suggested_name: String,
 }
 
+/// One standard curve the source has replicated, and the instrument it is currently fitted on.
+/// Re-homing is a curve-level decision, so the curves are listed in their own right rather than
+/// only inside the instrument that happens to own them.
+#[derive(Debug, Serialize)]
+pub struct PlanCurveAssignment {
+    pub id: Uuid,
+    pub name: Option<String>,
+    pub slope: f64,
+    pub intercept: f64,
+    pub r_squared: Option<f64>,
+    pub source_key: Option<String>,
+    pub sensor_id: Uuid,
+    pub instrument_name: String,
+    /// Readings this curve has already corrected. A curve with history is one whose instrument a
+    /// re-home changes the meaning of, so the number is shown beside the choice.
+    pub reading_count: i64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PlanInstrumentsResponse {
     pub groups: Vec<PlanInstrumentGroup>,
     pub unassigned: Vec<PlanUnassignedParameter>,
+    pub curves: Vec<PlanCurveAssignment>,
 }
 
 /// The instrument picture of a pairing plan: every instrument the plan binds, and the parameters
@@ -2253,8 +2272,69 @@ pub async fn plan_instruments(
             ))
     });
 
+    // Every curve the source replicated, with the instrument it sits on and how much data it has
+    // corrected. Independent of what this plan binds: a curve on the wrong instrument is a thing to
+    // fix whether or not a stream in this plan names it.
+    let instrument_names: std::collections::HashMap<Uuid, String> = sensors::Entity::find()
+        .filter(sensors::Column::SourceSystem.eq(plan.source_system.clone()))
+        .all(&state.db)
+        .await?
+        .into_iter()
+        .map(|s| {
+            let name = s
+                .name
+                .clone()
+                .or_else(|| s.serial_number.clone())
+                .unwrap_or_else(|| s.id.to_string());
+            (s.id, name)
+        })
+        .collect();
+    let mut usage: std::collections::HashMap<Uuid, i64> = std::collections::HashMap::new();
+    for row in state
+        .db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT standard_curve_id AS id, COUNT(*) AS n FROM readings
+             WHERE standard_curve_id IS NOT NULL GROUP BY standard_curve_id"
+                .to_string(),
+        ))
+        .await?
+    {
+        usage.insert(row.try_get::<Uuid>("", "id")?, row.try_get::<i64>("", "n")?);
+    }
+    let mut curves: Vec<PlanCurveAssignment> =
+        crate::routes::private::sensors::standard_curves::Entity::find()
+            .filter(
+                crate::routes::private::sensors::standard_curves::Column::SourceSystem
+                    .eq(plan.source_system.clone()),
+            )
+            .all(&state.db)
+            .await?
+            .into_iter()
+            .map(|c| PlanCurveAssignment {
+                instrument_name: instrument_names
+                    .get(&c.sensor_id)
+                    .cloned()
+                    .unwrap_or_else(|| c.sensor_id.to_string()),
+                reading_count: usage.get(&c.id).copied().unwrap_or(0),
+                id: c.id,
+                name: c.name,
+                slope: c.slope,
+                intercept: c.intercept,
+                r_squared: c.r_squared,
+                source_key: c.source_key,
+                sensor_id: c.sensor_id,
+            })
+            .collect();
+    curves.sort_by(|a, b| {
+        a.instrument_name
+            .cmp(&b.instrument_name)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
     Ok(Json(PlanInstrumentsResponse {
         groups,
         unassigned: unassigned.into_values().collect(),
+        curves,
     }))
 }
