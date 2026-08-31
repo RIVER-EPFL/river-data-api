@@ -290,9 +290,10 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
     );
 
     // The same claim on the stream that names no instrument, which is the state every curve stream
-    // was in before the plan settled one. Nothing errors: the reading is counted out and gone,
-    // which is why an unresolved curve column has to block the apply rather than warn about it.
-    let (status, dropped) = crate::common::post_json_parse_with_token(
+    // was in before the plan settled one. The reading is stored uncorrected, the claim is stripped
+    // into a review hold, and nothing is lost. The unresolved curve column still blocks the plan
+    // apply: until an instrument is settled, no claim on the stream can ever verify.
+    let (status, stripped) = crate::common::post_json_parse_with_token(
         &app,
         "/api/ingest",
         &json!({
@@ -306,18 +307,34 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
         &admin,
     )
     .await;
-    assert_eq!(status, 200, "ingest ({status}): {dropped}");
+    assert_eq!(status, 200, "ingest ({status}): {stripped}");
     assert_eq!(
-        dropped["inserted"], 0,
-        "a curve claim from a stream naming no instrument stores nothing: {dropped}",
+        stripped["inserted"], 1,
+        "the reading is stored; only the unverifiable claim is refused: {stripped}",
     );
-    assert_eq!(dropped["skipped"], 1, "{dropped}");
-    assert!(
-        dropped["skipped_reasons"]
-            .as_array()
-            .is_some_and(|r| r
-                .iter()
-                .any(|s| s.as_str().is_some_and(|s| s.contains("standard_curve_id")))),
-        "and says so: {dropped}",
+    assert_eq!(stripped["skipped"], 0, "{stripped}");
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM readings WHERE stream_id = '{plain}' \
+                 AND standard_curve_id IS NULL AND calibrated_value IS NULL"
+            )
+        )
+        .await,
+        1,
+        "stored uncorrected with no stamped curve",
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM replicate_audit_holds WHERE stream_id = '{plain}' \
+                 AND kind = 'curve_claim_stripped' AND status = 'pending'"
+            )
+        )
+        .await,
+        1,
+        "the stripped claim is a review-queue hold",
     );
 }

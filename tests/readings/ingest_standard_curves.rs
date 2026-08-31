@@ -1,6 +1,7 @@
 //! `/ingest` accepting a per-reading `standard_curve_id`: the stored value is computed from the
-//! curve's coefficients on top of any base calibration, the reference is stamped, and a claim
-//! naming another instrument's curve is skipped and counted rather than refusing the batch.
+//! curve's coefficients on top of any base calibration and the reference is stamped. A claim
+//! naming another instrument's curve is stripped, never the reading: the value is stored
+//! uncorrected and the claim lands in the review queue as a `curve_claim_stripped` hold.
 //!
 //! Run: cargo test --test readings ingest_standard_curves -- --test-threads=1
 
@@ -157,7 +158,7 @@ async fn curve_stamped_replicates_match_portal_mean() {
 
 #[tokio::test]
 #[serial]
-async fn wrong_instrument_curve_skipped_and_counted() {
+async fn wrong_instrument_curve_stripped_and_held() {
     let fx = setup().await;
     let (_doc_curve, doc_sensor) = register_curve(&fx, "standard_curves:17", "DOC corr").await;
     let (tn_curve, _tn_sensor) = register_curve(&fx, "standard_curves:18", "TN corr").await;
@@ -173,23 +174,53 @@ async fn wrong_instrument_curve_skipped_and_counted() {
     )
     .await;
     assert_eq!(status, 200, "ingest ({status}): {body}");
-    assert_eq!(body["inserted"], 0);
-    assert_eq!(body["skipped"], 1, "the wrong-instrument claim is skipped");
-    let reasons = body["skipped_reasons"].as_array().unwrap();
+    assert_eq!(body["inserted"], 1, "the reading is stored, only the claim is refused");
+    assert_eq!(body["skipped"], 0);
+
+    let row = fx
+        .db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT raw_value, calibrated_value, standard_curve_id FROM readings \
+                 WHERE stream_id = '{stream}'"
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the reading is stored");
+    assert_eq!(row.try_get::<f64>("", "raw_value").unwrap(), 10.0);
     assert!(
-        reasons.iter().any(|r| r
-            .as_str()
+        row.try_get::<Option<f64>>("", "calibrated_value")
             .unwrap()
-            .starts_with("standard_curve_id names no curve admissible for this reading")),
-        "the skip names its reason: {reasons:?}"
+            .is_none(),
+        "stored uncorrected: no curve was verifiably applicable"
     );
+    assert!(
+        row.try_get::<Option<uuid::Uuid>>("", "standard_curve_id")
+            .unwrap()
+            .is_none(),
+        "the inadmissible claim is not stamped"
+    );
+
+    let hold = fx
+        .db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT status, expected FROM replicate_audit_holds \
+                 WHERE stream_id = '{stream}' AND kind = 'curve_claim_stripped'"
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the stripped claim raises a hold");
+    assert_eq!(hold.try_get::<String>("", "status").unwrap(), "pending");
+    let expected = hold.try_get::<serde_json::Value>("", "expected").unwrap();
+    let claim = &expected["claims"][0];
+    assert_eq!(claim["standard_curve_id"], json!(tn_curve));
     assert_eq!(
-        count(
-            &fx.db,
-            &format!("SELECT COUNT(*) FROM readings WHERE stream_id = '{stream}'"),
-        )
-        .await,
-        0,
-        "the inadmissible reading is not stored"
+        claim["reason"],
+        json!("fitted on a different instrument than the reading's")
     );
 }

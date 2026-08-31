@@ -71,7 +71,8 @@ pub struct IngestReading {
     /// The lab standard curve that corrects this reading, for sync services replaying portal
     /// measurements that carried one. Held to the grab rules: the reading must be a spot
     /// measurement on the instrument the curve was fitted on, and the stored value is recomputed
-    /// from the curve's coefficients. An inadmissible claim skips the reading and is counted.
+    /// from the curve's coefficients. An inadmissible claim is stripped: the reading is stored
+    /// uncorrected and a `curve_claim_stripped` hold records the claim for review.
     #[serde(default)]
     pub standard_curve_id: Option<Uuid>,
 }
@@ -432,8 +433,11 @@ pub async fn ingest_readings(
     };
 
     // Standard curve claims, held to the grab rules (fitted on the reading's instrument, spot
-    // measurement) but skipped-and-counted rather than refused: a wrong claim stays wrong on
-    // every retry, and refusing the batch would stall the stream's cursor behind it.
+    // measurement). An inadmissible claim is stripped, never the reading: the value is stored
+    // uncorrected and the claim lands in the review queue as a `curve_claim_stripped` hold, so
+    // a mis-homed curve or a mis-declared stream instrument costs a correction, not data.
+    let mut stripped_claims: HashMap<chrono::DateTime<Utc>, Vec<serde_json::Value>> =
+        HashMap::new();
     let standard_curves_by_id: HashMap<Uuid, Curve> = {
         let mut ids: Vec<Uuid> = payload
             .readings
@@ -451,9 +455,9 @@ pub async fn ingest_readings(
                 .await?;
             let by_id: HashMap<Uuid, &standard_curves::Model> =
                 rows.iter().map(|c| (c.id, c)).collect();
-            payload.readings.retain(|r| {
+            for r in payload.readings.iter_mut() {
                 let Some(id) = r.standard_curve_id else {
-                    return true;
+                    continue;
                 };
                 let sensor_id = r
                     .sensor_id
@@ -466,18 +470,29 @@ pub async fn ingest_readings(
                         sensor_id,
                         &sensor_types,
                     );
-                let admissible = by_id
-                    .get(&id)
-                    .is_some_and(|c| Some(c.sensor_id) == sensor_id)
-                    && measurement_type == readings::sample_groups::SPOT;
-                if !admissible {
-                    record_rejection(&mut counts, admission::RejectionKind::InvalidStandardCurve);
-                    if track_rejections {
-                        rejected_keys.insert((r.time, r.replicate_index));
+                let reason = match by_id.get(&id) {
+                    None => Some("names no standard curve"),
+                    Some(c) if Some(c.sensor_id) != sensor_id => {
+                        Some("fitted on a different instrument than the reading's")
                     }
+                    Some(_) if measurement_type != readings::sample_groups::SPOT => {
+                        Some("the reading is not a spot measurement")
+                    }
+                    Some(_) => None,
+                };
+                if let Some(reason) = reason {
+                    r.standard_curve_id = None;
+                    stripped_claims.entry(r.time).or_default().push(
+                        serde_json::json!({
+                            "replicate_index": r.replicate_index,
+                            "standard_curve_id": id,
+                            "curve_instrument_id": by_id.get(&id).map(|c| c.sensor_id),
+                            "reading_instrument_id": sensor_id,
+                            "reason": reason,
+                        }),
+                    );
                 }
-                admissible
-            });
+            }
             rows.into_iter()
                 .map(|c| {
                     (
@@ -679,6 +694,19 @@ pub async fn ingest_readings(
                 }
             }
         }
+    }
+    // After the statistics audit on purpose: at one (stream, instant) key the later upsert wins,
+    // and a stripped claim explains the disagreement the audit would otherwise report bare.
+    if !stripped_claims.is_empty() {
+        let hold_status = if paired { "pending" } else { "deferred" };
+        for (time, claims) in &stripped_claims {
+            upsert_curve_claim_hold(db, payload.stream_id, *time, claims, hold_status).await?;
+        }
+        tracing::warn!(
+            stream_id = %payload.stream_id,
+            instants = stripped_claims.len(),
+            "Inadmissible standard curve claims stripped; readings stored uncorrected and held for review"
+        );
     }
     if payload.readings.is_empty() && payload.window.is_none() {
         return Ok(Json(ingest_outcome(
@@ -956,6 +984,36 @@ pub async fn ingest_readings(
     }
     tracing::debug!(total, inserted = outcome.inserted, skipped = outcome.skipped, changed = outcome.changed, withdrawn = outcome.withdrawn, stream_id = %payload.stream_id, paired, "Ingest complete");
     Ok(Json(outcome))
+}
+
+/// One review-queue row per instant whose standard curve claims were stripped. `expected` carries
+/// the claims as the source made them, `computed` what was stored instead; the (stream, instant)
+/// upsert key matches the statistics audit's, so re-detection updates in place.
+async fn upsert_curve_claim_hold<C: ConnectionTrait>(
+    conn: &C,
+    stream_id: Uuid,
+    group_time: chrono::DateTime<Utc>,
+    claims: &[serde_json::Value],
+    status: &str,
+) -> AppResult<()> {
+    conn.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO replicate_audit_holds
+             (stream_id, group_time, kind, expected, computed, delta, status)
+         VALUES ($1, $2, 'curve_claim_stripped', $3, $4, '{}'::jsonb, $5)
+         ON CONFLICT (stream_id, group_time) WHERE status IN ('pending', 'deferred')
+         DO UPDATE SET expected = EXCLUDED.expected, computed = EXCLUDED.computed,
+                       kind = 'curve_claim_stripped', created_at = NOW()",
+        [
+            stream_id.into(),
+            sea_orm::prelude::DateTimeWithTimeZone::from(group_time).into(),
+            serde_json::json!({ "claims": claims }).into(),
+            serde_json::json!({ "stored_without_curve": claims.len() }).into(),
+            status.into(),
+        ],
+    ))
+    .await?;
+    Ok(())
 }
 
 /// Add one rejection to the per-kind tally.
