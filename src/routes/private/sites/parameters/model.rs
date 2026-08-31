@@ -52,7 +52,9 @@ pub struct Model {
     /// 'population' (divisor n). NULL is UNDECLARED, not a synonym for 'sample': the sources use
     /// both conventions and which one a slot publishes is a decision, so an undeclared slot is
     /// reported and its population-signature audit holds cannot be waved through.
-    #[crudcrate(filterable)]
+    /// Excluded from update: a declaration change must recompute the slot's stored samples, so it
+    /// goes through `POST /site_parameters/{id}/declare_sd_estimator`, which enqueues the retag.
+    #[crudcrate(filterable, exclude(update))]
     pub sd_estimator: Option<String>,
     #[crudcrate(filterable)]
     pub is_derived: Option<bool>,

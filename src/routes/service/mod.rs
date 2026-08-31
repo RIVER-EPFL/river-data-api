@@ -491,6 +491,12 @@ pub fn api_router(state: &AppState) -> Router<()> {
             "/schedules/{job_name}/run_now",
             post(crate::routes::private::reprocessing_jobs::schedule_routes::run_now),
         )
+        // A declaration change recomputes the slot's stored samples, the same act as the audit
+        // resolution's slot scope, so it carries the same MANAGER gate rather than catalog CRUD.
+        .route(
+            "/site_parameters/{id}/declare_sd_estimator",
+            post(crate::routes::private::sites::parameters::declare::declare_sd_estimator),
+        )
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(middleware::from_fn(deny_scoped_token))
         .layer(middleware::from_fn(require_manage_sensors))

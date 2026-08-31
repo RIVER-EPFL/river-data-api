@@ -252,6 +252,7 @@ pub fn validate_optional_time_range(
         private::admin::calibrations::recalculate_calibration,
         private::admin::derived::recompute_derived,
         private::admin::merge::merge_site_parameters_handler,
+        private::sites::parameters::declare::declare_sd_estimator,
         private::admin::merge::merge_parameters_handler,
         private::admin::public_config::invalidate_public_config,
         private::sync::views::get_discovery,

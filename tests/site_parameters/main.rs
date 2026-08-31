@@ -7,4 +7,5 @@
 mod common;
 
 mod create_flags;
+mod declare_sd_estimator;
 mod minimal_create;

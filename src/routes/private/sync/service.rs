@@ -177,6 +177,13 @@ pub struct PlanEntry {
     /// stays undeclared and its audit disagreements are held for a decision instead.
     #[serde(default)]
     pub sd_estimator: Option<String>,
+    /// The evidence for that choice: open replicate-statistics holds on this stream, and how many
+    /// of them match the population signature. Written at plan creation so the review shows what
+    /// the incoming data reports rather than only that a question exists.
+    #[serde(default)]
+    pub sd_holds: i64,
+    #[serde(default)]
+    pub sd_population_holds: i64,
 }
 
 /// A catalog parameter a plan entry collides with, and what already depends on it. "Exists" on its
@@ -615,6 +622,38 @@ pub async fn create_plan(
     let named_instruments: Vec<Uuid> = streams.iter().filter_map(|s| s.sensor_id).collect();
     let instruments = load_instrument_catalog(db, source_system, &named_instruments).await?;
 
+    // Divisor evidence per stream: its open replicate-statistics holds and how many carry the
+    // population signature. The same signature SQL the audit list and gate use, so the numbers
+    // the review quotes cannot disagree with the queue.
+    let stream_ids: Vec<Uuid> = streams.iter().map(|s| s.id).collect();
+    let sd_evidence: std::collections::HashMap<Uuid, (i64, i64)> = db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT h.stream_id, count(*) AS holds, \
+                        count(*) FILTER (WHERE {}) AS population \
+                 FROM replicate_audit_holds h \
+                 WHERE h.kind = 'replicate_stats' \
+                   AND h.status IN ('pending', 'deferred') \
+                   AND h.stream_id = ANY($1) \
+                 GROUP BY h.stream_id",
+                *super::replicate_audit::POPULATION_SD_SQL
+            ),
+            [stream_ids.into()],
+        ))
+        .await?
+        .iter()
+        .filter_map(|r| {
+            Some((
+                r.try_get::<Uuid>("", "stream_id").ok()?,
+                (
+                    r.try_get::<i64>("", "holds").ok()?,
+                    r.try_get::<i64>("", "population").ok()?,
+                ),
+            ))
+        })
+        .collect();
+
     // Build entries
     let mut entries: Vec<PlanEntry> = Vec::with_capacity(streams.len());
 
@@ -625,6 +664,16 @@ pub async fn create_plan(
             "skip".to_string()
         } else {
             "pair".to_string()
+        };
+
+        // What is paired for a family is the replicate group, whose avg and sd this system
+        // computes, so the suggested parameter is the measurand rather than the incoming
+        // statistic column. The incoming name survives as original_parameter_name.
+        let replicates = plan_replicates(&stream.metadata);
+        let parameter_name = if replicates.is_some() && !h.parameter.is_empty() {
+            family_parameter_suggestion(&h.parameter, &catalog.params)
+        } else {
+            h.parameter.clone()
         };
 
         let mut entry = PlanEntry {
@@ -647,7 +696,7 @@ pub async fn create_plan(
             },
             parameter: PlanParamRef {
                 id: None,
-                name: h.parameter.clone(),
+                name: parameter_name,
                 label: h.parameter_label.clone(),
                 create: false,
                 units: h.units,
@@ -657,18 +706,21 @@ pub async fn create_plan(
             confidence: "none".to_string(),
             warnings: vec![],
             original_parameter_name: Some(h.parameter),
-            replicates: plan_replicates(&stream.metadata),
             instrument: resolve_instrument(
                 stream.sensor_id,
-                plan_replicates(&stream.metadata)
-                    .and_then(|r| r.curve_ref_column)
+                replicates
+                    .as_ref()
+                    .and_then(|r| r.curve_ref_column.clone())
                     .as_deref(),
                 source_system,
                 &instruments,
             ),
+            replicates,
             // Never guessed from the data: the source reported both conventions over the years,
             // so the review asks and the audit gate is the backstop if it is left unset.
             sd_estimator: None,
+            sd_holds: sd_evidence.get(&stream.id).map_or(0, |e| e.0),
+            sd_population_holds: sd_evidence.get(&stream.id).map_or(0, |e| e.1),
         };
         reclassify_entry(&mut entry, &catalog);
         entries.push(entry);
@@ -1525,6 +1577,31 @@ pub fn lookup_parameter_by_code_name_or_alias(
                 .find(|p| p.aliases.iter().any(|a| a.to_lowercase() == lower))
         })
         .map(|p| p.id)
+}
+
+/// The parameter a replicate family should suggest: the measurand, not the incoming statistic
+/// column. Strips the `avg` marker (`DOC_avg_ppb` -> `DOC_ppb`), and when dropping a trailing
+/// token on top of that finds an existing catalog parameter (`DOC_ppb` -> `DOC`), prefers it, so
+/// a synced family and a tool save land on one slot instead of minting a sibling.
+fn family_parameter_suggestion(name: &str, params: &[CatalogParam]) -> String {
+    let stripped: String = name
+        .split('_')
+        .filter(|seg| !seg.eq_ignore_ascii_case("avg"))
+        .collect::<Vec<_>>()
+        .join("_");
+    if stripped.is_empty() {
+        return name.to_string();
+    }
+    if lookup_parameter_by_code_name_or_alias(&stripped, params).is_some() {
+        return stripped;
+    }
+    if let Some((head, _)) = stripped.rsplit_once('_')
+        && !head.is_empty()
+        && lookup_parameter_by_code_name_or_alias(head, params).is_some()
+    {
+        return head.to_string();
+    }
+    stripped
 }
 
 fn match_entity_display(name: &str, existing: &[CatalogParam]) -> (Option<Uuid>, bool) {

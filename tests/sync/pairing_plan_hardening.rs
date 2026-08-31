@@ -622,3 +622,112 @@ async fn remap_to_existing_site_does_not_backfill_stream_coordinates() {
 
     crate::common::cleanup_test_db(&db).await;
 }
+
+/// Scenario: a replicate family arrives under its incoming statistic column (`DOC_avg_ppb`),
+/// with audit disagreements already recorded against the stream.
+///
+/// Expected behaviour: the plan suggests the measurand (the catalog's `DOC`), keeps the incoming
+/// name as `original_parameter_name`, and quotes the divisor evidence: how many open
+/// disagreements there are and how many match the population signature. A family matching no
+/// catalog row still drops the `avg` marker.
+#[tokio::test]
+#[serial]
+async fn a_replicate_family_suggests_the_measurand_and_quotes_divisor_evidence() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    crate::common::exec(
+        &db,
+        "INSERT INTO parameters (id, code, name, default_units, category) \
+         VALUES (gen_random_uuid(), 'DOC', 'Dissolved organic carbon', 'ppb', 'measurement')",
+    )
+    .await;
+
+    let family = |param: &str| {
+        format!(
+            r#"{{"hierarchy": {{"project": "Test River Project", "site": "Upstream Station", "parameter": "{param}"}},
+                "units": "ppb",
+                "replicates": {{"source_columns": ["{param}_1", "{param}_2", "{param}_3"],
+                                "portal_mean_column": "{param}", "portal_sd_column": "{param}_sd"}}}}"#
+        )
+    };
+    let doc_stream = Uuid::new_v4();
+    let other_stream = Uuid::new_v4();
+    for (id, param) in [(doc_stream, "DOC_avg_ppb"), (other_stream, "Xfoo_avg")] {
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO data_streams (id, source_system, source_key, metadata, is_active) \
+                 VALUES ('{id}', 'famsrc', 'STA:{param}:reps', '{}'::jsonb, true)",
+                family(param)
+            ),
+        )
+        .await;
+    }
+
+    // Two open disagreements on the DOC family: one whose incoming sd is exactly the population
+    // form of the computed spread, one that matches neither divisor.
+    for (hours_ago, expected_sd) in [(1, 0.816_496_580_927_726_f64), (2, 2.5)] {
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO replicate_audit_holds \
+                     (stream_id, group_time, expected, computed, delta, status, kind) \
+                 VALUES ('{doc_stream}', now() - interval '{hours_ago} hours', \
+                         '{{\"mean\": 10.0, \"sd\": {expected_sd}, \"n\": 3}}', \
+                         '{{\"mean\": 10.0, \"sd\": 1.0, \"n\": 3}}', '{{}}', 'deferred', \
+                         'replicate_stats')"
+            ),
+        )
+        .await;
+    }
+
+    let (status, plan) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sync/pairing-plans",
+        &serde_json::json!({ "source_system": "famsrc" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "create plan failed: {plan}");
+
+    let doc = entry_for(&plan, doc_stream);
+    assert_eq!(
+        doc["parameter"]["name"],
+        serde_json::json!("DOC"),
+        "the family lands on the catalog measurand: {doc}"
+    );
+    assert_eq!(
+        doc["parameter"]["create"],
+        serde_json::json!(false),
+        "no sibling parameter is minted: {doc}"
+    );
+    assert_eq!(
+        doc["original_parameter_name"],
+        serde_json::json!("DOC_avg_ppb"),
+        "the incoming column survives: {doc}"
+    );
+    assert_eq!(doc["sd_holds"], serde_json::json!(2), "{doc}");
+    assert_eq!(doc["sd_population_holds"], serde_json::json!(1), "{doc}");
+    assert!(
+        doc["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["kind"] == "sd_estimator_undeclared"),
+        "{doc}"
+    );
+
+    let other = entry_for(&plan, other_stream);
+    assert_eq!(
+        other["parameter"]["name"],
+        serde_json::json!("Xfoo"),
+        "no catalog match still drops the avg marker: {other}"
+    );
+    assert_eq!(other["sd_holds"], serde_json::json!(0), "{other}");
+
+    crate::common::cleanup_test_db(&db).await;
+}
