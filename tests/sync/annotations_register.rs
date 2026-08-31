@@ -191,7 +191,7 @@ async fn summary_counts_annotated_points_and_csv_exports() {
     assert_eq!(summary["per_parameter"][0]["annotated_points"], 2);
     assert_eq!(summary["flagged_readings"], 0, "{summary}");
     assert_eq!(summary["replicate_readings"], 0, "{summary}");
-    assert_eq!(summary["alarm_events"], 0, "{summary}");
+    assert_eq!(summary["alarm_readings"], 0, "{summary}");
 
     let (status, csv) = crate::common::get_csv_with_token(
         &fx.app,

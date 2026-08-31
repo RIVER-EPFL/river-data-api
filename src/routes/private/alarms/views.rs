@@ -64,6 +64,115 @@ fn alarms_table(times: &[DateTime<Utc>], params: &[ParameterViolationData]) -> T
     table
 }
 
+/// The site's breaching readings over a range, one row per violating instant
+/// (`parameter_id, time, value, severity`), unordered. `param_ids` `None` covers every slot the
+/// site has a threshold for. Binds `$1` = site id, `$2` = start,
+/// `$3` = end; the threshold scope is inlined, so the CTE carries no bind params of its own.
+///
+/// Each arm is what the site serves for that cadence, filtered to violations inside the arm.
+/// Continuous and derived rows live at replicate_index 0, kept when flagged: an out-of-range
+/// value should keep alerting after someone flags it. A spot instant is the replicate group
+/// `(stream_id, time)`, evaluated at the sample mean over its unflagged replicates (fallback:
+/// the lowest unflagged replicate's own value when no sample row exists), so flagging a bad
+/// replicate moves the evaluated value instead of hiding the instant or handing it to a
+/// different replicate. A fully flagged group is not evaluated.
+pub fn violations_sql(site_id: Uuid, param_ids: Option<Vec<Uuid>>, min_severity: i16) -> String {
+    // The violation filter and severity ladder are spliced into each cadence arm over that arm's
+    // own value expression, so the filter stays inside the index scan rather than above the union.
+    let arm_predicates = |val_expr: &str| {
+        (
+            super::thresholds::violation_condition(
+                val_expr,
+                "t.warning_min",
+                "t.warning_max",
+                "t.alarm_min",
+                "t.alarm_max",
+                min_severity,
+            ),
+            super::thresholds::severity_case(
+                val_expr,
+                "t.warning_min",
+                "t.warning_max",
+                "t.alarm_min",
+                "t.alarm_max",
+            ),
+        )
+    };
+    let (violation_cont, sev_cont) = arm_predicates("COALESCE(r.calibrated_value, r.raw_value)");
+    let (violation_spot, sev_spot) = arm_predicates("sp.value");
+    let resolved_cte = super::thresholds::resolve_thresholds_sql(Some(site_id), param_ids);
+
+    format!(
+        r"
+        WITH resolved_thresholds AS ({resolved_cte})
+        SELECT sv.parameter_id, sv.time, sv.value, sv.severity FROM (
+            SELECT r.parameter_id, r.time,
+                   COALESCE(r.calibrated_value, r.raw_value) AS value,
+                   ({sev_cont})::smallint AS severity
+            FROM readings r
+            JOIN resolved_thresholds t ON r.parameter_id = t.parameter_id
+            WHERE r.site_id = $1
+              AND r.time >= $2
+              AND r.time <= $3
+              AND r.measurement_type IS DISTINCT FROM 'spot'
+              AND r.replicate_index = 0
+              AND {violation_cont}
+            UNION ALL
+            SELECT sp.parameter_id, sp.time, sp.value,
+                   ({sev_spot})::smallint AS severity
+            FROM (
+                SELECT DISTINCT ON (r.stream_id, r.time)
+                    r.parameter_id,
+                    r.time,
+                    COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value
+                FROM readings r
+                LEFT JOIN samples smp ON smp.id = r.sample_id
+                WHERE r.site_id = $1
+                  AND r.time >= $2
+                  AND r.time <= $3
+                  AND r.parameter_id IN (SELECT parameter_id FROM resolved_thresholds)
+                  AND r.measurement_type = 'spot'
+                  AND r.withdrawn_at IS NULL
+                  AND r.is_flagged IS NOT TRUE
+                ORDER BY r.stream_id, r.time, r.replicate_index
+            ) sp
+            JOIN resolved_thresholds t ON sp.parameter_id = t.parameter_id
+            WHERE {violation_spot}
+        ) sv
+        "
+    )
+}
+
+/// How many breaching readings each parameter contributes over a range, from the same definition
+/// [`violations_sql`] serves, so a count and the export it gates cannot disagree.
+pub async fn count_violations_by_parameter(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> AppResult<std::collections::HashMap<Uuid, i64>> {
+    let sql = format!(
+        "SELECT parameter_id AS pid, COUNT(*) AS n FROM ({}) v GROUP BY parameter_id",
+        violations_sql(site_id, None, 1)
+    );
+    let mut counts = std::collections::HashMap::new();
+    for row in db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            [
+                site_id.into(),
+                sea_orm::prelude::DateTimeWithTimeZone::from(start).into(),
+                sea_orm::prelude::DateTimeWithTimeZone::from(end).into(),
+            ],
+        ))
+        .await?
+    {
+        counts.insert(row.try_get::<Uuid>("", "pid")?, row.try_get::<i64>("", "n")?);
+    }
+    Ok(counts)
+}
+
 /// Get alarm violations for a specific site
 ///
 /// Queries readings that violate configured thresholds within a time range.
@@ -124,6 +233,19 @@ pub async fn get_site_alarms(
         }
     }
 
+    if let Some(ref ids) = query.parameter_ids {
+        let parsed: Vec<Uuid> = ids
+            .split(',')
+            .filter_map(|s| Uuid::parse_str(s.trim()).ok())
+            .collect();
+        if parsed.is_empty() {
+            return Err(AppError::BadRequest(
+                "parameter_ids was provided but no UUIDs could be parsed".to_string(),
+            ));
+        }
+        param_query = param_query.filter(site_parameters::Column::ParameterId.is_in(parsed));
+    }
+
     let params_list = param_query
         .order_by_asc(site_parameters::Column::Name)
         .all(&state.db)
@@ -178,84 +300,9 @@ pub async fn get_site_alarms(
 
     let alarm_param_ids: Vec<uuid::Uuid> = params_with_thresholds.iter().map(|p| p.id).collect();
 
-    let min_severity = query.severity.unwrap_or(1);
-
-    // The violation filter and severity ladder are spliced into each cadence arm over that arm's
-    // own value expression, so the filter stays inside the index scan rather than above the union.
-    let arm_predicates = |val_expr: &str| {
-        (
-            super::thresholds::violation_condition(
-                val_expr,
-                "t.warning_min",
-                "t.warning_max",
-                "t.alarm_min",
-                "t.alarm_max",
-                min_severity,
-            ),
-            super::thresholds::severity_case(
-                val_expr,
-                "t.warning_min",
-                "t.warning_max",
-                "t.alarm_min",
-                "t.alarm_max",
-            ),
-        )
-    };
-    let (violation_cont, sev_cont) = arm_predicates("COALESCE(r.calibrated_value, r.raw_value)");
-    let (violation_spot, sev_spot) = arm_predicates("sp.value");
-
-    // The single resolution definition (site → global → parameter default), scoped to this site and
-    // spliced as the threshold CTE. Param ids are inlined in the rendered CTE, so the outer query
-    // only binds $1 = site_id, $2 = start, $3 = end.
-    let resolved_cte =
-        super::thresholds::resolve_thresholds_sql(Some(site.id), Some(alarm_param_ids));
-
-    // Each arm is what the site serves for that cadence, filtered to violations inside the arm.
-    // Continuous and derived rows live at replicate_index 0, kept when flagged: an out-of-range
-    // value should keep alerting after someone flags it. A spot instant is the replicate group
-    // `(stream_id, time)`, evaluated at the sample mean over its unflagged replicates (fallback:
-    // the lowest unflagged replicate's own value when no sample row exists), so flagging a bad
-    // replicate moves the evaluated value instead of hiding the instant or handing it to a
-    // different replicate. A fully flagged group is not evaluated.
     let sql = format!(
-        r"
-        WITH resolved_thresholds AS ({resolved_cte})
-        SELECT sv.parameter_id, sv.time, sv.value, sv.severity FROM (
-            SELECT r.parameter_id, r.time,
-                   COALESCE(r.calibrated_value, r.raw_value) AS value,
-                   ({sev_cont})::smallint AS severity
-            FROM readings r
-            JOIN resolved_thresholds t ON r.parameter_id = t.parameter_id
-            WHERE r.site_id = $1
-              AND r.time >= $2
-              AND r.time <= $3
-              AND r.measurement_type IS DISTINCT FROM 'spot'
-              AND r.replicate_index = 0
-              AND {violation_cont}
-            UNION ALL
-            SELECT sp.parameter_id, sp.time, sp.value,
-                   ({sev_spot})::smallint AS severity
-            FROM (
-                SELECT DISTINCT ON (r.stream_id, r.time)
-                    r.parameter_id,
-                    r.time,
-                    COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value
-                FROM readings r
-                LEFT JOIN samples smp ON smp.id = r.sample_id
-                WHERE r.site_id = $1
-                  AND r.time >= $2
-                  AND r.time <= $3
-                  AND r.parameter_id IN (SELECT parameter_id FROM resolved_thresholds)
-                  AND r.measurement_type = 'spot'
-                  AND r.withdrawn_at IS NULL
-                  AND r.is_flagged IS NOT TRUE
-                ORDER BY r.stream_id, r.time, r.replicate_index
-            ) sp
-            JOIN resolved_thresholds t ON sp.parameter_id = t.parameter_id
-            WHERE {violation_spot}
-        ) sv
-        ORDER BY sv.time, sv.parameter_id
-        "
+        "{}\nORDER BY sv.time, sv.parameter_id",
+        violations_sql(site.id, Some(alarm_param_ids), query.severity.unwrap_or(1))
     );
 
     let values: Vec<sea_orm::Value> = vec![site.id.into(), query.start.into(), query.end.into()];

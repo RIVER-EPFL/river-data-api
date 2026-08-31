@@ -187,8 +187,8 @@ pub struct ParameterExportSummary {
     pub flagged_readings: i64,
     /// Served readings beyond the first replicate slot (replicate_index > 0).
     pub replicate_readings: i64,
-    /// Alarm episodes overlapping the range.
-    pub alarm_events: i64,
+    /// Readings breaching a warning or alarm bound over the range.
+    pub alarm_readings: i64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -197,7 +197,7 @@ pub struct ExportSummaryResponse {
     pub annotated_points: i64,
     pub flagged_readings: i64,
     pub replicate_readings: i64,
-    pub alarm_events: i64,
+    pub alarm_readings: i64,
     pub per_parameter: Vec<ParameterExportSummary>,
 }
 
@@ -288,7 +288,7 @@ pub async fn get_site_export_summary(
              WHERE site_id = $1 AND time >= $2 AND time <= $3 AND withdrawn_at IS NULL
                AND (is_flagged = TRUE OR replicate_index > 0)
              GROUP BY parameter_id",
-            range.clone(),
+            range,
         ))
         .await?;
     for r in &rows {
@@ -297,22 +297,16 @@ pub async fn get_site_export_summary(
         s.replicate_readings = r.try_get::<i64>("", "reps")?;
     }
 
-    // Alarm episodes overlapping the range (open episodes overlap through now).
-    let rows = state
-        .db
-        .query_all(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT parameter_id AS pid, COUNT(*) AS episodes
-             FROM alarm_events
-             WHERE site_id = $1 AND started_at <= $3
-               AND COALESCE(resolved_at, NOW()) >= $2
-             GROUP BY parameter_id",
-            range,
-        ))
-        .await?;
-    for r in &rows {
-        let s = slot(&mut by_param, r.try_get::<Uuid>("", "pid")?);
-        s.alarm_events = r.try_get::<i64>("", "episodes")?;
+    // Breaching readings, from the same definition `/sites/{id}/alarms` serves, so the count and
+    // the export it gates cannot disagree. `alarm_events` is deliberately not the source: it holds
+    // the sweeper's episodes, which exist only from when the sweeper first saw a slot, while an
+    // export covers all of history.
+    for (pid, n) in crate::routes::private::alarms::views::count_violations_by_parameter(
+        &state.db, site.id, query.start, query.end,
+    )
+    .await?
+    {
+        slot(&mut by_param, pid).alarm_readings = n;
     }
 
     let ids: Vec<Uuid> = by_param.keys().copied().collect();
@@ -337,7 +331,7 @@ pub async fn get_site_export_summary(
         annotated_points: per_parameter.iter().map(|p| p.annotated_points).sum(),
         flagged_readings: per_parameter.iter().map(|p| p.flagged_readings).sum(),
         replicate_readings: per_parameter.iter().map(|p| p.replicate_readings).sum(),
-        alarm_events: per_parameter.iter().map(|p| p.alarm_events).sum(),
+        alarm_readings: per_parameter.iter().map(|p| p.alarm_readings).sum(),
         per_parameter,
     }))
 }

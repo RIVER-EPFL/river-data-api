@@ -48,6 +48,9 @@ pub struct SiteAlarmsQuery {
     pub severity: Option<i16>,
     /// Filter by sensor types (comma-separated)
     pub sensor_types: Option<String>,
+    /// Filter to a specific subset of parameters (comma-separated UUIDs). If omitted, covers every
+    /// parameter configured for the site.
+    pub parameter_ids: Option<String>,
     /// Response format: json (default), ndjson, csv
     #[serde(default = "crate::common::bulk::default_format")]
     pub format: String,
