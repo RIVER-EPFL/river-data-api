@@ -235,12 +235,6 @@ fn readings_table(times: &[DateTime<Utc>], params: &[ParameterData], include_fla
     for p in params {
         table.column(p.code.clone(), Cells::Float(p.values.clone()));
     }
-    for p in params {
-        table.column(
-            format!("{}_parameter_id", p.code),
-            Cells::Constant(p.parameter_id.to_string()),
-        );
-    }
     if params.iter().any(|p| p.measurement_types.is_some()) {
         for p in params {
             table.column(
