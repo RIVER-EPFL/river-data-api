@@ -1258,18 +1258,36 @@ async fn default_scan_floor(
 ) -> AppResult<Option<chrono::DateTime<chrono::Utc>>> {
     use sea_orm::{ConnectionTrait, Statement};
 
+    // The stream ingest cursors carry the newest instant without touching the hypertable: an
+    // unbounded MAX(time) over readings pays a planning cost proportional to the chunk count.
+    // A batch-written reading newer than every cursor at most shifts the floor slightly later,
+    // which the `since` parameter can always widen past. The unbounded probe remains only as
+    // the fallback for a database with readings but no cursors at all.
     let row = db
         .query_one(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT MAX(time) AS newest FROM readings".to_string(),
+            "SELECT MAX(last_data_time) AS newest FROM data_streams".to_string(),
         ))
         .await
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
-    let newest: Option<chrono::DateTime<chrono::FixedOffset>> = match row {
+    let mut newest: Option<chrono::DateTime<chrono::FixedOffset>> = match row {
         Some(r) => r.try_get("", "newest")?,
         None => None,
     };
+    if newest.is_none() {
+        let row = db
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT MAX(time) AS newest FROM readings".to_string(),
+            ))
+            .await
+            .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+        newest = match row {
+            Some(r) => r.try_get("", "newest")?,
+            None => None,
+        };
+    }
     Ok(newest.map(|t| t.with_timezone(&chrono::Utc) - chrono::Duration::days(CANDIDATE_SCAN_DAYS)))
 }
 
@@ -1720,6 +1738,10 @@ async fn fetch_duplicate_slots(
 ) -> AppResult<Vec<DuplicateSlot>> {
     use sea_orm::{ConnectionTrait, Statement};
 
+    // No pre-filter on paired streams: attribution can reach a slot without pairing
+    // (deployment-driven backfill stamps site/parameter by sensor), and this report exists to
+    // catch exactly the shapes no invariant covers. The windowed scan of every reading is the
+    // price of an exhaustive answer.
     let mut values: Vec<sea_orm::Value> = Vec::new();
     let time_filter = scan_floor_sql(since, &mut values);
     let project_filter = project_filter_sql(scope, "s.project_id", &mut values)

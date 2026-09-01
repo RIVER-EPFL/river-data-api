@@ -132,13 +132,16 @@ pub async fn list_site_visits(
         .map(|r| r.try_get("", "n").unwrap_or(0))
         .unwrap_or(0);
 
+    // The column set is every parameter this site has sampled, read from the materialised
+    // groups rather than the hypertable: an unbounded readings DISTINCT pays a planning cost
+    // proportional to the chunk count on every page load.
     let expected_rows = state
         .db
         .query_all(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT DISTINCT p.id, p.code, p.name FROM readings r \
-             JOIN parameters p ON p.id = r.parameter_id \
-             WHERE r.site_id = $1 AND r.measurement_type = 'spot' \
+            "SELECT DISTINCT p.id, p.code, p.name FROM samples s \
+             JOIN parameters p ON p.id = s.parameter_id \
+             WHERE s.site_id = $1 \
              ORDER BY p.code",
             [site.id.into()],
         ))

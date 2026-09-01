@@ -50,6 +50,31 @@ async fn parameters_report_frequency_from_measurement_types() {
     )
     .await;
 
+    // The extents read the maintained summaries, not the hypertable: continuous presence from
+    // the hourly aggregate, spot presence from `samples`. Re-refresh so the retag leaves the
+    // rollup, and materialise the spot groups as the write paths would have.
+    crate::common::refresh_continuous_aggregates(&db).await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO samples (site_id, parameter_id, collected_at, n) \
+             VALUES ('{site_id}', '{param}', '2025-01-15T06:00:00Z', 1)",
+            param = crate::common::GLOBAL_PARAM_TEMP_ID,
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO samples (site_id, parameter_id, collected_at, n) \
+             SELECT site_id, parameter_id, MIN(time), 2 FROM readings \
+             WHERE site_id = '{site_id}' AND parameter_id = '{param}' \
+             GROUP BY site_id, parameter_id",
+            param = crate::common::GLOBAL_PARAM_TURB_ID,
+        ),
+    )
+    .await;
+
     let (status, body) = crate::common::get_json_with_token(
         &app,
         &format!("/api/sites/{site_id}/parameters"),

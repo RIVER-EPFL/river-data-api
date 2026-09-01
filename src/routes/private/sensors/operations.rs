@@ -139,10 +139,18 @@ impl CRUDOperations for SensorOperations {
     ) -> Result<(), ApiError> {
         let id = entity.id;
 
+        // Summaries instead of an unbounded readings scan (whose planning cost grows with the
+        // hypertable's chunk count): the count is the hourly rollup's population plus recent spot
+        // rows, the newest instant is the stream ingest cursor with the rollup as fallback.
         let reading_row = db
             .query_one(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                "SELECT COUNT(*) as count, MAX(time) as last_time FROM readings WHERE sensor_id = $1",
+                "SELECT (SELECT COALESCE(SUM(count), 0)::bigint FROM readings_hourly WHERE sensor_id = $1) \
+                      + (SELECT COUNT(*) FROM readings WHERE sensor_id = $1 \
+                           AND time > now() - INTERVAL '90 days' \
+                           AND measurement_type = 'spot' AND is_flagged IS NOT TRUE) AS count, \
+                        GREATEST((SELECT MAX(last_data_time) FROM data_streams WHERE sensor_id = $1), \
+                                 (SELECT MAX(bucket) FROM readings_hourly WHERE sensor_id = $1)) AS last_time",
                 [id.into()],
             ))
             .await
@@ -234,30 +242,138 @@ impl CRUDOperations for SensorOperations {
             }
         }
 
-        // Query 2: Latest reading per sensor
-        let reading_sql = format!(
-            r"SELECT DISTINCT ON (sensor_id) sensor_id, time, COALESCE(calibrated_value, raw_value) as value
-              FROM readings
-              WHERE sensor_id IN ({placeholders})
-              ORDER BY sensor_id, time DESC"
-        );
-        let reading_rows = db
+        // Query 2: Latest reading per sensor. An unbounded DISTINCT ON over the hypertable pays
+        // a planning cost proportional to the chunk count, so the newest instant comes from the
+        // stream ingest cursors, and only the value is read from readings, time-bounded so chunk
+        // exclusion applies. Sensors whose cursors sit close together share one query; a stale
+        // straggler gets its own window rather than widening everyone's.
+        let cursor_rows = db
             .query_all(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                &reading_sql,
+                &format!(
+                    r"SELECT sensor_id, MAX(last_data_time) AS last_time
+                      FROM data_streams
+                      WHERE sensor_id IN ({placeholders}) AND last_data_time IS NOT NULL
+                      GROUP BY sensor_id"
+                ),
                 values.clone(),
             ))
             .await
             .map_err(ApiError::database)?;
-
-        let mut reading_by_sensor: HashMap<Uuid, (chrono::DateTime<Utc>, f64)> = HashMap::new();
-        for row in &reading_rows {
-            if let (Ok(sensor_id), Ok(time), Ok(value)) = (
+        let mut cursors: Vec<(Uuid, chrono::DateTime<Utc>)> = Vec::new();
+        for row in &cursor_rows {
+            if let (Ok(sensor_id), Ok(t)) = (
                 row.try_get::<Uuid>("", "sensor_id"),
-                row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "time"),
-                row.try_get::<f64>("", "value"),
+                row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "last_time"),
             ) {
-                reading_by_sensor.insert(sensor_id, (time.with_timezone(&Utc), value));
+                cursors.push((sensor_id, t.with_timezone(&Utc)));
+            }
+        }
+        let mut reading_by_sensor: HashMap<Uuid, (chrono::DateTime<Utc>, f64)> = HashMap::new();
+        // Streams fed by `/ingest` carry the cursor; batch- and CSV-fed sensors fall back to
+        // the hourly rollup's newest bucket (plus its width, so the in-bucket rows are inside
+        // the lookup window). Spot-only sensors appear in neither and get one bounded probe.
+        let with_cursor: std::collections::HashSet<Uuid> =
+            cursors.iter().map(|(id, _)| *id).collect();
+        let missing: Vec<Uuid> = ids
+            .iter()
+            .filter(|id| !with_cursor.contains(id))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            let ph = build_in_clause(missing.len());
+            let rows = db
+                .query_all(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    &format!(
+                        "SELECT sensor_id, MAX(bucket) AS last_bucket FROM readings_hourly \
+                         WHERE sensor_id IN ({ph}) GROUP BY sensor_id"
+                    ),
+                    uuid_values(&missing),
+                ))
+                .await
+                .map_err(ApiError::database)?;
+            for row in &rows {
+                if let (Ok(sensor_id), Ok(t)) = (
+                    row.try_get::<Uuid>("", "sensor_id"),
+                    row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "last_bucket"),
+                ) {
+                    cursors.push((sensor_id, t.with_timezone(&Utc) + chrono::Duration::hours(1)));
+                }
+            }
+        }
+        let covered: std::collections::HashSet<Uuid> =
+            cursors.iter().map(|(id, _)| *id).collect();
+        let uncovered: Vec<Uuid> = ids
+            .iter()
+            .filter(|id| !covered.contains(id))
+            .copied()
+            .collect();
+        if !uncovered.is_empty() {
+            let ph = build_in_clause(uncovered.len());
+            let rows = db
+                .query_all(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    &format!(
+                        r"SELECT DISTINCT ON (sensor_id) sensor_id, time, COALESCE(calibrated_value, raw_value) as value
+                          FROM readings
+                          WHERE sensor_id IN ({ph}) AND time > now() - INTERVAL '90 days'
+                          ORDER BY sensor_id, time DESC"
+                    ),
+                    uuid_values(&uncovered),
+                ))
+                .await
+                .map_err(ApiError::database)?;
+            for row in &rows {
+                if let (Ok(sensor_id), Ok(time), Ok(value)) = (
+                    row.try_get::<Uuid>("", "sensor_id"),
+                    row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "time"),
+                    row.try_get::<f64>("", "value"),
+                ) {
+                    reading_by_sensor.insert(sensor_id, (time.with_timezone(&Utc), value));
+                }
+            }
+        }
+        cursors.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
+
+        let mut i = 0;
+        while i < cursors.len() {
+            // One cluster: every sensor whose cursor lies within 30 days of the cluster's newest.
+            let hi = cursors[i].1;
+            let mut lo = cursors[i].1;
+            let mut ids: Vec<Uuid> = Vec::new();
+            while i < cursors.len() && hi - cursors[i].1 <= chrono::Duration::days(30) {
+                lo = cursors[i].1;
+                ids.push(cursors[i].0);
+                i += 1;
+            }
+            let cluster_ph = build_in_clause(ids.len());
+            let mut cluster_values = uuid_values(&ids);
+            cluster_values.push(sea_orm::prelude::DateTimeWithTimeZone::from(lo - chrono::Duration::days(1)).into());
+            let from_ref = cluster_values.len();
+            cluster_values.push(sea_orm::prelude::DateTimeWithTimeZone::from(hi).into());
+            let to_ref = cluster_values.len();
+            let rows = db
+                .query_all(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    &format!(
+                        r"SELECT DISTINCT ON (sensor_id) sensor_id, time, COALESCE(calibrated_value, raw_value) as value
+                          FROM readings
+                          WHERE sensor_id IN ({cluster_ph}) AND time >= ${from_ref} AND time <= ${to_ref}
+                          ORDER BY sensor_id, time DESC"
+                    ),
+                    cluster_values,
+                ))
+                .await
+                .map_err(ApiError::database)?;
+            for row in &rows {
+                if let (Ok(sensor_id), Ok(time), Ok(value)) = (
+                    row.try_get::<Uuid>("", "sensor_id"),
+                    row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "time"),
+                    row.try_get::<f64>("", "value"),
+                ) {
+                    reading_by_sensor.insert(sensor_id, (time.with_timezone(&Utc), value));
+                }
             }
         }
 

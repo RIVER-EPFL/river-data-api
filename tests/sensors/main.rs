@@ -8,6 +8,7 @@ mod common;
 
 mod import_adopt_swap_lifecycle;
 mod instruments_overview;
+mod list_latest_reading;
 mod multi_parameter_channel;
 mod read_endpoints;
 mod standard_curve_register;

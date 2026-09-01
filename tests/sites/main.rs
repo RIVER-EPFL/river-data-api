@@ -11,6 +11,7 @@ mod aggregate_propagation;
 mod aggregate_refresh_windows;
 mod aggregate_sensor_split;
 mod data_endpoints;
+mod parameter_extents;
 mod parameter_frequency;
 mod refresh_gaps;
 mod sensor_vs_grab_filters;

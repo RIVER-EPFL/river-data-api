@@ -19,11 +19,26 @@ use crate::routes::{resolve_site, resolve_site_with_project};
 use super::types::{ParameterResponse, ProjectRef, SiteDetailResponse};
 
 #[derive(Debug, FromQueryResult)]
-struct ParameterExtentRow {
+struct ContinuousExtentRow {
+    parameter_id: Uuid,
+    min_bucket: Option<DateTime<Utc>>,
+    max_bucket: Option<DateTime<Utc>>,
+    count: i64,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct SpotExtentRow {
     parameter_id: Uuid,
     min_time: Option<DateTime<Utc>>,
     max_time: Option<DateTime<Utc>>,
     count: i64,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct RecentExtentRow {
+    parameter_id: Uuid,
+    min_time: Option<DateTime<Utc>>,
+    max_time: Option<DateTime<Utc>>,
     spot_count: i64,
     continuous_count: i64,
 }
@@ -50,44 +65,150 @@ fn max_opt(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTim
     }
 }
 
+/// How far back the raw-readings freshness pass looks. Wide enough to cover the hourly
+/// aggregate's refresh lag (one bucket + one schedule interval) many times over, narrow enough
+/// that chunk exclusion keeps the scan to a handful of chunks.
+const RECENT_EXTENT_DAYS: i64 = 14;
+
+/// Per-parameter data extents and cadence counts, assembled from the maintained summaries
+/// instead of a full hypertable scan: an unbounded `readings` query pays a planning cost
+/// proportional to the chunk count on every call, which is what made this endpoint the slow
+/// half of a site page load.
+///
+/// - Continuous extents and counts come from `readings_hourly`, whose population (replicate 0,
+///   unflagged, non-spot) is exactly what `continuous_count` mirrors.
+/// - Spot extents and replicate counts come from `samples`, the materialised per-instant groups.
+/// - A bounded raw pass over the last `RECENT_EXTENT_DAYS` covers rows the hourly aggregate has
+///   not refreshed yet and decides `has_*` for brand-new slots; it carries no flag filter, so a
+///   freshly flagged tail still extends the extent.
+/// - `data_streams.last_data_time` supplies a flag-agnostic newest instant per slot, so a series
+///   whose trailing rows are all flagged and older than the raw pass still reports its true end.
+///   The extents seed the chart range slider, and flagged points are drawn and exported, so the
+///   flagged tail must stay inside the range.
+///
+/// `data_end` from the aggregate alone is the last bucket start plus one bucket, which can
+/// overstate by up to an hour; the exact sources win whenever they are newer. `reading_count`
+/// counts the summarised populations (unflagged continuous plus spot replicates), not raw rows.
 async fn parameter_extents(
     db: &sea_orm::DatabaseConnection,
     site_id: Uuid,
 ) -> AppResult<HashMap<Uuid, ParameterExtent>> {
-    // Cadence counts ride along on the extent scan: spot = grab/lab low-frequency readings;
-    // continuous counts NULL (legacy untagged) and 'derived' alongside 'continuous', since those
-    // series behave like continuous data on charts. The continuous count mirrors the continuous
-    // aggregates' population (replicate 0, unflagged) so has_continuous agrees with the rollups.
-    // Spot is counted at any replicate index: grab sets are served raw, never rolled up, and a
-    // replicate series need not start at 0.
-    let stmt = Statement::from_sql_and_values(
+    let continuous = ContinuousExtentRow::find_by_statement(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        "SELECT parameter_id, MIN(time) AS min_time, MAX(time) AS max_time, COUNT(*) AS count, \
-                COUNT(*) FILTER (WHERE measurement_type = 'spot' \
-                                   AND is_flagged IS NOT TRUE AND withdrawn_at IS NULL) AS spot_count, \
-                COUNT(*) FILTER (WHERE measurement_type IS DISTINCT FROM 'spot' \
-                                   AND replicate_index = 0 AND is_flagged IS NOT TRUE) AS continuous_count \
-         FROM readings WHERE site_id = $1 GROUP BY parameter_id",
+        "SELECT parameter_id, MIN(bucket) AS min_bucket, MAX(bucket) AS max_bucket, \
+                COALESCE(SUM(count), 0)::bigint AS count \
+         FROM readings_hourly WHERE site_id = $1 AND parameter_id IS NOT NULL \
+         GROUP BY parameter_id",
         [site_id.into()],
-    );
+    ))
+    .all(db)
+    .await?;
 
-    let rows = ParameterExtentRow::find_by_statement(stmt).all(db).await?;
+    let spot = SpotExtentRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT parameter_id, MIN(collected_at) AS min_time, MAX(collected_at) AS max_time, \
+                COALESCE(SUM(n), 0)::bigint AS count \
+         FROM samples WHERE site_id = $1 GROUP BY parameter_id",
+        [site_id.into()],
+    ))
+    .all(db)
+    .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|r| {
-            (
-                r.parameter_id,
-                ParameterExtent {
-                    data_start: r.min_time,
-                    data_end: r.max_time,
-                    reading_count: r.count,
-                    spot_count: r.spot_count,
-                    continuous_count: r.continuous_count,
-                },
-            )
-        })
-        .collect())
+    let recent = RecentExtentRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        &format!(
+            "SELECT parameter_id, MIN(time) AS min_time, MAX(time) AS max_time, \
+                    COUNT(*) FILTER (WHERE measurement_type = 'spot' \
+                                       AND is_flagged IS NOT TRUE AND withdrawn_at IS NULL) AS spot_count, \
+                    COUNT(*) FILTER (WHERE measurement_type IS DISTINCT FROM 'spot' \
+                                       AND replicate_index = 0 AND is_flagged IS NOT TRUE) AS continuous_count \
+             FROM readings \
+             WHERE site_id = $1 AND parameter_id IS NOT NULL \
+               AND time > now() - INTERVAL '{RECENT_EXTENT_DAYS} days' \
+             GROUP BY parameter_id"
+        ),
+        [site_id.into()],
+    ))
+    .all(db)
+    .await?;
+
+    let mut cursors: HashMap<Uuid, DateTime<Utc>> = HashMap::new();
+    for row in db
+        .query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT sp.parameter_id, MAX(ds.last_data_time) AS max_time \
+             FROM data_streams ds JOIN site_parameters sp ON ds.site_parameter_id = sp.id \
+             WHERE sp.site_id = $1 AND ds.last_data_time IS NOT NULL \
+             GROUP BY sp.parameter_id",
+            [site_id.into()],
+        ))
+        .await?
+    {
+        let parameter_id: Uuid = row.try_get("", "parameter_id")?;
+        if let Ok(t) = row.try_get::<DateTime<Utc>>("", "max_time") {
+            cursors.insert(parameter_id, t);
+        }
+    }
+
+    let mut extents: HashMap<Uuid, ParameterExtent> = HashMap::new();
+    let mut last_buckets: HashMap<Uuid, DateTime<Utc>> = HashMap::new();
+    for r in continuous {
+        let e = extents.entry(r.parameter_id).or_insert_with(empty_extent);
+        e.data_start = min_opt(e.data_start, r.min_bucket);
+        if let Some(b) = r.max_bucket {
+            last_buckets.insert(r.parameter_id, b);
+        }
+        e.continuous_count = r.count;
+    }
+    for r in spot {
+        let e = extents.entry(r.parameter_id).or_insert_with(empty_extent);
+        e.data_start = min_opt(e.data_start, r.min_time);
+        e.data_end = max_opt(e.data_end, r.max_time);
+        e.spot_count = r.count;
+    }
+    for r in recent {
+        let e = extents.entry(r.parameter_id).or_insert_with(empty_extent);
+        e.data_start = min_opt(e.data_start, r.min_time);
+        e.data_end = max_opt(e.data_end, r.max_time);
+        // The raw pass overlaps hours the aggregate already covers, so it only speaks for a slot
+        // the summaries report empty: it decides `has_*` for data too new to be summarised, it
+        // never adds to a summarised count.
+        if e.continuous_count == 0 {
+            e.continuous_count = r.continuous_count;
+        }
+        if e.spot_count == 0 {
+            e.spot_count = r.spot_count;
+        }
+    }
+    for (parameter_id, t) in cursors {
+        let e = extents.entry(parameter_id).or_insert_with(empty_extent);
+        e.data_end = max_opt(e.data_end, Some(t));
+    }
+    // An exact source (samples, the recent pass, a stream cursor) that has seen the newest
+    // bucket names the true end; only a series none of them cover falls back to the bucket
+    // plus its width, overstating by at most an hour rather than clipping the last hour off.
+    for (parameter_id, bucket) in last_buckets {
+        let e = extents.entry(parameter_id).or_insert_with(empty_extent);
+        e.data_end = match e.data_end {
+            Some(exact) if exact >= bucket => Some(exact),
+            _ => max_opt(e.data_end, Some(bucket + chrono::Duration::hours(1))),
+        };
+    }
+    for e in extents.values_mut() {
+        e.reading_count = e.continuous_count + e.spot_count;
+    }
+
+    Ok(extents)
+}
+
+fn empty_extent() -> ParameterExtent {
+    ParameterExtent {
+        data_start: None,
+        data_end: None,
+        reading_count: 0,
+        spot_count: 0,
+        continuous_count: 0,
+    }
 }
 
 /// Declared cadence per site_parameter, for slots with no data yet: paired stream
