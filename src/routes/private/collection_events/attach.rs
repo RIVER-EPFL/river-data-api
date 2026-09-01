@@ -21,15 +21,22 @@ pub enum EventSource {
     ByStreamOrigin,
 }
 
+/// `bool_or` SQL deciding whether any stream feeding a group was registered by a sync service:
+/// a stream this system did not create itself. Shared with the sample backfill, which uses the
+/// same distinction to decide whether a group's readings arrived as declared collections.
+pub fn any_sync_origin_sql() -> String {
+    "bool_or(ds.source_system NOT IN ('api', 'grab_sample', 'csv', 'csv_import'))".to_string()
+}
+
 impl EventSource {
-    fn sql(self) -> &'static str {
+    fn sql(self) -> String {
         match self {
-            Self::Manual => "'manual'",
-            Self::PortalSync => "'portal_sync'",
-            Self::ByStreamOrigin => {
-                "CASE WHEN bool_or(ds.source_system NOT IN ('api', 'grab_sample', 'csv', 'csv_import')) \
-                 THEN 'portal_sync' ELSE 'manual' END"
-            }
+            Self::Manual => "'manual'".to_string(),
+            Self::PortalSync => "'portal_sync'".to_string(),
+            Self::ByStreamOrigin => format!(
+                "CASE WHEN {} THEN 'portal_sync' ELSE 'manual' END",
+                any_sync_origin_sql()
+            ),
         }
     }
 }

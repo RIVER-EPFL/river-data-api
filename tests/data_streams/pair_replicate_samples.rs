@@ -1,6 +1,7 @@
 //! Pairing a stream that carries replicate-indexed readings (e.g. migrated NOMIS A/B/C rows)
 //! groups them into samples: pair backfills site/parameter, find-or-creates one samples row per
-//! replicate group, and stamps sample_id; unpair clears sample_id and removes the now
+//! replicate group (a sync-origin stream's groups form at any size, since its writer declares
+//! collections at ingest), and stamps sample_id; unpair clears sample_id and removes the now
 //! unreferenced samples.
 //!
 //! Run with: cargo test --test data_streams
@@ -169,7 +170,10 @@ async fn pair_groups_replicates_into_samples_and_unpair_clears_them() {
         ),
     )
     .await;
-    assert_eq!(lone_stamped, 0, "a single reading does not get a sample");
+    assert_eq!(
+        lone_stamped, 1,
+        "a sync-origin stream's single reading is a declared collection and forms a sample"
+    );
 
     let sample_n = scalar_i64(
         &db,

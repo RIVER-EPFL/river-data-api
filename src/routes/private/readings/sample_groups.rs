@@ -45,7 +45,8 @@ pub const fn forms_sample(declared_collection: bool, replicates: usize) -> bool 
 /// the stamping cannot disagree about what a group is.
 ///
 /// `declared_collection` is the writer stating that these readings are a collection event, which is
-/// what lets a single row form a sample. Backfills, which have no such statement, pass `false`.
+/// what lets a single row form a sample. Backfills recover it per group from stream origin
+/// instead ([`materialise_backfilled_samples`]).
 pub async fn materialise_samples<C: ConnectionTrait>(
     conn: &C,
     row_predicate: &str,
@@ -67,7 +68,20 @@ pub async fn materialise_samples_with_estimator<C: ConnectionTrait>(
     declared_collection: bool,
     stream_spec: Option<&str>,
 ) -> AppResult<()> {
-    let minimum = min_replicates(declared_collection);
+    let minimum = min_replicates(declared_collection).to_string();
+    materialise_samples_inner(conn, row_predicate, binds, &minimum, stream_spec).await
+}
+
+/// [`materialise_samples`] with the replicate minimum as a SQL expression over the group,
+/// evaluated per `(site, parameter, instant)`: one predicate can span streams whose writers
+/// made different declarations, so a single boolean cannot speak for all of them.
+async fn materialise_samples_inner<C: ConnectionTrait>(
+    conn: &C,
+    row_predicate: &str,
+    binds: Vec<sea_orm::Value>,
+    minimum_sql: &str,
+    stream_spec: Option<&str>,
+) -> AppResult<()> {
     let group_select = format!(
         "SELECT r.site_id, r.parameter_id, r.time
          FROM readings r
@@ -78,7 +92,7 @@ pub async fn materialise_samples_with_estimator<C: ConnectionTrait>(
            AND r.parameter_id IS NOT NULL
            AND r.measurement_type = '{SPOT}'
          GROUP BY r.site_id, r.parameter_id, r.time
-         HAVING COUNT(*) >= {minimum}"
+         HAVING COUNT(*) >= {minimum_sql}"
     );
 
     // The estimator each new row is computed with, and what chose it, decided in the insert so a
@@ -135,12 +149,20 @@ pub async fn materialise_samples_with_estimator<C: ConnectionTrait>(
     Ok(())
 }
 
-/// The backfill spelling of [`materialise_samples`]: a pairing or plan-apply backfill knows nothing
-/// about the writer's intent, so only a group of two or more spot readings forms a sample.
+/// The backfill spelling of [`materialise_samples`]: a pairing or plan-apply backfill did not
+/// witness the write, so it recovers the writer's intent from where each group's streams came
+/// from. A sync-registered stream ingests with `collection` declared, so its groups form samples
+/// at any replicate count, exactly as they would have at ingest had the stream been paired; a
+/// stream this system created itself made no such declaration, and only two or more spot
+/// readings sharing an instant form a sample there.
 pub async fn materialise_backfilled_samples<C: ConnectionTrait>(
     conn: &C,
     row_predicate: &str,
     bind: sea_orm::Value,
 ) -> AppResult<()> {
-    materialise_samples(conn, row_predicate, vec![bind], false).await
+    let minimum_sql = format!(
+        "CASE WHEN {} THEN 1 ELSE 2 END",
+        crate::routes::private::collection_events::attach::any_sync_origin_sql()
+    );
+    materialise_samples_inner(conn, row_predicate, vec![bind], &minimum_sql, None).await
 }

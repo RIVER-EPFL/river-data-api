@@ -469,3 +469,70 @@ async fn non_spot_replicates_never_sample() {
         "continuous readings sharing an instant are not a collection event"
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn single_replicate_backfills_at_pairing_by_stream_origin() {
+    // Scenario: a stream ingests one spot reading per instant while unpaired, then is paired.
+    // Expected behaviour: a sync-registered stream's group forms a sample at pairing (its writer
+    // declares collections at ingest, which pairing recovers from the stream's origin); a stream
+    // this system created itself does not form one from a single reading.
+    let fx = setup().await;
+
+    let sync_stream = register_spot_stream(&fx, "form-origin-sync").await;
+    ingest(
+        &fx,
+        &fx.token,
+        &sync_stream,
+        replicate_batch(T1, &[42.0], 0),
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        scalar_i64(
+            &fx.db,
+            &format!("SELECT COUNT(*) AS n FROM {}", temp_sample_where(T1))
+        )
+        .await,
+        0,
+        "unpaired single reading forms no sample"
+    );
+    pair_to_temp_slot(&fx, &sync_stream).await;
+    assert_eq!(
+        scalar_i64(
+            &fx.db,
+            &format!("SELECT n::bigint AS n FROM {}", temp_sample_where(T1))
+        )
+        .await,
+        1,
+        "pairing a sync-origin stream forms the single-replicate sample"
+    );
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &fx.app,
+        "/api/streams/register",
+        &json!({"source_system": "api", "source_key": "form-origin-self", "measurement_type": "spot"}),
+        &fx.token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "register ({status}): {body}");
+    let self_stream = crate::common::e2e::id_of(&body);
+    ingest(
+        &fx,
+        &fx.token,
+        &self_stream,
+        replicate_batch(T2, &[43.0], 0),
+        json!({}),
+    )
+    .await;
+    pair_to_temp_slot(&fx, &self_stream).await;
+    assert_eq!(
+        scalar_i64(
+            &fx.db,
+            &format!("SELECT COUNT(*) AS n FROM {}", temp_sample_where(T2))
+        )
+        .await,
+        0,
+        "pairing a self-origin stream does not mint a single-reading sample"
+    );
+}
