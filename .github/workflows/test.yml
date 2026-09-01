@@ -47,6 +47,44 @@ jobs:
           done
           echo "Keycloak did not become ready"; docker logs keycloak; exit 1
 
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Built from this commit's tools-runner/, not pulled: a test run has to exercise the R the
+      # commit ships, or a change to the runner is green here and broken on deploy. Reads the
+      # layer cache the publish workflow writes under the same scope, so an unchanged runner
+      # costs a cache restore rather than an R package build.
+      - name: Build the R tool runner
+        uses: docker/build-push-action@v6
+        with:
+          context: tools-runner
+          load: true
+          tags: river-data-tools-r:test
+          build-args: |
+            IMAGE_BUILD_SHA=${{ github.sha }}
+          cache-from: type=gha,scope=tools-r
+
+      # Same restrictions the deployment applies, so a script that only works on a writable root
+      # filesystem fails here rather than in the cluster.
+      - name: Start the R tool runner
+        run: |
+          docker run -d --name tools-r -p 8006:80 \
+            --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+            --tmpfs /tmp:uid=10001,gid=10001,mode=1777,size=256m \
+            --tmpfs /run/apache2:uid=10001,gid=10001,mode=0750 \
+            --tmpfs /var/lock/apache2:uid=10001,gid=10001,mode=0750 \
+            --tmpfs /var/log/apache2:uid=10001,gid=10001,mode=0750 \
+            --tmpfs /var/log/opencpu:uid=10001,gid=10001,mode=0750 \
+            river-data-tools-r:test
+          for _ in $(seq 1 60); do
+            if curl -sf -X POST -H 'Content-Type: application/json' -d '{}' \
+              'http://localhost:8006/ocpu/library/riverdata.tools/R/runtime_info/json?auto_unbox=true' >/dev/null; then
+              echo "Tool runner ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "Tool runner did not become ready"; docker logs tools-r; exit 1
+
       - name: Run tests
         env:
           DATABASE_URL: postgresql://postgres:psql@localhost:5432/river_test
@@ -63,6 +101,9 @@ jobs:
           TEST_KEYCLOAK_CLIENT_ID: river-data-ui-local
           # Without this a Keycloak-gated test skips silently, and a skip reports as a pass.
           REQUIRE_KEYCLOAK: "1"
+          # Same shape for the OpenCPU tool runner: without it, a runner-gated test skips.
+          TOOLS_RUNNER_URL: http://localhost:8006/ocpu
+          REQUIRE_TOOLS_RUNNER: "1"
           # libtest sizes its threads from this (2 MB default). The unoptimised `e2e` binary needs
           # 3-4 MB, measured, and aborts with SIGABRT below that, taking the rest of the run with it.
           RUST_MIN_STACK: "16777216"
@@ -71,3 +112,7 @@ jobs:
       - name: Keycloak logs on failure
         if: failure()
         run: docker logs keycloak
+
+      - name: Tool runner logs on failure
+        if: failure()
+        run: docker logs tools-r

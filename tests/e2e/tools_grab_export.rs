@@ -184,6 +184,9 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
     if !kc::require_keycloak_or_skip("doc_tool_replicates_saved_at_a_station").await {
         return;
     }
+    if !crate::common::tools_runner::require_runner_or_skip("doc_tool_replicates_saved_at_a_station").await {
+        return;
+    }
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     let app = kc::build_test_app_with_keycloak(db.clone()).await;
@@ -963,6 +966,9 @@ async fn sensor_vs_grab_empty_comparisons_and_invalid_windows() {
 #[serial]
 async fn doc_tool_rejects_malformed_input_and_accounts_for_every_request_key() {
     if !kc::require_keycloak_or_skip("doc_tool_input_contract").await {
+        return;
+    }
+    if !crate::common::tools_runner::require_runner_or_skip("doc_tool_input_contract").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
