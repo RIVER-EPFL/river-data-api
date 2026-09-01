@@ -6,8 +6,11 @@ use sea_orm::{
     ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, QueryResult, Statement,
 };
 
-/// Compress every uncompressed `readings` chunk overlapping `[start, end]`, returning how many were
-/// compressed (0 when the range holds no chunks).
+/// Compress the `readings` chunks overlapping `[start, end]`, returning how many chunks now hold
+/// the range compressed (0 when the range holds no chunks). A chunk that is already compressed is
+/// passed to `compress_chunk` again: rows inserted after a chunk was compressed sit in its
+/// uncompressed staging area until recompression, and with wide chunk intervals two test dates
+/// routinely share one chunk.
 pub async fn compress_readings_range(
     db: &DatabaseConnection,
     start: DateTime<Utc>,
@@ -18,7 +21,7 @@ pub async fn compress_readings_range(
             DatabaseBackend::Postgres,
             "SELECT format('%I.%I', chunk_schema, chunk_name) AS chunk \
              FROM timescaledb_information.chunks \
-             WHERE hypertable_name = 'readings' AND NOT is_compressed \
+             WHERE hypertable_name = 'readings' \
                AND range_end > $1 AND range_start <= $2 \
              ORDER BY range_start",
             [start.into(), end.into()],

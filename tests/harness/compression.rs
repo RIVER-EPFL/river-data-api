@@ -50,10 +50,11 @@ async fn test_compress_readings_range_compresses_matching_chunks() {
     assert!(compress_readings_range(&db, window.0, window.1).await >= 1);
     assert!(compressed_readings_chunk_count(&db).await >= 1);
 
-    // Nothing left to compress in the same window, and an empty window is a no-op.
-    assert_eq!(compress_readings_range(&db, window.0, window.1).await, 0);
+    // A second pass re-covers the same chunks, recompressing any rows staged since; an empty
+    // window is a no-op.
+    assert!(compress_readings_range(&db, window.0, window.1).await >= 1);
     assert_eq!(
-        compress_readings_range(&db, Utc::now(), Utc::now() + Duration::days(1)).await,
+        compress_readings_range(&db, Utc::now() + Duration::days(1), Utc::now() + Duration::days(2)).await,
         0
     );
 

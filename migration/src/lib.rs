@@ -90,6 +90,7 @@ mod m20260830_000003_audit_annotations;
 mod m20260831_000001_annotation_provenance;
 mod m20260831_000002_stream_window_digest;
 mod m20260901_000001_sync_interval;
+mod m20260901_000002_readings_chunk_interval;
 
 pub struct Migrator;
 
@@ -185,6 +186,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260831_000001_annotation_provenance::Migration),
             Box::new(m20260831_000002_stream_window_digest::Migration),
             Box::new(m20260901_000001_sync_interval::Migration),
+            Box::new(m20260901_000002_readings_chunk_interval::Migration),
         ]
     }
 }
