@@ -780,8 +780,32 @@ pub async fn ingest_readings(
             } else {
                 Replace::Nothing
             };
-            let n = insert_reading_chunks(txn, &models, replace).await?;
-            if let Some((lo, hi)) = sample_window {
+            // Under a diff, only classified-new and applied-changed rows are written; an
+            // unchanged row re-written with identical values is a hypertable write, WAL and
+            // an upsert count that reads as effect, all for nothing. An overwrite is exempt:
+            // it exists to rewrite attribution, which the diff's value equality cannot see.
+            let filtered: Vec<readings::ActiveModel>;
+            let to_write: &[readings::ActiveModel] = match &diff {
+                Some(d) if !payload.overwrite => {
+                    filtered = models
+                        .iter()
+                        .zip(payload.readings.iter())
+                        .filter(|(_, r)| d.write_keys.contains(&(r.time, r.replicate_index)))
+                        .map(|(m, _)| m.clone())
+                        .collect();
+                    &filtered
+                }
+                _ => &models,
+            };
+            let n = insert_reading_chunks(txn, to_write, replace).await?;
+            // A pass that wrote, withdrew or reinstated nothing left every group's content
+            // as it stood; sample statistics and event attachment have nothing to recompute.
+            // Overwrites recompute regardless: they may have moved attribution.
+            let diff_touched = payload.overwrite
+                || diff.as_ref().is_none_or(|d| {
+                    d.new_rows + d.changed + d.withdrawn + d.reinstated > 0
+                });
+            if diff_touched && let Some((lo, hi)) = sample_window {
                 let binds: Vec<sea_orm::Value> = vec![
                     payload.stream_id.into(),
                     sea_orm::prelude::DateTimeWithTimeZone::from(lo).into(),
@@ -921,19 +945,40 @@ pub async fn ingest_readings(
 
     // Update last_data_time on the stream. Every group is admitted (audit disagreements are
     // review records, not gates), so the cursor always advances to the batch's newest instant.
-    if let Some(max_time) = payload.readings.iter().map(|r| r.time).max() {
-        let should_update = stream
+    // The same UPDATE persists the handshake digest of a cleanly applied windowed pass (no
+    // brake, no holds, no rejections, no stripped curve claims): the claim the sync client
+    // compares its next payload against to skip re-sending unchanged content. A braked or held
+    // pass stores none, so those windows keep re-asserting until a person rules.
+    let advance_cursor = payload.readings.iter().map(|r| r.time).max().filter(|max_time| {
+        stream
             .last_data_time
-            .map(|t| max_time > t.with_timezone(&Utc))
-            .unwrap_or(true);
-
-        if should_update {
-            let mut active: data_streams::ActiveModel = stream.into();
+            .map(|t| *max_time > t.with_timezone(&Utc))
+            .unwrap_or(true)
+    });
+    let rejected_total: usize = counts.iter().map(|(_, n)| n).sum();
+    let clean_digest = payload
+        .window
+        .as_ref()
+        .and_then(|w| w.content_digest.clone())
+        .filter(|_| {
+            rejected_total == 0
+                && stripped_claims.is_empty()
+                && diff_outcome
+                    .as_ref()
+                    .is_some_and(|d| !d.braked && d.holds_raised == 0)
+        });
+    let digest_changed = clean_digest.is_some() && stream.last_window_digest != clean_digest;
+    if advance_cursor.is_some() || digest_changed {
+        let mut active: data_streams::ActiveModel = stream.into();
+        if let Some(max_time) = advance_cursor {
             active.last_data_time = Set(Some(max_time.into()));
-            active.updated_at = Set(Utc::now().into());
-            if let Err(e) = active.update(db).await {
-                tracing::warn!(error = %e, "Failed to update stream last_data_time");
-            }
+        }
+        if digest_changed {
+            active.last_window_digest = Set(clean_digest);
+        }
+        active.updated_at = Set(Utc::now().into());
+        if let Err(e) = active.update(db).await {
+            tracing::warn!(error = %e, "Failed to update stream sync state");
         }
     }
 
@@ -982,7 +1027,7 @@ pub async fn ingest_readings(
             tracing::warn!(stream_id = %payload.stream_id, changed = d.changed, withdrawn = d.withdrawn, "Windowed pass braked; corrections and withdrawals held for review");
         }
     }
-    tracing::debug!(total, inserted = outcome.inserted, skipped = outcome.skipped, changed = outcome.changed, withdrawn = outcome.withdrawn, stream_id = %payload.stream_id, paired, "Ingest complete");
+    tracing::debug!(total, inserted = outcome.inserted, skipped = outcome.skipped, changed = outcome.changed, withdrawn = outcome.withdrawn, reinstated = diff_reinstated, stream_id = %payload.stream_id, paired, "Ingest complete");
     Ok(Json(outcome))
 }
 
@@ -1087,6 +1132,10 @@ pub struct IngestStatusEventsResponse {
     /// than raised, for the same reason `/ingest` counts its skipped readings.
     #[serde(default)]
     pub skipped: usize,
+    /// Events dropped for repeating the stream's latest value: the series keeps its first
+    /// value and its transitions.
+    #[serde(default)]
+    pub deduplicated: usize,
     pub stream_id: Uuid,
     pub paired: bool,
 }
@@ -1112,6 +1161,7 @@ pub async fn ingest_status_events(
         return Ok(Json(IngestStatusEventsResponse {
             inserted: 0,
             skipped: 0,
+            deduplicated: 0,
             stream_id: payload.stream_id,
             paired: false,
         }));
@@ -1151,6 +1201,46 @@ pub async fn ingest_status_events(
         return Ok(Json(IngestStatusEventsResponse {
             inserted: 0,
             skipped,
+            deduplicated: 0,
+            stream_id: payload.stream_id,
+            paired,
+        }));
+    }
+
+    // A status equal to the stream's latest stored value (and any repeat inside the batch) says
+    // nothing new: the series keeps its first value and its transitions, and stops accreting one
+    // "still the same" row per poll. Events at or before the stored tip are backfill and insert
+    // as before; the primary key already collapses exact duplicates.
+    let tip = db
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT time, value FROM status_events WHERE stream_id = $1 ORDER BY time DESC LIMIT 1",
+            [payload.stream_id.into()],
+        ))
+        .await?;
+    let tip_time: Option<chrono::DateTime<Utc>> = tip
+        .as_ref()
+        .and_then(|r| r.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "time").ok())
+        .map(|t| t.with_timezone(&Utc));
+    let mut last_value: Option<String> = tip.as_ref().and_then(|r| r.try_get("", "value").ok());
+    payload.events.sort_by_key(|e| e.time);
+    let before_dedup = payload.events.len();
+    payload.events.retain(|e| {
+        let after_tip = tip_time.is_none_or(|t| e.time > t);
+        if after_tip && last_value.as_deref() == Some(e.value.as_str()) {
+            return false;
+        }
+        if after_tip {
+            last_value = Some(e.value.clone());
+        }
+        true
+    });
+    let deduplicated = before_dedup - payload.events.len();
+    if payload.events.is_empty() {
+        return Ok(Json(IngestStatusEventsResponse {
+            inserted: 0,
+            skipped,
+            deduplicated,
             stream_id: payload.stream_id,
             paired,
         }));
@@ -1198,10 +1288,11 @@ pub async fn ingest_status_events(
         }
     }
 
-    tracing::debug!(total, inserted, skipped, stream_id = %payload.stream_id, paired, "Status events ingest complete");
+    tracing::debug!(total, inserted, skipped, deduplicated, stream_id = %payload.stream_id, paired, "Status events ingest complete");
     Ok(Json(IngestStatusEventsResponse {
         inserted,
         skipped,
+        deduplicated,
         stream_id: payload.stream_id,
         paired,
     }))

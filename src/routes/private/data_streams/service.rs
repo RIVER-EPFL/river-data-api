@@ -64,6 +64,7 @@ pub async fn get_or_create_api_stream(
         is_active: Set(true),
         discovered_at: Set(now.into()),
         last_data_time: Set(None),
+        last_window_digest: Set(None),
         pairing_plan_id: Set(None),
         created_at: Set(now.into()),
         updated_at: Set(now.into()),

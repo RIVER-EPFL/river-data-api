@@ -18,6 +18,8 @@ pub fn category_for(trigger_type: &str) -> &'static str {
         | "janitor_service"
         | "alarm_sweep"
         | "sync_event_sweep"
+        | "sync_ledger_retention"
+        | "sync_full_reassert"
         | "identity_reconcile"
         | "notify_health"
         | "dispatch_notifications"

@@ -45,6 +45,9 @@ pub struct Model {
     pub paired_at: Option<DateTimeWithTimeZone>,
     #[crudcrate(sortable)]
     pub last_data_time: Option<DateTimeWithTimeZone>,
+    /// Content digest of the last cleanly-applied windowed pass, as the sync client claimed it.
+    #[crudcrate(exclude(create, update))]
+    pub last_window_digest: Option<String>,
     #[crudcrate(filterable, exclude(create, update))]
     pub pairing_plan_id: Option<Uuid>,
     #[crudcrate(exclude(create, update))]

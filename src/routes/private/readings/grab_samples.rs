@@ -297,6 +297,7 @@ async fn get_or_create_grab_stream(
         discovered_at: Set(now.into()),
         paired_at: Set(site_parameter_id.map(|_| now.into())),
         last_data_time: Set(None),
+        last_window_digest: Set(None),
         pairing_plan_id: Set(None),
         created_at: Set(now.into()),
         updated_at: Set(now.into()),

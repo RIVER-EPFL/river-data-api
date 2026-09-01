@@ -111,6 +111,8 @@ async fn ingest_status_event_dedup_first_write_wins() {
     let app = crate::common::build_test_app(db.clone());
     let stream = register_stream(&app, &token, "se1").await;
 
+    // The series keeps its first value and its transitions: a repeated "still ok" poll says
+    // nothing and is not stored.
     let t1 = "2025-01-15T00:00:00Z";
     let t2 = "2025-01-15T01:00:00Z";
     let t3 = "2025-01-15T02:00:00Z";
@@ -124,13 +126,15 @@ async fn ingest_status_event_dedup_first_write_wins() {
     )
     .await;
     assert_eq!(status, 200, "first status ingest ({status}): {body}");
+    assert_eq!(body["inserted"], 1, "repeats collapse to the first value: {body}");
 
-    // re-send two existing timestamps (with different values) + one new
+    // A value change past the stored tip lands; a re-sent stored timestamp keeps its first
+    // value; a repeat of the latest value is dropped again.
     let t4 = "2025-01-15T03:00:00Z";
     let (status, body) = crate::common::post_json_parse_with_token(
         &app, "/api/ingest/status_events",
         &serde_json::json!({"stream_id": stream, "events": [
-            {"time": t1, "value": "changed"}, {"time": t2, "value": "changed"}, {"time": t4, "value": "ok"}
+            {"time": t1, "value": "changed"}, {"time": t2, "value": "changed"}, {"time": t4, "value": "changed"}
         ]}),
         &token,
     ).await;
@@ -142,12 +146,16 @@ async fn ingest_status_event_dedup_first_write_wins() {
             &format!("SELECT count(*) AS c FROM status_events WHERE stream_id = '{stream}'")
         )
         .await,
-        4,
-        "only the one genuinely-new timestamp was added"
+        2,
+        "the transition landed once; the tip repeat was dropped"
     );
     assert_eq!(
-        count(&db, &format!("SELECT count(*) AS c FROM status_events WHERE stream_id = '{stream}' AND value = 'changed'")).await,
-        0, "existing (stream,time) keeps its first value"
+        count(&db, &format!("SELECT count(*) AS c FROM status_events WHERE stream_id = '{stream}' AND time = '{t1}' AND value = 'ok'")).await,
+        1, "existing (stream,time) keeps its first value"
+    );
+    assert_eq!(
+        count(&db, &format!("SELECT count(*) AS c FROM status_events WHERE stream_id = '{stream}' AND time = '{t2}' AND value = 'changed'")).await,
+        1, "the transition is recorded at its first instant"
     );
 }
 

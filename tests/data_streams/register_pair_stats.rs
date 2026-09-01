@@ -84,6 +84,57 @@ async fn test_register_stream_upsert() {
     assert_eq!(json2["source_name"], "Updated Name");
 }
 
+#[tokio::test]
+#[serial]
+async fn test_identical_registration_is_a_no_op_write() {
+    let (app, token, db) = setup().await;
+
+    let body = serde_json::json!({
+        "source_system": "test-upsert",
+        "source_key": "key-noop",
+        "source_name": "Same Name",
+        "metadata": { "column": "DO_mgL" }
+    });
+    let (status, _) =
+        crate::common::post_json_parse_with_token(&app, "/api/streams/register", &body, &token)
+            .await;
+    assert_eq!(status, 200);
+    let updated_at = |db: &sea_orm::DatabaseConnection| {
+        let db = db.clone();
+        async move {
+            db.query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT updated_at::text AS u FROM data_streams WHERE source_key = 'key-noop'"
+                    .to_string(),
+            ))
+            .await
+            .unwrap()
+            .expect("the stream exists")
+            .try_get::<String>("", "u")
+            .unwrap()
+        }
+    };
+    let first = updated_at(&db).await;
+
+    // A byte-identical re-registration (a sync service re-running discovery) writes nothing.
+    let (status, json) =
+        crate::common::post_json_parse_with_token(&app, "/api/streams/register", &body, &token)
+            .await;
+    assert_eq!(status, 200);
+    assert_eq!(json["source_name"], "Same Name");
+    assert_eq!(updated_at(&db).await, first, "no updated_at churn");
+
+    // A changed descriptor still lands.
+    let mut changed = body.clone();
+    changed["source_name"] = serde_json::json!("New Name");
+    let (status, json) =
+        crate::common::post_json_parse_with_token(&app, "/api/streams/register", &changed, &token)
+            .await;
+    assert_eq!(status, 200);
+    assert_eq!(json["source_name"], "New Name");
+    assert_ne!(updated_at(&db).await, first);
+}
+
 // ============================================================================
 // Stream pairing, pair, verify backfill, check stats
 // ============================================================================

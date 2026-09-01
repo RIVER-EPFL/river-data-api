@@ -172,6 +172,8 @@ pub fn register_scheduled_services(registry: &mut JobRegistry, config: &crate::c
     registry.register(Arc::new(super::jobs::JanitorRun::from_config(config)));
     registry.register(Arc::new(super::jobs::AlarmSweep::from_config(config)));
     registry.register(Arc::new(super::jobs::SyncEventSweep::from_config(config)));
+    registry.register(Arc::new(super::jobs::SyncLedgerRetention::from_config(config)));
+    registry.register(Arc::new(super::jobs::SyncFullReassert::from_config(config)));
     registry.register(Arc::new(super::jobs::PushSubscriptionReconcile::from_config(
         config,
     )));

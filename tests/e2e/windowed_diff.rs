@@ -86,6 +86,40 @@ async fn windowed_ingest(
     .await
 }
 
+async fn windowed_ingest_digest(
+    fx: &Fixture,
+    readings: Vec<serde_json::Value>,
+    rows: u64,
+    digest: &str,
+) -> (u16, serde_json::Value) {
+    let mut w = window(rows);
+    w["content_digest"] = json!(digest);
+    crate::common::post_json_parse_with_token(
+        &fx.app,
+        "/api/ingest",
+        &json!({
+            "stream_id": fx.stream_id,
+            "collection": true,
+            "window": w,
+            "readings": readings,
+        }),
+        &fx.sync_token,
+    )
+    .await
+}
+
+async fn stored_digest(db: &DatabaseConnection, stream_id: &str) -> Option<String> {
+    db.query_one(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!("SELECT last_window_digest FROM data_streams WHERE id = '{stream_id}'"),
+    ))
+    .await
+    .unwrap()
+    .expect("the stream exists")
+    .try_get("", "last_window_digest")
+    .unwrap()
+}
+
 async fn sample_stats(db: &DatabaseConnection) -> (f64, i32) {
     let row = db
         .query_one(Statement::from_string(
@@ -294,7 +328,7 @@ async fn a_bulk_reshape_is_braked_and_new_rows_still_apply() {
 
     // A pass claiming only two of them survive (plus one new row): 80% withdrawal trips the
     // brake, corrections and withdrawals hold, the new row still lands.
-    let (status, resp) = windowed_ingest(
+    let (status, resp) = windowed_ingest_digest(
         &fx,
         vec![
             json!({ "time": "2025-06-01T00:00:00Z", "raw_value": 10.0, "replicate_index": 0 }),
@@ -302,11 +336,17 @@ async fn a_bulk_reshape_is_braked_and_new_rows_still_apply() {
             json!({ "time": "2025-06-01T12:00:00Z", "raw_value": 99.0, "replicate_index": 0 }),
         ],
         3,
+        "braked-claim",
     )
     .await;
     assert_eq!(status, 200, "{resp}");
     assert_eq!(resp["withdrawn"], 0, "held, not applied: {resp}");
     assert_eq!(resp["inserted"], 1, "the new row applied: {resp}");
+    assert_eq!(
+        stored_digest(&fx.db, &fx.stream_id).await,
+        None,
+        "a braked pass claims no digest, so the source keeps re-asserting"
+    );
 
     let intact = crate::common::e2e::count(
         &fx.db,
@@ -408,4 +448,69 @@ async fn a_bulk_reshape_is_braked_and_new_rows_still_apply() {
         .try_get::<String>("", "status")
         .unwrap();
     assert_eq!(remediated, "remediated");
+}
+
+#[tokio::test]
+#[serial]
+async fn the_digest_handshake_stores_only_clean_claims() {
+    let fx = setup().await;
+
+    // A clean first pass persists the client's claim.
+    let (status, resp) =
+        windowed_ingest_digest(&fx, replicates(T1, &[(0, 10.0), (1, 20.0)]), 1, "d1").await;
+    assert_eq!(status, 200, "{resp}");
+    assert_eq!(stored_digest(&fx.db, &fx.stream_id).await, Some("d1".to_string()));
+
+    let row_xmin = |db: &DatabaseConnection, stream_id: &str| {
+        let q = format!(
+            "SELECT xmin::text AS x FROM readings \
+             WHERE stream_id = '{stream_id}' AND time = '{T1}' AND replicate_index = 0"
+        );
+        let db = db.clone();
+        async move {
+            db.query_one(Statement::from_string(DatabaseBackend::Postgres, q))
+                .await
+                .unwrap()
+                .expect("the reading exists")
+                .try_get::<String>("", "x")
+                .unwrap()
+        }
+    };
+    let before = row_xmin(&fx.db, &fx.stream_id).await;
+
+    // An identical re-send is a recorded no-op: the receipt commits, but no reading row is
+    // rewritten (the client would normally not even send this pass).
+    let (status, resp) =
+        windowed_ingest_digest(&fx, replicates(T1, &[(0, 10.0), (1, 20.0)]), 1, "d1").await;
+    assert_eq!(status, 200, "{resp}");
+    assert_eq!(resp["unchanged"], 2, "{resp}");
+    assert_eq!(row_xmin(&fx.db, &fx.stream_id).await, before, "no row version churn");
+    let receipts = crate::common::e2e::count(
+        &fx.db,
+        &format!(
+            "SELECT COUNT(*)::bigint FROM ingest_receipts WHERE stream_id = '{}'",
+            fx.stream_id
+        ),
+    )
+    .await;
+    assert_eq!(receipts, 2, "the ledger still records the pass");
+
+    // A pass that raises a hold stores no digest: the operator's ruling is pending, so the
+    // source must keep re-asserting the window.
+    crate::common::exec(
+        &fx.db,
+        &format!(
+            "UPDATE readings SET is_flagged = TRUE, flag_reason = 'under review' \
+             WHERE stream_id = '{}' AND time = '{T1}' AND replicate_index = 0",
+            fx.stream_id
+        ),
+    )
+    .await;
+    let (status, resp) = windowed_ingest_digest(&fx, replicates(T1, &[(1, 20.0)]), 1, "d2").await;
+    assert_eq!(status, 200, "{resp}");
+    assert_eq!(
+        stored_digest(&fx.db, &fx.stream_id).await,
+        Some("d1".to_string()),
+        "the held pass did not update the claim"
+    );
 }

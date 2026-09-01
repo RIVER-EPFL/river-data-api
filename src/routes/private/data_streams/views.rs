@@ -554,13 +554,16 @@ pub async fn register_stream(
         discovered_at: Set(now.into()),
         paired_at: Set(None),
         last_data_time: Set(None),
+        last_window_digest: Set(None),
         pairing_plan_id: Set(None),
         created_at: Set(now.into()),
         updated_at: Set(now.into()),
     };
 
-    // Upsert on (source_system, source_key)
-    data_streams::Entity::insert(model)
+    // Upsert on (source_system, source_key). A byte-identical re-registration must be a no-op
+    // write: the sync services re-run discovery every cycle, and rewriting an unchanged row
+    // bumps updated_at and churns WAL for nothing.
+    let upsert = data_streams::Entity::insert(model)
         .on_conflict(
             sea_orm::sea_query::OnConflict::columns([
                 data_streams::Column::SourceSystem,
@@ -572,10 +575,17 @@ pub async fn register_stream(
                 data_streams::Column::Metadata,
                 data_streams::Column::UpdatedAt,
             ])
+            .action_and_where(sea_orm::sea_query::Expr::cust(
+                "(data_streams.source_name, data_streams.source_path, data_streams.metadata)                  IS DISTINCT FROM                  (excluded.source_name, excluded.source_path, excluded.metadata)",
+            ))
             .to_owned(),
         )
         .exec(&state.db)
-        .await?;
+        .await;
+    match upsert {
+        Ok(_) | Err(sea_orm::DbErr::RecordNotInserted) => {}
+        Err(e) => return Err(e.into()),
+    }
 
     // Re-fetch the upserted row
     let mut stream = data_streams::Entity::find()

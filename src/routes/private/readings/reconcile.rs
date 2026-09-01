@@ -47,6 +47,11 @@ pub struct SourceWindow {
     /// Instants the backend saw but could not decode; stored rows at these keys are retained.
     #[serde(default)]
     pub dropped_times: Vec<DateTime<Utc>>,
+    /// The client's digest of this payload's source-asserted content. Opaque: persisted on the
+    /// stream when the pass applies cleanly, echoed on the stream list, and never computed
+    /// server-side. The client skips its next pass when its content digests to the same value.
+    #[serde(default)]
+    pub content_digest: Option<String>,
 }
 
 /// One stored row of the window, as the diff reads it.
@@ -66,11 +71,14 @@ pub struct DiffOutcome {
     pub retained: usize,
     pub reinstated: usize,
     pub braked: bool,
-    /// Keys the diff decided may be written (new + changed + unchanged); under a brake, changed
-    /// keys are removed so the upsert cannot correct them.
+    /// Whether classified-changed rows apply this pass; false under a brake.
     pub apply_changed: bool,
     pub holds_raised: usize,
     pub changed_keys: Vec<(DateTime<Utc>, i16)>,
+    /// The keys the upsert should write: new rows, plus changed rows when they apply. An
+    /// unchanged row re-written with identical values is WAL churn the diff exists to avoid;
+    /// under a brake the changed keys are excluded so the upsert cannot correct them.
+    pub write_keys: HashSet<Key>,
 }
 
 pub type Key = (DateTime<Utc>, i16);
@@ -248,16 +256,21 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
         apply_changed: true,
         holds_raised: 0,
         changed_keys: Vec::new(),
+        write_keys: HashSet::new(),
     };
 
     let mut admitted_keys: HashSet<Key> = HashSet::with_capacity(admitted.len());
     let mut changed_touched: Vec<Key> = Vec::new();
     let mut reinstate: Vec<Key> = Vec::new();
+    let mut changed_all: Vec<Key> = Vec::new();
     for (key, raw_value, standard_curve_id) in admitted {
         admitted_keys.insert(*key);
         // Keys outside the claimed window are plain appends and classify as new.
         match stored.get(key) {
-            None => outcome.new_rows += 1,
+            None => {
+                outcome.new_rows += 1;
+                outcome.write_keys.insert(*key);
+            }
             Some(row) => {
                 let equal =
                     row.raw_value == *raw_value && row.standard_curve_id == *standard_curve_id;
@@ -265,6 +278,7 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
                     outcome.unchanged += 1;
                 } else {
                     outcome.changed += 1;
+                    changed_all.push(*key);
                     if outcome.changed_keys.len() < 500 {
                         outcome.changed_keys.push(*key);
                     }
@@ -376,6 +390,8 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
             }
         }
     }
+
+    outcome.write_keys.extend(changed_all);
 
     // Curated rows never change servedness without a person: the withdrawal is not stamped and
     // the disagreement lands in the review queue. A corrected value on a curated row IS applied

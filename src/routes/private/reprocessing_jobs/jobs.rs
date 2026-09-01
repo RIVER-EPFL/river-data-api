@@ -1661,6 +1661,146 @@ pub async fn sweep_stale_sync_events(
     Ok(res.rows_affected())
 }
 
+/// Age-based retention for the sync ledgers. sync_events accretes one row per cycle and
+/// ingest_receipts one per windowed pass; without pruning both grow forever. Running
+/// sync_events rows are never touched (the staleness sweep owns those), and a stream's
+/// current state never rests on an old receipt: the source re-asserts its windows.
+pub struct SyncLedgerRetention {
+    sync_event_retention_days: u32,
+    ingest_receipt_retention_days: u32,
+}
+
+impl SyncLedgerRetention {
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            sync_event_retention_days: config.sync_event_retention_days,
+            ingest_receipt_retention_days: config.ingest_receipt_retention_days,
+        }
+    }
+}
+
+#[async_trait]
+impl Job for SyncLedgerRetention {
+    fn name(&self) -> &'static str {
+        "sync_ledger_retention"
+    }
+
+    fn default_schedule(&self) -> Option<Schedule> {
+        Some(Schedule::every_secs(86_400))
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let db = ctx.db();
+        let mut events_pruned = 0u64;
+        if self.sync_event_retention_days > 0 {
+            events_pruned = db
+                .execute(sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "DELETE FROM sync_events
+                     WHERE status <> 'running'
+                       AND started_at < NOW() - ($1 || ' days')::interval",
+                    [self.sync_event_retention_days.to_string().into()],
+                ))
+                .await?
+                .rows_affected();
+        }
+        let mut receipts_pruned = 0u64;
+        if self.ingest_receipt_retention_days > 0 {
+            receipts_pruned = db
+                .execute(sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "DELETE FROM ingest_receipts
+                     WHERE at < NOW() - ($1 || ' days')::interval",
+                    [self.ingest_receipt_retention_days.to_string().into()],
+                ))
+                .await?
+                .rows_affected();
+        }
+        ctx.set_detail(serde_json::json!({
+            "scope": {
+                "sync_event_retention_days": self.sync_event_retention_days,
+                "ingest_receipt_retention_days": self.ingest_receipt_retention_days,
+            },
+            "counts": {
+                "sync_events_pruned": events_pruned,
+                "ingest_receipts_pruned": receipts_pruned,
+            },
+        }))
+        .await;
+        Ok((events_pruned + receipts_pruned) as i64)
+    }
+}
+
+/// Queue a trigger_full_sync for every live, unpaused reconciled service. The digest
+/// handshake stops those services re-sending unchanged content, which also means routine
+/// passes can no longer repair server-side drift (rows changed outside the sync path); the
+/// periodic full pass ignores digests and re-asserts everything. Delivery is the normal
+/// heartbeat pickup; a service already holding a pending command is not queued twice.
+pub struct SyncFullReassert {
+    service_types: Vec<String>,
+    command_expiry_secs: u64,
+}
+
+impl SyncFullReassert {
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            service_types: config.sync_full_reassert_service_types.clone(),
+            command_expiry_secs: config.sync_command_expiry_secs,
+        }
+    }
+}
+
+#[async_trait]
+impl Job for SyncFullReassert {
+    fn name(&self) -> &'static str {
+        "sync_full_reassert"
+    }
+
+    fn default_schedule(&self) -> Option<Schedule> {
+        Some(Schedule::every_secs(604_800))
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        if self.service_types.is_empty() {
+            return Ok(0);
+        }
+        let queued = ctx
+            .db()
+            .execute(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "INSERT INTO sync_commands
+                     (id, service_id, command, status, created_at, expires_at)
+                 SELECT gen_random_uuid(), s.id, 'trigger_full_sync', 'pending', NOW(),
+                        NOW() + ($2 || ' seconds')::interval
+                 FROM sync_services s
+                 WHERE s.paused IS NOT TRUE
+                   AND s.service_type = ANY($1)
+                   AND s.last_heartbeat > NOW() - INTERVAL '1 hour'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM sync_commands c
+                       WHERE c.service_id = s.id
+                         AND c.command = 'trigger_full_sync'
+                         AND c.status = 'pending'
+                         AND c.expires_at > NOW()
+                   )",
+                [
+                    self.service_types.clone().into(),
+                    self.command_expiry_secs.to_string().into(),
+                ],
+            ))
+            .await?
+            .rows_affected();
+        ctx.set_detail(serde_json::json!({
+            "scope": { "service_types": self.service_types },
+            "counts": { "commands_queued": queued },
+        }))
+        .await;
+        Ok(queued as i64)
+    }
+}
+
 /// Prune Web Push subscriptions for users whose Keycloak account is revoked or disabled.
 pub struct PushSubscriptionReconcile {
     interval_seconds: u64,
