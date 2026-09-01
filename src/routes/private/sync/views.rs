@@ -62,6 +62,7 @@ pub fn read_routes() -> Router<AppState> {
 
 pub fn write_routes() -> Router<AppState> {
     Router::new()
+        .route("/services/{id}", patch(operator::update_service))
         .route("/services/{id}/commands", post(operator::issue_command))
         .route("/services/{id}/revoke", post(operator::revoke_service))
         .route("/apply-discovery", post(apply_discovery))

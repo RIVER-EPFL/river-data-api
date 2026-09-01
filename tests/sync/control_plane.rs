@@ -173,6 +173,81 @@ async fn heartbeat_updates_service_and_returns_no_pending_commands() {
 
 #[tokio::test]
 #[serial]
+async fn the_sync_cadence_is_set_by_an_operator_and_carried_on_the_heartbeat() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let (token, service_id) = crate::common::seed_sync_session_token(&db).await;
+    let admin = crate::common::seed_token_full(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let (status, hb) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sync/heartbeat",
+        &serde_json::json!({"service_id": service_id, "status": "idle"}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "heartbeat ({status}): {hb}");
+    assert!(
+        hb["sync_interval_secs"].is_null(),
+        "an unset cadence leaves the service on its own configuration: {hb}"
+    );
+
+    let (status, body) = crate::common::patch_json_with_token(
+        &app,
+        &format!("/api/sync/services/{service_id}"),
+        &serde_json::json!({"sync_interval_secs": 10}),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 400, "a cadence under the runner's floor is refused: {body}");
+
+    let (status, body) = crate::common::patch_json_with_token(
+        &app,
+        &format!("/api/sync/services/{service_id}"),
+        &serde_json::json!({"sync_interval_secs": 3600}),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "set cadence ({status}): {body}");
+    let updated: serde_json::Value = serde_json::from_str(&body).expect("service json");
+    assert_eq!(updated["sync_interval_secs"], 3600);
+
+    let (_, hb) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sync/heartbeat",
+        &serde_json::json!({"service_id": service_id, "status": "idle"}),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        hb["sync_interval_secs"], 3600,
+        "the running service learns the cadence from its heartbeat: {hb}"
+    );
+
+    let (status, body) = crate::common::patch_json_with_token(
+        &app,
+        &format!("/api/sync/services/{service_id}"),
+        &serde_json::json!({"sync_interval_secs": null}),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "clear cadence ({status}): {body}");
+    let (_, hb) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sync/heartbeat",
+        &serde_json::json!({"service_id": service_id, "status": "idle"}),
+        &token,
+    )
+    .await;
+    assert!(
+        hb["sync_interval_secs"].is_null(),
+        "clearing returns the service to its own configuration: {hb}"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn command_lifecycle_issue_deliver_acknowledge_complete() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
@@ -510,6 +585,7 @@ async fn health_state_derived_from_heartbeat_recency() {
             "paused",
             "service_type",
             "status",
+            "sync_interval_secs",
             "updated_at",
         ]
     );

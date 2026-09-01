@@ -85,14 +85,14 @@ pub async fn enroll(
 
     // `paused` deliberately survives re-enrollment: a pod restart must not
     // undo an operator's pause.
-    let (service_id, paused) = if let Some(existing) = existing {
+    let (service_id, paused, sync_interval_secs) = if let Some(existing) = existing {
         let mut active: services_model::ActiveModel = existing.clone().into();
         active.status = Set(starting);
         active.current_operation = Set(None);
         active.last_error = Set(None);
         active.updated_at = Set(Utc::now().into());
         active.update(&state.db).await?;
-        (existing.id, existing.paused)
+        (existing.id, existing.paused, existing.sync_interval_secs)
     } else {
         let service = services_model::ActiveModel {
             id: Set(Uuid::new_v4()),
@@ -101,6 +101,7 @@ pub async fn enroll(
             status: Set(starting),
             paused: Set(false),
             current_operation: Set(None),
+            sync_interval_secs: Set(None),
             last_heartbeat: Set(None),
             last_sync_completed_at: Set(None),
             last_error: Set(None),
@@ -108,7 +109,7 @@ pub async fn enroll(
             updated_at: Set(Utc::now().into()),
         };
         let inserted = service.insert(&state.db).await?;
-        (inserted.id, false)
+        (inserted.id, false, None)
     };
 
     if cred.service_id.is_none() {
@@ -126,5 +127,6 @@ pub async fn enroll(
         service_id,
         session_token,
         paused,
+        sync_interval_secs: sync_interval_secs.map(|s| s as u64),
     }))
 }

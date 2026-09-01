@@ -89,6 +89,7 @@ mod m20260830_000002_sd_estimator;
 mod m20260830_000003_audit_annotations;
 mod m20260831_000001_annotation_provenance;
 mod m20260831_000002_stream_window_digest;
+mod m20260901_000001_sync_interval;
 
 pub struct Migrator;
 
@@ -183,6 +184,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260830_000003_audit_annotations::Migration),
             Box::new(m20260831_000001_annotation_provenance::Migration),
             Box::new(m20260831_000002_stream_window_digest::Migration),
+            Box::new(m20260901_000001_sync_interval::Migration),
         ]
     }
 }

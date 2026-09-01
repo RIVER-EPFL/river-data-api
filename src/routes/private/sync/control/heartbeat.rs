@@ -67,6 +67,7 @@ pub async fn heartbeat(
         .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
 
     let paused = service.paused;
+    let sync_interval_secs = service.sync_interval_secs;
     let mut active: services_model::ActiveModel = service.into();
     active.status = Set(req.status);
     active.current_operation = Set(req.current_operation);
@@ -123,5 +124,6 @@ pub async fn heartbeat(
         session_token,
         pending_commands,
         paused,
+        sync_interval_secs: sync_interval_secs.map(|s| s as u64),
     }))
 }

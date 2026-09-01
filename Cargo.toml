@@ -101,7 +101,7 @@ async-trait = "0.1"
 migration = { path = "migration" }
 
 # Core library (sync control plane)
-river-data-core = { version = "0.8.0", features = ["openapi"] }
+river-data-core = { version = "0.9.0", features = ["openapi"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }

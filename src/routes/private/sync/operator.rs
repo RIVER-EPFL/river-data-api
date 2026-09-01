@@ -54,6 +54,8 @@ pub struct SyncServiceResponse {
     pub instance_id: String,
     pub status: String,
     pub paused: bool,
+    /// Operator-set scheduled cadence in seconds; null means the service's own configuration.
+    pub sync_interval_secs: Option<i32>,
     pub current_operation: Option<String>,
     pub last_heartbeat: Option<String>,
     pub last_sync_completed_at: Option<String>,
@@ -90,6 +92,7 @@ fn service_to_response(s: sync_services::Model, config: &Config) -> SyncServiceR
         instance_id: s.instance_id,
         status: s.status,
         paused: s.paused,
+        sync_interval_secs: s.sync_interval_secs,
         current_operation: s.current_operation,
         last_heartbeat: s.last_heartbeat.map(|t| t.to_rfc3339()),
         last_sync_completed_at: s.last_sync_completed_at.map(|t| t.to_rfc3339()),
@@ -354,6 +357,72 @@ pub async fn issue_command(
 
     let inserted = cmd.insert(&state.db).await?;
     Ok(Json(command_to_response(inserted)))
+}
+
+/// Settings an operator may change on a registered service. Absent fields are left alone;
+/// an explicit null clears the setting.
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateServiceRequest {
+    /// Scheduled sync cadence in seconds. Null returns the service to its own
+    /// `SYNC_INTERVAL_SECONDS`. Below `MIN_SYNC_INTERVAL_SECS` is refused.
+    #[serde(default, deserialize_with = "double_option")]
+    pub sync_interval_secs: Option<Option<i32>>,
+}
+
+/// Distinguish "field absent" from "field is null": the first leaves the setting, the second
+/// clears it.
+fn double_option<'de, D>(de: D) -> Result<Option<Option<i32>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(de).map(Some)
+}
+
+/// Shortest cadence an operator may set. Matches the floor the sync runner applies, so the
+/// portal refuses a number the service would silently override.
+const MIN_SYNC_INTERVAL_SECS: i32 = 30;
+
+/// Update a sync service's operator settings. The service adopts a new cadence on its next
+/// heartbeat, with no redeploy and no restart. Requires `write_metadata`.
+#[utoipa::path(
+    patch,
+    path = "/services/{id}",
+    params(("id" = Uuid, Path, description = "Sync service UUID")),
+    request_body = UpdateServiceRequest,
+    responses(
+        (status = 200, description = "Updated service", body = SyncServiceResponse),
+        (status = 400, description = "Cadence below the minimum"),
+        (status = 404, description = "Service not found"),
+    ),
+    tag = "sync"
+)]
+pub async fn update_service(
+    State(state): State<AppState>,
+    Path(service_id): Path<Uuid>,
+    Json(req): Json<UpdateServiceRequest>,
+) -> AppResult<Json<SyncServiceResponse>> {
+    let service = sync_services::Entity::find_by_id(service_id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+
+    let Some(interval) = req.sync_interval_secs else {
+        return Ok(Json(service_to_response(service, state.config.as_ref())));
+    };
+    if let Some(secs) = interval
+        && secs < MIN_SYNC_INTERVAL_SECS
+    {
+        return Err(AppError::BadRequest(format!(
+            "sync_interval_secs must be at least {MIN_SYNC_INTERVAL_SECS} seconds"
+        )));
+    }
+
+    let mut active: sync_services::ActiveModel = service.into();
+    active.sync_interval_secs = Set(interval);
+    active.updated_at = Set(Utc::now().into());
+    let updated = active.update(&state.db).await?;
+    Ok(Json(service_to_response(updated, state.config.as_ref())))
 }
 
 /// Paginated list of sync commands (newest first). Returns a `Content-Range: items {start}-{end}/{total}`

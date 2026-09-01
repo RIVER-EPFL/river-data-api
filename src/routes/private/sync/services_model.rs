@@ -23,6 +23,11 @@ pub struct Model {
     #[crudcrate(filterable, exclude(create), on_create = false)]
     pub paused: bool,
     pub current_operation: Option<String>,
+    /// Operator-set scheduled sync cadence in seconds. NULL leaves the service on its own
+    /// `SYNC_INTERVAL_SECONDS`. Set through `PATCH /sync/services/{id}`, which enforces the
+    /// minimum the runner floors at; generic CRUD must not write it around that check.
+    #[crudcrate(exclude(create, update))]
+    pub sync_interval_secs: Option<i32>,
     #[crudcrate(sortable, exclude(create, update))]
     pub last_heartbeat: Option<DateTimeWithTimeZone>,
     pub last_sync_completed_at: Option<DateTimeWithTimeZone>,
