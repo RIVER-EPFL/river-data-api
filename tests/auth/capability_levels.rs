@@ -113,6 +113,14 @@ async fn river_writes_data_and_field_metadata_only() {
     )
     .await;
     assert_eq!(s, 403, "river cannot manage sensors");
+    let (s, _) = crate::common::post_json_with_token(
+        &app,
+        "/api/parameters",
+        &sample_parameter("river_cap"),
+        &jwt,
+    )
+    .await;
+    assert_eq!(s, 403, "river cannot write the global catalog");
     let (s, _) = crate::common::get_with_token(&app, "/api/tokens", &jwt).await;
     assert_eq!(s, 403, "river cannot reach admin surfaces");
 }
@@ -146,15 +154,16 @@ async fn manager_writes_catalog_and_sensors_but_not_admin() {
     .await;
     assert!(passed_auth(s), "manager manages sensors: {s} {body}");
 
-    // The global parameter list is Administrator-managed, a manager cannot add a global parameter.
-    let (s, _) = crate::common::post_json_with_token(
+    // The global parameter list is the lab's catalog, not an administrative surface (Q24): a
+    // manager records what a parameter is and what range to expect from it.
+    let (s, body) = crate::common::post_json_with_token(
         &app,
         "/api/parameters",
         &sample_parameter("mgr_cap"),
         &jwt,
     )
     .await;
-    assert_eq!(s, 403, "manager cannot write the global catalog");
+    assert!(passed_auth(s), "manager writes the global catalog: {s} {body}");
     let (s, _) = crate::common::get_with_token(&app, "/api/tokens", &jwt).await;
     assert_eq!(s, 403, "manager cannot reach admin token surface");
     let (s, _) = crate::common::get_with_token(&app, "/api/api_token_audit_logs", &jwt).await;

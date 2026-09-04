@@ -31,6 +31,8 @@ use crate::routes::private::{
     parameters::Parameter,
     parameters::derived::definition_model::DerivedParameterDefinition,
     parameters::derived::source_model::DerivedParameterSource,
+    parameters::groups::group_model::ParameterGroup,
+    parameters::groups::member_model::ParameterGroupMember,
     projects::subprojects::Subproject,
     readings::samples::Sample,
     reprocessing_jobs::ReprocessingJob,
@@ -115,10 +117,21 @@ pub fn api_router(state: &AppState) -> Router<()> {
             TokenAccess::Same,
         )))
     };
-    // Admin-managed inventory/system entities (sensor onboarding, data streams, reprocessing
-    // jobs): human writes are Administrator-only, but the historical write_metadata token bit is
-    // preserved so sync-service session tokens (which register streams and auto-create sensors)
-    // keep working.
+    // The lab's own catalog: the global parameter list and the instrument inventory. A manager
+    // writes both (Q24: expected physical ranges on a parameter, manufacturer ranges and
+    // calibration on an instrument, which is the lab's work and not an administrative act). The
+    // write_metadata token bit is kept rather than `TokenAccess::Same`, because sync-service
+    // session tokens mint sensors as they register streams.
+    let catalog_inventory_crud = |r: OpenApiRouter| -> OpenApiRouter {
+        r.layer(middleware::from_fn(require_crud(
+            Capability::ReadMetadata,
+            Capability::WriteCatalog,
+            TokenAccess::Bit(TokenBit::WriteMetadata),
+        )))
+    };
+    // Admin-managed inventory/system entities (data streams, reprocessing jobs): human writes are
+    // Administrator-only, but the historical write_metadata token bit is preserved so sync-service
+    // session tokens (which register streams and auto-create sensors) keep working.
     let admin_write_crud = |r: OpenApiRouter| -> OpenApiRouter {
         r.layer(middleware::from_fn(require_crud(
             Capability::ReadMetadata,
@@ -153,15 +166,12 @@ pub fn api_router(state: &AppState) -> Router<()> {
             "/sites",
             invalidate_public_config(crate::routes::private::sites::router::service_router(state)),
         )
-        // Global catalog (the shared parameter list, constants, derived definitions) is
-        // Administrator-managed: onboarding a new global parameter is an admin act. Managers
-        // instead ASSIGN parameters to sites (site_parameters) and manage per-site alarm thresholds.
-        .nest("/parameters", admin_write_crud(Parameter::router(db)))
+        .nest("/parameters", catalog_inventory_crud(Parameter::router(db)))
         .nest(
             "/site_parameters",
             invalidate_public_config(catalog_crud(SiteParameter::router(db))),
         )
-        .nest("/sensors", admin_write_crud(Sensor::router(db)))
+        .nest("/sensors", catalog_inventory_crud(Sensor::router(db)))
         .nest(
             "/sensor_calibrations",
             sensor_crud(SensorCalibration::router(db)),
@@ -181,6 +191,14 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .nest(
             "/derived_parameter_sources",
             admin_write_crud(DerivedParameterSource::router(db)),
+        )
+        .nest(
+            "/parameter_groups",
+            admin_write_crud(ParameterGroup::router(db)),
+        )
+        .nest(
+            "/parameter_group_members",
+            admin_write_crud(ParameterGroupMember::router(db)),
         )
         .nest(
             "/alarm_thresholds",
@@ -453,6 +471,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
             get(crate::routes::private::reprocessing_jobs::routes::get_job_logs),
         )
         .route("/tools", get(tools::list_tools))
+        .route(
+            "/calculations/closure",
+            get(crate::routes::private::tools::calculations::get_calculation_closure),
+        )
         .route("/tools/{tool_name}/calculate", post(tools::calculate_tool))
         .route(
             "/readings/seasonal_check",
@@ -503,6 +525,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route(
             "/actions/undeclared_sd_estimators",
             get(actions::undeclared_sd_estimators),
+        )
+        .route(
+            "/parameter_groups/{id}/definition",
+            get(crate::routes::private::parameters::groups::definition::group_definition),
         )
         .route(
             "/schedules",
@@ -577,10 +603,11 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .with_state(state.clone());
 
     // A merge destroys rows across projects: the catalog merge hard-deletes a `parameters` row and
-    // the slot merge moves and deletes readings at any site named by id. Both hold the same
-    // Administrator gate as DELETE /parameters/{id} rather than the MANAGER gate the other
-    // operator actions carry. The write_metadata token bit is preserved for automation; scoped
-    // tokens are still denied, a per-project key has no business destroying another project's data.
+    // the slot merge moves and deletes readings at any site named by id. That reach, not the
+    // catalog level, is why both hold the Administrator gate where the parameter and instrument
+    // CRUD surfaces sit at MANAGER (Q24) and the other operator actions carry the MANAGER gate.
+    // The write_metadata token bit is preserved for automation; scoped tokens are still denied, a
+    // per-project key has no business destroying another project's data.
     let catalog_merge_routes = Router::new()
         .route(
             "/actions/merge_parameters",

@@ -749,6 +749,14 @@ pub struct EventCell {
     /// The oldest open event-audit finding for this cell.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finding: Option<CellFinding>,
+    /// The calculations that read this parameter, by tool name. A person typing into a field needs
+    /// to see which script it feeds while typing it, not after the save.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub read_by: Vec<String>,
+    /// The calculation that writes this parameter, when one does. Its value is a computed output,
+    /// not a measurement, and editing it is a different act from editing an input.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub written_by: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -953,6 +961,8 @@ pub async fn get_event_detail(
                     replicates: vec![replicate],
                     record: None,
                     finding: finding_by_param.remove(&parameter_id),
+                    read_by: Vec::new(),
+                    written_by: None,
                 });
             }
         }
@@ -990,6 +1000,8 @@ pub async fn get_event_detail(
             replicates: Vec::new(),
             record: None,
             finding: Some(finding),
+            read_by: Vec::new(),
+            written_by: None,
         });
     }
     let mut records = crate::routes::private::readings::provenance::records_for_event(
@@ -1000,6 +1012,27 @@ pub async fn get_event_detail(
     .await?;
     for cell in &mut cells {
         cell.record = records.remove(&cell.stream_id);
+    }
+
+    // Which calculation reads each cell, and which writes it: the grid colours by role and names
+    // the script in the tooltip, so the consequence of an edit is visible before it is made.
+    let touched: Vec<Uuid> = cells.iter().map(|c| c.parameter_id).collect();
+    let impacts =
+        crate::routes::private::tools::closure::calculations_fed_by(&state.db, &touched).await?;
+    for cell in &mut cells {
+        cell.read_by = impacts
+            .iter()
+            .filter(|i| i.reads.iter().any(|r| r.parameter_id == cell.parameter_id))
+            .map(|i| i.tool.clone())
+            .collect();
+        cell.written_by = impacts
+            .iter()
+            .find(|i| {
+                i.outputs
+                    .iter()
+                    .any(|o| o.parameter_id == cell.parameter_id)
+            })
+            .map(|i| i.tool.clone());
     }
 
     let recompute = super::recompute::status_for(&state.db, &[event.id])

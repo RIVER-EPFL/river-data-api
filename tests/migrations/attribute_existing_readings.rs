@@ -27,9 +27,22 @@ async fn revert_to_pre_rule_shape(db: &DatabaseConnection) {
     }
 }
 
-/// Put back the column default `setup_test_db` gives hand-built fixture streams, so the shared
-/// database is left as the next suite expects it.
+/// Put back the column default `setup_test_db` gives hand-built fixture streams, and the CHECK as
+/// `m20260906_000002_instrument_required_untyped` tightened it, so the shared database is left as
+/// the next suite expects it. The migration under test adds the rule in its pre-tightening form,
+/// which admits a reading whose `measurement_type` is NULL.
 async fn restore_fixture_default(db: &DatabaseConnection) {
+    exec(
+        db,
+        "ALTER TABLE readings DROP CONSTRAINT IF EXISTS readings_instrument_required",
+    )
+    .await;
+    exec(
+        db,
+        "ALTER TABLE readings ADD CONSTRAINT readings_instrument_required \
+         CHECK ((sensor_id IS NOT NULL) OR (measurement_type IS NOT DISTINCT FROM 'derived'))",
+    )
+    .await;
     exec(
         db,
         &format!(

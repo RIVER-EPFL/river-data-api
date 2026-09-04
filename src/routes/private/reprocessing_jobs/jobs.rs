@@ -1992,11 +1992,18 @@ impl Job for SyncLedgerRetention {
     }
 }
 
-/// Queue a trigger_full_sync for every live, unpaused reconciled service. The digest
-/// handshake stops those services re-sending unchanged content, which also means routine
-/// passes can no longer repair server-side drift (rows changed outside the sync path); the
-/// periodic full pass ignores digests and re-asserts everything. Delivery is the normal
-/// heartbeat pickup; a service already holding a pending command is not queued twice.
+/// Queue a trigger_full_sync for every live, unpaused service with `full_reassert_enabled`. The
+/// digest handshake stops a service re-sending unchanged content, which also means routine passes
+/// can no longer repair server-side drift (rows changed outside the sync path); the full pass
+/// ignores digests and re-asserts everything the source holds.
+///
+/// What that repairs depends on the source. A reconciled backend declares the window it
+/// re-asserts, so its diff applies the corrections. An append-only one (Vaisala, NOMIS) sends no
+/// window and the driver ingests with `overwrite` false, so the pass inserts rows missing here and
+/// leaves every stored value as it is; correcting those is `resync_streams`, not this.
+///
+/// Delivery is the normal heartbeat pickup; a service already holding a pending command is not
+/// queued twice.
 pub struct SyncFullReassert {
     command_expiry_secs: u64,
 }

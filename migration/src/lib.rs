@@ -10,6 +10,8 @@ pub mod m20260907_000002_backdate_auto_deployments;
 mod m20260907_000003_sample_statistics;
 mod m20260907_000004_unverified_entries;
 mod m20260907_000005_instrument_kind;
+pub mod m20260907_000006_synthesise_curation_record;
+mod m20260908_000001_parameter_groups;
 
 pub struct Migrator;
 
@@ -27,6 +29,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260907_000003_sample_statistics::Migration),
             Box::new(m20260907_000004_unverified_entries::Migration),
             Box::new(m20260907_000005_instrument_kind::Migration),
+            Box::new(m20260907_000006_synthesise_curation_record::Migration),
+            Box::new(m20260908_000001_parameter_groups::Migration),
         ]
     }
 }

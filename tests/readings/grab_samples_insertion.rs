@@ -563,3 +563,122 @@ async fn a_posted_value_is_stored_bit_for_bit() {
         );
     }
 }
+
+// ============================================================================
+// Hand-entered triplicate under one lab curve, with no tool run behind it
+// ============================================================================
+
+/// Scenario: an operator types three replicates of a field parameter and picks the lab curve
+/// they were read against, with no tool doing the arithmetic.
+///
+/// Expected behaviour: every replicate keeps its measured value, is corrected by the named curve
+/// and carries it, and the statistics the group forms are computed over the corrected values.
+#[tokio::test]
+#[serial]
+async fn a_hand_entered_triplicate_carries_its_curve_into_the_statistics() {
+    let (app, token, db) = setup().await;
+
+    let sensor_id = "00000000-0000-4000-c000-0000000000a2";
+    let curve_id = "00000000-0000-4000-c000-0000000000b2";
+    db.execute_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "INSERT INTO sensors (id, name, is_active, is_lab_instrument, created_at)
+             VALUES ('{sensor_id}', 'Bench pH meter', true, true, now())"
+        ),
+    ))
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "INSERT INTO standard_curves (id, sensor_id, slope, intercept, name)
+             VALUES ('{curve_id}', '{sensor_id}', 3.0, -1.5, 'Bench series 4')"
+        ),
+    ))
+    .await
+    .unwrap();
+
+    let time = "2025-08-04T07:30:00Z";
+    let measured = [4.0_f64, 5.0, 6.0];
+    let readings: Vec<serde_json::Value> = measured
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID,
+                "sensor_id": sensor_id,
+                "standard_curve_id": curve_id,
+                "value": v,
+                "time": time
+            })
+        })
+        .collect();
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &serde_json::json!({ "site_id": crate::common::SITE1_ID, "readings": readings }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "hand-entered triplicate should save: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["inserted"], 3);
+    assert_eq!(json["samples_created"], 1);
+
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT replicate_index, raw_value, calibrated_value, standard_curve_id, \
+                        calibration_id, measurement_type \
+                 FROM readings WHERE site_id = '{}' AND parameter_id = '{}' AND time = '{time}' \
+                 ORDER BY replicate_index",
+                crate::common::SITE1_ID,
+                crate::common::GLOBAL_PARAM_TEMP_ID
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3, "one reading per entered replicate");
+    for (index, row) in rows.iter().enumerate() {
+        let stored_index: i16 = row.try_get("", "replicate_index").unwrap();
+        let raw: f64 = row.try_get("", "raw_value").unwrap();
+        let calibrated: f64 = row.try_get("", "calibrated_value").unwrap();
+        let curve: Uuid = row.try_get("", "standard_curve_id").unwrap();
+        let mtype: String = row.try_get("", "measurement_type").unwrap();
+        assert_eq!(stored_index, index as i16, "positions are the entry order");
+        assert!((raw - measured[index]).abs() < 1e-9, "raw is what was typed");
+        assert!(
+            (calibrated - (3.0 * measured[index] - 1.5)).abs() < 1e-9,
+            "3.0 * {} - 1.5",
+            measured[index]
+        );
+        assert_eq!(curve.to_string(), curve_id, "the picked curve is stamped");
+        assert_eq!(mtype, "spot");
+    }
+
+    let row = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT n, mean, stdev, min_value, max_value FROM samples \
+                 WHERE site_id = '{}' AND parameter_id = '{}'",
+                crate::common::SITE1_ID,
+                crate::common::GLOBAL_PARAM_TEMP_ID
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("three replicates form a statistics row");
+    let n: i32 = row.try_get("", "n").unwrap();
+    let mean: f64 = row.try_get::<Option<f64>>("", "mean").unwrap().unwrap();
+    let stdev: f64 = row.try_get::<Option<f64>>("", "stdev").unwrap().unwrap();
+    let min_value: f64 = row.try_get::<Option<f64>>("", "min_value").unwrap().unwrap();
+    let max_value: f64 = row.try_get::<Option<f64>>("", "max_value").unwrap().unwrap();
+    assert_eq!(n, 3);
+    // Corrected values 10.5, 13.5, 16.5
+    assert!((mean - 13.5).abs() < 1e-9, "statistics read the corrected values, not the measured ones: {mean}");
+    assert!((stdev - 3.0).abs() < 1e-9, "sample sd of 10.5, 13.5, 16.5: {stdev}");
+    assert!((min_value - 10.5).abs() < 1e-9);
+    assert!((max_value - 16.5).abs() < 1e-9);
+}

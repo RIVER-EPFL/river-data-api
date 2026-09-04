@@ -537,3 +537,108 @@ async fn re_pairing_moves_the_visit_to_the_new_site() {
         "re-pairing must attach the readings to the second site's visit"
     );
 }
+
+/// Scenario: a field day covering two stations, entered as one block and saved in one sequence.
+///
+/// Expected behaviour: each station's visit is staged and saved on its own, so a save the Check
+/// gate refuses at the second station leaves the first station's visit standing with its readings.
+#[tokio::test]
+#[serial]
+async fn a_field_day_saves_each_station_independently() {
+    let (db, app, token) = setup().await;
+    let day = "2025-06-02T07:00:00Z";
+
+    let mut staged = Vec::new();
+    for site in [SITE1_ID, crate::common::SITE2_ID] {
+        let (status, event) = crate::common::post_json_parse_with_token(
+            &app,
+            "/api/collection_events/stage",
+            &json!({ "site_id": site, "collected_at": day }),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "stage {site}: {event}");
+        assert_eq!(event["created"], true);
+        staged.push(event["id"].as_str().unwrap().to_string());
+    }
+    assert_ne!(staged[0], staged[1], "a visit per station, not one for the day");
+
+    // The first station's values are screened, and saved under the check that screened them.
+    let (status, checked) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/seasonal_check",
+        &json!({
+            "site_id": SITE1_ID,
+            "time": day,
+            "values": [{ "parameter_id": GLOBAL_PARAM_DO_ID, "value": 9.4 }],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "check the first station: {checked}");
+    let check_id = checked["check_id"].as_str().unwrap().to_string();
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({
+            "site_id": SITE1_ID,
+            "check_id": check_id,
+            "readings": [{ "parameter_id": GLOBAL_PARAM_DO_ID, "value": 9.4, "time": day }],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "the screened station saves: {body}");
+
+    // The second station is sent under the first station's check, which screened neither its
+    // values nor its site: the save is refused rather than admitted on someone else's screening.
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({
+            "site_id": crate::common::SITE2_ID,
+            "check_id": check_id,
+            "readings": [{ "parameter_id": GLOBAL_PARAM_DO_ID, "value": 11.8, "time": day }],
+        }),
+        &token,
+    )
+    .await;
+    assert!(status >= 400, "an unscreened station is refused: {status} {body}");
+
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM readings r \
+                 JOIN collection_events ce ON ce.id = r.collection_event_id \
+                 WHERE ce.id = '{}' AND r.time = '{day}'",
+                staged[0]
+            ),
+        )
+        .await,
+        1,
+        "the station that saved keeps its reading"
+    );
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM readings WHERE collection_event_id = '{}'",
+                staged[1]
+            ),
+        )
+        .await,
+        0,
+        "the refused station stores nothing"
+    );
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!("SELECT COUNT(*) AS n FROM collection_events WHERE collected_at = '{day}'"),
+        )
+        .await,
+        2,
+        "both visits stand: a refused save does not unstage its visit"
+    );
+}

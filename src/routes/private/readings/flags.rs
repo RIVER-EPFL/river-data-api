@@ -48,6 +48,11 @@ pub struct UnflagReadingsRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct FlagReadingsResponse {
     pub updated: u64,
+    /// Under `dry_run`, the calculations the flagged parameter feeds and the outputs each would
+    /// rewrite. Flagging changes the served value, so it changes what a calculation reads; the
+    /// consequence is reported before the write, not discovered after it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub calculations: Vec<crate::routes::private::tools::closure::CalculationImpact>,
 }
 
 /// `SET` clause of the flag write, and the values it binds ahead of the keys.
@@ -310,7 +315,10 @@ pub async fn flag_readings(
     .await?;
 
     tracing::info!(updated, reason = %payload.reason, "Flagged readings");
-    Ok(Json(FlagReadingsResponse { updated }))
+    Ok(Json(FlagReadingsResponse {
+        updated,
+        calculations: Vec::new(),
+    }))
 }
 
 /// Unflag a set of previously-flagged readings. Requires `write_data`.
@@ -340,7 +348,10 @@ pub async fn unflag_readings(
     .await?;
 
     tracing::info!(updated, "Unflagged readings");
-    Ok(Json(FlagReadingsResponse { updated }))
+    Ok(Json(FlagReadingsResponse {
+        updated,
+        calculations: Vec::new(),
+    }))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -396,7 +407,15 @@ pub async fn flag_range(
     if payload.dry_run {
         let updated =
             count_flags_over_range(&state, &scope, range, &FlagWrite::Set(String::new())).await?;
-        return Ok(Json(FlagReadingsResponse { updated }));
+        let calculations = crate::routes::private::tools::closure::calculations_fed_by(
+            &state.db,
+            &[payload.parameter_id],
+        )
+        .await?;
+        return Ok(Json(FlagReadingsResponse {
+            updated,
+            calculations,
+        }));
     }
     if payload.reason.trim().is_empty() {
         return Err(AppError::BadRequest("Reason is required".to_string()));
@@ -417,7 +436,10 @@ pub async fn flag_range(
         reason = %payload.reason,
         "Flagged readings (range)"
     );
-    Ok(Json(FlagReadingsResponse { updated }))
+    Ok(Json(FlagReadingsResponse {
+        updated,
+        calculations: Vec::new(),
+    }))
 }
 
 /// Unflag every reading in a (site_id, parameter_id, time range). Requires `write_data`.
@@ -447,7 +469,15 @@ pub async fn unflag_range(
     };
     if payload.dry_run {
         let updated = count_flags_over_range(&state, &scope, range, &FlagWrite::Clear).await?;
-        return Ok(Json(FlagReadingsResponse { updated }));
+        let calculations = crate::routes::private::tools::closure::calculations_fed_by(
+            &state.db,
+            &[payload.parameter_id],
+        )
+        .await?;
+        return Ok(Json(FlagReadingsResponse {
+            updated,
+            calculations,
+        }));
     }
     let updated = apply_flags_over_range(
         &state,
@@ -464,5 +494,8 @@ pub async fn unflag_range(
         parameter_id = %payload.parameter_id,
         "Unflagged readings (range)"
     );
-    Ok(Json(FlagReadingsResponse { updated }))
+    Ok(Json(FlagReadingsResponse {
+        updated,
+        calculations: Vec::new(),
+    }))
 }

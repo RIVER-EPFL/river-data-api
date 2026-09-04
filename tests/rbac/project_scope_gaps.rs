@@ -158,7 +158,12 @@ async fn provision_two_projects(app: &Router, admin: &str) -> Scene {
 /// The first shape is what `backfill_candidates` and `backfill_attribution` operate on, the second
 /// what `calibration_candidates` operates on. The batch write is what leaves the second unstamped:
 /// a reading that names its own sensor skips slot-owner resolution, so no curve is applied to it.
+///
+/// The unattributed row is seeded in SQL with the instrument rule lifted, because no write path
+/// produces one any more: every channel carries an instrument and stamps what it writes. Rows of
+/// that shape are exactly the history `backfill_attribution` exists for.
 async fn seed_claimable_history(
+    db: &sea_orm::DatabaseConnection,
     app: &Router,
     admin: &str,
     site: &str,
@@ -178,13 +183,6 @@ async fn seed_claimable_history(
                 {
                     "site_id": site,
                     "parameter_id": parameter,
-                    "time": days_ago(10),
-                    "raw_value": 1.0,
-                    "measurement_type": "continuous",
-                },
-                {
-                    "site_id": site,
-                    "parameter_id": parameter,
                     "time": days_ago(1),
                     "raw_value": 2.0,
                     "sensor_id": sensor.as_str(),
@@ -199,6 +197,20 @@ async fn seed_claimable_history(
         status, 200,
         "site {site} takes its claimable history: {body}"
     );
+
+    let stream = format!("{site}:{parameter}");
+    crate::common::db::seed_before_instrument_rule(
+        db,
+        &[format!(
+            "INSERT INTO readings \
+                 (stream_id, time, replicate_index, site_id, parameter_id, raw_value, \
+                  sensor_id, measurement_type) \
+             SELECT id, '{time}'::timestamptz, 0, '{site}', '{parameter}', 1.0, NULL, 'continuous' \
+             FROM data_streams WHERE source_system = 'api' AND source_key = '{stream}'",
+            time = days_ago(10),
+        )],
+    )
+    .await;
 
     (sensor, deployment)
 }
@@ -334,14 +346,15 @@ async fn parameter_merges_hold_the_administrator_and_project_gates() {
         "the catalog read hands the manager the source parameter id: {body}"
     );
 
-    // Control: deleting a catalog row through CRUD is Administrator-only, and that is the gate the
-    // merge is expected to match.
+    // Control: the catalog itself is the manager's (Q24), so a CRUD delete reaches the handler and
+    // is refused by the rows that reference the parameter, not by the caller's level. The merge
+    // below is refused for a different reason: it reaches across projects.
     let (status, body) =
         crate::common::delete_with_token(&app, &format!("/api/parameters/{source}"), &manager)
             .await;
     assert_eq!(
-        status, 403,
-        "deleting a global parameter through CRUD is Administrator-only: {body}"
+        status, 409,
+        "a manager reaches the delete and is stopped by the references: {body}"
     );
 
     let (status, body) = crate::common::post_json_with_token(
@@ -356,8 +369,8 @@ async fn parameter_merges_hold_the_administrator_and_project_gates() {
     .await;
     assert_eq!(
         status, 403,
-        "merging a global parameter deletes the source catalog row, so it needs the same \
-         Administrator gate as the CRUD delete: {body}"
+        "merging a global parameter destroys rows across projects, which stays Administrator \
+         even though the catalog itself is the manager's: {body}"
     );
 
     let (status, body) =
@@ -962,9 +975,9 @@ async fn backfill_and_calibration_candidates_confine_to_the_callers_projects() {
     .await;
 
     let (sensor_a, deployment_a) =
-        seed_claimable_history(&app, &admin, &scene.site_a, &scene.parameter, "RD005-A").await;
+        seed_claimable_history(&db, &app, &admin, &scene.site_a, &scene.parameter, "RD005-A").await;
     let (sensor_b, deployment_b) =
-        seed_claimable_history(&app, &admin, &scene.site_b, &scene.parameter, "RD005-B").await;
+        seed_claimable_history(&db, &app, &admin, &scene.site_b, &scene.parameter, "RD005-B").await;
 
     // Controls: the CRUD reads of the same inventory already confine.
     let (status, body) =
@@ -1098,8 +1111,8 @@ async fn site_targeted_actions_refuse_a_site_outside_the_callers_grants() {
 
     // `backfill_attribution` 400s when nothing is claimable, so both sites get a claimable slot and
     // the current behaviour on the out-of-scope call is a clean success rather than a bad request.
-    seed_claimable_history(&app, &admin, &scene.site_a, &scene.parameter, "RD006-A").await;
-    seed_claimable_history(&app, &admin, &scene.site_b, &scene.parameter, "RD006-B").await;
+    seed_claimable_history(&db, &app, &admin, &scene.site_a, &scene.parameter, "RD006-A").await;
+    seed_claimable_history(&db, &app, &admin, &scene.site_b, &scene.parameter, "RD006-B").await;
 
     let window_start = days_ago(30);
     let window_end = days_ago(0);

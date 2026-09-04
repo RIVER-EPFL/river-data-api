@@ -12,6 +12,7 @@
 mod common;
 
 mod action_scope_edges;
+mod catalog_write_level;
 mod grants_api;
 mod me_sites;
 mod project_isolation;

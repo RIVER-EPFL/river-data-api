@@ -4,6 +4,7 @@
 //! surface (versions, validation, activation). The portal calculation functions themselves live
 //! inside the seeded scripts, verbatim.
 
+pub mod calculations;
 pub mod chain;
 pub mod closure;
 pub mod engine;

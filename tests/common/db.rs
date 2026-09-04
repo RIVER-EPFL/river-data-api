@@ -103,6 +103,15 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
         // leaves their buckets in place and the next test reading extents from a summary sees the
         // previous test's data.
         "TRUNCATE readings_hourly, readings_daily, readings_weekly, readings_monthly",
+        // Tool scripts a test installed. The migration-seeded ones (`created_by = 'seed'`) are
+        // reference data and stay; a fixture left enabled makes the next theme's visits recompute
+        // against a calculation that theme never installed.
+        "DELETE FROM tool_script_activations a USING tool_scripts s \
+          WHERE a.tool_script_id = s.id AND s.created_by IS DISTINCT FROM 'seed'",
+        "UPDATE tool_scripts SET active_version_id = NULL WHERE created_by IS DISTINCT FROM 'seed'",
+        "DELETE FROM tool_script_versions v USING tool_scripts s \
+          WHERE v.tool_script_id = s.id AND s.created_by IS DISTINCT FROM 'seed'",
+        "DELETE FROM tool_scripts WHERE created_by IS DISTINCT FROM 'seed'",
         // `constants` is migration-seeded reference data; truncating it cannot be undone by
         // seed_test_data, so it is deliberately absent from this list.
         "TRUNCATE readings, reading_decisions, status_events, samples, \
@@ -117,6 +126,7 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
          notification_subscribers, notification_subscriptions, notification_channel_health, \
          sensor_calibrations, sensor_deployments, sensors, \
          derived_parameter_sources, derived_parameter_definitions, \
+         parameter_group_members, parameter_group_history, parameter_groups, \
          user_project_grants, \
          site_parameters, parameters, sites, subprojects, projects CASCADE",
     ];
@@ -150,4 +160,68 @@ pub async fn exec(db: &DatabaseConnection, sql: &str) {
     ))
     .await
     .unwrap_or_else(|e| panic!("SQL failed: {e}\nQuery: {sql}"));
+}
+
+/// Seed rows that predate the instrument rule.
+///
+/// `readings_instrument_required` refuses a reading that names no instrument, so a fixture for the
+/// paths that exist to repair such rows (the import backfill, the attribution candidates) cannot
+/// insert one while the rule stands. The rule is lifted for the statements and restored with its
+/// own definition afterwards, which also asserts that what was seeded is legal again by the time
+/// the test looks at it.
+pub async fn seed_before_instrument_rule(db: &DatabaseConnection, statements: &[String]) {
+    // Both halves of the rule stand aside: the trigger would fill `sensor_id` from the row's
+    // stream, and the CHECK would then be moot anyway. The trigger is dropped and recreated rather
+    // than disabled, which a hypertable with columnstore refuses; its function is untouched.
+    exec(
+        db,
+        "DROP TRIGGER IF EXISTS trg_readings_inherit_stream_instrument ON readings",
+    )
+    .await;
+    exec(
+        db,
+        "ALTER TABLE readings DROP CONSTRAINT IF EXISTS readings_instrument_required",
+    )
+    .await;
+    for sql in statements {
+        exec(db, sql).await;
+    }
+    exec(
+        db,
+        "CREATE TRIGGER trg_readings_inherit_stream_instrument \
+         BEFORE INSERT OR UPDATE ON readings \
+         FOR EACH ROW EXECUTE FUNCTION readings_inherit_stream_instrument()",
+    )
+    .await;
+    // `NOT VALID` puts the rule back over everything written from here without validating the rows
+    // just seeded, which is what a database carried forward from before the rule looks like.
+    exec(
+        db,
+        "ALTER TABLE readings ADD CONSTRAINT readings_instrument_required \
+         CHECK ((sensor_id IS NOT NULL) OR (measurement_type IS NOT DISTINCT FROM 'derived')) \
+         NOT VALID",
+    )
+    .await;
+}
+
+/// Assert the rows [`seed_before_instrument_rule`] left behind now satisfy the instrument rule,
+/// which is how a test says the repair it drove missed nothing. The constraint itself cannot be
+/// re-validated: `VALIDATE CONSTRAINT` is refused on a hypertable with columnstore enabled, so the
+/// same predicate is asked as a query.
+pub async fn assert_instrument_rule_holds(db: &DatabaseConnection) {
+    let row = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM readings \
+             WHERE sensor_id IS NULL AND measurement_type IS DISTINCT FROM 'derived'"
+                .to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("count row");
+    let unattributed: i64 = row.try_get("", "n").expect("count");
+    assert_eq!(
+        unattributed, 0,
+        "every reading names an instrument, or is derived"
+    );
 }

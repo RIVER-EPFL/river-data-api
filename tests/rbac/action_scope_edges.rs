@@ -67,8 +67,11 @@ async fn scene() -> Option<Scene> {
                  'Water Temperature', 'DO_Temperature', 'degC', 600, true)"
         ),
         format!(
-            "INSERT INTO data_streams (id, source_system, source_key) VALUES \
-             ('{STREAM_A_ID}', 'test', 'edges-a'), ('{STREAM_B_ID}', 'test', 'edges-b')"
+            // Explicitly instrument-less: the harness defaults `data_streams.sensor_id` to the
+            // fixture instrument, and a stream that names one attributes its readings at insert,
+            // which is exactly the state the candidate enumerations exist to find and repair.
+            "INSERT INTO data_streams (id, source_system, source_key, sensor_id) VALUES \
+             ('{STREAM_A_ID}', 'test', 'edges-a', NULL), ('{STREAM_B_ID}', 'test', 'edges-b', NULL)"
         ),
         format!(
             "INSERT INTO sensors (id, name, is_active) VALUES \
@@ -107,16 +110,17 @@ async fn scene() -> Option<Scene> {
         .await;
         // Unattributed history before the deployment opens is what `backfill_candidates` reports;
         // the attributed reading inside the curve's window that carries no calibration_id is what
-        // `calibration_candidates` reports.
-        crate::common::exec(
+        // `calibration_candidates` reports. The first row predates the instrument rule, so the rule
+        // stands aside while it is seeded.
+        crate::common::db::seed_before_instrument_rule(
             &db,
-            &format!(
+            &[format!(
                 "INSERT INTO readings \
                      (stream_id, time, replicate_index, site_id, parameter_id, raw_value, sensor_id) \
                  VALUES \
                      ('{stream}', NOW() - INTERVAL '10 days', 0, '{site}', '{GLOBAL_PARAM_TEMP_ID}', 1.0, NULL), \
                      ('{stream}', NOW() - INTERVAL '1 days', 0, '{site}', '{GLOBAL_PARAM_TEMP_ID}', 2.0, '{sensor}')"
-            ),
+            )],
         )
         .await;
     }
