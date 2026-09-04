@@ -56,6 +56,8 @@ pub struct SyncServiceResponse {
     pub paused: bool,
     /// Operator-set scheduled cadence in seconds; null means the service's own configuration.
     pub sync_interval_secs: Option<i32>,
+    /// Whether the weekly full re-assert queues a `trigger_full_sync` for this service.
+    pub full_reassert_enabled: bool,
     pub current_operation: Option<String>,
     pub last_heartbeat: Option<String>,
     pub last_sync_completed_at: Option<String>,
@@ -130,6 +132,7 @@ fn service_to_response(
         status: s.status,
         paused: s.paused,
         sync_interval_secs: s.sync_interval_secs,
+        full_reassert_enabled: s.full_reassert_enabled,
         current_operation: s.current_operation,
         last_heartbeat: s.last_heartbeat.map(|t| t.to_rfc3339()),
         last_sync_completed_at: s.last_sync_completed_at.map(|t| t.to_rfc3339()),
@@ -438,6 +441,9 @@ pub struct UpdateServiceRequest {
     /// `SYNC_INTERVAL_SECONDS`. Below `MIN_SYNC_INTERVAL_SECS` is refused.
     #[serde(default, deserialize_with = "double_option")]
     pub sync_interval_secs: Option<Option<i32>>,
+    /// Whether the weekly full re-assert queues a `trigger_full_sync` for this service.
+    #[serde(default)]
+    pub full_reassert_enabled: Option<bool>,
 }
 
 /// Distinguish "field absent" from "field is null": the first leaves the setting, the second
@@ -480,14 +486,14 @@ pub async fn update_service(
     let last_error = recent_errors(&state.db, &[service.id])
         .await?
         .remove(&service_id);
-    let Some(interval) = req.sync_interval_secs else {
+    if req.sync_interval_secs.is_none() && req.full_reassert_enabled.is_none() {
         return Ok(Json(service_to_response(
             service,
             state.config.as_ref(),
             last_error,
         )));
-    };
-    if let Some(secs) = interval
+    }
+    if let Some(Some(secs)) = req.sync_interval_secs
         && secs < MIN_SYNC_INTERVAL_SECS
     {
         return Err(AppError::BadRequest(format!(
@@ -496,7 +502,12 @@ pub async fn update_service(
     }
 
     let mut active: sync_services::ActiveModel = service.into();
-    active.sync_interval_secs = Set(interval);
+    if let Some(interval) = req.sync_interval_secs {
+        active.sync_interval_secs = Set(interval);
+    }
+    if let Some(enabled) = req.full_reassert_enabled {
+        active.full_reassert_enabled = Set(enabled);
+    }
     active.updated_at = Set(Utc::now().into());
     let updated = active.update(&state.db).await?;
     Ok(Json(service_to_response(

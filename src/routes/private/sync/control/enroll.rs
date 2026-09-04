@@ -102,6 +102,7 @@ pub async fn enroll(
             paused: Set(false),
             current_operation: Set(None),
             sync_interval_secs: Set(None),
+            full_reassert_enabled: Set(false),
             last_heartbeat: Set(None),
             last_sync_completed_at: Set(None),
             last_error: Set(None),

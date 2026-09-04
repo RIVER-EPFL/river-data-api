@@ -157,7 +157,7 @@ pub struct PlanEntry {
     pub project: PlanEntityRef,
     pub site: PlanSiteRef,
     pub parameter: PlanParamRef,
-    pub confidence: String, // "exact" | "fuzzy" | "none"
+    pub confidence: String, // "exact" | "none"
     #[serde(default)]
     pub warnings: Vec<PlanWarning>,
     #[serde(default)]
@@ -534,38 +534,53 @@ pub fn resolve_instrument(
         source_key,
         resolved_by: "placeholder".to_string(),
         create: true,
-        confirmed: false,
+        confirmed: true,
         stamps_readings,
         curves: vec![],
         proposed_name: Some(name),
     })
 }
 
-/// The instrument a source parameter already resolves to, for the feeds that name no curve column.
+/// The instrument a source parameter resolves to, for the feeds that name no curve column.
 ///
-/// Only ever an instrument this source created under the key an apply mints (`{source}:{param}`).
-/// Nothing is proposed here: a parameter with no such instrument is a question for the review, and
-/// answering it is what `apply_instrument_updates` does.
+/// The source's own instrument under the key an apply mints (`{source}:{param}`) when it has one,
+/// and otherwise that same key proposed for creation, pre-agreed. Every stream is paired with an
+/// instrument, so the review's default is the suggestion rather than a question: an operator who
+/// wants another instrument attaches it, and one who wants none has nothing to pair.
 pub fn resolve_parameter_instrument(
     source_system: &str,
     parameter: &str,
     catalog: &InstrumentCatalog,
-) -> Option<PlanInstrumentRef> {
+) -> PlanInstrumentRef {
     let source_key = format!("{source_system}:{parameter}");
-    let id = catalog.by_source_key.get(&source_key).copied()?;
-    let (name, key) = catalog.by_id.get(&id).cloned().unwrap_or_default();
-    Some(PlanInstrumentRef {
+    if let Some(id) = catalog.by_source_key.get(&source_key).copied() {
+        let (name, key) = catalog.by_id.get(&id).cloned().unwrap_or_default();
+        return PlanInstrumentRef {
+            curve_column: None,
+            id: Some(id),
+            name,
+            source_key: key.unwrap_or(source_key),
+            resolved_by: "source_key".to_string(),
+            create: false,
+            confirmed: true,
+            stamps_readings: false,
+            curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
+            proposed_name: None,
+        };
+    }
+    let name = format!("{parameter} ({source_system})");
+    PlanInstrumentRef {
         curve_column: None,
-        id: Some(id),
-        name,
-        source_key: key.unwrap_or(source_key),
-        resolved_by: "source_key".to_string(),
-        create: false,
+        id: None,
+        name: name.clone(),
+        source_key,
+        resolved_by: "parameter".to_string(),
+        create: true,
         confirmed: true,
         stamps_readings: false,
-        curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
-        proposed_name: None,
-    })
+        curves: vec![],
+        proposed_name: Some(name),
+    }
 }
 
 fn plan_replicates(metadata: &serde_json::Value) -> Option<PlanReplicates> {
@@ -861,8 +876,11 @@ pub async fn create_plan(
         // an earlier plan. A device-shaped feed is never one of those: its instrument is minted
         // from its own provenance at pairing.
         if entry.instrument.is_none() && !entry.is_device {
-            entry.instrument =
-                resolve_parameter_instrument(source_system, &entry.parameter.name, &instruments);
+            entry.instrument = Some(resolve_parameter_instrument(
+                source_system,
+                &entry.parameter.name,
+                &instruments,
+            ));
         }
         if reports_sd
             && let (Some(site_id), Some(param_id)) = (entry.site.id, entry.parameter.id)
@@ -908,6 +926,7 @@ pub async fn create_plan(
         summary: Set(serde_json::to_value(&summary).unwrap_or_default()),
         entries: Set(serde_json::to_value(&entries).unwrap_or_default()),
         curve_assignments: Set(serde_json::Value::Array(Vec::new())),
+        version: Set(0),
         created_at: Set(Utc::now().into()),
         applied_at: Set(None),
         apply_result: Set(None),
@@ -1491,16 +1510,11 @@ async fn pair_entry_stream<C: ConnectionTrait>(
         Uuid::nil()
     };
 
+    // An entry the review left without an instrument takes the one its own source and parameter
+    // resolve, minted here. The apply fails rather than pairing a slot whose readings would name
+    // nothing that measured them.
     if needs_sensor {
-        if let Err(e) = create_sensor_for_stream(txn, &stream, parameter_id, site_id).await {
-            tracing::warn!(
-                error = %e,
-                stream_id = %stream.id,
-                parameter_id = %parameter_id,
-                site_id = %site_id,
-                "Failed to auto-create sensor for stream during pairing; stream will still be paired",
-            );
-        }
+        create_sensor_for_stream(txn, &stream, parameter_id, site_id).await?;
     } else if device && let Some(sensor_id) = stream.sensor_id.or(from_plan) {
         // A device is stationed at the site whichever route named it, so the slot's deployment is
         // opened here too. Without this the plan's own instrument choice silently costs the
@@ -2235,4 +2249,201 @@ async fn resolve_or_create_param(
 
 fn infer_category(_name: &str) -> String {
     "measurement".to_string()
+}
+
+/// Which entries a plan-wide bulk action covers. Every field is a further narrowing, so an empty
+/// `BulkWhere` selects the whole plan; a plan-wide action is then one predicate on the wire rather
+/// than one update per entry (1891 for CNET, 29,400 for NOMIS).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BulkWhere {
+    /// `exact` when the project, site and parameter all resolved, `none` otherwise.
+    #[serde(default)]
+    pub confidence: Option<String>,
+    #[serde(default)]
+    pub has_warnings: Option<bool>,
+    #[serde(default)]
+    pub site_name: Option<String>,
+    #[serde(default)]
+    pub parameter_name: Option<String>,
+}
+
+/// The positions in `entries` the predicate picks.
+pub fn select_entries(entries: &[PlanEntry], filter: &BulkWhere) -> Vec<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            filter
+                .confidence
+                .as_deref()
+                .is_none_or(|c| e.confidence.eq_ignore_ascii_case(c))
+                && filter
+                    .has_warnings
+                    .is_none_or(|w| e.warnings.is_empty() != w)
+                && filter
+                    .site_name
+                    .as_deref()
+                    .is_none_or(|n| e.site.name.eq_ignore_ascii_case(n))
+                && filter
+                    .parameter_name
+                    .as_deref()
+                    .is_none_or(|n| e.parameter.name.eq_ignore_ascii_case(n))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Apply a bulk action to the selected entries. An entry with no site or no parameter name is
+/// never set to `pair`: there is no slot to pair it to, which is the rule the per-entry updates
+/// already enforce.
+pub fn apply_bulk_action(entries: &mut [PlanEntry], filter: &BulkWhere, action: &str) -> usize {
+    let selected = select_entries(entries, filter);
+    let mut changed = 0;
+    for i in selected {
+        let entry = &mut entries[i];
+        let target = if action == "pair"
+            && (entry.site.name.trim().is_empty() || entry.parameter.name.trim().is_empty())
+        {
+            "skip"
+        } else {
+            action
+        };
+        if entry.action != target {
+            entry.action = target.to_string();
+            changed += 1;
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BulkWhere, InstrumentCatalog, PlanEntry, apply_bulk_action, resolve_parameter_instrument,
+        select_entries,
+    };
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    fn catalog(entries: &[(&str, Uuid)]) -> InstrumentCatalog {
+        InstrumentCatalog {
+            by_id: entries
+                .iter()
+                .map(|(key, id)| (*id, ((*key).to_string(), Some((*key).to_string()))))
+                .collect(),
+            labels: vec![],
+            by_source_key: entries
+                .iter()
+                .map(|(key, id)| ((*key).to_string(), *id))
+                .collect(),
+            curves: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_resolve_parameter_instrument_takes_the_source_s_own() {
+        let id = Uuid::new_v4();
+        let resolved = resolve_parameter_instrument("cnet", "NO2_mgL", &catalog(&[("cnet:NO2_mgL", id)]));
+        assert_eq!(resolved.id, Some(id));
+        assert!(!resolved.create, "an instrument that exists is not created again");
+        assert!(resolved.confirmed);
+    }
+
+    /// Expected behaviour: a parameter with no instrument is proposed, already agreed. The review
+    /// changes it by attaching another; leaving it alone creates the suggestion.
+    #[test]
+    fn test_resolve_parameter_instrument_proposes_one_already_agreed() {
+        let proposed = resolve_parameter_instrument("cnet", "NO2_mgL", &catalog(&[]));
+        assert_eq!(proposed.id, None);
+        assert_eq!(proposed.source_key, "cnet:NO2_mgL");
+        assert!(proposed.create && proposed.confirmed);
+        assert_eq!(proposed.proposed_name.as_deref(), Some("NO2_mgL (cnet)"));
+    }
+
+    fn plan_entry(site: &str, parameter: &str, confidence: &str, warnings: usize) -> PlanEntry {
+        let entry = serde_json::json!({
+            "stream_id": Uuid::new_v4(),
+            "source_key": format!("{site}:{parameter}"),
+            "source_name": null,
+            "action": "pair",
+            "project": { "id": null, "name": "CNET", "create": true },
+            "site": { "id": null, "name": site, "create": true,
+                      "latitude": null, "longitude": null, "altitude_m": null },
+            "parameter": { "id": null, "name": parameter, "label": null, "create": true,
+                           "units": "mm", "group_key": null, "original_names": [] },
+            "confidence": confidence,
+            "warnings": (0..warnings)
+                .map(|i| serde_json::json!({ "kind": "units_mismatch", "message": i.to_string() }))
+                .collect::<Vec<_>>(),
+        });
+        serde_json::from_value(entry).expect("a plan entry")
+    }
+
+    #[test]
+    fn test_select_entries_picks_exactly_each_predicate_s_set() {
+        let entries = vec![
+            plan_entry("FP1", "Depth", "exact", 0),
+            plan_entry("FP1", "CDOM", "none", 1),
+            plan_entry("FP2", "Depth", "none", 0),
+        ];
+
+        assert_eq!(select_entries(&entries, &BulkWhere::default()), vec![0, 1, 2]);
+        assert_eq!(
+            select_entries(
+                &entries,
+                &BulkWhere { confidence: Some("none".into()), ..Default::default() }
+            ),
+            vec![1, 2]
+        );
+        assert_eq!(
+            select_entries(
+                &entries,
+                &BulkWhere { has_warnings: Some(true), ..Default::default() }
+            ),
+            vec![1]
+        );
+        assert_eq!(
+            select_entries(
+                &entries,
+                &BulkWhere { site_name: Some("fp1".into()), ..Default::default() }
+            ),
+            vec![0, 1],
+            "the site is matched case-insensitively, as the review renders it"
+        );
+        assert_eq!(
+            select_entries(
+                &entries,
+                &BulkWhere {
+                    confidence: Some("none".into()),
+                    parameter_name: Some("Depth".into()),
+                    ..Default::default()
+                }
+            ),
+            vec![2],
+            "predicates narrow together"
+        );
+    }
+
+    #[test]
+    fn test_apply_bulk_action_never_pairs_an_entry_with_no_slot() {
+        let mut entries = vec![
+            plan_entry("", "Depth", "none", 0),
+            plan_entry("FP1", "", "none", 0),
+            plan_entry("FP1", "Depth", "none", 0),
+        ];
+        for entry in &mut entries {
+            entry.action = "skip".to_string();
+        }
+
+        let changed = apply_bulk_action(&mut entries, &BulkWhere::default(), "pair");
+        assert_eq!(changed, 1, "only the entry that names a slot moves");
+        assert_eq!(entries[0].action, "skip");
+        assert_eq!(entries[1].action, "skip");
+        assert_eq!(entries[2].action, "pair");
+
+        let changed = apply_bulk_action(&mut entries, &BulkWhere::default(), "skip");
+        assert_eq!(changed, 1, "and skipping is its inverse");
+        assert!(entries.iter().all(|e| e.action == "skip"));
+    }
 }

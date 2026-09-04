@@ -696,7 +696,10 @@ pub async fn insert_batch_readings(
     }
 
     // Stream-declared defaults: a retagged "api" stream must classify batch writes the same
-    // way it classifies /ingest writes.
+    // way it classifies /ingest writes. The channel's instrument travels with them: it is what a
+    // row naming neither an instrument of its own nor a deployed one is attributed to, so a batch
+    // write cannot store a measurement whose instrument is unknown.
+    let mut stream_sensors: HashMap<Uuid, Uuid> = HashMap::new();
     let stream_defaults: HashMap<Uuid, Option<String>> = {
         let stream_ids: Vec<Uuid> = stream_cache.values().copied().collect();
         let mut map = HashMap::with_capacity(stream_ids.len());
@@ -704,12 +707,15 @@ pub async fn insert_batch_readings(
             .db
             .query_all_raw(sea_orm::Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                "SELECT id, measurement_type FROM data_streams WHERE id = ANY($1)",
+                "SELECT id, measurement_type, sensor_id FROM data_streams WHERE id = ANY($1)",
                 [stream_ids.into()],
             ))
             .await?
         {
             let id: Uuid = row.try_get("", "id")?;
+            if let Ok(Some(sensor_id)) = row.try_get::<Option<Uuid>>("", "sensor_id") {
+                stream_sensors.insert(id, sensor_id);
+            }
             map.insert(id, row.try_get("", "measurement_type")?);
         }
         map
@@ -884,7 +890,10 @@ pub async fn insert_batch_readings(
                 replicate_index: Set(r.replicate_index.unwrap_or(0)),
                 raw_value: Set(r.raw_value),
                 calibrated_value: Set(calibrated_value),
-                sensor_id: Set(r.sensor_id.or(owner.sensor_id)),
+                sensor_id: Set(r
+                    .sensor_id
+                    .or(owner.sensor_id)
+                    .or_else(|| stream_sensors.get(&stream_id).copied())),
                 calibration_id: Set(calibration_id),
                 deployment_id: Set(r.deployment_id.or(owner.deployment_id)),
                 logged: Set(Some(true)),

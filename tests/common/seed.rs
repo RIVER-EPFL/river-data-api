@@ -182,14 +182,24 @@ fn generate_value(cfg: &ParamConfig, step: usize) -> f64 {
     value.clamp(cfg.units_min, cfg.units_max)
 }
 
+/// Every channel carries the instrument its readings name, the way registration mints one for a
+/// real feed: a seeded stream stands for a discovered one, and a reading with no instrument cannot
+/// be stored.
 async fn seed_streams_for_site_params(db: &DatabaseConnection) {
     let configs = param_configs();
+    let mut sensors = Vec::with_capacity(configs.len());
     let mut values = Vec::with_capacity(configs.len());
 
     for (i, p) in configs.iter().enumerate() {
         let stream_uuid = format!("00000000-0000-4000-d000-{:012}", i + 1);
+        let sensor_uuid = seed_stream_sensor_id(i);
+        sensors.push(format!(
+            "('{sensor_uuid}', 'Seed {name}', true, 'test-seed', 'test-seed:seed-{sp_id}')",
+            name = p.name,
+            sp_id = p.site_param_id,
+        ));
         values.push(format!(
-            "('{stream_uuid}', 'test-seed', 'seed-{sp_id}', 'Seed {name}', '{sp_id}', NOW(), true)",
+            "('{stream_uuid}', 'test-seed', 'seed-{sp_id}', 'Seed {name}', '{sp_id}', '{sensor_uuid}', NOW(), true)",
             name = p.name,
             sp_id = p.site_param_id,
         ));
@@ -198,11 +208,23 @@ async fn seed_streams_for_site_params(db: &DatabaseConnection) {
     exec(
         db,
         &format!(
-            "INSERT INTO data_streams (id, source_system, source_key, source_name, site_parameter_id, paired_at, is_active) VALUES {}",
+            "INSERT INTO sensors (id, name, is_active, source_system, source_key) VALUES {}",
+            sensors.join(", ")
+        ),
+    )
+    .await;
+    exec(
+        db,
+        &format!(
+            "INSERT INTO data_streams (id, source_system, source_key, source_name, site_parameter_id, sensor_id, paired_at, is_active) VALUES {}",
             values.join(", ")
         ),
     )
     .await;
+}
+
+fn seed_stream_sensor_id(cfg_index: usize) -> String {
+    format!("00000000-0000-4000-e000-{:012}", cfg_index + 1)
 }
 
 fn stream_id_for_param(cfg_index: usize) -> String {

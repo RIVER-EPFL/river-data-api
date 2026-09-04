@@ -75,8 +75,23 @@ pub async fn setup_test_db() -> DatabaseConnection {
         .await
         .expect("Failed to run migrations");
 
+    // Every channel carries an instrument in the deployed system: registration mints one, and a
+    // reading may not be stored without naming what measured it. A fixture stream built by raw SQL
+    // has no source to mint from, so the suite gives it [`FIXTURE_SENSOR_ID`] as the column
+    // default. A stream created through a route still sets the column itself, so the minting paths
+    // are exercised, not defaulted around.
+    db.execute_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!("ALTER TABLE data_streams ALTER COLUMN sensor_id SET DEFAULT '{FIXTURE_SENSOR_ID}'"),
+    ))
+    .await
+    .expect("default the fixture instrument onto hand-built streams");
+
     db
 }
+
+/// The instrument a hand-built fixture stream belongs to.
+pub const FIXTURE_SENSOR_ID: &str = "00000000-0000-4000-e000-000000000999";
 
 pub async fn cleanup_test_db(db: &DatabaseConnection) {
     let stmts = [
@@ -114,6 +129,18 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
             ))
             .await;
     }
+
+    // Truncated with the rest, and restored here: the column default above points at it.
+    let _ = db
+        .execute_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "INSERT INTO sensors (id, name, is_active, source_system, source_key) \
+                 VALUES ('{FIXTURE_SENSOR_ID}', 'Fixture instrument', true, 'fixture', 'fixture') \
+                 ON CONFLICT DO NOTHING"
+            ),
+        ))
+        .await;
 }
 
 pub async fn exec(db: &DatabaseConnection, sql: &str) {

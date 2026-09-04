@@ -291,6 +291,14 @@ async fn get_or_create_grab_stream(
             active.updated_at = Set(chrono::Utc::now().into());
             active.update(db).await?;
         }
+        crate::routes::private::sensors::operations::ensure_channel_instrument(
+            db,
+            &stream,
+            site_id,
+            parameter_id,
+            "grab entry",
+        )
+        .await?;
         return Ok(stream.id);
     }
 
@@ -335,6 +343,15 @@ async fn get_or_create_grab_stream(
         .one(db)
         .await?
         .ok_or_else(|| AppError::Internal("Failed to create grab sample stream".to_string()))?;
+
+    crate::routes::private::sensors::operations::ensure_channel_instrument(
+        db,
+        &stream,
+        site_id,
+        parameter_id,
+        "grab entry",
+    )
+    .await?;
 
     Ok(stream.id)
 }
@@ -1158,6 +1175,25 @@ pub async fn insert_grab_samples(
         }
     }
 
+    // The channel instrument each parameter's grab stream carries, which a reading naming no
+    // instrument of its own is attributed to. A hand-entered value still records what produced it.
+    let stream_sensors: HashMap<Uuid, Uuid> = {
+        let ids: Vec<Uuid> = stream_cache.values().copied().collect();
+        let mut map = HashMap::new();
+        for row in state
+            .db
+            .query_all_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT id, sensor_id FROM data_streams WHERE id = ANY($1) AND sensor_id IS NOT NULL",
+                [ids.into()],
+            ))
+            .await?
+        {
+            map.insert(row.try_get::<Uuid>("", "id")?, row.try_get::<Uuid>("", "sensor_id")?);
+        }
+        map
+    };
+
     // Window-aware attribution for grabs that name a sensor: which deployment the instrument was on
     // at the grab time (site-fixed to payload.site_id), instead of writing NULL. Grabs without a
     // sensor_id keep NULL deployment (manual lab values with no instrument).
@@ -1406,7 +1442,11 @@ pub async fn insert_grab_samples(
                     replicate_index: Set(p.replicate_index),
                     raw_value: Set(r.value),
                     calibrated_value: Set(p.calibrated_value),
-                    sensor_id: Set(r.sensor_id),
+                    sensor_id: Set(r.sensor_id.or_else(|| {
+                        stream_sensors
+                            .get(&stream_cache[&r.parameter_id])
+                            .copied()
+                    })),
                     calibration_id: Set(p.base_calibration.as_ref().map(|c| c.id)),
                     deployment_id: Set(r.sensor_id.and_then(|sid| {
                         grab_slots

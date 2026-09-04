@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use sea_orm::{ConnectionTrait, DbErr, EntityTrait, Set, Statement, TransactionTrait};
 use uuid::Uuid;
 
-use super::job::Job;
-use super::lifecycle::JobContext;
+use super::job::{Job, TunableKind, TunableSpec};
+use super::lifecycle::{JobContext, JobReport};
 use super::schedule::Schedule;
 use crate::common::sync_state;
 use crate::config::Config;
@@ -161,6 +161,65 @@ fn uuid_array(params: &serde_json::Value, key: &str) -> Vec<Uuid> {
 
 /// Parse an array of `[site_id, parameter_id]` UUID pairs under `key`. Each element is a two-string
 /// array; malformed elements are skipped.
+/// What a loop over slots did: how many succeeded, which failed and why, and the total the
+/// successful ones moved. A run whose every slot failed is a failed run, not a completed one that
+/// happened to move nothing.
+pub struct SlotOutcome {
+    pub succeeded: usize,
+    pub failed: Vec<(serde_json::Value, String)>,
+    pub readings: i64,
+}
+
+impl SlotOutcome {
+    pub fn from(results: impl IntoIterator<Item = (serde_json::Value, Result<i64, DbErr>)>) -> Self {
+        let mut outcome = Self {
+            succeeded: 0,
+            failed: Vec::new(),
+            readings: 0,
+        };
+        for (slot, result) in results {
+            match result {
+                Ok(n) => {
+                    outcome.succeeded += 1;
+                    outcome.readings += n;
+                }
+                Err(e) => outcome.failed.push((slot, e.to_string())),
+            }
+        }
+        outcome
+    }
+
+    #[must_use]
+    pub fn all_failed(&self) -> bool {
+        self.succeeded == 0 && !self.failed.is_empty()
+    }
+
+    /// One timeline line per failed slot, then the counts and the failed set on the report.
+    async fn record(&self, ctx: &JobContext, report: JobReport) -> JobReport {
+        for (slot, error) in &self.failed {
+            ctx.log(
+                "warn",
+                "slot failed",
+                serde_json::json!({ "slot": slot, "error": error }),
+            )
+            .await;
+        }
+        report
+            .scope(
+                "failed_slots",
+                self.failed
+                    .iter()
+                    .map(|(slot, _)| slot.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .count("slots_failed", self.failed.len())
+    }
+
+    fn error(&self) -> DbErr {
+        DbErr::Custom(format!("every one of {} slots failed", self.failed.len()))
+    }
+}
+
 fn uuid_pair_array(params: &serde_json::Value, key: &str) -> Vec<(Uuid, Uuid)> {
     params
         .get(key)
@@ -232,10 +291,11 @@ impl Job for ReprocessSensor {
                 ctx.set_site(site_id).await;
             }
         }
-        ctx.set_detail(serde_json::json!({
-            "scope": { "sensor_id": sensor_id },
-            "counts": { "readings_updated": count },
-        }))
+        ctx.report(
+            JobReport::new()
+                .scope("sensor_id", sensor_id.to_string())
+                .count("readings_updated", count),
+        )
         .await;
         Ok(count as i64)
     }
@@ -283,7 +343,11 @@ impl Job for RefreshAggregates {
         })
         .await;
         match outcome {
-            Ok(Ok(())) => Ok(0),
+            Ok(Ok(())) => {
+                ctx.report(JobReport::new().scope("full_refresh", self.full))
+                    .await;
+                Ok(0)
+            }
             Ok(Err(e)) => Err(DbErr::Custom(e.to_string())),
             Err(_) => Err(DbErr::Custom(
                 "Aggregate refresh timed out after 10 minutes".into(),
@@ -320,10 +384,12 @@ impl Job for ReprocessSlot {
             reprocess_sensor_readings(ctx.db(), sensor_id).await?;
         }
         ctx.set_site(site_id).await;
-        ctx.set_detail(serde_json::json!({
-            "scope": { "site_id": site_id, "parameter_id": parameter_id },
-            "counts": { "readings_updated": count },
-        }))
+        ctx.report(
+            JobReport::new()
+                .scope("site_id", site_id.to_string())
+                .scope("parameter_id", parameter_id.to_string())
+                .count("readings_updated", count),
+        )
         .await;
         Ok(count)
     }
@@ -379,10 +445,12 @@ impl Job for ReprocessDeployment {
         };
         reprocess_sensor_readings(ctx.db(), sensor_id).await?;
         ctx.set_site(site_id).await;
-        ctx.set_detail(serde_json::json!({
-            "scope": { "sensor_id": sensor_id, "site_id": site_id },
-            "counts": { "readings_updated": count },
-        }))
+        ctx.report(
+            JobReport::new()
+                .scope("sensor_id", sensor_id.to_string())
+                .scope("site_id", site_id.to_string())
+                .count("readings_updated", count),
+        )
         .await;
         Ok(count)
     }
@@ -459,6 +527,14 @@ impl Job for DerivedRecompute {
                     .map_err(as_db_err)?;
             }
             ctx.set_progress(total, Some(total)).await;
+            ctx.report(
+                JobReport::new()
+                    .scope("derived_definition_id", derived_id.to_string())
+                    .scope_opt("earliest_filled", min_filled.map(|t| t.to_rfc3339()))
+                    .count("timestamps", total)
+                    .count("filled", filled),
+            )
+            .await;
             tracing::info!(derived_id = %derived_id, total, filled, "Derived parameter recomputation complete");
             Ok::<i64, DbErr>(i64::from(filled))
         };
@@ -525,6 +601,15 @@ impl Job for DerivedAssignment {
                 .map_err(as_db_err)?;
         }
 
+        ctx.report(
+            JobReport::new()
+                .scope("derived_definition_id", def_id.to_string())
+                .scope("site_id", site_id.to_string())
+                .scope_opt("earliest_filled", earliest.map(|t| t.to_rfc3339()))
+                .count("timestamps", rows.len())
+                .count("filled", filled),
+        )
+        .await;
         tracing::info!(%def_id, %site_id, filled, "Derived assignment backfill completed");
         Ok(filled)
     }
@@ -633,6 +718,14 @@ impl Job for SiteTimestampsDerived {
                 .map_err(as_db_err)?;
         }
         ctx.set_progress(progress, Some(total)).await;
+        ctx.report(
+            JobReport::new()
+                .scope("sites", work.len())
+                .scope_opt("earliest_computed", earliest.map(|t| t.to_rfc3339()))
+                .count("timestamps", total)
+                .count("computed", progress),
+        )
+        .await;
         tracing::info!(computed = progress, "Derived computation complete");
         Ok(i64::from(progress))
     }
@@ -656,11 +749,12 @@ impl Job for IngestDerived {
         let total = i32::try_from(timestamps.len()).unwrap_or(i32::MAX);
 
         ctx.set_site(site_id).await;
-        ctx.set_detail(serde_json::json!({
-            "scope": { "site_id": site_id },
-            "source": { "stream_id": stream_id },
-            "counts": { "timestamps": total },
-        }))
+        ctx.report(
+            JobReport::new()
+                .scope("site_id", site_id.to_string())
+                .scope_opt("stream_id", stream_id.map(|id| id.to_string()))
+                .count("timestamps", total),
+        )
         .await;
         ctx.set_progress(0, Some(total)).await;
 
@@ -714,22 +808,30 @@ impl Job for ReprocessAll {
         let slot_count = slots.len();
         ctx.info(&format!("Backdating {slot_count} slot(s)")).await;
 
-        let mut total = 0i64;
+        let mut results = Vec::with_capacity(slot_count);
         for (site_id, parameter_id) in slots {
-            match reprocess_site_parameter_readings(ctx.db(), site_id, parameter_id).await {
-                Ok(n) => total += n as i64,
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    site_id = %site_id,
-                    parameter_id = %parameter_id,
-                    "reprocess_all: slot reprocess failed"
-                ),
-            }
+            let moved = reprocess_site_parameter_readings(ctx.db(), site_id, parameter_id)
+                .await
+                .map(|n| n as i64);
+            results.push((
+                serde_json::json!({ "site_id": site_id, "parameter_id": parameter_id }),
+                moved,
+            ));
         }
-        ctx.set_detail(serde_json::json!({
-            "counts": { "slots": slot_count, "readings_updated": total },
-        }))
-        .await;
+        let outcome = SlotOutcome::from(results);
+        let total = outcome.readings;
+        let report = outcome
+            .record(
+                &ctx,
+                JobReport::new()
+                    .count("slots", slot_count)
+                    .count("readings_updated", total),
+            )
+            .await;
+        ctx.report(report).await;
+        if outcome.all_failed() {
+            return Err(outcome.error());
+        }
         tracing::info!(readings_updated = total, "reprocess_all complete");
         Ok(total)
     }
@@ -764,31 +866,38 @@ impl Job for AlarmBackfill {
                     "alarm_backfill with slots requires start and end".into(),
                 ));
             };
-            let mut total = 0i64;
+            let mut results = Vec::with_capacity(slots.len());
             for (site_id, parameter_id) in &slots {
-                match crate::routes::private::alarms::episodes::evaluate_alarm_episodes(
+                let written = crate::routes::private::alarms::episodes::evaluate_alarm_episodes(
                     ctx.db(),
                     *site_id,
                     *parameter_id,
                     start,
                     end,
                 )
-                .await
-                {
-                    Ok(n) => total += n,
-                    Err(e) => tracing::warn!(
-                        error = %e, site_id = %site_id, parameter_id = %parameter_id,
-                        "alarm backfill slot failed"
-                    ),
-                }
+                .await;
+                results.push((
+                    serde_json::json!({ "site_id": site_id, "parameter_id": parameter_id }),
+                    written,
+                ));
             }
             if let Some((site_id, _)) = slots.first() {
                 ctx.set_site(*site_id).await;
             }
-            ctx.set_detail(serde_json::json!({
-                "counts": { "events_written": total, "slots": slots.len() },
-            }))
-            .await;
+            let outcome = SlotOutcome::from(results);
+            let total = outcome.readings;
+            let report = outcome
+                .record(
+                    &ctx,
+                    JobReport::new()
+                        .count("events_written", total)
+                        .count("slots", slots.len()),
+                )
+                .await;
+            ctx.report(report).await;
+            if outcome.all_failed() {
+                return Err(outcome.error());
+            }
             return Ok(total);
         }
 
@@ -805,9 +914,12 @@ impl Job for AlarmBackfill {
         if let Some(site_id) = site_id {
             ctx.set_site(site_id).await;
         }
-        ctx.set_detail(serde_json::json!({
-            "counts": { "events_written": count },
-        }))
+        ctx.report(
+            JobReport::new()
+                .scope_opt("site_id", site_id.map(|id| id.to_string()))
+                .scope_opt("parameter_id", parameter_id.map(|id| id.to_string()))
+                .count("events_written", count),
+        )
         .await;
         Ok(count)
     }
@@ -1307,14 +1419,13 @@ impl CsvImport {
             ))
             .await?;
 
-        ctx.set_detail(serde_json::json!({
-            "scope": { "site_id": site_id },
-            "counts": {
-                "inserted": inserted_total,
-                "overwritten": overwritten,
-                "replicate_groups": replicate_groups,
-            },
-        }))
+        ctx.report(
+            JobReport::new()
+                .scope("site_id", site_id.to_string())
+                .count("inserted", inserted_total)
+                .count("overwritten", overwritten)
+                .count("replicate_groups", replicate_groups),
+        )
         .await;
         Ok(i64::from(
             i32::try_from(inserted_total + overwritten).unwrap_or(i32::MAX),
@@ -1336,20 +1447,25 @@ impl Job for BackfillAttribution {
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         let slots = uuid_pair_array(ctx.params(), "slots");
-        let mut total = 0i64;
+        let mut results = Vec::with_capacity(slots.len());
         for (site_id, parameter_id) in slots {
-            match reprocess_site_parameter_readings(ctx.db(), site_id, parameter_id).await {
-                Ok(n) => total += n as i64,
-                Err(e) => tracing::warn!(
-                    error = %e, site_id = %site_id, parameter_id = %parameter_id,
-                    "backfill_attribution: slot reprocess failed"
-                ),
-            }
+            let moved = reprocess_site_parameter_readings(ctx.db(), site_id, parameter_id)
+                .await
+                .map(|n| n as i64);
+            results.push((
+                serde_json::json!({ "site_id": site_id, "parameter_id": parameter_id }),
+                moved,
+            ));
         }
-        ctx.set_detail(serde_json::json!({
-            "counts": { "readings_updated": total },
-        }))
-        .await;
+        let outcome = SlotOutcome::from(results);
+        let total = outcome.readings;
+        let report = outcome
+            .record(&ctx, JobReport::new().count("readings_updated", total))
+            .await;
+        ctx.report(report).await;
+        if outcome.all_failed() {
+            return Err(outcome.error());
+        }
         tracing::info!(readings_updated = total, "backfill_attribution complete");
         Ok(total)
     }
@@ -1368,20 +1484,22 @@ impl Job for BackfillCalibrations {
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         let sensors = uuid_array(ctx.params(), "sensors");
-        let mut total = 0i64;
+        let mut results = Vec::with_capacity(sensors.len());
         for sensor_id in sensors {
-            match reprocess_sensor_readings(ctx.db(), sensor_id).await {
-                Ok(n) => total += n as i64,
-                Err(e) => tracing::warn!(
-                    error = %e, sensor_id = %sensor_id,
-                    "backfill_calibrations: sensor reprocess failed"
-                ),
-            }
+            let moved = reprocess_sensor_readings(ctx.db(), sensor_id)
+                .await
+                .map(|n| n as i64);
+            results.push((serde_json::json!({ "sensor_id": sensor_id }), moved));
         }
-        ctx.set_detail(serde_json::json!({
-            "counts": { "readings_updated": total },
-        }))
-        .await;
+        let outcome = SlotOutcome::from(results);
+        let total = outcome.readings;
+        let report = outcome
+            .record(&ctx, JobReport::new().count("readings_updated", total))
+            .await;
+        ctx.report(report).await;
+        if outcome.all_failed() {
+            return Err(outcome.error());
+        }
         tracing::info!(readings_updated = total, "backfill_calibrations complete");
         Ok(total)
     }
@@ -1389,7 +1507,8 @@ impl Job for BackfillCalibrations {
 
 /// Absorb one `site_parameter` into another, moves readings, status events, streams, and
 /// deployments, then deletes the source. Idempotent on the readings PK and a no-op DELETE of an
-/// absent source, so a rerun is safe. Backs the `merge_site_parameters` operator action.
+/// absent source, so it is safe under the reaper's re-execution after a lost lease. Not offered as
+/// a rerun. Backs the `merge_site_parameters` operator action.
 pub struct MergeSiteParameters;
 
 #[async_trait]
@@ -1413,14 +1532,22 @@ impl Job for MergeSiteParameters {
         )
         .await
         .map_err(|e| DbErr::Custom(e.to_string()))?;
-        ctx.set_detail(serde_json::json!({ "counts": result }))
-            .await;
+        ctx.report(
+            JobReport::new()
+                .scope("source_deleted", result.source_deleted)
+                .count("merged_readings", result.merged_readings)
+                .count("merged_status_events", result.merged_status_events)
+                .count("streams_updated", result.streams_updated)
+                .count("deployments_moved", result.deployments_moved),
+        )
+        .await;
         Ok(i64::try_from(result.merged_readings).unwrap_or(i64::MAX))
     }
 }
 
 /// Absorb one global parameter into another, re-points every `site_parameter`, reading, status
-/// event, and stream from source to target, then deletes the source. Idempotent enough to rerun.
+/// event, and stream from source to target, then deletes the source. Idempotent under the reaper's
+/// re-execution after a lost lease; not offered as a rerun.
 /// Backs the `merge_parameters` operator action.
 pub struct MergeParameters;
 
@@ -1445,15 +1572,23 @@ impl Job for MergeParameters {
         )
         .await
         .map_err(|e| DbErr::Custom(e.to_string()))?;
-        ctx.set_detail(serde_json::json!({ "counts": result }))
-            .await;
+        ctx.report(
+            JobReport::new()
+                .scope("source_deleted", result.source_deleted)
+                .count("sites_merged", result.sites_merged)
+                .count("sites_reassigned", result.sites_reassigned)
+                .count("readings_moved", result.readings_moved)
+                .count("streams_updated", result.streams_updated),
+        )
+        .await;
         Ok(i64::try_from(result.readings_moved).unwrap_or(i64::MAX))
     }
 }
 
 /// Apply a pairing plan: resolve entities, execute pairings, backfill readings, mark the plan
-/// `applied`. The status transition is guarded (only a `draft` plan applies), so a rerun of an
-/// already-applied plan is a no-op. Backs the `apply_pairing_plan` operator action.
+/// `applied`. The status transition is guarded (only a `draft` plan applies), so a re-execution
+/// after a lost lease does nothing; not offered as a rerun. Backs the `apply_pairing_plan`
+/// operator action.
 pub struct PlanApply;
 
 #[async_trait]
@@ -1467,10 +1602,12 @@ impl Job for PlanApply {
         let result = crate::routes::private::sync::service::apply_plan(ctx.db(), plan_id)
             .await
             .map_err(|e| DbErr::Custom(e.to_string()))?;
-        ctx.set_detail(serde_json::json!({
-            "scope": { "plan_id": plan_id },
-            "counts": result,
-        }))
+        ctx.report(
+            JobReport::new()
+                .scope("plan_id", plan_id.to_string())
+                .count("streams_paired", result.streams_paired)
+                .count("readings_backfilled", result.readings_backfilled),
+        )
         .await;
         ctx.info(&format!(
             "Applied plan: {} streams paired, {} readings backfilled",
@@ -1483,7 +1620,8 @@ impl Job for PlanApply {
 
 /// Revert an applied pairing plan: unpair every stream it touched, restoring the prior state, and
 /// mark the plan `reverted`. The status transition is guarded (only an `applied` plan reverts), so
-/// a rerun is a no-op. Backs the `revert_pairing_plan` operator action.
+/// a re-execution after a lost lease does nothing; not offered as a rerun. Backs the
+/// `revert_pairing_plan` operator action.
 pub struct PlanRevert;
 
 #[async_trait]
@@ -1497,10 +1635,11 @@ impl Job for PlanRevert {
         let reverted = crate::routes::private::sync::service::revert_plan(ctx.db(), plan_id)
             .await
             .map_err(|e| DbErr::Custom(e.to_string()))?;
-        ctx.set_detail(serde_json::json!({
-            "scope": { "plan_id": plan_id },
-            "counts": { "reverted": reverted },
-        }))
+        ctx.report(
+            JobReport::new()
+                .scope("plan_id", plan_id.to_string())
+                .count("reverted", reverted),
+        )
         .await;
         ctx.info(&format!("Reverted plan: {reverted} streams unpaired"))
             .await;
@@ -1521,20 +1660,15 @@ impl Job for JanitorRun {
     // The one concrete tunable: `retention_days` overrides the operator-retention window for the
     // tracked-job prune. Other Services keep the default accept-anything `validate` (no tunables yet)
     // and follow this same pattern when they grow one.
-    fn validate(&self, tunables: &serde_json::Value) -> Result<(), String> {
-        if tunables.is_null() {
-            return Ok(());
-        }
-        let Some(obj) = tunables.as_object() else {
-            return Err("tunables must be a JSON object".to_string());
-        };
-        if let Some(v) = obj.get("retention_days") {
-            let ok = v.as_u64().is_some_and(|n| n >= 1);
-            if !ok {
-                return Err("retention_days must be a positive integer".to_string());
-            }
-        }
-        Ok(())
+    fn tunables(&self) -> Vec<TunableSpec> {
+        vec![TunableSpec {
+            key: "retention_days",
+            kind: TunableKind::Integer,
+            min: Some(1),
+            max: None,
+            default: serde_json::json!(self.operator_retention_days),
+            help: "How long an operator or metadata job row is kept before the prune removes it.",
+        }]
     }
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
@@ -1641,12 +1775,37 @@ impl Job for JanitorRun {
         )
         .await;
 
+        // 4. Report, never repair: readings whose curation columns are not the fold of their
+        //    live decisions. Which side is wrong is a decision (a rollback, or a fresh decision),
+        //    so a sweep may not pick one.
+        let curation_drift =
+            match crate::routes::private::readings::decisions::curation_drift_count(db).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Janitor: curation drift count failed");
+                    0
+                }
+            };
+        if curation_drift > 0 {
+            ctx.log(
+                "warn",
+                &format!(
+                    "{curation_drift} readings disagree with their decision record; nothing was changed"
+                ),
+                serde_json::json!({}),
+            )
+            .await;
+        }
+
         // What this tick actually changed, so a run's effect is readable per job rather than only
         // in its logs.
-        ctx.set_detail(serde_json::json!({
-            "scope": { "full_refresh": do_full },
-            "counts": { "recomposed": recomposed, "pruned": pruned },
-        }))
+        ctx.report(
+            JobReport::new()
+                .scope("full_refresh", do_full)
+                .count("recomposed", recomposed)
+                .count("pruned", pruned)
+                .count("curation_drift", curation_drift),
+        )
         .await;
         Ok(pruned as i64)
     }
@@ -1690,6 +1849,12 @@ impl Job for AlarmSweep {
                         resolved: stats.resolved,
                     });
                 }
+                ctx.report(
+                    JobReport::new()
+                        .count("opened", stats.opened)
+                        .count("resolved", stats.resolved),
+                )
+                .await;
                 Ok((stats.opened + stats.resolved) as i64)
             }
             Err(e) => Err(DbErr::Custom(format!("alarm sweep failed: {e}"))),
@@ -1727,6 +1892,12 @@ impl Job for SyncEventSweep {
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         let closed = sweep_stale_sync_events(ctx.db(), self.stale_after_seconds).await?;
+        ctx.report(
+            JobReport::new()
+                .scope("stale_after_seconds", self.stale_after_seconds)
+                .count("sync_events_closed", closed),
+        )
+        .await;
         Ok(closed as i64)
     }
 }
@@ -1806,16 +1977,16 @@ impl Job for SyncLedgerRetention {
                 .await?
                 .rows_affected();
         }
-        ctx.set_detail(serde_json::json!({
-            "scope": {
-                "sync_event_retention_days": self.sync_event_retention_days,
-                "ingest_receipt_retention_days": self.ingest_receipt_retention_days,
-            },
-            "counts": {
-                "sync_events_pruned": events_pruned,
-                "ingest_receipts_pruned": receipts_pruned,
-            },
-        }))
+        ctx.report(
+            JobReport::new()
+                .scope("sync_event_retention_days", self.sync_event_retention_days)
+                .scope(
+                    "ingest_receipt_retention_days",
+                    self.ingest_receipt_retention_days,
+                )
+                .count("sync_events_pruned", events_pruned)
+                .count("ingest_receipts_pruned", receipts_pruned),
+        )
         .await;
         Ok((events_pruned + receipts_pruned) as i64)
     }
@@ -1827,7 +1998,6 @@ impl Job for SyncLedgerRetention {
 /// periodic full pass ignores digests and re-asserts everything. Delivery is the normal
 /// heartbeat pickup; a service already holding a pending command is not queued twice.
 pub struct SyncFullReassert {
-    service_types: Vec<String>,
     command_expiry_secs: u64,
 }
 
@@ -1835,7 +2005,6 @@ impl SyncFullReassert {
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
         Self {
-            service_types: config.sync_full_reassert_service_types.clone(),
             command_expiry_secs: config.sync_command_expiry_secs,
         }
     }
@@ -1852,20 +2021,17 @@ impl Job for SyncFullReassert {
     }
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
-        if self.service_types.is_empty() {
-            return Ok(0);
-        }
-        let queued = ctx
+        let rows = ctx
             .db()
-            .execute_raw(sea_orm::Statement::from_sql_and_values(
+            .query_all_raw(sea_orm::Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "INSERT INTO sync_commands
                      (id, service_id, command, status, created_at, expires_at)
                  SELECT gen_random_uuid(), s.id, 'trigger_full_sync', 'pending', NOW(),
-                        NOW() + ($2 || ' seconds')::interval
+                        NOW() + ($1 || ' seconds')::interval
                  FROM sync_services s
                  WHERE s.paused IS NOT TRUE
-                   AND s.service_type = ANY($1)
+                   AND s.full_reassert_enabled
                    AND s.last_heartbeat > NOW() - INTERVAL '1 hour'
                    AND NOT EXISTS (
                        SELECT 1 FROM sync_commands c
@@ -1873,20 +2039,24 @@ impl Job for SyncFullReassert {
                          AND c.command = 'trigger_full_sync'
                          AND c.status = 'pending'
                          AND c.expires_at > NOW()
-                   )",
-                [
-                    self.service_types.clone().into(),
-                    self.command_expiry_secs.to_string().into(),
-                ],
+                   )
+                 RETURNING service_id",
+                [self.command_expiry_secs.to_string().into()],
             ))
-            .await?
-            .rows_affected();
-        ctx.set_detail(serde_json::json!({
-            "scope": { "service_types": self.service_types },
-            "counts": { "commands_queued": queued },
-        }))
+            .await?;
+        let services: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r.try_get::<Uuid>("", "service_id").ok())
+            .map(|id| id.to_string())
+            .collect();
+        let queued = services.len();
+        ctx.report(
+            JobReport::new()
+                .scope("service_ids", services)
+                .count("commands_queued", queued),
+        )
         .await;
-        Ok(queued as i64)
+        Ok(i64::try_from(queued).unwrap_or(i64::MAX))
     }
 }
 
@@ -1914,19 +2084,26 @@ impl Job for PushSubscriptionReconcile {
         Some(Schedule::every_secs(self.interval_seconds.max(1) as i64))
     }
 
-    async fn run(&self, _ctx: JobContext) -> Result<i64, DbErr> {
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         let Some(state) = crate::common::global_app_state() else {
             tracing::debug!("push_subscription_reconcile: no AppState in process; skipping");
             return Ok(0);
         };
         match crate::routes::private::notifications::reconcile::sweep(&state).await {
-            Ok(o) if o.total() == 0 => Ok(0),
             Ok(o) => {
-                tracing::info!(
-                    revoked = o.revoked,
-                    deactivated = o.deactivated,
-                    "Push subscription reconciliation: users pruned"
-                );
+                if o.total() > 0 {
+                    tracing::info!(
+                        revoked = o.revoked,
+                        deactivated = o.deactivated,
+                        "Push subscription reconciliation: users pruned"
+                    );
+                }
+                ctx.report(
+                    JobReport::new()
+                        .count("revoked", o.revoked)
+                        .count("deactivated", o.deactivated),
+                )
+                .await;
                 Ok(o.total() as i64)
             }
             Err(e) => Err(e),
@@ -1964,7 +2141,10 @@ impl Job for NotifyHealth {
             tracing::debug!("notify_health: no AppState in process; skipping");
             return Ok(0);
         };
-        crate::routes::private::notifications::health::probe_once(ctx.db(), &state.config).await;
+        let probed =
+            crate::routes::private::notifications::health::probe_once(ctx.db(), &state.config).await;
+        ctx.report(JobReport::new().count("channels_probed", probed))
+            .await;
         Ok(0)
     }
 }
@@ -1996,13 +2176,15 @@ impl Job for DispatchNotifications {
         Some(Schedule::every_secs(self.interval_seconds.max(1) as i64))
     }
 
-    async fn run(&self, _ctx: JobContext) -> Result<i64, DbErr> {
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         use crate::routes::private::notifications::dispatcher;
         let Some(state) = crate::common::global_app_state() else {
             tracing::debug!("dispatch_notifications: no AppState in process; skipping");
             return Ok(0);
         };
         let channels = dispatcher::build_channels(&state.config);
+        ctx.report(JobReport::new().count("channels", channels.len()))
+            .await;
         dispatcher::dispatch_once(&state, &channels).await;
         Ok(0)
     }
@@ -2219,11 +2401,13 @@ impl Job for MeasurementRetag {
             state.response_cache.invalidate_all();
         }
 
-        ctx.set_detail(serde_json::json!({
-            "counts": { "readings_retagged": retagged },
-            "target": target,
-            "window": { "from": lo.to_rfc3339(), "until": hi.to_rfc3339() },
-        }))
+        ctx.report(
+            JobReport::new()
+                .scope("target", target)
+                .scope("from", lo.to_rfc3339())
+                .scope("until", hi.to_rfc3339())
+                .count("readings_retagged", retagged),
+        )
         .await;
         Ok(retagged.try_into().unwrap_or(i64::MAX))
     }
@@ -2375,19 +2559,157 @@ impl Job for SdEstimatorRetag {
             state.response_cache.invalidate_all();
         }
 
-        ctx.set_detail(serde_json::json!({
-            "scope": {
-                "site_parameter_ids": site_parameter_ids,
-                "stream_ids": stream_ids,
-                "override_instants": override_instants,
-            },
-            "counts": {
-                "samples_retagged": retagged,
-                "instant_decisions_skipped": skipped,
-            },
-            "estimator": target,
-        }))
+        ctx.report(
+            JobReport::new()
+                .scope(
+                    "site_parameter_ids",
+                    site_parameter_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
+                )
+                .scope(
+                    "stream_ids",
+                    stream_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                )
+                .scope("override_instants", override_instants)
+                .scope("estimator", target)
+                .count("samples_retagged", retagged)
+                .count("instant_decisions_skipped", skipped),
+        )
         .await;
         Ok(retagged.try_into().unwrap_or(i64::MAX))
+    }
+}
+
+#[cfg(test)]
+mod slot_outcome_tests {
+    use super::SlotOutcome;
+    use sea_orm::DbErr;
+
+    fn slot(n: u32) -> serde_json::Value {
+        serde_json::json!({ "site_id": n })
+    }
+
+    #[test]
+    fn a_failed_slot_is_named_and_the_rest_still_count() {
+        let outcome = SlotOutcome::from(vec![
+            (slot(1), Ok(4)),
+            (slot(2), Err(DbErr::Custom("lock timeout".into()))),
+            (slot(3), Ok(6)),
+        ]);
+
+        assert_eq!(outcome.succeeded, 2);
+        assert_eq!(outcome.readings, 10);
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].0, slot(2));
+        assert!(outcome.failed[0].1.contains("lock timeout"));
+        assert!(!outcome.all_failed());
+    }
+
+    #[test]
+    fn every_slot_failing_is_a_failed_run() {
+        let outcome = SlotOutcome::from(vec![
+            (slot(1), Err(DbErr::Custom("a".into()))),
+            (slot(2), Err(DbErr::Custom("b".into()))),
+        ]);
+
+        assert_eq!(outcome.readings, 0);
+        assert!(outcome.all_failed());
+        assert!(outcome.error().to_string().contains('2'));
+    }
+
+    #[test]
+    fn an_empty_slot_set_is_not_a_failure() {
+        let outcome = SlotOutcome::from(Vec::new());
+
+        assert_eq!(outcome.succeeded, 0);
+        assert_eq!(outcome.readings, 0);
+        assert!(!outcome.all_failed());
+    }
+}
+
+#[cfg(test)]
+mod tunable_validation_tests {
+    use super::{AlarmSweep, JanitorRun};
+    use crate::routes::private::reprocessing_jobs::job::{Job, TunableKind};
+
+    fn janitor() -> JanitorRun {
+        JanitorRun {
+            interval_seconds: 300,
+            full_refresh_seconds: 3600,
+            maintenance_retention_days: 7,
+            operator_retention_days: 90,
+            maintenance_max_rows: 100_000,
+        }
+    }
+
+    #[test]
+    fn a_misspelt_tunable_is_refused_naming_it() {
+        let err = janitor()
+            .validate(&serde_json::json!({ "retention_dayz": 7 }))
+            .unwrap_err();
+        assert!(err.contains("retention_dayz"), "{err}");
+        assert!(err.contains("retention_days"), "{err}");
+    }
+
+    #[test]
+    fn the_janitor_still_takes_its_one_key() {
+        assert!(
+            janitor()
+                .validate(&serde_json::json!({ "retention_days": 7 }))
+                .is_ok()
+        );
+        assert!(janitor().validate(&serde_json::json!({})).is_ok());
+        assert!(janitor().validate(&serde_json::Value::Null).is_ok());
+        assert!(
+            janitor()
+                .validate(&serde_json::json!({ "retention_days": 0 }))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_job_with_no_tunables_refuses_every_key() {
+        let sweep = AlarmSweep {
+            interval_seconds: 60,
+        };
+        assert!(sweep.validate(&serde_json::json!({})).is_ok());
+        let err = sweep
+            .validate(&serde_json::json!({ "retention_days": 7 }))
+            .unwrap_err();
+        assert!(err.contains("no tunables"), "{err}");
+        assert!(err.contains("retention_days"), "{err}");
+    }
+
+    /// Every job accepts a tunables object built from its own declared defaults, and refuses a
+    /// value outside a spec's range.
+    #[test]
+    fn every_job_accepts_its_own_defaults_and_refuses_an_out_of_range_value() {
+        let registry = crate::routes::private::reprocessing_jobs::job::build_registry();
+        for name in registry.names() {
+            let handler = registry.get(name).expect("a listed name is registered");
+            let specs = handler.tunables();
+            let defaults: serde_json::Map<String, serde_json::Value> = specs
+                .iter()
+                .map(|s| (s.key.to_string(), s.default.clone()))
+                .collect();
+            handler
+                .validate(&serde_json::Value::Object(defaults))
+                .unwrap_or_else(|e| panic!("{name} refuses its own defaults: {e}"));
+
+            for spec in &specs {
+                let Some(min) = spec.min else { continue };
+                if !matches!(spec.kind, TunableKind::Integer | TunableKind::Duration) {
+                    continue;
+                }
+                let below = serde_json::json!({ spec.key: min - 1 });
+                assert!(
+                    handler.validate(&below).is_err(),
+                    "{name} accepts {} below its minimum",
+                    spec.key
+                );
+            }
+        }
     }
 }

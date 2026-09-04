@@ -1,6 +1,6 @@
-//! Single source of truth for per-`trigger_type` metadata. Today: the `category` used for UI
-//! grouping/filtering and retention tiering. Phases 3-4 will add `rerunnable`/`cancellable` here so
-//! the policy for every job type lives in one place.
+//! Single source of truth for per-`trigger_type` metadata: the `category` used for UI grouping and
+//! retention tiering, and the `rerunnable`/`cancellable` policies. A job row carries what these say
+//! about it, so a client renders its buttons from the server's answer rather than from a copy.
 
 /// Job categories. `operator` = a person (or an operator action) triggered it; `metadata` = a
 /// config change (calibration/deployment/derived assignment) triggered it; `maintenance` = routine
@@ -50,13 +50,14 @@ pub const METADATA: &[&str] = &[
     "derived_assignment",
 ];
 
-/// Whether a finished job of this `trigger_type` can be re-run by replaying it from the ids stored
-/// on its row (sensor reprocess, aggregate refresh, derived recompute). Keyed on trigger_type, not
-/// status, `failed`/`completed`/`cancelled` jobs are all rerunnable if the type is.
+/// Whether a finished job of this `trigger_type` can be re-run by replaying the `params` stored on
+/// its row. Keyed on trigger_type, not status, `failed`/`completed`/`cancelled` jobs are all
+/// rerunnable if the type is.
 ///
-/// Excluded for now: the timestamp-driven derived jobs (`ingest_derived`/`batch_derived`/
-/// `compute_derived`), faithful replay needs their persisted timestamps (a follow-up); the janitor
-/// already backfills any missed derived values. `csv_import` can never replay (source expires).
+/// Excluded: `csv_import`, whose staged source rows are deleted on completion; the timestamp-driven
+/// derived jobs (`ingest_derived`/`batch_derived`/`compute_derived`), whose faithful replay needs
+/// their persisted timestamps and whose values the janitor backfills anyway; and the merges and
+/// plan jobs, which are guarded no-ops on a second run rather than a replay worth offering.
 #[must_use]
 pub fn is_rerunnable(trigger_type: &str) -> bool {
     RERUNNABLE.contains(&trigger_type)
@@ -81,6 +82,8 @@ pub const RERUNNABLE: &[&str] = &[
     "sd_estimator_retag",
     "event_recompute",
     "event_audit",
+    "reprocess_all",
+    "pairing_backfill",
 ];
 
 /// Whether a running job of this `trigger_type` can be cooperatively cancelled, i.e. it iterates a

@@ -74,6 +74,14 @@ pub async fn get_or_create_api_stream(
         .one(db)
         .await?
     {
+        crate::routes::private::sensors::operations::ensure_channel_instrument(
+            db,
+            &stream,
+            site_id,
+            parameter_id,
+            "API entry",
+        )
+        .await?;
         return Ok(stream.id);
     }
 
@@ -124,6 +132,17 @@ pub async fn get_or_create_api_stream(
         .one(db)
         .await?
         .ok_or_else(|| AppError::Internal("Failed to create API stream".to_string()))?;
+
+    // The channel carries an instrument from the moment it exists, so nothing written through it
+    // can land without one.
+    crate::routes::private::sensors::operations::ensure_channel_instrument(
+        db,
+        &stream,
+        site_id,
+        parameter_id,
+        "API entry",
+    )
+    .await?;
 
     Ok(stream.id)
 }

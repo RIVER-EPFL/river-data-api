@@ -21,7 +21,7 @@ use crate::routes::private::readings::grab_samples::{
     GrabSampleReading, GrabSampleRequest, GrabWriteMode, insert_grab_samples,
 };
 use crate::routes::private::reprocessing_jobs::job::Job;
-use crate::routes::private::reprocessing_jobs::lifecycle::JobContext;
+use crate::routes::private::reprocessing_jobs::lifecycle::{JobContext, JobReport};
 
 use super::engine::{self, ActiveTool, ParameterCatalog};
 
@@ -869,20 +869,17 @@ impl Job for EventRecompute {
                 .iter()
                 .map(|(tool, reason)| serde_json::json!({ "tool": tool, "reason": reason }))
                 .collect();
-            ctx.set_detail(serde_json::json!({
-                "scope": {
-                    "collection_event_id": event_id,
-                    "skipped": skipped,
-                    "unchanged": outcome.unchanged,
-                },
-                "counts": {
-                    "tools_run": outcome.tools_run,
-                    "readings_written": outcome.readings_written,
-                    "tools_skipped": outcome.skipped.len(),
-                    "tools_unchanged": outcome.unchanged.len(),
-                    "findings_closed": outcome.findings_closed,
-                },
-            }))
+            ctx.report(
+                JobReport::new()
+                    .scope("collection_event_id", event_id.to_string())
+                    .scope("skipped", skipped)
+                    .scope("unchanged", outcome.unchanged.clone())
+                    .count("tools_run", outcome.tools_run)
+                    .count("readings_written", outcome.readings_written)
+                    .count("tools_skipped", outcome.skipped.len())
+                    .count("tools_unchanged", outcome.unchanged.len())
+                    .count("findings_closed", outcome.findings_closed),
+            )
             .await;
             return Ok(i64::try_from(outcome.readings_written).unwrap_or(i64::MAX));
         }
@@ -932,23 +929,20 @@ impl Job for EventRecompute {
                 .await;
             }
         }
-        ctx.set_detail(serde_json::json!({
-            "scope": {
-                "site_id": scope.site_id,
-                "start": scope.start,
-                "end": scope.end,
-                "only_findings": scope.only_findings,
-                "events_in_scope": events.len(),
-            },
-            "counts": {
-                "events_recomputed": events_recomputed,
-                "tools_run": tools_run,
-                "readings_written": readings_written,
-                "tools_skipped": tools_skipped,
-                "tools_unchanged": tools_unchanged,
-                "findings_closed": findings_closed,
-            },
-        }))
+        ctx.report(
+            JobReport::new()
+                .scope_opt("site_id", scope.site_id.map(|id| id.to_string()))
+                .scope_opt("start", scope.start.map(|t| t.to_rfc3339()))
+                .scope_opt("end", scope.end.map(|t| t.to_rfc3339()))
+                .scope("only_findings", scope.only_findings)
+                .count("events_in_scope", events.len())
+                .count("events_recomputed", events_recomputed)
+                .count("tools_run", tools_run)
+                .count("readings_written", readings_written)
+                .count("tools_skipped", tools_skipped)
+                .count("tools_unchanged", tools_unchanged)
+                .count("findings_closed", findings_closed),
+        )
         .await;
         Ok(i64::try_from(readings_written).unwrap_or(i64::MAX))
     }
@@ -1019,15 +1013,15 @@ impl Job for EventAudit {
                 .map_err(as_db_err)?;
         }
 
-        ctx.set_detail(serde_json::json!({
-            "scope": { "site_id": site_id, "collection_event_id": event_id },
-            "counts": {
-                "events_audited": counts.events_audited,
-                "missing_findings": counts.missing,
-                "stale_findings": counts.stale,
-                "superseded": counts.superseded,
-            },
-        }))
+        ctx.report(
+            JobReport::new()
+                .scope_opt("site_id", site_id.map(|id| id.to_string()))
+                .scope_opt("collection_event_id", event_id.map(|id| id.to_string()))
+                .count("events_audited", counts.events_audited)
+                .count("missing_findings", counts.missing)
+                .count("stale_findings", counts.stale)
+                .count("superseded", counts.superseded),
+        )
         .await;
         Ok(i64::try_from(counts.missing + counts.stale).unwrap_or(i64::MAX))
     }

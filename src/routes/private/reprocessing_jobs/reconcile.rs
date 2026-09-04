@@ -18,7 +18,7 @@ use sea_orm::{ConnectionTrait, DbErr, Statement};
 use uuid::Uuid;
 
 use super::job::Job;
-use super::lifecycle::JobContext;
+use super::lifecycle::{JobContext, JobReport};
 use crate::common::bulk_write;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::readings::sample_groups;
@@ -449,25 +449,22 @@ impl Job for ReplicateReconciliation {
             families.push(family);
         }
 
-        ctx.set_detail(serde_json::json!({
-            "scope": {
-                "source_system": source_system,
-                "dry_run": dry_run,
-                "tolerance": rel_tol,
-            },
-            "counts": {
-                "families": pairs.len(),
-                "migrated": cut_over,
-                "already_migrated": already,
-                "awaiting_backfill": not_ready,
-                "old_stream_unpaired": unpaired_old,
-                "preverify_failed": preverify_failed,
-                "cutover_failed": cutover_failed,
-                "stray_member_streams": strays.len(),
-            },
-            "families": families,
-            "mismatches": mismatches,
-        }))
+        ctx.report(
+            JobReport::new()
+                .scope("source_system", source_system.clone())
+                .scope("dry_run", dry_run)
+                .scope("tolerance", rel_tol)
+                .scope("families", families.clone())
+                .scope("mismatches", mismatches.clone())
+                .count("families", pairs.len())
+                .count("migrated", cut_over)
+                .count("already_migrated", already)
+                .count("awaiting_backfill", not_ready)
+                .count("old_stream_unpaired", unpaired_old)
+                .count("preverify_failed", preverify_failed)
+                .count("cutover_failed", cutover_failed)
+                .count("stray_member_streams", strays.len()),
+        )
         .await;
 
         if let Some(state) = crate::common::global_app_state() {
@@ -569,21 +566,18 @@ impl Job for ReplicateReconciliationDelete {
             families.push(family);
         }
 
-        ctx.set_detail(serde_json::json!({
-            "scope": {
-                "source_system": source_system,
-                "dry_run": dry_run,
-                "tolerance": rel_tol,
-            },
-            "counts": {
-                "families": pairs.len(),
-                "streams_deleted": deleted_streams,
-                "readings_deleted": deleted_readings,
-                "skipped_unmigrated": skipped_unmigrated,
-                "verify_failed": verify_failed,
-            },
-            "families": families,
-        }))
+        ctx.report(
+            JobReport::new()
+                .scope("source_system", source_system.clone())
+                .scope("dry_run", dry_run)
+                .scope("tolerance", rel_tol)
+                .scope("families", families.clone())
+                .count("families", pairs.len())
+                .count("streams_deleted", deleted_streams)
+                .count("readings_deleted", deleted_readings)
+                .count("skipped_unmigrated", skipped_unmigrated)
+                .count("verify_failed", verify_failed),
+        )
         .await;
 
         if let Some(state) = crate::common::global_app_state() {

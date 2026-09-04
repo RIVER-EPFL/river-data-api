@@ -118,10 +118,6 @@ pub struct Config {
     pub sync_event_retention_days: u32,
     /// Age-based retention for ingest_receipts rows (days); 0 disables pruning.
     pub ingest_receipt_retention_days: u32,
-    /// service_type values whose services get a scheduled trigger_full_sync (the reconciled
-    /// backends, whose digest handshake skips unchanged content between full passes).
-    /// Comma-separated; empty disables the schedule's effect.
-    pub sync_full_reassert_service_types: Vec<String>,
 
     // Sync control plane: session token lifetime, how long an unacknowledged command stays
     // deliverable, the heartbeat-age thresholds behind a service's health, and the prefix on a
@@ -357,13 +353,6 @@ impl Config {
                 .unwrap_or_else(|_| "365".to_string())
                 .parse()
                 .unwrap_or(365),
-            sync_full_reassert_service_types: env::var("SYNC_FULL_REASSERT_SERVICE_TYPES")
-                .unwrap_or_else(|_| "rshiny".to_string())
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect(),
 
             sync_session_token_ttl_secs: env::var("SYNC_SESSION_TOKEN_TTL_SECS")
                 .unwrap_or_else(|_| "900".to_string())

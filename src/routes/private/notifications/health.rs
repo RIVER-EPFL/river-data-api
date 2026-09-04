@@ -40,9 +40,11 @@ pub struct NotificationHealth {
     pub failed_24h: i64,
 }
 
-/// Probe every configured channel and upsert its health row. A no-op when nothing is configured.
-pub async fn probe_once(db: &DatabaseConnection, config: &Config) {
-    for ch in &build_channels(config) {
+/// Probe every configured channel and upsert its health row, returning how many were probed. A
+/// no-op when nothing is configured.
+pub async fn probe_once(db: &DatabaseConnection, config: &Config) -> usize {
+    let channels = build_channels(config);
+    for ch in &channels {
         let (healthy, detail) = match ch.check_health().await {
             Ok(d) => (true, d),
             Err(e) => (false, e),
@@ -61,6 +63,7 @@ pub async fn probe_once(db: &DatabaseConnection, config: &Config) {
             tracing::warn!(error = %e, channel = ch.name(), "failed to upsert channel health");
         }
     }
+    channels.len()
 }
 
 async fn read_health(db: &DatabaseConnection, config: &Config) -> NotificationHealth {
@@ -134,6 +137,6 @@ pub async fn get_health(State(state): State<AppState>) -> AppResult<Json<Notific
 
 /// `POST /api/notifications/health/refresh`, probe now, then return the fresh state (admin-only).
 pub async fn refresh_health(State(state): State<AppState>) -> AppResult<Json<NotificationHealth>> {
-    probe_once(&state.db, &state.config).await;
+    let _ = probe_once(&state.db, &state.config).await;
     Ok(Json(read_health(&state.db, &state.config).await))
 }

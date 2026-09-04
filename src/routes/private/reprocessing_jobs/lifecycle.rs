@@ -144,15 +144,14 @@ impl JobContext {
         self.log("info", message, serde_json::json!({})).await;
     }
 
-    /// Replace the job's structured `detail` summary (scope, time range, counts, provenance).
-    /// Best-effort.
-    pub async fn set_detail(&self, detail: serde_json::Value) {
+    /// Replace the job's structured `detail` with what this run reports. Best-effort.
+    pub async fn report(&self, report: JobReport) {
         if let Err(e) = self
             .db
             .execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "UPDATE reprocessing_jobs SET detail = $1::jsonb WHERE id = $2",
-                [detail.to_string().into(), self.job_id.into()],
+                [report.to_value().to_string().into(), self.job_id.into()],
             ))
             .await
         {
@@ -201,5 +200,81 @@ impl JobContext {
             progress: Some(progress),
             total,
         });
+    }
+}
+
+/// What a run reports, in one shape across every job: `scope` says what the run covered, `counts`
+/// how much of each kind it moved. A count is a number, so an aggregate over `detail->'counts'`
+/// cannot meet a boolean or a string; anything else about the run belongs in `scope`.
+#[derive(Debug, Default, Clone)]
+pub struct JobReport {
+    scope: serde_json::Map<String, serde_json::Value>,
+    counts: std::collections::BTreeMap<String, i64>,
+}
+
+impl JobReport {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// What the run covered: an id, a window, a flag, a target name.
+    #[must_use]
+    pub fn scope(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
+        self.scope.insert(key.to_string(), value.into());
+        self
+    }
+
+    /// Skip a scope entry whose value is absent, so an unscoped run reports no key rather than a
+    /// null.
+    #[must_use]
+    pub fn scope_opt(self, key: &str, value: Option<impl Into<serde_json::Value>>) -> Self {
+        match value {
+            Some(v) => self.scope(key, v),
+            None => self,
+        }
+    }
+
+    /// How much of one kind the run moved. A width that does not fit saturates at [`i64::MAX`]
+    /// rather than refusing the report.
+    #[must_use]
+    pub fn count(mut self, key: &str, value: impl TryInto<i64>) -> Self {
+        self.counts
+            .insert(key.to_string(), value.try_into().unwrap_or(i64::MAX));
+        self
+    }
+
+    #[must_use]
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::json!({ "scope": self.scope, "counts": self.counts })
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::JobReport;
+
+    #[test]
+    fn a_report_serialises_to_scope_and_counts_with_numeric_counts() {
+        let value = JobReport::new()
+            .scope("full_refresh", true)
+            .scope("source_system", "cnet")
+            .scope_opt("site_id", None::<String>)
+            .count("pruned", 3i64)
+            .count("recomposed", 7usize)
+            .to_value();
+
+        assert_eq!(
+            value.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["counts", "scope"]
+        );
+        assert_eq!(value["scope"]["full_refresh"], serde_json::json!(true));
+        assert_eq!(value["scope"]["source_system"], serde_json::json!("cnet"));
+        assert!(value["scope"].get("site_id").is_none());
+        for (key, count) in value["counts"].as_object().unwrap() {
+            assert!(count.is_number(), "{key} is not a number: {count}");
+        }
+        assert_eq!(value["counts"]["pruned"], serde_json::json!(3));
+        assert_eq!(value["counts"]["recomposed"], serde_json::json!(7));
     }
 }

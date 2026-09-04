@@ -82,3 +82,52 @@ async fn reprocess_all_reowns_unattributed_readings() {
         );
     }
 }
+
+/// A queued backdate holds the `reprocess_all` dedupe key, so a second request joins it rather than
+/// starting a concurrent pass over every slot. `next_attempt_at` keeps the worker from claiming the
+/// row (which releases the key) while the request is made.
+#[tokio::test]
+#[serial]
+async fn a_second_backdate_returns_the_queued_one() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    sl::seed_base_entities(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let queued = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO reprocessing_jobs (id, trigger_type, status, category, params, dedupe_key, next_attempt_at) \
+             VALUES ('{queued}', 'reprocess_all', 'queued', 'operator', '{{}}'::jsonb, 'reprocess_all', \
+                     NOW() + interval '1 hour')"
+        ),
+    )
+    .await;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/actions/reprocess_all",
+        &serde_json::json!({}),
+        &token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "reprocess_all ({status}): {body}"
+    );
+    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        resp["job_id"].as_str().unwrap(),
+        queued.to_string(),
+        "the request joins the queued backdate: {body}"
+    );
+
+    let count = e2e::count(
+        &db,
+        "SELECT COUNT(*) FROM reprocessing_jobs WHERE trigger_type = 'reprocess_all'",
+    )
+    .await;
+    assert_eq!(count, 1, "no second backdate was enqueued");
+}

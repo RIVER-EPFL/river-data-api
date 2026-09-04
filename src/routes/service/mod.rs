@@ -298,6 +298,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
             post(crate::routes::private::sensors::standard_curves::views::register_standard_curve),
         )
         .route(
+            "/sensors/register",
+            post(crate::routes::private::sensors::register::register_sensor),
+        )
+        .route(
             "/annotations/register",
             post(crate::routes::private::annotations::register::register_annotations),
         )

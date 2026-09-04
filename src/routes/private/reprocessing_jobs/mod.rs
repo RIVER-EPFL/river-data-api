@@ -2,6 +2,7 @@ pub mod job;
 pub mod jobs;
 pub mod lifecycle;
 pub mod model;
+pub mod operations;
 pub mod reconcile;
 pub mod registry;
 pub mod routes;

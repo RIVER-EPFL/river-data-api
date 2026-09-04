@@ -160,7 +160,7 @@ async fn slot_samples(db: &DatabaseConnection) -> i64 {
 }
 
 fn family_status(detail: &serde_json::Value) -> &str {
-    detail["families"][0]["status"].as_str().unwrap_or("")
+    detail["scope"]["families"][0]["status"].as_str().unwrap_or("")
 }
 
 #[tokio::test]
@@ -289,7 +289,7 @@ async fn preverify_mismatch_aborts_untouched() {
     assert_eq!(detail["counts"]["migrated"], 0);
     assert_eq!(family_status(&detail), "preverify_failed");
     assert!(
-        detail["mismatches"][0]["time"].is_string(),
+        detail["scope"]["mismatches"][0]["time"].is_string(),
         "the disagreeing instant is reported for review: {detail}"
     );
 
@@ -318,7 +318,7 @@ async fn awaiting_backfill_skips() {
     assert_eq!(status, "completed", "detail: {detail}");
     assert_eq!(detail["counts"]["awaiting_backfill"], 1, "detail: {detail}");
     assert_eq!(family_status(&detail), "awaiting_backfill");
-    assert_eq!(detail["families"][0]["missing_instants"], 1);
+    assert_eq!(detail["scope"]["families"][0]["missing_instants"], 1);
 
     assert!(!family_is_paired(&db, &family).await);
     assert_eq!(slot_samples(&db).await, 0);

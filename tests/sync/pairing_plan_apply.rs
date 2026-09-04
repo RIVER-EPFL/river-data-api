@@ -111,10 +111,10 @@ async fn apply_then_revert_pairing_plan_via_jobs() {
     .await;
 
     // Apply, returns a job id immediately; the backfill runs in the job.
-    let (status, text) = crate::common::post_json_with_token(
+    let (status, text) = crate::common::post_plan_action_with_token(
         &app,
-        &format!("/api/sync/pairing-plans/{plan_id}/apply"),
-        &serde_json::json!({}),
+        &plan_id.to_string(),
+        "apply",
         &token,
     )
     .await;
@@ -151,10 +151,10 @@ async fn apply_then_revert_pairing_plan_via_jobs() {
     );
 
     // Revert, also a job; unpairs the stream and clears the readings' site_id.
-    let (status, text) = crate::common::post_json_with_token(
+    let (status, text) = crate::common::post_plan_action_with_token(
         &app,
-        &format!("/api/sync/pairing-plans/{plan_id}/revert"),
-        &serde_json::json!({}),
+        &plan_id.to_string(),
+        "revert",
         &token,
     )
     .await;

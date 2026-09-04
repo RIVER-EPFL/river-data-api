@@ -106,10 +106,10 @@ async fn run_plan_action(
     plan_id: &str,
     action: &str,
 ) -> serde_json::Value {
-    let (status, res) = crate::common::post_json_parse_with_token(
+    let (status, res) = crate::common::post_plan_action_parse_with_token(
         app,
-        &format!("/api/sync/pairing-plans/{plan_id}/{action}"),
-        &serde_json::json!({}),
+        &plan_id.to_string(),
+        action,
         token,
     )
     .await;
@@ -385,9 +385,9 @@ async fn portal_migration_wizard_full_flow() {
 
     // Rename replicate 1 to a custom parameter, then converge replicate 2 onto the same
     // will-be-created parameter
-    let (status, body) = crate::common::patch_json_with_token(
+    let (status, body) = crate::common::patch_plan_with_token(
         &app,
-        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &plan_id.to_string(),
         &serde_json::json!({ "updates": [
             { "stream_id": streams.replicate_1, "parameter_name": "DO Replicate", "parameter_units": "mg/L" },
             { "stream_id": streams.replicate_2, "parameter_name": "DO Replicate" }
@@ -406,9 +406,9 @@ async fn portal_migration_wizard_full_flow() {
 
     // Rename replicate 3 to an existing catalog parameter's name: the entry reclassifies to
     // use the existing parameter instead of creating one
-    let (status, body) = crate::common::patch_json_with_token(
+    let (status, body) = crate::common::patch_plan_with_token(
         &app,
-        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &plan_id.to_string(),
         &serde_json::json!({ "updates": [
             { "stream_id": streams.replicate_3, "parameter_name": "turbidity fnu" }
         ]}),

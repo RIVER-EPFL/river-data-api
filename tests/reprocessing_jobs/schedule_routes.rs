@@ -154,6 +154,25 @@ async fn patch_invalid_tunables_is_400_with_message() {
         0,
         "a rejected PATCH writes no audit row"
     );
+
+    let (status, body) = crate::common::patch_json_with_token(
+        &app,
+        &format!("/api/schedules/{JOB}"),
+        &serde_json::json!({ "tunables": { "retention_dayz": 7 } }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 400, "a misspelt key is rejected, not saved: {body}");
+    assert!(
+        body.contains("retention_dayz"),
+        "the 400 names the key that arrived: {body}"
+    );
+    assert_eq!(
+        audit_count(&db, JOB).await,
+        0,
+        "a rejected PATCH writes no audit row"
+    );
+
     crate::common::cleanup_test_db(&db).await;
 }
 
@@ -312,5 +331,41 @@ async fn get_unknown_schedule_is_404() {
     let (status, _body) =
         crate::common::get_with_token(&app, "/api/schedules/no_such_service", &token).await;
     assert_eq!(status, 404, "GET of a non-existent schedule is a 404");
+    crate::common::cleanup_test_db(&db).await;
+}
+
+/// The schedules form is built from what each job declares it reads, so a job with no tunables
+/// offers no field rather than a free JSON box.
+#[tokio::test]
+#[serial]
+async fn a_schedule_states_the_tunables_its_job_accepts() {
+    let (db, app, token) = setup().await;
+    insert_schedule(&db, JOB, 3600).await;
+    insert_schedule(&db, "sync_ledger_retention", 86400).await;
+
+    let (status, body) = crate::common::get_json_with_token(&app, "/api/schedules", &token).await;
+    assert_eq!(status, 200, "{body}");
+    let rows = body.as_array().expect("a list of schedules");
+
+    let janitor = rows
+        .iter()
+        .find(|r| r["job_name"] == serde_json::json!(JOB))
+        .expect("the janitor is listed");
+    let specs = janitor["tunables_schema"].as_array().expect("a spec list");
+    assert_eq!(specs.len(), 1, "the janitor declares one tunable: {janitor}");
+    assert_eq!(specs[0]["key"], serde_json::json!("retention_days"));
+    assert_eq!(specs[0]["kind"]["type"], serde_json::json!("integer"));
+    assert_eq!(specs[0]["min"], serde_json::json!(1));
+
+    let ledger = rows
+        .iter()
+        .find(|r| r["job_name"] == serde_json::json!("sync_ledger_retention"))
+        .expect("the ledger retention job is listed");
+    assert_eq!(
+        ledger["tunables_schema"],
+        serde_json::json!([]),
+        "a job with no tunables declares none: {ledger}"
+    );
+
     crate::common::cleanup_test_db(&db).await;
 }

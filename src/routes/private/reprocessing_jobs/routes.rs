@@ -94,7 +94,7 @@ pub struct CancelResponse {
 /// claimed) is cancelled outright; a `running` worker-pool job is signalled via the `cancel_requested`
 /// column, which the owning replica's heartbeat observes (possibly on a different replica) and the job
 /// honors at its next checkpoint. 409 if the type isn't cancellable or the job isn't in a cancellable
-/// state; 404 if the id is unknown. Requires `write_metadata`.
+/// state; 404 if the id is unknown. Requires MANAGER, or a token with `write_metadata`.
 pub async fn cancel_job(
     State(state): State<AppState>,
     ProjectScope(scope): ProjectScope,
@@ -151,9 +151,10 @@ pub struct RerunResponse {
     pub status: String,
 }
 
-/// `POST /api/reprocessing_jobs/{id}/rerun`, replay a finished job by reconstructing it from the
-/// ids stored on its row. Returns a NEW job (history is preserved). 409 if the type isn't rerunnable
-/// or an equivalent job is already in flight; 404 if the job id is unknown. Requires `write_metadata`.
+/// `POST /api/reprocessing_jobs/{id}/rerun`, replay a finished job from the `params` stored on its
+/// row. Returns a NEW job (history is preserved). 409 if the type isn't rerunnable or an equivalent
+/// job is already in flight; 404 if the job id is unknown. Requires MANAGER, or a token with
+/// `write_metadata`.
 pub async fn rerun_job(
     State(state): State<AppState>,
     ProjectScope(scope): ProjectScope,
@@ -181,7 +182,9 @@ pub async fn rerun_job(
         )));
     }
 
-    // Reject if an equivalent job (same type + same target) is already in flight.
+    // Reject if an equivalent job (same type + same target) is already in flight. The slot-scoped
+    // jobs carry no `sensor_id` or `trigger_id`, so `params` is the only thing separating one
+    // slot's run from another's.
     let in_flight = state
         .db
         .query_one_raw(Statement::from_sql_and_values(
@@ -191,11 +194,13 @@ pub async fn rerun_job(
                AND trigger_type = $1 \
                AND sensor_id IS NOT DISTINCT FROM $2 \
                AND trigger_id IS NOT DISTINCT FROM $3 \
+               AND params IS NOT DISTINCT FROM $4::jsonb \
              LIMIT 1",
             [
                 trigger_type.as_str().into(),
                 sensor_id.map_or(sea_orm::Value::Uuid(None), Into::into),
                 trigger_id.map_or(sea_orm::Value::Uuid(None), Into::into),
+                params.to_string().into(),
             ],
         ))
         .await?;

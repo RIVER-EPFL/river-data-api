@@ -30,6 +30,8 @@ pub struct ScheduleView {
     pub overlap_policy: Option<String>,
     pub catchup_policy: Option<String>,
     pub tunables: serde_json::Value,
+    /// What this job accepts under `tunables`, from its own declaration. Empty means none.
+    pub tunables_schema: Vec<job::TunableSpec>,
     pub updated_by: Option<String>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     /// Whether a non-terminal job of this `job_name` is in flight (queued/pending/running/retrying).
@@ -71,6 +73,7 @@ fn actor_label(auth: &AuthContext) -> String {
 /// resolved in the same statement via an EXISTS subselect against the job queue.
 async fn load_view(
     db: &sea_orm::DatabaseConnection,
+    registry: &JobRegistry,
     job_name: &str,
 ) -> Result<Option<ScheduleView>, sea_orm::DbErr> {
     let row = db
@@ -88,7 +91,20 @@ async fn load_view(
             [job_name.into()],
         ))
         .await?;
-    row.map(|r| view_from_row(&r)).transpose()
+    row.map(|r| view_with_schema(&r, registry)).transpose()
+}
+
+/// The stored row plus what the registry says the job accepts, so a form is built from the
+/// server's declaration rather than from a copy of it.
+fn view_with_schema(
+    r: &sea_orm::QueryResult,
+    registry: &JobRegistry,
+) -> Result<ScheduleView, sea_orm::DbErr> {
+    let mut view = view_from_row(r)?;
+    if let Some(handler) = registry.get(&view.job_name) {
+        view.tunables_schema = handler.tunables();
+    }
+    Ok(view)
 }
 
 fn view_from_row(r: &sea_orm::QueryResult) -> Result<ScheduleView, sea_orm::DbErr> {
@@ -103,6 +119,7 @@ fn view_from_row(r: &sea_orm::QueryResult) -> Result<ScheduleView, sea_orm::DbEr
         tunables: r
             .try_get::<Option<serde_json::Value>>("", "tunables")?
             .unwrap_or_else(|| serde_json::json!({})),
+        tunables_schema: Vec::new(),
         updated_by: r.try_get("", "updated_by")?,
         updated_at: r.try_get("", "updated_at")?,
         running: r.try_get("", "running")?,
@@ -129,9 +146,10 @@ pub async fn list_schedules(State(state): State<AppState>) -> AppResult<Json<Vec
         ))
         .await?;
 
+    let registry = full_registry(&state);
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
-        out.push(view_from_row(r)?);
+        out.push(view_with_schema(r, &registry)?);
     }
     Ok(Json(out))
 }
@@ -141,7 +159,7 @@ pub async fn get_schedule(
     State(state): State<AppState>,
     Path(job_name): Path<String>,
 ) -> AppResult<Json<ScheduleView>> {
-    load_view(&state.db, &job_name)
+    load_view(&state.db, &full_registry(&state), &job_name)
         .await?
         .map(Json)
         .ok_or_else(|| AppError::NotFound(format!("schedule '{job_name}' not found")))
@@ -202,7 +220,8 @@ pub async fn update_schedule(
 
     // Read the pre-image (also the 404 check). Locked nowhere, the single UPDATE below is atomic and
     // we don't need cross-statement consistency for an operator edit.
-    let before = load_view(&state.db, &job_name)
+    let registry = full_registry(&state);
+    let before = load_view(&state.db, &registry, &job_name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("schedule '{job_name}' not found")))?;
 
@@ -210,7 +229,7 @@ pub async fn update_schedule(
     // edited (no handler to validate against), so only validate when both a handler and tunables are
     // present.
     if let Some(tunables) = req.tunables.as_ref()
-        && let Some(handler) = full_registry(&state).get(&job_name)
+        && let Some(handler) = registry.get(&job_name)
     {
         handler.validate(tunables).map_err(AppError::BadRequest)?;
     }
@@ -296,7 +315,7 @@ pub async fn update_schedule(
         ))
         .await?;
 
-    load_view(&state.db, &job_name)
+    load_view(&state.db, &registry, &job_name)
         .await?
         .map(Json)
         .ok_or_else(|| AppError::NotFound(format!("schedule '{job_name}' not found")))

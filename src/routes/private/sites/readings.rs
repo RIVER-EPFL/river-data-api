@@ -39,6 +39,9 @@ struct ReadingRow {
     sample_id: Option<Uuid>,
     calibration_id: Option<Uuid>,
     standard_curve_id: Option<Uuid>,
+    /// Only selected under `include_withdrawn`; false everywhere else, since nothing else serves
+    /// a retracted row.
+    withdrawn: Option<bool>,
 }
 
 /// Where a row lands on the response's row axis.
@@ -70,6 +73,8 @@ struct Annotations {
     sample_stats: bool,
     curves: bool,
     origin: bool,
+    /// Serve spot instants the source has retracted, marked as retracted, instead of omitting them.
+    withdrawn: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -136,6 +141,15 @@ pub struct ParameterData {
     /// `/readings/provenance`'s job). Only present when `include_origin=true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origins: Option<Vec<OriginRef>>,
+    /// Whether each served spot point is a retracted instant (same length as times). Only present
+    /// when `include_withdrawn=true`, which is also what makes such an instant served at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub withdrawn: Option<Vec<Option<bool>>>,
+    /// How many spot instants in the window the source has retracted in full, whether or not they
+    /// are served. Present whenever the request covers the spot arm, so a chart can say a visit was
+    /// taken back without fetching the points.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub withdrawn_count: Option<i64>,
 }
 
 /// One ingestion channel serving a slot.
@@ -496,6 +510,7 @@ pub async fn get_site_readings(
         sample_stats: query.include_sample_stats.unwrap_or(false),
         curves: query.include_curves.unwrap_or(false),
         origin: query.include_origin.unwrap_or(false),
+        withdrawn: query.include_withdrawn.unwrap_or(false),
     };
     let include_flags = query.include_flags.unwrap_or(false);
 
@@ -642,7 +657,8 @@ pub async fn get_site_readings(
             "r.parameter_id, r.time, r.replicate_index, \
              COALESCE(r.calibrated_value, r.raw_value) AS value, \
              {severity} AS severity, r.is_flagged, r.flag_reason, r.measurement_type, \
-             r.sample_id, r.calibration_id, r.standard_curve_id"
+             r.sample_id, r.calibration_id, r.standard_curve_id, \
+             (r.withdrawn_at IS NOT NULL) AS withdrawn"
         );
         // The collapsed spot arm excludes withdrawn rows; the replicate view was exporting them
         // as ordinary values, which publishes a number the source has taken back.
@@ -685,7 +701,8 @@ pub async fn get_site_readings(
                 }
             };
         let base_cols = "r.parameter_id, r.time, r.site_id, r.is_flagged, r.flag_reason, \
-             r.measurement_type, r.sample_id, r.calibration_id, r.standard_curve_id";
+             r.measurement_type, r.sample_id, r.calibration_id, r.standard_curve_id, \
+             (r.withdrawn_at IS NOT NULL) AS withdrawn";
         let mut arms: Vec<String> = Vec::new();
         if include_continuous_arm {
             arms.push(format!(
@@ -696,6 +713,13 @@ pub async fn get_site_readings(
                  {time_conditions}{continuous_extra}{flagged_condition}{sample_id_condition}"
             ));
         }
+        // A retracted instant is served only when asked for, and then the ordering above prefers a
+        // live replicate, so `withdrawn` on the served row means the whole group is retracted.
+        let spot_withdrawn_condition = if annotations.withdrawn {
+            ""
+        } else {
+            " AND r.withdrawn_at IS NULL"
+        };
         if include_spot_arm {
             arms.push(format!(
                 // One row per slot instant, not per stream: a `(site, parameter, time)` group is
@@ -710,10 +734,10 @@ pub async fn get_site_readings(
                            {base_cols} \
                     FROM readings r LEFT JOIN samples smp ON smp.id = r.sample_id \
                     WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
-                      AND r.measurement_type = 'spot' AND r.withdrawn_at IS NULL\
+                      AND r.measurement_type = 'spot'{spot_withdrawn_condition}\
                     {time_conditions}{flagged_condition}{sample_id_condition} \
-                    ORDER BY r.parameter_id, r.time, (r.is_flagged IS TRUE), r.replicate_index, \
-                             r.stream_id \
+                    ORDER BY r.parameter_id, r.time, (r.withdrawn_at IS NOT NULL), \
+                             (r.is_flagged IS TRUE), r.replicate_index, r.stream_id \
                  ) sp"
             ));
         }
@@ -730,7 +754,7 @@ pub async fn get_site_readings(
             "SELECT sv.parameter_id, sv.time, NULL::smallint AS replicate_index, sv.value, \
                     {severity} AS severity, \
                     sv.is_flagged, sv.flag_reason, sv.measurement_type, sv.sample_id, \
-                    sv.calibration_id, sv.standard_curve_id \
+                    sv.calibration_id, sv.standard_curve_id, sv.withdrawn \
              FROM ({inner}) sv{threshold_join} \
              ORDER BY sv.parameter_id, sv.time"
         )
@@ -835,6 +859,26 @@ pub async fn get_site_readings(
         HashMap::new()
     };
 
+    // A retracted visit is a fact about the window whether or not its points are drawn, so the
+    // count is served whenever the request covers the spot arm. Only instants no live replicate
+    // survives on are counted: one retracted replicate is not a retracted visit.
+    let withdrawn_counts: Option<HashMap<Uuid, i64>> = if include_replicates
+        || measurement_type_filter == "continuous"
+    {
+        None
+    } else {
+        Some(
+            count_withdrawn_instants(
+                &state.db,
+                site.id,
+                &params_list.iter().map(|sp| sp.parameter_id).collect::<Vec<_>>(),
+                effective_start,
+                effective_end,
+            )
+            .await?,
+        )
+    };
+
     let param_data: Vec<ParameterData> = params_list
         .iter()
         .map(|sp| {
@@ -847,6 +891,7 @@ pub async fn get_site_readings(
             let mut calibration_ids = annotations.curves.then(|| vec![None; len]);
             let mut standard_curve_ids = annotations.curves.then(|| vec![None; len]);
             let mut samples = annotations.sample_stats.then(|| vec![None; len]);
+            let mut withdrawn = annotations.withdrawn.then(|| vec![None; len]);
 
             if let Some(rows) = param_rows.get(&sp.parameter_id) {
                 for row in rows {
@@ -881,6 +926,9 @@ pub async fn get_site_readings(
                             .sample_id
                             .and_then(|sid| sample_stats.get(&sid).cloned());
                     }
+                    if let Some(v) = withdrawn.as_mut() {
+                        v[i] = row.withdrawn;
+                    }
                 }
             }
 
@@ -905,6 +953,10 @@ pub async fn get_site_readings(
                 origins: annotations
                     .origin
                     .then(|| origin_map.get(&sp.id).cloned().unwrap_or_default()),
+                withdrawn,
+                withdrawn_count: withdrawn_counts
+                    .as_ref()
+                    .map(|counts| counts.get(&sp.parameter_id).copied().unwrap_or(0)),
             }
         })
         .collect();
@@ -1017,4 +1069,57 @@ async fn fetch_sample_stats(
     }
 
     Ok(stats)
+}
+
+/// Spot instants in the window with no live replicate left, per parameter.
+///
+/// An instant every one of whose rows carries `withdrawn_at` is served by nothing, so a chart drawn
+/// from the readings response alone cannot tell it from a visit never made. This is what lets it
+/// say so.
+async fn count_withdrawn_instants(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    parameter_ids: &[Uuid],
+    start: DateTime<Utc>,
+    end: Option<DateTime<Utc>>,
+) -> Result<HashMap<Uuid, i64>, AppError> {
+    if parameter_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let (time_clause, values) = match end {
+        Some(e) => (
+            "AND r.time >= $3 AND r.time <= $4",
+            vec![site_id.into(), parameter_ids.to_vec().into(), start.into(), e.into()],
+        ),
+        None => (
+            "AND r.time >= $3",
+            vec![site_id.into(), parameter_ids.to_vec().into(), start.into()],
+        ),
+    };
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT parameter_id, count(*) AS withdrawn_count FROM ( \
+                     SELECT r.parameter_id, r.time \
+                     FROM readings r \
+                     WHERE r.site_id = $1 AND r.parameter_id = ANY($2) \
+                       AND r.measurement_type = 'spot' {time_clause} \
+                     GROUP BY r.parameter_id, r.time \
+                     HAVING bool_and(r.withdrawn_at IS NOT NULL) \
+                 ) g GROUP BY parameter_id"
+            ),
+            values,
+        ))
+        .await?;
+    let mut counts = HashMap::with_capacity(rows.len());
+    for row in rows {
+        if let (Ok(id), Ok(n)) = (
+            row.try_get::<Uuid>("", "parameter_id"),
+            row.try_get::<i64>("", "withdrawn_count"),
+        ) {
+            counts.insert(id, n);
+        }
+    }
+    Ok(counts)
 }

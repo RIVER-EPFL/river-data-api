@@ -1,4 +1,4 @@
-use crate::routes::private::reprocessing_jobs::lifecycle::JobContext;
+use crate::routes::private::reprocessing_jobs::lifecycle::{JobContext, JobReport};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
@@ -111,11 +111,13 @@ pub async fn run_once(
     }
     if let Some(ctx) = ctx {
         ctx.set_progress(total, Some(total)).await;
-        ctx.set_detail(serde_json::json!({
-            "counts": { "gaps_found": total, "filled": filled },
-            "time_range": { "earliest_filled": min_filled },
-            "capped_at_limit": total as usize >= MAX_GAPS_PER_RUN,
-        }))
+        ctx.report(
+            JobReport::new()
+                .scope_opt("earliest_filled", min_filled.map(|t| t.to_rfc3339()))
+                .scope("capped_at_limit", total as usize >= MAX_GAPS_PER_RUN)
+                .count("gaps_found", total)
+                .count("filled", filled),
+        )
         .await;
         ctx.info(&format!("Filled {filled} of {total} derived gaps"))
             .await;

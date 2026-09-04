@@ -5,6 +5,7 @@
 //! Run: cargo test --test reprocessing_jobs -- --test-threads=1
 
 use river_db::routes::private::reprocessing_jobs::job::Job;
+use river_db::routes::private::reprocessing_jobs::lifecycle::JobReport;
 use river_db::routes::private::reprocessing_jobs::worker;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
@@ -57,8 +58,12 @@ async fn tracked_job_records_category_detail_and_timeline() {
         ClosureJob::new("manual_reprocess", move |ctx| async move {
             ctx.info("starting reprocess").await;
             ctx.set_site(site).await;
-            ctx.set_detail(serde_json::json!({ "scope": { "sensor": "x" }, "counts": { "readings_updated": 7 } }))
-                .await;
+            ctx.report(
+                JobReport::new()
+                    .scope("sensor", "x")
+                    .count("readings_updated", 7i64),
+            )
+            .await;
             ctx.log("warn", "one slot skipped", serde_json::json!({ "slot": 3 })).await;
             Ok(7)
         }),
@@ -125,4 +130,86 @@ async fn maintenance_trigger_types_are_categorised_maintenance() {
     )
     .await;
     assert_eq!(category, "maintenance");
+}
+
+/// Every count a run reports is a number, so an aggregate over `detail->'counts'` meets no boolean
+/// or string. A merge reports whether it deleted its source, which is a fact about the scope.
+#[tokio::test]
+#[serial]
+async fn a_merge_reports_numeric_counts_and_carries_source_deleted_in_scope() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+
+    let source = Uuid::parse_str(crate::common::GLOBAL_PARAM_DEPTH_ID).unwrap();
+    let target = Uuid::parse_str(crate::common::GLOBAL_PARAM_TEMP_ID).unwrap();
+    let job_id = worker::enqueue(
+        &db,
+        "merge_parameters",
+        None,
+        None,
+        &serde_json::json!({ "source_parameter_id": source, "target_parameter_id": target }),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("the merge is enqueued");
+
+    let registry = river_db::routes::private::reprocessing_jobs::job::build_registry();
+    assert!(
+        worker::run_one(&db, &events(), &registry, &worker::worker_id())
+            .await
+            .unwrap(),
+        "the worker claims the merge"
+    );
+
+    let row = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT status, detail FROM reprocessing_jobs WHERE id = '{job_id}'"),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<String>("", "status").unwrap(), "completed");
+    let detail: serde_json::Value = row.try_get("", "detail").unwrap();
+    let counts = detail["counts"].as_object().expect("counts is an object");
+    assert!(!counts.is_empty(), "the merge reports its counts: {detail}");
+    for (key, value) in counts {
+        assert!(value.is_number(), "{key} is not a number: {value}");
+    }
+    assert!(
+        detail["scope"]["source_deleted"].is_boolean(),
+        "source_deleted is scope, not a count: {detail}"
+    );
+
+    crate::common::cleanup_test_db(&db).await;
+}
+
+/// Rerun replays what the row stores, so the row has to say what that is.
+#[tokio::test]
+#[serial]
+async fn a_job_row_carries_the_params_it_was_enqueued_with() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let params = serde_json::json!({ "target": "spot", "retag_existing": true });
+    let job_id = worker::enqueue(&db, "measurement_retag", None, None, &params, None)
+        .await
+        .unwrap()
+        .expect("the retag is enqueued");
+
+    let (status, body) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/reprocessing_jobs/{job_id}"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["params"], params, "the row states its inputs: {body}");
+
+    crate::common::cleanup_test_db(&db).await;
 }

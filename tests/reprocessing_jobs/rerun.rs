@@ -139,3 +139,131 @@ async fn rerun_rejects_non_rerunnable_type() {
     assert_eq!(status, 409, "csv_import is not rerunnable");
     crate::common::cleanup_test_db(&db).await;
 }
+
+#[tokio::test]
+#[serial]
+async fn rerun_replays_a_backdate_from_its_stored_params() {
+    let (db, app, token) = setup().await;
+
+    let job_id = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO reprocessing_jobs (id, trigger_type, status, category, params, completed_at) \
+             VALUES ('{job_id}', 'reprocess_all', 'completed', 'operator', '{{}}'::jsonb, NOW())"
+        ),
+    )
+    .await;
+
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/reprocessing_jobs/{job_id}/rerun"),
+        &serde_json::json!({}),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "rerun ({status}): {text}");
+    let rerun = job_id_of(&text);
+    assert_ne!(rerun, job_id.to_string(), "the rerun is a new row");
+
+    assert_eq!(wait_for_terminal(&db, &rerun).await, "completed");
+    crate::common::cleanup_test_db(&db).await;
+}
+
+/// Two `pairing_backfill` rows differ only by the slot in their `params`, so a guard comparing
+/// `sensor_id` and `trigger_id` (both NULL on every one of them) reads them as the same job.
+#[tokio::test]
+#[serial]
+async fn rerun_pairing_backfill_ignores_an_in_flight_row_for_another_slot() {
+    let (db, app, token) = setup().await;
+
+    let site = crate::common::SITE1_ID;
+    let done = Uuid::new_v4();
+    let queued = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO reprocessing_jobs (id, trigger_type, status, category, params, completed_at) \
+             VALUES ('{done}', 'pairing_backfill', 'completed', 'operator', \
+                     '{{\"site_id\": \"{site}\", \"parameter_id\": \"{}\"}}'::jsonb, NOW())",
+            crate::common::GLOBAL_PARAM_TEMP_ID
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO reprocessing_jobs (id, trigger_type, status, category, params, next_attempt_at) \
+             VALUES ('{queued}', 'pairing_backfill', 'queued', 'operator', \
+                     '{{\"site_id\": \"{site}\", \"parameter_id\": \"{}\"}}'::jsonb, NOW() + interval '1 hour')",
+            crate::common::GLOBAL_PARAM_DEPTH_ID
+        ),
+    )
+    .await;
+
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/reprocessing_jobs/{done}/rerun"),
+        &serde_json::json!({}),
+        &token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "a queued backfill for another slot does not block this rerun ({status}): {text}"
+    );
+    crate::common::cleanup_test_db(&db).await;
+}
+
+/// The Rerun and Cancel buttons follow the server's policy, so the row states it rather than the
+/// client keeping a copy of the two lists.
+#[tokio::test]
+#[serial]
+async fn a_job_row_states_whether_it_can_be_rerun_and_cancelled() {
+    let (db, app, token) = setup().await;
+
+    let recompute = Uuid::new_v4();
+    let import = Uuid::new_v4();
+    for (id, trigger_type) in [(recompute, "event_recompute"), (import, "csv_import")] {
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO reprocessing_jobs (id, trigger_type, status, category, completed_at) \
+                 VALUES ('{id}', '{trigger_type}', 'completed', 'operator', NOW())"
+            ),
+        )
+        .await;
+    }
+
+    let (status, body) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/reprocessing_jobs/{recompute}"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["rerunnable"], serde_json::json!(true));
+    assert_eq!(body["cancellable"], serde_json::json!(true));
+
+    let (status, body) =
+        crate::common::get_json_with_token(&app, &format!("/api/reprocessing_jobs/{import}"), &token)
+            .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["rerunnable"], serde_json::json!(false));
+    assert_eq!(body["cancellable"], serde_json::json!(true));
+
+    let (status, body) =
+        crate::common::get_json_with_token(&app, "/api/reprocessing_jobs?sort=created_at", &token)
+            .await;
+    assert_eq!(status, 200, "{body}");
+    let listed = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["id"] == serde_json::json!(recompute.to_string()))
+        .expect("the recompute row is listed");
+    assert_eq!(listed["rerunnable"], serde_json::json!(true));
+    assert_eq!(listed["cancellable"], serde_json::json!(true));
+
+    crate::common::cleanup_test_db(&db).await;
+}

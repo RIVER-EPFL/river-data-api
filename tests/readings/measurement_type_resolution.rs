@@ -96,6 +96,26 @@ async fn ingest_resolution_chain_override_stream_sensor_fallback() {
         "spot"
     );
 
+    // The instrument minted for a stream that names none is bookkeeping, not a device, so its
+    // frequency must not classify anything: the declaration is what makes these readings spot.
+    let minted = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT s.data_frequency FROM sensors s \
+                 JOIN data_streams d ON d.sensor_id = s.id WHERE d.id = '{spot_stream}'"
+            ),
+        ))
+        .await
+        .expect("query")
+        .expect("row");
+    assert_eq!(
+        minted
+            .try_get::<String>("", "data_frequency")
+            .expect("data_frequency"),
+        "high"
+    );
+
     // Per-reading override beats the stream default.
     ingest_one(&app, &token, &spot_stream, 3.0, Some("continuous")).await;
     assert_eq!(

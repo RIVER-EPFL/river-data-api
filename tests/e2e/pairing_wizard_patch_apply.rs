@@ -164,9 +164,9 @@ async fn patch_plan(
     plan_id: &str,
     updates: serde_json::Value,
 ) -> serde_json::Value {
-    let (status, body) = crate::common::patch_json_with_token(
+    let (status, body) = crate::common::patch_plan_with_token(
         app,
-        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &plan_id.to_string(),
         &json!({ "updates": updates }),
         jwt,
     )
@@ -183,10 +183,10 @@ async fn run_plan_action(
     plan_id: &str,
     action: &str,
 ) -> serde_json::Value {
-    let (status, res) = crate::common::post_json_parse_with_token(
+    let (status, res) = crate::common::post_plan_action_parse_with_token(
         app,
-        &format!("/api/sync/pairing-plans/{plan_id}/{action}"),
-        &json!({}),
+        &plan_id.to_string(),
+        action,
         jwt,
     )
     .await;
@@ -487,9 +487,9 @@ async fn final_patch_state_is_what_applies_and_late_patch_is_rejected() {
         "and none of it was attributed"
     );
 
-    let (status, late) = crate::common::patch_json_with_token(
+    let (status, late) = crate::common::patch_plan_with_token(
         &app,
-        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &plan_id.to_string(),
         &json!({ "updates": [{ "stream_id": s_rename, "parameter_name": "Too Late" }] }),
         &admin,
     )

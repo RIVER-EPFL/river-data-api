@@ -991,6 +991,193 @@ pub fn not_pinned_sql(alias: &str, kind: Kind) -> String {
     )
 }
 
+/// The reading columns the record owns outright: nothing outside the projection trigger writes
+/// them, so each must equal the fold of the key's live decisions. The attribution and value
+/// columns are deliberately absent, because a derivation rewrites those with no decision at all.
+pub const FOLDED_COLUMNS: [&str; 5] = [
+    "is_flagged",
+    "flag_reason",
+    "withdrawn_at",
+    "withdrawn_reason",
+    "unverified",
+];
+
+/// One live decision, as the fold reads it.
+#[derive(Debug, Clone)]
+pub struct FoldEntry {
+    pub kind: Kind,
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub new: serde_json::Value,
+}
+
+/// The folded columns of one reading. `Default` is the state a reading is born in, which is what
+/// a column no decision asserts must equal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectedColumns {
+    pub is_flagged: bool,
+    pub flag_reason: Option<String>,
+    pub withdrawn_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub withdrawn_reason: Option<String>,
+    pub unverified: bool,
+}
+
+/// What one decision asserts about the folded columns, mirroring `reading_decisions_project()`.
+/// A JSON null asserts the column empty; a kind that touches none of them asserts nothing.
+fn asserted_columns(entry: &FoldEntry) -> Vec<(&'static str, serde_json::Value)> {
+    use serde_json::{Value, json};
+    let reason = || entry.new.get("reason").cloned().unwrap_or(Value::Null);
+    let withdrawn_at = || {
+        entry
+            .new
+            .get("withdrawn_at")
+            .cloned()
+            .unwrap_or_else(|| json!(entry.at))
+    };
+    match entry.kind {
+        Kind::Flag => vec![("is_flagged", json!(true)), ("flag_reason", reason())],
+        Kind::Unflag => vec![("is_flagged", json!(false)), ("flag_reason", Value::Null)],
+        Kind::Withdraw => vec![
+            ("withdrawn_at", withdrawn_at()),
+            ("withdrawn_reason", reason()),
+        ],
+        Kind::Reject => vec![
+            ("withdrawn_at", withdrawn_at()),
+            ("withdrawn_reason", reason()),
+            ("unverified", json!(false)),
+        ],
+        Kind::Reassert => vec![
+            ("withdrawn_at", Value::Null),
+            ("withdrawn_reason", Value::Null),
+        ],
+        Kind::UnverifiedEntry => vec![("unverified", json!(true))],
+        Kind::Verify => vec![("unverified", json!(false))],
+        Kind::Rollback => entry
+            .new
+            .get("columns")
+            .and_then(serde_json::Value::as_object)
+            .map(|c| {
+                FOLDED_COLUMNS
+                    .iter()
+                    .filter_map(|col| c.get(*col).map(|v| (*col, v.clone())))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// The folded columns as the record says they stand: newest live decision asserting a column
+/// wins, and a column nothing asserts stands as the reading was born. `newest_first` is the key's
+/// live decisions, group decisions included, ordered by `at` descending.
+#[must_use]
+pub fn projected_state(newest_first: &[FoldEntry]) -> ProjectedColumns {
+    let mut asserted: std::collections::HashMap<&'static str, serde_json::Value> =
+        std::collections::HashMap::new();
+    for entry in newest_first {
+        for (col, value) in asserted_columns(entry) {
+            asserted.entry(col).or_insert(value);
+        }
+    }
+    let text = |col| {
+        asserted
+            .get(col)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let flag = |col| asserted.get(col).and_then(serde_json::Value::as_bool) == Some(true);
+    ProjectedColumns {
+        is_flagged: flag("is_flagged"),
+        flag_reason: text("flag_reason"),
+        withdrawn_at: asserted
+            .get("withdrawn_at")
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&chrono::Utc)),
+        withdrawn_reason: text("withdrawn_reason"),
+        unverified: flag("unverified"),
+    }
+}
+
+/// The same fold in SQL, anti-joined against the readings: every key whose folded columns are not
+/// what its live decisions say they should be. Report-only, because which side is wrong is a
+/// decision (a rollback, or a fresh decision), never something a sweep may pick.
+#[must_use]
+pub fn inconsistent_rows_sql() -> String {
+    "WITH candidate AS (
+         SELECT r.stream_id, r.time, r.replicate_index,
+                COALESCE(r.is_flagged, false) AS is_flagged, r.flag_reason,
+                r.withdrawn_at, r.withdrawn_reason, COALESCE(r.unverified, false) AS unverified
+         FROM readings r
+         WHERE r.is_flagged IS TRUE OR r.flag_reason IS NOT NULL
+            OR r.withdrawn_at IS NOT NULL OR r.withdrawn_reason IS NOT NULL
+            OR r.unverified IS TRUE
+            OR EXISTS (SELECT 1 FROM reading_decisions d
+                        WHERE d.stream_id = r.stream_id AND d.time = r.time
+                          AND (d.replicate_index IS NULL
+                               OR d.replicate_index = r.replicate_index)
+                          AND d.rolled_back_by IS NULL)
+     )
+     SELECT c.stream_id, c.time, c.replicate_index
+     FROM candidate c
+     LEFT JOIN LATERAL (
+         SELECT jsonb_object_agg(a.col, a.val) AS m
+         FROM (
+             SELECT DISTINCT ON (v.col) v.col, v.val
+             FROM reading_decisions d
+             CROSS JOIN LATERAL (VALUES
+                 ('is_flagged', CASE d.kind
+                      WHEN 'flag' THEN 'true'::jsonb
+                      WHEN 'unflag' THEN 'false'::jsonb
+                      WHEN 'rollback' THEN d.new -> 'columns' -> 'is_flagged' END),
+                 ('flag_reason', CASE d.kind
+                      WHEN 'flag' THEN COALESCE(d.new -> 'reason', 'null'::jsonb)
+                      WHEN 'unflag' THEN 'null'::jsonb
+                      WHEN 'rollback' THEN d.new -> 'columns' -> 'flag_reason' END),
+                 ('withdrawn_at', CASE
+                      WHEN d.kind IN ('withdraw', 'reject')
+                          THEN to_jsonb(COALESCE((d.new ->> 'withdrawn_at')::timestamptz, d.at))
+                      WHEN d.kind = 'reassert' THEN 'null'::jsonb
+                      WHEN d.kind = 'rollback' THEN d.new -> 'columns' -> 'withdrawn_at' END),
+                 ('withdrawn_reason', CASE
+                      WHEN d.kind IN ('withdraw', 'reject')
+                          THEN COALESCE(d.new -> 'reason', 'null'::jsonb)
+                      WHEN d.kind = 'reassert' THEN 'null'::jsonb
+                      WHEN d.kind = 'rollback' THEN d.new -> 'columns' -> 'withdrawn_reason' END),
+                 ('unverified', CASE
+                      WHEN d.kind = 'unverified_entry' THEN 'true'::jsonb
+                      WHEN d.kind IN ('verify', 'reject') THEN 'false'::jsonb
+                      WHEN d.kind = 'rollback' THEN d.new -> 'columns' -> 'unverified' END)
+             ) AS v(col, val)
+             WHERE d.stream_id = c.stream_id AND d.time = c.time
+               AND (d.replicate_index IS NULL OR d.replicate_index = c.replicate_index)
+               AND d.rolled_back_by IS NULL AND v.val IS NOT NULL
+             ORDER BY v.col, d.at DESC, d.id DESC
+         ) a
+     ) e ON TRUE
+     WHERE c.is_flagged IS DISTINCT FROM COALESCE((e.m ->> 'is_flagged')::boolean, false)
+        OR c.flag_reason IS DISTINCT FROM (e.m ->> 'flag_reason')
+        OR c.withdrawn_at IS DISTINCT FROM (e.m ->> 'withdrawn_at')::timestamptz
+        OR c.withdrawn_reason IS DISTINCT FROM (e.m ->> 'withdrawn_reason')
+        OR c.unverified IS DISTINCT FROM COALESCE((e.m ->> 'unverified')::boolean, false)"
+        .to_string()
+}
+
+/// How many readings the record and the columns disagree about. The janitor reports it; nothing
+/// repairs it.
+pub async fn curation_drift_count<C: ConnectionTrait>(conn: &C) -> AppResult<i64> {
+    let sql = format!(
+        "SELECT count(*)::bigint AS n FROM ({}) drift",
+        inconsistent_rows_sql()
+    );
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+        ))
+        .await?
+        .ok_or_else(|| AppError::Internal("counting curation drift returned no row".to_string()))?;
+    Ok(row.try_get("", "n")?)
+}
 /// One reading key inside an explicit selection.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct SelectionKey {
@@ -1988,6 +2175,171 @@ mod tests {
             (Kind::Detach, t("2025-06-02T00:00:00Z")),
         ];
         assert_eq!(slot_owner(&returned, None), Owner::Tool);
+    }
+
+    #[test]
+    fn the_fold_takes_the_newest_live_decision_per_column_and_the_born_state_otherwise() {
+        use super::{FoldEntry, ProjectedColumns, projected_state};
+        let t = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let entry = |kind, at, new| FoldEntry {
+            kind,
+            at: t(at),
+            new,
+        };
+        assert_eq!(projected_state(&[]), ProjectedColumns::default());
+        assert_eq!(
+            projected_state(&[entry(
+                Kind::Flag,
+                "2025-06-02T00:00:00Z",
+                serde_json::json!({ "reason": "spike" })
+            )]),
+            ProjectedColumns {
+                is_flagged: true,
+                flag_reason: Some("spike".to_string()),
+                ..Default::default()
+            }
+        );
+        // Newest first: the unflag stands and the flag under it is not consulted.
+        assert_eq!(
+            projected_state(&[
+                entry(Kind::Unflag, "2025-06-03T00:00:00Z", serde_json::json!({})),
+                entry(
+                    Kind::Flag,
+                    "2025-06-02T00:00:00Z",
+                    serde_json::json!({ "reason": "spike" })
+                ),
+            ]),
+            ProjectedColumns::default()
+        );
+        // A withdraw with no explicit instant is stamped at the decision.
+        assert_eq!(
+            projected_state(&[entry(
+                Kind::Withdraw,
+                "2025-06-04T00:00:00Z",
+                serde_json::json!({ "reason": "absent from source window" })
+            )]),
+            ProjectedColumns {
+                withdrawn_at: Some(t("2025-06-04T00:00:00Z")),
+                withdrawn_reason: Some("absent from source window".to_string()),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            projected_state(&[
+                entry(
+                    Kind::Reassert,
+                    "2025-06-05T00:00:00Z",
+                    serde_json::json!({})
+                ),
+                entry(
+                    Kind::Withdraw,
+                    "2025-06-04T00:00:00Z",
+                    serde_json::json!({ "reason": "gone" })
+                ),
+            ]),
+            ProjectedColumns::default()
+        );
+        // A reject withdraws and clears the unverified stamp in one decision.
+        assert_eq!(
+            projected_state(&[entry(
+                Kind::Reject,
+                "2025-06-06T00:00:00Z",
+                serde_json::json!({ "reason": "rejected" })
+            )]),
+            ProjectedColumns {
+                withdrawn_at: Some(t("2025-06-06T00:00:00Z")),
+                withdrawn_reason: Some("rejected".to_string()),
+                unverified: false,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            projected_state(&[entry(
+                Kind::UnverifiedEntry,
+                "2025-06-07T00:00:00Z",
+                serde_json::json!({})
+            )]),
+            ProjectedColumns {
+                unverified: true,
+                ..Default::default()
+            }
+        );
+        // Kinds that project nothing folded leave every column at the born state.
+        for k in [
+            Kind::Curve,
+            Kind::InstrumentPin,
+            Kind::CalibrationPin,
+            Kind::ValueCorrection,
+            Kind::SlotMove,
+            Kind::Chain,
+            Kind::Detach,
+            Kind::Return,
+        ] {
+            assert_eq!(
+                projected_state(&[entry(k, "2025-06-08T00:00:00Z", serde_json::json!({}))]),
+                ProjectedColumns::default(),
+                "{k:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rollback_asserts_the_columns_it_restores_and_the_decision_it_undid_is_not_folded() {
+        use super::{FoldEntry, ProjectedColumns, projected_state};
+        let t = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        // The rolled-back decision is not in the list: `rolled_back_by` takes it out of the fold.
+        let rollback = FoldEntry {
+            kind: Kind::Rollback,
+            at: t("2025-06-09T00:00:00Z"),
+            new: serde_json::json!({
+                "columns": { "is_flagged": false, "flag_reason": null },
+                "of": "00000000-0000-0000-0000-000000000000"
+            }),
+        };
+        assert_eq!(
+            projected_state(std::slice::from_ref(&rollback)),
+            ProjectedColumns::default()
+        );
+        // It asserts only the columns it names, so an unrelated live decision still stands.
+        let withdrawn = FoldEntry {
+            kind: Kind::Withdraw,
+            at: t("2025-06-08T00:00:00Z"),
+            new: serde_json::json!({ "reason": "gone" }),
+        };
+        assert_eq!(
+            projected_state(&[rollback, withdrawn]),
+            ProjectedColumns {
+                withdrawn_at: Some(t("2025-06-08T00:00:00Z")),
+                withdrawn_reason: Some("gone".to_string()),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn the_drift_statement_folds_every_owned_column_and_repairs_none() {
+        let sql = super::inconsistent_rows_sql();
+        for col in super::FOLDED_COLUMNS {
+            assert!(sql.contains(&format!("'{col}'")), "{col} is not folded");
+        }
+        assert!(sql.contains("d.rolled_back_by IS NULL"));
+        assert!(sql.contains("d.replicate_index IS NULL OR d.replicate_index = c.replicate_index"));
+        // A row with no decision at all is still a candidate when a column left the born state.
+        assert!(sql.contains("r.is_flagged IS TRUE OR r.flag_reason IS NOT NULL"));
+        for write in ["UPDATE ", "DELETE ", "INSERT "] {
+            assert!(
+                !sql.contains(write),
+                "the sweep reports, it does not repair"
+            );
+        }
     }
 
     #[test]

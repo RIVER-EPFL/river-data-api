@@ -588,36 +588,112 @@ pub async fn upsert_source_instrument<C: ConnectionTrait>(
     Ok(existing.id)
 }
 
-/// Create or reuse the instrument for a data stream being paired, when the stream is a device feed.
+/// The instrument a stream's readings are attributed to, resolved or minted.
 ///
-/// If the stream already has a `sensor_id`, reuses that instrument and ensures a deployment exists
-/// for the target site. Otherwise an instrument is minted for the stream's own channel identity
-/// `(source_system, source_key)`; no calibration is created, and the context carries whichever
-/// curve the instrument already has. Updates `data_streams.sensor_id` to link the stream.
+/// Every stream has one. A measurement whose instrument is unknown is a measurement whose
+/// provenance cannot be recovered later, so no write path may leave `sensor_id` NULL, and the
+/// resolution below always ends in an id.
 ///
-/// `None` when neither holds. The guard is the shape of the feed, not the presence of a serial:
-/// a device feed is one whose metadata carries a `device` block, which is what the viewLinc
-/// backend writes per channel. Portal streams carry no such block, so minting here would mean a
-/// distinct instrument per stream, thousands of them for one source, none of them a device. A
-/// portal instrument comes from its curves instead (`resolve_lab_instrument`), chosen in the
-/// pairing plan; an operator who wants one anyway has `POST /streams/{id}/import`.
+/// Identity, most specific first:
+/// 1. the instrument the stream already names,
+/// 2. a device feed's own channel `(source_system, source_key)`, one field instrument per channel,
+///    which is what the viewLinc backend writes and where the probe is the instrument,
+/// 3. the source's instrument for the parameter the feed carries, `{source_system}:{parameter}`:
+///    one lab instrument per parameter across every station, which is the key the pairing plan
+///    mints and resolves under, so a hand pairing and a plan converge on the same row.
+///
+/// Updates `data_streams.sensor_id` to link the stream.
+pub async fn resolve_or_mint_stream_instrument<C: ConnectionTrait>(
+    db: &C,
+    stream: &data_streams::Model,
+    name_hint: Option<&str>,
+) -> AppResult<Uuid> {
+    if let Some(sensor_id) = stream.sensor_id {
+        return Ok(sensor_id);
+    }
+    if is_device_feed(&stream.metadata) {
+        return Ok(import_sensor_for_stream(db, stream, name_hint)
+            .await?
+            .sensor_id);
+    }
+
+    let parameter = crate::routes::private::sync::service::extract_hierarchy(stream).parameter;
+    let key_part = if parameter.is_empty() {
+        stream.source_key.clone()
+    } else {
+        parameter.clone()
+    };
+    let source_key = format!("{}:{key_part}", stream.source_system);
+    let name = name_hint.map_or_else(
+        || format!("{key_part} ({})", stream.source_system),
+        ToString::to_string,
+    );
+    let sensor_id = upsert_source_instrument(
+        db,
+        &stream.source_system,
+        &source_key,
+        &name,
+        true,
+        // A bookkeeping instrument carries no evidence about cadence, and `data_frequency` is
+        // read as one by `resolve_measurement_type`. 'high' leaves that rung silent, so only a
+        // declaration or a real device moves a stream to spot.
+        "high",
+        Some(serde_json::json!({ "minted_from_stream": stream.source_key })),
+    )
+    .await?;
+    link_stream_to_sensor(db, stream, sensor_id).await?;
+    Ok(sensor_id)
+}
+
+/// Create or reuse the instrument for a data stream being paired, and deploy it when it is a field
+/// instrument.
+///
+/// The instrument comes from [`resolve_or_mint_stream_instrument`], so a stream reaches its slot
+/// attributed whatever its source is. A lab instrument gets no deployment: it corrects a grab, it
+/// is not stationed at the site, which is the "attributed but not deployed" state
+/// `import_sensor_for_stream` documents. No calibration is created either; the context carries
+/// whichever curve the instrument already has.
 pub async fn create_sensor_for_stream<C: ConnectionTrait>(
     db: &C,
     stream: &data_streams::Model,
     parameter_id: Uuid,
     site_id: Uuid,
-) -> AppResult<Option<SensorContext>> {
-    if stream.sensor_id.is_none() && !is_device_feed(&stream.metadata) {
-        return Ok(None);
-    }
+) -> AppResult<SensorContext> {
     let name = slot_instrument_name(db, site_id, parameter_id).await?;
-    let ctx = import_sensor_for_stream(db, stream, name.as_deref()).await?;
+    let sensor_id = resolve_or_mint_stream_instrument(db, stream, name.as_deref()).await?;
+    let is_lab = sensors::Entity::find_by_id(sensor_id)
+        .one(db)
+        .await?
+        .is_some_and(|s| s.is_lab_instrument.unwrap_or(false));
     // Ensure active deployment exists for this sensor+site+parameter (None if the slot is occupied).
-    let deployment_id = find_or_create_deployment(db, ctx.sensor_id, site_id, parameter_id).await?;
-    Ok(Some(SensorContext {
+    let deployment_id = if is_lab {
+        None
+    } else {
+        find_or_create_deployment(db, sensor_id, site_id, parameter_id).await?
+    };
+    Ok(SensorContext {
+        sensor_id,
         deployment_id,
-        ..ctx
-    }))
+    })
+}
+
+/// The instrument a per-slot internal channel (grab entry, API batch) attributes its readings to.
+///
+/// A hand-entered value is not the deployed probe's measurement, so the slot's field instrument is
+/// never borrowed here: the channel takes its own instrument, named for the slot it serves and
+/// minted the first time anything is entered there. An explicit instrument on the reading, the
+/// lab instrument a tool run's curve names, still wins over it at the write.
+pub async fn ensure_channel_instrument<C: ConnectionTrait>(
+    db: &C,
+    stream: &data_streams::Model,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    kind: &str,
+) -> AppResult<Uuid> {
+    let name = slot_instrument_name(db, site_id, parameter_id)
+        .await?
+        .map(|slot| format!("{slot} ({kind})"));
+    resolve_or_mint_stream_instrument(db, stream, name.as_deref()).await
 }
 
 /// A device feed is one whose stream metadata carries a `device` block. Broader than testing for a

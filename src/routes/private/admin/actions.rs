@@ -268,6 +268,9 @@ pub async fn reprocess_sensor(
     ))
 }
 
+/// One backdate is in flight at a time, so every request carries the same key.
+const REPROCESS_ALL_DEDUPE_KEY: &str = "reprocess_all";
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ReprocessAllResponse {
     pub job_id: Uuid,
@@ -317,17 +320,34 @@ pub async fn reprocess_all(
         })
         .count();
 
-    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
+    // One backdate at a time: a second request while one is queued joins it rather than starting a
+    // concurrent pass over every slot. The claim releases the key, so a run already under way still
+    // gets one follow-up.
+    let queued = crate::routes::private::reprocessing_jobs::worker::enqueue(
         db,
         "reprocess_all",
         None,
         None,
         &serde_json::json!({}),
-        None,
+        Some(REPROCESS_ALL_DEDUPE_KEY),
     )
     .await
-    .map_err(|e| AppError::Internal(e.to_string()))?
-    .ok_or_else(|| AppError::Internal("failed to enqueue reprocess_all job".to_string()))?;
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let job_id = match queued {
+        Some(id) => id,
+        None => db
+            .query_one_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT id FROM reprocessing_jobs WHERE dedupe_key = $1",
+                [REPROCESS_ALL_DEDUPE_KEY.into()],
+            ))
+            .await
+            .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
+            .ok_or_else(|| AppError::Internal("failed to enqueue reprocess_all job".to_string()))?
+            .try_get::<Uuid>("", "id")
+            .map_err(|e| AppError::Internal(format!("DB error: {e}")))?,
+    };
 
     Ok(Json(ReprocessAllResponse {
         job_id,

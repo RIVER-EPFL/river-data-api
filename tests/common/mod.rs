@@ -117,7 +117,6 @@ pub fn test_config() -> Config {
         sync_event_stale_after_seconds: 3600,
         sync_event_retention_days: 90,
         ingest_receipt_retention_days: 365,
-        sync_full_reassert_service_types: vec!["rshiny".to_string()],
         job_max_retries: 3,
         job_retry_backoff_seconds: 60,
         notify_poll_interval_seconds: 60,

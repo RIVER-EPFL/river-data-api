@@ -27,6 +27,7 @@ mod ingest_forms_samples;
 mod ingested_at_restamp;
 mod ingest_standard_curves;
 mod ingest_validation;
+mod instrument_required;
 mod measurement_type_resolution;
 mod provenance;
 mod replicate_index_resync;

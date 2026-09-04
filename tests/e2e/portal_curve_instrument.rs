@@ -120,10 +120,10 @@ async fn register_stream(
 
 /// Apply runs as a tracked job; the counts live on the finished job, not the response.
 async fn apply_plan(app: &Router, jwt: &str, plan_id: &str) -> serde_json::Value {
-    let (status, res) = crate::common::post_json_parse_with_token(
+    let (status, res) = crate::common::post_plan_action_parse_with_token(
         app,
-        &format!("/api/sync/pairing-plans/{plan_id}/apply"),
-        &json!({}),
+        &plan_id.to_string(),
+        "apply",
         jwt,
     )
     .await;
@@ -222,10 +222,10 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
         plan["summary"],
     );
 
-    let (status, refused) = crate::common::post_json_with_token(
+    let (status, refused) = crate::common::post_plan_action_with_token(
         &app,
-        &format!("/api/sync/pairing-plans/{plan_id}/apply"),
-        &json!({}),
+        &plan_id.to_string(),
+        "apply",
         &admin,
     )
     .await;
@@ -238,9 +238,9 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
         "the refusal names the stream that needs a decision: {refused}",
     );
 
-    let (status, patched) = crate::common::patch_json_with_token(
+    let (status, patched) = crate::common::patch_plan_with_token(
         &app,
-        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &plan_id.to_string(),
         &json!({ "updates": [{
             "stream_id": xyz,
             "instrument_name": "XYZ lab (curvesrc portal)",
@@ -416,9 +416,9 @@ async fn an_instrument_is_attached_to_streams_whose_source_names_no_curve() {
     );
 
     for stream in [&acid, &noacid] {
-        let (status, patched) = crate::common::patch_json_with_token(
-            &app,
-            &format!("/api/sync/pairing-plans/{plan_id}"),
+        let (status, patched) = crate::common::patch_plan_with_token(
+        &app,
+        &plan_id.to_string(),
             &json!({ "updates": [{ "stream_id": stream, "instrument_id": instrument_id }] }),
             &admin,
         )
@@ -445,9 +445,9 @@ async fn an_instrument_is_attached_to_streams_whose_source_names_no_curve() {
     );
 
     // A parameter no registered instrument covers gets one named here rather than left without.
-    let (status, patched) = crate::common::patch_json_with_token(
+    let (status, patched) = crate::common::patch_plan_with_token(
         &app,
-        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &plan_id.to_string(),
         &json!({ "updates": [{
             "stream_id": bix,
             "instrument_name": "BIX instrument (from curvesrc sync)",

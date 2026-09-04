@@ -598,6 +598,7 @@ async fn health_state_derived_from_heartbeat_recency() {
         [
             "created_at",
             "current_operation",
+            "full_reassert_enabled",
             "health",
             "id",
             "instance_id",

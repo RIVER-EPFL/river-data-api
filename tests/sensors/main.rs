@@ -11,5 +11,6 @@ mod instruments_overview;
 mod list_latest_reading;
 mod multi_parameter_channel;
 mod read_endpoints;
+mod sensor_register;
 mod standard_curve_register;
 mod swap_reattributes;

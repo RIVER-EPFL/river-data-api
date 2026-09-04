@@ -80,9 +80,9 @@ async fn patch_entry(
     plan_id: &str,
     update: serde_json::Value,
 ) -> (u16, String) {
-    crate::common::patch_json_with_token(
+    crate::common::patch_plan_with_token(
         app,
-        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &plan_id.to_string(),
         &serde_json::json!({ "updates": [update] }),
         token,
     )
@@ -117,10 +117,10 @@ async fn apply_and_wait(
     token: &str,
     plan_id: &str,
 ) {
-    let (status, text) = crate::common::post_json_with_token(
+    let (status, text) = crate::common::post_plan_action_with_token(
         app,
-        &format!("/api/sync/pairing-plans/{plan_id}/apply"),
-        &serde_json::json!({}),
+        &plan_id.to_string(),
+        "apply",
         token,
     )
     .await;
@@ -557,9 +557,9 @@ async fn a_curve_assigned_to_a_proposed_instrument_moves_when_the_plan_is_applie
         .expect("proposed instrument source_key")
         .to_string();
 
-    let (status, body) = crate::common::patch_json_with_token(
+    let (status, body) = crate::common::patch_plan_with_token(
         &app,
-        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &plan_id.to_string(),
         &serde_json::json!({
             "updates": [],
             "curves": [{ "curve_id": used_curve, "instrument_source_key": source_key }],
@@ -572,9 +572,9 @@ async fn a_curve_assigned_to_a_proposed_instrument_moves_when_the_plan_is_applie
         "a curve readings already name keeps its instrument: {body}"
     );
 
-    let (status, body) = crate::common::patch_json_with_token(
+    let (status, body) = crate::common::patch_plan_with_token(
         &app,
-        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &plan_id.to_string(),
         &serde_json::json!({
             "updates": [],
             "curves": [{ "curve_id": curve, "instrument_source_key": source_key }],

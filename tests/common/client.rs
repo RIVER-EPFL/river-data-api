@@ -143,6 +143,67 @@ pub async fn patch_json_with_token(
     (status, text)
 }
 
+pub async fn patch_json_parse_with_token(
+    app: &Router,
+    uri: &str,
+    body: &serde_json::Value,
+    token: &str,
+) -> (u16, serde_json::Value) {
+    let (status, text) = patch_json_with_token(app, uri, body, token).await;
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("Failed to parse JSON from {uri}: {e}\nBody: {text}"));
+    (status, json)
+}
+
+/// PATCH a pairing plan, naming the version it currently carries. A test is the only writer, so
+/// reading the version immediately before the write is the same thing a reviewer's client does
+/// with the version its last read returned.
+pub async fn patch_plan_with_token(
+    app: &Router,
+    plan_id: &str,
+    body: &serde_json::Value,
+    token: &str,
+) -> (u16, String) {
+    let (status, plan) =
+        get_json_with_token(app, &format!("/api/sync/pairing-plans/{plan_id}"), token).await;
+    assert_eq!(status, 200, "reading the plan's version: {plan}");
+    let mut body = body.clone();
+    body["expected_version"] = plan["version"].clone();
+    patch_json_with_token(app, &format!("/api/sync/pairing-plans/{plan_id}"), &body, token).await
+}
+
+/// POST a pairing plan action (`apply`, `revert`, `supersede`), naming the version it carries.
+pub async fn post_plan_action_with_token(
+    app: &Router,
+    plan_id: &str,
+    action: &str,
+    token: &str,
+) -> (u16, String) {
+    let (status, plan) =
+        get_json_with_token(app, &format!("/api/sync/pairing-plans/{plan_id}"), token).await;
+    assert_eq!(status, 200, "reading the plan's version: {plan}");
+    post_json_with_token(
+        app,
+        &format!("/api/sync/pairing-plans/{plan_id}/{action}"),
+        &serde_json::json!({ "expected_version": plan["version"] }),
+        token,
+    )
+    .await
+}
+
+/// The parsing form of `post_plan_action_with_token`.
+pub async fn post_plan_action_parse_with_token(
+    app: &Router,
+    plan_id: &str,
+    action: &str,
+    token: &str,
+) -> (u16, serde_json::Value) {
+    let (status, text) = post_plan_action_with_token(app, plan_id, action, token).await;
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("Failed to parse JSON from plan {action}: {e}\nBody: {text}"));
+    (status, json)
+}
+
 pub async fn put_json_with_token(
     app: &Router,
     uri: &str,

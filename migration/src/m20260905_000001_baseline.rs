@@ -23,6 +23,19 @@ use sea_orm_migration::prelude::*;
 /// ./target/debug/migration up -u postgresql://.../<a copy of the dump>
 /// ```
 ///
+/// The chain leaves that copy in this baseline's schema, so the ledger it wrote is replaced by the
+/// one row that describes the same schema and the copy is carried the rest of the way with the
+/// current migrator, which is what applies the migrations added after the flatten to the real
+/// rows. The replacement is required, not tidiness: the migrator refuses to run at all while
+/// `seaql_migrations` names versions whose files are gone.
+///
+/// ```text
+/// psql <copy> -c "DELETE FROM seaql_migrations; \
+///   INSERT INTO seaql_migrations (version, applied_at) \
+///   VALUES ('m20260905_000001_baseline', extract(epoch from now())::bigint)"
+/// cargo run -p migration -- up -u postgresql://.../<copy>
+/// ```
+///
 /// Then dump that copy `--data-only --exclude-table-data='_timescaledb_internal.*'`, build the
 /// target from this baseline, `TRUNCATE constants, parameters, tool_scripts, tool_script_versions,
 /// tool_script_activations CASCADE` so the seeds below do not collide with the dump's own copies,
@@ -195,6 +208,17 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION public.readings_inherit_stream_instrument() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+            BEGIN
+                IF NEW.sensor_id IS NULL AND NEW.measurement_type IS DISTINCT FROM 'derived' THEN
+                    SELECT sensor_id INTO NEW.sensor_id FROM data_streams WHERE id = NEW.stream_id;
+                END IF;
+                RETURN NEW;
+            END;
+            $$;
+
 CREATE FUNCTION public.samples_on_reading_delete() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
@@ -259,7 +283,8 @@ CREATE TABLE public.readings (
     notes text,
     created_by text,
     unverified boolean DEFAULT false NOT NULL,
-    CONSTRAINT readings_withdrawn_spot_only CHECK (((withdrawn_at IS NULL) OR ((measurement_type)::text = 'spot'::text)))
+    CONSTRAINT readings_withdrawn_spot_only CHECK (((withdrawn_at IS NULL) OR ((measurement_type)::text = 'spot'::text))),
+    CONSTRAINT readings_instrument_required CHECK (((sensor_id IS NOT NULL) OR ((measurement_type)::text IS NOT DISTINCT FROM 'derived'::text)))
 );
 
 CREATE TABLE public.alarm_events (
@@ -1321,6 +1346,8 @@ CREATE TRIGGER subprojects_move_cascade_trg AFTER UPDATE OF project_id ON public
 CREATE TRIGGER trg_inherit_calibration_parameter_id BEFORE INSERT ON public.sensor_calibrations FOR EACH ROW EXECUTE FUNCTION public.inherit_calibration_parameter_id();
 
 CREATE TRIGGER trg_reading_decisions_project AFTER INSERT ON public.reading_decisions FOR EACH ROW EXECUTE FUNCTION public.reading_decisions_project();
+
+CREATE TRIGGER trg_readings_inherit_stream_instrument BEFORE INSERT OR UPDATE ON public.readings FOR EACH ROW EXECUTE FUNCTION public.readings_inherit_stream_instrument();
 
 CREATE TRIGGER trg_readings_sample_refresh_del AFTER DELETE ON public.readings FOR EACH ROW WHEN ((old.sample_id IS NOT NULL)) EXECUTE FUNCTION public.samples_on_reading_delete();
 

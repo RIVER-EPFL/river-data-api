@@ -18,15 +18,30 @@ async fn exec(db: &sea_orm::DatabaseConnection, sql: &str) {
     .unwrap_or_else(|e| panic!("SQL failed: {e}\n{sql}"));
 }
 
+/// The readings below predate the instrument rule, and `readings_instrument_required` refuses them
+/// at insert, so the rule is lifted to seed them and put back once the import has attributed them.
+/// Restoring it is the assertion that the repair left nothing behind: a row the import missed
+/// refuses the constraint.
+const INSTRUMENT_RULE: &str =
+    "ALTER TABLE readings ADD CONSTRAINT readings_instrument_required \
+     CHECK ((sensor_id IS NOT NULL) OR (measurement_type IS NOT DISTINCT FROM 'derived'))";
+
 /// Create an UNPAIRED stream (no site_parameter, no sensor) with site-less readings.
 async fn seed_unpaired_stream(db: &sea_orm::DatabaseConnection, source_key: &str) -> Uuid {
     let stream = Uuid::new_v4();
     exec(
         db,
         &format!(
-            "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active) \
-             VALUES ('{stream}', 'test', '{source_key}', 'Imp {source_key}', true)"
+            // Explicitly instrument-less: the harness defaults `sensor_id` to the fixture
+            // instrument, and this stream is the state an import exists to repair.
+            "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active, sensor_id) \
+             VALUES ('{stream}', 'test', '{source_key}', 'Imp {source_key}', true, NULL)"
         ),
+    )
+    .await;
+    exec(
+        db,
+        "ALTER TABLE readings DROP CONSTRAINT IF EXISTS readings_instrument_required",
     )
     .await;
     for i in 0..6 {
@@ -73,6 +88,8 @@ async fn import_then_adopt_backfills_by_window() {
         "all six readings attributed"
     );
     let sensor_id = imp["sensor_id"].as_str().unwrap().to_string();
+
+    exec(&db, INSTRUMENT_RULE).await;
 
     let rows = sl::get_readings(&db, stream).await;
     assert_eq!(rows.len(), 6);

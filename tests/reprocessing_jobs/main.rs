@@ -18,5 +18,6 @@ mod retention;
 mod retry_backoff;
 mod schedule_control;
 mod schedule_routes;
+mod sync_full_reassert;
 mod scheduler;
 mod worker_pool;

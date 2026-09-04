@@ -44,10 +44,10 @@ async fn run_plan_action(
     plan_id: &str,
     action: &str,
 ) -> serde_json::Value {
-    let (status, res) = crate::common::post_json_parse_with_token(
+    let (status, res) = crate::common::post_plan_action_parse_with_token(
         app,
-        &format!("/api/sync/pairing-plans/{plan_id}/{action}"),
-        &serde_json::json!({}),
+        &plan_id.to_string(),
+        action,
         token,
     )
     .await;
@@ -263,9 +263,9 @@ async fn create_inspect_update_apply_revert_full_lifecycle() {
     .await;
 
     // update: map both Conductivity entries to the existing param
-    let (status, body) = crate::common::patch_json_with_token(
+    let (status, body) = crate::common::patch_plan_with_token(
         &app,
-        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &plan_id.to_string(),
         &serde_json::json!({"updates": [
             {"stream_id": cond1, "parameter_id": cond_param},
             {"stream_id": cond2, "parameter_id": cond_param}
@@ -331,14 +331,14 @@ async fn create_inspect_update_apply_revert_full_lifecycle() {
     assert_eq!(plan["status"], "applied");
 
     // re-apply rejected
-    let (status, _) = crate::common::post_json_with_token(
+    let (status, _) = crate::common::post_plan_action_with_token(
         &app,
-        &format!("/api/sync/pairing-plans/{plan_id}/apply"),
-        &serde_json::json!({}),
+        &plan_id.to_string(),
+        "apply",
         &token,
     )
     .await;
-    assert_eq!(status, 400, "cannot re-apply an applied plan");
+    assert_eq!(status, 409, "cannot re-apply an applied plan");
 
     // revert (runs as a plan_revert job)
     let counts = run_plan_action(&app, &token, &plan_id, "revert").await;
@@ -377,14 +377,14 @@ async fn create_inspect_update_apply_revert_full_lifecycle() {
     assert_eq!(plan["status"], "reverted");
 
     // re-revert rejected
-    let (status, _) = crate::common::post_json_with_token(
+    let (status, _) = crate::common::post_plan_action_with_token(
         &app,
-        &format!("/api/sync/pairing-plans/{plan_id}/revert"),
-        &serde_json::json!({}),
+        &plan_id.to_string(),
+        "revert",
         &token,
     )
     .await;
-    assert_eq!(status, 400, "cannot revert a non-applied plan");
+    assert_eq!(status, 409, "cannot revert a non-applied plan");
 }
 
 #[tokio::test]

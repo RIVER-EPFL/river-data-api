@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::{get, post},
 };
 use chrono::Utc;
@@ -71,6 +71,7 @@ pub fn write_routes() -> Router<AppState> {
         .route("/pairing-plans", post(create_pairing_plan))
         .route("/pairing-plans/{id}", patch(update_pairing_plan))
         .route("/pairing-plans/{id}/apply", post(apply_pairing_plan))
+        .route("/pairing-plans/{id}/supersede", post(supersede_pairing_plan))
         .route("/pairing-plans/{id}/revert", post(revert_pairing_plan))
 }
 
@@ -841,9 +842,9 @@ async fn pair_and_backfill<C: ConnectionTrait>(
     let sensor_ctx = create_sensor_for_stream(db, &stream, sp.parameter_id, sp.site_id)
         .await
         .map_err(|e| e.to_string())?;
-    let sensors_created = u32::from(stream.sensor_id.is_none() && sensor_ctx.is_some());
-    let sensor_id = sensor_ctx.as_ref().map(|c| c.sensor_id);
-    let deployment_id = sensor_ctx.as_ref().and_then(|c| c.deployment_id);
+    let sensors_created = u32::from(stream.sensor_id.is_none());
+    let sensor_id = Some(sensor_ctx.sensor_id);
+    let deployment_id = sensor_ctx.deployment_id;
 
     // Re-fetch stream (sensor_id may have been updated by create_sensor_for_stream)
     let stream = data_streams::Entity::find_by_id(stream_id)
@@ -1547,24 +1548,136 @@ pub async fn create_pairing_plan(
     Ok(Json(plan))
 }
 
-/// List existing pairing plans by status (draft/applied/reverted). Requires `read_metadata`.
+#[derive(Deserialize)]
+pub struct ListPairingPlansQuery {
+    #[serde(default)]
+    source_system: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// A plan without its `entries` document. A CNET draft's entries are 185 kB and a NOMIS draft's
+/// 2.5 MB, and the listing is a way back into a review, not a way to read every draft at once.
+#[derive(Serialize)]
+pub struct PairingPlanSummary {
+    id: Uuid,
+    source_system: String,
+    status: String,
+    created_by: Option<String>,
+    summary: serde_json::Value,
+    created_at: chrono::DateTime<chrono::FixedOffset>,
+    applied_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+}
+
+/// List pairing plans, newest first, optionally narrowed to one source system or one status
+/// (draft/applying/applied/reverting/reverted/superseded). Requires `read_metadata`.
 #[utoipa::path(
     get,
     path = "/api/sync/pairing-plans",
+    params(
+        ("source_system" = Option<String>, Query, description = "Only this source system"),
+        ("status" = Option<String>, Query, description = "Only this status"),
+    ),
     responses(
-        (status = 200, description = "Array of pairing plans", body = Object),
+        (status = 200, description = "Array of pairing plans without their entries", body = Object),
     ),
     tag = "sync"
 )]
 pub async fn list_pairing_plans(
     State(state): State<AppState>,
-) -> AppResult<Json<Vec<crate::routes::private::data_streams::pairing_plans::Model>>> {
-    use sea_orm::QueryOrder;
-    let plans = crate::routes::private::data_streams::pairing_plans::Entity::find()
-        .order_by_desc(crate::routes::private::data_streams::pairing_plans::Column::CreatedAt)
+    Query(query): Query<ListPairingPlansQuery>,
+) -> AppResult<Json<Vec<PairingPlanSummary>>> {
+    use crate::routes::private::data_streams::pairing_plans::{Column, Entity};
+    use sea_orm::{QueryOrder, QuerySelect};
+
+    let mut select = Entity::find();
+    if let Some(source) = query.source_system.as_deref().map(str::trim)
+        && !source.is_empty()
+    {
+        select = select.filter(Column::SourceSystem.eq(source));
+    }
+    if let Some(status) = query.status.as_deref().map(str::trim)
+        && !status.is_empty()
+    {
+        select = select.filter(Column::Status.eq(status));
+    }
+    let rows = select
+        .select_only()
+        .columns([
+            Column::Id,
+            Column::SourceSystem,
+            Column::Status,
+            Column::CreatedBy,
+            Column::Summary,
+            Column::CreatedAt,
+            Column::AppliedAt,
+        ])
+        .order_by_desc(Column::CreatedAt)
+        .into_tuple::<(
+            Uuid,
+            String,
+            String,
+            Option<String>,
+            serde_json::Value,
+            chrono::DateTime<chrono::FixedOffset>,
+            Option<chrono::DateTime<chrono::FixedOffset>>,
+        )>()
         .all(&state.db)
         .await?;
-    Ok(Json(plans))
+
+    Ok(Json(
+        rows.into_iter()
+            .map(
+                |(id, source_system, status, created_by, summary, created_at, applied_at)| {
+                    PairingPlanSummary {
+                        id,
+                        source_system,
+                        status,
+                        created_by,
+                        summary,
+                        created_at,
+                        applied_at,
+                    }
+                },
+            )
+            .collect(),
+    ))
+}
+
+/// Mark a draft superseded, which is what Start over does to the draft it replaces: the decisions
+/// stay readable and `apply` refuses it as it refuses an applied plan. Requires `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/api/sync/pairing-plans/{id}/supersede",
+    params(("id" = Uuid, Path, description = "Pairing plan UUID")),
+    responses(
+        (status = 200, description = "Plan superseded", body = Object),
+        (status = 404, description = "Plan not found"),
+        (status = 409, description = "Plan not in draft status"),
+    ),
+    tag = "sync"
+)]
+pub async fn supersede_pairing_plan(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<serde_json::Value>> {
+    let status = plan_status(&state.db, id).await?;
+    if status != "draft" {
+        return Err(AppError::Conflict(format!(
+            "Plan is '{status}', can only supersede 'draft' plans"
+        )));
+    }
+    state
+        .db
+        .execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE pairing_plans SET status = 'superseded' WHERE id = $1 AND status = 'draft'",
+            [id.into()],
+        ))
+        .await?;
+    Ok(Json(
+        serde_json::json!({ "id": id, "status": "superseded" }),
+    ))
 }
 
 /// Get a single pairing plan with its full pairing list. Requires `read_metadata`.
@@ -1591,11 +1704,27 @@ pub async fn get_pairing_plan(
 
 #[derive(Deserialize)]
 pub struct UpdatePairingPlanRequest {
+    /// The version the client read. The write is refused if the plan has moved on since.
+    expected_version: i32,
+    /// A plan-wide decision, applied before the per-entry updates so an operator can pair what
+    /// matched, or skip what did not, in one act rather than one line per entry.
+    #[serde(default)]
+    bulk: Option<BulkAction>,
+    #[serde(default)]
     updates: Vec<PlanEntryUpdate>,
     /// Standard curves to assign to instruments this plan will create. The move happens when the
     /// plan is applied, in the transaction that mints the instrument.
     #[serde(default)]
     curves: Vec<PlanCurveUpdate>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BulkAction {
+    #[serde(default)]
+    r#where: crate::routes::private::sync::service::BulkWhere,
+    /// `pair` or `skip`.
+    action: String,
 }
 
 #[derive(Deserialize)]
@@ -1908,7 +2037,7 @@ async fn apply_instrument_updates(
     responses(
         (status = 200, description = "Updated plan", body = Object),
         (status = 404, description = "Plan not found"),
-        (status = 409, description = "Plan not in draft status"),
+        (status = 409, description = "Plan not in draft status, or edited since the client read it", body = Object),
     ),
     tag = "sync"
 )]
@@ -1923,9 +2052,13 @@ pub async fn update_pairing_plan(
         .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
 
     if plan.status != "draft" {
-        return Err(AppError::BadRequest(
-            "Can only edit draft plans".to_string(),
-        ));
+        return Err(AppError::Conflict(format!(
+            "Plan is '{}', can only edit 'draft' plans",
+            plan.status
+        )));
+    }
+    if plan.version != req.expected_version {
+        return Err(stale_plan(plan.version));
     }
 
     let mut entries: Vec<crate::routes::private::sync::service::PlanEntry> =
@@ -1933,6 +2066,20 @@ pub async fn update_pairing_plan(
             .map_err(|e| AppError::Internal(format!("Failed to parse entries: {e}")))?;
 
     let catalog = crate::routes::private::sync::service::load_entity_catalog(&state.db).await?;
+
+    if let Some(bulk) = &req.bulk {
+        if bulk.action != "pair" && bulk.action != "skip" {
+            return Err(AppError::BadRequest(format!(
+                "Bulk action must be 'pair' or 'skip', got '{}'",
+                bulk.action
+            )));
+        }
+        crate::routes::private::sync::service::apply_bulk_action(
+            &mut entries,
+            &bulk.r#where,
+            &bulk.action,
+        );
+    }
 
     for update in &req.updates {
         if let Some(entry) = entries.iter_mut().find(|e| e.stream_id == update.stream_id) {
@@ -1995,13 +2142,60 @@ pub async fn update_pairing_plan(
     ))
     .unwrap_or_default();
 
-    let mut active: crate::routes::private::data_streams::pairing_plans::ActiveModel = plan.into();
-    active.entries = Set(serde_json::to_value(&entries).unwrap_or_default());
-    active.curve_assignments = Set(serde_json::to_value(&intents).unwrap_or_default());
-    active.summary = Set(summary);
-    let updated = active.update(&state.db).await?;
+    // The write names the version it read, so a second writer who read the same document is
+    // refused rather than carrying the first's entries back over the first's decisions.
+    let written = state
+        .db
+        .execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE pairing_plans SET entries = $1, curve_assignments = $2, summary = $3, \
+             version = version + 1 WHERE id = $4 AND version = $5",
+            [
+                serde_json::to_value(&entries).unwrap_or_default().into(),
+                serde_json::to_value(&intents).unwrap_or_default().into(),
+                summary.into(),
+                id.into(),
+                req.expected_version.into(),
+            ],
+        ))
+        .await?;
+    if written.rows_affected() == 0 {
+        return Err(stale_plan(plan_version(&state.db, id).await?));
+    }
 
+    let updated = crate::routes::private::data_streams::pairing_plans::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
     Ok(Json(updated))
+}
+
+/// The refusal a writer gets when the draft has moved on: the version it should reload is in the
+/// detail, so the client re-reads and re-applies rather than guessing.
+fn stale_plan(current_version: i32) -> AppError {
+    AppError::ConflictDetail {
+        message: "The plan changed since you read it; reload it and reapply your edits".to_string(),
+        detail: serde_json::json!({ "current_version": current_version }),
+    }
+}
+
+/// Fetch a pairing plan's version, or 404 if unknown.
+async fn plan_version(db: &sea_orm::DatabaseConnection, id: Uuid) -> AppResult<i32> {
+    let row = db
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT version FROM pairing_plans WHERE id = $1",
+            [id.into()],
+        ))
+        .await?
+        .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
+    Ok(row.try_get::<i32>("", "version")?)
+}
+
+#[derive(Deserialize)]
+pub struct ApplyPairingPlanRequest {
+    /// The version the client read. Applying a draft someone else has edited since is refused.
+    expected_version: i32,
 }
 
 /// Apply a pairing plan: execute all its pairings and backfills atomically. Marks the
@@ -2010,25 +2204,31 @@ pub async fn update_pairing_plan(
     post,
     path = "/api/sync/pairing-plans/{id}/apply",
     params(("id" = Uuid, Path, description = "Pairing plan UUID")),
+    request_body(content = Object),
     responses(
         (status = 200, description = "Plan applied with execution counts", body = Object),
         (status = 404, description = "Plan not found"),
-        (status = 409, description = "Plan already applied or reverted"),
+        (status = 409, description = "Plan already applied or reverted, or edited since the client read it", body = Object),
     ),
     tag = "sync"
 )]
 pub async fn apply_pairing_plan(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Json(req): Json<ApplyPairingPlanRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     // Validate synchronously for immediate feedback, then background the heavy entity-resolution +
     // readings backfill as a tracked job so the request doesn't block. The job's `detail` carries
     // the execution counts the UI used to read from the response.
     let status = plan_status(&state.db, id).await?;
     if status != "draft" {
-        return Err(AppError::BadRequest(format!(
+        return Err(AppError::Conflict(format!(
             "Plan is '{status}', can only apply 'draft' plans"
         )));
+    }
+    let version = plan_version(&state.db, id).await?;
+    if version != req.expected_version {
+        return Err(stale_plan(version));
     }
     // Unconfirmed instruments are the operator's decision, so the refusal belongs in the response
     // rather than in a failed job they have to go and read. `apply_plan` checks again: the job is
@@ -2088,7 +2288,7 @@ pub async fn revert_pairing_plan(
 ) -> AppResult<Json<serde_json::Value>> {
     let status = plan_status(&state.db, id).await?;
     if status != "applied" {
-        return Err(AppError::BadRequest(format!(
+        return Err(AppError::Conflict(format!(
             "Plan is '{status}', can only revert 'applied' plans"
         )));
     }

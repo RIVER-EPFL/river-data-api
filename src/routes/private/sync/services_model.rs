@@ -28,6 +28,10 @@ pub struct Model {
     /// minimum the runner floors at; generic CRUD must not write it around that check.
     #[crudcrate(exclude(create, update))]
     pub sync_interval_secs: Option<i32>,
+    /// Whether the weekly `sync_full_reassert` queues a `trigger_full_sync` for this service.
+    /// Set through `PATCH /sync/services/{id}`.
+    #[crudcrate(filterable, exclude(create, update))]
+    pub full_reassert_enabled: bool,
     #[crudcrate(sortable, exclude(create, update))]
     pub last_heartbeat: Option<DateTimeWithTimeZone>,
     pub last_sync_completed_at: Option<DateTimeWithTimeZone>,

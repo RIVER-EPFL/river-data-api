@@ -2,13 +2,16 @@ use crudcrate::EntityToModels;
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use super::operations::ReprocessingJobOperations;
+
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize, EntityToModels)]
 #[sea_orm(table_name = "reprocessing_jobs")]
 #[crudcrate(
     api_struct = "ReprocessingJob",
     name_singular = "reprocessing_job",
     name_plural = "reprocessing_jobs",
-    generate_router
+    generate_router,
+    operations = ReprocessingJobOperations
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
@@ -44,10 +47,21 @@ pub struct Model {
     /// Structured per-job summary + provenance (scope, time range, counts, source, samples).
     #[crudcrate(exclude(update, create))]
     pub detail: serde_json::Value,
+    /// What the run was asked to do, the object `worker::enqueue` stored and a rerun replays.
+    #[crudcrate(exclude(update, create))]
+    pub params: serde_json::Value,
     #[crudcrate(sortable, exclude(update, create))]
     pub created_at: DateTimeWithTimeZone,
     #[crudcrate(sortable, exclude(update, create))]
     pub completed_at: Option<DateTimeWithTimeZone>,
+    /// Whether `POST /reprocessing_jobs/{id}/rerun` accepts this row, from the registry's policy.
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(update, create))]
+    pub rerunnable: bool,
+    /// Whether `POST /reprocessing_jobs/{id}/cancel` accepts this row, from the registry's policy.
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(update, create))]
+    pub cancellable: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

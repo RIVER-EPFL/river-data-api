@@ -30,6 +30,10 @@ pub struct Model {
     #[sea_orm(column_type = "JsonBinary")]
     #[crudcrate(exclude(create, update), on_create = serde_json::Value::Array(Vec::new()))]
     pub curve_assignments: serde_json::Value,
+    /// Bumped by every edit. A PATCH or an apply names the version it read, so a second writer
+    /// on one draft is refused rather than carrying the first writer's decisions away.
+    #[crudcrate(exclude(create, update), on_create = 0)]
+    pub version: i32,
     #[crudcrate(sortable, exclude(create, update))]
     pub created_at: DateTimeWithTimeZone,
     #[crudcrate(sortable, exclude(create, update))]

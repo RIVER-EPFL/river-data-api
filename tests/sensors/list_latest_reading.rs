@@ -39,7 +39,7 @@ async fn create_sensor(fx: &Fixture, serial_number: &str) -> String {
 
 async fn sensor_row(fx: &Fixture, id: &str) -> serde_json::Value {
     let (status, body) =
-        crate::common::get_json_with_token(&fx.app, "/api/sensors?page_size=100", &fx.token).await;
+        crate::common::get_json_with_token(&fx.app, "/api/sensors?page=1&per_page=100", &fx.token).await;
     assert_eq!(status, 200, "sensors list ({status}): {body}");
     body.as_array()
         .expect("array body")

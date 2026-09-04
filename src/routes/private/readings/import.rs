@@ -924,6 +924,28 @@ pub async fn import_csv(
             .unwrap_or(stream_cache[parameter_id])
     };
 
+    // The instrument each candidate target channel carries, for the rows the slot's deployment
+    // window does not attribute: an imported measurement names what produced it either way.
+    let stream_sensors: HashMap<Uuid, Uuid> = {
+        let mut ids: Vec<Uuid> = stream_cache.values().copied().collect();
+        ids.extend(overlap.owning_stream.values().copied());
+        ids.sort_unstable();
+        ids.dedup();
+        let mut map = HashMap::new();
+        for row in state
+            .db
+            .query_all_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT id, sensor_id FROM data_streams WHERE id = ANY($1) AND sensor_id IS NOT NULL",
+                [ids.into()],
+            ))
+            .await?
+        {
+            map.insert(row.try_get::<Uuid>("", "id")?, row.try_get::<Uuid>("", "sensor_id")?);
+        }
+        map
+    };
+
     let staged: Vec<StagedRow> = rows
         .iter()
         .map(|(parameter_id, time, value, _)| {
@@ -931,8 +953,9 @@ pub async fn import_csv(
                 .get(&(*parameter_id, *time))
                 .cloned()
                 .unwrap_or_default();
+            let stream_id = write_target(parameter_id, time);
             StagedRow {
-                stream_id: write_target(parameter_id, time),
+                stream_id,
                 site_id,
                 parameter_id: *parameter_id,
                 time: *time,
@@ -940,7 +963,9 @@ pub async fn import_csv(
                 // Sensor and deployment are physical facts about the slot at that time and stay
                 // stamped either way; the calibration is a claim the row's value is uncorrected
                 // input, which only a declared-raw import may make.
-                sensor_id: owner.sensor_id,
+                sensor_id: owner
+                    .sensor_id
+                    .or_else(|| stream_sensors.get(&stream_id).copied()),
                 calibration_id: match req.values {
                     CsvValueState::Raw => owner.calibration_id,
                     CsvValueState::Corrected => None,

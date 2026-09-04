@@ -51,15 +51,138 @@ pub trait Job: Send + Sync {
         None
     }
 
-    /// Validate operator-supplied tunables before they are persisted onto a schedule or job.
-    /// Default accepts anything; jobs with tunables override to reject bad values.
-    fn validate(&self, _tunables: &serde_json::Value) -> Result<(), String> {
-        Ok(())
+    /// The operator-settable inputs this job reads. The default is none, which is what makes the
+    /// default [`Job::validate`] refuse every key.
+    fn tunables(&self) -> Vec<TunableSpec> {
+        Vec::new()
+    }
+
+    /// Validate operator-supplied tunables before they are persisted onto a schedule or job. A job
+    /// that declares no tunables reads none, so the default refuses every key rather than saving a
+    /// misspelling nothing will ever act on.
+    fn validate(&self, tunables: &serde_json::Value) -> Result<(), String> {
+        validate_against_specs(tunables, &self.tunables())
     }
 
     /// Execute one run. Inputs come from the job row via `ctx`; the returned count is recorded as
     /// `readings_updated` on completion.
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr>;
+}
+
+/// What one operator-settable input a job accepts looks like: enough for a form to build a field
+/// and for the server to refuse a value the job would not read.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct TunableSpec {
+    pub key: &'static str,
+    pub kind: TunableKind,
+    /// Inclusive bounds for an integer or a duration in seconds.
+    pub min: Option<i64>,
+    pub max: Option<i64>,
+    pub default: serde_json::Value,
+    pub help: &'static str,
+}
+
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum TunableKind {
+    Integer,
+    Boolean,
+    /// A count of seconds, rendered as a duration.
+    Duration,
+    Enum {
+        options: Vec<&'static str>,
+    },
+}
+
+/// Whether a value satisfies its spec. The message names the key and what it takes.
+fn check_tunable(spec: &TunableSpec, value: &serde_json::Value) -> Result<(), String> {
+    let key = spec.key;
+    match &spec.kind {
+        TunableKind::Integer | TunableKind::Duration => {
+            let Some(n) = value.as_i64() else {
+                return Err(format!("{key} must be an integer"));
+            };
+            if spec.min.is_some_and(|min| n < min) || spec.max.is_some_and(|max| n > max) {
+                return Err(match (spec.min, spec.max) {
+                    (Some(min), Some(max)) => format!("{key} must be between {min} and {max}"),
+                    (Some(min), None) => format!("{key} must be at least {min}"),
+                    (None, Some(max)) => format!("{key} must be at most {max}"),
+                    (None, None) => unreachable!("a bound was exceeded, so one is set"),
+                });
+            }
+            Ok(())
+        }
+        TunableKind::Boolean => value
+            .as_bool()
+            .map(|_| ())
+            .ok_or_else(|| format!("{key} must be true or false")),
+        TunableKind::Enum { options } => {
+            let Some(s) = value.as_str() else {
+                return Err(format!("{key} must be one of: {}", options.join(", ")));
+            };
+            if options.contains(&s) {
+                Ok(())
+            } else {
+                Err(format!("{key} must be one of: {}", options.join(", ")))
+            }
+        }
+    }
+}
+
+/// Validate an operator's tunables object against a job's declared specs: unknown keys are refused
+/// naming them, and every value present must satisfy its spec. A null or empty object is no
+/// tunables at all, which every job accepts.
+pub fn validate_against_specs(
+    tunables: &serde_json::Value,
+    specs: &[TunableSpec],
+) -> Result<(), String> {
+    let known: Vec<&str> = specs.iter().map(|s| s.key).collect();
+    reject_unknown_tunables(tunables, &known)?;
+    let Some(obj) = tunables.as_object() else {
+        return Ok(());
+    };
+    for spec in specs {
+        if let Some(value) = obj.get(spec.key) {
+            check_tunable(spec, value)?;
+        }
+    }
+    Ok(())
+}
+
+/// A job accepts exactly the keys it reads. Anything else is a misspelling that would be saved,
+/// audited and never acted on, so it is refused naming both what arrived and what is accepted.
+///
+/// A null or empty object is no tunables at all, which every job accepts.
+pub fn reject_unknown_tunables(
+    tunables: &serde_json::Value,
+    known: &[&str],
+) -> Result<(), String> {
+    if tunables.is_null() {
+        return Ok(());
+    }
+    let Some(obj) = tunables.as_object() else {
+        return Err("tunables must be a JSON object".to_string());
+    };
+    let unknown: Vec<&str> = obj
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !known.contains(k))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    if known.is_empty() {
+        Err(format!(
+            "this job takes no tunables, but got: {}",
+            unknown.join(", ")
+        ))
+    } else {
+        Err(format!(
+            "unknown tunable(s): {}; this job takes: {}",
+            unknown.join(", "),
+            known.join(", ")
+        ))
+    }
 }
 
 /// Name-keyed set of all known job kinds, built once at startup and shared read-only with the

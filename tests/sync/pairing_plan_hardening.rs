@@ -62,10 +62,10 @@ async fn apply_and_wait(
     token: &str,
     plan_id: Uuid,
 ) {
-    let (status, text) = crate::common::post_json_with_token(
+    let (status, text) = crate::common::post_plan_action_with_token(
         app,
-        &format!("/api/sync/pairing-plans/{plan_id}/apply"),
-        &serde_json::json!({}),
+        &plan_id.to_string(),
+        "apply",
         token,
     )
     .await;
@@ -218,9 +218,9 @@ async fn patch_rename_reclassifies_entry_and_recomputes_warnings() {
     assert_eq!(entry["warnings"], serde_json::json!([]));
 
     // Mapping to an existing parameter with different units resolves the id and adds a warning
-    let (status, text) = crate::common::patch_json_with_token(
+    let (status, text) = crate::common::patch_plan_with_token(
         &app,
-        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &plan_id.to_string(),
         &serde_json::json!({ "updates": [{ "stream_id": stream_id, "parameter_name": "Water Temperature" }] }),
         &token,
     )
@@ -239,9 +239,9 @@ async fn patch_rename_reclassifies_entry_and_recomputes_warnings() {
     );
 
     // Renaming away from the mismatch clears the warning and marks the parameter as new
-    let (status, text) = crate::common::patch_json_with_token(
+    let (status, text) = crate::common::patch_plan_with_token(
         &app,
-        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &plan_id.to_string(),
         &serde_json::json!({ "updates": [{ "stream_id": stream_id, "parameter_name": "Brand New Param" }] }),
         &token,
     )
@@ -290,9 +290,9 @@ async fn pair_action_on_empty_parameter_name_is_rejected() {
     assert_eq!(status, 200, "create plan failed: {plan}");
     let plan_id = plan["id"].as_str().unwrap().to_string();
 
-    let (status, text) = crate::common::patch_json_with_token(
+    let (status, text) = crate::common::patch_plan_with_token(
         &app,
-        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &plan_id.to_string(),
         &serde_json::json!({ "updates": [{ "stream_id": patched, "action": "pair" }] }),
         &token,
     )
@@ -593,9 +593,9 @@ async fn remap_to_existing_site_does_not_backfill_stream_coordinates() {
     assert_eq!(status, 200, "create plan failed: {plan}");
     let plan_id: Uuid = plan["id"].as_str().unwrap().parse().unwrap();
 
-    let (status, text) = crate::common::patch_json_with_token(
+    let (status, text) = crate::common::patch_plan_with_token(
         &app,
-        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &plan_id.to_string(),
         &serde_json::json!({ "updates": [{ "stream_id": stream_id, "site_name": "Bare Station" }] }),
         &token,
     )
@@ -883,6 +883,348 @@ async fn an_undisputed_family_stays_undeclared_through_apply() {
         declared, None,
         "apply writes no divisor the review did not choose"
     );
+
+    crate::common::cleanup_test_db(&db).await;
+}
+
+/// The draft is the operator's way back into a review, so the list must be filterable by source
+/// and status and must not carry every draft's `entries` document with it.
+#[tokio::test]
+#[serial]
+async fn plan_listing_filters_by_source_and_status_without_entries() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let entries = serde_json::json!([]);
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let other_source = Uuid::new_v4();
+    insert_plan(&db, first, &entries).await;
+    insert_plan(&db, second, &entries).await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO pairing_plans (id, source_system, status, summary, entries) \
+             VALUES ('{other_source}', 'elsewhere', 'draft', '{{}}'::jsonb, '[]'::jsonb)"
+        ),
+    )
+    .await;
+
+    let (status, body) = crate::common::get_json_with_token(
+        &app,
+        "/api/sync/pairing-plans?source_system=hardening&status=draft",
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "listing failed: {body}");
+    let rows = body.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "only the source's drafts: {body}");
+    for row in rows {
+        assert!(
+            row.get("entries").is_none(),
+            "the listing is a projection, not every draft's document: {row}"
+        );
+        assert!(row.get("summary").is_some(), "the summary is what it shows: {row}");
+    }
+
+    let (status, body) =
+        crate::common::get_json_with_token(&app, "/api/sync/pairing-plans", &token).await;
+    assert_eq!(status, 200, "unfiltered listing failed: {body}");
+    assert_eq!(
+        body.as_array().unwrap().len(),
+        3,
+        "no filter lists every plan: {body}"
+    );
+
+    crate::common::cleanup_test_db(&db).await;
+}
+
+/// Start over supersedes the draft it replaces, and a superseded draft can no longer be applied.
+#[tokio::test]
+#[serial]
+async fn superseded_plan_is_refused_by_apply() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let plan_id = Uuid::new_v4();
+    insert_plan(&db, plan_id, &serde_json::json!([])).await;
+
+    let (status, text) = crate::common::post_plan_action_with_token(
+        &app,
+        &plan_id.to_string(),
+        "supersede",
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "supersede failed: {text}");
+    assert_eq!(
+        scalar_opt_string(
+            &db,
+            &format!("SELECT status AS v FROM pairing_plans WHERE id = '{plan_id}'")
+        )
+        .await,
+        Some("superseded".to_string())
+    );
+
+    let (status, text) = crate::common::post_plan_action_with_token(
+        &app,
+        &plan_id.to_string(),
+        "apply",
+        &token,
+    )
+    .await;
+    assert!(
+        !(200..300).contains(&status),
+        "a superseded draft is not appliable: {text}"
+    );
+
+    let (status, text) = crate::common::patch_json_with_token(
+        &app,
+        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &serde_json::json!({ "expected_version": 0, "updates": [] }),
+        &token,
+    )
+    .await;
+    assert!(!(200..300).contains(&status), "nor editable: {text}");
+
+    crate::common::cleanup_test_db(&db).await;
+}
+
+/// Two reviewers on one draft: the second write of a pair carrying the same version is refused,
+/// so neither carries the other's decisions away without being told.
+#[tokio::test]
+#[serial]
+async fn concurrent_plan_edits_conflict_on_the_version_they_read() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let first_stream = Uuid::new_v4();
+    let second_stream = Uuid::new_v4();
+    for (stream, key, parameter) in [
+        (first_stream, "conc-1", "Depth"),
+        (second_stream, "conc-2", "CDOM"),
+    ] {
+        crate::common::seed_unpaired_stream_with_hierarchy(
+            &db,
+            &stream.to_string(),
+            "hardening",
+            key,
+            "Test River Project",
+            "Upstream Station",
+            parameter,
+            "mm",
+            None,
+            1,
+        )
+        .await;
+    }
+
+    let (status, plan) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sync/pairing-plans",
+        &serde_json::json!({ "source_system": "hardening" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "create plan failed: {plan}");
+    let plan_id = Uuid::parse_str(plan["id"].as_str().unwrap()).unwrap();
+    let version = plan["version"].as_i64().expect("a plan carries its version");
+
+    let (status, first) = crate::common::patch_json_parse_with_token(
+        &app,
+        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &serde_json::json!({
+            "expected_version": version,
+            "updates": [{ "stream_id": first_stream, "action": "skip" }],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "the first write lands: {first}");
+    assert_eq!(
+        first["version"].as_i64(),
+        Some(version + 1),
+        "an edit bumps the version: {first}"
+    );
+
+    let (status, text) = crate::common::patch_json_with_token(
+        &app,
+        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &serde_json::json!({
+            "expected_version": version,
+            "updates": [{ "stream_id": second_stream, "action": "skip" }],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 409, "the second write of the pair is refused: {text}");
+
+    let (status, plan) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{plan}");
+    assert_eq!(
+        entry_for(&plan, first_stream)["action"],
+        serde_json::json!("skip"),
+        "the first writer's decision stands"
+    );
+    assert_eq!(
+        entry_for(&plan, second_stream)["action"],
+        serde_json::json!("pair"),
+        "and the refused write changed nothing"
+    );
+
+    // Applying against a version someone else has moved past is the same conflict.
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/sync/pairing-plans/{plan_id}/apply"),
+        &serde_json::json!({ "expected_version": version }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 409, "a stale apply is refused: {text}");
+
+    crate::common::cleanup_test_db(&db).await;
+}
+
+/// A plan that is no longer a draft is a conflict, which is what the route has always documented.
+#[tokio::test]
+#[serial]
+async fn non_draft_plan_refusals_are_conflicts() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let plan_id = Uuid::new_v4();
+    insert_plan(&db, plan_id, &serde_json::json!([])).await;
+    crate::common::exec(
+        &db,
+        &format!("UPDATE pairing_plans SET status = 'applied' WHERE id = '{plan_id}'"),
+    )
+    .await;
+
+    let (status, text) = crate::common::patch_json_with_token(
+        &app,
+        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &serde_json::json!({ "expected_version": 0, "updates": [] }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 409, "an applied plan is not editable: {text}");
+
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/sync/pairing-plans/{plan_id}/apply"),
+        &serde_json::json!({ "expected_version": 0 }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 409, "nor appliable a second time: {text}");
+
+    crate::common::cleanup_test_db(&db).await;
+}
+
+/// A plan-wide decision is one predicate on the wire: skip everything the catalog did not
+/// recognise, without a line per entry, and pair back exactly that set with the opposite action.
+#[tokio::test]
+#[serial]
+async fn a_bulk_decision_moves_every_entry_its_predicate_selects() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    // Two streams the catalog knows, one it does not.
+    let known_a = Uuid::new_v4();
+    let known_b = Uuid::new_v4();
+    let unknown = Uuid::new_v4();
+    for (stream, key, site, parameter) in [
+        (known_a, "bulk-1", "Upstream Station", "Depth"),
+        (known_b, "bulk-2", "Upstream Station", "Water Temperature"),
+        (unknown, "bulk-3", "Nowhere Station", "Unheard Of"),
+    ] {
+        crate::common::seed_unpaired_stream_with_hierarchy(
+            &db,
+            &stream.to_string(),
+            "hardening",
+            key,
+            "Test River Project",
+            site,
+            parameter,
+            "mm",
+            None,
+            1,
+        )
+        .await;
+    }
+
+    let (status, plan) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sync/pairing-plans",
+        &serde_json::json!({ "source_system": "hardening" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "create plan failed: {plan}");
+    let plan_id = Uuid::parse_str(plan["id"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        entry_for(&plan, unknown)["confidence"],
+        serde_json::json!("none"),
+        "the unknown station is what the predicate selects"
+    );
+
+    let (status, body) = crate::common::patch_plan_with_token(
+        &app,
+        &plan_id.to_string(),
+        &serde_json::json!({ "bulk": { "where": { "confidence": "none" }, "action": "skip" } }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "the bulk skip lands: {body}");
+    let plan: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(entry_for(&plan, unknown)["action"], serde_json::json!("skip"));
+    for stream in [known_a, known_b] {
+        assert_eq!(
+            entry_for(&plan, stream)["action"],
+            serde_json::json!("pair"),
+            "an entry the predicate does not select is untouched"
+        );
+    }
+
+    let (status, body) = crate::common::patch_plan_with_token(
+        &app,
+        &plan_id.to_string(),
+        &serde_json::json!({ "bulk": { "where": { "confidence": "none" }, "action": "pair" } }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "and the opposite action reverses it: {body}");
+    let plan: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(entry_for(&plan, unknown)["action"], serde_json::json!("pair"));
+
+    let (status, body) = crate::common::patch_plan_with_token(
+        &app,
+        &plan_id.to_string(),
+        &serde_json::json!({ "bulk": { "where": {}, "action": "abandon" } }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 400, "an action that is neither pair nor skip: {body}");
 
     crate::common::cleanup_test_db(&db).await;
 }

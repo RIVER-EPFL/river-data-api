@@ -810,3 +810,115 @@ async fn a_pinned_instrument_survives_reprocess_and_a_rolled_back_pin_returns_th
     .await;
     assert_eq!(status, 400, "{body}");
 }
+
+/// Every key the record and the reading disagree about, as the janitor counts them.
+async fn drift_keys(db: &DatabaseConnection) -> Vec<(Uuid, i16)> {
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            decisions::inconsistent_rows_sql(),
+        ))
+        .await
+        .expect("the drift statement runs");
+    rows.iter()
+        .map(|r| {
+            (
+                r.try_get("", "stream_id").unwrap(),
+                r.try_get("", "replicate_index").unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+#[serial]
+async fn the_columns_equal_the_fold_of_the_decisions_that_wrote_them() {
+    let f = setup().await;
+    seed_group(&f, &[1.0, 2.0, 3.0]).await;
+    assert!(
+        drift_keys(&f.db).await.is_empty(),
+        "rows nothing has decided are born consistent"
+    );
+
+    let flag = record(
+        &f.db,
+        decision(
+            &f,
+            Kind::Flag,
+            Some(0),
+            serde_json::json!({ "reason": "spike" }),
+        ),
+    )
+    .await;
+    record(
+        &f.db,
+        decision(&f, Kind::Unflag, Some(1), serde_json::json!({})),
+    )
+    .await;
+    record(
+        &f.db,
+        decision(
+            &f,
+            Kind::Withdraw,
+            Some(1),
+            serde_json::json!({ "reason": "absent from source window" }),
+        ),
+    )
+    .await;
+    record(
+        &f.db,
+        decision(&f, Kind::UnverifiedEntry, Some(2), serde_json::json!({})),
+    )
+    .await;
+    record(
+        &f.db,
+        decision(&f, Kind::Verify, Some(2), serde_json::json!({})),
+    )
+    .await;
+    // A group decision covers every replicate, so the fold must read it for each of them.
+    record(
+        &f.db,
+        decision(
+            &f,
+            Kind::Withdraw,
+            None,
+            serde_json::json!({ "reason": "the whole instant" }),
+        ),
+    )
+    .await;
+    record(
+        &f.db,
+        decision(&f, Kind::Reassert, Some(0), serde_json::json!({})),
+    )
+    .await;
+    assert!(
+        drift_keys(&f.db).await.is_empty(),
+        "the projection is the fold after every kind that writes an owned column"
+    );
+
+    bulk_write::guarded(&f.db, async |txn| {
+        decisions::rollback(txn, flag, "tester", Some("undone")).await
+    })
+    .await
+    .expect("the flag rolls back");
+    assert!(
+        drift_keys(&f.db).await.is_empty(),
+        "a rollback restores exactly what the fold then expects"
+    );
+
+    // A column moved out of band, which is the projection bug the sweep exists to see.
+    crate::common::exec(
+        &f.db,
+        &format!(
+            "UPDATE readings SET is_flagged = TRUE WHERE stream_id = '{}' AND time = '{AT}' \
+             AND replicate_index = 2",
+            f.stream
+        ),
+    )
+    .await;
+    assert_eq!(
+        drift_keys(&f.db).await,
+        vec![(f.stream, 2)],
+        "the flagged row with no live flag decision is the only key reported"
+    );
+}

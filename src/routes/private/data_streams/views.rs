@@ -639,6 +639,27 @@ pub async fn register_stream(
         stream = active.update(&state.db).await?;
     }
 
+    // Every feed carries an instrument from the moment it is discovered: a reading whose
+    // instrument is unknown has lost its provenance, and the only point where nothing is missing
+    // yet is registration. The source's own identity decides which one (the channel for a device
+    // feed, the source's parameter instrument otherwise), so a later pairing plan reports the
+    // instrument the stream already names rather than asking for one.
+    if stream.sensor_id.is_none() {
+        let hierarchy = crate::routes::private::sync::service::extract_hierarchy(&stream);
+        let name_hint = (!hierarchy.site.is_empty() && !hierarchy.parameter.is_empty())
+            .then(|| format!("{} {}", hierarchy.site, hierarchy.parameter));
+        crate::routes::private::sensors::operations::resolve_or_mint_stream_instrument(
+            &state.db,
+            &stream,
+            name_hint.as_deref(),
+        )
+        .await?;
+        stream = data_streams::Entity::find_by_id(stream.id)
+            .one(&state.db)
+            .await?
+            .ok_or_else(|| AppError::Internal("Failed to re-fetch registered stream".to_string()))?;
+    }
+
     // A feed that describes its device can report a different one than the instrument it is
     // attached to was minted with, which is a probe swap. The channel is the identity, so nothing
     // forks: the serials are refreshed and the change goes to the review queue for an operator.
@@ -868,12 +889,12 @@ pub async fn pair_stream(
             )
             .await?;
 
-            // Create/reuse the sensor, then re-read the stream: it may have gained a sensor_id. A
-            // stream carrying no device identity keeps NULL attribution rather than minting one.
+            // Create/reuse the sensor, then re-read the stream: it has gained a sensor_id. Pairing
+            // never completes without an instrument: a slot's readings must name what measured them.
             let sensor_ctx =
                 create_sensor_for_stream(txn, &stream, sp.parameter_id, sp.site_id).await?;
-            let sensor_id = sensor_ctx.as_ref().map(|c| c.sensor_id);
-            let deployment_id = sensor_ctx.as_ref().and_then(|c| c.deployment_id);
+            let sensor_id = Some(sensor_ctx.sensor_id);
+            let deployment_id = sensor_ctx.deployment_id;
             let stream = data_streams::Entity::find_by_id(stream_id)
                 .one(txn)
                 .await?
