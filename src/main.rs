@@ -28,6 +28,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load configuration (fail-fast)
     let config = Config::from_env()?;
+    // The session-token cache window follows the configured token lifetime, so a short lifetime
+    // cannot leave the heartbeat handing out tokens the database has already dropped.
+    crate::routes::private::sync::control::heartbeat::init_session_token_cache_ttl(
+        config.sync_session_token_ttl_secs,
+    );
     tracing::info!(
         deployment = ?config.deployment,
         host = %config.api_host,
@@ -37,25 +42,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Connect to database with pool tuning (fail-fast)
     tracing::info!("Connecting to database...");
-    let mut db_opts = ConnectOptions::new(&config.database_url);
-    db_opts
-        .max_connections(config.db_max_connections)
-        .min_connections(config.db_min_connections)
-        .connect_timeout(Duration::from_secs(5))
-        // Without an explicit acquire timeout SeaORM reuses connect_timeout, so a saturated pool
-        // fails callers after 5s instead of queueing them behind a burst. 30s means a burst
-        // degrades to latency, not to 500s.
-        .acquire_timeout(Duration::from_secs(30))
-        // A backend's first query against the readings hypertable plans in ~240ms while it loads
-        // TimescaleDB's chunk metadata, and ~5ms after. Long enough that the warm set survives a
-        // quiet period rather than being recycled into cold connections.
-        .idle_timeout(Duration::from_secs(1800))
-        .sqlx_logging(false)
-        .set_schema_search_path("public");
-    let db = Database::connect(db_opts).await?;
+    let db = river_db::common::db_pool::connect_request_pool(&config).await?;
+    // Migrations and the job worker run for minutes, so they never draw from the pool carrying the
+    // request statement timeout.
+    let background_db = river_db::common::db_pool::connect_background_pool(&config).await?;
     tracing::info!(
         max_connections = config.db_max_connections,
         min_connections = config.db_min_connections,
+        statement_timeout_seconds = config.request_timeout_seconds,
         "Database connection pool established"
     );
 
@@ -108,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     lock_db
         .execute_unprepared("SELECT pg_advisory_lock(8526340921)")
         .await?;
-    let migrate_result = migration::Migrator::up(&db, None).await;
+    let migrate_result = migration::Migrator::up(&background_db, None).await;
     let _ = lock_db
         .execute_unprepared("SELECT pg_advisory_unlock(8526340921)")
         .await;
@@ -116,40 +110,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     migrate_result?;
     tracing::info!("Migrations completed");
 
-    // Statement timeout as defense-in-depth against runaway queries, set only once migrations are
-    // done. A migration that moves data legitimately runs for minutes, and the migrator draws from
-    // this pool, so a ceiling meant for request handling could otherwise abort one — and because
-    // Postgres runs every pending migration of a batch in a single transaction, that abort rolls
-    // back the whole batch. Migrations that need a wider ceiling still set their own `SET LOCAL`;
-    // this ordering is what keeps that from being something each one has to remember.
-    db.execute(sea_orm::Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        "SET statement_timeout = '30s'".to_string(),
-    ))
-    .await?;
-    tracing::info!("Statement timeout set to 30s");
-
-    // Worker-pool jobs left mid-flight by a dead process are recovered by the lease reaper (they
-    // carry a lease). In-process jobs do not carry a lease, so reap this replica's own leaseless
-    // orphans on boot, before any in-process job of this incarnation is spawned.
-    match river_db::routes::private::reprocessing_jobs::lifecycle::reconcile_orphaned_inline_jobs(
-        &db,
-    )
-    .await
-    {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(reclaimed = n, "Reaped orphaned in-process jobs on startup"),
-        Err(e) => tracing::warn!(error = %e, "Startup orphaned-job reconcile failed"),
-    }
-
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         shutdown_signal().await;
         let _ = shutdown_tx.send(true);
     });
 
-    river_db::routes::private::sensors::calibrations::service::set_job_retry_policy(
-        river_db::routes::private::sensors::calibrations::service::RetryPolicy {
+    river_db::routes::private::reprocessing_jobs::lifecycle::set_job_retry_policy(
+        river_db::routes::private::reprocessing_jobs::lifecycle::RetryPolicy {
             max_retries: config.job_max_retries,
             backoff_base: Duration::from_secs(config.job_retry_backoff_seconds),
         },
@@ -178,7 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     tokio::spawn({
-        let db = db.clone();
+        let db = background_db.clone();
         let events = state.events.clone();
         let registry = registry.clone();
         let mut shutdown_rx = shutdown_rx.clone();

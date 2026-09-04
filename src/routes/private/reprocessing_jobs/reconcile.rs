@@ -41,7 +41,7 @@ pub async fn family_pairs<C: ConnectionTrait>(
     source_system: &str,
 ) -> Result<Vec<FamilyPair>, DbErr> {
     let rows = conn
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT n.id AS new_id, n.source_key AS new_key,
                     n.site_parameter_id IS NOT NULL AS new_paired,
@@ -95,7 +95,7 @@ async fn verify_family<C: ConnectionTrait>(
 ) -> Result<VerifyOutcome, DbErr> {
     let bound = bound_sql("served.v", "o.v", "$3");
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "WITH o AS (
@@ -138,7 +138,7 @@ async fn mismatch_examples<C: ConnectionTrait>(
 ) -> Result<Vec<serde_json::Value>, DbErr> {
     let bound = bound_sql("served.v", "o.v", "$3");
     let rows = conn
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "WITH o AS (
@@ -187,7 +187,7 @@ async fn missing_instants<C: ConnectionTrait>(
     new_id: Uuid,
 ) -> Result<i64, DbErr> {
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT COUNT(*)::bigint AS missing
              FROM readings o
@@ -212,14 +212,14 @@ async fn cutover_family(
     rel_tol: f64,
 ) -> AppResult<VerifyOutcome> {
     bulk_write::guarded(db, async |txn| {
-        txn.execute(Statement::from_string(
+        txn.execute_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SET LOCAL lock_timeout = '5s'".to_owned(),
         ))
         .await?;
 
         let slot = txn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT site_id, parameter_id FROM site_parameters WHERE id = $1",
                 [site_parameter_id.into()],
@@ -232,7 +232,7 @@ async fn cutover_family(
         let parameter_id: Uuid = slot.try_get("", "parameter_id")?;
 
         let claimed = txn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "UPDATE data_streams
                  SET site_parameter_id = $1, paired_at = NOW(), updated_at = NOW()
@@ -266,9 +266,7 @@ async fn cutover_family(
         )
         .await?;
 
-        // The replicate spec is the writer's declaration that these groups are collection events,
-        // so a single-replicate instant still forms its samples row, as on declared ingest.
-        sample_groups::materialise_samples(txn, "r.stream_id = $1", vec![pair.new_id.into()], true)
+        sample_groups::materialise_samples(txn, "r.stream_id = $1", vec![pair.new_id.into()])
             .await?;
 
         // Trigger-computed verification: the row triggers have populated samples.mean inside this
@@ -310,7 +308,7 @@ async fn stray_member_streams<C: ConnectionTrait>(
     source_system: &str,
 ) -> Result<Vec<String>, DbErr> {
     let rows = conn
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT o.source_key
              FROM data_streams n
@@ -547,13 +545,13 @@ impl Job for ReplicateReconciliationDelete {
                 )
                 .await?
                 .rows;
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "DELETE FROM status_events WHERE stream_id = $1",
                     [pair.old_id.into()],
                 ))
                 .await?;
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "DELETE FROM data_streams WHERE id = $1",
                     [pair.old_id.into()],

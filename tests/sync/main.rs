@@ -7,14 +7,17 @@
 mod common;
 
 mod annotations_register;
+mod bulk_pair;
 mod control_plane;
 mod credential_listing_gate;
 mod credentials;
+mod duplicate_slots;
 mod hold_kinds;
 mod pagination;
 mod pagination_bounds;
 mod pairing_plan_apply;
 mod pairing_plan_hardening;
+mod plan_instrument_decisions;
 mod replicate_audit;
 mod replicate_flag_indexes;
 mod routes_surface;

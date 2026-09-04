@@ -32,7 +32,7 @@ pub async fn measurement_types_for_sensors<C: ConnectionTrait>(
         return Ok(HashMap::new());
     }
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT id, data_frequency FROM sensors WHERE id = ANY($1)",
             [sensor_ids.to_vec().into()],

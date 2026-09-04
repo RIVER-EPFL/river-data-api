@@ -43,7 +43,7 @@ async fn create_sensor(app: &axum::Router, token: &str, serial: &str) -> String 
 
 async fn sensor_count(db: &sea_orm::DatabaseConnection) -> i64 {
     use sea_orm::{ConnectionTrait, Statement};
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         "SELECT count(*) AS c FROM sensors".to_string(),
     ))
@@ -293,4 +293,84 @@ async fn an_unrestricted_caller_still_claims_undeployed_inventory() {
         .is_ok(),
         "an unconfined caller reaches inventory that is deployed nowhere yet"
     );
+}
+
+/// Scenario: a probe is replaced on a logger, so the feed re-registers reporting a different
+/// `probe_serial` on the same channel.
+///
+/// Expected behaviour: nothing forks. The channel is the instrument's identity and an upstream
+/// metadata correction is indistinguishable from a physical change, so an automatic fork would
+/// silently re-attribute history. The serials on the instrument are refreshed, being information
+/// rather than identity, and the change is raised in the review queue for an operator to act on.
+#[tokio::test]
+#[serial]
+async fn a_changed_probe_serial_refreshes_the_instrument_and_raises_a_hold() {
+    let (app, token, db) = setup().await;
+    let sensor_id = create_sensor(&app, &token, "SWAP-0001").await;
+
+    let register = async |probe: &str| {
+        let body = json!({
+            "source_system": "vaisala",
+            "source_key": "swap-1",
+            "sensor_id": sensor_id,
+            "metadata": {
+                "device": { "logger_serial": "SWAP-0001", "probe_serial": probe },
+            },
+        });
+        crate::common::post_json_parse_with_token(&app, "/api/streams/register", &body, &token).await
+    };
+
+    let (status, stream) = register("PROBE-A").await;
+    assert!((200..300).contains(&status), "register: {stream}");
+
+    // The first registration mints nothing new; the declared instrument carries the reported probe.
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE sensors SET metadata = '{{\"source_probe_serial\": \"PROBE-A\", \
+              \"source_device_serial\": \"SWAP-0001\"}}'::jsonb WHERE id = '{sensor_id}'"
+        ),
+    )
+    .await;
+
+    let (status, stream) = register("PROBE-B").await;
+    assert!((200..300).contains(&status), "re-register: {stream}");
+    let stream_id = stream["id"].as_str().expect("stream id");
+
+    let sensors = sensor_count(&db).await;
+    let stored = scalar_text(
+        &db,
+        &format!("SELECT metadata ->> 'source_probe_serial' AS v FROM sensors WHERE id = '{sensor_id}'"),
+    )
+    .await;
+    assert_eq!(
+        stored.as_deref(),
+        Some("PROBE-B"),
+        "the instrument's recorded probe follows the feed, {sensors} sensors exist"
+    );
+
+    let kind = scalar_text(
+        &db,
+        &format!(
+            "SELECT kind AS v FROM replicate_audit_holds \
+             WHERE stream_id = '{stream_id}' AND status = 'pending'"
+        ),
+    )
+    .await;
+    assert_eq!(
+        kind.as_deref(),
+        Some("source_identity_changed"),
+        "the swap is put in front of an operator rather than applied silently"
+    );
+}
+
+async fn scalar_text(db: &sea_orm::DatabaseConnection, sql: &str) -> Option<String> {
+    use sea_orm::{ConnectionTrait, Statement};
+    db.query_one_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql.to_string(),
+    ))
+    .await
+    .expect("query")
+    .and_then(|row| row.try_get::<Option<String>>("", "v").ok().flatten())
 }

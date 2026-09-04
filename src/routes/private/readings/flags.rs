@@ -7,9 +7,12 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::aggregates::{self, Window};
 use crate::common::authz::AccessScope;
-use crate::common::bulk_write::{self, TouchedRange};
+use crate::common::bulk_write;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::error::{AppError, AppResult};
+use crate::routes::private::collection_events::recompute;
+use crate::routes::private::readings::decisions::{self, Kind, Origin};
+use crate::routes::private::tools::scripts::actor_label;
 
 /// Keys per statement. A statement is one OR-chain, and each term carries `time = $n` equality, so
 /// chunk exclusion prunes; the bound is on statement size, not on correctness.
@@ -54,31 +57,48 @@ enum FlagWrite {
 }
 
 impl FlagWrite {
-    fn assignment(&self) -> &'static str {
+    fn kind(&self) -> Kind {
         match self {
-            FlagWrite::Set(_) => "is_flagged = TRUE, flag_reason = $1",
-            FlagWrite::Clear => "is_flagged = FALSE, flag_reason = NULL",
+            FlagWrite::Set(_) => Kind::Flag,
+            FlagWrite::Clear => Kind::Unflag,
         }
     }
 
-    /// Values bound before the key placeholders, and therefore the offset the keys start at.
-    fn leading_values(&self) -> Vec<sea_orm::Value> {
+    fn new_value(&self) -> serde_json::Value {
         match self {
-            FlagWrite::Set(reason) => vec![reason.clone().into()],
-            FlagWrite::Clear => Vec::new(),
+            FlagWrite::Set(reason) => serde_json::json!({ "reason": reason }),
+            FlagWrite::Clear => serde_json::json!({}),
+        }
+    }
+
+    fn reason(&self) -> Option<&str> {
+        match self {
+            FlagWrite::Set(reason) => Some(reason.as_str()),
+            FlagWrite::Clear => None,
+        }
+    }
+
+    /// Rows already in the requested state are not decided again.
+    fn state_predicate(&self) -> &'static str {
+        match self {
+            FlagWrite::Set(_) => "r.is_flagged IS NOT TRUE",
+            FlagWrite::Clear => "r.is_flagged IS TRUE",
         }
     }
 }
 
 /// Flag or unflag an explicit key set, then refresh the rollups over the buckets it changed.
 ///
-/// The whole key set is one transaction with the decompression cap lifted: a partial flag set is a
+/// Each key becomes a decision (ADR 0008); the record's trigger projects it onto the row. The
+/// whole key set is one transaction with the decompression cap lifted: a partial flag set is a
 /// state no reader can interpret, and any key may land in a chunk the compression policy has
-/// reached. The refresh runs after the commit because `refresh_continuous_aggregate` is a procedure
-/// with its own transaction control.
+/// reached. The refresh runs after the commit because `refresh_continuous_aggregate` is a
+/// procedure with its own transaction control, and so does the reactive hook the decisions
+/// reach.
 async fn apply_flags(
     state: &AppState,
     scope: &AccessScope,
+    actor: &str,
     keys: &[ReadingKey],
     write: FlagWrite,
 ) -> AppResult<u64> {
@@ -88,21 +108,20 @@ async fn apply_flags(
     let target_sites: Vec<Uuid> = keys.iter().map(|r| r.site_id).collect();
     enforce_project_scope_for_sites(&state.db, scope, &target_sites).await?;
 
-    let touched = bulk_write::guarded(&state.db, async |txn| {
-        let mut touched = TouchedRange::default();
+    let set_id = Uuid::new_v4();
+    let recorded = bulk_write::guarded(&state.db, async |txn| {
+        let mut all = decisions::Recorded::default();
         for chunk in keys.chunks(KEYS_PER_STATEMENT) {
-            let mut values = write.leading_values();
-            let offset = values.len();
+            let mut values: Vec<sea_orm::Value> = Vec::with_capacity(chunk.len() * 5);
             let mut conditions = Vec::with_capacity(chunk.len());
-
             for (i, key) in chunk.iter().enumerate() {
-                let base = offset + i * 5 + 1;
+                let base = i * 5 + 1;
                 conditions.push(format!(
-                    "(site_id = ${b0} AND parameter_id = ${b1} AND time = ${b2} \
+                    "(r.site_id = ${b0} AND r.parameter_id = ${b1} AND r.time = ${b2} \
                       AND (${b3}::smallint IS NULL \
-                           OR (replicate_index = ${b3} AND measurement_type = 'spot')) \
-                      AND (${b4}::text IS NULL OR measurement_type = ${b4} \
-                           OR (${b4} = 'continuous' AND measurement_type IS NULL)))",
+                           OR (r.replicate_index = ${b3} AND r.measurement_type = 'spot')) \
+                      AND (${b4}::text IS NULL OR r.measurement_type = ${b4} \
+                           OR (${b4} = 'continuous' AND r.measurement_type IS NULL)))",
                     b0 = base,
                     b1 = base + 1,
                     b2 = base + 2,
@@ -115,89 +134,153 @@ async fn apply_flags(
                 values.push(key.replicate_index.into());
                 values.push(key.measurement_type.clone().into());
             }
-
-            let sql = format!(
-                "UPDATE readings SET {} WHERE {}",
-                write.assignment(),
-                conditions.join(" OR ")
+            let predicate = format!(
+                "({}) AND {}",
+                conditions.join(" OR "),
+                write.state_predicate()
             );
-            let statement = sea_orm::Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                &sql,
+            let recorded = decisions::record_many(
+                txn,
+                write.kind(),
+                &predicate,
                 values,
-            );
-            touched = touched.merge(bulk_write::mutation(txn, statement).await?);
+                decisions::NewValue::Literal(write.new_value()),
+                actor,
+                write.reason(),
+                Origin::Manual,
+                Some(set_id),
+            )
+            .await?;
+            all.rows += recorded.rows;
+            all.span = match (all.span, recorded.span) {
+                (Some((a, b)), Some((c, d))) => Some((a.min(c), b.max(d))),
+                (x, None) => x,
+                (None, y) => y,
+            };
+            all.touched_events.extend(recorded.touched_events);
         }
-        Ok(touched)
+        Ok(all)
     })
     .await?;
 
-    if let Some(window) = Window::touched(&touched) {
+    if let Some(window) = Window::touched(&recorded.touched()) {
         aggregates::refresh(&state.db, window).await?;
         state.response_cache.invalidate_all();
     }
-    Ok(touched.rows)
+    recompute::enqueue_for(
+        &state.db,
+        &recorded.touched_events,
+        actor,
+        recompute::Writer::Person,
+    )
+    .await?;
+    Ok(recorded.rows)
 }
 
-/// Flag or unflag everything in one (site, parameter, time range), then refresh the rollups over
-/// the buckets it changed. Same guarantees as [`apply_flags`]; the predicate is a range rather than
-/// a key set.
-async fn apply_flags_over_range(
-    state: &AppState,
-    scope: &AccessScope,
+/// One slot over a closed time range.
+struct SlotRange {
     site_id: Uuid,
     parameter_id: Uuid,
     start_time: DateTime<Utc>,
     end_time: DateTime<Utc>,
+}
+
+impl SlotRange {
+    async fn admit(&self, state: &AppState, scope: &AccessScope) -> AppResult<()> {
+        if self.end_time < self.start_time {
+            return Err(AppError::BadRequest(
+                "end_time must be >= start_time".to_string(),
+            ));
+        }
+        enforce_project_scope_for_sites(&state.db, scope, &[self.site_id]).await
+    }
+
+    /// The rows the write selects: the slot, the range, and not already in the requested state.
+    fn predicate(&self, write: &FlagWrite) -> String {
+        format!(
+            "r.site_id = $1 AND r.parameter_id = $2 AND r.time >= $3 AND r.time <= $4 AND {}",
+            write.state_predicate()
+        )
+    }
+
+    fn binds(&self) -> Vec<sea_orm::Value> {
+        vec![
+            self.site_id.into(),
+            self.parameter_id.into(),
+            self.start_time.into(),
+            self.end_time.into(),
+        ]
+    }
+}
+
+/// The count `apply_flags_over_range` would report, with nothing written.
+async fn count_flags_over_range(
+    state: &AppState,
+    scope: &AccessScope,
+    range: SlotRange,
     write: &FlagWrite,
 ) -> AppResult<u64> {
-    if end_time < start_time {
-        return Err(AppError::BadRequest(
-            "end_time must be >= start_time".to_string(),
-        ));
-    }
-    enforce_project_scope_for_sites(&state.db, scope, &[site_id]).await?;
+    use sea_orm::{ConnectionTrait, Statement};
+    range.admit(state, scope).await?;
+    let row = state
+        .db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT COUNT(*) AS n FROM readings r WHERE {}",
+                range.predicate(write)
+            ),
+            range.binds(),
+        ))
+        .await?
+        .ok_or_else(|| AppError::Internal("count returned no row".to_string()))?;
+    let n: i64 = row.try_get("", "n")?;
+    Ok(u64::try_from(n).unwrap_or(0))
+}
 
-    let mut values = write.leading_values();
-    let offset = values.len();
-    // Unflagging restricts to already-flagged rows so the statement decompresses only what it
-    // changes; flagging has no such restriction, an already-flagged row may carry another reason.
-    let extra = match write {
-        FlagWrite::Set(_) => "",
-        FlagWrite::Clear => " AND is_flagged = TRUE",
-    };
-    let sql = format!(
-        "UPDATE readings SET {} \
-         WHERE site_id = ${} AND parameter_id = ${} AND time >= ${} AND time <= ${}{}",
-        write.assignment(),
-        offset + 1,
-        offset + 2,
-        offset + 3,
-        offset + 4,
-        extra
-    );
-    values.push(site_id.into());
-    values.push(parameter_id.into());
-    values.push(start_time.into());
-    values.push(end_time.into());
-
-    let touched = bulk_write::guarded_mutation(
-        &state.db,
-        sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, &sql, values),
-    )
+async fn apply_flags_over_range(
+    state: &AppState,
+    scope: &AccessScope,
+    actor: &str,
+    range: SlotRange,
+    write: &FlagWrite,
+) -> AppResult<u64> {
+    range.admit(state, scope).await?;
+    let predicate = range.predicate(write);
+    let binds = range.binds();
+    let recorded = bulk_write::guarded(&state.db, async |txn| {
+        decisions::record_many(
+            txn,
+            write.kind(),
+            &predicate,
+            binds.clone(),
+            decisions::NewValue::Literal(write.new_value()),
+            actor,
+            write.reason(),
+            Origin::Manual,
+            Some(Uuid::new_v4()),
+        )
+        .await
+    })
     .await?;
 
-    if let Some(window) = Window::touched(&touched) {
+    if let Some(window) = Window::touched(&recorded.touched()) {
         aggregates::refresh(&state.db, window).await?;
         state.response_cache.invalidate_all();
     }
-    Ok(touched.rows)
+    recompute::enqueue_for(
+        &state.db,
+        &recorded.touched_events,
+        actor,
+        recompute::Writer::Person,
+    )
+    .await?;
+    Ok(recorded.rows)
 }
 
-/// Flag readings by (site_id, parameter_id, time), optionally one replicate. Requires `write_data`.
 #[utoipa::path(
     patch,
-    path = "/readings/flag",
+    path = "/api/readings/flag",
     request_body = FlagReadingsRequest,
     responses(
         (status = 200, description = "Number of readings updated", body = FlagReadingsResponse),
@@ -207,6 +290,7 @@ async fn apply_flags_over_range(
 )]
 pub async fn flag_readings(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     ProjectScope(scope): ProjectScope,
     Json(payload): Json<FlagReadingsRequest>,
 ) -> AppResult<Json<FlagReadingsResponse>> {
@@ -219,6 +303,7 @@ pub async fn flag_readings(
     let updated = apply_flags(
         &state,
         &scope,
+        &actor_label(&auth),
         &payload.readings,
         FlagWrite::Set(payload.reason.clone()),
     )
@@ -231,7 +316,7 @@ pub async fn flag_readings(
 /// Unflag a set of previously-flagged readings. Requires `write_data`.
 #[utoipa::path(
     patch,
-    path = "/readings/unflag",
+    path = "/api/readings/unflag",
     request_body = UnflagReadingsRequest,
     responses(
         (status = 200, description = "Number of readings updated", body = FlagReadingsResponse),
@@ -241,10 +326,18 @@ pub async fn flag_readings(
 )]
 pub async fn unflag_readings(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     ProjectScope(scope): ProjectScope,
     Json(payload): Json<UnflagReadingsRequest>,
 ) -> AppResult<Json<FlagReadingsResponse>> {
-    let updated = apply_flags(&state, &scope, &payload.readings, FlagWrite::Clear).await?;
+    let updated = apply_flags(
+        &state,
+        &scope,
+        &actor_label(&auth),
+        &payload.readings,
+        FlagWrite::Clear,
+    )
+    .await?;
 
     tracing::info!(updated, "Unflagged readings");
     Ok(Json(FlagReadingsResponse { updated }))
@@ -256,7 +349,12 @@ pub struct FlagRangeRequest {
     pub parameter_id: Uuid,
     pub start_time: DateTime<Utc>,
     pub end_time: DateTime<Utc>,
+    /// Required unless `dry_run`.
+    #[serde(default)]
     pub reason: String,
+    /// Report the count the write would return and change nothing.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -265,13 +363,17 @@ pub struct UnflagRangeRequest {
     pub parameter_id: Uuid,
     pub start_time: DateTime<Utc>,
     pub end_time: DateTime<Utc>,
+    /// Report the count the write would return and change nothing.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// Flag every reading in a (site_id, parameter_id, time range). Requires `write_data`.
-/// Refreshes continuous aggregates for the affected window on success.
+/// Refreshes continuous aggregates for the affected window on success. `dry_run` returns the
+/// count alone.
 #[utoipa::path(
     patch,
-    path = "/readings/flag_range",
+    path = "/api/readings/flag_range",
     request_body = FlagRangeRequest,
     responses(
         (status = 200, description = "Number of readings updated", body = FlagReadingsResponse),
@@ -281,19 +383,29 @@ pub struct UnflagRangeRequest {
 )]
 pub async fn flag_range(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     ProjectScope(scope): ProjectScope,
     Json(payload): Json<FlagRangeRequest>,
 ) -> AppResult<Json<FlagReadingsResponse>> {
+    let range = SlotRange {
+        site_id: payload.site_id,
+        parameter_id: payload.parameter_id,
+        start_time: payload.start_time,
+        end_time: payload.end_time,
+    };
+    if payload.dry_run {
+        let updated =
+            count_flags_over_range(&state, &scope, range, &FlagWrite::Set(String::new())).await?;
+        return Ok(Json(FlagReadingsResponse { updated }));
+    }
     if payload.reason.trim().is_empty() {
         return Err(AppError::BadRequest("Reason is required".to_string()));
     }
     let updated = apply_flags_over_range(
         &state,
         &scope,
-        payload.site_id,
-        payload.parameter_id,
-        payload.start_time,
-        payload.end_time,
+        &actor_label(&auth),
+        range,
         &FlagWrite::Set(payload.reason.clone()),
     )
     .await?;
@@ -309,10 +421,11 @@ pub async fn flag_range(
 }
 
 /// Unflag every reading in a (site_id, parameter_id, time range). Requires `write_data`.
-/// Refreshes continuous aggregates for the affected window on success.
+/// Refreshes continuous aggregates for the affected window on success. `dry_run` returns the
+/// count alone.
 #[utoipa::path(
     patch,
-    path = "/readings/unflag_range",
+    path = "/api/readings/unflag_range",
     request_body = UnflagRangeRequest,
     responses(
         (status = 200, description = "Number of readings updated", body = FlagReadingsResponse),
@@ -322,16 +435,25 @@ pub async fn flag_range(
 )]
 pub async fn unflag_range(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     ProjectScope(scope): ProjectScope,
     Json(payload): Json<UnflagRangeRequest>,
 ) -> AppResult<Json<FlagReadingsResponse>> {
+    let range = SlotRange {
+        site_id: payload.site_id,
+        parameter_id: payload.parameter_id,
+        start_time: payload.start_time,
+        end_time: payload.end_time,
+    };
+    if payload.dry_run {
+        let updated = count_flags_over_range(&state, &scope, range, &FlagWrite::Clear).await?;
+        return Ok(Json(FlagReadingsResponse { updated }));
+    }
     let updated = apply_flags_over_range(
         &state,
         &scope,
-        payload.site_id,
-        payload.parameter_id,
-        payload.start_time,
-        payload.end_time,
+        &actor_label(&auth),
+        range,
         &FlagWrite::Clear,
     )
     .await?;

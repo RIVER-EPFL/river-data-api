@@ -147,7 +147,7 @@ pub async fn get_my_sites(
     };
     let rows = state
         .db
-        .query_all(stmt)
+        .query_all_raw(stmt)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -218,7 +218,7 @@ async fn named_projects(state: &AppState, ids: Option<&[Uuid]>) -> AppResult<Vec
     };
     let rows = state
         .db
-        .query_all(stmt)
+        .query_all_raw(stmt)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(rows

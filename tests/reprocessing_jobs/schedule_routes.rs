@@ -34,7 +34,7 @@ async fn insert_schedule(db: &DatabaseConnection, job_name: &str, interval_secon
 }
 
 async fn next_run_at(db: &DatabaseConnection, job_name: &str) -> chrono::DateTime<chrono::Utc> {
-    db.query_one(Statement::from_sql_and_values(
+    db.query_one_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "SELECT next_run_at FROM schedules WHERE job_name = $1",
         [job_name.into()],
@@ -47,7 +47,7 @@ async fn next_run_at(db: &DatabaseConnection, job_name: &str) -> chrono::DateTim
 }
 
 async fn audit_count(db: &DatabaseConnection, job_name: &str) -> i64 {
-    db.query_one(Statement::from_sql_and_values(
+    db.query_one_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "SELECT count(*) AS n FROM schedule_audit WHERE job_name = $1",
         [job_name.into()],
@@ -234,7 +234,7 @@ async fn run_now_enqueues_for_known_job_and_404s_for_unknown() {
 
     // An enqueued queued row of this trigger_type exists.
     let n: i64 = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT count(*) AS n FROM reprocessing_jobs WHERE trigger_type = $1",
             [JOB.into()],

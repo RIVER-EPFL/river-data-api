@@ -46,7 +46,7 @@ fn registry_with(name: &'static str, interval_secs: i64) -> Arc<JobRegistry> {
 }
 
 async fn count_queued(db: &DatabaseConnection, job_name: &str) -> i64 {
-    db.query_one(Statement::from_sql_and_values(
+    db.query_one_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "SELECT count(*) AS n FROM reprocessing_jobs WHERE trigger_type = $1 AND status = 'queued'",
         [job_name.into()],
@@ -71,7 +71,7 @@ async fn force_due(db: &DatabaseConnection, job_name: &str) {
 }
 
 async fn next_run_at(db: &DatabaseConnection, job_name: &str) -> chrono::DateTime<chrono::Utc> {
-    db.query_one(Statement::from_sql_and_values(
+    db.query_one_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "SELECT next_run_at FROM schedules WHERE job_name = $1",
         [job_name.into()],
@@ -94,7 +94,7 @@ async fn seed_inserts_one_row_per_service_idempotently() {
     scheduler::seed_default_schedules(&db, &reg).await.unwrap();
 
     let n: i64 = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT count(*) AS n FROM schedules WHERE job_name = 'sched_seed_probe'".to_string(),
         ))

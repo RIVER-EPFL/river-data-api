@@ -6,7 +6,9 @@
 //! five write paths cannot drift apart on what they accept or overwrite.
 
 use axum::{Json, extract::State};
-use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, ExprTrait, QueryFilter, Set,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
@@ -91,6 +93,34 @@ pub mod admission {
         Some(format!("{raw_value} is not a finite number"))
     }
 
+    /// Why this replicate index is not admissible for this cadence, or `None` when it is.
+    ///
+    /// Only a spot instant has replicates. Every continuous and derived reader filters
+    /// `replicate_index = 0`, and so do the four continuous aggregates, so a non-zero index on a
+    /// non-spot row is stored and served nowhere.
+    pub fn replicate_index_rejection(
+        measurement_type: Option<&str>,
+        replicate_index: i16,
+    ) -> Option<String> {
+        if replicate_index == 0
+            || measurement_type == Some(crate::routes::private::readings::sample_groups::SPOT)
+        {
+            return None;
+        }
+        Some(format!(
+            "Replicate index {replicate_index} is only valid on a spot reading; {} readings are served at index 0 alone",
+            measurement_type.unwrap_or("continuous")
+        ))
+    }
+
+    pub fn admit_replicate_index(
+        measurement_type: Option<&str>,
+        replicate_index: i16,
+    ) -> AppResult<()> {
+        replicate_index_rejection(measurement_type, replicate_index)
+            .map_or(Ok(()), |reason| Err(AppError::BadRequest(reason)))
+    }
+
     pub fn admit_time(time: DateTime<Utc>) -> AppResult<()> {
         time_rejection(time).map_or(Ok(()), |reason| Err(AppError::BadRequest(reason)))
     }
@@ -133,15 +163,14 @@ pub mod admission {
         NonFinite,
         UnknownMeasurementType,
         UnknownCalibration,
-        /// The named standard curve does not exist, was fitted on another instrument, or the
-        /// reading is not a spot measurement. Skipped rather than refused on the cursor-driven
-        /// paths, like `UnknownCalibration`: the claim is wrong for this reading and a retry
-        /// cannot make it right.
-        InvalidStandardCurve,
         /// Two payload rows at one (time, replicate_index) key under a completeness window. The
         /// last occurrence wins (the backends emit source-id order, so last is deterministic);
         /// the losers are counted here so the receipt arithmetic still closes.
         DuplicateKey,
+        /// A non-zero `replicate_index` on a reading whose resolved cadence is not spot. Only a
+        /// spot instant has replicates; every continuous and derived reader, and all four
+        /// continuous aggregates, filter `replicate_index = 0`.
+        ReplicateIndexOnNonSpot,
     }
 
     impl RejectionKind {
@@ -151,10 +180,8 @@ pub mod admission {
                 Self::NonFinite => "value is not a finite number",
                 Self::UnknownMeasurementType => "measurement_type outside the vocabulary",
                 Self::UnknownCalibration => "calibration_id names no calibration",
-                Self::InvalidStandardCurve => {
-                    "standard_curve_id names no curve admissible for this reading"
-                }
                 Self::DuplicateKey => "duplicate (time, replicate_index) key in one payload",
+                Self::ReplicateIndexOnNonSpot => "replicate_index is only valid on a spot reading",
             }
         }
     }
@@ -476,8 +503,13 @@ pub struct ReadingInput {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct BatchReadingsResponse {
     pub inserted: usize,
-    /// Existing rows replaced because `conflict = overwrite`. Always 0 in `skip` mode.
+    /// Stored rows whose value this write changed under `conflict = overwrite`; a re-sent
+    /// identical row is not counted. Always 0 in `skip` mode.
     pub overwritten: usize,
+    /// The calculations the spot parameters this batch landed feed, and what each rewrites at
+    /// the visits touched. Their recompute is enqueued when this is not empty.
+    #[serde(default)]
+    pub calculations: Vec<crate::routes::private::tools::closure::CalculationImpact>,
 }
 
 const BATCH_SIZE: usize = 1000;
@@ -576,7 +608,7 @@ pub(crate) fn readings_on_conflict(mode: ConflictMode) -> sea_orm::sea_query::On
 /// a (site, parameter) pair has none. 10MB body limit. Requires `write_data`.
 #[utoipa::path(
     post,
-    path = "/readings/batch",
+    path = "/api/readings/batch",
     request_body = BatchReadingsRequest,
     responses(
         (status = 200, description = "Inserted count", body = BatchReadingsResponse),
@@ -587,6 +619,7 @@ pub(crate) fn readings_on_conflict(mode: ConflictMode) -> sea_orm::sea_query::On
 )]
 pub async fn insert_batch_readings(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     ProjectScope(scope): ProjectScope,
     Json(payload): Json<BatchReadingsRequest>,
 ) -> AppResult<Json<BatchReadingsResponse>> {
@@ -669,7 +702,7 @@ pub async fn insert_batch_readings(
         let mut map = HashMap::with_capacity(stream_ids.len());
         for row in state
             .db
-            .query_all(sea_orm::Statement::from_sql_and_values(
+            .query_all_raw(sea_orm::Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT id, measurement_type FROM data_streams WHERE id = ANY($1)",
                 [stream_ids.into()],
@@ -789,6 +822,15 @@ pub async fn insert_batch_readings(
         }
     };
 
+    // The cadence a reading is stored under is resolved, not declared, so the replicate index is
+    // judged against the resolved value rather than the request's.
+    for (r, res) in payload.readings.iter().zip(&resolved) {
+        admission::admit_replicate_index(
+            Some(res.measurement_type.as_str()),
+            r.replicate_index.unwrap_or(0),
+        )?;
+    }
+
     let models: Vec<readings::ActiveModel> = payload
         .readings
         .into_iter()
@@ -828,6 +870,10 @@ pub async fn insert_batch_readings(
             readings::ActiveModel {
                 standard_curve_id: Set(r.standard_curve_id),
                 collection_event_id: Set(None),
+                provenance: Set(None),
+                label: Set(None),
+                notes: Set(None),
+                created_by: Set(None),
                 withdrawn_at: Set(None),
                 withdrawn_reason: Set(None),
                 ingested_at: sea_orm::ActiveValue::NotSet,
@@ -859,16 +905,31 @@ pub async fn insert_batch_readings(
     // hypertable older than the compression policy means decompressing them, and the per-statement
     // cap refuses that outside a transaction that lifts it. Chunking stays, so the statement size
     // is bounded; the transaction is what makes a part-written correction impossible.
-    (inserted, overwritten) = crate::common::bulk_write::guarded(&state.db, async |txn| {
+    let actor = crate::routes::private::tools::scripts::actor_label(&auth);
+    let touched_events;
+    (inserted, overwritten, touched_events) = crate::common::bulk_write::guarded(&state.db, async |txn| {
         let mut inserted = 0usize;
         let mut overwritten = 0usize;
         for chunk in models.chunks(BATCH_SIZE) {
             // In overwrite mode `rows_affected` counts both inserts and updates, so the count of
-            // keys already present (looked up before the write) tells us how many were replaced.
-            let pre_existing = if conflict == ConflictMode::Overwrite {
-                count_existing(txn, chunk).await?
+            // keys already present (looked up before the write) separates the inserts. Only the
+            // rows whose value the write changes count as overwritten, the same definition the
+            // CSV import reports; those are exactly the value corrections recorded (ADR 0008).
+            let (pre_existing, changed) = if conflict == ConflictMode::Overwrite {
+                let corrections =
+                    crate::routes::private::readings::decisions::record_value_corrections(
+                        txn,
+                        chunk,
+                        &actor,
+                        crate::routes::private::readings::decisions::Origin::Manual,
+                    )
+                    .await?;
+                (
+                    count_existing(txn, chunk).await?,
+                    usize::try_from(corrections.rows).unwrap_or(usize::MAX),
+                )
             } else {
-                0
+                (0, 0)
             };
 
             match readings::Entity::insert_many(chunk.to_vec())
@@ -879,7 +940,7 @@ pub async fn insert_batch_readings(
                 Ok(rows) => {
                     let affected = rows as usize;
                     inserted += affected.saturating_sub(pre_existing);
-                    overwritten += pre_existing;
+                    overwritten += changed;
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -892,6 +953,15 @@ pub async fn insert_batch_readings(
                 }
             }
         }
+        // A hand-picked curve on a batch row is a claim, recorded once (ADR 0008).
+        crate::routes::private::readings::decisions::record_curve_claims(
+            txn,
+            &models,
+            &actor,
+            crate::routes::private::readings::decisions::Origin::Manual,
+        )
+        .await?;
+
         // Attributed spot rows this batch landed belong to collection events (D7). A batch caller
         // is a person or a script acting for one, so the events are manual.
         let spot_times: Vec<chrono::DateTime<chrono::FixedOffset>> = models
@@ -902,6 +972,7 @@ pub async fn insert_batch_readings(
             })
             .map(|m| *m.time.as_ref())
             .collect();
+        let mut touched_events = Vec::new();
         if let (Some(first), Some(last)) = (
             spot_times.iter().min().copied(),
             spot_times.iter().max().copied(),
@@ -910,17 +981,53 @@ pub async fn insert_batch_readings(
                 models.iter().map(|m| *m.stream_id.as_ref()).collect();
             stream_ids.sort_unstable();
             stream_ids.dedup();
+            let row_predicate = "r.stream_id = ANY($1) AND r.time >= $2 AND r.time <= $3";
+            let binds: Vec<sea_orm::Value> =
+                vec![stream_ids.clone().into(), first.into(), last.into()];
             crate::routes::private::collection_events::attach::attach_collection_events(
                 txn,
-                "r.stream_id = ANY($1) AND r.time >= $2 AND r.time <= $3",
-                vec![stream_ids.into(), first.into(), last.into()],
+                row_predicate,
+                binds.clone(),
                 crate::routes::private::collection_events::attach::EventSource::Manual,
             )
             .await?;
+            // A replicate landing beside one already stored makes the instant a group, whichever
+            // path wrote either row, so the batch goes through the one materialiser too.
+            readings::sample_groups::materialise_samples(txn, row_predicate, binds.clone()).await?;
+            let mut instants = spot_times.clone();
+            instants.sort_unstable();
+            instants.dedup();
+            touched_events =
+                crate::routes::private::collection_events::recompute::touched_events(
+                    txn,
+                    "r.stream_id = ANY($1) AND r.time = ANY($2)",
+                    vec![stream_ids.into(), instants.into()],
+                )
+                .await?;
         }
 
-        Ok((inserted, overwritten))
+        Ok((inserted, overwritten, touched_events))
     })
+    .await?;
+
+    // The values have landed; the calculations that read them run without anyone asking
+    // (ADR 0007). What they are is reported back alongside the counts.
+    let calculations = {
+        let mut touched: Vec<Uuid> = touched_events
+            .iter()
+            .filter(|e| e.source != "portal_sync")
+            .flat_map(|e| e.parameter_ids.iter().copied())
+            .collect();
+        touched.sort_unstable();
+        touched.dedup();
+        crate::routes::private::tools::closure::calculations_fed_by(&state.db, &touched).await?
+    };
+    crate::routes::private::collection_events::recompute::enqueue_for(
+        &state.db,
+        &touched_events,
+        &crate::routes::private::tools::scripts::actor_label(&auth),
+        crate::routes::private::collection_events::recompute::Writer::Person,
+    )
     .await?;
 
     // An overwrite replaces the measurement, not the correction: the write keeps the stored curve
@@ -1065,6 +1172,7 @@ pub async fn insert_batch_readings(
     Ok(Json(BatchReadingsResponse {
         inserted,
         overwritten,
+        calculations,
     }))
 }
 

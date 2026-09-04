@@ -7,3 +7,4 @@
 mod common;
 
 mod infra_seed_and_healthz;
+mod openapi_paths;

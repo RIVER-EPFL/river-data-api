@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 async fn count_slot_orphans(db: &sea_orm::DatabaseConnection) -> i64 {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT COUNT(*) AS n FROM readings WHERE site_id = $1::uuid AND parameter_id = $2::uuid AND sensor_id IS NULL",
             [crate::common::SITE1_ID.into(), crate::common::GLOBAL_PARAM_TEMP_ID.into()],
@@ -28,7 +28,7 @@ async fn count_slot_orphans(db: &sea_orm::DatabaseConnection) -> i64 {
 
 async fn deployed_from(db: &sea_orm::DatabaseConnection, dep: Uuid) -> String {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT deployed_from FROM sensor_deployments WHERE id = $1",
             [dep.into()],

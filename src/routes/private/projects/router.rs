@@ -1,5 +1,6 @@
 use axum::middleware;
-use utoipa_axum::{router::OpenApiRouter, routes};
+use axum::routing::get;
+use utoipa_axum::router::OpenApiRouter;
 
 use crate::common::AppState;
 use crate::common::authz::{Capability, TokenAccess, TokenBit};
@@ -16,7 +17,7 @@ pub fn service_router(state: &AppState) -> OpenApiRouter {
     )));
 
     let custom = OpenApiRouter::new()
-        .routes(routes!(super::views::list_project_sites))
+        .route("/{project_id}/sites", get(super::views::list_project_sites))
         .with_state(state.clone())
         .layer(middleware::from_fn(require_read_metadata));
 

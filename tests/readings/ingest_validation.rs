@@ -100,13 +100,7 @@ async fn import_csv(app: &Router, jwt: &str, body: &serde_json::Value) -> serde_
 }
 
 /// Declare a sample at a slot, the row a lab plate's replicates are then linked to.
-async fn declare_sample(
-    app: &Router,
-    jwt: &str,
-    slot: &Slot,
-    collected_at: &str,
-    label: &str,
-) -> String {
+async fn declare_sample(app: &Router, jwt: &str, slot: &Slot, collected_at: &str) -> String {
     let (status, sample) = crate::common::post_json_parse_with_token(
         app,
         "/api/samples",
@@ -114,9 +108,6 @@ async fn declare_sample(
             "site_id": slot.site_id,
             "parameter_id": slot.parameter_id,
             "collected_at": collected_at,
-            "label": label,
-            "notes": "replicate plate",
-            "created_by": "lab",
         }),
         jwt,
     )
@@ -187,8 +178,8 @@ async fn batch_overwrite_keeps_the_sample_link_of_the_reading_it_corrects() {
     let corrected_at = "2025-06-10T09:00:00Z";
     let untouched_at = "2025-06-10T10:00:00Z";
 
-    let corrected_sample = declare_sample(&app, &admin, &slot, corrected_at, "morning plate").await;
-    let untouched_sample = declare_sample(&app, &admin, &slot, untouched_at, "midday plate").await;
+    let corrected_sample = declare_sample(&app, &admin, &slot, corrected_at).await;
+    let untouched_sample = declare_sample(&app, &admin, &slot, untouched_at).await;
 
     let replicate = |at: &str, index: i16, raw: f64, sample_id: Option<&str>| {
         let mut reading = json!({
@@ -271,15 +262,6 @@ async fn batch_overwrite_keeps_the_sample_link_of_the_reading_it_corrects() {
         (f64_at(&sample, "mean") - 16.0).abs() < 1e-9,
         "the sample mean follows the corrected value, ie. the mean of 20.0 and 12.0: {sample}"
     );
-    assert_eq!(
-        sample["label"], "morning plate",
-        "the operator-entered label survives a value correction: {sample}"
-    );
-    assert_eq!(
-        sample["notes"], "replicate plate",
-        "the operator-entered notes survive a value correction: {sample}"
-    );
-
     let (status, corrected) = crate::common::post_json_parse_with_token(
         &app,
         "/api/readings/batch",
@@ -341,10 +323,6 @@ async fn batch_overwrite_keeps_the_sample_link_of_the_reading_it_corrects() {
     assert!(
         (f64_at(&sample, "mean") - 16.0).abs() < 1e-9,
         "the relinked plate averages 20.0 and 12.0: {sample}"
-    );
-    assert_eq!(
-        sample["label"], "midday plate",
-        "the untouched label is unchanged: {sample}"
     );
 }
 
@@ -902,14 +880,28 @@ async fn csv_import_refuses_a_duplicated_timestamp_in_a_continuous_file() {
         &db,
         &format!(
             "SELECT count(*) FROM samples WHERE site_id = '{}' AND parameter_id = '{spot_parameter_id}' \
-             AND collected_at <> '{at}' AND n = 1",
+             AND collected_at <> '{at}'",
+            continuous_slot.site_id
+        ),
+    )
+    .await;
+    assert_eq!(
+        single_row_grabs, 0,
+        "the rows measured once are single measurements, not groups"
+    );
+    let single_row_readings = e2e::count(
+        &db,
+        &format!(
+            "SELECT count(*) FROM readings WHERE site_id = '{}' \
+               AND parameter_id = '{spot_parameter_id}' AND time <> '{at}' \
+               AND measurement_type = 'spot'",
             continuous_slot.site_id
         ),
     )
     .await;
     assert!(
-        single_row_grabs > 0,
-        "a grab measured once is a collection event too, and gets its samples row"
+        single_row_readings > 0,
+        "they are stored as the spot readings they are"
     );
 
     let carries_the_value = e2e::count(
@@ -928,8 +920,8 @@ async fn csv_import_refuses_a_duplicated_timestamp_in_a_continuous_file() {
     );
 }
 
-/// a grab collected without replicates is still a sample, so it appears in the
-/// sensor-vs-grab comparison alongside grabs that happen to carry two.
+/// a grab collected without replicates forms no sample, and still appears in the sensor-vs-grab
+/// comparison alongside grabs that carry two: the export derives n = 1 from the reading.
 #[tokio::test]
 #[serial]
 async fn a_single_replicate_grab_reaches_the_sensor_vs_grab_export() {
@@ -966,8 +958,8 @@ async fn a_single_replicate_grab_reaches_the_sensor_vs_grab_export() {
     );
     assert_eq!(lone["inserted"], 1, "the grab reading lands: {lone}");
     assert_eq!(
-        lone["samples_created"], 1,
-        "a grab is a sample whether or not it was measured twice: {lone}"
+        lone["samples_created"], 0,
+        "one measurement is not a group: {lone}"
     );
 
     let paired_grab_at = format!("{day}T14:00:00Z");
@@ -1017,15 +1009,12 @@ async fn a_single_replicate_grab_reaches_the_sensor_vs_grab_export() {
         &db,
         &format!(
             "SELECT count(*) FROM samples WHERE site_id = '{}' AND parameter_id = '{parameter_id}' \
-             AND collected_at = '{lone_grab_at}' AND n = 1",
+             AND collected_at = '{lone_grab_at}'",
             track.site_id
         ),
     )
     .await;
-    assert_eq!(
-        lone_sample, 1,
-        "the lone grab has a samples row counting its one replicate"
-    );
+    assert_eq!(lone_sample, 0, "the lone grab has no statistics row");
 
     let (status, export) = crate::common::get_json_with_token(
         &app,

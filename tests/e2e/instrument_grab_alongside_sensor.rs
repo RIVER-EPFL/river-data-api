@@ -65,7 +65,7 @@ async fn instrument_grabs_coexist_with_continuous_sensor_stream() {
              VALUES ('{curve_id}', '{instrument_id}', 2.0, 1.0, 'Plate A')"
         ),
     ] {
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             sql,
         ))
@@ -125,7 +125,7 @@ async fn instrument_grabs_coexist_with_continuous_sensor_stream() {
     // Per-row provenance: the grab carries the standard curve and no deployment; the sensor
     // stream keeps its deployment attribution.
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT sensor_id, standard_curve_id, deployment_id, measurement_type FROM readings \
              WHERE site_id = $1::uuid AND parameter_id = $2::uuid AND time = $3",
@@ -150,7 +150,7 @@ async fn instrument_grabs_coexist_with_continuous_sensor_stream() {
     assert_eq!(grab_mtype.as_deref(), Some("spot"));
 
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT sensor_id, deployment_id FROM readings \
              WHERE site_id = $1::uuid AND parameter_id = $2::uuid AND time = $3",

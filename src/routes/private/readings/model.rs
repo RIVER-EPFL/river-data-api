@@ -36,6 +36,18 @@ pub struct Model {
     /// When the stored value arrived (DB default on insert, re-stamped when an overwrite changes
     /// the value). NULL on rows that predate tracking.
     pub ingested_at: Option<DateTimeWithTimeZone>,
+    /// The server-built record of what produced this value: the tool run and pinned script version,
+    /// its resolved inputs, constants and curves, and the outputs it returned. Written by the grab
+    /// write path from the stored `tool_runs` row, never by a client.
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub provenance: Option<serde_json::Value>,
+    /// The operator's name for the measurement.
+    pub label: Option<String>,
+    /// The operator's free text about the measurement.
+    #[sea_orm(column_type = "Text", nullable)]
+    pub notes: Option<String>,
+    /// Who entered it, on a hand-entered measurement.
+    pub created_by: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

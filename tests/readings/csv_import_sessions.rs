@@ -81,7 +81,7 @@ async fn setup(test_name: &str) -> Option<Fixture> {
 /// A single numeric column aliased `v`, `None` when no row matches or the column is NULL.
 async fn value(db: &DatabaseConnection, sql: &str) -> Option<f64> {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             sql.to_string(),
         ))

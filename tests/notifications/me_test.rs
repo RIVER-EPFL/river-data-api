@@ -2,7 +2,7 @@
 //! handler binds to the JWT `sub`, so a second user gets a separate, empty record, no cross-user
 //! access. Requires the dev Keycloak for real JWTs; auto-skips when it's unreachable.
 
-use crate::common::fixtures::{SITE1_ID, PROJECT_ID};
+use crate::common::fixtures::{PROJECT_ID, SITE1_ID};
 use crate::common::keycloak::{
     build_test_app_with_keycloak, get_keycloak_jwt, grant_project, keycloak_reachable,
     keycloak_user_id,
@@ -72,10 +72,7 @@ async fn me_defaults_then_self_scoped_changes() {
     let (s, body) = crate::common::get_json_with_token(&app, "/api/notifications/me", &admin).await;
     assert_eq!(s, 200);
     assert_eq!(body["subscriptions"].as_array().unwrap().len(), 0);
-    assert_eq!(
-        body["webPushEnabled"], true,
-        "admin keeps its own default"
-    );
+    assert_eq!(body["webPushEnabled"], true, "admin keeps its own default");
 }
 
 /// Scenario: a device is registered, then removed the way the settings page removes it.
@@ -112,8 +109,7 @@ async fn push_device_registers_lists_and_deletes_by_endpoint() {
     assert_eq!(s, 200);
     assert_eq!(body.as_array().unwrap().len(), 2, "both devices registered");
 
-    let (s, _) =
-        crate::common::get_json_with_token(&app, "/api/notifications/me", &user).await;
+    let (s, _) = crate::common::get_json_with_token(&app, "/api/notifications/me", &user).await;
     assert_eq!(s, 200);
 
     let (s, body) = crate::common::delete_json_with_token(

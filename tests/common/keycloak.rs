@@ -371,7 +371,7 @@ pub async fn keycloak_user_id(username: &str) -> String {
 /// isolate the role→capability axis from the grant axis. Idempotent.
 pub async fn grant_project(db: &DatabaseConnection, sub: &str, project_id: &str) {
     use sea_orm::{ConnectionTrait, Statement};
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "INSERT INTO user_project_grants (user_sub, project_id, granted_by) VALUES ($1, $2::uuid, 'test') \
          ON CONFLICT (user_sub, project_id) DO NOTHING",
@@ -480,4 +480,100 @@ async fn build_test_app_with_keycloak_inner(
     // test that triggers a job would wait on one that is queued and never runs.
     super::spawn_test_worker(&state);
     river_db::routes::build_router(state)
+}
+
+/// Idempotently ensure a realm group exists whose realm role mappings include `role`. Returns the
+/// group id. Uses the master admin account: group management is beyond the service account.
+pub async fn ensure_group_with_role(group: &str, role: &str) -> String {
+    let admin_token = master_admin_token().await;
+    let base = format!("{}admin/realms/{}", keycloak_base_url(), keycloak_realm());
+    let client = reqwest::Client::new();
+    let found: serde_json::Value = client
+        .get(format!("{base}/groups?search={group}&exact=true"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("Keycloak unreachable")
+        .json()
+        .await
+        .expect("non-JSON group search");
+    let group_id = match found.as_array().and_then(|g| g.first()) {
+        Some(g) => g["id"].as_str().expect("group id").to_string(),
+        None => {
+            let created = client
+                .post(format!("{base}/groups"))
+                .bearer_auth(&admin_token)
+                .json(&serde_json::json!({ "name": group }))
+                .send()
+                .await
+                .expect("Keycloak unreachable");
+            assert!(
+                created.status().is_success(),
+                "group create: {}",
+                created.status()
+            );
+            created
+                .headers()
+                .get("location")
+                .and_then(|l| l.to_str().ok())
+                .and_then(|l| l.rsplit('/').next())
+                .expect("group location")
+                .to_string()
+        }
+    };
+    let rep = ensure_realm_role(&client, &admin_token, &base, role).await;
+    client
+        .post(format!("{base}/groups/{group_id}/role-mappings/realm"))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!([rep]))
+        .send()
+        .await
+        .expect("Keycloak unreachable");
+    group_id
+}
+
+/// Put a user in or out of a realm group.
+pub async fn set_group_membership(username: &str, group_id: &str, member: bool) {
+    let admin_token = master_admin_token().await;
+    let base = format!("{}admin/realms/{}", keycloak_base_url(), keycloak_realm());
+    let user_id = keycloak_user_id(username).await;
+    let url = format!("{base}/users/{user_id}/groups/{group_id}");
+    let client = reqwest::Client::new();
+    let req = if member {
+        client.put(url)
+    } else {
+        client.delete(url)
+    };
+    let resp = req
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("Keycloak unreachable");
+    assert!(
+        resp.status().is_success(),
+        "group membership: {}",
+        resp.status()
+    );
+}
+
+/// Idempotently ensure a realm role exists as a composite containing `contains`, and return its
+/// representation so it can be mapped to a user with `grant_realm_role`.
+pub async fn ensure_composite_role(role: &str, contains: &str) {
+    let admin_token = master_admin_token().await;
+    let base = format!("{}admin/realms/{}", keycloak_base_url(), keycloak_realm());
+    let client = reqwest::Client::new();
+    ensure_realm_role(&client, &admin_token, &base, role).await;
+    let inner = ensure_realm_role(&client, &admin_token, &base, contains).await;
+    let resp = client
+        .post(format!("{base}/roles/{role}/composites"))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!([inner]))
+        .send()
+        .await
+        .expect("Keycloak unreachable");
+    assert!(
+        resp.status().is_success(),
+        "composite add: {}",
+        resp.status()
+    );
 }

@@ -8,7 +8,9 @@ use sea_orm::sea_query::{
     Alias, Condition, Expr, JoinType, PostgresQueryBuilder, Query as SeaQuery, SelectStatement,
     UnionType,
 };
-use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, FromQueryResult, Statement};
+use sea_orm::{
+    ConnectionTrait, DatabaseBackend, DatabaseConnection, ExprTrait, FromQueryResult, Statement,
+};
 use uuid::Uuid;
 
 /// The four numeric bounds that define a breach for one (parameter, site) slot.
@@ -65,7 +67,7 @@ pub fn severity_of(value: f64, t: &ResolvedThreshold) -> i16 {
 pub fn severity_of_range(min: Option<f64>, max: Option<f64>, t: &ResolvedThreshold) -> i16 {
     let lo = min.map(|v| severity_of(v, t)).unwrap_or(0);
     let hi = max.map(|v| severity_of(v, t)).unwrap_or(0);
-    lo.max(hi)
+    std::cmp::max(lo, hi)
 }
 
 /// Boolean SQL predicate true when a value breaches at or above `min_severity` (1 includes warnings,
@@ -248,7 +250,7 @@ pub async fn resolve_threshold(
     let (sql, values) = resolve_thresholds_query(Some(site_id), Some(vec![parameter_id]))
         .build(PostgresQueryBuilder);
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             sql,
             values.0,

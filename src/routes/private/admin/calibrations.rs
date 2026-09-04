@@ -12,7 +12,7 @@ use crate::error::AppResult;
 /// Enqueues a tracked worker job and returns immediately.
 #[utoipa::path(
     post,
-    path = "/actions/sensor_calibrations/{id}/recalculate",
+    path = "/api/actions/sensor_calibrations/{id}/recalculate",
     params(("id" = Uuid, Path, description = "Calibration UUID")),
     responses(
         (status = 200, description = "Reprocessing job spawned"),
@@ -26,7 +26,7 @@ pub async fn recalculate_calibration(
 ) -> AppResult<Json<serde_json::Value>> {
     let row = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT sensor_id FROM sensor_calibrations WHERE id = $1",
             [id.into()],

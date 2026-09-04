@@ -46,7 +46,7 @@ async fn every_sync_route_the_dashboard_and_services_call_still_exists() {
     let credential_id = {
         use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
         let row = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DatabaseBackend::Postgres,
                 "SELECT id::text AS v FROM sync_service_credentials WHERE client_id = 'svc_surface'"
                     .to_string(),

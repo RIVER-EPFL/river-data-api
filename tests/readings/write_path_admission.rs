@@ -40,7 +40,7 @@ async fn register_stream(app: &axum::Router, token: &str, key: &str) -> String {
 }
 
 async fn scalar_f64(db: &DatabaseConnection, sql: &str) -> Option<f64> {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         sql.to_string(),
     ))
@@ -376,9 +376,6 @@ async fn correcting_a_lone_replicate_keeps_its_sample() {
             "site_id": SITE1_ID,
             "parameter_id": GLOBAL_PARAM_DO_ID,
             "collected_at": at,
-            "label": "lone bottle",
-            "notes": "one replicate",
-            "created_by": "lab",
         }),
         &token,
     )
@@ -433,10 +430,6 @@ async fn correcting_a_lone_replicate_keeps_its_sample() {
         "the sample survives a correction that omits the link ({status}): {sample}"
     );
     assert_eq!(sample["n"], 1, "its one replicate still counts: {sample}");
-    assert_eq!(
-        sample["label"], "lone bottle",
-        "the label survives: {sample}"
-    );
     assert_eq!(
         sample["mean"].as_f64(),
         Some(260.0),
@@ -541,5 +534,59 @@ async fn an_import_overlapping_another_streams_slot_writes_onto_the_stored_row()
         .await,
         Some(777.0),
         "the correction replaced the value the sync stream had stored"
+    );
+}
+
+/// Scenario: a batch writer sets `replicate_index` on a continuous reading.
+///
+/// Expected behaviour: refused, naming the field. Only a spot instant has replicates; every
+/// continuous and derived reader, and all four continuous aggregates, filter `replicate_index = 0`,
+/// so such a row would be stored and served nowhere while still counting toward the stream's totals
+/// and toward compression.
+#[tokio::test]
+#[serial]
+async fn a_continuous_batch_reading_may_not_carry_a_replicate_index() {
+    let (_db, app, token) = setup().await;
+    let at = chrono::Utc::now() - chrono::Duration::hours(1);
+
+    let reading = |measurement_type: &str, replicate_index: i16| {
+        json!({
+            "readings": [{
+                "site_id": SITE1_ID,
+                "parameter_id": GLOBAL_PARAM_DO_ID,
+                "time": seconds_rfc3339(at),
+                "raw_value": 8.0,
+                "measurement_type": measurement_type,
+                "replicate_index": replicate_index,
+            }]
+        })
+    };
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/batch",
+        &reading("continuous", 1),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a continuous reading at index 1 is refused: {body}"
+    );
+    assert!(
+        body.to_string().contains("Replicate index"),
+        "the refusal names the field: {body}"
+    );
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/batch",
+        &reading("spot", 1),
+        &token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "the same index on a spot reading is admitted ({status}): {body}"
     );
 }

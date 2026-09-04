@@ -19,7 +19,7 @@ async fn attr_at(
     time: &str,
 ) -> (Option<Uuid>, Option<Uuid>, Option<Uuid>) {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT sensor_id, deployment_id, calibration_id FROM readings \
              WHERE site_id = $1::uuid AND parameter_id = $2::uuid AND time = $3",

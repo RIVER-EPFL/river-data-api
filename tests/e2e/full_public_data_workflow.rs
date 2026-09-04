@@ -258,7 +258,7 @@ async fn test_full_public_data_workflow() {
     // 8. Mark the site_parameters as public.
     {
         use sea_orm::{ConnectionTrait, Statement};
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!("UPDATE site_parameters SET is_public = true WHERE site_id = '{site_id}'"),
         ))

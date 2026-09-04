@@ -3,6 +3,10 @@
 //! place, so the source may send its complete set every cycle. The site and parameter come from
 //! the stream's pairing, never from the request; an annotation on an unpaired stream is refused
 //! per item as `unpaired` and lands once the source re-asserts it after pairing.
+//!
+//! An annotation naming a `standard_curve_id` records which curve produced a source-corrected
+//! value. Once stored with one, its curve and text are frozen (`frozen`): the source's later text
+//! describes the curve as it is now, not the curve the value was made with.
 
 use axum::{Json, extract::State};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Statement};
@@ -35,6 +39,9 @@ pub struct AnnotationItem {
     pub time: chrono::DateTime<chrono::Utc>,
     pub category: String,
     pub text: String,
+    /// The standard curve the source applied to produce the annotated value, when it did.
+    #[serde(default)]
+    pub standard_curve_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -47,13 +54,13 @@ pub struct AnnotationOutcome {
     pub source_key: String,
     /// None when the annotation was not stored (`unpaired`).
     pub id: Option<Uuid>,
-    /// created | updated | unchanged | unpaired
+    /// created | updated | unchanged | frozen | unpaired
     pub status: String,
 }
 
 #[utoipa::path(
     post,
-    path = "/annotations/register",
+    path = "/api/annotations/register",
     request_body = RegisterAnnotationsRequest,
     responses((status = 200, body = RegisterAnnotationsResponse)),
     tag = "annotations"
@@ -63,7 +70,9 @@ pub async fn register_annotations(
     Json(payload): Json<RegisterAnnotationsRequest>,
 ) -> AppResult<Json<RegisterAnnotationsResponse>> {
     if payload.source_system.trim().is_empty() {
-        return Err(AppError::BadRequest("source_system must not be empty".into()));
+        return Err(AppError::BadRequest(
+            "source_system must not be empty".into(),
+        ));
     }
     let db = &state.db;
 
@@ -109,30 +118,39 @@ pub async fn register_annotations(
             continue;
         };
         // Single-statement upsert: the DO UPDATE's WHERE makes an identical re-assert return no
-        // row (unchanged), and `xmax = 0` distinguishes an insert from an update.
+        // row (unchanged), and `xmax = 0` distinguishes an insert from an update. A row that
+        // already names a curve keeps its curve and text, so the update only moves the slot and
+        // instant; `frozen` reports the text or curve the source sent and the row did not take.
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "INSERT INTO annotations
                      (id, site_id, parameter_id, start_time, end_time, text, category,
-                      created_by, source_system, source_key, created_at)
-                 VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8, $9, NOW())
+                      created_by, source_system, source_key, standard_curve_id, created_at)
+                 VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8, $9, $10, NOW())
                  ON CONFLICT (source_system, source_key)
                      WHERE source_system IS NOT NULL AND source_key IS NOT NULL
                      DO UPDATE SET site_id = EXCLUDED.site_id,
                                    parameter_id = EXCLUDED.parameter_id,
                                    start_time = EXCLUDED.start_time,
                                    end_time = EXCLUDED.end_time,
-                                   text = EXCLUDED.text,
+                                   text = CASE WHEN annotations.standard_curve_id IS NULL
+                                               THEN EXCLUDED.text ELSE annotations.text END,
+                                   standard_curve_id = COALESCE(annotations.standard_curve_id,
+                                                                EXCLUDED.standard_curve_id),
                                    category = EXCLUDED.category
                      WHERE (annotations.site_id, annotations.parameter_id,
                             annotations.start_time, annotations.end_time,
-                            annotations.text, annotations.category)
+                            annotations.category)
                            IS DISTINCT FROM
                            (EXCLUDED.site_id, EXCLUDED.parameter_id,
-                            EXCLUDED.start_time, EXCLUDED.end_time,
-                            EXCLUDED.text, EXCLUDED.category)
-                 RETURNING id, (xmax = 0) AS created",
+                            EXCLUDED.start_time, EXCLUDED.end_time, EXCLUDED.category)
+                        OR (annotations.standard_curve_id IS NULL
+                            AND (annotations.text, annotations.standard_curve_id)
+                                IS DISTINCT FROM (EXCLUDED.text, EXCLUDED.standard_curve_id))
+                 RETURNING id, (xmax = 0) AS created,
+                           (text IS DISTINCT FROM $5
+                            OR standard_curve_id IS DISTINCT FROM $10) AS frozen",
                 [
                     Uuid::new_v4().into(),
                     site_id.into(),
@@ -143,6 +161,7 @@ pub async fn register_annotations(
                     format!("sync:{}", payload.source_system).into(),
                     payload.source_system.clone().into(),
                     item.source_key.clone().into(),
+                    item.standard_curve_id.into(),
                 ],
             ))
             .await?;
@@ -152,19 +171,26 @@ pub async fn register_annotations(
                 id: Some(row.try_get::<Uuid>("", "id")?),
                 status: if row.try_get::<bool>("", "created")? {
                     "created".into()
+                } else if row.try_get::<bool>("", "frozen")? {
+                    "frozen".into()
                 } else {
                     "updated".into()
                 },
             },
             None => {
                 let existing = db
-                    .query_one(Statement::from_sql_and_values(
+                    .query_one_raw(Statement::from_sql_and_values(
                         sea_orm::DatabaseBackend::Postgres,
-                        "SELECT id FROM annotations
+                        "SELECT id,
+                                (text IS DISTINCT FROM $3
+                                 OR standard_curve_id IS DISTINCT FROM $4) AS frozen
+                         FROM annotations
                          WHERE source_system = $1 AND source_key = $2",
                         [
                             payload.source_system.clone().into(),
                             item.source_key.clone().into(),
+                            item.text.clone().into(),
+                            item.standard_curve_id.into(),
                         ],
                     ))
                     .await?
@@ -177,7 +203,11 @@ pub async fn register_annotations(
                 AnnotationOutcome {
                     source_key: item.source_key.clone(),
                     id: Some(existing.try_get::<Uuid>("", "id")?),
-                    status: "unchanged".into(),
+                    status: if existing.try_get::<bool>("", "frozen")? {
+                        "frozen".into()
+                    } else {
+                        "unchanged".into()
+                    },
                 }
             }
         };

@@ -252,3 +252,25 @@ pub async fn get_ndjson_with_token(app: &Router, uri: &str, token: &str) -> (u16
 
     (status, text)
 }
+
+/// Import a CSV as a screened commit: preview it first and pass the seasonal check the preview
+/// stored, the way the import page does. A spot or tool file whose values sit outside the site's
+/// seasonal range is otherwise refused without a check. `body` must not set `dry_run`.
+pub async fn post_screened_import(
+    app: &Router,
+    body: &serde_json::Value,
+    token: &str,
+) -> (u16, serde_json::Value) {
+    let mut preview = body.clone();
+    preview["dry_run"] = serde_json::json!(true);
+    let (status, plan) =
+        post_json_parse_with_token(app, "/api/readings/import_csv", &preview, token).await;
+    if status != 200 {
+        return (status, plan);
+    }
+    let mut commit = body.clone();
+    if let Some(check_id) = plan["check"]["check_id"].as_str() {
+        commit["check_id"] = serde_json::json!(check_id);
+    }
+    post_json_parse_with_token(app, "/api/readings/import_csv", &commit, token).await
+}

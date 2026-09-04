@@ -12,7 +12,7 @@ use crate::error::AppResult;
 /// aggregates on completion. Requires `write_metadata`.
 #[utoipa::path(
     post,
-    path = "/actions/derived_parameters/{id}/recompute",
+    path = "/api/actions/derived_parameters/{id}/recompute",
     params(("id" = Uuid, Path, description = "Derived parameter definition UUID")),
     responses(
         (status = 200, description = "Background recompute job triggered with job_id"),

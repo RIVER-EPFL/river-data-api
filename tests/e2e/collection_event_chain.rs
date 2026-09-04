@@ -1,10 +1,10 @@
-//! S2, collection event with chained tools (PLAN.md story catalog).
+//! S2, collection event with chained tools (story catalog: ../archived-documentation/PLAN.md).
 //!
-//! Scenario: a member stages a visit, runs one tool and saves it, and a second tool's
-//! `event_inputs` resolve from the first tool's saved outputs at the same (site, collected_at).
-//! The missing/stale audit reports a third tool that never ran although its input now exists, the
-//! chain executor recomputes the event on demand and fills it, and the trigger statistics are
-//! correct throughout.
+//! Scenario: a member stages a visit, runs one tool and saves it; a second tool's `event_inputs`
+//! resolve from the first tool's saved output at the same (site, collected_at) and it runs by
+//! itself (ADR 0007). A third tool, switched on after the visit was entered, is what the
+//! missing/stale audit reports; the chain executor recomputes the event on demand and fills it,
+//! and the trigger statistics are correct throughout.
 
 use serde_json::json;
 use serial_test::serial;
@@ -59,6 +59,31 @@ async fn author_chain(app: &axum::Router, admin: &str) {
     .await;
 }
 
+/// Switch a calculation in or out of the set that fires at visits and is audited.
+async fn set_enabled(app: &axum::Router, admin: &str, name: &str, enabled: bool) {
+    let (status, scripts) =
+        crate::common::get_json_with_token(app, "/api/tool_scripts", admin).await;
+    assert_eq!(status, 200, "{scripts}");
+    let id = scripts
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == name)
+        .map(|s| s["id"].as_str().unwrap().to_string())
+        .unwrap_or_else(|| panic!("{name} is listed"));
+    let (status, patched) = crate::common::patch_json_with_token(
+        app,
+        &format!("/api/tool_scripts/{id}"),
+        &json!({ "enabled": enabled }),
+        admin,
+    )
+    .await;
+    assert_eq!(status, 200, "{patched}");
+}
+
+/// Expected behaviour: saving A's output fires B by itself (ADR 0007); C, switched off while the
+/// visit was entered, is what the audit reports missing once it is switched on, and the
+/// on-demand executor fills it in dependency order with trigger statistics and a chain-run blob.
 #[tokio::test]
 #[serial]
 async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
@@ -107,6 +132,7 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
     let pb = e2e::create_parameter(&app, &admin, "ChainPB", "Chain PB", "ppb").await;
     let pc = e2e::create_parameter(&app, &admin, "ChainPC", "Chain PC", "ppb").await;
     author_chain(&app, &admin).await;
+    set_enabled(&app, &admin, "chain_c", false).await;
 
     kc::ensure_realm_user("river1", "river1", &["riverdata-river"]).await;
     kc::grant_project(&db, &kc::keycloak_user_id("river1").await, &project_id).await;
@@ -146,7 +172,33 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
     .await;
     assert_eq!(status, 200, "save A: {saved}");
 
-    // Tool B: nothing typed — its input resolves from A's saved output at the shared event.
+    // A's output landing is what runs B: its input resolves from the saved value at the shared
+    // event, and nobody presses anything.
+    assert!(e2e::wait_for_jobs_by_trigger(&db, "event_recompute", 60).await);
+    let reactive = {
+        use sea_orm::ConnectionTrait;
+        db.query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT COALESCE(r.calibrated_value, r.raw_value) AS mean, \
+                        r.provenance ->> 'tool' AS tool \
+                 FROM readings r \
+                 WHERE r.site_id = '{site_id}' AND r.parameter_id = '{pb}' \
+                   AND r.withdrawn_at IS NULL \
+                 ORDER BY r.replicate_index LIMIT 1"
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the save fired B")
+    };
+    assert_eq!(
+        reactive.try_get::<Option<f64>>("", "mean").unwrap(),
+        Some(47.0)
+    );
+    assert_eq!(reactive.try_get::<String>("", "tool").unwrap(), "chain_b");
+
+    // Run interactively, B records the same resolution.
     let (status, b) = crate::common::post_json_parse_with_token(
         &app,
         "/api/tools/chain_b/calculate",
@@ -173,22 +225,15 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
         &river,
     )
     .await;
-    // A wrong parameter/value pairing is refused; save out_b properly.
-    assert_eq!(status, 400, "a value the run did not produce is refused: {saved}");
-    let (status, saved) = crate::common::post_json_with_token(
-        &app,
-        "/api/grab_samples",
-        &json!({
-            "site_id": site_id,
-            "tool_run_id": b["run_id"],
-            "readings": [{ "parameter_id": pb, "value": 47.0, "time": EVENT_TIME, "output": "out_b" }],
-        }),
-        &river,
-    )
-    .await;
-    assert_eq!(status, 200, "save B: {saved}");
+    // A wrong parameter/value pairing is refused.
+    assert_eq!(
+        status, 400,
+        "a value the run did not produce is refused: {saved}"
+    );
 
-    // The audit reports the third tool's absent outputs: its input (ChainPB) now exists.
+    // C is switched on after the visit was entered: the audit reports its absent output, since
+    // its input (ChainPB) exists.
+    set_enabled(&app, &admin, "chain_c", true).await;
     let (status, audit) = crate::common::post_json_parse_with_token(
         &app,
         "/api/actions/event_audit",
@@ -201,21 +246,20 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
     let outcome = e2e::poll_job(&app, &admin, &job_id, 60).await;
     assert_eq!(outcome, "completed", "audit job");
 
-    let (status, findings) = crate::common::get_json_with_token(
-        &app,
-        &format!("/api/actions/event_audit_findings?site_id={site_id}"),
-        &river,
-    )
-    .await;
-    assert_eq!(status, 200, "{findings}");
+    let findings =
+        serde_json::Value::Array(e2e::pending_event_findings(&app, &admin, &site_id).await);
     let missing: Vec<&serde_json::Value> = findings
         .as_array()
         .unwrap()
         .iter()
         .filter(|f| f["kind"] == "missing_output" && f["tool"] == "chain_c")
         .collect();
-    assert_eq!(missing.len(), 1, "chain_c's absent output is reported: {findings}");
-    assert_eq!(missing[0]["parameter_id"].as_str().unwrap(), pc);
+    assert_eq!(
+        missing.len(),
+        1,
+        "chain_c's absent output is reported: {findings}"
+    );
+    assert_eq!(missing[0]["parameter_code"], "ChainPC", "the output slot is {pc}");
 
     // The executor recomputes the event on demand and fills the gap, in dependency order.
     let (status, recompute) = crate::common::post_json_parse_with_token(
@@ -233,17 +277,20 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
     // ChainPC = (42 + 5) * 10, with trigger statistics and a chain-run blob.
     let row = {
         use sea_orm::ConnectionTrait;
-        db.query_one(sea_orm::Statement::from_string(
+        db.query_one_raw(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
-                "SELECT s.mean, s.n, s.provenance ->> 'tool' AS tool, \
-                        s.provenance ->> 'source' AS source \
-                 FROM samples s WHERE s.site_id = '{site_id}' AND s.parameter_id = '{pc}'"
+                "SELECT COALESCE(s.mean, COALESCE(r.calibrated_value, r.raw_value)) AS mean, \
+                        COALESCE(s.n, 1) AS n, r.provenance ->> 'tool' AS tool, \
+                        r.provenance ->> 'source' AS source \
+                 FROM readings r LEFT JOIN samples s ON s.id = r.sample_id \
+                 WHERE r.site_id = '{site_id}' AND r.parameter_id = '{pc}' \
+                 ORDER BY r.replicate_index LIMIT 1"
             ),
         ))
         .await
         .unwrap()
-        .expect("the executor formed the ChainPC sample")
+        .expect("the executor saved the ChainPC value")
     };
     assert_eq!(row.try_get::<Option<f64>>("", "mean").unwrap(), Some(470.0));
     assert_eq!(row.try_get::<i32>("", "n").unwrap(), 1);
@@ -253,7 +300,7 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
     // The readings carry the event, and a fresh audit supersedes the finding.
     let attached = {
         use sea_orm::ConnectionTrait;
-        db.query_one(sea_orm::Statement::from_string(
+        db.query_one_raw(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT COUNT(*)::bigint AS n FROM readings \
@@ -278,23 +325,19 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
     assert_eq!(status, 200, "{audit}");
     let job_id = audit["job_id"].as_str().expect("job id").to_string();
     assert_eq!(e2e::poll_job(&app, &admin, &job_id, 60).await, "completed");
-    let (status, findings) = crate::common::get_json_with_token(
-        &app,
-        &format!("/api/actions/event_audit_findings?site_id={site_id}"),
-        &river,
-    )
-    .await;
-    assert_eq!(status, 200, "{findings}");
+    let findings =
+        serde_json::Value::Array(e2e::pending_event_findings(&app, &admin, &site_id).await);
     assert!(
         findings.as_array().unwrap().is_empty(),
         "the filled event has no open findings: {findings}"
     );
 }
 
-/// Expected behaviour: correcting an upstream value makes every downstream output demonstrably
-/// stale — the audit recomputes each saved output under its pinned version with the event's
-/// current values and reports the disagreement — and the chain executor converges the event,
-/// after which the audit finds nothing.
+/// Expected behaviour: an upstream correction landing while the downstream calculations are
+/// switched off leaves their outputs demonstrably stale — the audit recomputes each saved output
+/// under its pinned version with the event's current values and reports the disagreement — and
+/// the chain executor converges the event, after which the audit finds nothing. (Switched on, the
+/// correction itself would have re-run them: ADR 0007.)
 #[tokio::test]
 #[serial]
 async fn an_upstream_correction_surfaces_as_stale_and_recompute_converges() {
@@ -347,29 +390,29 @@ async fn an_upstream_correction_surfaces_as_stale_and_recompute_converges() {
     kc::grant_project(&db, &kc::keycloak_user_id("river1").await, &project_id).await;
     let river = kc::get_keycloak_jwt("river1", "river1").await;
 
-    let save = |run: serde_json::Value, param: String, value: f64, output: &'static str,
-                replace: bool| {
-        let app = app.clone();
-        let river = river.clone();
-        let site_id = site_id.clone();
-        async move {
-            let mut body = json!({
-                "site_id": site_id,
-                "tool_run_id": run["run_id"],
-                "readings": [{ "parameter_id": param, "value": value,
-                                "time": EVENT_TIME, "output": output }],
-            });
-            if replace {
-                body["mode"] = json!("replace");
+    let save =
+        |run: serde_json::Value, param: String, value: f64, output: &'static str, replace: bool| {
+            let app = app.clone();
+            let river = river.clone();
+            let site_id = site_id.clone();
+            async move {
+                let mut body = json!({
+                    "site_id": site_id,
+                    "tool_run_id": run["run_id"],
+                    "readings": [{ "parameter_id": param, "value": value,
+                                    "time": EVENT_TIME, "output": output }],
+                });
+                if replace {
+                    body["mode"] = json!("replace");
+                }
+                let (status, resp) =
+                    crate::common::post_json_with_token(&app, "/api/grab_samples", &body, &river)
+                        .await;
+                assert_eq!(status, 200, "save {output}: {resp}");
             }
-            let (status, resp) =
-                crate::common::post_json_with_token(&app, "/api/grab_samples", &body, &river)
-                    .await;
-            assert_eq!(status, 200, "save {output}: {resp}");
-        }
-    };
+        };
 
-    // The initial chain: A(21) -> 42, B resolves it -> 47, C resolves that -> 470.
+    // The initial chain: A(21) -> 42 saved, and the save runs B (47) and C (470) by itself.
     let (status, a) = crate::common::post_json_parse_with_token(
         &app,
         "/api/tools/chain_a/calculate",
@@ -379,26 +422,30 @@ async fn an_upstream_correction_surfaces_as_stale_and_recompute_converges() {
     .await;
     assert_eq!(status, 200, "{a}");
     save(a, pa.clone(), 42.0, "out_a", false).await;
-    let (status, b) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/tools/chain_b/calculate",
-        &json!({ "site_id": site_id, "collected_at": EVENT_TIME }),
-        &river,
-    )
-    .await;
-    assert_eq!(status, 200, "{b}");
-    save(b, pb.clone(), 47.0, "out_b", false).await;
-    let (status, c) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/tools/chain_c/calculate",
-        &json!({ "site_id": site_id, "collected_at": EVENT_TIME }),
-        &river,
-    )
-    .await;
-    assert_eq!(status, 200, "{c}");
-    save(c, pc.clone(), 470.0, "out_c", false).await;
+    assert!(e2e::wait_for_jobs_by_trigger(&db, "event_recompute", 60).await);
+    for (param, expected) in [(&pb, 47.0), (&pc, 470.0)] {
+        let mean = db
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT COALESCE(calibrated_value, raw_value) AS mean FROM readings \
+                     WHERE site_id = '{site_id}' AND parameter_id = '{param}' \
+                       AND withdrawn_at IS NULL AND is_flagged IS NOT TRUE \
+                     ORDER BY replicate_index LIMIT 1"
+                ),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<Option<f64>>("", "mean")
+            .unwrap();
+        assert_eq!(mean, Some(expected), "the save fired the chain for {param}");
+    }
 
-    // The upstream correction: A's input was mistyped; the corrected run replaces PA with 50.
+    // The upstream correction lands while B and C are switched off: A's input was mistyped and
+    // the corrected run replaces PA with 50, and nothing downstream moves.
+    set_enabled(&app, &admin, "chain_b", false).await;
+    set_enabled(&app, &admin, "chain_c", false).await;
     let (status, a2) = crate::common::post_json_parse_with_token(
         &app,
         "/api/tools/chain_a/calculate",
@@ -408,6 +455,18 @@ async fn an_upstream_correction_surfaces_as_stale_and_recompute_converges() {
     .await;
     assert_eq!(status, 200, "{a2}");
     save(a2, pa.clone(), 50.0, "out_a", true).await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(
+        crate::common::e2e::count(
+            &db,
+            "SELECT COUNT(*)::bigint FROM tool_runs WHERE tool_name = 'chain_b' AND source = 'chain'",
+        )
+        .await,
+        1,
+        "a switched-off calculation does not fire"
+    );
+    set_enabled(&app, &admin, "chain_b", true).await;
+    set_enabled(&app, &admin, "chain_c", true).await;
 
     // The audit recomputes B and C under their pinned versions with the corrected event values
     // and reports both stale. Nothing is written by the auditor.
@@ -421,13 +480,8 @@ async fn an_upstream_correction_surfaces_as_stale_and_recompute_converges() {
     assert_eq!(status, 200, "{audit}");
     let job_id = audit["job_id"].as_str().expect("job id").to_string();
     assert_eq!(e2e::poll_job(&app, &admin, &job_id, 60).await, "completed");
-    let (status, findings) = crate::common::get_json_with_token(
-        &app,
-        &format!("/api/actions/event_audit_findings?site_id={site_id}"),
-        &river,
-    )
-    .await;
-    assert_eq!(status, 200, "{findings}");
+    let findings =
+        serde_json::Value::Array(e2e::pending_event_findings(&app, &admin, &site_id).await);
     let stale: Vec<(&str, f64)> = findings
         .as_array()
         .unwrap()
@@ -460,7 +514,7 @@ async fn an_upstream_correction_surfaces_as_stale_and_recompute_converges() {
 
     // The executor converges the whole event; a fresh audit finds nothing open.
     let event_id = db
-        .query_one(sea_orm::Statement::from_string(
+        .query_one_raw(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT id::text AS id FROM collection_events \
@@ -485,11 +539,13 @@ async fn an_upstream_correction_surfaces_as_stale_and_recompute_converges() {
 
     for (param, expected) in [(&pb, 55.0), (&pc, 550.0)] {
         let mean = db
-            .query_one(sea_orm::Statement::from_string(
+            .query_one_raw(sea_orm::Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
                 format!(
-                    "SELECT mean FROM samples WHERE site_id = '{site_id}' \
-                     AND parameter_id = '{param}'"
+                    "SELECT COALESCE(s.mean, COALESCE(r.calibrated_value, r.raw_value)) AS mean \
+                     FROM readings r LEFT JOIN samples s ON s.id = r.sample_id \
+                     WHERE r.site_id = '{site_id}' AND r.parameter_id = '{param}' \
+                     ORDER BY r.replicate_index LIMIT 1"
                 ),
             ))
             .await
@@ -510,15 +566,231 @@ async fn an_upstream_correction_surfaces_as_stale_and_recompute_converges() {
     assert_eq!(status, 200, "{audit}");
     let job_id = audit["job_id"].as_str().expect("job id").to_string();
     assert_eq!(e2e::poll_job(&app, &admin, &job_id, 60).await, "completed");
-    let (status, findings) = crate::common::get_json_with_token(
-        &app,
-        &format!("/api/actions/event_audit_findings?site_id={site_id}"),
-        &river,
-    )
-    .await;
-    assert_eq!(status, 200, "{findings}");
+    let findings =
+        serde_json::Value::Array(e2e::pending_event_findings(&app, &admin, &site_id).await);
     assert!(
         findings.as_array().unwrap().is_empty(),
         "the converged event has no open findings: {findings}"
     );
+}
+
+/// Expected behaviour: a recompute of a visit whose inputs, constants, curves and script versions
+/// have not moved since the last run mints no `tool_runs` row and rewrites no output, and a
+/// changed upstream input runs each tool downstream of it exactly once.
+#[tokio::test]
+#[serial]
+async fn an_unchanged_visit_recomputes_nothing_and_a_changed_input_reruns_once() {
+    use sea_orm::ConnectionTrait;
+    if !kc::require_keycloak_or_skip(
+        "an_unchanged_visit_recomputes_nothing_and_a_changed_input_reruns_once",
+    )
+    .await
+    {
+        return;
+    }
+    if !crate::common::tools_runner::require_runner_or_skip(
+        "an_unchanged_visit_recomputes_nothing_and_a_changed_input_reruns_once",
+    )
+    .await
+    {
+        return;
+    }
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::exec(
+        &db,
+        "UPDATE tool_scripts SET active_version_id = NULL WHERE name LIKE 'chain_%'",
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        "DELETE FROM tool_script_activations WHERE tool_script_id IN \
+         (SELECT id FROM tool_scripts WHERE name LIKE 'chain_%')",
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        "DELETE FROM tool_script_versions WHERE tool_script_id IN \
+         (SELECT id FROM tool_scripts WHERE name LIKE 'chain_%')",
+    )
+    .await;
+    crate::common::exec(&db, "DELETE FROM tool_scripts WHERE name LIKE 'chain_%'").await;
+    let app = kc::build_test_app_with_keycloak(db.clone()).await;
+    let admin = kc::get_keycloak_jwt("admin", "admin").await;
+
+    let project_id = e2e::create_project(&app, &admin, "Idem Project", "idemp", false).await;
+    let site_id = e2e::create_site(&app, &admin, &project_id, "Idem Site", "idems").await;
+    let pa = e2e::create_parameter(&app, &admin, "ChainPA", "Chain PA", "ppb").await;
+    let pb = e2e::create_parameter(&app, &admin, "ChainPB", "Chain PB", "ppb").await;
+    let pc = e2e::create_parameter(&app, &admin, "ChainPC", "Chain PC", "ppb").await;
+    author_chain(&app, &admin).await;
+
+    kc::ensure_realm_user("river1", "river1", &["riverdata-river"]).await;
+    kc::grant_project(&db, &kc::keycloak_user_id("river1").await, &project_id).await;
+    let river = kc::get_keycloak_jwt("river1", "river1").await;
+
+    let calculate_and_save_a = |a: f64, replace: bool| {
+        let app = app.clone();
+        let river = river.clone();
+        let site_id = site_id.clone();
+        let pa = pa.clone();
+        async move {
+            let (status, run) = crate::common::post_json_parse_with_token(
+                &app,
+                "/api/tools/chain_a/calculate",
+                &json!({ "a": a, "site_id": site_id, "collected_at": EVENT_TIME }),
+                &river,
+            )
+            .await;
+            assert_eq!(status, 200, "{run}");
+            let mut body = json!({
+                "site_id": site_id,
+                "tool_run_id": run["run_id"],
+                "readings": [{ "parameter_id": pa, "value": a * 2.0,
+                                "time": EVENT_TIME, "output": "out_a" }],
+            });
+            if replace {
+                body["mode"] = json!("replace");
+            }
+            let (status, resp) =
+                crate::common::post_json_with_token(&app, "/api/grab_samples", &body, &river).await;
+            assert_eq!(status, 200, "save out_a: {resp}");
+        }
+    };
+    let recompute = |event_id: String| {
+        let app = app.clone();
+        let river = river.clone();
+        let admin = admin.clone();
+        async move {
+            let (status, resp) = crate::common::post_json_parse_with_token(
+                &app,
+                &format!("/api/collection_events/{event_id}/recompute"),
+                &json!({}),
+                &river,
+            )
+            .await;
+            assert_eq!(status, 200, "{resp}");
+            let job_id = resp["job_id"].as_str().expect("job id").to_string();
+            assert_eq!(e2e::poll_job(&app, &admin, &job_id, 60).await, "completed");
+            job_id
+        }
+    };
+    let runs = |tool: &'static str| {
+        let db = db.clone();
+        async move {
+            e2e::count(
+                &db,
+                &format!(
+                    "SELECT COUNT(*)::bigint FROM tool_runs \
+                     WHERE tool_name = '{tool}' AND source = 'chain'"
+                ),
+            )
+            .await
+        }
+    };
+    let saved_at = |param: String| {
+        let db = db.clone();
+        let site_id = site_id.clone();
+        async move {
+            db.query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT provenance ->> 'saved_at' AS saved_at FROM readings \
+                     WHERE site_id = '{site_id}' AND parameter_id = '{param}' \
+                       AND provenance IS NOT NULL ORDER BY replicate_index LIMIT 1"
+                ),
+            ))
+            .await
+            .unwrap()
+            .expect("the output has a sample")
+            .try_get::<String>("", "saved_at")
+            .unwrap()
+        }
+    };
+    let job_count = |job_id: String, key: &'static str| {
+        let db = db.clone();
+        async move {
+            e2e::count(
+                &db,
+                &format!(
+                    "SELECT COALESCE((detail -> 'counts' ->> '{key}')::bigint, 0) \
+                     FROM reprocessing_jobs WHERE id = '{job_id}'"
+                ),
+            )
+            .await
+        }
+    };
+
+    // The save fires B and C once each; A's stored inputs are the interactive run's.
+    calculate_and_save_a(21.0, false).await;
+    assert!(e2e::wait_for_jobs_by_trigger(&db, "event_recompute", 60).await);
+    assert_eq!(runs("chain_a").await, 0);
+    assert_eq!(runs("chain_b").await, 1);
+    assert_eq!(runs("chain_c").await, 1);
+    let event_id = db
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT id::text AS id FROM collection_events \
+                 WHERE site_id = '{site_id}' AND collected_at = '{EVENT_TIME}'"
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the save attached a collection event")
+        .try_get::<String>("", "id")
+        .unwrap();
+    let b_saved_at = saved_at(pb.clone()).await;
+    let c_saved_at = saved_at(pc.clone()).await;
+
+    // Nothing moved: a recompute mints no run and rewrites no provenance, and says why.
+    let unchanged = recompute(event_id.clone()).await;
+    assert_eq!(runs("chain_a").await, 0, "unchanged A re-ran");
+    assert_eq!(runs("chain_b").await, 1, "unchanged B re-ran");
+    assert_eq!(runs("chain_c").await, 1, "unchanged C re-ran");
+    assert_eq!(
+        saved_at(pb.clone()).await,
+        b_saved_at,
+        "B's provenance was rewritten"
+    );
+    assert_eq!(
+        saved_at(pc.clone()).await,
+        c_saved_at,
+        "C's provenance was rewritten"
+    );
+    assert_eq!(job_count(unchanged.clone(), "tools_run").await, 0);
+    assert_eq!(job_count(unchanged, "tools_unchanged").await, 3);
+
+    // A corrected upstream input: B and C each run exactly once more, A not at all, and a
+    // recompute after that is again unchanged.
+    calculate_and_save_a(25.0, true).await;
+    assert!(e2e::wait_for_jobs_by_trigger(&db, "event_recompute", 60).await);
+    assert_eq!(runs("chain_a").await, 0);
+    assert_eq!(runs("chain_b").await, 2, "B runs once for the correction");
+    assert_eq!(runs("chain_c").await, 2, "C runs once for the correction");
+    assert_ne!(saved_at(pb.clone()).await, b_saved_at);
+    assert_ne!(saved_at(pc.clone()).await, c_saved_at);
+    for (param, expected) in [(&pb, 55.0), (&pc, 550.0)] {
+        let mean = db
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT COALESCE(calibrated_value, raw_value) AS mean FROM readings \
+                     WHERE site_id = '{site_id}' AND parameter_id = '{param}' \
+                       AND withdrawn_at IS NULL AND is_flagged IS NOT TRUE \
+                     ORDER BY replicate_index LIMIT 1"
+                ),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<Option<f64>>("", "mean")
+            .unwrap();
+        assert_eq!(mean, Some(expected), "converged value for {param}");
+    }
+    let again = recompute(event_id).await;
+    assert_eq!(runs("chain_b").await, 2);
+    assert_eq!(runs("chain_c").await, 2);
+    assert_eq!(job_count(again.clone(), "tools_run").await, 0);
+    assert_eq!(job_count(again, "tools_unchanged").await, 3);
 }

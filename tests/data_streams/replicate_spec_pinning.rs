@@ -205,3 +205,59 @@ async fn a_pre_pinning_spec_derives_its_indexes_from_position() {
         "positional indexes from the legacy spec are pinned, not re-derived from the new order"
     );
 }
+
+/// Scenario: an update through the generated CRUD router carrying a `metadata` body.
+///
+/// Expected behaviour: the pinned column-to-index assignments are the register handler's to write.
+/// A CRUD edit cannot re-point a column at another column's index, nor erase the mapping with an
+/// empty object, because both merge two replicate series into one on the next registration.
+#[tokio::test]
+#[serial]
+async fn a_crud_update_cannot_rewrite_the_pinned_assignments() {
+    let (db, app, token) = setup().await;
+
+    let (status, body) = register(&app, &token, &["A", "B", "C"]).await;
+    assert!((200..300).contains(&status), "register: {body}");
+    let id = body["id"].as_str().expect("register returns the stream id");
+    let pinned = stored_metadata(&db, id).await;
+
+    for attempt in [
+        json!({"metadata": {"replicates": {"assignments": [
+            {"column": "A", "index": 0, "retired": false},
+            {"column": "B", "index": 0, "retired": false},
+            {"column": "C", "index": 0, "retired": false}
+        ]}}}),
+        json!({"metadata": {}}),
+    ] {
+        let (status, text) = crate::common::put_json_with_token(
+            &app,
+            &format!("/api/data_streams/{id}"),
+            &attempt,
+            &token,
+        )
+        .await;
+        assert!(
+            status != 500,
+            "a metadata update must not error, it must be ignored: {status} {text}"
+        );
+        assert_eq!(
+            stored_metadata(&db, id).await,
+            pinned,
+            "the pinned assignments survive {attempt}"
+        );
+    }
+}
+
+/// The stream's stored `metadata`, as the register handler last wrote it.
+async fn stored_metadata(db: &DatabaseConnection, id: &str) -> String {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    db.query_one_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!("SELECT metadata::text AS m FROM data_streams WHERE id = '{id}'"),
+    ))
+    .await
+    .expect("query")
+    .expect("the registered stream is stored")
+    .try_get::<String>("", "m")
+    .expect("metadata")
+}

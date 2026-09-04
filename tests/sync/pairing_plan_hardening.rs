@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::pairing_plan_apply::{job_id_of, wait_terminal};
 
 async fn scalar_i64(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_owned(),
     ))
@@ -21,7 +21,7 @@ async fn scalar_i64(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
 }
 
 async fn scalar_opt_string(db: &sea_orm::DatabaseConnection, sql: &str) -> Option<String> {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_owned(),
     ))
@@ -33,7 +33,7 @@ async fn scalar_opt_string(db: &sea_orm::DatabaseConnection, sql: &str) -> Optio
 }
 
 async fn scalar_opt_uuid(db: &sea_orm::DatabaseConnection, sql: &str) -> Option<Uuid> {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_owned(),
     ))
@@ -234,9 +234,7 @@ async fn patch_rename_reclassifies_entry_and_recomputes_warnings() {
     assert_eq!(entry["confidence"], serde_json::json!("exact"));
     let warnings = entry["warnings"].as_array().unwrap();
     assert!(
-        warnings
-            .iter()
-            .any(|w| w["kind"] == "units_mismatch"),
+        warnings.iter().any(|w| w["kind"] == "units_mismatch"),
         "unit mismatch warning expected, got {warnings:?}"
     );
 
@@ -735,15 +733,16 @@ async fn a_replicate_family_suggests_the_measurand_and_quotes_divisor_evidence()
     assert_eq!(other["sd_holds"], serde_json::json!(0), "{other}");
     assert_eq!(
         other["sd_estimator"],
-        serde_json::json!("sample"),
-        "nothing disputes this family, so it is declared sample and asks nothing: {other}"
+        serde_json::Value::Null,
+        "no disagreement is not a declaration; the family stays undeclared until the review \
+         answers: {other}"
     );
     assert!(
         other["warnings"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|w| w["kind"] != "sd_estimator_undeclared"),
+            .any(|w| w["kind"] == "sd_estimator_undeclared"),
         "{other}"
     );
 
@@ -752,9 +751,8 @@ async fn a_replicate_family_suggests_the_measurand_and_quotes_divisor_evidence()
 
 /// Scenario: a replicate family lands on a slot that has already declared its divisor.
 ///
-/// Expected behaviour: the entry adopts the slot's declaration and asks nothing. The automatic
-/// sample default is a presumption about an unanswered question, so it must never rewrite an
-/// answer somebody gave.
+/// Expected behaviour: the entry adopts the slot's declaration and asks nothing, because the
+/// answer somebody gave is the slot's and a plan must never rewrite it.
 #[tokio::test]
 #[serial]
 async fn a_declared_slot_keeps_its_divisor_through_pairing() {
@@ -810,6 +808,80 @@ async fn a_declared_slot_keeps_its_divisor_through_pairing() {
             .iter()
             .all(|w| w["kind"] != "sd_estimator_undeclared"),
         "{entry}"
+    );
+
+    crate::common::cleanup_test_db(&db).await;
+}
+
+/// Scenario: a replicate family that ships its own sd column is paired before anything has been
+/// ingested, so it has no audit holds at all.
+///
+/// Expected behaviour: the divisor is declared, never inferred. The plan leaves the family
+/// undeclared and warns, and applying it leaves `site_parameters.sd_estimator` NULL, so the
+/// undeclared-estimator gate and report still arm for the slot once population-shaped
+/// disagreements arrive.
+#[tokio::test]
+#[serial]
+async fn an_undisputed_family_stays_undeclared_through_apply() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let stream = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            r#"INSERT INTO data_streams (id, source_system, source_key, metadata, is_active)
+               VALUES ('{stream}', 'undecl', 'STA:Depth:reps',
+                       '{{"hierarchy": {{"project": "Test River Project", "site": "Upstream Station", "parameter": "Depth"}},
+                          "units": "mm",
+                          "replicates": {{"source_columns": ["Depth_1", "Depth_2"],
+                                          "portal_mean_column": "Depth", "portal_sd_column": "Depth_sd"}}}}'::jsonb,
+                       true)"#
+        ),
+    )
+    .await;
+
+    let (status, plan) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sync/pairing-plans",
+        &serde_json::json!({ "source_system": "undecl" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "create plan failed: {plan}");
+    let entry = entry_for(&plan, stream);
+    assert_eq!(entry["sd_holds"], serde_json::json!(0), "{entry}");
+    assert_eq!(
+        entry["sd_estimator"],
+        serde_json::Value::Null,
+        "no evidence is not a declaration: {entry}"
+    );
+    assert!(
+        entry["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["kind"] == "sd_estimator_undeclared"),
+        "the review is asked, with nothing presumed: {entry}"
+    );
+
+    let plan_id = Uuid::parse_str(plan["id"].as_str().unwrap()).unwrap();
+    apply_and_wait(&app, &db, &token, plan_id).await;
+
+    let declared = scalar_opt_string(
+        &db,
+        &format!(
+            "SELECT sd_estimator AS v FROM site_parameters WHERE id = '{}'",
+            crate::common::PARAM_S1_DEPTH_ID
+        ),
+    )
+    .await;
+    assert_eq!(
+        declared, None,
+        "apply writes no divisor the review did not choose"
     );
 
     crate::common::cleanup_test_db(&db).await;

@@ -4,7 +4,7 @@
 //! precision and the same null representation whether it is asked for as JSON, CSV or NDJSON, and
 //! a site reports the same definition of its own data to every consumer.
 //!
-//! Each test names the defect id it proves; the ids are documented in `docs/defect-findings.md`.
+//! Each test names the defect id it proves; the ids are documented in `../archived-documentation/defect-findings.md`.
 //! These run as a real Keycloak user so the flows are the ones a person performs, and self-skip
 //! when Keycloak is unreachable unless `REQUIRE_KEYCLOAK` is set.
 //!

@@ -277,6 +277,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
             get(crate::routes::private::sensors::calibrations::window::get_calibration_window),
         )
         .route(
+            "/sensors/{id}/curve_usage",
+            get(crate::routes::private::sensors::instruments::get_sensor_curve_usage),
+        )
+        .route(
             "/instruments/overview",
             get(crate::routes::private::sensors::instruments::get_instruments_overview),
         )
@@ -365,6 +369,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
             "/actions/event_audit",
             post(crate::routes::private::collection_events::run_event_audit),
         )
+        .route(
+            "/actions/event_recompute",
+            post(crate::routes::private::collection_events::run_event_recompute),
+        )
         .route("/readings/flag", patch(flags::flag_readings))
         .route("/readings/unflag", patch(flags::unflag_readings))
         .route("/readings/flag_range", patch(flags::flag_range))
@@ -404,6 +412,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
 
     let data_read_routes = Router::new()
         .route("/actions/preview_derived", post(actions::preview_derived))
+        .route(
+            "/readings/sample_preview",
+            post(crate::routes::private::readings::sample_preview::sample_preview),
+        )
         .route("/alarms/active", get(alarm_views::get_active_alarms))
         .route("/alarms/summary", get(alarm_views::get_alarm_summary))
         .route("/alarms/events", get(alarm_views::get_alarm_events))
@@ -420,16 +432,20 @@ pub fn api_router(state: &AppState) -> Router<()> {
             post(crate::routes::private::readings::checks::seasonal_check),
         )
         .route(
-            "/actions/event_audit_findings",
-            get(crate::routes::private::collection_events::list_event_audit_findings),
-        )
-        .route(
             "/readings/provenance",
             get(crate::routes::private::readings::provenance::get_reading_provenance),
         )
         .route(
+            "/readings/decisions",
+            get(crate::routes::private::readings::decisions::list_decisions),
+        )
+        .route(
             "/sites/{id}/visits",
             get(crate::routes::private::collection_events::visits::list_site_visits),
+        )
+        .route(
+            "/visits",
+            get(crate::routes::private::collection_events::visits::list_visits),
         )
         .route(
             "/collection_events/{id}/detail",
@@ -449,7 +465,6 @@ pub fn api_router(state: &AppState) -> Router<()> {
             "/actions/calibration_candidates",
             get(actions::calibration_candidates),
         )
-        .route("/actions/duplicate_slots", get(actions::duplicate_slots))
         .route(
             "/actions/undeclared_sd_estimators",
             get(actions::undeclared_sd_estimators),
@@ -480,6 +495,14 @@ pub fn api_router(state: &AppState) -> Router<()> {
         )
         .route("/actions/reprocess", post(actions::reprocess_sensor))
         .route(
+            "/readings/pins",
+            post(crate::routes::private::readings::decisions::pin_readings),
+        )
+        .route(
+            "/readings/pins/{set_id}/rollback",
+            post(crate::routes::private::readings::decisions::rollback_pin_set),
+        )
+        .route(
             "/actions/derived_parameters/{id}/recompute",
             post(derived::recompute_derived),
         )
@@ -508,6 +531,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route(
             "/site_parameters/{id}/declare_sd_estimator",
             post(crate::routes::private::sites::parameters::declare::declare_sd_estimator),
+        )
+        .route(
+            "/actions/retag_sd_estimator",
+            post(crate::routes::private::sites::parameters::declare::retag_sd_estimator),
         )
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(middleware::from_fn(deny_scoped_token))
@@ -569,6 +596,14 @@ pub fn api_router(state: &AppState) -> Router<()> {
 
     let sync_admin_admin = Router::new()
         .nest("/sync", sync_views::admin_routes())
+        .route(
+            "/readings/detach",
+            post(crate::routes::private::readings::decisions::detach_output),
+        )
+        .route(
+            "/readings/return",
+            post(crate::routes::private::readings::decisions::return_output),
+        )
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(middleware::from_fn(require_admin))
         .with_state(state.clone());
@@ -620,11 +655,15 @@ pub fn api_router(state: &AppState) -> Router<()> {
             .with_state(state.clone())
     };
 
-        // Admin notification oversight: per-channel health probe, one-off test send, subscriber roster.
+    // Admin notification oversight: per-channel health probe, one-off test send, subscriber roster.
     let notifications_admin_routes = {
-        use crate::routes::private::notifications::{health, views as notif_views};
+        use crate::routes::private::notifications::{deliveries, health, views as notif_views};
         Router::new()
             .route("/notifications/health", get(health::get_health))
+            .route(
+                "/notifications/deliveries",
+                get(deliveries::list_delivery_log),
+            )
             .route(
                 "/notifications/health/refresh",
                 post(health::refresh_health),

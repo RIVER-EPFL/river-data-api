@@ -15,7 +15,7 @@ use crate::error::{AppError, AppResult};
 /// validation cache is invalidated here. Admin-only (mounted behind `require_admin`).
 #[utoipa::path(
     post,
-    path = "/tokens/{id}/revoke",
+    path = "/api/tokens/{id}/revoke",
     params(("id" = Uuid, Path, description = "Token id")),
     responses(
         (status = 200, description = "Token revoked", body = ApiToken),
@@ -45,7 +45,7 @@ pub async fn revoke_token(
 /// (cache invalidated); the new secret is returned once in `token`. Admin-only.
 #[utoipa::path(
     post,
-    path = "/tokens/{id}/rotate",
+    path = "/api/tokens/{id}/rotate",
     params(("id" = Uuid, Path, description = "Token id")),
     responses(
         (status = 200, description = "Token rotated; new secret in `token`", body = ApiToken),
@@ -90,7 +90,7 @@ pub struct TokenUsageEntry {
 /// Admin-only, like all token management. Empty when auditing is disabled or the token is unused.
 #[utoipa::path(
     get,
-    path = "/tokens/{id}/usage",
+    path = "/api/tokens/{id}/usage",
     params(("id" = Uuid, Path, description = "Token id")),
     responses(
         (status = 200, description = "Recent token usage", body = [TokenUsageEntry]),
@@ -103,7 +103,7 @@ pub async fn token_usage(
 ) -> AppResult<Json<Vec<TokenUsageEntry>>> {
     let rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT method, path, status_code, project_scope, created_at \
              FROM api_token_audit_log WHERE token_id = $1 \

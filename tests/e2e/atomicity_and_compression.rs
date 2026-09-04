@@ -99,7 +99,7 @@ async fn compress_day(db: &DatabaseConnection, date: &str) {
 async fn compress_status_events_day(db: &DatabaseConnection, date: &str) {
     let start = day(date);
     let chunks = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "SELECT format('%I.%I', chunk_schema, chunk_name) AS chunk \
              FROM timescaledb_information.chunks \
@@ -118,7 +118,7 @@ async fn compress_status_events_day(db: &DatabaseConnection, date: &str) {
     );
     for row in chunks {
         let chunk: String = row.try_get("", "chunk").expect("chunk name column");
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "SELECT compress_chunk($1::regclass, if_not_compressed => true)",
             [chunk.clone().into()],
@@ -136,7 +136,7 @@ async fn compress_status_events_day(db: &DatabaseConnection, date: &str) {
 async fn assert_cap_bites(capped: &DatabaseConnection, table: &str, filter: &str) {
     let sql = format!("UPDATE {table} SET site_id = site_id WHERE {filter}");
     let outcome = capped
-        .execute(Statement::from_string(
+        .execute_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             sql.clone(),
         ))
@@ -151,7 +151,7 @@ async fn assert_cap_bites(capped: &DatabaseConnection, table: &str, filter: &str
 /// Every tracked job with its status, for assertion messages.
 async fn jobs_summary(db: &DatabaseConnection) -> String {
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             "SELECT trigger_type, status, retry_count, COALESCE(error_message, '') AS error \
              FROM reprocessing_jobs ORDER BY created_at"
@@ -202,7 +202,7 @@ async fn await_job(db: &DatabaseConnection, trigger_type: &str, max_secs: u64) -
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
     loop {
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "SELECT status FROM reprocessing_jobs WHERE trigger_type = $1 \
                  ORDER BY created_at DESC LIMIT 1",

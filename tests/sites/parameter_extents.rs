@@ -7,10 +7,7 @@
 
 use serial_test::serial;
 
-async fn temp_extent(
-    app: &axum::Router,
-    token: &str,
-) -> serde_json::Value {
+async fn temp_extent(app: &axum::Router, token: &str) -> serde_json::Value {
     let (status, body) = crate::common::get_json_with_token(
         app,
         &format!("/api/sites/{}/parameters", crate::common::SITE1_ID),
@@ -84,7 +81,10 @@ async fn flagged_tail_and_fresh_rows_extend_extents() {
         temp["data_end"], "2025-01-16T23:50:00Z",
         "the cursor keeps the flagged tail inside the extent: {temp}"
     );
-    assert_eq!(temp["reading_count"], 144, "unflagged rollup population: {temp}");
+    assert_eq!(
+        temp["reading_count"], 144,
+        "unflagged rollup population: {temp}"
+    );
     assert_eq!(temp["has_continuous"], true);
 
     let fresh = (chrono::Utc::now() - chrono::Duration::hours(1))
@@ -111,5 +111,41 @@ async fn flagged_tail_and_fresh_rows_extend_extents() {
     assert_eq!(
         data_end, fresh,
         "a reading too new for any refresh extends the extent through the bounded pass: {temp}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_flagged_head_stays_inside_the_extent() {
+    // Scenario: the oldest day of a series is flagged (a sensor out of water) and is older than
+    // the bounded recent pass, so no summary speaks for it.
+    // Expected behaviour: data_start still names the flagged first reading, because the extents
+    // seed the chart range slider and flagged points are drawn and exported.
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+    let site_id = crate::common::SITE1_ID;
+    let param = crate::common::GLOBAL_PARAM_TEMP_ID;
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE readings SET is_flagged = TRUE \
+             WHERE site_id = '{site_id}' AND parameter_id = '{param}' AND time < '2025-01-16T00:00:00Z'"
+        ),
+    )
+    .await;
+    crate::common::refresh_continuous_aggregates(&db).await;
+
+    let temp = temp_extent(&app, &token).await;
+    assert_eq!(
+        temp["data_start"], "2025-01-15T00:00:00Z",
+        "the flagged head stays inside the extent: {temp}"
+    );
+    assert_eq!(
+        temp["reading_count"], 144,
+        "the count still follows the rollup's unflagged population: {temp}"
     );
 }

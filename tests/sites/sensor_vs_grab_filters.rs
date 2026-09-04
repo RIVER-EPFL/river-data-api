@@ -69,12 +69,14 @@ async fn flagged_and_replicate_rows_are_excluded_from_the_sensor_average() {
     .await;
     assert_eq!(status, 200, "grab entry ({status}): {body}");
 
-    // Window is [T+2h, T+6h]: two clean points, one flagged spike, one stray replicate.
+    // Window is [T+2h, T+6h]: two clean points and one flagged spike. The export's
+    // `replicate_index = 0` predicate has no probe here any more: no write path admits a non-zero
+    // index on a non-spot reading and a table CHECK refuses one, so it covers only rows that
+    // predate both.
     let stream = make_stream(&db).await;
     insert_continuous(&db, stream, "2025-04-01T11:00:00Z", 0, 10.0, false).await;
     insert_continuous(&db, stream, "2025-04-01T12:00:00Z", 0, 14.0, false).await;
     insert_continuous(&db, stream, "2025-04-01T13:00:00Z", 0, 900.0, true).await;
-    insert_continuous(&db, stream, "2025-04-01T12:00:00Z", 1, 900.0, false).await;
 
     let uri = format!(
         "/api/sites/{}/export/sensor-vs-grab?parameter_id={}\
@@ -90,9 +92,9 @@ async fn flagged_and_replicate_rows_are_excluded_from_the_sensor_average() {
         .unwrap_or_else(|| panic!("rows in export: {resp}"));
     assert_eq!(rows.len(), 1, "one grab, one comparison row: {resp}");
     let row = &rows[0];
-    assert_eq!(row["sensor_n"], 2, "clean replicate-0 points only: {row}");
+    assert_eq!(row["sensor_n"], 2, "clean points only: {row}");
     assert!(
         (row["sensor_avg"].as_f64().unwrap() - 12.0).abs() < 1e-9,
-        "(10 + 14) / 2, flagged spike and stray replicate excluded: {row}"
+        "(10 + 14) / 2, the flagged spike excluded: {row}"
     );
 }

@@ -89,7 +89,7 @@ async fn flagged_readings_excluded_from_aggregates() {
 
     // Verify baseline: avg includes outlier ≈ 209.2
     let row = db
-        .query_one(sea_orm::Statement::from_string(
+        .query_one_raw(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT avg_value FROM readings_hourly \
@@ -129,7 +129,7 @@ async fn flagged_readings_excluded_from_aggregates() {
 
     // Query aggregate after flagging
     let row = db
-        .query_one(sea_orm::Statement::from_string(
+        .query_one_raw(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT avg_value, count FROM readings_hourly \

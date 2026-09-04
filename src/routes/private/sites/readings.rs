@@ -28,6 +28,9 @@ use super::types::{ProjectRef, SiteRef};
 struct ReadingRow {
     parameter_id: Uuid,
     time: chrono::DateTime<chrono::FixedOffset>,
+    /// NULL on the collapsed view, which serves one row per instant. On the replicate view it is
+    /// half the row's key: replicates share a timestamp, so time alone does not identify a row.
+    replicate_index: Option<i16>,
     value: f64,
     severity: Option<i16>,
     is_flagged: Option<bool>,
@@ -38,19 +41,21 @@ struct ReadingRow {
     standard_curve_id: Option<Uuid>,
 }
 
-/// Where a row lands on the response's time axis.
+/// Where a row lands on the response's row axis.
 ///
-/// Replicate groups share a timestamp, so the replicate view is positional and the collapsed view
-/// is keyed by time. One derivation either way, so the axis and the columns cannot disagree.
+/// Replicate groups share a timestamp, so the replicate view is keyed by `(time, replicate_index)`
+/// and the collapsed view by time alone. One derivation either way, so the axis and the columns
+/// cannot disagree. It was positional, which dated every parameter's values to whichever parameter
+/// happened to have the most rows.
 enum RowIndex<'a> {
-    Positional,
+    ByReplicate(&'a HashMap<(DateTime<Utc>, i16), usize>),
     ByTime(&'a HashMap<DateTime<Utc>, usize>),
 }
 
 impl RowIndex<'_> {
-    fn of(&self, position: usize, time: DateTime<Utc>) -> Option<usize> {
+    fn of(&self, time: DateTime<Utc>, replicate_index: Option<i16>) -> Option<usize> {
         match self {
-            Self::Positional => Some(position),
+            Self::ByReplicate(index) => index.get(&(time, replicate_index.unwrap_or(0))).copied(),
             Self::ByTime(index) => index.get(&time).copied(),
         }
     }
@@ -79,6 +84,10 @@ pub struct ReadingsResponse {
     pub end: Option<DateTime<Utc>>,
     /// Array of timestamps (aligned to 10-minute intervals)
     pub times: Vec<DateTime<Utc>>,
+    /// The replicate index of each row, present only under `include_replicates`. Replicates share
+    /// a timestamp, so `times` alone does not identify a row there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replicate_indices: Option<Vec<i16>>,
     /// Array of parameters with their values
     pub parameters: Vec<ParameterData>,
 }
@@ -151,6 +160,10 @@ pub struct ReplicateOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub standard_curve_id: Option<Uuid>,
     pub flagged: bool,
+    /// The source's claimed window no longer contains this replicate. It is excluded from the
+    /// sample statistics served alongside it, so a consumer listing the replicates under `n` has to
+    /// say so or it prints more values than it counts.
+    pub withdrawn: bool,
 }
 
 /// Sample statistics and replicate values behind one served grab point.
@@ -194,6 +207,8 @@ pub struct SiteReadingsQuery {
     pub include_flags: Option<bool>,
     /// Include replicate readings (default: false). When false, a replicate group is returned as
     /// one row at its lowest unflagged replicate index, carrying the group's sample mean.
+    /// Refused together with `include_sample_stats`: a row per replicate and a row per instant are
+    /// two files, not one.
     pub include_replicates: Option<bool>,
     /// Filter by sample ID to retrieve replicates for a specific sample.
     pub sample_id: Option<Uuid>,
@@ -204,9 +219,13 @@ pub struct SiteReadingsQuery {
     pub include_curves: Option<bool>,
     /// Attach per-point sample statistics (n, mean, stdev, min, max) and the individual
     /// replicate values behind each grab point. Spot data only; one batched lookup.
+    /// Refused together with `include_replicates`.
     pub include_sample_stats: Option<bool>,
     /// Attach each parameter's ingestion origins (the streams paired into the slot).
     pub include_origin: Option<bool>,
+    /// Include rows the source has retracted. Replicate exports exclude them by default, as every
+    /// other serving path does; with this on they are exported and carry a `withdrawn` column.
+    pub include_withdrawn: Option<bool>,
 }
 
 /// Everything that shapes a readings body. The query is flattened in whole, so a field added to
@@ -230,8 +249,21 @@ fn uuid_cells(ids: Option<&Vec<Option<Uuid>>>) -> Vec<Option<String>> {
         .unwrap_or_default()
 }
 
-fn readings_table(times: &[DateTime<Utc>], params: &[ParameterData], include_flags: bool) -> Table {
+fn readings_table(
+    times: &[DateTime<Utc>],
+    params: &[ParameterData],
+    include_flags: bool,
+    replicate_indices: Option<&[i16]>,
+) -> Table {
     let mut table = Table::at(times);
+    // A replicate export's rows are `(time, replicate_index)`; without the index column two rows
+    // at one instant are indistinguishable in the file.
+    if let Some(indices) = replicate_indices {
+        table.column(
+            "replicate_index".to_string(),
+            Cells::Int(indices.iter().map(|i| Some(i64::from(*i))).collect()),
+        );
+    }
     for p in params {
         table.column(p.code.clone(), Cells::Float(p.values.clone()));
     }
@@ -256,7 +288,10 @@ fn readings_table(times: &[DateTime<Utc>], params: &[ParameterData], include_fla
                     systems.join("+")
                 })
                 .unwrap_or_default();
-            table.column(format!("{}_source_system", p.code), Cells::Constant(sources));
+            table.column(
+                format!("{}_source_system", p.code),
+                Cells::Constant(sources),
+            );
         }
     }
     if params.iter().any(|p| p.calibration_ids.is_some()) {
@@ -356,7 +391,7 @@ fn readings_table(times: &[DateTime<Utc>], params: &[ParameterData], include_fla
 /// Supports JSON, CSV, and NDJSON formats.
 #[utoipa::path(
     get,
-    path = "/{site_id}/readings",
+    path = "/api/sites/{site_id}/readings",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
         SiteReadingsQuery
@@ -443,11 +478,22 @@ pub async fn get_site_readings(
     let catalog = site_parameters::catalog_map(&state.db, param_ids.iter().copied()).await?;
 
     let include_replicates = query.include_replicates.unwrap_or(false) || query.sample_id.is_some();
+    // Replicates and statistics never share one file (Q32): one is a row per replicate, the other
+    // a row per instant, and a file carrying both is neither. Asking for both was silently served
+    // as replicates alone, which reads as "this window has no sample statistics".
+    if include_replicates && query.include_sample_stats.unwrap_or(false) {
+        return Err(AppError::BadRequest(
+            "include_sample_stats and include_replicates cannot be combined: the replicate rows \
+             and the per-instant statistics are separate files. Request the statistics here, and \
+             the replicates as their own download."
+                .to_string(),
+        ));
+    }
     let annotations = Annotations {
         alarms: query.alarms.unwrap_or(false),
         flagged: query.include_flagged.unwrap_or(true),
         measurement_type: query.include_measurement_type.unwrap_or(false),
-        sample_stats: query.include_sample_stats.unwrap_or(false) && !include_replicates,
+        sample_stats: query.include_sample_stats.unwrap_or(false),
         curves: query.include_curves.unwrap_or(false),
         origin: query.include_origin.unwrap_or(false),
     };
@@ -485,7 +531,7 @@ pub async fn get_site_readings(
         return series::respond(
             &format,
             empty,
-            |(times, params)| readings_table(times, params, include_flags),
+            |(times, params)| readings_table(times, params, include_flags, None),
             |(times, parameters)| async move {
                 Ok(Json(ReadingsResponse {
                     project: project_ref,
@@ -493,6 +539,7 @@ pub async fn get_site_readings(
                     start: None,
                     end: None,
                     times,
+                    replicate_indices: None,
                     parameters,
                 })
                 .into_response())
@@ -592,10 +639,18 @@ pub async fn get_site_readings(
         };
         let severity = severity_expr("COALESCE(r.calibrated_value, r.raw_value)");
         let select_clause = format!(
-            "r.parameter_id, r.time, COALESCE(r.calibrated_value, r.raw_value) AS value, \
+            "r.parameter_id, r.time, r.replicate_index, \
+             COALESCE(r.calibrated_value, r.raw_value) AS value, \
              {severity} AS severity, r.is_flagged, r.flag_reason, r.measurement_type, \
              r.sample_id, r.calibration_id, r.standard_curve_id"
         );
+        // The collapsed spot arm excludes withdrawn rows; the replicate view was exporting them
+        // as ordinary values, which publishes a number the source has taken back.
+        let withdrawn_condition = if query.include_withdrawn.unwrap_or(false) {
+            ""
+        } else {
+            " AND r.withdrawn_at IS NULL"
+        };
         let from_clause = match &threshold_cte {
             Some(cte) => format!(
                 "readings r LEFT JOIN ({cte}) t \
@@ -606,7 +661,8 @@ pub async fn get_site_readings(
         format!(
             "SELECT {select_clause} FROM {from_clause} \
              WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders})\
-             {time_conditions}{measurement_type_condition}{flagged_condition}{sample_id_condition} \
+             {time_conditions}{measurement_type_condition}{flagged_condition}{sample_id_condition}\
+             {withdrawn_condition} \
              ORDER BY r.parameter_id, r.time, r.replicate_index"
         )
     } else {
@@ -642,15 +698,22 @@ pub async fn get_site_readings(
         }
         if include_spot_arm {
             arms.push(format!(
+                // One row per slot instant, not per stream: a `(site, parameter, time)` group is
+                // one sample whatever number of streams fed it, which is already what the
+                // materialiser and the samples trigger say. De-duplicating per stream instead
+                // returned the same instant twice, and the outer ordering had no stream tiebreak,
+                // so which of the two values the column fill kept could change between requests.
+                // `stream_id` is the last ordering key so the surviving row is at least stable.
                 "SELECT sp.* FROM ( \
-                    SELECT DISTINCT ON (r.stream_id, r.time) \
+                    SELECT DISTINCT ON (r.parameter_id, r.time) \
                            COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value, \
                            {base_cols} \
                     FROM readings r LEFT JOIN samples smp ON smp.id = r.sample_id \
                     WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
                       AND r.measurement_type = 'spot' AND r.withdrawn_at IS NULL\
                     {time_conditions}{flagged_condition}{sample_id_condition} \
-                    ORDER BY r.stream_id, r.time, (r.is_flagged IS TRUE), r.replicate_index \
+                    ORDER BY r.parameter_id, r.time, (r.is_flagged IS TRUE), r.replicate_index, \
+                             r.stream_id \
                  ) sp"
             ));
         }
@@ -664,7 +727,8 @@ pub async fn get_site_readings(
             None => String::new(),
         };
         format!(
-            "SELECT sv.parameter_id, sv.time, sv.value, {severity} AS severity, \
+            "SELECT sv.parameter_id, sv.time, NULL::smallint AS replicate_index, sv.value, \
+                    {severity} AS severity, \
                     sv.is_flagged, sv.flag_reason, sv.measurement_type, sv.sample_id, \
                     sv.calibration_id, sv.standard_curve_id \
              FROM ({inner}) sv{threshold_join} \
@@ -674,7 +738,7 @@ pub async fn get_site_readings(
 
     let query_result = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             values,
@@ -693,15 +757,24 @@ pub async fn get_site_readings(
         }
     }
 
-    // One derivation of the time axis, and the row-to-column mapping that goes with it. Replicates
-    // share timestamps, so that view is positional and takes its axis from the parameter with the
-    // most rows; every other view is keyed by time.
+    // One derivation of the row axis, and the row-to-column mapping that goes with it. Replicates
+    // share timestamps, so that view's axis is `(time, replicate_index)` pairs; every other view is
+    // keyed by time alone.
+    let mut replicate_keys: Vec<(DateTime<Utc>, i16)> = Vec::new();
     let times: Vec<DateTime<Utc>> = if include_replicates {
-        param_rows
-            .values()
-            .max_by_key(|rows| rows.len())
-            .map(|rows| rows.iter().map(|r| r.time.with_timezone(&Utc)).collect())
-            .unwrap_or_default()
+        // The union of every parameter's `(time, replicate_index)` pairs, sorted. Taking the
+        // longest parameter's timestamps and filling by position dated one parameter's values to
+        // another parameter's instants whenever the two had different row counts.
+        let mut set: HashSet<(DateTime<Utc>, i16)> = HashSet::with_capacity(estimated_times);
+        for rows in param_rows.values() {
+            for r in rows {
+                set.insert((r.time.with_timezone(&Utc), r.replicate_index.unwrap_or(0)));
+            }
+        }
+        let mut keys: Vec<(DateTime<Utc>, i16)> = set.into_iter().collect();
+        keys.sort_unstable();
+        replicate_keys = keys;
+        replicate_keys.iter().map(|(t, _)| *t).collect()
     } else {
         let mut set: HashSet<DateTime<Utc>> = HashSet::with_capacity(estimated_times);
         for rows in param_rows.values() {
@@ -716,8 +789,13 @@ pub async fn get_site_readings(
 
     let time_index: HashMap<DateTime<Utc>, usize> =
         times.iter().enumerate().map(|(i, t)| (*t, i)).collect();
+    let replicate_index_map: HashMap<(DateTime<Utc>, i16), usize> = replicate_keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (*k, i))
+        .collect();
     let index = if include_replicates {
-        RowIndex::Positional
+        RowIndex::ByReplicate(&replicate_index_map)
     } else {
         RowIndex::ByTime(&time_index)
     };
@@ -771,8 +849,9 @@ pub async fn get_site_readings(
             let mut samples = annotations.sample_stats.then(|| vec![None; len]);
 
             if let Some(rows) = param_rows.get(&sp.parameter_id) {
-                for (position, row) in rows.iter().enumerate() {
-                    let Some(i) = index.of(position, row.time.with_timezone(&Utc)) else {
+                for row in rows {
+                    let Some(i) = index.of(row.time.with_timezone(&Utc), row.replicate_index)
+                    else {
                         continue;
                     };
                     if i >= len {
@@ -833,10 +912,15 @@ pub async fn get_site_readings(
     let actual_start = times.first().copied();
     let actual_end = times.last().copied();
 
+    let indices: Option<Vec<i16>> =
+        include_replicates.then(|| replicate_keys.iter().map(|(_, i)| *i).collect());
+    let table_indices = indices.clone();
     series::respond(
         &format,
         (times, param_data),
-        |(times, params)| readings_table(times, params, include_flags),
+        move |(times, params)| {
+            readings_table(times, params, include_flags, table_indices.as_deref())
+        },
         |(times, parameters)| async move {
             let response = ReadingsResponse {
                 project: project_ref,
@@ -844,6 +928,7 @@ pub async fn get_site_readings(
                 start: actual_start,
                 end: actual_end,
                 times,
+                replicate_indices: indices,
                 parameters,
             };
             cache::cache_and_respond(&state, cache_key, &response, actual_end).await
@@ -899,11 +984,11 @@ async fn fetch_sample_stats(
         ),
     };
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT sample_id, replicate_index, raw_value, calibrated_value, is_flagged, \
-                 calibration_id, standard_curve_id \
+                 calibration_id, standard_curve_id, (withdrawn_at IS NOT NULL) AS withdrawn \
                  FROM readings WHERE sample_id = ANY($1) {time_clause} \
                  ORDER BY sample_id, replicate_index"
             ),
@@ -926,6 +1011,7 @@ async fn fetch_sample_stats(
                     .ok()
                     .flatten()
                     .unwrap_or(false),
+                withdrawn: row.try_get::<bool>("", "withdrawn").unwrap_or(false),
             });
         }
     }

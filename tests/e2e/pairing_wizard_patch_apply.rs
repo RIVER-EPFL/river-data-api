@@ -815,7 +815,11 @@ async fn plan_site_metadata_returns_one_typed_row_per_plan_site() {
         a["full_name"], "Otemma Downstream",
         "station full name: {a}"
     );
-    assert_eq!(a["device_serial"], "LOG-778", "logger serial: {a}");
+    // Devices are listed per site, so a site instrumented with two loggers reports both rather
+    // than whichever one a DISTINCT ON happened to keep.
+    let devices = a["devices"].as_array().expect("devices array");
+    assert_eq!(devices.len(), 1, "one device at this site: {a}");
+    assert_eq!(devices[0]["serial"], "LOG-778", "logger serial: {a}");
 
     let b = &rows[1];
     for field in [
@@ -828,7 +832,6 @@ async fn plan_site_metadata_returns_one_typed_row_per_plan_site() {
         "catchment",
         "full_name",
         "elevation",
-        "device_serial",
         "channel_id",
         "sample_interval_sec",
     ] {
@@ -837,6 +840,11 @@ async fn plan_site_metadata_returns_one_typed_row_per_plan_site() {
             "a stream carrying no enrichment reports {field} as null rather than an empty string: {b}"
         );
     }
+    assert_eq!(
+        b["devices"].as_array().map(Vec::len),
+        Some(0),
+        "a site whose streams name no device reports none: {b}"
+    );
 
     let (status, missing) = crate::common::get_json_with_token(
         &app,

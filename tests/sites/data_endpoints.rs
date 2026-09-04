@@ -643,3 +643,126 @@ async fn test_readings_csv_header_uses_parameter_code() {
         "CSV header must not use the site_parameter label: {header}"
     );
 }
+
+/// Scenario: a caller asks for the replicate rows and the per-instant statistics in one request.
+///
+/// Expected behaviour: refused, naming the conflict. The two are different shapes, a row per
+/// replicate against a row per instant, and the combination used to be served as replicates alone,
+/// which a caller reads as "this window has no sample statistics".
+#[tokio::test]
+#[serial]
+async fn replicates_and_sample_statistics_cannot_be_asked_for_together() {
+    let (_db, app, token) = setup().await;
+    let uri = format!(
+        "/api/sites/{}/readings?start=2025-01-01T00:00:00Z&end=2025-12-31T00:00:00Z\
+         &include_replicates=true&include_sample_stats=true",
+        crate::common::SITE1_ID
+    );
+    let (status, body) = crate::common::get_json_with_token(&app, &uri, &token).await;
+    assert_eq!(status, 400, "the combination is refused: {body}");
+    assert!(
+        body.to_string().contains("replicates"),
+        "and the refusal names the other download: {body}"
+    );
+}
+
+/// Scenario: a raw export of one continuous parameter and one replicated spot group in the same
+/// window, with replicates included.
+///
+/// Expected behaviour: every value sits on the row whose timestamp it was measured at, and each
+/// replicate row says which index it is. The axis used to be the longest parameter's timestamps
+/// filled by position, so a nine-row spot group was dated to the first nine continuous samples.
+#[tokio::test]
+#[serial]
+async fn a_replicate_export_dates_every_value_to_its_own_instant() {
+    let (_db, app, token) = setup().await;
+    let site = crate::common::SITE1_ID;
+
+    let mut rows: Vec<serde_json::Value> = (0..20)
+        .map(|i| {
+            serde_json::json!({
+                "site_id": site,
+                "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID,
+                "time": format!("2025-07-01T0{}:00:00Z", i / 10 + 1),
+                "raw_value": 1.0 + f64::from(i),
+                "measurement_type": "continuous",
+            })
+        })
+        .collect();
+    rows.dedup_by(|a, b| a["time"] == b["time"]);
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/batch",
+        &serde_json::json!({ "readings": rows }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "seed continuous: {body}");
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/grab_samples",
+        &serde_json::json!({
+            "site_id": site,
+            "readings": [
+                { "parameter_id": crate::common::GLOBAL_PARAM_DO_ID, "value": 7.0,
+                  "time": "2025-07-01T09:00:00Z" },
+                { "parameter_id": crate::common::GLOBAL_PARAM_DO_ID, "value": 7.4,
+                  "time": "2025-07-01T09:00:00Z" },
+                { "parameter_id": crate::common::GLOBAL_PARAM_DO_ID, "value": 7.2,
+                  "time": "2025-07-01T09:00:00Z" },
+            ],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "seed grab: {body}");
+
+    let uri = format!(
+        "/api/sites/{site}/readings?start=2025-07-01T00:00:00Z&end=2025-07-02T00:00:00Z\
+         &include_replicates=true"
+    );
+    let (status, body) = crate::common::get_json_with_token(&app, &uri, &token).await;
+    assert_eq!(status, 200, "{body}");
+
+    let times: Vec<&str> = body["times"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap())
+        .collect();
+    let indices: Vec<i64> = body["replicate_indices"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a replicate export names its indexes: {body}"))
+        .iter()
+        .map(|i| i.as_i64().unwrap())
+        .collect();
+    assert_eq!(times.len(), indices.len(), "one index per row: {body}");
+
+    let dissolved = body["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["parameter_id"] == crate::common::GLOBAL_PARAM_DO_ID)
+        .expect("the grab parameter is in the export");
+    for (i, value) in dissolved["values"].as_array().unwrap().iter().enumerate() {
+        if value.is_null() {
+            continue;
+        }
+        assert!(
+            times[i].starts_with("2025-07-01T09:00:00"),
+            "every grab value sits at the instant it was measured, not at row {i} ({}): {body}",
+            times[i]
+        );
+    }
+    assert_eq!(
+        dissolved["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| !v.is_null())
+            .count(),
+        3,
+        "all three replicates are exported: {dissolved}"
+    );
+}

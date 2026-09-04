@@ -69,7 +69,7 @@ pub struct InstrumentsOverviewResponse {
 /// and the streams naming it. `read_data`.
 #[utoipa::path(
     get,
-    path = "/instruments/overview",
+    path = "/api/instruments/overview",
     responses((status = 200, body = InstrumentsOverviewResponse)),
     tag = "sensors"
 )]
@@ -95,7 +95,7 @@ pub async fn get_instruments_overview(
     }
     let mut usage: HashMap<Uuid, Usage> = HashMap::new();
     for row in db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT standard_curve_id AS id, COUNT(*) AS n, MIN(time) AS first, MAX(time) AS last
              FROM readings WHERE standard_curve_id IS NOT NULL GROUP BY standard_curve_id"
@@ -144,7 +144,7 @@ pub async fn get_instruments_overview(
     // Streams naming an instrument, with the paired slot's names resolved in the same pass.
     let mut streams_by_sensor: HashMap<Uuid, Vec<InstrumentStreamRef>> = HashMap::new();
     for row in db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT ds.sensor_id, ds.id, ds.source_system, ds.source_key, ds.measurement_type,
                     s.name AS site_name, p.code AS parameter_code
@@ -231,7 +231,7 @@ const MAX_POINTS: i64 = 2000;
 /// `GET /standard_curves/{id}/usage`: the readings a curve corrected. `read_data`.
 #[utoipa::path(
     get,
-    path = "/standard_curves/{id}/usage",
+    path = "/api/standard_curves/{id}/usage",
     params(("id" = Uuid, Path, description = "Standard curve UUID")),
     responses(
         (status = 200, body = CurveUsageResponse),
@@ -254,7 +254,7 @@ pub async fn get_curve_usage(
     }
 
     let count = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT COUNT(*) AS n FROM readings WHERE standard_curve_id = $1",
             [curve_id.into()],
@@ -263,7 +263,7 @@ pub async fn get_curve_usage(
         .map_or(0, |r| r.try_get::<i64>("", "n").unwrap_or(0));
 
     let points = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT r.time, r.replicate_index, r.raw_value, r.calibrated_value,
@@ -303,4 +303,74 @@ pub async fn get_curve_usage(
         reading_count: count,
         points,
     }))
+}
+
+/// One curve's usage on the instrument that owns it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SensorCurveUsage {
+    pub curve_id: Uuid,
+    /// Readings this curve corrected.
+    pub reading_count: i64,
+    pub first_used: Option<DateTime<Utc>>,
+    pub last_used: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SensorCurveUsageResponse {
+    pub sensor_id: Uuid,
+    pub usage: Vec<SensorCurveUsage>,
+}
+
+/// `GET /sensors/{id}/curve_usage`: the usage figures the overview reports, for one instrument.
+/// A curve nothing was corrected with is reported at zero rather than omitted. `read_data`.
+#[utoipa::path(
+    get,
+    path = "/api/sensors/{id}/curve_usage",
+    params(("id" = Uuid, Path, description = "Sensor UUID")),
+    responses(
+        (status = 200, body = SensorCurveUsageResponse),
+        (status = 404, description = "Sensor not found"),
+    ),
+    tag = "sensors"
+)]
+pub async fn get_sensor_curve_usage(
+    State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+    Path(sensor_id): Path<Uuid>,
+) -> AppResult<Json<SensorCurveUsageResponse>> {
+    let db = &state.db;
+    if sensors::Entity::find_by_id(sensor_id).one(db).await?.is_none()
+        || !sensor_in_scope(db, &scope, sensor_id).await?
+    {
+        return Err(AppError::NotFound("Sensor not found".to_string()));
+    }
+
+    let usage = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT c.id AS curve_id, COUNT(r.standard_curve_id) AS n,
+                    MIN(r.time) AS first, MAX(r.time) AS last
+             FROM standard_curves c
+             LEFT JOIN readings r ON r.standard_curve_id = c.id
+             WHERE c.sensor_id = $1
+             GROUP BY c.id",
+            [sensor_id.into()],
+        ))
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(SensorCurveUsage {
+                curve_id: row.try_get::<Uuid>("", "curve_id")?,
+                reading_count: row.try_get::<i64>("", "n")?,
+                first_used: row
+                    .try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "first")?
+                    .map(|t| t.with_timezone(&Utc)),
+                last_used: row
+                    .try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "last")?
+                    .map(|t| t.with_timezone(&Utc)),
+            })
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+
+    Ok(Json(SensorCurveUsageResponse { sensor_id, usage }))
 }

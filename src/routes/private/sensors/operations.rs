@@ -74,7 +74,7 @@ impl CRUDOperations for SensorOperations {
     /// refuse this anyway; the check turns that into a stated 400 instead of an internal error.
     async fn before_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<(), ApiError> {
         let blocking = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT \
                    EXISTS(SELECT 1 FROM readings WHERE sensor_id = $1) AS readings, \
@@ -143,7 +143,7 @@ impl CRUDOperations for SensorOperations {
         // hypertable's chunk count): the count is the hourly rollup's population plus recent spot
         // rows, the newest instant is the stream ingest cursor with the rollup as fallback.
         let reading_row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT (SELECT COALESCE(SUM(count), 0)::bigint FROM readings_hourly WHERE sensor_id = $1) \
                       + (SELECT COUNT(*) FROM readings WHERE sensor_id = $1 \
@@ -165,7 +165,7 @@ impl CRUDOperations for SensorOperations {
         }
 
         let cal_row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT MAX(valid_from) as last_cal FROM sensor_calibrations WHERE sensor_id = $1",
                 [id.into()],
@@ -182,7 +182,7 @@ impl CRUDOperations for SensorOperations {
 
         // Also populate current_site fields for detail view
         let dep_row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r"SELECT sd.site_id, s.name as site_name
                   FROM sensor_deployments sd JOIN sites s ON s.id = sd.site_id
@@ -221,7 +221,7 @@ impl CRUDOperations for SensorOperations {
               WHERE sd.sensor_id IN ({placeholders}) AND sd.deployed_until IS NULL"
         );
         let dep_rows = db
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 &dep_sql,
                 values.clone(),
@@ -248,7 +248,7 @@ impl CRUDOperations for SensorOperations {
         // exclusion applies. Sensors whose cursors sit close together share one query; a stale
         // straggler gets its own window rather than widening everyone's.
         let cursor_rows = db
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 &format!(
                     r"SELECT sensor_id, MAX(last_data_time) AS last_time
@@ -283,7 +283,7 @@ impl CRUDOperations for SensorOperations {
         if !missing.is_empty() {
             let ph = build_in_clause(missing.len());
             let rows = db
-                .query_all(Statement::from_sql_and_values(
+                .query_all_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     &format!(
                         "SELECT sensor_id, MAX(bucket) AS last_bucket FROM readings_hourly \
@@ -298,12 +298,14 @@ impl CRUDOperations for SensorOperations {
                     row.try_get::<Uuid>("", "sensor_id"),
                     row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "last_bucket"),
                 ) {
-                    cursors.push((sensor_id, t.with_timezone(&Utc) + chrono::Duration::hours(1)));
+                    cursors.push((
+                        sensor_id,
+                        t.with_timezone(&Utc) + chrono::Duration::hours(1),
+                    ));
                 }
             }
         }
-        let covered: std::collections::HashSet<Uuid> =
-            cursors.iter().map(|(id, _)| *id).collect();
+        let covered: std::collections::HashSet<Uuid> = cursors.iter().map(|(id, _)| *id).collect();
         let uncovered: Vec<Uuid> = ids
             .iter()
             .filter(|id| !covered.contains(id))
@@ -312,7 +314,7 @@ impl CRUDOperations for SensorOperations {
         if !uncovered.is_empty() {
             let ph = build_in_clause(uncovered.len());
             let rows = db
-                .query_all(Statement::from_sql_and_values(
+                .query_all_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     &format!(
                         r"SELECT DISTINCT ON (sensor_id) sensor_id, time, COALESCE(calibrated_value, raw_value) as value
@@ -349,12 +351,14 @@ impl CRUDOperations for SensorOperations {
             }
             let cluster_ph = build_in_clause(ids.len());
             let mut cluster_values = uuid_values(&ids);
-            cluster_values.push(sea_orm::prelude::DateTimeWithTimeZone::from(lo - chrono::Duration::days(1)).into());
+            cluster_values.push(
+                sea_orm::prelude::DateTimeWithTimeZone::from(lo - chrono::Duration::days(1)).into(),
+            );
             let from_ref = cluster_values.len();
             cluster_values.push(sea_orm::prelude::DateTimeWithTimeZone::from(hi).into());
             let to_ref = cluster_values.len();
             let rows = db
-                .query_all(Statement::from_sql_and_values(
+                .query_all_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     &format!(
                         r"SELECT DISTINCT ON (sensor_id) sensor_id, time, COALESCE(calibrated_value, raw_value) as value
@@ -385,7 +389,7 @@ impl CRUDOperations for SensorOperations {
               ORDER BY sensor_id, valid_from DESC"
         );
         let cal_rows = db
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 &cal_sql,
                 values,
@@ -430,6 +434,14 @@ pub struct SensorContext {
     /// occupied by another sensor, or the sensor isn't adopted yet. Readings still carry
     /// `sensor_id`; the deployment FK is absent.
     pub deployment_id: Option<Uuid>,
+}
+
+/// The source device identity a stream reports, as it is recorded on the sensor. Public so the
+/// registration path can compare what a feed now reports against what its instrument was minted
+/// with.
+#[must_use]
+pub fn source_identity(stream_metadata: &serde_json::Value) -> Option<serde_json::Value> {
+    extract_source_metadata(stream_metadata)
 }
 
 /// Extract Vaisala device metadata from stream metadata for storage on the sensor.
@@ -536,7 +548,7 @@ async fn insert_or_get_sensor<C: ConnectionTrait>(
     };
 
     let inserted = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r#"INSERT INTO sensors
                    (id, serial_number, name, is_active, is_lab_instrument, metadata, created_at)
@@ -608,10 +620,12 @@ pub async fn import_sensor_for_stream<C: ConnectionTrait>(
     let sensor_id = if let Some(existing_sensor_id) = stream.sensor_id {
         existing_sensor_id
     } else {
-        let sensor_name = stream
-            .source_name
-            .clone()
-            .unwrap_or_else(|| format!("Stream {}", stream.source_key));
+        let sensor_name = device_instrument_name(&stream.metadata).unwrap_or_else(|| {
+            stream
+                .source_name
+                .clone()
+                .unwrap_or_else(|| format!("Stream {}", stream.source_key))
+        });
         let metadata = extract_source_metadata(&stream.metadata);
         let sensor_id = insert_or_get_sensor(db, serial.as_deref(), &sensor_name, metadata).await?;
         link_stream_to_sensor(db, stream, sensor_id).await?;
@@ -634,7 +648,7 @@ pub async fn import_sensor_for_stream<C: ConnectionTrait>(
 /// would poison the whole pairing transaction. The conditional insert below skips cleanly when the
 /// slot is occupied (the common swap case) instead of raising; the constraint remains the atomic
 /// backstop for the rare concurrent-double-deploy race.
-async fn find_or_create_deployment<C: ConnectionTrait>(
+pub async fn find_or_create_deployment<C: ConnectionTrait>(
     db: &C,
     sensor_id: Uuid,
     site_id: Uuid,
@@ -658,7 +672,7 @@ async fn find_or_create_deployment<C: ConnectionTrait>(
     // Insert an open deployment only when no other deployment occupies the (site, parameter) slot at
     // now(). `parameter_id` is authored here (the derive-from-sensor trigger was dropped).
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"INSERT INTO sensor_deployments
                   (id, sensor_id, site_id, parameter_id, deployed_from, deployment_type, notes)
@@ -686,18 +700,28 @@ async fn find_or_create_deployment<C: ConnectionTrait>(
     }
 }
 
-/// Close the active deployment for a sensor at a site.
+/// Close the active deployment for a sensor at one (site, parameter) slot.
+///
+/// Scoped to the parameter because a multi-channel instrument holds one open deployment per
+/// parameter at a site (`find_or_create_deployment`), and every other lifecycle path recalls by
+/// parameter. Closing by (sensor, site) alone would end channels nothing asked about.
 pub async fn close_sensor_deployment(
     db: &DatabaseConnection,
     sensor_id: Uuid,
     site_id: Uuid,
+    parameter_id: Uuid,
 ) -> AppResult<()> {
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE sensor_deployments
           SET deployed_until = $1
-          WHERE sensor_id = $2 AND site_id = $3 AND deployed_until IS NULL",
-        [Utc::now().into(), sensor_id.into(), site_id.into()],
+          WHERE sensor_id = $2 AND site_id = $3 AND parameter_id = $4 AND deployed_until IS NULL",
+        [
+            Utc::now().into(),
+            sensor_id.into(),
+            site_id.into(),
+            parameter_id.into(),
+        ],
     ))
     .await?;
     Ok(())
@@ -718,10 +742,16 @@ pub struct ResolvedSlot {
 /// `expected_site`: when `Some`, only a deployment at that site can attribute a time (used by grabs,
 /// which are site-fixed by the request); when `None`, whichever deployment covers the time wins
 /// (matches reprocess, used by continuous ingest).
+///
+/// `parameter_id`: the reading's parameter. A multi-channel instrument holds one open deployment
+/// per parameter at a site, so a deployment on another parameter never attributes the time. `None`
+/// (an unattributed reading) matches any deployment, the same three-way predicate the reprocess
+/// UPDATEs use.
 pub async fn resolve_windows_for_times<C: ConnectionTrait>(
     db: &C,
     sensor_id: Uuid,
     expected_site: Option<Uuid>,
+    parameter_id: Option<Uuid>,
     times: &[chrono::DateTime<Utc>],
 ) -> AppResult<std::collections::HashMap<chrono::DateTime<Utc>, ResolvedSlot>> {
     use std::collections::HashMap;
@@ -734,7 +764,7 @@ pub async fn resolve_windows_for_times<C: ConnectionTrait>(
     // and read it into a non-nullable DateTime, chrono/sqlx cannot represent infinity and would
     // panic for the (common) open calibration/deployment.
     let cal_rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT id, valid_from, valid_until
               FROM sensor_calibrations WHERE sensor_id = $1 ORDER BY valid_from",
@@ -757,11 +787,13 @@ pub async fn resolve_windows_for_times<C: ConnectionTrait>(
         .collect::<AppResult<_>>()?;
 
     let dep_rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT id, site_id, deployed_from, deployed_until
-              FROM sensor_deployments WHERE sensor_id = $1 ORDER BY deployed_from",
-            [sensor_id.into()],
+              FROM sensor_deployments
+              WHERE sensor_id = $1 AND ($2::uuid IS NULL OR parameter_id = $2)
+              ORDER BY deployed_from",
+            [sensor_id.into(), parameter_id.into()],
         ))
         .await?;
     let deps: Vec<(
@@ -843,7 +875,7 @@ pub async fn resolve_slot_owner_for_times<C: ConnectionTrait>(
     }
 
     let dep_rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT id, sensor_id, deployed_from, deployed_until
               FROM sensor_deployments WHERE site_id = $1 AND parameter_id = $2 ORDER BY deployed_from",
@@ -923,6 +955,25 @@ pub async fn resolve_slot_owner_for_times<C: ConnectionTrait>(
 }
 
 /// Extract the Vaisala device serial from stream metadata (for discovery response).
+/// The name a device-derived instrument gets: its model and serial, which is what it is.
+///
+/// A multi-channel device serves several parameters through several streams, and any of them may
+/// be the one that reaches `insert_or_get_sensor` first. Naming from the device rather than from
+/// that stream is what stops a four-channel logger being called after one of its channels.
+pub fn device_instrument_name(metadata: &serde_json::Value) -> Option<String> {
+    let serial = extract_vaisala_device_serial(metadata)?;
+    let model = metadata
+        .get("device")
+        .and_then(|d| d.get("logger_device"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    Some(match model {
+        Some(model) => format!("{model} {serial}"),
+        None => serial,
+    })
+}
+
 pub fn extract_vaisala_device_serial(metadata: &serde_json::Value) -> Option<String> {
     metadata
         .get("device")
@@ -930,4 +981,89 @@ pub fn extract_vaisala_device_serial(metadata: &serde_json::Value) -> Option<Str
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+/// Reconcile the device identity an instrument was minted with against what its feed now reports.
+///
+/// A logger's probe can be replaced without the channel changing, and the channel is the identity
+/// (Q26), so the swap mints nothing: the readings either side of it are attributed to one
+/// instrument and one calibration timeline. Nothing may fork the instrument automatically, because
+/// an upstream metadata correction is indistinguishable from a physical change and forking would
+/// silently re-attribute history. So the serials on the sensor are refreshed, being information
+/// rather than identity, and the change is put in front of an operator to act on.
+///
+/// Returns whether anything differed.
+pub async fn reconcile_source_identity<C: ConnectionTrait>(
+    db: &C,
+    sensor_id: Uuid,
+    stream_id: Uuid,
+    stream_metadata: &serde_json::Value,
+) -> AppResult<bool> {
+    let Some(reported) = source_identity(stream_metadata) else {
+        return Ok(false);
+    };
+    let Some(sensor) = super::Entity::find_by_id(sensor_id).one(db).await? else {
+        return Ok(false);
+    };
+    let stored = sensor.metadata.clone().unwrap_or(serde_json::Value::Null);
+
+    // Only the identity fields are compared; everything else on the sensor's metadata is the
+    // operator's and is carried through untouched.
+    let changed: Vec<&str> = ["source_device_serial", "source_probe_serial"]
+        .into_iter()
+        .filter(|key| stored.get(*key) != reported.get(*key))
+        .collect();
+    if changed.is_empty() {
+        return Ok(false);
+    }
+
+    let mut merged = match stored.clone() {
+        serde_json::Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    };
+    if let Some(obj) = reported.as_object() {
+        for (k, v) in obj {
+            merged.insert(k.clone(), v.clone());
+        }
+    }
+    let mut active: super::ActiveModel = sensor.into();
+    active.metadata = Set(Some(serde_json::Value::Object(merged)));
+    active.update(db).await?;
+
+    raise_source_identity_hold(db, stream_id, &changed, &stored, &reported).await?;
+    Ok(true)
+}
+
+/// Put a device-identity change in the review queue, updating the standing hold rather than adding
+/// one per sync cycle.
+async fn raise_source_identity_hold<C: ConnectionTrait>(
+    db: &C,
+    stream_id: Uuid,
+    changed: &[&str],
+    stored: &serde_json::Value,
+    reported: &serde_json::Value,
+) -> AppResult<()> {
+    let expected = serde_json::json!({ "was": stored, "fields": changed });
+    let computed = serde_json::json!({ "now": reported });
+    let updated = db
+        .execute_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE replicate_audit_holds SET expected = $2, computed = $3, created_at = NOW() \
+             WHERE stream_id = $1 AND kind = 'source_identity_changed' \
+               AND status IN ('pending', 'deferred')",
+            [stream_id.into(), expected.clone().into(), computed.clone().into()],
+        ))
+        .await?;
+    if updated.rows_affected() > 0 {
+        return Ok(());
+    }
+    db.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO replicate_audit_holds \
+             (stream_id, group_time, kind, expected, computed, delta, status) \
+         VALUES ($1, NOW(), 'source_identity_changed', $2, $3, '{}'::jsonb, 'pending')",
+        [stream_id.into(), expected.into(), computed.into()],
+    ))
+    .await?;
+    Ok(())
 }

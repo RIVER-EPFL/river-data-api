@@ -127,7 +127,7 @@ async fn test_project_scoped_token_cannot_access_other_project_site() {
     // Create a second project
     let other_project_id = "00000000-0000-4000-a000-000000000099";
     use sea_orm::{ConnectionTrait, Statement};
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "INSERT INTO projects (id, name, description) VALUES ('{other_project_id}', 'Other Project', 'Another project')"

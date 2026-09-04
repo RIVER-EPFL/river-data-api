@@ -99,7 +99,9 @@ async fn a_seeded_script_reports_the_inputs_and_curve_slots_it_reads() {
         "the prelude functions the entry calls: {prelude_used:?}"
     );
 
-    let (script, entry) = seed_script(include_str!("../../migration/tool_seed/chlorophyll/wrapper.R"));
+    let (script, entry) = seed_script(include_str!(
+        "../../migration/tool_seed/chlorophyll/wrapper.R"
+    ));
     let (status, out) = inspect(
         &app,
         &json!({ "script": script, "entry_function": entry }),
@@ -279,7 +281,9 @@ async fn reconciling_a_dynamic_script_reports_its_lists_as_incomplete() {
         return;
     }
     let (_db, app, admin) = setup().await;
-    let (script, entry) = seed_script(include_str!("../../migration/tool_seed/chlorophyll/wrapper.R"));
+    let (script, entry) = seed_script(include_str!(
+        "../../migration/tool_seed/chlorophyll/wrapper.R"
+    ));
 
     let (status, out) = inspect(
         &app,

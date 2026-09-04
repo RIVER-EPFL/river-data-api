@@ -11,7 +11,7 @@ pub struct DataStreamOperations;
 /// The stream's registered replicate-family key, when it has one.
 async fn family_key(db: &DatabaseConnection, id: Uuid) -> Result<Option<String>, ApiError> {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT source_key FROM data_streams WHERE id = $1 AND metadata -> $2 IS NOT NULL",
             [id.into(), replicates::METADATA_KEY.into()],

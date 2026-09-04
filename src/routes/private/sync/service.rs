@@ -177,6 +177,10 @@ pub struct PlanEntry {
     /// stays undeclared and its audit disagreements are held for a decision instead.
     #[serde(default)]
     pub sd_estimator: Option<String>,
+    /// The decimal places the source declared for this stream, written onto the slot on apply
+    /// where the slot declares none. An operator's declaration on the slot is never overwritten.
+    #[serde(default)]
+    pub decimal_places: Option<i16>,
     /// The evidence for that choice: open replicate-statistics holds on this stream, and how many
     /// of them match the population signature. Written at plan creation so the review shows what
     /// the incoming data reports rather than only that a question exists.
@@ -184,6 +188,14 @@ pub struct PlanEntry {
     pub sd_holds: i64,
     #[serde(default)]
     pub sd_population_holds: i64,
+    /// The device serial the source names for this feed. A feed with one is field-shaped: its
+    /// instrument is that device, attached from the serial when the stream is paired, and the plan
+    /// proposes no lab instrument for it.
+    #[serde(default)]
+    pub device_serial: Option<String>,
+    /// The device model, where the source reports one. Naming only.
+    #[serde(default)]
+    pub device_model: Option<String>,
 }
 
 /// A catalog parameter a plan entry collides with, and what already depends on it. "Exists" on its
@@ -250,17 +262,26 @@ impl PlanWarning {
         }
     }
 
-    /// This source ships its own precomputed standard deviation and the open holds say the
-    /// population divisor explains the disagreement. The pairing is where that can first be
-    /// asked, so it is asked here; leaving it unset is allowed and the audit gate is the backstop.
+    /// This source ships its own precomputed standard deviation and nothing has declared which
+    /// divisor it uses. The pairing is where that can first be asked, so it is asked here, with
+    /// the open holds matching the population signature as the evidence; leaving it unset is
+    /// allowed and the audit gate is the backstop.
     pub fn sd_estimator_undeclared(parameter: &str, population_holds: i64) -> Self {
-        Self {
-            kind: "sd_estimator_undeclared".to_string(),
-            message: format!(
+        let message = if population_holds == 0 {
+            format!(
+                "'{parameter}' ships its own standard deviation and no divisor is declared for \
+                 it. Declare which one this source uses."
+            )
+        } else {
+            format!(
                 "{population_holds} incoming standard deviation{} for '{parameter}' match the \
                  population divisor (n), not ours. Declare which one this source uses.",
                 if population_holds == 1 { "" } else { "s" }
-            ),
+            )
+        };
+        Self {
+            kind: "sd_estimator_undeclared".to_string(),
+            message,
             parameter: Some(parameter.to_string()),
             existing: None,
             source_units: None,
@@ -305,6 +326,11 @@ pub struct PlanInstrumentRef {
     pub stamps_readings: bool,
     #[serde(default)]
     pub curves: Vec<PlanCurveRef>,
+    /// The name this decision proposes creating, kept whatever else the entry resolves to. An
+    /// operator who attaches an existing instrument by mistake has the proposal to go back to;
+    /// without it, the only record of what the plan suggested is gone the moment it is overwritten.
+    #[serde(default)]
+    pub proposed_name: Option<String>,
 }
 
 /// Replicate-family summary carried on a plan entry, from the stream's registered spec.
@@ -324,6 +350,10 @@ pub struct InstrumentCatalog {
     by_id: HashMap<Uuid, (String, Option<String>)>,
     /// The source's own instruments, as (normalised label, id), for curve-column matching.
     labels: Vec<(String, Uuid)>,
+    /// The source's own instruments by `source_key`, which is the identity an apply mints and
+    /// dedupes on. Looked up before anything is proposed, so a plan built after an earlier one
+    /// reports the instrument it already created rather than asking to create it again.
+    by_source_key: HashMap<String, Uuid>,
     curves: HashMap<Uuid, Vec<PlanCurveRef>>,
 }
 
@@ -366,6 +396,7 @@ pub async fn load_instrument_catalog(
 
     let mut by_id = HashMap::new();
     let mut labels = Vec::new();
+    let mut by_source_key = HashMap::new();
     for row in &rows {
         let name = row
             .name
@@ -376,6 +407,7 @@ pub async fn load_instrument_catalog(
             && let Some(key) = &row.source_key
         {
             labels.push((instrument_label(key, source_system), row.id));
+            by_source_key.insert(key.clone(), row.id);
         }
         by_id.insert(row.id, (name, row.source_key.clone()));
     }
@@ -400,6 +432,7 @@ pub async fn load_instrument_catalog(
     Ok(InstrumentCatalog {
         by_id,
         labels,
+        by_source_key,
         curves,
     })
 }
@@ -437,11 +470,31 @@ pub fn resolve_instrument(
             confirmed: true,
             stamps_readings,
             curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
+            proposed_name: None,
         });
     }
 
     let column = curve_column.clone()?;
     let stem = curve_column_stem(&column);
+    let source_key = format!("{source_system}:{column}");
+
+    // An instrument this source already has under the key an apply would mint is that decision,
+    // already taken. Looking it up before proposing is what keeps a second plan from re-asking.
+    if let Some(id) = catalog.by_source_key.get(&source_key).copied() {
+        let (name, key) = catalog.by_id.get(&id).cloned().unwrap_or_default();
+        return Some(PlanInstrumentRef {
+            curve_column,
+            id: Some(id),
+            name,
+            source_key: key.unwrap_or(source_key),
+            resolved_by: "source_key".to_string(),
+            create: false,
+            confirmed: true,
+            stamps_readings,
+            curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
+            proposed_name: None,
+        });
+    }
 
     let matches: Vec<Uuid> = catalog
         .labels
@@ -462,19 +515,49 @@ pub fn resolve_instrument(
             confirmed: true,
             stamps_readings,
             curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
+            proposed_name: None,
         });
     }
 
+    let name = format!("{stem} {source_system}");
     Some(PlanInstrumentRef {
-        curve_column: Some(column.clone()),
+        curve_column: Some(column),
         id: None,
-        name: format!("{stem} ({source_system} portal)"),
-        source_key: format!("{source_system}:{column}"),
+        name: name.clone(),
+        source_key,
         resolved_by: "placeholder".to_string(),
         create: true,
         confirmed: false,
         stamps_readings,
         curves: vec![],
+        proposed_name: Some(name),
+    })
+}
+
+/// The instrument a source parameter already resolves to, for the feeds that name no curve column.
+///
+/// Only ever an instrument this source created under the key an apply mints (`{source}:{param}`).
+/// Nothing is proposed here: a parameter with no such instrument is a question for the review, and
+/// answering it is what `apply_instrument_updates` does.
+pub fn resolve_parameter_instrument(
+    source_system: &str,
+    parameter: &str,
+    catalog: &InstrumentCatalog,
+) -> Option<PlanInstrumentRef> {
+    let source_key = format!("{source_system}:{parameter}");
+    let id = catalog.by_source_key.get(&source_key).copied()?;
+    let (name, key) = catalog.by_id.get(&id).cloned().unwrap_or_default();
+    Some(PlanInstrumentRef {
+        curve_column: None,
+        id: Some(id),
+        name,
+        source_key: key.unwrap_or(source_key),
+        resolved_by: "source_key".to_string(),
+        create: false,
+        confirmed: true,
+        stamps_readings: false,
+        curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
+        proposed_name: None,
     })
 }
 
@@ -593,7 +676,7 @@ pub async fn create_plan(
     // retired legacy single whose stale metadata still carries the old label identity; planning it
     // would seed duplicate parameter rows. One query for the whole superseded set.
     let superseded: std::collections::HashSet<String> = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT ds.source_key FROM data_streams ds
              WHERE ds.source_system = $1
@@ -626,7 +709,7 @@ pub async fn create_plan(
     // the review quotes cannot disagree with the queue.
     let stream_ids: Vec<Uuid> = streams.iter().map(|s| s.id).collect();
     let sd_evidence: std::collections::HashMap<Uuid, (i64, i64)> = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT h.stream_id, count(*) AS holds, \
@@ -653,10 +736,10 @@ pub async fn create_plan(
         })
         .collect();
 
-    // Slots that already declare a divisor. A declaration is owned by the slot, so the automatic
-    // sample default must never rewrite one: an entry landing on such a slot adopts what it says.
+    // Slots that already declare a divisor. A declaration is owned by the slot, so an entry landing
+    // on one adopts what it says rather than asking again.
     let declared_slots: std::collections::HashMap<(Uuid, Uuid), String> = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT site_id, parameter_id, sd_estimator FROM site_parameters \
              WHERE sd_estimator IS NOT NULL",
@@ -696,20 +779,14 @@ pub async fn create_plan(
             h.parameter.clone()
         };
 
-        // Sample (n-1) is the presumption, so a family nothing disputes is declared with it and
-        // asks nothing. Population is only ever proposed where the incoming statistics say so:
-        // a family whose open holds carry the population signature is left undeclared, and the
-        // review answers it with that evidence in front of it.
+        // The divisor is declared, never inferred: a family the review has not answered stays
+        // undeclared, whatever its holds say, and the audit gate holds its disagreements until
+        // someone does. The holds are carried as evidence for that answer, not as one.
         let (sd_holds, sd_population_holds) =
             sd_evidence.get(&stream.id).copied().unwrap_or((0, 0));
         let reports_sd = replicates
             .as_ref()
             .is_some_and(|r| r.portal_sd_column.is_some());
-        let sd_estimator = if reports_sd && sd_population_holds == 0 {
-            Some("sample".to_string())
-        } else {
-            None
-        };
 
         let mut entry = PlanEntry {
             stream_id: stream.id,
@@ -751,17 +828,40 @@ pub async fn create_plan(
                 &instruments,
             ),
             replicates,
-            sd_estimator,
+            sd_estimator: None,
+            decimal_places: crate::routes::private::data_streams::service::declared_decimal_places(
+                &stream.metadata,
+            ),
             sd_holds,
             sd_population_holds,
+            device_serial:
+                crate::routes::private::sensors::operations::extract_vaisala_device_serial(
+                    &stream.metadata,
+                ),
+            device_model: stream
+                .metadata
+                .get("device")
+                .and_then(|d| d.get("logger_device"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         };
         reclassify_entry(&mut entry, &catalog);
+        // A feed naming no curve column can still belong to an instrument this source created in
+        // an earlier plan. A device-shaped feed is never one of those: its instrument is resolved
+        // from the serial at pairing.
+        if entry.instrument.is_none() && entry.device_serial.is_none() {
+            entry.instrument =
+                resolve_parameter_instrument(source_system, &entry.parameter.name, &instruments);
+        }
         if reports_sd
             && let (Some(site_id), Some(param_id)) = (entry.site.id, entry.parameter.id)
             && let Some(declared) = declared_slots.get(&(site_id, param_id))
         {
             entry.sd_estimator = Some(declared.clone());
-            entry.warnings.retain(|w| w.kind != "sd_estimator_undeclared");
+            entry
+                .warnings
+                .retain(|w| w.kind != "sd_estimator_undeclared");
         }
         entries.push(entry);
     }
@@ -797,6 +897,7 @@ pub async fn create_plan(
         created_by: Set(None),
         summary: Set(serde_json::to_value(&summary).unwrap_or_default()),
         entries: Set(serde_json::to_value(&entries).unwrap_or_default()),
+        curve_assignments: Set(serde_json::Value::Array(Vec::new())),
         created_at: Set(Utc::now().into()),
         applied_at: Set(None),
         apply_result: Set(None),
@@ -817,7 +918,73 @@ pub struct ApplyResult {
     pub streams_skipped: u32,
     #[serde(default)]
     pub instruments_created: u32,
+    /// Standard curves moved onto instruments this apply minted.
+    #[serde(default)]
+    pub curves_assigned: u32,
     pub readings_backfilled: u64,
+}
+
+/// A standard curve the review assigned to an instrument the plan creates, keyed by the
+/// instrument's `source_key` because the row does not exist until the apply mints it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanCurveIntent {
+    pub curve_id: Uuid,
+    pub instrument_source_key: String,
+}
+
+/// The curve assignments a plan carries. Unreadable JSON is an internal error, not an empty list:
+/// silently dropping an assignment is the failure this column exists to prevent.
+pub fn plan_curve_intents(plan: &pairing_plans::Model) -> AppResult<Vec<PlanCurveIntent>> {
+    serde_json::from_value(plan.curve_assignments.clone())
+        .map_err(|e| AppError::Internal(format!("Failed to parse plan curve assignments: {e}")))
+}
+
+/// Move each assigned curve onto the instrument the apply minted for its `source_key`. Runs
+/// inside the apply transaction, after `mint_plan_instruments`. An assignment naming an
+/// instrument the plan no longer creates, or a curve readings already name, fails the apply
+/// rather than being dropped: the review chose it, so nothing here may quietly not do it.
+async fn assign_plan_curves<C: ConnectionTrait>(
+    txn: &C,
+    intents: &[PlanCurveIntent],
+    minted: &HashMap<String, Uuid>,
+) -> AppResult<u32> {
+    let mut moved = 0u32;
+    for intent in intents {
+        let Some(&sensor_id) = minted.get(&intent.instrument_source_key) else {
+            return Err(AppError::BadRequest(format!(
+                "curve {} is assigned to instrument '{}', which this plan no longer creates; \
+                 reassign or clear the curve before applying",
+                intent.curve_id, intent.instrument_source_key
+            )));
+        };
+        if crate::routes::private::sensors::standard_curves::views::curve_is_used(
+            txn,
+            intent.curve_id,
+        )
+        .await?
+        {
+            return Err(AppError::BadRequest(format!(
+                "curve {} has already been applied to readings, so its instrument is fixed; \
+                 clear the assignment before applying",
+                intent.curve_id
+            )));
+        }
+        let result = txn
+            .execute_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE standard_curves SET sensor_id = $1 WHERE id = $2",
+                [sensor_id.into(), intent.curve_id.into()],
+            ))
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::BadRequest(format!(
+                "curve {} no longer exists; clear the assignment before applying",
+                intent.curve_id
+            )));
+        }
+        moved += 1;
+    }
+    Ok(moved)
 }
 
 struct EntityCaches {
@@ -836,6 +1003,7 @@ struct ApplyCounters {
     streams_paired: u32,
     streams_skipped: u32,
     instruments_created: u32,
+    curves_assigned: u32,
 }
 
 /// The streams whose curve references resolve to an instrument nobody has agreed to create.
@@ -889,6 +1057,7 @@ pub async fn apply_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> AppR
 
     let entries: Vec<PlanEntry> = serde_json::from_value(plan.entries.clone())
         .map_err(|e| AppError::Internal(format!("Failed to parse plan entries: {e}")))?;
+    let curve_intents = plan_curve_intents(&plan)?;
 
     refuse_unconfirmed_instruments(&entries)?;
 
@@ -897,7 +1066,7 @@ pub async fn apply_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> AppR
     // Atomic status claim: a concurrent apply of the same plan matches zero rows and bails.
     // A rollback restores 'draft'.
     let claimed = txn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE pairing_plans SET status = 'applying' WHERE id = $1 AND status = 'draft'",
             [plan_id.into()],
@@ -909,7 +1078,7 @@ pub async fn apply_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> AppR
         ));
     }
 
-    txn.execute(Statement::from_string(
+    txn.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
     ))
@@ -937,10 +1106,12 @@ pub async fn apply_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> AppR
         streams_paired: 0,
         streams_skipped: 0,
         instruments_created: 0,
+        curves_assigned: 0,
     };
 
     let minted = mint_plan_instruments(&txn, &plan.source_system, &entries).await?;
     counters.instruments_created = minted.len() as u32;
+    counters.curves_assigned = assign_plan_curves(&txn, &curve_intents, &minted).await?;
 
     for entry in entries.iter().filter(|e| e.action == "pair") {
         if (entry.site.id.is_none() && entry.site.name.trim().is_empty())
@@ -996,7 +1167,7 @@ pub async fn apply_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> AppR
     let readings_backfilled = backfill_plan_readings(&txn, plan_id).await?;
     // Audit mismatches recorded while these streams were unpaired become reviewable with the
     // pairing they just gained.
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "UPDATE replicate_audit_holds h SET status = 'pending'
          FROM data_streams ds
@@ -1015,7 +1186,7 @@ pub async fn apply_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> AppR
     // reprocess opens its own transaction and refreshes continuous aggregates (which can't run
     // inside one).
     let slot_rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT DISTINCT sp.site_id, sp.parameter_id
               FROM data_streams ds JOIN site_parameters sp ON ds.site_parameter_id = sp.id
@@ -1063,6 +1234,7 @@ pub async fn apply_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> AppR
         streams_paired: counters.streams_paired,
         streams_skipped: counters.streams_skipped,
         instruments_created: counters.instruments_created,
+        curves_assigned: counters.curves_assigned,
         readings_backfilled,
     };
 
@@ -1116,28 +1288,30 @@ async fn resolve_plan_entry<C: ConnectionTrait>(
         txn,
         site_id,
         parameter_id,
-        &entry.parameter.units,
+        entry,
         caches,
         &mut counters.sp_created,
-        entry.sd_estimator.as_deref(),
     )
     .await?;
     Ok((site_parameter_id, parameter_id))
 }
 
+/// The slot an entry pairs into, created when the site has none. The entry's review choices (sd
+/// estimator, decimal places) reach an existing slot too, each under its own rule.
 async fn resolve_or_create_site_param<C: ConnectionTrait>(
     txn: &C,
     site_id: Uuid,
     parameter_id: Uuid,
-    units: &str,
+    entry: &PlanEntry,
     caches: &mut EntityCaches,
     sp_created: &mut u32,
-    sd_estimator: Option<&str>,
 ) -> AppResult<Uuid> {
+    let units = entry.parameter.units.as_str();
+    let decimal_places = entry.decimal_places;
     // Refused rather than defaulted: the review chose this, and an unrecognised value is a bug in
     // the caller, not a licence to pick a divisor.
     let sd_estimator =
-        crate::routes::private::readings::sd_estimator::parse_opt(sd_estimator)?;
+        crate::routes::private::readings::sd_estimator::parse_opt(entry.sd_estimator.as_deref())?;
     let key = (site_id, parameter_id);
     if let Some(&id) = caches.site_params.get(&key) {
         return Ok(id);
@@ -1163,10 +1337,20 @@ async fn resolve_or_create_site_param<C: ConnectionTrait>(
             active.sd_estimator = Set(Some(declared.to_string()));
             active.update(txn).await?;
         }
+        crate::routes::private::data_streams::service::declare_slot_decimal_places(
+            txn,
+            existing.id,
+            decimal_places,
+        )
+        .await?;
         existing.id
     } else {
         let id = Uuid::new_v4();
-        let mut param_name_val = caches.param_names.get(&parameter_id).cloned().unwrap_or_default();
+        let mut param_name_val = caches
+            .param_names
+            .get(&parameter_id)
+            .cloned()
+            .unwrap_or_default();
         // (site_id, name) is unique; a clash here means the name belongs to a different
         // parameter's slot, so suffix with units (or the parameter code) to disambiguate.
         let name_taken = site_parameters::Entity::find()
@@ -1205,11 +1389,12 @@ async fn resolve_or_create_site_param<C: ConnectionTrait>(
             units_name: Set(units_val),
             units_min: Set(None),
             units_max: Set(None),
-            decimal_places: Set(None),
+            decimal_places: Set(decimal_places),
             channel_id: Set(None),
             sample_interval_sec: Set(None),
             is_active: Set(Some(true)),
             is_public: Set(Some(false)),
+            needs_review: Set(false),
             is_derived: Set(Some(false)),
             derived_definition_id: Set(None),
             variable_mappings: Set(None),
@@ -1282,17 +1467,31 @@ async fn pair_entry_stream<C: ConnectionTrait>(
     parameter_id: Uuid,
     instrument_id: Option<Uuid>,
 ) -> AppResult<()> {
-    // The plan's instrument, when the stream does not already name one. Deliberately no
-    // deployment: a lab instrument corrects a grab, it is not stationed at the site, and the
-    // "attributed but not deployed" state is the one `import_sensor_for_stream` documents.
-    let from_plan = stream.sensor_id.is_none().then_some(instrument_id).flatten();
-
-    if stream.sensor_id.is_none() && from_plan.is_none() {
-        let site_id = site_parameters::Entity::find_by_id(site_parameter_id)
+    // The plan's instrument, when the stream does not already name one. A lab instrument gets no
+    // deployment: it corrects a grab, it is not stationed at the site, and the "attributed but not
+    // deployed" state is the one `import_sensor_for_stream` documents.
+    let from_plan = stream
+        .sensor_id
+        .is_none()
+        .then_some(instrument_id)
+        .flatten();
+    let needs_sensor = stream.sensor_id.is_none() && from_plan.is_none();
+    let device = crate::routes::private::sensors::operations::extract_vaisala_device_serial(
+        &stream.metadata,
+    )
+    .is_some();
+    // Read once, and only for the entries that will use it: an apply runs this per stream.
+    let site_id = if needs_sensor || device {
+        site_parameters::Entity::find_by_id(site_parameter_id)
             .one(txn)
             .await?
             .map(|sp| sp.site_id)
-            .unwrap_or_default();
+            .unwrap_or_default()
+    } else {
+        Uuid::nil()
+    };
+
+    if needs_sensor {
         if let Err(e) = create_sensor_for_stream(txn, &stream, parameter_id, site_id).await {
             tracing::warn!(
                 error = %e,
@@ -1300,6 +1499,25 @@ async fn pair_entry_stream<C: ConnectionTrait>(
                 parameter_id = %parameter_id,
                 site_id = %site_id,
                 "Failed to auto-create sensor for stream during pairing; stream will still be paired",
+            );
+        }
+    } else if device && let Some(sensor_id) = stream.sensor_id.or(from_plan) {
+        // A device is stationed at the site whichever route named it, so the slot's deployment is
+        // opened here too. Without this the plan's own instrument choice silently costs the
+        // deployment that pairing the same stream by hand would have opened.
+        if let Err(e) = crate::routes::private::sensors::operations::find_or_create_deployment(
+            txn,
+            sensor_id,
+            site_id,
+            parameter_id,
+        )
+        .await
+        {
+            tracing::warn!(
+                error = %e,
+                stream_id = %stream.id,
+                %sensor_id,
+                "Failed to open the deployment for a device-shaped stream during pairing",
             );
         }
     }
@@ -1319,9 +1537,31 @@ async fn pair_entry_stream<C: ConnectionTrait>(
     Ok(())
 }
 
+/// Rows the plan's readings point at through `column`, read before the readings lose it.
+async fn plan_reading_references<C: ConnectionTrait>(
+    conn: &C,
+    plan_id: Uuid,
+    column: &str,
+) -> AppResult<Vec<Uuid>> {
+    Ok(conn
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT DISTINCT r.{column} AS id FROM readings r
+                 JOIN data_streams ds ON r.stream_id = ds.id
+                 WHERE ds.pairing_plan_id = $1 AND r.{column} IS NOT NULL"
+            ),
+            [plan_id.into()],
+        ))
+        .await?
+        .iter()
+        .filter_map(|row| row.try_get::<Uuid>("", "id").ok())
+        .collect())
+}
+
 async fn backfill_plan_readings<C: ConnectionTrait>(txn: &C, plan_id: Uuid) -> AppResult<u64> {
     let backfill_result = txn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE readings r
           SET site_id = sp.site_id, parameter_id = sp.parameter_id,
@@ -1336,14 +1576,14 @@ async fn backfill_plan_readings<C: ConnectionTrait>(txn: &C, plan_id: Uuid) -> A
 
     // Replicate groups on the newly paired streams (2+ spot readings sharing a slot and timestamp,
     // e.g. migrated NOMIS A/B/C rows) form samples. The row-level triggers populate the statistics.
-    crate::routes::private::readings::sample_groups::materialise_backfilled_samples(
+    crate::routes::private::readings::sample_groups::materialise_samples(
         txn,
         "ds.pairing_plan_id = $1",
-        plan_id.into(),
+        vec![plan_id.into()],
     )
     .await?;
 
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE status_events se
           SET site_id = sp.site_id, parameter_id = sp.parameter_id
@@ -1372,6 +1612,7 @@ async fn finalize_plan<C: ConnectionTrait>(
         streams_paired: counters.streams_paired,
         streams_skipped: counters.streams_skipped,
         instruments_created: counters.instruments_created,
+        curves_assigned: counters.curves_assigned,
         readings_backfilled,
     };
 
@@ -1405,7 +1646,7 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
 
     // Atomic status claim: a concurrent revert of the same plan matches zero rows and bails.
     let claimed = txn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE pairing_plans SET status = 'reverting' WHERE id = $1 AND status = 'applied'",
             [plan_id.into()],
@@ -1417,7 +1658,7 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
         ));
     }
 
-    txn.execute(Statement::from_string(
+    txn.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
     ))
@@ -1426,22 +1667,16 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
     // NULL out readings for streams from this plan; samples formed by the pairing backfill
     // lose their last reference and are removed below
     // Samples referenced by this plan's readings, so only those can be removed below.
-    let sample_ids: Vec<Uuid> = txn
-        .query_all(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT DISTINCT r.sample_id AS id FROM readings r
-              JOIN data_streams ds ON r.stream_id = ds.id
-              WHERE ds.pairing_plan_id = $1 AND r.sample_id IS NOT NULL",
-            [plan_id.into()],
-        ))
-        .await?
-        .iter()
-        .filter_map(|row| row.try_get::<Uuid>("", "id").ok())
-        .collect();
+    let sample_ids = plan_reading_references(&txn, plan_id, "sample_id").await?;
+    // The visit is attributed state too: `collection_events::attach` only stamps a reading whose
+    // collection_event_id is NULL, so a reading left pointing at the reverted site's visit would
+    // never be re-attached when the stream is paired somewhere else.
+    let event_ids = plan_reading_references(&txn, plan_id, "collection_event_id").await?;
 
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE readings r SET site_id = NULL, parameter_id = NULL, sample_id = NULL
+        r"UPDATE readings r
+          SET site_id = NULL, parameter_id = NULL, sample_id = NULL, collection_event_id = NULL
           FROM data_streams ds
           WHERE r.stream_id = ds.id AND ds.pairing_plan_id = $1",
         [plan_id.into()],
@@ -1449,7 +1684,7 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
     .await?;
 
     // Reverting the pairing takes the reviewer away again; open reviews wait as deferred.
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "UPDATE replicate_audit_holds h SET status = 'deferred'
          FROM data_streams ds
@@ -1459,7 +1694,7 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
     .await?;
 
     if !sample_ids.is_empty() {
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"DELETE FROM samples s
               WHERE s.id = ANY($1)
@@ -1469,7 +1704,18 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
         .await?;
     }
 
-    txn.execute(Statement::from_sql_and_values(
+    if !event_ids.is_empty() {
+        txn.execute_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"DELETE FROM collection_events ce
+              WHERE ce.id = ANY($1)
+                AND NOT EXISTS (SELECT 1 FROM readings r WHERE r.collection_event_id = ce.id)",
+            [event_ids.into()],
+        ))
+        .await?;
+    }
+
+    txn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE status_events se SET site_id = NULL, parameter_id = NULL
           FROM data_streams ds
@@ -1480,7 +1726,7 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
 
     // Unpair the streams; pairing_plan_id stays as the audit link back to this plan
     let result = txn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE data_streams SET site_parameter_id = NULL, paired_at = NULL
           WHERE pairing_plan_id = $1",
@@ -1691,7 +1937,7 @@ pub async fn load_entity_catalog(db: &impl ConnectionTrait) -> AppResult<EntityC
     // the slots, not the hypertable's rows, so this stays a catalog-sized query.
     let mut usage: HashMap<Uuid, (i64, i64)> = HashMap::new();
     for row in db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT sp.parameter_id AS parameter_id,
                     COUNT(*) AS slots,
@@ -1767,11 +2013,10 @@ pub fn reclassify_entry(entry: &mut PlanEntry, catalog: &EntityCatalog) {
             &entry.parameter.units,
         ));
     }
-    // A family whose source reports an sd, left undeclared because its open holds carry the
-    // population signature. `catalog` has no slot rows, so this reads the plan's own declaration:
-    // an entry that has already been patched with one is settled.
+    // A family whose source reports an sd and has no declaration yet. `catalog` has no slot rows,
+    // so this reads the plan's own declaration: an entry that has already been patched with one,
+    // or adopted its slot's, is settled.
     if entry.sd_estimator.is_none()
-        && entry.sd_population_holds > 0
         && entry
             .replicates
             .as_ref()

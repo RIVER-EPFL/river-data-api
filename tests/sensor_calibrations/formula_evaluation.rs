@@ -160,7 +160,7 @@ async fn test_derived_parameter_skips_infinity() {
 
     // Check that NO derived reading was written (Infinity should have been skipped)
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT raw_value FROM readings WHERE site_id = $1 AND parameter_id = $2 AND time = $3",
             [
@@ -182,7 +182,7 @@ async fn test_derived_parameter_skips_infinity() {
 
 async fn exec(db: &sea_orm::DatabaseConnection, sql: &str) {
     use sea_orm::{ConnectionTrait, Statement};
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_string(),
     ))

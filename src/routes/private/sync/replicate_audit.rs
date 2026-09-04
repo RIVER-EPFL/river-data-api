@@ -45,7 +45,7 @@ async fn enforce_hold_scope(
     hold_id: Uuid,
 ) -> AppResult<()> {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT COALESCE(sp.site_id, h.site_id) AS site_id FROM replicate_audit_holds h
              LEFT JOIN data_streams ds ON ds.id = h.stream_id
@@ -196,6 +196,18 @@ pub fn stats_agree_with(
     }
 }
 
+/// Whether a group's recomputed statistics meet the source's claim: mean and sd within their
+/// tolerances, and the count equal when the source stated one. The one comparison the audit,
+/// the review queue and the preview all make.
+#[must_use]
+pub fn agrees(expected: &GroupAudit, stats: &GroupStats) -> bool {
+    stats_agree(expected.expected_mean, stats.mean, DEFAULT_REL_TOL)
+        && stats_agree_with(expected.expected_sd, stats.sd, SD_REL_TOL, SD_ABS_TOL)
+        && expected
+            .expected_n
+            .is_none_or(|n| i64::try_from(stats.n) == Ok(n))
+}
+
 /// One stored value with the replicate index it is stored at. The index is the source's column
 /// position and nothing renumbers it, so it is the only handle a resolution can flag by.
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -239,6 +251,8 @@ pub struct GroupMismatch {
     pub computed_mean: Option<f64>,
     pub computed_sd: Option<f64>,
     pub n: usize,
+    /// The divisor `computed_sd` was computed under, 'sample' or 'population'.
+    pub sd_estimator: String,
     /// The stored values the statistics were computed over, each at its replicate index.
     pub values: Vec<ReplicateValue>,
 }
@@ -291,7 +305,11 @@ pub fn expected_changed(recorded: &serde_json::Value, audit: &GroupAudit) -> boo
     ) || recorded.get("n").and_then(serde_json::Value::as_i64) != audit.expected_n
 }
 
-/// The most recent hold per group for a stream at the given instants, any status.
+/// The most recent statistics hold per group for a stream at the given instants, any status.
+///
+/// Scoped to `replicate_stats`: the caller is the statistics audit deciding whether a group's
+/// recorded expectation changed at source, and a `source_modified` or `brake_fired` row at the same
+/// instant answers a different question.
 pub async fn latest_holds<C: ConnectionTrait>(
     conn: &C,
     stream_id: Uuid,
@@ -304,11 +322,12 @@ pub async fn latest_holds<C: ConnectionTrait>(
     // one batch's audit instants are contiguous anyway.
     let wanted: std::collections::HashSet<DateTime<Utc>> = times.iter().copied().collect();
     let rows = conn
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT DISTINCT ON (group_time) id, group_time, status, expected
              FROM replicate_audit_holds
              WHERE stream_id = $1 AND group_time >= $2 AND group_time <= $3
+               AND kind = 'replicate_stats'
              ORDER BY group_time, created_at DESC, id DESC",
             [
                 stream_id.into(),
@@ -356,6 +375,7 @@ pub async fn upsert_hold<C: ConnectionTrait>(
         "mean": mismatch.computed_mean,
         "sd": mismatch.computed_sd,
         "n": mismatch.n,
+        "sd_estimator": mismatch.sd_estimator,
         "values": mismatch.values,
     });
     let mut delta = serde_json::json!({
@@ -367,12 +387,12 @@ pub async fn upsert_hold<C: ConnectionTrait>(
         delta["n"] =
             i64::try_from(mismatch.n).map_or(serde_json::Value::Null, |n| (expected_n - n).into());
     }
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         format!(
-            "INSERT INTO replicate_audit_holds (stream_id, group_time, expected, computed, delta, status)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (stream_id, group_time) WHERE status IN {OPEN}
+            "INSERT INTO replicate_audit_holds (stream_id, group_time, kind, expected, computed, delta, status)
+             VALUES ($1, $2, 'replicate_stats', $3, $4, $5, $6)
+             ON CONFLICT (stream_id, group_time, kind) WHERE status IN {OPEN}
              DO UPDATE SET expected = EXCLUDED.expected, computed = EXCLUDED.computed,
                            delta = EXCLUDED.delta,
                            status = CASE WHEN replicate_audit_holds.status = 'deferred'
@@ -403,7 +423,7 @@ pub async fn close_hold<C: ConnectionTrait>(
     hold_id: Uuid,
     terminal_status: &str,
 ) -> AppResult<()> {
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "UPDATE replicate_audit_holds SET status = $2 WHERE id = $1",
         [hold_id.into(), terminal_status.to_string().into()],
@@ -491,6 +511,9 @@ fn merged_resolution(
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ListHoldsQuery {
+    /// One hold, for a link that names it.
+    #[serde(default)]
+    pub id: Option<Uuid>,
     #[serde(default)]
     pub stream_id: Option<Uuid>,
     /// Comma-separated stream UUIDs.
@@ -622,6 +645,7 @@ pub struct HoldRow {
     pub source_name: Option<String>,
     /// Site and parameter of the paired slot (or of the event finding itself); NULL while the
     /// stream is unpaired.
+    pub site_id: Option<Uuid>,
     pub site_name: Option<String>,
     pub parameter_name: Option<String>,
     pub parameter_code: Option<String>,
@@ -639,6 +663,9 @@ pub struct HoldRow {
     /// Signature of the disagreement: `n_mismatch` | `population_sd` | `stale_subset` |
     /// `unexplained`. Computed from the stored expectation and recompute, never persisted.
     pub classification: String,
+    /// The divisor `computed.sd` was computed under, 'sample' or 'population'. Recorded on the
+    /// hold; a hold that predates the record reads the slot's declaration, else 'sample'.
+    pub sd_estimator: Option<String>,
     /// The decision record: latest action plus prior actions under `history`.
     #[schema(value_type = Object)]
     pub resolution: Option<serde_json::Value>,
@@ -662,12 +689,15 @@ pub struct ListHoldsResponse {
     pub pending: u64,
     /// Deferred holds (unpaired streams) within the same filters.
     pub deferred: u64,
+    /// Pending holds per `kind`, so an entry point can say what is waiting rather than calling
+    /// every kind a replicate-statistics disagreement.
+    pub pending_by_kind: std::collections::BTreeMap<String, u64>,
 }
 
 /// List replicate audit holds, newest first. The UI's Audits view reads this.
 #[utoipa::path(
     get,
-    path = "/sync/replicate_audit_holds",
+    path = "/api/sync/replicate_audit_holds",
     params(
         ("stream_id" = Option<Uuid>, Query, description = "Filter to one stream"),
         ("stream_ids" = Option<String>, Query, description = "Comma-separated stream UUIDs"),
@@ -701,6 +731,10 @@ pub async fn list_holds(
               AND st.project_id = ANY(${n})))",
             n = binds.len()
         ));
+    }
+    if let Some(id) = query.id {
+        binds.push(id.into());
+        conditions.push(format!("h.id = ${}", binds.len()));
     }
     if let Some(stream_id) = query.stream_id {
         binds.push(stream_id.into());
@@ -736,7 +770,10 @@ pub async fn list_holds(
     }
     match query.classification.as_deref() {
         Some("population_sd") => {
-            conditions.push(format!("h.kind = 'replicate_stats' AND ({})", *POPULATION_SD_SQL));
+            conditions.push(format!(
+                "h.kind = 'replicate_stats' AND ({})",
+                *POPULATION_SD_SQL
+            ));
         }
         Some("not_population_sd") => {
             // COALESCE, not a bare NOT: a hold missing a statistic leaves the signature NULL, and
@@ -794,7 +831,7 @@ pub async fn list_holds(
 
     let count_row = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT COUNT(*) FILTER (WHERE {status_sql})::bigint AS total,
@@ -816,6 +853,7 @@ pub async fn list_holds(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "SELECT h.id, h.stream_id, h.kind, ds.source_system, ds.source_key, ds.source_name,
+                    COALESCE(s.id, es.id) AS site_id,
                     COALESCE(s.name, es.name) AS site_name,
                     COALESCE(p.name, ep.name) AS parameter_name,
                     COALESCE(p.code, ep.code) AS parameter_code,
@@ -823,7 +861,11 @@ pub async fn list_holds(
                     COALESCE(ds.site_parameter_id IS NOT NULL, FALSE) AS paired,
                     h.group_time,
                     h.expected, h.computed, h.delta, h.status,
-                    ''::text AS classification, h.resolution,
+                    ''::text AS classification,
+                    CASE WHEN h.kind = 'replicate_stats'
+                         THEN COALESCE(h.computed->>'sd_estimator', sp.sd_estimator, 'sample')
+                    END AS sd_estimator,
+                    h.resolution,
                     h.created_at, h.acknowledged_by, h.acknowledged_at,
                     {RELATIVE_DELTA_SQL} AS relative_delta,
                     {MEAN_RELATIVE_DELTA_SQL} AS mean_relative_delta,
@@ -839,7 +881,7 @@ pub async fn list_holds(
              ORDER BY {order_by}
              LIMIT {page_size} OFFSET {offset}"
         ),
-        binds,
+        binds.clone(),
     ))
     .all(&state.db)
     .await?;
@@ -851,11 +893,35 @@ pub async fn list_holds(
         }
     }
 
+    // Same filters as the counts above, split by kind: the entry points announce what is waiting,
+    // and a fired brake is not a replicate-statistics disagreement.
+    let kind_rows = state
+        .db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT h.kind, COUNT(*)::bigint AS n
+                 FROM replicate_audit_holds h
+                 LEFT JOIN data_streams ds ON ds.id = h.stream_id
+                 WHERE {base_clause} AND h.status = 'pending'
+                 GROUP BY h.kind"
+            ),
+            binds.clone(),
+        ))
+        .await?;
+    let mut pending_by_kind = std::collections::BTreeMap::new();
+    for row in &kind_rows {
+        let kind: String = row.try_get("", "kind")?;
+        let n: i64 = row.try_get("", "n")?;
+        pending_by_kind.insert(kind, u64::try_from(n).unwrap_or(0));
+    }
+
     Ok(Json(ListHoldsResponse {
         holds: rows,
         total: u64::try_from(total).unwrap_or(0),
         pending: u64::try_from(pending).unwrap_or(0),
         deferred: u64::try_from(deferred).unwrap_or(0),
+        pending_by_kind,
     }))
 }
 
@@ -890,7 +956,7 @@ const AUDIT_ANNOTATION_CATEGORY: &str = "audit";
 /// because it could not also be drawn. Failures are logged, never returned.
 async fn mint_audit_annotation<C: ConnectionTrait>(conn: &C, hold_id: Uuid, text: &str, by: &str) {
     let result = conn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "INSERT INTO annotations
                  (site_id, parameter_id, start_time, end_time, text, category,
@@ -919,7 +985,7 @@ async fn mint_audit_annotation<C: ConnectionTrait>(conn: &C, hold_id: Uuid, text
 /// Remove the annotations a hold's decisions minted. Runs on reopen, inside its transaction: the
 /// note said a decision had been taken, and it has not any more.
 async fn delete_audit_annotations<C: ConnectionTrait>(conn: &C, hold_id: Uuid) -> AppResult<()> {
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "DELETE FROM annotations WHERE audit_hold_id = $1",
         [hold_id.into()],
@@ -951,7 +1017,7 @@ async fn hold_numbers<C: ConnectionTrait>(
     hold_id: Uuid,
 ) -> (serde_json::Value, serde_json::Value) {
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT expected, computed FROM replicate_audit_holds WHERE id = $1",
             [hold_id.into()],
@@ -963,8 +1029,10 @@ async fn hold_numbers<C: ConnectionTrait>(
         || (serde_json::Value::Null, serde_json::Value::Null),
         |row| {
             (
-                row.try_get("", "expected").unwrap_or(serde_json::Value::Null),
-                row.try_get("", "computed").unwrap_or(serde_json::Value::Null),
+                row.try_get("", "expected")
+                    .unwrap_or(serde_json::Value::Null),
+                row.try_get("", "computed")
+                    .unwrap_or(serde_json::Value::Null),
             )
         },
     )
@@ -999,7 +1067,7 @@ async fn refuse_undeclared_estimator(
 ) -> AppResult<()> {
     let population_sd = &*POPULATION_SD_SQL;
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT (h.expected->>'sd')::float8 AS expected_sd,
@@ -1042,7 +1110,7 @@ async fn refuse_undeclared_estimator(
 /// The acting identity is taken from the caller's authentication, never from the request.
 #[utoipa::path(
     post,
-    path = "/sync/replicate_audit_holds/{id}/acknowledge",
+    path = "/api/sync/replicate_audit_holds/{id}/acknowledge",
     responses(
         (status = 200, body = AcknowledgeResponse),
         (status = 404, description = "No pending hold with this id"),
@@ -1061,7 +1129,7 @@ pub async fn acknowledge_hold(
     let resolution_sql = accept_ours_resolution_sql("$2");
     let updated = state
         .db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "UPDATE replicate_audit_holds AS h
@@ -1139,7 +1207,7 @@ pub struct ResolveHoldResponse {
 /// over the rest. Both record the decision on the hold.
 #[utoipa::path(
     post,
-    path = "/sync/replicate_audit_holds/{id}/resolve",
+    path = "/api/sync/replicate_audit_holds/{id}/resolve",
     request_body = ResolveHoldRequest,
     responses(
         (status = 200, body = ResolveHoldResponse),
@@ -1166,7 +1234,7 @@ pub async fn resolve_hold(
             let resolution_sql = accept_ours_resolution_sql("$2");
             let updated = state
                 .db
-                .execute(Statement::from_sql_and_values(
+                .execute_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     format!(
                         "UPDATE replicate_audit_holds AS h
@@ -1227,7 +1295,7 @@ pub async fn resolve_hold(
                 // The hold is locked before anything is flagged: the flags and the decision record
                 // that explains them must land together or not at all.
                 let hold = txn
-                    .query_one(Statement::from_sql_and_values(
+                    .query_one_raw(Statement::from_sql_and_values(
                         sea_orm::DatabaseBackend::Postgres,
                         "SELECT stream_id, group_time, resolution, computed
                          FROM replicate_audit_holds
@@ -1275,7 +1343,7 @@ pub async fn resolve_hold(
                 }
 
                 let group_rows = txn
-                    .query_all(Statement::from_sql_and_values(
+                    .query_all_raw(Statement::from_sql_and_values(
                         sea_orm::DatabaseBackend::Postgres,
                         "SELECT replicate_index, is_flagged IS TRUE AS flagged FROM readings
                          WHERE stream_id = $1 AND time = $2",
@@ -1328,23 +1396,26 @@ pub async fn resolve_hold(
                     ));
                 }
 
-                let flagged: Vec<i16> = txn
-                    .query_all(Statement::from_sql_and_values(
-                        sea_orm::DatabaseBackend::Postgres,
-                        format!(
-                            "UPDATE readings SET is_flagged = TRUE, flag_reason = $3
-                             WHERE stream_id = $1 AND time = $2
-                               AND replicate_index IN ({index_list})
-                               AND is_flagged IS NOT TRUE
-                             RETURNING replicate_index"
-                        ),
-                        [stream_id.into(), group_time.into(), reason.clone().into()],
-                    ))
-                    .await?
-                    .iter()
-                    .map(|row| row.try_get::<i16>("", "replicate_index"))
-                    .collect::<Result<_, _>>()?;
-                if flagged.len() != indexes.len() {
+                // Each flagged replicate is a decision of audit origin (ADR 0008); the record's
+                // trigger projects it.
+                let flagged = crate::routes::private::readings::decisions::record_many(
+                    txn,
+                    crate::routes::private::readings::decisions::Kind::Flag,
+                    &format!(
+                        "r.stream_id = $1 AND r.time = $2 AND r.replicate_index IN ({index_list}) \
+                         AND r.is_flagged IS NOT TRUE"
+                    ),
+                    vec![stream_id.into(), group_time.into()],
+                    crate::routes::private::readings::decisions::NewValue::Literal(
+                        serde_json::json!({ "reason": reason, "hold_id": id }),
+                    ),
+                    &by,
+                    Some(&reason),
+                    crate::routes::private::readings::decisions::Origin::Audit,
+                    Some(id),
+                )
+                .await?;
+                if usize::try_from(flagged.rows).unwrap_or(usize::MAX) != indexes.len() {
                     return Err(AppError::Conflict(format!(
                         "the replicate group changed under this request; nothing was flagged \
                          (hold {id})"
@@ -1361,7 +1432,7 @@ pub async fn resolve_hold(
                     &by,
                 );
                 let decided = txn
-                    .execute(Statement::from_sql_and_values(
+                    .execute_raw(Statement::from_sql_and_values(
                         sea_orm::DatabaseBackend::Postgres,
                         "UPDATE replicate_audit_holds
                          SET status = 'remediated', resolution = $2,
@@ -1437,7 +1508,7 @@ async fn declare_estimator(
     let (site_parameter_id, affected) =
         crate::common::bulk_write::guarded(&state.db, async |txn| {
             let hold = txn
-                .query_one(Statement::from_sql_and_values(
+                .query_one_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "SELECT h.group_time, h.resolution, sp.id AS site_parameter_id,
                             sp.site_id, sp.parameter_id, sp.sd_estimator AS previous
@@ -1464,7 +1535,7 @@ async fn declare_estimator(
             let prev_resolution: Option<serde_json::Value> = hold.try_get("", "resolution")?;
 
             let affected = if scope == "slot" {
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "UPDATE site_parameters SET sd_estimator = $2 WHERE id = $1",
                     [site_parameter_id.into(), estimator.into()],
@@ -1472,7 +1543,7 @@ async fn declare_estimator(
                 .await?;
                 // Counted here, inside the same transaction the declaration lands in, so the
                 // number reported is the one the retag will act on.
-                txn.query_one(Statement::from_sql_and_values(
+                txn.query_one_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "SELECT COUNT(*)::bigint AS n FROM samples
                      WHERE site_id = $1 AND parameter_id = $2
@@ -1486,7 +1557,7 @@ async fn declare_estimator(
                 // One group: set it and refresh that row alone. `sample` as the source is what
                 // keeps a later slot-level retag from overwriting this decision.
                 let rows = txn
-                    .execute(Statement::from_sql_and_values(
+                    .execute_raw(Statement::from_sql_and_values(
                         sea_orm::DatabaseBackend::Postgres,
                         "UPDATE samples
                          SET sd_estimator = $3, sd_estimator_source = 'sample'
@@ -1500,7 +1571,7 @@ async fn declare_estimator(
                     ))
                     .await?
                     .rows_affected();
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "SELECT refresh_sample_aggregate(id) FROM samples
                      WHERE site_id = $1 AND parameter_id = $2 AND collected_at = $3",
@@ -1521,7 +1592,7 @@ async fn declare_estimator(
                 by,
             );
             let updated = txn
-                .execute(Statement::from_sql_and_values(
+                .execute_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "UPDATE replicate_audit_holds
                      SET status = 'remediated', resolution = $2,
@@ -1595,7 +1666,7 @@ async fn declare_estimator(
 /// `deferred` per the stream's current pairing.
 #[utoipa::path(
     post,
-    path = "/sync/replicate_audit_holds/{id}/reopen",
+    path = "/api/sync/replicate_audit_holds/{id}/reopen",
     responses(
         (status = 200, body = ResolveHoldResponse),
         (status = 404, description = "No decided hold with this id"),
@@ -1612,7 +1683,7 @@ pub async fn reopen_hold(
     let by = actor_label(&auth);
     let reopened = crate::common::bulk_write::guarded(&state.db, async |txn| {
         let hold = txn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT h.stream_id, h.group_time, h.status, h.resolution,
                         (ds.site_parameter_id IS NOT NULL) AS paired,
@@ -1682,16 +1753,22 @@ pub async fn reopen_hold(
         {
             // Only the rows this resolution flagged: a flag someone set since, or with another
             // reason, stays.
-            txn.execute(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                format!(
-                    "UPDATE readings SET is_flagged = FALSE, flag_reason = NULL
-                     WHERE stream_id = $1 AND time = $2
-                       AND replicate_index IN ({index_list})
-                       AND is_flagged = TRUE AND flag_reason = $3"
+            crate::routes::private::readings::decisions::record_many(
+                txn,
+                crate::routes::private::readings::decisions::Kind::Unflag,
+                &format!(
+                    "r.stream_id = $1 AND r.time = $2 AND r.replicate_index IN ({index_list}) \
+                     AND r.is_flagged = TRUE AND r.flag_reason = $3"
                 ),
-                [stream_id.into(), group_time.into(), reason.clone().into()],
-            ))
+                vec![stream_id.into(), group_time.into(), reason.clone().into()],
+                crate::routes::private::readings::decisions::NewValue::Literal(
+                    serde_json::json!({ "hold_id": id, "reopened": true }),
+                ),
+                &by,
+                Some("reopened"),
+                crate::routes::private::readings::decisions::Origin::Audit,
+                Some(id),
+            )
             .await?;
         }
         if status == "remediated"
@@ -1702,7 +1779,7 @@ pub async fn reopen_hold(
             let parameter_id: Option<Uuid> = hold.try_get("", "parameter_id")?;
             if decl_scope == "slot" {
                 if let Some(sp_id) = site_parameter_id {
-                    txn.execute(Statement::from_sql_and_values(
+                    txn.execute_raw(Statement::from_sql_and_values(
                         sea_orm::DatabaseBackend::Postgres,
                         "UPDATE site_parameters SET sd_estimator = $2 WHERE id = $1",
                         [sp_id.into(), previous.clone().into()],
@@ -1710,7 +1787,7 @@ pub async fn reopen_hold(
                     .await?;
                     // The samples this declaration moved go back with it. A row whose estimator
                     // was chosen for its own instant is not one of them.
-                    txn.execute(Statement::from_sql_and_values(
+                    txn.execute_raw(Statement::from_sql_and_values(
                         sea_orm::DatabaseBackend::Postgres,
                         "UPDATE samples s
                          SET sd_estimator = COALESCE($3, 'sample'),
@@ -1720,10 +1797,14 @@ pub async fn reopen_hold(
                          WHERE sp.id = $1 AND s.site_id = sp.site_id
                            AND s.parameter_id = sp.parameter_id
                            AND s.sd_estimator_source <> 'sample'",
-                        [sp_id.into(), previous.clone().into(), previous.clone().into()],
+                        [
+                            sp_id.into(),
+                            previous.clone().into(),
+                            previous.clone().into(),
+                        ],
                     ))
                     .await?;
-                    txn.execute(Statement::from_sql_and_values(
+                    txn.execute_raw(Statement::from_sql_and_values(
                         sea_orm::DatabaseBackend::Postgres,
                         "SELECT refresh_sample_aggregate(s.id) FROM samples s
                          JOIN site_parameters sp
@@ -1736,7 +1817,7 @@ pub async fn reopen_hold(
             } else if let (Some(site_id), Some(parameter_id)) = (site_id, parameter_id) {
                 // The instant goes back to whatever its slot says, which is the state it would
                 // have been created in.
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "UPDATE samples s
                      SET sd_estimator = COALESCE(sp.sd_estimator, 'sample'),
@@ -1748,7 +1829,7 @@ pub async fn reopen_hold(
                     [site_id.into(), parameter_id.into(), group_time.into()],
                 ))
                 .await?;
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "SELECT refresh_sample_aggregate(id) FROM samples
                      WHERE site_id = $1 AND parameter_id = $2 AND collected_at = $3",
@@ -1758,7 +1839,7 @@ pub async fn reopen_hold(
             }
         }
         let restored = txn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "UPDATE replicate_audit_holds
                  SET status = $2, resolution = $3, acknowledged_by = NULL, acknowledged_at = NULL
@@ -1816,7 +1897,7 @@ pub struct BulkAcknowledgeRequest {
 /// acknowledgement per instant.
 #[utoipa::path(
     post,
-    path = "/sync/replicate_audit_holds/acknowledge_bulk",
+    path = "/api/sync/replicate_audit_holds/acknowledge_bulk",
     request_body = BulkAcknowledgeRequest,
     responses((status = 200, body = AcknowledgeResponse)),
     tag = "sync"
@@ -1881,7 +1962,7 @@ pub async fn acknowledge_holds_bulk(
     );
     let skipped = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT COUNT(*)::bigint AS n
@@ -1897,7 +1978,7 @@ pub async fn acknowledge_holds_bulk(
     let resolution_sql = accept_ours_resolution_sql("$1");
     let acknowledged = state
         .db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "UPDATE replicate_audit_holds AS h
@@ -1917,7 +1998,7 @@ pub async fn acknowledge_holds_bulk(
     if acknowledged > 0 {
         let annotated = state
             .db
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "INSERT INTO annotations
                      (site_id, parameter_id, start_time, end_time, text, category,

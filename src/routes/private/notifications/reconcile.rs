@@ -25,7 +25,7 @@ pub async fn sweep(state: &AppState) -> Result<SweepOutcome, sea_orm::DbErr> {
     let mut outcome = SweepOutcome::default();
 
     let subs = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             PG,
             "SELECT DISTINCT keycloak_sub FROM web_push_subscriptions".to_string(),
         ))
@@ -36,7 +36,7 @@ pub async fn sweep(state: &AppState) -> Result<SweepOutcome, sea_orm::DbErr> {
         let resolution = state.authorizer.resolve(state, &sub).await;
         if matches!(resolution, Some(RoleResolution::Revoked)) {
             let res = db
-                .execute(Statement::from_sql_and_values(
+                .execute_raw(Statement::from_sql_and_values(
                     PG,
                     "DELETE FROM web_push_subscriptions WHERE keycloak_sub = $1",
                     [sub.clone().into()],
@@ -48,7 +48,7 @@ pub async fn sweep(state: &AppState) -> Result<SweepOutcome, sea_orm::DbErr> {
     }
 
     let subscribers = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             PG,
             "SELECT keycloak_sub FROM notification_subscribers WHERE is_active".to_string(),
         ))
@@ -58,7 +58,7 @@ pub async fn sweep(state: &AppState) -> Result<SweepOutcome, sea_orm::DbErr> {
         let sub: String = row.try_get("", "keycloak_sub")?;
         let resolution = state.authorizer.resolve(state, &sub).await;
         if matches!(resolution, Some(RoleResolution::Revoked)) {
-            db.execute(Statement::from_sql_and_values(
+            db.execute_raw(Statement::from_sql_and_values(
                 PG,
                 "UPDATE notification_subscribers SET is_active = false WHERE keycloak_sub = $1",
                 [sub.into()],

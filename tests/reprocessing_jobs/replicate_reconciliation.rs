@@ -117,7 +117,7 @@ async fn run_job(db: &DatabaseConnection, trigger: &str, dry_run: bool) -> Uuid 
 
 async fn job_outcome(db: &DatabaseConnection, id: Uuid) -> (String, serde_json::Value) {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!("SELECT status, detail FROM reprocessing_jobs WHERE id = '{id}'"),
         ))
@@ -181,7 +181,7 @@ async fn migrate_verify_happy_path() {
     assert_eq!(slot_samples(&db).await, 3, "one sample per replicate group");
     for (time, _reps, avg) in GROUPS {
         let row = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DatabaseBackend::Postgres,
                 format!(
                     "SELECT mean, n::bigint AS n FROM samples \

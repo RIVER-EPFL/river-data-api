@@ -66,8 +66,9 @@ async fn resolve_or_create_site_parameter<C: ConnectionTrait>(
         sample_interval_sec: Set(None),
         is_active: Set(Some(true)),
         is_public: Set(Some(false)),
+        needs_review: Set(false),
         sd_estimator: Set(None),
-            is_derived: Set(Some(false)),
+        is_derived: Set(Some(false)),
         derived_definition_id: Set(None),
         variable_mappings: Set(None),
         created_at: Set(Some(Utc::now())),
@@ -134,7 +135,7 @@ async fn resolve_sensor_parameter<C: ConnectionTrait>(
         return Ok(p);
     }
     let sensor_exists = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT 1 FROM sensors WHERE id = $1",
             [sensor_id.into()],
@@ -144,7 +145,7 @@ async fn resolve_sensor_parameter<C: ConnectionTrait>(
         return Err(AppError::NotFound("Sensor not found".to_string()));
     }
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT DISTINCT parameter_id FROM (
                   SELECT parameter_id FROM sensor_deployments WHERE sensor_id = $1
@@ -182,7 +183,7 @@ async fn resolve_swap_parameter<C: ConnectionTrait>(
         return Ok(p);
     }
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT parameter_id FROM sensor_deployments
               WHERE sensor_id = $1 AND site_id = $2
@@ -203,7 +204,7 @@ async fn resolve_swap_parameter<C: ConnectionTrait>(
 /// then re-derives the sensor's readings by window (tracked job). Requires `write_metadata`.
 #[utoipa::path(
     post,
-    path = "/sensors/{sensor_id}/adopt",
+    path = "/api/sensors/{sensor_id}/adopt",
     params(("sensor_id" = Uuid, Path, description = "Sensor UUID")),
     request_body = AdoptRequest,
     responses(
@@ -226,7 +227,7 @@ pub async fn adopt_sensor(
     let parameter_id = resolve_sensor_parameter(db, sensor_id, payload.parameter_id).await?;
 
     let site_exists = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT 1 FROM sites WHERE id = $1",
             [payload.site_id.into()],
@@ -248,7 +249,7 @@ pub async fn adopt_sensor(
     let txn = db.begin().await?;
     // Lift the decompression cap for the readings parameter_id backfill below (no-op on uncompressed
     // data; resets on commit). Applies to the whole transaction.
-    txn.execute(Statement::from_string(
+    txn.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
     ))
@@ -264,7 +265,7 @@ pub async fn adopt_sensor(
     // Auto-recall this sensor's currently-open deployment FOR THIS PARAMETER at the new start (twin of
     // the sensor_deployments before_create hook). Scoped to the parameter so adopting one channel of a
     // multi-channel instrument doesn't recall its other channels.
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE sensor_deployments SET deployed_until = $1
           WHERE sensor_id = $2 AND parameter_id = $3 AND deployed_until IS NULL",
@@ -285,7 +286,7 @@ pub async fn adopt_sensor(
         .unwrap_or_else(|| "Adopted via /sensors/{id}/adopt".to_string());
     let until_val: sea_orm::Value = payload.deployed_until.into();
     let insert = txn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"INSERT INTO sensor_deployments
                   (id, sensor_id, site_id, parameter_id, deployed_from, deployed_until, deployment_type, notes)
@@ -318,7 +319,7 @@ pub async fn adopt_sensor(
     // insert, so a failure can't leave a half-applied adopt. The reprocess itself is a post-commit
     // tracked job (heavy, async, retryable).
     recompute_deployed_until(&txn, sensor_id).await?;
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "UPDATE readings SET parameter_id = $1 WHERE sensor_id = $2 AND parameter_id IS NULL",
         [parameter_id.into(), sensor_id.into()],
@@ -369,7 +370,7 @@ pub struct AdoptSuggestion {
 /// Suggested deploy dates for a sensor: now, the end of its last deployment, and its first reading.
 #[utoipa::path(
     get,
-    path = "/sensors/{sensor_id}/adopt_suggestions",
+    path = "/api/sensors/{sensor_id}/adopt_suggestions",
     params(("sensor_id" = Uuid, Path, description = "Sensor UUID")),
     responses((status = 200, description = "Suggested dates", body = AdoptSuggestion)),
     tag = "sensors"
@@ -385,7 +386,7 @@ pub async fn adopt_suggestions(
         return Err(AppError::NotFound("Sensor not found".to_string()));
     }
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT
                 (SELECT MAX(COALESCE(deployed_until, deployed_from)) FROM sensor_deployments WHERE sensor_id = $1) AS end_last,
@@ -446,7 +447,7 @@ pub struct SwapResponse {
 /// start the incoming sensor's at the same instant, in one transaction. Requires `write_metadata`.
 #[utoipa::path(
     post,
-    path = "/actions/swap",
+    path = "/api/actions/swap",
     request_body = SwapRequest,
     responses(
         (status = 200, description = "Swap complete; returns deployments + tracked jobs", body = SwapResponse),
@@ -481,7 +482,7 @@ pub async fn swap_sensors(
 
     let txn = db.begin().await?;
     // Lift the decompression cap for the readings parameter_id backfill below (resets on commit).
-    txn.execute(Statement::from_string(
+    txn.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
     ))
@@ -497,7 +498,7 @@ pub async fn swap_sensors(
     // Recall the INCOMING sensor's open deployment for THIS PARAMETER at the swap instant, so it can't
     // end up double-open for the channel (twin of the outgoing recall + the adopt before_create hook).
     // Scoped to the parameter so swapping one channel doesn't recall the instrument's other channels.
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE sensor_deployments SET deployed_until = $1
           WHERE sensor_id = $2 AND parameter_id = $3 AND deployed_until IS NULL",
@@ -512,7 +513,7 @@ pub async fn swap_sensors(
     // End the outgoing sensor's open deployment at THIS (site, parameter) slot only, a multi-channel
     // outgoing instrument keeps its other channels running.
     let ended = txn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE sensor_deployments SET deployed_until = $1
               WHERE sensor_id = $2 AND site_id = $3 AND parameter_id = $4 AND deployed_until IS NULL
@@ -530,7 +531,7 @@ pub async fn swap_sensors(
     // Start the incoming sensor at the same instant; half-open windows mean no overlap.
     let started_id = Uuid::new_v4();
     let insert = txn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"INSERT INTO sensor_deployments
                   (id, sensor_id, site_id, parameter_id, deployed_from, deployment_type, notes)
@@ -559,13 +560,13 @@ pub async fn swap_sensors(
     // leave a half-applied swap. The handover reprocess is a post-commit tracked job.
     recompute_deployed_until(&txn, payload.outgoing_sensor_id).await?;
     recompute_deployed_until(&txn, payload.incoming_sensor_id).await?;
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "UPDATE data_streams SET sensor_id = $1, updated_at = now() WHERE site_parameter_id = $2",
         [payload.incoming_sensor_id.into(), site_parameter_id.into()],
     ))
     .await?;
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "UPDATE readings SET parameter_id = $1 WHERE sensor_id = $2 AND parameter_id IS NULL",
         [parameter_id.into(), payload.incoming_sensor_id.into()],

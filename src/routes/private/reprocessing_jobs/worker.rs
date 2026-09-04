@@ -11,7 +11,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
 use super::job::JobRegistry;
-use super::lifecycle::{self, JobContext};
+use super::lifecycle::{self, JobContext, RetryPolicy};
 
 /// Lease lifetime before the reaper may reclaim a row. Sized well above a plausible GC / k8s
 /// CPU-throttle stall so a slow-but-alive worker is not reaped mid-run.
@@ -42,7 +42,7 @@ pub async fn enqueue(
     let id = Uuid::new_v4();
     let category = super::registry::category_for(trigger_type);
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "INSERT INTO reprocessing_jobs \
                  (id, trigger_type, sensor_id, trigger_id, status, category, params, dedupe_key, \
@@ -74,12 +74,14 @@ struct Claimed {
 
 /// Claim one due `queued` row or one expired-lease `running` row (the reaper arm), stamping this
 /// worker's ownership and a fresh lease. `SKIP LOCKED` keeps two workers from taking the same row.
+/// The claim releases `dedupe_key`: the key coalesces enqueues while a job waits, and a change
+/// landing once the run has started needs a run of its own.
 async fn claim_one(
     db: &DatabaseConnection,
     worker_id: &str,
 ) -> Result<Option<Claimed>, sea_orm::DbErr> {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "WITH claimable AS ( \
                  SELECT id FROM reprocessing_jobs \
@@ -92,6 +94,7 @@ async fn claim_one(
              UPDATE reprocessing_jobs j \
              SET status = 'running', \
                  owner = $1, \
+                 dedupe_key = NULL, \
                  lease_epoch = j.lease_epoch + 1, \
                  lease_expires_at = now() + (interval '1 second' * $2) \
              FROM claimable c \
@@ -127,7 +130,7 @@ async fn heartbeat(
     loop {
         tick.tick().await;
         let renewed = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "UPDATE reprocessing_jobs \
                  SET lease_expires_at = now() + (interval '1 second' * $1) \
@@ -168,7 +171,7 @@ async fn commit_terminal(
     error_message: Option<&str>,
 ) -> Result<bool, sea_orm::DbErr> {
     let res = db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE reprocessing_jobs \
              SET status = $1, readings_updated = $2, error_message = $3, completed_at = now(), \
@@ -187,19 +190,19 @@ async fn commit_terminal(
     Ok(res.rows_affected() > 0)
 }
 
-/// On a retryable failure, durably reschedule (`status='pending'`, future `next_attempt_at` with
+/// On a retryable failure, durably reschedule (`status='queued'`, future `next_attempt_at` with
 /// exponential backoff) until the retry budget is spent, then fail. Ownership-guarded. The backoff is
 /// computed in SQL from the *current* `retry_count` so it survives restarts (no in-process timer).
 async fn reschedule_or_fail(
     db: &DatabaseConnection,
     claimed: &Claimed,
     worker_id: &str,
+    policy: RetryPolicy,
     error_message: &str,
 ) -> Result<(), sea_orm::DbErr> {
-    let policy = lifecycle::job_retry_policy();
     let max_retries = i64::from(policy.max_retries);
     let backoff_base = policy.backoff_base.as_secs() as i64;
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "UPDATE reprocessing_jobs \
          SET status = CASE WHEN retry_count < $1 THEN 'queued' ELSE 'failed' END, \
@@ -231,6 +234,7 @@ async fn execute(
     events: &crate::common::EventSender,
     registry: &JobRegistry,
     worker_id: &str,
+    policy: RetryPolicy,
     claimed: Claimed,
 ) -> Result<(), sea_orm::DbErr> {
     let Some(job) = registry.get(&claimed.trigger_type) else {
@@ -295,9 +299,9 @@ async fn execute(
             let owned =
                 commit_terminal(db, &claimed, worker_id, status, Some(readings), None).await?;
             if owned {
-                // Mirror the inline lifecycle's post-success reconcile. Most tracked jobs rewrite
-                // reading values or attribution (recalibration, reprocess, pairing/derived backfill,
-                // merge, adopt/swap), any of which can change breach state. Reconcile unconditionally:
+                // Most tracked jobs rewrite reading values or attribution (recalibration, reprocess,
+                // pairing/derived backfill, merge, adopt/swap), any of which can change breach
+                // state. Reconcile unconditionally:
                 // it is idempotent, O(active slots), spawns no jobs (no recursion), and is merely
                 // redundant for jobs that don't touch values. Guarded on `owned` so only the winning
                 // worker runs it.
@@ -311,23 +315,42 @@ async fn execute(
             }
         }
         Err(e) => {
-            reschedule_or_fail(db, &claimed, worker_id, &e.to_string()).await?;
+            reschedule_or_fail(db, &claimed, worker_id, policy, &e.to_string()).await?;
         }
     }
     Ok(())
 }
 
-/// Claim and execute at most one job. Returns `true` if a job ran, `false` if the queue was empty.
-/// The unit of work tests drive directly.
+/// Claim and execute at most one job under the process-wide retry policy. Returns `true` if a job
+/// ran, `false` if the queue was empty. The unit of work tests drive directly.
 pub async fn run_one(
     db: &DatabaseConnection,
     events: &crate::common::EventSender,
     registry: &JobRegistry,
     worker_id: &str,
 ) -> Result<bool, sea_orm::DbErr> {
+    run_one_with_policy(
+        db,
+        events,
+        registry,
+        worker_id,
+        lifecycle::job_retry_policy(),
+    )
+    .await
+}
+
+/// [`run_one`] with an explicit retry policy, for a caller that must not depend on the process-wide
+/// one.
+pub async fn run_one_with_policy(
+    db: &DatabaseConnection,
+    events: &crate::common::EventSender,
+    registry: &JobRegistry,
+    worker_id: &str,
+    policy: RetryPolicy,
+) -> Result<bool, sea_orm::DbErr> {
     match claim_one(db, worker_id).await? {
         Some(claimed) => {
-            execute(db, events, registry, worker_id, claimed).await?;
+            execute(db, events, registry, worker_id, policy, claimed).await?;
             Ok(true)
         }
         None => Ok(false),

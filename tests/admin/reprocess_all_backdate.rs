@@ -37,7 +37,7 @@ async fn reprocess_all_reowns_unattributed_readings() {
         .iter()
         .enumerate()
     {
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "INSERT INTO readings (stream_id, time, raw_value, parameter_id, sensor_id, replicate_index) \

@@ -18,7 +18,7 @@
 //! ```
 
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseTransaction, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseBackend, Statement, TransactionSession, TransactionTrait};
 
 use crate::error::{AppError, AppResult};
 
@@ -65,7 +65,7 @@ impl TouchedRange {
 /// cannot be called without it; this exists for a transaction opened for other reasons that also
 /// carries hypertable DML.
 pub async fn lift_decompression_cap<C: ConnectionTrait>(conn: &C) -> AppResult<()> {
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         LIFT_CAP.to_owned(),
     ))
@@ -81,7 +81,7 @@ pub async fn lift_decompression_cap<C: ConnectionTrait>(conn: &C) -> AppResult<(
 pub async fn guarded<C, F, T>(db: &C, work: F) -> AppResult<T>
 where
     C: TransactionTrait,
-    F: AsyncFnOnce(&DatabaseTransaction) -> AppResult<T>,
+    F: AsyncFnOnce(&C::Transaction) -> AppResult<T>,
 {
     let txn = db.begin().await?;
     lift_decompression_cap(&txn).await?;
@@ -120,7 +120,7 @@ pub async fn mutation<C: ConnectionTrait>(
         values: statement.values,
         db_backend: statement.db_backend,
     };
-    let row = conn.query_one(wrapped).await?.ok_or_else(|| {
+    let row = conn.query_one_raw(wrapped).await?.ok_or_else(|| {
         AppError::Internal("Guarded mutation returned no summary row".to_string())
     })?;
     let rows: i64 = row.try_get("", "touched_rows")?;
@@ -221,5 +221,80 @@ mod tests {
             TouchedRange::default().merge(TouchedRange::default()),
             TouchedRange::default()
         );
+    }
+}
+
+#[cfg(test)]
+mod delete_sites {
+    use std::path::{Path, PathBuf};
+
+    /// Nothing deletes a reading except these statements, each a recorded decision: the
+    /// destructive replicate reconciliation (retired streams, admin-gated) and grab `replace`
+    /// mode (uncurated spot rows at the instant being re-entered). A new delete of readings
+    /// anywhere else fails this test until it is argued into the list. Test modules are not
+    /// scanned; only live code counts.
+    const ALLOWED: &[(&str, usize)] = &[
+        ("src/routes/private/readings/grab_samples.rs", 1),
+        ("src/routes/private/reprocessing_jobs/reconcile.rs", 1),
+    ];
+
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read src") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Count `DELETE FROM readings…` statements in the non-test part of a source file, over any
+    /// whitespace, quoting or case.
+    fn delete_statements(source: &str) -> usize {
+        let live = source.split("#[cfg(test)]").next().unwrap_or("");
+        live.to_ascii_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .windows(3)
+            .filter(|w| w[0] == "delete" && w[1] == "from" && w[2].starts_with("readings"))
+            .count()
+    }
+
+    #[test]
+    fn test_delete_from_readings_appears_only_at_allowlisted_sites() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rust_files(&root.join("src"), &mut files);
+        files.sort();
+        let mut found: Vec<(String, usize)> = files
+            .iter()
+            .filter_map(|f| {
+                let n = delete_statements(&std::fs::read_to_string(f).expect("read file"));
+                (n > 0).then(|| {
+                    (
+                        f.strip_prefix(root).unwrap().to_string_lossy().into_owned(),
+                        n,
+                    )
+                })
+            })
+            .collect();
+        found.sort();
+        let expected: Vec<(String, usize)> = ALLOWED
+            .iter()
+            .map(|(f, n)| ((*f).to_string(), *n))
+            .collect();
+        assert_eq!(found, expected, "the delete sites moved; see ALLOWED");
+    }
+
+    #[test]
+    fn test_delete_statements_counts_across_lines_quoting_and_case() {
+        assert_eq!(delete_statements("DELETE FROM readings WHERE x"), 1);
+        assert_eq!(delete_statements("delete\n  from\n  readings r"), 1);
+        assert_eq!(delete_statements(r#"r"DELETE FROM readings WHERE""#), 1);
+        assert_eq!(delete_statements("DELETE FROM readings_hourly"), 1);
+        assert_eq!(delete_statements("DELETE FROM samples"), 0);
+        assert_eq!(delete_statements("fn live() {}\n#[cfg(test)]\nmod t { const S: &str = \"DELETE FROM readings\"; }"), 0);
     }
 }

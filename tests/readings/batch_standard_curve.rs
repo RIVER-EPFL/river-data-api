@@ -77,7 +77,7 @@ async fn stored_at(
     db: &DatabaseConnection,
     time: &str,
 ) -> Option<(f64, Option<f64>, Option<Uuid>)> {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "SELECT raw_value, calibrated_value, standard_curve_id FROM readings \
@@ -306,7 +306,7 @@ async fn a_named_base_calibration_is_applied_not_just_stamped() {
 
     let row = fx
         .db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT calibrated_value, calibration_id FROM readings \

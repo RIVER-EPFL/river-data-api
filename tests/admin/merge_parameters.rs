@@ -13,7 +13,7 @@ async fn setup() -> (DatabaseConnection, axum::Router, String) {
 
 async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
     use sea_orm::{ConnectionTrait, Statement};
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_string(),
     ))
@@ -27,7 +27,7 @@ async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
 async fn aliases(db: &DatabaseConnection, param_id: &str) -> Vec<String> {
     use sea_orm::{ConnectionTrait, Statement};
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT aliases FROM parameters WHERE id = $1",
             [uuid::Uuid::parse_str(param_id).unwrap().into()],
@@ -90,6 +90,7 @@ async fn test_simple_reassign() {
             crate::common::GLOBAL_PARAM_DO_ID,
             crate::common::GLOBAL_PARAM_TEMP_ID,
         ),
+        "tester",
     )
     .await
     .expect("merge should succeed");
@@ -157,6 +158,7 @@ async fn test_conflict_merge() {
             crate::common::GLOBAL_PARAM_DO_ID,
             crate::common::GLOBAL_PARAM_TEMP_ID,
         ),
+        "tester",
     )
     .await
     .expect("merge should succeed");
@@ -209,6 +211,7 @@ async fn test_cross_site() {
             crate::common::GLOBAL_PARAM_DEPTH_ID,
             crate::common::GLOBAL_PARAM_TURB_ID,
         ),
+        "tester",
     )
     .await
     .expect("merge should succeed");
@@ -273,6 +276,7 @@ async fn test_derived_sources_reassigned() {
             crate::common::GLOBAL_PARAM_DO_ID,
             crate::common::GLOBAL_PARAM_TEMP_ID,
         ),
+        "tester",
     )
     .await
     .expect("merge should succeed");
@@ -314,7 +318,7 @@ async fn test_aliases_absorbed() {
 
     let source_code: String = {
         use sea_orm::{ConnectionTrait, Statement};
-        db.query_one(Statement::from_sql_and_values(
+        db.query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT code FROM parameters WHERE id = $1",
             [uuid::Uuid::parse_str(crate::common::GLOBAL_PARAM_DO_ID)
@@ -334,6 +338,7 @@ async fn test_aliases_absorbed() {
             crate::common::GLOBAL_PARAM_DO_ID,
             crate::common::GLOBAL_PARAM_TEMP_ID,
         ),
+        "tester",
     )
     .await
     .expect("merge should succeed");
@@ -365,6 +370,7 @@ async fn test_same_id_rejection() {
             crate::common::GLOBAL_PARAM_TEMP_ID,
             crate::common::GLOBAL_PARAM_TEMP_ID,
         ),
+        "tester",
     )
     .await;
     assert!(result.is_err(), "should reject same-id merge");
@@ -382,6 +388,7 @@ async fn test_not_found_rejection() {
             "00000000-0000-4000-b000-999999999999",
             crate::common::GLOBAL_PARAM_TEMP_ID,
         ),
+        "tester",
     )
     .await;
     assert!(result.is_err(), "should reject nonexistent source");
@@ -428,7 +435,7 @@ async fn test_http_round_trip() {
 
 async fn needs_review(db: &DatabaseConnection, param_id: &str) -> bool {
     use sea_orm::{ConnectionTrait, Statement};
-    db.query_one(Statement::from_sql_and_values(
+    db.query_one_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "SELECT needs_review FROM parameters WHERE id = $1",
         [uuid::Uuid::parse_str(param_id).unwrap().into()],
@@ -461,6 +468,7 @@ async fn test_merge_clears_needs_review_on_survivor() {
             crate::common::GLOBAL_PARAM_DO_ID,
             crate::common::GLOBAL_PARAM_TEMP_ID,
         ),
+        "tester",
     )
     .await
     .expect("merge succeeds");

@@ -58,7 +58,7 @@ async fn authoring_rows(db: &DatabaseConnection) -> Vec<i64> {
         "tool_script_activations",
     ] {
         let row = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
                 format!("SELECT count(*) AS n FROM {table}"),
             ))

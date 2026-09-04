@@ -17,7 +17,7 @@ use uuid::Uuid;
 async fn wait_for_alarm_backfill(db: &sea_orm::DatabaseConnection) -> String {
     for _ in 0..150 {
         let row = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DatabaseBackend::Postgres,
                 "SELECT status FROM reprocessing_jobs WHERE trigger_type = 'alarm_backfill' \
                  ORDER BY created_at DESC LIMIT 1"
@@ -38,7 +38,7 @@ async fn wait_for_alarm_backfill(db: &sea_orm::DatabaseConnection) -> String {
 
 /// (max_severity, resolved) for every alarm event at SITE1/Turbidity, ordered by start.
 async fn turbidity_episodes(db: &sea_orm::DatabaseConnection) -> Vec<(i16, bool)> {
-    db.query_all(Statement::from_string(
+    db.query_all_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "SELECT max_severity, resolved_at IS NOT NULL AS resolved FROM alarm_events \
@@ -156,7 +156,7 @@ async fn rebuild_alarm_events_action_is_idempotent() {
     let site1 = crate::common::SITE1_ID;
     let turb = crate::common::GLOBAL_PARAM_TURB_ID;
     let stream_id: Uuid = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!("SELECT stream_id FROM readings WHERE site_id='{site1}' AND parameter_id='{turb}' LIMIT 1"),
         ))
@@ -172,7 +172,7 @@ async fn rebuild_alarm_events_action_is_idempotent() {
         ("2025-02-01T00:10:00Z", 600.0),
         ("2025-02-01T00:20:00Z", 40.0),
     ] {
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, replicate_index) \

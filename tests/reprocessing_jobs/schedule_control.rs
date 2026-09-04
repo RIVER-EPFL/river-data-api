@@ -133,7 +133,7 @@ async fn set_slot(db: &DatabaseConnection, job: &str, at: &str) {
 }
 
 async fn next_run_at(db: &DatabaseConnection, job: &str) -> chrono::DateTime<Utc> {
-    db.query_one(Statement::from_sql_and_values(
+    db.query_one_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "SELECT next_run_at FROM schedules WHERE job_name = $1",
         [job.into()],
@@ -148,7 +148,7 @@ async fn next_run_at(db: &DatabaseConnection, job: &str) -> chrono::DateTime<Utc
 /// A `schedules` column no endpoint exposes as a raw persisted value, read to prove an edit landed
 /// in the table rather than only in the response body.
 async fn persisted(db: &DatabaseConnection, job: &str, column: &str) -> Option<String> {
-    db.query_one(Statement::from_sql_and_values(
+    db.query_one_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         format!("SELECT {column} AS v FROM schedules WHERE job_name = $1"),
         [job.into()],
@@ -161,7 +161,7 @@ async fn persisted(db: &DatabaseConnection, job: &str, column: &str) -> Option<S
 }
 
 async fn count(db: &DatabaseConnection, sql: &str, param: &str) -> i64 {
-    db.query_one(Statement::from_sql_and_values(
+    db.query_one_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         sql,
         [param.into()],
@@ -217,7 +217,7 @@ async fn audit_rows(db: &DatabaseConnection, job: &str) -> i64 {
 /// `dedupe_key` and `params` are job columns the API does not serialise, so the enqueue's identity
 /// and its snapshotted inputs are only checkable here.
 async fn dedupe_keys(db: &DatabaseConnection, trigger: &str) -> Vec<String> {
-    db.query_all(Statement::from_sql_and_values(
+    db.query_all_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "SELECT dedupe_key FROM reprocessing_jobs WHERE trigger_type = $1",
         [trigger.into()],
@@ -230,7 +230,7 @@ async fn dedupe_keys(db: &DatabaseConnection, trigger: &str) -> Vec<String> {
 }
 
 async fn job_params(db: &DatabaseConnection, job_id: &str) -> Value {
-    db.query_one(Statement::from_sql_and_values(
+    db.query_one_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "SELECT params FROM reprocessing_jobs WHERE id = $1",
         [Uuid::parse_str(job_id).expect("job id is a uuid").into()],

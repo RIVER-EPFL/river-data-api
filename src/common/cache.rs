@@ -195,7 +195,7 @@ pub async fn get_latest_time(
 
     let result = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             values,

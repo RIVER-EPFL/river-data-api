@@ -4,6 +4,40 @@ use uuid::Uuid;
 use super::model;
 use crate::error::AppError;
 
+/// The key a stream's declared decimal places are stored under in `data_streams.metadata`.
+pub const DECIMAL_PLACES_KEY: &str = "decimal_places";
+
+/// The decimal places the stream's source declared at registration, if any.
+#[must_use]
+pub fn declared_decimal_places(metadata: &serde_json::Value) -> Option<i16> {
+    metadata
+        .get(DECIMAL_PLACES_KEY)
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|n| i16::try_from(n).ok())
+}
+
+/// Write a declaration onto a slot that has none. A slot's own declaration is an operator's and
+/// is never overwritten. Returns whether the slot was written.
+pub async fn declare_slot_decimal_places<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    site_parameter_id: Uuid,
+    decimal_places: Option<i16>,
+) -> Result<bool, sea_orm::DbErr> {
+    let Some(places) = decimal_places else {
+        return Ok(false);
+    };
+    let written = db
+        .execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE site_parameters SET decimal_places = $1, updated_at = NOW() \
+             WHERE id = $2 AND decimal_places IS NULL",
+            [places.into(), site_parameter_id.into()],
+        ))
+        .await?
+        .rows_affected();
+    Ok(written > 0)
+}
+
 /// Get or create an "api" stream for a given (site_id, parameter_id) pair.
 ///
 /// Used by batch insert endpoints to assign a stream_id to API-submitted readings.
@@ -17,7 +51,7 @@ pub async fn site_parameter_of(
 ) -> Result<Option<Uuid>, AppError> {
     use sea_orm::{ConnectionTrait, Statement};
     Ok(db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT id FROM site_parameters WHERE site_id = $1 AND parameter_id = $2 LIMIT 1",
             [site_id.into(), parameter_id.into()],

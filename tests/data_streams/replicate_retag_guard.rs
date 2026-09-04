@@ -52,7 +52,7 @@ async fn setup() -> (DatabaseConnection, axum::Router, String, Uuid, Uuid) {
 }
 
 async fn measurement_type_of(db: &DatabaseConnection, stream: Uuid) -> Option<String> {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!("SELECT measurement_type FROM data_streams WHERE id = '{stream}'"),
     ))

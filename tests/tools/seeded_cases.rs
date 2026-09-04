@@ -23,7 +23,7 @@ struct ActiveVersion {
 }
 
 async fn active_versions(db: &DatabaseConnection) -> Vec<ActiveVersion> {
-    db.query_all(Statement::from_string(
+    db.query_all_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         r"SELECT s.name, s.id AS script_id, v.id AS version_id,
                  COALESCE(jsonb_array_length(v.test_cases->'cases'), 0)::bigint AS cases,

@@ -1,20 +1,23 @@
 //! A tracked job records its `category` (from the trigger_type registry), a structured `detail`
-//! summary, a `site_id` scope, and an ordered timeline in `reprocessing_job_logs`. Drives the
-//! synchronous `run_tracked_job` so the assertions are deterministic.
+//! summary, a `site_id` scope, and an ordered timeline in `reprocessing_job_logs`. Enqueues the job
+//! and runs one worker cycle over it so the assertions are deterministic.
 //!
 //! Run: cargo test --test reprocessing_jobs -- --test-threads=1
 
-use river_db::routes::private::reprocessing_jobs::lifecycle::run_tracked_job;
+use river_db::routes::private::reprocessing_jobs::job::Job;
+use river_db::routes::private::reprocessing_jobs::worker;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 use uuid::Uuid;
+
+use crate::common::jobs::{ClosureJob, registry_of};
 
 fn events() -> river_db::common::EventSender {
     tokio::sync::broadcast::channel::<river_db::common::AppEvent>(16).0
 }
 
 async fn scalar_string(db: &DatabaseConnection, sql: &str) -> String {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_owned(),
     ))
@@ -25,6 +28,23 @@ async fn scalar_string(db: &DatabaseConnection, sql: &str) -> String {
     .unwrap()
 }
 
+/// Enqueue one job of `job`'s kind and run it through a worker cycle, returning its row id.
+async fn run_job(db: &DatabaseConnection, job: ClosureJob) -> Uuid {
+    let trigger_type = job.name();
+    let registry = registry_of(job);
+    let job_id = worker::enqueue(db, trigger_type, None, None, &serde_json::json!({}), None)
+        .await
+        .unwrap()
+        .expect("a fresh enqueue inserts a row");
+    assert!(
+        worker::run_one(db, &events(), &registry, &worker::worker_id())
+            .await
+            .unwrap(),
+        "the worker claims the enqueued job"
+    );
+    job_id
+}
+
 #[tokio::test]
 #[serial]
 async fn tracked_job_records_category_detail_and_timeline() {
@@ -32,21 +52,22 @@ async fn tracked_job_records_category_detail_and_timeline() {
     crate::common::cleanup_test_db(&db).await;
 
     let site = Uuid::new_v4();
-    let count = run_tracked_job(&db, None, "manual_reprocess", None, events(), move |ctx| async move {
-        ctx.info("starting reprocess").await;
-        ctx.set_site(site).await;
-        ctx.set_detail(serde_json::json!({ "scope": { "sensor": "x" }, "counts": { "readings_updated": 7 } }))
-            .await;
-        ctx.log("warn", "one slot skipped", serde_json::json!({ "slot": 3 })).await;
-        Ok(7)
-    })
-    .await
-    .unwrap();
-    assert_eq!(count, 7);
+    run_job(
+        &db,
+        ClosureJob::new("manual_reprocess", move |ctx| async move {
+            ctx.info("starting reprocess").await;
+            ctx.set_site(site).await;
+            ctx.set_detail(serde_json::json!({ "scope": { "sensor": "x" }, "counts": { "readings_updated": 7 } }))
+                .await;
+            ctx.log("warn", "one slot skipped", serde_json::json!({ "slot": 3 })).await;
+            Ok(7)
+        }),
+    )
+    .await;
 
     // Job row: operator category (manual_reprocess), completed, detail + site_id persisted.
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT category, status, readings_updated, site_id, detail \
              FROM reprocessing_jobs WHERE trigger_type = 'manual_reprocess'"
@@ -70,7 +91,7 @@ async fn tracked_job_records_category_detail_and_timeline() {
 
     // Timeline: two ordered lines (info seq 0, warn seq 1) with structured context.
     let lines = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT seq, level, message, context FROM reprocessing_job_logs ORDER BY seq"
                 .to_owned(),
@@ -92,20 +113,15 @@ async fn maintenance_trigger_types_are_categorised_maintenance() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
 
-    run_tracked_job(
+    run_job(
         &db,
-        None,
-        "janitor_run",
-        None,
-        events(),
-        |_ctx| async move { Ok(0) },
+        ClosureJob::new("janitor_service", |_ctx| async { Ok(0) }),
     )
-    .await
-    .unwrap();
+    .await;
 
     let category = scalar_string(
         &db,
-        "SELECT category AS v FROM reprocessing_jobs WHERE trigger_type = 'janitor_run'",
+        "SELECT category AS v FROM reprocessing_jobs WHERE trigger_type = 'janitor_service'",
     )
     .await;
     assert_eq!(category, "maintenance");

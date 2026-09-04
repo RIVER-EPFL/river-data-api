@@ -15,6 +15,7 @@ mod forward_new_data;
 mod grab_preview;
 mod grab_recomposition;
 mod historical_edit;
+mod last_used_curve;
 mod reprocessing;
 mod standard_curves;
 mod window_boundaries;

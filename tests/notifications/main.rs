@@ -7,8 +7,10 @@ mod common;
 
 mod admin_test;
 mod capabilities_test;
+mod delivery_log;
 mod dispatcher_test;
 mod fanout_test;
 mod me_test;
 mod mute_gate;
+mod reconcile_test;
 mod triggers_test;

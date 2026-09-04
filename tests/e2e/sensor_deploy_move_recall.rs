@@ -92,7 +92,7 @@ async fn deploy_move_recall_reprocess_over_http() {
 
     // The old deployment was auto-closed exactly at the move instant.
     let until: chrono::DateTime<chrono::FixedOffset> = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT deployed_until FROM sensor_deployments WHERE id = $1",
             [dep_a.into()],

@@ -15,7 +15,7 @@ const BREACH: f64 = 600.0; // turbidity global threshold: warning > 100, alarm >
 const IN_RANGE: f64 = 50.0;
 
 async fn turb_stream(db: &sea_orm::DatabaseConnection) -> Uuid {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "SELECT stream_id FROM readings WHERE site_id='{}' AND parameter_id='{}' LIMIT 1",
@@ -49,7 +49,7 @@ async fn turb_event_count(db: &sea_orm::DatabaseConnection, only_open: bool) -> 
     } else {
         ""
     };
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "SELECT COUNT(*) AS c FROM alarm_events \
@@ -567,7 +567,7 @@ async fn threshold_batch_delete_reconciles_without_new_reading() {
 }
 
 async fn open_event_count(db: &sea_orm::DatabaseConnection, parameter_id: &str) -> i64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "SELECT COUNT(*) AS c FROM alarm_events \
@@ -638,10 +638,12 @@ async fn merge_reconciles_source_and_target_slots() {
 #[tokio::test]
 #[serial]
 async fn tracked_job_completion_reconciles_alarms() {
+    use river_db::routes::private::reprocessing_jobs::worker;
+
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
-    let (_app, events) = crate::common::build_test_app_with_events(db.clone());
+    let events = tokio::sync::broadcast::channel::<river_db::common::AppEvent>(16).0;
     let stream = turb_stream(&db).await;
 
     inject(&db, stream, "2025-02-01T00:00:00Z", BREACH).await;
@@ -650,51 +652,55 @@ async fn tracked_job_completion_reconciles_alarms() {
 
     let site = crate::common::SITE1_ID;
     let param = crate::common::GLOBAL_PARAM_TURB_ID;
-    let job_id = river_db::routes::private::sensors::calibrations::service::spawn_tracked_job(
-        &db,
-        None,
+    let registry = crate::common::jobs::registry_of(crate::common::jobs::ClosureJob::new(
         "manual_reprocess",
-        None,
-        events,
-        move |db| async move {
-            db.execute(Statement::from_string(
-                DatabaseBackend::Postgres,
-                format!(
-                    "UPDATE readings SET raw_value = {IN_RANGE} \
-                     WHERE site_id='{site}' AND parameter_id='{param}' AND raw_value={BREACH}"
-                ),
-            ))
-            .await?;
+        move |ctx| async move {
+            ctx.db()
+                .execute_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    format!(
+                        "UPDATE readings SET raw_value = {IN_RANGE} \
+                         WHERE site_id='{site}' AND parameter_id='{param}' AND raw_value={BREACH}"
+                    ),
+                ))
+                .await?;
             Ok(1)
         },
+    ));
+    let job_id = worker::enqueue(
+        &db,
+        "manual_reprocess",
+        None,
+        None,
+        &serde_json::json!({}),
+        None,
     )
     .await
-    .unwrap();
-
-    // The completion reconcile runs inside the spawned job task; poll the alarm state itself
-    // (the job row flips to 'completed' just before the reconcile, so job status alone races).
-    let mut reconciled = false;
-    for _ in 0..50 {
-        if open_turb_event_count(&db).await == 0 {
-            reconciled = true;
-            break;
-        }
-        let status: String = db
-            .query_one(Statement::from_string(
-                DatabaseBackend::Postgres,
-                format!("SELECT status FROM reprocessing_jobs WHERE id='{job_id}'"),
-            ))
-            .await
-            .unwrap()
-            .unwrap()
-            .try_get("", "status")
-            .unwrap();
-        assert_ne!(status, "failed", "job must not fail");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    .unwrap()
+    .expect("a fresh enqueue inserts a row");
     assert!(
-        reconciled,
-        "job completion did not reconcile the alarm within 5s"
+        worker::run_one(&db, &events, &registry, &worker::worker_id())
+            .await
+            .unwrap(),
+        "the worker claims the enqueued job"
+    );
+
+    let status: String = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("SELECT status FROM reprocessing_jobs WHERE id='{job_id}'"),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "status")
+        .unwrap();
+    assert_eq!(status, "completed");
+    // The worker's completion reconcile ran before `run_one` returned.
+    assert_eq!(
+        open_turb_event_count(&db).await,
+        0,
+        "job completion reconciles the alarm"
     );
 }
 

@@ -23,7 +23,7 @@ impl MigrationTrait for Migration {
         .await?;
 
         for (code, name, units) in ANALYTES {
-            db.execute(Statement::from_sql_and_values(
+            db.execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r"INSERT INTO parameters (id, code, name, default_units, category, needs_review)
                   SELECT gen_random_uuid(), $1, $2, $3, 'measurement', true
@@ -44,18 +44,18 @@ impl MigrationTrait for Migration {
         // `foreign_key_violation` skips exactly the rows something still points at; the block is
         // a subtransaction, so the failed DELETE rolls back alone and the rest proceeds. The
         // codes travel through a temp table because a DO block takes no bind parameters.
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "CREATE TEMP TABLE rollback_analyte_codes (code text)",
         ))
         .await?;
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "INSERT INTO rollback_analyte_codes (code) SELECT unnest($1::text[])",
             [codes.into()],
         ))
         .await?;
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             r"DO $$
               DECLARE target uuid;
@@ -74,7 +74,7 @@ impl MigrationTrait for Migration {
               END $$;",
         ))
         .await?;
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "DROP TABLE rollback_analyte_codes",
         ))

@@ -51,7 +51,7 @@ async fn grab_replicates_aggregate_then_tool_result_saved_to_station() {
     );
 
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!("SELECT n, mean, min_value, max_value FROM samples WHERE site_id='{site1}' AND parameter_id='{param}'"),
         ))

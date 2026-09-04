@@ -39,7 +39,7 @@ pub struct UpdateSyncEventRequest {
 /// against the SyncEventType / SyncEventStatus enums. Requires sync session token auth.
 #[utoipa::path(
     post,
-    path = "/events",
+    path = "/api/sync/events",
     request_body = CreateSyncEventRequest,
     responses(
         (status = 200, description = "Event created; id and status returned"),
@@ -116,7 +116,7 @@ pub async fn create_sync_event(
 /// also update the owning service's `last_sync_completed_at`. Requires sync session token.
 #[utoipa::path(
     patch,
-    path = "/events/{id}",
+    path = "/api/sync/events/{id}",
     params(("id" = Uuid, Path, description = "Sync event UUID")),
     request_body = UpdateSyncEventRequest,
     responses(

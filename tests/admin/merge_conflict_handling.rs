@@ -118,7 +118,7 @@ async fn merge_preserves_conflicting_readings() {
 
     // Count readings before merge
     let before_count = db
-        .query_one(sea_orm::Statement::from_string(
+        .query_one_raw(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT COUNT(*) as cnt FROM readings".to_string(),
         ))
@@ -135,6 +135,7 @@ async fn merge_preserves_conflicting_readings() {
             source_site_parameter_id: crate::common::PARAM_S1_TEMP_ID.parse().unwrap(),
             target_site_parameter_id: crate::common::PARAM_S1_DO_ID.parse().unwrap(),
         },
+        "tester",
     )
     .await;
 
@@ -149,7 +150,7 @@ async fn merge_preserves_conflicting_readings() {
     // conflicting reading (value=100) was silently dropped.
     // After merge, we should still have access to BOTH values at 12:00.
     let after_count = db
-        .query_one(sea_orm::Statement::from_string(
+        .query_one_raw(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT COUNT(*) as cnt FROM readings WHERE site_id = '{sid}' AND parameter_id = '{p2}'",

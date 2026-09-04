@@ -42,7 +42,7 @@ fn channels(sent: &Arc<Mutex<Vec<OutgoingMessage>>>) -> Vec<Box<dyn Notification
 }
 
 async fn scalar_count(db: &DatabaseConnection, sql: &str) -> i64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         sql.to_string(),
     ))
@@ -66,7 +66,7 @@ async fn mute(db: &DatabaseConnection, parameter_id: &str, expires_sql: &str) {
 }
 
 async fn stream_of(db: &DatabaseConnection, site_parameter_id: &str) -> String {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!("SELECT id FROM data_streams WHERE site_parameter_id = '{site_parameter_id}'"),
     ))
@@ -119,11 +119,22 @@ async fn a_muted_slot_raises_no_stale_data_alert() {
     assert_eq!(
         scalar_count(
             &db,
-            "SELECT COUNT(*) AS c FROM notification_log WHERE kind = 'stale_data'"
+            "SELECT COUNT(*) AS c FROM notification_log \
+             WHERE kind = 'stale_data' AND status = 'muted' AND channel = 'all'"
+        )
+        .await,
+        1,
+        "the suppression is logged, so it reads differently from an alert nobody subscribed to"
+    );
+    assert_eq!(
+        scalar_count(
+            &db,
+            "SELECT COUNT(*) AS c FROM notification_log \
+             WHERE kind = 'stale_data' AND status = 'sent'"
         )
         .await,
         0,
-        "a suppressed alert is not logged as a delivery"
+        "nothing was delivered"
     );
     assert_eq!(
         scalar_count(

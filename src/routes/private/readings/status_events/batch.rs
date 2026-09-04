@@ -36,7 +36,7 @@ const BATCH_SIZE: usize = 1000;
 /// Auto-creates "api" streams as needed. 10MB body limit. Requires `write_data`.
 #[utoipa::path(
     post,
-    path = "/status_events/batch",
+    path = "/api/status_events/batch",
     request_body = BatchStatusEventsRequest,
     responses(
         (status = 200, description = "Inserted count", body = BatchStatusEventsResponse),

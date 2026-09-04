@@ -119,6 +119,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # The runner image has one source: tools-runner/ in this repository, published by this job.
+      # A second workflow naming the image would publish a second lineage under the same tag.
+      - name: Assert this is the only workflow publishing the runner image
+        run: |
+          set -euo pipefail
+          publishers=$(grep -l 'river-data-tools-r' .github/workflows/*.yml | grep -v 'workflows/test.yml' || true)
+          [ "$publishers" = ".github/workflows/publish-container.yml" ] || { echo "workflows naming the runner image: $publishers"; exit 1; }
+
       - name: Install cosign
         uses: sigstore/cosign-installer@v3.7.0
         with:

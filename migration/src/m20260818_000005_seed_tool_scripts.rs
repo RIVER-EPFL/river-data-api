@@ -57,7 +57,7 @@ impl MigrationTrait for Migration {
                 crate::tool_hash::stored_version_content(db, &script, "tool", &manifest, &cases)
                     .await?;
 
-            db.execute(Statement::from_sql_and_values(
+            db.execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r"INSERT INTO tool_scripts (name, label, description, created_by)
                   SELECT $1, COALESCE($2::jsonb->>'label', $1), $2::jsonb->>'description', 'seed'
@@ -67,7 +67,7 @@ impl MigrationTrait for Migration {
             ))
             .await?;
 
-            db.execute(Statement::from_sql_and_values(
+            db.execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r"INSERT INTO tool_script_versions
                       (tool_script_id, version_no, script, entry_function, manifest, test_cases,
@@ -87,7 +87,7 @@ impl MigrationTrait for Migration {
             ))
             .await?;
 
-            db.execute(Statement::from_sql_and_values(
+            db.execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r"UPDATE tool_scripts s SET active_version_id = v.id, updated_at = now()
                   FROM tool_script_versions v
@@ -97,7 +97,7 @@ impl MigrationTrait for Migration {
             ))
             .await?;
 
-            db.execute(Statement::from_sql_and_values(
+            db.execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r"INSERT INTO tool_script_activations (tool_script_id, to_version_id, activated_by)
                   SELECT s.id, s.active_version_id, 'seed'
@@ -115,13 +115,13 @@ impl MigrationTrait for Migration {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let names: Vec<String> = SEEDS.iter().map(|s| s.name.to_string()).collect();
         let db = manager.get_connection();
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE tool_scripts SET active_version_id = NULL WHERE name = ANY($1)",
             [names.clone().into()],
         ))
         .await?;
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "DELETE FROM tool_scripts WHERE name = ANY($1)",
             [names.into()],

@@ -1,5 +1,7 @@
-use crudcrate::{CRUDResource, EntityToModels};
+use crudcrate::EntityToModels;
 use sea_orm::entity::prelude::*;
+
+use super::operations::CollectionEventOperations;
 
 #[derive(
     Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
@@ -9,7 +11,8 @@ use sea_orm::entity::prelude::*;
     api_struct = "CollectionEvent",
     name_singular = "collection_event",
     name_plural = "collection_events",
-    generate_router
+    generate_router,
+    operations = CollectionEventOperations
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]

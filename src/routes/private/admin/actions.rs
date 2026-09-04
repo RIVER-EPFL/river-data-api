@@ -74,7 +74,7 @@ async fn deployment_sites(
     let ids: Vec<sea_orm::Value> = deployment_ids.iter().map(|id| (*id).into()).collect();
     let placeholders: Vec<String> = (1..=ids.len()).map(|n| format!("${n}")).collect();
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT DISTINCT site_id FROM sensor_deployments WHERE id IN ({})",
@@ -115,7 +115,7 @@ pub struct RefreshAggregatesRequest {
 /// 10-minute timeout (a timeout marks the job `failed`). Requires `write_data`.
 #[utoipa::path(
     post,
-    path = "/actions/refresh_aggregates",
+    path = "/api/actions/refresh_aggregates",
     request_body = RefreshAggregatesRequest,
     responses(
         (status = 200, description = "Refresh triggered; returns job_id and status 'pending'"),
@@ -165,7 +165,7 @@ pub struct SiteTimestamps {
 /// immediately. Requires `write_data`.
 #[utoipa::path(
     post,
-    path = "/actions/compute_derived",
+    path = "/api/actions/compute_derived",
     request_body = ComputeDerivedRequest,
     responses(
         (status = 200, description = "Computation triggered; returns job_id, status 'pending', total_timestamps"),
@@ -232,7 +232,7 @@ pub struct ReprocessSensorRequest {
 /// id immediately. Requires `write_metadata`.
 #[utoipa::path(
     post,
-    path = "/actions/reprocess",
+    path = "/api/actions/reprocess",
     request_body = ReprocessSensorRequest,
     responses(
         (status = 200, description = "Reprocessing triggered; returns job_id and status 'pending'"),
@@ -283,7 +283,7 @@ pub struct ReprocessAllResponse {
 /// `reprocess_site_parameter_readings`; runs as one tracked job. Requires `write_data`.
 #[utoipa::path(
     post,
-    path = "/actions/reprocess_all",
+    path = "/api/actions/reprocess_all",
     responses(
         (status = 200, description = "Backdate reprocessing triggered; returns job_id and slot count", body = ReprocessAllResponse),
         (status = 403, description = "The backdate names no target, so a caller confined to a project set is refused"),
@@ -301,7 +301,7 @@ pub async fn reprocess_all(
 
     let db = &app_state.db;
     let slot_rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT DISTINCT site_id, parameter_id FROM sensor_deployments".to_owned(),
         ))
@@ -360,7 +360,7 @@ pub struct RebuildAlarmEventsRequest {
 /// the job id immediately. Requires `write_data`.
 #[utoipa::path(
     post,
-    path = "/actions/rebuild_alarm_events",
+    path = "/api/actions/rebuild_alarm_events",
     request_body = RebuildAlarmEventsRequest,
     responses(
         (status = 200, description = "Rebuild triggered; returns job_id and status 'pending'"),
@@ -413,7 +413,7 @@ pub async fn rebuild_alarm_events(
 /// for "I changed something and want the alarm state correct immediately". Requires `write_data`.
 #[utoipa::path(
     post,
-    path = "/actions/reconcile_alarms",
+    path = "/api/actions/reconcile_alarms",
     responses(
         (status = 200, description = "Reconcile complete; counts of opened/updated/resolved events"),
     ),
@@ -457,7 +457,7 @@ pub struct RollbackDeploymentResponse {
 /// deployment's site. Used after an accidentally-created deployment. Requires `write_data`.
 #[utoipa::path(
     post,
-    path = "/actions/rollback_deployment",
+    path = "/api/actions/rollback_deployment",
     request_body = RollbackDeploymentRequest,
     responses(
         (status = 200, description = "Rollback complete with reassignment count", body = RollbackDeploymentResponse),
@@ -477,7 +477,7 @@ pub async fn rollback_deployment(
 
     // 1. Load the target deployment
     let target = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT id, sensor_id, site_id, parameter_id, deployed_from, deployed_until
               FROM sensor_deployments WHERE id = $1",
@@ -514,7 +514,7 @@ pub async fn rollback_deployment(
     //    instrument the immediately-prior deployment by time could belong to a different channel;
     //    reopening that one would extend the wrong channel's window.
     let previous = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT id, site_id, deployed_from FROM sensor_deployments
               WHERE sensor_id = $1 AND parameter_id = $4 AND deployed_from < $2 AND id != $3
@@ -540,7 +540,7 @@ pub async fn rollback_deployment(
         .begin()
         .await
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-    txn.execute(Statement::from_string(
+    txn.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
     ))
@@ -548,7 +548,7 @@ pub async fn rollback_deployment(
     .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
     let cleared = txn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE readings SET deployment_id = NULL WHERE deployment_id = $1",
             [payload.deployment_id.into()],
@@ -557,7 +557,7 @@ pub async fn rollback_deployment(
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
     let readings_reassigned = cleared.rows_affected();
 
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"DELETE FROM sensor_deployments WHERE id = $1",
         [payload.deployment_id.into()],
@@ -602,7 +602,7 @@ pub async fn rollback_deployment(
             )));
         }
 
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE sensor_deployments SET deployed_until = $1 WHERE id = $2",
             [target_deployed_until.into(), prev_id.into()],
@@ -728,7 +728,7 @@ fn extract_variables(formula: &str) -> Vec<String> {
 /// formulas before saving. Requires `read_data`.
 #[utoipa::path(
     post,
-    path = "/actions/preview_derived",
+    path = "/api/actions/preview_derived",
     request_body = PreviewDerivedRequest,
     responses(
         (status = 200, description = "Computed values with per-timestamp errors", body = PreviewDerivedResponse),
@@ -762,7 +762,7 @@ pub async fn preview_derived(
 
     // Get site name
     let site_row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT name FROM sites WHERE id = $1",
             [payload.site_id.into()],
@@ -800,7 +800,7 @@ pub async fn preview_derived(
 
     for var_name in &var_names {
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r"SELECT sp.id as sp_id, sp.parameter_id, COALESCE(sp.display_units, '') as units
                   FROM site_parameters sp
@@ -835,7 +835,7 @@ pub async fn preview_derived(
         source_units.insert(var_name.clone(), units.clone());
 
         let rows = db
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r"SELECT DISTINCT ON (r.time)
                          r.time, COALESCE(smp.mean, r.calibrated_value, r.raw_value) as val
@@ -1033,7 +1033,7 @@ async fn fetch_backfill_candidates(
           ORDER BY c.claimable_count DESC"
     );
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             values,
@@ -1064,7 +1064,7 @@ async fn fetch_backfill_candidates(
 /// `read_metadata`.
 #[utoipa::path(
     get,
-    path = "/actions/backfill_candidates",
+    path = "/api/actions/backfill_candidates",
     responses((status = 200, description = "Backfill candidates", body = BackfillCandidatesResponse)),
     tag = "actions"
 )]
@@ -1128,7 +1128,7 @@ pub struct BackfillAttributionResponse {
 /// `write_data`.
 #[utoipa::path(
     post,
-    path = "/actions/backfill_attribution",
+    path = "/api/actions/backfill_attribution",
     request_body = BackfillAttributionRequest,
     responses(
         (status = 200, description = "Backfill triggered", body = BackfillAttributionResponse),
@@ -1187,7 +1187,7 @@ pub async fn backfill_attribution(
         // Idempotent backdate: only move `deployed_from` earlier. After the first apply the row sits
         // at `target_from`, so a client retry replayed against another replica matches no rows
         // (`deployed_from > target_from` is false) and can't double-apply or re-widen the window.
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE sensor_deployments SET deployed_from = $1 WHERE id = $2 AND deployed_from > $1",
             [c.target_from.into(), c.deployment_id.into()],
@@ -1264,7 +1264,7 @@ async fn default_scan_floor(
     // which the `since` parameter can always widen past. The unbounded probe remains only as
     // the fallback for a database with readings but no cursors at all.
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT MAX(last_data_time) AS newest FROM data_streams".to_string(),
         ))
@@ -1277,7 +1277,7 @@ async fn default_scan_floor(
     };
     if newest.is_none() {
         let row = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT MAX(time) AS newest FROM readings".to_string(),
             ))
@@ -1405,7 +1405,7 @@ async fn fetch_calibration_candidates(
     );
 
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             values,
@@ -1420,7 +1420,7 @@ async fn fetch_calibration_candidates(
         let target_from: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "target_from")?;
 
         let cal_row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r"SELECT valid_from
                   FROM sensor_calibrations
@@ -1491,7 +1491,7 @@ async fn fetch_orphaned_corrections(
     );
 
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             values,
@@ -1525,7 +1525,7 @@ async fn fetch_orphaned_corrections(
 /// backfill it feeds agree on which sensors are repairable.
 #[utoipa::path(
     get,
-    path = "/actions/calibration_candidates",
+    path = "/api/actions/calibration_candidates",
     params(CalibrationCandidatesQuery),
     responses((status = 200, description = "Calibration backfill candidates", body = CalibrationBackfillCandidatesResponse)),
     tag = "actions"
@@ -1578,7 +1578,7 @@ pub struct BackfillCalibrationsResponse {
 /// Requires `write_data`.
 #[utoipa::path(
     post,
-    path = "/actions/backfill_calibrations",
+    path = "/api/actions/backfill_calibrations",
     request_body = BackfillCalibrationsRequest,
     responses(
         (status = 200, description = "Calibration backfill triggered", body = BackfillCalibrationsResponse),
@@ -1667,203 +1667,6 @@ pub async fn backfill_calibrations(
 }
 
 // ---------------------------------------------------------------------------
-// Duplicate slots
-// ---------------------------------------------------------------------------
-
-// Nothing in the write path can see this shape. Deduplication is keyed on the readings primary key,
-// `(stream_id, time, replicate_index)`, which is per channel, while the rollups group by
-// `(site_id, parameter_id)`, which is per slot. Two channels paired to one slot therefore both
-// ingest cleanly and both land in the same bucket, so an average over the period is taken over two
-// populations at once.
-//
-// Read-only, and it stays that way. Which of two disagreeing copies is the measurement is a
-// question about where each came from, which lives outside the database, so this reports the
-// disagreement and its size and leaves the decision to an operator.
-
-#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
-pub struct DuplicateSlotStream {
-    pub stream_id: Uuid,
-    pub source_system: String,
-    pub source_key: String,
-    /// Instants this stream contributes to the slot's overlap.
-    pub instants: i64,
-}
-
-#[derive(Debug, Serialize, ToSchema, Clone)]
-pub struct DuplicateSlot {
-    pub site_id: Uuid,
-    pub parameter_id: Uuid,
-    /// Instants at this slot served by more than one stream.
-    pub overlapping_instants: i64,
-    /// Of those, the instants whose served values are not all equal. An instant where the copies
-    /// agree is redundant rather than contradictory, and an average over it is still right.
-    pub disagreeing_instants: i64,
-    /// Largest and mean spread between the served values at one instant, over the disagreeing
-    /// instants alone. A spread the size of the parameter's rounding step reads as one channel
-    /// carrying fewer decimals than the other; a large one is two different measurements.
-    pub max_difference: Option<f64>,
-    pub mean_difference: Option<f64>,
-    pub first_time: chrono::DateTime<chrono::Utc>,
-    pub last_time: chrono::DateTime<chrono::Utc>,
-    /// Every stream feeding the overlap, busiest first.
-    pub streams: Vec<DuplicateSlotStream>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct DuplicateSlotsResponse {
-    pub total_slots: usize,
-    pub total_overlapping_instants: i64,
-    pub total_disagreeing_instants: i64,
-    pub slots: Vec<DuplicateSlot>,
-    /// The earliest reading this report read, on the same terms as
-    /// `/actions/calibration_candidates`: every count is a floor for that window alone.
-    pub scanned_from: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-/// Slots where one instant is served by more than one stream, with the size of the disagreement.
-///
-/// The served value is `COALESCE(calibrated_value, raw_value)`, the number the rollups average, so
-/// the spread reported here is the spread that reaches a chart. Flagged readings are excluded for
-/// the same reason: the aggregates already leave them out, so a flagged copy is not a second
-/// population. A stream contributes ONE served value per instant, the mean over its unflagged
-/// replicates: indexes are the source's column positions and need not align between streams, so a
-/// replicate family overlapping another stream at an instant is an overlap of the values each
-/// would serve, never a per-index comparison. A stream's own replicates are not an overlap.
-///
-/// Confined to the caller's projects through the reading's own site.
-async fn fetch_duplicate_slots(
-    db: &sea_orm::DatabaseConnection,
-    scope: &AccessScope,
-    since: Option<chrono::DateTime<chrono::Utc>>,
-) -> AppResult<Vec<DuplicateSlot>> {
-    use sea_orm::{ConnectionTrait, Statement};
-
-    // No pre-filter on paired streams: attribution can reach a slot without pairing
-    // (deployment-driven backfill stamps site/parameter by sensor), and this report exists to
-    // catch exactly the shapes no invariant covers. The windowed scan of every reading is the
-    // price of an exhaustive answer.
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    let time_filter = scan_floor_sql(since, &mut values);
-    let project_filter = project_filter_sql(scope, "s.project_id", &mut values)
-        .map(|predicate| {
-            format!("AND EXISTS (SELECT 1 FROM sites s WHERE s.id = r.site_id AND {predicate})")
-        })
-        .unwrap_or_default();
-    // `overlap` is read twice, which is what keeps the hypertable read to one pass: Postgres
-    // materialises a CTE with more than one reference rather than inlining it into both.
-    let sql = format!(
-        r"WITH stream_instant AS (
-              SELECT r.site_id, r.parameter_id, r.time, r.stream_id,
-                     AVG(COALESCE(r.calibrated_value, r.raw_value)) AS v
-              FROM readings r
-              WHERE r.site_id IS NOT NULL AND r.parameter_id IS NOT NULL
-                AND r.is_flagged IS NOT TRUE
-                {time_filter}
-                {project_filter}
-              GROUP BY r.site_id, r.parameter_id, r.time, r.stream_id
-          ),
-          overlap AS (
-              SELECT site_id, parameter_id, time,
-                     array_agg(stream_id) AS streams,
-                     MAX(v) - MIN(v) AS spread
-              FROM stream_instant
-              GROUP BY site_id, parameter_id, time
-              HAVING COUNT(*) > 1
-          ),
-          per_stream AS (
-              SELECT o.site_id, o.parameter_id, e AS stream_id, COUNT(*) AS instants
-              FROM overlap o, unnest(o.streams) AS e
-              GROUP BY o.site_id, o.parameter_id, e
-          )
-          SELECT a.site_id, a.parameter_id, a.overlapping_instants, a.disagreeing_instants,
-                 a.max_difference, a.mean_difference, a.first_time, a.last_time,
-                 COALESCE((
-                     SELECT jsonb_agg(jsonb_build_object(
-                                'stream_id', p.stream_id,
-                                'source_system', d.source_system,
-                                'source_key', d.source_key,
-                                'instants', p.instants)
-                            ORDER BY p.instants DESC, d.source_system)
-                     FROM per_stream p
-                     JOIN data_streams d ON d.id = p.stream_id
-                     WHERE p.site_id = a.site_id AND p.parameter_id = a.parameter_id
-                 ), '[]'::jsonb) AS streams
-          FROM (
-              SELECT site_id, parameter_id,
-                     COUNT(*) AS overlapping_instants,
-                     COUNT(*) FILTER (WHERE spread > 0) AS disagreeing_instants,
-                     MAX(spread) FILTER (WHERE spread > 0) AS max_difference,
-                     AVG(spread) FILTER (WHERE spread > 0) AS mean_difference,
-                     MIN(time) AS first_time, MAX(time) AS last_time
-              FROM overlap
-              GROUP BY site_id, parameter_id
-          ) a
-          ORDER BY a.overlapping_instants DESC"
-    );
-
-    let rows = db
-        .query_all(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &sql,
-            values,
-        ))
-        .await
-        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-
-    rows.iter()
-        .map(|row| {
-            let first: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "first_time")?;
-            let last: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "last_time")?;
-            let streams: serde_json::Value = row.try_get("", "streams")?;
-            let streams: Vec<DuplicateSlotStream> = serde_json::from_value(streams)
-                .map_err(|e| AppError::Internal(format!("malformed stream summary: {e}")))?;
-            Ok(DuplicateSlot {
-                site_id: row.try_get("", "site_id")?,
-                parameter_id: row.try_get("", "parameter_id")?,
-                overlapping_instants: row.try_get("", "overlapping_instants")?,
-                disagreeing_instants: row.try_get("", "disagreeing_instants")?,
-                max_difference: row.try_get("", "max_difference")?,
-                mean_difference: row.try_get("", "mean_difference")?,
-                first_time: first.with_timezone(&chrono::Utc),
-                last_time: last.with_timezone(&chrono::Utc),
-                streams,
-            })
-        })
-        .collect()
-}
-
-/// List slots fed by more than one stream at the same instant. Requires `read_metadata`.
-///
-/// Reads the readings hypertable with no index behind it, so it covers the most recent 90 days
-/// unless `since` names an earlier floor, and `scanned_from` reports which was used.
-#[utoipa::path(
-    get,
-    path = "/actions/duplicate_slots",
-    params(CalibrationCandidatesQuery),
-    responses((status = 200, description = "Slots served by more than one stream", body = DuplicateSlotsResponse)),
-    tag = "actions"
-)]
-pub async fn duplicate_slots(
-    State(app_state): State<AppState>,
-    ProjectScope(scope): ProjectScope,
-    _: DenyScoped,
-    Query(query): Query<CalibrationCandidatesQuery>,
-) -> AppResult<Json<DuplicateSlotsResponse>> {
-    let scanned_from = match query.since {
-        Some(since) => Some(since),
-        None => default_scan_floor(&app_state.db).await?,
-    };
-    let slots = fetch_duplicate_slots(&app_state.db, &scope, scanned_from).await?;
-    Ok(Json(DuplicateSlotsResponse {
-        total_slots: slots.len(),
-        total_overlapping_instants: slots.iter().map(|s| s.overlapping_instants).sum(),
-        total_disagreeing_instants: slots.iter().map(|s| s.disagreeing_instants).sum(),
-        slots,
-        scanned_from,
-    }))
-}
-
-// ---------------------------------------------------------------------------
 // Undeclared sd estimators
 
 #[derive(Debug, Serialize, ToSchema, sea_orm::FromQueryResult)]
@@ -1910,7 +1713,7 @@ pub struct UndeclaredEstimatorsResponse {
 /// source's, so nothing here decides one.
 #[utoipa::path(
     get,
-    path = "/actions/undeclared_sd_estimators",
+    path = "/api/actions/undeclared_sd_estimators",
     responses((status = 200, description = "Slots with no declared sd estimator", body = UndeclaredEstimatorsResponse)),
     tag = "actions"
 )]
@@ -1924,8 +1727,7 @@ pub async fn undeclared_sd_estimators(
     let project_filter = project_filter_sql(&scope, "st.project_id", &mut values)
         .map(|predicate| format!(" AND {predicate}"))
         .unwrap_or_default();
-    let population_sd =
-        &*crate::routes::private::sync::replicate_audit::POPULATION_SD_SQL;
+    let population_sd = &*crate::routes::private::sync::replicate_audit::POPULATION_SD_SQL;
 
     let sql = format!(
         r"SELECT sp.site_id, sp.parameter_id, sp.id AS site_parameter_id,
@@ -1980,10 +1782,7 @@ pub async fn undeclared_sd_estimators(
     Ok(Json(UndeclaredEstimatorsResponse {
         total_slots: slots.len(),
         total_undeclared_samples: slots.iter().map(|s| s.undeclared_samples).sum(),
-        total_population_signature_holds: slots
-            .iter()
-            .map(|s| s.population_signature_holds)
-            .sum(),
+        total_population_signature_holds: slots.iter().map(|s| s.population_signature_holds).sum(),
         slots,
     }))
 }

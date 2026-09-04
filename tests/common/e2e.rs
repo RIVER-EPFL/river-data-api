@@ -18,7 +18,7 @@ pub async fn refresh_hourly(
     since: chrono::DateTime<chrono::Utc>,
 ) {
     use sea_orm::{ConnectionTrait, Statement};
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "CALL refresh_continuous_aggregate('readings_hourly', '{}'::timestamptz, NOW())",
@@ -44,7 +44,7 @@ pub async fn hourly_bucket(
 ) -> Option<(f64, i64)> {
     use sea_orm::{ConnectionTrait, Statement};
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 // `count` is bigint, and SUM over bigint is NUMERIC in Postgres, which does not
@@ -69,7 +69,7 @@ pub async fn hourly_bucket(
 /// The first column of a single-row COUNT query.
 pub async fn count(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
     use sea_orm::{ConnectionTrait, Statement};
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_string(),
     ))
@@ -146,7 +146,7 @@ pub async fn wait_for_jobs_by_trigger(
     let start = Instant::now();
     loop {
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT \
                    COUNT(*) FILTER (WHERE status IN ('queued','pending','running','retrying')) AS active, \
@@ -353,7 +353,7 @@ pub async fn create_calibration(
 /// is PUT-only, so tests set it with a direct UPDATE (matching `public_workflow_e2e_test`).
 pub async fn set_site_parameter_public(db: &sea_orm::DatabaseConnection, sp_id: &str) {
     use sea_orm::{ConnectionTrait, Statement};
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!("UPDATE site_parameters SET is_public = true WHERE id = '{sp_id}'"),
     ))
@@ -378,7 +378,10 @@ pub async fn author_tool(
         admin,
     )
     .await;
-    assert!((200..300).contains(&status), "create {name} ({status}): {created}");
+    assert!(
+        (200..300).contains(&status),
+        "create {name} ({status}): {created}"
+    );
     let script_id = id_of(&created);
 
     let (status, version) = crate::common::client::post_json_parse_with_token(
@@ -392,7 +395,10 @@ pub async fn author_tool(
         admin,
     )
     .await;
-    assert!((200..300).contains(&status), "version {name} ({status}): {version}");
+    assert!(
+        (200..300).contains(&status),
+        "version {name} ({status}): {version}"
+    );
     let version_id = id_of(&version["version"]);
 
     let (status, validated) = crate::common::client::post_json_parse_with_token(
@@ -414,5 +420,26 @@ pub async fn author_tool(
         admin,
     )
     .await;
-    assert!((200..300).contains(&status), "activate {name} ({status}): {activated}");
+    assert!(
+        (200..300).contains(&status),
+        "activate {name} ({status}): {activated}"
+    );
+}
+
+/// The open event-audit findings at a site, read from the review queue the dashboard reads.
+pub async fn pending_event_findings(app: &Router, token: &str, site_id: &str) -> Vec<serde_json::Value> {
+    let (status, body) = super::get_json_with_token(
+        app,
+        "/api/sync/replicate_audit_holds?status=pending&page_size=500",
+        token,
+    )
+    .await;
+    assert_eq!(status, 200, "holds list ({status}): {body}");
+    body["holds"]
+        .as_array()
+        .expect("holds array")
+        .iter()
+        .filter(|h| h["stream_id"].is_null() && h["site_id"] == site_id)
+        .cloned()
+        .collect()
 }

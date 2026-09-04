@@ -15,7 +15,7 @@ pub async fn wait_terminal(db: &sea_orm::DatabaseConnection, job_id: &str) -> St
     let start = Instant::now();
     loop {
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT status FROM reprocessing_jobs WHERE id = $1",
                 [id.into()],
@@ -46,7 +46,7 @@ pub fn job_id_of(text: &str) -> String {
 }
 
 async fn scalar_opt_uuid(db: &sea_orm::DatabaseConnection, sql: &str) -> Option<Uuid> {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_owned(),
     ))
@@ -126,7 +126,7 @@ async fn apply_then_revert_pairing_plan_via_jobs() {
 
     // Plan applied, stream paired, readings backfilled with a site_id.
     let plan_status = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!("SELECT status AS v FROM pairing_plans WHERE id = '{plan_id}'"),
         ))
@@ -165,7 +165,7 @@ async fn apply_then_revert_pairing_plan_via_jobs() {
     assert_eq!(wait_terminal(&db, &job_id_of(&text)).await, "completed");
 
     let plan_status = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!("SELECT status AS v FROM pairing_plans WHERE id = '{plan_id}'"),
         ))

@@ -437,7 +437,7 @@ pub async fn create_unpaired_stream_with_device(
 /// Query all readings for a stream, ordered by time.
 pub async fn get_readings(db: &DatabaseConnection, stream_id: Uuid) -> Vec<ReadingRow> {
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT time, raw_value, calibrated_value, site_id, parameter_id, \
                     sensor_id, calibration_id, standard_curve_id, deployment_id \
@@ -478,7 +478,7 @@ pub async fn wait_for_reprocessing(
     let start = Instant::now();
     loop {
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT \
                    COUNT(*) FILTER (WHERE status IN ('queued', 'pending', 'running', 'retrying')) AS active, \
@@ -508,7 +508,7 @@ pub async fn wait_for_reprocessing(
 /// Query all readings for a sensor across all streams, ordered by time.
 pub async fn get_readings_for_sensor(db: &DatabaseConnection, sensor_id: Uuid) -> Vec<ReadingRow> {
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT time, raw_value, calibrated_value, site_id, parameter_id, \
                     sensor_id, calibration_id, standard_curve_id, deployment_id \

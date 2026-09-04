@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 async fn insert_backdated(db: &DatabaseConnection, category: &str, interval: &str) -> Uuid {
     let id = Uuid::new_v4();
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "INSERT INTO reprocessing_jobs (id, trigger_type, status, category, created_at) \
@@ -23,7 +23,7 @@ async fn insert_backdated(db: &DatabaseConnection, category: &str, interval: &st
 }
 
 async fn exists(db: &DatabaseConnection, id: Uuid) -> bool {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!("SELECT 1 AS v FROM reprocessing_jobs WHERE id = '{id}'"),
     ))
@@ -44,7 +44,7 @@ async fn retention_prunes_by_category_tier_and_cascades_logs() {
     let ancient_op = insert_backdated(&db, "operator", "200 days").await; // > 180d -> pruned
 
     // A log line on the to-be-pruned maintenance job should cascade-delete with it.
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "INSERT INTO reprocessing_job_logs (job_id, seq, level, message) \
@@ -63,7 +63,7 @@ async fn retention_prunes_by_category_tier_and_cascades_logs() {
     assert!(!exists(&db, ancient_op).await);
 
     let log_count = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!("SELECT COUNT(*) AS v FROM reprocessing_job_logs WHERE job_id = '{old_maint}'"),
         ))
@@ -90,7 +90,7 @@ async fn retention_count_cap_trims_maintenance_overflow() {
     assert_eq!(deleted, 3);
 
     let remaining = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT COUNT(*) AS v FROM reprocessing_jobs WHERE category = 'maintenance'".to_owned(),
         ))

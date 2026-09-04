@@ -40,7 +40,7 @@ pub async fn seed_default_schedules(
     for (job_name, sched) in registry.default_schedules() {
         let interval_seconds = sched.interval.num_seconds().max(1);
         let next_run_at = now + sched.interval;
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "INSERT INTO schedules \
                  (job_name, enabled, next_run_at, interval_seconds, overlap_policy, catchup_policy) \
@@ -104,7 +104,7 @@ pub async fn tick(
 async fn claim_one_due(db: &DatabaseConnection) -> Result<Option<DueSchedule>, sea_orm::DbErr> {
     let txn = db.begin().await?;
     let row = txn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT id, job_name, next_run_at, interval_seconds, overlap_policy, catchup_policy, tunables \
              FROM schedules \
@@ -148,7 +148,7 @@ async fn claim_one_due(db: &DatabaseConnection) -> Result<Option<DueSchedule>, s
     let interval = chrono::Duration::seconds(interval_seconds);
     let missed = scheduled_at + interval <= now;
     let next = schedule::next_run_after(scheduled_at, interval, now);
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "UPDATE schedules SET next_run_at = $1, last_enqueued_at = now() WHERE id = $2",
         [next.into(), id.into()],
@@ -217,13 +217,13 @@ async fn enqueue_due(
 }
 
 /// Whether a non-terminal job of this `job_name` already exists, the skip-if-running guard. Covers
-/// every pre-completion state a worker-pool or inline job can be in.
+/// every pre-completion state, including the `pending`/`retrying` statuses older rows carry.
 async fn non_terminal_exists(
     db: &DatabaseConnection,
     job_name: &str,
 ) -> Result<bool, sea_orm::DbErr> {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT 1 FROM reprocessing_jobs \
              WHERE trigger_type = $1 \

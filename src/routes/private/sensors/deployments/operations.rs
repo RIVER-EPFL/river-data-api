@@ -152,7 +152,7 @@ impl CRUDOperations for SensorDeploymentOperations {
         }
 
         let Some(existing) = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT sensor_id, site_id, parameter_id, deployed_from, deployed_until \
                  FROM sensor_deployments WHERE id = $1",
@@ -312,7 +312,7 @@ impl CRUDOperations for SensorDeploymentOperations {
 
     async fn perform_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<Uuid, ApiError> {
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT sensor_id, site_id, parameter_id FROM sensor_deployments WHERE id = $1",
                 [id.into()],
@@ -354,7 +354,7 @@ impl CRUDOperations for SensorDeploymentOperations {
             )
         })?;
 
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "DELETE FROM sensor_deployments WHERE id = $1",
             [id.into()],

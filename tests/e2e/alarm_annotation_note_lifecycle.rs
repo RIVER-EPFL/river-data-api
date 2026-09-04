@@ -129,7 +129,7 @@ async fn alarm_acknowledge_and_autoresolve() {
     // Reuse a seeded stream for SITE1/Turbidity to inject readings at later-than-seed timestamps so
     // they become the latest reading the sweeper evaluates.
     let stream_id: uuid::Uuid = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!("SELECT stream_id FROM readings WHERE site_id='{site1}' AND parameter_id='{turb}' LIMIT 1"),
         ))
@@ -144,7 +144,7 @@ async fn alarm_acknowledge_and_autoresolve() {
             "INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, replicate_index) \
              VALUES ('{stream_id}', '{site1}', '{turb}', '{time}', {value}, 0) ON CONFLICT DO NOTHING"
         );
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             sql,
         ))
@@ -239,7 +239,7 @@ async fn alarm_acknowledge_and_autoresolve() {
     );
 
     let resolved: bool = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT resolved_at IS NOT NULL AS done FROM alarm_events WHERE id='{event_id}'"

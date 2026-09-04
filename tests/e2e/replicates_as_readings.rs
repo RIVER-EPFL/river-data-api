@@ -14,7 +14,13 @@ use crate::common::e2e;
 const DOC_PARAM: &str = "00000000-0000-4000-b000-0000000000d1";
 const AT: &str = "2025-06-15T11:00:00Z";
 
-async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String, String, String) {
+async fn setup() -> (
+    sea_orm::DatabaseConnection,
+    axum::Router,
+    String,
+    String,
+    String,
+) {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
@@ -36,7 +42,10 @@ async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String, String, 
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "standard curve ({status}): {curve}");
+    assert!(
+        (200..300).contains(&status),
+        "standard curve ({status}): {curve}"
+    );
     (db, app, token, sensor_id, e2e::id_of(&curve))
 }
 
@@ -98,7 +107,7 @@ async fn typed_replicates_are_stored_at_their_index_with_the_curve_the_run_appli
     assert_eq!(saved["samples_created"], 1);
 
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT replicate_index, raw_value, calibrated_value, standard_curve_id::text AS curve, \
@@ -109,22 +118,37 @@ async fn typed_replicates_are_stored_at_their_index_with_the_curve_the_run_appli
         ))
         .await
         .unwrap();
-    assert_eq!(rows.len(), 2, "one reading per typed vial, the gap left unstored");
+    assert_eq!(
+        rows.len(),
+        2,
+        "one reading per typed vial, the gap left unstored"
+    );
     for (row, (index, raw)) in rows.iter().zip([(0i16, 120.0f64), (2, 118.0)]) {
         assert_eq!(row.try_get::<i16>("", "replicate_index").unwrap(), index);
         assert_eq!(row.try_get::<f64>("", "raw_value").unwrap(), raw);
-        let calibrated = row.try_get::<Option<f64>>("", "calibrated_value").unwrap().unwrap();
-        assert!((calibrated - (1.05 * raw - 2.0)).abs() < 1e-9, "{calibrated}");
+        let calibrated = row
+            .try_get::<Option<f64>>("", "calibrated_value")
+            .unwrap()
+            .unwrap();
+        assert!(
+            (calibrated - (1.05 * raw - 2.0)).abs() < 1e-9,
+            "{calibrated}"
+        );
         assert_eq!(row.try_get::<String>("", "curve").unwrap(), curve_id);
-        assert!(row.try_get::<bool>("", "attached").unwrap(), "attached to the visit");
+        assert!(
+            row.try_get::<bool>("", "attached").unwrap(),
+            "attached to the visit"
+        );
     }
 
     let sample = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
-                "SELECT n, mean, stdev, provenance FROM samples \
-                 WHERE site_id = '{site}' AND parameter_id = '{DOC_PARAM}'"
+                "SELECT s.n, s.mean, s.stdev, r.provenance FROM samples s \
+                 JOIN readings r ON r.sample_id = s.id \
+                 WHERE s.site_id = '{site}' AND s.parameter_id = '{DOC_PARAM}' \
+                 ORDER BY r.replicate_index LIMIT 1"
             ),
         ))
         .await
@@ -133,8 +157,14 @@ async fn typed_replicates_are_stored_at_their_index_with_the_curve_the_run_appli
     assert_eq!(sample.try_get::<i32>("", "n").unwrap(), 2);
     let mean = sample.try_get::<Option<f64>>("", "mean").unwrap().unwrap();
     let stdev = sample.try_get::<Option<f64>>("", "stdev").unwrap().unwrap();
-    assert!((mean - shown_avg).abs() < 1e-9, "served {mean}, shown {shown_avg}");
-    assert!((stdev - shown_sd).abs() < 1e-9, "served {stdev}, shown {shown_sd}");
+    assert!(
+        (mean - shown_avg).abs() < 1e-9,
+        "served {mean}, shown {shown_avg}"
+    );
+    assert!(
+        (stdev - shown_sd).abs() < 1e-9,
+        "served {stdev}, shown {shown_sd}"
+    );
     let blob: serde_json::Value = sample.try_get("", "provenance").unwrap();
     assert_eq!(blob["run_id"], run_id);
     assert_eq!(blob["saved_inputs"]["DOC"], DOC_PARAM);
@@ -171,8 +201,10 @@ async fn a_replicate_the_run_did_not_consume_is_refused() {
         (vec![reading(&sensor_id, &curve_id, 120.0, 1)], "consumed"),
         // Not a replicates input of this run.
         (
-            vec![json!({ "parameter_id": DOC_PARAM, "time": AT, "value": 120.0,
-                         "replicate_index": 0, "input": "std_curve" })],
+            vec![
+                json!({ "parameter_id": DOC_PARAM, "time": AT, "value": 120.0,
+                         "replicate_index": 0, "input": "std_curve" }),
+            ],
             "not a replicates input",
         ),
     ] {
@@ -196,4 +228,117 @@ async fn a_replicate_the_run_did_not_consume_is_refused() {
     .await;
     assert_eq!(status, 400, "an input without its run: {refused}");
     assert!(refused.contains("tool_run_id"), "{refused}");
+}
+
+/// 10, 12, 14 with no curve: mean 12, sample sd 2, population sd 1.632993161855452.
+const POPULATION_SD: f64 = 1.632_993_161_855_452;
+
+/// Scenario: an audit decision settled one instant's divisor as the population one while the slot
+/// itself stayed undeclared, and the operator re-runs the tool over the same replicates.
+///
+/// Expected behaviour: the sd the tool displays is the sd the database serves. The display path
+/// resolves through the same ladder as the write path, so a decision recorded on the instant
+/// outranks the slot for the displayed number too.
+#[tokio::test]
+#[serial]
+async fn a_per_instant_declaration_moves_the_sd_the_tool_displays() {
+    if !crate::common::tools_runner::require_runner_or_skip(
+        "a_per_instant_declaration_moves_the_sd_the_tool_displays",
+    )
+    .await
+    {
+        return;
+    }
+    let (db, app, token, sensor_id, _curve_id) = setup().await;
+    let site = crate::common::SITE1_ID;
+
+    let calculate = json!({
+        "DOC": [10.0, 12.0, 14.0],
+        "site_id": site,
+        "collected_at": AT,
+    });
+    let (status, run) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/tools/doc/calculate",
+        &calculate,
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "calculate ({status}): {run}");
+    let run_id = run["run_id"].as_str().expect("run_id").to_string();
+    assert!(
+        (run["results"]["DOC_sd_ppb"].as_f64().unwrap() - 2.0).abs() < 1e-9,
+        "an undeclared slot shows the sample sd: {run}"
+    );
+
+    let readings: Vec<serde_json::Value> = [10.0, 12.0, 14.0]
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            json!({"parameter_id": DOC_PARAM, "sensor_id": sensor_id, "time": AT,
+                   "value": v, "replicate_index": i, "input": "DOC"})
+        })
+        .collect();
+    let (status, saved) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({ "site_id": site, "tool_run_id": run_id, "readings": readings }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "save ({status}): {saved}");
+
+    // The state a `resolve {mode: "estimator", scope: "instant"}` leaves: the group carries the
+    // divisor a person chose for it, the slot still declares nothing. Written directly because
+    // that resolution needs an audit hold, which a grab stream does not raise.
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE samples SET sd_estimator = 'population', sd_estimator_source = 'sample' \
+             WHERE site_id = '{site}' AND parameter_id = '{DOC_PARAM}' AND collected_at = '{AT}'"
+        ),
+    )
+    .await;
+    // The sd is recomputed by the same function the retag job calls, from the group's own column.
+    crate::common::exec(
+        &db,
+        &format!(
+            "SELECT refresh_sample_aggregate(id) FROM samples \
+             WHERE site_id = '{site}' AND parameter_id = '{DOC_PARAM}' AND collected_at = '{AT}'"
+        ),
+    )
+    .await;
+
+    let served: f64 = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT stdev FROM samples WHERE site_id = '{site}' \
+                 AND parameter_id = '{DOC_PARAM}' AND collected_at = '{AT}'"
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the sample survives the declaration")
+        .try_get::<Option<f64>>("", "stdev")
+        .unwrap()
+        .expect("a recomputed stdev");
+    assert!(
+        (served - POPULATION_SD).abs() < 1e-9,
+        "the database serves the declared divisor: {served}"
+    );
+
+    let (status, rerun) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/tools/doc/calculate",
+        &calculate,
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "re-run ({status}): {rerun}");
+    let shown = rerun["results"]["DOC_sd_ppb"].as_f64().expect("sd");
+    assert!(
+        (shown - served).abs() < 1e-9,
+        "shown {shown}, served {served}: one set of values, one standard deviation"
+    );
 }

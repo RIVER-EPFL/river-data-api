@@ -126,6 +126,8 @@ pub struct CalibrationRef {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CurveRef {
     pub id: Uuid,
+    /// The lab instrument the curve belongs to, which is where its record lives.
+    pub sensor_id: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub slope: f64,
@@ -138,6 +140,66 @@ pub struct ChainInfo {
     pub sensor: Option<SensorRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deployment: Option<DeploymentRef>,
+    /// Live instrument or calibration pins on the group: attribution a person decided, which
+    /// reprocess leaves alone.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub pins: Vec<PinRef>,
+}
+
+/// Live instrument and calibration pins on the streams' instant (ADR 0008, M59), keyed by stream.
+async fn load_pins(
+    db: &sea_orm::DatabaseConnection,
+    stream_ids: &[Uuid],
+    at: DateTime<Utc>,
+) -> AppResult<HashMap<Uuid, Vec<PinRef>>> {
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT stream_id, id, kind, replicate_index, new, actor, at, reason, set_id
+             FROM reading_decisions
+             WHERE stream_id = ANY($1) AND time = $2
+               AND kind IN ('instrument_pin', 'calibration_pin') AND rolled_back_by IS NULL
+             ORDER BY at DESC",
+            [
+                stream_ids.to_vec().into(),
+                sea_orm::prelude::DateTimeWithTimeZone::from(at).into(),
+            ],
+        ))
+        .await?;
+    let mut out: HashMap<Uuid, Vec<PinRef>> = HashMap::new();
+    for r in &rows {
+        let stream_id: Uuid = r.try_get("", "stream_id")?;
+        out.entry(stream_id).or_default().push(PinRef {
+            decision_id: r.try_get("", "id")?,
+            kind: r.try_get("", "kind")?,
+            replicate_index: r.try_get("", "replicate_index")?,
+            target: r.try_get("", "new")?,
+            actor: r.try_get("", "actor")?,
+            at: r
+                .try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "at")?
+                .with_timezone(&Utc),
+            reason: r.try_get("", "reason")?,
+            set_id: r.try_get("", "set_id")?,
+        });
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PinRef {
+    pub decision_id: Uuid,
+    /// `instrument_pin` | `calibration_pin`.
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replicate_index: Option<i16>,
+    #[schema(value_type = Object)]
+    pub target: serde_json::Value,
+    pub actor: String,
+    pub at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -175,10 +237,16 @@ pub struct EventRef {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ComputationInfo {
-    pub sample_id: Uuid,
+    /// The statistics row, when the instant carries two or more replicates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
-    /// The server-built tool-run blob stored on the sample, verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    /// The server-built tool-run blob stored on the reading, verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provenance: Option<serde_json::Value>,
     /// The run's minting path: 'interactive' | 'csv_import' | 'chain'.
@@ -186,9 +254,12 @@ pub struct ComputationInfo {
     pub run_source: Option<String>,
     /// Which divisor this group's served standard deviation uses ('sample' = n-1, 'population' =
     /// n) and what chose it. `sd_estimator_source` 'default' means nothing declared one, so the
-    /// number is served under a convention nobody stated.
-    pub sd_estimator: String,
-    pub sd_estimator_source: String,
+    /// number is served under a convention nobody stated. Absent on a single measurement, which
+    /// has no standard deviation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sd_estimator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sd_estimator_source: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -201,7 +272,9 @@ pub struct HoldRef {
 
 /// The stream's origin class, from the writer-side source-system set in
 /// `collection_events::attach`.
-fn classify_source(source_system: &str) -> &'static str {
+/// How a reading reached the store, from the stream it arrived on: `manual`, `csv`, `api` or
+/// `sync`. One definition, so every surface naming an origin names the same thing.
+pub fn classify_source(source_system: &str) -> &'static str {
     match source_system {
         "grab_sample" => "manual",
         "csv" | "csv_import" => "csv",
@@ -210,7 +283,7 @@ fn classify_source(source_system: &str) -> &'static str {
     }
 }
 
-struct RawRow {
+pub struct RawRow {
     stream_id: Uuid,
     replicate_index: i16,
     site_id: Option<Uuid>,
@@ -229,12 +302,16 @@ struct RawRow {
     withdrawn_at: Option<DateTime<Utc>>,
     withdrawn_reason: Option<String>,
     ingested_at: Option<DateTime<Utc>>,
+    provenance: Option<serde_json::Value>,
+    label: Option<String>,
+    notes: Option<String>,
+    created_by: Option<String>,
 }
 
 const ROW_COLUMNS: &str = "stream_id, replicate_index, site_id, parameter_id, raw_value, \
      calibrated_value, sensor_id, calibration_id, standard_curve_id, deployment_id, \
      measurement_type, is_flagged, flag_reason, sample_id, collection_event_id, \
-     withdrawn_at, withdrawn_reason, ingested_at";
+     withdrawn_at, withdrawn_reason, ingested_at, provenance, label, notes, created_by";
 
 fn decode_row(row: &sea_orm::QueryResult) -> Result<RawRow, sea_orm::DbErr> {
     let fixed = |name: &str| -> Option<DateTime<Utc>> {
@@ -262,6 +339,10 @@ fn decode_row(row: &sea_orm::QueryResult) -> Result<RawRow, sea_orm::DbErr> {
         withdrawn_at: fixed("withdrawn_at"),
         withdrawn_reason: row.try_get("", "withdrawn_reason")?,
         ingested_at: fixed("ingested_at"),
+        provenance: row.try_get("", "provenance")?,
+        label: row.try_get("", "label")?,
+        notes: row.try_get("", "notes")?,
+        created_by: row.try_get("", "created_by")?,
     })
 }
 
@@ -270,7 +351,7 @@ fn decode_row(row: &sea_orm::QueryResult) -> Result<RawRow, sea_orm::DbErr> {
 /// that computed it, and any review holds touching it. Requires `read_data`.
 #[utoipa::path(
     get,
-    path = "/readings/provenance",
+    path = "/api/readings/provenance",
     params(ProvenanceQuery),
     responses(
         (status = 200, description = "Provenance record", body = ProvenanceResponse),
@@ -294,14 +375,15 @@ pub async fn get_reading_provenance(
                 ),
                 [stream_id.into(), q.time.into()],
             );
-            state.db.query_all(stmt).await?
+            state.db.query_all_raw(stmt).await?
         }
         (None, Some(site_id), Some(parameter_id)) => {
             let cadence = match q.measurement_type.as_deref() {
                 None => String::new(),
-                Some("continuous") => {
-                    " AND (measurement_type IS NULL OR measurement_type = 'continuous')".into()
-                }
+                // The same word the readings query serves under: everything that is not a grab.
+                // A derived row plots on the continuous line, so a chart that drew it must be able
+                // to resolve the point it drew.
+                Some("continuous") => " AND (measurement_type IS DISTINCT FROM 'spot')".into(),
                 Some(other) => format!(" AND measurement_type = '{}'", sanitize_cadence(other)?),
             };
             let stmt = Statement::from_sql_and_values(
@@ -313,7 +395,7 @@ pub async fn get_reading_provenance(
                 ),
                 [site_id.into(), parameter_id.into(), q.time.into()],
             );
-            state.db.query_all(stmt).await?
+            state.db.query_all_raw(stmt).await?
         }
         _ => {
             return Err(AppError::BadRequest(
@@ -343,9 +425,27 @@ pub async fn get_reading_provenance(
         }
     }
 
+    let records = assemble_records(&state.db, &rows, q.time).await?;
+
+    Ok(Json(ProvenanceResponse {
+        time: q.time,
+        site_id: rows.iter().find_map(|r| r.site_id).or(q.site_id),
+        parameter_id: rows.iter().find_map(|r| r.parameter_id).or(q.parameter_id),
+        duplicate_slot: records.len() > 1,
+        records,
+    }))
+}
+
+/// The readings of one instant, grouped by stream into assembled records. Every lookup is batched
+/// over the whole row set, so a visit's twenty cells cost the same number of queries as one.
+pub async fn assemble_records(
+    db: &sea_orm::DatabaseConnection,
+    rows: &[RawRow],
+    time: DateTime<Utc>,
+) -> AppResult<Vec<ProvenanceRecord>> {
     // --- Batch-resolve everything the rows reference ---
     let mut groups: BTreeMap<Uuid, Vec<&RawRow>> = BTreeMap::new();
-    for r in &rows {
+    for r in rows {
         groups.entry(r.stream_id).or_default().push(r);
     }
     let collect = |f: fn(&RawRow) -> Option<Uuid>| -> Vec<Uuid> {
@@ -358,49 +458,49 @@ pub async fn get_reading_provenance(
 
     let streams: HashMap<Uuid, data_streams::Model> = data_streams::Entity::find()
         .filter(data_streams::Column::Id.is_in(groups.keys().copied().collect::<Vec<_>>()))
-        .all(&state.db)
+        .all(db)
         .await?
         .into_iter()
         .map(|s| (s.id, s))
         .collect();
     let sensor_map: HashMap<Uuid, sensors::Model> = sensors::Entity::find()
         .filter(sensors::Column::Id.is_in(collect(|r| r.sensor_id)))
-        .all(&state.db)
+        .all(db)
         .await?
         .into_iter()
         .map(|s| (s.id, s))
         .collect();
     let deployment_map: HashMap<Uuid, deployments::Model> = deployments::Entity::find()
         .filter(deployments::Column::Id.is_in(collect(|r| r.deployment_id)))
-        .all(&state.db)
+        .all(db)
         .await?
         .into_iter()
         .map(|d| (d.id, d))
         .collect();
     let calibration_map: HashMap<Uuid, calibrations::Model> = calibrations::Entity::find()
         .filter(calibrations::Column::Id.is_in(collect(|r| r.calibration_id)))
-        .all(&state.db)
+        .all(db)
         .await?
         .into_iter()
         .map(|c| (c.id, c))
         .collect();
     let curve_map: HashMap<Uuid, standard_curves::Model> = standard_curves::Entity::find()
         .filter(standard_curves::Column::Id.is_in(collect(|r| r.standard_curve_id)))
-        .all(&state.db)
+        .all(db)
         .await?
         .into_iter()
         .map(|c| (c.id, c))
         .collect();
     let event_map: HashMap<Uuid, collection_events::Model> = collection_events::Entity::find()
         .filter(collection_events::Column::Id.is_in(collect(|r| r.collection_event_id)))
-        .all(&state.db)
+        .all(db)
         .await?
         .into_iter()
         .map(|e| (e.id, e))
         .collect();
     let sample_map: HashMap<Uuid, samples::Model> = samples::Entity::find()
         .filter(samples::Column::Id.is_in(collect(|r| r.sample_id)))
-        .all(&state.db)
+        .all(db)
         .await?
         .into_iter()
         .map(|s| (s.id, s))
@@ -416,11 +516,18 @@ pub async fn get_reading_provenance(
                     .collect::<Vec<_>>(),
             ),
         )
-        .all(&state.db)
+        .all(db)
         .await?
         .into_iter()
         .map(|s| (s.id, s.name))
         .collect();
+
+    let stream_ids: Vec<Uuid> = groups.keys().copied().collect();
+    let mut receipts = fetch_covering_receipts(db, &stream_ids, time).await?;
+    let mut holds_by_stream = fetch_stream_holds(db, &stream_ids, time).await?;
+    let mut holds_by_slot = fetch_slot_holds(db, rows, time).await?;
+    let mut pins = load_pins(db, &stream_ids, time).await?;
+    let run_sources = fetch_run_sources(db, rows).await?;
 
     let mut records = Vec::with_capacity(groups.len());
     for (stream_id, group) in &groups {
@@ -428,8 +535,15 @@ pub async fn get_reading_provenance(
             .get(stream_id)
             .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
 
-        let receipt = fetch_covering_receipt(&state.db, *stream_id, q.time).await?;
-        let holds = fetch_holds(&state.db, *stream_id, group[0], q.time).await?;
+        let receipt = receipts.remove(stream_id);
+        let mut holds = holds_by_stream.remove(stream_id).unwrap_or_default();
+        if let (Some(site_id), Some(parameter_id)) = (group[0].site_id, group[0].parameter_id) {
+            holds.extend(
+                holds_by_slot
+                    .remove(&(site_id, parameter_id))
+                    .unwrap_or_default(),
+            );
+        }
 
         let readings_out: Vec<ReadingFacet> = group
             .iter()
@@ -455,6 +569,7 @@ pub async fn get_reading_provenance(
                 standard_curve: r.standard_curve_id.and_then(|id| {
                     curve_map.get(&id).map(|c| CurveRef {
                         id: c.id,
+                        sensor_id: c.sensor_id,
                         name: c.name.clone(),
                         slope: c.slope,
                         intercept: c.intercept,
@@ -495,32 +610,28 @@ pub async fn get_reading_provenance(
                 source: e.source.clone(),
                 created_by: e.created_by.clone(),
             });
-        let computation = match group
+        // The story of a measurement lives on the reading, so a group with no statistics row
+        // still has one; the sample adds the estimator its stored sd was computed with.
+        let sample = group
             .iter()
             .find_map(|r| r.sample_id)
-            .and_then(|id| sample_map.get(&id))
-        {
-            Some(sample) => {
-                let run_source = match sample
-                    .provenance
-                    .as_ref()
-                    .and_then(|p| p.get("run_id"))
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| Uuid::parse_str(s).ok())
-                {
-                    Some(run_id) => fetch_run_source(&state.db, run_id).await?,
-                    None => None,
-                };
-                Some(ComputationInfo {
-                    sample_id: sample.id,
-                    created_by: sample.created_by.clone(),
-                    provenance: sample.provenance.clone(),
-                    run_source,
-                    sd_estimator: sample.sd_estimator.clone(),
-                    sd_estimator_source: sample.sd_estimator_source.clone(),
-                })
-            }
-            None => None,
+            .and_then(|id| sample_map.get(&id));
+        let blob = group.iter().find_map(|r| r.provenance.clone());
+        let entered_by = group.iter().find_map(|r| r.created_by.clone());
+        let computation = if blob.is_some() || entered_by.is_some() || sample.is_some() {
+            let run_source = run_id_of(blob.as_ref()).and_then(|id| run_sources.get(&id).cloned());
+            Some(ComputationInfo {
+                sample_id: sample.map(|s| s.id),
+                created_by: entered_by,
+                label: group.iter().find_map(|r| r.label.clone()),
+                notes: group.iter().find_map(|r| r.notes.clone()),
+                provenance: blob,
+                run_source,
+                sd_estimator: sample.map(|s| s.sd_estimator.clone()),
+                sd_estimator_source: sample.map(|s| s.sd_estimator_source.clone()),
+            })
+        } else {
+            None
         };
 
         records.push(ProvenanceRecord {
@@ -535,20 +646,51 @@ pub async fn get_reading_provenance(
                 receipt,
             },
             readings: readings_out,
-            chain: ChainInfo { sensor, deployment },
+            chain: ChainInfo {
+                sensor,
+                deployment,
+                pins: pins.remove(stream_id).unwrap_or_default(),
+            },
             event,
             computation,
             holds,
         });
     }
 
-    Ok(Json(ProvenanceResponse {
-        time: q.time,
-        site_id: rows.iter().find_map(|r| r.site_id).or(q.site_id),
-        parameter_id: rows.iter().find_map(|r| r.parameter_id).or(q.parameter_id),
-        duplicate_slot: records.len() > 1,
-        records,
-    }))
+    Ok(records)
+}
+
+/// Every record at a collection event, keyed by the stream that serves it.
+pub async fn records_for_event(
+    db: &sea_orm::DatabaseConnection,
+    event_id: Uuid,
+    collected_at: DateTime<Utc>,
+) -> AppResult<HashMap<Uuid, ProvenanceRecord>> {
+    let rows: Vec<RawRow> = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT {ROW_COLUMNS} FROM readings WHERE collection_event_id = $1 \
+                 ORDER BY stream_id, replicate_index"
+            ),
+            [event_id.into()],
+        ))
+        .await?
+        .iter()
+        .map(decode_row)
+        .collect::<Result<_, _>>()?;
+    Ok(assemble_records(db, &rows, collected_at)
+        .await?
+        .into_iter()
+        .map(|r| (r.origin.stream_id, r))
+        .collect())
+}
+
+fn run_id_of(blob: Option<&serde_json::Value>) -> Option<Uuid> {
+    blob?
+        .get("run_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
 }
 
 fn sanitize_cadence(value: &str) -> AppResult<&str> {
@@ -560,107 +702,152 @@ fn sanitize_cadence(value: &str) -> AppResult<&str> {
     }
 }
 
-async fn fetch_covering_receipt(
-    db: &sea_orm::DatabaseConnection,
-    stream_id: Uuid,
-    time: DateTime<Utc>,
-) -> AppResult<Option<ReceiptSummary>> {
-    let row = db
-        .query_one(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, at, window_from, window_to, submitted, new_rows, changed, unchanged, \
-                    withdrawn, rejected_total, braked \
-             FROM ingest_receipts \
-             WHERE stream_id = $1 AND window_from <= $2 AND window_to >= $2 \
-             ORDER BY at DESC LIMIT 1",
-            [stream_id.into(), time.into()],
-        ))
-        .await?;
-    let Some(row) = row else { return Ok(None) };
-    let fixed = |name: &str| -> Option<DateTime<Utc>> {
-        row.try_get::<Option<DateTime<chrono::FixedOffset>>>("", name)
-            .ok()
-            .flatten()
-            .map(|t| t.with_timezone(&Utc))
-    };
-    Ok(Some(ReceiptSummary {
-        id: row.try_get("", "id").map_err(AppError::Database)?,
-        at: fixed("at").unwrap_or(time),
-        window_from: fixed("window_from"),
-        window_to: fixed("window_to"),
-        submitted: row.try_get("", "submitted").map_err(AppError::Database)?,
-        new_rows: row.try_get("", "new_rows").map_err(AppError::Database)?,
-        changed: row.try_get("", "changed").map_err(AppError::Database)?,
-        unchanged: row.try_get("", "unchanged").map_err(AppError::Database)?,
-        withdrawn: row.try_get("", "withdrawn").map_err(AppError::Database)?,
-        rejected_total: row
-            .try_get("", "rejected_total")
-            .map_err(AppError::Database)?,
-        braked: row.try_get("", "braked").map_err(AppError::Database)?,
-    }))
+fn fixed_at(row: &sea_orm::QueryResult, name: &str) -> Option<DateTime<Utc>> {
+    row.try_get::<Option<DateTime<chrono::FixedOffset>>>("", name)
+        .ok()
+        .flatten()
+        .map(|t| t.with_timezone(&Utc))
 }
 
-/// Review holds touching the instant: replicate-statistics holds by stream, event-audit findings
-/// and reconciliation holds by slot. Terminal holds are left out.
-async fn fetch_holds(
+/// The latest windowed-ingest pass covering the instant, per stream.
+async fn fetch_covering_receipts(
     db: &sea_orm::DatabaseConnection,
-    stream_id: Uuid,
-    sample_row: &RawRow,
+    stream_ids: &[Uuid],
     time: DateTime<Utc>,
-) -> AppResult<Vec<HoldRef>> {
-    let mut holds = Vec::new();
-    let mut push_rows = |rows: Vec<sea_orm::QueryResult>| -> AppResult<()> {
-        for row in rows {
-            let created: DateTime<chrono::FixedOffset> =
-                row.try_get("", "created_at").map_err(AppError::Database)?;
-            holds.push(HoldRef {
-                id: row.try_get("", "id").map_err(AppError::Database)?,
-                kind: row.try_get("", "kind").map_err(AppError::Database)?,
-                status: row.try_get("", "status").map_err(AppError::Database)?,
-                created_at: created.with_timezone(&Utc),
-            });
-        }
-        Ok(())
-    };
-
-    let by_stream = db
-        .query_all(Statement::from_sql_and_values(
+) -> AppResult<HashMap<Uuid, ReceiptSummary>> {
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, kind, status, created_at FROM replicate_audit_holds \
-             WHERE stream_id = $1 AND group_time = $2 \
+            "SELECT DISTINCT ON (stream_id) stream_id, id, at, window_from, window_to, \
+                    submitted, new_rows, changed, unchanged, withdrawn, rejected_total, braked \
+             FROM ingest_receipts \
+             WHERE stream_id = ANY($1) AND window_from <= $2 AND window_to >= $2 \
+             ORDER BY stream_id, at DESC",
+            [stream_ids.to_vec().into(), time.into()],
+        ))
+        .await?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let stream_id: Uuid = row.try_get("", "stream_id")?;
+        out.insert(
+            stream_id,
+            ReceiptSummary {
+                id: row.try_get("", "id")?,
+                at: fixed_at(&row, "at").unwrap_or(time),
+                window_from: fixed_at(&row, "window_from"),
+                window_to: fixed_at(&row, "window_to"),
+                submitted: row.try_get("", "submitted")?,
+                new_rows: row.try_get("", "new_rows")?,
+                changed: row.try_get("", "changed")?,
+                unchanged: row.try_get("", "unchanged")?,
+                withdrawn: row.try_get("", "withdrawn")?,
+                rejected_total: row.try_get("", "rejected_total")?,
+                braked: row.try_get("", "braked")?,
+            },
+        );
+    }
+    Ok(out)
+}
+
+fn hold_ref(row: &sea_orm::QueryResult) -> Result<HoldRef, sea_orm::DbErr> {
+    let created: DateTime<chrono::FixedOffset> = row.try_get("", "created_at")?;
+    Ok(HoldRef {
+        id: row.try_get("", "id")?,
+        kind: row.try_get("", "kind")?,
+        status: row.try_get("", "status")?,
+        created_at: created.with_timezone(&Utc),
+    })
+}
+
+/// Replicate-statistics holds keyed by stream at the instant. Terminal holds are left out.
+async fn fetch_stream_holds(
+    db: &sea_orm::DatabaseConnection,
+    stream_ids: &[Uuid],
+    time: DateTime<Utc>,
+) -> AppResult<HashMap<Uuid, Vec<HoldRef>>> {
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT stream_id, id, kind, status, created_at FROM replicate_audit_holds \
+             WHERE stream_id = ANY($1) AND group_time = $2 \
                AND status IN ('pending', 'deferred', 'acknowledged') \
              ORDER BY created_at DESC",
-            [stream_id.into(), time.into()],
+            [stream_ids.to_vec().into(), time.into()],
         ))
         .await?;
-    push_rows(by_stream)?;
-
-    if let (Some(site_id), Some(parameter_id)) = (sample_row.site_id, sample_row.parameter_id) {
-        let by_slot = db
-            .query_all(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT id, kind, status, created_at FROM replicate_audit_holds \
-                 WHERE stream_id IS NULL AND site_id = $1 AND parameter_id = $2 \
-                   AND group_time = $3 AND status IN ('pending', 'deferred', 'acknowledged') \
-                 ORDER BY created_at DESC",
-                [site_id.into(), parameter_id.into(), time.into()],
-            ))
-            .await?;
-        push_rows(by_slot)?;
+    let mut out: HashMap<Uuid, Vec<HoldRef>> = HashMap::new();
+    for row in rows {
+        let stream_id: Uuid = row.try_get("", "stream_id")?;
+        out.entry(stream_id).or_default().push(hold_ref(&row)?);
     }
-    Ok(holds)
+    Ok(out)
 }
 
-async fn fetch_run_source(
+/// Event-audit findings and reconciliation holds keyed by (site, parameter) at the instant.
+async fn fetch_slot_holds(
     db: &sea_orm::DatabaseConnection,
-    run_id: Uuid,
-) -> AppResult<Option<String>> {
-    let row = db
-        .query_one(Statement::from_sql_and_values(
+    rows: &[RawRow],
+    time: DateTime<Utc>,
+) -> AppResult<HashMap<(Uuid, Uuid), Vec<HoldRef>>> {
+    let mut by_site: BTreeMap<Uuid, HashSet<Uuid>> = BTreeMap::new();
+    for r in rows {
+        if let (Some(site_id), Some(parameter_id)) = (r.site_id, r.parameter_id) {
+            by_site.entry(site_id).or_default().insert(parameter_id);
+        }
+    }
+    let mut out: HashMap<(Uuid, Uuid), Vec<HoldRef>> = HashMap::new();
+    for (site_id, parameter_ids) in by_site {
+        let found = db
+            .query_all_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT parameter_id, id, kind, status, created_at FROM replicate_audit_holds \
+                 WHERE stream_id IS NULL AND site_id = $1 AND parameter_id = ANY($2) \
+                   AND group_time = $3 AND status IN ('pending', 'deferred', 'acknowledged') \
+                 ORDER BY created_at DESC",
+                [
+                    site_id.into(),
+                    parameter_ids.into_iter().collect::<Vec<_>>().into(),
+                    time.into(),
+                ],
+            ))
+            .await?;
+        for row in found {
+            let parameter_id: Uuid = row.try_get("", "parameter_id")?;
+            out.entry((site_id, parameter_id))
+                .or_default()
+                .push(hold_ref(&row)?);
+        }
+    }
+    Ok(out)
+}
+
+/// The minting path of every tool run the rows' provenance blobs name.
+async fn fetch_run_sources(
+    db: &sea_orm::DatabaseConnection,
+    rows: &[RawRow],
+) -> AppResult<HashMap<Uuid, String>> {
+    let run_ids: Vec<Uuid> = rows
+        .iter()
+        .filter_map(|r| run_id_of(r.provenance.as_ref()))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    if run_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let found = db
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT source FROM tool_runs WHERE id = $1",
-            [run_id.into()],
+            "SELECT id, source FROM tool_runs WHERE id = ANY($1)",
+            [run_ids.into()],
         ))
         .await?;
-    Ok(row.and_then(|r| r.try_get("", "source").ok()))
+    let mut out = HashMap::new();
+    for row in found {
+        let id: Uuid = row.try_get("", "id")?;
+        if let Some(source) = row.try_get::<Option<String>>("", "source")? {
+            out.insert(id, source);
+        }
+    }
+    Ok(out)
 }

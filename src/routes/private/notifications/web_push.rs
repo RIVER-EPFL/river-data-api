@@ -35,7 +35,10 @@ pub struct Subscription {
 fn deep_link_url(base: Option<&str>, slot: &Option<Slot>) -> Option<String> {
     let base = base?.trim_end_matches('/');
     match slot {
-        Some(s) => Some(format!("{}/sites/{}?focus={}", base, s.site_id, s.parameter_id)),
+        Some(s) => Some(format!(
+            "{}/sites/{}?focus={}",
+            base, s.site_id, s.parameter_id
+        )),
         None => Some(format!("{}/alarms", base)),
     }
 }
@@ -46,7 +49,7 @@ pub async fn slot_subscriptions(
 ) -> Result<Vec<Subscription>, String> {
     let rows = match slot {
         Some(s) => {
-            db.query_all(Statement::from_sql_and_values(
+            db.query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT wps.id, wps.keycloak_sub AS sub, wps.endpoint, wps.p256dh, wps.auth \
                  FROM web_push_subscriptions wps \
@@ -67,7 +70,7 @@ pub async fn slot_subscriptions(
             .await
         }
         None => {
-            db.query_all(Statement::from_string(
+            db.query_all_raw(Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT wps.id, wps.keycloak_sub AS sub, wps.endpoint, wps.p256dh, wps.auth \
                  FROM web_push_subscriptions wps \
@@ -95,7 +98,7 @@ pub async fn slot_subscriptions(
 
 pub(super) async fn prune_subscription(db: &DatabaseConnection, id: Uuid) {
     if let Err(e) = db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "DELETE FROM web_push_subscriptions WHERE id = $1",
             [id.into()],
@@ -108,7 +111,7 @@ pub(super) async fn prune_subscription(db: &DatabaseConnection, id: Uuid) {
 
 pub(super) async fn stamp_success(db: &DatabaseConnection, id: Uuid) {
     let _ = db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE web_push_subscriptions SET last_success_at = NOW() WHERE id = $1",
             [id.into()],
@@ -125,11 +128,9 @@ pub async fn send_push(
 ) -> Result<(), String> {
     let info = ::web_push::SubscriptionInfo::new(&sub.endpoint, &sub.p256dh, &sub.auth);
 
-    let mut sig_builder = ::web_push::VapidSignatureBuilder::from_pem(
-        std::io::Cursor::new(vapid_pem),
-        &info,
-    )
-    .map_err(|e| format!("VAPID build: {e}"))?;
+    let mut sig_builder =
+        ::web_push::VapidSignatureBuilder::from_pem(std::io::Cursor::new(vapid_pem), &info)
+            .map_err(|e| format!("VAPID build: {e}"))?;
     sig_builder.add_claim("sub", serde_json::Value::String(vapid_subject.to_string()));
     let sig = sig_builder
         .build()
@@ -191,10 +192,7 @@ impl NotificationChannel for WebPushChannel {
 
         let project = msg.slot.as_ref().and_then(|s| s.project_id);
 
-        let url = deep_link_url(
-            state.config.dashboard_base_url.as_deref(),
-            &msg.slot,
-        );
+        let url = deep_link_url(state.config.dashboard_base_url.as_deref(), &msg.slot);
 
         let payload = serde_json::json!({
             "title": msg.subject,

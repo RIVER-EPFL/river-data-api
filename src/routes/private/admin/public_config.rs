@@ -12,7 +12,7 @@ use crate::routes::public::service::invalidate_config;
 /// `write_metadata`.
 #[utoipa::path(
     post,
-    path = "/actions/invalidate_public_config/{code}",
+    path = "/api/actions/invalidate_public_config/{code}",
     params(("code" = String, Path, description = "Public project code")),
     responses(
         (status = 200, description = "Cache invalidated"),

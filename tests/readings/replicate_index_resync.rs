@@ -73,7 +73,7 @@ async fn ingest(fx: &Fixture, readings: Vec<serde_json::Value>) -> serde_json::V
 
 async fn stored_indexes(fx: &Fixture) -> Vec<i16> {
     fx.db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT replicate_index FROM readings \
@@ -91,7 +91,7 @@ async fn stored_indexes(fx: &Fixture) -> Vec<i16> {
 async fn sample_mean_and_n(fx: &Fixture) -> (f64, i64) {
     let row = fx
         .db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT mean, n::bigint AS n FROM samples \

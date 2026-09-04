@@ -6,7 +6,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, EntityTrait,
     QueryFilter, Set, Statement,
 };
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -19,19 +19,41 @@ use river_data_core::models::{
     CommandStatus, HeartbeatRequest, HeartbeatResponse, PendingCommand, ServiceStatus,
 };
 
+/// The default `SYNC_SESSION_TOKEN_TTL_SECS`, so the cache has a sane window when nothing has
+/// declared one (the test harness builds the router without going through `main`).
+const DEFAULT_SESSION_TOKEN_TTL_SECS: u64 = 900;
+
+/// A cached token must expire before the row backing it does, or the heartbeat hands out a token
+/// the database has already dropped and the service churns through re-enrollment. Four fifths of
+/// the configured lifetime leaves a margin no operator has to know about.
+const CACHE_FRACTION_OF_TTL: f64 = 0.8;
+
+static SESSION_TOKEN_CACHE_TTL: OnceLock<Duration> = OnceLock::new();
+
+/// Fix the session-token cache window from the configured token lifetime. Called once at startup,
+/// before the cache is first touched; without it the default lifetime applies.
+pub fn init_session_token_cache_ttl(token_ttl_secs: u64) {
+    let window = (token_ttl_secs as f64 * CACHE_FRACTION_OF_TTL) as u64;
+    let _ = SESSION_TOKEN_CACHE_TTL.set(Duration::from_secs(window.max(1)));
+}
+
 pub(crate) static SESSION_TOKEN_CACHE: LazyLock<Cache<Uuid, String>> = LazyLock::new(|| {
-    Cache::builder()
-        .max_capacity(100)
-        .time_to_live(Duration::from_secs(13 * 60))
-        .build()
+    let ttl = *SESSION_TOKEN_CACHE_TTL.get_or_init(|| {
+        Duration::from_secs((DEFAULT_SESSION_TOKEN_TTL_SECS as f64 * CACHE_FRACTION_OF_TTL) as u64)
+    });
+    Cache::builder().max_capacity(100).time_to_live(ttl).build()
 });
 
 /// Periodic heartbeat from a sync service. Updates `last_heartbeat`, `status`, and
-/// `current_operation`. Returns a fresh session token (rotated on every heartbeat) and
-/// any pending commands queued for this service. Requires sync session token auth.
+/// `current_operation`. Returns a session token and any pending commands queued for this service.
+/// Requires sync session token auth.
+///
+/// The token is cached per service for a fraction of its configured lifetime, so a heartbeat
+/// usually returns the same token rather than minting one per cycle; rotation happens when that
+/// window lapses.
 #[utoipa::path(
     post,
-    path = "/heartbeat",
+    path = "/api/sync/heartbeat",
     request_body = HeartbeatRequest,
     responses(
         (status = 200, description = "Heartbeat acknowledged; fresh token and pending commands", body = HeartbeatResponse),
@@ -108,7 +130,7 @@ pub async fn heartbeat(
     let sid = req.service_id;
     tokio::spawn(async move {
         let _ = db_clone
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "UPDATE sync_commands SET status = $2 WHERE service_id = $1 AND status = $3 AND expires_at < NOW()",
                 [
@@ -126,4 +148,28 @@ pub async fn heartbeat(
         paused,
         sync_interval_secs: sync_interval_secs.map(|s| s as u64),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scenario: an operator shortens `SYNC_SESSION_TOKEN_TTL_SECS`.
+    ///
+    /// Expected behaviour: the cache window shortens with it and stays strictly inside the token's
+    /// lifetime. A fixed window wider than a configured lifetime would have the heartbeat hand back
+    /// tokens the database had already expired, 401 its own next call, and churn the service
+    /// through re-enrollment.
+    #[test]
+    fn the_cache_window_stays_inside_the_token_lifetime() {
+        let window = |ttl: u64| (ttl as f64 * CACHE_FRACTION_OF_TTL) as u64;
+        for ttl in [60, 300, 600, DEFAULT_SESSION_TOKEN_TTL_SECS, 3600] {
+            assert!(
+                window(ttl) < ttl,
+                "a {ttl}s token must outlive its {}s cache entry",
+                window(ttl)
+            );
+        }
+        assert_eq!(window(DEFAULT_SESSION_TOKEN_TTL_SECS), 720);
+    }
 }

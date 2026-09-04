@@ -210,7 +210,7 @@ pub async fn family_keys_in_streams<C: ConnectionTrait>(
     source_system: Option<&str>,
 ) -> AppResult<Vec<String>> {
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT source_key FROM data_streams \
              WHERE (id = ANY($1) OR ($2::text IS NOT NULL AND source_system = $2)) \
@@ -237,7 +237,7 @@ pub async fn family_keys_for_sensors<C: ConnectionTrait>(
     sensor_ids: &[Uuid],
 ) -> AppResult<Vec<String>> {
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT source_key FROM data_streams s \
              WHERE s.metadata -> $2 IS NOT NULL \
@@ -264,7 +264,7 @@ pub async fn family_keys_in_retag_scope<C: ConnectionTrait>(
     source_system: Option<&str>,
 ) -> AppResult<Vec<String>> {
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT source_key FROM data_streams s \
              WHERE s.metadata -> $4 IS NOT NULL \

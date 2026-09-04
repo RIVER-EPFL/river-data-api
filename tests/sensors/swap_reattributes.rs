@@ -35,7 +35,7 @@ async fn swap_reattributes_post_swap_readings() {
 
     // One feed (paired stream) initially owned by A, with six readings.
     let stream = sl::create_paired_stream(&db, "feed", crate::common::PARAM_S1_TEMP_ID).await;
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "UPDATE data_streams SET sensor_id = $1 WHERE id = $2",
         [sensor_a.id.into(), stream.into()],
@@ -105,7 +105,7 @@ async fn swap_reattributes_post_swap_readings() {
 
     // The feed is relinked to B for future ingest.
     let stream_sensor: Uuid = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT sensor_id FROM data_streams WHERE id = $1",
             [stream.into()],
@@ -163,7 +163,7 @@ async fn swap_recalls_incoming_sensor_open_elsewhere() {
     assert!((200..300).contains(&status), "swap ({status}): {body}");
 
     let open_b: i64 = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT count(*) AS c FROM sensor_deployments \
              WHERE sensor_id = $1 AND deployed_until IS NULL",

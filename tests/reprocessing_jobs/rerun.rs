@@ -29,7 +29,7 @@ async fn wait_for_terminal(db: &sea_orm::DatabaseConnection, job_id: &str) -> St
     let start = Instant::now();
     loop {
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT status FROM reprocessing_jobs WHERE id = $1",
                 [id.into()],
@@ -96,7 +96,7 @@ async fn rerun_replays_a_sensor_reprocess_as_a_new_job() {
 
     // The original row is preserved; the new one replays the same trigger_type + sensor.
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT trigger_type, sensor_id FROM reprocessing_jobs WHERE id = $1",
             [Uuid::parse_str(&rerun).unwrap().into()],

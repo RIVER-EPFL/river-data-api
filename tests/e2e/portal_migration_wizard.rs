@@ -18,7 +18,7 @@ const DO_FIELD_DISPLAY: &str = "Dissolved Oxygen - Field [mg/L]";
 
 async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             sql.to_string(),
         ))
@@ -29,7 +29,7 @@ async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
 }
 
 async fn scalar_opt_string(db: &DatabaseConnection, sql: &str) -> Option<String> {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         sql.to_owned(),
     ))

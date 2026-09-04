@@ -91,6 +91,16 @@ mod m20260831_000001_annotation_provenance;
 mod m20260831_000002_stream_window_digest;
 mod m20260901_000001_sync_interval;
 mod m20260901_000002_readings_chunk_interval;
+mod m20260902_000001_annotation_standard_curve;
+mod m20260902_000001_audit_hold_kind_uniq;
+mod m20260902_000002_flagged_head_index;
+mod m20260903_000001_replicate_index_cadence;
+mod m20260903_000002_reactive_recompute;
+mod m20260903_000003_reading_provenance;
+mod m20260903_000004_reading_decisions;
+mod m20260903_000005_reading_decision_sets;
+mod m20260903_000006_value_correction_restamp;
+mod m20260904_000001_plan_curve_assignments;
 
 pub struct Migrator;
 
@@ -187,6 +197,16 @@ impl MigratorTrait for Migrator {
             Box::new(m20260831_000002_stream_window_digest::Migration),
             Box::new(m20260901_000001_sync_interval::Migration),
             Box::new(m20260901_000002_readings_chunk_interval::Migration),
+            Box::new(m20260902_000001_annotation_standard_curve::Migration),
+            Box::new(m20260902_000001_audit_hold_kind_uniq::Migration),
+            Box::new(m20260902_000002_flagged_head_index::Migration),
+            Box::new(m20260903_000001_replicate_index_cadence::Migration),
+            Box::new(m20260903_000002_reactive_recompute::Migration),
+            Box::new(m20260903_000003_reading_provenance::Migration),
+            Box::new(m20260903_000004_reading_decisions::Migration),
+            Box::new(m20260903_000005_reading_decision_sets::Migration),
+            Box::new(m20260903_000006_value_correction_restamp::Migration),
+            Box::new(m20260904_000001_plan_curve_assignments::Migration),
         ]
     }
 }

@@ -48,7 +48,7 @@ struct StoredGrab {
 
 async fn grab_at(db: &DatabaseConnection, time: &str) -> StoredGrab {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT calibrated_value, calibration_id, standard_curve_id FROM readings \
@@ -107,7 +107,7 @@ async fn edit_calibration(fx: &Fixture, id: Uuid, patch: serde_json::Value) -> (
 
 /// Whether the curve's end date is recorded as an operator's rather than the window chain's.
 async fn window_provenance(db: &DatabaseConnection, calibration_id: Uuid) -> bool {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "SELECT valid_until_explicit FROM sensor_calibrations WHERE id = '{calibration_id}'"
@@ -466,7 +466,7 @@ async fn a_rejected_update_leaves_the_window_provenance_unchanged() {
 
     let row = fx
         .db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT valid_until_explicit, valid_from FROM sensor_calibrations WHERE id = '{second}'"

@@ -22,7 +22,7 @@ async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
 
 async fn scalar_i64(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
     use sea_orm::{ConnectionTrait, Statement};
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_owned(),
     ))
@@ -35,7 +35,7 @@ async fn scalar_i64(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
 
 async fn slot_estimator(db: &sea_orm::DatabaseConnection) -> Option<String> {
     use sea_orm::{ConnectionTrait, Statement};
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!("SELECT sd_estimator AS v FROM site_parameters WHERE id = '{PARAM_S1_TEMP_ID}'"),
     ))

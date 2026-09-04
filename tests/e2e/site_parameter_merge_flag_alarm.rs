@@ -51,7 +51,7 @@ async fn merge_site_parameters_then_flag_and_query_alarms() {
         "merged-away source site_parameter should be gone"
     );
     let remaining_temp: i64 = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT COUNT(*) AS c FROM readings WHERE site_id='{site1}' AND parameter_id='{}'",
@@ -82,7 +82,7 @@ async fn merge_site_parameters_then_flag_and_query_alarms() {
     assert!((200..300).contains(&status), "flag ({status}): {body}");
 
     let flagged: bool = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT is_flagged FROM readings WHERE site_id='{site1}' AND parameter_id='{}' AND time='{flag_time}'",
@@ -105,7 +105,7 @@ async fn merge_site_parameters_then_flag_and_query_alarms() {
     .await;
     assert!((200..300).contains(&status), "unflag ({status}): {body}");
     let still_flagged: bool = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT is_flagged FROM readings WHERE site_id='{site1}' AND parameter_id='{}' AND time='{flag_time}'",

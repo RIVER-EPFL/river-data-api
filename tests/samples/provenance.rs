@@ -1,6 +1,6 @@
-//! The provenance blob on a tool save is built by the server from the stored `tool_runs` row:
-//! a client cannot author it, a save cannot claim a run it did not use, a curve-consuming run
-//! refuses a `standard_curve_id`, and the stored blob survives CRUD untouched.
+//! The provenance blob on a tool save is built by the server from the stored `tool_runs` row and
+//! stored on the readings it produced: a client cannot author it, a save cannot claim a run it did
+//! not use, and a curve-consuming run refuses a `standard_curve_id`.
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde_json::json;
@@ -28,7 +28,7 @@ async fn mint_run(
     curves: serde_json::Value,
 ) -> Uuid {
     let id = Uuid::new_v4();
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "INSERT INTO tool_runs (id, tool_name, tool_version, inputs, constants, curves, outputs, \
          created_by) VALUES ($1, $2, '{\"content_hash\": \"abc\"}', '{\"DO_rep_A\": 10.0}', \
@@ -58,11 +58,12 @@ fn tool_save_body(run_id: Uuid) -> serde_json::Value {
 
 async fn stored_blobs(db: &DatabaseConnection) -> Vec<(String, serde_json::Value)> {
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
-                "SELECT parameter_id::text AS pid, provenance FROM samples \
-                 WHERE site_id = '{SITE1_ID}' ORDER BY parameter_id"
+                "SELECT DISTINCT ON (parameter_id) parameter_id::text AS pid, provenance \
+                 FROM readings WHERE site_id = '{SITE1_ID}' AND measurement_type = 'spot' \
+                 ORDER BY parameter_id, replicate_index"
             ),
         ))
         .await
@@ -95,12 +96,13 @@ async fn a_tool_save_builds_the_blob_from_the_stored_run() {
     assert_eq!(status, 200, "tool save lands: {body}");
 
     let blobs = stored_blobs(&db).await;
-    assert_eq!(blobs.len(), 2, "one samples row per parameter group");
+    assert_eq!(blobs.len(), 2, "one blob per parameter group");
     for (_, blob) in &blobs {
         assert_eq!(blob["tool"], "doc");
         assert_eq!(blob["run_id"], json!(run_id));
         assert_eq!(
-            blob["outputs"], run_outputs(),
+            blob["outputs"],
+            run_outputs(),
             "the blob's outputs are the stored run's, not the request's"
         );
         assert_eq!(
@@ -187,7 +189,10 @@ async fn a_save_cannot_claim_a_run_it_did_not_make() {
     runless.as_object_mut().unwrap().remove("tool_run_id");
     let (status, resp) =
         crate::common::post_json_with_token(&app, "/api/grab_samples", &runless, &token).await;
-    assert_eq!(status, 400, "an output claim without a run is refused: {resp}");
+    assert_eq!(
+        status, 400,
+        "an output claim without a run is refused: {resp}"
+    );
 }
 
 /// Expected behaviour: a run that consumed a standard curve produced corrected outputs, so a
@@ -321,7 +326,7 @@ async fn a_tool_save_provisions_its_slot_and_a_manual_one_is_refused() {
     assert_eq!(status, 200, "the verified save provisions the slot: {resp}");
 
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT needs_review, name FROM site_parameters \
@@ -350,7 +355,7 @@ async fn a_tool_save_provisions_its_slot_and_a_manual_one_is_refused() {
     .await;
     assert_eq!(status, 200, "{resp}");
     let count = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT COUNT(*)::bigint AS n FROM site_parameters \
@@ -382,9 +387,11 @@ async fn a_tool_save_provisions_its_slot_and_a_manual_one_is_refused() {
     assert!(resp.contains("catalog"), "{resp}");
 }
 
+/// Expected behaviour: the blob is written by the save path alone. `samples` is statistics only,
+/// so there is no CRUD surface carrying provenance at all, and an edit naming one is refused.
 #[tokio::test]
 #[serial]
-async fn the_blob_is_not_editable_through_samples_crud() {
+async fn the_blob_has_no_crud_surface() {
     let (db, app, token) = setup().await;
 
     let run_id = mint_run(&db, "doc", run_outputs(), json!([])).await;
@@ -398,7 +405,7 @@ async fn the_blob_is_not_editable_through_samples_crud() {
     assert_eq!(status, 200);
 
     let sample_id = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT id::text AS id FROM samples \
@@ -407,28 +414,33 @@ async fn the_blob_is_not_editable_through_samples_crud() {
         ))
         .await
         .unwrap()
-        .unwrap()
+        .expect("the two DO replicates form a sample")
         .try_get::<String>("", "id")
         .unwrap();
 
     let (status, body) = crate::common::put_json_with_token(
         &app,
         &format!("/api/samples/{sample_id}"),
-        &json!({ "label": "renamed", "provenance": { "tool": "forged" } }),
+        &json!({ "provenance": { "tool": "forged" } }),
         &token,
     )
     .await;
-    assert_eq!(status, 200, "the label edit itself lands: {body}");
+    assert_eq!(status, 200, "the sample edit itself lands: {body}");
+    let updated: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        updated.get("provenance").is_none(),
+        "a sample carries statistics only: {updated}"
+    );
 
     let (_, blob) = stored_blobs(&db)
         .await
         .into_iter()
         .find(|(pid, _)| pid == GLOBAL_PARAM_DO_ID)
-        .expect("sample row exists");
+        .expect("the saved readings exist");
     assert_eq!(
         blob["run_id"],
         json!(run_id),
-        "the CRUD update cannot touch the blob: {blob}"
+        "the stored blob is untouched: {blob}"
     );
     assert_eq!(blob["tool"], "doc");
 }

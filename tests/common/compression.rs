@@ -17,7 +17,7 @@ pub async fn compress_readings_range(
     end: DateTime<Utc>,
 ) -> usize {
     let chunks = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "SELECT format('%I.%I', chunk_schema, chunk_name) AS chunk \
              FROM timescaledb_information.chunks \
@@ -35,7 +35,7 @@ pub async fn compress_readings_range(
 /// (a Postgres interval literal such as `"30 days"`), returning how many were compressed.
 pub async fn compress_readings_older_than(db: &DatabaseConnection, interval: &str) -> usize {
     let chunks = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "SELECT format('%I.%I', chunk_schema, chunk_name) AS chunk \
              FROM timescaledb_information.chunks \
@@ -52,7 +52,7 @@ pub async fn compress_readings_older_than(db: &DatabaseConnection, interval: &st
 /// Number of `readings` chunks currently compressed.
 pub async fn compressed_readings_chunk_count(db: &DatabaseConnection) -> usize {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             "SELECT count(*)::bigint AS n FROM timescaledb_information.chunks \
              WHERE hypertable_name = 'readings' AND is_compressed",
@@ -82,7 +82,7 @@ async fn compress_each(db: &DatabaseConnection, chunks: Vec<QueryResult>) -> usi
     let mut compressed = 0;
     for row in chunks {
         let chunk: String = row.try_get("", "chunk").expect("chunk name column");
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "SELECT compress_chunk($1::regclass, if_not_compressed => true)",
             [chunk.clone().into()],

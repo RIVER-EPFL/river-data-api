@@ -8,7 +8,7 @@ use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
 
 async fn refresh_hourly(db: &sea_orm::DatabaseConnection) {
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         "CALL refresh_continuous_aggregate('readings_hourly', '2025-01-14', '2025-01-16')"
             .to_owned(),

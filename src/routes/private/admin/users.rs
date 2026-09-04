@@ -15,33 +15,12 @@ use crate::common::authz::{RIVER_ROLE_NAMES, Role};
 use crate::common::state::KeycloakAdmin;
 use crate::error::{AppError, AppResult};
 
-fn has_riverdata_role(roles: &[String]) -> bool {
-    roles.iter().any(|r| RIVER_ROLE_NAMES.contains(&r.as_str()))
-}
-
-/// Anti-backdoor hook: a user's bot access must not outlive their system access. On any change to a
-/// user's roles / enabled flag / existence, drop their cached role so the bot re-resolves on the next
-/// command, and, when they no longer have access, deactivate their linked Telegram chats outright
-/// rather than waiting for the reconciliation sweep. Best-effort: never fails the user-management op.
-async fn revoke_telegram_access(state: &AppState, sub: &str, still_has_access: bool) {
+/// Anti-backdoor hook: a user's cached access must not outlive their real access. On any change to
+/// a user's roles, enabled flag or existence, drop their cached role and their cached project
+/// grants so both re-resolve on the next request rather than waiting for a sweep.
+async fn invalidate_cached_access(state: &AppState, sub: &str) {
     state.authorizer.invalidate(sub).await;
-    // A user's project visibility must re-resolve the moment their access changes (role edit,
-    // disable, delete). Cheap, and it means a disabled user's cached grants can't linger.
     state.grants_cache.invalidate(sub).await;
-    if !still_has_access {
-        let res = state
-            .db
-            .execute(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "UPDATE telegram_identities SET is_active = FALSE, updated_at = NOW() \
-                 WHERE linked_keycloak_sub = $1",
-                [sub.into()],
-            ))
-            .await;
-        if let Err(e) = res {
-            tracing::warn!(error = %e, "failed to deactivate telegram identities on access change");
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
@@ -176,7 +155,7 @@ fn simplify_user(u: &serde_json::Value) -> serde_json::Value {
 /// admin API. Requires Keycloak Administrator role (`require_admin`).
 #[utoipa::path(
     get,
-    path = "/users",
+    path = "/api/users",
     params(ListQuery),
     responses(
         (status = 200, description = "User list with Content-Range header", body = Object),
@@ -222,34 +201,32 @@ pub async fn list_users(
     // too. A missing role (a level not yet created in Keycloak) yields no members via
     // `fetch_role_users`; any real failure (forbidden, server error) still propagates.
     let admin_role = Role::Administrator.to_string();
-    let role_member_lists = futures::future::join_all(
-        RIVER_ROLE_NAMES
-            .iter()
-            .map(|role| fetch_role_users(client, &token, &base, role)),
-    )
-    .await;
+    let role_member_lists = effective_role_members(client, &token, &base).await?;
     // Attribute each level to the user that holds it, first-seen order preserved. The roles a user
     // collects across the membership lists ARE their access levels, no per-user role fetch needed.
     let mut order: Vec<String> = Vec::new();
     let mut by_id: std::collections::HashMap<String, (serde_json::Value, Vec<String>)> =
         std::collections::HashMap::new();
-    for (role, members) in RIVER_ROLE_NAMES.iter().zip(role_member_lists) {
-        for u in members? {
+    for (role, members) in role_member_lists {
+        for u in members {
             let Some(id) = u["id"].as_str().map(str::to_string) else {
                 continue;
             };
             if let Some((_, roles)) = by_id.get_mut(&id) {
-                roles.push((*role).to_string());
+                if !roles.contains(&role) {
+                    roles.push(role.clone());
+                }
             } else {
                 order.push(id.clone());
-                by_id.insert(id, (u, vec![(*role).to_string()]));
+                by_id.insert(id, (u, vec![role.clone()]));
             }
         }
     }
     let mut users: Vec<serde_json::Value> = order
         .into_iter()
         .map(|id| {
-            let (u, roles) = by_id.remove(&id).expect("id came from order");
+            let (u, mut roles) = by_id.remove(&id).expect("id came from order");
+            roles.sort_by_key(|r| RIVER_ROLE_NAMES.iter().position(|n| n == r));
             let mut user = simplify_user(&u);
             user["roles"] = serde_json::json!(roles);
             user
@@ -304,7 +281,7 @@ pub struct SearchQuery {
 /// has river-data access. Used by the UI's add-user flow. Requires `require_admin`.
 #[utoipa::path(
     get,
-    path = "/users/search",
+    path = "/api/users/search",
     params(SearchQuery),
     responses(
         (status = 200, description = "Matching users with their realm roles", body = Object),
@@ -370,7 +347,7 @@ pub async fn search_users(
 /// Get a Keycloak user by ID with their realm roles attached. Requires `require_admin`.
 #[utoipa::path(
     get,
-    path = "/users/{id}",
+    path = "/api/users/{id}",
     params(("id" = String, Path, description = "Keycloak user UUID")),
     responses(
         (status = 200, description = "User detail", body = Object),
@@ -421,7 +398,7 @@ pub async fn get_user(
 /// Update a Keycloak user (partial JSON merge). Requires `require_admin`.
 #[utoipa::path(
     put,
-    path = "/users/{id}",
+    path = "/api/users/{id}",
     params(("id" = String, Path, description = "Keycloak user UUID")),
     request_body(content = Object, description = "Partial user fields to update"),
     responses(
@@ -493,8 +470,7 @@ pub async fn update_user(
         fetch_user_roles(client, &token, &base, &id).await?
     };
 
-    let enabled = current["enabled"].as_bool().unwrap_or(true);
-    revoke_telegram_access(&state, &id, enabled && has_riverdata_role(&roles)).await;
+    invalidate_cached_access(&state, &id).await;
 
     let mut result = simplify_user(&current);
     result["roles"] = serde_json::json!(roles);
@@ -504,7 +480,7 @@ pub async fn update_user(
 /// Delete a Keycloak user. Requires `require_admin`.
 #[utoipa::path(
     delete,
-    path = "/users/{id}",
+    path = "/api/users/{id}",
     params(("id" = String, Path, description = "Keycloak user UUID")),
     responses(
         (status = 200, description = "User deleted"),
@@ -539,7 +515,7 @@ pub async fn delete_user(
         )));
     }
 
-    revoke_telegram_access(&state, &id, false).await;
+    invalidate_cached_access(&state, &id).await;
 
     Ok(Json(serde_json::json!({ "id": id })))
 }
@@ -547,7 +523,7 @@ pub async fn delete_user(
 /// Set the realm roles for a user (overwrites; not additive). Requires `require_admin`.
 #[utoipa::path(
     post,
-    path = "/users/{id}/roles",
+    path = "/api/users/{id}/roles",
     params(("id" = String, Path, description = "Keycloak user UUID")),
     request_body = AssignRolesRequest,
     responses(
@@ -567,7 +543,7 @@ pub async fn assign_roles(
 
     set_user_roles(client, &token, &base, &id, &req.roles).await?;
 
-    revoke_telegram_access(&state, &id, has_riverdata_role(&req.roles)).await;
+    invalidate_cached_access(&state, &id).await;
 
     Ok(Json(serde_json::json!({ "success": true })))
 }
@@ -641,7 +617,7 @@ pub async fn check_realm_roles(state: &AppState) -> RealmRoleCheck {
 /// Used by the UI's role-assignment picker. Requires `require_admin`.
 #[utoipa::path(
     get,
-    path = "/roles",
+    path = "/api/roles",
     responses(
         (status = 200, description = "Realm roles", body = [KeycloakRole]),
     ),
@@ -683,50 +659,176 @@ pub async fn list_roles(State(state): State<AppState>) -> AppResult<Json<Vec<ser
     Ok(Json(roles))
 }
 
+/// Page size for the Keycloak admin listings; every listing here is walked to its end.
+const KC_PAGE: usize = 100;
+
+/// GET a Keycloak admin listing page by page until a short page. A 404 is an empty listing (a
+/// role or endpoint the realm does not have); any other failure propagates.
+async fn fetch_all_pages(
+    client: &KeycloakAdmin,
+    token: &str,
+    url: &str,
+    what: &str,
+) -> AppResult<Vec<serde_json::Value>> {
+    let mut out = Vec::new();
+    let mut first = 0usize;
+    loop {
+        let resp = client
+            .http_client
+            .get(url)
+            .bearer_auth(token)
+            .query(&[("first", first.to_string()), ("max", KC_PAGE.to_string())])
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::warn!("Keycloak {what} request error: {e}");
+                AppError::Internal(format!("Keycloak {what} request failed: {e}"))
+            })?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(out);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!("Keycloak {what} request failed ({status}): {body}");
+            return Err(AppError::Internal(format!(
+                "Keycloak {what} request failed ({status}): {body}"
+            )));
+        }
+        let page: Vec<serde_json::Value> = resp
+            .json()
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to parse {what}: {e}")))?;
+        let n = page.len();
+        out.extend(page);
+        if n < KC_PAGE {
+            return Ok(out);
+        }
+        first += n;
+    }
+}
+
+/// The users directly mapped to a realm role, every page of them.
 async fn fetch_role_users(
     client: &KeycloakAdmin,
     token: &str,
     base: &str,
     role_name: &str,
 ) -> AppResult<Vec<serde_json::Value>> {
-    let url = format!("{base}/roles/{role_name}/users");
-    tracing::debug!("Fetching role users from: {url}");
-    let resp = client
-        .http_client
-        .get(&url)
-        .bearer_auth(token)
-        .query(&[("first", "0"), ("max", "1000")])
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::warn!("Keycloak role users request error: {e}");
-            AppError::Internal(format!("Keycloak role users request failed: {e}"))
-        })?;
-
-    // A role that doesn't exist yet (the new intern/river/manager levels before they are created
-    // in Keycloak) is not an error, it simply has no members. Any other failure propagates.
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(Vec::new());
-    }
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        tracing::warn!("Keycloak role users request failed ({status}): {body}");
-        return Err(AppError::Internal(format!(
-            "Keycloak role users request failed ({status}): {body}"
-        )));
-    }
-
-    let users: Vec<serde_json::Value> = resp
-        .json()
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to parse role users: {e}")))?;
+    let users = fetch_all_pages(
+        client,
+        token,
+        &format!("{base}/roles/{role_name}/users"),
+        "role users",
+    )
+    .await?;
     tracing::debug!("Got {} users with role {role_name}", users.len());
     Ok(users)
 }
 
-/// A user's directly assigned riverdata access roles. Only the four canonical levels are
-/// returned so every endpoint reports the same `roles` shape as `list_users`.
+fn river_role_names(roles: &[serde_json::Value]) -> Vec<String> {
+    roles
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .filter(|n| RIVER_ROLE_NAMES.contains(n))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `(river role, members)` from every path a realm role reaches a user: a direct mapping, a
+/// composite role that contains it, and a group (or an ancestor group) that maps it. Access is
+/// decided from the JWT, which carries all three, so the list has to see all three.
+async fn effective_role_members(
+    client: &KeycloakAdmin,
+    token: &str,
+    base: &str,
+) -> AppResult<Vec<(String, Vec<serde_json::Value>)>> {
+    let mut out = Vec::new();
+    let direct = futures::future::join_all(
+        RIVER_ROLE_NAMES
+            .iter()
+            .map(|role| fetch_role_users(client, token, base, role)),
+    )
+    .await;
+    for (role, members) in RIVER_ROLE_NAMES.iter().zip(direct) {
+        out.push(((*role).to_string(), members?));
+    }
+
+    // Composite roles: every realm role whose expansion contains a river level.
+    let all_roles = fetch_all_pages(client, token, &format!("{base}/roles"), "roles").await?;
+    for role in &all_roles {
+        let Some(name) = role["name"].as_str() else {
+            continue;
+        };
+        if role["composite"].as_bool() != Some(true) || RIVER_ROLE_NAMES.contains(&name) {
+            continue;
+        }
+        let expanded = fetch_all_pages(
+            client,
+            token,
+            &format!("{base}/roles/{name}/composites/realm"),
+            "role composites",
+        )
+        .await?;
+        let contained = river_role_names(&expanded);
+        if contained.is_empty() {
+            continue;
+        }
+        let members = fetch_role_users(client, token, base, name).await?;
+        for level in contained {
+            out.push((level, members.clone()));
+        }
+    }
+
+    // Groups: a group's effective realm mappings (composites expanded) plus what it inherits
+    // from its ancestors, applied to its direct members; children walked with that inheritance.
+    let top = fetch_all_pages(client, token, &format!("{base}/groups"), "groups").await?;
+    let mut stack: Vec<(serde_json::Value, Vec<String>)> =
+        top.into_iter().map(|g| (g, Vec::new())).collect();
+    while let Some((group, inherited)) = stack.pop() {
+        let Some(id) = group["id"].as_str() else {
+            continue;
+        };
+        let mapped = fetch_all_pages(
+            client,
+            token,
+            &format!("{base}/groups/{id}/role-mappings/realm/composite"),
+            "group role mappings",
+        )
+        .await?;
+        let mut levels = inherited;
+        for level in river_role_names(&mapped) {
+            if !levels.contains(&level) {
+                levels.push(level);
+            }
+        }
+        if !levels.is_empty() {
+            let members = fetch_all_pages(
+                client,
+                token,
+                &format!("{base}/groups/{id}/members"),
+                "group members",
+            )
+            .await?;
+            for level in &levels {
+                out.push((level.clone(), members.clone()));
+            }
+        }
+        let children = fetch_all_pages(
+            client,
+            token,
+            &format!("{base}/groups/{id}/children"),
+            "group children",
+        )
+        .await?;
+        stack.extend(children.into_iter().map(|c| (c, levels.clone())));
+    }
+    Ok(out)
+}
+
+/// A user's effective riverdata access roles, composites and group mappings expanded, which is
+/// what their JWT carries. Only the four canonical levels are returned so every endpoint reports
+/// the same `roles` shape as `list_users`.
 async fn fetch_user_roles(
     client: &KeycloakAdmin,
     token: &str,
@@ -735,7 +837,9 @@ async fn fetch_user_roles(
 ) -> AppResult<Vec<String>> {
     let resp = client
         .http_client
-        .get(format!("{base}/users/{user_id}/role-mappings/realm"))
+        .get(format!(
+            "{base}/users/{user_id}/role-mappings/realm/composite"
+        ))
         .bearer_auth(token)
         .send()
         .await
@@ -913,7 +1017,7 @@ pub async fn list_user_grants(
 ) -> AppResult<Json<Vec<crate::routes::private::me::GrantedProject>>> {
     let rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT p.id, p.name FROM user_project_grants g \
              JOIN projects p ON p.id = g.project_id \
@@ -949,7 +1053,7 @@ pub async fn set_user_grants(
         .begin()
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "DELETE FROM user_project_grants WHERE user_sub = $1",
         [id.clone().into()],
@@ -957,7 +1061,7 @@ pub async fn set_user_grants(
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
     for project_id in &req.project_ids {
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "INSERT INTO user_project_grants (user_sub, project_id, granted_by) VALUES ($1, $2, $3) \
              ON CONFLICT (user_sub, project_id) DO NOTHING",

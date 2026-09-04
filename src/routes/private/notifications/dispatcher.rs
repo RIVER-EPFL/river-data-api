@@ -119,7 +119,7 @@ async fn fetch_pending(db: &DatabaseConnection, opened: bool) -> Result<Vec<Row>
          ORDER BY ae.resolved_at"
     };
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             sql.to_string(),
         ))
@@ -149,6 +149,10 @@ async fn fetch_pending(db: &DatabaseConnection, opened: bool) -> Result<Vec<Row>
 /// nothing was attempted (no channels/recipients) or at least one delivery succeeded; otherwise leave
 /// it for the next tick to retry.
 ///
+/// Every path through here writes a `notification_log` row, including the two that send nothing: a
+/// muted slot and a deployment with no channel configured at all. The stamp says the dispatcher is
+/// finished with the message, not that anyone was told.
+///
 /// This is the single gate every notification passes through, so the mute check lives here rather
 /// than in each caller: a slot-keyed message for a muted slot is dropped before any channel sees it
 /// and reported as delivered, which is what stamps the outbox and leaves the trigger dedup state in
@@ -163,7 +167,21 @@ pub(super) async fn deliver(
     let db = &state.db;
     if let Some(slot) = &msg.slot {
         match mutes_model::is_muted(db, slot.site_id, slot.parameter_id).await {
-            Ok(true) => return true,
+            Ok(true) => {
+                // Suppression is an outcome, not an absence: without this row the delivery log
+                // reads the same as a slot nobody subscribes to.
+                log_delivery(
+                    db,
+                    single_event_id,
+                    msg.kind,
+                    "all",
+                    &format!("slot:{}:{}", slot.site_id, slot.parameter_id),
+                    "muted",
+                    None,
+                )
+                .await;
+                return true;
+            }
             Ok(false) => {}
             // An unreadable mute table must not silently unmute a slot, nor drop the alert: leave
             // the message unsent and unstamped so the next tick reassesses it.
@@ -173,10 +191,41 @@ pub(super) async fn deliver(
             }
         }
     }
+    // A message with nowhere to go is an outcome, not an absence. Notifications are complementary
+    // and never block ingestion, so the outbox row is still stamped; without this row the log reads
+    // exactly like a clean delivery and nothing anywhere says the alarm went nowhere.
+    if channels.is_empty() {
+        log_delivery(
+            db,
+            single_event_id,
+            msg.kind,
+            "-",
+            "-",
+            "undeliverable",
+            Some("no notification channel is configured"),
+        )
+        .await;
+        return true;
+    }
+
     let mut attempted = 0usize;
     let mut any_success = false;
     for ch in channels {
-        for r in ch.deliver(state, msg).await {
+        let results = ch.deliver(state, msg).await;
+        if results.is_empty() {
+            log_delivery(
+                db,
+                single_event_id,
+                msg.kind,
+                ch.name(),
+                "-",
+                "skipped",
+                None,
+            )
+            .await;
+            continue;
+        }
+        for r in results {
             attempted += 1;
             let (status, error) = match &r.outcome {
                 Ok(()) => {
@@ -210,7 +259,7 @@ pub(super) async fn log_delivery(
     error: Option<&str>,
 ) {
     let res = db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "INSERT INTO notification_log (alarm_event_id, kind, channel, recipient, status, error) \
              VALUES ($1, $2, $3, $4, $5, $6)",
@@ -238,7 +287,7 @@ async fn claim_event(db: &DatabaseConnection, column: &str, id: Uuid) -> Result<
          WHERE id = $1 AND {column} IS NULL RETURNING id"
     );
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             [id.into()],
@@ -250,7 +299,7 @@ async fn claim_event(db: &DatabaseConnection, column: &str, id: Uuid) -> Result<
 /// Release a claim after an all-channel send failure so the next tick retries it (at-least-once).
 async fn release_claim(db: &DatabaseConnection, column: &str, id: Uuid) -> Result<(), DbErr> {
     let sql = format!("UPDATE alarm_events SET {column} = NULL WHERE id = $1");
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         &sql,
         [id.into()],

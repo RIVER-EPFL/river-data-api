@@ -805,7 +805,7 @@ fn require_any_or_unbound(projects: Vec<Uuid>, what: &str) -> ScopeOutcome {
 /// the callers treat as unresolved → fail closed.
 async fn distinct_projects(db: &sea_orm::DatabaseConnection, sql: &str, id: Uuid) -> Vec<Uuid> {
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-    db.query_all(Statement::from_sql_and_values(
+    db.query_all_raw(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         sql,
         [id.into()],
@@ -838,7 +838,7 @@ pub async fn enforce_project_scope_for_sites(
             continue;
         }
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "SELECT project_id FROM sites WHERE id = $1",
                 [(*site_id).into()],

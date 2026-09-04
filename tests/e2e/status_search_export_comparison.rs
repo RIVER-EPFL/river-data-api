@@ -193,7 +193,7 @@ async fn sensor_vs_grab_comparison_export() {
 
     // Cross-check sensor_avg against a direct query over the same window + continuous filter.
     let expected_avg: f64 = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT avg(COALESCE(calibrated_value, raw_value)) AS a FROM readings \

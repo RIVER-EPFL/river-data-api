@@ -41,7 +41,7 @@ const MAX_POINTS: i64 = 2000;
 /// `GET /sensor_calibrations/{id}/window`, the readings a calibration window resolves. `read_data`.
 #[utoipa::path(
     get,
-    path = "/sensor_calibrations/{id}/window",
+    path = "/api/sensor_calibrations/{id}/window",
     params(("id" = Uuid, Path, description = "Calibration UUID")),
     responses(
         (status = 200, description = "Calibration window + resolved points", body = CalibrationWindowResponse),
@@ -57,7 +57,7 @@ pub async fn get_calibration_window(
     let db = &state.db;
 
     let cal = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT c.sensor_id, c.slope, c.intercept, c.valid_from, c.valid_until, c.parameter_id
               FROM sensor_calibrations c
@@ -106,7 +106,7 @@ pub async fn get_calibration_window(
     let mut count_vals: Vec<sea_orm::Value> = vec![sensor_id.into(), vf.clone(), vu.clone()];
     let count_scope = scope_clause(&mut count_vals);
     let count_row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &format!(
                 r"SELECT (SELECT COUNT(*) FROM readings
@@ -135,7 +135,7 @@ pub async fn get_calibration_window(
     point_vals.push(MAX_POINTS.into());
     let limit_idx = point_vals.len();
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &format!(
                 r"SELECT time, raw_value, calibrated_value, is_flagged FROM (

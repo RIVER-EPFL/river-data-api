@@ -135,7 +135,7 @@ async fn bucket_of(
     at: DateTime<Utc>,
 ) -> Option<(f64, i64)> {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT SUM(sum_value) AS total, SUM(count)::bigint AS n FROM {view} \

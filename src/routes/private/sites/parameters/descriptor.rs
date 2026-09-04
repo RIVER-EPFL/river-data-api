@@ -140,6 +140,7 @@ mod tests {
             sample_interval_sec: None,
             is_active: Some(true),
             is_public: Some(false),
+            needs_review: false,
             is_derived: Some(false),
             derived_definition_id: None,
             variable_mappings: None,

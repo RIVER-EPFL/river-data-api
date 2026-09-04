@@ -178,7 +178,7 @@ impl CRUDOperations for SiteParameterOperations {
         // Backfill a human-readable name from the parameter when the client omitted it.
         // `name` is fulltext/sortable, so it must not be left empty.
         if entity.name.trim().is_empty() {
-            db.execute(Statement::from_sql_and_values(
+            db.execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "UPDATE site_parameters SET name = $1 WHERE id = $2",
                 [parameter.name.clone().into(), entity.id.into()],
@@ -196,24 +196,23 @@ impl CRUDOperations for SiteParameterOperations {
 
         // Backfill derived values for the readings already present at this site when a
         // derived site_parameter is assigned. Enqueued as a durable `derived_assignment` job on
-        // the claim-based worker pool. A guard skips the enqueue if an overlapping backfill is
-        // already in flight (this definition's own assignment/recompute, or a CSV import / pairing
-        // backfill that will produce the same derived rows) so we don't double-run the same work.
+        // the claim-based worker pool. The guard skips the enqueue only when this definition's
+        // own assignment or recompute is already in flight. An import or pairing backfill at any
+        // site is not an overlap: rows it lands after this point reach the new slot through its
+        // own derived cascade, and rows already present are this job's to compute.
         if entity.is_derived == Some(true)
             && let Some(def_id) = entity.derived_definition_id
         {
             let site_id = entity.site_id;
 
             let in_flight = db
-                .query_one(Statement::from_sql_and_values(
+                .query_one_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     r"SELECT 1
                       FROM reprocessing_jobs
                       WHERE status IN ('queued', 'pending', 'running', 'retrying')
-                        AND (
-                          (trigger_type IN ('derived_assignment', 'derived_recompute') AND trigger_id = $1)
-                          OR trigger_type IN ('csv_import', 'pairing_backfill')
-                        )
+                        AND trigger_type IN ('derived_assignment', 'derived_recompute')
+                        AND trigger_id = $1
                       LIMIT 1",
                     [def_id.into()],
                 ))
@@ -223,7 +222,7 @@ impl CRUDOperations for SiteParameterOperations {
             if in_flight.is_some() {
                 tracing::info!(
                     %def_id, %site_id,
-                    "Skipping derived assignment backfill: an overlapping reprocessing job is in flight"
+                    "Skipping derived assignment backfill: this definition's backfill is already in flight"
                 );
             } else {
                 crate::routes::private::reprocessing_jobs::worker::enqueue(

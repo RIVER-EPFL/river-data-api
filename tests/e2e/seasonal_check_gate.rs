@@ -1,4 +1,4 @@
-//! S3, the seasonal check gate (PLAN.md story catalog).
+//! S3, the seasonal check gate (story catalog: ../archived-documentation/PLAN.md).
 //!
 //! Scenario: a member enters a value that is an outlier for the season. Check screens it against
 //! the site's multi-year distribution (entry month ±2 across all years, replicates pooled,
@@ -32,7 +32,10 @@ async fn an_outlier_warns_and_the_save_is_held_to_its_check() {
     let track = tracks::onboard_grab_track(&app, &admin).await;
     let parameter_id = track.parameter_id("TrkGrabDoc").to_string();
 
-    for (user, role) in [("intern1", "riverdata-intern"), ("river1", "riverdata-river")] {
+    for (user, role) in [
+        ("intern1", "riverdata-intern"),
+        ("river1", "riverdata-river"),
+    ] {
         kc::ensure_realm_user(user, user, &[role]).await;
         kc::grant_project(&db, &kc::keycloak_user_id(user).await, &track.project_id).await;
     }
@@ -77,7 +80,9 @@ async fn an_outlier_warns_and_the_save_is_held_to_its_check() {
     assert_eq!(finding["warning"], true);
     assert_eq!(finding["n"], 7, "the pooled seasonal population: {check}");
     assert!(
-        finding["distribution"].as_array().is_some_and(|d| d.len() == 7),
+        finding["distribution"]
+            .as_array()
+            .is_some_and(|d| d.len() == 7),
         "the distribution payload feeds the plot: {check}"
     );
     let check_id = check["check_id"].as_str().expect("check id").to_string();

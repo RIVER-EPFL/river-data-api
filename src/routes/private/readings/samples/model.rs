@@ -1,10 +1,12 @@
-use crudcrate::{CRUDResource, EntityToModels};
+use crudcrate::EntityToModels;
 use sea_orm::entity::prelude::*;
 
-/// A user-declared sample groups one or more replicate readings of the same
-/// parameter at a site. Aggregate columns (mean/stdev/n/min_value/max_value)
-/// are maintained by a PostgreSQL trigger; application code never writes them
-/// and they are excluded from create/update payloads.
+/// The statistics of two or more replicate readings of the same parameter sharing an instant at a
+/// site. Aggregate columns (mean/stdev/n/min_value/max_value) are maintained by a PostgreSQL
+/// trigger; application code never writes them and they are excluded from create/update payloads.
+///
+/// Statistics only: what a measurement is, who entered it and what produced it are properties of
+/// the reading and are stored there, so a single measurement needs no row here.
 #[derive(
     Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
 )]
@@ -28,16 +30,6 @@ pub struct Model {
     pub parameter_id: Uuid,
     #[crudcrate(filterable, sortable, exclude(update))]
     pub collected_at: chrono::DateTime<chrono::Utc>,
-    #[crudcrate(fulltext, sortable)]
-    pub label: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub notes: Option<String>,
-    pub created_by: Option<String>,
-    // Written only by the grab save path; a CRUD edit must not be able to forge or erase the
-    // record of what produced the numbers.
-    #[sea_orm(column_type = "JsonBinary", nullable)]
-    #[crudcrate(exclude(create, update))]
-    pub provenance: Option<serde_json::Value>,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     // Aggregate columns, trigger-maintained, read-only to clients.

@@ -21,7 +21,7 @@ use river_db::routes::private::api_tokens::service::hash_token;
 
 async fn scalar(db: &DatabaseConnection, sql: &str) -> String {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             sql.to_string(),
         ))
@@ -33,7 +33,7 @@ async fn scalar(db: &DatabaseConnection, sql: &str) -> String {
 
 async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             sql.to_string(),
         ))

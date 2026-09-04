@@ -464,3 +464,110 @@ async fn user_search_grant_and_revoke_flow() {
 
     crate::common::cleanup_test_db(&db).await;
 }
+
+/// The `roles` an endpoint reports for one username, or None when the user is absent.
+fn reported_roles(users: &[serde_json::Value], username: &str) -> Option<Vec<String>> {
+    users.iter().find(|u| u["username"] == username).map(|u| {
+        u["roles"]
+            .as_array()
+            .map(|r| {
+                r.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+#[tokio::test]
+#[serial]
+async fn a_member_through_a_group_is_listed_with_that_level() {
+    // Scenario: the user holds no riverdata role directly; a realm group maps riverdata-river and
+    // the user is in it. Keycloak puts the inherited role in the JWT, so the login works.
+    // Expected behaviour: the Users list and the user detail report the level the login has.
+    require_keycloak!();
+    use crate::common::keycloak::{ensure_group_with_role, set_group_membership};
+    let (_db, app) = seeded_app().await;
+    ensure_realm_user("groupmember", "groupmember", &[]).await;
+    let group = ensure_group_with_role("lab-river", "riverdata-river").await;
+    set_group_membership("groupmember", &group, true).await;
+
+    let member_jwt = get_keycloak_jwt("groupmember", "groupmember").await;
+    let (status, body) = crate::common::get_with_token(&app, "/api/me", &member_jwt).await;
+    assert_eq!(status, 200, "the group grants access: {body}");
+
+    let jwt = get_keycloak_jwt("admin", "admin").await;
+    let (status, body) = crate::common::get_with_token(&app, "/api/users", &jwt).await;
+    assert_eq!(status, 200, "{body}");
+    let users: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        reported_roles(&users, "groupmember"),
+        Some(vec!["riverdata-river".to_string()]),
+        "a member through a group is listed with the level the group maps"
+    );
+
+    let id = keycloak_user_id("groupmember").await;
+    let (status, body) =
+        crate::common::get_with_token(&app, &format!("/api/users/{id}"), &jwt).await;
+    assert_eq!(status, 200, "{body}");
+    let detail: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        detail["roles"],
+        serde_json::json!(["riverdata-river"]),
+        "{detail}"
+    );
+
+    let (status, body) =
+        crate::common::get_with_token(&app, "/api/users/search?q=groupmember", &jwt).await;
+    assert_eq!(status, 200, "{body}");
+    let found: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        reported_roles(&found, "groupmember"),
+        Some(vec!["riverdata-river".to_string()]),
+        "search reports the same level"
+    );
+
+    set_group_membership("groupmember", &group, false).await;
+    let (_, body) = crate::common::get_with_token(&app, "/api/users", &jwt).await;
+    let users: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        reported_roles(&users, "groupmember"),
+        None,
+        "leaving the group leaves the list"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_member_through_a_composite_role_is_listed_with_that_level() {
+    require_keycloak!();
+    use crate::common::keycloak::ensure_composite_role;
+    let (_db, app) = seeded_app().await;
+    ensure_realm_user("compmember", "compmember", &[]).await;
+    ensure_composite_role("lab-staff", "riverdata-manager").await;
+    grant_realm_role("compmember", "lab-staff").await;
+
+    let member_jwt = get_keycloak_jwt("compmember", "compmember").await;
+    let (status, body) = crate::common::get_with_token(&app, "/api/me", &member_jwt).await;
+    assert_eq!(status, 200, "the composite grants access: {body}");
+
+    let jwt = get_keycloak_jwt("admin", "admin").await;
+    let (status, body) = crate::common::get_with_token(&app, "/api/users", &jwt).await;
+    assert_eq!(status, 200, "{body}");
+    let users: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        reported_roles(&users, "compmember"),
+        Some(vec!["riverdata-manager".to_string()]),
+        "a member through a composite role is listed with the level it contains"
+    );
+    let id = keycloak_user_id("compmember").await;
+    let (status, body) =
+        crate::common::get_with_token(&app, &format!("/api/users/{id}"), &jwt).await;
+    assert_eq!(status, 200, "{body}");
+    let detail: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        detail["roles"],
+        serde_json::json!(["riverdata-manager"]),
+        "{detail}"
+    );
+}

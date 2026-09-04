@@ -17,7 +17,7 @@ struct SampleAggregate {
 
 async fn fetch_aggregate(db: &DatabaseConnection, sample_id: Uuid) -> SampleAggregate {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT mean, stdev, n, min_value, max_value \
@@ -38,7 +38,7 @@ async fn fetch_aggregate(db: &DatabaseConnection, sample_id: Uuid) -> SampleAggr
 }
 
 async fn exec(db: &DatabaseConnection, sql: &str) {
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_string(),
     ))
@@ -63,7 +63,7 @@ async fn ensure_stream(db: &DatabaseConnection, site_id: &str, parameter_id: &st
     .await;
 
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT id FROM data_streams \
@@ -77,18 +77,13 @@ async fn ensure_stream(db: &DatabaseConnection, site_id: &str, parameter_id: &st
     row.try_get::<Uuid>("", "id").unwrap()
 }
 
-async fn create_sample(
-    db: &DatabaseConnection,
-    site_id: &str,
-    parameter_id: &str,
-    label: &str,
-) -> Uuid {
+async fn create_sample(db: &DatabaseConnection, site_id: &str, parameter_id: &str) -> Uuid {
     let id = Uuid::new_v4();
     exec(
         db,
         &format!(
-            "INSERT INTO samples (id, site_id, parameter_id, collected_at, label) \
-             VALUES ('{id}', '{site_id}', '{parameter_id}', '2025-01-15T12:00:00Z', '{label}')"
+            "INSERT INTO samples (id, site_id, parameter_id, collected_at) \
+             VALUES ('{id}', '{site_id}', '{parameter_id}', '2025-01-15T12:00:00Z')"
         ),
     )
     .await;
@@ -145,12 +140,7 @@ async fn samples_trigger_populates_aggregate_on_insert() {
         crate::common::GLOBAL_PARAM_TEMP_ID,
     )
     .await;
-    let sample_id = create_sample(
-        &db,
-        crate::common::SITE1_ID,
-        crate::common::GLOBAL_PARAM_TEMP_ID,
-        "test-happy",
-    )
+    let sample_id = create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID)
     .await;
 
     let values = [10.0_f64, 12.0, 14.0];
@@ -189,12 +179,7 @@ async fn samples_trigger_recomputes_on_flag() {
         crate::common::GLOBAL_PARAM_TEMP_ID,
     )
     .await;
-    let sample_id = create_sample(
-        &db,
-        crate::common::SITE1_ID,
-        crate::common::GLOBAL_PARAM_TEMP_ID,
-        "test-flag",
-    )
+    let sample_id = create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID)
     .await;
 
     for (i, v) in [10.0_f64, 12.0, 14.0].iter().enumerate() {
@@ -238,12 +223,7 @@ async fn samples_trigger_deletes_unreferenced_sample() {
         crate::common::GLOBAL_PARAM_TEMP_ID,
     )
     .await;
-    let sample_id = create_sample(
-        &db,
-        crate::common::SITE1_ID,
-        crate::common::GLOBAL_PARAM_TEMP_ID,
-        "test-empty",
-    )
+    let sample_id = create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID)
     .await;
 
     insert_replicate(
@@ -267,7 +247,7 @@ async fn samples_trigger_deletes_unreferenced_sample() {
     .await;
 
     let survivors = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!("SELECT COUNT(*) AS n FROM samples WHERE id = '{sample_id}'"),
         ))
@@ -293,12 +273,7 @@ async fn samples_trigger_keeps_row_when_only_flagged_readings_remain() {
         crate::common::GLOBAL_PARAM_TEMP_ID,
     )
     .await;
-    let sample_id = create_sample(
-        &db,
-        crate::common::SITE1_ID,
-        crate::common::GLOBAL_PARAM_TEMP_ID,
-        "test-flagged-only",
-    )
+    let sample_id = create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID)
     .await;
 
     insert_replicate(
@@ -340,12 +315,7 @@ async fn samples_trigger_handles_reassignment() {
         crate::common::GLOBAL_PARAM_TEMP_ID,
     )
     .await;
-    let sample_a = create_sample(
-        &db,
-        crate::common::SITE1_ID,
-        crate::common::GLOBAL_PARAM_TEMP_ID,
-        "a",
-    )
+    let sample_a = create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID)
     .await;
     // Create sample B at a different timestamp so its readings don't collide
     // with sample A's (stream_id, time, replicate_index) PK.
@@ -353,8 +323,8 @@ async fn samples_trigger_handles_reassignment() {
     exec(
         &db,
         &format!(
-            "INSERT INTO samples (id, site_id, parameter_id, collected_at, label) \
-             VALUES ('{sample_b_id}', '{}', '{}', '2025-01-15T13:00:00Z', 'b')",
+            "INSERT INTO samples (id, site_id, parameter_id, collected_at) \
+             VALUES ('{sample_b_id}', '{}', '{}', '2025-01-15T13:00:00Z')",
             crate::common::SITE1_ID,
             crate::common::GLOBAL_PARAM_TEMP_ID
         ),
@@ -433,12 +403,7 @@ async fn samples_delete_sets_reading_sample_id_null() {
         crate::common::GLOBAL_PARAM_TEMP_ID,
     )
     .await;
-    let sample_id = create_sample(
-        &db,
-        crate::common::SITE1_ID,
-        crate::common::GLOBAL_PARAM_TEMP_ID,
-        "del",
-    )
+    let sample_id = create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID)
     .await;
 
     insert_replicate(
@@ -460,7 +425,7 @@ async fn samples_delete_sets_reading_sample_id_null() {
 
     // The reading should still exist, with sample_id = NULL.
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT sample_id::text, raw_value FROM readings \

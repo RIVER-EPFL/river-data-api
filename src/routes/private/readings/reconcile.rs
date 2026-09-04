@@ -75,6 +75,11 @@ pub struct DiffOutcome {
     pub apply_changed: bool,
     pub holds_raised: usize,
     pub changed_keys: Vec<(DateTime<Utc>, i16)>,
+    /// The keys this pass stamped withdrawn, and the keys it cleared the stamp from. Neither is a
+    /// payload row (a withdrawn key is absent from the payload by construction), so a consumer
+    /// working from the request alone cannot see the instants whose served value moved.
+    pub withdrawn_keys: Vec<Key>,
+    pub reinstated_keys: Vec<Key>,
     /// The keys the upsert should write: new rows, plus changed rows when they apply. An
     /// unchanged row re-written with identical values is WAL churn the diff exists to avoid;
     /// under a brake the changed keys are excluded so the upsert cannot correct them.
@@ -91,13 +96,12 @@ async fn stored_window<C: ConnectionTrait>(
     window: &SourceWindow,
 ) -> AppResult<HashMap<Key, StoredRow>> {
     let rows = conn
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT r.time, r.replicate_index, r.raw_value, r.standard_curve_id,
                     r.withdrawn_at IS NOT NULL AS withdrawn,
                     (r.is_flagged IS TRUE OR r.flag_reason IS NOT NULL
-                     OR EXISTS (SELECT 1 FROM samples s WHERE s.id = r.sample_id
-                                  AND (s.label IS NOT NULL OR s.notes IS NOT NULL))) AS touched
+                     OR r.label IS NOT NULL OR r.notes IS NOT NULL) AS touched
              FROM readings r
              WHERE r.stream_id = $1 AND r.time >= $2 AND r.time < $3",
             [
@@ -126,17 +130,13 @@ async fn stored_window<C: ConnectionTrait>(
     Ok(out)
 }
 
-
 /// Bind a set of keys as parallel arrays for an `unnest` join. Timestamps travel as RFC 3339
 /// text and are cast in SQL (`::text[]::timestamptz[]`) — the same convention as the calibration
 /// resolver, because the driver cannot bind a timestamptz array directly.
 fn key_arrays(keys: &[Key]) -> (sea_orm::Value, sea_orm::Value) {
     use sea_orm::sea_query::ArrayType;
     let times: Vec<sea_orm::Value> = keys.iter().map(|(t, _)| t.to_rfc3339().into()).collect();
-    let indices: Vec<sea_orm::Value> = keys
-        .iter()
-        .map(|(_, i)| i32::from(*i).into())
-        .collect();
+    let indices: Vec<sea_orm::Value> = keys.iter().map(|(_, i)| i32::from(*i).into()).collect();
     (
         sea_orm::Value::Array(ArrayType::String, Some(Box::new(times))),
         sea_orm::Value::Array(ArrayType::Int, Some(Box::new(indices))),
@@ -168,21 +168,21 @@ pub fn refuse_dishonest_window(
     Ok(())
 }
 
-async fn upsert_source_modified_hold<C: ConnectionTrait>(
+pub(crate) async fn upsert_source_modified_hold<C: ConnectionTrait>(
     conn: &C,
     stream_id: Uuid,
     group_time: DateTime<Utc>,
     expected: serde_json::Value,
     computed: serde_json::Value,
 ) -> AppResult<()> {
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "INSERT INTO replicate_audit_holds
              (stream_id, group_time, kind, expected, computed, delta, status)
          VALUES ($1, $2, $3, $4, $5, '{}'::jsonb, 'pending')
-         ON CONFLICT (stream_id, group_time) WHERE status IN ('pending', 'deferred')
+         ON CONFLICT (stream_id, group_time, kind) WHERE status IN ('pending', 'deferred')
          DO UPDATE SET expected = EXCLUDED.expected, computed = EXCLUDED.computed,
-                       kind = EXCLUDED.kind, created_at = NOW()",
+                       created_at = NOW()",
         [
             stream_id.into(),
             sea_orm::prelude::DateTimeWithTimeZone::from(group_time).into(),
@@ -203,14 +203,14 @@ async fn upsert_brake_hold<C: ConnectionTrait>(
     withdrawn: usize,
     stored: usize,
 ) -> AppResult<()> {
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "INSERT INTO replicate_audit_holds
              (stream_id, group_time, kind, expected, computed, delta, status)
          VALUES ($1, $2, 'brake_fired', $3, $4, '{}'::jsonb, 'pending')
-         ON CONFLICT (stream_id, group_time) WHERE status IN ('pending', 'deferred')
+         ON CONFLICT (stream_id, group_time, kind) WHERE status IN ('pending', 'deferred')
          DO UPDATE SET expected = EXCLUDED.expected, computed = EXCLUDED.computed,
-                       kind = 'brake_fired', created_at = NOW()",
+                       created_at = NOW()",
         [
             stream_id.into(),
             sea_orm::prelude::DateTimeWithTimeZone::from(window.from).into(),
@@ -239,6 +239,7 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
     window: &SourceWindow,
     admitted: &[AdmittedRow],
     rejected_keys: &HashSet<Key>,
+    actor: &str,
 ) -> AppResult<DiffOutcome> {
     let stored = stored_window(conn, stream_id, window).await?;
     refuse_dishonest_window(window, admitted.len(), stored.len())?;
@@ -256,6 +257,8 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
         apply_changed: true,
         holds_raised: 0,
         changed_keys: Vec::new(),
+        withdrawn_keys: Vec::new(),
+        reinstated_keys: Vec::new(),
         write_keys: HashSet::new(),
     };
 
@@ -351,7 +354,7 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
         // cycle, so "acknowledge, then let the next cycle through" is the whole workflow; a
         // later reshape brakes afresh with a new hold.
         let release = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT id FROM replicate_audit_holds
                  WHERE stream_id = $1 AND kind = 'brake_fired' AND status = 'acknowledged'
@@ -362,7 +365,7 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
         match release {
             Some(row) => {
                 let hold_id: Uuid = row.try_get("", "id")?;
-                conn.execute(Statement::from_sql_and_values(
+                conn.execute_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "UPDATE replicate_audit_holds SET status = 'remediated'
                      WHERE id = $1 AND status = 'acknowledged'",
@@ -421,34 +424,54 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
         outcome.holds_raised += 1;
     }
 
+    // A withdrawal and a reinstatement are decisions of sync origin (ADR 0008): the source
+    // retracted or re-asserted the row, and the record says so beside any operator's judgement.
     if !to_withdraw.is_empty() {
-        let (times, indices) = key_arrays(&to_withdraw);
-        conn.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE readings r
-             SET withdrawn_at = NOW(), withdrawn_reason = 'absent from source window'
-             FROM unnest($2::text[]::timestamptz[], $3::int[]::smallint[]) AS k(t, ri)
-             WHERE r.stream_id = $1 AND r.time = k.t AND r.replicate_index = k.ri
-               AND r.withdrawn_at IS NULL",
-            [stream_id.into(), times, indices],
-        ))
+        let rows: Vec<(DateTime<Utc>, i16, serde_json::Value)> = to_withdraw
+            .iter()
+            .map(|(t, i)| {
+                (
+                    *t,
+                    *i,
+                    serde_json::json!({ "reason": "absent from source window" }),
+                )
+            })
+            .collect();
+        super::decisions::record_keyed(
+            conn,
+            super::decisions::Kind::Withdraw,
+            stream_id,
+            &rows,
+            actor,
+            Some("absent from source window"),
+            super::decisions::Origin::Sync,
+            super::decisions::Keyed::All,
+            None,
+        )
         .await?;
         outcome.withdrawn = to_withdraw.len();
+        outcome.withdrawn_keys = to_withdraw.iter().copied().collect();
     }
 
     if !reinstate.is_empty() {
-        let (times, indices) = key_arrays(&reinstate);
-        conn.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE readings r
-             SET withdrawn_at = NULL, withdrawn_reason = NULL
-             FROM unnest($2::text[]::timestamptz[], $3::int[]::smallint[]) AS k(t, ri)
-             WHERE r.stream_id = $1 AND r.time = k.t AND r.replicate_index = k.ri
-               AND r.withdrawn_at IS NOT NULL",
-            [stream_id.into(), times, indices],
-        ))
+        let rows: Vec<(DateTime<Utc>, i16, serde_json::Value)> = reinstate
+            .iter()
+            .map(|(t, i)| (*t, *i, serde_json::json!({})))
+            .collect();
+        super::decisions::record_keyed(
+            conn,
+            super::decisions::Kind::Reassert,
+            stream_id,
+            &rows,
+            actor,
+            Some("re-asserted by the source window"),
+            super::decisions::Origin::Sync,
+            super::decisions::Keyed::All,
+            None,
+        )
         .await?;
         outcome.reinstated = reinstate.len();
+        outcome.reinstated_keys = reinstate.iter().copied().collect();
     }
 
     Ok(outcome)
@@ -477,7 +500,7 @@ pub async fn write_receipt<C: ConnectionTrait>(
                 .collect::<Vec<_>>()
         )
     };
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "INSERT INTO ingest_receipts
              (stream_id, window_from, window_to, submitted, new_rows, changed, unchanged,

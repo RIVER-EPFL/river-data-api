@@ -10,3 +10,4 @@ mod api_serialization_and_filter;
 mod lifecycle_rules;
 mod rollback_reopens_previous;
 mod slot_boundaries;
+mod ui_shaped_bodies;

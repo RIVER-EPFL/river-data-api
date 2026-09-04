@@ -1,5 +1,6 @@
 pub mod batch;
 pub mod checks;
+pub mod decisions;
 pub mod flags;
 pub mod grab_samples;
 pub mod import;
@@ -9,6 +10,7 @@ pub mod model;
 pub mod provenance;
 pub mod reconcile;
 pub mod sample_groups;
+pub mod sample_preview;
 pub mod samples;
 pub mod sd_estimator;
 pub mod status_events;

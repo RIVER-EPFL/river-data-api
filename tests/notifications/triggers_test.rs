@@ -36,7 +36,7 @@ impl NotificationChannel for MockChannel {
 }
 
 async fn turb_stream(db: &DatabaseConnection) -> String {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "SELECT id FROM data_streams WHERE site_parameter_id = '{}'",
@@ -65,7 +65,7 @@ async fn insert_reading(db: &DatabaseConnection, stream: &str, time_sql: &str) {
 }
 
 async fn stale_state_count(db: &DatabaseConnection) -> i64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         "SELECT COUNT(*) AS c FROM notification_state WHERE kind = 'stale_data'".to_string(),
     ))

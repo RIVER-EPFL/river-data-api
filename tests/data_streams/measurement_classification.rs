@@ -9,7 +9,7 @@ use serial_test::serial;
 use uuid::Uuid;
 
 async fn measurement_types(db: &DatabaseConnection, stream_id: Uuid) -> Vec<String> {
-    db.query_all(Statement::from_string(
+    db.query_all_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "SELECT COALESCE(measurement_type, 'null') AS mt FROM readings \

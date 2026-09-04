@@ -325,3 +325,123 @@ async fn an_unknown_parameter_selector_is_rejected() {
     .await;
     assert_eq!(status, 400, "an unknown parameter is a bad request: {body}");
 }
+
+/// The two deployments at the site, with the streams' `sensor_id` set so that ingest attributes by
+/// the instrument's windows. Returns `(sensor, temp_deployment, cond_deployment, cond_stream)`.
+async fn seed_two_channel_deployments(
+    db: &sea_orm::DatabaseConnection,
+) -> (Uuid, Uuid, Uuid, Uuid) {
+    let sensor = sl::create_sensor(db, "two-channel", crate::common::GLOBAL_PARAM_TEMP_ID).await;
+    let temp_deployment = sl::deploy_sensor(
+        db,
+        sensor.id,
+        crate::common::SITE1_ID,
+        sl::dt("2025-06-01T00:00:00Z"),
+    )
+    .await;
+    let cond_deployment = deploy_on_parameter(
+        db,
+        sensor.id,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_COND_ID,
+        "2025-06-01T01:00:00Z",
+    )
+    .await;
+    let cond_stream =
+        sl::create_paired_stream(db, "two-channel-cond", crate::common::PARAM_S1_COND_ID).await;
+    exec(
+        db,
+        &format!(
+            "UPDATE data_streams SET sensor_id = '{}' WHERE id = '{cond_stream}'",
+            sensor.id
+        ),
+    )
+    .await;
+    (sensor.id, temp_deployment, cond_deployment, cond_stream)
+}
+
+async fn deployment_ids_for_parameter(
+    db: &sea_orm::DatabaseConnection,
+    parameter_id: &str,
+) -> Vec<Option<Uuid>> {
+    use sea_orm::{ConnectionTrait, Statement};
+    db.query_all_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "SELECT deployment_id FROM readings WHERE parameter_id = '{parameter_id}' ORDER BY time"
+        ),
+    ))
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| r.try_get("", "deployment_id").unwrap())
+    .collect()
+}
+
+#[tokio::test]
+#[serial]
+async fn ingest_stamps_the_deployment_of_the_streams_own_channel() {
+    // Scenario: the temperature deployment starts earlier and also covers the time, and the stream
+    // is paired to conductivity.
+    // Expected behaviour: each reading carries the conductivity deployment, not the earliest one.
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    sl::seed_base_entities(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+    let (_sensor, _temp_deployment, cond_deployment, cond_stream) =
+        seed_two_channel_deployments(&db).await;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/ingest",
+        &serde_json::json!({"stream_id": cond_stream, "readings": [
+            {"time": "2025-06-02T03:00:00Z", "raw_value": 500.0},
+            {"time": "2025-06-02T04:00:00Z", "raw_value": 501.0},
+        ]}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "ingest ({status}): {body}");
+    assert_eq!(
+        deployment_ids_for_parameter(&db, crate::common::GLOBAL_PARAM_COND_ID).await,
+        vec![Some(cond_deployment), Some(cond_deployment)],
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_grab_on_the_second_channel_carries_that_channels_deployment() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    sl::seed_base_entities(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+    let (sensor, temp_deployment, cond_deployment, _cond_stream) =
+        seed_two_channel_deployments(&db).await;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID, "created_by": "test",
+            "readings": [
+                {"parameter_id": crate::common::GLOBAL_PARAM_COND_ID, "sensor_id": sensor,
+                 "value": 510.0, "time": "2025-06-02T05:00:00Z"},
+                {"parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID, "sensor_id": sensor,
+                 "value": 11.0, "time": "2025-06-02T05:00:00Z"},
+            ],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "grab ({status}): {body}");
+    assert_eq!(
+        deployment_ids_for_parameter(&db, crate::common::GLOBAL_PARAM_COND_ID).await,
+        vec![Some(cond_deployment)],
+    );
+    assert_eq!(
+        deployment_ids_for_parameter(&db, crate::common::GLOBAL_PARAM_TEMP_ID).await,
+        vec![Some(temp_deployment)],
+    );
+}

@@ -23,6 +23,7 @@ use crate::routes::public::service::list_public_codes;
         handlers::SiteDetailResponse,
         handlers::ReadingsResponse,
         handlers::ParameterData,
+        handlers::SampleStatsData,
         handlers::AggregatesResponse,
         handlers::ParameterAggregateData,
     )),
@@ -80,7 +81,7 @@ async fn serve_docs(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Path(project_code): axum::extract::Path<String>,
 ) -> Result<axum::response::Html<String>, crate::error::AppError> {
-    use crate::routes::public::service::get_public_config;
+    use crate::routes::public::service::{SERVING_CONTRACT_VERSION, get_public_config};
 
     let config = get_public_config(&state.db, &state.public_config_cache, &project_code).await?;
 
@@ -88,6 +89,14 @@ async fn serve_docs(
     spec.info.title = config.api_title.clone();
     spec.info.description = Some(config.api_description.clone());
     spec.info.version = config.api_version.clone();
+    // The pin decides what `version` advertises; the contract the code serves travels beside it
+    // so a consumer can tell the two apart.
+    let mut extensions = utoipa::openapi::extensions::ExtensionsBuilder::new()
+        .add("x-serving-contract", SERVING_CONTRACT_VERSION);
+    if let Some(pin) = &config.version_override {
+        extensions = extensions.add("x-project-version", pin.clone());
+    }
+    spec.info.extensions = Some(extensions.build());
 
     // Add contact email if configured
     if let Some(email) = &config.contact_email {

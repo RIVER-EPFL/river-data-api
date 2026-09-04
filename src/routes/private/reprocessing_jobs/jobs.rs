@@ -27,6 +27,92 @@ fn as_db_err(e: crate::error::AppError) -> DbErr {
     DbErr::Custom(e.to_string())
 }
 
+/// Take a spot group's replicates from `count` onwards out of what the group serves, ahead of an
+/// overwrite that carries only `count` columns.
+///
+/// The displacement is a `withdrawn_at` stamp, not a delete: a flag, a hand-picked standard curve
+/// and the value itself all survive it, and an import that later carries the column again clears
+/// the stamp. A displaced row somebody had curated raises a `source_modified` hold, because
+/// dropping it out of the served group is a ruling the file's column count should not make alone.
+async fn displace_spot_tail(
+    txn: &sea_orm::DatabaseTransaction,
+    stream_id: Uuid,
+    time: chrono::DateTime<chrono::Utc>,
+    count: i16,
+) -> crate::error::AppResult<()> {
+    let time_value = sea_orm::prelude::DateTimeWithTimeZone::from(time);
+    let curated = txn
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT replicate_index, \
+                    CASE WHEN is_flagged IS TRUE THEN 'flagged' ELSE 'standard_curve' END AS reason \
+             FROM readings \
+             WHERE stream_id = $1 AND time = $2 AND replicate_index >= $3 \
+               AND measurement_type = 'spot' AND withdrawn_at IS NULL \
+               AND (is_flagged IS TRUE OR standard_curve_id IS NOT NULL) \
+             ORDER BY replicate_index",
+            [
+                stream_id.into(),
+                time_value.into(),
+                count.into(),
+            ],
+        ))
+        .await?;
+    if !curated.is_empty() {
+        let entries = curated
+            .iter()
+            .map(|row| {
+                Ok(serde_json::json!({
+                    "replicate_index": row.try_get::<i16>("", "replicate_index")?,
+                    "reason": row.try_get::<String>("", "reason")?,
+                }))
+            })
+            .collect::<Result<Vec<_>, DbErr>>()?;
+        crate::routes::private::readings::reconcile::upsert_source_modified_hold(
+            txn,
+            stream_id,
+            time,
+            serde_json::json!({ "claim": "displaced", "withdrawn": entries }),
+            serde_json::json!({ "replicates": count }),
+        )
+        .await?;
+    }
+
+    // The displacement and its reversal are decisions of CSV origin (ADR 0008).
+    use crate::routes::private::readings::decisions::{Kind, NewValue, Origin, record_many};
+    record_many(
+        txn,
+        Kind::Withdraw,
+        "r.stream_id = $1 AND r.time = $2 AND r.replicate_index >= $3 \
+         AND r.measurement_type = 'spot' AND r.withdrawn_at IS NULL",
+        vec![stream_id.into(), time_value.clone().into(), count.into()],
+        NewValue::Literal(serde_json::json!({ "reason": "displaced_by_overwrite" })),
+        "csv_import",
+        Some("displaced_by_overwrite"),
+        Origin::Csv,
+        None,
+    )
+    .await
+    .map_err(as_db_err)?;
+
+    // A file that carries the column again re-asserts it, so its own displacement is reversed.
+    record_many(
+        txn,
+        Kind::Reassert,
+        "r.stream_id = $1 AND r.time = $2 AND r.replicate_index < $3 \
+         AND r.withdrawn_reason = 'displaced_by_overwrite'",
+        vec![stream_id.into(), time_value.into(), count.into()],
+        NewValue::Literal(serde_json::json!({})),
+        "csv_import",
+        Some("re-asserted by the file"),
+        Origin::Csv,
+        None,
+    )
+    .await
+    .map_err(as_db_err)?;
+    Ok(())
+}
+
 fn required_uuid(params: &serde_json::Value, key: &str) -> Result<Uuid, DbErr> {
     params
         .get(key)
@@ -135,7 +221,7 @@ impl Job for ReprocessSensor {
         let count = reprocess_sensor_readings(ctx.db(), sensor_id).await?;
         if let Ok(Some(row)) = ctx
             .db()
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT DISTINCT site_id FROM readings WHERE sensor_id = $1 AND site_id IS NOT NULL LIMIT 1",
                 [sensor_id.into()],
@@ -276,7 +362,7 @@ impl Job for ReprocessDeployment {
             Some(p) => Some(p),
             None => ctx
                 .db()
-                .query_one(Statement::from_sql_and_values(
+                .query_one_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "SELECT parameter_id FROM sensor_deployments \
                      WHERE sensor_id = $1 AND site_id = $2 \
@@ -319,7 +405,7 @@ impl Job for DerivedRecompute {
             tracing::info!(derived_id = %derived_id, job_id = %ctx.job_id(), "Recomputing derived parameter");
             let rows = ctx
                 .db()
-                .query_all(Statement::from_sql_and_values(
+                .query_all_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     r"SELECT DISTINCT r.site_id, r.time
                       FROM readings r
@@ -403,7 +489,7 @@ impl Job for DerivedAssignment {
 
         let rows = ctx
             .db()
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r"SELECT DISTINCT r.time
                   FROM readings r
@@ -612,7 +698,7 @@ impl Job for ReprocessAll {
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         let slot_rows = ctx
             .db()
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT DISTINCT site_id, parameter_id FROM sensor_deployments".to_owned(),
             ))
@@ -748,7 +834,7 @@ impl Job for CsvImport {
             // (there is no janitor for csv_import_staging), so drop them on the failure path too.
             let _ = ctx
                 .db()
-                .execute(Statement::from_sql_and_values(
+                .execute_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "DELETE FROM csv_import_staging WHERE import_token = $1",
                     [import_token.into()],
@@ -795,7 +881,7 @@ impl CsvImport {
         // Read the staged rows back and rebuild the readings, re-applying the constant fields.
         let mut staged = ctx
             .db()
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT stream_id, site_id, parameter_id, time, raw_value, \
                         sensor_id, calibration_id, deployment_id \
@@ -816,7 +902,7 @@ impl CsvImport {
             staged_streams.dedup();
             let family_ids: std::collections::HashSet<Uuid> = ctx
                 .db()
-                .query_all(Statement::from_sql_and_values(
+                .query_all_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "SELECT id FROM data_streams \
                      WHERE id = ANY($1) AND metadata -> 'replicates' IS NOT NULL",
@@ -861,7 +947,7 @@ impl CsvImport {
             if !ids.is_empty() {
                 for row in ctx
                     .db()
-                    .query_all(Statement::from_sql_and_values(
+                    .query_all_raw(Statement::from_sql_and_values(
                         sea_orm::DatabaseBackend::Postgres,
                         "SELECT id, slope, intercept FROM sensor_calibrations WHERE id = ANY($1)",
                         [ids.into()],
@@ -900,7 +986,7 @@ impl CsvImport {
                 std::collections::HashMap::new();
             for row in ctx
                 .db()
-                .query_all(Statement::from_sql_and_values(
+                .query_all_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "SELECT id, measurement_type FROM data_streams WHERE id = ANY($1)",
                     [stream_ids.into()],
@@ -954,6 +1040,10 @@ impl CsvImport {
             models.push(readings::ActiveModel {
                 standard_curve_id: Set(None),
                 collection_event_id: Set(None),
+                provenance: Set(None),
+                label: Set(None),
+                notes: Set(None),
+                created_by: Set(None),
                 withdrawn_at: Set(None),
                 withdrawn_reason: Set(None),
                 ingested_at: sea_orm::ActiveValue::NotSet,
@@ -993,11 +1083,7 @@ impl CsvImport {
         }
 
         // Whether a group is a sample is not decided here: `sample_groups::forms_sample` is the
-        // one answer. A request-level `spot` is the writer declaring a collection event, so a
-        // single row is a grab that has to reach the views reading `samples`; without that
-        // declaration only two or more rows classified spot on a paired slot form one, because two
-        // logger points sharing a timestamp are a malformed file rather than a sampling event.
-        let declared_collection = request_measurement_type.as_deref() == Some(sample_groups::SPOT);
+        // one answer, two or more rows classified spot sharing a slot instant.
         let mut spot_groups: std::collections::HashMap<
             (Uuid, Uuid, chrono::DateTime<chrono::Utc>),
             usize,
@@ -1014,7 +1100,7 @@ impl CsvImport {
         }
         let replicate_groups = spot_groups
             .values()
-            .filter(|count| sample_groups::forms_sample(declared_collection, **count))
+            .filter(|count| sample_groups::forms_sample(**count))
             .count();
 
         let total = i32::try_from(models.len()).unwrap_or(i32::MAX);
@@ -1022,12 +1108,12 @@ impl CsvImport {
 
         // An overwrite replaces the whole replicate set, not the Nth row by the Nth: stored spot
         // replicates beyond the incoming count would survive a positional upsert and keep
-        // double-counting the group, so the tail is dropped before the insert.
+        // double-counting the group, so the tail leaves the group before the insert.
+        let mut spot_group_sizes: std::collections::HashMap<
+            (Uuid, chrono::DateTime<chrono::Utc>),
+            i16,
+        > = std::collections::HashMap::new();
         if conflict == ConflictMode::Overwrite {
-            let mut spot_group_sizes: std::collections::HashMap<
-                (Uuid, chrono::DateTime<chrono::Utc>),
-                i16,
-            > = std::collections::HashMap::new();
             for m in &models {
                 if m.measurement_type.as_ref().as_deref() == Some(sample_groups::SPOT) {
                     *spot_group_sizes
@@ -1038,53 +1124,45 @@ impl CsvImport {
                         .or_default() += 1;
                 }
             }
-            for ((stream_id, time), count) in spot_group_sizes {
-                crate::common::bulk_write::guarded_mutation(
-                    ctx.db(),
-                    Statement::from_sql_and_values(
-                        sea_orm::DatabaseBackend::Postgres,
-                        "DELETE FROM readings \
-                         WHERE stream_id = $1 AND time = $2 AND replicate_index >= $3 \
-                           AND measurement_type = 'spot'",
-                        [
-                            stream_id.into(),
-                            sea_orm::prelude::DateTimeWithTimeZone::from(time).into(),
-                            count.into(),
-                        ],
-                    ),
-                )
-                .await
-                .map_err(as_db_err)?;
-            }
         }
 
-        // Phase 1: insert readings.
-        let mut affected_total = 0usize;
+        // Phase 1: displace the tail and insert, in one transaction. A crash between the two
+        // would otherwise leave the group short of both its old rows and its new ones.
         let mut inserted_so_far = 0usize;
-        for chunk in models.chunks(CSV_BATCH_SIZE) {
-            match readings::Entity::insert_many(chunk.to_vec())
-                .on_conflict(readings_on_conflict(conflict))
-                .exec_without_returning(ctx.db())
-                .await
-            {
-                Ok(affected) => affected_total += affected as usize,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.contains("None of the records") {
-                        tracing::warn!(error = %e, "Failed to insert imported readings chunk");
-                        return Err(e);
+        let affected_total = crate::common::bulk_write::guarded(ctx.db(), async |txn| {
+            for ((stream_id, time), count) in &spot_group_sizes {
+                displace_spot_tail(txn, *stream_id, *time, *count).await?;
+            }
+
+            let mut affected_total = 0usize;
+            for chunk in models.chunks(CSV_BATCH_SIZE) {
+                match readings::Entity::insert_many(chunk.to_vec())
+                    .on_conflict(readings_on_conflict(conflict))
+                    .exec_without_returning(txn)
+                    .await
+                {
+                    Ok(affected) => affected_total += affected as usize,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if !msg.contains("None of the records") {
+                            tracing::warn!(error = %e, "Failed to insert imported readings chunk");
+                            return Err(e.into());
+                        }
                     }
                 }
+                inserted_so_far += chunk.len();
+                if inserted_so_far % 5000 < CSV_BATCH_SIZE {
+                    ctx.set_progress(
+                        i32::try_from(inserted_so_far).unwrap_or(i32::MAX),
+                        Some(total),
+                    )
+                    .await;
+                }
             }
-            inserted_so_far += chunk.len();
-            if inserted_so_far % 5000 < CSV_BATCH_SIZE {
-                ctx.set_progress(
-                    i32::try_from(inserted_so_far).unwrap_or(i32::MAX),
-                    Some(total),
-                )
-                .await;
-            }
-        }
+            Ok(affected_total)
+        })
+        .await
+        .map_err(as_db_err)?;
 
         // An overwrite replaces the measurement, not the correction: an import never decides which
         // curve applies, so the corrected raw value goes back through the curves already on the row.
@@ -1133,7 +1211,6 @@ impl CsvImport {
                 ctx.db(),
                 &row_predicate,
                 vec![stream_ids.clone().into()],
-                declared_collection,
             )
             .await
             .map_err(as_db_err)?;
@@ -1223,7 +1300,7 @@ impl CsvImport {
 
         // The staging source has served its purpose, drop it (makes this job non-rerunnable).
         ctx.db()
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "DELETE FROM csv_import_staging WHERE import_token = $1",
                 [import_token.into()],
@@ -1326,10 +1403,16 @@ impl Job for MergeSiteParameters {
             source_site_parameter_id: required_uuid(ctx.params(), "source_site_parameter_id")?,
             target_site_parameter_id: required_uuid(ctx.params(), "target_site_parameter_id")?,
         };
-        let result =
-            crate::routes::private::admin::merge_services::merge_site_parameters(ctx.db(), &req)
-                .await
-                .map_err(|e| DbErr::Custom(e.to_string()))?;
+        let result = crate::routes::private::admin::merge_services::merge_site_parameters(
+            ctx.db(),
+            &req,
+            ctx.params()
+                .get("actor")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("system"),
+        )
+        .await
+        .map_err(|e| DbErr::Custom(e.to_string()))?;
         ctx.set_detail(serde_json::json!({ "counts": result }))
             .await;
         Ok(i64::try_from(result.merged_readings).unwrap_or(i64::MAX))
@@ -1352,10 +1435,16 @@ impl Job for MergeParameters {
             source_parameter_id: required_uuid(ctx.params(), "source_parameter_id")?,
             target_parameter_id: required_uuid(ctx.params(), "target_parameter_id")?,
         };
-        let result =
-            crate::routes::private::admin::merge_services::merge_parameters(ctx.db(), &req)
-                .await
-                .map_err(|e| DbErr::Custom(e.to_string()))?;
+        let result = crate::routes::private::admin::merge_services::merge_parameters(
+            ctx.db(),
+            &req,
+            ctx.params()
+                .get("actor")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("system"),
+        )
+        .await
+        .map_err(|e| DbErr::Custom(e.to_string()))?;
         ctx.set_detail(serde_json::json!({ "counts": result }))
             .await;
         Ok(i64::try_from(result.readings_moved).unwrap_or(i64::MAX))
@@ -1648,7 +1737,7 @@ pub async fn sweep_stale_sync_events(
     stale_after_seconds: u64,
 ) -> Result<u64, DbErr> {
     let res = db
-        .execute(sea_orm::Statement::from_sql_and_values(
+        .execute_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE sync_events
              SET status = 'failed',
@@ -1695,7 +1784,7 @@ impl Job for SyncLedgerRetention {
         let mut events_pruned = 0u64;
         if self.sync_event_retention_days > 0 {
             events_pruned = db
-                .execute(sea_orm::Statement::from_sql_and_values(
+                .execute_raw(sea_orm::Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "DELETE FROM sync_events
                      WHERE status <> 'running'
@@ -1708,7 +1797,7 @@ impl Job for SyncLedgerRetention {
         let mut receipts_pruned = 0u64;
         if self.ingest_receipt_retention_days > 0 {
             receipts_pruned = db
-                .execute(sea_orm::Statement::from_sql_and_values(
+                .execute_raw(sea_orm::Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "DELETE FROM ingest_receipts
                      WHERE at < NOW() - ($1 || ' days')::interval",
@@ -1768,7 +1857,7 @@ impl Job for SyncFullReassert {
         }
         let queued = ctx
             .db()
-            .execute(sea_orm::Statement::from_sql_and_values(
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "INSERT INTO sync_commands
                      (id, service_id, command, status, created_at, expires_at)
@@ -2015,7 +2104,7 @@ impl Job for MeasurementRetag {
         // Affected window (for the aggregate refresh), read before the rewrite.
         let window = ctx
             .db()
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 &format!(
                     "SELECT min(r.time) AS lo, max(r.time) AS hi FROM readings r{from_clause} \
@@ -2042,7 +2131,7 @@ impl Job for MeasurementRetag {
         if !declared {
             let conflicting = ctx
                 .db()
-                .query_all(Statement::from_sql_and_values(
+                .query_all_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "SELECT source_system, source_key FROM data_streams \
                      WHERE measurement_type IS NOT NULL AND measurement_type <> $1 \
@@ -2073,13 +2162,13 @@ impl Job for MeasurementRetag {
         ctx.info(&format!("Retagging readings in scope to '{target}'"))
             .await;
         let txn = ctx.db().begin().await?;
-        txn.execute(Statement::from_string(
+        txn.execute_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
         ))
         .await?;
         let retagged = txn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 &format!(
                     "UPDATE readings r SET measurement_type = {new_value} \
@@ -2104,7 +2193,7 @@ impl Job for MeasurementRetag {
         ] {
             if let Err(e) = ctx
                 .db()
-                .execute(Statement::from_string(
+                .execute_raw(Statement::from_string(
                     sea_orm::DatabaseBackend::Postgres,
                     format!(
                         "CALL refresh_continuous_aggregate('{agg}', '{}'::timestamptz, '{}'::timestamptz)",
@@ -2218,7 +2307,7 @@ impl Job for SdEstimatorRetag {
             0
         } else {
             ctx.db()
-                .query_one(Statement::from_sql_and_values(
+                .query_one_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     format!(
                         "SELECT COUNT(*)::bigint AS n FROM samples s \
@@ -2240,7 +2329,7 @@ impl Job for SdEstimatorRetag {
         // replicates under the new divisor. Nothing here writes a statistic.
         let retagged = ctx
             .db()
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 format!(
                     "UPDATE samples s SET sd_estimator = $1, sd_estimator_source = 'slot' \
@@ -2254,7 +2343,7 @@ impl Job for SdEstimatorRetag {
         // The samples trigger fires on readings, not on the samples row itself, so the UPDATE
         // above changes the declaration without recomputing. Refresh each touched row explicitly.
         ctx.db()
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 format!(
                     "SELECT refresh_sample_aggregate(s.id) FROM samples s \

@@ -19,7 +19,7 @@ async fn deployment_window(
     Option<chrono::DateTime<chrono::Utc>>,
 ) {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT deployed_from, deployed_until FROM sensor_deployments WHERE id = '{id}'"
@@ -40,7 +40,7 @@ async fn deployment_window(
 
 async fn deployment_count(db: &DatabaseConnection, sensor: &str) -> i64 {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!("SELECT count(*) AS c FROM sensor_deployments WHERE sensor_id = '{sensor}'"),
         ))

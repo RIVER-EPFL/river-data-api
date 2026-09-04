@@ -48,7 +48,7 @@ async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
 }
 
 async fn stored_slope(db: &DatabaseConnection, curve_id: &str) -> f64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!("SELECT slope AS v FROM standard_curves WHERE id = '{curve_id}'"),
     ))
@@ -215,4 +215,56 @@ async fn used_curve_edit_mints_successor() {
         "re-registration resolves the successor"
     );
     assert_eq!(third["superseded"], false);
+}
+
+/// An annotation recording the curve as the source-side correction, the reference a corrected
+/// column leaves when no reading may carry the curve.
+async fn reference_curve_from_an_annotation(fx: &Fixture, curve_id: &str) {
+    let (status, stream) = crate::common::post_json_parse_with_token(
+        &fx.app,
+        "/api/streams/register",
+        &json!({"source_system": "cnet", "source_key": "FP1:chla", "measurement_type": "spot"}),
+        &fx.token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "register stream: {stream}");
+    let stream_id = crate::common::e2e::id_of(&stream);
+    let (status, body) = crate::common::post_json_with_token(
+        &fx.app,
+        &format!("/api/streams/{stream_id}/pair"),
+        &json!({"site_parameter_id": crate::common::PARAM_S1_TEMP_ID}),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "pair ({status}): {body}");
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &fx.app,
+        "/api/annotations/register",
+        &json!({"source_system": "cnet", "annotations": [
+            {"source_key": "FP1:chla_std_curve_id:2025-06-01T08:00:00Z", "stream_id": stream_id,
+             "time": "2025-06-01T08:00:00Z", "category": "sync",
+             "text": "Corrected at source", "standard_curve_id": curve_id}
+        ]}),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "register annotation ({status}): {body}");
+    assert_eq!(body["annotations"][0]["status"], "created", "{body}");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_curve_referenced_only_by_an_annotation_is_used() {
+    let fx = setup().await;
+    let first = register(&fx, 2.0, 1.0).await;
+    let old_id = first["id"].as_str().unwrap().to_string();
+    reference_curve_from_an_annotation(&fx, &old_id).await;
+
+    let second = register(&fx, 3.0, 0.5).await;
+    assert_eq!(second["superseded"], true, "{second}");
+    assert_ne!(second["id"].as_str().unwrap(), old_id);
+    assert!(
+        (stored_slope(&fx.db, &old_id).await - 2.0).abs() < 1e-12,
+        "the curve the annotation names keeps the coefficients it recorded"
+    );
 }

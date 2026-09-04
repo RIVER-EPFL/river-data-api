@@ -63,7 +63,7 @@ pub struct ProjectResult {
 /// projects by name (case-insensitive substring). Requires `read_metadata`.
 #[utoipa::path(
     get,
-    path = "/search",
+    path = "/api/search",
     params(SearchParams),
     responses(
         (status = 200, description = "Matching entities grouped by type", body = SearchResponse),

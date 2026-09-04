@@ -97,6 +97,10 @@ pub fn manage_routes() -> Router<AppState> {
             post(super::replicate_audit::acknowledge_holds_bulk),
         )
         .route(
+            "/replicate_reconciliation/duplicate_slots",
+            get(super::replicate_reconciliation::duplicate_slots),
+        )
+        .route(
             "/replicate_reconciliation/candidates",
             get(super::replicate_reconciliation::reconciliation_candidates),
         )
@@ -216,7 +220,7 @@ fn match_confidence(name: &str, candidates: &[(Uuid, String)]) -> DiscoverySugge
 /// for project, site, parameter, and site_parameter resolution. Requires `read_metadata`.
 #[utoipa::path(
     get,
-    path = "/sync/discovery",
+    path = "/api/sync/discovery",
     responses(
         (status = 200, description = "Array of discovery items with match suggestions", body = Object),
     ),
@@ -518,7 +522,7 @@ struct ActionStats {
 /// Requires `write_metadata`.
 #[utoipa::path(
     post,
-    path = "/sync/apply-discovery",
+    path = "/api/sync/apply-discovery",
     request_body(content = Object, description = "Discovery actions to apply (per-stream)"),
     responses(
         (status = 200, description = "Pairing results per stream", body = Object),
@@ -532,7 +536,7 @@ pub async fn apply_discovery(
 ) -> AppResult<Json<ApplyDiscoveryResponse>> {
     let db = &state.db;
     let txn = db.begin().await?;
-    txn.execute(Statement::from_string(
+    txn.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
     ))
@@ -791,6 +795,7 @@ async fn resolve_or_create_site_parameter<C: ConnectionTrait>(
         sample_interval_sec: Set(create.and_then(|c| c.sample_interval_sec)),
         is_active: Set(Some(true)),
         is_public: Set(Some(false)),
+        needs_review: Set(false),
         sd_estimator: Set(None),
         is_derived: Set(Some(false)),
         derived_definition_id: Set(None),
@@ -825,6 +830,13 @@ async fn pair_and_backfill<C: ConnectionTrait>(
         .await
         .map_err(|e| e.to_string())?
         .ok_or("Site parameter not found")?;
+    crate::routes::private::data_streams::service::declare_slot_decimal_places(
+        db,
+        sp.id,
+        crate::routes::private::data_streams::service::declared_decimal_places(&stream.metadata),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     let sensor_ctx = create_sensor_for_stream(db, &stream, sp.parameter_id, sp.site_id)
         .await
@@ -854,7 +866,7 @@ async fn pair_and_backfill<C: ConnectionTrait>(
     // Both callers enqueue a slot reprocess post-commit; that is what resolves `calibration_id` and
     // `calibrated_value` per reading, from the reading's own time.
     let result = db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE readings r
           SET site_id = $1, parameter_id = $2,
@@ -874,7 +886,7 @@ async fn pair_and_backfill<C: ConnectionTrait>(
         .map_err(|e| e.to_string())?;
     let backfilled = result.rows_affected();
 
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE status_events
           SET site_id = $1, parameter_id = $2, sensor_id = $4
@@ -991,7 +1003,7 @@ struct GroupedParameter {
 /// of created/paired entities per group. Requires `write_metadata`.
 #[utoipa::path(
     post,
-    path = "/sync/grouped-discovery",
+    path = "/api/sync/grouped-discovery",
     request_body(content = Object, description = "Stream groupings with site-level decisions"),
     responses(
         (status = 200, description = "Per-group counts of created/paired entities", body = Object),
@@ -1196,7 +1208,7 @@ pub struct BulkPairResponse {
 /// Backfills readings for each paired stream. Requires `write_metadata`.
 #[utoipa::path(
     post,
-    path = "/sync/bulk-pair",
+    path = "/api/sync/bulk-pair",
     request_body(content = Object, description = "List of (stream_id, site_parameter_id) pairings"),
     responses(
         (status = 200, description = "Pairing counts and backfill totals", body = Object),
@@ -1288,60 +1300,74 @@ pub async fn bulk_pair(
         site_map.insert(s.name.to_lowercase(), id);
     }
 
-    // 3. Resolve or create parameters → build name→id map
-    let mut param_map: HashMap<String, Uuid> = HashMap::new();
+    // 3. Resolve or create parameters, then build the name→id map over the whole catalog.
+    // An incoming parameter without an `existing_id` resolves the way the pairing plan does
+    // (`lookup_parameter_by_code_name_or_alias`), so a request naming a catalog row by its display
+    // name or alias reuses it rather than minting a sibling.
+    let mut catalog = super::service::load_entity_catalog(&txn).await?.params;
     let mut params_created = 0u32;
+    // Request parameters bound to a catalog row by id, under the names the request gives them.
+    let mut chosen: Vec<(String, Uuid)> = Vec::new();
     for p in &req.parameters {
-        let id = if let Some(eid) = p.existing_id {
-            eid
-        } else {
-            let existing = parameters::Entity::find()
-                .filter(Expr::cust_with_values(
-                    "LOWER(code) = $1",
-                    [p.code.to_lowercase()],
-                ))
-                .one(&txn)
-                .await?;
-            if let Some(existing) = existing {
-                existing.id
-            } else {
-                let id = Uuid::new_v4();
-                parameters::ActiveModel {
-                    id: Set(id),
-                    code: Set(p.code.clone()),
-                    name: Set(p.name.clone()),
-                    default_units: Set(p.units.clone()),
-                    category: Set("measurement".to_string()),
-                    // Mechanically created from a sync source; a manager confirms or merges it later.
-                    needs_review: Set(true),
-                    description: Set(None),
-                    aliases: Set(vec![]),
-                    default_warning_min: Set(None),
-                    default_warning_max: Set(None),
-                    default_alarm_min: Set(None),
-                    default_alarm_max: Set(None),
-                    created_at: Set(Some(Utc::now())),
-                }
-                .insert(&txn)
-                .await?;
-                params_created += 1;
-                id
-            }
-        };
-        param_map.insert(p.code.to_lowercase(), id);
-        param_map.insert(p.name.to_lowercase(), id);
+        if let Some(eid) = p.existing_id {
+            chosen.push((p.code.to_lowercase(), eid));
+            chosen.push((p.name.to_lowercase(), eid));
+            continue;
+        }
+        if super::service::lookup_parameter_by_code_name_or_alias(&p.code, &catalog).is_some() {
+            continue;
+        }
+        let id = Uuid::new_v4();
+        parameters::ActiveModel {
+            id: Set(id),
+            code: Set(p.code.clone()),
+            name: Set(p.name.clone()),
+            default_units: Set(p.units.clone()),
+            category: Set("measurement".to_string()),
+            // Mechanically created from a sync source; a manager confirms or merges it later.
+            needs_review: Set(true),
+            description: Set(None),
+            aliases: Set(vec![]),
+            default_warning_min: Set(None),
+            default_warning_max: Set(None),
+            default_alarm_min: Set(None),
+            default_alarm_max: Set(None),
+            created_at: Set(Some(Utc::now())),
+        }
+        .insert(&txn)
+        .await?;
+        params_created += 1;
+        catalog.push(super::service::CatalogParam {
+            id,
+            code: p.code.clone(),
+            name: p.name.clone(),
+            aliases: vec![],
+            units: p.units.clone(),
+            category: "measurement".to_string(),
+            site_parameter_count: 0,
+            reading_count: 0,
+        });
     }
 
-    // Same precedence as `lookup_parameter_by_code_name_or_alias`: code wins over display name,
-    // which wins over alias. `or_insert` preserves that order as the map is filled.
-    for param in parameters::Entity::find().all(&txn).await? {
+    // Same precedence as `lookup_parameter_by_code_name_or_alias`: every code wins over every
+    // display name, which wins over every alias. Filled with `or_insert` in that order, so one
+    // parameter's name can never shadow another's code; the request's explicit choices go first.
+    let mut param_map: HashMap<String, Uuid> = HashMap::new();
+    for (name, id) in chosen {
+        param_map.entry(name).or_insert(id);
+    }
+    for param in &catalog {
         param_map
             .entry(param.code.to_lowercase())
             .or_insert(param.id);
+    }
+    for param in &catalog {
         param_map
             .entry(param.name.to_lowercase())
             .or_insert(param.id);
-        for alias in param.aliases {
+    }
+    for param in &catalog {
+        for alias in &param.aliases {
             param_map.entry(alias.to_lowercase()).or_insert(param.id);
         }
     }
@@ -1404,6 +1430,7 @@ pub async fn bulk_pair(
                 sample_interval_sec: Set(None),
                 is_active: Set(Some(true)),
                 is_public: Set(Some(false)),
+                needs_review: Set(false),
                 sd_estimator: Set(None),
                 is_derived: Set(Some(false)),
                 derived_definition_id: Set(None),
@@ -1423,7 +1450,7 @@ pub async fn bulk_pair(
     }
 
     // Raise the TimescaleDB decompression limit so backfills reach compressed history
-    txn.execute(Statement::from_string(
+    txn.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
     ))
@@ -1504,7 +1531,7 @@ pub struct CreatePairingPlanRequest {
 /// pairings. The plan is reviewable and applied separately. Requires `write_metadata`.
 #[utoipa::path(
     post,
-    path = "/sync/pairing-plans",
+    path = "/api/sync/pairing-plans",
     request_body(content = Object),
     responses(
         (status = 200, description = "Created pairing plan", body = Object),
@@ -1523,7 +1550,7 @@ pub async fn create_pairing_plan(
 /// List existing pairing plans by status (draft/applied/reverted). Requires `read_metadata`.
 #[utoipa::path(
     get,
-    path = "/sync/pairing-plans",
+    path = "/api/sync/pairing-plans",
     responses(
         (status = 200, description = "Array of pairing plans", body = Object),
     ),
@@ -1543,7 +1570,7 @@ pub async fn list_pairing_plans(
 /// Get a single pairing plan with its full pairing list. Requires `read_metadata`.
 #[utoipa::path(
     get,
-    path = "/sync/pairing-plans/{id}",
+    path = "/api/sync/pairing-plans/{id}",
     params(("id" = Uuid, Path, description = "Pairing plan UUID")),
     responses(
         (status = 200, description = "Pairing plan with intended pairings", body = Object),
@@ -1565,6 +1592,83 @@ pub async fn get_pairing_plan(
 #[derive(Deserialize)]
 pub struct UpdatePairingPlanRequest {
     updates: Vec<PlanEntryUpdate>,
+    /// Standard curves to assign to instruments this plan will create. The move happens when the
+    /// plan is applied, in the transaction that mints the instrument.
+    #[serde(default)]
+    curves: Vec<PlanCurveUpdate>,
+}
+
+#[derive(Deserialize)]
+struct PlanCurveUpdate {
+    curve_id: Uuid,
+    /// The `source_key` of an instrument the plan proposes creating. Null clears the assignment,
+    /// leaving the curve on the instrument it has.
+    #[serde(default)]
+    instrument_source_key: Option<String>,
+}
+
+/// Fold the review's curve assignments into the plan's list. An assignment must name a curve that
+/// exists and that no reading names yet (the curve's own update route refuses a used curve the
+/// same way), and an instrument some paired entry proposes creating; anything else is a 400 now
+/// rather than a failed apply later.
+async fn apply_curve_updates(
+    db: &sea_orm::DatabaseConnection,
+    entries: &[crate::routes::private::sync::service::PlanEntry],
+    intents: &mut Vec<crate::routes::private::sync::service::PlanCurveIntent>,
+    updates: &[PlanCurveUpdate],
+) -> AppResult<()> {
+    for update in updates {
+        intents.retain(|i| i.curve_id != update.curve_id);
+        let Some(source_key) = update
+            .instrument_source_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+        else {
+            continue;
+        };
+        let proposed = entries.iter().any(|e| {
+            e.action == "pair"
+                && e.instrument
+                    .as_ref()
+                    .is_some_and(|i| i.create && i.source_key == source_key)
+        });
+        if !proposed {
+            return Err(AppError::BadRequest(format!(
+                "this plan does not create an instrument with source key '{source_key}'; a \
+                 curve can only be assigned here to an instrument the plan will create, an \
+                 existing instrument takes it through the curve itself"
+            )));
+        }
+        if crate::routes::private::sensors::standard_curves::Entity::find_by_id(update.curve_id)
+            .one(db)
+            .await?
+            .is_none()
+        {
+            return Err(AppError::BadRequest(format!(
+                "standard curve {} does not exist",
+                update.curve_id
+            )));
+        }
+        if crate::routes::private::sensors::standard_curves::views::curve_is_used(
+            db,
+            update.curve_id,
+        )
+        .await?
+        {
+            return Err(AppError::BadRequest(format!(
+                "standard curve {} has already been applied to readings, so its instrument is \
+                 fixed. Create a new curve on the new instrument and re-enter the affected \
+                 measurements against it.",
+                update.curve_id
+            )));
+        }
+        intents.push(crate::routes::private::sync::service::PlanCurveIntent {
+            curve_id: update.curve_id,
+            instrument_source_key: source_key.to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -1648,13 +1752,25 @@ async fn apply_instrument_updates(
         {
             continue;
         }
-        let Some(scope) = entries
-            .iter()
-            .find(|e| e.stream_id == update.stream_id)
-            .map(instrument_scope)
-        else {
+        let Some(target) = entries.iter().find(|e| e.stream_id == update.stream_id) else {
             continue;
         };
+        let scope = instrument_scope(target);
+
+        // A feed the source identifies by device serial has its instrument already: the device,
+        // attached from the serial when the stream is paired, with the site slot's deployment
+        // opened. Minting a lab instrument for it instead would take both.
+        if update.instrument_name.is_some()
+            && update.instrument_id.is_none()
+            && let Some(serial) = target.device_serial.clone()
+        {
+            return Err(AppError::BadRequest(format!(
+                "stream {} names device serial {serial}, so its instrument is that device and is \
+                 attached when the stream is paired. Attach an existing instrument to override \
+                 that, or leave it unset.",
+                update.stream_id
+            )));
+        }
 
         // A repoint has to name an instrument that exists; otherwise the plan would carry an id
         // the apply cannot resolve.
@@ -1707,13 +1823,14 @@ async fn apply_instrument_updates(
                     .filter(|n| !n.is_empty());
                 if repointed.is_some() || proposed.is_some() {
                     let parameter = entry.parameter.name.clone();
+                    let name = proposed
+                        .map(str::to_string)
+                        .unwrap_or_else(|| parameter.clone());
                     entry.instrument =
                         Some(crate::routes::private::sync::service::PlanInstrumentRef {
                             curve_column: None,
                             id: None,
-                            name: proposed
-                                .map(str::to_string)
-                                .unwrap_or_else(|| parameter.clone()),
+                            name: name.clone(),
                             source_key: format!("{source_system}:{parameter}"),
                             resolved_by: if repointed.is_some() {
                                 "manual".to_string()
@@ -1724,9 +1841,11 @@ async fn apply_instrument_updates(
                             confirmed: repointed.is_some(),
                             stamps_readings: false,
                             curves: Vec::new(),
+                            proposed_name: Some(name),
                         });
                 }
             }
+            let entry_parameter = entry.parameter.name.clone();
             let Some(instrument) = entry.instrument.as_mut() else {
                 continue;
             };
@@ -1743,11 +1862,32 @@ async fn apply_instrument_updates(
                 instrument.confirmed = true;
                 instrument.curves = repointed_curves.clone();
             }
+            // Naming an instrument proposes one; picking from the inventory attaches one. So a
+            // name arriving at an entry that holds an existing instrument returns it to a
+            // proposal, rather than doing nothing (which is what an operator undoing a mis-click
+            // used to get) or renaming the inventory row (which this route never does).
             if let Some(name) = &update.instrument_name
-                && instrument.create
+                && repointed.is_none()
                 && !name.trim().is_empty()
             {
-                instrument.name = name.trim().to_string();
+                let name = name.trim().to_string();
+                if instrument.create {
+                    instrument.name = name.clone();
+                    instrument.proposed_name = Some(name);
+                } else {
+                    let source_key = match &instrument.curve_column {
+                        Some(column) => format!("{source_system}:{column}"),
+                        None => format!("{source_system}:{entry_parameter}"),
+                    };
+                    instrument.id = None;
+                    instrument.name = name.clone();
+                    instrument.proposed_name = Some(name);
+                    instrument.source_key = source_key;
+                    instrument.resolved_by = "placeholder".to_string();
+                    instrument.create = true;
+                    instrument.confirmed = false;
+                    instrument.curves = Vec::new();
+                }
             }
 
             if let Some(confirmed) = update.instrument_confirmed {
@@ -1761,7 +1901,7 @@ async fn apply_instrument_updates(
 /// Edit a draft pairing plan (only `draft` status allows updates). Requires `write_metadata`.
 #[utoipa::path(
     patch,
-    path = "/sync/pairing-plans/{id}",
+    path = "/api/sync/pairing-plans/{id}",
     params(("id" = Uuid, Path, description = "Pairing plan UUID")),
     request_body(content = Object),
     responses(
@@ -1846,6 +1986,9 @@ pub async fn update_pairing_plan(
 
     apply_instrument_updates(&state, &plan.source_system, &mut entries, &req.updates).await?;
 
+    let mut intents = crate::routes::private::sync::service::plan_curve_intents(&plan)?;
+    apply_curve_updates(&state.db, &entries, &mut intents, &req.curves).await?;
+
     let summary = serde_json::to_value(crate::routes::private::sync::service::compute_summary_pub(
         &entries,
     ))
@@ -1853,6 +1996,7 @@ pub async fn update_pairing_plan(
 
     let mut active: crate::routes::private::data_streams::pairing_plans::ActiveModel = plan.into();
     active.entries = Set(serde_json::to_value(&entries).unwrap_or_default());
+    active.curve_assignments = Set(serde_json::to_value(&intents).unwrap_or_default());
     active.summary = Set(summary);
     let updated = active.update(&state.db).await?;
 
@@ -1863,7 +2007,7 @@ pub async fn update_pairing_plan(
 /// plan as `applied`. Requires `write_metadata`.
 #[utoipa::path(
     post,
-    path = "/sync/pairing-plans/{id}/apply",
+    path = "/api/sync/pairing-plans/{id}/apply",
     params(("id" = Uuid, Path, description = "Pairing plan UUID")),
     responses(
         (status = 200, description = "Plan applied with execution counts", body = Object),
@@ -1914,7 +2058,7 @@ pub async fn apply_pairing_plan(
 /// Fetch a pairing plan's status, or 404 if unknown.
 async fn plan_status(db: &sea_orm::DatabaseConnection, id: Uuid) -> AppResult<String> {
     let row = db
-        .query_one(sea_orm::Statement::from_sql_and_values(
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT status FROM pairing_plans WHERE id = $1",
             [id.into()],
@@ -1928,7 +2072,7 @@ async fn plan_status(db: &sea_orm::DatabaseConnection, id: Uuid) -> AppResult<St
 /// state. Marks the plan as `reverted`. Requires `write_metadata`.
 #[utoipa::path(
     post,
-    path = "/sync/pairing-plans/{id}/revert",
+    path = "/api/sync/pairing-plans/{id}/revert",
     params(("id" = Uuid, Path, description = "Pairing plan UUID")),
     responses(
         (status = 200, description = "Plan reverted with unpaired counts", body = Object),
@@ -1965,7 +2109,7 @@ pub async fn revert_pairing_plan(
 /// to surface streams needing attention. Requires `read_metadata`.
 #[utoipa::path(
     get,
-    path = "/sync/unpaired-summary",
+    path = "/api/sync/unpaired-summary",
     responses(
         (status = 200, description = "Counts of unpaired streams by source_system", body = Object),
     ),
@@ -1977,7 +2121,7 @@ pub async fn unpaired_summary(
     use sea_orm::{ConnectionTrait, Statement};
     let rows = state
         .db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT source_system, \
                 COUNT(*) FILTER (WHERE site_parameter_id IS NULL) as unpaired, \
@@ -2001,7 +2145,7 @@ pub async fn unpaired_summary(
 /// stream counts. Used by the pairing UI to display context. Requires `read_metadata`.
 #[utoipa::path(
     get,
-    path = "/sync/pairing-plans/{id}/site-metadata",
+    path = "/api/sync/pairing-plans/{id}/site-metadata",
     params(("id" = Uuid, Path, description = "Pairing plan UUID")),
     responses(
         (status = 200, description = "Site metadata map keyed by site name", body = Object),
@@ -2031,7 +2175,7 @@ pub async fn plan_site_metadata(
 
     let rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT DISTINCT ON (metadata->'hierarchy'->>'site') \
             metadata->'hierarchy'->>'site' as site_name, \
@@ -2044,7 +2188,6 @@ pub async fn plan_site_metadata(
             metadata->'station'->>'catchment' as catchment, \
             metadata->'station'->>'full_name' as full_name, \
             metadata->'station'->>'elevation' as elevation, \
-            metadata->'device'->>'logger_serial' as device_serial, \
             metadata->>'channel_id' as channel_id, \
             metadata->>'sample_interval_sec' as sample_interval_sec \
          FROM data_streams WHERE id = ANY($1) \
@@ -2053,8 +2196,8 @@ pub async fn plan_site_metadata(
                 sea_orm::sea_query::ArrayType::Uuid,
                 Some(Box::new(
                     stream_ids
-                        .into_iter()
-                        .map(|id| sea_orm::Value::Uuid(Some(Box::new(id))))
+                        .iter()
+                        .map(|id| sea_orm::Value::Uuid(Some(*id)))
                         .collect(),
                 )),
             )],
@@ -2077,11 +2220,66 @@ pub async fn plan_site_metadata(
             "catchment": get("catchment"),
             "full_name": get("full_name"),
             "elevation": get("elevation").and_then(|s| s.parse::<f64>().ok()),
-            "device_serial": get("device_serial"),
             "channel_id": get("channel_id"),
             "sample_interval_sec": get("sample_interval_sec").and_then(|s| s.parse::<i64>().ok()),
         })
     }).collect();
+
+    // Devices are counted per site, not folded into the site row: a site instrumented with two
+    // loggers has two, and reporting one of them names channels that belong to the other.
+    let device_rows = state
+        .db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT metadata->'hierarchy'->>'site' AS site_name, \
+                    metadata->'device'->>'logger_serial' AS serial, \
+                    max(metadata->'device'->>'logger_device') AS model, \
+                    count(*) AS streams \
+             FROM data_streams \
+             WHERE id = ANY($1) AND metadata->'device'->>'logger_serial' <> '' \
+             GROUP BY 1, 2 ORDER BY 1, 2",
+            [sea_orm::Value::Array(
+                sea_orm::sea_query::ArrayType::Uuid,
+                Some(Box::new(
+                    stream_ids
+                        .iter()
+                        .map(|id| sea_orm::Value::Uuid(Some(*id)))
+                        .collect(),
+                )),
+            )],
+        ))
+        .await?;
+    let mut devices_by_site: std::collections::HashMap<String, Vec<serde_json::Value>> =
+        std::collections::HashMap::new();
+    for row in &device_rows {
+        let site: String = row.try_get("", "site_name").unwrap_or_default();
+        let serial: String = row.try_get("", "serial").unwrap_or_default();
+        if serial.is_empty() {
+            continue;
+        }
+        devices_by_site
+            .entry(site)
+            .or_default()
+            .push(serde_json::json!({
+                "serial": serial,
+                "model": row.try_get::<Option<String>>("", "model").ok().flatten(),
+                "streams": row.try_get::<i64>("", "streams").unwrap_or_default(),
+            }));
+    }
+
+    let result: Vec<serde_json::Value> = result
+        .into_iter()
+        .map(|mut site| {
+            let name = site
+                .get("site_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            site["devices"] =
+                serde_json::Value::Array(devices_by_site.get(&name).cloned().unwrap_or_default());
+            site
+        })
+        .collect();
 
     Ok(Json(result))
 }
@@ -2110,6 +2308,9 @@ pub struct PlanInstrumentGroup {
     /// A stream to address an update to; every entry in the same scope moves with it.
     pub anchor_stream_id: Option<Uuid>,
     pub curves: Vec<crate::routes::private::sync::service::PlanCurveRef>,
+    /// What this decision proposed creating, kept through an attach so the picker can offer it
+    /// back. Absent for an instrument that was never a proposal.
+    pub proposed_name: Option<String>,
 }
 
 /// The source parameters this plan pairs that no instrument covers, so an operator can attach one
@@ -2143,12 +2344,35 @@ pub struct PlanCurveAssignment {
     /// Readings this curve has already corrected. A curve with history is one whose instrument a
     /// re-home changes the meaning of, so the number is shown beside the choice.
     pub reading_count: i64,
+    /// The instrument this plan will move the curve onto when applied, by `source_key`, and the
+    /// name the plan proposes for it. Absent when no assignment is pending.
+    pub pending_source_key: Option<String>,
+    pub pending_instrument_name: Option<String>,
+}
+
+/// One physical device a plan's feeds name, and the channels it serves at one site.
+///
+/// A device is not a decision the plan takes: the serial is the identity, pairing attaches it and
+/// opens the site slot's deployment. It is listed so an operator can see which instrument each
+/// site's feeds will land on, and whether it is already in the inventory.
+#[derive(Debug, Serialize)]
+pub struct PlanDeviceGroup {
+    pub site: String,
+    pub serial: String,
+    pub model: Option<String>,
+    /// The inventory row this serial already resolves to, when it has one.
+    pub instrument_id: Option<Uuid>,
+    pub instrument_name: Option<String>,
+    pub parameters: Vec<String>,
+    pub stream_count: usize,
+    pub anchor_stream_id: Uuid,
 }
 
 #[derive(Debug, Serialize)]
 pub struct PlanInstrumentsResponse {
     pub groups: Vec<PlanInstrumentGroup>,
     pub unassigned: Vec<PlanUnassignedParameter>,
+    pub devices: Vec<PlanDeviceGroup>,
     pub curves: Vec<PlanCurveAssignment>,
 }
 
@@ -2156,7 +2380,7 @@ pub struct PlanInstrumentsResponse {
 /// still without one. Requires `read_metadata`.
 #[utoipa::path(
     get,
-    path = "/sync/pairing-plans/{id}/instruments",
+    path = "/api/sync/pairing-plans/{id}/instruments",
     params(("id" = Uuid, Path, description = "Pairing plan UUID")),
     responses(
         (status = 200, description = "The plan's instruments and unassigned parameters", body = Object),
@@ -2188,6 +2412,12 @@ pub async fn plan_instruments(
 
     for entry in entries.iter().filter(|e| e.action == "pair") {
         let scope = instrument_scope(entry);
+        // A device-shaped feed is reported as its device, whether or not it already names one.
+        // Listing it as a lab decision as well would put the same instrument in two places, one of
+        // which offers to change it.
+        if entry.device_serial.is_some() {
+            continue;
+        }
         match &entry.instrument {
             Some(instrument) => {
                 let acc = bound.entry(scope).or_insert_with(|| Acc {
@@ -2208,7 +2438,7 @@ pub async fn plan_instruments(
                         .or_insert_with(|| PlanUnassignedParameter {
                             scope,
                             suggested_name: format!(
-                                "{} instrument (from {} sync)",
+                                "{} {}",
                                 entry.parameter.name, plan.source_system
                             ),
                             parameter: entry.parameter.name.clone(),
@@ -2226,7 +2456,7 @@ pub async fn plan_instruments(
         std::collections::BTreeSet<String>,
     > = std::collections::BTreeMap::new();
     for entry in entries.iter().filter(|e| e.action == "pair") {
-        if entry.instrument.is_none() {
+        if entry.instrument.is_none() && entry.device_serial.is_none() {
             unassigned_sites
                 .entry(instrument_scope(entry))
                 .or_default()
@@ -2255,6 +2485,7 @@ pub async fn plan_instruments(
             parameters: acc.parameters.into_iter().collect(),
             site_count: acc.sites.len(),
             anchor_stream_id: Some(acc.anchor),
+            proposed_name: acc.instrument.proposed_name,
             curves: acc.instrument.curves,
         })
         .collect();
@@ -2293,7 +2524,7 @@ pub async fn plan_instruments(
     let mut usage: std::collections::HashMap<Uuid, i64> = std::collections::HashMap::new();
     for row in state
         .db
-        .query_all(sea_orm::Statement::from_string(
+        .query_all_raw(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT standard_curve_id AS id, COUNT(*) AS n FROM readings
              WHERE standard_curve_id IS NOT NULL GROUP BY standard_curve_id"
@@ -2303,6 +2534,13 @@ pub async fn plan_instruments(
     {
         usage.insert(row.try_get::<Uuid>("", "id")?, row.try_get::<i64>("", "n")?);
     }
+    let intents = crate::routes::private::sync::service::plan_curve_intents(&plan)?;
+    let proposed_names: std::collections::HashMap<&str, &str> = entries
+        .iter()
+        .filter_map(|e| e.instrument.as_ref())
+        .filter(|i| i.create)
+        .map(|i| (i.source_key.as_str(), i.name.as_str()))
+        .collect();
     let mut curves: Vec<PlanCurveAssignment> =
         crate::routes::private::sensors::standard_curves::Entity::find()
             .filter(
@@ -2312,19 +2550,28 @@ pub async fn plan_instruments(
             .all(&state.db)
             .await?
             .into_iter()
-            .map(|c| PlanCurveAssignment {
-                instrument_name: instrument_names
-                    .get(&c.sensor_id)
-                    .cloned()
-                    .unwrap_or_else(|| c.sensor_id.to_string()),
-                reading_count: usage.get(&c.id).copied().unwrap_or(0),
-                id: c.id,
-                name: c.name,
-                slope: c.slope,
-                intercept: c.intercept,
-                r_squared: c.r_squared,
-                source_key: c.source_key,
-                sensor_id: c.sensor_id,
+            .map(|c| {
+                let pending = intents.iter().find(|i| i.curve_id == c.id);
+                PlanCurveAssignment {
+                    instrument_name: instrument_names
+                        .get(&c.sensor_id)
+                        .cloned()
+                        .unwrap_or_else(|| c.sensor_id.to_string()),
+                    reading_count: usage.get(&c.id).copied().unwrap_or(0),
+                    pending_source_key: pending.map(|i| i.instrument_source_key.clone()),
+                    pending_instrument_name: pending.and_then(|i| {
+                        proposed_names
+                            .get(i.instrument_source_key.as_str())
+                            .map(|n| (*n).to_string())
+                    }),
+                    id: c.id,
+                    name: c.name,
+                    slope: c.slope,
+                    intercept: c.intercept,
+                    r_squared: c.r_squared,
+                    source_key: c.source_key,
+                    sensor_id: c.sensor_id,
+                }
             })
             .collect();
     curves.sort_by(|a, b| {
@@ -2333,9 +2580,54 @@ pub async fn plan_instruments(
             .then_with(|| a.name.cmp(&b.name))
     });
 
+    // The devices the plan's feeds name, one row per (site, serial). Grouped that way because a
+    // device sits at one site and serves several of its channels, which is the shape the site view
+    // and the deployment slots both take.
+    let mut device_acc: std::collections::BTreeMap<(String, String), PlanDeviceGroup> =
+        std::collections::BTreeMap::new();
+    for entry in entries.iter().filter(|e| e.action == "pair") {
+        let Some(serial) = entry.device_serial.clone() else {
+            continue;
+        };
+        let group = device_acc
+            .entry((entry.site.name.clone(), serial.clone()))
+            .or_insert_with(|| PlanDeviceGroup {
+                site: entry.site.name.clone(),
+                serial: serial.clone(),
+                model: entry.device_model.clone(),
+                instrument_id: None,
+                instrument_name: None,
+                parameters: Vec::new(),
+                stream_count: 0,
+                anchor_stream_id: entry.stream_id,
+            });
+        group.stream_count += 1;
+        if !group.parameters.contains(&entry.parameter.name) {
+            group.parameters.push(entry.parameter.name.clone());
+        }
+    }
+    if !device_acc.is_empty() {
+        let serials: Vec<String> = device_acc.keys().map(|(_, s)| s.clone()).collect();
+        for sensor in sensors::Entity::find()
+            .filter(sensors::Column::SerialNumber.is_in(serials))
+            .all(&state.db)
+            .await?
+        {
+            let Some(serial) = sensor.serial_number.clone() else {
+                continue;
+            };
+            for group in device_acc.values_mut().filter(|g| g.serial == serial) {
+                group.instrument_id = Some(sensor.id);
+                group.instrument_name =
+                    sensor.name.clone().or_else(|| sensor.serial_number.clone());
+            }
+        }
+    }
+
     Ok(Json(PlanInstrumentsResponse {
         groups,
         unassigned: unassigned.into_values().collect(),
+        devices: device_acc.into_values().collect(),
         curves,
     }))
 }

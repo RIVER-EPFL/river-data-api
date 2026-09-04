@@ -85,6 +85,12 @@ impl Authorizer {
     pub async fn invalidate(&self, sub: &str) {
         self.cache.invalidate(sub).await;
     }
+
+    /// Seed a resolved role into the cache, bypassing live Keycloak resolution. For tests that
+    /// reconcile against a known role set without a Keycloak backend.
+    pub async fn prime(&self, sub: &str, resolution: RoleResolution) {
+        self.cache.insert(sub.to_string(), resolution).await;
+    }
 }
 
 async fn resolve_live(state: &AppState, sub: &str) -> Option<RoleResolution> {

@@ -2,7 +2,7 @@ use axum_keycloak_auth::instance::KeycloakAuthInstance;
 use chrono::{DateTime, Utc};
 use moka::future::Cache;
 use sea_orm::DatabaseConnection;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, broadcast};
 
@@ -82,14 +82,19 @@ pub fn global_event_sender() -> Option<EventSender> {
 /// Global handle to the running `AppState` so worker-run scheduled Jobs (which receive only a
 /// `JobContext` carrying `db`/`events`/`params`) can reach config and shared in-process services,
 /// most importantly the live `Authorizer` cache the identity-reconcile job re-resolves against.
-/// Same single-replica, set-once contract as [`GLOBAL_EVENT_SENDER`]: the first `AppState::new` wins
-/// (later ones in tests are ignored), so this is the real serving state in `main.rs`.
-static GLOBAL_APP_STATE: OnceLock<AppState> = OnceLock::new();
+/// The most recent `AppState::new` wins. `main.rs` constructs exactly one, so in service this is
+/// the serving state; a test process builds one per test on its own runtime and pool, and a job
+/// claimed in a later test must not run against a pool whose connections belong to a runtime
+/// that has already been dropped (they never wake, and the acquire times out).
+static GLOBAL_APP_STATE: RwLock<Option<AppState>> = RwLock::new(None);
 
 /// Returns a clone of the global `AppState`, if initialised. `None` in contexts that never built one.
 #[must_use]
 pub fn global_app_state() -> Option<AppState> {
-    GLOBAL_APP_STATE.get().cloned()
+    GLOBAL_APP_STATE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 /// Cached admin token: (access_token, expiry).
@@ -210,8 +215,10 @@ impl AppState {
             authorizer: Arc::new(Authorizer::new()),
         };
         // Publish the serving state so worker-run scheduled Jobs can reach config + the shared
-        // Authorizer. Set-once: the first construction (the real one in `main.rs`) wins.
-        let _ = GLOBAL_APP_STATE.set(state.clone());
+        // Authorizer.
+        *GLOBAL_APP_STATE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(state.clone());
         // Every writer that announces a write on the event bus invalidates the site it wrote,
         // without a cache call of its own. No-op when caching is off.
         super::cache::spawn_write_invalidator(&state);

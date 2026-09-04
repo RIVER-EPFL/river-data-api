@@ -928,7 +928,7 @@ async fn calibration_time_windows_auto_bounded() {
     assert!(wait_for_reprocessing(&db, sensor.id, WAIT_TIMEOUT).await);
 
     let rows = db
-        .query_all(sea_orm::Statement::from_sql_and_values(
+        .query_all_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT id, valid_from, valid_until FROM sensor_calibrations \
              WHERE sensor_id = $1 ORDER BY valid_from",
@@ -1125,7 +1125,7 @@ async fn full_cascade_calibration_to_aggregates() {
     .await;
 
     let agg_before = db
-        .query_one(sea_orm::Statement::from_sql_and_values(
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT avg_value FROM readings_hourly \
              WHERE site_id = $1 AND parameter_id = $2 \
@@ -1171,7 +1171,7 @@ async fn full_cascade_calibration_to_aggregates() {
 
     // Verify aggregate: avg should now be 25.0
     let agg_after = db
-        .query_one(sea_orm::Statement::from_sql_and_values(
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT avg_value FROM readings_hourly \
              WHERE site_id = $1 AND parameter_id = $2 \

@@ -71,7 +71,7 @@ fn position_of(name: &str) -> usize {
 }
 
 async fn applied(db: &DatabaseConnection, name: &str) -> bool {
-    db.query_one(Statement::from_sql_and_values(
+    db.query_one_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "SELECT 1 AS one FROM seaql_migrations WHERE version = $1",
         [name.into()],
@@ -82,7 +82,7 @@ async fn applied(db: &DatabaseConnection, name: &str) -> bool {
 }
 
 pub async fn exec(db: &DatabaseConnection, sql: &str) {
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_string(),
     ))
@@ -95,7 +95,7 @@ pub async fn scalar<T>(db: &DatabaseConnection, sql: &str) -> Option<T>
 where
     T: sea_orm::TryGetable,
 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_string(),
     ))

@@ -22,7 +22,7 @@ const VALID_UPDATE_STATUSES: &[&str] = &[
 /// update its commands. Requires sync session token auth.
 #[utoipa::path(
     patch,
-    path = "/commands/{id}",
+    path = "/api/sync/commands/{id}",
     params(("id" = Uuid, Path, description = "Sync command UUID")),
     request_body = CommandUpdateRequest,
     responses(

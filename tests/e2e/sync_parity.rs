@@ -67,7 +67,7 @@ fn index_of(mapping: &[(String, i64)], column: &str) -> i64 {
 /// The replicate indexes stored for a stream at one instant, ascending.
 async fn stored_indexes(db: &DatabaseConnection, stream_id: &str, time: &str) -> Vec<i64> {
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT replicate_index::bigint AS i FROM readings \
@@ -82,7 +82,7 @@ async fn stored_indexes(db: &DatabaseConnection, stream_id: &str, time: &str) ->
 }
 
 async fn scalar_f64(db: &DatabaseConnection, sql: &str) -> f64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         sql.to_string(),
     ))
@@ -170,7 +170,7 @@ async fn sync_parity_family_lifecycle() {
         "the group is stored at its source indexes exactly, no index 0"
     );
     let hold = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT id::text AS id, status, computed->'values' AS values \

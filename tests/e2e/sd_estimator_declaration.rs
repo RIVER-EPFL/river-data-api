@@ -126,7 +126,12 @@ async fn hold_at(fx: &Fixture, time: &str) -> serde_json::Value {
         .as_array()
         .unwrap()
         .iter()
-        .find(|h| h["group_time"].as_str().unwrap_or_default().starts_with(&time[..19]))
+        .find(|h| {
+            h["group_time"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with(&time[..19])
+        })
         .unwrap_or_else(|| panic!("no hold at {time}: {listed}"))
         .clone()
 }
@@ -149,7 +154,7 @@ async fn resolve(
 async fn sample_row(fx: &Fixture, time: &str) -> (Option<f64>, String, String) {
     let row = fx
         .db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT stdev, sd_estimator, sd_estimator_source FROM samples \
@@ -170,7 +175,7 @@ async fn sample_row(fx: &Fixture, time: &str) -> (Option<f64>, String, String) {
 
 async fn slot_declaration(fx: &Fixture) -> Option<String> {
     fx.db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT sd_estimator FROM site_parameters WHERE id = '{}'",
@@ -187,7 +192,7 @@ async fn slot_declaration(fx: &Fixture) -> Option<String> {
 /// The audit annotations a hold's decision minted, as (text, category, start_time).
 async fn audit_annotations(fx: &Fixture, hold_id: &str) -> Vec<(String, String, String)> {
     fx.db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT text, category, start_time::text AS start_time FROM annotations \
@@ -208,7 +213,7 @@ async fn audit_annotations(fx: &Fixture, hold_id: &str) -> Vec<(String, String, 
 }
 
 async fn hold_status(db: &DatabaseConnection, hold_id: &str) -> String {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!("SELECT status FROM replicate_audit_holds WHERE id = '{hold_id}'"),
     ))
@@ -238,7 +243,10 @@ async fn an_undeclared_estimator_blocks_acceptance_until_it_is_declared() {
         ),
     )
     .await;
-    assert_eq!(readings, 3, "the audit always admits: every replicate stored");
+    assert_eq!(
+        readings, 3,
+        "the audit always admits: every replicate stored"
+    );
 
     let hold = hold_at(&fx, T1).await;
     assert_eq!(hold["classification"], "population_sd");
@@ -246,28 +254,34 @@ async fn an_undeclared_estimator_blocks_acceptance_until_it_is_declared() {
     let hold_id = hold["id"].as_str().unwrap().to_string();
 
     let (stdev, estimator, source) = sample_row(&fx, T1).await;
-    assert!(close(stdev.unwrap(), SAMPLE_SD), "served under the sample divisor: {stdev:?}");
+    assert!(
+        close(stdev.unwrap(), SAMPLE_SD),
+        "served under the sample divisor: {stdev:?}"
+    );
     assert_eq!(estimator, "sample");
     assert_eq!(source, "default", "computed under no declaration");
 
     // --- The report lists it, with the evidence and no ruling ---
-    let (status, body) = crate::common::get_with_token(
-        &fx.app,
-        "/api/actions/undeclared_sd_estimators",
-        &fx.token,
-    )
-    .await;
+    let (status, body) =
+        crate::common::get_with_token(&fx.app, "/api/actions/undeclared_sd_estimators", &fx.token)
+            .await;
     assert_eq!(status, 200, "undeclared report ({status}): {body}");
     let report: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(report["total_slots"], 1, "{report}");
     let slot = &report["slots"][0];
     assert_eq!(slot["population_signature_holds"], 1);
-    assert_eq!(slot["source_reports_sd"], true, "the source ships an sd column");
+    assert_eq!(
+        slot["source_reports_sd"], true,
+        "the source ships an sd column"
+    );
 
     // --- The gate: three ways of accepting, all refused ---
     let (status, body) = resolve(&fx, &hold_id, &json!({"mode": "ours"})).await;
     assert_eq!(status, 409, "resolve ours must be gated: {body}");
-    let message = body["message"].as_str().or_else(|| body["error"].as_str()).unwrap_or_default();
+    let message = body["message"]
+        .as_str()
+        .or_else(|| body["error"].as_str())
+        .unwrap_or_default();
     assert!(
         message.contains("population") && message.contains("sample"),
         "the refusal must name both divisors: {body}"
@@ -290,7 +304,10 @@ async fn an_undeclared_estimator_blocks_acceptance_until_it_is_declared() {
     )
     .await;
     assert_eq!(status, 200, "bulk ({status}): {body}");
-    assert_eq!(body["acknowledged"], 0, "the sweep must not reach it: {body}");
+    assert_eq!(
+        body["acknowledged"], 0,
+        "the sweep must not reach it: {body}"
+    );
     assert_eq!(
         body["skipped_undeclared_estimator"], 1,
         "and must say what it left: {body}"
@@ -327,33 +344,38 @@ async fn an_undeclared_estimator_blocks_acceptance_until_it_is_declared() {
 
     // --- The decision is on the chart, not only in the queue ---
     let notes = audit_annotations(&fx, &hold_id).await;
-    assert_eq!(notes.len(), 1, "one point annotation per decision: {notes:?}");
+    assert_eq!(
+        notes.len(),
+        1,
+        "one point annotation per decision: {notes:?}"
+    );
     let (text, category, start) = &notes[0];
     assert_eq!(category, "audit");
-    assert!(start.starts_with("2025-07-01 08:00"), "at the group's instant: {start}");
+    assert!(
+        start.starts_with("2025-07-01 08:00"),
+        "at the group's instant: {start}"
+    );
     assert!(
         text.contains("population") && text.contains("1.63") && text.contains('2'),
         "the note carries the decision and both numbers: {text}"
     );
 
     // The report no longer lists the slot: it has declared.
-    let (_, body) = crate::common::get_with_token(
-        &fx.app,
-        "/api/actions/undeclared_sd_estimators",
-        &fx.token,
-    )
-    .await;
+    let (_, body) =
+        crate::common::get_with_token(&fx.app, "/api/actions/undeclared_sd_estimators", &fx.token)
+            .await;
     let report: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(report["total_slots"], 0, "{report}");
 
     // --- The comparison now agrees, so the same claim raises nothing ---
     ingest_population_claim(&fx, T2).await;
     let listed = holds(&fx, "&page_size=100").await;
-    let at_t2 = listed["holds"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|h| h["group_time"].as_str().unwrap_or_default().starts_with(&T2[..19]));
+    let at_t2 = listed["holds"].as_array().unwrap().iter().any(|h| {
+        h["group_time"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with(&T2[..19])
+    });
     assert!(!at_t2, "a declared slot stops disagreeing: {listed}");
 
     // --- A real disagreement is still held, and now acceptable ---
@@ -395,7 +417,10 @@ async fn an_undeclared_estimator_blocks_acceptance_until_it_is_declared() {
         "reverted to undeclared, not to a divisor nobody chose"
     );
     let (stdev, estimator, source) = sample_row(&fx, T1).await;
-    assert!(close(stdev.unwrap(), SAMPLE_SD), "back to the sample divisor: {stdev:?}");
+    assert!(
+        close(stdev.unwrap(), SAMPLE_SD),
+        "back to the sample divisor: {stdev:?}"
+    );
     assert_eq!(estimator, "sample");
     assert_eq!(source, "default");
 
@@ -430,10 +455,16 @@ async fn an_instant_decision_leaves_the_parameter_undeclared_and_survives_a_reta
     let (stdev, estimator, source) = sample_row(&fx, T1).await;
     assert!(close(stdev.unwrap(), POPULATION_SD), "{stdev:?}");
     assert_eq!(estimator, "population");
-    assert_eq!(source, "sample", "recorded as a decision about this instant");
+    assert_eq!(
+        source, "sample",
+        "recorded as a decision about this instant"
+    );
 
     let (stdev, _, source) = sample_row(&fx, T2).await;
-    assert!(close(stdev.unwrap(), SAMPLE_SD), "the other instant is untouched: {stdev:?}");
+    assert!(
+        close(stdev.unwrap(), SAMPLE_SD),
+        "the other instant is untouched: {stdev:?}"
+    );
     assert_eq!(source, "default");
 
     // The slot's other hold is still gated: one instant's decision is not the parameter's.
@@ -448,7 +479,10 @@ async fn an_instant_decision_leaves_the_parameter_undeclared_and_survives_a_reta
         &json!({"mode": "estimator", "estimator": "sample", "scope": "slot"}),
     )
     .await;
-    assert_eq!(status, 200, "declare sample for the slot ({status}): {body}");
+    assert_eq!(
+        status, 200,
+        "declare sample for the slot ({status}): {body}"
+    );
     crate::common::e2e::wait_for_jobs_by_trigger(&fx.db, "sd_estimator_retag", 30).await;
 
     let (stdev, estimator, source) = sample_row(&fx, T1).await;

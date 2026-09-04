@@ -49,12 +49,16 @@ pub struct RegisterStandardCurveResponse {
     pub superseded: bool,
 }
 
-/// Whether any reading was corrected with this curve; a used curve's coefficients are frozen.
-async fn curve_is_used<C: ConnectionTrait>(conn: &C, id: Uuid) -> AppResult<bool> {
+/// Whether any reading was corrected with this curve, or any annotation records a source-side
+/// correction made with it; a used curve's coefficients are frozen.
+pub(crate) async fn curve_is_used<C: ConnectionTrait>(conn: &C, id: Uuid) -> AppResult<bool> {
     Ok(conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT 1 AS one FROM readings WHERE standard_curve_id = $1 LIMIT 1",
+            "SELECT 1 AS one FROM readings WHERE standard_curve_id = $1
+             UNION ALL
+             SELECT 1 FROM annotations WHERE standard_curve_id = $1
+             LIMIT 1",
             [id.into()],
         ))
         .await?
@@ -117,7 +121,7 @@ pub(crate) async fn resolve_lab_instrument(
 /// while the curve is unused, and mint a successor row once any reading references it.
 #[utoipa::path(
     post,
-    path = "/standard_curves/register",
+    path = "/api/standard_curves/register",
     request_body = RegisterStandardCurveRequest,
     responses(
         (status = 200, description = "Curve registered (created, unchanged, updated, or superseded)", body = RegisterStandardCurveResponse),
@@ -184,7 +188,7 @@ pub async fn register_standard_curve(
         let old_id = current.id;
         state
             .db
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "UPDATE standard_curves SET source_system = NULL, source_key = NULL WHERE id = $1",
                 [old_id.into()],
@@ -225,7 +229,7 @@ async fn insert_curve(
     let id = Uuid::new_v4();
     state
         .db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "INSERT INTO standard_curves
                  (id, sensor_id, name, slope, intercept, r_squared, notes, created_at,
@@ -260,4 +264,124 @@ async fn insert_curve(
         .await?
         .ok_or_else(|| AppError::Internal("registered curve not found after upsert".to_string()))?;
     Ok(row.id)
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct LastUsedCurveQuery {
+    /// One of `parameter_id` and `parameter_code` is required.
+    pub parameter_id: Option<Uuid>,
+    pub parameter_code: Option<String>,
+}
+
+/// The instrument and standard curve the newest grab at a site and parameter recorded. Every
+/// field but `method` is null when no grab there names either.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LastUsedCurveResponse {
+    pub site_id: Uuid,
+    pub parameter_id: Uuid,
+    pub sensor_id: Option<Uuid>,
+    pub sensor_name: Option<String>,
+    pub standard_curve_id: Option<Uuid>,
+    pub curve_name: Option<String>,
+    pub curve_created_at: Option<chrono::DateTime<Utc>>,
+    /// The instant of the grab the answer was read from.
+    pub used_at: Option<chrono::DateTime<Utc>>,
+    /// How the answer was decided, for the picker to show beside it.
+    pub method: String,
+}
+
+const LAST_USED_METHOD: &str = "The newest spot reading at this site and parameter that records \
+    an instrument or a standard curve, withdrawn readings excluded. The instrument is the one the \
+    reading names, or the curve's when the reading names none.";
+
+/// `GET /sites/{id}/last_curve`: what the last grab at a slot was measured on and corrected
+/// with, so the picker opens where the previous batch left off. `read_data`.
+#[utoipa::path(
+    get,
+    path = "/api/sites/{id}/last_curve",
+    params(("id" = Uuid, Path, description = "Site UUID"), LastUsedCurveQuery),
+    responses(
+        (status = 200, body = LastUsedCurveResponse),
+        (status = 400, description = "Neither parameter_id nor parameter_code given"),
+        (status = 404, description = "Site or parameter not found"),
+    ),
+    tag = "sensors"
+)]
+pub async fn last_used_curve(
+    State(state): State<AppState>,
+    crate::common::middleware::ProjectScope(scope): crate::common::middleware::ProjectScope,
+    axum::extract::Path(site_id): axum::extract::Path<Uuid>,
+    axum::extract::Query(q): axum::extract::Query<LastUsedCurveQuery>,
+) -> AppResult<Json<LastUsedCurveResponse>> {
+    use crate::common::scope::{Unowned, project_of_site, require_row_in_scope};
+    let db = &state.db;
+    let site = project_of_site(db, site_id).await?;
+    require_row_in_scope(&scope, &site, Unowned::Deny, "site")?;
+
+    let parameter_id = match (q.parameter_id, q.parameter_code.as_deref()) {
+        (Some(id), _) => id,
+        (None, Some(code)) => db
+            .query_one_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT id FROM parameters WHERE LOWER(code) = LOWER($1)",
+                [code.into()],
+            ))
+            .await?
+            .map(|r| r.try_get::<Uuid>("", "id"))
+            .transpose()?
+            .ok_or_else(|| AppError::NotFound(format!("Parameter '{code}' not found")))?,
+        (None, None) => {
+            return Err(AppError::BadRequest(
+                "parameter_id or parameter_code is required".to_string(),
+            ));
+        }
+    };
+
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT r.time,
+                    COALESCE(r.sensor_id, c.sensor_id) AS sensor_id,
+                    s.name AS sensor_name,
+                    r.standard_curve_id,
+                    c.name AS curve_name,
+                    c.created_at AS curve_created_at
+             FROM readings r
+             LEFT JOIN standard_curves c ON c.id = r.standard_curve_id
+             LEFT JOIN sensors s ON s.id = COALESCE(r.sensor_id, c.sensor_id)
+             WHERE r.site_id = $1
+               AND r.parameter_id = $2
+               AND r.measurement_type = 'spot'
+               AND r.withdrawn_at IS NULL
+               AND (r.standard_curve_id IS NOT NULL OR r.sensor_id IS NOT NULL)
+             ORDER BY r.time DESC, r.replicate_index ASC
+             LIMIT 1",
+            [site_id.into(), parameter_id.into()],
+        ))
+        .await?;
+
+    let mut out = LastUsedCurveResponse {
+        site_id,
+        parameter_id,
+        sensor_id: None,
+        sensor_name: None,
+        standard_curve_id: None,
+        curve_name: None,
+        curve_created_at: None,
+        used_at: None,
+        method: LAST_USED_METHOD.to_string(),
+    };
+    if let Some(row) = row {
+        out.sensor_id = row.try_get("", "sensor_id")?;
+        out.sensor_name = row.try_get("", "sensor_name")?;
+        out.standard_curve_id = row.try_get("", "standard_curve_id")?;
+        out.curve_name = row.try_get("", "curve_name")?;
+        out.curve_created_at = row
+            .try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "curve_created_at")?
+            .map(|t| t.with_timezone(&Utc));
+        out.used_at = row
+            .try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "time")?
+            .map(|t| t.with_timezone(&Utc));
+    }
+    Ok(Json(out))
 }

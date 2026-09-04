@@ -61,7 +61,7 @@ pub async fn get_job_logs(
 
     let rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT seq, ts, level, message, context \
              FROM reprocessing_job_logs \
@@ -103,7 +103,7 @@ pub async fn cancel_job(
     confine_job(&state, &scope, id).await?;
     let row = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT trigger_type, status FROM reprocessing_jobs WHERE id = $1",
             [id.into()],
@@ -122,7 +122,7 @@ pub async fn cancel_job(
     // next checkpoint; a still-queued job is cancelled outright since nothing is running it yet.
     let flagged = state
         .db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE reprocessing_jobs \
              SET cancel_requested = true, \
@@ -162,7 +162,7 @@ pub async fn rerun_job(
     confine_job(&state, &scope, id).await?;
     let row = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT trigger_type, sensor_id, trigger_id, params FROM reprocessing_jobs WHERE id = $1",
             [id.into()],
@@ -184,7 +184,7 @@ pub async fn rerun_job(
     // Reject if an equivalent job (same type + same target) is already in flight.
     let in_flight = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT 1 FROM reprocessing_jobs \
              WHERE status IN ('queued', 'pending', 'running', 'retrying') \

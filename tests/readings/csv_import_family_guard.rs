@@ -16,7 +16,7 @@ const CSV: &str = "DateTime,Dissolved_O2\n\
 2025-06-02 00:10:00,300\n";
 
 async fn scalar_i64(db: &DatabaseConnection, sql: &str) -> i64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_string(),
     ))

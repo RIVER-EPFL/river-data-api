@@ -8,14 +8,12 @@
 //!
 //! Base state is the CSV onboarding track: the project, site and parameters are provisioned over
 //! HTTP as a real Keycloak user, and the CSV dump's own `csv_import` job is read alongside the
-//! probes. No endpoint writes a timeline line, the job lifecycle does, so the probe timelines go in
-//! through `run_tracked_job`, the same writer every registered job uses.
-
-use std::sync::{Arc, Mutex};
+//! probes. No endpoint writes a timeline line, so the probe rows are seeded as the lifecycle writes
+//! them: a completed job row and its `reprocessing_job_logs` lines numbered by `seq`. The app's own
+//! worker is live here, so a job the test enqueued could be claimed by either side.
 
 use axum::Router;
-use river_db::routes::private::reprocessing_jobs::lifecycle::run_tracked_job;
-use sea_orm::DatabaseConnection;
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde_json::json;
 use serial_test::serial;
 use uuid::Uuid;
@@ -23,44 +21,45 @@ use uuid::Uuid;
 use crate::common::keycloak as kc;
 use crate::common::tracks;
 
-fn events() -> river_db::common::EventSender {
-    tokio::sync::broadcast::channel::<river_db::common::AppEvent>(16).0
-}
-
-/// Run a tracked job that writes `lines` to its timeline, returning the job's id.
-///
-/// The id is lifted out of the `JobContext` because `run_tracked_job` hands back the work's count,
-/// not the row it created.
+/// Seed a completed job at `site_id` whose timeline holds `lines`, returning the job's id.
 async fn write_job_timeline(
     db: &DatabaseConnection,
     trigger_type: &str,
     site_id: Uuid,
     lines: Vec<(&'static str, String, serde_json::Value)>,
 ) -> Uuid {
-    let captured: Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
-    let sink = Arc::clone(&captured);
-    let written = lines.len() as i64;
-
-    run_tracked_job(
-        db,
-        None,
-        trigger_type,
-        None,
-        events(),
-        move |ctx| async move {
-            *sink.lock().unwrap() = Some(ctx.job_id());
-            ctx.set_site(site_id).await;
-            for (level, message, context) in &lines {
-                ctx.log(level, message, context.clone()).await;
-            }
-            Ok(written)
-        },
-    )
+    let job_id = Uuid::new_v4();
+    db.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO reprocessing_jobs \
+             (id, trigger_type, status, category, site_id, readings_updated, completed_at) \
+         VALUES ($1, $2, 'completed', 'operator', $3, $4, now())",
+        [
+            job_id.into(),
+            trigger_type.into(),
+            site_id.into(),
+            (lines.len() as i32).into(),
+        ],
+    ))
     .await
-    .unwrap_or_else(|e| panic!("tracked {trigger_type} job runs: {e}"));
-
-    let id = *captured.lock().unwrap();
-    id.expect("the job context exposes the id of the row it created")
+    .unwrap_or_else(|e| panic!("seed {trigger_type} job row: {e}"));
+    for (seq, (level, message, context)) in lines.into_iter().enumerate() {
+        db.execute_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO reprocessing_job_logs (job_id, seq, level, message, context) \
+             VALUES ($1, $2, $3, $4, $5::jsonb)",
+            [
+                job_id.into(),
+                (seq as i64).into(),
+                level.into(),
+                message.into(),
+                context.to_string().into(),
+            ],
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("seed timeline line {seq}: {e}"));
+    }
+    job_id
 }
 
 async fn fetch_logs(app: &Router, token: &str, job_id: Uuid, query: &str) -> (u16, String) {

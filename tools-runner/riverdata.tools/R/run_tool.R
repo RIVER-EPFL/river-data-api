@@ -107,15 +107,30 @@ runtime_info <- function() {
 
 #' The `constants` table shape the portal calculation functions filter on:
 #' `constants %>% filter(name == '...') %>% pull('value')`.
+#'
+#' Each value is taken by name, one at a time. A JSON null arrives as a NULL entry, and a
+#' `unlist()` over the whole list would drop it and pair every later value with the wrong name.
 constants_df <- function(constants) {
   if (length(constants) == 0L) {
     return(data.frame(name = character(0), value = numeric(0), stringsAsFactors = FALSE))
   }
-  data.frame(
-    name = names(constants),
-    value = as.numeric(unlist(constants, use.names = FALSE)),
-    stringsAsFactors = FALSE
-  )
+  names <- names(constants)
+  if (is.null(names) || any(!nzchar(names))) {
+    stop("every constant must be named", call. = FALSE)
+  }
+  value <- vapply(names, function(name) constant_value(name, constants[[name]]), numeric(1))
+  data.frame(name = names, value = unname(value), stringsAsFactors = FALSE)
+}
+
+constant_value <- function(name, v) {
+  if (is.null(v) || length(v) != 1L) {
+    stop(sprintf("constant '%s' has no value", name), call. = FALSE)
+  }
+  n <- suppressWarnings(as.numeric(v))
+  if (is.na(n)) {
+    stop(sprintf("constant '%s' is not a number", name), call. = FALSE)
+  }
+  n
 }
 
 #' The `standard_curves` row shape the portal functions pull `a`/`b` from. The API sends

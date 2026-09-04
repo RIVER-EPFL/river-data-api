@@ -59,7 +59,7 @@ async fn healthz() -> StatusCode {
 async fn readyz(axum::extract::State(state): axum::extract::State<AppState>) -> StatusCode {
     let result = state
         .db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT 1".to_string(),
         ))
@@ -166,6 +166,27 @@ pub fn validate_optional_time_range(
 #[openapi(
     paths(
         healthz,
+        private::admin::actions::backfill_candidates,
+        private::admin::actions::backfill_attribution,
+        private::alarms::views::get_active_alarms,
+        private::alarms::views::get_alarm_summary,
+        private::api_tokens::audit_log::views::distinct_status_codes,
+        private::api_tokens::views::revoke_token,
+        private::api_tokens::views::rotate_token,
+        private::api_tokens::views::token_usage,
+        private::notifications::me::get_my_notifications,
+        private::notifications::me::update_my_notifications,
+        private::notifications::me::set_my_subscriptions,
+        private::notifications::me::register_push_subscription,
+        private::notifications::me::list_push_subscriptions,
+        private::notifications::me::delete_push_subscription,
+        private::notifications::me::test_push,
+        private::notifications::me::schedule_ping,
+        private::notifications::views::test_send,
+        private::notifications::views::list_subscribers,
+        private::notifications::deliveries::list_delivery_log,
+        private::sync::replicate_reconciliation::duplicate_slots,
+        private::sites::annotations::get_site_export_summary,
         version::get_version,
         private::projects::views::list_project_sites,
         private::sites::views::list_site_parameters,
@@ -192,18 +213,27 @@ pub fn validate_optional_time_range(
         private::collection_events::stage_collection_event,
         private::collection_events::recompute_collection_event,
         private::collection_events::run_event_audit,
-        private::collection_events::list_event_audit_findings,
+        private::collection_events::run_event_recompute,
         private::collection_events::visits::list_site_visits,
+        private::collection_events::visits::list_visits,
         private::collection_events::visits::get_event_detail,
         private::readings::provenance::get_reading_provenance,
+        private::readings::sample_preview::sample_preview,
+        private::readings::decisions::list_decisions,
+        private::readings::decisions::pin_readings,
+        private::readings::decisions::rollback_pin_set,
+        private::readings::decisions::detach_output,
+        private::readings::decisions::return_output,
         private::readings::status_events::batch::insert_batch_status_events,
         private::data_streams::views::stream_stats,
         private::data_streams::views::stream_preview,
         private::data_streams::views::stream_receipts,
         private::data_streams::views::register_stream,
         private::sensors::standard_curves::views::register_standard_curve,
+        private::sensors::standard_curves::views::last_used_curve,
         private::sensors::instruments::get_instruments_overview,
         private::sensors::instruments::get_curve_usage,
+        private::sensors::instruments::get_sensor_curve_usage,
         private::annotations::register::register_annotations,
         private::sync::replicate_audit::list_holds,
         private::sync::replicate_audit::acknowledge_hold,
@@ -248,7 +278,6 @@ pub fn validate_optional_time_range(
         private::admin::actions::reconcile_alarms,
         private::admin::actions::rollback_deployment,
         private::admin::actions::calibration_candidates,
-        private::admin::actions::duplicate_slots,
         private::admin::actions::undeclared_sd_estimators,
         private::admin::actions::backfill_calibrations,
         private::admin::actions::preview_derived,
@@ -256,6 +285,7 @@ pub fn validate_optional_time_range(
         private::admin::derived::recompute_derived,
         private::admin::merge::merge_site_parameters_handler,
         private::sites::parameters::declare::declare_sd_estimator,
+        private::sites::parameters::declare::retag_sd_estimator,
         private::admin::merge::merge_parameters_handler,
         private::admin::public_config::invalidate_public_config,
         private::sync::views::get_discovery,
@@ -297,6 +327,10 @@ pub fn validate_optional_time_range(
     ),
     components(
         schemas(
+            private::notifications::deliveries::DeliveryLogPage,
+            private::notifications::deliveries::DeliveryMessage,
+            private::notifications::deliveries::DeliveryRecipient,
+            private::notifications::deliveries::DeliveryCounts,
             private::projects::types::ProjectResponse,
             private::sites::types::SiteResponse,
             private::sites::types::SiteDetailResponse,
@@ -341,12 +375,16 @@ pub fn validate_optional_time_range(
             private::readings::checks::SeasonalCheckRequest,
             private::readings::checks::SeasonalCheckResponse,
             private::readings::checks::SeasonalFinding,
+            private::readings::checks::SeasonalMethod,
+            private::readings::checks::SeasonalClassDescription,
             private::readings::checks::SeasonalCheckValue,
             private::readings::reconcile::SourceWindow,
             private::collection_events::EventAuditRequest,
+            private::collection_events::EventRecomputeRequest,
             private::collection_events::EnqueuedJobResponse,
-            private::collection_events::EventAuditFinding,
             private::collection_events::visits::VisitsResponse,
+            private::collection_events::visits::VisitListResponse,
+            private::collection_events::visits::VisitListRow,
             private::collection_events::visits::VisitRow,
             private::collection_events::visits::VisitCell,
             private::collection_events::visits::ExpectedParameter,
@@ -355,9 +393,22 @@ pub fn validate_optional_time_range(
             private::collection_events::visits::CellSample,
             private::collection_events::visits::CellReplicate,
             private::collection_events::visits::CellFinding,
+            private::readings::decisions::DecisionRow,
+            private::readings::decisions::PinRequest,
+            private::readings::decisions::PinResponse,
+            private::readings::decisions::PinKind,
+            private::readings::decisions::Selection,
+            private::readings::decisions::SelectionKey,
+            private::readings::decisions::RollbackSetResponse,
+            private::readings::decisions::OutputSlotRequest,
+            private::readings::decisions::OwnershipResponse,
+            private::readings::decisions::Owner,
+            private::readings::decisions::Kind,
+            private::readings::decisions::Origin,
             private::readings::provenance::ProvenanceResponse,
             private::readings::provenance::ProvenanceRecord,
             private::readings::provenance::OriginInfo,
+            private::readings::provenance::PinRef,
             private::readings::provenance::ReceiptSummary,
             private::readings::provenance::ReadingFacet,
             private::readings::provenance::CalibrationRef,
@@ -393,6 +444,9 @@ pub fn validate_optional_time_range(
             private::sync::replicate_audit::ResolveHoldRequest,
             private::sync::replicate_audit::ResolveHoldResponse,
             private::sync::replicate_reconciliation::CandidatesResponse,
+            private::sync::replicate_reconciliation::DuplicateSlotsResponse,
+            private::sync::replicate_reconciliation::DuplicateSlot,
+            private::sync::replicate_reconciliation::DuplicateSlotStream,
             private::sync::replicate_reconciliation::FamilyCandidate,
             private::sync::replicate_reconciliation::StartReconciliationRequest,
             private::sync::replicate_reconciliation::StartReconciliationResponse,
@@ -404,6 +458,8 @@ pub fn validate_optional_time_range(
             private::data_streams::views::ImportStreamResponse,
             private::readings::import::ImportCsvRequest,
             private::readings::import::ImportCsvResponse,
+            private::readings::import::ImportCheck,
+            private::readings::checks::ScreenedCell,
             private::readings::import::OverlapDiff,
             private::readings::import::RowError,
             private::sensors::readings::SensorReadingsResponse,
@@ -478,9 +534,6 @@ pub fn validate_optional_time_range(
             private::admin::actions::CalibrationBackfillCandidate,
             private::admin::actions::CalibrationBackfillCandidatesResponse,
             private::admin::actions::OrphanedCorrection,
-            private::admin::actions::DuplicateSlot,
-            private::admin::actions::DuplicateSlotStream,
-            private::admin::actions::DuplicateSlotsResponse,
             private::admin::actions::BackfillCalibrationsRequest,
             private::admin::actions::BackfillCalibrationsResponse,
             private::admin::merge_services::MergeSiteParametersRequest,
@@ -559,6 +612,14 @@ impl utoipa::Modify for SecurityAddon {
             ),
         );
     }
+}
+
+/// The private API's OpenAPI document as `/docs` serves it. Every path is absolute from the
+/// server root, so a key in it is a URL the router resolves.
+pub fn openapi_spec() -> utoipa::openapi::OpenApi {
+    let mut openapi = ApiDoc::openapi();
+    openapi.info.version = env!("CARGO_PKG_VERSION").to_string();
+    openapi
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -690,12 +751,13 @@ pub fn build_router(state: AppState) -> Router {
 </html>"#;
     // Report the crate's actual version in the served OpenAPI doc rather than a hand-maintained
     // literal (which had gone stale at 0.2.0 while the crate was 0.4.2).
-    let mut openapi = ApiDoc::openapi();
-    openapi.info.version = env!("CARGO_PKG_VERSION").to_string();
-    // `/docs` is intentionally unauthenticated. The ingress routes only `/api` externally and keeps
-    // root paths (`/docs`, `/healthz`) cluster-internal, so the Scalar UI + spec are never publicly
-    // reachable. Leaving it auth-free also stops the auth-wrapped fallback from answering unmatched
-    // root routes with 401 instead of 404.
+    let openapi = openapi_spec();
+    // `/docs` is unauthenticated and ingress-exposed on the same host as `/api`; only the
+    // ingress whitelist-source-range (EPFL ranges, in every overlay) keeps the private spec off
+    // the open internet. `/healthz` stays cluster-internal. The spec is the operator-facing
+    // contract: `tests/smoke/openapi_paths.rs` checks every path in it resolves. Leaving it auth-free
+    // also stops the auth-wrapped fallback from answering unmatched root routes with 401 instead of
+    // 404.
     let docs_routes = Router::new()
         .merge(Scalar::with_url("/docs", openapi).custom_html(PINNED_SCALAR_HTML))
         .with_state(state.clone());

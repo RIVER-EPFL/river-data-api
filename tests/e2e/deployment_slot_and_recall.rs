@@ -17,7 +17,7 @@ async fn deployed_until(
     deployment_id: &str,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT deployed_until FROM sensor_deployments WHERE id = $1",
             [Uuid::parse_str(deployment_id).unwrap().into()],
@@ -73,7 +73,7 @@ async fn slot_exclusion_rejects_a_second_sensor() {
     );
 
     let count: i64 = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT count(*) AS c FROM sensor_deployments \
              WHERE site_id = $1 AND parameter_id = $2 AND deployed_until IS NULL",

@@ -44,7 +44,7 @@ async fn resolve_series_parameter(
     requested: Option<Uuid>,
 ) -> AppResult<(Option<Uuid>, Option<String>)> {
     let row = if let Some(parameter_id) = requested {
-        db.query_one(Statement::from_sql_and_values(
+        db.query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT p.id AS parameter_id, p.default_units FROM parameters p WHERE p.id = $1",
             [parameter_id.into()],
@@ -53,7 +53,7 @@ async fn resolve_series_parameter(
         .ok_or_else(|| AppError::BadRequest(format!("Unknown parameter {parameter_id}")))?
     } else {
         let Some(row) = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r"SELECT d.parameter_id, p.default_units
                   FROM sensor_deployments d
@@ -109,7 +109,7 @@ pub struct SensorReadingsResponse {
 /// Per-sensor time series (raw + calibrated), for the sensor detail plot. Requires `read_data`.
 #[utoipa::path(
     get,
-    path = "/sensors/{id}/readings",
+    path = "/api/sensors/{id}/readings",
     params(
         ("id" = Uuid, Path, description = "Sensor UUID"),
         SensorReadingsQuery
@@ -134,7 +134,7 @@ pub async fn get_sensor_readings(
     // channel. The channel resolved here is the one the response names, the one whose units it
     // reports, and the one every query below filters on.
     let sensor_exists = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT 1 FROM sensors WHERE id = $1",
             [sensor_id.into()],
@@ -196,7 +196,7 @@ pub async fn get_sensor_readings(
     let extent_scope = scope_filter(&mut extent_vals, "site_id");
     let extent_param = param_filter(&mut extent_vals, "parameter_id");
     let extent = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &format!(
                 r"SELECT MIN(time) AS data_start, MAX(time) AS data_end
@@ -227,7 +227,7 @@ pub async fn get_sensor_readings(
     let slot_scope = scope_filter(&mut slot_vals, "r.site_id");
     let slot_param = param_filter(&mut slot_vals, "d.parameter_id");
     let slot_data_start = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &format!(
                 r"SELECT MIN(r.time) AS slot_start
@@ -317,7 +317,7 @@ pub async fn get_sensor_readings(
     }
 
     let mut rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             values.clone(),
@@ -325,7 +325,7 @@ pub async fn get_sensor_readings(
         .await?;
     if let Some(spot_sql) = spot_sql {
         let spot_rows = db
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 &spot_sql,
                 values,
@@ -432,7 +432,7 @@ pub struct SensorDeploymentBandsResponse {
 /// it is correct mid-reprocess. Requires `read_data`.
 #[utoipa::path(
     get,
-    path = "/sensors/{id}/deployment_bands",
+    path = "/api/sensors/{id}/deployment_bands",
     params(
         ("id" = Uuid, Path, description = "Sensor UUID"),
         SensorBandsQuery
@@ -482,7 +482,7 @@ pub async fn get_sensor_deployment_bands(
     sql.push_str(" ORDER BY d.deployed_from ASC");
 
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             values,

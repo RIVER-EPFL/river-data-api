@@ -17,7 +17,7 @@ use crate::error::AppResult;
 /// separately collected groups would rewrite the survivor's stored mean, sd and n.
 #[utoipa::path(
     post,
-    path = "/actions/merge_site_parameters",
+    path = "/api/actions/merge_site_parameters",
     request_body = MergeSiteParametersRequest,
     responses(
         (status = 200, description = "Counts of moved rows and source deletion status", body = MergeSiteParametersResponse),
@@ -29,6 +29,7 @@ use crate::error::AppResult;
 )]
 pub async fn merge_site_parameters_handler(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     ProjectScope(scope): ProjectScope,
     Json(payload): Json<MergeSiteParametersRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
@@ -54,6 +55,7 @@ pub async fn merge_site_parameters_handler(
         &serde_json::json!({
             "source_site_parameter_id": payload.source_site_parameter_id,
             "target_site_parameter_id": payload.target_site_parameter_id,
+            "actor": crate::routes::private::tools::scripts::actor_label(&auth),
         }),
         None,
     )
@@ -70,7 +72,7 @@ pub async fn merge_site_parameters_handler(
 /// carrying `write_metadata` is admitted for automation, unless it is project-scoped.
 #[utoipa::path(
     post,
-    path = "/actions/merge_parameters",
+    path = "/api/actions/merge_parameters",
     request_body = MergeParametersRequest,
     responses(
         (status = 200, description = "Counts of moved rows", body = MergeParametersResponse),
@@ -81,6 +83,7 @@ pub async fn merge_site_parameters_handler(
 )]
 pub async fn merge_parameters_handler(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(payload): Json<MergeParametersRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     let trigger_id = payload.source_parameter_id;
@@ -92,6 +95,7 @@ pub async fn merge_parameters_handler(
         &serde_json::json!({
             "source_parameter_id": payload.source_parameter_id,
             "target_parameter_id": payload.target_parameter_id,
+            "actor": crate::routes::private::tools::scripts::actor_label(&auth),
         }),
         None,
     )

@@ -48,7 +48,12 @@ async fn register_stream(fx: &Fixture, key: &str, pair: bool) -> String {
     stream_id
 }
 
-async fn register(fx: &Fixture, stream_id: &str, source_key: &str, text: &str) -> serde_json::Value {
+async fn register(
+    fx: &Fixture,
+    stream_id: &str,
+    source_key: &str,
+    text: &str,
+) -> serde_json::Value {
     let (status, body) = crate::common::post_json_parse_with_token(
         &fx.app,
         "/api/annotations/register",
@@ -70,13 +75,19 @@ async fn upsert_is_idempotent_and_pairing_resolves_the_slot() {
     let stream = register_stream(&fx, "FP1:DOC:reps", true).await;
     let key = "FP1:doc_std_curve_id:2025-06-10T08:00:00Z";
 
-    let first = register(&fx, &stream, key, "Corrected at source with curve 'DOC corr'").await;
+    let first = register(
+        &fx,
+        &stream,
+        key,
+        "Corrected at source with curve 'DOC corr'",
+    )
+    .await;
     assert_eq!(first["status"], "created", "{first}");
     let id = first["id"].as_str().unwrap().to_string();
 
     let row = fx
         .db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT site_id::text AS site_id, parameter_id::text AS parameter_id,
@@ -97,20 +108,39 @@ async fn upsert_is_idempotent_and_pairing_resolves_the_slot() {
         crate::common::GLOBAL_PARAM_TEMP_ID,
         "parameter comes from the pairing"
     );
-    assert!(row.try_get::<bool>("", "point").unwrap(), "stored as a point");
+    assert!(
+        row.try_get::<bool>("", "point").unwrap(),
+        "stored as a point"
+    );
     assert_eq!(row.try_get::<String>("", "category").unwrap(), "sync");
     assert_eq!(
         row.try_get::<Option<String>>("", "created_by").unwrap(),
         Some("sync:cnet".to_string())
     );
 
-    let again = register(&fx, &stream, key, "Corrected at source with curve 'DOC corr'").await;
+    let again = register(
+        &fx,
+        &stream,
+        key,
+        "Corrected at source with curve 'DOC corr'",
+    )
+    .await;
     assert_eq!(again["status"], "unchanged", "{again}");
     assert_eq!(again["id"].as_str().unwrap(), id, "same row on re-assert");
 
-    let edited = register(&fx, &stream, key, "Corrected at source with curve 'DOC corr' v2").await;
+    let edited = register(
+        &fx,
+        &stream,
+        key,
+        "Corrected at source with curve 'DOC corr' v2",
+    )
+    .await;
     assert_eq!(edited["status"], "updated", "{edited}");
-    assert_eq!(edited["id"].as_str().unwrap(), id, "an edit updates in place");
+    assert_eq!(
+        edited["id"].as_str().unwrap(),
+        id,
+        "an edit updates in place"
+    );
 
     let n = crate::common::e2e::count(
         &fx.db,
@@ -159,8 +189,14 @@ async fn summary_counts_annotated_points_and_csv_exports() {
     assert_eq!(status, 200, "ingest ({status}): {body}");
 
     for (key, time) in [
-        ("FP1:doc_std_curve_id:2025-06-10T08:00:00Z", "2025-06-10T08:00:00Z"),
-        ("FP1:doc_std_curve_id:2025-06-10T09:00:00Z", "2025-06-10T09:00:00Z"),
+        (
+            "FP1:doc_std_curve_id:2025-06-10T08:00:00Z",
+            "2025-06-10T08:00:00Z",
+        ),
+        (
+            "FP1:doc_std_curve_id:2025-06-10T09:00:00Z",
+            "2025-06-10T09:00:00Z",
+        ),
     ] {
         let (status, body) = crate::common::post_json_parse_with_token(
             &fx.app,
@@ -178,7 +214,10 @@ async fn summary_counts_annotated_points_and_csv_exports() {
     let range = "start=2025-06-10T00:00:00Z&end=2025-06-11T00:00:00Z";
     let (status, summary) = crate::common::get_json_with_token(
         &fx.app,
-        &format!("/api/sites/{}/export/summary?{range}", crate::common::SITE1_ID),
+        &format!(
+            "/api/sites/{}/export/summary?{range}",
+            crate::common::SITE1_ID
+        ),
         &fx.token,
     )
     .await;
@@ -212,5 +251,125 @@ async fn summary_counts_annotated_points_and_csv_exports() {
     assert!(
         lines[1].contains("sync") && lines[1].contains("cnet"),
         "category and source_system in the row: {csv}"
+    );
+}
+
+/// A registered standard curve to reference from an annotation. Returns its id.
+async fn register_curve(fx: &Fixture, source_key: &str, slope: f64) -> String {
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &fx.app,
+        "/api/standard_curves/register",
+        &json!({"source_system": "cnet", "source_key": source_key,
+                "instrument_label": "DOC corr", "slope": slope, "intercept": 1.0}),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "register curve ({status}): {body}");
+    body["id"].as_str().unwrap().to_string()
+}
+
+async fn register_with_curve(
+    fx: &Fixture,
+    stream_id: &str,
+    source_key: &str,
+    text: &str,
+    curve_id: &str,
+) -> serde_json::Value {
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &fx.app,
+        "/api/annotations/register",
+        &json!({"source_system": "cnet", "annotations": [
+            {"source_key": source_key, "stream_id": stream_id, "time": T1,
+             "category": "sync", "text": text, "standard_curve_id": curve_id}
+        ]}),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "register annotations ({status}): {body}");
+    body["annotations"][0].clone()
+}
+
+async fn stored_curve_and_text(fx: &Fixture, id: &str) -> (Option<String>, String) {
+    let row = fx
+        .db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT standard_curve_id::text AS curve, text FROM annotations WHERE id = '{id}'"
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("annotation stored");
+    (
+        row.try_get::<Option<String>>("", "curve").unwrap(),
+        row.try_get::<String>("", "text").unwrap(),
+    )
+}
+
+#[tokio::test]
+#[serial]
+async fn a_curve_annotation_is_frozen_once_it_names_its_curve() {
+    // Scenario: the source records which curve corrected a value, then the curve is edited
+    // upstream and the re-asserted annotation describes the successor.
+    // Expected behaviour: the stored annotation keeps the curve and text it was first given; only
+    // a curve-less annotation follows the source's text.
+    let fx = setup().await;
+    let stream = register_stream(&fx, "FP1:DOC:reps", true).await;
+    let key = "FP1:doc_std_curve_id:2025-06-10T08:00:00Z";
+    let curve = register_curve(&fx, "standard_curves:5", 2.0).await;
+
+    let first = register_with_curve(&fx, &stream, key, "curve 'A' (raw * 2 + 1)", &curve).await;
+    assert_eq!(first["status"], "created", "{first}");
+    let id = first["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        stored_curve_and_text(&fx, &id).await,
+        (Some(curve.clone()), "curve 'A' (raw * 2 + 1)".into())
+    );
+
+    let same = register_with_curve(&fx, &stream, key, "curve 'A' (raw * 2 + 1)", &curve).await;
+    assert_eq!(same["status"], "unchanged", "{same}");
+
+    let successor = register_curve(&fx, "standard_curves:5", 3.0).await;
+    assert_ne!(
+        successor, curve,
+        "the referenced curve is used, so the edit mints a successor"
+    );
+    let edited =
+        register_with_curve(&fx, &stream, key, "curve 'A' (raw * 3 + 1)", &successor).await;
+    assert_eq!(edited["status"], "frozen", "{edited}");
+    assert_eq!(edited["id"].as_str().unwrap(), id);
+    assert_eq!(
+        stored_curve_and_text(&fx, &id).await,
+        (Some(curve.clone()), "curve 'A' (raw * 2 + 1)".into()),
+        "the record of what corrected the value does not follow the edit"
+    );
+
+    let plain = register(&fx, &stream, key, "curve 'A' (raw * 3 + 1)").await;
+    assert_eq!(
+        plain["status"], "frozen",
+        "dropping the curve does not unfreeze: {plain}"
+    );
+    assert_eq!(
+        stored_curve_and_text(&fx, &id).await,
+        (Some(curve), "curve 'A' (raw * 2 + 1)".into())
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_curve_less_annotation_takes_its_curve_on_the_first_pass_that_names_it() {
+    let fx = setup().await;
+    let stream = register_stream(&fx, "FP1:DOC:reps", true).await;
+    let key = "FP1:doc_std_curve_id:2025-06-10T08:00:00Z";
+    let curve = register_curve(&fx, "standard_curves:5", 2.0).await;
+
+    let first = register(&fx, &stream, key, "curve 'A'").await;
+    let id = first["id"].as_str().unwrap().to_string();
+    let stamped = register_with_curve(&fx, &stream, key, "curve 'A' (raw * 2 + 1)", &curve).await;
+    assert_eq!(stamped["status"], "updated", "{stamped}");
+    assert_eq!(
+        stored_curve_and_text(&fx, &id).await,
+        (Some(curve), "curve 'A' (raw * 2 + 1)".into())
     );
 }

@@ -54,7 +54,7 @@ pub async fn attach_collection_events<C: ConnectionTrait>(
     binds: Vec<sea_orm::Value>,
     source: EventSource,
 ) -> AppResult<()> {
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "INSERT INTO collection_events (site_id, collected_at, source)
@@ -75,7 +75,7 @@ pub async fn attach_collection_events<C: ConnectionTrait>(
 
     // The stamping UPDATE can reach chunks the compression policy already closed.
     bulk_write::lift_decompression_cap(conn).await?;
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "UPDATE readings r SET collection_event_id = ce.id

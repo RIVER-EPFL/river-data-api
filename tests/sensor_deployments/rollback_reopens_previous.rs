@@ -15,7 +15,7 @@ async fn deployed_until(
     id: Uuid,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT deployed_until FROM sensor_deployments WHERE id = $1",
             [id.into()],
@@ -134,7 +134,7 @@ async fn rollback_reopens_previous_deployment() {
     }
 
     let open_count: i64 = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT count(*) AS c FROM sensor_deployments WHERE sensor_id = $1 AND deployed_until IS NULL",
             [sensor.id.into()],

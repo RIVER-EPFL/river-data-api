@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use river_db::common::AppEvent;
 use river_db::routes::private::reprocessing_jobs::job::{Job, JobRegistry};
-use river_db::routes::private::reprocessing_jobs::lifecycle::{self, JobContext};
+use river_db::routes::private::reprocessing_jobs::lifecycle::JobContext;
 use river_db::routes::private::reprocessing_jobs::worker;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
@@ -75,7 +75,7 @@ struct JobRow {
 
 async fn job_row(db: &DatabaseConnection, id: Uuid) -> JobRow {
     let r = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT status, readings_updated, retry_count, error_message, \
@@ -234,13 +234,12 @@ async fn failure_records_error_and_releases_lease() {
 
     assert!(worker::run_one(&db, &ev, &reg, &wid).await.unwrap());
     let row = job_row(&db, id).await;
-    // Default policy is no-retries → 'failed'; under a retry policy the same failure reschedules to
-    // 'pending'. Either way the error is recorded, the lease released, and the attempt counted, so
-    // assert the policy-independent invariants.
+    // `run_one` runs under the process-wide policy, which no test sets: no retries, so the failure
+    // is terminal. The retry arm is `retry_backoff.rs`.
     assert!(row.error_message.unwrap_or_default().contains("boom"));
     assert!(row.owner_is_null, "lease released on failure");
     assert_eq!(row.retry_count, 1);
-    assert!(matches!(row.status.as_str(), "failed" | "pending"));
+    assert_eq!(row.status, "failed");
 }
 
 #[tokio::test]
@@ -271,10 +270,9 @@ async fn handler_panic_fails_job_and_worker_survives() {
         "the panicking job is claimed and handled without unwinding the worker"
     );
     let row = job_row(&db, panic_id).await;
-    assert!(
-        matches!(row.status.as_str(), "failed" | "pending"),
-        "a panic terminalizes the job (got {}), not the worker",
-        row.status
+    assert_eq!(
+        row.status, "failed",
+        "a panic terminalizes the job, not the worker"
     );
     assert!(
         row.error_message
@@ -304,138 +302,4 @@ async fn handler_panic_fails_job_and_worker_survives() {
         "worker still processes work after a panic"
     );
     assert_eq!(job_row(&db, ok_id).await.status, "completed");
-}
-
-#[tokio::test]
-#[serial]
-async fn startup_reaps_own_leaseless_orphans_only() {
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    let own = lifecycle::process_owner();
-
-    // This replica's crashed in-process job: running, our owner, no lease → the reaper can't see it
-    // (it keys on an expired lease), so the startup sweep must reclaim it.
-    let orphan = Uuid::new_v4();
-    crate::common::exec(
-        &db,
-        &format!(
-            "INSERT INTO reprocessing_jobs (id, trigger_type, status, category, owner) \
-             VALUES ('{orphan}', 'x_orphan', 'running', 'operator', '{own}')"
-        ),
-    )
-    .await;
-
-    // A peer replica's leaseless orphan (different owner), left for that pod's own boot.
-    let peer = Uuid::new_v4();
-    crate::common::exec(
-        &db,
-        &format!(
-            "INSERT INTO reprocessing_jobs (id, trigger_type, status, category, owner) \
-             VALUES ('{peer}', 'x_peer', 'running', 'operator', 'other-pod')"
-        ),
-    )
-    .await;
-
-    // A live worker-pool job: running, worker owner, valid lease, must not be touched.
-    let leased = Uuid::new_v4();
-    crate::common::exec(
-        &db,
-        &format!(
-            "INSERT INTO reprocessing_jobs \
-                (id, trigger_type, status, category, owner, lease_expires_at) \
-             VALUES ('{leased}', 'x_leased', 'running', 'operator', 'worker-live', \
-                     now() + interval '5 minutes')"
-        ),
-    )
-    .await;
-
-    let reclaimed = lifecycle::reconcile_orphaned_inline_jobs(&db)
-        .await
-        .unwrap();
-    assert_eq!(
-        reclaimed, 1,
-        "only this replica's leaseless orphan is reaped"
-    );
-
-    let orphan_row = job_row(&db, orphan).await;
-    assert_eq!(orphan_row.status, "failed", "the own orphan is failed");
-    assert!(
-        orphan_row.owner_is_null,
-        "the reaped orphan's owner is cleared"
-    );
-    assert!(
-        orphan_row.completed,
-        "the reaped orphan gets a completed_at"
-    );
-    assert_eq!(
-        job_row(&db, peer).await.status,
-        "running",
-        "a peer's orphan is left for its own boot"
-    );
-    assert_eq!(
-        job_row(&db, leased).await.status,
-        "running",
-        "a live leased worker job is untouched"
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn worker_runs_registered_reprocess_job() {
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    crate::common::seed_test_data(&db).await;
-    let ev = events();
-    let registry = river_db::routes::private::reprocessing_jobs::job::build_registry();
-    let wid = worker::worker_id();
-
-    let sensor_id = Uuid::new_v4();
-    crate::common::exec(
-        &db,
-        &format!(
-            "INSERT INTO sensors (id, name, is_active) \
-             VALUES ('{sensor_id}', 'Worker-Probe', true)"
-        ),
-    )
-    .await;
-    crate::common::exec(
-        &db,
-        &format!(
-            "INSERT INTO sensor_calibrations (id, sensor_id, slope, intercept, valid_from, notes) \
-             VALUES ('{}', '{sensor_id}', 1.0, 0.0, '2000-01-01T00:00:00Z', 'bench base')",
-            Uuid::new_v4()
-        ),
-    )
-    .await;
-
-    let id = worker::enqueue(
-        &db,
-        "manual_reprocess",
-        Some(sensor_id),
-        None,
-        &serde_json::json!({ "sensor_id": sensor_id }),
-        None,
-    )
-    .await
-    .unwrap()
-    .unwrap();
-
-    worker::drain(&db, &ev, &registry, &wid).await.unwrap();
-
-    let row = job_row(&db, id).await;
-    assert_eq!(
-        row.status, "completed",
-        "the registered ReprocessSensor job runs end to end"
-    );
-    let detail: serde_json::Value = db
-        .query_one(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            format!("SELECT detail FROM reprocessing_jobs WHERE id = '{id}'"),
-        ))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get("", "detail")
-        .unwrap();
-    assert_eq!(detail["scope"]["sensor_id"], serde_json::json!(sensor_id));
 }

@@ -13,7 +13,7 @@ const DELETED_PARAMETER_ID: &str = "00000000-0000-4000-c000-0000000000fe";
 const REPLACEMENT_PARAMETER_ID: &str = "00000000-0000-4000-c000-0000000000fd";
 
 async fn insert_parameter(db: &DatabaseConnection, id: &str, code: &str) {
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "INSERT INTO parameters (id, code, name, default_units, category) \
@@ -29,7 +29,7 @@ async fn remove_script(db: &DatabaseConnection, name: &str) {
         "UPDATE tool_scripts SET active_version_id = NULL WHERE name = $1",
         "DELETE FROM tool_scripts WHERE name = $1",
     ] {
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             sql,
             [name.into()],
@@ -417,7 +417,7 @@ async fn a_dangling_parameter_id_is_flagged_and_reported_at_activation() {
     )
     .await;
 
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!("DELETE FROM parameters WHERE id = '{DELETED_PARAMETER_ID}'"),
     ))

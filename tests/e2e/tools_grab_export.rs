@@ -184,7 +184,11 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
     if !kc::require_keycloak_or_skip("doc_tool_replicates_saved_at_a_station").await {
         return;
     }
-    if !crate::common::tools_runner::require_runner_or_skip("doc_tool_replicates_saved_at_a_station").await {
+    if !crate::common::tools_runner::require_runner_or_skip(
+        "doc_tool_replicates_saved_at_a_station",
+    )
+    .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -311,7 +315,7 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
 
     let stored = {
         use sea_orm::{ConnectionTrait, Statement};
-        db.query_all(Statement::from_string(
+        db.query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT replicate_index, raw_value, calibrated_value, calibration_id, measurement_type \
@@ -357,7 +361,7 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
 
     let sample = {
         use sea_orm::{ConnectionTrait, Statement};
-        db.query_one(Statement::from_string(
+        db.query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT n, mean, stdev, min_value, max_value FROM samples \
@@ -668,8 +672,8 @@ async fn sensor_vs_grab_orders_grabs_and_reports_an_empty_post_grab_window() {
         "the lone reading lands: {afternoon}"
     );
     assert_eq!(
-        afternoon["samples_created"], 1,
-        "a note gives even a single reading a sample to hang on: {afternoon}"
+        afternoon["samples_created"], 0,
+        "one bottle is a measurement, not a group: {afternoon}"
     );
 
     let (status, morning) = crate::common::post_json_parse_with_token(

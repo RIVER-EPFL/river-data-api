@@ -36,7 +36,7 @@ pub struct TestSendResponse {
 
 #[utoipa::path(
     post,
-    path = "/notifications/test-send",
+    path = "/api/notifications/test-send",
     request_body = TestSendRequest,
     responses((status = 200, description = "Test attempted", body = TestSendResponse)),
     tag = "notifications"
@@ -57,8 +57,9 @@ pub async fn test_send(
                     "Web Push is not configured".to_string(),
                 ));
             }
-            let channel = super::web_push::WebPushChannel::new(&state.config)
-                .ok_or_else(|| AppError::Internal("failed to build web push channel".to_string()))?;
+            let channel = super::web_push::WebPushChannel::new(&state.config).ok_or_else(|| {
+                AppError::Internal("failed to build web push channel".to_string())
+            })?;
             let msg = super::OutgoingMessage {
                 kind: "test",
                 subject: "RIVER Data test notification".to_string(),
@@ -117,7 +118,7 @@ pub struct SubscriberRow {
 
 #[utoipa::path(
     get,
-    path = "/notifications/subscribers",
+    path = "/api/notifications/subscribers",
     responses((status = 200, description = "Subscriber roster", body = [SubscriberRow])),
     tag = "notifications"
 )]
@@ -126,7 +127,7 @@ pub async fn list_subscribers(
 ) -> AppResult<Json<Vec<SubscriberRow>>> {
     let rows = state
         .db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             PG,
             "WITH subs AS ( \
                 SELECT keycloak_sub FROM notification_subscribers \

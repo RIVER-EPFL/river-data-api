@@ -9,7 +9,7 @@ use serial_test::serial;
 use uuid::Uuid;
 
 async fn exec(db: &DatabaseConnection, sql: &str) {
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_string(),
     ))

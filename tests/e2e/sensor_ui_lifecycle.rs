@@ -95,7 +95,7 @@ struct SlotReading {
 /// `site_id` NULL-clear cannot hide rows from the assertions that check for it.
 async fn slot_readings(db: &DatabaseConnection, parameter_id: &str) -> Vec<SlotReading> {
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT time, raw_value, calibrated_value, site_id, sensor_id, calibration_id, \
                     deployment_id \
@@ -126,7 +126,7 @@ async fn deployment_window(
     deployment_id: &str,
 ) -> (DateTime<Utc>, Option<DateTime<Utc>>) {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT deployed_from, deployed_until FROM sensor_deployments WHERE id = $1",
             [uid(deployment_id).into()],
@@ -152,7 +152,7 @@ struct CurveRow {
 
 /// Run a statement that shapes stored state directly, for the rows no endpoint can produce.
 async fn exec(db: &DatabaseConnection, sql: &str) {
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_string(),
     ))
@@ -163,7 +163,7 @@ async fn exec(db: &DatabaseConnection, sql: &str) {
 /// The sensor's earliest calibration window.
 async fn earliest_curve(db: &DatabaseConnection, sensor_id: &str) -> CurveRow {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT id, slope, intercept, valid_from FROM sensor_calibrations \
              WHERE sensor_id = $1 ORDER BY valid_from LIMIT 1",
@@ -194,7 +194,7 @@ async fn settled_jobs(
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT \
                    COUNT(*) FILTER (WHERE status = 'completed') AS completed, \

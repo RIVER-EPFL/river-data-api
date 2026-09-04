@@ -44,7 +44,7 @@ async fn state_get(
     key: &str,
 ) -> Result<Option<(String, DateTime<Utc>)>, DbErr> {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             PG,
             "SELECT state, last_notified_at FROM notification_state \
              WHERE kind = $1 AND subject_key = $2",
@@ -66,7 +66,7 @@ async fn state_upsert(
     key: &str,
     state: &str,
 ) -> Result<(), DbErr> {
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         PG,
         "INSERT INTO notification_state (kind, subject_key, state, last_notified_at) \
          VALUES ($1, $2, $3, NOW()) \
@@ -79,7 +79,7 @@ async fn state_upsert(
 }
 
 async fn state_clear(db: &DatabaseConnection, kind: &str, key: &str) -> Result<(), DbErr> {
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         PG,
         "DELETE FROM notification_state WHERE kind = $1 AND subject_key = $2",
         [kind.into(), key.into()],
@@ -95,7 +95,7 @@ async fn state_clear(db: &DatabaseConnection, kind: &str, key: &str) -> Result<(
 /// Claim a fresh firing transition: insert the dedup row iff absent. Winner sends.
 async fn claim_insert(db: &DatabaseConnection, kind: &str, key: &str) -> Result<bool, DbErr> {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             PG,
             "INSERT INTO notification_state (kind, subject_key, state, last_notified_at) \
              VALUES ($1, $2, 'firing', NOW()) \
@@ -109,7 +109,7 @@ async fn claim_insert(db: &DatabaseConnection, kind: &str, key: &str) -> Result<
 /// Claim a resolve transition: delete the dedup row. Winner sends the recovery message.
 async fn claim_clear(db: &DatabaseConnection, kind: &str, key: &str) -> Result<bool, DbErr> {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             PG,
             "DELETE FROM notification_state WHERE kind = $1 AND subject_key = $2 RETURNING 1 AS one",
             [kind.into(), key.into()],
@@ -134,7 +134,7 @@ async fn claim_renotify(
          RETURNING 1 AS one"
     );
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             PG,
             &sql,
             [kind.into(), key.into()],
@@ -153,7 +153,7 @@ async fn claim_cas(
     expected: DateTime<Utc>,
 ) -> Result<bool, DbErr> {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             PG,
             "INSERT INTO notification_state (kind, subject_key, state, last_notified_at) \
              VALUES ($1, $2, 'firing', NOW()) \
@@ -179,7 +179,7 @@ async fn stale_data(
 
     // Subject keys gained a cadence suffix; the pre-suffix rows are unreachable, so drop them
     // rather than leave a firing state nothing can ever resolve.
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         PG,
         "DELETE FROM notification_state \
          WHERE kind = 'stale_data' AND subject_key NOT LIKE '%:%:%'"
@@ -190,7 +190,7 @@ async fn stale_data(
     // The dispatcher wakes on every alarm-state broadcast, so each lookup is a backward walk of
     // idx_readings_site_param_time stopping at the first match, never an aggregate over the slot.
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             PG,
             "SELECT sp.site_id, sp.parameter_id, s.project_id, s.name AS site_name, \
                     p.name AS param_name, \
@@ -306,7 +306,7 @@ async fn battery_forecast(
     let db = &state.db;
     let config = state.config.as_ref();
     let Some(battery_param) = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             PG,
             "SELECT id FROM parameters \
              WHERE category = 'device_health' AND (code ILIKE '%batt%' OR name ILIKE '%batt%') \
@@ -321,7 +321,7 @@ async fn battery_forecast(
     };
 
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             PG,
             "SELECT s.id AS site_id, s.project_id, s.name AS site_name, \
                 (SELECT COALESCE(r2.calibrated_value, r2.raw_value) FROM readings r2 \
@@ -397,7 +397,7 @@ async fn sync_staleness(
     let db = &state.db;
     let stale_after = state.config.sync_health_warning_secs;
     let services = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             PG,
             "SELECT instance_id, service_type, last_heartbeat FROM sync_services              WHERE paused IS NOT TRUE"
                 .to_string(),
@@ -444,7 +444,7 @@ async fn sync_failures(
 ) -> Result<(), DbErr> {
     let db = &state.db;
     let services = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             PG,
             "SELECT id, instance_id, service_type FROM sync_services".to_string(),
         ))
@@ -463,7 +463,7 @@ async fn sync_failures(
             .await?
             .map_or_else(|| Utc::now() - Duration::hours(24), |(_, t)| t);
         let count_row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 PG,
                 "SELECT COUNT(*) FILTER (WHERE status = 'failed') AS n_failed, \
                         COUNT(*) FILTER (WHERE status = 'partial') AS n_partial, \

@@ -193,7 +193,7 @@ pub async fn project_of_sensor(db: &DatabaseConnection, sensor_id: Uuid) -> AppR
 /// Run a resolver query returning `(untargeted, project_id)` rows and classify the result.
 async fn resolve(db: &DatabaseConnection, sql: &str, id: Uuid) -> AppResult<RowProject> {
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             sql,
             [id.into()],

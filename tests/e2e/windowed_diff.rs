@@ -1,4 +1,4 @@
-//! S8, windowed reconciliation (PLAN.md story catalog).
+//! S8, windowed reconciliation (story catalog: ../archived-documentation/PLAN.md).
 //!
 //! Scenario: a sync service re-reads its mutable source in full and asserts a completeness
 //! window. The store converges — a removed replicate is withdrawn (a stamp, never a delete), a
@@ -109,7 +109,7 @@ async fn windowed_ingest_digest(
 }
 
 async fn stored_digest(db: &DatabaseConnection, stream_id: &str) -> Option<String> {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!("SELECT last_window_digest FROM data_streams WHERE id = '{stream_id}'"),
     ))
@@ -122,7 +122,7 @@ async fn stored_digest(db: &DatabaseConnection, stream_id: &str) -> Option<Strin
 
 async fn sample_stats(db: &DatabaseConnection) -> (f64, i32) {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT mean, n FROM samples WHERE site_id = '{}' AND parameter_id = '{}' \
@@ -135,13 +135,15 @@ async fn sample_stats(db: &DatabaseConnection) -> (f64, i32) {
         .unwrap()
         .expect("the sample exists");
     (
-        row.try_get::<Option<f64>>("", "mean").unwrap().unwrap_or(f64::NAN),
+        row.try_get::<Option<f64>>("", "mean")
+            .unwrap()
+            .unwrap_or(f64::NAN),
         row.try_get::<i32>("", "n").unwrap(),
     )
 }
 
 async fn withdrawn_index(db: &DatabaseConnection, stream_id: &str, index: i16) -> bool {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "SELECT withdrawn_at IS NOT NULL AS w FROM readings \
@@ -165,7 +167,10 @@ async fn a_windowed_resend_converges_on_the_source() {
         windowed_ingest(&fx, replicates(T1, &[(0, 10.0), (1, 20.0), (2, 36.0)]), 1).await;
     assert_eq!(status, 200, "{resp}");
     assert_eq!(resp["inserted"], 3, "{resp}");
-    assert_eq!(resp["accepted_window"]["source_rows_read"], 1, "the claim is echoed: {resp}");
+    assert_eq!(
+        resp["accepted_window"]["source_rows_read"], 1,
+        "the claim is echoed: {resp}"
+    );
     assert_eq!(sample_stats(&fx.db).await, (22.0, 3));
 
     // Steady state: the same content re-sent is a recorded no-op.
@@ -182,7 +187,11 @@ async fn a_windowed_resend_converges_on_the_source() {
     assert_eq!(status, 200, "{resp}");
     assert_eq!(resp["withdrawn"], 1, "{resp}");
     assert!(withdrawn_index(&fx.db, &fx.stream_id, 1).await);
-    assert_eq!(sample_stats(&fx.db).await, (23.0, 2), "served statistics exclude the retraction");
+    assert_eq!(
+        sample_stats(&fx.db).await,
+        (23.0, 2),
+        "served statistics exclude the retraction"
+    );
 
     // The source corrected replicate 0: applied in place, flags and sample links untouched.
     let (status, resp) = windowed_ingest(&fx, replicates(T1, &[(0, 12.0), (2, 36.0)]), 1).await;
@@ -194,7 +203,10 @@ async fn a_windowed_resend_converges_on_the_source() {
     let (status, resp) =
         windowed_ingest(&fx, replicates(T1, &[(0, 12.0), (1, 20.0), (2, 36.0)]), 1).await;
     assert_eq!(status, 200, "{resp}");
-    assert!(!withdrawn_index(&fx.db, &fx.stream_id, 1).await, "reinstated");
+    assert!(
+        !withdrawn_index(&fx.db, &fx.stream_id, 1).await,
+        "reinstated"
+    );
     assert_eq!(sample_stats(&fx.db).await, ((12.0 + 20.0 + 36.0) / 3.0, 3));
 
     // Every pass left a receipt whose arithmetic the database CHECKed on commit.
@@ -232,11 +244,14 @@ async fn a_flagged_reading_is_held_not_withdrawn() {
     let (status, resp) = windowed_ingest(&fx, replicates(T1, &[(1, 20.0), (2, 36.0)]), 1).await;
     assert_eq!(status, 200, "{resp}");
     assert_eq!(resp["withdrawn"], 0, "{resp}");
-    assert!(!withdrawn_index(&fx.db, &fx.stream_id, 0).await, "never stamped");
+    assert!(
+        !withdrawn_index(&fx.db, &fx.stream_id, 0).await,
+        "never stamped"
+    );
 
     let hold = fx
         .db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT kind, status FROM replicate_audit_holds \
@@ -247,7 +262,10 @@ async fn a_flagged_reading_is_held_not_withdrawn() {
         .await
         .unwrap()
         .expect("the disagreement is a review item");
-    assert_eq!(hold.try_get::<String>("", "kind").unwrap(), "source_modified");
+    assert_eq!(
+        hold.try_get::<String>("", "kind").unwrap(),
+        "source_modified"
+    );
     assert_eq!(hold.try_get::<String>("", "status").unwrap(), "pending");
 }
 
@@ -255,14 +273,16 @@ async fn a_flagged_reading_is_held_not_withdrawn() {
 #[serial]
 async fn dishonest_windows_are_refused_and_windows_are_sync_only() {
     let fx = setup().await;
-    let (status, resp) =
-        windowed_ingest(&fx, replicates(T1, &[(0, 10.0), (1, 20.0)]), 1).await;
+    let (status, resp) = windowed_ingest(&fx, replicates(T1, &[(0, 10.0), (1, 20.0)]), 1).await;
     assert_eq!(status, 200, "{resp}");
 
     // An empty payload claiming source rows over stored content: refused, applies nothing.
     let (status, resp) = windowed_ingest(&fx, vec![], 5).await;
     assert_eq!(status, 400, "{resp}");
-    assert!(resp.to_string().contains("never read as a deletion"), "{resp}");
+    assert!(
+        resp.to_string().contains("never read as a deletion"),
+        "{resp}"
+    );
     assert!(!withdrawn_index(&fx.db, &fx.stream_id, 0).await);
 
     // A claim of zero source rows over stored content: equally refused.
@@ -361,7 +381,7 @@ async fn a_bulk_reshape_is_braked_and_new_rows_still_apply() {
 
     let hold = fx
         .db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT kind FROM replicate_audit_holds WHERE stream_id = '{}' \
@@ -388,7 +408,7 @@ async fn a_bulk_reshape_is_braked_and_new_rows_still_apply() {
     // legitimate; the next identical pass applies in full and consumes the ruling.
     let hold_id = fx
         .db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT id::text AS id FROM replicate_audit_holds \
@@ -421,7 +441,10 @@ async fn a_bulk_reshape_is_braked_and_new_rows_still_apply() {
     )
     .await;
     assert_eq!(status, 200, "{resp}");
-    assert_eq!(resp["withdrawn"], 8, "the acknowledged reshape applies: {resp}");
+    assert_eq!(
+        resp["withdrawn"], 8,
+        "the acknowledged reshape applies: {resp}"
+    );
     let intact = crate::common::e2e::count(
         &fx.db,
         &format!(
@@ -436,11 +459,9 @@ async fn a_bulk_reshape_is_braked_and_new_rows_still_apply() {
     // The ruling is consumed: the hold is terminal and a fresh reshape would brake anew.
     let remediated = fx
         .db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
-            format!(
-                "SELECT status FROM replicate_audit_holds WHERE id = '{hold_id}'"
-            ),
+            format!("SELECT status FROM replicate_audit_holds WHERE id = '{hold_id}'"),
         ))
         .await
         .unwrap()
@@ -452,6 +473,79 @@ async fn a_bulk_reshape_is_braked_and_new_rows_still_apply() {
 
 #[tokio::test]
 #[serial]
+async fn a_dropped_replicate_index_is_braked_by_the_index_arm() {
+    // Scenario: a source silently stops emitting one member column. Only a minority of the
+    // window's total rows withdraw, so the row-fraction brake arm never sees it; the
+    // index-fraction arm does, because that one index is wiped entirely.
+    //
+    // Fixture: 40 instants carry index 0, five of them also carry index 1 (45 stored rows). The
+    // re-assert keeps every index-0 value unchanged and drops index 1.
+    //   over_floor:          would_touch = 5 withdrawals >= RECONCILE_BRAKE_MIN_ROWS (5)     -> true
+    //   over_fraction:       5 / 45 = 0.111 <= RECONCILE_BRAKE_FRACTION (0.15)               -> false
+    //   over_index_fraction: index 1 withdrawn 5/5 = 1.0 > RECONCILE_BRAKE_INDEX_FRACTION (0.5) -> true
+    // The row-fraction arm cannot fire on this fixture, so a brake here is the index arm alone.
+    let fx = setup().await;
+
+    let mut readings = Vec::new();
+    for m in 0..40 {
+        readings.push(json!({
+            "time": format!("2025-06-01T08:{m:02}:00Z"),
+            "raw_value": 10.0 + f64::from(m),
+            "replicate_index": 0,
+        }));
+    }
+    for m in 0..5 {
+        readings.push(json!({
+            "time": format!("2025-06-01T08:{m:02}:00Z"),
+            "raw_value": 20.0 + f64::from(m),
+            "replicate_index": 1,
+        }));
+    }
+    let (status, resp) = windowed_ingest(&fx, readings, 45).await;
+    assert_eq!(status, 200, "{resp}");
+    assert_eq!(resp["inserted"], 45, "{resp}");
+
+    let mut reassert = Vec::new();
+    for m in 0..40 {
+        reassert.push(json!({
+            "time": format!("2025-06-01T08:{m:02}:00Z"),
+            "raw_value": 10.0 + f64::from(m),
+            "replicate_index": 0,
+        }));
+    }
+    let (status, resp) = windowed_ingest(&fx, reassert, 40).await;
+    assert_eq!(status, 200, "{resp}");
+    assert_eq!(resp["withdrawn"], 0, "braked pass applies only new rows: {resp}");
+
+    let intact = crate::common::e2e::count(
+        &fx.db,
+        &format!(
+            "SELECT COUNT(*)::bigint FROM readings \
+             WHERE stream_id = '{}' AND withdrawn_at IS NULL",
+            fx.stream_id
+        ),
+    )
+    .await;
+    assert_eq!(intact, 45, "the wiped index is held, not withdrawn");
+    assert!(
+        !withdrawn_index(&fx.db, &fx.stream_id, 1).await,
+        "index 1 is held for review, not stamped withdrawn"
+    );
+
+    let holds = crate::common::e2e::count(
+        &fx.db,
+        &format!(
+            "SELECT COUNT(*)::bigint FROM replicate_audit_holds \
+             WHERE stream_id = '{}' AND kind = 'brake_fired'",
+            fx.stream_id
+        ),
+    )
+    .await;
+    assert_eq!(holds, 1, "the dropped index raises exactly one brake review item");
+}
+
+#[tokio::test]
+#[serial]
 async fn the_digest_handshake_stores_only_clean_claims() {
     let fx = setup().await;
 
@@ -459,7 +553,10 @@ async fn the_digest_handshake_stores_only_clean_claims() {
     let (status, resp) =
         windowed_ingest_digest(&fx, replicates(T1, &[(0, 10.0), (1, 20.0)]), 1, "d1").await;
     assert_eq!(status, 200, "{resp}");
-    assert_eq!(stored_digest(&fx.db, &fx.stream_id).await, Some("d1".to_string()));
+    assert_eq!(
+        stored_digest(&fx.db, &fx.stream_id).await,
+        Some("d1".to_string())
+    );
 
     let row_xmin = |db: &DatabaseConnection, stream_id: &str| {
         let q = format!(
@@ -468,7 +565,7 @@ async fn the_digest_handshake_stores_only_clean_claims() {
         );
         let db = db.clone();
         async move {
-            db.query_one(Statement::from_string(DatabaseBackend::Postgres, q))
+            db.query_one_raw(Statement::from_string(DatabaseBackend::Postgres, q))
                 .await
                 .unwrap()
                 .expect("the reading exists")
@@ -484,7 +581,11 @@ async fn the_digest_handshake_stores_only_clean_claims() {
         windowed_ingest_digest(&fx, replicates(T1, &[(0, 10.0), (1, 20.0)]), 1, "d1").await;
     assert_eq!(status, 200, "{resp}");
     assert_eq!(resp["unchanged"], 2, "{resp}");
-    assert_eq!(row_xmin(&fx.db, &fx.stream_id).await, before, "no row version churn");
+    assert_eq!(
+        row_xmin(&fx.db, &fx.stream_id).await,
+        before,
+        "no row version churn"
+    );
     let receipts = crate::common::e2e::count(
         &fx.db,
         &format!(
@@ -512,5 +613,158 @@ async fn the_digest_handshake_stores_only_clean_claims() {
         stored_digest(&fx.db, &fx.stream_id).await,
         Some("d1".to_string()),
         "the held pass did not update the claim"
+    );
+}
+
+async fn hold_status_at(db: &DatabaseConnection, stream_id: &str, time: &str) -> Option<String> {
+    db.query_one_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            "SELECT status FROM replicate_audit_holds WHERE stream_id = '{stream_id}' \
+             AND kind = 'replicate_stats' AND group_time = '{time}' ORDER BY created_at DESC LIMIT 1"
+        ),
+    ))
+    .await
+    .unwrap()
+    .map(|r| r.try_get::<String>("", "status").unwrap())
+}
+
+#[tokio::test]
+#[serial]
+async fn a_braked_pass_leaves_its_holds_where_they_were() {
+    // Scenario: an instant holds a pending statistics hold. A later pass corrects that instant's
+    // replicates to values that agree with the portal's claim, but the pass reshapes the window
+    // enough to trip the brake, so the corrections are not applied.
+    // Expected behaviour: the stored replicates still disagree with the portal, so the hold that
+    // records it stays pending; the audit judges what was stored, not what was offered.
+    let fx = setup().await;
+    let t0 = "2025-06-01T00:00:00Z";
+    let mut readings = replicates(t0, &[(0, 10.0), (1, 12.0)]);
+    for h in 1..10 {
+        readings.push(json!({
+            "time": format!("2025-06-01T{h:02}:00:00Z"),
+            "raw_value": 10.0 + f64::from(h),
+            "replicate_index": 0,
+        }));
+    }
+    let (status, resp) = crate::common::post_json_parse_with_token(
+        &fx.app,
+        "/api/ingest",
+        &json!({
+            "stream_id": fx.stream_id, "collection": true, "window": window(10),
+            "readings": readings,
+            "audit": [{ "time": t0, "expected_mean": 50.0, "expected_sd": 0.0, "expected_n": 2 }],
+        }),
+        &fx.sync_token,
+    )
+    .await;
+    assert_eq!(status, 200, "{resp}");
+    assert_eq!(
+        hold_status_at(&fx.db, &fx.stream_id, t0).await.as_deref(),
+        Some("pending"),
+        "the portal's claim disagrees with what was stored"
+    );
+
+    // Corrected to agree with the claim, inside a pass that withdraws eight of ten instants.
+    let mut braked = replicates(t0, &[(0, 50.0), (1, 50.0)]);
+    braked.push(json!({ "time": "2025-06-01T01:00:00Z", "raw_value": 11.0, "replicate_index": 0 }));
+    let (status, resp) = crate::common::post_json_parse_with_token(
+        &fx.app,
+        "/api/ingest",
+        &json!({
+            "stream_id": fx.stream_id, "collection": true, "window": window(3),
+            "readings": braked,
+            "audit": [{ "time": t0, "expected_mean": 50.0, "expected_sd": 0.0, "expected_n": 2 }],
+        }),
+        &fx.sync_token,
+    )
+    .await;
+    assert_eq!(status, 200, "{resp}");
+    assert_eq!(resp["withdrawn"], 0, "the brake held: {resp}");
+    let stored: Vec<f64> = fx
+        .db
+        .query_all_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT raw_value FROM readings WHERE stream_id = '{}' AND time = '{t0}' \
+                 ORDER BY replicate_index",
+                fx.stream_id
+            ),
+        ))
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.try_get::<f64>("", "raw_value").unwrap())
+        .collect();
+    assert_eq!(stored, vec![10.0, 12.0], "the correction was not applied");
+    assert_eq!(
+        hold_status_at(&fx.db, &fx.stream_id, t0).await.as_deref(),
+        Some("pending"),
+        "the hold records a disagreement that is still stored, so it stays"
+    );
+}
+
+/// Scenario: a reconciled pass whose only effect is to retract an instant, on a site that has an
+/// active derived parameter.
+///
+/// Expected behaviour: the recompute the pass enqueues covers the retracted instant. A withdrawn
+/// key is absent from the payload by construction, so a timestamp list built from the payload
+/// alone leaves the derived output standing on an input the source has taken back, and the next
+/// honest window reports the same absence, so nothing re-enqueues it.
+#[tokio::test]
+#[serial]
+async fn a_withdrawal_enqueues_the_recompute_at_the_retracted_instant() {
+    use crate::common::exec;
+
+    let fx = setup().await;
+    exec(
+        &fx.db,
+        "INSERT INTO parameters (id, code, name, default_units, category) \
+         VALUES ('00000000-0000-4000-b000-0000000009d0', 'WDiffDerived', 'WDiff derived', 'x', \
+                 'measurement')",
+    )
+    .await;
+    exec(
+        &fx.db,
+        &format!(
+            "INSERT INTO site_parameters \
+                 (id, site_id, parameter_id, name, sensor_type, is_active, is_derived) \
+             VALUES ('00000000-0000-4000-a000-0000000009d1', '{site}', \
+                     '00000000-0000-4000-b000-0000000009d0', 'WDiffDerived', 'WDiffDerived', \
+                     true, true)",
+            site = crate::common::SITE1_ID,
+        ),
+    )
+    .await;
+
+    const T2: &str = "2025-06-01T09:00:00Z";
+    let mut both = replicates(T1, &[(0, 3.0)]);
+    both.extend(replicates(T2, &[(0, 4.0)]));
+    let (status, body) = windowed_ingest(&fx, both, 2).await;
+    assert!((200..300).contains(&status), "first pass: {body}");
+
+    exec(&fx.db, "DELETE FROM reprocessing_jobs").await;
+
+    // The same window without T2: nothing new, nothing changed, one whole instant withdrawn and
+    // so absent from the payload the enqueue reads its timestamps from.
+    let (status, body) = windowed_ingest(&fx, replicates(T1, &[(0, 3.0)]), 1).await;
+    assert!((200..300).contains(&status), "withdrawing pass: {body}");
+
+    let payload = fx
+        .db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT params::text AS p FROM reprocessing_jobs \
+             WHERE trigger_type = 'ingest_derived' ORDER BY created_at DESC LIMIT 1"
+                .to_string(),
+        ))
+        .await
+        .expect("query")
+        .map(|row| row.try_get::<String>("", "p").expect("payload"))
+        .expect("a withdrawal is an effect, so a recompute is enqueued");
+
+    assert!(
+        payload.contains("2025-06-01T09:00:00"),
+        "the retracted instant is in the recompute's timestamps: {payload}"
     );
 }

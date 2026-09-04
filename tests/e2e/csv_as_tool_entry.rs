@@ -1,4 +1,4 @@
-//! S4, CSV import as data entry (PLAN.md story catalog).
+//! S4, CSV import as data entry (story catalog: ../archived-documentation/PLAN.md).
 //!
 //! Scenario: a member imports a result sheet. Already-processed values are stored as served: no
 //! calibration is stamped onto them and nothing recomputes them, because a stored calibration id
@@ -11,6 +11,7 @@
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
+use uuid::Uuid;
 
 async fn setup() -> (DatabaseConnection, axum::Router, String) {
     let db = crate::common::setup_test_db().await;
@@ -29,7 +30,7 @@ async fn poll_readings(db: &DatabaseConnection, time: &str, want: i64) -> i64 {
     );
     for _ in 0..100 {
         let row = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
                 sql.clone(),
             ))
@@ -71,9 +72,12 @@ async fn deploy_calibrated_probe(db: &DatabaseConnection) {
     .await;
 }
 
-async fn imported_row(db: &DatabaseConnection, time: &str) -> (f64, Option<f64>, Option<uuid::Uuid>) {
+async fn imported_row(
+    db: &DatabaseConnection,
+    time: &str,
+) -> (f64, Option<f64>, Option<uuid::Uuid>) {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT raw_value, calibrated_value, calibration_id FROM readings \
@@ -143,7 +147,10 @@ async fn a_processed_import_is_not_recalibrated_and_a_raw_one_is() {
     let (raw, calibrated, calibration_id) = imported_row(&db, "2025-06-02T00:00:00Z").await;
     assert_eq!(raw, 250.0);
     assert_eq!(calibrated, Some(501.0), "2 * 250 + 1");
-    assert!(calibration_id.is_some(), "the applied calibration is recorded");
+    assert!(
+        calibration_id.is_some(),
+        "the applied calibration is recorded"
+    );
 }
 
 /// Expected behaviour: a request field the server does not know is refused by name, never
@@ -234,7 +241,7 @@ async fn an_import_of_raw_inputs_runs_the_tool_and_carries_its_provenance() {
 
     // One run per row, minted by the import path.
     let runs = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT COUNT(*)::bigint AS n FROM tool_runs \
              WHERE tool_name = 'doc' AND source = 'csv_import'"
@@ -248,38 +255,44 @@ async fn an_import_of_raw_inputs_runs_the_tool_and_carries_its_provenance() {
     assert_eq!(runs, 2);
 
     // Each row's replicates went through the grab write path as readings of the DOC parameter:
-    // a sample with the server-built blob, source csv_import, on the auto-provisioned slot,
-    // every replicate attached to a collection event, the mean derived by the database.
+    // each carrying the server-built blob, source csv_import, on the auto-provisioned slot, every
+    // replicate attached to a collection event, the mean derived by the database.
     for (time, expected) in [
         ("2025-06-01T10:00:00Z", (120.0 + 125.0 + 118.0) / 3.0),
         ("2025-06-02T10:00:00Z", 130.0),
     ] {
         let row = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
                 format!(
-                    "SELECT s.provenance ->> 'source' AS source, s.provenance ->> 'tool' AS tool, \
-                            s.mean, \
-                            (SELECT COUNT(*)::bigint FROM readings r \
-                              WHERE r.sample_id = s.id AND r.collection_event_id IS NOT NULL) AS attached \
-                     FROM samples s \
-                     WHERE s.site_id = '{}' AND s.parameter_id = '{doc_param}' \
-                       AND s.collected_at = '{time}'",
+                    "SELECT r.provenance ->> 'source' AS source, r.provenance ->> 'tool' AS tool, \
+                            COALESCE(s.mean, COALESCE(r.calibrated_value, r.raw_value)) AS mean, \
+                            (SELECT COUNT(*)::bigint FROM readings r2 \
+                              WHERE r2.site_id = r.site_id AND r2.parameter_id = r.parameter_id \
+                                AND r2.time = r.time AND r2.collection_event_id IS NOT NULL) \
+                              AS attached \
+                     FROM readings r LEFT JOIN samples s ON s.id = r.sample_id \
+                     WHERE r.site_id = '{}' AND r.parameter_id = '{doc_param}' \
+                       AND r.time = '{time}' \
+                     ORDER BY r.replicate_index LIMIT 1",
                     crate::common::SITE1_ID
                 ),
             ))
             .await
             .unwrap()
-            .unwrap_or_else(|| panic!("sample at {time} exists"));
+            .unwrap_or_else(|| panic!("the saved reading at {time} exists"));
         assert_eq!(row.try_get::<String>("", "source").unwrap(), "csv_import");
         assert_eq!(row.try_get::<String>("", "tool").unwrap(), "doc");
         let mean = row.try_get::<Option<f64>>("", "mean").unwrap().unwrap();
-        assert!((mean - expected).abs() < 1e-9, "served {mean}, portal math {expected}");
+        assert!(
+            (mean - expected).abs() < 1e-9,
+            "served {mean}, portal math {expected}"
+        );
         assert_eq!(row.try_get::<i64>("", "attached").unwrap(), 3);
     }
 
     let provisioned = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT needs_review FROM site_parameters \
@@ -291,4 +304,118 @@ async fn an_import_of_raw_inputs_runs_the_tool_and_carries_its_provenance() {
         .unwrap()
         .expect("the import provisioned the slot");
     assert!(provisioned.try_get::<bool>("", "needs_review").unwrap());
+}
+
+#[tokio::test]
+#[serial]
+async fn an_import_naming_a_curve_saves_the_replicates_it_corrected_with_it() {
+    if !crate::common::tools_runner::require_runner_or_skip(
+        "an_import_naming_a_curve_saves_the_replicates_it_corrected_with_it",
+    )
+    .await
+    {
+        return;
+    }
+    let (db, app, token) = setup().await;
+    crate::common::exec(
+        &db,
+        "INSERT INTO parameters (id, code, name, category) \
+         VALUES ('00000000-0000-4000-b000-0000000000d0', 'DOC', 'DOC', 'measurement')",
+    )
+    .await;
+    let doc_param = "00000000-0000-4000-b000-0000000000d0";
+    let analyser =
+        crate::common::sensor_lifecycle::create_sensor_without_curve(&db, "TOC analyser").await;
+    let mut curves = Vec::new();
+    for (name, slope, intercept) in [("Plate A", 2.0, 1.0), ("Plate B", 3.0, -1.0)] {
+        let (status, body) = crate::common::post_json_parse_with_token(
+            &app,
+            "/api/standard_curves",
+            &serde_json::json!({
+                "sensor_id": analyser, "name": name, "slope": slope, "intercept": intercept,
+            }),
+            &token,
+        )
+        .await;
+        assert!(
+            (200..300).contains(&status),
+            "curve {name} ({status}): {body}"
+        );
+        curves.push(body["id"].as_str().unwrap().parse::<Uuid>().unwrap());
+    }
+    let (plate_a, plate_b) = (curves[0], curves[1]);
+
+    // Row 1 takes the request's curve, row 2 names its own in the slot's column.
+    let csv = format!(
+        "DateTime,DOC_rep_1,DOC_rep_2,std_curve\n\
+         2025-06-01 10:00:00,120,125,\n\
+         2025-06-02 10:00:00,130,131,{plate_b}\n"
+    );
+    let (status, resp) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/import_csv",
+        &serde_json::json!({
+            "site": crate::common::SITE1_ID,
+            "csv": csv,
+            "tool": "doc",
+            "curves": { "std_curve": plate_a },
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "import ({status}): {resp}");
+    assert_eq!(resp["tool_runs_created"], 2, "{resp}");
+    assert_eq!(resp["error_count"], 0, "{resp}");
+
+    // Each replicate is stored raw, attributed to the curve's instrument, carrying the curve the
+    // run applied, and served corrected by it; the run recorded the curve it consumed.
+    for (time, curve, raw, expected) in [
+        ("2025-06-01T10:00:00Z", plate_a, 120.0, 2.0 * 120.0 + 1.0),
+        ("2025-06-02T10:00:00Z", plate_b, 130.0, 3.0 * 130.0 - 1.0),
+    ] {
+        let row = db
+            .query_one_raw(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT r.raw_value, r.calibrated_value, r.standard_curve_id, r.sensor_id, \
+                            s.mean, \
+                            (SELECT jsonb_array_length(t.curves) FROM tool_runs t \
+                              WHERE t.id = (r.provenance ->> 'run_id')::uuid) AS run_curves \
+                     FROM readings r LEFT JOIN samples s ON s.id = r.sample_id \
+                     WHERE r.site_id = '{}' AND r.parameter_id = '{doc_param}' \
+                       AND r.time = '{time}' AND r.replicate_index = 0",
+                    crate::common::SITE1_ID
+                ),
+            ))
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("the saved replicate at {time} exists"));
+        assert_eq!(row.try_get::<f64>("", "raw_value").unwrap(), raw);
+        assert_eq!(
+            row.try_get::<Option<Uuid>>("", "standard_curve_id")
+                .unwrap(),
+            Some(curve)
+        );
+        assert_eq!(
+            row.try_get::<Option<Uuid>>("", "sensor_id").unwrap(),
+            Some(analyser)
+        );
+        let corrected = row
+            .try_get::<Option<f64>>("", "calibrated_value")
+            .unwrap()
+            .unwrap();
+        assert!(
+            (corrected - expected).abs() < 1e-9,
+            "stored {corrected}, curve {expected}"
+        );
+        let mean = row.try_get::<Option<f64>>("", "mean").unwrap().unwrap();
+        assert!(
+            mean > expected,
+            "the served mean {mean} is over corrected replicates"
+        );
+        assert_eq!(
+            row.try_get::<Option<i32>>("", "run_curves").unwrap(),
+            Some(1)
+        );
+    }
 }

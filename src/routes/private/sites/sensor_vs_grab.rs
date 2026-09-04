@@ -97,7 +97,7 @@ struct ComparisonRow {
 /// the paired values plus their difference. Supports JSON (default) and CSV.
 #[utoipa::path(
     get,
-    path = "/{site_id}/export/sensor-vs-grab",
+    path = "/api/sites/{site_id}/export/sensor-vs-grab",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
         SensorVsGrabQuery
@@ -145,7 +145,7 @@ pub async fn get_sensor_vs_grab(
     let end_condition = match effective_end {
         Some(end) => {
             values.push(end.into());
-            " AND s.collected_at <= $6"
+            " AND g.collected_at <= $6"
         }
         None => "",
     };
@@ -155,38 +155,51 @@ pub async fn get_sensor_vs_grab(
     let sql = format!(
         r#"
         SELECT
-            s.collected_at AS grab_time,
-            s.mean         AS grab_value,
-            s.stdev        AS grab_sd,
-            s.n            AS grab_n,
+            g.collected_at AS grab_time,
+            g.mean         AS grab_value,
+            g.stdev        AS grab_sd,
+            g.n            AS grab_n,
             agg.sensor_avg,
             agg.sensor_sd,
             agg.sensor_n
-        FROM samples s
+        FROM (
+            -- A grab instant is its sample's statistics, or the lone measurement itself: a single
+            -- reading forms no sample, and n = 1 is derived from it here.
+            SELECT r.site_id, r.parameter_id, r.time AS collected_at,
+                   COALESCE(MAX(smp.mean), AVG(COALESCE(r.calibrated_value, r.raw_value)))
+                       AS mean,
+                   MAX(smp.stdev) AS stdev,
+                   COALESCE(MAX(smp.n), COUNT(*)::int) AS n
+            FROM readings r
+            LEFT JOIN samples smp ON smp.id = r.sample_id
+            WHERE r.site_id = $1 AND r.parameter_id = $2
+              AND r.measurement_type = 'spot'
+              AND r.is_flagged IS NOT TRUE AND r.withdrawn_at IS NULL
+            GROUP BY r.site_id, r.parameter_id, r.time
+        ) g
         LEFT JOIN LATERAL (
             SELECT
                 avg(COALESCE(r.calibrated_value, r.raw_value))         AS sensor_avg,
                 stddev_samp(COALESCE(r.calibrated_value, r.raw_value)) AS sensor_sd,
                 count(*)                                               AS sensor_n
             FROM readings r
-            WHERE r.site_id = s.site_id
-              AND r.parameter_id = s.parameter_id
+            WHERE r.site_id = g.site_id
+              AND r.parameter_id = g.parameter_id
               AND r.measurement_type IS DISTINCT FROM 'spot'
               AND r.measurement_type IS DISTINCT FROM 'derived'
               AND r.is_flagged IS NOT TRUE
               AND r.replicate_index = 0
-              AND r.time >= s.collected_at + ($4 * interval '1 hour')
-              AND r.time <= s.collected_at + ($5 * interval '1 hour')
+              AND r.time >= g.collected_at + ($4 * interval '1 hour')
+              AND r.time <= g.collected_at + ($5 * interval '1 hour')
         ) agg ON true
-        WHERE s.site_id = $1 AND s.parameter_id = $2 AND s.n > 0
-          AND s.collected_at >= $3{end_condition}
-        ORDER BY s.collected_at
+        WHERE g.collected_at >= $3{end_condition}
+        ORDER BY g.collected_at
         "#,
     );
 
     let query_result = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             values,

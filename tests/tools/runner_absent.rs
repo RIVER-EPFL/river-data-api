@@ -20,7 +20,7 @@ async fn install_probe_tool(db: &DatabaseConnection) {
         "UPDATE tool_scripts SET active_version_id = NULL WHERE name = $1",
         "DELETE FROM tool_scripts WHERE name = $1",
     ] {
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             sql,
             [PROBE.into()],
@@ -60,7 +60,9 @@ async fn install_probe_tool(db: &DatabaseConnection) {
             [PROBE.into()],
         ),
     ] {
-        db.execute(statement).await.expect("probe tool installed");
+        db.execute_raw(statement)
+            .await
+            .expect("probe tool installed");
     }
 }
 

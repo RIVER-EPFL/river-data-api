@@ -62,6 +62,16 @@ pub fn version_content_hash(
     format!("sha256:{:x}", hasher.finalize())
 }
 
+/// The sha256 of a value's canonical serialisation, for any record that has to be compared by
+/// content rather than by the bytes it happened to arrive in.
+pub fn canonical_hash(value: &serde_json::Value) -> String {
+    let mut canonical = String::new();
+    canonical_json(value, &mut canonical);
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
 /// A version's content after Postgres has had its say about the JSON halves: the bytes to store
 /// and the hash of exactly those bytes.
 pub struct StoredVersionContent {
@@ -95,7 +105,7 @@ pub async fn stored_version_content<C: ConnectionTrait>(
     test_cases: &serde_json::Value,
 ) -> Result<StoredVersionContent, DbErr> {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm_migration::sea_orm::DatabaseBackend::Postgres,
             "SELECT $1::jsonb::text AS manifest, $2::jsonb::text AS test_cases",
             [

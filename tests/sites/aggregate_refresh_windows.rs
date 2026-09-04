@@ -56,7 +56,7 @@ async fn buckets(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Vec<(DateTime<Utc>, i64, f64)> {
-    db.query_all(Statement::from_sql_and_values(
+    db.query_all_raw(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         format!(
             "SELECT bucket, count::bigint AS n, avg_value::float8 AS avg FROM {view} \

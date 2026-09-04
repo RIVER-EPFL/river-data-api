@@ -27,7 +27,7 @@ async fn setup() -> (DatabaseConnection, axum::Router, String) {
 
 async fn stored(db: &DatabaseConnection) -> (f64, Option<f64>) {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT raw_value, calibrated_value FROM readings \
@@ -329,7 +329,7 @@ async fn the_janitor_job_runs_the_sweep_and_the_sample_stats_follow() {
         let db = db.clone();
         async move {
             let row = db
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     sea_orm::DatabaseBackend::Postgres,
                     format!(
                         "SELECT mean, stdev, n FROM samples \
@@ -375,7 +375,7 @@ async fn the_janitor_job_runs_the_sweep_and_the_sample_stats_follow() {
     worker::drain(&db, &ev, &registry, &wid).await.unwrap();
 
     let status_row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!("SELECT status FROM reprocessing_jobs WHERE id = '{id}'"),
         ))
@@ -389,7 +389,7 @@ async fn the_janitor_job_runs_the_sweep_and_the_sample_stats_follow() {
     );
 
     let recomposed = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT calibrated_value FROM readings \

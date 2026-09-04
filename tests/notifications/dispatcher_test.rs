@@ -70,7 +70,7 @@ async fn insert_open_event(db: &DatabaseConnection) {
 }
 
 async fn count(db: &DatabaseConnection, where_clause: &str) -> i64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!("SELECT COUNT(*) AS c FROM alarm_events WHERE {where_clause}"),
     ))
@@ -82,7 +82,7 @@ async fn count(db: &DatabaseConnection, where_clause: &str) -> i64 {
 }
 
 async fn log_count(db: &DatabaseConnection, status: &str) -> i64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!("SELECT COUNT(*) AS c FROM notification_log WHERE status = '{status}'"),
     ))
@@ -265,5 +265,46 @@ async fn concurrent_dispatchers_send_each_event_once() {
         count(&db, "notified_at IS NULL AND resolved_at IS NULL").await,
         0,
         "the event is stamped exactly once"
+    );
+}
+
+/// Scenario: a deployment with no notification channel configured at all, which is what prod runs
+/// as today.
+///
+/// Expected behaviour: the alarm is still stamped, because notifications are complementary and must
+/// never hold up the API, but the attempt is recorded as undeliverable. Without that row the log
+/// reads exactly like a clean delivery and nothing anywhere says the alarm reached nobody.
+#[tokio::test]
+#[serial]
+async fn an_alarm_with_no_channel_configured_is_stamped_undeliverable() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO alarm_events \
+                (site_id, parameter_id, severity, max_severity, started_at, value_at_start, \
+                 last_seen_at, last_value) \
+             VALUES ('{site}', '{param}', 2, 2, NOW(), 600, NOW(), 600)",
+            site = crate::common::SITE1_ID,
+            param = crate::common::GLOBAL_PARAM_TURB_ID,
+        ),
+    )
+    .await;
+
+    dispatcher::dispatch_once(&state, &[]).await;
+
+    assert_eq!(
+        count(&db, "notified_at IS NULL").await,
+        0,
+        "the outbox row is stamped: a missing channel never blocks the dispatcher"
+    );
+    assert_eq!(
+        log_count(&db, "undeliverable").await,
+        1,
+        "and the attempt that reached nobody is on the record"
     );
 }

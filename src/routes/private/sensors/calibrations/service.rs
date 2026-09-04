@@ -13,14 +13,6 @@ fn app_error_as_db_err(e: crate::error::AppError) -> sea_orm::DbErr {
     }
 }
 
-// The generic tracked-job lifecycle now lives in `reprocessing_jobs::lifecycle` (the jobs home).
-// Re-exported here so existing `calibrations::service::{spawn_tracked_job, ...}` call sites
-// and tests keep compiling against the same path.
-pub use crate::routes::private::reprocessing_jobs::lifecycle::{
-    JobContext, RetryPolicy, set_job_retry_policy, spawn_tracked_job, spawn_tracked_job_ctx,
-    spawn_tracked_job_with_retry,
-};
-
 #[must_use]
 pub fn apply_calibration(raw: f64, slope: f64, intercept: f64) -> f64 {
     slope * raw + intercept
@@ -113,6 +105,32 @@ pub fn window_resolved_rows(alias: &str) -> String {
     format!("{alias}.measurement_type IS DISTINCT FROM 'spot'")
 }
 
+/// A row whose calibration a window may author: window-resolved and not pinned to a calibration
+/// (ADR 0008, M59).
+pub fn calibration_derivable(alias: &str) -> String {
+    format!(
+        "{} AND {}",
+        window_resolved_rows(alias),
+        crate::routes::private::readings::decisions::not_pinned_sql(
+            alias,
+            crate::routes::private::readings::decisions::Kind::CalibrationPin
+        )
+    )
+}
+
+/// A row whose instrument and deployment a window may author: window-resolved and not pinned to
+/// an instrument.
+pub fn attribution_derivable(alias: &str) -> String {
+    format!(
+        "{} AND {}",
+        window_resolved_rows(alias),
+        crate::routes::private::readings::decisions::not_pinned_sql(
+            alias,
+            crate::routes::private::readings::decisions::Kind::InstrumentPin
+        )
+    )
+}
+
 /// A reading holding a correction no curve accounts for: it names neither curve, yet carries a
 /// `calibrated_value` that is a different number from its raw value.
 ///
@@ -194,7 +212,7 @@ pub async fn recompose_from_own_curves<C: ConnectionTrait>(
         orphaned = orphaned_correction_rows("r"),
     );
     let result = db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             params,
@@ -262,7 +280,7 @@ pub async fn sweep_curve_drift(db: &DatabaseConnection) -> Result<CurveDrift, se
     txn.execute_unprepared("SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0")
         .await?;
     let row = txn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             sql,
         ))
@@ -315,7 +333,7 @@ async fn fetch_derived_work_items(
     site_id: Uuid,
 ) -> Result<Vec<DerivedWork>, sea_orm::DbErr> {
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT sp.id, sp.derived_definition_id, d.formula, sp.site_id, sp.parameter_id
               FROM site_parameters sp
@@ -400,7 +418,7 @@ async fn get_or_create_derived_stream(
     item: &DerivedWork,
 ) -> Result<Uuid, sea_orm::DbErr> {
     let existing = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT id FROM data_streams WHERE site_parameter_id = $1 LIMIT 1",
             [item.site_param_id.into()],
@@ -411,7 +429,7 @@ async fn get_or_create_derived_stream(
     }
 
     let def_row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT name FROM derived_parameter_definitions WHERE id = $1",
             [item.derived_definition_id.into()],
@@ -427,7 +445,7 @@ async fn get_or_create_derived_stream(
 
     let source_key = format!("{}_{}", def_name, item.derived_site_id);
     let stream_id = Uuid::new_v4();
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"INSERT INTO data_streams
             (id, source_system, source_key, source_name, site_parameter_id, is_active, discovered_at, paired_at, measurement_type)
@@ -445,7 +463,7 @@ async fn get_or_create_derived_stream(
     .await?;
 
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT id FROM data_streams WHERE site_parameter_id = $1 LIMIT 1",
             [item.site_param_id.into()],
@@ -464,7 +482,7 @@ async fn source_parameter_ids_for_definition(
     derived_definition_id: Uuid,
 ) -> Result<Vec<Uuid>, sea_orm::DbErr> {
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT parameter_id FROM derived_parameter_sources
               WHERE derived_definition_id = $1",
@@ -501,7 +519,7 @@ async fn resolve_variables_for_derived(
     time: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<HashMap<String, f64>>, sea_orm::DbErr> {
     let mapping_rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT variable_name, parameter_id
               FROM derived_parameter_sources
@@ -521,14 +539,18 @@ async fn resolve_variables_for_derived(
 
         // Deterministic input pick when a sensor point and a grab share the timestamp:
         // prefer the continuous reading, then tie-break by stream_id (stable across VACUUM).
+        // A withdrawn or flagged row is not a measurement, and a sample whose members are all
+        // gone carries n = 0 with a NULL mean, so neither may reach the formula.
         let value_row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                r"SELECT COALESCE(smp.mean, r.calibrated_value, r.raw_value) as val,
+                r"SELECT COALESCE(CASE WHEN smp.n > 0 THEN smp.mean END,
+                                  r.calibrated_value, r.raw_value) as val,
                          r.measurement_type
                   FROM readings r
                   LEFT JOIN samples smp ON smp.id = r.sample_id
                   WHERE r.site_id = $1 AND r.parameter_id = $2 AND r.time = $3
+                    AND r.withdrawn_at IS NULL AND r.is_flagged IS NOT TRUE
                   ORDER BY (r.measurement_type IS NOT DISTINCT FROM 'spot') ASC,
                            r.replicate_index ASC, r.stream_id
                   LIMIT 1",
@@ -587,7 +609,7 @@ async fn evaluate_and_upsert_derived(
     // the value outright. Writing both columns also made the upsert lopsided: the previous
     // ON CONFLICT maintained only `calibrated_value`, so a recomputed row's `raw_value` stayed
     // frozen at whatever the very first evaluation produced.
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, replicate_index, measurement_type)
           VALUES ($1, $2, $3, $4, $5, NULL, 0, 'derived')
@@ -609,7 +631,7 @@ pub async fn recompute_valid_until<C: ConnectionTrait>(
     db: &C,
     sensor_id: Uuid,
 ) -> Result<(), sea_orm::DbErr> {
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         // Windows chain within a (sensor, parameter): a multi-parameter instrument holds one
         // calibration timeline per parameter, so LEAD must partition by parameter_id (never let one
@@ -657,7 +679,7 @@ pub async fn recompute_deployed_until<C: ConnectionTrait>(
     db: &C,
     sensor_id: Uuid,
 ) -> Result<(), sea_orm::DbErr> {
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"WITH ordered AS (
             SELECT id,
@@ -738,7 +760,7 @@ pub async fn reprocess_sensor_readings(
             WHERE tgt.stream_id = picked.p_stream_id
               AND tgt.time = picked.p_time
               AND tgt.replicate_index = picked.p_replicate_index",
-        windowed = window_resolved_rows("r"),
+        windowed = calibration_derivable("r"),
         orphaned = orphaned_correction_rows("r"),
         value = recomposed_value_sql(
             "tgt.raw_value",
@@ -758,7 +780,7 @@ pub async fn reprocess_sensor_readings(
 
     let readings_updated = crate::common::bulk_write::guarded(db, async |txn| {
         let cal_result = txn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 &cal_sql,
                 [sensor_id.into()],
@@ -769,7 +791,7 @@ pub async fn reprocess_sensor_readings(
         readings_updated +=
             recompose_spot_readings(txn, "r.sensor_id = $1", vec![sensor_id.into()]).await? as usize;
 
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 r"UPDATE readings r
@@ -786,7 +808,7 @@ pub async fn reprocess_sensor_readings(
               AND r.time >= dw.deployed_from
               AND r.time < dw.deployed_until
               AND (dw.parameter_id IS NULL OR r.parameter_id IS NULL OR dw.parameter_id = r.parameter_id)",
-                windowed = window_resolved_rows("r")
+                windowed = attribution_derivable("r")
             ),
             [sensor_id.into()],
         ))
@@ -798,7 +820,7 @@ pub async fn reprocess_sensor_readings(
         // deployment` so readings that predate any deployment keep the site_id the stream pairing
         // gave them (auto-created deployments start at pairing time, not data start; without this
         // guard a reprocess would un-attribute all historical data).
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 r"UPDATE readings r
@@ -817,7 +839,7 @@ pub async fn reprocess_sensor_readings(
                       AND r.time >= d.deployed_from
                       AND r.time < COALESCE(d.deployed_until, 'infinity'::timestamptz)
                 )",
-                windowed = window_resolved_rows("r")
+                windowed = attribution_derivable("r")
             ),
             [sensor_id.into()],
         ))
@@ -829,7 +851,7 @@ pub async fn reprocess_sensor_readings(
     .map_err(app_error_as_db_err)?;
 
     let affected = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT DISTINCT site_id, time FROM readings
               WHERE sensor_id = $1 AND site_id IS NOT NULL",
@@ -852,7 +874,7 @@ pub async fn reprocess_sensor_readings(
     }
 
     let time_range = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT MIN(time) AS min_time, MAX(time) AS max_time
               FROM readings WHERE sensor_id = $1",
@@ -921,7 +943,7 @@ pub async fn reprocess_site_parameter_readings(
           WHERE tgt.stream_id = picked.p_stream_id
             AND tgt.time = picked.p_time
             AND tgt.replicate_index = picked.p_replicate_index",
-        windowed = window_resolved_rows("r"),
+        windowed = calibration_derivable("r"),
         orphaned = orphaned_correction_rows("r"),
         value = recomposed_value_sql(
             "tgt.raw_value",
@@ -942,7 +964,7 @@ pub async fn reprocess_site_parameter_readings(
     let updated = crate::common::bulk_write::guarded(db, async |txn| {
         // 1. Re-own + re-stamp deployment/site from the (site, parameter) deployment timeline.
         let dep_result = txn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 format!(
                     r"UPDATE readings r
@@ -960,7 +982,7 @@ pub async fn reprocess_site_parameter_readings(
                     AND (r.site_id = $1 OR r.sensor_id = dw.sensor_id)
                     AND r.time >= dw.deployed_from
                     AND r.time < dw.deployed_until",
-                    windowed = window_resolved_rows("r")
+                    windowed = attribution_derivable("r")
                 ),
                 [site_id.into(), parameter_id.into()],
             ))
@@ -968,7 +990,7 @@ pub async fn reprocess_site_parameter_readings(
         let updated = dep_result.rows_affected() as usize;
 
         // 2. Re-derive calibrated_value/calibration_id for the (now correct) owner.
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &cal_sql,
             [site_id.into(), parameter_id.into()],
@@ -986,7 +1008,7 @@ pub async fn reprocess_site_parameter_readings(
 
         // 4. Recall NULL-clear: a reading in a deployment gap drops out of the site (guarded to
         //    time >= the slot's first deployment so pre-deployment history is kept).
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 r"UPDATE readings r
@@ -1001,7 +1023,7 @@ pub async fn reprocess_site_parameter_readings(
                       AND r.time >= d.deployed_from
                       AND r.time < COALESCE(d.deployed_until, 'infinity'::timestamptz)
                 )",
-                windowed = window_resolved_rows("r")
+                windowed = attribution_derivable("r")
             ),
             [site_id.into(), parameter_id.into()],
         ))
@@ -1014,7 +1036,7 @@ pub async fn reprocess_site_parameter_readings(
 
     // 4. Cascade derived + refresh aggregates over the affected range (same tail as per-sensor).
     let affected = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT DISTINCT site_id, time FROM readings
               WHERE site_id = $1 AND parameter_id = $2",
@@ -1031,7 +1053,7 @@ pub async fn reprocess_site_parameter_readings(
         }
     }
     let range = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT MIN(time) AS min_time FROM readings WHERE site_id = $1 AND parameter_id = $2",
             [site_id.into(), parameter_id.into()],

@@ -27,8 +27,17 @@ pub struct ChannelHealth {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NotificationHealth {
     pub channels: Vec<ChannelHealth>,
+    /// No channel resolves from config, so every notification is stamped undeliverable. The API
+    /// runs regardless (notifications never block ingestion), which is exactly why this has to be
+    /// visible rather than inferred from an empty list.
+    pub no_channel_configured: bool,
+    /// Deliveries in the last 24 hours that reached nobody: `undeliverable` (no channel at all) and
+    /// `failed` (a channel refused the send).
+    pub undeliverable_24h: i64,
+    pub failed_24h: i64,
 }
 
 /// Probe every configured channel and upsert its health row. A no-op when nothing is configured.
@@ -39,7 +48,7 @@ pub async fn probe_once(db: &DatabaseConnection, config: &Config) {
             Err(e) => (false, e),
         };
         let res = db
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 PG,
                 "INSERT INTO notification_channel_health (channel, healthy, detail, checked_at) \
                  VALUES ($1, $2, $3, NOW()) \
@@ -55,13 +64,11 @@ pub async fn probe_once(db: &DatabaseConnection, config: &Config) {
 }
 
 async fn read_health(db: &DatabaseConnection, config: &Config) -> NotificationHealth {
-    let known = [
-        ("web_push", config.web_push_configured()),
-    ];
+    let known = [("web_push", config.web_push_configured())];
     let mut channels = Vec::with_capacity(known.len());
     for (name, available) in known {
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 PG,
                 "SELECT healthy, detail, checked_at FROM notification_channel_health \
                  WHERE channel = $1",
@@ -86,7 +93,38 @@ async fn read_health(db: &DatabaseConnection, config: &Config) -> NotificationHe
             checked_at,
         });
     }
-    NotificationHealth { channels }
+    let (undeliverable_24h, failed_24h) = recent_failures(db).await;
+    NotificationHealth {
+        no_channel_configured: channels.iter().all(|c| !c.available),
+        channels,
+        undeliverable_24h,
+        failed_24h,
+    }
+}
+
+/// How many deliveries reached nobody in the last day, by kind of failure.
+async fn recent_failures(db: &DatabaseConnection) -> (i64, i64) {
+    let row = db
+        .query_one_raw(Statement::from_string(
+            PG,
+            "SELECT \
+                 COUNT(*) FILTER (WHERE status = 'undeliverable')::bigint AS undeliverable, \
+                 COUNT(*) FILTER (WHERE status = 'failed')::bigint AS failed \
+             FROM notification_log WHERE created_at > NOW() - INTERVAL '24 hours'"
+                .to_string(),
+        ))
+        .await;
+    match row {
+        Ok(Some(r)) => (
+            r.try_get::<i64>("", "undeliverable").unwrap_or(0),
+            r.try_get::<i64>("", "failed").unwrap_or(0),
+        ),
+        Ok(None) => (0, 0),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to count recent notification failures");
+            (0, 0)
+        }
+    }
 }
 
 /// `GET /api/notifications/health`, latest persisted health per channel (admin-only).

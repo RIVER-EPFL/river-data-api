@@ -11,7 +11,7 @@ use serial_test::serial;
 
 async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             sql.to_string(),
         ))
@@ -126,7 +126,10 @@ async fn ingest_status_event_dedup_first_write_wins() {
     )
     .await;
     assert_eq!(status, 200, "first status ingest ({status}): {body}");
-    assert_eq!(body["inserted"], 1, "repeats collapse to the first value: {body}");
+    assert_eq!(
+        body["inserted"], 1,
+        "repeats collapse to the first value: {body}"
+    );
 
     // A value change past the stored tip lands; a re-sent stored timestamp keeps its first
     // value; a repeat of the latest value is dropped again.
@@ -312,7 +315,7 @@ async fn ingest_overwrite_updates_values_and_is_sync_only() {
     .await;
     assert_eq!(status, 200, "first ingest ({status}): {body}");
 
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "UPDATE readings SET is_flagged = TRUE, flag_reason = 'manual' WHERE stream_id = '{stream}'"
@@ -418,7 +421,7 @@ async fn ingest_overwrite_keeps_a_hand_picked_curve_and_recomposes_through_it() 
     assert_eq!(status, 200, "the correction is accepted ({status}): {body}");
 
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT raw_value, calibrated_value, standard_curve_id FROM readings \

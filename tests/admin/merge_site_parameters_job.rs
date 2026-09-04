@@ -14,7 +14,7 @@ pub async fn wait_terminal(db: &sea_orm::DatabaseConnection, job_id: &str) -> St
     let start = Instant::now();
     loop {
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT status FROM reprocessing_jobs WHERE id = $1",
                 [id.into()],
@@ -38,7 +38,7 @@ pub async fn wait_terminal(db: &sea_orm::DatabaseConnection, job_id: &str) -> St
 }
 
 async fn site_parameter_exists(db: &sea_orm::DatabaseConnection, id: &str) -> bool {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!("SELECT 1 AS v FROM site_parameters WHERE id = '{id}'"),
     ))

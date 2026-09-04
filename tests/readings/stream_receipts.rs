@@ -118,7 +118,7 @@ async fn stream_stats_count_withdrawn_rows() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "UPDATE readings SET withdrawn_at = NOW() \

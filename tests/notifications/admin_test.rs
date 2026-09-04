@@ -85,9 +85,7 @@ async fn subscriber_roster_lists_opted_in_users() {
         "the opted-in user appears in the roster"
     );
     assert!(
-        roster
-            .iter()
-            .all(|r| r["keycloakSub"].is_string()),
+        roster.iter().all(|r| r["keycloakSub"].is_string()),
         "each row carries keycloakSub"
     );
 

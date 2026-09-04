@@ -95,7 +95,7 @@ pub async fn slot_declaration<C: ConnectionTrait>(
     parameter_id: Uuid,
 ) -> AppResult<Option<&'static str>> {
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT sd_estimator FROM site_parameters
              WHERE site_id = $1 AND parameter_id = $2 AND sd_estimator IS NOT NULL
@@ -107,6 +107,37 @@ pub async fn slot_declaration<C: ConnectionTrait>(
     let stored: Option<String> = row.try_get("", "sd_estimator")?;
     // A value outside the two is not reachable through the CHECK constraint; treat it as
     // undeclared rather than failing a read.
+    Ok(stored.as_deref().and_then(|v| match v {
+        SAMPLE => Some(SAMPLE),
+        POPULATION => Some(POPULATION),
+        _ => None,
+    }))
+}
+
+/// The estimator a stored collection group already carries because a person chose it there: an
+/// audit resolution scoped to the instant (`sd_estimator_source = 'sample'`). It belongs to the
+/// group, not the slot, so it is read by instant and outranks every slot-level declaration.
+pub async fn instant_declaration<C: ConnectionTrait>(
+    conn: &C,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    collected_at: chrono::DateTime<chrono::Utc>,
+) -> AppResult<Option<&'static str>> {
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT sd_estimator FROM samples
+             WHERE site_id = $1 AND parameter_id = $2 AND collected_at = $3
+               AND sd_estimator_source = 'sample'",
+            [
+                site_id.into(),
+                parameter_id.into(),
+                sea_orm::prelude::DateTimeWithTimeZone::from(collected_at).into(),
+            ],
+        ))
+        .await?;
+    let Some(row) = row else { return Ok(None) };
+    let stored: Option<String> = row.try_get("", "sd_estimator")?;
     Ok(stored.as_deref().and_then(|v| match v {
         SAMPLE => Some(SAMPLE),
         POPULATION => Some(POPULATION),

@@ -10,7 +10,7 @@ use serial_test::serial;
 use uuid::Uuid;
 
 async fn turb_stream(db: &sea_orm::DatabaseConnection) -> Uuid {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "SELECT stream_id FROM readings WHERE site_id='{}' AND parameter_id='{}' LIMIT 1",
@@ -26,7 +26,7 @@ async fn turb_stream(db: &sea_orm::DatabaseConnection) -> Uuid {
 }
 
 async fn inject(db: &sea_orm::DatabaseConnection, stream_id: Uuid, time: &str, value: f64) {
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, replicate_index) \
@@ -40,7 +40,7 @@ async fn inject(db: &sea_orm::DatabaseConnection, stream_id: Uuid, time: &str, v
 }
 
 async fn open_turb_event_count(db: &sea_orm::DatabaseConnection) -> i64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "SELECT COUNT(*) AS c FROM alarm_events \
@@ -67,7 +67,7 @@ async fn reset_to_defaults_re_enables_alarms() {
     let stream = turb_stream(&db).await;
 
     // A wide site-specific override that lets everything pass.
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "INSERT INTO alarm_thresholds (id, parameter_id, site_id, warning_max, alarm_max) \
@@ -88,7 +88,7 @@ async fn reset_to_defaults_re_enables_alarms() {
     );
 
     // Reset to defaults = delete the site-specific row → falls back to the global threshold.
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "DELETE FROM alarm_thresholds WHERE parameter_id='{}' AND site_id='{}'",
@@ -123,7 +123,7 @@ async fn disable_alarms_null_row_suppresses_and_resolves() {
     assert_eq!(open_turb_event_count(&db).await, 1);
 
     // Disable alarms: an all-NULL site row at priority 1.
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "INSERT INTO alarm_thresholds (id, parameter_id, site_id, warning_min, warning_max, alarm_min, alarm_max) \
@@ -158,7 +158,7 @@ async fn rebreach_opens_fresh_event() {
     let stream = turb_stream(&db).await;
 
     let event_ids = || async {
-        db.query_all(Statement::from_string(
+        db.query_all_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT id FROM alarm_events WHERE site_id='{}' AND parameter_id='{}' ORDER BY started_at",

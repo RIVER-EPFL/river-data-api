@@ -14,7 +14,7 @@ use crate::routes::resolve_project;
 /// List sites belonging to a project
 #[utoipa::path(
     get,
-    path = "/{project_id}/sites",
+    path = "/api/projects/{project_id}/sites",
     params(
         ("project_id" = String, Path, description = "Project UUID or name"),
     ),

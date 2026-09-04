@@ -27,7 +27,7 @@ async fn test_infra_seed_and_healthz() {
 
     // First, verify DB works directly
     let row = db
-        .query_one(sea_orm::Statement::from_string(
+        .query_one_raw(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT name FROM projects WHERE id = '{}'",

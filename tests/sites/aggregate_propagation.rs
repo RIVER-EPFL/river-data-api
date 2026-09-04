@@ -194,7 +194,7 @@ async fn stream_holding(
     parameter_id: &str,
     at: &str,
 ) -> Uuid {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "SELECT stream_id FROM readings \
@@ -240,7 +240,7 @@ async fn live_hourly(
     at: &str,
 ) -> (Option<f64>, i64) {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT AVG(COALESCE(calibrated_value, raw_value)) AS mean, COUNT(*)::bigint AS n \
@@ -262,7 +262,7 @@ async fn live_hourly(
 
 async fn count_rows(db: &DatabaseConnection, predicate: &str) -> i64 {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!("SELECT COUNT(*)::bigint AS c FROM readings WHERE {predicate}"),
         ))
@@ -281,7 +281,7 @@ async fn flag_state(
     day: &str,
 ) -> Vec<(f64, bool)> {
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT raw_value, COALESCE(is_flagged, false) AS flagged FROM readings \
@@ -309,7 +309,7 @@ async fn jobs_settled(db: &DatabaseConnection, timeout_secs: u64) -> bool {
     let start = std::time::Instant::now();
     loop {
         let row = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT COUNT(*)::bigint AS active FROM reprocessing_jobs \
                  WHERE status IN ('queued', 'pending', 'running', 'retrying')"
@@ -1186,10 +1186,6 @@ async fn continuous_aggregates_apply_their_filter_algebra_exactly() {
             calibrated_reading(&site1, &flow, "2025-11-05T09:10:00Z", 999.0, 20.0),
             reading(&site1, &flow, "2025-11-05T09:30:00Z", 1000.0),
             json!({
-                "site_id": site1, "parameter_id": flow, "time": "2025-11-05T09:40:00Z",
-                "raw_value": 2000.0, "calibrated_value": null, "replicate_index": 1,
-            }),
-            json!({
                 "site_id": site1, "parameter_id": flow, "time": "2025-11-05T09:50:00Z",
                 "raw_value": 3000.0, "calibrated_value": null, "measurement_type": "spot",
             }),
@@ -1274,9 +1270,9 @@ async fn continuous_aggregates_apply_their_filter_algebra_exactly() {
             count: 2,
             flagged: 1
         },
-        "only the two eligible readings roll up: the flagged 1000, the replicate-1 2000, the spot \
-         3000 and the site-less 4000 are all excluded, and COALESCE took the calibrated 20 over the \
-         raw 999. The flagged row still shows in the live flagged tally: {hourly}"
+        "only the two eligible readings roll up: the flagged 1000, the spot 3000 and the site-less \
+         4000 are all excluded, and COALESCE took the calibrated 20 over the raw 999. The flagged \
+         row still shows in the live flagged tally: {hourly}"
     );
     assert_eq!(
         bucket(
@@ -1339,14 +1335,19 @@ async fn continuous_aggregates_apply_their_filter_algebra_exactly() {
 
     assert_eq!(
         count_rows(&db, "TRUE").await,
-        9,
+        8,
         "the rollup filters readings, it does not delete them"
     );
     assert_eq!(
-        count_rows(&db, "raw_value IN (1000, 2000, 3000, 4000)").await,
-        4,
+        count_rows(&db, "raw_value IN (1000, 3000, 4000)").await,
+        3,
         "each excluded reading is still stored with its original value"
     );
+
+    // The aggregates' `replicate_index = 0` predicate has no probe here any more: no write path
+    // admits a non-zero index on a non-spot reading and a table CHECK refuses one, so the predicate
+    // now covers only rows that predate both.
+
 }
 
 // ============================================================================

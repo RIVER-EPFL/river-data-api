@@ -113,7 +113,7 @@ async fn save_replicates(
 
 async fn fetch_aggregate(db: &DatabaseConnection, time: &str) -> SampleAggregate {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT mean, stdev, n, min_value, max_value FROM samples \
@@ -135,7 +135,7 @@ async fn fetch_aggregate(db: &DatabaseConnection, time: &str) -> SampleAggregate
 
 /// Stored replicates as (replicate_index, raw_value), in index order.
 async fn fetch_replicates(db: &DatabaseConnection, time: &str) -> Vec<(i16, f64)> {
-    db.query_all(Statement::from_string(
+    db.query_all_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "SELECT replicate_index, raw_value FROM readings \
@@ -216,7 +216,7 @@ async fn stored_sample_statistics_equal_the_tools_own_summaries() {
     // Only the replicates are stored: no row and no sample carries an aggregate output.
     assert_eq!(fetch_replicates(&db, GRAB_TIME).await.len(), 3);
     let aggregate_rows = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT COUNT(*) AS n FROM readings \
@@ -235,7 +235,7 @@ async fn stored_sample_statistics_equal_the_tools_own_summaries() {
     );
 
     let samples = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!("SELECT COUNT(*) AS n FROM samples WHERE site_id = '{SITE1_ID}'"),
         ))

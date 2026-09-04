@@ -50,7 +50,7 @@ struct StoredReading {
 
 async fn reading_at(db: &DatabaseConnection, time: &str) -> StoredReading {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT raw_value, calibrated_value, calibration_id, standard_curve_id, \
@@ -247,7 +247,7 @@ async fn a_curve_from_another_instrument_or_from_nowhere_is_refused() {
 
     let count = fx
         .db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!("SELECT COUNT(*) AS c FROM readings WHERE time = '{GRAB_TIME}'"),
         ))

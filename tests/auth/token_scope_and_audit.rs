@@ -32,7 +32,7 @@ async fn token_id(db: &DatabaseConnection, raw: &str) -> uuid::Uuid {
         .map(|(p, _)| p)
         .expect("api token must be rvd_<prefix>_<secret>");
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "SELECT id FROM api_tokens WHERE token_prefix = $1",
             [prefix.into()],
@@ -341,7 +341,7 @@ async fn api_token_use_is_recorded_in_audit_log() {
     let mut count: i64 = 0;
     for _ in 0..40 {
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "SELECT COUNT(*) AS c FROM api_token_audit_log WHERE token_id = $1",
                 [tid.into()],
@@ -362,7 +362,7 @@ async fn api_token_use_is_recorded_in_audit_log() {
     );
 
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "SELECT method, path, status_code FROM api_token_audit_log \
              WHERE token_id = $1 ORDER BY created_at DESC LIMIT 1",

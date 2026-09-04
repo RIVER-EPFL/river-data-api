@@ -101,6 +101,12 @@ impl JobRegistry {
             .filter_map(|job| job.default_schedule().map(|sched| (job.name(), sched)))
     }
 
+    /// Every registered `trigger_type`. The policy tables in [`registry`] are keyed by these, so a
+    /// name only they know is a name nothing answers to.
+    pub fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.jobs.keys().copied()
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.jobs.len()
@@ -112,8 +118,8 @@ impl JobRegistry {
     }
 }
 
-/// Build the registry of every on-demand worker-run job kind. Called once at startup; jobs register
-/// here as they are ported off the inline lifecycle. The recurring Services (which carry a
+/// Build the registry of every on-demand worker-run job kind. Called once at startup. The
+/// recurring Services (which carry a
 /// `default_schedule` derived from `Config`) are added separately via
 /// [`register_scheduled_services`] so this stays zero-arg for the worker-pool tests.
 #[must_use]
@@ -130,7 +136,12 @@ pub fn build_registry() -> JobRegistry {
     }
     registry.register(Arc::new(super::jobs::RefreshAggregates::incremental()));
     registry.register(Arc::new(super::jobs::RefreshAggregates::full()));
-    for trigger in ["sensor_swap", "pairing_backfill", "manual_adopt"] {
+    for trigger in [
+        "sensor_swap",
+        "pairing_backfill",
+        "manual_adopt",
+        "attribution_pin",
+    ] {
         registry.register(Arc::new(super::jobs::ReprocessSlot::new(trigger)));
     }
     for trigger in [
@@ -159,7 +170,9 @@ pub fn build_registry() -> JobRegistry {
     registry.register(Arc::new(super::jobs::PlanRevert));
     registry.register(Arc::new(super::reconcile::ReplicateReconciliation));
     registry.register(Arc::new(super::reconcile::ReplicateReconciliationDelete));
-    registry.register(Arc::new(crate::routes::private::tools::chain::EventRecompute));
+    registry.register(Arc::new(
+        crate::routes::private::tools::chain::EventRecompute,
+    ));
     registry.register(Arc::new(crate::routes::private::tools::chain::EventAudit));
     registry
 }
@@ -172,15 +185,26 @@ pub fn register_scheduled_services(registry: &mut JobRegistry, config: &crate::c
     registry.register(Arc::new(super::jobs::JanitorRun::from_config(config)));
     registry.register(Arc::new(super::jobs::AlarmSweep::from_config(config)));
     registry.register(Arc::new(super::jobs::SyncEventSweep::from_config(config)));
-    registry.register(Arc::new(super::jobs::SyncLedgerRetention::from_config(config)));
-    registry.register(Arc::new(super::jobs::SyncFullReassert::from_config(config)));
-    registry.register(Arc::new(super::jobs::PushSubscriptionReconcile::from_config(
+    registry.register(Arc::new(super::jobs::SyncLedgerRetention::from_config(
         config,
     )));
+    registry.register(Arc::new(super::jobs::SyncFullReassert::from_config(config)));
+    registry.register(Arc::new(
+        super::jobs::PushSubscriptionReconcile::from_config(config),
+    ));
     registry.register(Arc::new(super::jobs::NotifyHealth::from_config(config)));
     registry.register(Arc::new(super::jobs::DispatchNotifications::from_config(
         config,
     )));
+
+    // The policy tables in `registry` are keyed by trigger_type and cannot construct these, so the
+    // name list they check against is verified here instead of drifting quietly.
+    for name in super::registry::SCHEDULED_SERVICE_NAMES {
+        assert!(
+            registry.get(name).is_some(),
+            "registry::SCHEDULED_SERVICE_NAMES lists {name:?}, which no service registered under"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -223,7 +247,7 @@ mod tests {
     fn register_and_lookup() {
         let mut r = JobRegistry::new();
         r.register(dummy("manual_reprocess", None));
-        r.register(dummy("janitor_run", Some(3600)));
+        r.register(dummy("janitor_service", Some(3600)));
         assert_eq!(r.len(), 2);
         assert!(r.get("manual_reprocess").is_some());
         assert!(r.get("unknown").is_none());
@@ -232,7 +256,7 @@ mod tests {
     #[test]
     fn category_delegates_to_registry_table() {
         assert_eq!(
-            dummy("janitor_run", None).category(),
+            dummy("janitor_service", None).category(),
             registry::CATEGORY_MAINTENANCE
         );
         assert_eq!(
@@ -249,11 +273,40 @@ mod tests {
     fn default_schedules_lists_only_recurring_services() {
         let mut r = JobRegistry::new();
         r.register(dummy("manual_reprocess", None));
-        r.register(dummy("janitor_run", Some(3600)));
+        r.register(dummy("janitor_service", Some(3600)));
         let scheds: Vec<_> = r.default_schedules().collect();
         assert_eq!(scheds.len(), 1);
-        assert_eq!(scheds[0].0, "janitor_run");
+        assert_eq!(scheds[0].0, "janitor_service");
         assert_eq!(scheds[0].1.interval, chrono::Duration::seconds(3600));
+    }
+
+    /// Scenario: a policy table names a `trigger_type` that no handler registers under.
+    ///
+    /// Expected behaviour: none do. `is_cancellable` and `is_rerunnable` are keyed on the name a
+    /// job answers to, so a stale spelling silently withdraws the policy from the job it was
+    /// written for, and nothing else reports it.
+    #[test]
+    fn every_policy_name_is_a_registered_job() {
+        let r = super::build_registry();
+        // The recurring services need a Config to build; `register_scheduled_services` asserts it
+        // registered exactly the names below, so taking them from the const is not taking them on
+        // trust.
+        let registered: std::collections::HashSet<&str> = r
+            .names()
+            .chain(registry::SCHEDULED_SERVICE_NAMES.iter().copied())
+            .collect();
+
+        let policy_names = registry::MAINTENANCE
+            .iter()
+            .chain(registry::METADATA)
+            .chain(registry::RERUNNABLE)
+            .chain(registry::CANCELLABLE);
+        for name in policy_names {
+            assert!(
+                registered.contains(name),
+                "policy table names {name:?}, which no job registers under"
+            );
+        }
     }
 
     #[test]

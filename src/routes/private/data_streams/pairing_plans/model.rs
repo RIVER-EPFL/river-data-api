@@ -1,4 +1,4 @@
-use crudcrate::{CRUDResource, EntityToModels};
+use crudcrate::EntityToModels;
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +25,11 @@ pub struct Model {
     pub summary: serde_json::Value,
     #[sea_orm(column_type = "JsonBinary")]
     pub entries: serde_json::Value,
+    /// Curves the review assigned to instruments this plan creates, `[{curve_id,
+    /// instrument_source_key}]`, moved in the apply transaction that mints them.
+    #[sea_orm(column_type = "JsonBinary")]
+    #[crudcrate(exclude(create, update), on_create = serde_json::Value::Array(Vec::new()))]
+    pub curve_assignments: serde_json::Value,
     #[crudcrate(sortable, exclude(create, update))]
     pub created_at: DateTimeWithTimeZone,
     #[crudcrate(sortable, exclude(create, update))]

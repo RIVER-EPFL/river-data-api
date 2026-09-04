@@ -53,7 +53,7 @@ async fn insert_paired_reading(
 }
 
 async fn count_where(db: &DatabaseConnection, sql: &str) -> i64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!("SELECT count(*) AS n FROM {sql}"),
     ))
@@ -65,7 +65,7 @@ async fn count_where(db: &DatabaseConnection, sql: &str) -> i64 {
 }
 
 async fn job_status(db: &DatabaseConnection, id: Uuid) -> String {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!("SELECT status FROM reprocessing_jobs WHERE id = '{id}'"),
     ))
@@ -206,7 +206,7 @@ async fn a_stored_retag_row_cannot_move_a_family_off_spot() {
     worker::drain(&db, &ev, &registry, &wid).await.unwrap();
 
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!("SELECT status, error_message FROM reprocessing_jobs WHERE id = '{id}'"),
         ))
@@ -321,7 +321,7 @@ async fn sensors_retag_frequency_endpoint_updates_and_enqueues() {
     assert!(body["job_id"].is_string(), "job enqueued: {body}");
 
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!("SELECT data_frequency FROM sensors WHERE id = '{sensor_id}'"),
         ))
@@ -473,7 +473,7 @@ async fn retag_job_source_system_scope_flips_readings_and_refreshes_aggregates()
     // The job's aggregate refresh drops the retagged spot rows out of the rollup; the untouched
     // vaisala reading keeps the bucket alive with only its own contribution.
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!("SELECT SUM(count)::bigint AS n FROM {hourly}"),
         ))

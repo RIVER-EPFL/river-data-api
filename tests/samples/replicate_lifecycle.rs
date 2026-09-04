@@ -10,7 +10,7 @@ use serial_test::serial;
 const GRAB_TIME: &str = "2025-01-20T10:00:00Z";
 
 async fn scalar_i64(db: &DatabaseConnection, sql: &str) -> i64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_string(),
     ))
@@ -69,7 +69,7 @@ async fn grab_replicates_form_sample_and_serve_mean() {
     assert_eq!(resp["samples_created"], 1);
 
     let indices = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT replicate_index FROM readings \
@@ -342,4 +342,50 @@ async fn duplicate_explicit_replicate_indices_are_refused() {
         0,
         "a refused request stores nothing"
     );
+}
+
+/// Scenario: a source retracts one replicate of a three-replicate group.
+///
+/// Expected behaviour: the statistics count two, and the retracted replicate is served marked. A
+/// consumer that lists every replicate under `n` otherwise prints three values beside a count of
+/// two, with a mean matching none of them, and offers a Flag action on a row the source has already
+/// taken back.
+#[tokio::test]
+#[serial]
+async fn a_withdrawn_replicate_is_served_marked_and_outside_n() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let (status, body) =
+        crate::common::post_json_with_token(&app, "/api/grab_samples", &grab_payload(), &token)
+            .await;
+    assert_eq!(status, 200, "grab insert ({status}): {body}");
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE readings SET withdrawn_at = NOW(), withdrawn_reason = 'absent from source window' \
+             WHERE site_id = '{}' AND parameter_id = '{}' AND time = '{GRAB_TIME}' \
+               AND replicate_index = 2",
+            crate::common::SITE1_ID,
+            crate::common::GLOBAL_PARAM_TEMP_ID,
+        ),
+    )
+    .await;
+
+    let series = fetch_temp_series(&app, &token, "&include_sample_stats=true").await;
+    let stats = &series["parameters"][0]["samples"][0];
+    assert_eq!(stats["n"], 2, "the retracted replicate is outside n: {series}");
+
+    let replicates = stats["replicates"].as_array().expect("replicates");
+    assert_eq!(replicates.len(), 3, "every stored replicate is listed: {stats}");
+    let withdrawn: Vec<i64> = replicates
+        .iter()
+        .filter(|r| r["withdrawn"] == serde_json::json!(true))
+        .map(|r| r["replicate_index"].as_i64().unwrap())
+        .collect();
+    assert_eq!(withdrawn, vec![2], "the stamped replicate says so: {stats}");
 }

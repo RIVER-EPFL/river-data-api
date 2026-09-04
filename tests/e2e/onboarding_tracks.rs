@@ -18,7 +18,7 @@ use crate::common::tracks::{
 
 async fn count(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
     use sea_orm::{ConnectionTrait, Statement};
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_string(),
     ))
@@ -271,7 +271,7 @@ async fn grab_and_tool_onboarding_produces_spot_series_with_sample_statistics() 
 
     let row = {
         use sea_orm::{ConnectionTrait, Statement};
-        db.query_one(Statement::from_string(
+        db.query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT mean, stdev, n FROM samples WHERE site_id = '{}' AND parameter_id = '{}'",

@@ -1,4 +1,4 @@
-//! S1, tool lifecycle with server-side provenance (PLAN.md story catalog).
+//! S1, tool lifecycle with server-side provenance (story catalog: ../archived-documentation/PLAN.md).
 //!
 //! Scenario: a member runs an analytical tool and saves its outputs at a station. The calculation
 //! itself is the stored record (`tool_runs`), the save names that run, and the provenance blob on
@@ -63,11 +63,26 @@ async fn a_calculation_is_a_stored_run_and_the_save_carries_its_blob() {
     assert_eq!(status, 200, "calculate ({status}): {tool}");
     let run_id = tool["run_id"].as_str().expect("run_id on the response");
     let doc_avg = tool["results"]["DOC_avg_ppb"].as_f64().expect("DOC avg");
+    // The replicates the run consumed are what is stored; its avg and sd are statistics of that
+    // group and are served from `samples`.
+    let replicates: Vec<serde_json::Value> = [120.0, 125.0, 118.0]
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            json!({
+                "parameter_id": parameter_id,
+                "value": v,
+                "time": "2025-06-15T11:00:00Z",
+                "replicate_index": i as i16,
+                "input": "DOC",
+            })
+        })
+        .collect();
 
     // The stored run carries the calculating actor, resolved from the JWT, not the request.
     let run_row = {
         use sea_orm::{ConnectionTrait, Statement};
-        db.query_one(Statement::from_string(
+        db.query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT created_by, outputs->>'DOC_avg_ppb' AS avg FROM tool_runs \
@@ -88,12 +103,7 @@ async fn a_calculation_is_a_stored_run_and_the_save_carries_its_blob() {
     let save_body = json!({
         "site_id": track.site_id,
         "tool_run_id": run_id,
-        "readings": [{
-            "parameter_id": parameter_id,
-            "value": doc_avg,
-            "time": "2025-06-15T11:00:00Z",
-            "output": "DOC_avg_ppb",
-        }],
+        "readings": replicates,
     });
     let (status, refused) =
         crate::common::post_json_with_token(&app, "/api/grab_samples", &save_body, &intern).await;
@@ -103,24 +113,24 @@ async fn a_calculation_is_a_stored_run_and_the_save_carries_its_blob() {
         crate::common::post_json_parse_with_token(&app, "/api/grab_samples", &save_body, &river)
             .await;
     assert_eq!(status, 200, "the member saves ({status}): {saved}");
-    assert_eq!(saved["inserted"], 1);
+    assert_eq!(saved["inserted"], 3);
 
-    // The blob on the samples row is the stored run, plus the saved mapping and both actors.
+    // The blob on the reading is the stored run, plus the saved mapping and both actors.
     let blob = {
         use sea_orm::{ConnectionTrait, Statement};
-        db.query_one(Statement::from_string(
+        db.query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
-                "SELECT provenance FROM samples WHERE site_id = '{}' \
-                 AND parameter_id = '{parameter_id}'",
+                "SELECT provenance FROM readings WHERE site_id = '{}' \
+                 AND parameter_id = '{parameter_id}' AND provenance IS NOT NULL LIMIT 1",
                 track.site_id
             ),
         ))
         .await
-        .expect("query samples")
-        .expect("the save formed a sample")
+        .expect("query readings")
+        .expect("the save stored its readings")
         .try_get::<serde_json::Value>("", "provenance")
-        .expect("the sample carries the blob")
+        .expect("the reading carries the blob")
     };
     assert_eq!(blob["tool"], "doc");
     assert_eq!(blob["run_id"], run_id);
@@ -131,20 +141,27 @@ async fn a_calculation_is_a_stored_run_and_the_save_carries_its_blob() {
     );
     assert_eq!(blob["inputs"]["DOC"][0], 120.0);
     assert_eq!(blob["outputs"]["DOC_avg_ppb"], doc_avg);
-    assert_eq!(blob["saved"]["DOC_avg_ppb"], parameter_id);
+    assert_eq!(blob["saved_inputs"]["DOC"], parameter_id);
     assert!(
         blob["tool_version"]["content_hash"].as_str().is_some(),
         "the blob pins the script version: {blob}"
     );
 
-    // The blob reads back through the samples API, so an auditor never needs the database.
-    let (status, listed) = crate::common::get_json_with_token(&app, "/api/samples", &river).await;
-    assert_eq!(status, 200, "samples list ({status}): {listed}");
-    let row = listed
-        .as_array()
-        .and_then(|rows| rows.iter().find(|r| r["parameter_id"] == parameter_id))
-        .unwrap_or_else(|| panic!("saved sample listed: {listed}"));
-    assert_eq!(row["provenance"]["run_id"], run_id);
+    // The blob reads back through the provenance endpoint, so an auditor never needs the database.
+    let (status, record) = crate::common::get_json_with_token(
+        &app,
+        &format!(
+            "/api/readings/provenance?site_id={}&parameter_id={parameter_id}&time=2025-06-15T11:00:00Z",
+            track.site_id
+        ),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "provenance ({status}): {record}");
+    assert_eq!(
+        record["records"][0]["computation"]["provenance"]["run_id"], run_id,
+        "the served record carries the run: {record}"
+    );
 }
 
 /// Expected behaviour: the link between a save and a run is verified, so a claim the run does not
@@ -344,23 +361,29 @@ async fn a_station_input_resolves_from_the_site_and_a_missing_property_is_refuse
     assert_eq!(status, 200, "{saved}");
     let blob = {
         use sea_orm::{ConnectionTrait, Statement};
-        db.query_one(Statement::from_string(
+        db.query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
-                "SELECT provenance FROM samples WHERE site_id = '{}' \
-                 AND parameter_id = '{echo_param}'",
+                "SELECT provenance FROM readings WHERE site_id = '{}' \
+                 AND parameter_id = '{echo_param}' AND provenance IS NOT NULL LIMIT 1",
                 track.site_id
             ),
         ))
         .await
         .unwrap()
-        .expect("the save formed a sample")
+        .expect("the save stored its reading")
         .try_get::<serde_json::Value>("", "provenance")
         .unwrap()
     };
-    assert_eq!(blob["context"]["station_inputs"][0]["property"], "altitude_m");
+    assert_eq!(
+        blob["context"]["station_inputs"][0]["property"],
+        "altitude_m"
+    );
     assert_eq!(blob["context"]["station_inputs"][0]["value"], 512.0);
-    assert_eq!(blob["inputs"]["altitude_m"], 512.0, "the resolved value is a recorded input");
+    assert_eq!(
+        blob["inputs"]["altitude_m"], 512.0,
+        "the resolved value is a recorded input"
+    );
 
     // A typed value wins over the stored property, and then nothing is recorded as resolved.
     let (status, tool) = crate::common::post_json_parse_with_token(
@@ -372,7 +395,10 @@ async fn a_station_input_resolves_from_the_site_and_a_missing_property_is_refuse
     .await;
     assert_eq!(status, 200, "{tool}");
     assert_eq!(tool["results"]["alt_echo"], 300.0);
-    assert!(tool["station_inputs"].as_array().is_none_or(Vec::is_empty), "{tool}");
+    assert!(
+        tool["station_inputs"].as_array().is_none_or(Vec::is_empty),
+        "{tool}"
+    );
 
     // A resolved value is kind-checked exactly like a typed one: a manifest wiring a text
     // property (the site's name) into a number param is refused naming the mismatch, never
@@ -426,7 +452,7 @@ async fn a_first_save_provisions_the_site_parameter() {
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
     let track = tracks::onboard_grab_track(&app, &admin).await;
-    // A catalog parameter matching doc's DOC_avg_ppb output code, assigned to no site.
+    // A catalog parameter matching the doc tool's replicates param, assigned to no site.
     let doc_param = crate::common::e2e::create_parameter(&app, &admin, "DOC", "DOC", "ppb").await;
     let river = member(&db, &track.project_id, "river1", "riverdata-river").await;
 
@@ -438,13 +464,11 @@ async fn a_first_save_provisions_the_site_parameter() {
     )
     .await;
     assert_eq!(status, 200, "{tool}");
-    let doc_avg = tool["results"]["DOC_avg_ppb"].as_f64().expect("avg");
-
     let save = json!({
         "site_id": track.site_id,
         "tool_run_id": tool["run_id"],
-        "readings": [{ "parameter_id": doc_param, "value": doc_avg,
-                        "time": "2025-06-15T13:00:00Z", "output": "DOC_avg_ppb" }],
+        "readings": [{ "parameter_id": doc_param, "value": 120.0, "replicate_index": 0,
+                        "time": "2025-06-15T13:00:00Z", "input": "DOC" }],
     });
     let (status, saved) =
         crate::common::post_json_with_token(&app, "/api/grab_samples", &save, &river).await;
@@ -453,7 +477,7 @@ async fn a_first_save_provisions_the_site_parameter() {
     let (needs_review, count) = {
         use sea_orm::{ConnectionTrait, Statement};
         let row = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
                 format!(
                     "SELECT needs_review, (SELECT COUNT(*)::bigint FROM site_parameters \
@@ -500,4 +524,220 @@ async fn a_first_save_provisions_the_site_parameter() {
     )
     .await;
     assert_eq!(slots, 1, "the second save reuses the provisioned slot");
+}
+
+/// A run records the visit it was calculated for. Saving it at another station, or onto another
+/// instant, would file numbers computed from one visit's context as another's.
+#[tokio::test]
+#[serial]
+async fn a_run_cannot_be_saved_onto_another_visit() {
+    if !kc::require_keycloak_or_skip("a_run_cannot_be_saved_onto_another_visit").await {
+        return;
+    }
+    if !crate::common::tools_runner::require_runner_or_skip(
+        "a_run_cannot_be_saved_onto_another_visit",
+    )
+    .await
+    {
+        return;
+    }
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::exec(
+        &db,
+        "UPDATE tool_scripts SET active_version_id = NULL WHERE name LIKE 'context_%'",
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        "DELETE FROM tool_script_activations WHERE tool_script_id IN \
+         (SELECT id FROM tool_scripts WHERE name LIKE 'context_%')",
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        "DELETE FROM tool_script_versions WHERE tool_script_id IN \
+         (SELECT id FROM tool_scripts WHERE name LIKE 'context_%')",
+    )
+    .await;
+    crate::common::exec(&db, "DELETE FROM tool_scripts WHERE name LIKE 'context_%'").await;
+    let app = kc::build_test_app_with_keycloak(db.clone()).await;
+    let admin = kc::get_keycloak_jwt("admin", "admin").await;
+
+    let track = tracks::onboard_grab_track(&app, &admin).await;
+    let other_site =
+        crate::common::e2e::create_site(&app, &admin, &track.project_id, "Other Station", "othr")
+            .await;
+    let echo_param =
+        crate::common::e2e::create_parameter(&app, &admin, "CtxEcho", "Context echo", "m").await;
+    crate::common::e2e::author_tool(
+        &app,
+        &admin,
+        "context_echo",
+        "tool <- function(inputs, constants, curves) list(ctx_echo = inputs$altitude_m * 1)",
+        json!({
+            "label": "Context echo",
+            "params": [{ "name": "altitude_m", "label": "Altitude", "kind": "number", "required": true }],
+            "station_inputs": [{ "property": "altitude_m" }],
+            "outputs": [{ "key": "ctx_echo", "label": "Echo", "suggested_parameter_code": "CtxEcho" }],
+        }),
+        json!({ "name": "echoes", "inputs": { "altitude_m": 100.0 }, "expected": { "ctx_echo": 100.0 } }),
+    )
+    .await;
+    let river = member(&db, &track.project_id, "river1", "riverdata-river").await;
+
+    let (status, patched) = crate::common::put_json_with_token(
+        &app,
+        &format!("/api/sites/{}", track.site_id),
+        &json!({ "altitude_m": 512.0 }),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "{patched}");
+
+    const VISIT: &str = "2025-06-15T12:00:00Z";
+    let (status, tool) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/tools/context_echo/calculate",
+        &json!({ "site_id": track.site_id, "collected_at": VISIT }),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "{tool}");
+    let run_id = tool["run_id"].clone();
+
+    let reading = |time: &str| json!([{ "parameter_id": echo_param, "value": 512.0, "time": time, "output": "ctx_echo" }]);
+
+    let (status, resp) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({ "site_id": other_site, "tool_run_id": run_id, "readings": reading(VISIT) }),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 400, "another station must be refused: {resp}");
+    assert!(
+        resp.contains(&track.site_id),
+        "the refusal names the site the run was calculated for: {resp}"
+    );
+
+    let (status, resp) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({
+            "site_id": track.site_id,
+            "tool_run_id": run_id,
+            "readings": reading("2025-06-16T12:00:00Z"),
+        }),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 400, "another visit must be refused: {resp}");
+    assert!(
+        resp.contains("2025-06-15") && resp.contains("2025-06-16"),
+        "the refusal names both instants: {resp}"
+    );
+
+    let (status, saved) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({ "site_id": track.site_id, "tool_run_id": run_id, "readings": reading(VISIT) }),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "the run's own visit still saves: {saved}");
+}
+
+/// An output that reduces a replicates param is a statistic of the group, not a measurement.
+/// Saving it would put a mean in the readings the `samples` trigger takes a mean over.
+#[tokio::test]
+#[serial]
+async fn an_aggregate_output_cannot_be_saved_as_a_measurement() {
+    if !kc::require_keycloak_or_skip("an_aggregate_output_cannot_be_saved_as_a_measurement").await {
+        return;
+    }
+    if !crate::common::tools_runner::require_runner_or_skip(
+        "an_aggregate_output_cannot_be_saved_as_a_measurement",
+    )
+    .await
+    {
+        return;
+    }
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let app = kc::build_test_app_with_keycloak(db.clone()).await;
+    let admin = kc::get_keycloak_jwt("admin", "admin").await;
+
+    let track = tracks::onboard_grab_track(&app, &admin).await;
+    let parameter_id = track.parameter_id("TrkGrabDoc").to_string();
+    let river = member(&db, &track.project_id, "river1", "riverdata-river").await;
+
+    const AT: &str = "2025-06-15T14:00:00Z";
+    let values = [120.0, 125.0, 118.0];
+    let (status, tool) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/tools/doc/calculate",
+        &json!({ "DOC": values }),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "{tool}");
+    let run_id = tool["run_id"].clone();
+    let doc_avg = tool["results"]["DOC_avg_ppb"].as_f64().expect("avg");
+
+    for output in ["DOC_avg_ppb", "DOC_sd_ppb"] {
+        let (status, refused) = crate::common::post_json_with_token(
+            &app,
+            "/api/grab_samples",
+            &json!({
+                "site_id": track.site_id,
+                "tool_run_id": run_id,
+                "readings": [{ "parameter_id": parameter_id, "time": AT, "output": output,
+                                "value": tool["results"][output] }],
+            }),
+            &river,
+        )
+        .await;
+        assert_eq!(status, 400, "{output} must be refused: {refused}");
+        assert!(refused.contains(output), "the refusal names it: {refused}");
+    }
+
+    // The replicates the statistics reduce still save, and the sample mean is the run's average.
+    let readings: Vec<serde_json::Value> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            json!({ "parameter_id": parameter_id, "time": AT, "value": v,
+                     "replicate_index": i as i16, "input": "DOC" })
+        })
+        .collect();
+    let (status, saved) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({ "site_id": track.site_id, "tool_run_id": run_id, "readings": readings }),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "the replicates save: {saved}");
+
+    let mean = {
+        use sea_orm::{ConnectionTrait, Statement};
+        db.query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT mean FROM samples WHERE site_id = '{}' \
+                 AND parameter_id = '{parameter_id}' AND collected_at = '{AT}'",
+                track.site_id
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the save formed a sample")
+        .try_get::<f64>("", "mean")
+        .unwrap()
+    };
+    assert!(
+        (mean - doc_avg).abs() < 1e-9,
+        "the served mean is the run's average: {mean} vs {doc_avg}"
+    );
 }

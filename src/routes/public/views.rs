@@ -106,6 +106,8 @@ fn resolve_site_parameters(site_id: Uuid, config: &PublicProjectConfig) -> Vec<R
             code: ep.code.clone(),
             name: ep.name.clone(),
             units: ep.units.clone(),
+            sd_estimator: ep.sd_estimator.clone(),
+            decimal_places: ep.decimal_places,
         })
         .collect();
     resolved.sort_by(|a, b| a.code.cmp(&b.code));
@@ -135,6 +137,28 @@ struct ResolvedParam {
     code: String,
     name: String,
     units: String,
+    sd_estimator: Option<String>,
+    decimal_places: Option<i16>,
+}
+
+/// The value expressed at the slot's declared decimal places. A slot with no declaration is
+/// served as stored; the private API and the site exports never round.
+fn expressed(value: f64, decimal_places: Option<i16>) -> f64 {
+    match decimal_places {
+        Some(places) => {
+            let scale = 10f64.powi(i32::from(places));
+            (value * scale).round() / scale
+        }
+        None => value,
+    }
+}
+
+fn express_all(values: &mut [Option<f64>], decimal_places: Option<i16>) {
+    if decimal_places.is_some() {
+        for v in values.iter_mut().flatten() {
+            *v = expressed(*v, decimal_places);
+        }
+    }
 }
 
 /// Parse the `parameters` query string and resolve each requested entry against the
@@ -296,7 +320,7 @@ pub async fn get_site(
 
         let range = state
             .db
-            .query_one(stmt)
+            .query_one_raw(stmt)
             .await?
             .and_then(|row| DataRangeRow::from_query_result(&row, "").ok());
 
@@ -373,6 +397,14 @@ pub struct ReadingsQuery {
     /// Include a per-point measurement_type array (continuous/spot/derived) on each parameter.
     #[serde(default)]
     pub include_measurement_type: Option<bool>,
+    /// Publish the replicate statistics behind each served value: `n`, `mean`, `sd`, `min` and
+    /// `max` per point under `sample_stats` (JSON) or as `{code}_n`, `{code}_mean`, `{code}_sd`,
+    /// `{code}_min`, `{code}_max` and `{code}_sd_estimator` columns (CSV, NDJSON). A spot value
+    /// is the mean over its unflagged replicates and reports their count; a continuous or derived
+    /// value is one measurement and reports `n = 1` with no statistics. The sd is published only
+    /// with its estimator, so a parameter whose slot has not declared one publishes `n` and no sd.
+    #[serde(default)]
+    pub include_sample_stats: Option<bool>,
     /// json (default), csv, or ndjson.
     ///
     /// Deliberately outside the cache key: the public tier caches the fetched data, and every
@@ -405,6 +437,28 @@ pub struct ParameterData {
     /// Only present when `include_measurement_type=true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measurement_types: Option<Vec<Option<String>>>,
+    /// The replicate statistics behind each value, aligned with `values`.
+    /// Only present when `include_sample_stats=true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_stats: Option<SampleStatsData>,
+}
+
+/// Replicate statistics per served point. A spot value is the mean over the instant's unflagged
+/// replicates; `n` counts them. A continuous or derived value is one measurement: `n` is 1 and
+/// the statistics are null.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SampleStatsData {
+    /// The divisor every `sd` here was computed with: `sample` (n - 1) or `population` (n). Null
+    /// when the slot has not declared one, in which case no `sd` is published.
+    pub sd_estimator: Option<String>,
+    /// Replicates behind each value. Null where no value is served.
+    pub n: Vec<Option<i64>>,
+    /// The replicate mean, equal to the served value for a spot instant.
+    pub mean: Vec<Option<f64>>,
+    /// The replicate standard deviation under `sd_estimator`.
+    pub sd: Vec<Option<f64>>,
+    pub min: Vec<Option<f64>>,
+    pub max: Vec<Option<f64>>,
 }
 
 /// The public readings export: the value column per parameter, plus the per-point cadence when
@@ -422,6 +476,22 @@ fn readings_table(times: &[String], params: &[ParameterData]) -> Table {
             );
         }
     }
+    if params.iter().any(|p| p.sample_stats.is_some()) {
+        for p in params {
+            let Some(stats) = &p.sample_stats else {
+                continue;
+            };
+            table.column(format!("{}_n", p.code), Cells::Int(stats.n.clone()));
+            table.column(format!("{}_mean", p.code), Cells::Float(stats.mean.clone()));
+            table.column(format!("{}_sd", p.code), Cells::Float(stats.sd.clone()));
+            table.column(format!("{}_min", p.code), Cells::Float(stats.min.clone()));
+            table.column(format!("{}_max", p.code), Cells::Float(stats.max.clone()));
+            table.column(
+                format!("{}_sd_estimator", p.code),
+                Cells::Text(vec![stats.sd_estimator.clone(); times.len()]),
+            );
+        }
+    }
     table
 }
 
@@ -431,6 +501,14 @@ struct ReadingRow {
     time: chrono::DateTime<chrono::FixedOffset>,
     value: f64,
     measurement_type: Option<String>,
+    /// The sample row behind a spot instant; all null for a continuous or derived reading and
+    /// for a spot instant served from its fallback replicate.
+    n: Option<i64>,
+    mean: Option<f64>,
+    sd: Option<f64>,
+    min: Option<f64>,
+    max: Option<f64>,
+    sd_estimator: Option<String>,
 }
 
 /// Raw time-series readings for a public project site.
@@ -485,6 +563,7 @@ pub async fn get_readings(
         )));
     }
     let include_measurement_type = query.include_measurement_type.unwrap_or(false);
+    let include_sample_stats = query.include_sample_stats.unwrap_or(false);
 
     let requested_names = resolve_requested_param_names(query.parameters.as_deref(), &config)?;
 
@@ -534,6 +613,7 @@ pub async fn get_readings(
         end,
         measurement_type,
         include_measurement_type,
+        include_sample_stats,
     )
     .await?;
 
@@ -786,7 +866,7 @@ pub async fn get_aggregates(
 
     let rows: Vec<AggregateRow> = state
         .db
-        .query_all(stmt)
+        .query_all_raw(stmt)
         .await?
         .into_iter()
         .filter_map(|row| AggregateRow::from_query_result(&row, "").ok())
@@ -859,6 +939,10 @@ pub async fn get_aggregates(
             }
         }
 
+        let decimal_places = matched.and_then(|rp| rp.decimal_places);
+        express_all(&mut avg, decimal_places);
+        express_all(&mut min, decimal_places);
+        express_all(&mut max, decimal_places);
         output_params.push(ParameterAggregateData {
             code: code.clone(),
             name: name.to_string(),
@@ -986,6 +1070,7 @@ async fn fetch_readings(
     end: Option<DateTime<Utc>>,
     measurement_type: &str,
     include_measurement_type: bool,
+    include_sample_stats: bool,
 ) -> AppResult<(Vec<String>, Vec<ParameterData>)> {
     let param_ids: Vec<Uuid> = {
         let mut ids: Vec<Uuid> = resolved.iter().map(|rp| rp.parameter_id).collect();
@@ -1049,7 +1134,10 @@ async fn fetch_readings(
     if let Some(extra) = continuous_extra {
         arms.push(format!(
             "SELECT r.parameter_id::TEXT AS param_id, r.time, \
-                    COALESCE(r.calibrated_value, r.raw_value) AS value, r.measurement_type \
+                    COALESCE(r.calibrated_value, r.raw_value) AS value, r.measurement_type, \
+                    NULL::BIGINT AS n, NULL::DOUBLE PRECISION AS mean, \
+                    NULL::DOUBLE PRECISION AS sd, NULL::DOUBLE PRECISION AS min, \
+                    NULL::DOUBLE PRECISION AS max, NULL::TEXT AS sd_estimator \
              FROM readings r \
              WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
                AND {SERVED_CONTINUOUS}{time_cond}{extra}"
@@ -1057,11 +1145,14 @@ async fn fetch_readings(
     }
     if include_spot {
         arms.push(format!(
-            "SELECT sp.param_id, sp.time, sp.value, sp.measurement_type FROM ( \
+            "SELECT sp.param_id, sp.time, sp.value, sp.measurement_type, \
+                    sp.n, sp.mean, sp.sd, sp.min, sp.max, sp.sd_estimator FROM ( \
                 SELECT DISTINCT ON (r.stream_id, r.time) \
                        r.parameter_id::TEXT AS param_id, r.time, \
                        COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value, \
-                       r.measurement_type \
+                       r.measurement_type, \
+                       smp.n::BIGINT AS n, smp.mean, smp.stdev AS sd, \
+                       smp.min_value AS min, smp.max_value AS max, smp.sd_estimator \
                 FROM readings r \
                 LEFT JOIN samples smp ON smp.id = r.sample_id \
                 WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
@@ -1076,7 +1167,7 @@ async fn fetch_readings(
 
     let rows: Vec<ReadingRow> = state
         .db
-        .query_all(stmt)
+        .query_all_raw(stmt)
         .await?
         .into_iter()
         .filter_map(|row| ReadingRow::from_query_result(&row, "").ok())
@@ -1084,9 +1175,8 @@ async fn fetch_readings(
 
     let mut times_ordered: Vec<DateTime<Utc>> = Vec::new();
     let mut time_set: std::collections::HashSet<DateTime<Utc>> = std::collections::HashSet::new();
-    // Map from parameter name -> Vec<(time, value, measurement_type)>
-    let mut param_values: HashMap<String, Vec<(DateTime<Utc>, f64, Option<String>)>> =
-        HashMap::new();
+    // Map from parameter name -> the rows served under it
+    let mut param_values: HashMap<String, Vec<(DateTime<Utc>, &ReadingRow)>> = HashMap::new();
 
     for row in &rows {
         let time = row.time.with_timezone(&Utc);
@@ -1097,11 +1187,10 @@ async fn fetch_readings(
         let param_uuid = row.param_id.parse::<Uuid>().ok();
         if let Some(configs) = param_uuid.and_then(|uuid| id_to_publics.get(&uuid)) {
             for (name, _units) in configs {
-                param_values.entry(name.to_string()).or_default().push((
-                    time,
-                    row.value,
-                    row.measurement_type.clone(),
-                ));
+                param_values
+                    .entry(name.to_string())
+                    .or_default()
+                    .push((time, row));
             }
         }
     }
@@ -1122,19 +1211,55 @@ async fn fetch_readings(
         let name = matched.map_or("", |rp| rp.name.as_str());
         let units = matched.map_or("", |rp| rp.units.as_str());
 
+        let decimal_places = matched.and_then(|rp| rp.decimal_places);
+        let declared_estimator = matched.and_then(|rp| rp.sd_estimator.as_deref());
+
         let mut values = vec![None; num_times];
         let mut measurement_types = if include_measurement_type {
             Some(vec![None::<String>; num_times])
         } else {
             None
         };
+        let mut stats = if include_sample_stats {
+            Some(SampleStatsData {
+                sd_estimator: declared_estimator.map(str::to_string),
+                n: vec![None; num_times],
+                mean: vec![None; num_times],
+                sd: vec![None; num_times],
+                min: vec![None; num_times],
+                max: vec![None; num_times],
+            })
+        } else {
+            None
+        };
         if let Some(readings) = param_values.get(code.as_str()) {
-            for (time, value, mt) in readings {
+            for (time, row) in readings {
                 if let Some(&idx) = time_index.get(time) {
-                    values[idx] = Some(*value);
+                    values[idx] = Some(expressed(row.value, decimal_places));
                     if let Some(mts) = measurement_types.as_mut() {
                         // NULL legacy rows read as continuous, matching the filter semantics.
-                        mts[idx] = Some(mt.clone().unwrap_or_else(|| "continuous".to_string()));
+                        mts[idx] = Some(
+                            row.measurement_type
+                                .clone()
+                                .unwrap_or_else(|| "continuous".to_string()),
+                        );
+                    }
+                    if let Some(st) = stats.as_mut() {
+                        // No sample row means the served value is one measurement: the fallback
+                        // replicate of a spot instant, or a continuous or derived reading.
+                        st.n[idx] = Some(row.n.unwrap_or(1));
+                        st.mean[idx] = row.mean.map(|v| expressed(v, decimal_places));
+                        st.min[idx] = row.min.map(|v| expressed(v, decimal_places));
+                        st.max[idx] = row.max.map(|v| expressed(v, decimal_places));
+                        // The sd travels only under the divisor the slot declares. A sample
+                        // computed under another divisor (an instant-level override) is not what
+                        // the parameter's estimator says, so it is withheld rather than mislabelled.
+                        st.sd[idx] = match (declared_estimator, row.sd_estimator.as_deref()) {
+                            (Some(declared), Some(used)) if declared == used => {
+                                row.sd.map(|v| expressed(v, decimal_places))
+                            }
+                            _ => None,
+                        };
                     }
                 }
             }
@@ -1145,9 +1270,37 @@ async fn fetch_readings(
             units: units.to_string(),
             values,
             measurement_types,
+            sample_stats: stats,
         });
     }
 
     let times_formatted: Vec<String> = times_ordered.iter().map(|t| format_time(*t)).collect();
     Ok((times_formatted, output_params))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_expressed_rounds_a_float32_artefact_to_the_declared_places() {
+        // 100.8 stored as a MySQL single-precision float, widened to a double
+        assert_eq!(expressed(f64::from(100.8_f32), Some(2)), 100.8);
+        assert_eq!(expressed(0.0031, Some(4)), 0.0031);
+        assert_eq!(expressed(412.66, Some(1)), 412.7);
+        assert_eq!(expressed(-1.005, Some(0)), -1.0);
+    }
+
+    #[test]
+    fn test_expressed_leaves_an_undeclared_slot_as_stored() {
+        let stored = f64::from(100.8_f32);
+        assert_eq!(expressed(stored, None).to_bits(), stored.to_bits());
+    }
+
+    #[test]
+    fn test_express_all_rounds_only_present_cells() {
+        let mut cells = vec![Some(f64::from(100.8_f32)), None];
+        express_all(&mut cells, Some(2));
+        assert_eq!(cells, vec![Some(100.8), None]);
+    }
 }

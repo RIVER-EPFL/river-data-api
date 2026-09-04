@@ -14,7 +14,7 @@ async fn stored_measurement_type(
     raw_value: f64,
 ) -> String {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT measurement_type FROM readings \
@@ -194,7 +194,7 @@ async fn register_stream_omitted_classification_never_clears() {
     // Re-registration without a classification (a backend that predates the field) keeps 'spot'.
     register_stream(&app, &token, "sticky", None).await;
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!("SELECT measurement_type FROM data_streams WHERE id = '{stream}'"),
         ))
@@ -210,7 +210,7 @@ async fn register_stream_omitted_classification_never_clears() {
     // A declared classification on re-registration wins.
     register_stream(&app, &token, "sticky", Some("continuous")).await;
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!("SELECT measurement_type FROM data_streams WHERE id = '{stream}'"),
         ))
@@ -251,7 +251,7 @@ async fn batch_readings_explicit_spot_is_stored() {
     assert_eq!(status, 200, "batch ({status}): {body}");
 
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT measurement_type FROM readings WHERE raw_value = 7.5 \

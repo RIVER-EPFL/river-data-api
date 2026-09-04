@@ -13,3 +13,4 @@ mod register_pair_stats;
 mod replicate_retag_guard;
 mod replicate_spec_pinning;
 mod slot_retirement;
+mod unpair_deployment_scope;

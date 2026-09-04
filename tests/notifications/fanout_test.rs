@@ -41,7 +41,9 @@ async fn mute_site(db: &DatabaseConnection, sub: &str) {
     .await;
 }
 
-fn endpoints(subs: &[river_db::routes::private::notifications::web_push::Subscription]) -> Vec<String> {
+fn endpoints(
+    subs: &[river_db::routes::private::notifications::web_push::Subscription],
+) -> Vec<String> {
     let mut eps: Vec<String> = subs.iter().map(|s| s.endpoint.clone()).collect();
     eps.sort();
     eps

@@ -67,7 +67,7 @@ fn parse_uuid_csv(s: &str) -> Vec<Uuid> {
 /// `GET /sites/{site_id}/sensor_identity`, deployment bands + calibration markers per parameter.
 #[utoipa::path(
     get,
-    path = "/{site_id}/sensor_identity",
+    path = "/api/sites/{site_id}/sensor_identity",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
         SensorIdentityQuery
@@ -121,7 +121,7 @@ pub async fn get_site_sensor_identity(
     band_sql.push_str(" ORDER BY d.parameter_id, d.deployed_from");
 
     let band_rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &band_sql,
             values.clone(),
@@ -181,7 +181,7 @@ pub async fn get_site_sensor_identity(
     );
 
     let cal_rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &cal_sql,
             values,

@@ -23,7 +23,7 @@ struct Curve {
 }
 
 async fn exec_sql(db: &DatabaseConnection, sql: &str) {
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         sql.to_string(),
     ))
@@ -33,7 +33,7 @@ async fn exec_sql(db: &DatabaseConnection, sql: &str) {
 
 /// The sensor's windowed curves, oldest first.
 async fn curves_of(db: &DatabaseConnection, sensor_id: Uuid) -> Vec<Curve> {
-    db.query_all(Statement::from_string(
+    db.query_all_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "SELECT id, slope, valid_from, valid_until FROM sensor_calibrations \

@@ -10,7 +10,7 @@ use serial_test::serial;
 use uuid::Uuid;
 
 async fn exec(db: &sea_orm::DatabaseConnection, sql: &str) {
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_string(),
     ))
@@ -205,7 +205,7 @@ async fn swap_ends_a_starts_b() {
 
     // A's deployment closed at the swap instant; exactly one deployment covers any later instant.
     let open_count: i64 = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT count(*) AS c FROM sensor_deployments \
              WHERE site_id = $1 AND parameter_id = $2 AND deployed_until IS NULL",

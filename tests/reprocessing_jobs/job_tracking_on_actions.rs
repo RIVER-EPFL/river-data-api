@@ -1,6 +1,6 @@
 //! E2E tests for tracked background actions.
 //!
-//! Covers the action endpoints that now run inside `spawn_tracked_job` and therefore
+//! Covers the action endpoints that enqueue a worker-pool job and therefore
 //! create a visible `reprocessing_jobs` row: `/actions/reprocess`,
 //! `/actions/refresh_aggregates`, and `/actions/compute_derived`.
 //!
@@ -26,7 +26,7 @@ async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
 /// Number of `reprocessing_jobs` rows with the given id (0 or 1).
 async fn job_exists(db: &sea_orm::DatabaseConnection, job_id: &str) -> bool {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT COUNT(*) AS n FROM reprocessing_jobs WHERE id = $1",
             [Uuid::parse_str(job_id).unwrap().into()],
@@ -56,7 +56,7 @@ async fn wait_for_terminal(db: &sea_orm::DatabaseConnection, job_id: &str) -> St
     let start = Instant::now();
     loop {
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT status FROM reprocessing_jobs WHERE id = $1",
                 [id.into()],
@@ -114,7 +114,7 @@ async fn reprocess_creates_tracked_job_for_seeded_sensor() {
     );
 
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT trigger_type, sensor_id FROM reprocessing_jobs WHERE id = $1",
             [Uuid::parse_str(&job_id).unwrap().into()],

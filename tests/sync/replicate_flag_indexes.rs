@@ -86,7 +86,7 @@ async fn setup_gapped_group(key: &str) -> (Fixture, String) {
 
 async fn flagged_indexes(fx: &Fixture) -> Vec<i16> {
     fx.db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT replicate_index FROM readings \
@@ -104,7 +104,7 @@ async fn flagged_indexes(fx: &Fixture) -> Vec<i16> {
 
 async fn hold_status(fx: &Fixture, hold_id: &str) -> String {
     fx.db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!("SELECT status FROM replicate_audit_holds WHERE id = '{hold_id}'"),
         ))
@@ -118,7 +118,7 @@ async fn hold_status(fx: &Fixture, hold_id: &str) -> String {
 async fn sample_mean_and_n(fx: &Fixture) -> (f64, i64) {
     let row = fx
         .db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT mean, n::bigint AS n FROM samples \

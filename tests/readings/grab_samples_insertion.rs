@@ -46,7 +46,7 @@ async fn test_insert_triplicate_grab_samples() {
 
     // Verify readings were inserted with correct site_id and parameter_id
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT COUNT(*) as c FROM readings \
@@ -64,7 +64,7 @@ async fn test_insert_triplicate_grab_samples() {
 
     // Verify sample row was created and that the trigger populated aggregates
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT n, mean, stdev, min_value, max_value FROM samples \
@@ -119,15 +119,14 @@ async fn test_insert_triplicate_grab_samples() {
 }
 
 // ============================================================================
-// Single reading (no replicates), still gets its own sample row
+// Single reading (no replicates): the measurement, with no statistics row
 // ============================================================================
 
-/// A grab is a collection event from its first measurement. The views that read grabs, the
-/// sensor-vs-grab export and the standard-curve filter among them, join through `samples`, so a
-/// single-replicate grab needs a row there to be visible at all.
+/// A `samples` row is the statistics of a group. A grab measured once is the reading itself, and
+/// the views that read grabs derive n = 1 from it rather than from a row of one.
 #[tokio::test]
 #[serial]
-async fn test_single_grab_sample_creates_sample_row() {
+async fn test_single_grab_sample_mints_no_sample_row() {
     let (app, token, db) = setup().await;
 
     let (status, body) = crate::common::post_json_with_token(
@@ -146,12 +145,12 @@ async fn test_single_grab_sample_creates_sample_row() {
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["inserted"], 1);
     assert_eq!(
-        json["samples_created"], 1,
-        "a single-replicate grab is still a collection event"
+        json["samples_created"], 0,
+        "a single measurement is not a group"
     );
 
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT COUNT(*) as c, MIN(n) as n FROM samples \
@@ -165,9 +164,7 @@ async fn test_single_grab_sample_creates_sample_row() {
         .unwrap()
         .unwrap();
     let count: i64 = row.try_get("", "c").unwrap();
-    let n: Option<i32> = row.try_get("", "n").unwrap();
-    assert_eq!(count, 1, "exactly one sample row for the grab");
-    assert_eq!(n, Some(1), "trigger counts the single replicate");
+    assert_eq!(count, 0, "no statistics row for one reading");
 }
 
 // ============================================================================
@@ -198,8 +195,8 @@ async fn test_multi_parameter_grab_samples() {
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["inserted"], 3);
     assert_eq!(
-        json["samples_created"], 2,
-        "one sample per (parameter, instant) group, the single Conductivity grab included"
+        json["samples_created"], 1,
+        "one sample for the two Temperature replicates; the lone Conductivity grab forms none"
     );
 }
 
@@ -228,7 +225,7 @@ async fn test_grab_sample_creates_stream() {
 
     // Verify a grab_sample stream was created
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT COUNT(*) as c FROM data_streams \
@@ -363,7 +360,7 @@ async fn test_grab_applies_standard_curve_server_side() {
 
     let sensor_id = "00000000-0000-4000-c000-0000000000a1";
     let curve_id = "00000000-0000-4000-c000-0000000000b1";
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "INSERT INTO sensors (id, name, is_active, is_lab_instrument, created_at)
@@ -372,7 +369,7 @@ async fn test_grab_applies_standard_curve_server_side() {
     ))
     .await
     .unwrap();
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "INSERT INTO standard_curves (id, sensor_id, slope, intercept, name)
@@ -399,7 +396,7 @@ async fn test_grab_applies_standard_curve_server_side() {
     assert_eq!(status, 200, "grab with curve should succeed: {body}");
 
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT raw_value, calibrated_value, standard_curve_id, measurement_type FROM readings \
@@ -458,7 +455,7 @@ async fn test_grab_rejects_curve_without_an_instrument() {
 
     let sensor_id = "00000000-0000-4000-c000-0000000000a2";
     let curve_id = "00000000-0000-4000-c000-0000000000b2";
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "INSERT INTO sensors (id, name, is_active, is_lab_instrument, created_at)
@@ -467,7 +464,7 @@ async fn test_grab_rejects_curve_without_an_instrument() {
     ))
     .await
     .unwrap();
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "INSERT INTO standard_curves (id, sensor_id, slope, intercept, name)

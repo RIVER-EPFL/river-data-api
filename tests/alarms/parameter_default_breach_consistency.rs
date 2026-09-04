@@ -33,7 +33,7 @@ async fn every_path_agrees_on_a_parameter_default_breach() {
 
     // Inject an alarm-level breach (> 500) as the latest reading.
     let stream_id: Uuid = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!("SELECT stream_id FROM readings WHERE site_id='{site}' AND parameter_id='{turb}' LIMIT 1"),
         ))
@@ -162,7 +162,7 @@ async fn every_path_agrees_on_a_parameter_default_breach() {
     let stats = alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
     assert!(stats.opened >= 1, "sweeper opens from default: {stats:?}");
     let sev: i16 = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT severity FROM alarm_events WHERE site_id='{site}' AND parameter_id='{turb}' AND resolved_at IS NULL"

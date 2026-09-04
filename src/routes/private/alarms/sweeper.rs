@@ -170,7 +170,7 @@ async fn reconcile_cadence(
     };
     let mut open_keys: HashSet<(Uuid, Uuid)> = HashSet::new();
     for row in db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &open_keys_sql,
             open_keys_values,
@@ -187,7 +187,7 @@ async fn reconcile_cadence(
     // Open-or-update each current breach.
     for b in &breaches {
         let is_new = !open_keys.contains(&(b.site_id, b.parameter_id));
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "INSERT INTO alarm_events \
                 (site_id, parameter_id, measurement_type, severity, max_severity, started_at, value_at_start, last_seen_at, last_value) \
@@ -267,7 +267,7 @@ async fn reconcile_cadence(
          WHERE ae.resolved_at IS NULL AND ae.measurement_type = '{cadence}'{scope_clause}{not_in_clause}"
     );
     let resolved = db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &resolve_sql,
             values,

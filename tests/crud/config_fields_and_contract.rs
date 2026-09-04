@@ -734,11 +734,23 @@ async fn muted_slot_receives_no_stale_data_notification() {
     assert_eq!(
         e2e::count(
             &db,
-            "SELECT count(*) AS c FROM notification_log WHERE kind = 'stale_data'"
+            "SELECT count(*) AS c FROM notification_log \
+             WHERE kind = 'stale_data' AND status = 'sent'"
         )
         .await,
         1,
-        "only the unmuted slot's delivery is logged"
+        "only the unmuted slot is delivered"
+    );
+    assert_eq!(
+        e2e::count(
+            &db,
+            "SELECT count(*) AS c FROM notification_log \
+             WHERE kind = 'stale_data' AND status = 'muted' AND channel = 'all'"
+        )
+        .await,
+        1,
+        "the muted slot's suppression is logged, so it reads differently from a slot nobody \
+         subscribed to"
     );
 }
 

@@ -17,7 +17,7 @@ use crate::support::fresh_database;
 /// case-insensitive, matching `ParameterCatalog::resolve` and the catalog's unique index on
 /// `LOWER(code)`.
 async fn unresolved_codes(db: &DatabaseConnection) -> Vec<String> {
-    db.query_all(Statement::from_string(
+    db.query_all_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         "SELECT tool, key, code FROM (
              SELECT s.name AS tool, o->>'key' AS key, o->>'suggested_parameter_code' AS code
@@ -50,7 +50,7 @@ async fn unresolved_codes(db: &DatabaseConnection) -> Vec<String> {
 }
 
 async fn count_of(db: &DatabaseConnection, sql: &str) -> i64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_string(),
     ))

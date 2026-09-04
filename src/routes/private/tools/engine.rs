@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::readings::sd_estimator;
 
 /// The serialization the API requires of the runner: full precision (the default rounds to 4
 /// significant digits), scalars as scalars, and R NA as null.
@@ -677,7 +678,10 @@ fn check_sections(raw: &ManifestRaw) -> Result<(), String> {
         if let Some(key) = p.section.as_deref()
             && !raw.sections.iter().any(|s| s.key == key)
         {
-            return Err(format!("param '{}': section '{key}' is not declared", p.name));
+            return Err(format!(
+                "param '{}': section '{key}' is not declared",
+                p.name
+            ));
         }
     }
     Ok(())
@@ -733,8 +737,9 @@ pub struct Manifest {
     pub station_inputs: Vec<ManifestStationInput>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub event_inputs: Vec<ManifestEventInput>,
-    /// QC declarations (replicate pooling, check exclusions), read by the seasonal check and the
-    /// event audit. Stored as declared; the shape is an object.
+    /// Opaque QC block, stored as declared and served on `GET /tools` for clients that read it.
+    /// Nothing server-side reads it: the seasonal check and the event audit take no input from
+    /// the manifest. The only validation is that it is an object.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qc: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -922,6 +927,24 @@ pub struct ParameterCatalog {
 }
 
 impl ParameterCatalog {
+    /// A catalog of bare (id, code) rows, for tests that exercise resolution without a database.
+    #[cfg(test)]
+    pub(crate) fn with_codes(rows: &[(Uuid, &str)]) -> Self {
+        let mut catalog = Self::default();
+        for (id, code) in rows {
+            let row = CatalogRow {
+                id: *id,
+                code: (*code).to_string(),
+                name: (*code).to_string(),
+                default_units: None,
+                needs_review: false,
+            };
+            catalog.by_code.insert(code.to_lowercase(), row.clone());
+            catalog.by_id.insert(*id, row);
+        }
+        catalog
+    }
+
     /// The parameter an output names: `parameter_id` when it resolves, else
     /// `suggested_parameter_code`, else nothing.
     #[must_use]
@@ -977,7 +1000,7 @@ pub async fn load_parameter_catalog<'a>(
         return Ok(catalog);
     }
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT id, code, name, default_units, needs_review FROM parameters
               WHERE id = ANY($1) OR LOWER(code) = ANY($2)",
@@ -1131,7 +1154,7 @@ async fn missing_constants(db: &DatabaseConnection, names: &[String]) -> AppResu
         return Ok(Vec::new());
     }
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT name FROM constants WHERE name = ANY($1)",
             [names.to_vec().into()],
@@ -1299,11 +1322,13 @@ fn row_to_active(row: &sea_orm::QueryResult) -> AppResult<ActiveTool> {
     })
 }
 
+/// The calculation set: every enabled tool with an active version. A disabled tool is left out
+/// here, so the chain, the audit and the tools list do not see it; it can still be run by name.
 pub async fn list_active_tools(db: &DatabaseConnection) -> AppResult<Vec<ActiveTool>> {
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            format!("{ACTIVE_TOOL_SQL} ORDER BY s.name"),
+            format!("{ACTIVE_TOOL_SQL} WHERE s.enabled ORDER BY s.name"),
         ))
         .await?;
     rows.iter().map(row_to_active).collect()
@@ -1311,7 +1336,7 @@ pub async fn list_active_tools(db: &DatabaseConnection) -> AppResult<Vec<ActiveT
 
 pub async fn find_active_tool(db: &DatabaseConnection, name: &str) -> AppResult<ActiveTool> {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!("{ACTIVE_TOOL_SQL} WHERE LOWER(s.name) = LOWER($1)"),
             [name.into()],
@@ -1449,7 +1474,7 @@ async fn resolve_curve(
             .parse()
             .map_err(|_| AppError::BadRequest(format!("curve '{}': invalid UUID", slot.name)))?;
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT slope, intercept, name FROM standard_curves WHERE id = $1",
                 [id.into()],
@@ -1508,7 +1533,7 @@ async fn resolve_constants(
         return Ok(out);
     }
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT name, value FROM constants WHERE name = ANY($1)",
             [names.to_vec().into()],
@@ -1610,7 +1635,7 @@ pub async fn resolve_station_inputs(
         return Ok(Vec::new());
     };
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT name, to_jsonb(s) AS site FROM sites s WHERE id = $1",
             [site_id.into()],
@@ -1632,7 +1657,9 @@ pub async fn resolve_station_inputs(
                 {
                     return Err(AppError::BadRequest(format!(
                         "station property '{}' of site '{site_name}' resolved to {value}, which                          is not a {} for input '{}' of tool '{tool_name}'",
-                        s.property, param.kind, s.target()
+                        s.property,
+                        param.kind,
+                        s.target()
                     )));
                 }
                 body.insert(s.target().to_string(), value.clone());
@@ -1678,7 +1705,7 @@ pub async fn resolve_event_inputs(
     let mut resolved = Vec::new();
     for e in pending {
         let Some(row) = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT p.id AS parameter_id, COALESCE(
                     (SELECT smp.mean FROM samples smp
@@ -1745,6 +1772,68 @@ pub async fn run_tool_body(
     constants_override: Option<&serde_json::Map<String, serde_json::Value>>,
     missing_constant: MissingConstant,
 ) -> AppResult<RunOutcome> {
+    let resolved = resolve_run(state, tool, body, constants_override, missing_constant).await?;
+    execute_resolved(state, tool, resolved).await
+}
+
+/// A run resolved up to the point of execution: exactly what the runner will receive, before it
+/// is asked for anything.
+pub struct ResolvedRun {
+    /// The inputs as the runner will receive them: request values plus defaults and the resolved
+    /// station/event inputs, minus the curves.
+    pub inputs: serde_json::Map<String, serde_json::Value>,
+    pub constants: serde_json::Map<String, serde_json::Value>,
+    /// Curves by slot name, as the runner receives them.
+    pub curves: serde_json::Map<String, serde_json::Value>,
+    /// The same curves as `{name, curve}` snapshots, the form the stored run records.
+    pub curve_snapshots: Vec<serde_json::Value>,
+    curves_consumed: Vec<String>,
+    provided: Vec<String>,
+    pub station_inputs: Vec<serde_json::Value>,
+    pub event_inputs: Vec<serde_json::Value>,
+    pub site_id: Option<Uuid>,
+    pub collected_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl ResolvedRun {
+    /// The identity of what this run would consume under `version_id`. Equal fingerprints mean
+    /// equal outputs, so a recompute can skip the runner.
+    pub fn fingerprint(&self, version_id: Uuid) -> String {
+        run_fingerprint(
+            version_id,
+            &serde_json::Value::Object(self.inputs.clone()),
+            &serde_json::Value::Object(self.constants.clone()),
+            &serde_json::Value::Array(self.curve_snapshots.clone()),
+        )
+    }
+}
+
+/// One hash over a script version and the inputs, constants and curve snapshots a run consumes,
+/// in the canonical form the stored run and provenance blob hold. Computed the same way from a
+/// resolved run and from a stored record, so the two are comparable.
+pub fn run_fingerprint(
+    version_id: Uuid,
+    inputs: &serde_json::Value,
+    constants: &serde_json::Value,
+    curves: &serde_json::Value,
+) -> String {
+    migration::tool_hash::canonical_hash(&serde_json::json!({
+        "script_version_id": version_id,
+        "inputs": inputs,
+        "constants": constants,
+        "curves": curves,
+    }))
+}
+
+/// Everything [`run_tool_body`] does before the runner is called: the manifest checks, the
+/// context resolution, defaults and requiredness, curve and constant resolution.
+pub async fn resolve_run(
+    state: &AppState,
+    tool: &ActiveTool,
+    body: &[u8],
+    constants_override: Option<&serde_json::Map<String, serde_json::Value>>,
+    missing_constant: MissingConstant,
+) -> AppResult<ResolvedRun> {
     let body: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| AppError::BadRequest(format!("Invalid request body: {e}")))?;
     let mut body = match body {
@@ -1794,9 +1883,15 @@ pub async fn run_tool_body(
     // resolved one fills the gap, and a manifest default is the last resort.
     let station_inputs =
         resolve_station_inputs(&state.db, &tool.name, manifest, site_id, &mut body).await?;
-    let event_inputs =
-        resolve_event_inputs(&state.db, &tool.name, manifest, site_id, collected_at, &mut body)
-            .await?;
+    let event_inputs = resolve_event_inputs(
+        &state.db,
+        &tool.name,
+        manifest,
+        site_id,
+        collected_at,
+        &mut body,
+    )
+    .await?;
 
     // Defaults land before requiredness so a condition reads the same values the runner will,
     // whatever order the params are declared in.
@@ -1861,13 +1956,47 @@ pub async fn run_tool_body(
         None => resolve_constants(&state.db, &manifest.constants, missing_constant).await?,
     };
     let provided: Vec<String> = body.keys().cloned().collect();
-    let effective_inputs = body.clone();
+    Ok(ResolvedRun {
+        inputs: body,
+        constants,
+        curves,
+        curve_snapshots,
+        curves_consumed,
+        provided,
+        station_inputs,
+        event_inputs,
+        site_id,
+        collected_at,
+    })
+}
+
+/// Hand a resolved run to the runner and shape its answer: NA outputs dropped, manifest
+/// aggregates applied, `inputs_used` accounted.
+pub async fn execute_resolved(
+    state: &AppState,
+    tool: &ActiveTool,
+    resolved: ResolvedRun,
+) -> AppResult<RunOutcome> {
+    let manifest = &tool.manifest;
+    let param_names: Vec<&str> = manifest.params.iter().map(|p| p.name.as_str()).collect();
+    let ResolvedRun {
+        inputs: effective_inputs,
+        constants,
+        curves,
+        curve_snapshots,
+        curves_consumed,
+        provided,
+        station_inputs,
+        event_inputs,
+        site_id,
+        collected_at,
+    } = resolved;
 
     let raw = execute_script(
         state,
         &tool.script,
         &tool.entry_function,
-        &serde_json::Value::Object(body),
+        &serde_json::Value::Object(effective_inputs.clone()),
         &serde_json::Value::Object(constants.clone()),
         &serde_json::Value::Object(curves),
     )
@@ -1892,6 +2021,7 @@ pub async fn run_tool_body(
         &effective_inputs,
         &curve_snapshots,
         site_id,
+        collected_at,
         &mut results,
     )
     .await?;
@@ -1937,18 +2067,19 @@ pub async fn run_tool_body(
 /// Compute the manifest's `aggregate` outputs over the curve-applied replicate values, replacing
 /// anything the script emitted under the same keys. The preview must be the number the database
 /// will serve after the save: same curve, same divisor. The divisor is the output's fixed
-/// declaration, else the slot's (when the run carries a site), else sample, matching the grab
-/// write path's resolution.
+/// declaration, else what [`displayed_sd_estimator`] resolves for the instant being calculated.
 async fn apply_manifest_aggregates(
     db: &DatabaseConnection,
     manifest: &Manifest,
     inputs: &serde_json::Map<String, serde_json::Value>,
     curve_snapshots: &[serde_json::Value],
     site_id: Option<Uuid>,
+    collected_at: Option<chrono::DateTime<chrono::Utc>>,
     results: &mut serde_json::Map<String, serde_json::Value>,
 ) -> AppResult<()> {
     for output in &manifest.outputs {
-        let (Some(kind), Some(source)) = (output.aggregate.as_deref(), output.aggregate_of.as_deref())
+        let (Some(kind), Some(source)) =
+            (output.aggregate.as_deref(), output.aggregate_of.as_deref())
         else {
             continue;
         };
@@ -1981,9 +2112,7 @@ async fn apply_manifest_aggregates(
             .collect();
 
         let computed = match kind {
-            "mean" if !values.is_empty() => {
-                Some(values.iter().sum::<f64>() / values.len() as f64)
-            }
+            "mean" if !values.is_empty() => Some(values.iter().sum::<f64>() / values.len() as f64),
             "sd" if values.len() >= 2 => {
                 let n = values.len() as f64;
                 let mean = values.iter().sum::<f64>() / n;
@@ -1991,8 +2120,8 @@ async fn apply_manifest_aggregates(
                 let divisor = match output.fixed_sd_estimator() {
                     Some("population") => n,
                     Some(_) => n - 1.0,
-                    None => match slot_sd_estimator(db, site_id, param).await?.as_deref() {
-                        Some("population") => n,
+                    None => match displayed_sd_estimator(db, site_id, collected_at, param).await? {
+                        Some(sd_estimator::POPULATION) => n,
                         _ => n - 1.0,
                     },
                 };
@@ -2012,26 +2141,46 @@ async fn apply_manifest_aggregates(
     Ok(())
 }
 
-/// The declaration of the slot a replicates param's readings will land on, reachable only when
+/// The divisor the database will serve for the group this run is calculating, reachable only when
 /// the run carries a site and the param names a catalog code.
-async fn slot_sd_estimator(
+///
+/// Same ladder as the write path (`sd_estimator::resolve`), preceded by the one declaration that
+/// belongs to the instant rather than the slot: an audit resolution scoped to a collection group
+/// records its choice on that `samples` row, and the trigger computes the served sd from it. A
+/// display resolved from the slot alone would show a different standard deviation for the same
+/// values.
+async fn displayed_sd_estimator(
     db: &DatabaseConnection,
     site_id: Option<Uuid>,
+    collected_at: Option<chrono::DateTime<chrono::Utc>>,
     param: &ManifestParam,
-) -> AppResult<Option<String>> {
+) -> AppResult<Option<&'static str>> {
     let (Some(site), Some(code)) = (site_id, param.parameter_code.as_deref()) else {
         return Ok(None);
     };
+    let Some(parameter_id) = catalog_parameter_id(db, code).await? else {
+        return Ok(None);
+    };
+    if let Some(at) = collected_at
+        && let Some(estimator) =
+            sd_estimator::instant_declaration(db, site, parameter_id, at).await?
+    {
+        return Ok(Some(estimator));
+    }
+    let resolved = sd_estimator::resolve(db, site, parameter_id, None, None).await?;
+    Ok(resolved.is_declared().then_some(resolved.estimator))
+}
+
+/// The catalog parameter a manifest param names, matched the way every other code lookup does.
+async fn catalog_parameter_id(db: &DatabaseConnection, code: &str) -> AppResult<Option<Uuid>> {
     let row = db
-        .query_one(sea_orm::Statement::from_sql_and_values(
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT sp.sd_estimator FROM site_parameters sp
-             JOIN parameters p ON p.id = sp.parameter_id
-             WHERE sp.site_id = $1 AND LOWER(p.code) = LOWER($2)",
-            [site.into(), code.into()],
+            "SELECT id FROM parameters WHERE LOWER(code) = LOWER($1)",
+            [code.into()],
         ))
         .await?;
-    Ok(row.and_then(|r| r.try_get::<Option<String>>("", "sd_estimator").ok().flatten()))
+    Ok(row.map(|r| r.try_get::<Uuid>("", "id")).transpose()?)
 }
 
 /// Where a script failed to parse. `line`/`column` are absent when R's message carries no

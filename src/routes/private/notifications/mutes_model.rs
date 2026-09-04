@@ -1,6 +1,6 @@
-use crudcrate::{CRUDResource, EntityToModels};
+use crudcrate::EntityToModels;
 use sea_orm::entity::prelude::*;
-use sea_orm::{Condition, sea_query::Expr};
+use sea_orm::{Condition, ExprTrait, sea_query::Expr};
 
 #[derive(
     Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,

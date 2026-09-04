@@ -17,7 +17,7 @@ pub struct AuditStatusCodes {
 /// Distinct `status_code` values recorded in `api_token_audit_log`, ascending. Admin-only, read-only.
 #[utoipa::path(
     get,
-    path = "/api_token_audit_logs/distinct/status_codes",
+    path = "/api/api_token_audit_logs/distinct/status_codes",
     responses(
         (status = 200, description = "Distinct status codes recorded in the audit log", body = AuditStatusCodes),
     ),
@@ -28,7 +28,7 @@ pub async fn distinct_status_codes(
 ) -> AppResult<Json<AuditStatusCodes>> {
     let rows = state
         .db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT DISTINCT status_code FROM api_token_audit_log ORDER BY status_code".to_string(),
         ))

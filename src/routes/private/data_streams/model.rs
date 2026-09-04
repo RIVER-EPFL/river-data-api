@@ -1,4 +1,4 @@
-use crudcrate::{CRUDResource, EntityToModels};
+use crudcrate::EntityToModels;
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -19,15 +19,18 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
     pub id: Uuid,
-    #[crudcrate(filterable, sortable)]
+    #[crudcrate(filterable, sortable, exclude(update))]
     pub source_system: String,
-    #[crudcrate(filterable, fulltext, sortable)]
+    #[crudcrate(filterable, fulltext, sortable, exclude(update))]
     pub source_key: String,
     #[crudcrate(fulltext, sortable)]
     pub source_name: Option<String>,
     #[crudcrate(fulltext)]
     pub source_path: Option<String>,
+    // The replicate column-to-index assignments live here and are append-only: register, pair and
+    // retag are the only writers. A CRUD PATCH must not be able to re-point or erase them.
     #[sea_orm(column_type = "JsonBinary")]
+    #[crudcrate(exclude(update))]
     pub metadata: serde_json::Value,
     #[crudcrate(filterable)]
     pub site_parameter_id: Option<Uuid>,
@@ -43,7 +46,7 @@ pub struct Model {
     pub discovered_at: DateTimeWithTimeZone,
     #[crudcrate(sortable)]
     pub paired_at: Option<DateTimeWithTimeZone>,
-    #[crudcrate(sortable)]
+    #[crudcrate(sortable, exclude(update))]
     pub last_data_time: Option<DateTimeWithTimeZone>,
     /// Content digest of the last cleanly-applied windowed pass, as the sync client claimed it.
     #[crudcrate(exclude(create, update))]

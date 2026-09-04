@@ -4,6 +4,7 @@ pub mod bulk;
 pub mod bulk_write;
 pub mod cache;
 pub mod cache_key;
+pub mod db_pool;
 pub mod grants;
 pub mod middleware;
 pub mod plot;

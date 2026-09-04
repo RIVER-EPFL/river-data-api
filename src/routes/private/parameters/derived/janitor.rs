@@ -13,7 +13,7 @@ pub async fn site_has_active_derived(
     site_id: Uuid,
 ) -> Result<bool, sea_orm::DbErr> {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT 1 FROM site_parameters \
              WHERE site_id = $1 AND is_derived = true AND COALESCE(is_active, true) = true LIMIT 1",
@@ -34,7 +34,7 @@ pub async fn site_has_active_derived(
 /// the hourly/daily/weekly/monthly rollups reflect the newly written derived values.
 ///
 /// Reports progress into the caller's job rather than opening one of its own: the janitor always
-/// runs as a step of the worker-pool `janitor_run` job, and a second row opened from inside that
+/// runs as a step of the worker-pool `janitor_service` job, and a second row opened from inside that
 /// job would carry no lease, so nothing could ever reclaim it.
 pub async fn run_once(
     db: &DatabaseConnection,
@@ -43,7 +43,7 @@ pub async fn run_once(
     let started = std::time::Instant::now();
 
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT DISTINCT r.site_id, r.time
               FROM readings r
@@ -189,7 +189,7 @@ pub async fn prune_tracked_jobs(
 
 async fn run_delete(db: &DatabaseConnection, sql: String, label: &str) -> u64 {
     match db
-        .execute(Statement::from_string(
+        .execute_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             sql,
         ))

@@ -57,7 +57,7 @@ fn bump_all(stream_id: Uuid) -> Statement {
 
 async fn sum_of(db: &DatabaseConnection, stream_id: Uuid) -> f64 {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "SELECT COALESCE(SUM(raw_value), 0)::float8 AS total FROM readings WHERE stream_id = $1",
             [stream_id.into()],
@@ -73,7 +73,7 @@ async fn sum_of(db: &DatabaseConnection, stream_id: Uuid) -> f64 {
 async fn guarded_mutation_completes_where_the_bare_statement_hits_the_decompression_cap() {
     let (db, capped, stream_id, base) = seed_compressed("guarded_bulk_write_cap").await;
 
-    let bare = capped.execute(bump_all(stream_id)).await;
+    let bare = capped.execute_raw(bump_all(stream_id)).await;
     assert!(
         bare.is_err(),
         "an uncapped bare UPDATE would prove nothing; the cap must bite first"

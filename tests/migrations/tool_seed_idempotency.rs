@@ -49,7 +49,7 @@ async fn duplicates(db: &DatabaseConnection) -> Vec<String> {
         ),
     ] {
         for row in db
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
                 sql.to_string(),
             ))
@@ -66,7 +66,7 @@ async fn duplicates(db: &DatabaseConnection) -> Vec<String> {
 
 /// Every seeded hash, keyed by tool name.
 async fn seeded_hashes(db: &DatabaseConnection) -> Vec<(String, String)> {
-    db.query_all(Statement::from_string(
+    db.query_all_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         "SELECT s.name, v.content_hash FROM tool_script_versions v \
          JOIN tool_scripts s ON s.id = v.tool_script_id ORDER BY s.name"
@@ -101,7 +101,7 @@ async fn every_seeded_hash_recomputes_from_the_row_it_identifies() {
         .expect("migrations apply");
 
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT s.name, v.script, v.entry_function, v.manifest, v.test_cases, v.content_hash \
              FROM tool_script_versions v JOIN tool_scripts s ON s.id = v.tool_script_id \
@@ -110,7 +110,11 @@ async fn every_seeded_hash_recomputes_from_the_row_it_identifies() {
         ))
         .await
         .expect("read the seeded versions");
-    assert_eq!(rows.len(), 1, "the seed list holds doc alone until each tool is reworked");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the seed list holds doc alone until each tool is reworked"
+    );
 
     for row in &rows {
         let name: String = row.try_get("", "name").expect("name");

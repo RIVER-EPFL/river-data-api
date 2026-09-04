@@ -77,7 +77,9 @@ const RECENT_EXTENT_DAYS: i64 = 14;
 ///
 /// - Continuous extents and counts come from `readings_hourly`, whose population (replicate 0,
 ///   unflagged, non-spot) is exactly what `continuous_count` mirrors.
-/// - Spot extents and replicate counts come from `samples`, the materialised per-instant groups.
+/// - Spot extents and replicate counts come from the spot readings themselves, over
+///   `idx_readings_spot_site_param_time`: a single measurement forms no `samples` row, so the
+///   materialised groups do not speak for every grab.
 /// - A bounded raw pass over the last `RECENT_EXTENT_DAYS` covers rows the hourly aggregate has
 ///   not refreshed yet and decides `has_*` for brand-new slots; it carries no flag filter, so a
 ///   freshly flagged tail still extends the extent.
@@ -85,6 +87,10 @@ const RECENT_EXTENT_DAYS: i64 = 14;
 ///   whose trailing rows are all flagged and older than the raw pass still reports its true end.
 ///   The extents seed the chart range slider, and flagged points are drawn and exported, so the
 ///   flagged tail must stay inside the range.
+/// - A probe over flagged rows alone supplies the same guarantee at the head, where there is no
+///   cursor to speak for it. Flagged rows are the only population the summaries leave out, so
+///   this is the whole of the correction; `idx_readings_flagged_site_param_time` is what keeps it
+///   off an unbounded scan.
 ///
 /// `data_end` from the aggregate alone is the last bucket start plus one bucket, which can
 /// overstate by up to an hour; the exact sources win whenever they are newer. `reading_count`
@@ -106,9 +112,12 @@ async fn parameter_extents(
 
     let spot = SpotExtentRow::find_by_statement(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        "SELECT parameter_id, MIN(collected_at) AS min_time, MAX(collected_at) AS max_time, \
-                COALESCE(SUM(n), 0)::bigint AS count \
-         FROM samples WHERE site_id = $1 GROUP BY parameter_id",
+        "SELECT parameter_id, MIN(time) AS min_time, MAX(time) AS max_time, \
+                COUNT(*) FILTER (WHERE is_flagged IS NOT TRUE \
+                                   AND withdrawn_at IS NULL)::bigint AS count \
+         FROM readings WHERE site_id = $1 AND parameter_id IS NOT NULL \
+           AND measurement_type = 'spot' \
+         GROUP BY parameter_id",
         [site_id.into()],
     ))
     .all(db)
@@ -132,9 +141,26 @@ async fn parameter_extents(
     .all(db)
     .await?;
 
+    let mut flagged_heads: HashMap<Uuid, DateTime<Utc>> = HashMap::new();
+    for row in db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT parameter_id, MIN(time) AS min_time FROM readings \
+             WHERE site_id = $1 AND parameter_id IS NOT NULL AND is_flagged \
+             GROUP BY parameter_id",
+            [site_id.into()],
+        ))
+        .await?
+    {
+        let parameter_id: Uuid = row.try_get("", "parameter_id")?;
+        if let Ok(t) = row.try_get::<DateTime<Utc>>("", "min_time") {
+            flagged_heads.insert(parameter_id, t);
+        }
+    }
+
     let mut cursors: HashMap<Uuid, DateTime<Utc>> = HashMap::new();
     for row in db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT sp.parameter_id, MAX(ds.last_data_time) AS max_time \
              FROM data_streams ds JOIN site_parameters sp ON ds.site_parameter_id = sp.id \
@@ -180,6 +206,10 @@ async fn parameter_extents(
             e.spot_count = r.spot_count;
         }
     }
+    for (parameter_id, t) in flagged_heads {
+        let e = extents.entry(parameter_id).or_insert_with(empty_extent);
+        e.data_start = min_opt(e.data_start, Some(t));
+    }
     for (parameter_id, t) in cursors {
         let e = extents.entry(parameter_id).or_insert_with(empty_extent);
         e.data_end = max_opt(e.data_end, Some(t));
@@ -220,7 +250,7 @@ async fn declared_frequencies(
     let mut map: HashMap<Uuid, &'static str> = HashMap::new();
 
     for row in db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT d.parameter_id, bool_or(sn.data_frequency = 'low') AS any_low, \
                     bool_or(sn.data_frequency = 'high') AS any_high \
@@ -247,7 +277,7 @@ async fn declared_frequencies(
     }
 
     for row in db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT sp.parameter_id, bool_or(ds.measurement_type = 'spot') AS any_spot, \
                     bool_or(ds.measurement_type <> 'spot') AS any_continuous \
@@ -319,7 +349,7 @@ fn build_parameter_response(
 /// List parameters for a site
 #[utoipa::path(
     get,
-    path = "/{site_id}/parameters",
+    path = "/api/sites/{site_id}/parameters",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
     ),
@@ -366,7 +396,7 @@ pub async fn list_site_parameters(
 /// Get detailed site information including project, parameters, and data range
 #[utoipa::path(
     get,
-    path = "/{site_id}/detail",
+    path = "/api/sites/{site_id}/detail",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
     ),

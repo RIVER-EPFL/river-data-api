@@ -1,5 +1,8 @@
 use axum::{Json, extract::State};
-use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    Set,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
@@ -8,19 +11,18 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::error::{AppError, AppResult};
+use crate::routes::private::collection_events::recompute;
 use crate::routes::private::readings::batch::{
     CurveClaim, Replace, admission, admit_standard_curves, readings_upsert,
 };
+use crate::routes::private::readings::decisions;
 use crate::routes::private::{
-    data_streams, readings, readings::sample_groups, readings::samples,
-    readings::sd_estimator, sensors::calibrations, sites, sites::parameters as site_parameters,
+    data_streams, readings, readings::sample_groups, readings::samples, readings::sd_estimator,
+    sensors::calibrations, sites, sites::parameters as site_parameters,
 };
 
 /// Grabs are spot measurements by definition: a bottle, not a logger cadence.
 const GRAB_MEASUREMENT_TYPE: &str = "spot";
-
-/// Posting to this endpoint is the declaration that a collection event happened.
-const GRAB_IS_A_COLLECTION_EVENT: bool = true;
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -107,14 +109,25 @@ pub struct GrabSampleResponse {
     pub created_sample_ids: Vec<Uuid>,
     /// True when nothing was written.
     pub dry_run: bool,
-    /// Rows removed by `mode: replace` before the insert.
+    /// Rows removed by `mode: replace` before the insert. Only the grab stream's own rows at the
+    /// instant are candidates; rows another source wrote at the same slot and time are untouched.
     pub replaced: usize,
+    /// Curated rows on the grab stream that `mode: replace` left in place: flagged, withdrawn, or
+    /// carrying a standard curve the request did not supply. Each group with one raises a
+    /// `source_modified` hold, and the value entered at that replicate index is not written.
+    #[serde(default)]
+    pub kept_curated: usize,
     /// What each reading stores: the measured value, the curves that apply and the value they
     /// produce together, computed by the code the write itself uses.
     pub preview: Vec<GrabPreview>,
     /// Replicate groups already stored at the requested (parameter, time) keys, as found before
     /// this request wrote anything.
     pub existing_groups: Vec<ExistingGroup>,
+    /// The calculations the saved parameters feed and the output parameters each rewrites at the
+    /// visit, in run order. Reported on `dry_run` too, so the consequence is known before the
+    /// write; the save enqueues the visit's recompute when this is not empty.
+    #[serde(default)]
+    pub calculations: Vec<crate::routes::private::tools::closure::CalculationImpact>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -220,7 +233,7 @@ async fn fetch_existing_groups(
     let mut out = Vec::new();
     for (parameter_id, time) in groups {
         let rows = db
-            .query_all(sea_orm::Statement::from_sql_and_values(
+            .query_all_raw(sea_orm::Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r"SELECT replicate_index, raw_value, calibrated_value, standard_curve_id
                   FROM readings
@@ -326,18 +339,61 @@ async fn get_or_create_grab_stream(
     Ok(stream.id)
 }
 
-/// What a request puts on the `samples` rows it creates or reuses, as opposed to what identifies
-/// them. Grouped so the two find-or-create helpers take the identity and the contents separately
-/// rather than a dozen positional arguments.
-struct SampleFacts<'a> {
+/// What a request records about the measurement itself, as opposed to its value: who entered it,
+/// what they called it, what they wrote about it, and the server-built blob saying what produced
+/// the number. Every one of these is a property of the reading, so they are written onto each row
+/// the request lands rather than onto the statistics row its replicates may or may not form.
+struct GrabFacts<'a> {
     created_by: Option<&'a str>,
     label: Option<&'a str>,
     notes: Option<&'a str>,
     provenance: Option<&'a serde_json::Value>,
 }
 
-/// The samples row for this collection event, created if it is not already there, with its label and
-/// notes refreshed when the request carries them.
+/// The same four facts as they are stored on a reading, owned.
+#[derive(Default)]
+struct StoredFacts {
+    created_by: Option<String>,
+    label: Option<String>,
+    notes: Option<String>,
+    provenance: Option<serde_json::Value>,
+}
+
+impl StoredFacts {
+    fn is_empty(&self) -> bool {
+        self.created_by.is_none()
+            && self.label.is_none()
+            && self.notes.is_none()
+            && self.provenance.is_none()
+    }
+}
+
+impl GrabFacts<'_> {
+    /// This request's facts over what the group already carried, field by field: a rewrite that
+    /// says nothing about the label keeps the one the group was entered under.
+    fn over(&self, prior: Option<&StoredFacts>) -> StoredFacts {
+        StoredFacts {
+            created_by: self
+                .created_by
+                .map(String::from)
+                .or_else(|| prior.and_then(|p| p.created_by.clone())),
+            label: self
+                .label
+                .map(String::from)
+                .or_else(|| prior.and_then(|p| p.label.clone())),
+            notes: self
+                .notes
+                .map(String::from)
+                .or_else(|| prior.and_then(|p| p.notes.clone())),
+            provenance: self
+                .provenance
+                .cloned()
+                .or_else(|| prior.and_then(|p| p.provenance.clone())),
+        }
+    }
+}
+
+/// The statistics row for this group, created if it is not already there.
 ///
 /// Returns the row's id and whether this call is the one that created it.
 ///
@@ -350,24 +406,13 @@ async fn find_or_create_sample(
     site_id: Uuid,
     parameter_id: Uuid,
     time: chrono::DateTime<chrono::Utc>,
-    facts: &SampleFacts<'_>,
     estimator: sd_estimator::Resolved,
 ) -> Result<(Uuid, bool), AppError> {
-    let SampleFacts {
-        created_by,
-        label,
-        notes,
-        provenance,
-    } = *facts;
     let candidate = samples::ActiveModel {
         id: Set(Uuid::new_v4()),
         site_id: Set(site_id),
         parameter_id: Set(parameter_id),
         collected_at: Set(time),
-        label: Set(label.map(String::from)),
-        notes: Set(notes.map(String::from)),
-        created_by: Set(created_by.map(String::from)),
-        provenance: Set(provenance.cloned()),
         created_at: Set(Some(chrono::Utc::now())),
         mean: Set(None),
         stdev: Set(None),
@@ -407,57 +452,35 @@ async fn find_or_create_sample(
         .ok_or_else(|| {
             AppError::Internal("Failed to record the sample for this grab".to_string())
         })?;
-    let sample_id = existing.id;
 
-    if !inserted && (label.is_some() || notes.is_some() || provenance.is_some()) {
-        let mut active: samples::ActiveModel = existing.into();
-        if let Some(l) = label {
-            active.label = Set(Some(l.to_string()));
-        }
-        if let Some(n) = notes {
-            active.notes = Set(Some(n.to_string()));
-        }
-        // A re-post carrying provenance is a new run over this collection event; the blob
-        // follows the numbers being written, never the ones being replaced.
-        if let Some(p) = provenance {
-            active.provenance = Set(Some(p.clone()));
-        }
-        active.updated_at = Set(Some(chrono::Utc::now()));
-        active.update(txn).await?;
-    }
-
-    Ok((sample_id, inserted))
+    Ok((existing.id, inserted))
 }
 
-/// Create a `samples` row per (parameter_id, time) group. Returns the group-to-sample map and how
-/// many rows were created.
-async fn auto_create_samples(
+/// Form the `samples` row for every group this request left with two or more stored spot readings,
+/// and stamp the group's readings with it. Returns the group-to-sample map and the rows created.
+///
+/// Counted over what is stored rather than over the request: a second replicate entered later joins
+/// the instant's group, and a single measurement re-posted alone never mints a row of one.
+async fn materialise_grab_samples(
     txn: &sea_orm::DatabaseTransaction,
-    readings: &[GrabSampleReading],
+    groups: &[(Uuid, chrono::DateTime<chrono::Utc>)],
     site_id: Uuid,
-    facts: &SampleFacts<'_>,
     requested_estimator: Option<&'static str>,
     fixed_estimators: &HashMap<Uuid, &'static str>,
-) -> Result<
-    (
-        HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Uuid>,
-        Vec<Uuid>,
-    ),
-    AppError,
-> {
-    let mut groups: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), usize> = HashMap::new();
-    for r in readings {
-        *groups.entry((r.parameter_id, r.time)).or_default() += 1;
-    }
-
-    let mut sample_map = HashMap::new();
+) -> Result<Vec<Uuid>, AppError> {
     let mut created: Vec<Uuid> = Vec::new();
-    for ((parameter_id, time), count) in groups {
-        // A grab request is an operator recording a collection event, so every group is a sample
-        // whether or not it was measured twice. Views that read grabs, the sensor-vs-grab export
-        // and the curve filter among them, join through `samples`, so a grab without a row there
-        // is invisible to them.
-        if !sample_groups::forms_sample(GRAB_IS_A_COLLECTION_EVENT, count) {
+    for (parameter_id, time) in groups {
+        let stored: i64 = txn
+            .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r"SELECT COUNT(*)::bigint AS n FROM readings
+                  WHERE site_id = $1 AND parameter_id = $2 AND time = $3
+                    AND measurement_type = 'spot'",
+                [site_id.into(), (*parameter_id).into(), (*time).into()],
+            ))
+            .await?
+            .map_or(Ok(0), |row| row.try_get::<i64>("", "n"))?;
+        if !sample_groups::forms_sample(usize::try_from(stored).unwrap_or(0)) {
             continue;
         }
         // Each group resolves its own estimator: one request can span several parameters, and the
@@ -465,27 +488,41 @@ async fn auto_create_samples(
         // request's, which is the operator's choice for a `selectable` output; both are stamped
         // `tool`, and neither is invented here.
         let explicit = fixed_estimators
-            .get(&parameter_id)
+            .get(parameter_id)
             .copied()
             .or(requested_estimator);
         let estimator = sd_estimator::resolve(
             txn,
             site_id,
-            parameter_id,
+            *parameter_id,
             explicit.map(|e| (e, sd_estimator::Source::Tool)),
             None,
         )
         .await?;
         // Re-posting the same grab must reuse its sample, not accumulate empty duplicates.
         let (sample_id, is_new) =
-            find_or_create_sample(txn, site_id, parameter_id, time, facts, estimator).await?;
-        sample_map.insert((parameter_id, time), sample_id);
+            find_or_create_sample(txn, site_id, *parameter_id, *time, estimator).await?;
         if is_new {
             created.push(sample_id);
         }
+        // Scoped to spot readings: a sonde reading sharing the grab's snapped timestamp must not be
+        // adopted into the sample, or the trigger folds sensor data into the grab statistics.
+        txn.execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE readings SET sample_id = $1
+              WHERE site_id = $2 AND parameter_id = $3 AND time = $4 AND sample_id IS NULL
+                AND measurement_type = 'spot'",
+            [
+                sample_id.into(),
+                site_id.into(),
+                (*parameter_id).into(),
+                (*time).into(),
+            ],
+        ))
+        .await?;
     }
 
-    Ok((sample_map, created))
+    Ok(created)
 }
 
 /// Whether `value` is the output's value: the scalar itself, or one of the numeric leaves of a
@@ -518,6 +555,30 @@ fn output_carries_value(output: &serde_json::Value, value: f64) -> bool {
 ///
 /// The manifest read is the run's own pinned version, not the tool's active one: a save records
 /// what the run that produced it meant.
+/// The manifest of the tool version a run was executed under. A save reads what the run meant,
+/// never the tool's current active manifest. `None` when there is no run, no matching version, or
+/// a stored manifest that no longer parses (a tool-authoring problem, not this write's).
+async fn run_pinned_manifest(
+    db: &DatabaseConnection,
+    run_id: Uuid,
+) -> Result<Option<crate::routes::private::tools::engine::Manifest>, AppError> {
+    let Some(row) = db
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT v.manifest FROM tool_runs r
+             JOIN tool_script_versions v
+               ON v.id = (r.tool_version->>'script_version_id')::uuid
+             WHERE r.id = $1",
+            [run_id.into()],
+        ))
+        .await?
+    else {
+        return Ok(None);
+    };
+    let manifest: serde_json::Value = row.try_get("", "manifest").map_err(AppError::Database)?;
+    Ok(crate::routes::private::tools::engine::parse_manifest(&manifest).ok())
+}
+
 async fn tool_run_fixed_estimators(
     db: &DatabaseConnection,
     tool_run_id: Option<Uuid>,
@@ -526,23 +587,7 @@ async fn tool_run_fixed_estimators(
     let Some(run_id) = tool_run_id else {
         return Ok(HashMap::new());
     };
-    let row = db
-        .query_one(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT v.manifest FROM tool_runs r
-             JOIN tool_script_versions v
-               ON v.id = (r.tool_version->>'script_version_id')::uuid
-             WHERE r.id = $1",
-            [run_id.into()],
-        ))
-        .await?;
-    let Some(row) = row else {
-        return Ok(HashMap::new());
-    };
-    let manifest: serde_json::Value = row.try_get("", "manifest").map_err(AppError::Database)?;
-    let Ok(manifest) = crate::routes::private::tools::engine::parse_manifest(&manifest) else {
-        // A stored manifest that no longer parses is the tool authoring path's problem, not this
-        // write's: the slot's declaration still applies.
+    let Some(manifest) = run_pinned_manifest(db, run_id).await? else {
         return Ok(HashMap::new());
     };
     let by_key: HashMap<&str, &'static str> = manifest
@@ -577,24 +622,35 @@ async fn tool_run_fixed_estimators(
 async fn resolve_tool_run_provenance(
     db: &DatabaseConnection,
     tool_run_id: Option<Uuid>,
+    site_id: Uuid,
     readings: &[GrabSampleReading],
     saved_by: &str,
 ) -> Result<Option<serde_json::Value>, AppError> {
     let Some(run_id) = tool_run_id else {
-        if let Some(r) = readings.iter().find(|r| r.output.is_some() || r.input.is_some()) {
+        if let Some(r) = readings
+            .iter()
+            .find(|r| r.output.is_some() || r.input.is_some())
+        {
             return Err(AppError::BadRequest(format!(
                 "Reading for parameter {} names tool {} '{}' but the request carries no \
                  tool_run_id",
                 r.parameter_id,
-                if r.output.is_some() { "output" } else { "input" },
-                r.output.as_deref().or(r.input.as_deref()).unwrap_or_default()
+                if r.output.is_some() {
+                    "output"
+                } else {
+                    "input"
+                },
+                r.output
+                    .as_deref()
+                    .or(r.input.as_deref())
+                    .unwrap_or_default()
             )));
         }
         return Ok(None);
     };
 
     let row = db
-        .query_one(sea_orm::Statement::from_sql_and_values(
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT tool_name, tool_version, inputs, constants, curves, outputs, created_by, \
              created_at, context, source FROM tool_runs WHERE id = $1",
@@ -607,8 +663,9 @@ async fn resolve_tool_run_provenance(
     let run_source: String = row.try_get("", "source").map_err(AppError::Database)?;
     let run_context: Option<serde_json::Value> =
         row.try_get("", "context").map_err(AppError::Database)?;
-    let tool_version: serde_json::Value =
-        row.try_get("", "tool_version").map_err(AppError::Database)?;
+    let tool_version: serde_json::Value = row
+        .try_get("", "tool_version")
+        .map_err(AppError::Database)?;
     let inputs: serde_json::Value = row.try_get("", "inputs").map_err(AppError::Database)?;
     let constants: serde_json::Value = row.try_get("", "constants").map_err(AppError::Database)?;
     let curves: serde_json::Value = row.try_get("", "curves").map_err(AppError::Database)?;
@@ -618,6 +675,51 @@ async fn resolve_tool_run_provenance(
         .try_get::<chrono::DateTime<chrono::FixedOffset>>("", "created_at")
         .map_err(AppError::Database)?
         .with_timezone(&chrono::Utc);
+
+    // The run resolved its station properties and same-event reads for one visit, and those
+    // resolutions travel into the blob below. Saving it anywhere else would file a number computed
+    // from one site's properties as another site's measurement, so the context the run recorded is
+    // held to the save. A context-free run is a draft and stays saveable anywhere.
+    if let Some(context) = run_context.as_ref().filter(|c| !c.is_null()) {
+        if let Some(run_site) = context
+            .get("site_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| Uuid::parse_str(s).ok())
+            && run_site != site_id
+        {
+            return Err(AppError::BadRequest(format!(
+                "This {tool_name} run was calculated for site {run_site}; saving it at site \
+                 {site_id} would file its resolved station inputs as another station's"
+            )));
+        }
+        if let Some(run_time) = context
+            .get("collected_at")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&chrono::Utc))
+            && let Some(r) = readings.iter().find(|r| r.time != run_time)
+        {
+            return Err(AppError::BadRequest(format!(
+                "This {tool_name} run was calculated for the visit at {run_time}; a reading at \
+                 {} belongs to another visit",
+                r.time
+            )));
+        }
+    }
+
+    // An output that reduces a replicates param is a display of the group the save is about to
+    // write, not a measurement of its own. Storing it would put a mean in the readings the
+    // `samples` trigger then takes a mean over. The manifest is the run's own pinned version.
+    let aggregate_outputs: std::collections::HashSet<String> = run_pinned_manifest(db, run_id)
+        .await?
+        .map(|m| {
+            m.outputs
+                .iter()
+                .filter(|o| o.aggregate_of.is_some())
+                .map(|o| o.key.clone())
+                .collect()
+        })
+        .unwrap_or_default();
 
     let run_applied_curves = curves.as_array().is_some_and(|c| !c.is_empty());
     let mut saved: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
@@ -675,6 +777,12 @@ async fn resolve_tool_run_provenance(
                 "'{output}' is not an output of this {tool_name} run"
             )));
         };
+        if aggregate_outputs.contains(output) {
+            return Err(AppError::BadRequest(format!(
+                "'{output}' is a statistic of this {tool_name} run's replicates, not a \
+                 measurement; save the replicates it reduces and the sample statistics follow"
+            )));
+        }
         if !output_carries_value(output_value, r.value) {
             return Err(AppError::BadRequest(format!(
                 "Value {} is not what this {tool_name} run produced for '{output}'; the \
@@ -743,7 +851,7 @@ async fn provision_site_parameter(
     site_name: &str,
 ) -> Result<Uuid, AppError> {
     let parameter = db
-        .query_one(sea_orm::Statement::from_sql_and_values(
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT name FROM parameters WHERE id = $1",
             [parameter_id.into()],
@@ -757,7 +865,7 @@ async fn provision_site_parameter(
         })?;
     let name: String = parameter.try_get("", "name").unwrap_or_default();
 
-    db.execute(sea_orm::Statement::from_sql_and_values(
+    db.execute_raw(sea_orm::Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, is_active, \
          is_public, needs_review, created_at)
@@ -773,7 +881,7 @@ async fn provision_site_parameter(
     .await?;
 
     let row = db
-        .query_one(sea_orm::Statement::from_sql_and_values(
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT id FROM site_parameters WHERE site_id = $1 AND parameter_id = $2",
             [site_id.into(), parameter_id.into()],
@@ -790,7 +898,7 @@ async fn provision_site_parameter(
 /// streams. Requires `write_data`.
 #[utoipa::path(
     post,
-    path = "/grab_samples",
+    path = "/api/grab_samples",
     request_body = GrabSampleRequest,
     responses(
         (status = 200, description = "Counts of inserted readings and created Sample rows", body = GrabSampleResponse),
@@ -854,8 +962,7 @@ pub async fn insert_grab_samples(
             if valid_param_ids.contains(&pid) {
                 continue;
             }
-            let sp_id =
-                provision_site_parameter(&state.db, site.id, pid, &site.name).await?;
+            let sp_id = provision_site_parameter(&state.db, site.id, pid, &site.name).await?;
             valid_param_ids.insert(pid);
             sp_lookup.insert(pid, sp_id);
         }
@@ -888,6 +995,7 @@ pub async fn insert_grab_samples(
     let provenance = resolve_tool_run_provenance(
         &state.db,
         payload.tool_run_id,
+        site.id,
         &payload.readings,
         &crate::routes::private::tools::scripts::actor_label(&auth),
     )
@@ -992,6 +1100,24 @@ pub async fn insert_grab_samples(
     };
     let existing_groups = fetch_existing_groups(&state.db, payload.site_id, &groups).await?;
 
+    // Which calculations this save feeds, known before anything is written. The chain's own save
+    // is the recompute: it reports nothing and enqueues nothing.
+    let writer = match tool_run_source(&state.db, payload.tool_run_id)
+        .await?
+        .as_deref()
+    {
+        Some("chain") => recompute::Writer::Chain,
+        _ => recompute::Writer::Person,
+    };
+    let calculations = if writer == recompute::Writer::Chain {
+        Vec::new()
+    } else {
+        let mut touched: Vec<Uuid> = payload.readings.iter().map(|r| r.parameter_id).collect();
+        touched.sort_unstable();
+        touched.dedup();
+        crate::routes::private::tools::closure::calculations_fed_by(&state.db, &touched).await?
+    };
+
     if payload.dry_run {
         return Ok(Json(GrabSampleResponse {
             inserted: 0,
@@ -999,8 +1125,10 @@ pub async fn insert_grab_samples(
             created_sample_ids: vec![],
             dry_run: true,
             replaced: 0,
+            kept_curated: 0,
             preview,
             existing_groups,
+            calculations,
         }));
     }
 
@@ -1037,20 +1165,30 @@ pub async fn insert_grab_samples(
         use crate::routes::private::sensors::operations::{
             ResolvedSlot, resolve_windows_for_times,
         };
-        let mut times_by_sensor: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = HashMap::new();
+        let mut times_by_channel: HashMap<(Uuid, Uuid), Vec<chrono::DateTime<chrono::Utc>>> =
+            HashMap::new();
         for r in &payload.readings {
             if let Some(sid) = r.sensor_id {
-                times_by_sensor.entry(sid).or_default().push(r.time);
+                times_by_channel
+                    .entry((sid, r.parameter_id))
+                    .or_default()
+                    .push(r.time);
             }
         }
-        let mut slots: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), ResolvedSlot> =
+        let mut slots: HashMap<(Uuid, Uuid, chrono::DateTime<chrono::Utc>), ResolvedSlot> =
             HashMap::new();
-        for (sid, times) in &times_by_sensor {
-            let resolved = resolve_windows_for_times(&state.db, *sid, Some(payload.site_id), times)
-                .await
-                .unwrap_or_default();
+        for ((sid, pid), times) in &times_by_channel {
+            let resolved = resolve_windows_for_times(
+                &state.db,
+                *sid,
+                Some(payload.site_id),
+                Some(*pid),
+                times,
+            )
+            .await
+            .unwrap_or_default();
             for (t, slot) in resolved {
-                slots.insert((*sid, t), slot);
+                slots.insert((*sid, *pid, t), slot);
             }
         }
         slots
@@ -1073,102 +1211,183 @@ pub async fn insert_grab_samples(
 
     let total = payload.readings.len();
 
-    // The blob is stamped on every samples row this request touches; a run_id groups them back
-    // into one tool run when the caller did not mint one itself.
-
     // One guarded transaction: a replace on a compressed chunk must not fail on the cap, and the
     // delete, the sample rows and the insert land together or not at all.
-    let (inserted, replaced, created_sample_ids) =
+    let actor = crate::routes::private::tools::scripts::actor_label(&auth);
+    let (inserted, replaced, kept_curated, created_sample_ids, touched_events) =
         crate::common::bulk_write::guarded(&state.db, async |txn| {
-            // Deleting a group's last replicate reaps its samples row through the trigger, so the
-            // row's label, notes and authorship are captured first and restored onto the recreated
-            // row wherever the request does not carry its own.
-            let mut prior_samples: HashMap<
-                (Uuid, chrono::DateTime<chrono::Utc>),
-                (Option<String>, Option<String>, Option<String>),
-            > = HashMap::new();
-            let replaced: usize = if payload.mode == Some(GrabWriteMode::Replace) {
-                for (parameter_id, time) in &groups {
-                    if let Some(row) = txn
-                        .query_one(sea_orm::Statement::from_sql_and_values(
-                            sea_orm::DatabaseBackend::Postgres,
-                            r"SELECT label, notes, created_by FROM samples
-                              WHERE site_id = $1 AND parameter_id = $2 AND collected_at = $3",
-                            [
-                                payload.site_id.into(),
-                                (*parameter_id).into(),
-                                (*time).into(),
-                            ],
-                        ))
-                        .await?
-                    {
-                        prior_samples.insert(
-                            (*parameter_id, *time),
-                            (
-                                row.try_get("", "label").unwrap_or(None),
-                                row.try_get("", "notes").unwrap_or(None),
-                                row.try_get("", "created_by").unwrap_or(None),
-                            ),
-                        );
-                    }
-                }
-                let mut removed: u64 = 0;
-                for (parameter_id, time) in &groups {
-                    let res = txn
-                        .execute(sea_orm::Statement::from_sql_and_values(
-                            sea_orm::DatabaseBackend::Postgres,
-                            r"DELETE FROM readings
-                              WHERE site_id = $1 AND parameter_id = $2 AND time = $3
-                                AND measurement_type = 'spot'",
-                            [
-                                payload.site_id.into(),
-                                (*parameter_id).into(),
-                                (*time).into(),
-                            ],
-                        ))
+            // A replace deletes the rows carrying the group's label, notes, authorship and blob,
+            // so they are captured first and restored onto the rewritten rows wherever the request
+            // does not carry its own.
+            let mut prior_facts: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), StoredFacts> =
+                HashMap::new();
+            let (replaced, kept_curated): (usize, usize) =
+                if payload.mode == Some(GrabWriteMode::Replace) {
+                    // What the replace rewrites is decided before the rows go: a person's
+                    // correction of a stored value, or the chain superseding an output with a
+                    // fresh run (ADR 0008). Rows whose value does not change decide nothing.
+                    let (kind, origin, reason) = match writer {
+                        recompute::Writer::Chain => (
+                            decisions::Kind::Chain,
+                            decisions::Origin::Chain,
+                            "superseded by a recompute",
+                        ),
+                        recompute::Writer::Person => (
+                            decisions::Kind::ValueCorrection,
+                            decisions::Origin::Manual,
+                            "replaced by a new entry",
+                        ),
+                    };
+                    for (parameter_id, time) in &groups {
+                        let rows: Vec<(chrono::DateTime<chrono::Utc>, i16, serde_json::Value)> =
+                            payload
+                                .readings
+                                .iter()
+                                .zip(&preview)
+                                .filter(|(r, _)| r.parameter_id == *parameter_id && r.time == *time)
+                                .map(|(_, p)| {
+                                    let new = match (writer, payload.tool_run_id) {
+                                        (recompute::Writer::Chain, Some(run_id)) => {
+                                            serde_json::json!({ "run_id": run_id })
+                                        }
+                                        _ => serde_json::json!({ "raw_value": p.raw_value }),
+                                    };
+                                    (*time, p.replicate_index, new)
+                                })
+                                .collect();
+                        // Only the rows the replace rewrites are decided: a flagged, withdrawn
+                        // or hand-curved row stays as it is (SB5) and gets a hold, not a
+                        // correction. The curve rule is the delete's own, per group.
+                        let supplies_curve = payload.readings.iter().zip(&preview).any(|(r, p)| {
+                            r.parameter_id == *parameter_id
+                                && r.time == *time
+                                && p.standard_curve.is_some()
+                        });
+                        let guard = if supplies_curve {
+                            "r.is_flagged IS NOT TRUE AND r.withdrawn_at IS NULL"
+                        } else {
+                            "r.is_flagged IS NOT TRUE AND r.withdrawn_at IS NULL \
+                             AND r.standard_curve_id IS NULL"
+                        };
+                        decisions::record_keyed(
+                            txn,
+                            kind,
+                            stream_cache[parameter_id],
+                            &rows,
+                            &actor,
+                            Some(reason),
+                            origin,
+                            decisions::Keyed::Changed,
+                            Some(guard),
+                        )
                         .await?;
-                    removed += res.rows_affected();
-                }
-                usize::try_from(removed).unwrap_or(usize::MAX)
-            } else {
-                0
-            };
-
-            // One samples row per (parameter, time) group in the request.
-            let (sample_map, created_sample_ids) = auto_create_samples(
-                txn,
-                &payload.readings,
-                payload.site_id,
-                &SampleFacts {
-                    created_by: payload.created_by.as_deref(),
-                    label: payload.label.as_deref(),
-                    notes: payload.notes.as_deref(),
-                    provenance: provenance.as_ref(),
-                },
-                requested_estimator,
-                &fixed_estimators,
-            )
-            .await?;
-
-            for (group, sample_id) in &sample_map {
-                let Some((label, notes, created_by)) = prior_samples.get(group) else {
-                    continue;
+                    }
+                    for (parameter_id, time) in &groups {
+                        if let Some(row) = txn
+                            .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                                sea_orm::DatabaseBackend::Postgres,
+                                r"SELECT label, notes, created_by, provenance FROM readings
+                              WHERE site_id = $1 AND parameter_id = $2 AND time = $3
+                                AND measurement_type = 'spot'
+                                AND (label IS NOT NULL OR notes IS NOT NULL
+                                     OR created_by IS NOT NULL OR provenance IS NOT NULL)
+                              ORDER BY replicate_index LIMIT 1",
+                                [
+                                    payload.site_id.into(),
+                                    (*parameter_id).into(),
+                                    (*time).into(),
+                                ],
+                            ))
+                            .await?
+                        {
+                            prior_facts.insert(
+                                (*parameter_id, *time),
+                                StoredFacts {
+                                    label: row.try_get("", "label").unwrap_or(None),
+                                    notes: row.try_get("", "notes").unwrap_or(None),
+                                    created_by: row.try_get("", "created_by").unwrap_or(None),
+                                    provenance: row.try_get("", "provenance").unwrap_or(None),
+                                },
+                            );
+                        }
+                    }
+                    // The delete is scoped to the grab stream: another source's rows at the same
+                    // instant are not this request's to rewrite. Curation wins, as in the windowed
+                    // diff: a flagged, withdrawn or hand-curved row stays and the disagreement
+                    // lands in the review queue.
+                    let mut removed: u64 = 0;
+                    let mut kept_total: usize = 0;
+                    for (parameter_id, time) in &groups {
+                        let stream_id = stream_cache[parameter_id];
+                        let supplies_curve = payload.readings.iter().zip(&preview).any(|(r, p)| {
+                            r.parameter_id == *parameter_id
+                                && r.time == *time
+                                && p.standard_curve.is_some()
+                        });
+                        let kept = txn
+                            .query_all_raw(sea_orm::Statement::from_sql_and_values(
+                                sea_orm::DatabaseBackend::Postgres,
+                                r"SELECT replicate_index,
+                                     CASE WHEN is_flagged IS TRUE THEN 'flagged'
+                                          WHEN withdrawn_at IS NOT NULL THEN 'withdrawn'
+                                          ELSE 'standard_curve' END AS reason
+                              FROM readings
+                              WHERE stream_id = $1 AND time = $2 AND measurement_type = 'spot'
+                                AND (is_flagged IS TRUE OR withdrawn_at IS NOT NULL
+                                     OR (NOT $3 AND standard_curve_id IS NOT NULL))
+                              ORDER BY replicate_index",
+                                [stream_id.into(), (*time).into(), supplies_curve.into()],
+                            ))
+                            .await?;
+                        if !kept.is_empty() {
+                            let entries = kept
+                            .iter()
+                            .map(|row| {
+                                Ok(serde_json::json!({
+                                    "replicate_index": row.try_get::<i16>("", "replicate_index")?,
+                                    "reason": row.try_get::<String>("", "reason")?,
+                                }))
+                            })
+                            .collect::<Result<Vec<_>, sea_orm::DbErr>>()?;
+                            super::reconcile::upsert_source_modified_hold(
+                                txn,
+                                stream_id,
+                                *time,
+                                serde_json::json!({ "claim": "replaced", "kept": entries }),
+                                serde_json::json!({ "kept": true }),
+                            )
+                            .await?;
+                            kept_total += kept.len();
+                        }
+                        let res = txn
+                            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                                sea_orm::DatabaseBackend::Postgres,
+                                r"DELETE FROM readings
+                              WHERE stream_id = $1 AND time = $2 AND measurement_type = 'spot'
+                                AND is_flagged IS NOT TRUE AND withdrawn_at IS NULL
+                                AND ($3 OR standard_curve_id IS NULL)",
+                                [stream_id.into(), (*time).into(), supplies_curve.into()],
+                            ))
+                            .await?;
+                        removed += res.rows_affected();
+                    }
+                    (usize::try_from(removed).unwrap_or(usize::MAX), kept_total)
+                } else {
+                    (0, 0)
                 };
-                txn.execute(sea_orm::Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    r"UPDATE samples SET label = COALESCE(label, $2),
-                                         notes = COALESCE(notes, $3),
-                                         created_by = COALESCE(created_by, $4)
-                      WHERE id = $1",
-                    [
-                        (*sample_id).into(),
-                        label.clone().into(),
-                        notes.clone().into(),
-                        created_by.clone().into(),
-                    ],
-                ))
-                .await?;
-            }
+
+            // What each row records about the measurement, request first and the rewritten group's
+            // own prior values where the request is silent.
+            let facts = GrabFacts {
+                created_by: payload.created_by.as_deref(),
+                label: payload.label.as_deref(),
+                notes: payload.notes.as_deref(),
+                provenance: provenance.as_ref(),
+            };
+            let stored_facts: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), StoredFacts> = groups
+                .iter()
+                .map(|group| (*group, facts.over(prior_facts.get(group))))
+                .collect();
 
             let models: Vec<readings::ActiveModel> = payload
                 .readings
@@ -1177,9 +1396,9 @@ pub async fn insert_grab_samples(
                 .map(|(r, p)| readings::ActiveModel {
                     standard_curve_id: Set(p.standard_curve.as_ref().map(|c| c.id)),
                     collection_event_id: Set(None),
-                withdrawn_at: Set(None),
-                withdrawn_reason: Set(None),
-                ingested_at: sea_orm::ActiveValue::NotSet,
+                    withdrawn_at: Set(None),
+                    withdrawn_reason: Set(None),
+                    ingested_at: sea_orm::ActiveValue::NotSet,
                     stream_id: Set(stream_cache[&r.parameter_id]),
                     site_id: Set(Some(payload.site_id)),
                     parameter_id: Set(Some(r.parameter_id)),
@@ -1190,17 +1409,23 @@ pub async fn insert_grab_samples(
                     sensor_id: Set(r.sensor_id),
                     calibration_id: Set(p.base_calibration.as_ref().map(|c| c.id)),
                     deployment_id: Set(r.sensor_id.and_then(|sid| {
-                        grab_slots.get(&(sid, r.time)).and_then(|s| s.deployment_id)
+                        grab_slots
+                            .get(&(sid, r.parameter_id, r.time))
+                            .and_then(|s| s.deployment_id)
                     })),
                     logged: Set(Some(true)),
                     measurement_type: Set(Some(GRAB_MEASUREMENT_TYPE.to_string())),
                     is_flagged: Set(Some(false)),
                     flag_reason: Set(None),
-                    sample_id: Set(sample_map.get(&(r.parameter_id, r.time)).copied()),
+                    sample_id: Set(None),
+                    label: Set(stored_facts[&(r.parameter_id, r.time)].label.clone()),
+                    notes: Set(stored_facts[&(r.parameter_id, r.time)].notes.clone()),
+                    created_by: Set(stored_facts[&(r.parameter_id, r.time)].created_by.clone()),
+                    provenance: Set(stored_facts[&(r.parameter_id, r.time)].provenance.clone()),
                 })
                 .collect();
 
-            let inserted = match readings::Entity::insert_many(models)
+            let inserted = match readings::Entity::insert_many(models.clone())
                 .on_conflict(readings_upsert(Replace::Nothing))
                 .exec_without_returning(txn)
                 .await
@@ -1215,29 +1440,52 @@ pub async fn insert_grab_samples(
                     }
                 }
             };
+            // A curve chosen with the entry is a claim, recorded once (ADR 0008).
+            decisions::record_curve_claims(txn, &models, &actor, decisions::Origin::Manual).await?;
 
-            // Readings the insert skipped on conflict still belong to the group's sample; linking
-            // them fires the aggregate trigger so the stats cover every replicate. Scoped to spot
-            // readings: a sonde reading sharing the grab's snapped timestamp must not be adopted
-            // into the sample, or the trigger folds sensor data into the grab statistics.
-            for ((parameter_id, time), sample_id) in &sample_map {
-                txn.execute(sea_orm::Statement::from_sql_and_values(
+            // A re-post is the same measurement recorded again: the rows the insert skipped on
+            // conflict still take this request's story, so a second run's blob does not sit behind
+            // the value it produced. Keyed on the rows this request wrote, so a curated row a
+            // replace left in place keeps the provenance of the run that made it.
+            for (r, p) in payload.readings.iter().zip(&preview) {
+                let stored = &stored_facts[&(r.parameter_id, r.time)];
+                if stored.is_empty() {
+                    continue;
+                }
+                txn.execute_raw(sea_orm::Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
-                    r"UPDATE readings SET sample_id = $1
-                      WHERE site_id = $2 AND parameter_id = $3 AND time = $4 AND sample_id IS NULL
-                        AND measurement_type = 'spot'",
+                    r"UPDATE readings
+                         SET label = COALESCE($4, label),
+                             notes = COALESCE($5, notes),
+                             created_by = COALESCE($6, created_by),
+                             provenance = COALESCE($7, provenance)
+                       WHERE stream_id = $1 AND time = $2 AND replicate_index = $3",
                     [
-                        (*sample_id).into(),
-                        payload.site_id.into(),
-                        (*parameter_id).into(),
-                        (*time).into(),
+                        stream_cache[&r.parameter_id].into(),
+                        r.time.into(),
+                        p.replicate_index.into(),
+                        stored.label.clone().into(),
+                        stored.notes.clone().into(),
+                        stored.created_by.clone().into(),
+                        stored.provenance.clone().into(),
                     ],
                 ))
                 .await?;
             }
 
+            // The statistics row, for the groups that now hold two or more replicates.
+            let created_sample_ids = materialise_grab_samples(
+                txn,
+                &groups,
+                payload.site_id,
+                requested_estimator,
+                &fixed_estimators,
+            )
+            .await?;
+
             // Every attributed spot instant this request touched belongs to a collection event
             // (D7); a hand-entered grab is a manual visit.
+            let mut touched_events = Vec::new();
             if let (Some(lo), Some(hi)) = (
                 groups.iter().map(|(_, t)| *t).min(),
                 groups.iter().map(|(_, t)| *t).max(),
@@ -1253,11 +1501,38 @@ pub async fn insert_grab_samples(
                     crate::routes::private::collection_events::attach::EventSource::Manual,
                 )
                 .await?;
+                let mut instants: Vec<sea_orm::prelude::DateTimeWithTimeZone> = groups
+                    .iter()
+                    .map(|(_, t)| sea_orm::prelude::DateTimeWithTimeZone::from(*t))
+                    .collect();
+                instants.sort_unstable();
+                instants.dedup();
+                touched_events = recompute::touched_events(
+                    txn,
+                    "r.site_id = $1 AND r.time = ANY($2)",
+                    vec![payload.site_id.into(), instants.into()],
+                )
+                .await?;
             }
 
-            Ok((inserted, replaced, created_sample_ids))
+            Ok((
+                inserted,
+                replaced,
+                kept_curated,
+                created_sample_ids,
+                touched_events,
+            ))
         })
         .await?;
+
+    // The value has landed; the calculations that read it run without anyone asking (ADR 0007).
+    recompute::enqueue_for(
+        &state.db,
+        &touched_events,
+        &crate::routes::private::tools::scripts::actor_label(&auth),
+        writer,
+    )
+    .await?;
 
     // Event-driven open-alarm reconcile for the sampled slots (error-safe; backstop covers it),
     // plus historical episode reconstruction per slot so back-dated grabs land in alarm_events
@@ -1297,14 +1572,94 @@ pub async fn insert_grab_samples(
     }
 
     let samples_created = created_sample_ids.len();
-    tracing::info!(total, inserted, replaced, samples_created, site = %site.name, "Grab samples inserted");
+    tracing::info!(total, inserted, replaced, kept_curated, samples_created, site = %site.name, "Grab samples inserted");
     Ok(Json(GrabSampleResponse {
         inserted,
         samples_created,
         created_sample_ids,
         dry_run: false,
         replaced,
+        kept_curated,
         preview,
         existing_groups,
+        calculations,
     }))
+}
+
+/// The `source` of a stored tool run: `interactive` | `csv_import` | `chain`. `None` when the
+/// request names no run.
+async fn tool_run_source(
+    db: &DatabaseConnection,
+    tool_run_id: Option<Uuid>,
+) -> AppResult<Option<String>> {
+    let Some(run_id) = tool_run_id else {
+        return Ok(None);
+    };
+    let row = db
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT source FROM tool_runs WHERE id = $1",
+            [run_id.into()],
+        ))
+        .await?;
+    Ok(row.and_then(|r| r.try_get("", "source").ok()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GrabFacts, StoredFacts};
+
+    fn stored(label: &str, notes: &str, author: &str) -> StoredFacts {
+        StoredFacts {
+            created_by: Some(author.to_string()),
+            label: Some(label.to_string()),
+            notes: Some(notes.to_string()),
+            provenance: Some(serde_json::json!({ "tool": "doc" })),
+        }
+    }
+
+    #[test]
+    fn a_silent_field_keeps_what_the_group_carried() {
+        let prior = stored("batch 7", "filtered on site", "lab");
+        let request = GrabFacts {
+            created_by: None,
+            label: None,
+            notes: Some("corrected note"),
+            provenance: None,
+        };
+        let merged = request.over(Some(&prior));
+        assert_eq!(merged.label.as_deref(), Some("batch 7"));
+        assert_eq!(merged.notes.as_deref(), Some("corrected note"));
+        assert_eq!(merged.created_by.as_deref(), Some("lab"));
+        assert_eq!(
+            merged.provenance,
+            Some(serde_json::json!({ "tool": "doc" })),
+            "a rewrite that names no run keeps the blob behind the value"
+        );
+    }
+
+    #[test]
+    fn a_first_write_carries_only_what_the_request_says() {
+        let request = GrabFacts {
+            created_by: Some("evan"),
+            label: None,
+            notes: None,
+            provenance: None,
+        };
+        let merged = request.over(None);
+        assert_eq!(merged.created_by.as_deref(), Some("evan"));
+        assert_eq!(merged.label, None);
+        assert!(!merged.is_empty(), "an author alone is worth storing");
+        assert!(
+            GrabFacts {
+                created_by: None,
+                label: None,
+                notes: None,
+                provenance: None,
+            }
+            .over(None)
+            .is_empty(),
+            "a request that records nothing writes nothing"
+        );
+    }
 }

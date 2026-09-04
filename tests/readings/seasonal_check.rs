@@ -76,7 +76,10 @@ async fn the_window_pools_replicates_across_years_and_stays_seasonal() {
     let (status, resp) = check(&app, &token, "2025-06-15T10:00:00Z", 10.5).await;
     assert_eq!(status, 200, "{resp}");
     let f = &resp["findings"][0];
-    assert_eq!(f["n"], 7, "May–July replicates across all years, December excluded: {resp}");
+    assert_eq!(
+        f["n"], 7,
+        "May–July replicates across all years, December excluded: {resp}"
+    );
     assert_eq!(f["class"], "normal");
     assert_eq!(f["min"], 8.0);
     assert_eq!(f["max"], 12.0);
@@ -130,8 +133,14 @@ async fn the_month_window_wraps_the_year_boundary() {
     let (status, resp) = check(&app, &token, "2025-01-10T10:00:00Z", 1100.0).await;
     assert_eq!(status, 200, "{resp}");
     let f = &resp["findings"][0];
-    assert_eq!(f["n"], 2, "only the December visit is in a January window: {resp}");
-    assert_eq!(f["class"], "normal", "1100 sits inside the December range: {resp}");
+    assert_eq!(
+        f["n"], 2,
+        "only the December visit is in a January window: {resp}"
+    );
+    assert_eq!(
+        f["class"], "normal",
+        "1100 sits inside the December range: {resp}"
+    );
 }
 
 #[tokio::test]
@@ -200,4 +209,72 @@ async fn a_save_is_held_to_the_check_it_names() {
     .await;
     assert_eq!(status, 400, "a foreign check is refused: {body}");
     assert!(body.contains("different site"), "{body}");
+}
+
+/// Scenario: the stored history carries corrections. A grab measured against an instrument with a
+/// covering calibration stores a `raw_value` the operator typed and a `calibrated_value` the curve
+/// produced; the value being screened is what the operator types.
+///
+/// Expected behaviour (Q1: raw against raw): the window pools `raw_value`, so a correction applied
+/// to the history does not move the distribution the entered value is screened against. Comparing a
+/// typed number against a corrected distribution would either cry wolf on every entry or pass real
+/// outliers.
+#[tokio::test]
+#[serial]
+async fn the_window_screens_raw_against_raw() {
+    let (db, app, token) = setup().await;
+    seed_history(&app, &token).await;
+
+    let (status, before) = check(&app, &token, "2025-06-15T09:00:00Z", 10.0).await;
+    assert_eq!(status, 200, "check before correction: {before}");
+    let stats = &before["findings"][0];
+    let (min, max) = (
+        stats["min"].as_f64().expect("min"),
+        stats["max"].as_f64().expect("max"),
+    );
+
+    // Every stored row acquires a correction that doubles it. The typed values are untouched.
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE readings SET calibrated_value = raw_value * 2 \
+             WHERE site_id = '{SITE1_ID}' AND parameter_id = '{GLOBAL_PARAM_DO_ID}'"
+        ),
+    )
+    .await;
+
+    let (status, after) = check(&app, &token, "2025-06-15T09:00:00Z", 10.0).await;
+    assert_eq!(status, 200, "check after correction: {after}");
+    let stats = &after["findings"][0];
+    assert!(
+        (stats["min"].as_f64().expect("min") - min).abs() < 1e-9
+            && (stats["max"].as_f64().expect("max") - max).abs() < 1e-9,
+        "the corrected history must not move the raw window: {min}..{max} became {stats}"
+    );
+    assert_eq!(
+        after["findings"][0]["classification"], before["findings"][0]["classification"],
+        "and the entered value classifies the same: {after}"
+    );
+}
+
+/// The response explains itself: the method object is built beside the query, so the panel
+/// renders what was computed rather than a hand-written string.
+#[tokio::test]
+#[serial]
+async fn the_response_describes_its_method() {
+    let (_db, app, token) = setup().await;
+    let (status, resp) = check(&app, &token, "2025-06-15T10:00:00Z", 10.5).await;
+    assert_eq!(status, 200, "{resp}");
+    let m = &resp["method"];
+    assert_eq!(m["window_months"], 2, "{m}");
+    assert!(m["window"].as_str().unwrap().contains("every year"), "{m}");
+    assert!(m["pooled"].as_str().unwrap().contains("withdrawn"), "{m}");
+    assert!(m["value"].as_str().unwrap().contains("raw"), "{m}");
+    let classes = m["classes"].as_array().expect("classes");
+    assert_eq!(classes.len(), 6, "{m}");
+    let by_class = |c: &str| classes.iter().find(|d| d["class"] == c).cloned().expect(c);
+    assert_eq!(by_class("normal")["warning"], false);
+    assert_eq!(by_class("no_history")["warning"], false);
+    assert_eq!(by_class("above_max")["warning"], true);
+    assert!(by_class("above_max")["meaning"].as_str().unwrap().contains("highest"));
 }

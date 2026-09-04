@@ -24,7 +24,7 @@ const PORTAL_CONSTANTS: &[(&str, f64, Option<&str>)] = &[
 ];
 
 async fn constant_row(db: &DatabaseConnection, name: &str) -> Option<(f64, Option<String>)> {
-    db.query_one(Statement::from_sql_and_values(
+    db.query_one_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "SELECT value, units FROM constants WHERE name = $1",
         [name.into()],

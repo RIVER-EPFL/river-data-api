@@ -49,7 +49,7 @@ pub struct MyNotifications {
 async fn ensure_subscriber(state: &AppState, sub: &str) -> AppResult<()> {
     state
         .db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             PG,
             "INSERT INTO notification_subscribers (keycloak_sub) VALUES ($1) \
              ON CONFLICT (keycloak_sub) DO NOTHING",
@@ -62,7 +62,7 @@ async fn ensure_subscriber(state: &AppState, sub: &str) -> AppResult<()> {
 async fn load(state: &AppState, sub: &str) -> AppResult<MyNotifications> {
     let row = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             PG,
             "SELECT COALESCE(ns.web_push_enabled, true) AS web_push_enabled \
              FROM notification_subscribers ns WHERE ns.keycloak_sub = $1",
@@ -76,7 +76,7 @@ async fn load(state: &AppState, sub: &str) -> AppResult<MyNotifications> {
 
     let push_count = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             PG,
             "SELECT COUNT(*) AS cnt FROM web_push_subscriptions WHERE keycloak_sub = $1",
             [sub.into()],
@@ -87,7 +87,7 @@ async fn load(state: &AppState, sub: &str) -> AppResult<MyNotifications> {
 
     let sub_rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             PG,
             "SELECT project_id, site_id, parameter_id, enabled FROM notification_subscriptions \
              WHERE keycloak_sub = $1",
@@ -113,7 +113,7 @@ async fn load(state: &AppState, sub: &str) -> AppResult<MyNotifications> {
 
 #[utoipa::path(
     get,
-    path = "/notifications/me",
+    path = "/api/notifications/me",
     responses((status = 200, description = "My notification settings", body = MyNotifications)),
     tag = "notifications"
 )]
@@ -133,7 +133,7 @@ pub struct UpdatePrefsRequest {
 
 #[utoipa::path(
     patch,
-    path = "/notifications/me",
+    path = "/api/notifications/me",
     request_body = UpdatePrefsRequest,
     responses((status = 200, description = "Updated settings", body = MyNotifications)),
     tag = "notifications"
@@ -147,7 +147,7 @@ pub async fn update_my_notifications(
     ensure_subscriber(&state, &sub).await?;
     state
         .db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             PG,
             "UPDATE notification_subscribers \
              SET web_push_enabled = COALESCE($2, web_push_enabled), \
@@ -166,7 +166,7 @@ pub struct SetSubscriptionsRequest {
 
 #[utoipa::path(
     put,
-    path = "/notifications/me/subscriptions",
+    path = "/api/notifications/me/subscriptions",
     request_body = SetSubscriptionsRequest,
     responses((status = 200, description = "Updated settings", body = MyNotifications)),
     tag = "notifications"
@@ -195,14 +195,14 @@ pub async fn set_my_subscriptions(
     }
 
     let txn = state.db.begin().await?;
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         PG,
         "DELETE FROM notification_subscriptions WHERE keycloak_sub = $1",
         [sub.clone().into()],
     ))
     .await?;
     for s in &req.subscriptions {
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             PG,
             "INSERT INTO notification_subscriptions \
                 (keycloak_sub, project_id, site_id, parameter_id, enabled) \
@@ -252,7 +252,7 @@ pub async fn register_push_subscription(
     let sub = require_sub(&auth)?;
     let row = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             PG,
             "INSERT INTO web_push_subscriptions (keycloak_sub, endpoint, p256dh, auth, user_agent) \
              VALUES ($1, $2, $3, $4, $5) \
@@ -290,7 +290,7 @@ pub async fn list_push_subscriptions(
     let sub = require_sub(&auth)?;
     let rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             PG,
             "SELECT id, endpoint, user_agent, created_at, last_success_at \
              FROM web_push_subscriptions WHERE keycloak_sub = $1 ORDER BY created_at DESC",
@@ -325,7 +325,7 @@ pub async fn delete_push_subscription(
     let sub = require_sub(&auth)?;
     state
         .db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             PG,
             "DELETE FROM web_push_subscriptions WHERE keycloak_sub = $1 AND endpoint = $2",
             [sub.into(), body.endpoint.into()],
@@ -354,8 +354,13 @@ pub async fn test_push(
     Extension(auth): Extension<AuthContext>,
 ) -> AppResult<Json<Vec<PushAttempt>>> {
     let sub = require_sub(&auth)?;
-    let attempts =
-        send_to_user(&state, &sub, "Test notification", "Push notifications are working.").await?;
+    let attempts = send_to_user(
+        &state,
+        &sub,
+        "Test notification",
+        "Push notifications are working.",
+    )
+    .await?;
     Ok(Json(attempts))
 }
 
@@ -370,7 +375,13 @@ pub async fn schedule_ping(
     let owned_sub = sub.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
-        let _ = send_to_user(&state, &owned_sub, "Ping", &format!("Your {seconds}-second ping.")).await;
+        let _ = send_to_user(
+            &state,
+            &owned_sub,
+            "Ping",
+            &format!("Your {seconds}-second ping."),
+        )
+        .await;
     });
     Ok(Json(serde_json::json!({ "seconds": seconds })))
 }
@@ -401,7 +412,7 @@ async fn send_to_user(
 ) -> AppResult<Vec<PushAttempt>> {
     let rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             PG,
             "SELECT id, endpoint, p256dh, auth, user_agent \
              FROM web_push_subscriptions WHERE keycloak_sub = $1 ORDER BY created_at",
@@ -410,14 +421,18 @@ async fn send_to_user(
         .await?;
 
     if rows.is_empty() {
-        return Err(AppError::BadRequest("no push subscriptions registered".to_string()));
+        return Err(AppError::BadRequest(
+            "no push subscriptions registered".to_string(),
+        ));
     }
 
     let Some(pem) = &state.config.vapid_private_key_pem else {
         return Err(AppError::Internal("VAPID not configured".to_string()));
     };
     let Some(vapid_subject) = &state.config.vapid_subject else {
-        return Err(AppError::Internal("VAPID subject not configured".to_string()));
+        return Err(AppError::Internal(
+            "VAPID subject not configured".to_string(),
+        ));
     };
 
     // A unique tag per send: notifications sharing a tag replace each other, so a fixed

@@ -13,7 +13,7 @@ use uuid::Uuid;
 const REPLICATE_TIME: &str = "2025-02-10T09:00:00Z";
 
 async fn scalar_i64(db: &DatabaseConnection, sql: &str) -> i64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_string(),
     ))
@@ -171,8 +171,8 @@ async fn pair_groups_replicates_into_samples_and_unpair_clears_them() {
     )
     .await;
     assert_eq!(
-        lone_stamped, 1,
-        "a sync-origin stream's single reading is a declared collection and forms a sample"
+        lone_stamped, 0,
+        "a single reading is a measurement, not a group, whoever wrote it"
     );
 
     let sample_n = scalar_i64(

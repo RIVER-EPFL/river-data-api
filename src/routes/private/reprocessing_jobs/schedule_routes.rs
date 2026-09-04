@@ -74,7 +74,7 @@ async fn load_view(
     job_name: &str,
 ) -> Result<Option<ScheduleView>, sea_orm::DbErr> {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT s.job_name, s.enabled, s.interval_seconds, s.next_run_at, s.last_enqueued_at, \
                     s.overlap_policy, s.catchup_policy, s.tunables, s.updated_by, s.updated_at, \
@@ -114,7 +114,7 @@ fn view_from_row(r: &sea_orm::QueryResult) -> Result<ScheduleView, sea_orm::DbEr
 pub async fn list_schedules(State(state): State<AppState>) -> AppResult<Json<Vec<ScheduleView>>> {
     let rows = state
         .db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT s.job_name, s.enabled, s.interval_seconds, s.next_run_at, s.last_enqueued_at, \
                     s.overlap_policy, s.catchup_policy, s.tunables, s.updated_by, s.updated_at, \
@@ -234,7 +234,7 @@ pub async fn update_schedule(
     // Single UPDATE; `next_run_at` is reset in SQL (`now() + interval`) only when needed.
     state
         .db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE schedules SET \
                  enabled = $2, \
@@ -277,7 +277,7 @@ pub async fn update_schedule(
     };
     state
         .db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "INSERT INTO schedule_audit (job_name, changed_by, old_value, new_value) \
              VALUES ($1, $2, $3::jsonb, $4::jsonb)",
@@ -326,7 +326,7 @@ pub async fn run_now(
     // Snapshot the schedule's tunables so a manual run mirrors a scheduled one; no row → `{}`.
     let tunables: serde_json::Value = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT tunables FROM schedules WHERE job_name = $1",
             [job_name.clone().into()],
@@ -375,7 +375,7 @@ pub async fn get_schedule_audit(
 ) -> AppResult<Json<Vec<ScheduleAuditEntry>>> {
     let rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT changed_at, changed_by, old_value, new_value \
              FROM schedule_audit \

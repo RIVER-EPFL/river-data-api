@@ -7,6 +7,8 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serde_json::json;
 use serial_test::serial;
 
+use uuid::Uuid;
+
 use crate::common::{GLOBAL_PARAM_DO_ID, GLOBAL_PARAM_TEMP_ID, SITE1_ID};
 
 const T1: &str = "2025-06-01T08:00:00Z";
@@ -64,18 +66,19 @@ async fn the_list_is_the_wide_portal_row() {
     let (_db, app, token) = setup().await;
     save_two_visits(&app, &token).await;
 
-    let (status, body) = crate::common::get_json_with_token(
-        &app,
-        &format!("/api/sites/{SITE1_ID}/visits"),
-        &token,
-    )
-    .await;
+    let (status, body) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["total"], 2);
     let columns = body["expected_parameters"].as_array().unwrap();
     assert!(
-        columns.iter().any(|c| c["parameter_id"] == GLOBAL_PARAM_DO_ID)
-            && columns.iter().any(|c| c["parameter_id"] == GLOBAL_PARAM_TEMP_ID),
+        columns
+            .iter()
+            .any(|c| c["parameter_id"] == GLOBAL_PARAM_DO_ID)
+            && columns
+                .iter()
+                .any(|c| c["parameter_id"] == GLOBAL_PARAM_TEMP_ID),
         "both spot parameters are grid columns: {body}"
     );
 
@@ -84,10 +87,16 @@ async fn the_list_is_the_wide_portal_row() {
     assert_eq!(visits[0]["parameters_filled"], 1);
     assert_eq!(visits[1]["parameters_filled"], 2);
     let do_cell = cell(&visits[1], GLOBAL_PARAM_DO_ID).expect("DO cell at T1");
-    assert_eq!(do_cell["value"], 11.0, "the served value is the sample mean");
+    assert_eq!(
+        do_cell["value"], 11.0,
+        "the served value is the sample mean"
+    );
     let temp_cell = cell(&visits[1], GLOBAL_PARAM_TEMP_ID).expect("Temp cell at T1");
     assert_eq!(temp_cell["value"], 4.2);
-    assert!(cell(&visits[0], GLOBAL_PARAM_TEMP_ID).is_none(), "no Temp at T2");
+    assert!(
+        cell(&visits[0], GLOBAL_PARAM_TEMP_ID).is_none(),
+        "no Temp at T2"
+    );
 }
 
 #[tokio::test]
@@ -97,7 +106,7 @@ async fn the_detail_grid_shows_replicates_and_sample_stats() {
     save_two_visits(&app, &token).await;
 
     let event_id: String = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT id::text AS id FROM collection_events \
@@ -127,7 +136,20 @@ async fn the_detail_grid_shows_replicates_and_sample_stats() {
     assert_eq!(do_cell["served_value"], 11.0);
     assert_eq!(do_cell["sample"]["n"], 2);
     assert_eq!(do_cell["replicates"].as_array().unwrap().len(), 2);
-    assert_eq!(do_cell["sample"]["has_provenance"], false);
+    assert_eq!(do_cell["has_provenance"], false);
+    // The cell carries the instant's assembled record, so the point record opened from the
+    // grid needs no second round trip.
+    let record = &do_cell["record"];
+    assert_eq!(record["origin"]["stream_id"], do_cell["stream_id"]);
+    assert_eq!(record["origin"]["classification"], "manual");
+    assert_eq!(record["readings"].as_array().unwrap().len(), 2);
+    assert_eq!(record["readings"][1]["replicate_index"], 1);
+    assert_eq!(record["computation"]["sd_estimator"], "sample");
+    let temp_cell = cells
+        .iter()
+        .find(|c| c["parameter_id"] == GLOBAL_PARAM_TEMP_ID)
+        .unwrap();
+    assert_eq!(temp_cell["record"]["readings"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -136,7 +158,7 @@ async fn a_finding_marks_its_cell_and_the_row() {
     let (db, app, token) = setup().await;
     save_two_visits(&app, &token).await;
 
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "INSERT INTO replicate_audit_holds \
@@ -148,12 +170,9 @@ async fn a_finding_marks_its_cell_and_the_row() {
     .await
     .unwrap();
 
-    let (status, body) = crate::common::get_json_with_token(
-        &app,
-        &format!("/api/sites/{SITE1_ID}/visits"),
-        &token,
-    )
-    .await;
+    let (status, body) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
     assert_eq!(status, 200, "{body}");
     let visits = body["visits"].as_array().unwrap();
     assert_eq!(visits[1]["findings_open"], 1);
@@ -170,7 +189,7 @@ async fn a_fully_withdrawn_group_empties_its_cell() {
     let (db, app, token) = setup().await;
     save_two_visits(&app, &token).await;
 
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "UPDATE readings SET withdrawn_at = NOW() \
@@ -181,15 +200,481 @@ async fn a_fully_withdrawn_group_empties_its_cell() {
     .await
     .unwrap();
 
-    let (status, body) = crate::common::get_json_with_token(
+    let (status, body) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
+    assert_eq!(status, 200, "{body}");
+    let visits = body["visits"].as_array().unwrap();
+    assert_eq!(
+        visits[0]["parameters_filled"], 0,
+        "a withdrawn group no longer fills"
+    );
+    let do_cell = cell(&visits[0], GLOBAL_PARAM_DO_ID).unwrap();
+    assert_eq!(do_cell["withdrawn"], true);
+}
+
+/// Scenario: two of a visit's replicates are flagged during review, and a parameter's every
+/// replicate is flagged.
+///
+/// Expected behaviour: the partly curated cell reports what was removed, because the served mean
+/// moved and a plain number gives a reviewer no way to tell a curation from a measurement change;
+/// and a parameter serving nothing does not count toward the visit's fill, which would otherwise
+/// claim a value the same row renders as empty.
+#[tokio::test]
+#[serial]
+async fn curated_replicates_are_counted_and_do_not_count_as_filled() {
+    let (db, app, token) = setup().await;
+    save_two_visits(&app, &token).await;
+
+    // One of the two DO replicates, and the lone TEMP replicate.
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE readings SET is_flagged = true, flag_reason = 'outlier' \
+             WHERE site_id = '{SITE1_ID}' AND time = '{T1}' \
+               AND (parameter_id = '{GLOBAL_PARAM_TEMP_ID}' \
+                    OR (parameter_id = '{GLOBAL_PARAM_DO_ID}' AND replicate_index = 1))"
+        ),
+    )
+    .await;
+
+    let (status, body) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
+    assert_eq!(status, 200, "{body}");
+    let row = body["visits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| {
+            v["collected_at"]
+                .as_str()
+                .unwrap()
+                .starts_with("2025-06-01")
+        })
+        .expect("the first visit is listed");
+
+    let dissolved = cell(row, GLOBAL_PARAM_DO_ID).expect("DO cell");
+    assert_eq!(dissolved["n_total"], 2, "{dissolved}");
+    assert_eq!(dissolved["n_flagged"], 1, "{dissolved}");
+    assert_eq!(
+        dissolved["flagged"], false,
+        "one of two flagged is not a flagged group: {dissolved}"
+    );
+
+    assert_eq!(
+        row["parameters_filled"], 1,
+        "a parameter serving nothing is not filled: {row}"
+    );
+    assert!(
+        row["parameters_filled"].as_i64().unwrap()
+            <= body["expected_parameters"].as_array().unwrap().len() as i64,
+        "the ratio cannot exceed its denominator: {body}"
+    );
+}
+
+/// Scenario: a statistics disagreement on a paired stream at a visit's own instant.
+///
+/// Expected behaviour: it is counted and marks its cell. A hold is keyed on the slot or on the
+/// stream that raised it, and only event-audit findings carry a slot, so reading one key shape
+/// makes every replicate, source-modification and brake hold invisible in the grid.
+#[tokio::test]
+#[serial]
+async fn a_stream_keyed_hold_marks_the_visit_it_lands_at() {
+    let (db, app, token) = setup().await;
+    save_two_visits(&app, &token).await;
+
+    let stream_id = crate::common::e2e::id_of(
+        &crate::common::post_json_parse_with_token(
+            &app,
+            "/api/streams/register",
+            &json!({"source_system": "cnet", "source_key": "visit-hold:reps",
+                    "measurement_type": "spot"}),
+            &token,
+        )
+        .await
+        .1,
+    );
+    let (status, body) = crate::common::post_json_with_token(
         &app,
-        &format!("/api/sites/{SITE1_ID}/visits"),
+        &format!("/api/streams/{stream_id}/pair"),
+        &json!({"site_parameter_id": crate::common::PARAM_S1_DO_ID}),
         &token,
     )
     .await;
     assert_eq!(status, 200, "{body}");
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO replicate_audit_holds \
+                 (stream_id, group_time, kind, expected, computed, delta, status) \
+             VALUES ('{stream_id}', '{T1}', 'replicate_stats', '{{}}'::jsonb, '{{}}'::jsonb, \
+                     '{{}}'::jsonb, 'pending')"
+        ),
+    )
+    .await;
+
+    let (status, body) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
+    assert_eq!(status, 200, "{body}");
+    let row = body["visits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| {
+            v["collected_at"]
+                .as_str()
+                .unwrap()
+                .starts_with("2025-06-01")
+        })
+        .expect("the first visit is listed");
+    assert_eq!(
+        row["findings_open"], 1,
+        "a stream-keyed hold at the visit's instant is a finding on it: {row}"
+    );
+    assert_eq!(
+        cell(row, GLOBAL_PARAM_DO_ID).and_then(|c| c["finding"].as_str()),
+        Some("replicate_stats"),
+        "and it marks the slot's own cell: {row}"
+    );
+}
+
+/// Scenario: two paired streams serve one slot at one spot instant, which is what reconciliation
+/// produces while a legacy `_avg` stream and its `:reps` sibling are both paired.
+///
+/// Expected behaviour: one chart point, not two. A `(site, parameter, time)` group is one sample
+/// whatever number of feeds contributed, which is already what the materialiser and the samples
+/// trigger say; the serving layer was the only place drawing it once per stream, and which of the
+/// two values survived was whichever row the plan emitted last.
+#[tokio::test]
+#[serial]
+async fn two_streams_on_one_slot_serve_one_spot_point() {
+    let (db, app, token) = setup().await;
+
+    for key in ["dup-a", "dup-b"] {
+        let stream_id = crate::common::e2e::id_of(
+            &crate::common::post_json_parse_with_token(
+                &app,
+                "/api/streams/register",
+                &json!({"source_system": "cnet", "source_key": key, "measurement_type": "spot"}),
+                &token,
+            )
+            .await
+            .1,
+        );
+        let (status, body) = crate::common::post_json_with_token(
+            &app,
+            &format!("/api/streams/{stream_id}/pair"),
+            &json!({"site_parameter_id": crate::common::PARAM_S1_DO_ID}),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let (status, body) = crate::common::post_json_with_token(
+            &app,
+            "/api/ingest",
+            &json!({
+                "stream_id": stream_id,
+                "readings": [{ "time": T1, "raw_value": if key == "dup-a" { 3.0 } else { 9.0 } }],
+            }),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+    }
+
+    let (status, body) = crate::common::get_json_with_token(
+        &app,
+        &format!(
+            "/api/sites/{SITE1_ID}/readings?start=2025-06-01T00:00:00Z&end=2025-06-02T00:00:00Z\
+             &parameter_ids={GLOBAL_PARAM_DO_ID}&measurement_type=spot"
+        ),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["times"].as_array().map(Vec::len),
+        Some(1),
+        "one slot instant is one point however many feeds reached it: {body}"
+    );
+
+    // Both feeds' readings are still on the record, each naming the stream it arrived on.
+    let event_id: Uuid = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT id FROM collection_events \
+                 WHERE site_id = '{SITE1_ID}' AND collected_at = '{T1}'"
+            ),
+        ))
+        .await
+        .expect("query")
+        .expect("the instant staged an event")
+        .try_get("", "id")
+        .expect("id");
+    let (status, detail) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/collection_events/{event_id}/detail"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{detail}");
+    let named: Vec<&str> = detail["cells"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["source_key"].as_str())
+        .collect();
+    assert_eq!(named.len(), 2, "each feed's row names its stream: {detail}");
+}
+
+/// Scenario: a group that reached the store through the CSV importer or a token batch rather than
+/// by hand.
+///
+/// Expected behaviour: the detail grid can say so. "No tool-run blob" is not the same claim as
+/// "a person typed this", and a reviewer deciding whether a suspicious number was entered or
+/// imported was being told the wrong one.
+#[tokio::test]
+#[serial]
+async fn a_cell_reports_how_its_readings_reached_the_store() {
+    let (_db, app, token) = setup().await;
+    save_two_visits(&app, &token).await;
+
+    let (status, body) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
+    assert_eq!(status, 200, "{body}");
+    let event_id = body["visits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| {
+            v["collected_at"]
+                .as_str()
+                .unwrap()
+                .starts_with("2025-06-01")
+        })
+        .and_then(|v| v["id"].as_str())
+        .expect("the visit is listed")
+        .to_string();
+
+    let (status, detail) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/collection_events/{event_id}/detail"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{detail}");
+    let origins: Vec<&str> = detail["cells"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["origin"].as_str())
+        .collect();
+    assert!(
+        !origins.is_empty() && origins.iter().all(|o| *o == "manual"),
+        "a grab save is manual, and says so rather than being inferred from a missing blob: {detail}"
+    );
+}
+
+/// Fifty-five empty visits on top of the two with readings, so the default page size the list
+/// used to apply would truncate the answer.
+async fn stage_many_visits(db: &DatabaseConnection) {
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO collection_events (site_id, collected_at, source) \
+             SELECT '{SITE1_ID}', TIMESTAMPTZ '2020-01-01T10:00:00Z' + (n || ' days')::interval, \
+                    'portal_sync' \
+             FROM generate_series(1, 55) AS n"
+        ),
+    )
+    .await;
+}
+
+/// Scenario: a station with more visits than one page, read with and without a date range.
+///
+/// Expected behaviour: the unbounded call lists every event at the site (the page devoted to
+/// them lists them all), and `start`/`end` narrow the rows to the visits inside the range.
+#[tokio::test]
+#[serial]
+async fn a_date_range_narrows_the_list_and_no_range_lists_every_visit() {
+    let (db, app, token) = setup().await;
+    save_two_visits(&app, &token).await;
+    stage_many_visits(&db).await;
+
+    let (status, body) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total"], 57);
+    assert_eq!(
+        body["visits"].as_array().map(Vec::len),
+        Some(57),
+        "an unbounded call lists every visit: {}",
+        body["visits"].as_array().map(Vec::len).unwrap_or(0)
+    );
+
+    let (status, body) = crate::common::get_json_with_token(
+        &app,
+        &format!(
+            "/api/sites/{SITE1_ID}/visits?start=2025-06-02T00:00:00Z&end=2025-06-30T00:00:00Z"
+        ),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total"], 1);
     let visits = body["visits"].as_array().unwrap();
-    assert_eq!(visits[0]["parameters_filled"], 0, "a withdrawn group no longer fills");
-    let do_cell = cell(&visits[0], GLOBAL_PARAM_DO_ID).unwrap();
-    assert_eq!(do_cell["withdrawn"], true);
+    assert_eq!(visits.len(), 1);
+    assert_eq!(visits[0]["collected_at"], T2);
+
+    let (status, body) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/sites/{SITE1_ID}/visits?page=1&page_size=10"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total"], 57);
+    assert_eq!(
+        body["visits"].as_array().map(Vec::len),
+        Some(10),
+        "asking for a page still pages"
+    );
+}
+
+/// Scenario: the operator downloads the visits grid as displayed.
+///
+/// Expected behaviour: the CSV is the grid cell for cell, one row per visit newest first, one
+/// column per expected parameter headed by its code, the served value in each cell and an empty
+/// cell where the grid shows none. The file is named by site and date range.
+#[tokio::test]
+#[serial]
+async fn the_csv_download_reproduces_the_grid() {
+    let (_db, app, token) = setup().await;
+    save_two_visits(&app, &token).await;
+
+    let (status, grid) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
+    assert_eq!(status, 200, "{grid}");
+    let (status, headers, csv) = crate::common::get_with_token_headers(
+        &app,
+        &format!("/api/sites/{SITE1_ID}/visits?format=csv"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{csv}");
+    assert!(
+        headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/csv")),
+        "{headers:?}"
+    );
+    let disposition = headers
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        disposition.contains("visits")
+            && disposition.contains("2025-06-01")
+            && disposition.contains("2025-06-08"),
+        "named by site and date range: {disposition}"
+    );
+
+    let mut lines = csv.lines();
+    let header: Vec<&str> = lines.next().expect("header").split(',').collect();
+    let codes: Vec<&str> = grid["expected_parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(header[0], "collected_at");
+    assert_eq!(
+        &header[header.len() - codes.len()..],
+        &codes[..],
+        "one column per expected parameter, headed by code: {header:?}"
+    );
+    let first_code_col = header.len() - codes.len();
+
+    let visits = grid["visits"].as_array().unwrap();
+    let rows: Vec<Vec<&str>> = lines.map(|l| l.split(',').collect()).collect();
+    assert_eq!(rows.len(), visits.len(), "one line per visit: {csv}");
+    for (row, visit) in rows.iter().zip(visits) {
+        assert_eq!(row[0], visit["collected_at"].as_str().unwrap());
+        for (i, col) in grid["expected_parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            let expected = cell(visit, col["parameter_id"].as_str().unwrap())
+                .and_then(|c| c["value"].as_f64());
+            let got = row[first_code_col + i].parse::<f64>().ok();
+            assert_eq!(got, expected, "cell {} at {}: {csv}", col["code"], row[0]);
+        }
+    }
+}
+
+/// Scenario: the cross-site visits list, the way into a site's grid.
+///
+/// Expected behaviour: each row carries the same fill and open-finding counts the site-scoped
+/// list computes, the site's name, and can be narrowed to one site and ordered by findings.
+#[tokio::test]
+#[serial]
+async fn the_cross_site_list_reports_fill_and_findings() {
+    let (db, app, token) = setup().await;
+    save_two_visits(&app, &token).await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO collection_events (site_id, collected_at, source) \
+             VALUES ('{}', '2025-06-03T08:00:00Z', 'portal_sync')",
+            crate::common::SITE2_ID
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO replicate_audit_holds \
+                 (kind, site_id, parameter_id, group_time, tool, expected, computed, delta, status) \
+             VALUES ('stale_output', '{SITE1_ID}', '{GLOBAL_PARAM_DO_ID}', '{T1}', 'chain_b', \
+                     '{{}}', '{{}}', '{{}}', 'pending')"
+        ),
+    )
+    .await;
+
+    let (status, body) = crate::common::get_json_with_token(&app, "/api/visits", &token).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total"], 3);
+    let visits = body["visits"].as_array().unwrap();
+    let first = visits
+        .iter()
+        .find(|v| v["collected_at"] == T1)
+        .expect("the first visit is listed");
+    assert_eq!(first["site_id"], SITE1_ID);
+    assert_eq!(first["site_name"], "Upstream Station");
+    assert_eq!(first["parameters_filled"], 2, "{first}");
+    assert_eq!(first["findings_open"], 1, "{first}");
+    assert_eq!(first["recompute"], "stale", "{first}");
+
+    let (status, body) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/visits?site_id={SITE1_ID}&sort=findings_open&order=desc"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total"], 2);
+    let visits = body["visits"].as_array().unwrap();
+    assert_eq!(visits[0]["collected_at"], T1, "most findings first: {body}");
+    assert_eq!(visits[1]["findings_open"], 0);
 }

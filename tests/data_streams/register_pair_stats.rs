@@ -102,7 +102,7 @@ async fn test_identical_registration_is_a_no_op_write() {
     let updated_at = |db: &sea_orm::DatabaseConnection| {
         let db = db.clone();
         async move {
-            db.query_one(sea_orm::Statement::from_string(
+            db.query_one_raw(sea_orm::Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT updated_at::text AS u FROM data_streams WHERE source_key = 'key-noop'"
                     .to_string(),
@@ -152,7 +152,7 @@ async fn test_pair_stream_backfills_readings() {
     for i in 0..10 {
         let time = bt + chrono::Duration::minutes(i * 10);
         let value = 330.0 + (i as f64) * 0.5;
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "INSERT INTO readings (stream_id, time, raw_value) VALUES ('{stream_id}', '{}', {value})",
@@ -165,7 +165,7 @@ async fn test_pair_stream_backfills_readings() {
 
     // Verify readings have no site_id yet
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!("SELECT COUNT(*) as c FROM readings WHERE stream_id = '{stream_id}' AND site_id IS NULL"),
         ))
@@ -196,7 +196,7 @@ async fn test_pair_stream_backfills_readings() {
 
     // Verify readings now have site_id and parameter_id
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT COUNT(*) as c FROM readings WHERE stream_id = '{stream_id}' AND site_id = '{}'",
@@ -215,7 +215,7 @@ async fn test_pair_stream_backfills_readings() {
     // Pairing attributes the readings; it does not correct them. The instrument the stream names
     // has no curve, so there is nothing to apply and calibrated_value stays null.
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT COUNT(*) as c FROM readings WHERE stream_id = '{stream_id}' AND calibrated_value IS NOT NULL"
@@ -279,7 +279,7 @@ async fn test_unpair_stream_clears_readings() {
     let bt = crate::common::base_time();
     for i in 0..5 {
         let time = bt + chrono::Duration::minutes(i * 10);
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value) \
@@ -312,7 +312,7 @@ async fn test_unpair_stream_clears_readings() {
 
     // Verify readings have site_id = NULL
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!("SELECT COUNT(*) as c FROM readings WHERE stream_id = '{stream_id}' AND site_id IS NULL"),
         ))
@@ -360,7 +360,7 @@ async fn test_stream_stats() {
     for i in 0..20 {
         let time = bt + chrono::Duration::minutes(i * 10);
         let value = 290.0 + (i as f64) * 1.5;
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "INSERT INTO readings (stream_id, time, raw_value) VALUES ('{stream_id}', '{}', {value})",

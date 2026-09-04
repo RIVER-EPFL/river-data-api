@@ -33,7 +33,7 @@ async fn poll_for_derived(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_seconds);
     while std::time::Instant::now() < deadline {
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT COALESCE(calibrated_value, raw_value) AS value FROM readings \
                  WHERE site_id = $1 AND parameter_id = $2 AND time = $3 \

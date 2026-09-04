@@ -43,7 +43,7 @@ pub async fn load_grants(
 
 async fn query_grants(db: &DatabaseConnection, sub: &str) -> Result<HashSet<Uuid>, sea_orm::DbErr> {
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "SELECT project_id FROM user_project_grants WHERE user_sub = $1",
             [sub.into()],

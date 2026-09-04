@@ -3,6 +3,7 @@ pub mod compression;
 pub mod db;
 pub mod e2e;
 pub mod fixtures;
+pub mod jobs;
 pub mod keycloak;
 pub mod seed;
 pub mod sensor_lifecycle;

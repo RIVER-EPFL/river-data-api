@@ -157,7 +157,7 @@ pub async fn count_violations_by_parameter(
     );
     let mut counts = std::collections::HashMap::new();
     for row in db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             [
@@ -168,7 +168,10 @@ pub async fn count_violations_by_parameter(
         ))
         .await?
     {
-        counts.insert(row.try_get::<Uuid>("", "pid")?, row.try_get::<i64>("", "n")?);
+        counts.insert(
+            row.try_get::<Uuid>("", "pid")?,
+            row.try_get::<i64>("", "n")?,
+        );
     }
     Ok(counts)
 }
@@ -179,7 +182,7 @@ pub async fn count_violations_by_parameter(
 /// Returns time-series data with severity levels (1=warning, 2=alarm).
 #[utoipa::path(
     get,
-    path = "/{site_id}/alarms",
+    path = "/api/sites/{site_id}/alarms",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
         SiteAlarmsQuery
@@ -309,7 +312,7 @@ pub async fn get_site_alarms(
 
     let violations: Vec<ViolationRow> = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             values,
@@ -556,7 +559,7 @@ pub(crate) async fn fetch_active_alarm_rows(
     );
 
     let rows: Vec<ActiveAlarmRow> = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             values,
@@ -601,7 +604,7 @@ async fn fetch_open_events(
     );
     let mut map = HashMap::new();
     for row in db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             values,
@@ -622,7 +625,7 @@ async fn fetch_open_events(
 /// state) so the UI can acknowledge it; the breach set itself stays driven by the latest readings.
 #[utoipa::path(
     get,
-    path = "/alarms/active",
+    path = "/api/alarms/active",
     responses(
         (status = 200, description = "Active alarm violations", body = ActiveAlarmsResponse),
     ),
@@ -702,7 +705,7 @@ fn actor_label(auth: &AuthContext) -> String {
 /// is already resolved.
 #[utoipa::path(
     post,
-    path = "/alarms/{event_id}/acknowledge",
+    path = "/api/alarms/{event_id}/acknowledge",
     params(("event_id" = String, Path, description = "Alarm event id")),
     responses(
         (status = 200, description = "Alarm acknowledged", body = AcknowledgedAlarmResponse),
@@ -728,7 +731,7 @@ pub async fn acknowledge_alarm(
 
     let existing = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT resolved_at, acknowledged_at, acknowledged_by FROM alarm_events WHERE id = $1",
             [event_id.into()],
@@ -756,7 +759,7 @@ pub async fn acknowledge_alarm(
     let actor = actor_label(&auth);
     let row = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE alarm_events SET acknowledged_at = NOW(), acknowledged_by = $2, updated_at = NOW() \
              WHERE id = $1 AND resolved_at IS NULL RETURNING acknowledged_at",
@@ -781,7 +784,7 @@ pub async fn acknowledge_alarm(
 /// already resolved. Idempotent, returns 204 even if already unacknowledged.
 #[utoipa::path(
     delete,
-    path = "/alarms/{event_id}/acknowledge",
+    path = "/api/alarms/{event_id}/acknowledge",
     params(("event_id" = String, Path, description = "Alarm event id")),
     responses(
         (status = 204, description = "Acknowledgement removed"),
@@ -804,7 +807,7 @@ pub async fn unacknowledge_alarm(
 
     let existing = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT resolved_at FROM alarm_events WHERE id = $1",
             [event_id.into()],
@@ -823,7 +826,7 @@ pub async fn unacknowledge_alarm(
 
     state
         .db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE alarm_events SET acknowledged_at = NULL, acknowledged_by = NULL, updated_at = NOW() \
              WHERE id = $1 AND resolved_at IS NULL",
@@ -839,7 +842,7 @@ pub async fn unacknowledge_alarm(
 /// Returns counts by severity and by site.
 #[utoipa::path(
     get,
-    path = "/alarms/summary",
+    path = "/api/alarms/summary",
     responses(
         (status = 200, description = "Alarm summary", body = AlarmSummaryResponse),
     ),
@@ -957,7 +960,7 @@ async fn fetch_latest_reading_times(
     );
 
     let rows: Vec<LatestReadingTimeRow> = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             values,
@@ -1005,7 +1008,7 @@ async fn fetch_last_alarm_warning_times(
     );
 
     let rows: Vec<LastAlarmWarningRow> = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             values,
@@ -1056,7 +1059,7 @@ struct AlarmEventRow {
 /// (`max_severity`), and lifecycle status (`open`/`resolved`/`all`). Ordered most-recently-seen first.
 #[utoipa::path(
     get,
-    path = "/alarms/events",
+    path = "/api/alarms/events",
     params(AlarmEventsQuery),
     responses(
         (status = 200, description = "Persisted alarm events", body = AlarmEventsResponse),
@@ -1139,7 +1142,7 @@ pub async fn get_alarm_events(
     );
     let total: usize = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &count_sql,
             values.clone(),
@@ -1151,7 +1154,7 @@ pub async fn get_alarm_events(
 
     let events: Vec<AlarmEventResponse> = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             values,
@@ -1210,7 +1213,7 @@ pub struct ThresholdWithValue {
 /// re-deriving the tiers client-side. Optional `site_id` / `parameter_id` scope.
 #[utoipa::path(
     get,
-    path = "/alarms/thresholds",
+    path = "/api/alarms/thresholds",
     params(ThresholdsQuery),
     responses((status = 200, description = "Resolved thresholds + current value per (site, parameter)")),
     tag = "alarms"
@@ -1261,7 +1264,7 @@ pub async fn get_thresholds(
 
     let rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             values,

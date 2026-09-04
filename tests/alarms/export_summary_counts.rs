@@ -32,7 +32,7 @@ async fn breaching_readings_count_without_an_alarm_event_row() {
     .await;
 
     let stream_id: Uuid = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!("SELECT stream_id FROM readings WHERE site_id='{site}' AND parameter_id='{turb}' LIMIT 1"),
         ))

@@ -1,4 +1,4 @@
-use crudcrate::{CRUDResource, EntityToModels};
+use crudcrate::EntityToModels;
 use sea_orm::entity::prelude::*;
 
 #[derive(
@@ -39,6 +39,11 @@ pub struct Model {
     pub source_system: Option<String>,
     #[crudcrate(exclude(create, update), filterable)]
     pub source_key: Option<String>,
+    /// The standard curve a source-side correction was made with, written only by
+    /// `/annotations/register`. Once set, the annotation's curve and text are frozen: the record
+    /// of what produced a value does not follow a later edit of the curve.
+    #[crudcrate(exclude(create, update), filterable)]
+    pub standard_curve_id: Option<Uuid>,
     #[crudcrate(exclude(create, update))]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }

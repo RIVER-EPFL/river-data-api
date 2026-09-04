@@ -49,7 +49,7 @@ async fn insert_turbidity(db: &DatabaseConnection, stream_id: Uuid, time: &str, 
 }
 
 async fn turbidity_episode_count(db: &DatabaseConnection) -> i64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "SELECT count(*) AS n FROM alarm_events WHERE site_id = '{site}' AND parameter_id = '{param}'",
@@ -108,7 +108,7 @@ async fn alarm_backfill_with_slots_reconstructs_episodes_per_pair() {
     worker::drain(&db, &ev, &registry, &wid).await.unwrap();
 
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!("SELECT status FROM reprocessing_jobs WHERE id = '{id}'"),
         ))
@@ -152,7 +152,7 @@ async fn alarm_backfill_with_slots_requires_window() {
     worker::drain(&db, &ev, &registry, &wid).await.unwrap();
 
     let status: String = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!("SELECT status FROM reprocessing_jobs WHERE id = '{id}'"),
         ))

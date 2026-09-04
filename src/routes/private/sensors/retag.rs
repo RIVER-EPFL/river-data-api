@@ -35,7 +35,7 @@ pub struct RetagFrequencyResponse {
 /// Classify sensors as low- or high-frequency in bulk. Requires `write_metadata`.
 #[utoipa::path(
     post,
-    path = "/sensors/retag_frequency",
+    path = "/api/sensors/retag_frequency",
     request_body = RetagFrequencyRequest,
     responses(
         (status = 200, description = "Sensors reclassified", body = RetagFrequencyResponse),
@@ -86,7 +86,7 @@ pub async fn retag_frequency(
 
     let sensors_updated = state
         .db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE sensors SET data_frequency = $1 WHERE id = ANY($2)",
             [

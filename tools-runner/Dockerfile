@@ -15,6 +15,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         opencpu-server build-essential gfortran curl \
         libicu-dev libssl-dev libxml2-dev libcurl4-openssl-dev libblas-dev liblapack-dev \
+        libuv1-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # renv.lock was resolved against this R. A different R would silently re-resolve nothing but would
@@ -26,13 +27,22 @@ RUN R -e "stopifnot(getRversion() == '4.6.0')"
 RUN R -e "install.packages('renv', repos = 'https://cloud.r-project.org')" \
     && R -e "stopifnot(packageVersion('renv') == '1.2.4')"
 
+# The lockfile also pins testthat (libuv1-dev above is for its fs dependency). Only the packages
+# a script can reach are restored into the library the runtime stage copies; the test packages go
+# to a library that stays in this stage.
 COPY renv.lock /tmp/renv.lock
-RUN R -e "renv::restore(lockfile = '/tmp/renv.lock', library = '/usr/local/lib/R/site-library', prompt = FALSE)" \
+RUN R -e "renv::restore(lockfile = '/tmp/renv.lock', library = '/usr/local/lib/R/site-library', packages = c('dplyr','tidyr','magrittr','pracma','signal','bigleaf','jsonlite'), prompt = FALSE)" \
     && R -e "stopifnot(sapply(c('dplyr','tidyr','magrittr','pracma','signal','bigleaf'), requireNamespace, quietly = TRUE))"
 
 COPY riverdata.tools /tmp/riverdata.tools
 RUN R -e "install.packages('/tmp/riverdata.tools', lib = '/usr/local/lib/R/site-library', repos = NULL, type = 'source')" \
     && R -e "stopifnot(requireNamespace('riverdata.tools', quietly = TRUE))"
+
+# The package's testthat suite runs against the installed package, so a failing test fails the
+# build and no image is produced from it. Both CI workflows build this stage.
+RUN mkdir -p /tmp/test-library \
+    && R -e "renv::restore(lockfile = '/tmp/renv.lock', library = '/tmp/test-library', packages = 'testthat', prompt = FALSE)" \
+    && R -e ".libPaths(c('/tmp/test-library', .libPaths())); testthat::test_local('/tmp/riverdata.tools', load_package = 'installed')"
 
 
 FROM ubuntu:26.04@sha256:678c6550cc43645e08669028bc177f50be4e7c5b8cca677067b1914d4afc7a03

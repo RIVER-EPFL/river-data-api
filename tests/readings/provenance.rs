@@ -7,6 +7,7 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serde_json::json;
 use serial_test::serial;
 
+use crate::common::sensor_lifecycle::create_sensor_without_curve;
 use crate::common::{GLOBAL_PARAM_DO_ID, PARAM_S1_DO_ID, SITE1_ID};
 
 const T1: &str = "2025-06-01T08:00:00Z";
@@ -50,8 +51,7 @@ async fn the_slot_form_assembles_a_grab_instant() {
     let (_db, app, token) = setup().await;
     save_grab(&app, &token).await;
 
-    let (status, body) =
-        crate::common::get_json_with_token(&app, &slot_uri(T1), &token).await;
+    let (status, body) = crate::common::get_json_with_token(&app, &slot_uri(T1), &token).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["duplicate_slot"], false);
     let records = body["records"].as_array().unwrap();
@@ -88,7 +88,7 @@ async fn flag_and_withdrawal_state_travel_on_the_facets() {
     let (db, app, token) = setup().await;
     save_grab(&app, &token).await;
 
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "UPDATE readings SET is_flagged = TRUE, flag_reason = 'outlier' \
@@ -97,7 +97,7 @@ async fn flag_and_withdrawal_state_travel_on_the_facets() {
     ))
     .await
     .unwrap();
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "UPDATE readings SET withdrawn_at = NOW(), withdrawn_reason = 'absent from window' \
@@ -107,14 +107,46 @@ async fn flag_and_withdrawal_state_travel_on_the_facets() {
     .await
     .unwrap();
 
-    let (status, body) =
-        crate::common::get_json_with_token(&app, &slot_uri(T1), &token).await;
+    let (status, body) = crate::common::get_json_with_token(&app, &slot_uri(T1), &token).await;
     assert_eq!(status, 200, "{body}");
     let readings = body["records"][0]["readings"].as_array().unwrap();
     assert_eq!(readings[0]["is_flagged"], true);
     assert_eq!(readings[0]["flag_reason"], "outlier");
     assert!(readings[1]["withdrawn_at"].is_string());
     assert_eq!(readings[1]["withdrawn_reason"], "absent from window");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_standard_curve_reference_names_its_instrument() {
+    let (db, app, token) = setup().await;
+    save_grab(&app, &token).await;
+    let sensor_id = create_sensor_without_curve(&db, "Lab fluorometer").await;
+    let (status, curve) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/standard_curves",
+        &json!({"sensor_id": sensor_id, "name": "Plate 7", "slope": 2.0, "intercept": 1.0}),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "{curve}");
+    let curve_id = curve["id"].as_str().unwrap();
+    db.execute_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            "UPDATE readings SET standard_curve_id = '{curve_id}' \
+             WHERE site_id = '{SITE1_ID}' AND time = '{T1}' AND replicate_index = 0"
+        ),
+    ))
+    .await
+    .unwrap();
+
+    let (status, body) = crate::common::get_json_with_token(&app, &slot_uri(T1), &token).await;
+    assert_eq!(status, 200, "{body}");
+    let curve_ref = &body["records"][0]["readings"][0]["standard_curve"];
+    assert_eq!(curve_ref["id"], curve_id);
+    assert_eq!(curve_ref["name"], "Plate 7");
+    assert_eq!(curve_ref["sensor_id"], sensor_id.to_string());
 }
 
 #[tokio::test]
@@ -154,8 +186,7 @@ async fn two_streams_on_one_slot_report_duplicate_slot() {
         assert_eq!(status, 200, "{body}");
     }
 
-    let (status, body) =
-        crate::common::get_json_with_token(&app, &slot_uri(T1), &token).await;
+    let (status, body) = crate::common::get_json_with_token(&app, &slot_uri(T1), &token).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["duplicate_slot"], true);
     assert_eq!(body["records"].as_array().unwrap().len(), 2);
@@ -170,7 +201,7 @@ async fn holds_touching_the_instant_are_listed() {
     let (db, app, token) = setup().await;
     save_grab(&app, &token).await;
 
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "INSERT INTO replicate_audit_holds \
@@ -182,8 +213,7 @@ async fn holds_touching_the_instant_are_listed() {
     .await
     .unwrap();
 
-    let (status, body) =
-        crate::common::get_json_with_token(&app, &slot_uri(T1), &token).await;
+    let (status, body) = crate::common::get_json_with_token(&app, &slot_uri(T1), &token).await;
     assert_eq!(status, 200, "{body}");
     let holds = body["records"][0]["holds"].as_array().unwrap();
     assert_eq!(holds.len(), 1, "{body}");
@@ -207,4 +237,47 @@ async fn missing_instant_and_missing_key_are_refused() {
     )
     .await;
     assert_eq!(status, 400);
+}
+
+/// Scenario: clicking a derived point the chart drew on the continuous line.
+///
+/// Expected behaviour: the record comes back. The readings query serves `continuous` as everything
+/// that is not a grab, which is what puts derived rows on that line in the first place, so the
+/// resolver has to read the word the same way or the chart can draw a point it cannot explain.
+#[tokio::test]
+#[serial]
+async fn the_continuous_cadence_resolves_a_derived_reading() {
+    let (db, app, token) = setup().await;
+
+    crate::common::seed_data_stream(
+        &db,
+        "00000000-0000-4000-c000-0000000009e1",
+        "test",
+        "derived_provenance",
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO readings \
+                 (stream_id, time, replicate_index, site_id, parameter_id, raw_value, \
+                  measurement_type) \
+             VALUES ('00000000-0000-4000-c000-0000000009e1', '{T1}', 0, '{SITE1_ID}', \
+                     '{GLOBAL_PARAM_DO_ID}', 7.5, 'derived')"
+        ),
+    )
+    .await;
+
+    let (status, body) = crate::common::get_json_with_token(
+        &app,
+        &format!("{}&measurement_type=continuous", slot_uri(T1)),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a derived row is served on the continuous line, so it resolves there: {body}"
+    );
+    let records = body["records"].as_array().expect("records");
+    assert_eq!(records.len(), 1, "{body}");
 }

@@ -9,7 +9,7 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use serial_test::serial;
 
 async fn threshold_count(db: &sea_orm::DatabaseConnection, param: &str, site: &str) -> i64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "SELECT count(*) AS c FROM alarm_thresholds WHERE parameter_id='{param}' AND site_id='{site}'"

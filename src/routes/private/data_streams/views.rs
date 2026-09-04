@@ -71,7 +71,7 @@ pub struct StreamPreviewResponse {
 /// stores its data unattributed), so this works at review time. Requires `read_metadata`.
 #[utoipa::path(
     get,
-    path = "/streams/{id}/preview",
+    path = "/api/streams/{id}/preview",
     params(
         ("id" = Uuid, Path, description = "Stream UUID"),
         ("limit" = Option<u32>, Query, description = "Instants to return (default 3, max 20)"),
@@ -115,7 +115,7 @@ pub async fn stream_preview(
     // The newest `limit` instants, then every replicate at those instants.
     let rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT r.time, r.replicate_index,
                     COALESCE(r.calibrated_value, r.raw_value) AS value,
@@ -172,8 +172,8 @@ pub async fn stream_preview(
         let mean = values.iter().sum::<f64>() / values.len() as f64;
         instant.mean = Some(mean);
         if values.len() > 1 {
-            let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
-                / (values.len() - 1) as f64;
+            let variance =
+                values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (values.len() - 1) as f64;
             instant.sd = Some(variance.sqrt());
         }
     }
@@ -199,7 +199,7 @@ async fn guard_stream_scope(
     let stream_project = match stream.site_parameter_id {
         Some(sp_id) => state
             .db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT s.project_id FROM site_parameters sp JOIN sites s ON s.id = sp.site_id WHERE sp.id = $1",
                 [sp_id.into()],
@@ -218,7 +218,7 @@ async fn guard_stream_scope(
 /// Requires `read_metadata`.
 #[utoipa::path(
     get,
-    path = "/streams/{id}/stats",
+    path = "/api/streams/{id}/stats",
     params(("id" = Uuid, Path, description = "Stream UUID")),
     responses(
         (status = 200, description = "Stream statistics", body = StreamStatsResponse),
@@ -240,7 +240,7 @@ pub async fn stream_stats(
     guard_stream_scope(&state, &stream, &scope).await?;
 
     let row = state.db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT COUNT(*) as count, COUNT(*) FILTER (WHERE withdrawn_at IS NOT NULL) as withdrawn, MIN(time) as min_time, MAX(time) as max_time FROM readings WHERE stream_id = $1",
             [id.into()],
@@ -267,7 +267,7 @@ pub async fn stream_stats(
     // Get latest value
     let latest_row = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT raw_value FROM readings WHERE stream_id = $1 ORDER BY time DESC LIMIT 1",
             [id.into()],
@@ -323,7 +323,7 @@ pub struct ReceiptsResponse {
 /// Requires `read_metadata`.
 #[utoipa::path(
     get,
-    path = "/streams/{id}/receipts",
+    path = "/api/streams/{id}/receipts",
     params(("id" = Uuid, Path, description = "Stream UUID"), ReceiptsQuery),
     responses(
         (status = 200, description = "Ingest receipts", body = ReceiptsResponse),
@@ -345,7 +345,7 @@ pub async fn stream_receipts(
         let stream_project = match stream.site_parameter_id {
             Some(sp_id) => state
                 .db
-                .query_one(Statement::from_sql_and_values(
+                .query_one_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "SELECT s.project_id FROM site_parameters sp JOIN sites s ON s.id = sp.site_id WHERE sp.id = $1",
                     [sp_id.into()],
@@ -363,7 +363,7 @@ pub async fn stream_receipts(
     let page_size = q.page_size.unwrap_or(50).clamp(1, 200);
     let total: i64 = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT COUNT(*) AS n FROM ingest_receipts WHERE stream_id = $1",
             [id.into()],
@@ -373,7 +373,7 @@ pub async fn stream_receipts(
         .unwrap_or(0);
     let rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT id, at, window_from, window_to, submitted, new_rows, changed, unchanged, \
                     retained, rejected_total, dropped, withdrawn, braked \
@@ -445,6 +445,11 @@ pub struct RegisterStreamRequest {
     /// is the authoritative mapping to assign indexes from.
     #[serde(default)]
     pub replicates: Option<super::replicates::ReplicateSpec>,
+    /// The decimal places the source stores or presents this channel at (0 to 10). Stored under
+    /// `metadata.decimal_places`; pairing writes it onto the slot where none is declared, and the
+    /// public API expresses the slot's values at it. Omit to declare nothing.
+    #[serde(default)]
+    pub decimal_places: Option<i16>,
 }
 
 fn default_metadata() -> serde_json::Value {
@@ -500,7 +505,7 @@ impl From<data_streams::Model> for StreamResponse {
 /// discovery to register streams before pairing. Requires `write_metadata`.
 #[utoipa::path(
     post,
-    path = "/streams/register",
+    path = "/api/streams/register",
     request_body = RegisterStreamRequest,
     responses(
         (status = 200, description = "Stream registered (created or updated)", body = StreamResponse),
@@ -537,6 +542,17 @@ pub async fn register_stream(
     }
     if let Some(sensor_id) = payload.sensor_id {
         validate_declared_sensor(&state.db, &scope, sensor_id, &payload.metadata).await?;
+    }
+    if let Some(places) = payload.decimal_places {
+        if !(0..=10).contains(&places) {
+            return Err(AppError::BadRequest(format!(
+                "decimal_places {places} is out of range (expected 0 to 10)"
+            )));
+        }
+        if !payload.metadata.is_object() {
+            payload.metadata = serde_json::json!({});
+        }
+        payload.metadata[super::service::DECIMAL_PLACES_KEY] = serde_json::json!(places);
     }
     let now = Utc::now();
 
@@ -623,6 +639,23 @@ pub async fn register_stream(
         stream = active.update(&state.db).await?;
     }
 
+    // A feed that describes its device can report a different one than the instrument it is
+    // attached to was minted with, which is a probe swap. The channel is the identity, so nothing
+    // forks: the serials are refreshed and the change goes to the review queue for an operator.
+    if let Some(sensor_id) = stream.sensor_id
+        && let Err(e) = crate::routes::private::sensors::operations::reconcile_source_identity(
+            &state.db,
+            sensor_id,
+            stream.id,
+            &stream.metadata,
+        )
+        .await
+    {
+        // Registration is the sync cycle's first call; failing it here would stop ingestion over a
+        // metadata note.
+        tracing::warn!(error = %e, stream = %stream.id, "device identity reconciliation failed");
+    }
+
     Ok(Json(stream.into()))
 }
 
@@ -679,14 +712,15 @@ pub struct ImportStreamResponse {
     pub attributed: u64,
 }
 
-/// Import a stream's sensor into inventory WITHOUT deploying it to a site. Creates/reuses the sensor
-/// by (serial, parameter), links it to the stream, and stamps `sensor_id` plus whichever curve
-/// covers each reading on the stream's site-less readings (an instrument with no curve leaves them
-/// uncorrected; the readings stay un-attributed to any site until an explicit adopt). Idempotent: re-import reuses the same sensor and only fills
-/// readings missing this attribution. Requires `write_metadata`.
+/// Import a stream's sensor into inventory WITHOUT deploying it to a site. Creates or reuses the
+/// sensor by serial number alone (import is parameter-free; a parameter is bound at deploy or grab
+/// time), links it to the stream, and stamps `sensor_id` plus whichever curve covers each reading
+/// on the stream's site-less readings (an instrument with no curve leaves them uncorrected; the
+/// readings stay un-attributed to any site until an explicit adopt). Idempotent: re-import reuses
+/// the same sensor and only fills readings missing this attribution. Requires `write_metadata`.
 #[utoipa::path(
     post,
-    path = "/streams/{id}/import",
+    path = "/api/streams/{id}/import",
     params(("id" = Uuid, Path, description = "Stream UUID")),
     request_body = ImportStreamRequest,
     responses(
@@ -758,7 +792,7 @@ fn claim_error(e: sea_orm::DbErr) -> AppError {
 /// Requires `write_metadata`.
 #[utoipa::path(
     post,
-    path = "/streams/{id}/pair",
+    path = "/api/streams/{id}/pair",
     params(("id" = Uuid, Path, description = "Stream UUID")),
     request_body = PairStreamRequest,
     responses(
@@ -771,6 +805,7 @@ fn claim_error(e: sea_orm::DbErr) -> AppError {
 )]
 pub async fn pair_stream(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Path(stream_id): Path<Uuid>,
     Json(payload): Json<PairStreamRequest>,
 ) -> AppResult<Json<PairStreamResponse>> {
@@ -780,138 +815,162 @@ pub async fn pair_stream(
     // Claim first, then work, all in one transaction with the decompression cap lifted: the claim
     // is what stops two concurrent pairings of one stream both succeeding, and the transaction is
     // what stops a failed backfill leaving the stream paired with unattributed readings.
-    let (sp_site_id, sp_parameter_id, backfilled) = bulk_write::guarded(db, async |txn| {
-        // A concurrent claim holds the row lock; wait a few seconds for it rather than either
-        // failing instantly or hanging, then re-evaluate the claim predicate against its outcome.
-        txn.execute(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SET LOCAL lock_timeout = '5s'".to_owned(),
-        ))
-        .await?;
-
-        let sp = site_parameters::Entity::find_by_id(payload.site_parameter_id)
-            .one(txn)
-            .await?
-            .ok_or_else(|| AppError::NotFound("Site parameter not found".to_string()))?;
-
-        let claimed = txn
-            .execute(Statement::from_sql_and_values(
+    let (sp_site_id, sp_parameter_id, backfilled, touched_events) =
+        bulk_write::guarded(db, async |txn| {
+            // A concurrent claim holds the row lock; wait a few seconds for it rather than either
+            // failing instantly or hanging, then re-evaluate the claim predicate against its outcome.
+            txn.execute_raw(Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
-                "UPDATE data_streams \
+                "SET LOCAL lock_timeout = '5s'".to_owned(),
+            ))
+            .await?;
+
+            let sp = site_parameters::Entity::find_by_id(payload.site_parameter_id)
+                .one(txn)
+                .await?
+                .ok_or_else(|| AppError::NotFound("Site parameter not found".to_string()))?;
+
+            let claimed = txn
+                .execute_raw(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "UPDATE data_streams \
                  SET site_parameter_id = $1, paired_at = $2, updated_at = $2 \
                  WHERE id = $3 AND site_parameter_id IS NULL",
-                [
-                    payload.site_parameter_id.into(),
-                    now.into(),
-                    stream_id.into(),
-                ],
-            ))
-            .await
-            .map_err(claim_error)?
-            .rows_affected();
+                    [
+                        payload.site_parameter_id.into(),
+                        now.into(),
+                        stream_id.into(),
+                    ],
+                ))
+                .await
+                .map_err(claim_error)?
+                .rows_affected();
 
-        let stream = data_streams::Entity::find_by_id(stream_id)
-            .one(txn)
-            .await?
-            .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
-        if claimed == 0 {
-            return Err(AppError::BadRequest(
-                "Stream is already paired. Unpair it first.".to_string(),
-            ));
-        }
+            let stream = data_streams::Entity::find_by_id(stream_id)
+                .one(txn)
+                .await?
+                .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
+            if claimed == 0 {
+                return Err(AppError::BadRequest(
+                    "Stream is already paired. Unpair it first.".to_string(),
+                ));
+            }
+            super::service::declare_slot_decimal_places(
+                txn,
+                sp.id,
+                super::service::declared_decimal_places(&stream.metadata),
+            )
+            .await?;
 
-        // Create/reuse the sensor, then re-read the stream: it may have gained a sensor_id. A
-        // stream carrying no device identity keeps NULL attribution rather than minting one.
-        let sensor_ctx =
-            create_sensor_for_stream(txn, &stream, sp.parameter_id, sp.site_id).await?;
-        let sensor_id = sensor_ctx.as_ref().map(|c| c.sensor_id);
-        let deployment_id = sensor_ctx.as_ref().and_then(|c| c.deployment_id);
-        let stream = data_streams::Entity::find_by_id(stream_id)
-            .one(txn)
-            .await?
-            .ok_or_else(|| AppError::Internal("Failed to re-fetch stream".to_string()))?;
-        let stream_measurement_type = stream.measurement_type.clone();
+            // Create/reuse the sensor, then re-read the stream: it may have gained a sensor_id. A
+            // stream carrying no device identity keeps NULL attribution rather than minting one.
+            let sensor_ctx =
+                create_sensor_for_stream(txn, &stream, sp.parameter_id, sp.site_id).await?;
+            let sensor_id = sensor_ctx.as_ref().map(|c| c.sensor_id);
+            let deployment_id = sensor_ctx.as_ref().and_then(|c| c.deployment_id);
+            let stream = data_streams::Entity::find_by_id(stream_id)
+                .one(txn)
+                .await?
+                .ok_or_else(|| AppError::Internal("Failed to re-fetch stream".to_string()))?;
+            let stream_measurement_type = stream.measurement_type.clone();
 
-        // Backfill: update readings with site_id + parameter_id + sensor context, and adopt the
-        // stream's declared classification for its history. A per-reading measurement_type set at
-        // ingest outranks the stream declaration and must survive pairing.
-        //
-        // No curve is stamped and no value computed. The sensor context carries the instrument's
-        // NEWEST calibration, which is not in general the one covering a given reading's time, nor
-        // necessarily one authored for this parameter; applying it across a whole backfilled
-        // history would correct every row by whichever curve happens to be latest. Which curve
-        // covers a reading is a question the reading's own time answers, and the slot reprocess
-        // enqueued post-commit is what asks it, for `calibration_id` and `calibrated_value`
-        // together.
-        let backfilled = bulk_write::mutation(
-            txn,
-            Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"UPDATE readings
+            // Backfill: update readings with site_id + parameter_id + sensor context, and adopt the
+            // stream's declared classification for its history. A per-reading measurement_type set at
+            // ingest outranks the stream declaration and must survive pairing.
+            //
+            // No curve is stamped and no value computed. The sensor context carries the instrument's
+            // NEWEST calibration, which is not in general the one covering a given reading's time, nor
+            // necessarily one authored for this parameter; applying it across a whole backfilled
+            // history would correct every row by whichever curve happens to be latest. Which curve
+            // covers a reading is a question the reading's own time answers, and the slot reprocess
+            // enqueued post-commit is what asks it, for `calibration_id` and `calibrated_value`
+            // together.
+            let backfilled = bulk_write::mutation(
+                txn,
+                Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    r"UPDATE readings
                   SET site_id = $1, parameter_id = $2,
                       sensor_id = $4, deployment_id = $5,
                       measurement_type = COALESCE(measurement_type, $6)
                   WHERE stream_id = $3 AND site_id IS NULL",
+                    [
+                        sp.site_id.into(),
+                        sp.parameter_id.into(),
+                        stream_id.into(),
+                        sensor_id.into(),
+                        deployment_id.into(),
+                        stream_measurement_type.into(),
+                    ],
+                ),
+            )
+            .await?
+            .rows;
+
+            // Replicate groups on the newly paired stream (2+ spot readings sharing a timestamp, e.g.
+            // migrated NOMIS A/B/C rows) form samples at pairing time. The row-level triggers populate
+            // the sample statistics.
+            crate::routes::private::readings::sample_groups::materialise_samples(
+                txn,
+                "r.stream_id = $1",
+                vec![stream_id.into()],
+            )
+            .await?;
+
+            // Attribution arriving is what makes these spot readings addressable as visits: attach
+            // their collection events now, deriving the source from where the stream came from.
+            crate::routes::private::collection_events::attach::attach_collection_events(
+                txn,
+                "r.stream_id = $1",
+                vec![stream_id.into()],
+                crate::routes::private::collection_events::attach::EventSource::ByStreamOrigin,
+            )
+            .await?;
+            let touched_events =
+                crate::routes::private::collection_events::recompute::touched_events(
+                    txn,
+                    "r.stream_id = $1",
+                    vec![stream_id.into()],
+                )
+                .await?;
+
+            // Also backfill status_events
+            txn.execute_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r"UPDATE status_events
+              SET site_id = $1, parameter_id = $2, sensor_id = $4
+              WHERE stream_id = $3 AND site_id IS NULL",
                 [
                     sp.site_id.into(),
                     sp.parameter_id.into(),
                     stream_id.into(),
                     sensor_id.into(),
-                    deployment_id.into(),
-                    stream_measurement_type.into(),
                 ],
-            ),
-        )
-        .await?
-        .rows;
+            ))
+            .await?;
 
-        // Replicate groups on the newly paired stream (2+ spot readings sharing a timestamp, e.g.
-        // migrated NOMIS A/B/C rows) form samples at pairing time. The row-level triggers populate
-        // the sample statistics.
-        crate::routes::private::readings::sample_groups::materialise_backfilled_samples(
-            txn,
-            "r.stream_id = $1",
-            stream_id.into(),
-        )
-        .await?;
-
-        // Attribution arriving is what makes these spot readings addressable as visits: attach
-        // their collection events now, deriving the source from where the stream came from.
-        crate::routes::private::collection_events::attach::attach_collection_events(
-            txn,
-            "r.stream_id = $1",
-            vec![stream_id.into()],
-            crate::routes::private::collection_events::attach::EventSource::ByStreamOrigin,
-        )
-        .await?;
-
-        // Also backfill status_events
-        txn.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE status_events
-              SET site_id = $1, parameter_id = $2, sensor_id = $4
-              WHERE stream_id = $3 AND site_id IS NULL",
-            [
-                sp.site_id.into(),
-                sp.parameter_id.into(),
-                stream_id.into(),
-                sensor_id.into(),
-            ],
-        ))
-        .await?;
-
-        // Audit mismatches recorded while the stream was unpaired become reviewable now that the
-        // data serves a slot.
-        txn.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE replicate_audit_holds SET status = 'pending'
+            // Audit mismatches recorded while the stream was unpaired become reviewable now that the
+            // data serves a slot.
+            txn.execute_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE replicate_audit_holds SET status = 'pending'
              WHERE stream_id = $1 AND status = 'deferred'",
-            [stream_id.into()],
-        ))
+                [stream_id.into()],
+            ))
+            .await?;
+
+            Ok((sp.site_id, sp.parameter_id, backfilled, touched_events))
+        })
         .await?;
 
-        Ok((sp.site_id, sp.parameter_id, backfilled))
-    })
+    // Attribution is what made these readings visit values; the calculations that read them at
+    // each manual visit run now (ADR 0007).
+    crate::routes::private::collection_events::recompute::enqueue_for(
+        db,
+        &touched_events,
+        &crate::routes::private::tools::scripts::actor_label(&auth),
+        crate::routes::private::collection_events::recompute::Writer::Person,
+    )
     .await?;
 
     // Window-reprocess the slot in the background (tracked): re-attributes the backfilled readings
@@ -924,7 +983,7 @@ pub async fn pair_stream(
     // and still needs its window resolved against the slot it now feeds.
     let has_readings = state
         .db
-        .query_one(sea_orm::Statement::from_sql_and_values(
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT 1 AS one FROM readings WHERE stream_id = $1 LIMIT 1",
             [stream_id.into()],
@@ -969,7 +1028,7 @@ pub struct UnpairStreamResponse {
 /// continuous aggregates); samples left unreferenced are deleted. Requires `write_metadata`.
 #[utoipa::path(
     post,
-    path = "/streams/{id}/unpair",
+    path = "/api/streams/{id}/unpair",
     params(("id" = Uuid, Path, description = "Stream UUID")),
     responses(
         (status = 200, description = "Stream unpaired, cleared count returned", body = UnpairStreamResponse),
@@ -997,7 +1056,7 @@ pub async fn unpair_stream(
     if let Some(sensor_id) = stream.sensor_id
         && let Some(sp) = site_parameters::Entity::find_by_id(sp_id).one(db).await?
     {
-        close_sensor_deployment(db, sensor_id, sp.site_id).await?;
+        close_sensor_deployment(db, sensor_id, sp.site_id, sp.parameter_id).await?;
     }
 
     let now = Utc::now();
@@ -1015,7 +1074,7 @@ pub async fn unpair_stream(
 
     // Open reviews lose their reviewer along with the slot; they wait as deferred until the
     // stream is paired again.
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "UPDATE replicate_audit_holds SET status = 'deferred'
          WHERE stream_id = $1 AND status = 'pending'",
@@ -1063,7 +1122,7 @@ pub struct RetagStreamsResponse {
 /// classification on). Requires `write_metadata`.
 #[utoipa::path(
     post,
-    path = "/streams/retag",
+    path = "/api/streams/retag",
     request_body = RetagStreamsRequest,
     responses(
         (status = 200, description = "Streams reclassified", body = RetagStreamsResponse),
@@ -1107,7 +1166,7 @@ pub async fn retag_streams(
 
         state
             .db
-            .execute(sea_orm::Statement::from_sql_and_values(
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "UPDATE data_streams SET measurement_type = $1, updated_at = now() \
                  WHERE id = ANY($2) OR ($3::text IS NOT NULL AND source_system = $3)",
@@ -1183,7 +1242,12 @@ pub struct SlotTable {
 pub const SLOT_TABLES: [SlotTable; 4] = [
     SlotTable {
         table: "readings",
-        release: Release::Unattribute(&["site_id", "parameter_id", "sample_id"]),
+        release: Release::Unattribute(&[
+            "site_id",
+            "parameter_id",
+            "sample_id",
+            "collection_event_id",
+        ]),
         timed: true,
         feeds_rollups: true,
         unique_with: None,
@@ -1274,7 +1338,7 @@ pub async fn slot_move_collisions<C: ConnectionTrait>(
              ORDER BY 1 LIMIT 20"
         );
         for row in conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 &sql,
                 values,
@@ -1297,6 +1361,7 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
     scope: MoveScope,
     source_param: Uuid,
     target_param: Uuid,
+    actor: &str,
 ) -> AppResult<SlotMove> {
     // $1 is the target parameter, $2 the source, $3 the site when the scope names one.
     let (predicate, site) = match scope {
@@ -1304,6 +1369,33 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
         MoveScope::Site(site_id) => ("parameter_id = $2 AND site_id = $3", Some(site_id)),
     };
     let mut moved = SlotMove::default();
+
+    // Every reading re-pointed is a slot-move decision (ADR 0008), recorded before the move so
+    // the record holds the slot it came from.
+    {
+        let mut values: Vec<sea_orm::Value> = vec![target_param.into(), source_param.into()];
+        if let Some(site_id) = site {
+            values.push(site_id.into());
+        }
+        let row_predicate = match scope {
+            MoveScope::EverySite => "r.parameter_id = $2",
+            MoveScope::Site(_) => "r.parameter_id = $2 AND r.site_id = $3",
+        };
+        crate::routes::private::readings::decisions::record_many(
+            conn,
+            crate::routes::private::readings::decisions::Kind::SlotMove,
+            row_predicate,
+            values,
+            crate::routes::private::readings::decisions::NewValue::Literal(
+                serde_json::json!({ "parameter_id": target_param }),
+            ),
+            actor,
+            Some("merged into the target parameter"),
+            crate::routes::private::readings::decisions::Origin::Manual,
+            Some(Uuid::new_v4()),
+        )
+        .await?;
+    }
 
     for slot in SLOT_TABLES {
         let mut values: Vec<sea_orm::Value> = vec![target_param.into(), source_param.into()];
@@ -1324,7 +1416,7 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
             }
             touched.rows
         } else {
-            conn.execute(statement).await?.rows_affected()
+            conn.execute_raw(statement).await?.rows_affected()
         };
 
         match slot.table {
@@ -1358,7 +1450,7 @@ async fn resolve_retire_target<C: ConnectionTrait>(
         })),
         SlotScope::SiteParameter(sp_id) => {
             let Some(row) = conn
-                .query_one(Statement::from_sql_and_values(
+                .query_one_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "SELECT site_id, parameter_id FROM site_parameters WHERE id = $1",
                     [sp_id.into()],
@@ -1425,7 +1517,8 @@ async fn release_slot_rows<C: ConnectionTrait>(
     conn: &C,
     target: &RetireTarget,
 ) -> AppResult<TouchedRange> {
-    let sample_ids = referenced_sample_ids(conn, target).await?;
+    let sample_ids = referenced_ids(conn, target, "sample_id").await?;
+    let event_ids = referenced_ids(conn, target, "collection_event_id").await?;
     let mut touched = TouchedRange::default();
 
     for slot in SLOT_TABLES {
@@ -1459,14 +1552,14 @@ async fn release_slot_rows<C: ConnectionTrait>(
                         touched = touched.merge(range);
                     }
                 } else {
-                    conn.execute(statement).await?;
+                    conn.execute_raw(statement).await?;
                 }
             }
             Release::DeleteWhenOrphaned => {
                 if sample_ids.is_empty() {
                     continue;
                 }
-                conn.execute(Statement::from_sql_and_values(
+                conn.execute_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     format!(
                         "DELETE FROM {} s WHERE s.id = ANY($1) \
@@ -1480,10 +1573,23 @@ async fn release_slot_rows<C: ConnectionTrait>(
         }
     }
 
+    // A visit describes a group of readings the same way a sample does, but it is keyed on
+    // (site, collected_at) rather than on the slot, so it is released here rather than through
+    // SLOT_TABLES: nothing that walks that list by parameter_id can address it.
+    if !event_ids.is_empty() {
+        conn.execute_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "DELETE FROM collection_events ce WHERE ce.id = ANY($1) \
+             AND NOT EXISTS (SELECT 1 FROM readings r WHERE r.collection_event_id = ce.id)",
+            [event_ids.into()],
+        ))
+        .await?;
+    }
+
     if let Some(sp_id) = target.site_parameter_id {
         // Load-bearing rather than tidy-up: `data_streams.site_parameter_id` has no ON DELETE
         // clause, so the row cannot be deleted while a stream points at it.
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE data_streams SET site_parameter_id = NULL, paired_at = NULL, updated_at = now() \
              WHERE site_parameter_id = $1",
@@ -1495,17 +1601,18 @@ async fn release_slot_rows<C: ConnectionTrait>(
     Ok(touched)
 }
 
-/// Samples the scope's readings point at, read before the readings lose their `sample_id`.
-async fn referenced_sample_ids<C: ConnectionTrait>(
+/// Rows the scope's readings point at through `column`, read before the readings lose it.
+async fn referenced_ids<C: ConnectionTrait>(
     conn: &C,
     target: &RetireTarget,
+    column: &str,
 ) -> AppResult<Vec<Uuid>> {
     let sql = format!(
-        "SELECT DISTINCT sample_id AS id FROM readings WHERE {} AND sample_id IS NOT NULL",
+        "SELECT DISTINCT {column} AS id FROM readings WHERE {} AND {column} IS NOT NULL",
         target.predicate
     );
     Ok(conn
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             target.values.clone(),

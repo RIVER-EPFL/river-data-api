@@ -241,7 +241,7 @@ pub fn record_token_use(
     };
     tokio::spawn(async move {
         let _ = db
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "INSERT INTO api_token_audit_log \
                  (id, token_id, method, path, status_code, project_scope) \

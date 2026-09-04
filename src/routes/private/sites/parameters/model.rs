@@ -1,4 +1,4 @@
-use crudcrate::{CRUDResource, EntityToModels};
+use crudcrate::EntityToModels;
 use sea_orm::entity::prelude::*;
 
 use super::operations::SiteParameterOperations;
@@ -48,6 +48,10 @@ pub struct Model {
     pub is_active: Option<bool>,
     #[crudcrate(filterable, on_create = false)]
     pub is_public: Option<bool>,
+    /// Set when a verified tool save mints the slot (`provision_site_parameter`); cleared by a
+    /// manager confirming the slot from the site's Parameters tab.
+    #[crudcrate(filterable, on_create = false)]
+    pub needs_review: bool,
     /// How this slot's replicate standard deviation is defined: 'sample' (divisor n-1) or
     /// 'population' (divisor n). NULL is UNDECLARED, not a synonym for 'sample': the sources use
     /// both conventions and which one a slot publishes is a decision, so an undeclared slot is

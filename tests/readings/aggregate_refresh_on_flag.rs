@@ -12,7 +12,7 @@ use serial_test::serial;
 
 async fn hourly(db: &DatabaseConnection, bucket: &str) -> Option<(f64, i64)> {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT avg_value, count FROM readings_hourly \

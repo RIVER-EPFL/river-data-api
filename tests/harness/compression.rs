@@ -54,7 +54,12 @@ async fn test_compress_readings_range_compresses_matching_chunks() {
     // window is a no-op.
     assert!(compress_readings_range(&db, window.0, window.1).await >= 1);
     assert_eq!(
-        compress_readings_range(&db, Utc::now() + Duration::days(1), Utc::now() + Duration::days(2)).await,
+        compress_readings_range(
+            &db,
+            Utc::now() + Duration::days(1),
+            Utc::now() + Duration::days(2)
+        )
+        .await,
         0
     );
 
@@ -69,18 +74,18 @@ async fn test_decompression_cap_rejects_unguarded_update_on_compressed_chunk() {
 
     let capped = connect_with_decompression_cap(20).await;
     assert!(
-        capped.execute(update_all(stream_id)).await.is_err(),
+        capped.execute_raw(update_all(stream_id)).await.is_err(),
         "an unguarded UPDATE of {ROWS} rows should exceed a 20-tuple decompression cap"
     );
 
     let txn = capped.begin().await.expect("begin");
-    txn.execute(Statement::from_string(
+    txn.execute_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0",
     ))
     .await
     .expect("cap lift");
-    txn.execute(update_all(stream_id))
+    txn.execute_raw(update_all(stream_id))
         .await
         .expect("guarded UPDATE over a compressed chunk");
     txn.commit().await.expect("commit");

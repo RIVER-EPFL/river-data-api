@@ -153,7 +153,7 @@ async fn derived_assignment_backfills_and_publishes() {
     .await;
     assert!((200..300).contains(&status), "recompute ({status})");
 
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "UPDATE projects SET is_public = true, public_code = 'e2e_derived' WHERE id = '{}'",
@@ -163,7 +163,7 @@ async fn derived_assignment_backfills_and_publishes() {
     .await
     .unwrap();
     // A site is only included in the public config when it has a public_code (services.rs load_public_config).
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "UPDATE sites SET public_code = 'e2e_derived_site1' WHERE id = '{}'",
@@ -180,5 +180,112 @@ async fn derived_assignment_backfills_and_publishes() {
     assert!(
         !e2e::values_for(&pub_readings, "DOmgL_e2e").is_empty(),
         "derived exposed publicly"
+    );
+}
+
+/// A `running` job of the given trigger at a site, leased far enough ahead that the worker's
+/// reaper leaves it alone for the length of the test.
+async fn insert_running_job(db: &sea_orm::DatabaseConnection, trigger_type: &str, site_id: &str) {
+    db.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO reprocessing_jobs \
+             (id, trigger_type, status, category, params, detail, owner, lease_epoch, \
+              lease_expires_at) \
+         VALUES (gen_random_uuid(), $1, 'running', 'data', '{}'::jsonb, \
+                 jsonb_build_object('scope', jsonb_build_object('site_id', $2::text)), \
+                 'another-replica', 1, now() + interval '1 hour')",
+        [trigger_type.into(), site_id.into()],
+    ))
+    .await
+    .expect("insert running job");
+}
+
+#[tokio::test]
+#[serial]
+async fn an_unrelated_sites_import_does_not_suppress_the_assignment_backfill() {
+    // Scenario: a CSV import is running at SITE2 while a derived parameter is assigned at SITE1.
+    // Expected behaviour: the derived_assignment job is enqueued and completes; the other site's
+    // job has nothing to do with the rows this one produces.
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+    insert_running_job(&db, "csv_import", crate::common::SITE2_ID).await;
+
+    let (def_id, output_param_id) = create_derived(&app, &token).await;
+    let (status, sp) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/site_parameters",
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID, "parameter_id": output_param_id, "name": "DOmgL_e2e",
+            "sensor_type": "derived", "is_derived": true, "derived_definition_id": def_id, "display_units": "mg/L",
+        }),
+        &token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "assign derived ({status}): {sp}"
+    );
+
+    let enqueued = e2e::count(
+        &db,
+        &format!("SELECT COUNT(*) FROM reprocessing_jobs WHERE trigger_type = 'derived_assignment' AND trigger_id = '{def_id}'"),
+    )
+    .await;
+    assert_eq!(
+        enqueued, 1,
+        "the backfill is enqueued regardless of the other site's import"
+    );
+    assert!(
+        e2e::wait_for_jobs_by_trigger(&db, "derived_assignment", 30).await,
+        "and it completes"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn the_same_definitions_in_flight_backfill_is_not_duplicated() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let (def_id, output_param_id) = create_derived(&app, &token).await;
+    db.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO reprocessing_jobs \
+             (id, trigger_type, trigger_id, status, category, params, owner, lease_epoch, \
+              lease_expires_at) \
+         VALUES (gen_random_uuid(), 'derived_assignment', $1::uuid, 'running', 'data', \
+                 '{}'::jsonb, 'another-replica', 1, now() + interval '1 hour')",
+        [def_id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    let (status, sp) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/site_parameters",
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID, "parameter_id": output_param_id, "name": "DOmgL_e2e",
+            "sensor_type": "derived", "is_derived": true, "derived_definition_id": def_id, "display_units": "mg/L",
+        }),
+        &token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "assign derived ({status}): {sp}"
+    );
+    let rows = e2e::count(
+        &db,
+        &format!("SELECT COUNT(*) FROM reprocessing_jobs WHERE trigger_type = 'derived_assignment' AND trigger_id = '{def_id}'"),
+    )
+    .await;
+    assert_eq!(
+        rows, 1,
+        "this definition's own in-flight backfill is not doubled"
     );
 }

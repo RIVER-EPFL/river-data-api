@@ -385,7 +385,7 @@ async fn deployment_window(
     deployment: Uuid,
 ) -> (DateTime<Utc>, Option<DateTime<Utc>>) {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT deployed_from, deployed_until FROM sensor_deployments WHERE id = $1",
             [deployment.into()],
@@ -404,7 +404,7 @@ async fn deployment_window(
 }
 
 async fn deployment_exists(db: &DatabaseConnection, deployment: Uuid) -> bool {
-    db.query_one(Statement::from_sql_and_values(
+    db.query_one_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "SELECT 1 AS one FROM sensor_deployments WHERE id = $1",
         [deployment.into()],

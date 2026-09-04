@@ -167,13 +167,16 @@ pub async fn refresh(db: &DatabaseConnection, window: Window) -> AppResult<()> {
 
     for resolution in Resolution::ALL {
         let view_window = if escalated.contains(&resolution) {
-            tracing::warn!(view = resolution.view(), "Rollup is missing its history; running a full refresh");
+            tracing::warn!(
+                view = resolution.view(),
+                "Rollup is missing its history; running a full refresh"
+            );
             Window::Full
         } else {
             window
         };
         let statement = refresh_statement(resolution, view_window, now);
-        match db.execute(statement).await {
+        match db.execute_raw(statement).await {
             Ok(_) => tracing::debug!(view = resolution.view(), "Continuous aggregate refreshed"),
             Err(e) => {
                 tracing::warn!(view = resolution.view(), error = %e, "Failed to refresh continuous aggregate");
@@ -199,7 +202,7 @@ pub async fn refresh(db: &DatabaseConnection, window: Window) -> AppResult<()> {
 /// probes per tick).
 async fn views_missing_history(db: &DatabaseConnection) -> AppResult<Vec<Resolution>> {
     let earliest = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             "SELECT MIN(time) AS t FROM readings
              WHERE site_id IS NOT NULL AND replicate_index = 0
@@ -220,7 +223,7 @@ async fn views_missing_history(db: &DatabaseConnection) -> AppResult<Vec<Resolut
     let mut missing = Vec::new();
     for resolution in Resolution::ALL {
         let min_bucket = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DatabaseBackend::Postgres,
                 format!("SELECT MIN(bucket) AS b FROM {}", resolution.view()),
             ))
@@ -230,8 +233,8 @@ async fn views_missing_history(db: &DatabaseConnection) -> AppResult<Vec<Resolut
                     .ok()
                     .flatten()
             });
-        let covered = min_bucket
-            .is_some_and(|b| b.with_timezone(&Utc) <= resolution.floor(earliest));
+        let covered =
+            min_bucket.is_some_and(|b| b.with_timezone(&Utc) <= resolution.floor(earliest));
         if !covered {
             missing.push(resolution);
         }
@@ -420,7 +423,7 @@ mod tests {
             .expect("a bounded window binds its start and end")
             .0;
         let bound = |v: &sea_orm::Value| match v {
-            sea_orm::Value::ChronoDateTimeUtc(Some(b)) => **b,
+            sea_orm::Value::ChronoDateTimeUtc(Some(b)) => *b,
             other => panic!("expected a timestamptz binding, got {other:?}"),
         };
         (bound(&values[0]), bound(&values[1]))

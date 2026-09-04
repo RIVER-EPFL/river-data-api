@@ -11,6 +11,9 @@ pub struct VersionInfo {
     pub version: &'static str,
     pub commit: &'static str,
     pub built_at: &'static str,
+    /// The public serving contract this build implements, what a project's docs advertise when
+    /// it pins no `public_api_version` of its own.
+    pub public_api_contract: &'static str,
 }
 
 const COMMIT: &str = match option_env!("BUILD_VERSION") {
@@ -36,5 +39,6 @@ pub async fn get_version() -> Json<VersionInfo> {
         version: env!("CARGO_PKG_VERSION"),
         commit: COMMIT,
         built_at: BUILT_AT,
+        public_api_contract: crate::routes::public::service::SERVING_CONTRACT_VERSION,
     })
 }

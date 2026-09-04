@@ -43,7 +43,7 @@ pub(crate) async fn create_session_token(state: &AppState, service_id: Uuid) -> 
 /// authenticated requests (heartbeat, command updates, events). Unauthenticated.
 #[utoipa::path(
     post,
-    path = "/enroll",
+    path = "/api/sync/enroll",
     request_body = EnrollRequest,
     responses(
         (status = 200, description = "Service enrolled; session token returned", body = EnrollResponse),

@@ -5,6 +5,7 @@
 //! inside the seeded scripts, verbatim.
 
 pub mod chain;
+pub mod closure;
 pub mod engine;
 pub mod scripts;
 
@@ -59,7 +60,7 @@ pub struct ToolResult {
 /// named a row that has since gone and the code carried the output instead. Requires `read_data`.
 #[utoipa::path(
     get,
-    path = "/tools",
+    path = "/api/tools",
     responses(
         (status = 200, description = "List of tool descriptors", body = [ToolDescriptor]),
     ),
@@ -78,7 +79,7 @@ pub async fn list_tools(State(state): State<AppState>) -> AppResult<Json<Vec<Too
 /// unknown fields are refused by name. Requires `read_data`.
 #[utoipa::path(
     post,
-    path = "/tools/{tool_name}/calculate",
+    path = "/api/tools/{tool_name}/calculate",
     params(("tool_name" = String, Path, description = "Tool name (e.g. 'doc', 'dic', 'pco2')")),
     request_body(content = Object, description = "Per-tool request body (see GET /tools for schemas)"),
     responses(
@@ -96,7 +97,14 @@ pub async fn calculate_tool(
     body: axum::body::Bytes,
 ) -> AppResult<Json<ToolResult>> {
     let tool = engine::find_active_tool(&state.db, &tool_name).await?;
-    let result = execute_and_store_run(&state, &tool, &body, &scripts::actor_label(&auth), "interactive").await?;
+    let result = execute_and_store_run(
+        &state,
+        &tool,
+        &body,
+        &scripts::actor_label(&auth),
+        "interactive",
+    )
+    .await?;
     Ok(Json(result))
 }
 
@@ -116,6 +124,29 @@ pub async fn execute_and_store_run(
     source: &str,
 ) -> AppResult<ToolResult> {
     let outcome = engine::run_active_tool(state, tool, body).await?;
+    store_run(state, tool, outcome, actor, source).await
+}
+
+/// [`execute_and_store_run`] for a run the caller has already resolved (and, say, compared
+/// against a prior run before deciding to execute it).
+pub async fn execute_and_store_resolved(
+    state: &AppState,
+    tool: &engine::ActiveTool,
+    resolved: engine::ResolvedRun,
+    actor: &str,
+    source: &str,
+) -> AppResult<ToolResult> {
+    let outcome = engine::execute_resolved(state, tool, resolved).await?;
+    store_run(state, tool, outcome, actor, source).await
+}
+
+async fn store_run(
+    state: &AppState,
+    tool: &engine::ActiveTool,
+    outcome: engine::RunOutcome,
+    actor: &str,
+    source: &str,
+) -> AppResult<ToolResult> {
     let runtime = engine::runner_runtime(state).await;
     let tool_version = tool.version_ref(runtime.as_ref());
     let results = serde_json::Value::Object(outcome.results);
@@ -138,7 +169,7 @@ pub async fn execute_and_store_run(
     let run_id = Uuid::new_v4();
     state
         .db
-        .execute(sea_orm::Statement::from_sql_and_values(
+        .execute_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "INSERT INTO tool_runs (id, tool_name, tool_version, inputs, constants, curves, \
              outputs, created_by, context, source) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",

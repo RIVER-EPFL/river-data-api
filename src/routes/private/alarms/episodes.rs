@@ -77,7 +77,7 @@ pub async fn evaluate_alarm_episodes(
     // Idempotent: clear the resolved episodes previously written for this slot+window, then reinsert
     // the freshly computed set. Open rows (`resolved_at IS NULL`) are owned by the sweeper and left
     // alone.
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "DELETE FROM alarm_events \
          WHERE site_id = $1 AND parameter_id = $2 AND resolved_at IS NOT NULL \
@@ -93,7 +93,7 @@ pub async fn evaluate_alarm_episodes(
 
     for (cadence, episodes) in &all_episodes {
         for ep in episodes {
-            db.execute(Statement::from_sql_and_values(
+            db.execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "INSERT INTO alarm_events \
                     (site_id, parameter_id, measurement_type, severity, max_severity, started_at, \
@@ -214,7 +214,7 @@ async fn fetch_episodes(
     ];
 
     let episodes: Vec<EpisodeRow> = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             values,
@@ -253,7 +253,7 @@ pub async fn rebuild_alarm_events(
         conditions.join(" AND ")
     );
     let slots: Vec<(Uuid, Uuid)> = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &slot_sql,
             values,
@@ -273,7 +273,7 @@ pub async fn rebuild_alarm_events(
             (a, b)
         } else {
             let row = db
-                .query_one(Statement::from_sql_and_values(
+                .query_one_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "SELECT MIN(time) AS lo, MAX(time) AS hi FROM readings \
                      WHERE site_id = $1 AND parameter_id = $2",

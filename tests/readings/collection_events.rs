@@ -7,8 +7,8 @@
 
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serde_json::json;
-use uuid::Uuid;
 use serial_test::serial;
+use uuid::Uuid;
 
 use crate::common::{GLOBAL_PARAM_DO_ID, GLOBAL_PARAM_TEMP_ID, SITE1_ID};
 
@@ -24,7 +24,7 @@ async fn setup() -> (DatabaseConnection, axum::Router, String) {
 }
 
 async fn scalar_i64(db: &DatabaseConnection, sql: &str) -> i64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         sql.to_string(),
     ))
@@ -36,7 +36,7 @@ async fn scalar_i64(db: &DatabaseConnection, sql: &str) -> i64 {
 }
 
 async fn event_row(db: &DatabaseConnection, time: &str) -> Option<(String, String)> {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "SELECT id::text AS id, source FROM collection_events \
@@ -155,7 +155,9 @@ async fn a_sync_ingest_attaches_a_portal_sync_event() {
     .await;
     assert_eq!(status, 200, "{body}");
 
-    let (event_id, source) = event_row(&db, T1).await.expect("the portal row became a visit");
+    let (event_id, source) = event_row(&db, T1)
+        .await
+        .expect("the portal row became a visit");
     assert_eq!(source, "portal_sync");
     assert_eq!(
         scalar_i64(
@@ -210,8 +212,13 @@ async fn pairing_attaches_events_to_a_backfilled_stream() {
     .await;
     assert_eq!(status, 200, "{body}");
 
-    let (_, source) = event_row(&db, T1).await.expect("pairing attached the visit");
-    assert_eq!(source, "portal_sync", "a portal stream's backfill is a synced visit");
+    let (_, source) = event_row(&db, T1)
+        .await
+        .expect("pairing attached the visit");
+    assert_eq!(
+        source, "portal_sync",
+        "a portal stream's backfill is a synced visit"
+    );
 }
 
 #[tokio::test]
@@ -340,5 +347,193 @@ async fn continuous_readings_get_no_event() {
     assert!(
         event_row(&db, T1).await.is_none(),
         "a logger cadence is not a visit"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn an_event_with_readings_cannot_be_deleted() {
+    // Scenario: a staged visit has spot readings attached; an operator deletes the event.
+    // Expected behaviour: the delete is refused, and the visit still lists its readings. Deleting
+    // it would detach the readings from every visit with no route to re-attach them.
+    let (db, app, token) = setup().await;
+    let (status, event) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/collection_events/stage",
+        &json!({ "site_id": SITE1_ID, "collected_at": T1 }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{event}");
+    let event_id = event["id"].as_str().unwrap().to_string();
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({
+            "site_id": SITE1_ID,
+            "readings": [{ "parameter_id": GLOBAL_PARAM_DO_ID, "value": 9.0, "time": T1 }],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = crate::common::delete_with_token(
+        &app,
+        &format!("/api/collection_events/{event_id}"),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status, 409,
+        "an event with readings is not deletable: {body}"
+    );
+    assert!(body.contains("reading"), "the refusal says why: {body}");
+
+    let attached = scalar_i64(
+        &db,
+        &format!("SELECT COUNT(*) AS n FROM readings WHERE collection_event_id = '{event_id}'"),
+    )
+    .await;
+    assert_eq!(attached, 1, "the reading is still attached");
+    let (status, visits) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
+    assert_eq!(status, 200, "{visits}");
+    let listed = visits["visits"]
+        .as_array()
+        .or_else(|| visits["events"].as_array())
+        .or_else(|| visits.as_array())
+        .map(|v| {
+            v.iter()
+                .any(|e| e["id"] == event_id || e["event_id"] == event_id)
+        })
+        .unwrap_or(false);
+    assert!(listed, "the visit still lists: {visits}");
+}
+
+#[tokio::test]
+#[serial]
+async fn an_empty_event_can_be_deleted() {
+    let (_db, app, token) = setup().await;
+    let (status, event) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/collection_events/stage",
+        &json!({ "site_id": SITE1_ID, "collected_at": T1 }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{event}");
+    let (status, body) = crate::common::delete_with_token(
+        &app,
+        &format!("/api/collection_events/{}", event["id"].as_str().unwrap()),
+        &token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "a visit nothing references is deletable: {body}"
+    );
+}
+
+/// A stream paired to the wrong site is unpaired and paired again elsewhere. The readings must
+/// follow, so the first site's visit is gone and the second site's visit holds them.
+#[tokio::test]
+#[serial]
+async fn re_pairing_moves_the_visit_to_the_new_site() {
+    let (db, app, token) = setup().await;
+    let (sync_token, _service) = crate::common::seed_sync_session_token(&db).await;
+
+    let (status, stream) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/streams/register",
+        &json!({"source_system": "metalp", "source_key": "stn:moved:reps", "measurement_type": "spot"}),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "{stream}");
+    let stream_id = crate::common::e2e::id_of(&stream);
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/ingest",
+        &json!({
+            "stream_id": stream_id,
+            "collection": true,
+            "readings": [
+                { "time": T1, "raw_value": 1.0, "replicate_index": 0 },
+                { "time": T1, "raw_value": 2.0, "replicate_index": 1 },
+            ],
+        }),
+        &sync_token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/streams/{stream_id}/pair"),
+        &json!({"site_parameter_id": crate::common::PARAM_S1_DO_ID}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (site1_event, _) = event_row(&db, T1).await.expect("first pairing attached");
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/streams/{stream_id}/unpair"),
+        &json!({}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT COUNT(*)::bigint AS n FROM readings WHERE collection_event_id = '{site1_event}'"
+            ),
+        )
+        .await,
+        0,
+        "unpairing must release the readings from the first site's visit"
+    );
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT COUNT(*)::bigint AS n FROM collection_events WHERE id = '{site1_event}'"
+            ),
+        )
+        .await,
+        0,
+        "the first site's visit is left with no readings and must be deleted"
+    );
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/streams/{stream_id}/pair"),
+        &json!({"site_parameter_id": crate::common::PARAM_S2_DO_ID}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT COUNT(*)::bigint AS n FROM readings r \
+                 JOIN collection_events ce ON ce.id = r.collection_event_id \
+                 WHERE r.stream_id = '{stream_id}' \
+                   AND ce.site_id = '{}' AND ce.collected_at = '{T1}'",
+                crate::common::SITE2_ID
+            ),
+        )
+        .await,
+        2,
+        "re-pairing must attach the readings to the second site's visit"
     );
 }

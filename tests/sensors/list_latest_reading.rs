@@ -30,7 +30,10 @@ async fn create_sensor(fx: &Fixture, serial_number: &str) -> String {
         &fx.token,
     )
     .await;
-    assert!((200..300).contains(&status), "create sensor ({status}): {body}");
+    assert!(
+        (200..300).contains(&status),
+        "create sensor ({status}): {body}"
+    );
     body["id"].as_str().unwrap().to_string()
 }
 
@@ -63,7 +66,10 @@ async fn list_reads_latest_from_cursor_and_rollup() {
         &fx.token,
     )
     .await;
-    assert!((200..300).contains(&status), "register ({status}): {stream}");
+    assert!(
+        (200..300).contains(&status),
+        "register ({status}): {stream}"
+    );
     let stream_id = crate::common::e2e::id_of(&stream);
     let (status, body) = crate::common::post_json_parse_with_token(
         &fx.app,

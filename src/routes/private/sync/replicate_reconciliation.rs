@@ -43,7 +43,7 @@ pub struct CandidatesResponse {
 /// The replicate families of a source and their migration state.
 #[utoipa::path(
     get,
-    path = "/sync/replicate_reconciliation/candidates",
+    path = "/api/sync/replicate_reconciliation/candidates",
     params(("source_system" = String, Query, description = "e.g. cnet")),
     responses((status = 200, body = CandidatesResponse)),
     tag = "sync"
@@ -57,7 +57,7 @@ pub async fn reconciliation_candidates(
     for pair in &pairs {
         let row = state
             .db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT
                      (SELECT COUNT(*)::bigint FROM readings r
@@ -119,7 +119,7 @@ async fn enqueue_reconciliation(
     // would race the per-family claims for no benefit.
     let active = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT id FROM reprocessing_jobs
              WHERE trigger_type = $1 AND status IN ('queued', 'running', 'retrying')
@@ -157,7 +157,7 @@ async fn enqueue_reconciliation(
 /// materialises samples; a family failing verification rolls back untouched.
 #[utoipa::path(
     post,
-    path = "/sync/replicate_reconciliation",
+    path = "/api/sync/replicate_reconciliation",
     request_body = StartReconciliationRequest,
     responses(
         (status = 200, body = StartReconciliationResponse),
@@ -177,7 +177,7 @@ pub async fn start_reconciliation(
 /// migrate job's verification report.
 #[utoipa::path(
     post,
-    path = "/sync/replicate_reconciliation/delete",
+    path = "/api/sync/replicate_reconciliation/delete",
     request_body = StartReconciliationRequest,
     responses(
         (status = 200, body = StartReconciliationResponse),
@@ -190,4 +190,125 @@ pub async fn start_reconciliation_delete(
     Json(payload): Json<StartReconciliationRequest>,
 ) -> AppResult<Json<StartReconciliationResponse>> {
     enqueue_reconciliation(&state, "replicate_reconciliation_delete", &payload).await
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DuplicateSlotStream {
+    pub stream_id: Uuid,
+    pub source_system: String,
+    pub source_key: String,
+    pub readings: i64,
+    pub first_reading: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_reading: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DuplicateSlot {
+    pub site_id: Uuid,
+    pub site_name: String,
+    pub parameter_id: Uuid,
+    pub parameter_name: String,
+    pub site_parameter_id: Uuid,
+    pub streams: Vec<DuplicateSlotStream>,
+    /// Instants at this slot carrying readings from more than one stream.
+    pub duplicated_instants: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DuplicateSlotsResponse {
+    pub slots: Vec<DuplicateSlot>,
+}
+
+/// The (site, parameter) slots where two streams carry the same instant. Serving returns one row
+/// per instant, so a duplicated slot is invisible on the chart; this is the list the operator
+/// reconciles from. Two streams sharing a slot without ever sharing an instant (a sensor feed
+/// beside a grab feed) is the normal case and is not listed.
+#[utoipa::path(
+    get,
+    path = "/api/sync/replicate_reconciliation/duplicate_slots",
+    responses((status = 200, body = DuplicateSlotsResponse)),
+    tag = "sync"
+)]
+pub async fn duplicate_slots(State(state): State<AppState>) -> AppResult<Json<DuplicateSlotsResponse>> {
+    // Duplication is a property of the pairing: a reading's site and parameter come from its
+    // stream's slot, so two streams can only collide at an instant by sharing one.
+    let rows = state
+        .db
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT sp.id AS site_parameter_id, sp.site_id, sp.parameter_id, \
+                    s.name AS site_name, p.name AS parameter_name, \
+                    ds.id AS stream_id, ds.source_system, ds.source_key \
+             FROM data_streams ds \
+             JOIN site_parameters sp ON sp.id = ds.site_parameter_id \
+             JOIN sites s ON s.id = sp.site_id \
+             JOIN parameters p ON p.id = sp.parameter_id \
+             WHERE sp.id IN ( \
+                 SELECT site_parameter_id FROM data_streams \
+                 WHERE site_parameter_id IS NOT NULL \
+                 GROUP BY site_parameter_id HAVING COUNT(*) > 1 \
+             ) \
+             ORDER BY s.name, p.name, ds.source_key"
+                .to_string(),
+        ))
+        .await?;
+
+    let mut slots: Vec<DuplicateSlot> = Vec::new();
+    for r in rows {
+        let site_parameter_id: Uuid = r.try_get("", "site_parameter_id")?;
+        let stream_id: Uuid = r.try_get("", "stream_id")?;
+        let stats = state
+            .db
+            .query_one_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT COUNT(*)::bigint AS readings, MIN(time) AS first, MAX(time) AS last \
+                 FROM readings WHERE stream_id = $1",
+                [stream_id.into()],
+            ))
+            .await?
+            .ok_or_else(|| AppError::Internal("stream probe returned no row".to_string()))?;
+        let stream = DuplicateSlotStream {
+            stream_id,
+            source_system: r.try_get("", "source_system")?,
+            source_key: r.try_get("", "source_key")?,
+            readings: stats.try_get("", "readings")?,
+            first_reading: stats.try_get("", "first")?,
+            last_reading: stats.try_get("", "last")?,
+        };
+        match slots.iter_mut().find(|s| s.site_parameter_id == site_parameter_id) {
+            Some(slot) => slot.streams.push(stream),
+            None => slots.push(DuplicateSlot {
+                site_id: r.try_get("", "site_id")?,
+                site_name: r.try_get("", "site_name")?,
+                parameter_id: r.try_get("", "parameter_id")?,
+                parameter_name: r.try_get("", "parameter_name")?,
+                site_parameter_id,
+                streams: vec![stream],
+                duplicated_instants: 0,
+            }),
+        }
+    }
+
+    for slot in &mut slots {
+        let row = state
+            .db
+            .query_one_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT COUNT(*)::bigint AS c FROM ( \
+                     SELECT time FROM readings \
+                     WHERE site_id = $1 AND parameter_id = $2 AND withdrawn_at IS NULL \
+                     GROUP BY time HAVING COUNT(DISTINCT stream_id) > 1 \
+                 ) t",
+                [slot.site_id.into(), slot.parameter_id.into()],
+            ))
+            .await?;
+        slot.duplicated_instants = row
+            .map(|r| r.try_get::<i64>("", "c"))
+            .transpose()?
+            .unwrap_or(0);
+    }
+
+    // A shared slot is only a duplicate once an instant actually carries both feeds.
+    slots.retain(|s| s.duplicated_instants > 0);
+    Ok(Json(DuplicateSlotsResponse { slots }))
 }

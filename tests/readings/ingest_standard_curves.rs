@@ -71,7 +71,7 @@ async fn register_paired_spot_stream(fx: &Fixture, key: &str, sensor_id: &str) -
 }
 
 async fn scalar_f64(db: &DatabaseConnection, sql: &str) -> f64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         sql.to_string(),
     ))
@@ -174,12 +174,15 @@ async fn wrong_instrument_curve_stripped_and_held() {
     )
     .await;
     assert_eq!(status, 200, "ingest ({status}): {body}");
-    assert_eq!(body["inserted"], 1, "the reading is stored, only the claim is refused");
+    assert_eq!(
+        body["inserted"], 1,
+        "the reading is stored, only the claim is refused"
+    );
     assert_eq!(body["skipped"], 0);
 
     let row = fx
         .db
-        .query_one(sea_orm::Statement::from_string(
+        .query_one_raw(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT raw_value, calibrated_value, standard_curve_id FROM readings \
@@ -205,7 +208,7 @@ async fn wrong_instrument_curve_stripped_and_held() {
 
     let hold = fx
         .db
-        .query_one(sea_orm::Statement::from_string(
+        .query_one_raw(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT status, expected FROM replicate_audit_holds \

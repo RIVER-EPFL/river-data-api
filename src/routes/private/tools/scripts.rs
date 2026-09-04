@@ -343,21 +343,24 @@ pub struct ToolScriptSummary {
     pub active_version_id: Option<Uuid>,
     pub active_version_no: Option<i32>,
     pub version_count: i64,
+    /// Whether the tool is part of the calculation set: fired at visits by the chain, audited,
+    /// and listed on the Tools page. Off, it can still be run by name.
+    pub enabled: bool,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// List every tool script with its active version. Requires Administrator.
-#[utoipa::path(get, path = "/tool_scripts",
+#[utoipa::path(get, path = "/api/tool_scripts",
     responses((status = 200, body = [ToolScriptSummary])), tag = "tool_scripts")]
 pub async fn list_scripts(
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<ToolScriptSummary>>> {
     let rows = state
         .db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT s.id, s.name, s.label, s.description, s.active_version_id, s.updated_at,
-                     av.version_no AS active_version_no,
+                     s.enabled, av.version_no AS active_version_no,
                      (SELECT count(*) FROM tool_script_versions v
                        WHERE v.tool_script_id = s.id) AS version_count
               FROM tool_scripts s
@@ -376,6 +379,7 @@ pub async fn list_scripts(
             active_version_id: row.try_get("", "active_version_id")?,
             active_version_no: row.try_get("", "active_version_no")?,
             version_count: row.try_get("", "version_count")?,
+            enabled: row.try_get("", "enabled")?,
             updated_at: row.try_get("", "updated_at")?,
         });
     }
@@ -406,10 +410,10 @@ pub struct ToolScriptDetail {
 async fn load_summary(state: &AppState, id: Uuid) -> AppResult<ToolScriptSummary> {
     let row = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT s.id, s.name, s.label, s.description, s.active_version_id, s.updated_at,
-                     av.version_no AS active_version_no,
+                     s.enabled, av.version_no AS active_version_no,
                      (SELECT count(*) FROM tool_script_versions v
                        WHERE v.tool_script_id = s.id) AS version_count
               FROM tool_scripts s
@@ -427,12 +431,13 @@ async fn load_summary(state: &AppState, id: Uuid) -> AppResult<ToolScriptSummary
         active_version_id: row.try_get("", "active_version_id")?,
         active_version_no: row.try_get("", "active_version_no")?,
         version_count: row.try_get("", "version_count")?,
+        enabled: row.try_get("", "enabled")?,
         updated_at: row.try_get("", "updated_at")?,
     })
 }
 
 /// One script with its version history, newest first. Requires Administrator.
-#[utoipa::path(get, path = "/tool_scripts/{id}", params(("id" = Uuid, Path)),
+#[utoipa::path(get, path = "/api/tool_scripts/{id}", params(("id" = Uuid, Path)),
     responses((status = 200, body = ToolScriptDetail)), tag = "tool_scripts")]
 pub async fn get_script(
     State(state): State<AppState>,
@@ -441,7 +446,7 @@ pub async fn get_script(
     let summary = load_summary(&state, id).await?;
     let rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT id, version_no, content_hash, entry_function, note, created_by, created_at,
                      validated_at
@@ -477,7 +482,7 @@ pub struct CreateScriptRequest {
 
 /// Create a tool script (no versions yet; it lists in `GET /tools` only once a version is
 /// activated). `created_by` is the authenticated caller. Requires Administrator.
-#[utoipa::path(post, path = "/tool_scripts", request_body = CreateScriptRequest,
+#[utoipa::path(post, path = "/api/tool_scripts", request_body = CreateScriptRequest,
     responses((status = 200, body = ToolScriptSummary)), tag = "tool_scripts")]
 pub async fn create_script(
     State(state): State<AppState>,
@@ -492,7 +497,7 @@ pub async fn create_script(
     }
     let row = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"INSERT INTO tool_scripts (name, label, description, created_by)
               VALUES ($1, $2, $3, $4) RETURNING id",
@@ -522,10 +527,15 @@ pub struct UpdateScriptRequest {
     pub label: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    /// Switch the tool in or out of the calculation set. A disabled tool keeps its versions and
+    /// activation and fires at no visit until it is switched back on.
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
-/// Update a script's label/description (the code lives in versions). Requires Administrator.
-#[utoipa::path(patch, path = "/tool_scripts/{id}", params(("id" = Uuid, Path)),
+/// Update a script's label, description or enabled switch (the code lives in versions).
+/// Requires Administrator.
+#[utoipa::path(patch, path = "/api/tool_scripts/{id}", params(("id" = Uuid, Path)),
     request_body = UpdateScriptRequest,
     responses((status = 200, body = ToolScriptSummary)), tag = "tool_scripts")]
 pub async fn update_script(
@@ -535,12 +545,18 @@ pub async fn update_script(
 ) -> AppResult<Json<ToolScriptSummary>> {
     state
         .db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE tool_scripts SET label = COALESCE($2, label),
-                     description = COALESCE($3, description), updated_at = now()
+                     description = COALESCE($3, description),
+                     enabled = COALESCE($4, enabled), updated_at = now()
               WHERE id = $1",
-            [id.into(), payload.label.into(), payload.description.into()],
+            [
+                id.into(),
+                payload.label.into(),
+                payload.description.into(),
+                payload.enabled.into(),
+            ],
         ))
         .await?;
     Ok(Json(load_summary(&state, id).await?))
@@ -581,7 +597,7 @@ pub struct CreateVersionResponse {
 /// version is identified by its whole content, and that content is the stamped manifest, so a
 /// manifest-only or case-only edit is a new version. `created_by` is the authenticated caller.
 /// Requires Administrator.
-#[utoipa::path(post, path = "/tool_scripts/{id}/versions", params(("id" = Uuid, Path)),
+#[utoipa::path(post, path = "/api/tool_scripts/{id}/versions", params(("id" = Uuid, Path)),
     request_body = CreateVersionRequest,
     responses((status = 200, body = CreateVersionResponse),
               (status = 400, description = "Invalid manifest"),
@@ -643,7 +659,7 @@ pub async fn create_version(
     .await?;
     let row = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"INSERT INTO tool_script_versions
                   (tool_script_id, version_no, script, entry_function, manifest, test_cases,
@@ -807,7 +823,7 @@ fn draft_failure(error: AppError) -> Result<DraftRunFailure, AppError> {
 /// is a failed request. Only content that could not be read at all is a 400 here, because there
 /// is nothing to report findings about: a request body that is not the expected JSON, or a
 /// manifest that does not parse (named by the path that was refused).
-#[utoipa::path(post, path = "/tool_scripts/draft_run", request_body = DraftRunRequest,
+#[utoipa::path(post, path = "/api/tool_scripts/draft_run", request_body = DraftRunRequest,
     responses((status = 200, body = DraftRunResponse,
                description = "The lint findings, plus results or the reason the run ended"),
               (status = 400, description = "Unreadable request body or manifest")),
@@ -930,7 +946,7 @@ pub struct InspectScriptResponse {
 /// names the manifest does not declare, and which declared names the script does not read,
 /// qualified by those two completeness flags. It is a comparison only, it generates no manifest.
 /// Requires Administrator.
-#[utoipa::path(post, path = "/tool_scripts/inspect", request_body = InspectScriptRequest,
+#[utoipa::path(post, path = "/api/tool_scripts/inspect", request_body = InspectScriptRequest,
     responses((status = 200, body = InspectScriptResponse),
               (status = 400, description = "Invalid manifest"),
               (status = 503, description = "The tool runner is not configured or unreachable")),
@@ -977,7 +993,7 @@ pub struct VersionDetail {
 async fn load_version(state: &AppState, script_id: Uuid, vid: Uuid) -> AppResult<VersionDetail> {
     let row = state
         .db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT id, version_no, script, entry_function, manifest, test_cases, content_hash,
                      note, created_by, created_at, validated_at
@@ -1002,7 +1018,7 @@ async fn load_version(state: &AppState, script_id: Uuid, vid: Uuid) -> AppResult
 }
 
 /// Full version content (script text, manifest, cases). Requires Administrator.
-#[utoipa::path(get, path = "/tool_scripts/{id}/versions/{version_id}",
+#[utoipa::path(get, path = "/api/tool_scripts/{id}/versions/{version_id}",
     params(("id" = Uuid, Path), ("version_id" = Uuid, Path)),
     responses((status = 200, body = VersionDetail)), tag = "tool_scripts")]
 pub async fn get_version(
@@ -1188,7 +1204,7 @@ async fn run_stored_cases(
     let validated_at = all_passed.then(chrono::Utc::now);
     state
         .db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE tool_script_versions SET validated_at = $2 WHERE id = $1",
             [version.id.into(), validated_at.into()],
@@ -1204,7 +1220,7 @@ async fn run_stored_cases(
 
 /// Run a version's stored test cases through the runner. All-pass stamps `validated_at`; a
 /// failure clears it. Requires Administrator.
-#[utoipa::path(post, path = "/tool_scripts/{id}/versions/{version_id}/validate",
+#[utoipa::path(post, path = "/api/tool_scripts/{id}/versions/{version_id}/validate",
     params(("id" = Uuid, Path), ("version_id" = Uuid, Path)),
     responses((status = 200, body = ValidateResponse)), tag = "tool_scripts")]
 pub async fn validate_version(
@@ -1247,7 +1263,7 @@ pub struct ActivateResponse {
 /// not block: a version whose outputs still resolve serves correctly, and refusing to activate it
 /// would leave the operator with no way to put the repaired version live either. Requires
 /// Administrator.
-#[utoipa::path(post, path = "/tool_scripts/{id}/versions/{version_id}/activate",
+#[utoipa::path(post, path = "/api/tool_scripts/{id}/versions/{version_id}/activate",
     params(("id" = Uuid, Path), ("version_id" = Uuid, Path)),
     request_body = ActivateRequest,
     responses((status = 200, body = ActivateResponse),
@@ -1289,7 +1305,7 @@ pub async fn activate_version(
         .map(manifest_finding)
         .collect();
     let txn = state.db.begin().await?;
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"INSERT INTO tool_script_activations
               (tool_script_id, from_version_id, to_version_id, activated_by)
@@ -1297,7 +1313,7 @@ pub async fn activate_version(
         [id.into(), vid.into(), actor_label(&auth).into()],
     ))
     .await?;
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "UPDATE tool_scripts SET active_version_id = $2, updated_at = now() WHERE id = $1",
         [id.into(), vid.into()],
@@ -1319,7 +1335,7 @@ pub struct ActivationRecord {
 }
 
 /// The script's activation history, newest first. Requires Administrator.
-#[utoipa::path(get, path = "/tool_scripts/{id}/activations", params(("id" = Uuid, Path)),
+#[utoipa::path(get, path = "/api/tool_scripts/{id}/activations", params(("id" = Uuid, Path)),
     responses((status = 200, body = [ActivationRecord])), tag = "tool_scripts")]
 pub async fn list_activations(
     State(state): State<AppState>,
@@ -1327,7 +1343,7 @@ pub async fn list_activations(
 ) -> AppResult<Json<Vec<ActivationRecord>>> {
     let rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT fv.version_no AS from_version_no, tv.version_no AS to_version_no,
                      a.activated_by, a.activated_at

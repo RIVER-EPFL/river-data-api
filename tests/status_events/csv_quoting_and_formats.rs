@@ -11,7 +11,7 @@ use serial_test::serial;
 
 async fn exec(db: &sea_orm::DatabaseConnection, sql: &str) {
     use sea_orm::{ConnectionTrait, Statement};
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_string(),
     ))

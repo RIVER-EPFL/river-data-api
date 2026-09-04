@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 
 pub mod access;
+pub mod deliveries;
 pub mod dispatcher;
 pub mod health;
 pub mod log_model;

@@ -138,7 +138,7 @@ async fn list_holds(fx: &Fixture, extra: &str) -> serde_json::Value {
 }
 
 async fn hold_status(db: &DatabaseConnection, hold_id: &str) -> String {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!("SELECT status FROM replicate_audit_holds WHERE id = '{hold_id}'"),
     ))
@@ -172,7 +172,7 @@ async fn resolve(
 
 async fn sample_stats(fx: &Fixture, time: &str) -> Option<(f64, Option<f64>, i64)> {
     fx.db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "SELECT s.mean, s.stdev, s.n::bigint AS n FROM samples s \
@@ -264,6 +264,27 @@ async fn mismatch_admits_group_and_records_pending_hold() {
         1,
         "the cursor advances past the disagreeing group"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn one_hold_is_addressable_by_id() {
+    let fx = setup("audit-by-id").await;
+    let audit = json!([
+        {"time": T1, "expected_mean": 25.0, "expected_sd": 10.0},
+        {"time": T2, "expected_mean": 25.0, "expected_sd": 10.0},
+    ]);
+    let mut batch = group(T1, &[10.0, 20.0, 30.0]);
+    batch.extend(group(T2, &[10.0, 20.0, 30.0]));
+    ingest_audited(&fx, batch, audit).await;
+
+    let all = list_holds(&fx, "").await;
+    assert_eq!(all["total"], 2, "{all}");
+    let wanted = all["holds"][1]["id"].as_str().unwrap().to_string();
+
+    let one = list_holds(&fx, &format!("&id={wanted}")).await;
+    assert_eq!(one["total"], 1, "{one}");
+    assert_eq!(one["holds"][0]["id"], wanted);
 }
 
 #[tokio::test]
@@ -862,7 +883,7 @@ async fn a_legacy_bare_array_hold_refuses_the_flag_mode() {
     ingest_audited(&fx, group(T1, &[10.0, 20.0, 999.0]), audit).await;
     let hold_id = pending_hold_id(&fx).await;
     fx.db
-        .execute(Statement::from_string(
+        .execute_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "UPDATE replicate_audit_holds \
@@ -1303,7 +1324,10 @@ async fn the_sql_signature_and_classify_agree() {
         .map(|h| h["group_time"].as_str().unwrap())
         .collect();
     assert_eq!(by_sql, by_classify, "the SQL spelling agrees: {filtered}");
-    assert_eq!(filtered["total"], 1, "and the count pages honestly: {filtered}");
+    assert_eq!(
+        filtered["total"], 1,
+        "and the count pages honestly: {filtered}"
+    );
 
     // The complement is the other half of the same partition: what the divisor does not explain.
     let rest = list_holds(&fx, "&page_size=100&classification=not_population_sd").await;
@@ -1313,7 +1337,10 @@ async fn the_sql_signature_and_classify_agree() {
         .iter()
         .map(|h| h["group_time"].as_str().unwrap())
         .collect();
-    assert_eq!(rest["total"], 1, "the complement pages honestly too: {rest}");
+    assert_eq!(
+        rest["total"], 1,
+        "the complement pages honestly too: {rest}"
+    );
     assert!(
         !rest_times.contains(&by_classify[0]),
         "the two filters partition the holds: {rest}"
@@ -1334,7 +1361,7 @@ async fn the_sql_signature_and_classify_agree() {
 async fn a_bulk_accept_annotates_every_instant_it_decides() {
     let fx = setup("bulkann").await;
     fx.db
-        .execute(Statement::from_string(
+        .execute_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "UPDATE site_parameters SET sd_estimator = 'sample' WHERE id = '{}'",
@@ -1370,4 +1397,81 @@ async fn a_bulk_accept_annotates_every_instant_it_decides() {
     )
     .await;
     assert_eq!(annotations, 2, "one note per instant the sweep decided");
+}
+
+/// Scenario: a reviewer working a stale-subset hold wants to know, before flagging, whether
+/// dropping the suspect replicate meets the source's cells. Expected behaviour: the preview
+/// keyed by the hold reports the recomputed statistics and the match, and writes nothing.
+#[tokio::test]
+#[serial]
+async fn preview_against_a_hold_says_whether_the_expectation_is_met() {
+    let fx = setup("audit-preview").await;
+    let audit = json!([{"time": T1, "expected_mean": 15.0,
+                        "expected_sd": 7.071_067_811_865_476}]);
+    ingest_audited(&fx, group(T1, &[10.0, 20.0, 999.0]), audit).await;
+    let hold_id = pending_hold_id(&fx).await;
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &fx.app,
+        "/api/readings/sample_preview",
+        &json!({
+            "stream_id": fx.stream,
+            "time": T1,
+            "exclude_replicate_indexes": [2],
+            "hold_id": hold_id,
+        }),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "preview ({status}): {body}");
+    assert_eq!(body["hold"]["meets_now"], false, "{body}");
+    assert_eq!(body["hold"]["meets_after"], true, "{body}");
+    assert!((body["proposed"]["mean"].as_f64().unwrap() - 15.0).abs() < 1e-9);
+    assert_eq!(flagged_at(&fx, T1).await, 0, "a preview flags nothing");
+    assert_eq!(hold_status(&fx.db, &hold_id).await, "pending");
+
+    // Excluding the wrong replicate does not meet it, and says which statistic fails.
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &fx.app,
+        "/api/readings/sample_preview",
+        &json!({ "stream_id": fx.stream, "time": T1,
+                 "exclude_replicate_indexes": [0], "hold_id": hold_id }),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["hold"]["meets_after"], false, "{body}");
+    assert_eq!(body["hold"]["mean_agrees"], false, "{body}");
+}
+
+/// Scenario: a slot declared `population`, and a later cycle raises a hold there for a count
+/// mismatch. Expected behaviour: the hold carries the divisor its computed sd was made with, so
+/// the review queue can label it, rather than every hold reading as the sample formula.
+#[tokio::test]
+#[serial]
+async fn a_hold_records_the_divisor_its_sd_was_computed_under() {
+    let fx = setup("audit-divisor").await;
+    let (status, declared) = crate::common::post_json_parse_with_token(
+        &fx.app,
+        &format!("/api/site_parameters/{}/declare_sd_estimator", crate::common::PARAM_S1_TEMP_ID),
+        &json!({ "estimator": "population" }),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "{declared}");
+
+    // 10, 20, 30: population sd 8.165; the source counted four cells.
+    let audit = json!([{"time": T1, "expected_mean": 20.0,
+                        "expected_sd": 8.164_965_809_277_26, "expected_n": 4}]);
+    ingest_audited(&fx, group(T1, &[10.0, 20.0, 30.0]), audit).await;
+
+    let holds = list_holds(&fx, "").await;
+    let hold = &holds["holds"][0];
+    assert_eq!(hold["classification"], "n_mismatch", "{hold}");
+    assert_eq!(hold["sd_estimator"], "population", "{hold}");
+    assert_eq!(hold["computed"]["sd_estimator"], "population", "{hold}");
+    assert!(
+        (hold["computed"]["sd"].as_f64().unwrap() - 8.164_965_809_277_26).abs() < 1e-9,
+        "the stored sd is the population number: {hold}"
+    );
 }

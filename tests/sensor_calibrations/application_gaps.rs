@@ -8,7 +8,7 @@
 //! parameter and window cover it, and an explicit end date the operator sets is the end date
 //! stored.
 //!
-//! Each test names the finding in `docs/defect-findings.md` that it proves.
+//! Each test names the finding in `../archived-documentation/defect-findings.md` that it proves.
 
 use std::time::Duration;
 

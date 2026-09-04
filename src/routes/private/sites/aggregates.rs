@@ -194,7 +194,7 @@ fn aggregates_table(times: &[DateTime<Utc>], params: &[ParameterAggregateData]) 
 /// raw resolution via the readings endpoint.
 #[utoipa::path(
     get,
-    path = "/{site_id}/aggregates/{resolution}",
+    path = "/api/sites/{site_id}/aggregates/{resolution}",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
         ("resolution" = String, Path, description = "Aggregation resolution: hourly, daily, weekly, monthly"),
@@ -320,7 +320,7 @@ pub async fn get_site_aggregates(
         let mut map = HashMap::new();
         for row in state
             .db
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 sql,
                 values.0,
@@ -395,7 +395,7 @@ pub async fn get_site_aggregates(
 
     let rows: Vec<AggregateRow> = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             bind(&window),
@@ -428,7 +428,7 @@ pub async fn get_site_aggregates(
 
     let flagged_rows: Vec<FlaggedBucketRow> = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &flagged_sql,
             bind(&window),

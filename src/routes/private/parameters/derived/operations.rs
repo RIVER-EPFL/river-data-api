@@ -70,7 +70,7 @@ async fn resolve_variables(
 
     for var_name in &var_names {
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r"SELECT id FROM parameters WHERE code = $1 LIMIT 1",
                 [var_name.clone().into()],
@@ -100,7 +100,7 @@ async fn find_derived_definition_for_param(
     parameter_id: Uuid,
 ) -> Result<Option<Uuid>, ApiError> {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT dpd.id FROM derived_parameter_definitions dpd
               JOIN parameters p ON p.code = dpd.code
@@ -135,7 +135,7 @@ fn compute_chain_depth<'a>(
 
         // Get this definition's sources
         let source_rows = db
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r"SELECT parameter_id FROM derived_parameter_sources WHERE derived_definition_id = $1",
                 [def_id.into()],
@@ -181,7 +181,7 @@ async fn validate_dependency_chain(
         if let Some(_def_id) = find_derived_definition_for_param(db, *parameter_id).await? {
             // Check if any parameter in the chain matches our definition name
             let cycle_row = db
-                .query_one(Statement::from_sql_and_values(
+                .query_one_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     r"SELECT 1 FROM parameters WHERE code = $1 AND id = $2",
                     [definition_name.into(), (*parameter_id).into()],
@@ -208,7 +208,7 @@ async fn sync_sources(
     resolved_params: &[(String, Uuid)],
 ) -> Result<(), ApiError> {
     // Delete existing rows
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"DELETE FROM derived_parameter_sources WHERE derived_definition_id = $1",
         [definition_id.into()],
@@ -218,7 +218,7 @@ async fn sync_sources(
 
     // Insert new rows
     for (var_name, param_id) in resolved_params {
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"INSERT INTO derived_parameter_sources (derived_definition_id, parameter_id, variable_name)
               VALUES ($1, $2, $3)",
@@ -242,7 +242,7 @@ async fn ensure_output_parameter(
     // Reuse existing link if present
     if let Some(existing_id) = entity.output_parameter_id {
         // Keep the parameter row in sync
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE parameters SET name = $2, default_units = $3, description = $4
               WHERE id = $1",
@@ -260,7 +260,7 @@ async fn ensure_output_parameter(
 
     // Create or find the output parameter
     let existing = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT id FROM parameters WHERE LOWER(code) = LOWER($1) LIMIT 1",
             [entity.code.clone().into()],
@@ -272,7 +272,7 @@ async fn ensure_output_parameter(
         let id: Uuid = row
             .try_get("", "id")
             .map_err(|e| ApiError::internal(format!("Failed to read parameter id: {e}"), None))?;
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE parameters SET name = $2, default_units = $3, description = $4
               WHERE id = $1",
@@ -288,7 +288,7 @@ async fn ensure_output_parameter(
         id
     } else {
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r"INSERT INTO parameters (id, code, name, default_units, category, description)
                   VALUES (gen_random_uuid(), $1, $2, $3, 'measurement', $4)
@@ -312,7 +312,7 @@ async fn ensure_output_parameter(
     };
 
     // Store the link on the definition
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE derived_parameter_definitions SET output_parameter_id = $1 WHERE id = $2",
         [param_id.into(), entity.id.into()],
@@ -346,7 +346,7 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
     }
 
     async fn before_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<(), ApiError> {
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "DELETE FROM derived_parameter_sources WHERE derived_definition_id = $1",
             [id.into()],
@@ -354,7 +354,7 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
         .await
         .map_err(|e| ApiError::internal(format!("Failed to delete sources: {e}"), None))?;
 
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE site_parameters SET derived_definition_id = NULL WHERE derived_definition_id = $1",
             [id.into()],

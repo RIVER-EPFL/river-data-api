@@ -157,7 +157,7 @@ async fn insert_reading_chunks<C: ConnectionTrait>(
 /// in continuous aggregates until paired). Requires `write_data`.
 #[utoipa::path(
     post,
-    path = "/ingest",
+    path = "/api/ingest",
     request_body = IngestReadingsRequest,
     responses(
         (status = 200, description = "Inserted count and pairing state. Inadmissible readings (out-of-window timestamp, non-finite value, unknown measurement_type, unknown calibration_id) are skipped and counted in `skipped`, not refused", body = IngestResponse),
@@ -167,6 +167,7 @@ async fn insert_reading_chunks<C: ConnectionTrait>(
 )]
 pub async fn ingest_readings(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     ProjectScope(scope): ProjectScope,
     IsSyncService(is_sync_service): IsSyncService,
     Json(mut payload): Json<IngestReadingsRequest>,
@@ -232,8 +233,9 @@ pub async fn ingest_readings(
     // What the source says about its own sd divisor, if anything. Absent is the common answer and
     // is carried through as absent: the slot then decides, and absent that the samples this pass
     // materialises are recorded undeclared.
-    let stream_sd_estimator = data_streams::replicates::ReplicateSpec::from_metadata(&stream.metadata)
-        .and_then(|spec| spec.sd_estimator.clone());
+    let stream_sd_estimator =
+        data_streams::replicates::ReplicateSpec::from_metadata(&stream.metadata)
+            .and_then(|spec| spec.sd_estimator.clone());
 
     // Withdrawal is confined to spot rows by a database CHECK; the continuous aggregates exclude
     // spot, which is what keeps a retraction structurally unreachable by a rollup. A window on a
@@ -316,9 +318,7 @@ pub async fn ingest_readings(
     // owner; cal/deployment/site come from whichever window covers each timestamp.
     let resolved = if let Some(stream_sensor) = stream.sensor_id {
         let times: Vec<chrono::DateTime<Utc>> = payload.readings.iter().map(|r| r.time).collect();
-        resolve_windows_for_times(db, stream_sensor, None, &times)
-            .await
-            .unwrap_or_default()
+        resolve_windows_for_times(db, stream_sensor, None, parameter_id, &times).await?
     } else {
         std::collections::HashMap::new()
     };
@@ -329,9 +329,7 @@ pub async fn ingest_readings(
         (None, Some(s), Some(p)) => {
             let times: Vec<chrono::DateTime<Utc>> =
                 payload.readings.iter().map(|r| r.time).collect();
-            resolve_slot_owner_for_times(db, s, p, &times)
-                .await
-                .unwrap_or_default()
+            resolve_slot_owner_for_times(db, s, p, &times).await?
         }
         _ => std::collections::HashMap::new(),
     };
@@ -432,6 +430,36 @@ pub async fn ingest_readings(
         .await?
     };
 
+    // Replicates belong to a spot instant. The declared cadence is not the stored one, so this is
+    // judged against the resolved value; a row that fails it would be stored at an index every
+    // continuous reader filters out, ie. served nowhere.
+    payload.readings.retain(|r| {
+        if r.replicate_index == 0 {
+            return true;
+        }
+        let sensor_id = r
+            .sensor_id
+            .or(stream.sensor_id)
+            .or_else(|| slot_owner.get(&r.time).and_then(|o| o.sensor_id));
+        let resolved = crate::routes::private::readings::measurement::resolve_measurement_type(
+            r.measurement_type.as_deref(),
+            stream.measurement_type.as_deref(),
+            sensor_id,
+            &sensor_types,
+        );
+        if resolved == readings::sample_groups::SPOT {
+            return true;
+        }
+        record_rejection(
+            &mut counts,
+            admission::RejectionKind::ReplicateIndexOnNonSpot,
+        );
+        if track_rejections {
+            rejected_keys.insert((r.time, r.replicate_index));
+        }
+        false
+    });
+
     // Standard curve claims, held to the grab rules (fitted on the reading's instrument, spot
     // measurement). An inadmissible claim is stripped, never the reading: the value is stored
     // uncorrected and the claim lands in the review queue as a `curve_claim_stripped` hold, so
@@ -482,15 +510,16 @@ pub async fn ingest_readings(
                 };
                 if let Some(reason) = reason {
                     r.standard_curve_id = None;
-                    stripped_claims.entry(r.time).or_default().push(
-                        serde_json::json!({
+                    stripped_claims
+                        .entry(r.time)
+                        .or_default()
+                        .push(serde_json::json!({
                             "replicate_index": r.replicate_index,
                             "standard_curve_id": id,
                             "curve_instrument_id": by_id.get(&id).map(|c| c.sensor_id),
                             "reading_instrument_id": sensor_id,
                             "reason": reason,
-                        }),
-                    );
+                        }));
                 }
             }
             rows.into_iter()
@@ -553,6 +582,10 @@ pub async fn ingest_readings(
             readings::ActiveModel {
                 standard_curve_id: Set(standard.map(|c| c.id)),
                 collection_event_id: Set(None),
+                provenance: Set(None),
+                label: Set(None),
+                notes: Set(None),
+                created_by: Set(None),
                 withdrawn_at: Set(None),
                 withdrawn_reason: Set(None),
                 ingested_at: sea_orm::ActiveValue::NotSet,
@@ -592,131 +625,24 @@ pub async fn ingest_readings(
         })
         .collect();
 
-    // The replicate audit: recompute each audited group's statistics over the values about to be
-    // stored, compare against the portal's claim, and admit the group either way. Served
-    // statistics are trigger-computed from the stored replicates, so a disagreement questions the
-    // portal's aggregate cells, not the data, and withholding would only hide measurements from
-    // the people waiting on them. A mismatch records a hold for review (pending when paired,
-    // deferred until pairing); a group that matches again at source supersedes its open hold; a
-    // group an operator already ruled on (acknowledged or remediated) is left alone unless the
-    // portal's expected statistics have moved since the ruling, which opens a fresh hold.
-    if let Some(audits) = payload.audit.as_deref().filter(|a| !a.is_empty()) {
-        use crate::routes::private::sync::replicate_audit as audit;
-
-        let mut group_values: HashMap<chrono::DateTime<Utc>, Vec<audit::ReplicateValue>> =
-            HashMap::new();
-        for m in &models {
-            if let (
-                sea_orm::ActiveValue::Set(time),
-                sea_orm::ActiveValue::Set(raw),
-                sea_orm::ActiveValue::Set(index),
-            ) = (&m.time, &m.raw_value, &m.replicate_index)
-            {
-                let value = match &m.calibrated_value {
-                    sea_orm::ActiveValue::Set(Some(v)) => *v,
-                    _ => *raw,
-                };
-                group_values
-                    .entry(time.with_timezone(&Utc))
-                    .or_default()
-                    .push(audit::ReplicateValue {
-                        index: *index,
-                        value,
-                    });
-            }
-        }
-
-        // The slot's declaration, resolved once for the batch: every audited group on this stream
-        // sits on the same slot.
-        let audit_estimator = match (stream_sd_estimator.clone(), site_id, parameter_id) {
-            (Some(declared), _, _) => Some(declared),
-            (None, Some(site_id), Some(parameter_id)) => {
-                readings::sd_estimator::slot_declaration(db, site_id, parameter_id)
-                    .await?
-                    .map(str::to_string)
-            }
-            _ => None,
-        };
-        let audit_times: Vec<chrono::DateTime<Utc>> = audits.iter().map(|a| a.time).collect();
-        let holds_by_time: HashMap<chrono::DateTime<Utc>, audit::LatestHold> =
-            audit::latest_holds(db, payload.stream_id, &audit_times)
+    // The replicate audit runs inside the write transaction below, over the rows it stored. The
+    // slot's declaration is resolved once here: every audited group on this stream sits on the
+    // same slot.
+    let audit_estimator = match (
+        payload.audit.as_deref().filter(|a| !a.is_empty()),
+        stream_sd_estimator.clone(),
+        site_id,
+        parameter_id,
+    ) {
+        (None, ..) => None,
+        (Some(_), Some(declared), _, _) => Some(declared),
+        (Some(_), None, Some(site_id), Some(parameter_id)) => {
+            readings::sd_estimator::slot_declaration(db, site_id, parameter_id)
                 .await?
-                .into_iter()
-                .map(|h| (h.time, h))
-                .collect();
-
-        for a in audits {
-            let values = group_values
-                .get(&a.time)
-                .map_or(&[] as &[audit::ReplicateValue], Vec::as_slice);
-            let numbers: Vec<f64> = values.iter().map(|v| v.value).collect();
-            // Compared under the divisor the slot publishes. An undeclared slot compares as
-            // sample, which is what makes its population-shaped groups disagree and surface for a
-            // decision rather than being quietly reconciled under a convention nobody chose.
-            let stats = audit::group_stats(&numbers).under(audit_estimator.as_deref().unwrap_or("sample"));
-            let agree = audit::stats_agree(a.expected_mean, stats.mean, audit::DEFAULT_REL_TOL)
-                && audit::stats_agree_with(
-                    a.expected_sd,
-                    stats.sd,
-                    audit::SD_REL_TOL,
-                    audit::SD_ABS_TOL,
-                )
-                && a.expected_n
-                    .is_none_or(|expected| i64::try_from(stats.n) == Ok(expected));
-            let mismatch = audit::GroupMismatch {
-                time: a.time,
-                expected_mean: a.expected_mean,
-                expected_sd: a.expected_sd,
-                expected_n: a.expected_n,
-                computed_mean: stats.mean,
-                computed_sd: stats.sd,
-                n: stats.n,
-                values: values.to_vec(),
-            };
-            let hold_status = if paired { "pending" } else { "deferred" };
-            match (agree, holds_by_time.get(&a.time)) {
-                (true, Some(hold)) if matches!(hold.status.as_str(), "pending" | "deferred") => {
-                    audit::close_hold(db, hold.id, "superseded").await?;
-                }
-                (true, _) => {}
-                // The operator's decision stands against re-detection of the SAME disagreement.
-                // A cycle whose expected statistics moved is new evidence the decision never
-                // covered, so it opens a fresh hold beside the terminal one.
-                (false, Some(hold))
-                    if matches!(hold.status.as_str(), "acknowledged" | "remediated") =>
-                {
-                    if audit::expected_changed(&hold.expected, a) {
-                        audit::upsert_hold(db, payload.stream_id, &mismatch, hold_status).await?;
-                    }
-                }
-                (false, _) => {
-                    audit::upsert_hold(db, payload.stream_id, &mismatch, hold_status).await?;
-                }
-            }
+                .map(str::to_string)
         }
-    }
-    // After the statistics audit on purpose: at one (stream, instant) key the later upsert wins,
-    // and a stripped claim explains the disagreement the audit would otherwise report bare.
-    if !stripped_claims.is_empty() {
-        let hold_status = if paired { "pending" } else { "deferred" };
-        for (time, claims) in &stripped_claims {
-            upsert_curve_claim_hold(db, payload.stream_id, *time, claims, hold_status).await?;
-        }
-        tracing::warn!(
-            stream_id = %payload.stream_id,
-            instants = stripped_claims.len(),
-            "Inadmissible standard curve claims stripped; readings stored uncorrected and held for review"
-        );
-    }
-    if payload.readings.is_empty() && payload.window.is_none() {
-        return Ok(Json(ingest_outcome(
-            payload.stream_id,
-            paired,
-            submitted,
-            0,
-            &counts,
-        )));
-    }
+        _ => None,
+    };
 
     let total = models.len();
 
@@ -748,83 +674,116 @@ pub async fn ingest_readings(
     // inside one transaction with the decompression cap lifted, like every other back-dated
     // write path. The diff, the writes and the receipt commit together or not at all.
     let mut diff_outcome: Option<crate::routes::private::readings::reconcile::DiffOutcome> = None;
-    let inserted = if payload.overwrite || sample_window.is_some() || payload.window.is_some() {
-        let (n, diff) = crate::common::bulk_write::guarded(db, async |txn| {
-            use crate::routes::private::readings::reconcile;
-            let diff = match &payload.window {
-                Some(window) => {
-                    let admitted: Vec<reconcile::AdmittedRow> = payload
-                        .readings
-                        .iter()
-                        .map(|r| ((r.time, r.replicate_index), r.raw_value, r.standard_curve_id))
-                        .collect();
-                    Some(
-                        reconcile::run_windowed_diff(
-                            txn,
-                            payload.stream_id,
-                            window,
-                            &admitted,
-                            &rejected_keys,
+    let audited =
+        payload.audit.as_deref().is_some_and(|a| !a.is_empty()) || !stripped_claims.is_empty();
+    let inserted = if payload.overwrite
+        || sample_window.is_some()
+        || payload.window.is_some()
+        || audited
+    {
+        let actor = crate::routes::private::tools::scripts::actor_label(&auth);
+        let (n, diff, touched_events) = crate::common::bulk_write::guarded(db, async |txn| {
+                use crate::routes::private::readings::reconcile;
+                let diff = match &payload.window {
+                    Some(window) => {
+                        let admitted: Vec<reconcile::AdmittedRow> = payload
+                            .readings
+                            .iter()
+                            .map(|r| {
+                                (
+                                    (r.time, r.replicate_index),
+                                    r.raw_value,
+                                    r.standard_curve_id,
+                                )
+                            })
+                            .collect();
+                        Some(
+                            reconcile::run_windowed_diff(
+                                txn,
+                                payload.stream_id,
+                                window,
+                                &admitted,
+                                &rejected_keys,
+                                &actor,
+                            )
+                            .await?,
                         )
-                        .await?,
+                    }
+                    None => None,
+                };
+                let replace = if payload.overwrite {
+                    Replace::ValuesAndAttribution
+                } else if diff.as_ref().is_some_and(|d| d.apply_changed) {
+                    // The windowed path retires Replace::Nothing: a differing value is a correction
+                    // and it is applied, through the clause that never touches flags or sample links.
+                    Replace::ValuesAndAttribution
+                } else {
+                    Replace::Nothing
+                };
+                // Under a diff, only classified-new and applied-changed rows are written; an
+                // unchanged row re-written with identical values is a hypertable write, WAL and
+                // an upsert count that reads as effect, all for nothing. An overwrite is exempt:
+                // it exists to rewrite attribution, which the diff's value equality cannot see.
+                let filtered: Vec<readings::ActiveModel>;
+                let to_write: &[readings::ActiveModel] = match &diff {
+                    Some(d) if !payload.overwrite => {
+                        filtered = models
+                            .iter()
+                            .zip(payload.readings.iter())
+                            .filter(|(_, r)| d.write_keys.contains(&(r.time, r.replicate_index)))
+                            .map(|(m, _)| m.clone())
+                            .collect();
+                        &filtered
+                    }
+                    _ => &models,
+                };
+                // A correction is a decision of sync origin (ADR 0008), recorded before the
+                // upsert so the value it replaces is what the record holds; a hand-picked curve
+                // the source names is a claim, recorded once.
+                if replace != Replace::Nothing {
+                    crate::routes::private::readings::decisions::record_value_corrections(
+                        txn,
+                        to_write,
+                        &actor,
+                        crate::routes::private::readings::decisions::Origin::Sync,
                     )
+                    .await?;
                 }
-                None => None,
-            };
-            let replace = if payload.overwrite {
-                Replace::ValuesAndAttribution
-            } else if diff.as_ref().is_some_and(|d| d.apply_changed) {
-                // The windowed path retires Replace::Nothing: a differing value is a correction
-                // and it is applied, through the clause that never touches flags or sample links.
-                Replace::ValuesAndAttribution
-            } else {
-                Replace::Nothing
-            };
-            // Under a diff, only classified-new and applied-changed rows are written; an
-            // unchanged row re-written with identical values is a hypertable write, WAL and
-            // an upsert count that reads as effect, all for nothing. An overwrite is exempt:
-            // it exists to rewrite attribution, which the diff's value equality cannot see.
-            let filtered: Vec<readings::ActiveModel>;
-            let to_write: &[readings::ActiveModel] = match &diff {
-                Some(d) if !payload.overwrite => {
-                    filtered = models
-                        .iter()
-                        .zip(payload.readings.iter())
-                        .filter(|(_, r)| d.write_keys.contains(&(r.time, r.replicate_index)))
-                        .map(|(m, _)| m.clone())
-                        .collect();
-                    &filtered
-                }
-                _ => &models,
-            };
-            let n = insert_reading_chunks(txn, to_write, replace).await?;
-            // A pass that wrote, withdrew or reinstated nothing left every group's content
-            // as it stood; sample statistics and event attachment have nothing to recompute.
-            // Overwrites recompute regardless: they may have moved attribution.
-            let diff_touched = payload.overwrite
-                || diff.as_ref().is_none_or(|d| {
-                    d.new_rows + d.changed + d.withdrawn + d.reinstated > 0
-                });
-            if diff_touched && let Some((lo, hi)) = sample_window {
-                let binds: Vec<sea_orm::Value> = vec![
-                    payload.stream_id.into(),
-                    sea_orm::prelude::DateTimeWithTimeZone::from(lo).into(),
-                    sea_orm::prelude::DateTimeWithTimeZone::from(hi).into(),
-                ];
-                readings::sample_groups::materialise_samples_with_estimator(
+                let n = insert_reading_chunks(txn, to_write, replace).await?;
+                crate::routes::private::readings::decisions::record_curve_claims(
+                    txn,
+                    to_write,
+                    &actor,
+                    crate::routes::private::readings::decisions::Origin::Sync,
+                )
+                .await?;
+                // A pass that wrote, withdrew or reinstated nothing left every group's content
+                // as it stood; sample statistics and event attachment have nothing to recompute.
+                // Overwrites recompute regardless: they may have moved attribution.
+                let diff_touched = payload.overwrite
+                    || diff
+                        .as_ref()
+                        .is_none_or(|d| d.new_rows + d.changed + d.withdrawn + d.reinstated > 0);
+                let mut touched_events = Vec::new();
+                if diff_touched && let Some((lo, hi)) = sample_window {
+                    let binds: Vec<sea_orm::Value> = vec![
+                        payload.stream_id.into(),
+                        sea_orm::prelude::DateTimeWithTimeZone::from(lo).into(),
+                        sea_orm::prelude::DateTimeWithTimeZone::from(hi).into(),
+                    ];
+                    readings::sample_groups::materialise_samples_with_estimator(
+                        txn,
+                        "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
+                        binds.clone(),
+                        stream_sd_estimator.as_deref(),
+                    )
+                    .await?;
+                    // Each source row maps onto one collection event (D7). A sync service replaying
+                    // a portal row writes a portal_sync event; any other writer is a person.
+                    crate::routes::private::collection_events::attach::attach_collection_events(
                     txn,
                     "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
                     binds.clone(),
-                    payload.collection,
-                    stream_sd_estimator.as_deref(),
-                )
-                .await?;
-                // Each source row maps onto one collection event (D7). A sync service replaying
-                // a portal row writes a portal_sync event; any other writer is a person.
-                crate::routes::private::collection_events::attach::attach_collection_events(
-                    txn,
-                    "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
-                    binds,
                     if is_sync_service {
                         crate::routes::private::collection_events::attach::EventSource::PortalSync
                     } else {
@@ -832,30 +791,76 @@ pub async fn ingest_readings(
                     },
                 )
                 .await?;
-            }
-            if let (Some(window), Some(d)) = (&payload.window, &diff) {
-                let rejected_total: usize = counts.iter().map(|(_, n)| n).sum();
-                let rejected_json = serde_json::Value::Object(
-                    counts
-                        .iter()
-                        .map(|(k, n)| (k.as_str().to_string(), serde_json::json!(n)))
-                        .collect(),
-                );
-                reconcile::write_receipt(
-                    txn,
-                    payload.stream_id,
-                    window,
-                    submitted,
-                    d,
-                    rejected_total,
-                    &rejected_json,
-                )
-                .await?;
-            }
-            Ok((n, diff))
-        })
-        .await?;
+                    touched_events =
+                        crate::routes::private::collection_events::recompute::touched_events(
+                            txn,
+                            "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
+                            binds,
+                        )
+                        .await?;
+                }
+                // The audit judges what this transaction stored, so its hold transitions commit or
+                // roll back with the writes. A braked pass withheld the corrections the claim
+                // describes, so the stored groups are not what the source asserted; the holds stand.
+                if let Some(audits) = payload.audit.as_deref().filter(|a| !a.is_empty())
+                    && diff.as_ref().is_none_or(|d| d.apply_changed)
+                {
+                    run_replicate_audit(
+                        txn,
+                        payload.stream_id,
+                        audits,
+                        audit_estimator.as_deref(),
+                        paired,
+                    )
+                    .await?;
+                }
+                // After the statistics audit on purpose: at one (stream, instant) key the later
+                // upsert wins, and a stripped claim explains the disagreement the audit would
+                // otherwise report bare.
+                if !stripped_claims.is_empty() {
+                    let hold_status = if paired { "pending" } else { "deferred" };
+                    for (time, claims) in &stripped_claims {
+                        upsert_curve_claim_hold(txn, payload.stream_id, *time, claims, hold_status)
+                            .await?;
+                    }
+                    tracing::warn!(
+                        stream_id = %payload.stream_id,
+                        instants = stripped_claims.len(),
+                        "Inadmissible standard curve claims stripped; readings stored uncorrected and held for review"
+                    );
+                }
+                if let (Some(window), Some(d)) = (&payload.window, &diff) {
+                    let rejected_total: usize = counts.iter().map(|(_, n)| n).sum();
+                    let rejected_json = serde_json::Value::Object(
+                        counts
+                            .iter()
+                            .map(|(k, n)| (k.as_str().to_string(), serde_json::json!(n)))
+                            .collect(),
+                    );
+                    reconcile::write_receipt(
+                        txn,
+                        payload.stream_id,
+                        window,
+                        submitted,
+                        d,
+                        rejected_total,
+                        &rejected_json,
+                    )
+                    .await?;
+                }
+                Ok((n, diff, touched_events))
+            })
+            .await?;
         diff_outcome = diff;
+        // A served value moved at a visit somebody entered here: its calculations run (ADR 0007).
+        // A portal_sync visit is left to its portal (Q41), which the hook enforces.
+        crate::routes::private::collection_events::recompute::enqueue_for(
+            db,
+            &touched_events,
+            &crate::routes::private::tools::scripts::actor_label(&auth),
+            crate::routes::private::collection_events::recompute::Writer::Person,
+        )
+        .await?;
         n
     } else {
         insert_reading_chunks(db, &models, Replace::Nothing).await?
@@ -866,8 +871,7 @@ pub async fn ingest_readings(
     let diff_reinstated = diff_outcome.as_ref().map_or(0, |d| d.reinstated);
     // What this pass did to served content, the gate every post-write side effect reads: a
     // correction or a withdrawal with `inserted == 0` still rewrote history.
-    let effect =
-        inserted > 0 || diff_changed > 0 || diff_withdrawn > 0 || diff_reinstated > 0;
+    let effect = inserted > 0 || diff_changed > 0 || diff_withdrawn > 0 || diff_reinstated > 0;
 
     // Sample formation retroactively changes served historical points (the group's mean replaces
     // the lone value), so bounded cached responses cannot be left to expire on TTL. Withdrawals
@@ -949,12 +953,17 @@ pub async fn ingest_readings(
     // brake, no holds, no rejections, no stripped curve claims): the claim the sync client
     // compares its next payload against to skip re-sending unchanged content. A braked or held
     // pass stores none, so those windows keep re-asserting until a person rules.
-    let advance_cursor = payload.readings.iter().map(|r| r.time).max().filter(|max_time| {
-        stream
-            .last_data_time
-            .map(|t| *max_time > t.with_timezone(&Utc))
-            .unwrap_or(true)
-    });
+    let advance_cursor = payload
+        .readings
+        .iter()
+        .map(|r| r.time)
+        .max()
+        .filter(|max_time| {
+            stream
+                .last_data_time
+                .map(|t| *max_time > t.with_timezone(&Utc))
+                .unwrap_or(true)
+        });
     let rejected_total: usize = counts.iter().map(|(_, n)| n).sum();
     let clean_digest = payload
         .window
@@ -992,8 +1001,15 @@ pub async fn ingest_readings(
             .await
             .unwrap_or(true)
     {
+        // A withdrawn key is absent from the payload by construction, so the retracted instants
+        // have to be unioned in or the derived output computed from a retracted input is never
+        // revisited. Reinstated keys are in the same position from the other direction.
         let mut unique_timestamps: Vec<chrono::DateTime<Utc>> =
             payload.readings.iter().map(|r| r.time).collect();
+        if let Some(d) = &diff_outcome {
+            unique_timestamps.extend(d.withdrawn_keys.iter().map(|(t, _)| *t));
+            unique_timestamps.extend(d.reinstated_keys.iter().map(|(t, _)| *t));
+        }
         unique_timestamps.sort();
         unique_timestamps.dedup();
         let source_stream = payload.stream_id;
@@ -1032,8 +1048,12 @@ pub async fn ingest_readings(
 }
 
 /// One review-queue row per instant whose standard curve claims were stripped. `expected` carries
-/// the claims as the source made them, `computed` what was stored instead; the (stream, instant)
-/// upsert key matches the statistics audit's, so re-detection updates in place.
+/// the claims as the source made them, `computed` what was stored instead.
+///
+/// A stripped claim explains a statistics disagreement at the same instant rather than sitting
+/// beside it, so raising this hold supersedes a live `replicate_stats` hold there. That precedence
+/// used to fall out of the two sharing one upsert key; the key now carries `kind`, so it is stated
+/// here instead of happening by accident.
 async fn upsert_curve_claim_hold<C: ConnectionTrait>(
     conn: &C,
     stream_id: Uuid,
@@ -1041,20 +1061,31 @@ async fn upsert_curve_claim_hold<C: ConnectionTrait>(
     claims: &[serde_json::Value],
     status: &str,
 ) -> AppResult<()> {
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "INSERT INTO replicate_audit_holds
              (stream_id, group_time, kind, expected, computed, delta, status)
          VALUES ($1, $2, 'curve_claim_stripped', $3, $4, '{}'::jsonb, $5)
-         ON CONFLICT (stream_id, group_time) WHERE status IN ('pending', 'deferred')
+         ON CONFLICT (stream_id, group_time, kind) WHERE status IN ('pending', 'deferred')
          DO UPDATE SET expected = EXCLUDED.expected, computed = EXCLUDED.computed,
-                       kind = 'curve_claim_stripped', created_at = NOW()",
+                       created_at = NOW()",
         [
             stream_id.into(),
             sea_orm::prelude::DateTimeWithTimeZone::from(group_time).into(),
             serde_json::json!({ "claims": claims }).into(),
             serde_json::json!({ "stored_without_curve": claims.len() }).into(),
             status.into(),
+        ],
+    ))
+    .await?;
+    conn.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "UPDATE replicate_audit_holds SET status = 'superseded'
+         WHERE stream_id = $1 AND group_time = $2 AND kind = 'replicate_stats'
+           AND status IN ('pending', 'deferred')",
+        [
+            stream_id.into(),
+            sea_orm::prelude::DateTimeWithTimeZone::from(group_time).into(),
         ],
     ))
     .await?;
@@ -1144,7 +1175,7 @@ pub struct IngestStatusEventsResponse {
 /// Hypertable inserts keyed by stream_id. Requires `write_data`.
 #[utoipa::path(
     post,
-    path = "/ingest/status_events",
+    path = "/api/ingest/status_events",
     request_body = IngestStatusEventsRequest,
     responses(
         (status = 200, description = "Inserted count and pairing state. Events outside the admissible timestamp window are skipped and counted in `skipped`", body = IngestStatusEventsResponse),
@@ -1212,7 +1243,7 @@ pub async fn ingest_status_events(
     // "still the same" row per poll. Events at or before the stored tip are backfill and insert
     // as before; the primary key already collapses exact duplicates.
     let tip = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT time, value FROM status_events WHERE stream_id = $1 ORDER BY time DESC LIMIT 1",
             [payload.stream_id.into()],
@@ -1220,7 +1251,10 @@ pub async fn ingest_status_events(
         .await?;
     let tip_time: Option<chrono::DateTime<Utc>> = tip
         .as_ref()
-        .and_then(|r| r.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "time").ok())
+        .and_then(|r| {
+            r.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "time")
+                .ok()
+        })
         .map(|t| t.with_timezone(&Utc));
     let mut last_value: Option<String> = tip.as_ref().and_then(|r| r.try_get("", "value").ok());
     payload.events.sort_by_key(|e| e.time);
@@ -1308,7 +1342,7 @@ async fn resolve_stream_slot(
         return Ok((None, None));
     };
     let Some(row) = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT site_id, parameter_id FROM site_parameters WHERE id = $1",
             [sp_id.into()],
@@ -1343,6 +1377,114 @@ async fn enforce_ingest_scope(
             return Err(AppError::Forbidden(
                 "Project-scoped token cannot ingest into an unpaired stream".to_string(),
             ));
+        }
+    }
+    Ok(())
+}
+
+/// The replicate audit: recompute each audited group's statistics over the stored replicates,
+/// compare against the portal's claim, and admit the group either way. Served statistics are
+/// trigger-computed from the stored replicates, so a disagreement questions the portal's
+/// aggregate cells, not the data, and withholding would only hide measurements from the people
+/// waiting on them. A mismatch records a hold for review (pending when paired, deferred until
+/// pairing); a group that matches again at source supersedes its open hold; a group an operator
+/// already ruled on (acknowledged or remediated) is left alone unless the portal's expected
+/// statistics have moved since the ruling, which opens a fresh hold.
+async fn run_replicate_audit(
+    txn: &sea_orm::DatabaseTransaction,
+    stream_id: Uuid,
+    audits: &[crate::routes::private::sync::replicate_audit::GroupAudit],
+    estimator: Option<&str>,
+    paired: bool,
+) -> AppResult<()> {
+    use crate::routes::private::sync::replicate_audit as audit;
+
+    let audit_times: Vec<chrono::DateTime<Utc>> = audits.iter().map(|a| a.time).collect();
+    let (Some(lo), Some(hi)) = (
+        audit_times.iter().min().copied(),
+        audit_times.iter().max().copied(),
+    ) else {
+        return Ok(());
+    };
+    let audited_instants: std::collections::HashSet<chrono::DateTime<Utc>> =
+        audit_times.iter().copied().collect();
+    let rows = txn
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT time, replicate_index, COALESCE(calibrated_value, raw_value) AS value
+              FROM readings
+              WHERE stream_id = $1 AND time >= $2 AND time <= $3 AND withdrawn_at IS NULL
+              ORDER BY time, replicate_index",
+            [
+                stream_id.into(),
+                sea_orm::prelude::DateTimeWithTimeZone::from(lo).into(),
+                sea_orm::prelude::DateTimeWithTimeZone::from(hi).into(),
+            ],
+        ))
+        .await?;
+    let mut group_values: HashMap<chrono::DateTime<Utc>, Vec<audit::ReplicateValue>> =
+        HashMap::new();
+    for r in &rows {
+        let time: sea_orm::prelude::DateTimeWithTimeZone = r.try_get("", "time")?;
+        if !audited_instants.contains(&time.with_timezone(&Utc)) {
+            continue;
+        }
+        let index: i16 = r.try_get("", "replicate_index")?;
+        let value: f64 = r.try_get("", "value")?;
+        group_values
+            .entry(time.with_timezone(&Utc))
+            .or_default()
+            .push(audit::ReplicateValue { index, value });
+    }
+
+    let holds_by_time: HashMap<chrono::DateTime<Utc>, audit::LatestHold> =
+        audit::latest_holds(txn, stream_id, &audit_times)
+            .await?
+            .into_iter()
+            .map(|h| (h.time, h))
+            .collect();
+
+    for a in audits {
+        let values = group_values
+            .get(&a.time)
+            .map_or(&[] as &[audit::ReplicateValue], Vec::as_slice);
+        let numbers: Vec<f64> = values.iter().map(|v| v.value).collect();
+        // Compared under the divisor the slot publishes. An undeclared slot compares as sample,
+        // which is what makes its population-shaped groups disagree and surface for a decision
+        // rather than being quietly reconciled under a convention nobody chose.
+        let estimator = estimator.unwrap_or("sample");
+        let stats = audit::group_stats(&numbers).under(estimator);
+        let agree = audit::agrees(a, &stats);
+        let mismatch = audit::GroupMismatch {
+            time: a.time,
+            expected_mean: a.expected_mean,
+            expected_sd: a.expected_sd,
+            expected_n: a.expected_n,
+            computed_mean: stats.mean,
+            computed_sd: stats.sd,
+            n: stats.n,
+            sd_estimator: estimator.to_string(),
+            values: values.to_vec(),
+        };
+        let hold_status = if paired { "pending" } else { "deferred" };
+        match (agree, holds_by_time.get(&a.time)) {
+            (true, Some(hold)) if matches!(hold.status.as_str(), "pending" | "deferred") => {
+                audit::close_hold(txn, hold.id, "superseded").await?;
+            }
+            (true, _) => {}
+            // The operator's decision stands against re-detection of the SAME disagreement. A
+            // cycle whose expected statistics moved is new evidence the decision never covered,
+            // so it opens a fresh hold beside the terminal one.
+            (false, Some(hold))
+                if matches!(hold.status.as_str(), "acknowledged" | "remediated") =>
+            {
+                if audit::expected_changed(&hold.expected, a) {
+                    audit::upsert_hold(txn, stream_id, &mismatch, hold_status).await?;
+                }
+            }
+            (false, _) => {
+                audit::upsert_hold(txn, stream_id, &mismatch, hold_status).await?;
+            }
         }
     }
     Ok(())

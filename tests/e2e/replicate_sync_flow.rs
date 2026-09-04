@@ -25,7 +25,7 @@ const GROUPS: [(&str, [f64; 3], f64, f64); 3] = [
 ];
 
 async fn scalar_f64(db: &DatabaseConnection, sql: &str) -> f64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         sql.to_string(),
     ))
@@ -252,7 +252,7 @@ async fn replicate_sync_full_flow() {
     );
     for (time, _raws, mean, sd) in &GROUPS {
         let row = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DatabaseBackend::Postgres,
                 format!(
                     "SELECT mean, stdev, n::bigint AS n FROM samples \

@@ -12,7 +12,7 @@
 //! align this file" before the operator confirms.
 
 use axum::{Json, extract::State};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -24,7 +24,9 @@ use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams::service::get_or_create_api_stream;
 use crate::routes::private::readings::batch::{ConflictMode, admission};
+use crate::routes::private::readings::checks;
 use crate::routes::private::sensors::operations::{ResolvedOwner, resolve_slot_owner_for_times};
+use crate::routes::private::sensors::standard_curves;
 use crate::routes::resolve_site_with_project;
 
 /// What the file's numbers are, deciding whether the import may claim a correction.
@@ -85,6 +87,19 @@ pub struct ImportCsvRequest {
     /// catalog parameters and values import as-is.
     #[serde(default)]
     pub tool: Option<String>,
+    /// With `tool`: the standard curve each of the tool's curve slots takes, by slot name, for
+    /// every row. A CSV column headed with a slot's name overrides it row by row with the curve
+    /// id in the cell (a blank cell falls back to this). The run applies the curve, so outputs
+    /// are saved corrected and carry no curve id; the replicates it consumed are saved raw
+    /// carrying the curve and its instrument, and the database corrects them.
+    #[serde(default)]
+    pub curves: Option<HashMap<String, Uuid>>,
+    /// The seasonal check a `dry_run` of this file returned (`check.check_id`). A spot or tool
+    /// file is screened against the site's seasonal distribution; a commit naming the check is
+    /// held to exactly the values it screened, and a commit naming none is refused when the
+    /// screen finds a value outside the recorded range.
+    #[serde(default)]
+    pub check_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -125,7 +140,8 @@ pub struct ImportCsvResponse {
     /// Incoming readings whose (stream, time) already exists with a different stored value.
     /// In `overwrite` mode these are the rows that would be (or were) replaced.
     pub overlaps_differing: usize,
-    /// Existing rows replaced because `conflict = overwrite`. Always 0 in `skip` mode or `dry_run`.
+    /// Stored rows whose value this import changed under `conflict = overwrite`; an identical
+    /// overlap is not counted. Always 0 in `skip` mode or `dry_run`.
     pub overwritten: usize,
     /// Up to 20 differing overlaps, so the UI can preview what an overwrite would change.
     pub overlap_sample: Vec<OverlapDiff>,
@@ -139,6 +155,117 @@ pub struct ImportCsvResponse {
     /// plain import.
     #[serde(default)]
     pub tool_runs_created: usize,
+    /// One entry per curve slot of the tool (tool entry only): where its curve comes from.
+    #[serde(default)]
+    pub curves: Vec<ImportCurve>,
+    /// The seasonal screen over the file's cells. `null` for a continuous file, which the check
+    /// does not apply to (its history is spot readings).
+    pub check: Option<ImportCheck>,
+}
+
+/// The seasonal Check gate's CSV arm: every cell the file will store as a spot reading, screened
+/// against the site's seasonal distribution for its own month.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ImportCheck {
+    /// The stored check a commit must name. Set by `dry_run`; echoed by a commit that named one;
+    /// `null` on a commit that needed none (nothing outside the range).
+    pub check_id: Option<Uuid>,
+    /// Cells screened.
+    pub screened: usize,
+    /// Cells outside the recorded seasonal range.
+    pub warnings: usize,
+    /// The cells that warn, in file order, capped at `IMPORT_CHECK_FINDINGS_CAP`.
+    pub findings: Vec<checks::ScreenedCell>,
+    pub method: checks::SeasonalMethod,
+}
+
+/// Cap on the warning cells an import response lists.
+const IMPORT_CHECK_FINDINGS_CAP: usize = 200;
+
+/// Screen the cells a spot or tool file will store, and decide what the request may do with the
+/// result. `dry_run` stores the check and returns its id. A commit naming a check is validated
+/// against it (every screened cell must be a checked pair, the grab save's rule); a commit
+/// naming none is refused when any cell warns, with the findings in the 409 body.
+async fn screen_import(
+    state: &AppState,
+    auth: &crate::common::middleware::AuthContext,
+    req: &ImportCsvRequest,
+    site_id: Uuid,
+    cells: &[(usize, Uuid, chrono::DateTime<chrono::Utc>, f64)],
+) -> AppResult<ImportCheck> {
+    let screened = checks::screen_cells(&state.db, site_id, cells).await?;
+    let mut seen: HashSet<(Uuid, u64)> = HashSet::new();
+    let pairs: Vec<checks::SeasonalCheckValue> = screened
+        .iter()
+        .filter(|c| seen.insert((c.parameter_id, c.value.to_bits())))
+        .map(|c| checks::SeasonalCheckValue {
+            parameter_id: c.parameter_id,
+            value: c.value,
+        })
+        .collect();
+    let warnings = screened.iter().filter(|c| c.warning).count();
+    let findings: Vec<checks::ScreenedCell> = screened
+        .into_iter()
+        .filter(|c| c.warning)
+        .take(IMPORT_CHECK_FINDINGS_CAP)
+        .collect();
+    let method = checks::method();
+    let check_id = if req.dry_run {
+        let anchor = cells
+            .iter()
+            .map(|c| c.2)
+            .min()
+            .unwrap_or_else(chrono::Utc::now);
+        Some(
+            checks::store_check(
+                &state.db,
+                site_id,
+                anchor,
+                &pairs,
+                crate::routes::private::tools::scripts::actor_label(auth),
+            )
+            .await?,
+        )
+    } else if let Some(check_id) = req.check_id {
+        let keyed: Vec<(Uuid, f64)> = pairs.iter().map(|p| (p.parameter_id, p.value)).collect();
+        checks::validate_check_claim(&state.db, check_id, site_id, &keyed).await?;
+        Some(check_id)
+    } else if warnings > 0 {
+        return Err(AppError::ConflictDetail {
+            message: format!(
+                "{warnings} value(s) fall outside the site's seasonal range; preview the file \
+                 (dry_run) and pass its check_id to import it as screened"
+            ),
+            detail: serde_json::json!({
+                "screened": cells.len(),
+                "warnings": warnings,
+                "findings": findings,
+                "method": method,
+            }),
+        });
+    } else {
+        None
+    };
+    Ok(ImportCheck {
+        check_id,
+        screened: cells.len(),
+        warnings,
+        findings,
+        method,
+    })
+}
+
+/// How a tool-entry import fills one of the tool's curve slots.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ImportCurve {
+    pub slot: String,
+    pub label: String,
+    pub required: bool,
+    /// The CSV column supplying a curve id per row, when one is headed with the slot's name.
+    pub column: Option<String>,
+    /// The request-level curve every row takes unless its column cell names another.
+    pub standard_curve_id: Option<Uuid>,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -195,7 +322,7 @@ fn parse_datetime(s: &str, tz_offset: chrono::Duration) -> Option<chrono::DateTi
 /// resolution plan only. Requires `write_data`.
 #[utoipa::path(
     post,
-    path = "/readings/import_csv",
+    path = "/api/readings/import_csv",
     request_body = ImportCsvRequest,
     responses(
         (status = 200, description = "Import summary or dry-run plan", body = ImportCsvResponse),
@@ -250,6 +377,12 @@ pub async fn import_csv(
     // A project-scoped token may only import into a site within its project.
     enforce_project_scope_for_sites(&state.db, &scope, &[site_id]).await?;
 
+    if req.curves.is_some() && req.tool.is_none() {
+        return Err(AppError::BadRequest(
+            "curves fills a tool's curve slots; name the tool the file is entry for".into(),
+        ));
+    }
+
     // Tool entry: the file's columns are tool inputs, not catalog parameters. Same write path as
     // typing the rows into the tool (D15).
     if let Some(tool_name) = req.tool.as_deref() {
@@ -266,7 +399,7 @@ pub async fn import_csv(
     // Also build alias map from the site's parameters only.
     let sp_rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT sp.name AS sp_name, sp.parameter_id, p.code AS param_name, p.aliases \
              FROM site_parameters sp JOIN parameters p ON p.id = sp.parameter_id \
@@ -301,7 +434,7 @@ pub async fn import_csv(
     // Derived-output parameters are computed, never ingested.
     let derived_rows = state
         .db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT output_parameter_id FROM derived_parameter_definitions \
              WHERE output_parameter_id IS NOT NULL"
@@ -316,7 +449,7 @@ pub async fn import_csv(
     // Global catalog fallback: lower(name) -> id, lower(alias) -> id.
     let catalog_rows = state
         .db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT id, code, aliases FROM parameters".to_owned(),
         ))
@@ -467,16 +600,6 @@ pub async fn import_csv(
             }
         };
 
-    // A file that declares a non-spot cadence holds one reading per (parameter, timestamp): a
-    // repeat is a source defect, and absorbing it as replicate 1 hides the row from the default
-    // read and from every rollup while fabricating a grab sample around it. A file declared 'spot'
-    // is a replicate plate, where the repeat is the point.
-    let one_reading_per_timestamp = match req.measurement_type.as_deref() {
-        Some(declared @ ("continuous" | "derived")) => Some(declared),
-        _ => None,
-    };
-    let mut seen_slots: HashSet<(Uuid, chrono::DateTime<chrono::Utc>)> = HashSet::new();
-
     for record in reader.records() {
         line += 1;
         let record = match record {
@@ -524,22 +647,6 @@ pub async fn import_csv(
                 }
                 admission::Cell::Value(raw) => (raw - m.conversion_offset) / m.conversion_factor,
             };
-            if let Some(declared) = one_reading_per_timestamp
-                && !seen_slots.insert((m.parameter_id, time))
-            {
-                record_error(
-                    line,
-                    format!(
-                        "Column '{}': timestamp {} is repeated, and a '{declared}' series holds \
-                         one reading per timestamp",
-                        m.header,
-                        time.to_rfc3339()
-                    ),
-                    &mut errors,
-                    &mut error_count,
-                );
-                continue;
-            }
             rows.push((m.parameter_id, time, stored, line));
         }
     }
@@ -560,7 +667,7 @@ pub async fn import_csv(
         if !owning_ids.is_empty() {
             for row in state
                 .db
-                .query_all(Statement::from_sql_and_values(
+                .query_all_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "SELECT id, source_key FROM data_streams \
                      WHERE id = ANY($1) AND metadata -> 'replicates' IS NOT NULL",
@@ -603,6 +710,120 @@ pub async fn import_csv(
             }
         }
     }
+    // Attribute each row to the sensor whose deployment window covers its time, so imported readings
+    // that fall inside an existing deployment land attributed instead of NULL (the historical-orphan
+    // source). Rows outside every deployment window resolve to all-None and need a later backdate.
+    let mut owner_map: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), ResolvedOwner> =
+        HashMap::new();
+    {
+        let mut times_by_param: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = HashMap::new();
+        for (pid, t, _, _) in &rows {
+            times_by_param.entry(*pid).or_default().push(*t);
+        }
+        for (pid, ts) in &times_by_param {
+            let resolved = resolve_slot_owner_for_times(&state.db, site_id, *pid, ts).await?;
+            for (t, owner) in resolved {
+                owner_map.insert((*pid, t), owner);
+            }
+        }
+    }
+
+    // One reading per (parameter, timestamp) on every cadence but spot: a repeat is a source
+    // defect, and absorbing it as replicate 1 hides the row from the default read and from every
+    // rollup while fabricating a grab sample around it. A spot file is a replicate plate, where
+    // the repeat is the point. The cadence is the one the write will resolve (request declaration
+    // → the stream that will carry the row → the deployed sensor's data_frequency → continuous),
+    // never the declaration alone, or a caller who declares nothing escapes the rule.
+    {
+        let mut api_stream_of: HashMap<Uuid, Uuid> = HashMap::new();
+        let mapped_params: Vec<Uuid> = mappings.iter().map(|m| m.parameter_id).collect();
+        for row in state
+            .db
+            .query_all_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT sp.parameter_id, ds.id FROM data_streams ds \
+                 JOIN site_parameters sp ON sp.id = ds.site_parameter_id \
+                 WHERE ds.source_system = 'api' AND sp.site_id = $1 AND sp.parameter_id = ANY($2)",
+                [site_id.into(), mapped_params.into()],
+            ))
+            .await?
+        {
+            api_stream_of.insert(row.try_get("", "parameter_id")?, row.try_get("", "id")?);
+        }
+
+        let mut stream_ids: Vec<Uuid> = overlap
+            .owning_stream
+            .values()
+            .copied()
+            .chain(api_stream_of.values().copied())
+            .collect();
+        stream_ids.sort_unstable();
+        stream_ids.dedup();
+        let mut stream_default: HashMap<Uuid, Option<String>> = HashMap::new();
+        if !stream_ids.is_empty() {
+            for row in state
+                .db
+                .query_all_raw(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT id, measurement_type FROM data_streams WHERE id = ANY($1)",
+                    [stream_ids.into()],
+                ))
+                .await?
+            {
+                stream_default.insert(row.try_get("", "id")?, row.try_get("", "measurement_type")?);
+            }
+        }
+
+        let mut sensor_ids: Vec<Uuid> = owner_map.values().filter_map(|o| o.sensor_id).collect();
+        sensor_ids.sort_unstable();
+        sensor_ids.dedup();
+        let sensor_types =
+            crate::routes::private::readings::measurement::measurement_types_for_sensors(
+                &state.db,
+                &sensor_ids,
+            )
+            .await?;
+
+        let header_of: HashMap<Uuid, String> = mappings
+            .iter()
+            .map(|m| (m.parameter_id, m.header.clone()))
+            .collect();
+        let mut seen_slots: HashSet<(Uuid, chrono::DateTime<chrono::Utc>)> = HashSet::new();
+        let before = rows.len();
+        rows.retain(|(pid, time, _, line)| {
+            let stream_id = overlap
+                .owning_stream
+                .get(&(*pid, *time))
+                .or_else(|| api_stream_of.get(pid));
+            let resolved = crate::routes::private::readings::measurement::resolve_measurement_type(
+                req.measurement_type.as_deref(),
+                stream_id
+                    .and_then(|id| stream_default.get(id))
+                    .and_then(Option::as_deref),
+                owner_map.get(&(*pid, *time)).and_then(|o| o.sensor_id),
+                &sensor_types,
+            );
+            if resolved == "spot" || seen_slots.insert((*pid, *time)) {
+                return true;
+            }
+            record_error(
+                *line,
+                format!(
+                    "Column '{}': timestamp {} is repeated, and a '{resolved}' series holds \
+                     one reading per timestamp",
+                    header_of.get(pid).map_or("?", String::as_str),
+                    time.to_rfc3339()
+                ),
+                &mut errors,
+                &mut error_count,
+            );
+            false
+        });
+        if rows.len() != before {
+            overlap = compute_overlaps(&state.db, site_id, &rows, earliest, latest).await?;
+        }
+    }
+
     let overlap = overlap;
 
     let replicate_groups = if req.measurement_type.as_deref() == Some("spot") {
@@ -613,6 +834,20 @@ pub async fn import_csv(
         group_sizes.values().filter(|n| **n > 1).count()
     } else {
         0
+    };
+
+    // A spot file is screened against the site's seasonal history, cell by cell; a continuous
+    // file is not, the check's history being spot readings. A cell already stored with the same
+    // value is not screened: it is its own history, and importing it again changes nothing.
+    let check = if req.measurement_type.as_deref() == Some("spot") {
+        let cells: Vec<(usize, Uuid, chrono::DateTime<chrono::Utc>, f64)> = rows
+            .iter()
+            .filter(|(_, _, _, line)| !overlap.identical_lines.contains(line))
+            .map(|(pid, time, value, line)| (*line, *pid, *time, *value))
+            .collect();
+        Some(screen_import(&state, &auth, &req, site_id, &cells).await?)
+    } else {
+        None
     };
 
     // Dry run: report the plan and overlap diff without writing.
@@ -641,6 +876,8 @@ pub async fn import_csv(
             errors,
             error_count,
             tool_runs_created: 0,
+            curves: Vec::new(),
+            check,
         }));
     }
 
@@ -656,24 +893,6 @@ pub async fn import_csv(
         if let std::collections::hash_map::Entry::Vacant(e) = stream_cache.entry(m.parameter_id) {
             let stream_id = get_or_create_api_stream(&state.db, site_id, m.parameter_id).await?;
             e.insert(stream_id);
-        }
-    }
-
-    // Attribute each row to the sensor whose deployment window covers its time, so imported readings
-    // that fall inside an existing deployment land attributed instead of NULL (the historical-orphan
-    // source). Rows outside every deployment window resolve to all-None and need a later backdate.
-    let mut owner_map: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), ResolvedOwner> =
-        HashMap::new();
-    {
-        let mut times_by_param: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = HashMap::new();
-        for (pid, t, _, _) in &rows {
-            times_by_param.entry(*pid).or_default().push(*t);
-        }
-        for (pid, ts) in &times_by_param {
-            let resolved = resolve_slot_owner_for_times(&state.db, site_id, *pid, ts).await?;
-            for (t, owner) in resolved {
-                owner_map.insert((*pid, t), owner);
-            }
         }
     }
 
@@ -817,6 +1036,8 @@ pub async fn import_csv(
         errors,
         error_count,
         tool_runs_created: 0,
+        curves: Vec::new(),
+        check,
     }))
 }
 
@@ -878,7 +1099,7 @@ async fn stage_import_rows(
             values.push(seq.into());
             seq += 1;
         }
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             sql,
             values,
@@ -895,6 +1116,8 @@ struct OverlapReport {
     /// Stream already holding readings for a (parameter, time), ie. the row an incoming value for
     /// that slot must be written onto. Absent when the slot is empty.
     owning_stream: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Uuid>,
+    /// File lines whose value is already stored: nothing to screen, nothing changes.
+    identical_lines: HashSet<usize>,
 }
 
 /// Cap on differing-overlap rows returned for UI preview.
@@ -916,6 +1139,7 @@ async fn compute_overlaps(
     let mut differing = 0usize;
     let mut sample = Vec::new();
     let mut owning_stream = HashMap::new();
+    let mut identical_lines = HashSet::new();
 
     let (Some(t_min), Some(t_max)) = (earliest, latest) else {
         return Ok(OverlapReport {
@@ -923,6 +1147,7 @@ async fn compute_overlaps(
             differing,
             sample,
             owning_stream,
+            identical_lines,
         });
     };
     if rows.is_empty() {
@@ -931,6 +1156,7 @@ async fn compute_overlaps(
             differing,
             sample,
             owning_stream,
+            identical_lines,
         });
     }
 
@@ -942,7 +1168,7 @@ async fn compute_overlaps(
         .collect();
 
     let existing_rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT parameter_id, time, stream_id, COALESCE(calibrated_value, raw_value) AS val \
              FROM readings \
@@ -979,7 +1205,7 @@ async fn compute_overlaps(
     }
 
     let mut occurrence: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), usize> = HashMap::new();
-    for (pid, time, incoming, _) in rows {
+    for (pid, time, incoming, line) in rows {
         let key = (*pid, *time);
         let idx = occurrence.entry(key).or_insert(0);
         let slot = *idx;
@@ -989,6 +1215,7 @@ async fn compute_overlaps(
         };
         if (stored - incoming).abs() <= OVERLAP_EPSILON {
             identical += 1;
+            identical_lines.insert(*line);
         } else {
             differing += 1;
             if sample.len() < OVERLAP_SAMPLE_CAP {
@@ -1007,6 +1234,7 @@ async fn compute_overlaps(
         differing,
         sample,
         owning_stream,
+        identical_lines,
     })
 }
 
@@ -1032,12 +1260,66 @@ fn replicate_column(
         })
 }
 
+/// A header naming one of the tool's curve slots (case-insensitive): its cells are standard curve
+/// ids, one per row.
+fn curve_column(
+    curves: &[crate::routes::private::tools::engine::ManifestCurve],
+    header: &str,
+) -> Option<String> {
+    curves
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(header))
+        .map(|c| c.name.clone())
+}
+
+/// The curve each slot takes for one row: the row's own cell when it names one, else the
+/// request-level curve. A cell that is not a curve id is the row's error.
+fn row_curves(
+    defaults: &HashMap<String, Uuid>,
+    cells: &[(&str, &str)],
+) -> Result<HashMap<String, Uuid>, String> {
+    let mut curves = defaults.clone();
+    for (slot, cell) in cells {
+        let cell = cell.trim();
+        if cell.is_empty() {
+            continue;
+        }
+        let id: Uuid = cell
+            .parse()
+            .map_err(|_| format!("Column '{slot}': '{cell}' is not a standard curve id"))?;
+        curves.insert((*slot).to_string(), id);
+    }
+    Ok(curves)
+}
+
+/// The curve a `replicates` param's stored readings carry: the row's curve for the slot the
+/// param declares. The run applied it to what it computed; the stored replicate is raw, so the
+/// reference is what makes the database apply it there too.
+fn replicate_curve(
+    params: &[crate::routes::private::tools::engine::ManifestParam],
+    param: &str,
+    curves: &HashMap<String, Uuid>,
+) -> Option<Uuid> {
+    let slot = params.iter().find(|p| p.name == param)?.curve.as_deref()?;
+    curves.get(slot).copied()
+}
+
+/// One parsed data row of a tool-entry file: the run's typed inputs and the curve each slot takes.
+struct ToolRow {
+    line: usize,
+    time: chrono::DateTime<chrono::Utc>,
+    body: serde_json::Map<String, serde_json::Value>,
+    curves: HashMap<String, Uuid>,
+}
+
 /// The tool-entry import: one tool run per data row, outputs saved through the grab write path.
 ///
 /// Columns map to the tool's manifest params (case-insensitive, exact otherwise); the `DateTime`
 /// column is the row's collection instant and travels to the engine as `collected_at`, so
-/// station and event inputs resolve exactly as they would for a typed entry. Each row's run is
-/// stored with `source = 'csv_import'` and its save builds the ordinary server-side blob.
+/// station and event inputs resolve exactly as they would for a typed entry. A column headed
+/// with a curve slot's name carries a standard curve id per row, over the request's `curves`.
+/// Each row's run is stored with `source = 'csv_import'` and its save builds the ordinary
+/// server-side blob.
 #[allow(clippy::too_many_arguments)]
 async fn import_tool_csv(
     state: &AppState,
@@ -1056,6 +1338,23 @@ async fn import_tool_csv(
     use crate::routes::private::tools::{engine, execute_and_store_run};
 
     let tool = engine::find_active_tool(&state.db, tool_name).await?;
+
+    let request_curves: HashMap<String, Uuid> = req.curves.clone().unwrap_or_default();
+    for slot in request_curves.keys() {
+        if !tool.manifest.curves.iter().any(|c| &c.name == slot) {
+            let slots: Vec<&str> = tool
+                .manifest
+                .curves
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect();
+            return Err(AppError::BadRequest(format!(
+                "'{slot}' is not a curve slot of tool '{}'; its slots are [{}]",
+                tool.name,
+                slots.join(", ")
+            )));
+        }
+    }
 
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
@@ -1076,8 +1375,14 @@ async fn import_tool_csv(
     let mut warnings: Vec<String> = Vec::new();
     // (column index, param name, position within a replicates param)
     let mut column_params: Vec<(usize, String, Option<usize>)> = Vec::new();
+    // (column index, curve slot)
+    let mut curve_columns: Vec<(usize, String)> = Vec::new();
     for (idx, header) in headers.iter().enumerate() {
         if idx == datetime_idx {
+            continue;
+        }
+        if let Some(slot) = curve_column(&tool.manifest.curves, header) {
+            curve_columns.push((idx, slot));
             continue;
         }
         let hit = tool
@@ -1120,8 +1425,7 @@ async fn import_tool_csv(
 
     // Parse every row up front so the plan (and dry_run) reports the whole file before anything
     // runs.
-    let mut rows: Vec<(usize, chrono::DateTime<chrono::Utc>, serde_json::Map<String, serde_json::Value>)> =
-        Vec::new();
+    let mut rows: Vec<ToolRow> = Vec::new();
     let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut latest: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut line = 1usize;
@@ -1130,7 +1434,12 @@ async fn import_tool_csv(
         let record = match record {
             Ok(r) => r,
             Err(e) => {
-                record_error(line, format!("CSV parse error: {e}"), &mut errors, &mut error_count);
+                record_error(
+                    line,
+                    format!("CSV parse error: {e}"),
+                    &mut errors,
+                    &mut error_count,
+                );
                 continue;
             }
         };
@@ -1184,9 +1493,25 @@ async fn import_tool_csv(
         if bad_cell || body.is_empty() {
             continue;
         }
+        let cells: Vec<(&str, &str)> = curve_columns
+            .iter()
+            .map(|(idx, slot)| (slot.as_str(), record.get(*idx).unwrap_or("")))
+            .collect();
+        let curves = match row_curves(&request_curves, &cells) {
+            Ok(curves) => curves,
+            Err(reason) => {
+                record_error(line, reason, &mut errors, &mut error_count);
+                continue;
+            }
+        };
         earliest = Some(earliest.map_or(time, |e| e.min(time)));
         latest = Some(latest.map_or(time, |l| l.max(time)));
-        rows.push((line, time, body));
+        rows.push(ToolRow {
+            line,
+            time,
+            body,
+            curves,
+        });
     }
     if rows.len() > TOOL_IMPORT_ROW_CAP {
         return Err(AppError::BadRequest(format!(
@@ -1194,6 +1519,67 @@ async fn import_tool_csv(
             rows.len()
         )));
     }
+
+    // Every curve the file or the request names, loaded once: a request-level id nothing
+    // carries refuses the plan, a row's own does the row.
+    let curve_ids: Vec<Uuid> = request_curves
+        .values()
+        .chain(rows.iter().flat_map(|r| r.curves.values()))
+        .copied()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let stored_curves: HashMap<Uuid, standard_curves::Model> = standard_curves::Entity::find()
+        .filter(standard_curves::Column::Id.is_in(curve_ids))
+        .all(&state.db)
+        .await?
+        .into_iter()
+        .map(|c| (c.id, c))
+        .collect();
+    for (slot, id) in &request_curves {
+        if !stored_curves.contains_key(id) {
+            return Err(AppError::BadRequest(format!(
+                "curve '{slot}': standard curve {id} not found"
+            )));
+        }
+    }
+    rows.retain(|row| {
+        match row
+            .curves
+            .iter()
+            .find(|(_, id)| !stored_curves.contains_key(id))
+        {
+            Some((slot, id)) => {
+                record_error(
+                    row.line,
+                    format!("Column '{slot}': standard curve {id} not found"),
+                    &mut errors,
+                    &mut error_count,
+                );
+                false
+            }
+            None => true,
+        }
+    });
+    let curve_plan: Vec<ImportCurve> = tool
+        .manifest
+        .curves
+        .iter()
+        .map(|c| {
+            let standard_curve_id = request_curves.get(&c.name).copied();
+            ImportCurve {
+                slot: c.name.clone(),
+                label: c.label.clone(),
+                required: c.required,
+                column: curve_columns
+                    .iter()
+                    .find(|(_, slot)| slot == &c.name)
+                    .map(|(idx, _)| headers[*idx].to_string()),
+                standard_curve_id,
+                name: standard_curve_id.and_then(|id| stored_curves[&id].name.clone()),
+            }
+        })
+        .collect();
 
     let catalog =
         engine::load_parameter_catalog(&state.db, std::iter::once(&tool.manifest)).await?;
@@ -1222,12 +1608,38 @@ async fn import_tool_csv(
         )));
     }
 
+    // The cells the file stores as readings are the replicate inputs; outputs exist only once
+    // the tool has run, so they are screened by the grab save's own gate, not here.
+    let mut cells: Vec<(usize, Uuid, chrono::DateTime<chrono::Utc>, f64)> = Vec::new();
+    for row in &rows {
+        for (name, parameter_id) in &saved_inputs {
+            let values: Vec<f64> = match row.body.get(name) {
+                Some(serde_json::Value::Array(list)) => {
+                    list.iter().filter_map(serde_json::Value::as_f64).collect()
+                }
+                Some(v) => v.as_f64().into_iter().collect(),
+                None => Vec::new(),
+            };
+            cells.extend(values.into_iter().map(|v| (row.line, *parameter_id, row.time, v)));
+        }
+    }
+    let check = Some(screen_import(state, auth, req, site.id, &cells).await?);
+
     let row_count = rows.len();
     let mut inserted_total = 0usize;
     let mut tool_runs_created = 0usize;
     if !req.dry_run {
         let actor = crate::routes::private::tools::scripts::actor_label(auth);
-        for (line, time, mut body) in rows {
+        for ToolRow {
+            line,
+            time,
+            mut body,
+            curves,
+        } in rows
+        {
+            for (slot, id) in &curves {
+                body.insert(slot.clone(), serde_json::json!({ "standard_curve_id": id }));
+            }
             body.insert("site_id".into(), serde_json::json!(site.id));
             body.insert(
                 "collected_at".into(),
@@ -1236,14 +1648,21 @@ async fn import_tool_csv(
             let body = serde_json::Value::Object(body);
             let body_bytes =
                 serde_json::to_vec(&body).map_err(|e| AppError::Internal(e.to_string()))?;
-            let result =
-                match execute_and_store_run(state, &tool, &body_bytes, &actor, "csv_import").await {
-                    Ok(result) => result,
-                    Err(e) => {
-                        record_error(line, e.to_string(), &mut errors, &mut error_count);
-                        continue;
-                    }
-                };
+            let result = match execute_and_store_run(
+                state,
+                &tool,
+                &body_bytes,
+                &actor,
+                "csv_import",
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    record_error(line, e.to_string(), &mut errors, &mut error_count);
+                    continue;
+                }
+            };
             tool_runs_created += 1;
 
             let mut readings: Vec<GrabSampleReading> = saved_outputs
@@ -1269,6 +1688,10 @@ async fn import_tool_csv(
                 let Some(values) = body.get(name).and_then(serde_json::Value::as_array) else {
                     continue;
                 };
+                // A curve is fitted on one instrument, so the replicate it corrects is that
+                // instrument's measurement.
+                let standard_curve_id = replicate_curve(&tool.manifest.params, name, &curves);
+                let sensor_id = standard_curve_id.map(|id| stored_curves[&id].sensor_id);
                 for (position, cell) in values.iter().enumerate() {
                     let (Some(value), Ok(replicate_index)) =
                         (cell.as_f64(), i16::try_from(position))
@@ -1277,13 +1700,13 @@ async fn import_tool_csv(
                     };
                     readings.push(GrabSampleReading {
                         parameter_id: *parameter_id,
-                        sensor_id: None,
+                        sensor_id,
                         value,
                         time,
                         replicate_index: Some(replicate_index),
                         output: None,
                         input: Some(name.clone()),
-                        standard_curve_id: None,
+                        standard_curve_id,
                     });
                 }
             }
@@ -1348,5 +1771,84 @@ async fn import_tool_csv(
         errors,
         error_count,
         tool_runs_created,
+        curves: curve_plan,
+        check,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routes::private::tools::engine::{ManifestCurve, ManifestParam};
+
+    fn slots() -> Vec<ManifestCurve> {
+        vec![ManifestCurve {
+            name: "std_curve".into(),
+            label: "Standard curve".into(),
+            required: false,
+            description: None,
+        }]
+    }
+
+    fn doc_params() -> Vec<ManifestParam> {
+        serde_json::from_value(serde_json::json!([
+            { "name": "DOC", "label": "DOC", "kind": "replicates",
+              "parameter_code": "DOC", "curve": "std_curve" },
+            { "name": "volume", "label": "Volume", "kind": "number" }
+        ]))
+        .unwrap()
+    }
+
+    const CURVE_A: Uuid = Uuid::from_u128(0xa);
+    const CURVE_B: Uuid = Uuid::from_u128(0xb);
+
+    #[test]
+    fn test_curve_column_matches_a_slot_name_case_insensitively() {
+        assert_eq!(
+            curve_column(&slots(), "STD_Curve").as_deref(),
+            Some("std_curve")
+        );
+        assert_eq!(curve_column(&slots(), "DOC_rep_1"), None);
+    }
+
+    #[test]
+    fn test_row_curves_cell_overrides_the_request_default() {
+        let defaults = HashMap::from([("std_curve".to_string(), CURVE_A)]);
+        let curves = row_curves(&defaults, &[("std_curve", &CURVE_B.to_string())]).unwrap();
+        assert_eq!(curves["std_curve"], CURVE_B);
+    }
+
+    #[test]
+    fn test_row_curves_blank_cell_keeps_the_request_default() {
+        let defaults = HashMap::from([("std_curve".to_string(), CURVE_A)]);
+        let curves = row_curves(&defaults, &[("std_curve", "  ")]).unwrap();
+        assert_eq!(curves["std_curve"], CURVE_A);
+    }
+
+    #[test]
+    fn test_row_curves_without_a_column_or_default_names_nothing() {
+        assert!(row_curves(&HashMap::new(), &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_row_curves_rejects_a_cell_that_is_not_an_id() {
+        let err = row_curves(&HashMap::new(), &[("std_curve", "plate 3")]).unwrap_err();
+        assert!(
+            err.contains("std_curve") && err.contains("plate 3"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_replicate_curve_is_the_slot_the_param_declares() {
+        let curves = HashMap::from([("std_curve".to_string(), CURVE_A)]);
+        assert_eq!(
+            replicate_curve(&doc_params(), "DOC", &curves),
+            Some(CURVE_A)
+        );
+        // A param declaring no slot carries nothing, whatever the row resolved.
+        assert_eq!(replicate_curve(&doc_params(), "volume", &curves), None);
+        // A declared slot the row left empty carries nothing.
+        assert_eq!(replicate_curve(&doc_params(), "DOC", &HashMap::new()), None);
+    }
 }

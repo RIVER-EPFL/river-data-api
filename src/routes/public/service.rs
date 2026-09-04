@@ -8,6 +8,19 @@ use uuid::Uuid;
 
 use crate::routes::private::{projects, sites};
 
+/// The version of the public serving contract this code implements: what the readings and
+/// aggregates arms select and how they express it. Bumped when a serving predicate or an output
+/// shape changes.
+///
+/// 2.3.0: spot instants are served as sample statistics (the unflagged replicate mean, with the
+/// lowest unflagged replicate as the no-sample fallback), so which replicate index exists or is
+/// flagged no longer decides whether an instant is served or which value it carries.
+///
+/// 2.4.0: `include_sample_stats` publishes n, mean, sd, min and max per instant with the slot's
+/// declared sd estimator beside the sd, and a slot declaring `decimal_places` has every served
+/// value, statistic and aggregate expressed at those places.
+pub const SERVING_CONTRACT_VERSION: &str = "2.4.0";
+
 /// Cache for public project configurations
 pub type PublicConfigCache = Cache<String, Arc<PublicProjectConfig>>;
 
@@ -19,7 +32,11 @@ pub struct PublicProjectConfig {
     pub code: String,
     pub api_title: String,
     pub api_description: String,
+    /// The version the docs advertise: the project's pin when set, else the serving contract.
     pub api_version: String,
+    /// `projects.public_api_version`, a per-project pin over what the docs advertise. It never
+    /// changes what is served, which is why the spec carries `SERVING_CONTRACT_VERSION` beside it.
+    pub version_override: Option<String>,
     pub contact_email: Option<String>,
     pub sites: Vec<PublicSiteConfig>,
     pub exposed_params: Vec<ExposedParamConfig>,
@@ -39,6 +56,10 @@ pub struct ExposedParamConfig {
     pub name: String,
     pub units: String,
     pub site_id: Uuid,
+    /// The slot's declared sd estimator (`sample` | `population`); None is undeclared.
+    pub sd_estimator: Option<String>,
+    /// The slot's declared decimal places; None serves unrounded.
+    pub decimal_places: Option<i16>,
 }
 
 /// Create a new public config cache with a 5-minute TTL.
@@ -124,6 +145,8 @@ async fn load_public_config(
         param_code: String,
         param_name: String,
         default_units: String,
+        sd_estimator: Option<String>,
+        decimal_places: Option<i16>,
     }
 
     let site_ids: Vec<Uuid> = site_configs.iter().map(|s| s.site_id).collect();
@@ -138,7 +161,8 @@ async fn load_public_config(
             values.push((*id).into());
         }
         let sql = format!(
-            "SELECT sp.parameter_id, sp.site_id, p.code AS param_code, p.name AS param_name, p.default_units \
+            "SELECT sp.parameter_id, sp.site_id, p.code AS param_code, p.name AS param_name, \
+                    p.default_units, sp.sd_estimator, sp.decimal_places \
              FROM site_parameters sp \
              JOIN parameters p ON p.id = sp.parameter_id \
              WHERE sp.is_public = true AND sp.site_id IN ({}) \
@@ -151,7 +175,7 @@ async fn load_public_config(
             values,
         );
         let rows: Vec<ExposedRow> = db
-            .query_all(stmt)
+            .query_all_raw(stmt)
             .await
             .map_err(crate::error::AppError::Database)?
             .into_iter()
@@ -164,6 +188,8 @@ async fn load_public_config(
                 name: r.param_name,
                 units: r.default_units,
                 site_id: r.site_id,
+                sd_estimator: r.sd_estimator,
+                decimal_places: r.decimal_places,
             })
             .collect()
     };
@@ -178,13 +204,11 @@ async fn load_public_config(
         api_description: project
             .public_api_description
             .unwrap_or_else(|| "Public sensor data API.".to_string()),
-        // 2.3.0: spot instants are served as sample statistics (the unflagged replicate mean, with
-        // the lowest unflagged replicate as the no-sample fallback), so which replicate index
-        // exists or is flagged no longer decides whether an instant is served or which value it
-        // carries.
         api_version: project
             .public_api_version
-            .unwrap_or_else(|| "2.3.0".to_string()),
+            .clone()
+            .unwrap_or_else(|| SERVING_CONTRACT_VERSION.to_string()),
+        version_override: project.public_api_version,
         contact_email: project.public_contact_email,
         sites: site_configs,
         exposed_params: exposed_configs,

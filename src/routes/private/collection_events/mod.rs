@@ -4,6 +4,8 @@
 
 pub mod attach;
 pub mod model;
+pub mod operations;
+pub mod recompute;
 pub mod visits;
 pub use model::*;
 
@@ -26,7 +28,7 @@ pub struct EnqueuedJobResponse {
 /// the grab write path with fresh server-built provenance. Tracked job. Requires `write_data`.
 #[utoipa::path(
     post,
-    path = "/collection_events/{id}/recompute",
+    path = "/api/collection_events/{id}/recompute",
     params(("id" = Uuid, Path, description = "Collection event id")),
     responses(
         (status = 200, description = "The tracked recompute job", body = EnqueuedJobResponse),
@@ -84,7 +86,7 @@ pub struct StagedEvent {
 /// one row instead of racing the unique key. Requires `write_data`.
 #[utoipa::path(
     post,
-    path = "/collection_events/stage",
+    path = "/api/collection_events/stage",
     request_body = StageEventRequest,
     responses(
         (status = 200, description = "The staged visit", body = StagedEvent),
@@ -104,14 +106,17 @@ pub async fn stage_collection_event(
         .await?
         .is_none()
     {
-        return Err(AppError::NotFound(format!("Site {} not found", req.site_id)));
+        return Err(AppError::NotFound(format!(
+            "Site {} not found",
+            req.site_id
+        )));
     }
 
     let actor = crate::routes::private::tools::scripts::actor_label(&auth);
     let collected_at = sea_orm::prelude::DateTimeWithTimeZone::from(req.collected_at);
     let row = state
         .db
-        .query_one(sea_orm::Statement::from_sql_and_values(
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "WITH staged AS (
                  INSERT INTO collection_events (site_id, collected_at, source, created_by, notes)
@@ -149,6 +154,85 @@ pub async fn stage_collection_event(
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
+pub struct EventRecomputeRequest {
+    /// Recompute every visit at this site.
+    #[serde(default)]
+    pub site_id: Option<Uuid>,
+    /// Visits collected at or after this instant.
+    #[serde(default)]
+    pub start: Option<chrono::DateTime<chrono::Utc>>,
+    /// Visits collected at or before this instant.
+    #[serde(default)]
+    pub end: Option<chrono::DateTime<chrono::Utc>>,
+    /// Only visits with an open missing- or stale-output finding.
+    #[serde(default)]
+    pub only_findings: bool,
+}
+
+/// The scoped apply (ADR 0007): run the chain over every manual visit in a site and/or time
+/// range, or over the visits with open event findings, in one tracked job. This is the repair
+/// path for what the reactive hook does not see: a constant, a curve or a script activation. An
+/// unbounded scope (no site, no range, not held to findings) is refused. Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/api/actions/event_recompute",
+    request_body = EventRecomputeRequest,
+    responses(
+        (status = 200, description = "The tracked recompute job", body = EnqueuedJobResponse),
+        (status = 400, description = "Unbounded scope, or end before start"),
+        (status = 404, description = "Unknown site"),
+    ),
+    tag = "collection_events"
+)]
+pub async fn run_event_recompute(
+    State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
+    Json(req): Json<EventRecomputeRequest>,
+) -> AppResult<Json<EnqueuedJobResponse>> {
+    let scope = crate::routes::private::tools::chain::RecomputeScope {
+        site_id: req.site_id,
+        start: req.start,
+        end: req.end,
+        only_findings: req.only_findings,
+    };
+    if !scope.is_bounded() {
+        return Err(AppError::BadRequest(
+            "A recompute needs a scope: a site, a time range, or only_findings".to_string(),
+        ));
+    }
+    if let (Some(start), Some(end)) = (req.start, req.end)
+        && end < start
+    {
+        return Err(AppError::BadRequest("end must be >= start".to_string()));
+    }
+    if let Some(site_id) = req.site_id
+        && crate::routes::private::sites::Entity::find_by_id(site_id)
+            .one(&state.db)
+            .await?
+            .is_none()
+    {
+        return Err(AppError::NotFound(format!("Site {site_id} not found")));
+    }
+    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
+        &state.db,
+        "event_recompute",
+        None,
+        req.site_id,
+        &serde_json::json!({
+            "site_id": req.site_id,
+            "start": req.start,
+            "end": req.end,
+            "only_findings": req.only_findings,
+            "actor": crate::routes::private::tools::scripts::actor_label(&auth),
+        }),
+        None,
+    )
+    .await?;
+    Ok(Json(EnqueuedJobResponse { job_id }))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EventAuditRequest {
     /// Audit every event at this site. Omit both fields to audit every site.
     #[serde(default)]
@@ -164,7 +248,7 @@ pub struct EventAuditRequest {
 /// auditor never writes values. Tracked job. Requires `write_data`.
 #[utoipa::path(
     post,
-    path = "/actions/event_audit",
+    path = "/api/actions/event_audit",
     request_body = EventAuditRequest,
     responses((status = 200, description = "The tracked audit job", body = EnqueuedJobResponse)),
     tag = "collection_events"
@@ -176,7 +260,9 @@ pub async fn run_event_audit(
     if let Some(id) = req.collection_event_id
         && Entity::find_by_id(id).one(&state.db).await?.is_none()
     {
-        return Err(AppError::NotFound(format!("Collection event {id} not found")));
+        return Err(AppError::NotFound(format!(
+            "Collection event {id} not found"
+        )));
     }
     let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
         &state.db,
@@ -193,83 +279,3 @@ pub async fn run_event_audit(
     Ok(Json(EnqueuedJobResponse { job_id }))
 }
 
-/// One event-audit finding as the review queue lists it.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct EventAuditFinding {
-    pub id: Uuid,
-    /// `missing_output` or `stale_output`.
-    pub kind: String,
-    pub site_id: Uuid,
-    pub parameter_id: Uuid,
-    pub collected_at: chrono::DateTime<chrono::Utc>,
-    pub tool: Option<String>,
-    pub status: String,
-    #[schema(value_type = Object)]
-    pub expected: serde_json::Value,
-    #[schema(value_type = Object)]
-    pub computed: serde_json::Value,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-pub struct EventAuditFindingsQuery {
-    #[serde(default)]
-    pub site_id: Option<Uuid>,
-    /// Filter by status; defaults to `pending`.
-    #[serde(default)]
-    pub status: Option<String>,
-}
-
-/// List event-audit findings from the review queue. Requires `read_data`.
-#[utoipa::path(
-    get,
-    path = "/actions/event_audit_findings",
-    params(EventAuditFindingsQuery),
-    responses((status = 200, description = "Findings, newest first", body = [EventAuditFinding])),
-    tag = "collection_events"
-)]
-pub async fn list_event_audit_findings(
-    State(state): State<AppState>,
-    axum::extract::Query(query): axum::extract::Query<EventAuditFindingsQuery>,
-) -> AppResult<Json<Vec<EventAuditFinding>>> {
-    use sea_orm::ConnectionTrait;
-    let status = query.status.as_deref().unwrap_or("pending").to_string();
-    let mut sql = String::from(
-        "SELECT id, kind, site_id, parameter_id, group_time, tool, status, expected, computed, \
-         created_at FROM replicate_audit_holds WHERE stream_id IS NULL AND status = $1",
-    );
-    let mut binds: Vec<sea_orm::Value> = vec![status.into()];
-    if let Some(site_id) = query.site_id {
-        binds.push(site_id.into());
-        sql.push_str(" AND site_id = $2");
-    }
-    sql.push_str(" ORDER BY created_at DESC LIMIT 500");
-    let rows = state
-        .db
-        .query_all(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-            binds,
-        ))
-        .await?;
-    let mut out = Vec::with_capacity(rows.len());
-    for r in &rows {
-        out.push(EventAuditFinding {
-            id: r.try_get("", "id")?,
-            kind: r.try_get("", "kind")?,
-            site_id: r.try_get("", "site_id")?,
-            parameter_id: r.try_get("", "parameter_id")?,
-            collected_at: r
-                .try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "group_time")?
-                .with_timezone(&chrono::Utc),
-            tool: r.try_get("", "tool")?,
-            status: r.try_get("", "status")?,
-            expected: r.try_get("", "expected")?,
-            computed: r.try_get("", "computed")?,
-            created_at: r
-                .try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "created_at")?
-                .with_timezone(&chrono::Utc),
-        });
-    }
-    Ok(Json(out))
-}

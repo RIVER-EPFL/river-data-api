@@ -7,6 +7,7 @@
 mod common;
 
 mod continuous_recompute_and_backfill;
+mod excluded_inputs;
 mod formula_validation_and_crud;
 mod janitor_gap_filler;
 mod lifecycle_define_assign_publish;

@@ -29,7 +29,7 @@ async fn setup() -> Fixture {
 }
 
 async fn scalar_i64(db: &DatabaseConnection, sql: &str) -> i64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         sql.to_string(),
     ))
@@ -41,7 +41,7 @@ async fn scalar_i64(db: &DatabaseConnection, sql: &str) -> i64 {
 }
 
 async fn scalar_f64(db: &DatabaseConnection, sql: &str) -> f64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         sql.to_string(),
     ))
@@ -373,7 +373,7 @@ async fn overwrite_resync_idempotent() {
 
     let sample_id = fx
         .db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!("SELECT id::text AS id FROM {}", temp_sample_where(T1)),
         ))
@@ -436,29 +436,49 @@ async fn overwrite_resync_idempotent() {
 
 #[tokio::test]
 #[serial]
-async fn non_spot_replicates_never_sample() {
+async fn non_spot_readings_never_sample() {
+    // Two logger points at one instant are a malformed file, not a sampling event. Only a spot
+    // instant carries replicates, so the two points come from two streams serving the same slot.
     let fx = setup().await;
-    let (status, stream) = crate::common::post_json_parse_with_token(
-        &fx.app,
-        "/api/streams/register",
-        &json!({"source_system": "replform", "source_key": "form-cont",
-                "measurement_type": "continuous"}),
-        &fx.token,
-    )
-    .await;
-    assert!((200..300).contains(&status), "register: {stream}");
-    let stream = crate::common::e2e::id_of(&stream);
-    pair_to_temp_slot(&fx, &stream).await;
+    let mut streams = Vec::new();
+    for (key, value) in [("form-cont-a", 10.0), ("form-cont-b", 20.0)] {
+        let (status, stream) = crate::common::post_json_parse_with_token(
+            &fx.app,
+            "/api/streams/register",
+            &json!({"source_system": "replform", "source_key": key,
+                    "measurement_type": "continuous"}),
+            &fx.token,
+        )
+        .await;
+        assert!((200..300).contains(&status), "register: {stream}");
+        let stream = crate::common::e2e::id_of(&stream);
+        pair_to_temp_slot(&fx, &stream).await;
+
+        let body = ingest(
+            &fx,
+            &fx.token,
+            &stream,
+            replicate_batch(T1, &[value], 0),
+            json!({}),
+        )
+        .await;
+        assert_eq!(body["inserted"], 1);
+        streams.push(stream);
+    }
 
     let body = ingest(
         &fx,
         &fx.token,
-        &stream,
-        replicate_batch(T1, &[10.0, 20.0], 0),
+        &streams[0],
+        replicate_batch(T2, &[10.0, 20.0], 0),
         json!({}),
     )
     .await;
-    assert_eq!(body["inserted"], 2);
+    // Only a spot instant has replicates, so the second row is skipped and reported rather than
+    // stored at an index every continuous reader filters out. `/ingest` skips rather than refuses:
+    // its caller replays from a cursor that only advances on success.
+    assert_eq!(body["inserted"], 1, "{body}");
+    assert_eq!(body["skipped"], 1, "{body}");
     assert_eq!(
         scalar_i64(
             &fx.db,
@@ -472,11 +492,74 @@ async fn non_spot_replicates_never_sample() {
 
 #[tokio::test]
 #[serial]
-async fn single_replicate_backfills_at_pairing_by_stream_origin() {
-    // Scenario: a stream ingests one spot reading per instant while unpaired, then is paired.
-    // Expected behaviour: a sync-registered stream's group forms a sample at pairing (its writer
-    // declares collections at ingest, which pairing recovers from the stream's origin); a stream
-    // this system created itself does not form one from a single reading.
+async fn a_lone_reading_is_not_a_sample_whoever_wrote_it() {
+    // A samples row exists for two or more spot readings at an instant, whatever the writer
+    // declared: a single measurement is the reading, and n = 1 is derived from it.
+    let fx = setup().await;
+    let (sync_token, _service_id) = crate::common::seed_sync_session_token(&fx.db).await;
+    let stream = register_spot_stream(&fx, "form-lone").await;
+    pair_to_temp_slot(&fx, &stream).await;
+
+    ingest(
+        &fx,
+        &sync_token,
+        &stream,
+        replicate_batch(T1, &[42.0], 0),
+        json!({"collection": true}),
+    )
+    .await;
+    assert_eq!(
+        scalar_i64(
+            &fx.db,
+            &format!("SELECT COUNT(*) AS n FROM {}", temp_sample_where(T1))
+        )
+        .await,
+        0,
+        "a declared collection of one measurement forms no sample"
+    );
+    let series = fetch_temp_series(&fx, "").await;
+    assert_eq!(
+        series["parameters"][0]["values"][0].as_f64(),
+        Some(42.0),
+        "the lone reading is served as its own value: {series}"
+    );
+
+    ingest(
+        &fx,
+        &sync_token,
+        &stream,
+        replicate_batch(T1, &[44.0], 1),
+        json!({"collection": true}),
+    )
+    .await;
+    assert_eq!(
+        scalar_i64(
+            &fx.db,
+            &format!("SELECT n::bigint AS n FROM {}", temp_sample_where(T1))
+        )
+        .await,
+        2,
+        "the second replicate at the instant forms the sample"
+    );
+    assert!(
+        (scalar_f64(
+            &fx.db,
+            &format!("SELECT mean AS v FROM {}", temp_sample_where(T1))
+        )
+        .await
+            - 43.0)
+            .abs()
+            < 1e-9,
+        "the sample covers both replicates"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn pairing_backfill_applies_the_same_rule_as_ingest() {
+    // Scenario: one spot reading per instant arrives while the stream is unpaired, then it is
+    // paired. Expected behaviour: the backfill forms exactly the samples ingest would have, so a
+    // slot's history has one shape whether it was paired before or after the data arrived.
     let fx = setup().await;
 
     let sync_stream = register_spot_stream(&fx, "form-origin-sync").await;
@@ -488,6 +571,7 @@ async fn single_replicate_backfills_at_pairing_by_stream_origin() {
         json!({}),
     )
     .await;
+    pair_to_temp_slot(&fx, &sync_stream).await;
     assert_eq!(
         scalar_i64(
             &fx.db,
@@ -495,17 +579,7 @@ async fn single_replicate_backfills_at_pairing_by_stream_origin() {
         )
         .await,
         0,
-        "unpaired single reading forms no sample"
-    );
-    pair_to_temp_slot(&fx, &sync_stream).await;
-    assert_eq!(
-        scalar_i64(
-            &fx.db,
-            &format!("SELECT n::bigint AS n FROM {}", temp_sample_where(T1))
-        )
-        .await,
-        1,
-        "pairing a sync-origin stream forms the single-replicate sample"
+        "pairing a sync-origin stream does not mint a single-reading sample"
     );
 
     let (status, body) = crate::common::post_json_parse_with_token(
@@ -521,7 +595,7 @@ async fn single_replicate_backfills_at_pairing_by_stream_origin() {
         &fx,
         &fx.token,
         &self_stream,
-        replicate_batch(T2, &[43.0], 0),
+        replicate_batch(T2, &[43.0, 45.0], 0),
         json!({}),
     )
     .await;
@@ -529,10 +603,10 @@ async fn single_replicate_backfills_at_pairing_by_stream_origin() {
     assert_eq!(
         scalar_i64(
             &fx.db,
-            &format!("SELECT COUNT(*) AS n FROM {}", temp_sample_where(T2))
+            &format!("SELECT n::bigint AS n FROM {}", temp_sample_where(T2))
         )
         .await,
-        0,
-        "pairing a self-origin stream does not mint a single-reading sample"
+        2,
+        "two replicates form their sample at pairing"
     );
 }

@@ -14,7 +14,7 @@ async fn remove_script(db: &DatabaseConnection, name: &str) {
         "UPDATE tool_scripts SET active_version_id = NULL WHERE name = $1",
         "DELETE FROM tool_scripts WHERE name = $1",
     ] {
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             sql,
             [name.into()],
@@ -634,7 +634,7 @@ fn constant_manifest() -> serde_json::Value {
 }
 
 async fn set_probe_gate(db: &DatabaseConnection, value: f64) {
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "INSERT INTO constants (name, value) VALUES ('probe_gate', {value}) \
@@ -646,7 +646,7 @@ async fn set_probe_gate(db: &DatabaseConnection, value: f64) {
 }
 
 async fn stored_stamp(db: &DatabaseConnection, vid: &str) -> Option<String> {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!("SELECT validated_at::text AS stamp FROM tool_script_versions WHERE id = '{vid}'"),
     ))
@@ -731,7 +731,7 @@ async fn a_failed_revalidation_clears_the_stamp_and_blocks_activation() {
         "a version that now fails stays inactive: {refused}"
     );
 
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         "DELETE FROM constants WHERE name = 'probe_gate'".to_string(),
     ))
@@ -814,7 +814,7 @@ async fn activation_runs_the_cases_rather_than_trusting_the_stamp() {
         "nothing went live: {script}"
     );
 
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         "DELETE FROM constants WHERE name = 'probe_gate'".to_string(),
     ))
@@ -844,7 +844,7 @@ async fn every_shipped_tool_script_passes_the_lint() {
     let (app, admin, sid, db) = setup_with_db("seed_lint_subject").await;
 
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT s.name, v.script, v.entry_function, v.manifest
               FROM tool_scripts s

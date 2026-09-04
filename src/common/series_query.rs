@@ -237,7 +237,7 @@ pub async fn fetch_series(
                 ",
                 view = resolution.view(),
             );
-            db.query_all(Statement::from_sql_and_values(
+            db.query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 &sql,
                 [
@@ -275,7 +275,7 @@ pub async fn fetch_series(
                 ORDER BY r.time ASC
                 "
             );
-            db.query_all(Statement::from_sql_and_values(
+            db.query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 &sql,
                 [

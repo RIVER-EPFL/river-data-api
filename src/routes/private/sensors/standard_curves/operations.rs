@@ -17,9 +17,12 @@ pub struct StandardCurveOperations;
 /// A corrected curve is a new row, and the affected grabs are re-entered against it.
 async fn curve_is_used(db: &DatabaseConnection, id: Uuid) -> Result<bool, ApiError> {
     let found = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT 1 AS one FROM readings WHERE standard_curve_id = $1 LIMIT 1",
+            "SELECT 1 AS one FROM readings WHERE standard_curve_id = $1
+             UNION ALL
+             SELECT 1 FROM annotations WHERE standard_curve_id = $1
+             LIMIT 1",
             [id.into()],
         ))
         .await

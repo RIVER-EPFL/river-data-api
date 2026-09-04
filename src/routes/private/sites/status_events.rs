@@ -72,7 +72,7 @@ pub struct StatusEventsResponse {
 /// for the specified site. Supports JSON, CSV, and NDJSON formats.
 #[utoipa::path(
     get,
-    path = "/{site_id}/status_events",
+    path = "/api/sites/{site_id}/status_events",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
         StatusEventsQuery
@@ -170,7 +170,7 @@ pub async fn get_site_status_events(
         );
         let total = state
             .db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 &count_sql,
                 values.clone(),
@@ -191,7 +191,7 @@ pub async fn get_site_status_events(
 
     let query_result = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             values,

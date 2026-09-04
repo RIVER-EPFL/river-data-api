@@ -324,7 +324,7 @@ async fn count_readings(db: &DatabaseConnection, parameter_id: &str, time_rfc333
     let param = Uuid::parse_str(parameter_id).unwrap();
     let time: chrono::DateTime<chrono::Utc> = time_rfc3339.parse().unwrap();
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT count(*) AS n FROM readings WHERE parameter_id = $1 AND time = $2",
             [param.into(), time.into()],
@@ -364,7 +364,7 @@ async fn scalar(
     let param = Uuid::parse_str(parameter_id).unwrap();
     let time: chrono::DateTime<chrono::Utc> = time_rfc3339.parse().unwrap();
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &format!(
                 "SELECT {column} AS v FROM readings WHERE parameter_id = $1 AND time = $2 LIMIT 1"

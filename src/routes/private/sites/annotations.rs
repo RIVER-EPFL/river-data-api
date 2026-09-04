@@ -58,7 +58,7 @@ fn csv_field(s: &str) -> String {
 /// List annotations for a site, optionally filtered by parameter and time range
 #[utoipa::path(
     get,
-    path = "/{site_id}/annotations",
+    path = "/api/sites/{site_id}/annotations",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
         SiteAnnotationsQuery
@@ -206,7 +206,7 @@ pub struct ExportSummaryResponse {
 /// numbers and shows them beside it.
 #[utoipa::path(
     get,
-    path = "/{site_id}/export/summary",
+    path = "/api/sites/{site_id}/export/summary",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
         ExportSummaryQuery
@@ -255,7 +255,7 @@ pub async fn get_site_export_summary(
     // annotations do not double-count an instant within a parameter.
     let rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT a.parameter_id AS pid,
                     COUNT(DISTINCT a.id) AS ann_count,
@@ -279,7 +279,7 @@ pub async fn get_site_export_summary(
     // Flagged and extra-replicate rows in one pass over the range's readings.
     let rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT parameter_id AS pid,
                     COUNT(*) FILTER (WHERE is_flagged = TRUE) AS flagged,
@@ -302,7 +302,10 @@ pub async fn get_site_export_summary(
     // the sweeper's episodes, which exist only from when the sweeper first saw a slot, while an
     // export covers all of history.
     for (pid, n) in crate::routes::private::alarms::views::count_violations_by_parameter(
-        &state.db, site.id, query.start, query.end,
+        &state.db,
+        site.id,
+        query.start,
+        query.end,
     )
     .await?
     {

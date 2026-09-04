@@ -66,7 +66,7 @@ async fn token_id(db: &sea_orm::DatabaseConnection, raw: &str) -> uuid::Uuid {
         .map(|(p, _)| p)
         .expect("api token must be rvd_<prefix>_<secret>");
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "SELECT id FROM api_tokens WHERE token_prefix = $1",
             [prefix.into()],
@@ -87,7 +87,7 @@ async fn external_push_key_confined_to_its_project_on_every_write_path() {
 
     // Stored securely: argon2id hash + non-secret lookup prefix (never the raw secret).
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "SELECT token_hash, token_prefix FROM api_tokens WHERE token_prefix = $1",
             [key.strip_prefix("rvd_")

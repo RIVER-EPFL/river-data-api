@@ -30,7 +30,7 @@ async fn duplicate_instant_exists(
     exclude: Option<Uuid>,
 ) -> Result<bool, ApiError> {
     let found = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT 1 AS one FROM sensor_calibrations
               WHERE sensor_id = $1
@@ -147,7 +147,7 @@ impl CRUDOperations for SensorCalibrationOperations {
             return Ok(());
         }
         let Some(existing) = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT sensor_id, parameter_id, valid_from FROM sensor_calibrations WHERE id = $1",
                 [id.into()],
@@ -277,7 +277,7 @@ impl CRUDOperations for SensorCalibrationOperations {
 
     async fn perform_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<Uuid, ApiError> {
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT sensor_id FROM sensor_calibrations WHERE id = $1",
                 [id.into()],
@@ -331,13 +331,17 @@ impl CRUDOperations for SensorCalibrationOperations {
                          cw.id AS cal_id, cw.slope, cw.intercept
                   FROM readings r
                   LEFT JOIN LATERAL ({pick}) cw ON true
-                  WHERE r.calibration_id = $1
+                  WHERE r.calibration_id = $1 AND {not_pinned}
               ) picked
               LEFT JOIN standard_curves sc ON sc.id = picked.p_standard_curve_id
               WHERE tgt.stream_id = picked.p_stream_id
                 AND tgt.time = picked.p_time
                 AND tgt.replicate_index = picked.p_replicate_index",
             pick = super::resolver::pick_calibration_lateral_excluding("$2", Some("$1")),
+            not_pinned = crate::routes::private::readings::decisions::not_pinned_sql(
+                "r",
+                crate::routes::private::readings::decisions::Kind::CalibrationPin
+            ),
         );
         crate::common::bulk_write::guarded_mutation(
             db,
@@ -355,7 +359,7 @@ impl CRUDOperations for SensorCalibrationOperations {
             )
         })?;
 
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "DELETE FROM sensor_calibrations WHERE id = $1",
             [id.into()],

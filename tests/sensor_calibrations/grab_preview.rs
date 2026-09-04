@@ -15,7 +15,7 @@ use crate::common::{GLOBAL_PARAM_TEMP_ID, SITE1_ID};
 const GRAB_TIME: &str = "2025-06-15T10:00:00Z";
 
 async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         sql.to_string(),
     ))
@@ -123,7 +123,7 @@ async fn dry_run_returns_the_result_and_writes_nothing() {
     );
 
     let stored = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT calibrated_value FROM readings \

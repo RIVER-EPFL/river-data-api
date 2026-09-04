@@ -16,7 +16,7 @@ use serial_test::serial;
 
 async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             sql.to_string(),
         ))
@@ -200,7 +200,10 @@ async fn the_sync_cadence_is_set_by_an_operator_and_carried_on_the_heartbeat() {
         &admin,
     )
     .await;
-    assert_eq!(status, 400, "a cadence under the runner's floor is refused: {body}");
+    assert_eq!(
+        status, 400,
+        "a cadence under the runner's floor is refused: {body}"
+    );
 
     let (status, body) = crate::common::patch_json_with_token(
         &app,
@@ -289,6 +292,25 @@ async fn command_lifecycle_issue_deliver_acknowledge_complete() {
         status, 400,
         "invalid command name rejected (it is trigger_full_sync)"
     );
+
+    let (status, resync) = crate::common::post_json_parse_with_token(
+        &app,
+        &format!("/api/sync/services/{service_id}/commands"),
+        &serde_json::json!({"command": "resync_streams", "payload": {"source_keys": ["FP3:DOC_avg_ppb:reps"]}}),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "resync_streams with source_keys ({status}): {resync}");
+    assert_eq!(resync["payload"]["source_keys"][0], "FP3:DOC_avg_ppb:reps");
+
+    let (status, _) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/sync/services/{service_id}/commands"),
+        &serde_json::json!({"command": "resync_streams", "payload": {"source_keys": []}}),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 400, "resync_streams with no source_keys is refused");
 
     let (status, hb) = crate::common::post_json_parse_with_token(
         &app,
@@ -695,7 +717,7 @@ async fn stale_running_sync_events_are_swept() {
     let (_token, service_id) = crate::common::seed_sync_session_token(&db).await;
 
     for (age, label) in [("2 hours", "stale"), ("1 minute", "fresh")] {
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "INSERT INTO sync_events (service_id, event_type, status, started_at) \
@@ -1040,5 +1062,73 @@ async fn session_and_command_lifetimes_match_the_configured_defaults() {
         .await,
         1,
         "command expiry is 300s"
+    );
+}
+
+/// Scenario: a service's last cycle reported errors (a refused window, a scope rejection). The
+/// System page's service row has a slot for exactly that.
+///
+/// Expected behaviour: the slot is filled from the cycle ledger. `sync_services.last_error` has
+/// never had a writer and the heartbeat carries no field to report one through, so reading the
+/// column would leave the line permanently blank while the reason sat in `sync_events`.
+#[tokio::test]
+#[serial]
+async fn a_service_reports_the_error_of_its_most_recent_failing_cycle() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let (_token, service_id) = crate::common::seed_sync_session_token(&db).await;
+    let admin = crate::common::seed_token_full(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let (status, body) =
+        crate::common::get_json_with_token(&app, "/api/sync/services", &admin).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body[0]["last_error"].is_null(),
+        "a service with no failing cycle reports none: {body}"
+    );
+
+    for (started, errors) in [
+        (
+            "2025-06-01T08:00:00Z",
+            r#"["stn:old:reps: ingest failed (HTTP 400 ...), 3 deferred"]"#,
+        ),
+        (
+            "2025-06-01T09:00:00Z",
+            r#"["stn:x:reps: ingest failed (HTTP 400 from /api/ingest: a completeness window is only accepted on a stream declared spot), 12 readings deferred to next cycle"]"#,
+        ),
+    ] {
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO sync_events \
+                     (id, service_id, event_type, status, readings_synced, readings_skipped, \
+                      status_events_synced, errors, started_at) \
+                 VALUES (gen_random_uuid(), '{service_id}', 'sync', 'partial', 0, 0, 0, \
+                         '{errors}'::jsonb, '{started}')"
+            ),
+        )
+        .await;
+    }
+
+    let (status, body) =
+        crate::common::get_json_with_token(&app, "/api/sync/services", &admin).await;
+    assert_eq!(status, 200, "{body}");
+    let reported = body[0]["last_error"].as_str().expect("an error line");
+    assert!(
+        reported.contains("only accepted on a stream declared spot"),
+        "the newest cycle's first error, with the server's reason: {reported}"
+    );
+
+    let (status, one) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/sync/services/{service_id}"),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "{one}");
+    assert_eq!(
+        one["last_error"], body[0]["last_error"],
+        "the detail agrees"
     );
 }

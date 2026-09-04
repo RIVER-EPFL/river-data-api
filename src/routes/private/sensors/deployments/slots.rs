@@ -44,7 +44,7 @@ pub async fn find_occupant<C: ConnectionTrait>(
     req: &SlotRequest,
 ) -> Result<Option<SlotOccupant>, DbErr> {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT d.id, d.sensor_id, d.deployed_from, d.deployed_until
               FROM sensor_deployments d
@@ -128,7 +128,7 @@ pub async fn recall_open_deployments<C: ConnectionTrait>(
     except: Option<Uuid>,
 ) -> Result<u64, DbErr> {
     let result = db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE sensor_deployments
               SET deployed_until = $1
@@ -175,7 +175,7 @@ pub async fn follow_forward_move<C: ConnectionTrait>(
         return Ok(0);
     }
     let result = db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE sensor_deployments p
               SET deployed_until = $5

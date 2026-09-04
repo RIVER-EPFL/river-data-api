@@ -15,7 +15,7 @@ const WAIT: Duration = Duration::from_secs(30);
 
 async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             sql.to_string(),
         ))
@@ -30,7 +30,7 @@ async fn deployed_until(
     id: &str,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!("SELECT deployed_until FROM sensor_deployments WHERE id = '{id}'"),
         ))

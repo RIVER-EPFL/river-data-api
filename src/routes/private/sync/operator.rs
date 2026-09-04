@@ -59,6 +59,9 @@ pub struct SyncServiceResponse {
     pub current_operation: Option<String>,
     pub last_heartbeat: Option<String>,
     pub last_sync_completed_at: Option<String>,
+    /// The first error of the service's most recent cycle that reported one. Read from
+    /// `sync_events`, not from `sync_services.last_error`: nothing has ever written that column and
+    /// a service has no field to report an error through, so the row itself cannot carry one.
     pub last_error: Option<String>,
     pub health: String,
     pub created_at: String,
@@ -84,7 +87,41 @@ fn compute_health(
     }
 }
 
-fn service_to_response(s: sync_services::Model, config: &Config) -> SyncServiceResponse {
+/// The first error of a service's most recent cycle that reported one, or None when its recent
+/// cycles were clean. One query for every service on the page.
+async fn recent_errors<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    service_ids: &[Uuid],
+) -> AppResult<std::collections::HashMap<Uuid, String>> {
+    if service_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows = conn
+        .query_all_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT DISTINCT ON (service_id) service_id, errors->>0 AS error
+             FROM sync_events
+             WHERE service_id = ANY($1)
+               AND jsonb_typeof(errors) = 'array' AND jsonb_array_length(errors) > 0
+             ORDER BY service_id, started_at DESC",
+            [service_ids.to_vec().into()],
+        ))
+        .await?;
+    let mut out = std::collections::HashMap::new();
+    for row in &rows {
+        let id: Uuid = row.try_get("", "service_id")?;
+        if let Ok(Some(error)) = row.try_get::<Option<String>>("", "error") {
+            out.insert(id, error);
+        }
+    }
+    Ok(out)
+}
+
+fn service_to_response(
+    s: sync_services::Model,
+    config: &Config,
+    last_error: Option<String>,
+) -> SyncServiceResponse {
     let health = compute_health(s.last_heartbeat, config);
     SyncServiceResponse {
         id: s.id,
@@ -96,7 +133,7 @@ fn service_to_response(s: sync_services::Model, config: &Config) -> SyncServiceR
         current_operation: s.current_operation,
         last_heartbeat: s.last_heartbeat.map(|t| t.to_rfc3339()),
         last_sync_completed_at: s.last_sync_completed_at.map(|t| t.to_rfc3339()),
-        last_error: s.last_error,
+        last_error,
         health,
         created_at: s.created_at.to_rfc3339(),
         updated_at: s.updated_at.to_rfc3339(),
@@ -242,7 +279,7 @@ impl PaginationQuery {
 /// Sorted by `updated_at` DESC. Requires `read_metadata`.
 #[utoipa::path(
     get,
-    path = "/services",
+    path = "/api/sync/services",
     responses(
         (status = 200, description = "Registered sync services with health", body = [SyncServiceResponse]),
     ),
@@ -257,10 +294,15 @@ pub async fn list_services(
         .await?;
 
     let config = state.config.as_ref();
+    let ids: Vec<Uuid> = services.iter().map(|s| s.id).collect();
+    let mut errors = recent_errors(&state.db, &ids).await?;
     Ok(Json(
         services
             .into_iter()
-            .map(|s| service_to_response(s, config))
+            .map(|s| {
+                let error = errors.remove(&s.id);
+                service_to_response(s, config, error)
+            })
             .collect(),
     ))
 }
@@ -268,7 +310,7 @@ pub async fn list_services(
 /// Get a single sync service by ID with its computed health. Requires `read_metadata`.
 #[utoipa::path(
     get,
-    path = "/services/{id}",
+    path = "/api/sync/services/{id}",
     params(("id" = Uuid, Path, description = "Sync service UUID")),
     responses(
         (status = 200, description = "Sync service detail", body = SyncServiceResponse),
@@ -285,15 +327,55 @@ pub async fn get_service(
         .await?
         .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
 
-    Ok(Json(service_to_response(service, state.config.as_ref())))
+    let error = recent_errors(&state.db, &[service.id]).await?.remove(&id);
+    Ok(Json(service_to_response(
+        service,
+        state.config.as_ref(),
+        error,
+    )))
+}
+
+/// Command names an operator may queue, and the payload each accepts.
+const VALID_COMMANDS: [&str; 5] = [
+    commands::TRIGGER_SYNC,
+    commands::TRIGGER_FULL_SYNC,
+    commands::PAUSE,
+    commands::RESUME,
+    commands::RESYNC_STREAMS,
+];
+
+/// Refuse a command the driver would not run: an unknown name, or `resync_streams` without a
+/// non-empty `source_keys` list of strings.
+pub fn validate_command(command: &str, payload: Option<&serde_json::Value>) -> Result<(), String> {
+    if !VALID_COMMANDS.contains(&command) {
+        return Err(format!(
+            "Invalid command '{command}'. Valid commands: {}",
+            VALID_COMMANDS.join(", ")
+        ));
+    }
+    if command != commands::RESYNC_STREAMS {
+        return Ok(());
+    }
+    let keys = payload
+        .and_then(|p| p.get("source_keys"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "resync_streams needs a payload with a source_keys list".to_string())?;
+    if keys.is_empty() {
+        return Err("resync_streams: source_keys is empty".to_string());
+    }
+    if let Some(bad) = keys.iter().find(|k| !k.is_string()) {
+        return Err(format!("resync_streams: source_keys entry {bad} is not a string"));
+    }
+    Ok(())
 }
 
 /// Queue a command for a sync service. The command is picked up on the next heartbeat
 /// (within `command_expiry_secs`). Valid commands: `trigger_sync`, `trigger_full_sync`,
-/// `pause`, `resume`. Requires `write_metadata`.
+/// `pause`, `resume`, and `resync_streams` with `{"source_keys": [...]}` (re-fetch the named
+/// streams from the start of history and ingest with overwrite). Requires `write_metadata`.
 #[utoipa::path(
     post,
-    path = "/services/{id}/commands",
+    path = "/api/sync/services/{id}/commands",
     params(("id" = Uuid, Path, description = "Sync service UUID")),
     request_body = IssueCommandRequest,
     responses(
@@ -313,19 +395,7 @@ pub async fn issue_command(
         .await?
         .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
 
-    let valid_commands = [
-        commands::TRIGGER_SYNC,
-        commands::TRIGGER_FULL_SYNC,
-        commands::PAUSE,
-        commands::RESUME,
-    ];
-    if !valid_commands.contains(&req.command.as_str()) {
-        return Err(AppError::BadRequest(format!(
-            "Invalid command '{}'. Valid commands: {}",
-            req.command,
-            valid_commands.join(", ")
-        )));
-    }
+    validate_command(&req.command, req.payload.as_ref()).map_err(AppError::BadRequest)?;
 
     // Persist the desired pause state at issue time so it takes effect even if
     // the service is down and never acknowledges the command.
@@ -387,7 +457,7 @@ const MIN_SYNC_INTERVAL_SECS: i32 = 30;
 /// heartbeat, with no redeploy and no restart. Requires `write_metadata`.
 #[utoipa::path(
     patch,
-    path = "/services/{id}",
+    path = "/api/sync/services/{id}",
     params(("id" = Uuid, Path, description = "Sync service UUID")),
     request_body = UpdateServiceRequest,
     responses(
@@ -407,8 +477,15 @@ pub async fn update_service(
         .await?
         .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
 
+    let last_error = recent_errors(&state.db, &[service.id])
+        .await?
+        .remove(&service_id);
     let Some(interval) = req.sync_interval_secs else {
-        return Ok(Json(service_to_response(service, state.config.as_ref())));
+        return Ok(Json(service_to_response(
+            service,
+            state.config.as_ref(),
+            last_error,
+        )));
     };
     if let Some(secs) = interval
         && secs < MIN_SYNC_INTERVAL_SECS
@@ -422,14 +499,18 @@ pub async fn update_service(
     active.sync_interval_secs = Set(interval);
     active.updated_at = Set(Utc::now().into());
     let updated = active.update(&state.db).await?;
-    Ok(Json(service_to_response(updated, state.config.as_ref())))
+    Ok(Json(service_to_response(
+        updated,
+        state.config.as_ref(),
+        last_error,
+    )))
 }
 
 /// Paginated list of sync commands (newest first). Returns a `Content-Range: items {start}-{end}/{total}`
 /// header for React-admin style pagination. Requires `read_metadata`.
 #[utoipa::path(
     get,
-    path = "/commands",
+    path = "/api/sync/commands",
     params(PaginationQuery),
     responses(
         (
@@ -469,7 +550,7 @@ pub async fn list_commands(
 /// One command's current state, for polling a command just issued. Requires `read_metadata`.
 #[utoipa::path(
     get,
-    path = "/commands/{id}",
+    path = "/api/sync/commands/{id}",
     params(("id" = Uuid, Path, description = "Command UUID")),
     responses(
         (status = 200, body = SyncCommandResponse),
@@ -494,7 +575,7 @@ pub async fn get_command(
 /// only, no API token can pass).
 #[utoipa::path(
     post,
-    path = "/credentials",
+    path = "/api/sync/credentials",
     request_body = CreateCredentialRequest,
     responses(
         (status = 200, description = "Plaintext client_id and client_secret (only returned once)", body = CreateCredentialResponse),
@@ -535,7 +616,7 @@ pub async fn create_credential(
 /// sync session token, so no API token may enumerate them.
 #[utoipa::path(
     get,
-    path = "/credentials",
+    path = "/api/sync/credentials",
     responses(
         (status = 200, description = "Credentials list (no secrets)", body = [CredentialResponse]),
     ),
@@ -569,7 +650,7 @@ pub async fn list_credentials(
 /// as 401. Requires Keycloak Administrator (`require_admin` upstream).
 #[utoipa::path(
     post,
-    path = "/credentials/{id}/revoke",
+    path = "/api/sync/credentials/{id}/revoke",
     params(("id" = Uuid, Path, description = "Credential UUID")),
     responses(
         (status = 200, description = "Credential revoked, active sessions terminated"),
@@ -605,7 +686,7 @@ pub async fn revoke_credential(
 /// optional errors/log JSON payloads, and duration. Requires `read_metadata`.
 #[utoipa::path(
     get,
-    path = "/events",
+    path = "/api/sync/events",
     params(PaginationQuery),
     responses(
         (
@@ -644,7 +725,7 @@ pub async fn list_sync_events(
 /// until a new credential is minted. Requires `write_metadata`.
 #[utoipa::path(
     post,
-    path = "/services/{id}/revoke",
+    path = "/api/sync/services/{id}/revoke",
     params(("id" = Uuid, Path, description = "Sync service UUID")),
     responses(
         (status = 200, description = "Service revoked"),
@@ -667,4 +748,39 @@ pub async fn revoke_service(
         .await?;
 
     Ok(Json(serde_json::json!({"revoked": true})))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::validate_command;
+
+    #[test]
+    fn test_validate_command_accepts_the_four_bare_commands() {
+        for c in ["trigger_sync", "trigger_full_sync", "pause", "resume"] {
+            assert_eq!(validate_command(c, None), Ok(()), "{c}");
+        }
+    }
+
+    #[test]
+    fn test_validate_command_rejects_an_unknown_name() {
+        let err = validate_command("full_sync", None).unwrap_err();
+        assert!(err.contains("Invalid command 'full_sync'"), "{err}");
+        assert!(err.contains("resync_streams"), "lists every valid name: {err}");
+    }
+
+    #[test]
+    fn test_validate_command_resync_needs_source_keys() {
+        let keys = json!({"source_keys": ["FP3:DOC_avg_ppb:reps"]});
+        assert_eq!(validate_command("resync_streams", Some(&keys)), Ok(()));
+        let with_overwrite = json!({"source_keys": ["FP3:DOC_avg_ppb:reps"], "overwrite": false});
+        assert_eq!(validate_command("resync_streams", Some(&with_overwrite)), Ok(()));
+
+        assert!(validate_command("resync_streams", None).is_err());
+        assert!(validate_command("resync_streams", Some(&json!({}))).is_err());
+        assert!(validate_command("resync_streams", Some(&json!({"source_keys": []}))).is_err());
+        assert!(validate_command("resync_streams", Some(&json!({"source_keys": "FP3"}))).is_err());
+        assert!(validate_command("resync_streams", Some(&json!({"source_keys": [1]}))).is_err());
+    }
 }

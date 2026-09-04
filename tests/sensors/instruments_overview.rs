@@ -127,3 +127,90 @@ async fn overview_lists_instruments_curves_and_their_readings() {
         "{usage}"
     );
 }
+
+/// `GET /sensors/{id}/curve_usage`: the same usage figures as the overview, for one instrument,
+/// so the instrument's Curves tab can report them without reading every instrument in the system.
+#[tokio::test]
+#[serial]
+async fn sensor_curve_usage_reports_per_curve_counts() {
+    let fx = setup().await;
+
+    let mut curve_ids = Vec::new();
+    let mut sensor_id = String::new();
+    for (key, name) in [("standard_curves:7", "used"), ("standard_curves:8", "unused")] {
+        let (status, curve) = crate::common::post_json_parse_with_token(
+            &fx.app,
+            "/api/standard_curves/register",
+            &json!({
+                "source_system": "cnet",
+                "source_key": key,
+                "instrument_label": "DOC corr",
+                "slope": 2.0,
+                "intercept": 1.0,
+                "name": name,
+            }),
+            &fx.token,
+        )
+        .await;
+        assert_eq!(status, 200, "register curve ({status}): {curve}");
+        sensor_id = curve["sensor_id"].as_str().unwrap().to_string();
+        curve_ids.push(curve["id"].as_str().unwrap().to_string());
+    }
+
+    let (status, stream) = crate::common::post_json_parse_with_token(
+        &fx.app,
+        "/api/streams/register",
+        &json!({"source_system": "cnet", "source_key": "FP2:DOC_avg_ppb:reps",
+                "measurement_type": "spot", "sensor_id": sensor_id}),
+        &fx.token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "register stream: {stream}");
+    let stream_id = crate::common::e2e::id_of(&stream);
+    let (status, body) = crate::common::post_json_with_token(
+        &fx.app,
+        &format!("/api/streams/{stream_id}/pair"),
+        &json!({"site_parameter_id": crate::common::PARAM_S1_TEMP_ID}),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "pair ({status}): {body}");
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &fx.app,
+        "/api/ingest",
+        &json!({"stream_id": stream_id, "readings": [
+            {"time": T1, "raw_value": 10.0, "replicate_index": 0, "standard_curve_id": curve_ids[0]},
+            {"time": "2025-06-11T08:00:00Z", "raw_value": 12.0, "replicate_index": 0,
+             "standard_curve_id": curve_ids[0]}
+        ]}),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "ingest ({status}): {body}");
+
+    let (status, usage) = crate::common::get_json_with_token(
+        &fx.app,
+        &format!("/api/sensors/{sensor_id}/curve_usage"),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "curve usage ({status}): {usage}");
+    let rows = usage["usage"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "every curve on the instrument is reported: {usage}");
+
+    let used = rows
+        .iter()
+        .find(|r| r["curve_id"] == json!(curve_ids[0]))
+        .expect("the corrected curve is reported");
+    assert_eq!(used["reading_count"], 2, "{usage}");
+    assert_eq!(used["first_used"], json!("2025-06-10T08:00:00Z"), "{usage}");
+    assert_eq!(used["last_used"], json!("2025-06-11T08:00:00Z"), "{usage}");
+
+    let unused = rows
+        .iter()
+        .find(|r| r["curve_id"] == json!(curve_ids[1]))
+        .expect("a curve nothing was corrected with is reported at zero");
+    assert_eq!(unused["reading_count"], 0, "{usage}");
+    assert_eq!(unused["first_used"], json!(null), "{usage}");
+}

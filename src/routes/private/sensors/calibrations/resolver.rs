@@ -92,7 +92,7 @@ pub async fn resolve_for_times<C: ConnectionTrait>(
     );
 
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &sql,
             [sensor_id.into(), parameter_id.into(), wanted.into()],
@@ -183,7 +183,7 @@ where
           WHERE tgt.stream_id = picked.p_stream_id
             AND tgt.time = picked.p_time
             AND tgt.replicate_index = picked.p_replicate_index",
-        windowed = super::service::window_resolved_rows("tgt"),
+        windowed = super::service::calibration_derivable("tgt"),
         value = calibrated_value_sql("tgt.raw_value", "picked.slope", "picked.intercept"),
         pick = pick_calibration_lateral("$2")
     );

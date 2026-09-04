@@ -20,7 +20,7 @@ async fn setup() -> (DatabaseConnection, axum::Router, String) {
 
 async fn count_derived(db: &DatabaseConnection, site_id: Uuid, parameter_id: Uuid) -> i64 {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT COUNT(*) AS n FROM readings WHERE site_id = $1 AND parameter_id = $2",
             [site_id.into(), parameter_id.into()],
@@ -38,7 +38,7 @@ async fn derived_value_at(
     time: DateTime<Utc>,
 ) -> Option<f64> {
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT COALESCE(calibrated_value, raw_value) AS value FROM readings \
              WHERE site_id = $1 AND parameter_id = $2 AND time = $3 LIMIT 1",
@@ -78,7 +78,7 @@ async fn test_janitor_fills_derived_gaps() {
         .to_string();
     let derived_param_uuid = Uuid::parse_str(&output_parameter_id).unwrap();
 
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"INSERT INTO site_parameters
             (id, site_id, parameter_id, name, sensor_type, display_units, is_active, is_derived, derived_definition_id)
@@ -115,7 +115,7 @@ async fn test_janitor_fills_derived_gaps() {
     );
 
     let new_source_time = base + Duration::days(7);
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, replicate_index, measurement_type)
           VALUES (

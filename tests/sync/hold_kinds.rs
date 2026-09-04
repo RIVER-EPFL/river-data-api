@@ -21,7 +21,7 @@ async fn setup() -> (DatabaseConnection, axum::Router, String) {
 }
 
 async fn insert_event_finding(db: &DatabaseConnection) -> String {
-    db.query_one(Statement::from_string(
+    db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "INSERT INTO replicate_audit_holds \
@@ -80,7 +80,7 @@ async fn a_stream_hold_still_lists_and_carries_its_kind() {
     .await;
     assert!((200..300).contains(&status), "{stream}");
     let stream_id = crate::common::e2e::id_of(&stream);
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
             "INSERT INTO replicate_audit_holds (stream_id, group_time, expected, computed, delta) \
@@ -120,7 +120,7 @@ async fn an_event_finding_can_be_acknowledged() {
     assert_eq!(status, 200, "{body}");
 
     let status_now: String = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             format!("SELECT status FROM replicate_audit_holds WHERE id = '{hold_id}'"),
         ))
@@ -130,4 +130,211 @@ async fn an_event_finding_can_be_acknowledged() {
         .try_get("", "status")
         .unwrap();
     assert_eq!(status_now, "acknowledged");
+}
+
+/// Scenario: one instant both disagrees statistically with the source and carries a curated row
+/// the source changed. Two writers, two different kinds, one `(stream, instant)`.
+///
+/// Expected behaviour: both holds stand. The statistics hold keeps the `{index, value}` pairs the
+/// `flag` resolution addresses replicates by, and the `source_modified` hold keeps its own
+/// evidence and label; neither overwrites the other, and the review UI branches on a kind that is
+/// still true.
+#[tokio::test]
+#[serial]
+async fn two_kinds_coexist_at_one_instant() {
+    let (db, app, token) = setup().await;
+    let (status, stream) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/streams/register",
+        &json!({"source_system": "cnet", "source_key": "stn:coexist:reps", "measurement_type": "spot"}),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "{stream}");
+    let stream_id = crate::common::e2e::id_of(&stream);
+
+    let stats = json!({
+        "mean": 1.5, "sd": 0.1, "n": 3,
+        "values": [{"index": 0, "value": 1.0}, {"index": 1, "value": 2.0}],
+    });
+    db.execute_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            "INSERT INTO replicate_audit_holds \
+                 (stream_id, group_time, kind, expected, computed, delta, status) \
+             VALUES ('{stream_id}', '{T1}', 'replicate_stats', \
+                     '{{\"mean\": 1.0, \"sd\": 0.1, \"n\": 3}}', '{stats}', '{{}}', 'pending')"
+        ),
+    ))
+    .await
+    .unwrap();
+
+    db.execute_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            "INSERT INTO replicate_audit_holds \
+                 (stream_id, group_time, kind, expected, computed, delta, status) \
+             VALUES ('{stream_id}', '{T1}', 'source_modified', \
+                     '{{\"claim\": \"replaced\"}}', '{{\"kept\": true}}', '{{}}', 'pending') \
+             ON CONFLICT (stream_id, group_time, kind) WHERE status IN ('pending', 'deferred') \
+             DO UPDATE SET expected = EXCLUDED.expected, computed = EXCLUDED.computed"
+        ),
+    ))
+    .await
+    .unwrap();
+
+    let (status, body) = crate::common::get_json_with_token(
+        &app,
+        "/api/sync/replicate_audit_holds?status=pending",
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let holds = body["holds"].as_array().unwrap();
+    let kinds: Vec<&str> = holds.iter().filter_map(|h| h["kind"].as_str()).collect();
+    assert!(
+        kinds.contains(&"replicate_stats") && kinds.contains(&"source_modified"),
+        "both kinds stand at the instant: {kinds:?}"
+    );
+
+    let stats_hold = holds
+        .iter()
+        .find(|h| h["kind"] == "replicate_stats")
+        .expect("the statistics hold survives");
+    assert!(
+        stats_hold["computed"]["values"].is_array(),
+        "its replicate values survive, so `flag` can still address them: {stats_hold}"
+    );
+}
+
+/// Scenario: a windowed pass braked and its ruling is waiting in the queue; the next cycle's
+/// statistics audit agrees with the source at the same instant.
+///
+/// Expected behaviour: the brake hold still stands. An agreeing re-audit supersedes the statistics
+/// hold it is about and nothing else; closing a brake ruling nobody acted on would release a pass
+/// the operator never admitted.
+#[tokio::test]
+#[serial]
+async fn an_agreeing_re_audit_leaves_a_standing_brake_alone() {
+    let (db, app, token) = setup().await;
+    let (sync_token, _service) = crate::common::seed_sync_session_token(&db).await;
+    let (status, stream) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/streams/register",
+        &json!({"source_system": "cnet", "source_key": "stn:brake:reps", "measurement_type": "spot"}),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "{stream}");
+    let stream_id = crate::common::e2e::id_of(&stream);
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/streams/{stream_id}/pair"),
+        &json!({"site_parameter_id": crate::common::PARAM_S1_TEMP_ID}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "pair: {body}");
+
+    db.execute_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            "INSERT INTO replicate_audit_holds \
+                 (stream_id, group_time, kind, expected, computed, delta, status) \
+             VALUES ('{stream_id}', '{T1}', 'brake_fired', \
+                     '{{\"would_withdraw\": 40}}', '{{\"held\": \"changed and withdrawn\"}}', \
+                     '{{}}', 'pending')"
+        ),
+    ))
+    .await
+    .unwrap();
+
+    // 10, 12, 14: mean 12, sample sd 2. The source states exactly that, so the audit agrees.
+    let readings: Vec<serde_json::Value> = [10.0, 12.0, 14.0]
+        .iter()
+        .enumerate()
+        .map(|(i, v)| json!({"time": T1, "raw_value": v, "replicate_index": i}))
+        .collect();
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/ingest",
+        &json!({
+            "stream_id": stream_id,
+            "readings": readings,
+            "audit": [{"time": T1, "expected_mean": 12.0, "expected_sd": 2.0, "expected_n": 3}],
+        }),
+        &sync_token,
+    )
+    .await;
+    assert_eq!(status, 200, "ingest: {body}");
+
+    let row = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT status FROM replicate_audit_holds \
+                 WHERE stream_id = '{stream_id}' AND group_time = '{T1}' AND kind = 'brake_fired'"
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the brake hold is still there");
+    assert_eq!(
+        row.try_get::<String>("", "status").unwrap(),
+        "pending",
+        "an agreeing statistics audit must not close a brake ruling"
+    );
+}
+
+/// Expected behaviour: the list reports pending holds per kind, so the audits tab, its banner and
+/// the operations badge can name what is waiting instead of calling every kind a
+/// replicate-statistics disagreement.
+#[tokio::test]
+#[serial]
+async fn the_list_breaks_pending_holds_down_by_kind() {
+    let (db, app, token) = setup().await;
+    insert_event_finding(&db).await;
+    let (status, stream) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/streams/register",
+        &json!({"source_system": "cnet", "source_key": "stn:kinds:reps", "measurement_type": "spot"}),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "{stream}");
+    let stream_id = crate::common::e2e::id_of(&stream);
+    for (kind, at) in [
+        ("replicate_stats", "2025-06-02T08:00:00Z"),
+        ("replicate_stats", "2025-06-03T08:00:00Z"),
+        ("brake_fired", "2025-06-04T08:00:00Z"),
+    ] {
+        db.execute_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "INSERT INTO replicate_audit_holds                      (stream_id, group_time, kind, expected, computed, delta, status)                  VALUES ('{stream_id}', '{at}', '{kind}', '{{}}', '{{}}', '{{}}', 'pending')"
+            ),
+        ))
+        .await
+        .unwrap();
+    }
+
+    let (status, body) = crate::common::get_json_with_token(
+        &app,
+        "/api/sync/replicate_audit_holds?status=pending",
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["pending"], 4, "four pending in total: {body}");
+    let by_kind = &body["pending_by_kind"];
+    assert_eq!(by_kind["replicate_stats"], 2, "{by_kind}");
+    assert_eq!(by_kind["brake_fired"], 1, "{by_kind}");
+    assert_eq!(
+        by_kind["stale_output"], 1,
+        "the event finding counts too: {by_kind}"
+    );
+    assert!(
+        by_kind.get("source_modified").is_none(),
+        "a kind with nothing pending is absent, not zero: {by_kind}"
+    );
 }

@@ -99,7 +99,7 @@ async fn wait_for_job(
     let deadline = Instant::now() + timeout;
     loop {
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT status FROM reprocessing_jobs \
                  WHERE trigger_type = $1 AND trigger_id = $2::uuid",

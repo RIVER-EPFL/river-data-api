@@ -60,7 +60,7 @@ async fn cancel_endpoint_rejects_non_cancellable_and_unknown() {
         "a running cancellable job accepts a cross-replica cancel"
     );
     let flagged: bool = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT cancel_requested FROM reprocessing_jobs WHERE id = $1",
             [running.into()],
