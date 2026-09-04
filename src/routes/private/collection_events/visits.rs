@@ -74,6 +74,23 @@ pub struct VisitCell {
     pub n_total: i64,
     pub n_flagged: i64,
     pub n_withdrawn: i64,
+    /// The group's statistics, so a triplicate and a single measurement do not render identically.
+    /// `n` counts what the mean stands on, which is `n_total` less the exclusions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdev: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub median: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+    /// Which divisor produced `stdev`, and what chose it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sd_estimator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sd_estimator_source: Option<String>,
     /// Kind of the oldest open finding on this cell, when one exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finding: Option<String>,
@@ -87,6 +104,13 @@ pub struct ExpectedParameter {
     pub parameter_id: Uuid,
     pub code: String,
     pub name: String,
+    /// The unit the column's numbers are in, from the site's slot when it declares one and the
+    /// catalog default otherwise. A grid of bare numbers cannot be read without it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub units: Option<String>,
+    /// `site_parameters.decimal_places` for the slot, null when it declares none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decimal_places: Option<i16>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -276,13 +300,17 @@ pub async fn list_site_visits(
         .db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT DISTINCT p.id, p.code, p.name FROM parameters p \
+            "SELECT DISTINCT ON (p.code) p.id, p.code, p.name, \
+                    COALESCE(sp.display_units, p.default_units) AS units, \
+                    sp.decimal_places \
+             FROM parameters p \
+             LEFT JOIN site_parameters sp ON sp.parameter_id = p.id AND sp.site_id = $1 \
              WHERE p.id IN (SELECT r.parameter_id FROM readings r \
                               JOIN collection_events ce ON ce.id = r.collection_event_id \
                              WHERE ce.site_id = $1) \
-                OR p.id IN (SELECT sp.parameter_id FROM site_parameters sp \
-                             WHERE sp.site_id = $1 AND COALESCE(sp.is_active, true) = true) \
-             ORDER BY p.code",
+                OR p.id IN (SELECT sp2.parameter_id FROM site_parameters sp2 \
+                             WHERE sp2.site_id = $1 AND COALESCE(sp2.is_active, true) = true) \
+             ORDER BY p.code, sp.id",
             [site.id.into()],
         ))
         .await?;
@@ -292,6 +320,8 @@ pub async fn list_site_visits(
             parameter_id: r.try_get("", "id")?,
             code: r.try_get("", "code")?,
             name: r.try_get("", "name")?,
+            units: r.try_get("", "units")?,
+            decimal_places: r.try_get("", "decimal_places")?,
         });
     }
 
@@ -354,7 +384,14 @@ pub async fn list_site_visits(
                         BOOL_AND(r.withdrawn_at IS NOT NULL) AS all_withdrawn,
                         COUNT(*)::bigint AS n_total,
                         COUNT(*) FILTER (WHERE r.is_flagged IS TRUE)::bigint AS n_flagged,
-                        COUNT(*) FILTER (WHERE r.withdrawn_at IS NOT NULL)::bigint AS n_withdrawn
+                        COUNT(*) FILTER (WHERE r.withdrawn_at IS NOT NULL)::bigint AS n_withdrawn,
+                        MAX(s.n) AS sample_n,
+                        MAX(s.stdev) AS stdev,
+                        MAX(s.median) AS median,
+                        MAX(s.min_value) AS min_value,
+                        MAX(s.max_value) AS max_value,
+                        MAX(s.sd_estimator) AS sd_estimator,
+                        MAX(s.sd_estimator_source) AS sd_estimator_source
                  FROM readings r
                  LEFT JOIN samples s ON s.id = r.sample_id
                  WHERE r.collection_event_id = ANY($1) AND r.parameter_id IS NOT NULL
@@ -417,6 +454,13 @@ pub async fn list_site_visits(
                 n_total: c.try_get("", "n_total")?,
                 n_flagged: c.try_get("", "n_flagged")?,
                 n_withdrawn: c.try_get("", "n_withdrawn")?,
+                n: c.try_get("", "sample_n")?,
+                stdev: c.try_get("", "stdev")?,
+                median: c.try_get("", "median")?,
+                min: c.try_get("", "min_value")?,
+                max: c.try_get("", "max_value")?,
+                sd_estimator: c.try_get("", "sd_estimator")?,
+                sd_estimator_source: c.try_get("", "sd_estimator_source")?,
                 finding: None,
                 finding_count: None,
             });
@@ -442,6 +486,13 @@ pub async fn list_site_visits(
                         n_total: 0,
                         n_flagged: 0,
                         n_withdrawn: 0,
+                        n: None,
+                        stdev: None,
+                        median: None,
+                        min: None,
+                        max: None,
+                        sd_estimator: None,
+                        sd_estimator_source: None,
                         finding: Some(kind.clone()),
                         finding_count: (*n > 1).then_some(*n),
                     });
@@ -705,9 +756,24 @@ pub struct CellSample {
     pub sample_id: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mean: Option<f64>,
+    /// The sd under the divisor the slot declares. `sd_estimator` names which that is; the other
+    /// travels beside it so a reviewer can read both without declaring anything first.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stdev: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdev_sample: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdev_population: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub median: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
     pub n: i32,
+    /// 'sample' | 'population', and what chose it ('default' is the fallback having applied).
+    pub sd_estimator: String,
+    pub sd_estimator_source: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -717,7 +783,17 @@ pub struct CellReplicate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub calibrated_value: Option<f64>,
     pub flagged: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flag_reason: Option<String>,
     pub withdrawn: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub withdrawn_at: Option<DateTime<Utc>>,
+    /// The base calibration this replicate was corrected with, null when none was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calibration_id: Option<Uuid>,
+    /// The standard curve applied on top of the base calibration, null when none was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standard_curve_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -773,6 +849,10 @@ pub async fn get_event_detail(
                     r.raw_value, r.calibrated_value, r.is_flagged, \
                     (r.withdrawn_at IS NOT NULL) AS withdrawn, r.sample_id, \
                     s.mean AS sample_mean, s.stdev AS sample_stdev, s.n AS sample_n, \
+                    s.stdev_sample, s.stdev_population, s.median AS sample_median, \
+                    s.min_value AS sample_min, s.max_value AS sample_max, \
+                    s.sd_estimator, s.sd_estimator_source, \
+                    r.flag_reason, r.withdrawn_at, r.calibration_id, r.standard_curve_id, \
                     (r.provenance IS NOT NULL) AS has_provenance, \
                     r.provenance ->> 'tool' AS tool \
              FROM readings r \
@@ -820,7 +900,11 @@ pub async fn get_event_detail(
             flagged: r
                 .try_get::<Option<bool>>("", "is_flagged")?
                 .unwrap_or(false),
+            flag_reason: r.try_get("", "flag_reason")?,
             withdrawn: r.try_get("", "withdrawn")?,
+            withdrawn_at: r.try_get("", "withdrawn_at")?,
+            calibration_id: r.try_get("", "calibration_id")?,
+            standard_curve_id: r.try_get("", "standard_curve_id")?,
         };
         let same_cell = cells
             .last_mut()
@@ -834,7 +918,18 @@ pub async fn get_event_detail(
                         sample_id,
                         mean: r.try_get("", "sample_mean")?,
                         stdev: r.try_get("", "sample_stdev")?,
+                        stdev_sample: r.try_get("", "stdev_sample")?,
+                        stdev_population: r.try_get("", "stdev_population")?,
+                        median: r.try_get("", "sample_median")?,
+                        min: r.try_get("", "sample_min")?,
+                        max: r.try_get("", "sample_max")?,
                         n: r.try_get::<Option<i32>>("", "sample_n")?.unwrap_or(0),
+                        sd_estimator: r
+                            .try_get::<Option<String>>("", "sd_estimator")?
+                            .unwrap_or_default(),
+                        sd_estimator_source: r
+                            .try_get::<Option<String>>("", "sd_estimator_source")?
+                            .unwrap_or_default(),
                     }),
                     None => None,
                 };
@@ -871,16 +966,19 @@ pub async fn get_event_detail(
         cell.served_value = cell.sample.as_ref().and_then(|s| s.mean).or(live_value);
     }
     // Findings for parameters with no readings at the event (missing outputs) still get a cell.
+    // One filtered find for all of them: an audit reporting eight missing outputs at one visit was
+    // costing eight round trips on the request path.
+    let finding_catalog = crate::routes::private::sites::parameters::descriptor::catalog_map(
+        &state.db,
+        finding_by_param.keys().copied(),
+    )
+    .await?;
     for (parameter_id, finding) in finding_by_param {
-        let (code, name) = crate::routes::private::parameters::Entity::find_by_id(parameter_id)
-            .one(&state.db)
-            .await?
-            .map(|p| (p.code, p.name))
-            .unwrap_or_else(|| (String::new(), String::new()));
+        let catalog = finding_catalog.get(&parameter_id);
         cells.push(EventCell {
             parameter_id,
-            parameter_code: code,
-            parameter_name: name,
+            parameter_code: catalog.map(|c| c.code.clone()).unwrap_or_default(),
+            parameter_name: catalog.map(|c| c.name.clone()).unwrap_or_default(),
             stream_id: Uuid::nil(),
             origin: crate::routes::private::readings::provenance::classify_source("").to_string(),
             has_provenance: false,

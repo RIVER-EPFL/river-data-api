@@ -7,6 +7,8 @@
 mod common;
 
 mod measurement_classification;
+mod nomis_pairing_refused;
+mod pair_opens_at_history;
 mod pair_replicate_samples;
 mod register_declares_instrument;
 mod register_pair_stats;

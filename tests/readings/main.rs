@@ -7,6 +7,7 @@
 mod common;
 
 mod aggregate_refresh_on_flag;
+mod attribution_order;
 mod batch_overwrite_count;
 mod batch_standard_curve;
 mod collection_events;
@@ -18,6 +19,7 @@ mod csv_import_sessions;
 mod csv_import_tool_curves;
 mod csv_import_worker;
 mod decisions;
+mod edits;
 mod flag_range_dry_run;
 mod grab_replace_scope;
 mod grab_samples_insertion;
@@ -34,6 +36,7 @@ mod replicate_index_resync;
 mod sample_preview;
 mod sample_row_predicate;
 mod seasonal_check;
+mod spot_instant_shape;
 mod stream_receipts;
 mod visits;
 mod write_path_admission;

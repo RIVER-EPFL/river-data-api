@@ -134,6 +134,7 @@ pub fn violations_sql(site_id: Uuid, param_ids: Option<Vec<Uuid>>, min_severity:
                   AND r.measurement_type = 'spot'
                   AND r.withdrawn_at IS NULL
                   AND r.is_flagged IS NOT TRUE
+                  AND r.unverified IS NOT TRUE
                 ORDER BY r.stream_id, r.time, r.replicate_index
             ) sp
             JOIN resolved_thresholds t ON sp.parameter_id = t.parameter_id
@@ -438,7 +439,7 @@ pub(crate) fn latest_served_sql(spot: bool, site_col: &str, param_col: &str) -> 
              FROM readings r LEFT JOIN samples smp ON smp.id = r.sample_id \
              WHERE r.site_id = {site_col} AND r.parameter_id = {param_col} \
                AND r.measurement_type = 'spot' AND r.withdrawn_at IS NULL \
-               AND r.is_flagged IS NOT TRUE \
+               AND r.is_flagged IS NOT TRUE AND r.unverified IS NOT TRUE \
              ORDER BY r.time DESC, r.replicate_index LIMIT 1"
         )
     } else {
@@ -1249,6 +1250,7 @@ pub async fn get_thresholds(
             FROM readings r \
             LEFT JOIN samples smp ON smp.id = r.sample_id \
             WHERE r.site_id IS NOT NULL AND r.is_flagged IS NOT TRUE \
+              AND r.unverified IS NOT TRUE \
               AND r.time > now() - interval '30 days' \
             ORDER BY r.site_id, r.parameter_id, \
                      (r.measurement_type IS NOT DISTINCT FROM 'spot') ASC, r.time DESC, \

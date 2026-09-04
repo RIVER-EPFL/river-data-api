@@ -23,6 +23,7 @@ mod pairing_plan_lifecycle;
 mod pairing_wizard_patch_apply;
 mod portal_curve_instrument;
 mod portal_migration_wizard;
+mod portal_station_pairing;
 mod provision_to_public;
 mod reactive_recompute;
 mod replicate_sync_flow;

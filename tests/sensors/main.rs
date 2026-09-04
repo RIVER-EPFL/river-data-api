@@ -7,6 +7,7 @@
 mod common;
 
 mod import_adopt_swap_lifecycle;
+mod instrument_kinds;
 mod instruments_overview;
 mod list_latest_reading;
 mod multi_parameter_channel;

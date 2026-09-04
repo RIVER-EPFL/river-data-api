@@ -7,3 +7,4 @@
 mod common;
 
 mod attribute_existing_readings;
+mod backdate_auto_deployments;

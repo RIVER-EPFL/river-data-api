@@ -13,7 +13,8 @@ use crate::common::authz::{Capability, TokenAccess, TokenBit};
 use crate::common::middleware::{
     bust_token_cache_on_mutation, deny_scoped_token, enforce_scope_on_crud, inject_read_scope,
     require_admin, require_admin_or_token_write_metadata, require_crud, require_manage_sensors,
-    require_read_data, require_read_metadata, require_write_data,
+    require_enter_field_data, require_read_data, require_read_metadata,
+    require_write_data,
 };
 use crate::common::rate_limit::FallbackIpKeyExtractor;
 use crate::routes::private::{
@@ -302,6 +303,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
             post(crate::routes::private::sensors::register::register_sensor),
         )
         .route(
+            "/notes/register",
+            post(crate::routes::private::notes::register::register_notes),
+        )
+        .route(
             "/annotations/register",
             post(crate::routes::private::annotations::register::register_annotations),
         )
@@ -360,7 +365,6 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .layer(RequestBodyLimitLayer::new(DATA_BODY_LIMIT))
         .route("/readings/import_csv", post(readings_import::import_csv))
         .layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT))
-        .route("/grab_samples", post(grab_samples::insert_grab_samples))
         .route(
             "/collection_events/stage",
             post(crate::routes::private::collection_events::stage_collection_event),
@@ -377,11 +381,30 @@ pub fn api_router(state: &AppState) -> Router<()> {
             "/actions/event_recompute",
             post(crate::routes::private::collection_events::run_event_recompute),
         )
+        .route(
+            "/readings/edits/preview",
+            post(crate::routes::private::readings::edits::preview),
+        )
+        .route(
+            "/readings/edits",
+            post(crate::routes::private::readings::edits::commit),
+        )
+        .route(
+            "/readings/edits/{id}/rollback",
+            post(crate::routes::private::readings::edits::rollback),
+        )
         .route("/readings/flag", patch(flags::flag_readings))
         .route("/readings/unflag", patch(flags::unflag_readings))
         .route("/readings/flag_range", patch(flags::flag_range))
         .route("/readings/unflag_range", patch(flags::unflag_range))
         .layer(middleware::from_fn(require_write_data))
+        .with_state(state.clone());
+
+    // Entering a field measurement. An intern reaches this and nothing else that writes: the
+    // save lands unverified and is refused a replace (Q21, M44).
+    let field_entry_routes = Router::new()
+        .route("/grab_samples", post(grab_samples::insert_grab_samples))
+        .layer(middleware::from_fn(require_enter_field_data))
         .with_state(state.clone());
 
     // Operator / global data actions that span projects or have no per-project target. Denied to
@@ -442,6 +465,14 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route(
             "/readings/decisions",
             get(crate::routes::private::readings::decisions::list_decisions),
+        )
+        .route(
+            "/readings/edits/inspect",
+            post(crate::routes::private::readings::edits::inspect),
+        )
+        .route(
+            "/tool_runs/{id}/reload",
+            get(crate::routes::private::readings::edits::reload_run),
         )
         .route(
             "/sites/{id}/visits",
@@ -749,6 +780,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .merge(sensor_adopt_write)
         .merge(metadata_read_routes)
         .merge(data_push_routes)
+        .merge(field_entry_routes)
         .merge(data_action_routes)
         .merge(data_read_routes)
         .merge(operator_action_routes)

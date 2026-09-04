@@ -110,6 +110,11 @@ pub struct ParameterData {
     #[serde(rename = "type")]
     pub sensor_type: String,
     pub units: Option<String>,
+    /// `site_parameters.decimal_places` for the slot, null when it declares none. The private arm
+    /// serves values as stored; this is what a consumer needs to render them at the declared
+    /// precision without asking a second endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decimal_places: Option<i16>,
     /// Values array (same length as times, null for missing data)
     pub values: Vec<Option<f64>>,
     /// Severity levels (0=ok, 1=warning, 2=alarm). Only present when alarms=true.
@@ -187,12 +192,23 @@ pub struct SampleStatOut {
     pub n: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mean: Option<f64>,
+    /// The sd under the divisor the slot declares; `sd_estimator` names which. Both divisors are
+    /// served beside it, so the one not declared stays readable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stdev: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdev_sample: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdev_population: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub median: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max: Option<f64>,
+    /// 'sample' | 'population', and what chose it ('default' is the fallback having applied).
+    pub sd_estimator: String,
+    pub sd_estimator_source: String,
     pub replicates: Vec<ReplicateOut>,
 }
 
@@ -335,6 +351,17 @@ fn readings_table(
     if params.iter().any(|p| p.samples.is_some()) {
         for p in params {
             let stats = p.samples.clone().unwrap_or_default();
+            // The join key to the replicates download, which is a row per replicate where this is
+            // a row per instant.
+            table.column(
+                format!("{}_sample_id", p.code),
+                Cells::Text(
+                    stats
+                        .iter()
+                        .map(|s| s.as_ref().map(|s| s.sample_id.to_string()))
+                        .collect(),
+                ),
+            );
             table.column(
                 format!("{}_n", p.code),
                 Cells::Int(
@@ -359,6 +386,26 @@ fn readings_table(
                     stats
                         .iter()
                         .map(|s| s.as_ref().and_then(|s| s.stdev))
+                        .collect(),
+                ),
+            );
+            // The divisor beside the number it produced: an sd whose formula is not named is one
+            // two readers can compare and disagree about, which is the whole of I6.
+            table.column(
+                format!("{}_sd_estimator", p.code),
+                Cells::Text(
+                    stats
+                        .iter()
+                        .map(|s| s.as_ref().map(|s| s.sd_estimator.clone()))
+                        .collect(),
+                ),
+            );
+            table.column(
+                format!("{}_median", p.code),
+                Cells::Float(
+                    stats
+                        .iter()
+                        .map(|s| s.as_ref().and_then(|s| s.median))
                         .collect(),
                 ),
             );
@@ -942,6 +989,7 @@ pub async fn get_site_readings(
                 display_name: descriptor.catalog_name,
                 sensor_type: descriptor.sensor_type,
                 units: descriptor.units,
+                decimal_places: descriptor.decimal_places,
                 values,
                 severities,
                 flagged,
@@ -1016,8 +1064,13 @@ async fn fetch_sample_stats(
                     n: s.n,
                     mean: s.mean,
                     stdev: s.stdev,
+                    stdev_sample: s.stdev_sample,
+                    stdev_population: s.stdev_population,
+                    median: s.median,
                     min: s.min_value,
                     max: s.max_value,
+                    sd_estimator: s.sd_estimator,
+                    sd_estimator_source: s.sd_estimator_source,
                     replicates: Vec::new(),
                 },
             )

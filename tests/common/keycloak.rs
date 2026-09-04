@@ -402,7 +402,18 @@ pub async fn get_keycloak_jwt(username: &str, password: &str) -> String {
         .expect("Keycloak unreachable");
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.expect("Keycloak returned non-JSON");
-    assert!(status.is_success(), "Keycloak token request failed: {body}");
+    // A locked-out user and a wrong password are the same response, `invalid_grant` with
+    // "Invalid user credentials"; only the Keycloak container's log separates them
+    // (`error="user_temporarily_disabled"`). The fixture users' passwords do not change, so name
+    // the lockout rather than leaving the run looking like a credentials defect.
+    assert!(
+        status.is_success(),
+        "Keycloak token request for '{username}' failed: {body}\n\
+         If this is `invalid_grant`, the realm's brute-force lockout gives the same response as a \
+         wrong password. Check the Keycloak log for `user_temporarily_disabled`, and that the \
+         realm was imported with `bruteForceProtected: false` \
+         (tests/fixtures/keycloak-realm-test.json)."
+    );
     body["access_token"]
         .as_str()
         .expect("no access_token in Keycloak response")

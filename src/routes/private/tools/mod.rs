@@ -29,6 +29,10 @@ pub struct ToolResult {
     pub tool: String,
     #[schema(value_type = Object)]
     pub results: serde_json::Value,
+    /// Outputs the script computed as NA. The portal blanked such a column rather than leaving
+    /// the previous number standing, so these name the stored values a save must clear.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub cleared: Vec<String>,
     pub inputs_used: Vec<String>,
     pub inputs_ignored: Vec<String>,
     /// The constant values the server resolved and passed to the runner, by name.
@@ -40,7 +44,7 @@ pub struct ToolResult {
     /// Station properties resolved from the site named by `site_id`, as `{property, param, value}`.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     #[schema(value_type = Vec<Object>)]
-    pub station_inputs: Vec<serde_json::Value>,
+    pub site_inputs: Vec<serde_json::Value>,
     /// Same-event parameter values resolved at `(site_id, collected_at)`, as
     /// `{param, parameter_code, parameter_id, value}`.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -117,7 +121,7 @@ pub async fn calculate_tool(
 /// The run row is written before the results are handed out: a save references the row, the
 /// provenance blob is built from it, and every claim in the blob predates the save. The stored
 /// inputs are the effective inputs the runner received (request values plus defaults and the
-/// resolved station/event inputs), and `context` records where each resolved value came from.
+/// resolved site/event inputs), and `context` records where each resolved value came from.
 pub async fn execute_and_store_run(
     state: &AppState,
     tool: &engine::ActiveTool,
@@ -153,15 +157,24 @@ async fn store_run(
     let tool_version = tool.version_ref(runtime.as_ref());
     let results = serde_json::Value::Object(outcome.results);
     let constants = serde_json::Value::Object(outcome.constants);
+    // The run records what the script produced, cleared outputs included: an explicit null is
+    // what says the value was computed and is not a number, as against never computed at all.
+    let stored_outputs = {
+        let mut map = results.as_object().cloned().unwrap_or_default();
+        for key in &outcome.cleared {
+            map.insert(key.clone(), serde_json::Value::Null);
+        }
+        serde_json::Value::Object(map)
+    };
 
     let context = if outcome.site_id.is_some()
-        || !outcome.station_inputs.is_empty()
+        || !outcome.site_inputs.is_empty()
         || !outcome.event_inputs.is_empty()
     {
         serde_json::json!({
             "site_id": outcome.site_id,
             "collected_at": outcome.collected_at,
-            "station_inputs": outcome.station_inputs,
+            "site_inputs": outcome.site_inputs,
             "event_inputs": outcome.event_inputs,
         })
     } else {
@@ -184,7 +197,7 @@ async fn store_run(
                 serde_json::Value::Object(outcome.inputs).into(),
                 constants.clone().into(),
                 serde_json::Value::Array(outcome.curves.clone()).into(),
-                results.clone().into(),
+                stored_outputs.into(),
                 actor.into(),
                 context.into(),
                 source.into(),
@@ -195,11 +208,12 @@ async fn store_run(
     Ok(ToolResult {
         tool: tool.name.clone(),
         results,
+        cleared: outcome.cleared,
         inputs_used: outcome.inputs_used,
         inputs_ignored: outcome.inputs_ignored,
         constants,
         curves: outcome.curves,
-        station_inputs: outcome.station_inputs,
+        site_inputs: outcome.site_inputs,
         event_inputs: outcome.event_inputs,
         tool_version,
         run_id,

@@ -39,6 +39,10 @@ pub struct GrabSampleRequest {
     /// Compute the preview and report existing groups without writing anything.
     #[serde(default)]
     pub dry_run: bool,
+    /// Set by the chain when the inputs it computed from are themselves pending, so the outputs
+    /// inherit that state. Never deserialized: a client cannot claim it or clear it.
+    #[serde(skip)]
+    pub pending_inputs: bool,
     /// The `tool_runs` row these readings came from (returned by `/tools/{name}/calculate` as
     /// `run_id`). The server builds the provenance blob from that row, so the blob's inputs,
     /// constants, curves and outputs are what the engine resolved, its actor is the calculating
@@ -433,6 +437,9 @@ async fn find_or_create_sample(
         created_at: Set(Some(chrono::Utc::now())),
         mean: Set(None),
         stdev: Set(None),
+        stdev_sample: Set(None),
+        stdev_population: Set(None),
+        median: Set(None),
         n: Set(0),
         min_value: Set(None),
         max_value: Set(None),
@@ -1149,6 +1156,21 @@ pub async fn insert_grab_samples(
         }));
     }
 
+    // An intern enters measurements; a stored value is someone else's to change (Q21).
+    if decisions::entry_state(auth.highest_role().as_ref()).is_some()
+        && payload.mode == Some(GrabWriteMode::Replace)
+    {
+        return Err(AppError::Forbidden(
+            "An intern's entry cannot replace stored values; a manager rewrites them".to_string(),
+        ));
+    }
+    // A value computed from a pending measurement is pending too (M62): the chain says so.
+    let entry_state = if payload.pending_inputs {
+        Some(decisions::Kind::UnverifiedEntry)
+    } else {
+        decisions::entry_state(auth.highest_role().as_ref())
+    };
+
     if !existing_groups.is_empty() && payload.mode != Some(GrabWriteMode::Replace) {
         let detail = serde_json::to_value(&existing_groups)
             .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -1483,6 +1505,19 @@ pub async fn insert_grab_samples(
             // A curve chosen with the entry is a claim, recorded once (ADR 0008).
             decisions::record_curve_claims(txn, &models, &actor, decisions::Origin::Manual).await?;
 
+            // An intern's entry lands pending: the record carries it, the columns project it and
+            // the review queue lists it until a manager verifies or rejects (Q21, M44).
+            if entry_state == Some(decisions::Kind::UnverifiedEntry) {
+                decisions::record_unverified_entries(
+                    txn,
+                    &models,
+                    &actor,
+                    decisions::Origin::Manual,
+                )
+                .await?;
+                open_unverified_holds(txn, payload.site_id, &groups, &actor).await?;
+            }
+
             // A re-post is the same measurement recorded again: the rows the insert skipped on
             // conflict still take this request's story, so a second run's blob does not sit behind
             // the value it produced. Keyed on the rows this request wrote, so a curated row a
@@ -1624,6 +1659,49 @@ pub async fn insert_grab_samples(
         existing_groups,
         calculations,
     }))
+}
+
+/// One review-queue row per slot instant an intern entered, so a manager sees the pending entry
+/// beside every other finding. Keyed on (site, parameter, instant): a re-entry at the same slot
+/// refreshes the open hold rather than filing a second one.
+async fn open_unverified_holds<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    site_id: Uuid,
+    groups: &[(Uuid, chrono::DateTime<chrono::Utc>)],
+    actor: &str,
+) -> AppResult<()> {
+    for (parameter_id, at) in groups {
+        let binds = [
+            site_id.into(),
+            (*parameter_id).into(),
+            sea_orm::prelude::DateTimeWithTimeZone::from(*at).into(),
+            serde_json::json!({ "state": "unverified", "entered_by": actor }).into(),
+        ];
+        let updated = conn
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE replicate_audit_holds SET computed = $4, created_at = NOW() \
+                 WHERE site_id = $1 AND parameter_id = $2 AND group_time = $3 \
+                   AND kind = 'unverified_entry' AND status IN ('pending', 'deferred')",
+                binds.clone(),
+            ))
+            .await?
+            .rows_affected();
+        if updated > 0 {
+            continue;
+        }
+        conn.execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO replicate_audit_holds \
+                 (stream_id, site_id, parameter_id, group_time, kind, expected, computed, delta, \
+                  status) \
+             VALUES (NULL, $1, $2, $3, 'unverified_entry', '{\"state\": \"verified\"}'::jsonb, \
+                     $4, '{}'::jsonb, 'pending')",
+            binds,
+        ))
+        .await?;
+    }
+    Ok(())
 }
 
 /// The `source` of a stored tool run: `interactive` | `csv_import` | `chain`. `None` when the

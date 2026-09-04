@@ -171,6 +171,9 @@ pub enum Capability {
     ReadData,
     /// Ingestion and data curation: readings/grab-sample writes, CSV import, flagging.
     WriteData,
+    /// Entering a field measurement that nobody has curated yet. An intern holds this and
+    /// nothing else that writes: the entry lands unverified and a manager rules on it (Q21).
+    EnterFieldData,
     /// Field-level entity management: sites, site parameters, standard curves, notes, annotations.
     WriteFieldMetadata,
     /// Sensor movement: deployments, calibrations, adopt/swap/recall, reprocessing.
@@ -187,7 +190,9 @@ impl Capability {
     #[must_use]
     pub fn min_role(&self) -> Role {
         match self {
-            Capability::ReadMetadata | Capability::ReadData => Role::Intern,
+            Capability::ReadMetadata | Capability::ReadData | Capability::EnterFieldData => {
+                Role::Intern
+            }
             Capability::WriteData | Capability::WriteFieldMetadata => Role::River,
             Capability::ManageSensors | Capability::WriteCatalog => Role::Manager,
             Capability::Admin => Role::Administrator,
@@ -201,7 +206,7 @@ impl Capability {
         match self {
             Capability::ReadMetadata => Some(TokenBit::ReadMetadata),
             Capability::ReadData => Some(TokenBit::ReadData),
-            Capability::WriteData => Some(TokenBit::WriteData),
+            Capability::WriteData | Capability::EnterFieldData => Some(TokenBit::WriteData),
             // The historical `write_metadata` bit covered all entity management; the human-side
             // split does not change what a token may do.
             Capability::WriteFieldMetadata
@@ -218,6 +223,7 @@ impl std::fmt::Display for Capability {
             Capability::ReadMetadata => "read_metadata",
             Capability::ReadData => "read_data",
             Capability::WriteData => "write_data",
+            Capability::EnterFieldData => "enter_field_data",
             Capability::WriteFieldMetadata => "write_field_metadata",
             Capability::ManageSensors => "manage_sensors",
             Capability::WriteCatalog => "write_catalog",

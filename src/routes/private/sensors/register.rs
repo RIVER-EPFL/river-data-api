@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors;
-use crate::routes::private::sensors::operations::upsert_source_instrument;
+use crate::routes::private::sensors::operations::{InstrumentKind, upsert_source_instrument};
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -131,7 +131,11 @@ pub async fn register_sensor(
         &payload.source_system,
         &payload.source_key,
         &payload.name,
-        payload.is_lab_instrument,
+        if payload.is_lab_instrument {
+            InstrumentKind::Lab
+        } else {
+            InstrumentKind::Device
+        },
         &payload.data_frequency,
         payload.metadata.clone(),
     )

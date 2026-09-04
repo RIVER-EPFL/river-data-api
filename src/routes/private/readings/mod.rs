@@ -1,6 +1,7 @@
 pub mod batch;
 pub mod checks;
 pub mod decisions;
+pub mod edits;
 pub mod flags;
 pub mod grab_samples;
 pub mod import;

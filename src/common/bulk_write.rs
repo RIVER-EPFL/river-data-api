@@ -99,6 +99,23 @@ where
     }
 }
 
+/// Run `work` in one transaction with the decompression cap lifted and roll it back either way,
+/// so what the work did is read back from the write itself and then undone. This is how a preview
+/// shows the arithmetic a commit would do without implementing it twice.
+pub async fn guarded_rollback<C, F, T>(db: &C, work: F) -> AppResult<T>
+where
+    C: TransactionTrait,
+    F: AsyncFnOnce(&C::Transaction) -> AppResult<T>,
+{
+    let txn = db.begin().await?;
+    lift_decompression_cap(&txn).await?;
+    let outcome = work(&txn).await;
+    if let Err(rollback) = txn.rollback().await {
+        tracing::warn!(error = %rollback, "Rollback after a preview failed");
+    }
+    outcome
+}
+
 /// One hypertable DML statement in its own guarded transaction, reporting the rows and the time span
 /// it touched.
 pub async fn guarded_mutation<C: TransactionTrait>(

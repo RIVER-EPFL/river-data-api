@@ -652,6 +652,7 @@ pub async fn register_stream(
             &state.db,
             &stream,
             name_hint.as_deref(),
+            crate::routes::private::sensors::operations::InstrumentKind::SourceParameter,
         )
         .await?;
         stream = data_streams::Entity::find_by_id(stream.id)
@@ -856,6 +857,14 @@ pub async fn pair_stream(
                 .one(txn)
                 .await?
                 .ok_or_else(|| AppError::NotFound("Site parameter not found".to_string()))?;
+
+            let existing = data_streams::Entity::find_by_id(stream_id)
+                .one(txn)
+                .await?
+                .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
+            if let Some(reason) = super::service::pairing_refusal(&existing.source_system) {
+                return Err(AppError::BadRequest(reason));
+            }
 
             let claimed = txn
                 .execute_raw(Statement::from_sql_and_values(

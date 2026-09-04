@@ -9,6 +9,7 @@ mod common;
 mod calculators;
 mod constants_parity;
 mod draft_run;
+mod na_clears_output;
 mod output_parameters;
 mod run_contract;
 mod runner_absent;

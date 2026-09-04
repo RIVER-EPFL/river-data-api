@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
@@ -521,6 +521,41 @@ async fn link_stream_to_sensor<C: ConnectionTrait>(
     Ok(())
 }
 
+/// What an instrument row is. Three of the four minting paths produce something that is not a
+/// device, and a picker offering all four asks an operator to tell a spectrophotometer from a
+/// bookkeeping row with nothing to go on. It is a display and selection attribute:
+/// `(source_system, source_key)` stays the identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstrumentKind {
+    /// A physical instrument: a probe, a logger channel, a lab device with a serial.
+    Device,
+    /// A portal curve label, one row per analyte.
+    Lab,
+    /// A source's instrument for one parameter, across every station it reports.
+    SourceParameter,
+    /// A slot's own hand-entry channel (grab entry, API batch).
+    EntryChannel,
+}
+
+impl InstrumentKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Device => "device",
+            Self::Lab => "lab",
+            Self::SourceParameter => "source_parameter",
+            Self::EntryChannel => "entry_channel",
+        }
+    }
+
+    /// Everything that is not a field device has sat under this flag since before the kinds were
+    /// distinguished, and the inventory's Lab tab still reads it.
+    #[must_use]
+    pub fn is_lab_instrument(self) -> bool {
+        self != Self::Device
+    }
+}
+
 /// Insert a source-registered instrument for `(source_system, source_key)`, or return the existing
 /// one. Race-safe: the `ON CONFLICT … DO NOTHING` targets the partial unique index
 /// `sensors_provenance_uniq (source_system, source_key)`, so concurrent pairings of the same
@@ -539,10 +574,11 @@ pub async fn upsert_source_instrument<C: ConnectionTrait>(
     source_system: &str,
     source_key: &str,
     name: &str,
-    is_lab_instrument: bool,
+    kind: InstrumentKind,
     data_frequency: &str,
     metadata: Option<serde_json::Value>,
 ) -> AppResult<Uuid> {
+    let is_lab_instrument = kind.is_lab_instrument();
     let metadata_val: sea_orm::Value = match &metadata {
         Some(v) => serde_json::to_string(v)
             .unwrap_or_else(|_| "null".to_string())
@@ -555,8 +591,8 @@ pub async fn upsert_source_instrument<C: ConnectionTrait>(
             sea_orm::DatabaseBackend::Postgres,
             r#"INSERT INTO sensors
                    (id, name, is_active, is_lab_instrument, data_frequency,
-                    source_system, source_key, metadata, created_at)
-               VALUES (gen_random_uuid(), $1, true, $2, $3, $4, $5, $6::jsonb, now())
+                    source_system, source_key, metadata, kind, created_at)
+               VALUES (gen_random_uuid(), $1, true, $2, $3, $4, $5, $6::jsonb, $7, now())
                ON CONFLICT (source_system, source_key)
                    WHERE source_system IS NOT NULL AND source_key IS NOT NULL
                DO NOTHING
@@ -568,6 +604,7 @@ pub async fn upsert_source_instrument<C: ConnectionTrait>(
                 source_system.into(),
                 source_key.into(),
                 metadata_val,
+                kind.as_str().into(),
             ],
         ))
         .await?;
@@ -607,6 +644,7 @@ pub async fn resolve_or_mint_stream_instrument<C: ConnectionTrait>(
     db: &C,
     stream: &data_streams::Model,
     name_hint: Option<&str>,
+    kind: InstrumentKind,
 ) -> AppResult<Uuid> {
     if let Some(sensor_id) = stream.sensor_id {
         return Ok(sensor_id);
@@ -633,7 +671,7 @@ pub async fn resolve_or_mint_stream_instrument<C: ConnectionTrait>(
         &stream.source_system,
         &source_key,
         &name,
-        true,
+        kind,
         // A bookkeeping instrument carries no evidence about cadence, and `data_frequency` is
         // read as one by `resolve_measurement_type`. 'high' leaves that rung silent, so only a
         // declaration or a real device moves a stream to spot.
@@ -660,7 +698,9 @@ pub async fn create_sensor_for_stream<C: ConnectionTrait>(
     site_id: Uuid,
 ) -> AppResult<SensorContext> {
     let name = slot_instrument_name(db, site_id, parameter_id).await?;
-    let sensor_id = resolve_or_mint_stream_instrument(db, stream, name.as_deref()).await?;
+    let sensor_id =
+        resolve_or_mint_stream_instrument(db, stream, name.as_deref(), InstrumentKind::SourceParameter)
+            .await?;
     let is_lab = sensors::Entity::find_by_id(sensor_id)
         .one(db)
         .await?
@@ -669,7 +709,14 @@ pub async fn create_sensor_for_stream<C: ConnectionTrait>(
     let deployment_id = if is_lab {
         None
     } else {
-        find_or_create_deployment(db, sensor_id, site_id, parameter_id).await?
+        find_or_create_deployment(
+            db,
+            sensor_id,
+            site_id,
+            parameter_id,
+            stream_history_start(db, stream.id).await?,
+        )
+        .await?
     };
     Ok(SensorContext {
         sensor_id,
@@ -693,7 +740,7 @@ pub async fn ensure_channel_instrument<C: ConnectionTrait>(
     let name = slot_instrument_name(db, site_id, parameter_id)
         .await?
         .map(|slot| format!("{slot} ({kind})"));
-    resolve_or_mint_stream_instrument(db, stream, name.as_deref()).await
+    resolve_or_mint_stream_instrument(db, stream, name.as_deref(), InstrumentKind::EntryChannel).await
 }
 
 /// A device feed is one whose stream metadata carries a `device` block. Broader than testing for a
@@ -759,7 +806,7 @@ pub async fn import_sensor_for_stream<C: ConnectionTrait>(
             &stream.source_system,
             &stream.source_key,
             &sensor_name,
-            false,
+            InstrumentKind::Device,
             "high",
             metadata,
         )
@@ -772,6 +819,27 @@ pub async fn import_sensor_for_stream<C: ConnectionTrait>(
         sensor_id,
         deployment_id: None,
     })
+}
+
+/// When a stream's history begins, which is when a deployment auto-created for it opens: a stream
+/// paired months after it started measuring has readings the site is entitled to, and a deployment
+/// opening at the pairing instant leaves every one of them without one. `NOW()` when the stream has
+/// no readings yet.
+pub async fn stream_history_start<C: ConnectionTrait>(
+    db: &C,
+    stream_id: Uuid,
+) -> AppResult<DateTime<Utc>> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT MIN(time) AS first_reading FROM readings WHERE stream_id = $1",
+            [stream_id.into()],
+        ))
+        .await?;
+    let first = row
+        .and_then(|r| r.try_get::<Option<DateTime<Utc>>>("", "first_reading").ok())
+        .flatten();
+    Ok(first.unwrap_or_else(Utc::now))
 }
 
 /// Find this sensor's open deployment at the site, or auto-create one, but only if the
@@ -789,6 +857,7 @@ pub async fn find_or_create_deployment<C: ConnectionTrait>(
     sensor_id: Uuid,
     site_id: Uuid,
     parameter_id: Uuid,
+    opens_at: DateTime<Utc>,
 ) -> AppResult<Option<Uuid>> {
     let existing = deployments::Entity::find()
         .filter(
@@ -805,22 +874,37 @@ pub async fn find_or_create_deployment<C: ConnectionTrait>(
         return Ok(Some(dep.id));
     }
 
-    // Insert an open deployment only when no other deployment occupies the (site, parameter) slot at
-    // now(). `parameter_id` is authored here (the derive-from-sensor trigger was dropped).
+    // Insert an open deployment only when nothing else holds the (site, parameter) slot open. It
+    // opens at `opens_at`, clamped forward to the end of the last deployment that covered the slot:
+    // that instrument owns the history it covered, and the clamp is what keeps the slot's exclusion
+    // constraint satisfied. `parameter_id` is authored here (the derive-from-sensor trigger was
+    // dropped).
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"INSERT INTO sensor_deployments
                   (id, sensor_id, site_id, parameter_id, deployed_from, deployment_type, notes)
-              SELECT gen_random_uuid(), $1, $2, $3, NOW(), 'permanent', 'Auto-created during stream pairing'
+              SELECT gen_random_uuid(), $1, $2, $3,
+                     GREATEST($4::timestamptz, COALESCE((
+                         SELECT MAX(d.deployed_until) FROM sensor_deployments d
+                         WHERE d.site_id = $2
+                           AND d.parameter_id = $3
+                           AND d.deployed_until IS NOT NULL
+                     ), $4::timestamptz)),
+                     'permanent', 'Auto-created during stream pairing'
               WHERE NOT EXISTS (
                   SELECT 1 FROM sensor_deployments d
                   WHERE d.site_id = $2
                     AND d.parameter_id = $3
-                    AND COALESCE(d.deployed_until, 'infinity'::timestamptz) > NOW()
+                    AND d.deployed_until IS NULL
               )
               RETURNING id",
-            [sensor_id.into(), site_id.into(), parameter_id.into()],
+            [
+                sensor_id.into(),
+                site_id.into(),
+                parameter_id.into(),
+                opens_at.into(),
+            ],
         ))
         .await?;
 

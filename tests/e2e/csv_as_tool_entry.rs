@@ -2,12 +2,11 @@
 //!
 //! Scenario: a member imports a result sheet. Already-processed values are stored as served: no
 //! calibration is stamped onto them and nothing recomputes them, because a stored calibration id
-//! claims the row's `raw_value` is uncorrected input (ADR 0003) — importing a computed value used
-//! to stamp the deployed sensor's calibration and recompute over it, and S4b pins that bug fixed.
-//! Declared-raw imports keep the old behaviour: the covering calibration is stamped and applied.
+//! claims the row's `raw_value` is uncorrected input (ADR 0003). A declared-raw import is the
+//! other arm: the covering calibration is stamped and applied.
 //!
-//! S4a (a CSV of raw tool inputs running the tool itself, with a tool_runs row and the same
-//! provenance blob a typed entry gets) lands with Phase 3 and is encoded ignored below.
+//! S4a is here too: a CSV of raw tool inputs runs the named tool once per row, with a `tool_runs`
+//! row and the same server-built provenance blob a typed entry gets.
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
@@ -97,7 +96,7 @@ async fn imported_row(
 }
 
 /// S4b. Expected behaviour: an import of processed values under a covering deployment stores them
-/// untouched — no calibration id, no recomputation — although the very same rows imported as
+/// untouched (no calibration id, no recomputation), although the very same rows imported as
 /// declared-raw get the calibration stamped and applied.
 #[tokio::test]
 #[serial]
@@ -154,7 +153,7 @@ async fn a_processed_import_is_not_recalibrated_and_a_raw_one_is() {
 }
 
 /// Expected behaviour: a request field the server does not know is refused by name, never
-/// silently dropped — the guard that keeps a version skew from eating a declaration.
+/// silently dropped: the guard that keeps a version skew from eating a declaration.
 #[tokio::test]
 #[serial]
 async fn an_unknown_import_field_is_refused_not_dropped() {
@@ -178,7 +177,7 @@ async fn an_unknown_import_field_is_refused_not_dropped() {
     assert!(resp.contains("value_state"), "{resp}");
 }
 
-/// S4a: importing raw tool inputs runs the tool over each row — same write path, same `tool_runs`
+/// S4a: importing raw tool inputs runs the tool over each row: same write path, same `tool_runs`
 /// row and server-built provenance blob as a typed entry, source recorded as the import.
 #[tokio::test]
 #[serial]

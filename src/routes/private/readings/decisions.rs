@@ -608,6 +608,26 @@ pub enum Keyed {
     Claim,
 }
 
+/// Every kind, in declaration order. The enumerations below filter this rather than repeat it.
+const ALL_KINDS: [Kind; 16] = [
+    Kind::Flag,
+    Kind::Unflag,
+    Kind::Withdraw,
+    Kind::Reassert,
+    Kind::Curve,
+    Kind::CalibrationPin,
+    Kind::InstrumentPin,
+    Kind::SlotMove,
+    Kind::ValueCorrection,
+    Kind::UnverifiedEntry,
+    Kind::Verify,
+    Kind::Reject,
+    Kind::Chain,
+    Kind::Detach,
+    Kind::Return,
+    Kind::Rollback,
+];
+
 fn family_kinds(kind: Kind) -> Vec<String> {
     [
         Kind::Flag,
@@ -989,6 +1009,114 @@ pub fn not_pinned_sql(alias: &str, kind: Kind) -> String {
                AND d.kind = '{}' AND d.rolled_back_by IS NULL)",
         kind.as_str()
     )
+}
+
+/// A judgement is a person's ruling on a reading: whether it counts, which curve made it, what
+/// instrument it belongs to, whether it has been reviewed. Sync owns the measurement, the value
+/// and whether the source still asserts the row, and never a judgement (M61), so a re-send may
+/// correct a judged row but never clears the ruling and never moves its servedness silently.
+#[must_use]
+pub fn is_judgement(kind: Kind) -> bool {
+    matches!(
+        kind,
+        Kind::Flag
+            | Kind::Curve
+            | Kind::CalibrationPin
+            | Kind::InstrumentPin
+            | Kind::UnverifiedEntry
+            | Kind::Verify
+            | Kind::Reject
+    )
+}
+
+/// The judgements standing on a row, from its live decision kinds, newest first as given. Empty
+/// means a re-send may correct and retract the row without anyone ruling again.
+#[must_use]
+pub fn judgements_on(live_kinds: &[Kind]) -> Vec<Kind> {
+    live_kinds
+        .iter()
+        .copied()
+        .filter(|k| is_judgement(*k))
+        .collect()
+}
+
+/// Every kind [`is_judgement`] holds, as SQL literals, so the statement and the function cannot
+/// disagree about what a judgement is.
+fn judgement_kinds_sql() -> String {
+    let kinds: Vec<String> = ALL_KINDS
+        .iter()
+        .copied()
+        .filter(|k| is_judgement(*k))
+        .map(|k| format!("'{}'", k.as_str()))
+        .collect();
+    kinds.join(", ")
+}
+
+/// SQL over `alias` (a `readings` row) that is true when no live judgement stands on it, so a
+/// writer that must not override a person's ruling can say so in one clause.
+#[must_use]
+pub fn unjudged_sql(alias: &str) -> String {
+    format!(
+        "NOT EXISTS (SELECT 1 FROM reading_decisions d \
+             WHERE d.stream_id = {alias}.stream_id AND d.time = {alias}.time \
+               AND (d.replicate_index IS NULL OR d.replicate_index = {alias}.replicate_index) \
+               AND d.rolled_back_by IS NULL AND d.kind IN ({kinds}))",
+        kinds = judgement_kinds_sql()
+    )
+}
+
+/// SQL over `alias` (a `readings` row) producing the live judgements standing on it as a jsonb
+/// array of `{id, kind}`, newest first, or `'[]'`. This is what a `source_modified` hold names,
+/// so an operator is told which of their rulings the re-send collided with.
+#[must_use]
+pub fn live_judgements_sql(alias: &str) -> String {
+    format!(
+        "COALESCE((SELECT jsonb_agg(jsonb_build_object('id', d.id, 'kind', d.kind) \
+                            ORDER BY d.at DESC, d.id DESC) \
+                     FROM reading_decisions d \
+                    WHERE d.stream_id = {alias}.stream_id AND d.time = {alias}.time \
+                      AND (d.replicate_index IS NULL \
+                           OR d.replicate_index = {alias}.replicate_index) \
+                      AND d.rolled_back_by IS NULL AND d.kind IN ({kinds})), '[]'::jsonb)",
+        kinds = judgement_kinds_sql()
+    )
+}
+
+/// The state a save lands in, by the caller's standing: an intern's entry is pending until a
+/// manager verifies or rejects it (Q21). Every other level, and every API token, enters verified.
+#[must_use]
+pub fn entry_state(highest_role: Option<&crate::common::authz::Role>) -> Option<Kind> {
+    match highest_role {
+        Some(crate::common::authz::Role::Intern) => Some(Kind::UnverifiedEntry),
+        _ => None,
+    }
+}
+
+/// After an entry lands: one `unverified_entry` per row it wrote, so the review queue and every
+/// exclusion read the same record the columns project from.
+pub async fn record_unverified_entries<C: ConnectionTrait>(
+    conn: &C,
+    models: &[Model],
+    actor: &str,
+    origin: Origin,
+) -> AppResult<Recorded> {
+    let mut all = Recorded::default();
+    for (stream, rows) in by_stream(models, |_| Some(serde_json::json!({ "unverified": true }))) {
+        let r = record_keyed(
+            conn,
+            Kind::UnverifiedEntry,
+            stream,
+            &rows,
+            actor,
+            Some("entered by an intern, pending review"),
+            origin,
+            Keyed::Changed,
+            None,
+        )
+        .await?;
+        all.rows += r.rows;
+    }
+    Ok(all)
 }
 
 /// The reading columns the record owns outright: nothing outside the projection trigger writes
@@ -2340,6 +2468,75 @@ mod tests {
                 "the sweep reports, it does not repair"
             );
         }
+    }
+
+    #[test]
+    fn only_an_intern_enters_a_pending_measurement() {
+        use super::entry_state;
+        use crate::common::authz::Role;
+        assert_eq!(entry_state(Some(&Role::Intern)), Some(Kind::UnverifiedEntry));
+        for role in [
+            Role::River,
+            Role::Manager,
+            Role::Administrator,
+            Role::Unknown("offline_access".to_string()),
+        ] {
+            assert_eq!(entry_state(Some(&role)), None, "{role:?}");
+        }
+        // An API token has bits, not a level: it enters verified, as it always did.
+        assert_eq!(entry_state(None), None);
+    }
+
+    #[test]
+    fn sync_owns_the_measurement_and_never_a_judgement() {
+        use super::{is_judgement, judgements_on};
+        for k in [
+            Kind::Flag,
+            Kind::Curve,
+            Kind::CalibrationPin,
+            Kind::InstrumentPin,
+            Kind::UnverifiedEntry,
+            Kind::Verify,
+            Kind::Reject,
+        ] {
+            assert!(is_judgement(k), "{k:?} is a person's ruling");
+        }
+        // The measurement, and the record's own bookkeeping, are not judgements: a re-send
+        // corrects a value and retracts a row it no longer asserts without anyone ruling again.
+        for k in [
+            Kind::Withdraw,
+            Kind::Reassert,
+            Kind::ValueCorrection,
+            Kind::Unflag,
+            Kind::SlotMove,
+            Kind::Chain,
+            Kind::Detach,
+            Kind::Return,
+            Kind::Rollback,
+        ] {
+            assert!(!is_judgement(k), "{k:?} is not a ruling sync must respect");
+        }
+        assert!(judgements_on(&[]).is_empty(), "an untouched row is free");
+        assert!(
+            judgements_on(&[Kind::Withdraw, Kind::ValueCorrection]).is_empty(),
+            "a row sync has only corrected is still free"
+        );
+        assert_eq!(
+            judgements_on(&[Kind::ValueCorrection, Kind::Flag, Kind::Curve]),
+            vec![Kind::Flag, Kind::Curve],
+            "the rulings are named in the order they stand"
+        );
+    }
+
+    #[test]
+    fn the_judgement_statement_names_every_judged_kind_and_no_other() {
+        let sql = super::live_judgements_sql("r");
+        for k in super::ALL_KINDS {
+            let named = sql.contains(&format!("'{}'", k.as_str()));
+            assert_eq!(named, super::is_judgement(k), "{k:?}");
+        }
+        assert!(sql.contains("d.rolled_back_by IS NULL"));
+        assert!(sql.contains("d.replicate_index IS NULL OR d.replicate_index = r.replicate_index"));
     }
 
     #[test]

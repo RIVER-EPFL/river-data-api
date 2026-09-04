@@ -13,6 +13,7 @@ mod credential_listing_gate;
 mod credentials;
 mod duplicate_slots;
 mod hold_kinds;
+mod notes_register;
 mod pagination;
 mod pagination_bounds;
 mod pairing_plan_apply;

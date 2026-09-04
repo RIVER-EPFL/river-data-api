@@ -4,8 +4,8 @@
 //! DB helpers; the operations under test (move = new deployment, recall = PUT deployed_until,
 //! manual reprocess) go through the real endpoints so the CrudCrate hooks + tracked jobs fire.
 //!
-//! Complements `reprocessing_test.rs` (which drives the same engine purely via SQL) by exercising
-//! the HTTP surface WS2 wired up.
+//! Complements `../reprocessing_jobs/reprocessing.rs` (which drives the same engine purely via
+//! SQL) by exercising the HTTP surface.
 //!
 //! Run: cargo test --test e2e -- --test-threads=1
 

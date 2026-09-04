@@ -818,8 +818,8 @@ pub async fn reprocess_sensor_readings(
         // was pulled out, e.g. sitting in the lab) belongs to no site. Clear its site/deployment so
         // it drops out of the continuous aggregates. Guarded to `time >= the sensor's first
         // deployment` so readings that predate any deployment keep the site_id the stream pairing
-        // gave them (auto-created deployments start at pairing time, not data start; without this
-        // guard a reprocess would un-attribute all historical data).
+        // gave them. An auto-created deployment opens at its stream's first reading, so the floor
+        // now protects hand-dated deployments only.
         txn.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
@@ -1007,7 +1007,8 @@ pub async fn reprocess_site_parameter_readings(
         .await?;
 
         // 4. Recall NULL-clear: a reading in a deployment gap drops out of the site (guarded to
-        //    time >= the slot's first deployment so pre-deployment history is kept).
+        //    time >= the slot's first deployment, which protects history under a hand-dated
+        //    deployment; an auto-created one opens at its stream's first reading).
         txn.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(

@@ -146,3 +146,45 @@ pub async fn get_or_create_api_stream(
 
     Ok(stream.id)
 }
+
+/// Why this source's streams may not be paired yet, or `None` when they may.
+///
+/// NOMIS reports a plain date and a plain time with no zone column, unlike CNET and METALP, and
+/// the connector reads them as UTC (`nomis/mod.rs`, `parse_nomis_datetime`). ADR 0004 records that
+/// as an assumption to be confirmed before any NOMIS data is paired: if the columns are Valais
+/// wall clock, every NOMIS grab lands one or two hours off, attaches to the wrong collection event
+/// and is compared against a sensor window shifted by the same amount, with nothing on the reading
+/// saying so. Pairing is where that becomes visible data, so it is refused until the question is
+/// answered rather than guarded further downstream.
+#[must_use]
+pub fn pairing_refusal(source_system: &str) -> Option<String> {
+    (source_system.eq_ignore_ascii_case("nomis")).then(|| {
+        "NOMIS streams cannot be paired yet: the portal reports a date and a time with no zone, \
+         and whether they are UTC or Valais wall clock is unconfirmed (ADR 0004). Pairing one \
+         would attribute every grab to a timestamp that may be one or two hours off."
+            .to_string()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pairing_refusal;
+
+    #[test]
+    fn nomis_is_refused_and_says_why() {
+        let reason = pairing_refusal("nomis").expect("NOMIS is refused");
+        assert!(reason.contains("no zone"), "{reason}");
+        assert!(reason.contains("ADR 0004"), "{reason}");
+        assert!(
+            pairing_refusal("NOMIS").is_some(),
+            "the source system is compared without regard to case"
+        );
+    }
+
+    #[test]
+    fn every_other_source_pairs() {
+        for source in ["cnet", "metalp", "vaisala", "api", "grab_sample"] {
+            assert!(pairing_refusal(source).is_none(), "{source} pairs");
+        }
+    }
+}

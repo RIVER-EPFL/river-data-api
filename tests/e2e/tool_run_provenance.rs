@@ -1,14 +1,15 @@
 //! S1, tool lifecycle with server-side provenance (story catalog: ../archived-documentation/PLAN.md).
 //!
-//! Scenario: a member runs an analytical tool and saves its outputs at a station. The calculation
+//! Scenario: a member runs an analytical tool and saves its outputs at a site. The calculation
 //! itself is the stored record (`tool_runs`), the save names that run, and the provenance blob on
 //! the samples rows is built by the server from the stored run: actor from the authenticated
 //! caller, inputs, constants and curves as the engine resolved them, and the saved mapping from
 //! run outputs to catalog parameters. Nothing in the blob is client-authored.
 //!
-//! The Phase 3 halves of S1 (manifest `station_inputs` resolved from site properties,
-//! `event_inputs` from the shared collection event, site_parameter auto-provisioning on first
-//! save) are encoded below as ignored tests gating that phase.
+//! `site_inputs` resolved from the site's own properties and site_parameter provisioning on a
+//! first save are covered here too, along with the refusals: a value the run did not produce, a
+//! client-authored blob, a run saved onto another visit, and an aggregate output saved as a
+//! measurement while its replicates still save.
 
 use serde_json::json;
 use serial_test::serial;
@@ -237,21 +238,21 @@ async fn a_forged_or_edited_tool_link_is_refused_at_the_gate() {
     assert_eq!(status, 422, "a client-authored blob is refused: {resp}");
 }
 
-/// S1's Phase 3 half: a manifest declares `station_inputs` that the engine resolves from the site
+/// S1's Phase 3 half: a manifest declares `site_inputs` that the engine resolves from the site
 /// at calculate time; a site missing a declared property is refused naming it, and the resolved
 /// value lands in the run and its blob.
 #[tokio::test]
 #[serial]
-async fn a_station_input_resolves_from_the_site_and_a_missing_property_is_refused() {
+async fn a_site_input_resolves_from_the_site_and_a_missing_property_is_refused() {
     if !kc::require_keycloak_or_skip(
-        "a_station_input_resolves_from_the_site_and_a_missing_property_is_refused",
+        "a_site_input_resolves_from_the_site_and_a_missing_property_is_refused",
     )
     .await
     {
         return;
     }
     if !crate::common::tools_runner::require_runner_or_skip(
-        "a_station_input_resolves_from_the_site_and_a_missing_property_is_refused",
+        "a_site_input_resolves_from_the_site_and_a_missing_property_is_refused",
     )
     .await
     {
@@ -342,8 +343,8 @@ async fn a_station_input_resolves_from_the_site_and_a_missing_property_is_refuse
     .await;
     assert_eq!(status, 200, "{tool}");
     assert_eq!(tool["results"]["alt_echo"], 512.0);
-    assert_eq!(tool["station_inputs"][0]["property"], "altitude_m");
-    assert_eq!(tool["station_inputs"][0]["value"], 512.0);
+    assert_eq!(tool["site_inputs"][0]["property"], "altitude_m");
+    assert_eq!(tool["site_inputs"][0]["value"], 512.0);
 
     // The save carries the resolution into the blob's context.
     let (status, saved) = crate::common::post_json_with_token(
@@ -376,10 +377,10 @@ async fn a_station_input_resolves_from_the_site_and_a_missing_property_is_refuse
         .unwrap()
     };
     assert_eq!(
-        blob["context"]["station_inputs"][0]["property"],
+        blob["context"]["site_inputs"][0]["property"],
         "altitude_m"
     );
-    assert_eq!(blob["context"]["station_inputs"][0]["value"], 512.0);
+    assert_eq!(blob["context"]["site_inputs"][0]["value"], 512.0);
     assert_eq!(
         blob["inputs"]["altitude_m"], 512.0,
         "the resolved value is a recorded input"
@@ -396,7 +397,7 @@ async fn a_station_input_resolves_from_the_site_and_a_missing_property_is_refuse
     assert_eq!(status, 200, "{tool}");
     assert_eq!(tool["results"]["alt_echo"], 300.0);
     assert!(
-        tool["station_inputs"].as_array().is_none_or(Vec::is_empty),
+        tool["site_inputs"].as_array().is_none_or(Vec::is_empty),
         "{tool}"
     );
 
@@ -411,7 +412,7 @@ async fn a_station_input_resolves_from_the_site_and_a_missing_property_is_refuse
         json!({
             "label": "Station name echo",
             "params": [{ "name": "alt", "label": "Alt", "kind": "number", "required": true }],
-            "station_inputs": [{ "property": "name", "param": "alt" }],
+            "site_inputs": [{ "property": "name", "param": "alt" }],
             "outputs": [],
         }),
         json!({ "name": "echoes", "inputs": { "alt": 1.0 }, "expected": { "out": 1.0 } }),
@@ -578,7 +579,7 @@ async fn a_run_cannot_be_saved_onto_another_visit() {
         json!({
             "label": "Context echo",
             "params": [{ "name": "altitude_m", "label": "Altitude", "kind": "number", "required": true }],
-            "station_inputs": [{ "property": "altitude_m" }],
+            "site_inputs": [{ "property": "altitude_m" }],
             "outputs": [{ "key": "ctx_echo", "label": "Echo", "suggested_parameter_code": "CtxEcho" }],
         }),
         json!({ "name": "echoes", "inputs": { "altitude_m": 100.0 }, "expected": { "ctx_echo": 100.0 } }),

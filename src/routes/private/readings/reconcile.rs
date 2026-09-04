@@ -59,7 +59,12 @@ struct StoredRow {
     raw_value: f64,
     standard_curve_id: Option<Uuid>,
     withdrawn: bool,
-    /// The operator-touched predicate: flagged, hand-curved, or in a labelled/annotated sample.
+    /// The judgements standing on the row, as `{id, kind}`. Non-empty means a person has ruled
+    /// on it, and the hold a collision raises names exactly these.
+    judgements: serde_json::Value,
+    /// Whether a person has ruled on the row at all: a live judgement decision, or the curation
+    /// columns of a row that predates the record (T20 gives those their decisions), or a sample
+    /// an operator labelled or annotated.
     touched: bool,
 }
 
@@ -98,12 +103,17 @@ async fn stored_window<C: ConnectionTrait>(
     let rows = conn
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT r.time, r.replicate_index, r.raw_value, r.standard_curve_id,
-                    r.withdrawn_at IS NOT NULL AS withdrawn,
-                    (r.is_flagged IS TRUE OR r.flag_reason IS NOT NULL
-                     OR r.label IS NOT NULL OR r.notes IS NOT NULL) AS touched
-             FROM readings r
-             WHERE r.stream_id = $1 AND r.time >= $2 AND r.time < $3",
+            format!(
+                "SELECT r.time, r.replicate_index, r.raw_value, r.standard_curve_id,
+                        r.withdrawn_at IS NOT NULL AS withdrawn,
+                        {judgements} AS judgements,
+                        ({judgements} <> '[]'::jsonb
+                         OR r.is_flagged IS TRUE OR r.flag_reason IS NOT NULL
+                         OR r.label IS NOT NULL OR r.notes IS NOT NULL) AS touched
+                 FROM readings r
+                 WHERE r.stream_id = $1 AND r.time >= $2 AND r.time < $3",
+                judgements = super::decisions::live_judgements_sql("r")
+            ),
             [
                 stream_id.into(),
                 sea_orm::prelude::DateTimeWithTimeZone::from(window.from).into(),
@@ -123,6 +133,7 @@ async fn stored_window<C: ConnectionTrait>(
                 raw_value: row.try_get("", "raw_value")?,
                 standard_curve_id: row.try_get("", "standard_curve_id")?,
                 withdrawn: row.try_get("", "withdrawn")?,
+                judgements: row.try_get("", "judgements")?,
                 touched: row.try_get("", "touched")?,
             },
         );
@@ -263,7 +274,7 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
     };
 
     let mut admitted_keys: HashSet<Key> = HashSet::with_capacity(admitted.len());
-    let mut changed_touched: Vec<Key> = Vec::new();
+    let mut changed_touched: Vec<(Key, serde_json::Value)> = Vec::new();
     let mut reinstate: Vec<Key> = Vec::new();
     let mut changed_all: Vec<Key> = Vec::new();
     for (key, raw_value, standard_curve_id) in admitted {
@@ -286,7 +297,7 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
                         outcome.changed_keys.push(*key);
                     }
                     if row.touched {
-                        changed_touched.push(*key);
+                        changed_touched.push((*key, row.judgements.clone()));
                     }
                 }
                 // An honest window re-asserting a row clears its retraction, equal or corrected.
@@ -300,7 +311,7 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
     // Withdrawal, computed defensively: absent from the payload, not refused by the funnel, not
     // dropped by the backend, not already withdrawn.
     let mut to_withdraw: Vec<Key> = Vec::new();
-    let mut withdraw_touched: Vec<Key> = Vec::new();
+    let mut withdraw_touched: Vec<(Key, serde_json::Value)> = Vec::new();
     for (key, row) in &stored {
         if admitted_keys.contains(key) || rejected_keys.contains(key) {
             continue;
@@ -313,7 +324,7 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
             continue;
         }
         if row.touched {
-            withdraw_touched.push(*key);
+            withdraw_touched.push((*key, row.judgements.clone()));
         } else {
             to_withdraw.push(*key);
         }
@@ -337,7 +348,10 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
             let _ = t;
             *groups_with_index.entry(*i).or_default() += 1;
         }
-        for (_, i) in to_withdraw.iter().chain(withdraw_touched.iter()) {
+        for (_, i) in to_withdraw
+            .iter()
+            .chain(withdraw_touched.iter().map(|(key, _)| key))
+        {
             *withdrawn_with_index.entry(*i).or_default() += 1;
         }
         over_floor
@@ -400,24 +414,26 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
     // the disagreement lands in the review queue. A corrected value on a curated row IS applied
     // (upstream owns the value; the flag still excludes it from serving), with the same hold so
     // the operator re-rules on the new number.
-    for key in &withdraw_touched {
+    for (key, judgements) in &withdraw_touched {
         upsert_source_modified_hold(
             conn,
             stream_id,
             key.0,
             serde_json::json!({ "claim": "withdrawn", "replicate_index": key.1,
+                                "judgements": judgements,
                                 "window": { "from": window.from, "to": window.to } }),
             serde_json::json!({ "kept_served": true }),
         )
         .await?;
         outcome.holds_raised += 1;
     }
-    for key in &changed_touched {
+    for (key, judgements) in &changed_touched {
         upsert_source_modified_hold(
             conn,
             stream_id,
             key.0,
-            serde_json::json!({ "claim": "value_changed", "replicate_index": key.1 }),
+            serde_json::json!({ "claim": "value_changed", "replicate_index": key.1,
+                                "judgements": judgements }),
             serde_json::json!({ "applied": true, "still_excluded_if_flagged": true }),
         )
         .await?;

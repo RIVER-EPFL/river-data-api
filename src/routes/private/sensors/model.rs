@@ -28,6 +28,12 @@ pub struct Model {
     pub is_active: Option<bool>,
     #[crudcrate(filterable)]
     pub is_lab_instrument: Option<bool>,
+    /// What this row is: `device` (a physical instrument), `lab` (a portal curve label),
+    /// `source_parameter` (a source's instrument for one parameter across every station) or
+    /// `entry_channel` (a slot's hand-entry channel). Written by whichever path minted it;
+    /// `(source_system, source_key)` stays the identity.
+    #[crudcrate(filterable, sortable, on_create = "device".to_string())]
+    pub kind: String,
     /// Sync provenance: the source a replicated lab instrument came from (e.g. "cnet"). NULL on
     /// devices registered by serial. Written only by the sync paths, never through CRUD.
     #[crudcrate(exclude(create, update), filterable)]

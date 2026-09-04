@@ -58,6 +58,17 @@ impl AuthContext {
         }
     }
 
+    /// The caller's highest realm role, or `None` for an API token (which has bits, not a level).
+    #[must_use]
+    pub fn highest_role(&self) -> Option<Role> {
+        match self {
+            AuthContext::Keycloak { roles, .. } => {
+                roles.iter().max_by_key(|r| r.level()).cloned()
+            }
+            AuthContext::ApiToken { .. } => None,
+        }
+    }
+
     pub fn is_admin(&self) -> bool {
         self.has_role(&Role::Administrator)
     }
@@ -284,6 +295,19 @@ pub async fn require_read_data(request: Request, next: Next) -> Response {
 /// Requires the `write_data` capability (RIVER member; token with write_data).
 pub async fn require_write_data(request: Request, next: Next) -> Response {
     authz::check(Capability::WriteData, TokenAccess::Same, request, next).await
+}
+
+/// Requires the `enter_field_data` capability: any member down to intern, or a token with
+/// `write_data`. An intern's entry lands unverified and cannot displace a stored value; the
+/// handler enforces both.
+pub async fn require_enter_field_data(request: Request, next: Next) -> Response {
+    authz::check(
+        Capability::EnterFieldData,
+        TokenAccess::Same,
+        request,
+        next,
+    )
+    .await
 }
 
 /// Requires the `manage_sensors` capability (MANAGER member; token with write_metadata).

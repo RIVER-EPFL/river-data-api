@@ -31,7 +31,9 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 # Serialization
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# `float_roundtrip`: without it the JSON parser can land a value one ULP from the literal it read,
+# so a posted measurement is not the number that was entered.
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 serde_path_to_error = "0.1"
 csv = "1.3"
 
@@ -41,7 +43,7 @@ utoipa-axum = "0.2"
 utoipa-scalar = { version = "0.3", features = ["axum"] }
 
 # Utilities
-uuid = { version = "1.11", features = ["v4", "serde"] }
+uuid = { version = "1.11", features = ["v4", "v5", "serde"] }
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -60,22 +62,6 @@ crudcrate = { version = "0.11.0", features = ["postgresql", "derive"] }
 
 # HTTP client (Keycloak admin proxy, Web Push)
 reqwest = { version = "0.12", features = ["json"] }
-
-# Chart rendering. `default-features = false` is load-bearing: the default
-# `ttf` feature pulls font-kit -> fontconfig/freetype, which exist in neither the builder nor the
-# debian-slim runtime image. `ab_glyph` keeps the text path pure Rust against an embedded font.
-# PNG encoding of the rendered buffer. Pinned to the same 0.24 line plotters-bitmap already
-# depends on, so this shares one compiled copy rather than adding a second.
-image = { version = "0.24", default-features = false, features = ["png"] }
-plotters = { version = "0.3.7", default-features = false, features = [
-    "bitmap_backend",
-    "bitmap_encoder",
-    "ab_glyph",
-    "line_series",
-    "area_series",
-    "chrono",
-] }
-
 
 # Crypto / token generation
 sha2 = "0.10"
@@ -105,7 +91,7 @@ river-data-core = { version = "0.9.0", features = ["openapi"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 serial_test = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

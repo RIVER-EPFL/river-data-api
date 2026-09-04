@@ -39,6 +39,15 @@ pub struct Model {
     pub stdev: Option<f64>,
     #[crudcrate(exclude(create, update), sortable)]
     pub n: i32,
+    // Both divisors, always. `stdev` is whichever the slot declares; these two make the other
+    // readable without declaring anything, which is what a reviewer working an estimator hold
+    // needs before deciding.
+    #[crudcrate(exclude(create, update))]
+    pub stdev_sample: Option<f64>,
+    #[crudcrate(exclude(create, update))]
+    pub stdev_population: Option<f64>,
+    #[crudcrate(exclude(create, update))]
+    pub median: Option<f64>,
     #[crudcrate(exclude(create, update))]
     pub min_value: Option<f64>,
     #[crudcrate(exclude(create, update))]

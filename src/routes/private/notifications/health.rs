@@ -1,6 +1,6 @@
-//! Channel health heartbeat. A background probe checks each configured channel (Telegram `getMe`,
-//! SMTP connection test, or Graph token fetch) and upserts `notification_channel_health`; the admin
-//! endpoint reads the latest persisted state so the dashboard shows reachability + a last-checked time.
+//! Channel health heartbeat. A background probe checks each configured channel and upserts
+//! `notification_channel_health`; the admin endpoint reads the latest persisted state so the
+//! dashboard shows reachability and a last-checked time. Web Push is the one channel today.
 
 use axum::{Json, extract::State};
 use chrono::{DateTime, Utc};

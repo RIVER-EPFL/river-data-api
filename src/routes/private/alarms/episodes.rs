@@ -154,6 +154,7 @@ async fn fetch_episodes(
                 AND r.measurement_type = 'spot'
                 AND r.withdrawn_at IS NULL
                 AND r.is_flagged IS NOT TRUE
+                AND r.unverified IS NOT TRUE
               ORDER BY r.stream_id, r.time, r.replicate_index
           ) sp"
     } else {

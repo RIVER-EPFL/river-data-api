@@ -22,6 +22,12 @@ pub struct Model {
     #[crudcrate(on_create = false)]
     pub verified: bool,
     pub created_by: Option<String>,
+    /// Where a source-authored note came from, written only by `/notes/register` so a CRUD caller
+    /// cannot claim sync provenance. NULL on hand-entered notes.
+    #[crudcrate(exclude(create, update), filterable)]
+    pub source_system: Option<String>,
+    #[crudcrate(exclude(create, update), filterable)]
+    pub source_key: Option<String>,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: chrono::DateTime<chrono::Utc>,
     #[crudcrate(exclude(create, update))]

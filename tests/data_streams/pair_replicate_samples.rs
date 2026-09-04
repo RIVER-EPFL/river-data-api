@@ -1,5 +1,5 @@
-//! Pairing a stream that carries replicate-indexed readings (e.g. migrated NOMIS A/B/C rows)
-//! groups them into samples: pair backfills site/parameter, find-or-creates one samples row per
+//! Pairing a stream that carries replicate-indexed readings (portal A/B/C columns) groups them
+//! into samples: pair backfills site/parameter, find-or-creates one samples row per
 //! replicate group (a sync-origin stream's groups form at any size, since its writer declares
 //! collections at ingest), and stamps sample_id; unpair clears sample_id and removes the now
 //! unreferenced samples.
@@ -30,7 +30,7 @@ async fn seed_stream_with_replicates(db: &DatabaseConnection) -> Uuid {
         db,
         &format!(
             "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active) \
-             VALUES ('{stream_id}', 'nomis', '{}', 'NOMIS lab column', true)",
+             VALUES ('{stream_id}', 'metalp', '{}', 'Portal lab column', true)",
             Uuid::new_v4()
         ),
     )
@@ -70,7 +70,7 @@ async fn pairing_preserves_source_replicate_indexes() {
         &db,
         &format!(
             "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active) \
-             VALUES ('{stream_id}', 'nomis', '{}', 'NOMIS B/C/D only', true)",
+             VALUES ('{stream_id}', 'metalp', '{}', 'Portal B/C/D only', true)",
             Uuid::new_v4()
         ),
     )

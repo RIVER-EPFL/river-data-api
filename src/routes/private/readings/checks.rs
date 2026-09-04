@@ -40,6 +40,7 @@ const POOLED_ROWS_SQL: &str = "SELECT raw_value AS v
       AND measurement_type = 'spot'
       AND is_flagged IS NOT TRUE
       AND withdrawn_at IS NULL
+      AND unverified IS NOT TRUE
       AND LEAST(
             (EXTRACT(MONTH FROM time)::int - EXTRACT(MONTH FROM $3::timestamptz)::int + 12) % 12,
             (EXTRACT(MONTH FROM $3::timestamptz)::int - EXTRACT(MONTH FROM time)::int + 12) % 12

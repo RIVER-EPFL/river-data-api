@@ -269,6 +269,102 @@ async fn a_flagged_reading_is_held_not_withdrawn() {
     assert_eq!(hold.try_get::<String>("", "status").unwrap(), "pending");
 }
 
+/// The boundary, end to end: sync corrects the measurement, the operator's ruling stands
+/// untouched beside it, and the hold names the ruling the re-send collided with.
+#[tokio::test]
+#[serial]
+async fn a_correction_on_a_judged_reading_names_the_judgement_it_collided_with() {
+    let fx = setup().await;
+    let (status, resp) =
+        windowed_ingest(&fx, replicates(T1, &[(0, 10.0), (1, 20.0), (2, 36.0)]), 1).await;
+    assert_eq!(status, 200, "{resp}");
+
+    let (status, resp) = crate::common::patch_json_with_token(
+        &fx.app,
+        "/api/readings/flag",
+        &serde_json::json!({
+            "readings": [{
+                "site_id": crate::common::SITE1_ID,
+                "parameter_id": crate::common::GLOBAL_PARAM_DO_ID,
+                "time": T1,
+                "replicate_index": 0
+            }],
+            "reason": "outlier under review"
+        }),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "{resp}");
+
+    let flag_id = fx
+        .db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT id FROM reading_decisions WHERE stream_id = '{}' AND time = '{T1}' \
+                   AND kind = 'flag' AND rolled_back_by IS NULL",
+                fx.stream_id
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the flag is on the record")
+        .try_get::<uuid::Uuid>("", "id")
+        .unwrap();
+
+    // The source corrects the value the operator flagged. Upstream owns the measurement, so the
+    // correction applies; the flag is not touched, and the hold says which ruling it met.
+    let (status, resp) =
+        windowed_ingest(&fx, replicates(T1, &[(0, 11.5), (1, 20.0), (2, 36.0)]), 1).await;
+    assert_eq!(status, 200, "{resp}");
+
+    let row = fx
+        .db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT r.raw_value, r.is_flagged, \
+                        (SELECT count(*) FROM reading_decisions d \
+                          WHERE d.stream_id = r.stream_id AND d.time = r.time \
+                            AND d.replicate_index = r.replicate_index \
+                            AND d.kind = 'value_correction' AND d.origin = 'sync') AS corrections, \
+                        (SELECT h.expected -> 'judgements' FROM replicate_audit_holds h \
+                          WHERE h.stream_id = r.stream_id AND h.group_time = r.time \
+                            AND h.kind = 'source_modified') AS judgements \
+                 FROM readings r \
+                 WHERE r.stream_id = '{}' AND r.time = '{T1}' AND r.replicate_index = 0",
+                fx.stream_id
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the corrected reading");
+    assert!(
+        (row.try_get::<f64>("", "raw_value").unwrap() - 11.5).abs() < 1e-9,
+        "the source owns the value"
+    );
+    assert!(
+        row.try_get::<Option<bool>>("", "is_flagged").unwrap() == Some(true),
+        "the operator's ruling stands"
+    );
+    assert_eq!(
+        row.try_get::<i64>("", "corrections").unwrap(),
+        1,
+        "the correction is a sync decision beside the flag"
+    );
+    let judgements: serde_json::Value = row.try_get("", "judgements").unwrap();
+    assert_eq!(
+        judgements
+            .as_array()
+            .expect("the hold names the rulings")
+            .iter()
+            .filter_map(|j| Some((j["id"].as_str()?.to_string(), j["kind"].as_str()?.to_string())))
+            .collect::<Vec<_>>(),
+        vec![(flag_id.to_string(), "flag".to_string())],
+        "the hold names the flag the re-send collided with"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn dishonest_windows_are_refused_and_windows_are_sync_only() {

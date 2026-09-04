@@ -1,11 +1,11 @@
 //! End-to-end observability surfaces: ingest device-health status events and read them back
-//! (US-2.1/2.3), cross-entity search (US-9.2), CSV/NDJSON export of readings (US-8.1), and the
-//! sensor-vs-grab comparison export (US-8.2, ported from CNET/METALP).
+//! (US-2.1/2.3), cross-entity search (US-9.2), CSV/NDJSON export of readings (US-8.1), and grabs
+//! tagged alongside continuous readings (US-8.2). The comparison export the same story used to
+//! drive is covered, with its edges, by `tools_grab_export.rs`.
 //!
 //! Run: cargo test --test e2e -- --test-threads=1
 
 use crate::common::e2e;
-use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
 
 #[tokio::test]
@@ -87,11 +87,11 @@ async fn status_events_search_and_export() {
 }
 
 /// US-8.2 (CNET/METALP port): grab samples coexist with continuous readings, tagged by
-/// `measurement_type` so they render/filter distinctly, and the comparison export pairs each grab
-/// with the continuous sensor average over the post-grab window [T+2h, T+6h].
+/// `measurement_type` so they render and filter distinctly, on the private readings arm in JSON
+/// and CSV. The comparison export itself is `tools_grab_export.rs`.
 #[tokio::test]
 #[serial]
-async fn sensor_vs_grab_comparison_export() {
+async fn grabs_are_tagged_alongside_continuous_readings() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await; // continuous readings at SITE1 for DO, 10-min cadence from 2025-01-15
@@ -169,64 +169,5 @@ async fn sensor_vs_grab_comparison_export() {
     assert!(
         csv.contains("spot"),
         "CSV should tag the grab row 'spot':\n{csv}"
-    );
-
-    // The comparison export pairs the grab with the continuous average over [T+2h, T+6h].
-    let exp = format!(
-        "/api/sites/{site1}/export/sensor-vs-grab?parameter_id={dop}&start=2025-01-15T00:00:00Z&end=2025-01-15T23:59:59Z"
-    );
-    let (status, cmp) = crate::common::get_json_with_token(&app, &exp, &token).await;
-    assert_eq!(status, 200, "sensor-vs-grab ({status}): {cmp}");
-    let rows = cmp["rows"].as_array().expect("rows");
-    assert_eq!(rows.len(), 1, "exactly one grab in range: {cmp}");
-    let row = &rows[0];
-    assert!(
-        (row["grab_value"].as_f64().unwrap() - 9.2).abs() < 1e-9,
-        "grab_value is the replicate mean: {row}"
-    );
-    let sensor_n = row["sensor_n"].as_i64().unwrap();
-    assert!(
-        sensor_n > 0,
-        "continuous readings should fall in the +2-6h window: {row}"
-    );
-    let sensor_avg = row["sensor_avg"].as_f64().expect("sensor_avg present");
-
-    // Cross-check sensor_avg against a direct query over the same window + continuous filter.
-    let expected_avg: f64 = db
-        .query_one_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT avg(COALESCE(calibrated_value, raw_value)) AS a FROM readings \
-                 WHERE site_id='{site1}' AND parameter_id='{dop}' \
-                   AND measurement_type IS DISTINCT FROM 'spot' AND measurement_type IS DISTINCT FROM 'derived' \
-                   AND time >= '2025-01-15T08:05:00Z' AND time <= '2025-01-15T12:05:00Z'"
-            ),
-        ))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get("", "a")
-        .unwrap();
-    assert!(
-        (sensor_avg - expected_avg).abs() < 1e-6,
-        "sensor_avg {sensor_avg} should match window average {expected_avg}"
-    );
-    assert!(
-        (row["difference"].as_f64().unwrap() - (9.2 - sensor_avg)).abs() < 1e-6,
-        "difference should be grab − sensor_avg: {row}"
-    );
-
-    // CSV form of the comparison: header + one row.
-    let (status, ccsv) =
-        crate::common::get_csv_with_token(&app, &format!("{exp}&format=csv"), &token).await;
-    assert_eq!(status, 200, "comparison csv ({status})");
-    let clines: Vec<&str> = ccsv.lines().filter(|l| !l.is_empty()).collect();
-    assert_eq!(clines.len(), 2, "comparison CSV: header + one row:\n{ccsv}");
-    assert!(
-        clines[0].contains("grab_value")
-            && clines[0].contains("sensor_avg")
-            && clines[0].contains("difference"),
-        "comparison CSV header columns: {}",
-        clines[0]
     );
 }

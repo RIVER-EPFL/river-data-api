@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::operations::{
-    create_sensor_for_stream, upsert_source_instrument,
+    InstrumentKind, create_sensor_for_stream, upsert_source_instrument,
 };
 use crate::routes::private::{
     data_streams, data_streams::pairing_plans, parameters, projects, sensors,
@@ -1089,6 +1089,11 @@ pub async fn apply_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> AppR
     let curve_intents = plan_curve_intents(&plan)?;
 
     refuse_unconfirmed_instruments(&entries)?;
+    if let Some(reason) =
+        crate::routes::private::data_streams::service::pairing_refusal(&plan.source_system)
+    {
+        return Err(AppError::BadRequest(reason));
+    }
 
     let txn = db.begin().await?;
 
@@ -1468,8 +1473,10 @@ async fn mint_plan_instruments<C: ConnectionTrait>(
             source_system,
             source_key,
             &want.name,
-            true,
-            "low",
+            // The same identity `resolve_or_mint_stream_instrument` mints under, so a hand pairing
+            // and a plan converge on one row rather than on two that disagree about what it is.
+            InstrumentKind::SourceParameter,
+            "high",
             None,
         )
         .await?;
@@ -1519,11 +1526,15 @@ async fn pair_entry_stream<C: ConnectionTrait>(
         // A device is stationed at the site whichever route named it, so the slot's deployment is
         // opened here too. Without this the plan's own instrument choice silently costs the
         // deployment that pairing the same stream by hand would have opened.
+        let opens_at =
+            crate::routes::private::sensors::operations::stream_history_start(txn, stream.id)
+                .await?;
         if let Err(e) = crate::routes::private::sensors::operations::find_or_create_deployment(
             txn,
             sensor_id,
             site_id,
             parameter_id,
+            opens_at,
         )
         .await
         {

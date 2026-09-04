@@ -43,6 +43,10 @@ fn probe_manifest() -> serde_json::Value {
 }
 
 async fn install_probe_tool(db: &DatabaseConnection, manifest: &serde_json::Value) {
+    install_probe_script(db, manifest, PROBE_SCRIPT).await;
+}
+
+async fn install_probe_script(db: &DatabaseConnection, manifest: &serde_json::Value, script: &str) {
     remove_probe_tool(db).await;
     for statement in [
         Statement::from_sql_and_values(
@@ -59,7 +63,7 @@ async fn install_probe_tool(db: &DatabaseConnection, manifest: &serde_json::Valu
               FROM tool_scripts s WHERE s.name = $1",
             [
                 PROBE.into(),
-                PROBE_SCRIPT.into(),
+                script.into(),
                 manifest.to_string().into(),
             ],
         ),
@@ -515,4 +519,74 @@ async fn an_unknown_kind_is_refused_at_authoring() {
         "computed field names no field: {}",
         bad_structure.1
     );
+}
+
+/// Expected behaviour: an output the script computes as NA is reported as cleared, not silently
+/// dropped, so a save can blank the stored column the way the portal did. An output the script
+/// never names is a different thing and says nothing about the stored value.
+#[tokio::test]
+#[serial]
+async fn an_na_output_is_reported_as_cleared_and_recorded_as_an_explicit_null() {
+    if !crate::common::tools_runner::require_runner_or_skip(
+        "an_na_output_is_reported_as_cleared_and_recorded_as_an_explicit_null",
+    )
+    .await
+    {
+        return;
+    }
+    let (db, app, token) = setup().await;
+    install_probe_script(
+        &db,
+        &json!({
+            "label": "Probe",
+            "params": [
+                { "name": "value", "label": "Value", "kind": "number", "required": true }
+            ],
+            "outputs": [
+                { "key": "doubled", "label": "Doubled", "per_replicate": false },
+                { "key": "uncomputable", "label": "Uncomputable", "per_replicate": false },
+                { "key": "never_named", "label": "Never named", "per_replicate": false }
+            ]
+        }),
+        r#"tool <- function(inputs, constants, curves) {
+  list(doubled = inputs$value * 2, uncomputable = as.numeric(NA))
+}"#,
+    )
+    .await;
+
+    let (status, json) = calculate(&app, PROBE, json!({ "value": 4.0 }), &token).await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["results"]["doubled"], 8.0);
+    assert!(
+        json["results"].get("uncomputable").is_none(),
+        "a cleared output carries no value: {json}"
+    );
+    assert_eq!(
+        json["cleared"],
+        json!(["uncomputable"]),
+        "the NA is named as a clear, and the output nothing mentioned is not: {json}"
+    );
+
+    let outputs: serde_json::Value = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT outputs FROM tool_runs WHERE id = $1",
+            [json["run_id"]
+                .as_str()
+                .expect("run id")
+                .parse::<uuid::Uuid>()
+                .expect("run id parses")
+                .into()],
+        ))
+        .await
+        .expect("run row")
+        .expect("the run is stored")
+        .try_get("", "outputs")
+        .expect("outputs");
+    assert_eq!(
+        outputs,
+        json!({ "doubled": 8.0, "uncomputable": null }),
+        "the run records the clear as an explicit null, not an absence"
+    );
+    remove_probe_tool(&db).await;
 }

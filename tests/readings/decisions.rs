@@ -922,3 +922,106 @@ async fn the_columns_equal_the_fold_of_the_decisions_that_wrote_them() {
         "the flagged row with no live flag decision is the only key reported"
     );
 }
+
+/// The hold an intern's entry files, so the resolve route has one to rule on. Written directly
+/// because minting an intern JWT needs the Keycloak fixture; the level-to-kind decision is
+/// covered inline and the route gate in the capability matrix.
+async fn open_unverified_hold(f: &Fixture) -> Uuid {
+    let id = Uuid::new_v4();
+    crate::common::exec(
+        &f.db,
+        &format!(
+            "INSERT INTO replicate_audit_holds \
+                 (id, stream_id, site_id, parameter_id, group_time, kind, expected, computed, \
+                  delta, status) \
+             VALUES ('{id}', NULL, '{}', '{}', '{AT}', 'unverified_entry', \
+                     '{{\"state\": \"verified\"}}'::jsonb, \
+                     '{{\"state\": \"unverified\"}}'::jsonb, '{{}}'::jsonb, 'pending')",
+            crate::common::SITE1_ID,
+            crate::common::GLOBAL_PARAM_TEMP_ID
+        ),
+    )
+    .await;
+    id
+}
+
+async fn resolve(f: &Fixture, hold: Uuid, mode: &str) -> (u16, String) {
+    crate::common::post_json_with_token(
+        &f.app,
+        &format!("/api/sync/replicate_audit_holds/{hold}/resolve"),
+        &serde_json::json!({ "mode": mode }),
+        &f.token,
+    )
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn a_verify_accepts_an_intern_entry_as_it_stands() {
+    let f = setup().await;
+    seed_group(&f, &[1.0, 2.0, 3.0]).await;
+    bulk_write::guarded(&f.db, async |txn| {
+        decisions::record(
+            txn,
+            &decision(&f, Kind::UnverifiedEntry, None, serde_json::json!({})),
+        )
+        .await
+    })
+    .await
+    .expect("the entry is pending");
+    assert!(projected(&f, 0).await.unverified, "the entry lands pending");
+
+    let hold = open_unverified_hold(&f).await;
+    let (status, body) = resolve(&f, hold, "verify").await;
+    assert_eq!(status, 200, "{body}");
+    for index in 0..3 {
+        let row = projected(&f, index).await;
+        assert!(!row.unverified, "replicate {index} is verified");
+        assert!(!row.withdrawn, "a verify withdraws nothing");
+    }
+    // Ruling twice on one entry is refused: the hold is no longer pending.
+    let (status, _) = resolve(&f, hold, "verify").await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_reject_withdraws_an_intern_entry_and_a_reassert_restores_it() {
+    let f = setup().await;
+    seed_group(&f, &[1.0, 2.0, 3.0]).await;
+    bulk_write::guarded(&f.db, async |txn| {
+        decisions::record(
+            txn,
+            &decision(&f, Kind::UnverifiedEntry, None, serde_json::json!({})),
+        )
+        .await
+    })
+    .await
+    .expect("the entry is pending");
+
+    let hold = open_unverified_hold(&f).await;
+    let (status, body) = resolve(&f, hold, "reject").await;
+    assert_eq!(status, 200, "{body}");
+    for index in 0..3 {
+        let row = projected(&f, index).await;
+        assert!(row.withdrawn, "replicate {index} is withdrawn");
+        assert!(!row.unverified, "a rejected entry is no longer pending");
+    }
+
+    // Nothing deletes: the rejection is a stamp a reassert lifts.
+    record(
+        &f.db,
+        decision(&f, Kind::Reassert, None, serde_json::json!({})),
+    )
+    .await;
+    for index in 0..3 {
+        assert!(
+            !projected(&f, index).await.withdrawn,
+            "replicate {index} is restored"
+        );
+    }
+    assert!(
+        drift_keys(&f.db).await.is_empty(),
+        "every ruling is on the record, so nothing drifts"
+    );
+}

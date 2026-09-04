@@ -691,12 +691,12 @@ const fn default_true() -> bool {
     true
 }
 
-/// A station property the tool reads (elevation, latitude, ...), resolved from the `sites` row at
+/// A site property the tool reads (elevation, latitude, ...), resolved from the `sites` row at
 /// calculate time and recorded with its resolved value in the run. Fill-if-missing: a value the
 /// request carries wins, so an operator can override the stored property exactly as the portal's
 /// forms allow. A required property the site does not hold refuses the run naming it.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ManifestStationInput {
+pub struct ManifestSiteInput {
     /// Column of the `sites` row, e.g. `altitude_m`.
     pub property: String,
     /// The manifest param the resolved value fills. Defaults to the property name.
@@ -706,7 +706,7 @@ pub struct ManifestStationInput {
     pub required: bool,
 }
 
-impl ManifestStationInput {
+impl ManifestSiteInput {
     #[must_use]
     pub fn target(&self) -> &str {
         self.param.as_deref().unwrap_or(&self.property)
@@ -734,7 +734,7 @@ pub struct Manifest {
     pub constants: Vec<String>,
     pub curves: Vec<ManifestCurve>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub station_inputs: Vec<ManifestStationInput>,
+    pub site_inputs: Vec<ManifestSiteInput>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub event_inputs: Vec<ManifestEventInput>,
     /// Opaque QC block, stored as declared and served on `GET /tools` for clients that read it.
@@ -762,8 +762,11 @@ struct ManifestRaw {
     constants: Vec<String>,
     #[serde(default)]
     curves: Vec<ManifestCurve>,
-    #[serde(default)]
-    station_inputs: Vec<ManifestStationInput>,
+    /// `station_inputs` is the spelling every stored manifest was written with; the entity is a
+    /// site everywhere else in the schema, the API and the UI, so the key is `site_inputs` and the
+    /// old one still parses.
+    #[serde(default, alias = "station_inputs")]
+    site_inputs: Vec<ManifestSiteInput>,
     #[serde(default)]
     event_inputs: Vec<ManifestEventInput>,
     #[serde(default)]
@@ -815,11 +818,11 @@ impl<'de> Deserialize<'de> for Manifest {
         }
         // A resolved value reaches the runner as an input, so the field it fills has to be a
         // declared param: an undeclared target would be refused as an unknown field at call time.
-        for s in &raw.station_inputs {
+        for s in &raw.site_inputs {
             let target = s.target();
             if !raw.params.iter().any(|p| p.name == target) {
                 return Err(D::Error::custom(format!(
-                    "station_input '{}': fills param '{target}', which the manifest does not declare",
+                    "site_input '{}': fills param '{target}', which the manifest does not declare",
                     s.property
                 )));
             }
@@ -844,7 +847,7 @@ impl<'de> Deserialize<'de> for Manifest {
             outputs: raw.outputs,
             constants: raw.constants,
             curves: raw.curves,
-            station_inputs: raw.station_inputs,
+            site_inputs: raw.site_inputs,
             event_inputs: raw.event_inputs,
             qc: raw.qc,
             sections: raw.sections,
@@ -1193,7 +1196,7 @@ pub struct ToolDescriptor {
     pub constants: Vec<String>,
     pub curves: Vec<ManifestCurve>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub station_inputs: Vec<ManifestStationInput>,
+    pub site_inputs: Vec<ManifestSiteInput>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub event_inputs: Vec<ManifestEventInput>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1405,7 +1408,7 @@ impl ActiveTool {
                 .collect(),
             constants: self.manifest.constants.clone(),
             curves: self.manifest.curves.clone(),
-            station_inputs: self.manifest.station_inputs.clone(),
+            site_inputs: self.manifest.site_inputs.clone(),
             event_inputs: self.manifest.event_inputs.clone(),
             qc: self.manifest.qc.clone(),
             sections: self.manifest.sections.clone(),
@@ -1561,16 +1564,19 @@ async fn resolve_constants(
 
 pub struct RunOutcome {
     pub results: serde_json::Map<String, serde_json::Value>,
+    /// Outputs the script computed as NA, which is a request to clear the stored value rather
+    /// than an output it declined to name.
+    pub cleared: Vec<String>,
     pub inputs_used: Vec<String>,
     pub inputs_ignored: Vec<String>,
     pub curves: Vec<serde_json::Value>,
     pub constants: serde_json::Map<String, serde_json::Value>,
     /// The inputs exactly as the runner received them: request values, plus defaults and the
-    /// resolved station/event inputs, minus the curves. This is what the stored run records, so a
+    /// resolved site/event inputs, minus the curves. This is what the stored run records, so a
     /// recompute replays what actually ran rather than what the client happened to type.
     pub inputs: serde_json::Map<String, serde_json::Value>,
     /// Station properties resolved from the site, as `{property, param, value}`.
-    pub station_inputs: Vec<serde_json::Value>,
+    pub site_inputs: Vec<serde_json::Value>,
     /// Same-event parameter reads, as `{param, parameter_code, parameter_id, value}`.
     pub event_inputs: Vec<serde_json::Value>,
     /// The calculation context the request declared, echoed for the stored run.
@@ -1605,18 +1611,18 @@ fn take_context(
     Ok((site_id, collected_at))
 }
 
-/// Fill the params the manifest's `station_inputs` declare from the `sites` row, where the request
+/// Fill the params the manifest's `site_inputs` declare from the `sites` row, where the request
 /// did not carry them. Any column of the row is resolvable (D13); a required property the site
 /// does not hold refuses the run naming it.
-pub async fn resolve_station_inputs(
+pub async fn resolve_site_inputs(
     db: &DatabaseConnection,
     tool_name: &str,
     manifest: &Manifest,
     site_id: Option<Uuid>,
     body: &mut serde_json::Map<String, serde_json::Value>,
 ) -> AppResult<Vec<serde_json::Value>> {
-    let pending: Vec<&ManifestStationInput> = manifest
-        .station_inputs
+    let pending: Vec<&ManifestSiteInput> = manifest
+        .site_inputs
         .iter()
         .filter(|s| body.get(s.target()).is_none_or(serde_json::Value::is_null))
         .collect();
@@ -1626,7 +1632,7 @@ pub async fn resolve_station_inputs(
     let Some(site_id) = site_id else {
         if let Some(required) = pending.iter().find(|s| s.required) {
             return Err(AppError::BadRequest(format!(
-                "tool '{tool_name}' reads station property '{}'; pass site_id so it can be \
+                "tool '{tool_name}' reads site property '{}'; pass site_id so it can be \
                  resolved, or supply '{}' directly",
                 required.property,
                 required.target()
@@ -1656,7 +1662,7 @@ pub async fn resolve_station_inputs(
                     && !kind_accepts(&param.kind, value)
                 {
                     return Err(AppError::BadRequest(format!(
-                        "station property '{}' of site '{site_name}' resolved to {value}, which                          is not a {} for input '{}' of tool '{tool_name}'",
+                        "site property '{}' of site '{site_name}' resolved to {value}, which                          is not a {} for input '{}' of tool '{tool_name}'",
                         s.property,
                         param.kind,
                         s.target()
@@ -1671,7 +1677,7 @@ pub async fn resolve_station_inputs(
             }
             _ if s.required => {
                 return Err(AppError::BadRequest(format!(
-                    "site '{site_name}' has no value for station property '{}', which tool \
+                    "site '{site_name}' has no value for site property '{}', which tool \
                      '{tool_name}' requires",
                     s.property
                 )));
@@ -1780,7 +1786,7 @@ pub async fn run_tool_body(
 /// is asked for anything.
 pub struct ResolvedRun {
     /// The inputs as the runner will receive them: request values plus defaults and the resolved
-    /// station/event inputs, minus the curves.
+    /// site/event inputs, minus the curves.
     pub inputs: serde_json::Map<String, serde_json::Value>,
     pub constants: serde_json::Map<String, serde_json::Value>,
     /// Curves by slot name, as the runner receives them.
@@ -1789,7 +1795,7 @@ pub struct ResolvedRun {
     pub curve_snapshots: Vec<serde_json::Value>,
     curves_consumed: Vec<String>,
     provided: Vec<String>,
-    pub station_inputs: Vec<serde_json::Value>,
+    pub site_inputs: Vec<serde_json::Value>,
     pub event_inputs: Vec<serde_json::Value>,
     pub site_id: Option<Uuid>,
     pub collected_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -1881,8 +1887,8 @@ pub async fn resolve_run(
     }
     // Resolved context values land before defaults and requiredness: a typed value wins, a
     // resolved one fills the gap, and a manifest default is the last resort.
-    let station_inputs =
-        resolve_station_inputs(&state.db, &tool.name, manifest, site_id, &mut body).await?;
+    let site_inputs =
+        resolve_site_inputs(&state.db, &tool.name, manifest, site_id, &mut body).await?;
     let event_inputs = resolve_event_inputs(
         &state.db,
         &tool.name,
@@ -1963,7 +1969,7 @@ pub async fn resolve_run(
         curve_snapshots,
         curves_consumed,
         provided,
-        station_inputs,
+        site_inputs,
         event_inputs,
         site_id,
         collected_at,
@@ -1986,7 +1992,7 @@ pub async fn execute_resolved(
         curve_snapshots,
         curves_consumed,
         provided,
-        station_inputs,
+        site_inputs,
         event_inputs,
         site_id,
         collected_at,
@@ -2012,8 +2018,7 @@ pub async fn execute_resolved(
             map
         }
     };
-    // NA outputs arrive as null; absent is the contract for an uncomputable value.
-    results.retain(|_, v| !v.is_null());
+    let cleared = partition_cleared(&mut results);
 
     apply_manifest_aggregates(
         &state.db,
@@ -2052,16 +2057,34 @@ pub async fn execute_resolved(
 
     Ok(RunOutcome {
         results,
+        cleared,
         inputs_used,
         inputs_ignored,
         curves: curve_snapshots,
         constants,
         inputs: effective_inputs,
-        station_inputs,
+        site_inputs,
         event_inputs,
         site_id,
         collected_at,
     })
+}
+
+/// Split the script's result map into the values it produced and the outputs it cleared.
+///
+/// An NA arrives as null. The portal wrote NULL into that column rather than leaving the old
+/// number standing, so a null is a clear, not an omission: the key leaves `results`, where every
+/// consumer reads a value, and travels as `cleared`, which the chain turns into a withdrawal of
+/// the stored output. An output the script never named is not in the map at all and is untouched.
+fn partition_cleared(results: &mut serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    let mut cleared: Vec<String> = results
+        .iter()
+        .filter(|(_, v)| v.is_null())
+        .map(|(k, _)| k.clone())
+        .collect();
+    cleared.sort();
+    results.retain(|_, v| !v.is_null());
+    cleared
 }
 
 /// Compute the manifest's `aggregate` outputs over the curve-applied replicate values, replacing
@@ -2523,6 +2546,27 @@ async fn call_runner(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_na_output_is_a_clear_and_an_unnamed_output_is_left_alone() {
+        use super::partition_cleared;
+        let mut results = serde_json::json!({
+            "doc_avg": 1.25, "doc_sd": null, "dom": null, "flag": "ok"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let cleared = partition_cleared(&mut results);
+        assert_eq!(cleared, vec!["doc_sd".to_string(), "dom".to_string()]);
+        assert_eq!(
+            serde_json::Value::Object(results),
+            serde_json::json!({ "doc_avg": 1.25, "flag": "ok" }),
+            "a cleared key never reaches a consumer reading values"
+        );
+        // A run that named nothing clears nothing: silence is not a request to blank a column.
+        let mut empty = serde_json::Map::new();
+        assert!(partition_cleared(&mut empty).is_empty());
+    }
+
     use super::{Manifest, ParamWhen, StructLayout, parse_tool_error};
 
     fn manifest_with(param: serde_json::Value) -> Result<Manifest, serde_json::Error> {
@@ -2887,5 +2931,31 @@ mod tests {
         assert!(cond.holds(&body));
         body.insert("mode".into(), serde_json::json!("simple"));
         assert!(!cond.holds(&body));
+    }
+
+    /// The entity is a site; `station_inputs` is what every stored manifest was written with.
+    #[test]
+    fn both_spellings_of_the_site_inputs_key_parse_the_same() {
+        let by_site = manifest(serde_json::json!({
+            "label": "T",
+            "params": [{ "name": "alt", "label": "Altitude", "kind": "number" }],
+            "site_inputs": [{ "property": "altitude_m", "param": "alt" }],
+        }))
+        .expect("site_inputs parses");
+        let by_station = manifest(serde_json::json!({
+            "label": "T",
+            "params": [{ "name": "alt", "label": "Altitude", "kind": "number" }],
+            "station_inputs": [{ "property": "altitude_m", "param": "alt" }],
+        }))
+        .expect("station_inputs still parses");
+
+        assert_eq!(by_site.site_inputs.len(), 1);
+        assert_eq!(by_station.site_inputs.len(), 1);
+        assert_eq!(
+            by_site.site_inputs[0].property,
+            by_station.site_inputs[0].property
+        );
+        assert_eq!(by_site.site_inputs[0].target(), "alt");
+        assert_eq!(by_station.site_inputs[0].target(), "alt");
     }
 }

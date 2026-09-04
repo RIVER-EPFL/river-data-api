@@ -7,12 +7,10 @@ pub mod cache_key;
 pub mod db_pool;
 pub mod grants;
 pub mod middleware;
-pub mod plot;
 pub mod rate_limit;
 pub mod request_metrics;
 pub mod scope;
 pub mod series;
-pub mod series_query;
 pub mod state;
 pub mod sync_state;
 

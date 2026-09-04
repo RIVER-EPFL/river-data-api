@@ -493,3 +493,73 @@ async fn test_grab_rejects_curve_without_an_instrument() {
         "a curve on a grab naming no instrument should be a 400: {body}"
     );
 }
+
+// ============================================================================
+// Bit fidelity of the JSON ingest path
+// ============================================================================
+
+/// Scenario: a value that needs all 17 significant digits to round-trip is posted as JSON.
+///
+/// Expected behaviour: the stored double is the posted one, bit for bit. The export arms are
+/// pinned separately (T14) by inserting through SQL, so this is the half that covers the request
+/// parse, the bind and the column.
+#[tokio::test]
+#[serial]
+async fn a_posted_value_is_stored_bit_for_bit() {
+    let (app, token, db) = setup().await;
+
+    // An f32-origin double, a sum that is not representable, and a curve output: each needs more
+    // than the shortest decimal a careless formatter would write.
+    let values: Vec<f64> = vec![
+        f64::from(100.8f32),
+        0.1 + 0.2,
+        1683.4228f64.mul_add(1.3642, -1.6985),
+    ];
+
+    let readings: Vec<serde_json::Value> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            serde_json::json!({
+                "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID,
+                "value": v,
+                "time": format!("2025-07-0{}T10:00:00Z", i + 1),
+            })
+        })
+        .collect();
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID,
+            "created_by": "test-user",
+            "readings": readings,
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "insert should succeed: {body}");
+
+    for (i, expected) in values.iter().enumerate() {
+        let time = format!("2025-07-0{}T10:00:00Z", i + 1);
+        let stored: f64 = db
+            .query_one_raw(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT raw_value FROM readings WHERE site_id = '{}' AND time = '{time}'",
+                    crate::common::SITE1_ID
+                ),
+            ))
+            .await
+            .expect("query")
+            .expect("the reading was stored")
+            .try_get::<f64>("", "raw_value")
+            .expect("raw_value");
+        assert_eq!(
+            stored.to_bits(),
+            expected.to_bits(),
+            "stored {stored:.17} for posted {expected:.17} at {time}"
+        );
+    }
+}

@@ -16,3 +16,4 @@ mod read_only_endpoints;
 mod replicate_determinism;
 mod sample_stats_annotation;
 mod served_instant_selection;
+mod unverified_entries;

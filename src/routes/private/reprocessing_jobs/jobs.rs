@@ -2111,7 +2111,7 @@ impl Job for PushSubscriptionReconcile {
     }
 }
 
-/// Probe each configured notification channel (Telegram `getMe` / SMTP / Graph token) and upsert
+/// Probe each configured notification channel and upsert
 /// `notification_channel_health`, the channel health heartbeat. Wraps [`health::probe_once`].
 pub struct NotifyHealth {
     interval_seconds: u64,

@@ -38,6 +38,16 @@ pub struct ProvenanceResponse {
     pub time: DateTime<Utc>,
     pub site_id: Option<Uuid>,
     pub parameter_id: Option<Uuid>,
+    /// What the instant measured, named. The record was serving bare numbers under a bare uuid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameter_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameter_name: Option<String>,
+    /// The slot's unit when it declares one, the catalog default otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub units: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decimal_places: Option<i16>,
     /// More than one stream serves this (site, parameter) at this instant.
     pub duplicate_slot: bool,
     /// One record per stream serving the instant.
@@ -105,6 +115,8 @@ pub struct ReadingFacet {
     pub withdrawn_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub withdrawn_reason: Option<String>,
+    /// A pending entry: stored and shown here, never published (Q18, Q21).
+    pub unverified: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ingested_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -260,6 +272,24 @@ pub struct ComputationInfo {
     pub sd_estimator: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sd_estimator_source: Option<String>,
+    /// The group's statistics, the numbers the chart plotted and drew its bar from. Without these
+    /// the record shows the replicates and a sentence about the divisor, and never what was served.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mean: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdev: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdev_sample: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdev_population: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub median: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -300,6 +330,7 @@ pub struct RawRow {
     sample_id: Option<Uuid>,
     collection_event_id: Option<Uuid>,
     withdrawn_at: Option<DateTime<Utc>>,
+    unverified: Option<bool>,
     withdrawn_reason: Option<String>,
     ingested_at: Option<DateTime<Utc>>,
     provenance: Option<serde_json::Value>,
@@ -311,7 +342,8 @@ pub struct RawRow {
 const ROW_COLUMNS: &str = "stream_id, replicate_index, site_id, parameter_id, raw_value, \
      calibrated_value, sensor_id, calibration_id, standard_curve_id, deployment_id, \
      measurement_type, is_flagged, flag_reason, sample_id, collection_event_id, \
-     withdrawn_at, withdrawn_reason, ingested_at, provenance, label, notes, created_by";
+     withdrawn_at, withdrawn_reason, unverified, ingested_at, provenance, label, notes, \
+     created_by";
 
 fn decode_row(row: &sea_orm::QueryResult) -> Result<RawRow, sea_orm::DbErr> {
     let fixed = |name: &str| -> Option<DateTime<Utc>> {
@@ -337,6 +369,7 @@ fn decode_row(row: &sea_orm::QueryResult) -> Result<RawRow, sea_orm::DbErr> {
         sample_id: row.try_get("", "sample_id")?,
         collection_event_id: row.try_get("", "collection_event_id")?,
         withdrawn_at: fixed("withdrawn_at"),
+        unverified: row.try_get("", "unverified")?,
         withdrawn_reason: row.try_get("", "withdrawn_reason")?,
         ingested_at: fixed("ingested_at"),
         provenance: row.try_get("", "provenance")?,
@@ -427,10 +460,23 @@ pub async fn get_reading_provenance(
 
     let records = assemble_records(&state.db, &rows, q.time).await?;
 
+    let site_id = rows.iter().find_map(|r| r.site_id).or(q.site_id);
+    let parameter_id = rows.iter().find_map(|r| r.parameter_id).or(q.parameter_id);
+    let slot = match (site_id, parameter_id) {
+        (Some(site_id), Some(parameter_id)) => {
+            slot_identity(&state.db, site_id, parameter_id).await?
+        }
+        _ => None,
+    };
+
     Ok(Json(ProvenanceResponse {
         time: q.time,
-        site_id: rows.iter().find_map(|r| r.site_id).or(q.site_id),
-        parameter_id: rows.iter().find_map(|r| r.parameter_id).or(q.parameter_id),
+        site_id,
+        parameter_id,
+        parameter_code: slot.as_ref().map(|s| s.0.clone()),
+        parameter_name: slot.as_ref().map(|s| s.1.clone()),
+        units: slot.as_ref().and_then(|s| s.2.clone()),
+        decimal_places: slot.as_ref().and_then(|s| s.3),
         duplicate_slot: records.len() > 1,
         records,
     }))
@@ -555,6 +601,7 @@ pub async fn assemble_records(
                 is_flagged: r.is_flagged.unwrap_or(false),
                 flag_reason: r.flag_reason.clone(),
                 withdrawn_at: r.withdrawn_at,
+                unverified: r.unverified.unwrap_or(false),
                 withdrawn_reason: r.withdrawn_reason.clone(),
                 ingested_at: r.ingested_at,
                 calibration: r.calibration_id.and_then(|id| {
@@ -629,6 +676,14 @@ pub async fn assemble_records(
                 run_source,
                 sd_estimator: sample.map(|s| s.sd_estimator.clone()),
                 sd_estimator_source: sample.map(|s| s.sd_estimator_source.clone()),
+                n: sample.map(|s| s.n),
+                mean: sample.and_then(|s| s.mean),
+                stdev: sample.and_then(|s| s.stdev),
+                stdev_sample: sample.and_then(|s| s.stdev_sample),
+                stdev_population: sample.and_then(|s| s.stdev_population),
+                median: sample.and_then(|s| s.median),
+                min: sample.and_then(|s| s.min_value),
+                max: sample.and_then(|s| s.max_value),
             })
         } else {
             None
@@ -850,4 +905,31 @@ async fn fetch_run_sources(
         }
     }
     Ok(out)
+}
+
+/// The slot's code, name, unit and declared precision. The site's own configuration wins over the
+/// catalog default, which is what makes the number on screen readable in the unit it was served in.
+async fn slot_identity(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    parameter_id: Uuid,
+) -> AppResult<Option<(String, String, Option<String>, Option<i16>)>> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT p.code, p.name, COALESCE(sp.display_units, p.default_units) AS units, \
+                    sp.decimal_places \
+             FROM parameters p \
+             LEFT JOIN site_parameters sp ON sp.parameter_id = p.id AND sp.site_id = $2 \
+             WHERE p.id = $1 LIMIT 1",
+            [parameter_id.into(), site_id.into()],
+        ))
+        .await?;
+    let Some(row) = row else { return Ok(None) };
+    Ok(Some((
+        row.try_get("", "code")?,
+        row.try_get("", "name")?,
+        row.try_get("", "units")?,
+        row.try_get("", "decimal_places")?,
+    )))
 }

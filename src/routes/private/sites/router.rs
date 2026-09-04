@@ -43,8 +43,16 @@ pub fn service_router(state: &AppState) -> OpenApiRouter {
             get(super::annotations::get_site_export_summary),
         )
         .route(
+            "/{site_id}/export/replicates",
+            get(super::replicates_export::get_site_replicates),
+        )
+        .route(
             "/{site_id}/export/sensor-vs-grab",
             get(super::sensor_vs_grab::get_sensor_vs_grab),
+        )
+        .route(
+            "/{site_id}/statistics",
+            get(super::statistics::get_site_statistics),
         )
         .route(
             "/{site_id}/sensor_identity",

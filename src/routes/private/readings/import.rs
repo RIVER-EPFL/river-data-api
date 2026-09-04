@@ -1745,6 +1745,7 @@ async fn import_tool_csv(
                 continue;
             }
             let request = GrabSampleRequest {
+                pending_inputs: false,
                 site_id: site.id,
                 created_by: Some(actor.clone()),
                 label: None,

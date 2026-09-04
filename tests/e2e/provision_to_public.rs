@@ -3,8 +3,8 @@
 //! register and pair a data stream, ingest readings through the stream, then verify the readings,
 //! the tracked aggregate refresh, and the public API surface (JSON + CSV).
 //!
-//! Complements `public_workflow_e2e_test.rs` (which drives the CSV-import path) by exercising the
-//! stream register → pair → ingest path and the WS1 minimal-assignment friction fix.
+//! Complements `full_public_data_workflow.rs` (which drives the CSV-import path) by exercising the
+//! stream register, pair and ingest path and the minimal site-parameter assignment.
 //!
 //! Run: cargo test --test e2e -- --test-threads=1
 

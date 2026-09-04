@@ -188,7 +188,7 @@ fn body_for_run(
         for e in &tool.manifest.event_inputs {
             body.remove(&e.param);
         }
-        for s in &tool.manifest.station_inputs {
+        for s in &tool.manifest.site_inputs {
             body.remove(s.target());
         }
     }
@@ -218,6 +218,9 @@ pub struct RecomputeOutcome {
     pub readings_written: usize,
     /// Open missing/stale findings closed because this run rewrote their output.
     pub findings_closed: usize,
+    /// Stored outputs withdrawn because the script computed them as NA (M23): the portal blanked
+    /// the column, and here the stamp is reversible.
+    pub readings_withdrawn: usize,
     pub skipped: Vec<(String, String)>,
     /// Tools whose prior run at this event consumed exactly what a fresh run would, under the
     /// same script version, with its outputs still served: left alone, no run minted.
@@ -292,6 +295,7 @@ pub async fn recompute_event(
     let order = dependency_order(&tools, &catalog)?;
 
     let mut outcome = RecomputeOutcome {
+        readings_withdrawn: 0,
         tools_run: 0,
         readings_written: 0,
         findings_closed: 0,
@@ -381,6 +385,41 @@ pub async fn recompute_event(
                 owned_outputs.push((key.clone(), *parameter_id));
             }
         }
+        // An output the script computed as NA is a request to blank the column, so the stored
+        // value is withdrawn rather than left standing beside a run that did not produce it. A
+        // person's ruling on the row is not overridden: those keep their value and their hold.
+        for (key, parameter_id) in &owned_outputs {
+            if !result.cleared.iter().any(|c| c == key) {
+                continue;
+            }
+            let withdrawn = crate::common::bulk_write::guarded(&state.db, async |txn| {
+                crate::routes::private::readings::decisions::record_many(
+                    txn,
+                    crate::routes::private::readings::decisions::Kind::Withdraw,
+                    &format!(
+                        "r.site_id = $1 AND r.parameter_id = $2 AND r.time = $3 \
+                         AND r.measurement_type = 'spot' AND r.withdrawn_at IS NULL AND {free}",
+                        free = crate::routes::private::readings::decisions::unjudged_sql("r")
+                    ),
+                    vec![
+                        event.site_id.into(),
+                        (*parameter_id).into(),
+                        sea_orm::prelude::DateTimeWithTimeZone::from(event.collected_at).into(),
+                    ],
+                    crate::routes::private::readings::decisions::NewValue::Literal(
+                        serde_json::json!({ "reason": "the calculation now yields no value" }),
+                    ),
+                    actor,
+                    Some("computed as NA by the recompute"),
+                    crate::routes::private::readings::decisions::Origin::Chain,
+                    None,
+                )
+                .await
+            })
+            .await?;
+            outcome.readings_withdrawn += usize::try_from(withdrawn.rows).unwrap_or(0);
+        }
+
         let readings: Vec<GrabSampleReading> = owned_outputs
             .iter()
             .filter_map(|(key, parameter_id)| {
@@ -408,6 +447,24 @@ pub async fn recompute_event(
             continue;
         }
 
+        // A value computed from a pending measurement is pending too (M62): whatever an intern
+        // entered at this visit carries into everything the chain derives from it.
+        let inputs_pending: bool = state
+            .db
+            .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT EXISTS (SELECT 1 FROM readings
+                                 WHERE site_id = $1 AND time = $2 AND unverified IS TRUE) AS p",
+                [
+                    event.site_id.into(),
+                    sea_orm::prelude::DateTimeWithTimeZone::from(event.collected_at).into(),
+                ],
+            ))
+            .await?
+            .map(|r| r.try_get("", "p"))
+            .transpose()?
+            .unwrap_or(false);
+
         let auth = crate::common::middleware::AuthContext::Keycloak {
             roles: Vec::new(),
             sub: actor.to_string(),
@@ -417,6 +474,7 @@ pub async fn recompute_event(
         };
         let request = GrabSampleRequest {
             site_id: event.site_id,
+            pending_inputs: inputs_pending,
             created_by: Some(actor.to_string()),
             label: None,
             notes: None,
@@ -629,7 +687,7 @@ async fn pinned_tool(
 }
 
 /// Whether every required param of a tool is answerable at the event without a person: a manifest
-/// default, a resolvable station property, or a same-event value. This is "the declared inputs
+/// default, a resolvable site property, or a same-event value. This is "the declared inputs
 /// exist" for the missing-output report.
 async fn inputs_exist(
     state: &AppState,
@@ -652,7 +710,7 @@ async fn inputs_exist(
     let mut body = probe.clone();
     body.remove("site_id");
     body.remove("collected_at");
-    let station = engine::resolve_station_inputs(
+    let site = engine::resolve_site_inputs(
         &state.db,
         &tool.name,
         &tool.manifest,
@@ -660,7 +718,7 @@ async fn inputs_exist(
         &mut body,
     )
     .await;
-    if station.is_err() {
+    if site.is_err() {
         return Ok(false);
     }
     engine::resolve_event_inputs(
@@ -876,6 +934,7 @@ impl Job for EventRecompute {
                     .scope("unchanged", outcome.unchanged.clone())
                     .count("tools_run", outcome.tools_run)
                     .count("readings_written", outcome.readings_written)
+                    .count("readings_withdrawn", outcome.readings_withdrawn)
                     .count("tools_skipped", outcome.skipped.len())
                     .count("tools_unchanged", outcome.unchanged.len())
                     .count("findings_closed", outcome.findings_closed),
@@ -904,6 +963,7 @@ impl Job for EventRecompute {
         let mut events_recomputed = 0usize;
         let mut tools_run = 0usize;
         let mut readings_written = 0usize;
+        let mut readings_withdrawn = 0usize;
         let mut tools_unchanged = 0usize;
         let mut tools_skipped = 0usize;
         let mut findings_closed = 0usize;
@@ -917,6 +977,7 @@ impl Job for EventRecompute {
             events_recomputed += 1;
             tools_run += outcome.tools_run;
             readings_written += outcome.readings_written;
+            readings_withdrawn += outcome.readings_withdrawn;
             tools_unchanged += outcome.unchanged.len();
             tools_skipped += outcome.skipped.len();
             findings_closed += outcome.findings_closed;
@@ -939,6 +1000,7 @@ impl Job for EventRecompute {
                 .count("events_recomputed", events_recomputed)
                 .count("tools_run", tools_run)
                 .count("readings_written", readings_written)
+                .count("readings_withdrawn", readings_withdrawn)
                 .count("tools_skipped", tools_skipped)
                 .count("tools_unchanged", tools_unchanged)
                 .count("findings_closed", findings_closed),

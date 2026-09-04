@@ -220,11 +220,11 @@ pub fn flow_cycle_readings(cycle: usize) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Track C: a site plus a lab instrument carrying a standard curve, fed by grab entry.
+/// Track C: a site plus a lab instrument, fed by grab entry.
 ///
 /// The instrument is a sensor like any other, which is how field and lab devices are modelled, but
-/// it is never deployed to a slot: grab readings carry their curve through `calibration_id` per
-/// reading instead.
+/// it is never deployed to a slot: grab readings carry their curve per reading instead. No curve
+/// is created here; a suite that needs one creates it against this instrument.
 pub async fn onboard_grab_track(app: &Router, token: &str) -> Track {
     let (project_id, site_id, parameters, site_parameter_ids) = provision(
         app,

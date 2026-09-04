@@ -141,8 +141,8 @@ pub struct AppState {
     pub token_rate_limiters: TokenRateLimiters,
     pub events: EventSender,
     pub import_staging: ImportStagingCache,
-    /// Live role resolver for Telegram chats (anti-backdoor). Shared so the user-management revoke
-    /// path can invalidate a sub's cached role immediately.
+    /// Live role resolver for notification recipients (anti-backdoor). Shared so the
+    /// user-management revoke path can invalidate a sub's cached role immediately.
     pub authorizer: Arc<Authorizer>,
 }
 

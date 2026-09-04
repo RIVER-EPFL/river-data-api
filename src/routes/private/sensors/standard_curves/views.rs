@@ -18,7 +18,7 @@ use super::{Column, Entity, Model};
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors;
-use crate::routes::private::sensors::operations::upsert_source_instrument;
+use crate::routes::private::sensors::operations::{InstrumentKind, upsert_source_instrument};
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RegisterStandardCurveRequest {
@@ -112,7 +112,7 @@ pub(crate) async fn resolve_lab_instrument(
         source_system,
         &source_key,
         &format!("{instrument_label} ({source_system})"),
-        true,
+        InstrumentKind::Lab,
         "low",
         None,
     )

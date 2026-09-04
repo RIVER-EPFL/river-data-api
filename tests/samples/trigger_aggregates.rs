@@ -446,3 +446,58 @@ async fn samples_delete_sets_reading_sample_id_null() {
     let raw_value: f64 = row.try_get("", "raw_value").unwrap();
     assert!((raw_value - 7.0).abs() < 1e-9);
 }
+
+/// A pending entry publishes no statistics: an unverified replicate is out of the sample the way
+/// a flagged one is, and a verify brings it back without anyone recomputing anything by hand.
+#[tokio::test]
+#[serial]
+async fn samples_trigger_excludes_unverified_replicates_until_they_are_verified() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+
+    let stream_id = ensure_stream(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+    )
+    .await;
+    let sample_id =
+        create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID).await;
+
+    let values = [10.0, 12.0, 14.0];
+    for (i, v) in values.iter().enumerate() {
+        insert_replicate(
+            &db,
+            stream_id,
+            crate::common::SITE1_ID,
+            crate::common::GLOBAL_PARAM_TEMP_ID,
+            sample_id,
+            (i as i16) + 1,
+            *v,
+        )
+        .await;
+    }
+
+    exec(
+        &db,
+        &format!(
+            "UPDATE readings SET unverified = true \
+             WHERE sample_id = '{sample_id}' AND replicate_index = 3"
+        ),
+    )
+    .await;
+    let agg = fetch_aggregate(&db, sample_id).await;
+    assert_eq!(agg.n, 2, "the pending replicate is out of the statistics");
+    assert!((agg.mean.unwrap() - 11.0).abs() < 1e-9);
+    assert!((agg.max_value.unwrap() - 12.0).abs() < 1e-9);
+
+    exec(
+        &db,
+        &format!("UPDATE readings SET unverified = false WHERE sample_id = '{sample_id}'"),
+    )
+    .await;
+    let agg = fetch_aggregate(&db, sample_id).await;
+    assert_eq!(agg.n, 3, "a verify recomputes the group");
+    assert!((agg.mean.unwrap() - mean(&values)).abs() < 1e-9);
+}

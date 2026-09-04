@@ -1168,7 +1168,8 @@ pub async fn acknowledge_hold(
 pub struct ResolveHoldRequest {
     /// `ours` (accept the recomputed statistics; identical to acknowledge) | `flag` (flag the
     /// named replicates so the sample statistics recompute over the rest) | `estimator` (declare
-    /// which standard-deviation divisor this slot, or this one instant, publishes).
+    /// which standard-deviation divisor this slot, or this one instant, publishes) | `verify` /
+    /// `reject` (rule on an intern's entry: accept it as it stands, or withdraw it).
     pub mode: String,
     /// The replicate indexes to flag; required for `flag`. Each must be among the values the
     /// hold recorded and unflagged, and at least one unflagged replicate must remain after.
@@ -1470,10 +1471,99 @@ pub async fn resolve_hold(
             }))
         }
         "estimator" => declare_estimator(&state, id, &payload, &by).await,
+        "verify" | "reject" => {
+            rule_on_entry(&state, id, &payload.mode, payload.reason.as_deref(), &by).await
+        }
         other => Err(AppError::BadRequest(format!(
             "unknown resolve mode '{other}'"
         ))),
     }
+}
+
+/// Rule on an intern's entry (Q21, M44): `verify` accepts it as it stands, `reject` withdraws it.
+/// Both are decisions on the record, so both are reversible: a rejected entry is re-asserted, and
+/// reopen returns the hold to review.
+async fn rule_on_entry(
+    state: &AppState,
+    id: Uuid,
+    mode: &str,
+    reason: Option<&str>,
+    by: &str,
+) -> AppResult<Json<ResolveHoldResponse>> {
+    use crate::routes::private::readings::decisions::{Kind, NewValue, Origin, record_many};
+    let hold = state
+        .db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT site_id, parameter_id, group_time FROM replicate_audit_holds
+             WHERE id = $1 AND kind = 'unverified_entry' AND status IN ('pending', 'deferred')",
+            [id.into()],
+        ))
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("no pending unverified entry hold {id}")))?;
+    let site_id: Option<Uuid> = hold.try_get("", "site_id")?;
+    let parameter_id: Option<Uuid> = hold.try_get("", "parameter_id")?;
+    let group_time: sea_orm::prelude::DateTimeWithTimeZone = hold.try_get("", "group_time")?;
+    let (Some(site_id), Some(parameter_id)) = (site_id, parameter_id) else {
+        return Err(AppError::BadRequest(format!(
+            "unverified entry hold {id} names no slot"
+        )));
+    };
+    let reason = reason
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map_or_else(|| format!("unverified entry hold {id}"), String::from);
+    let (kind, new, status) = if mode == "verify" {
+        (
+            Kind::Verify,
+            serde_json::json!({ "unverified": false }),
+            "acknowledged",
+        )
+    } else {
+        (
+            Kind::Reject,
+            serde_json::json!({ "reason": reason.clone() }),
+            "remediated",
+        )
+    };
+    let decided = crate::common::bulk_write::guarded(&state.db, async |txn| {
+        let recorded = record_many(
+            txn,
+            kind,
+            "r.site_id = $1 AND r.parameter_id = $2 AND r.time = $3 AND r.unverified IS TRUE",
+            vec![site_id.into(), parameter_id.into(), group_time.into()],
+            NewValue::Literal(new),
+            by,
+            Some(&reason),
+            Origin::Audit,
+            None,
+        )
+        .await?;
+        txn.execute_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "UPDATE replicate_audit_holds
+                 SET status = '{status}', acknowledged_by = $2, acknowledged_at = NOW(),
+                     resolution = jsonb_build_object('mode', $3::text, 'by', $2::text,
+                                                     'at', to_jsonb(NOW()), 'rows', $4::bigint)
+                 WHERE id = $1"
+            ),
+            [
+                id.into(),
+                by.into(),
+                mode.into(),
+                i64::try_from(recorded.rows).unwrap_or(i64::MAX).into(),
+            ],
+        ))
+        .await?;
+        Ok(recorded.rows)
+    })
+    .await?;
+    Ok(Json(ResolveHoldResponse {
+        status: status.to_string(),
+        job_id: None,
+        samples_affected: Some(i64::try_from(decided).unwrap_or(i64::MAX)),
+    }))
 }
 
 /// Declare which standard-deviation divisor a slot, or one collection group, publishes.

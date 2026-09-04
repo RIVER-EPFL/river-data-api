@@ -751,7 +751,9 @@ CREATE TABLE public.sensors (
     data_frequency character varying(16) DEFAULT 'high'::character varying NOT NULL,
     source_system text,
     source_key text,
-    CONSTRAINT sensors_data_frequency_check CHECK (data_frequency IN ('high', 'low'))
+    kind text DEFAULT 'device'::text NOT NULL,
+    CONSTRAINT sensors_data_frequency_check CHECK (data_frequency IN ('high', 'low')),
+    CONSTRAINT sensors_kind_check CHECK (kind IN ('device', 'lab', 'source_parameter', 'entry_channel'))
 );
 
 CREATE TABLE public.site_parameters (
