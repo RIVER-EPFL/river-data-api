@@ -58,6 +58,9 @@ pub struct Config {
 
     // CORS
     pub cors_allowed_origins: Vec<String>,
+    /// Networks a forwarded-for chain may be believed from. Anything reaching the API from
+    /// outside these is keyed on its own address, whatever headers it sends.
+    pub trusted_proxy_cidrs: Vec<crate::common::rate_limit::IpCidr>,
 
     // Connection pool
     pub db_max_connections: u32,
@@ -92,6 +95,11 @@ pub struct Config {
     /// the tool endpoints answering 503.
     pub tools_runner_url: Option<String>,
     pub tools_runner_timeout_seconds: u64,
+
+    /// MeteoSwiss Open Government Data SMN collection. The per-station recent file hangs under it.
+    pub meteoswiss_base_url: String,
+    pub meteoswiss_interval_seconds: u64,
+    pub meteoswiss_timeout_seconds: u64,
 
     // Derived-parameter janitor
     pub janitor_interval_seconds: u64,
@@ -242,6 +250,15 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty()),
 
+            trusted_proxy_cidrs: env::var("TRUSTED_PROXY_CIDRS")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map_or_else(crate::common::rate_limit::default_trusted_proxies, |v| {
+                    v.split(',')
+                        .filter_map(crate::common::rate_limit::IpCidr::parse)
+                        .collect()
+                }),
+
             // CORS
             cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS")
                 .unwrap_or_else(|_| "http://localhost:5173,http://localhost:3005".to_string())
@@ -306,6 +323,21 @@ impl Config {
                 .map(|u| u.trim_end_matches('/').to_string())
                 .filter(|u| !u.is_empty()),
             tools_runner_timeout_seconds: env::var("TOOLS_RUNNER_TIMEOUT_SECONDS")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()
+                .unwrap_or(60),
+
+            meteoswiss_base_url: env::var("METEOSWISS_BASE_URL")
+                .unwrap_or_else(|_| {
+                    "https://data.geo.admin.ch/ch.meteoschweiz.ogd-smn".to_string()
+                })
+                .trim_end_matches('/')
+                .to_string(),
+            meteoswiss_interval_seconds: env::var("METEOSWISS_INTERVAL_SECONDS")
+                .unwrap_or_else(|_| "3600".to_string())
+                .parse()
+                .unwrap_or(3600),
+            meteoswiss_timeout_seconds: env::var("METEOSWISS_TIMEOUT_SECONDS")
                 .unwrap_or_else(|_| "60".to_string())
                 .parse()
                 .unwrap_or(60),
@@ -432,4 +464,70 @@ impl Config {
 pub enum ConfigError {
     #[error("Missing required environment variable: {0}")]
     Missing(&'static str),
+}
+
+/// The origins a deployed instance may serve cross-origin, and the ones it refuses to.
+///
+/// The compiled-in default is the two local dev servers, so an overlay that names no origin leaves
+/// a deployed API allowing credentialed requests from anything a browser loads off `localhost`.
+/// A loopback origin is meaningful only where the browser and the API share the machine, so
+/// outside `local` it is dropped and named rather than served.
+#[must_use]
+pub fn served_cors_origins(
+    deployment: Deployment,
+    origins: &[String],
+) -> (Vec<String>, Vec<String>) {
+    if matches!(deployment, Deployment::Local) {
+        return (origins.to_vec(), Vec::new());
+    }
+    let loopback = |o: &String| {
+        let host = o.split("://").nth(1).unwrap_or(o);
+        let host = host.split('/').next().unwrap_or(host);
+        let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
+        matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+    };
+    let (dropped, kept): (Vec<String>, Vec<String>) =
+        origins.iter().cloned().partition(|o| loopback(o));
+    (kept, dropped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Deployment, served_cors_origins};
+
+    fn origins(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn test_served_cors_origins_keeps_loopback_locally() {
+        let list = origins(&["http://localhost:5173", "http://127.0.0.1:3005"]);
+        let (kept, dropped) = served_cors_origins(Deployment::Local, &list);
+        assert_eq!(kept, list, "a local API is reached from a local dev server");
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn test_served_cors_origins_drops_loopback_when_deployed() {
+        let list = origins(&[
+            "http://localhost:5173",
+            "http://127.0.0.1:3005",
+            "http://[::1]:5173",
+            "https://river-data.epfl.ch",
+        ]);
+        for deployment in [Deployment::Dev, Deployment::Stage, Deployment::Prod] {
+            let (kept, dropped) = served_cors_origins(deployment, &list);
+            assert_eq!(kept, origins(&["https://river-data.epfl.ch"]));
+            assert_eq!(dropped.len(), 3, "every loopback origin is named, not served");
+        }
+    }
+
+    #[test]
+    fn test_served_cors_origins_leaves_the_deployment_with_none() {
+        // Dropping every origin is not the same as allowing every origin: the caller decides what
+        // an empty allowlist means, and must not read this as "unset".
+        let (kept, dropped) = served_cors_origins(Deployment::Prod, &origins(&["http://localhost:5173"]));
+        assert!(kept.is_empty());
+        assert_eq!(dropped.len(), 1);
+    }
 }

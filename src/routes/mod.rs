@@ -228,6 +228,7 @@ pub fn validate_optional_time_range(
         private::readings::edits::preview,
         private::readings::edits::commit,
         private::readings::edits::rollback,
+        private::readings::edits::rollback_edit_set,
         private::readings::edits::reload_run,
         private::readings::status_events::batch::insert_batch_status_events,
         private::data_streams::views::stream_stats,
@@ -689,7 +690,7 @@ pub fn build_router(state: AppState) -> Router {
             let rate = config.auth_rate_limit_per_second.max(1);
             let period_nanos = (1_000_000_000u64 / rate).max(1);
             let auth_limiter = GovernorConfigBuilder::default()
-                .key_extractor(FallbackIpKeyExtractor)
+                .key_extractor(FallbackIpKeyExtractor::new(&config.trusted_proxy_cidrs))
                 .period(Duration::from_nanos(period_nanos))
                 .burst_size(config.auth_rate_limit_burst)
                 .finish()
@@ -709,7 +710,7 @@ pub fn build_router(state: AppState) -> Router {
         // bucket of `burst` cells refilled 1 per `period` (default 10 burst, 1/2s ⇒
         // ~30/min). Public data is cache-backed, so this caps abuse without hurting use.
         let public_limiter = GovernorConfigBuilder::default()
-            .key_extractor(FallbackIpKeyExtractor)
+            .key_extractor(FallbackIpKeyExtractor::new(&config.trusted_proxy_cidrs))
             .period(Duration::from_secs(config.public_rate_limit_period_secs))
             .burst_size(config.public_rate_limit_burst)
             .finish()
@@ -780,8 +781,21 @@ pub fn build_router(state: AppState) -> Router {
 
     // Build CORS layer from config
     let cors = {
-        let origins = &config.cors_allowed_origins;
-        if origins.is_empty() || origins.iter().any(|o| o == "*") {
+        // A loopback origin is not served by a deployed instance: the compiled-in default is the
+        // two local dev servers, and an overlay that names no origin would otherwise let anything
+        // a browser loads off localhost make credentialed calls.
+        let (served, refused) =
+            crate::config::served_cors_origins(config.deployment.clone(), &config.cors_allowed_origins);
+        if !refused.is_empty() {
+            tracing::error!(
+                refused = ?refused,
+                deployment = ?config.deployment,
+                "CORS: loopback origins are not served by a deployed instance; \
+                 set CORS_ALLOWED_ORIGINS to this deployment's own dashboard origin"
+            );
+        }
+        let origins = &served;
+        if config.cors_allowed_origins.is_empty() || origins.iter().any(|o| o == "*") {
             tracing::warn!("CORS: allowing all origins");
             CorsLayer::new()
                 .allow_origin(tower_http::cors::Any)

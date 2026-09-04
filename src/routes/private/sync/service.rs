@@ -2159,6 +2159,7 @@ async fn resolve_or_create_site(
         longitude: Set(site_ref.longitude),
         altitude_m: Set(site_ref.altitude_m),
         public_code: Set(None),
+        meteoswiss_station_abbr: sea_orm::ActiveValue::NotSet,
         created_at: Set(Some(Utc::now())),
         discovered_at: Set(Some(Utc::now())),
     }

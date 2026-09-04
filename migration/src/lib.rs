@@ -11,7 +11,9 @@ mod m20260907_000003_sample_statistics;
 mod m20260907_000004_unverified_entries;
 mod m20260907_000005_instrument_kind;
 pub mod m20260907_000006_synthesise_curation_record;
+mod m20260907_000007_meteoswiss_pressure;
 mod m20260908_000001_parameter_groups;
+mod m20260908_000002_calculation_engines;
 
 pub struct Migrator;
 
@@ -30,7 +32,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260907_000004_unverified_entries::Migration),
             Box::new(m20260907_000005_instrument_kind::Migration),
             Box::new(m20260907_000006_synthesise_curation_record::Migration),
+            Box::new(m20260907_000007_meteoswiss_pressure::Migration),
             Box::new(m20260908_000001_parameter_groups::Migration),
+            Box::new(m20260908_000002_calculation_engines::Migration),
         ]
     }
 }

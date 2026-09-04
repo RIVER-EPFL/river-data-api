@@ -388,6 +388,11 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
         // derived output can be referenced as a parameter_id in site_parameters.
         ensure_output_parameter(db, entity).await?;
 
+        // A formula of a calculation is part of its version, so the calculation is re-minted.
+        crate::routes::private::tools::calculation_versions::mint_stale_formula_versions(db, None)
+            .await
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
         // Populate the sources field on the response
         entity.sources = resolved
             .into_iter()
@@ -435,6 +440,10 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
         // Keep the output parameter in sync
         ensure_output_parameter(db, entity).await?;
 
+        crate::routes::private::tools::calculation_versions::mint_stale_formula_versions(db, None)
+            .await
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
         // Populate the sources field on the response
         entity.sources = resolved
             .into_iter()
@@ -450,5 +459,21 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
             .collect();
 
         Ok(())
+    }
+
+    async fn after_delete(&self, db: &DatabaseConnection, _id: Uuid) -> Result<(), ApiError> {
+        crate::routes::private::tools::calculation_versions::mint_stale_formula_versions(db, None)
+            .await
+            .map_err(|e| ApiError::bad_request(e.to_string()))
+    }
+
+    async fn after_delete_many(
+        &self,
+        db: &DatabaseConnection,
+        _ids: &[Uuid],
+    ) -> Result<(), ApiError> {
+        crate::routes::private::tools::calculation_versions::mint_stale_formula_versions(db, None)
+            .await
+            .map_err(|e| ApiError::bad_request(e.to_string()))
     }
 }

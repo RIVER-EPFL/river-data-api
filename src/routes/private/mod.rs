@@ -7,6 +7,7 @@ pub mod constants;
 pub mod data_streams;
 pub mod events;
 pub mod me;
+pub mod meteoswiss;
 pub mod notes;
 pub mod notifications;
 pub mod parameters;

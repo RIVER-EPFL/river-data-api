@@ -216,6 +216,7 @@ origin. A public project's own documentation is at `/api/public/{code}/docs`.
 | `KEYCLOAK_URL`, `KEYCLOAK_REALM`, `KEYCLOAK_CLIENT_ID` | Token validation | required |
 | `KEYCLOAK_ADMIN_CLIENT_ID`, `KEYCLOAK_ADMIN_CLIENT_SECRET` | User management | required |
 | `TOOLS_RUNNER_URL` | OpenCPU endpoint for tool scripts | none, tools disabled |
+| `METEOSWISS_BASE_URL`, `METEOSWISS_INTERVAL_SECONDS` | SMN pressure feed and its cadence | OGD SMN, `3600` |
 | `CACHE_TTL_SECONDS`, `CACHE_MAX_BYTES` | Response cache | `300`, `209715200` |
 | `DISABLE_RATE_LIMITING` | Turn off the public rate limiter | `false` |
 | `ALARM_SWEEP_INTERVAL_SECONDS` | Alarm reconciliation cadence | `60` |

@@ -4,10 +4,12 @@
 //! surface (versions, validation, activation). The portal calculation functions themselves live
 //! inside the seeded scripts, verbatim.
 
+pub mod calculation_versions;
 pub mod calculations;
 pub mod chain;
 pub mod closure;
 pub mod engine;
+pub mod formula;
 /// Content hashing for tool script versions, over the jsonb-normalised stored form.
 pub mod hash;
 pub mod scripts;

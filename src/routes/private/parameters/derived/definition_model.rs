@@ -29,6 +29,13 @@ pub struct Model {
     pub description: Option<String>,
     #[crudcrate(exclude(create, update))]
     pub output_parameter_id: Option<Uuid>,
+    /// The calculation this formula belongs to (M67). NULL is a standalone derived parameter, the
+    /// per-reading continuous kind the derived job and janitor serve.
+    #[crudcrate(filterable)]
+    pub tool_script_id: Option<Uuid>,
+    /// Evaluation order inside the calculation.
+    #[crudcrate(filterable, sortable, on_create = 0)]
+    pub ordinal: i32,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     #[sea_orm(ignore)]

@@ -265,3 +265,99 @@ async fn an_unknown_group_has_no_definition() {
     .await;
     assert_eq!(status, 404);
 }
+
+#[tokio::test]
+#[serial]
+async fn the_document_carries_the_calculation_s_sections_without_reordering() {
+    let (db, app, token) = setup().await;
+    let group = create_group(&app, &token, "dom").await;
+    let group_id = group["id"].as_str().unwrap().to_string();
+
+    add_member(
+        &app,
+        &token,
+        &group_id,
+        crate::common::GLOBAL_PARAM_DO_ID,
+        "measured",
+        1,
+    )
+    .await;
+    add_member(
+        &app,
+        &token,
+        &group_id,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        "measured",
+        2,
+    )
+    .await;
+
+    // The manifest declares the thermal section first. The ordinals are the order.
+    let manifest = json!({
+        "label": "DOM",
+        "params": [
+            { "name": "t", "label": "T", "kind": "number",
+              "parameter_code": "DO_Temperature", "section": "thermal" },
+            { "name": "o", "label": "O", "kind": "number",
+              "parameter_code": "Dissolved_O2", "section": "gases" }
+        ],
+        "outputs": [],
+        "sections": [
+            { "key": "thermal", "label": "Thermal" },
+            { "key": "gases", "label": "Gases" }
+        ]
+    });
+    let script_id = "00000000-0000-4000-c000-0000000002a1";
+    let version_id = "00000000-0000-4000-c000-0000000002a2";
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO tool_scripts (id, name, label, engine, parameter_group_id, created_by) \
+             VALUES ('{script_id}', 'dom_sections', 'DOM', 'script', '{group_id}', 'test')"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO tool_script_versions \
+                 (id, tool_script_id, version_no, script, manifest, content_hash) \
+             VALUES ('{version_id}', '{script_id}', 1, 'tool <- function() list()', \
+                     '{payload}'::jsonb, 'sections-fixture')",
+            payload = manifest.to_string().replace('\'', "''")
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE tool_scripts SET active_version_id = '{version_id}' WHERE id = '{script_id}'"
+        ),
+    )
+    .await;
+
+    let (status, text) = crate::common::get_with_token(
+        &app,
+        &format!("/api/parameter_groups/{group_id}/definition"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "definition ({status}): {text}");
+    let doc: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    let members = doc["members"].as_array().expect("members");
+    assert_eq!(
+        members[0]["parameter_id"],
+        crate::common::GLOBAL_PARAM_DO_ID
+    );
+    assert_eq!(members[0]["section"], "gases");
+    assert_eq!(
+        members[1]["parameter_id"],
+        crate::common::GLOBAL_PARAM_TEMP_ID
+    );
+    assert_eq!(members[1]["section"], "thermal");
+    assert_eq!(
+        doc["sections"],
+        serde_json::json!(["gases", "thermal"]),
+        "sections follow the columns, not the manifest's own order: {text}"
+    );
+}

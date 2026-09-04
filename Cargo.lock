@@ -1008,9 +1008,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -1834,9 +1834,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.14"
+version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "171fefbc92fe4a4de27e0698d6a5b392d6a0e333506bc49133760b3bcf948733"
+checksum = "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3538,9 +3538,7 @@ dependencies = [
 
 [[package]]
 name = "river-data-core"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d01bc553fe613d3abc5fba9829e5b0bf6f38d9b16627be7cbc28de3acd5eacb0"
+version = "0.11.0"
 dependencies = [
  "chrono",
  "serde",
@@ -3580,6 +3578,7 @@ dependencies = [
  "serde_path_to_error",
  "serial_test",
  "sha2 0.10.9",
+ "subtle",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",

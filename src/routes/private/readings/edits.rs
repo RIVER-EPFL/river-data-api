@@ -479,26 +479,24 @@ async fn touched_parameters<C: ConnectionTrait>(
         .collect()
 }
 
-/// Apply the decision on `conn`, which the caller may then roll back.
+/// Apply the decision on `conn` as one decision set, which the caller may then roll back. The
+/// set is what makes a many-row edit, a visit retracted whole, one act to undo.
 async fn apply<C: ConnectionTrait>(
     conn: &C,
     selection: &Selection,
     decision: &EditDecision,
     actor: &str,
-) -> AppResult<decisions::Recorded> {
+) -> AppResult<(Uuid, decisions::Recorded)> {
     let kind = decision.parsed()?;
     let (new, _) = decision.assertion(kind)?;
-    let (predicate, binds) = selection.predicate()?;
-    decisions::record_many(
+    decisions::record_set(
         conn,
         kind,
-        &predicate,
-        binds,
-        NewValue::Literal(new),
+        selection,
+        new,
         actor,
         decision.reason.as_deref(),
         Origin::Manual,
-        None,
     )
     .await
 }
@@ -562,13 +560,15 @@ pub async fn preview(
         let rows: Vec<MovedRow> = before_rows
             .into_iter()
             .zip(after_rows)
-            .map(|((stream_id, time, index, before), (_, _, _, after))| MovedRow {
-                stream_id,
-                time,
-                replicate_index: index,
-                before,
-                after,
-            })
+            .map(
+                |((stream_id, time, index, before), (_, _, _, after))| MovedRow {
+                    stream_id,
+                    time,
+                    replicate_index: index,
+                    before,
+                    after,
+                },
+            )
             .collect();
         let samples: Vec<MovedSample> = before_samples
             .into_iter()
@@ -583,14 +583,12 @@ pub async fn preview(
     })
     .await?;
 
-    let calculations = crate::routes::private::tools::closure::calculations_fed_by(
-        &state.db,
-        &parameters,
-    )
-    .await?
-    .into_iter()
-    .map(|c| serde_json::to_value(c).unwrap_or(serde_json::Value::Null))
-    .collect();
+    let calculations =
+        crate::routes::private::tools::closure::calculations_fed_by(&state.db, &parameters)
+            .await?
+            .into_iter()
+            .map(|c| serde_json::to_value(c).unwrap_or(serde_json::Value::Null))
+            .collect();
 
     Ok(Json(PreviewResponse {
         preview_id: preview_id(&req.selection, &req.decision)?,
@@ -610,6 +608,8 @@ pub struct EditResponse {
     /// The decisions this edit recorded, which is what a rollback names.
     pub rows_decided: u64,
     pub decision_ids: Vec<Uuid>,
+    /// The set the decisions were recorded under, rolled back as one act.
+    pub set_id: Uuid,
 }
 
 /// Commit an edit, held to the selection and decision the preview covered. Requires `write_data`;
@@ -652,15 +652,17 @@ pub async fn commit(
     }
     refuse_unrouted(&state.db, &req.selection, option).await?;
 
-    let recorded = crate::common::bulk_write::guarded(&state.db, async |txn| {
+    let (set_id, recorded) = crate::common::bulk_write::guarded(&state.db, async |txn| {
         apply(txn, &req.selection, &req.decision, &actor).await
     })
     .await?;
 
     if let Some((lo, hi)) = recorded.span
-        && let Err(e) =
-            crate::common::aggregates::refresh(&state.db, crate::common::aggregates::Window::Range(lo, hi))
-                .await
+        && let Err(e) = crate::common::aggregates::refresh(
+            &state.db,
+            crate::common::aggregates::Window::Range(lo, hi),
+        )
+        .await
     {
         tracing::warn!(error = %e, "edit: aggregate refresh failed");
     }
@@ -689,10 +691,7 @@ pub async fn commit(
                   ORDER BY d.at DESC, d.id DESC LIMIT $%LIMIT%",
                 kind = kind.as_str()
             )
-            .replace(
-                "$%LIMIT%",
-                &recorded.rows.max(1).to_string(),
-            ),
+            .replace("$%LIMIT%", &recorded.rows.max(1).to_string()),
             binds,
         ))
         .await?;
@@ -702,6 +701,7 @@ pub async fn commit(
             .iter()
             .map(|r| r.try_get("", "id"))
             .collect::<Result<_, _>>()?,
+        set_id,
     }))
 }
 
@@ -744,6 +744,41 @@ pub async fn rollback(
     })
     .await?;
     Ok(Json(RollbackResponse { rollback_id }))
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RollbackSetResponse {
+    pub set_id: Uuid,
+    pub rolled_back: usize,
+}
+
+/// Invert every live decision an edit's set recorded, restoring exactly the state each one
+/// recorded. This is how a visit retracted whole is put back. Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/api/readings/edits/sets/{set_id}/rollback",
+    params(("set_id" = Uuid, Path, description = "The set the edit recorded")),
+    responses(
+        (status = 200, description = "Inverted", body = RollbackSetResponse),
+        (status = 404, description = "No such set"),
+        (status = 409, description = "Already rolled back"),
+    ),
+    tag = "readings"
+)]
+pub async fn rollback_edit_set(
+    State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<AuthContext>,
+    axum::extract::Path(set_id): axum::extract::Path<Uuid>,
+) -> AppResult<Json<RollbackSetResponse>> {
+    let actor = actor_label(&auth);
+    let rolled_back = crate::common::bulk_write::guarded(&state.db, async |txn| {
+        decisions::rollback_set(txn, set_id, &actor, Some("edit set rolled back")).await
+    })
+    .await?;
+    Ok(Json(RollbackSetResponse {
+        set_id,
+        rolled_back,
+    }))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -899,7 +934,11 @@ mod tests {
     #[test]
     fn attribution_needs_more_than_curation_does() {
         use crate::common::authz::Capability;
-        for option in [EditOption::ValueCorrection, EditOption::Flag, EditOption::Withdraw] {
+        for option in [
+            EditOption::ValueCorrection,
+            EditOption::Flag,
+            EditOption::Withdraw,
+        ] {
             assert_eq!(option.capability(), Capability::WriteData, "{option:?}");
         }
         for option in [

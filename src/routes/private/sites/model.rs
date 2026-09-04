@@ -35,6 +35,10 @@ pub struct Model {
     #[crudcrate(exclude(create, update))]
     pub discovered_at: Option<chrono::DateTime<chrono::Utc>>,
     pub public_code: Option<String>,
+    /// The MeteoSwiss SMN station abbreviation (`MOB`, `SIO`, ...) supplying this site's
+    /// barometric pressure. Null means the site takes no pressure series.
+    #[crudcrate(filterable, sortable)]
+    pub meteoswiss_station_abbr: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

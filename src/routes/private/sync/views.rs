@@ -701,6 +701,7 @@ async fn resolve_or_create_site<C: ConnectionTrait>(
         longitude: Set(None),
         altitude_m: Set(None),
         public_code: Set(None),
+        meteoswiss_station_abbr: sea_orm::ActiveValue::NotSet,
         created_at: Set(Some(Utc::now())),
         discovered_at: Set(Some(Utc::now())),
     };
@@ -1289,6 +1290,7 @@ pub async fn bulk_pair(
                     longitude: Set(s.longitude),
                     altitude_m: Set(s.altitude_m),
                     public_code: Set(None),
+                    meteoswiss_station_abbr: sea_orm::ActiveValue::NotSet,
                     created_at: Set(Some(Utc::now())),
                     discovered_at: Set(Some(Utc::now())),
                 }

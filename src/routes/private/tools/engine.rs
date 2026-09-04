@@ -1283,6 +1283,31 @@ fn runner_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(reqwest::Client::new)
 }
 
+/// Which engine a calculation's versions carry (Q43). One concept, two ways of expressing the
+/// arithmetic: R in the sandbox, or the formulas attached to the calculation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Engine {
+    Script,
+    Formula,
+}
+
+impl Engine {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "script" => Some(Self::Script),
+            "formula" => Some(Self::Formula),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Script => "script",
+            Self::Formula => "formula",
+        }
+    }
+}
+
 pub struct ActiveTool {
     pub script_id: Uuid,
     pub name: String,
@@ -1294,6 +1319,11 @@ pub struct ActiveTool {
     pub entry_function: String,
     pub content_hash: String,
     pub manifest: Manifest,
+    pub engine: Engine,
+    /// The parameter group this calculation reads and writes, when it declares one (M66).
+    pub parameter_group_id: Option<Uuid>,
+    /// The formula engine's formulas, in no particular order; empty for a script calculation.
+    pub formulas: Vec<super::formula::PinnedFormula>,
 }
 
 fn stored_manifest(name: &str, raw: &serde_json::Value) -> AppResult<Manifest> {
@@ -1302,7 +1332,7 @@ fn stored_manifest(name: &str, raw: &serde_json::Value) -> AppResult<Manifest> {
 }
 
 const ACTIVE_TOOL_SQL: &str = r"
-    SELECT s.id AS script_id, s.name, s.label, s.description,
+    SELECT s.id AS script_id, s.name, s.label, s.description, s.engine, s.parameter_group_id,
            v.id AS version_id, v.version_no, v.script, v.entry_function, v.manifest,
            v.content_hash
     FROM tool_scripts s
@@ -1321,8 +1351,86 @@ fn row_to_active(row: &sea_orm::QueryResult) -> AppResult<ActiveTool> {
         entry_function: row.try_get("", "entry_function")?,
         content_hash: row.try_get("", "content_hash")?,
         manifest,
+        engine: Engine::parse(&row.try_get::<String>("", "engine")?).unwrap_or(Engine::Script),
+        parameter_group_id: row.try_get("", "parameter_group_id")?,
+        formulas: Vec::new(),
         name,
     })
+}
+
+/// The formulas attached to the given calculations, as `(script_id, formula)` pairs.
+pub async fn load_formulas(
+    db: &DatabaseConnection,
+    script_ids: &[Uuid],
+) -> AppResult<Vec<(Uuid, super::formula::PinnedFormula)>> {
+    if script_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT d.tool_script_id, d.code, d.name, NULLIF(d.units, '') AS units, d.formula,
+                    d.ordinal, out.code AS output_parameter_code,
+                    COALESCE(
+                        (SELECT jsonb_agg(jsonb_build_array(src.variable_name, p.code)
+                                            ORDER BY src.variable_name)
+                           FROM derived_parameter_sources src
+                           JOIN parameters p ON p.id = src.parameter_id
+                          WHERE src.derived_definition_id = d.id),
+                        '[]'::jsonb) AS sources
+               FROM derived_parameter_definitions d
+               LEFT JOIN parameters out ON out.id = d.output_parameter_id
+              WHERE d.tool_script_id = ANY($1)
+              ORDER BY d.ordinal, d.code",
+            [script_ids.to_vec().into()],
+        ))
+        .await?;
+    let mut formulas = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let script_id: Uuid = row.try_get("", "tool_script_id")?;
+        let raw: serde_json::Value = row.try_get("", "sources")?;
+        let sources: Vec<(String, String)> = raw
+            .as_array()
+            .map(|pairs| {
+                pairs
+                    .iter()
+                    .filter_map(|pair| {
+                        let variable = pair.get(0)?.as_str()?.to_string();
+                        let code = pair.get(1)?.as_str()?.to_string();
+                        Some((variable, code))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        formulas.push((
+            script_id,
+            super::formula::PinnedFormula {
+                code: row.try_get("", "code")?,
+                label: row.try_get("", "name")?,
+                units: row.try_get("", "units")?,
+                formula: row.try_get("", "formula")?,
+                ordinal: row.try_get("", "ordinal")?,
+                output_parameter_code: row.try_get("", "output_parameter_code")?,
+                sources,
+            },
+        ));
+    }
+    Ok(formulas)
+}
+
+/// Load the formulas of every formula calculation in the set. A script calculation is left alone.
+async fn attach_formulas(db: &DatabaseConnection, tools: &mut [ActiveTool]) -> AppResult<()> {
+    let ids: Vec<Uuid> = tools
+        .iter()
+        .filter(|t| t.engine == Engine::Formula)
+        .map(|t| t.script_id)
+        .collect();
+    for (script_id, formula) in load_formulas(db, &ids).await? {
+        if let Some(tool) = tools.iter_mut().find(|t| t.script_id == script_id) {
+            tool.formulas.push(formula);
+        }
+    }
+    Ok(())
 }
 
 /// The calculation set: every enabled tool with an active version. A disabled tool is left out
@@ -1334,7 +1442,9 @@ pub async fn list_active_tools(db: &DatabaseConnection) -> AppResult<Vec<ActiveT
             format!("{ACTIVE_TOOL_SQL} WHERE s.enabled ORDER BY s.name"),
         ))
         .await?;
-    rows.iter().map(row_to_active).collect()
+    let mut tools: Vec<ActiveTool> = rows.iter().map(row_to_active).collect::<AppResult<_>>()?;
+    attach_formulas(db, &mut tools).await?;
+    Ok(tools)
 }
 
 pub async fn find_active_tool(db: &DatabaseConnection, name: &str) -> AppResult<ActiveTool> {
@@ -1346,7 +1456,9 @@ pub async fn find_active_tool(db: &DatabaseConnection, name: &str) -> AppResult<
         ))
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Unknown tool: {name}")))?;
-    row_to_active(&row)
+    let mut tools = vec![row_to_active(&row)?];
+    attach_formulas(db, &mut tools).await?;
+    Ok(tools.remove(0))
 }
 
 impl ActiveTool {
@@ -1370,6 +1482,9 @@ impl ActiveTool {
             entry_function,
             content_hash,
             manifest,
+            engine: Engine::Script,
+            parameter_group_id: None,
+            formulas: Vec::new(),
         }
     }
 
@@ -1998,15 +2113,36 @@ pub async fn execute_resolved(
         collected_at,
     } = resolved;
 
-    let raw = execute_script(
-        state,
-        &tool.script,
-        &tool.entry_function,
-        &serde_json::Value::Object(effective_inputs.clone()),
-        &serde_json::Value::Object(constants.clone()),
-        &serde_json::Value::Object(curves),
-    )
-    .await?;
+    // The engine decides only how the arithmetic is done. Everything after this point, the
+    // cleared outputs, the manifest aggregates, the inputs the run records, is one path.
+    let raw = if tool.engine == Engine::Formula {
+        let numbers: std::collections::HashMap<String, f64> = effective_inputs
+            .iter()
+            .filter_map(|(k, v)| v.as_f64().map(|n| (k.clone(), n)))
+            .collect();
+        let produced = super::formula::evaluate(&tool.formulas, &numbers)
+            .map_err(|message| AppError::ToolScriptError {
+                message: format!("{}: {message}", tool.name),
+                call: None,
+                traceback: Vec::new(),
+            })?;
+        serde_json::Value::Object(
+            produced
+                .into_iter()
+                .map(|(key, value)| (key, serde_json::json!(value)))
+                .collect(),
+        )
+    } else {
+        execute_script(
+            state,
+            &tool.script,
+            &tool.entry_function,
+            &serde_json::Value::Object(effective_inputs.clone()),
+            &serde_json::Value::Object(constants.clone()),
+            &serde_json::Value::Object(curves),
+        )
+        .await?
+    };
 
     let mut results = match raw {
         serde_json::Value::Object(map) => map,

@@ -19,7 +19,6 @@ use super::{
 use crate::common::AppState;
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
-use crate::routes::private::api_tokens::service::hash_token;
 use crate::routes::private::sync::control::tokens::generate_token;
 
 /// `Content-Range: items {start}-{end}/{total}` with an inclusive end, per RFC 7233, plus the
@@ -339,12 +338,13 @@ pub async fn get_service(
 }
 
 /// Command names an operator may queue, and the payload each accepts.
-const VALID_COMMANDS: [&str; 5] = [
+const VALID_COMMANDS: [&str; 6] = [
     commands::TRIGGER_SYNC,
     commands::TRIGGER_FULL_SYNC,
     commands::PAUSE,
     commands::RESUME,
     commands::RESYNC_STREAMS,
+    commands::SOURCE_AUDIT,
 ];
 
 /// Refuse a command the driver would not run: an unknown name, or `resync_streams` without a
@@ -374,8 +374,10 @@ pub fn validate_command(command: &str, payload: Option<&serde_json::Value>) -> R
 
 /// Queue a command for a sync service. The command is picked up on the next heartbeat
 /// (within `command_expiry_secs`). Valid commands: `trigger_sync`, `trigger_full_sync`,
-/// `pause`, `resume`, and `resync_streams` with `{"source_keys": [...]}` (re-fetch the named
-/// streams from the start of history and ingest with overwrite). Requires `write_metadata`.
+/// `pause`, `resume`, `resync_streams` with `{"source_keys": [...]}` (re-fetch the named
+/// streams from the start of history and ingest with overwrite), and `source_audit` (walk
+/// everything the source holds against everything registered here; read-only, its result is the
+/// report). Requires `write_metadata`.
 #[utoipa::path(
     post,
     path = "/api/sync/services/{id}/commands",
@@ -601,7 +603,8 @@ pub async fn create_credential(
     let prefix = &state.config.as_ref().sync_client_id_prefix;
     let client_id = format!("{prefix}{}", &full_token[..16]);
     let client_secret = generate_token();
-    let secret_hash = hash_token(&client_secret);
+    let secret_hash =
+        crate::routes::private::api_tokens::service::hash_api_secret(&client_secret);
 
     let cred = sync_service_credentials::ActiveModel {
         id: Set(Uuid::new_v4()),
@@ -768,8 +771,8 @@ mod tests {
     use super::validate_command;
 
     #[test]
-    fn test_validate_command_accepts_the_four_bare_commands() {
-        for c in ["trigger_sync", "trigger_full_sync", "pause", "resume"] {
+    fn test_validate_command_accepts_every_command_that_needs_no_payload() {
+        for c in ["trigger_sync", "trigger_full_sync", "pause", "resume", "source_audit"] {
             assert_eq!(validate_command(c, None), Ok(()), "{c}");
         }
     }
@@ -779,6 +782,7 @@ mod tests {
         let err = validate_command("full_sync", None).unwrap_err();
         assert!(err.contains("Invalid command 'full_sync'"), "{err}");
         assert!(err.contains("resync_streams"), "lists every valid name: {err}");
+        assert!(err.contains("source_audit"), "lists every valid name: {err}");
     }
 
     #[test]

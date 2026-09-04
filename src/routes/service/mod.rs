@@ -12,9 +12,8 @@ use crate::common::AppState;
 use crate::common::authz::{Capability, TokenAccess, TokenBit};
 use crate::common::middleware::{
     bust_token_cache_on_mutation, deny_scoped_token, enforce_scope_on_crud, inject_read_scope,
-    require_admin, require_admin_or_token_write_metadata, require_crud, require_manage_sensors,
-    require_enter_field_data, require_read_data, require_read_metadata,
-    require_write_data,
+    require_admin, require_admin_or_token_write_metadata, require_crud, require_enter_field_data,
+    require_manage_sensors, require_read_data, require_read_metadata, require_write_data,
 };
 use crate::common::rate_limit::FallbackIpKeyExtractor;
 use crate::routes::private::{
@@ -410,6 +409,10 @@ pub fn api_router(state: &AppState) -> Router<()> {
         .route(
             "/readings/edits/{id}/rollback",
             post(crate::routes::private::readings::edits::rollback),
+        )
+        .route(
+            "/readings/edits/sets/{set_id}/rollback",
+            post(crate::routes::private::readings::edits::rollback_edit_set),
         )
         .route("/readings/flag", patch(flags::flag_readings))
         .route("/readings/unflag", patch(flags::unflag_readings))
@@ -830,12 +833,12 @@ pub fn service_router(state: &AppState) -> Router<()> {
     api_router(state)
 }
 
-pub fn sync_control_router(_state: &AppState) -> Router<AppState> {
+pub fn sync_control_router(state: &AppState) -> Router<AppState> {
     use std::sync::Arc;
     use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
     let enroll_limiter = GovernorConfigBuilder::default()
-        .key_extractor(FallbackIpKeyExtractor)
+        .key_extractor(FallbackIpKeyExtractor::new(&state.config.trusted_proxy_cidrs))
         .per_second(3)
         .burst_size(10)
         .finish()

@@ -37,6 +37,7 @@ pub const MAINTENANCE: &[&str] = &[
     "refresh_aggregates",
     "refresh_aggregates_full",
     "alarm_backfill",
+    "meteoswiss_sync",
 ];
 
 /// Triggered by a configuration change rather than by a person.
@@ -104,6 +105,7 @@ pub const CANCELLABLE: &[&str] = &[
     "replicate_reconciliation_delete",
     "event_audit",
     "event_recompute",
+    "meteoswiss_sync",
 ];
 
 /// The recurring services [`super::job::register_scheduled_services`] adds. They carry a cadence
@@ -118,4 +120,5 @@ pub const SCHEDULED_SERVICE_NAMES: &[&str] = &[
     "identity_reconcile",
     "notify_health",
     "dispatch_notifications",
+    "meteoswiss_sync",
 ];

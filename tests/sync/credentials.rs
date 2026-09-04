@@ -85,7 +85,19 @@ async fn minted_credentials_enroll_and_are_stored_hashed() {
         ),
     )
     .await;
-    assert_eq!(stored, hash_token(&minted.client_secret));
+    assert!(
+        stored.starts_with("$argon2id$"),
+        "stored salted and work-factored, not as a digest a wordlist covers in one pass: {stored}"
+    );
+    assert_ne!(stored, hash_token(&minted.client_secret));
+    assert_ne!(stored, minted.client_secret);
+    assert!(
+        river_db::routes::private::api_tokens::service::verify_api_secret(
+            &minted.client_secret,
+            &stored
+        ),
+        "the minted secret verifies against what was stored"
+    );
 
     let service_type = scalar(
         &db,
@@ -135,6 +147,76 @@ async fn minted_credentials_enroll_and_are_stored_hashed() {
         status, 200,
         "enroll with minted credentials ({status}): {body}"
     );
+}
+
+/// Scenario: a credential issued before enrollment secrets were argon2-hashed, so the row holds an
+/// unsalted SHA-256 digest and the plaintext is held nowhere.
+///
+/// Expected behaviour: it still enrolls, because breaking every deployed service is not an upgrade
+/// path, and the enrollment is the one moment the plaintext is in hand, so the row is rewritten as
+/// argon2 there. The second enrollment then verifies against the new hash, and the secret is not
+/// re-issued.
+#[tokio::test]
+#[serial]
+async fn a_credential_stored_as_a_bare_digest_enrolls_and_is_rehashed() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let (app, _state) = crate::common::build_test_app_with_state(db.clone());
+
+    let secret = "a".repeat(64);
+    let client_id = "svc_legacydigest0001";
+    db.execute_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            "INSERT INTO sync_service_credentials \
+             (id, client_id, client_secret_hash, service_type, revoked, created_at) \
+             VALUES ('{}', '{client_id}', '{}', 'vaisala', false, NOW())",
+            Uuid::new_v4(),
+            hash_token(&secret)
+        ),
+    ))
+    .await
+    .expect("seed a legacy credential");
+
+    async fn enroll(
+        app: &axum::Router,
+        client_id: &str,
+        secret: &str,
+        instance: &str,
+    ) -> (u16, String) {
+        crate::common::post_json(
+            app,
+            "/api/sync/enroll",
+            &serde_json::json!({
+                "client_id": client_id,
+                "client_secret": secret,
+                "instance_id": instance,
+            }),
+        )
+        .await
+    }
+
+    let (status, body) = enroll(&app, client_id, &secret, "inst-legacy-1").await;
+    assert_eq!(status, 200, "a legacy credential still enrolls: {body}");
+
+    let stored = scalar(
+        &db,
+        &format!(
+            "SELECT client_secret_hash AS v FROM sync_service_credentials \
+             WHERE client_id = '{client_id}'"
+        ),
+    )
+    .await;
+    assert!(
+        stored.starts_with("$argon2id$"),
+        "the enrollment rehashed it: {stored}"
+    );
+
+    let (status, body) = enroll(&app, client_id, &secret, "inst-legacy-2").await;
+    assert_eq!(status, 200, "the same secret enrolls against the new hash: {body}");
+
+    let (status, _) = enroll(&app, client_id, &"b".repeat(64), "inst-legacy-3").await;
+    assert_eq!(status, 401, "a wrong secret is still refused after the rehash");
 }
 
 #[tokio::test]

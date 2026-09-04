@@ -332,6 +332,50 @@ async fn acknowledged_decision_stands_against_redetection() {
     assert_eq!(hold_status(&fx.db, &hold_id).await, "acknowledged");
 }
 
+/// Scenario: a group agreed with the portal when it was first stored, and the portal later edited
+/// only its precomputed `_avg`/`_sd` cells. The values here are unchanged, so no row is written.
+///
+/// Expected behaviour: the audit is a comparison against what is stored, not a side effect of
+/// storing, so the later pass re-audits the group it already holds and the moved expectation
+/// raises a hold. Without this a portal-side statistics edit after our ingest of that span is
+/// never noticed.
+#[tokio::test]
+#[serial]
+async fn moved_expectation_reaudits_a_group_already_stored() {
+    let fx = setup("audit-reaudit").await;
+
+    let batch = group(T1, &[10.0, 20.0, 30.0]);
+    let first = ingest_audited(
+        &fx,
+        batch.clone(),
+        json!([{"time": T1, "expected_mean": 20.0, "expected_sd": 10.0}]),
+    )
+    .await;
+    assert_eq!(first["inserted"], 3);
+    assert_eq!(
+        count(&fx.db, "SELECT COUNT(*) FROM replicate_audit_holds").await,
+        0,
+        "the group agreed on arrival"
+    );
+
+    // The same replicates, re-asserted: nothing to write, only the claim about them has moved.
+    let second = ingest_audited(
+        &fx,
+        batch,
+        json!([{"time": T1, "expected_mean": 25.0, "expected_sd": 10.0}]),
+    )
+    .await;
+    assert_eq!(second["inserted"], 0, "no replicate changed");
+    assert_eq!(second["held"], 0, "the group is admitted either way");
+    assert_eq!(readings_at(&fx, T1).await, 3);
+
+    let holds = list_holds(&fx, "&status=pending").await;
+    let items = holds["holds"].as_array().expect("holds");
+    assert_eq!(items.len(), 1, "the moved expectation is held for review: {holds}");
+    assert_eq!(items[0]["expected"]["mean"], 25.0, "held against the moved claim, not the original");
+    assert_eq!(items[0]["computed"]["mean"], 20.0, "the stored replicates are what it recomputed");
+}
+
 #[tokio::test]
 #[serial]
 async fn matching_resend_supersedes_stale_hold() {

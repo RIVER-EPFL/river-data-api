@@ -561,7 +561,10 @@ async fn a_field_day_saves_each_station_independently() {
         assert_eq!(event["created"], true);
         staged.push(event["id"].as_str().unwrap().to_string());
     }
-    assert_ne!(staged[0], staged[1], "a visit per station, not one for the day");
+    assert_ne!(
+        staged[0], staged[1],
+        "a visit per station, not one for the day"
+    );
 
     // The first station's values are screened, and saved under the check that screened them.
     let (status, checked) = crate::common::post_json_parse_with_token(
@@ -604,7 +607,10 @@ async fn a_field_day_saves_each_station_independently() {
         &token,
     )
     .await;
-    assert!(status >= 400, "an unscreened station is refused: {status} {body}");
+    assert!(
+        status >= 400,
+        "an unscreened station is refused: {status} {body}"
+    );
 
     assert_eq!(
         scalar_i64(
@@ -641,4 +647,101 @@ async fn a_field_day_saves_each_station_independently() {
         2,
         "both visits stand: a refused save does not unstage its visit"
     );
+}
+
+/// M87: the portal's Delete row. A visit is retracted as one selection, and the set that
+/// retracted it re-asserts exactly what it withdrew.
+#[tokio::test]
+#[serial]
+async fn a_visit_is_withdrawn_and_re_asserted_as_one_set() {
+    let (db, app, token) = setup().await;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({
+            "site_id": SITE1_ID,
+            "readings": [
+                { "parameter_id": GLOBAL_PARAM_DO_ID, "value": 10.0, "time": T1 },
+                { "parameter_id": GLOBAL_PARAM_DO_ID, "value": 12.0, "time": T1 },
+                { "parameter_id": GLOBAL_PARAM_TEMP_ID, "value": 4.2, "time": T1 },
+            ],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (event_id, _) = event_row(&db, T1).await.expect("the visit");
+
+    let withdrawn = |db: DatabaseConnection, event: String| async move {
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM readings \
+                 WHERE collection_event_id = '{event}' AND withdrawn_at IS NOT NULL"
+            ),
+        )
+        .await
+    };
+    assert_eq!(withdrawn(db.clone(), event_id.clone()).await, 0);
+
+    let selection = json!({ "collection_event_id": event_id });
+    let decision = json!({ "kind": "withdraw", "reason": "contaminated vials" });
+    let (status, preview) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/edits/preview",
+        &json!({ "selection": selection, "decision": decision }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{preview}");
+    assert_eq!(
+        preview["rows"].as_array().unwrap().len(),
+        3,
+        "every replicate of every parameter at the visit: {preview}"
+    );
+    let preview_id = preview["preview_id"].as_str().unwrap().to_string();
+
+    let (status, committed) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/edits",
+        &json!({ "selection": selection, "decision": decision, "preview_id": preview_id }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{committed}");
+    assert_eq!(committed["rows_decided"], 3);
+    assert_eq!(withdrawn(db.clone(), event_id.clone()).await, 3);
+    assert!(
+        event_row(&db, T1).await.is_some(),
+        "the visit itself still stands; only its measurements are retracted"
+    );
+
+    let set_id = committed["set_id"]
+        .as_str()
+        .expect("a visit withdrawal is one set")
+        .to_string();
+    let (status, rolled) = crate::common::post_json_parse_with_token(
+        &app,
+        &format!("/api/readings/edits/sets/{set_id}/rollback"),
+        &json!({}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{rolled}");
+    assert_eq!(rolled["rolled_back"], 3);
+    assert_eq!(
+        withdrawn(db.clone(), event_id.clone()).await,
+        0,
+        "the rollback re-asserts exactly what the set withdrew"
+    );
+
+    let (status, again) = crate::common::post_json_parse_with_token(
+        &app,
+        &format!("/api/readings/edits/sets/{set_id}/rollback"),
+        &json!({}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 409, "a set is rolled back once: {again}");
 }

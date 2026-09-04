@@ -116,3 +116,16 @@ jobs:
       - name: Tool runner logs on failure
         if: failure()
         run: docker logs tools-r
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Exceptions and the reason for each are in .cargo/audit.toml; a new advisory fails here
+      # rather than waiting to be found in a review.
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit

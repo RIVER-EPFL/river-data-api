@@ -1315,13 +1315,15 @@ pub struct SelectionKey {
     pub replicate_index: Option<i16>,
 }
 
-/// The readings a set decision covers: a stream, a slot, or explicit keys, each optionally
-/// bounded by a time window.
+/// The readings a set decision covers: a stream, a visit, a slot, or explicit keys, each
+/// optionally bounded by a time window.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Selection {
     #[serde(default)]
     pub stream_id: Option<Uuid>,
+    #[serde(default)]
+    pub collection_event_id: Option<Uuid>,
     #[serde(default)]
     pub site_id: Option<Uuid>,
     #[serde(default)]
@@ -1343,6 +1345,10 @@ impl Selection {
         if let Some(stream_id) = self.stream_id {
             binds.push(stream_id.into());
             clauses.push(format!("r.stream_id = ${}", binds.len()));
+        }
+        if let Some(event_id) = self.collection_event_id {
+            binds.push(event_id.into());
+            clauses.push(format!("r.collection_event_id = ${}", binds.len()));
         }
         match (self.site_id, self.parameter_id) {
             (Some(site_id), Some(parameter_id)) => {
@@ -1382,9 +1388,13 @@ impl Selection {
             }
             clauses.push(format!("({})", triples.join(" OR ")));
         }
-        if self.stream_id.is_none() && self.site_id.is_none() && self.keys.is_empty() {
+        if self.stream_id.is_none()
+            && self.collection_event_id.is_none()
+            && self.site_id.is_none()
+            && self.keys.is_empty()
+        {
             return Err(AppError::BadRequest(
-                "A selection names a stream, a slot (site_id and parameter_id), or keys"
+                "A selection names a stream, a visit, a slot (site_id and parameter_id), or keys"
                     .to_string(),
             ));
         }
@@ -2274,6 +2284,33 @@ mod tests {
     }
 
     #[test]
+    fn a_selection_can_name_one_visit() {
+        use super::Selection;
+        let event = uuid::Uuid::nil();
+        let by_event = Selection {
+            collection_event_id: Some(event),
+            ..Default::default()
+        };
+        let (sql, binds) = by_event.predicate().unwrap();
+        assert_eq!(sql, "r.collection_event_id = $1");
+        assert_eq!(binds.len(), 1);
+
+        // A visit narrowed to one parameter is still a selection, and the slot rule still holds.
+        let one_parameter = Selection {
+            collection_event_id: Some(event),
+            site_id: Some(uuid::Uuid::nil()),
+            parameter_id: Some(uuid::Uuid::nil()),
+            ..Default::default()
+        };
+        let (sql, binds) = one_parameter.predicate().unwrap();
+        assert_eq!(
+            sql,
+            "r.collection_event_id = $1 AND r.site_id = $2 AND r.parameter_id = $3"
+        );
+        assert_eq!(binds.len(), 3);
+    }
+
+    #[test]
     fn a_detach_makes_the_slot_manual_until_an_input_moves_or_it_is_returned() {
         use super::{Owner, slot_owner};
         let t = |s: &str| {
@@ -2474,7 +2511,10 @@ mod tests {
     fn only_an_intern_enters_a_pending_measurement() {
         use super::entry_state;
         use crate::common::authz::Role;
-        assert_eq!(entry_state(Some(&Role::Intern)), Some(Kind::UnverifiedEntry));
+        assert_eq!(
+            entry_state(Some(&Role::Intern)),
+            Some(Kind::UnverifiedEntry)
+        );
         for role in [
             Role::River,
             Role::Manager,

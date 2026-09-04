@@ -346,6 +346,10 @@ pub struct ToolScriptSummary {
     /// Whether the tool is part of the calculation set: fired at visits by the chain, audited,
     /// and listed on the Tools page. Off, it can still be run by name.
     pub enabled: bool,
+    /// `script` (R in the sandbox) or `formula` (the definitions attached to the calculation).
+    pub engine: String,
+    /// The parameter group this calculation reads and writes, when it declares one.
+    pub parameter_group_id: Option<Uuid>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -360,7 +364,7 @@ pub async fn list_scripts(
         .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT s.id, s.name, s.label, s.description, s.active_version_id, s.updated_at,
-                     s.enabled, av.version_no AS active_version_no,
+                     s.enabled, s.engine, s.parameter_group_id, av.version_no AS active_version_no,
                      (SELECT count(*) FROM tool_script_versions v
                        WHERE v.tool_script_id = s.id) AS version_count
               FROM tool_scripts s
@@ -380,6 +384,8 @@ pub async fn list_scripts(
             active_version_no: row.try_get("", "active_version_no")?,
             version_count: row.try_get("", "version_count")?,
             enabled: row.try_get("", "enabled")?,
+            engine: row.try_get("", "engine")?,
+            parameter_group_id: row.try_get("", "parameter_group_id")?,
             updated_at: row.try_get("", "updated_at")?,
         });
     }
@@ -413,7 +419,7 @@ async fn load_summary(state: &AppState, id: Uuid) -> AppResult<ToolScriptSummary
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT s.id, s.name, s.label, s.description, s.active_version_id, s.updated_at,
-                     s.enabled, av.version_no AS active_version_no,
+                     s.enabled, s.engine, s.parameter_group_id, av.version_no AS active_version_no,
                      (SELECT count(*) FROM tool_script_versions v
                        WHERE v.tool_script_id = s.id) AS version_count
               FROM tool_scripts s
@@ -432,6 +438,8 @@ async fn load_summary(state: &AppState, id: Uuid) -> AppResult<ToolScriptSummary
         active_version_no: row.try_get("", "active_version_no")?,
         version_count: row.try_get("", "version_count")?,
         enabled: row.try_get("", "enabled")?,
+        engine: row.try_get("", "engine")?,
+        parameter_group_id: row.try_get("", "parameter_group_id")?,
         updated_at: row.try_get("", "updated_at")?,
     })
 }
@@ -478,6 +486,14 @@ pub struct CreateScriptRequest {
     pub label: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// `script` (the default) or `formula`. A formula calculation has no authored versions: its
+    /// versions are minted from the definitions attached to it.
+    #[serde(default)]
+    pub engine: Option<String>,
+    /// The parameter group whose members this calculation reads and writes. One calculation per
+    /// group (Q43).
+    #[serde(default)]
+    pub parameter_group_id: Option<Uuid>,
 }
 
 /// Create a tool script (no versions yet; it lists in `GET /tools` only once a version is
@@ -495,17 +511,27 @@ pub async fn create_script(
             "tool name must be non-empty [a-z0-9_]".to_string(),
         ));
     }
+    if let Some(engine) = payload.engine.as_deref()
+        && engine::Engine::parse(engine).is_none()
+    {
+        return Err(AppError::BadRequest(format!(
+            "engine {engine} is not script or formula"
+        )));
+    }
     let row = state
         .db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"INSERT INTO tool_scripts (name, label, description, created_by)
-              VALUES ($1, $2, $3, $4) RETURNING id",
+            r"INSERT INTO tool_scripts
+                  (name, label, description, created_by, engine, parameter_group_id)
+              VALUES ($1, $2, $3, $4, COALESCE($5, 'script'), $6) RETURNING id",
             [
                 name.to_lowercase().into(),
                 payload.label.into(),
                 payload.description.into(),
                 actor_label(&auth).into(),
+                payload.engine.clone().into(),
+                payload.parameter_group_id.into(),
             ],
         ))
         .await
@@ -531,6 +557,10 @@ pub struct UpdateScriptRequest {
     /// activation and fires at no visit until it is switched back on.
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// Bind the calculation to a parameter group. Omitted leaves the binding as it is, the way
+    /// the other fields of this request behave.
+    #[serde(default)]
+    pub parameter_group_id: Option<Uuid>,
 }
 
 /// Update a script's label, description or enabled switch (the code lives in versions).
@@ -549,13 +579,15 @@ pub async fn update_script(
             sea_orm::DatabaseBackend::Postgres,
             r"UPDATE tool_scripts SET label = COALESCE($2, label),
                      description = COALESCE($3, description),
-                     enabled = COALESCE($4, enabled), updated_at = now()
+                     enabled = COALESCE($4, enabled),
+                     parameter_group_id = COALESCE($5, parameter_group_id), updated_at = now()
               WHERE id = $1",
             [
                 id.into(),
                 payload.label.into(),
                 payload.description.into(),
                 payload.enabled.into(),
+                payload.parameter_group_id.into(),
             ],
         ))
         .await?;
@@ -1100,6 +1132,9 @@ fn version_as_tool(
         entry_function: version.entry_function.clone(),
         content_hash: version.content_hash.clone(),
         manifest,
+        engine: engine::Engine::Script,
+        parameter_group_id: None,
+        formulas: Vec::new(),
     })
 }
 
@@ -1291,6 +1326,18 @@ pub async fn activate_version(
     }
     let mut manifest = engine::parse_manifest(&version.manifest)
         .map_err(|e| AppError::BadRequest(format!("invalid manifest: {e}")))?;
+    let summary = load_summary(&state, id).await?;
+    // A calculation bound to a group reads and writes only that group's members, in the roles the
+    // group declares. Checked at activation, where the version becomes the one that runs.
+    if let Some(group_id) = summary.parameter_group_id {
+        super::calculation_versions::check_manifest_against_group(
+            &state.db,
+            group_id,
+            &summary.name,
+            &version.manifest,
+        )
+        .await?;
+    }
     let catalog = engine::check_manifest_against_catalog(
         &state.db,
         &mut manifest,

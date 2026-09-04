@@ -319,6 +319,9 @@ pub fn register_scheduled_services(registry: &mut JobRegistry, config: &crate::c
     registry.register(Arc::new(super::jobs::DispatchNotifications::from_config(
         config,
     )));
+    registry.register(Arc::new(
+        crate::routes::private::meteoswiss::sync::MeteoswissSync::from_config(config),
+    ));
 
     // The policy tables in `registry` are keyed by trigger_type and cannot construct these, so the
     // name list they check against is verified here instead of drifting quietly.

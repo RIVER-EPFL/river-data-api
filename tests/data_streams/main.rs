@@ -7,6 +7,7 @@
 mod common;
 
 mod measurement_classification;
+mod meteoswiss_provisioning;
 mod nomis_pairing_refused;
 mod pair_opens_at_history;
 mod pair_replicate_samples;

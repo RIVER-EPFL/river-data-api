@@ -1,0 +1,10 @@
+# Advisories that stand, each with the reason it stands. Anything not listed here fails the build.
+[advisories]
+ignore = [
+    # rkyv 0.7 arrives under rust_decimal, which uses it for trait impls only. The advisory is an
+    # out-of-bounds read while validating an untrusted rkyv archive; nothing here deserialises one.
+    # rust_decimal reaches the tree through SeaORM, so the version is not ours to choose.
+    "RUSTSEC-2026-0235",
+    # rsa arrives under web-push -> jwt-simple -> superboring. No patched release exists.
+    "RUSTSEC-2023-0071",
+]

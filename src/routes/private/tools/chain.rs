@@ -660,8 +660,11 @@ async fn pinned_tool(
     let Some(row) = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT tool_script_id, version_no, script, entry_function, manifest, content_hash
-             FROM tool_script_versions WHERE id = $1",
+            "SELECT v.tool_script_id, v.version_no, v.script, v.entry_function, v.manifest,
+                    v.content_hash, s.engine, s.parameter_group_id
+             FROM tool_script_versions v
+             JOIN tool_scripts s ON s.id = v.tool_script_id
+             WHERE v.id = $1",
             [version_id.into()],
         ))
         .await?
@@ -672,6 +675,18 @@ async fn pinned_tool(
     let Ok(manifest) = engine::parse_manifest(&manifest_raw) else {
         return Ok(None);
     };
+    let engine_kind = engine::Engine::parse(&row.try_get::<String>("", "engine")?)
+        .unwrap_or(engine::Engine::Script);
+    let body: String = row.try_get("", "script")?;
+    let formulas = if engine_kind == engine::Engine::Formula {
+        match super::formula::parse_pinned(&body) {
+            Ok(formulas) => formulas,
+            Err(_) => return Ok(None),
+        }
+    } else {
+        Vec::new()
+    };
+    let engine = engine_kind;
     Ok(Some(ActiveTool {
         script_id: row.try_get("", "tool_script_id")?,
         name: tool_name.to_string(),
@@ -683,6 +698,11 @@ async fn pinned_tool(
         entry_function: row.try_get("", "entry_function")?,
         content_hash: row.try_get("", "content_hash")?,
         manifest,
+        engine,
+        parameter_group_id: row.try_get("", "parameter_group_id")?,
+        // The version body is the formula set, so a recompute under a pinned version runs the
+        // formulas that version holds rather than the definitions as they stand today.
+        formulas,
     }))
 }
 
