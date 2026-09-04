@@ -1757,17 +1757,18 @@ async fn apply_instrument_updates(
         };
         let scope = instrument_scope(target);
 
-        // A feed the source identifies by device serial has its instrument already: the device,
-        // attached from the serial when the stream is paired, with the site slot's deployment
-        // opened. Minting a lab instrument for it instead would take both.
-        if update.instrument_name.is_some()
-            && update.instrument_id.is_none()
-            && let Some(serial) = target.device_serial.clone()
-        {
+        // A feed the source reports as a device has its instrument already: one minted for the
+        // slot it serves when the stream is paired, with that slot's deployment opened. Minting a
+        // lab instrument for it instead would take both.
+        if update.instrument_name.is_some() && update.instrument_id.is_none() && target.is_device {
+            let named = match &target.device_serial {
+                Some(serial) => format!(" (the source names device serial {serial})"),
+                None => String::new(),
+            };
             return Err(AppError::BadRequest(format!(
-                "stream {} names device serial {serial}, so its instrument is that device and is \
-                 attached when the stream is paired. Attach an existing instrument to override \
-                 that, or leave it unset.",
+                "stream {} is reported as a device{named}, so its instrument is minted for the \
+                 slot it serves when the stream is paired. Attach an existing instrument to \
+                 override that, or leave it unset.",
                 update.stream_id
             )));
         }
@@ -2350,11 +2351,14 @@ pub struct PlanCurveAssignment {
     pub pending_instrument_name: Option<String>,
 }
 
-/// One physical device a plan's feeds name, and the channels it serves at one site.
+/// One device-shaped feed a plan carries, and the slot it serves.
 ///
-/// A device is not a decision the plan takes: the serial is the identity, pairing attaches it and
-/// opens the site slot's deployment. It is listed so an operator can see which instrument each
-/// site's feeds will land on, and whether it is already in the inventory.
+/// A device is not a decision the plan takes: the feed's own `(source_system, source_key)` is the
+/// identity, and pairing mints the instrument for its slot and opens that slot's deployment. One
+/// instrument serves one (site, parameter), so a multi-channel logger is one group per channel
+/// rather than one group carrying them all; the serial it reports is displayed, never matched on.
+/// It is listed so an operator can see which instrument each feed will land on, and whether it is
+/// already in the inventory.
 #[derive(Debug, Serialize)]
 pub struct PlanDeviceGroup {
     pub site: String,
@@ -2415,7 +2419,7 @@ pub async fn plan_instruments(
         // A device-shaped feed is reported as its device, whether or not it already names one.
         // Listing it as a lab decision as well would put the same instrument in two places, one of
         // which offers to change it.
-        if entry.device_serial.is_some() {
+        if entry.is_device {
             continue;
         }
         match &entry.instrument {
@@ -2456,7 +2460,7 @@ pub async fn plan_instruments(
         std::collections::BTreeSet<String>,
     > = std::collections::BTreeMap::new();
     for entry in entries.iter().filter(|e| e.action == "pair") {
-        if entry.instrument.is_none() && entry.device_serial.is_none() {
+        if entry.instrument.is_none() && !entry.is_device {
             unassigned_sites
                 .entry(instrument_scope(entry))
                 .or_default()
@@ -2580,20 +2584,21 @@ pub async fn plan_instruments(
             .then_with(|| a.name.cmp(&b.name))
     });
 
-    // The devices the plan's feeds name, one row per (site, serial). Grouped that way because a
-    // device sits at one site and serves several of its channels, which is the shape the site view
-    // and the deployment slots both take.
+    // The devices the plan's feeds name, one row per channel: a channel is an instrument, so the
+    // key is the feed's own `source_key`. Grouping by serial would merge a multi-channel logger's
+    // parameters into one row and then fail to resolve it, since a source-registered instrument
+    // carries no serial.
     let mut device_acc: std::collections::BTreeMap<(String, String), PlanDeviceGroup> =
         std::collections::BTreeMap::new();
     for entry in entries.iter().filter(|e| e.action == "pair") {
-        let Some(serial) = entry.device_serial.clone() else {
+        if !entry.is_device {
             continue;
-        };
+        }
         let group = device_acc
-            .entry((entry.site.name.clone(), serial.clone()))
+            .entry((entry.site.name.clone(), entry.source_key.clone()))
             .or_insert_with(|| PlanDeviceGroup {
                 site: entry.site.name.clone(),
-                serial: serial.clone(),
+                serial: entry.device_serial.clone().unwrap_or_default(),
                 model: entry.device_model.clone(),
                 instrument_id: None,
                 instrument_name: None,
@@ -2607,19 +2612,23 @@ pub async fn plan_instruments(
         }
     }
     if !device_acc.is_empty() {
-        let serials: Vec<String> = device_acc.keys().map(|(_, s)| s.clone()).collect();
+        let keys: Vec<String> = device_acc.keys().map(|(_, k)| k.clone()).collect();
         for sensor in sensors::Entity::find()
-            .filter(sensors::Column::SerialNumber.is_in(serials))
+            .filter(sensors::Column::SourceSystem.eq(plan.source_system.as_str()))
+            .filter(sensors::Column::SourceKey.is_in(keys))
             .all(&state.db)
             .await?
         {
-            let Some(serial) = sensor.serial_number.clone() else {
+            let Some(source_key) = sensor.source_key.clone() else {
                 continue;
             };
-            for group in device_acc.values_mut().filter(|g| g.serial == serial) {
+            for group in device_acc
+                .iter_mut()
+                .filter(|((_, k), _)| *k == source_key)
+                .map(|(_, g)| g)
+            {
                 group.instrument_id = Some(sensor.id);
-                group.instrument_name =
-                    sensor.name.clone().or_else(|| sensor.serial_number.clone());
+                group.instrument_name = sensor.name.clone().or_else(|| sensor.source_key.clone());
             }
         }
     }

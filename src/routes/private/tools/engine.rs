@@ -1817,7 +1817,7 @@ pub fn run_fingerprint(
     constants: &serde_json::Value,
     curves: &serde_json::Value,
 ) -> String {
-    migration::tool_hash::canonical_hash(&serde_json::json!({
+    crate::routes::private::tools::hash::canonical_hash(&serde_json::json!({
         "script_version_id": version_id,
         "inputs": inputs,
         "constants": constants,

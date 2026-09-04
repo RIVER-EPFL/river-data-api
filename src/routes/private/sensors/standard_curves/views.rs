@@ -7,7 +7,8 @@
 use axum::{Json, extract::State};
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, Statement,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
+    Statement,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -17,6 +18,7 @@ use super::{Column, Entity, Model};
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors;
+use crate::routes::private::sensors::operations::upsert_source_instrument;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RegisterStandardCurveRequest {
@@ -86,8 +88,13 @@ pub(crate) async fn resolve_lab_instrument(
     {
         return Ok(existing.id);
     }
+    // Rows that predate the provenance columns carry the key in `serial_number`. Only an unclaimed
+    // row may be adopted, so one source can never take over another's instrument, and the oldest
+    // wins so the choice is deterministic now that a serial is no longer unique.
     if let Some(existing) = sensors::Entity::find()
         .filter(sensors::Column::SerialNumber.eq(source_key.clone()))
+        .filter(sensors::Column::SourceSystem.is_null())
+        .order_by_asc(sensors::Column::CreatedAt)
         .one(&state.db)
         .await?
     {
@@ -98,22 +105,18 @@ pub(crate) async fn resolve_lab_instrument(
         active.update(&state.db).await?;
         return Ok(id);
     }
-    let id = Uuid::new_v4();
-    sensors::ActiveModel {
-        id: Set(id),
-        serial_number: Set(Some(source_key.clone())),
-        source_system: Set(Some(source_system.to_string())),
-        source_key: Set(Some(source_key)),
-        name: Set(Some(format!("{instrument_label} ({source_system})"))),
-        is_active: Set(Some(true)),
-        is_lab_instrument: Set(Some(true)),
-        data_frequency: Set("low".to_string()),
-        created_at: Set(Some(Utc::now())),
-        ..Default::default()
-    }
-    .insert(&state.db)
-    .await?;
-    Ok(id)
+    // `serial_number` is left unset: it holds the lab's own serial for an instrument, never a
+    // fabricated copy of the provenance key, which `source_key` already carries.
+    upsert_source_instrument(
+        &state.db,
+        source_system,
+        &source_key,
+        &format!("{instrument_label} ({source_system})"),
+        true,
+        "low",
+        None,
+    )
+    .await
 }
 
 /// Upsert a standard curve by provenance. Requires `write_metadata` (sync session tokens carry

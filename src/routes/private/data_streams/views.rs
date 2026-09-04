@@ -669,9 +669,10 @@ pub async fn register_stream(
 /// unrestricted caller's operation, ie. an administrator or an unscoped sync service.
 ///
 /// Two further conditions hold for every caller: the instrument exists, and it does not contradict
-/// the device serial the stream's own metadata carries. That serial check is a cross-check on feeds
-/// that describe their device, not the confinement: metadata arrives in the same request, so a
-/// caller can always omit it, and the scope guard above is what a restricted caller is held to.
+/// the device serial the stream's own metadata carries, when the instrument records one. That
+/// serial check is a cross-check on feeds that describe their device, not the confinement:
+/// metadata arrives in the same request, so a caller can always omit it, and the scope guard above
+/// is what a restricted caller is held to.
 pub async fn validate_declared_sensor(
     db: &DatabaseConnection,
     scope: &crate::common::authz::AccessScope,
@@ -686,8 +687,13 @@ pub async fn validate_declared_sensor(
     let project = scope::project_of_sensor(db, sensor_id).await?;
     scope::require_target_in_scope(scope, &project, scope::Unowned::Deny, "instrument")?;
 
+    // Only an operator-entered serial can contradict: a source-registered instrument carries none
+    // (its identity is the channel, and the feed's serials live in `metadata` as information), and
+    // comparing against those would make a logger swap reject its own channel's next registration,
+    // which is `reconcile_source_identity`'s job to record rather than refuse.
     if let Some(declared_serial) = extract_vaisala_device_serial(metadata)
-        && sensor.serial_number.as_deref() != Some(declared_serial.as_str())
+        && let Some(recorded) = sensor.serial_number.as_deref()
+        && recorded != declared_serial.as_str()
     {
         return Err(AppError::BadRequest(format!(
             "stream metadata reports device serial '{declared_serial}', which is not the serial of \
@@ -743,7 +749,7 @@ pub async fn import_stream(
         .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
 
     // Import is parameter-free: a sensor is a device, its parameter is bound at deploy/grab time.
-    let ctx = import_sensor_for_stream(db, &stream).await?;
+    let ctx = import_sensor_for_stream(db, &stream, None).await?;
 
     // Stamp sensor/calibration on site-less readings only; do NOT touch
     // site_id/parameter_id/deployment_id (those are set at adopt). Idempotent.

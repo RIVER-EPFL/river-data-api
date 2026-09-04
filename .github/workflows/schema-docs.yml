@@ -1,0 +1,73 @@
+name: Schema docs
+
+# The diagrams are generated from a database the migrations have actually been run against,
+# so a new migration updates them without anyone redrawing anything.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "migration/**"
+      - "scripts/generate-schema-docs.py"
+      - "scripts/check-svg-portability.py"
+      - ".github/workflows/schema-docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+
+    services:
+      timescaledb:
+        image: timescale/timescaledb:2.23.0-pg18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: psql
+          POSTGRES_DB: river_schema
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://postgres:psql@localhost:5432/river_schema
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run the migrations
+        run: cargo run -p migration -- up
+
+      - name: Generate the diagrams
+        run: scripts/generate-schema-docs.py
+
+      - name: Install Graphviz
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends graphviz
+
+      - name: Render the diagrams
+        run: |
+          for chart in schema schema-core; do
+            dot -Tsvg "docs/$chart.dot" -o "docs/$chart.svg"
+          done
+          scripts/check-svg-portability.py docs/schema.svg docs/schema-core.svg
+
+      - name: Commit the change
+        run: |
+          if [ -z "$(git status --porcelain -- docs)" ]; then
+            echo "Schema docs are current"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs
+          git commit -m "Update schema diagrams"
+          git push

@@ -414,8 +414,8 @@ pub async fn create_unpaired_stream(db: &DatabaseConnection, source_key: &str) -
     id
 }
 
-/// An unpaired stream whose metadata names a device serial, so pairing creates an instrument for
-/// it. Without a serial there is no identity to deduplicate on and pairing attributes none.
+/// An unpaired stream the source reports as a device, so pairing mints an instrument for it. The
+/// identity is the stream's own `(source_system, source_key)`; the serial travels as information.
 pub async fn create_unpaired_stream_with_device(
     db: &DatabaseConnection,
     source_key: &str,

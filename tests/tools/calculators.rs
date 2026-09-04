@@ -1,7 +1,7 @@
 //! Exact-value portal-parity tests for the analytical tools. Expected numbers come from the
 //! verbatim CNET/METALP portal R functions, which are seeded into every tool script as
-//! `migration/tool_seed/prelude.R` and run by the tools runner. The same numbers are pinned per
-//! tool in `migration/tool_seed/{tool}/cases.json`, which is what a version has to reproduce
+//! the vendored portal prelude and run by the tools runner. The same numbers are pinned as the
+//! stored version's own test cases, which is what a version has to reproduce
 //! before it can be activated.
 
 use serial_test::serial;

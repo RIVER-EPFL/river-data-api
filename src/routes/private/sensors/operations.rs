@@ -489,18 +489,17 @@ fn extract_source_metadata(stream_metadata: &serde_json::Value) -> Option<serde_
     }
 }
 
-/// Find an existing sensor by its natural key `serial_number`. A serial identifies one physical
-/// instrument (a device measures many parameters through one serial), so dedup is serial-only.
-/// Returns `None` when no serial is available (we never dedupe serial-less sensors).
-async fn find_sensor_by_serial<C: ConnectionTrait>(
+/// Find an existing source-registered instrument by its natural key `(source_system, source_key)`.
+/// The channel is the identity: a device instrument's `source_key` is its stream's `source_key`,
+/// so a multi-channel logger resolves to one instrument per channel rather than one per device.
+async fn find_sensor_by_source<C: ConnectionTrait>(
     db: &C,
-    serial: Option<&str>,
+    source_system: &str,
+    source_key: &str,
 ) -> AppResult<Option<sensors::Model>> {
-    let Some(serial) = serial else {
-        return Ok(None);
-    };
     let existing = sensors::Entity::find()
-        .filter(sensors::Column::SerialNumber.eq(serial))
+        .filter(sensors::Column::SourceSystem.eq(source_system))
+        .filter(sensors::Column::SourceKey.eq(source_key))
         .one(db)
         .await?;
     Ok(existing)
@@ -522,24 +521,28 @@ async fn link_stream_to_sensor<C: ConnectionTrait>(
     Ok(())
 }
 
-/// Insert a new sensor for `serial`, or return the existing one if a sensor with that serial already
-/// exists. Race-safe: the `ON CONFLICT … DO NOTHING` targets the partial unique index
-/// `idx_sensors_serial_unique (serial_number) WHERE serial_number IS NOT NULL`, so concurrent pairings
-/// of the same device converge on one row WITHOUT raising a unique violation. That matters because
-/// some callers run inside a transaction (sync plan/discovery apply): a raised violation there would
-/// poison the whole transaction, not just this insert. A serial-less sensor has no dedupe key (the
-/// predicate excludes it), so it always inserts and the new id comes back via `RETURNING`. The
-/// conflict branch re-selects the winner.
-async fn insert_or_get_sensor<C: ConnectionTrait>(
+/// Insert a source-registered instrument for `(source_system, source_key)`, or return the existing
+/// one. Race-safe: the `ON CONFLICT … DO NOTHING` targets the partial unique index
+/// `sensors_provenance_uniq (source_system, source_key)`, so concurrent pairings of the same
+/// channel converge on one row WITHOUT raising a unique violation. That matters because some
+/// callers run inside a transaction (sync plan/discovery apply): a raised violation there would
+/// poison the whole transaction, not just this insert. The conflict branch re-selects the winner.
+///
+/// Both key halves are required, which is what makes minting idempotent: there is no "no dedupe
+/// key" case that inserts a fresh row on every call.
+///
+/// `DO NOTHING` rather than `DO UPDATE`: refreshing a claimed instrument's metadata belongs to
+/// [`reconcile_source_identity`], which raises a review hold, so a sync cycle cannot silently
+/// overwrite what an operator recorded.
+pub async fn upsert_source_instrument<C: ConnectionTrait>(
     db: &C,
-    serial: Option<&str>,
+    source_system: &str,
+    source_key: &str,
     name: &str,
+    is_lab_instrument: bool,
+    data_frequency: &str,
     metadata: Option<serde_json::Value>,
 ) -> AppResult<Uuid> {
-    let serial_val: sea_orm::Value = match serial {
-        Some(s) => s.to_string().into(),
-        None => sea_orm::Value::String(None),
-    };
     let metadata_val: sea_orm::Value = match &metadata {
         Some(v) => serde_json::to_string(v)
             .unwrap_or_else(|_| "null".to_string())
@@ -551,12 +554,21 @@ async fn insert_or_get_sensor<C: ConnectionTrait>(
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r#"INSERT INTO sensors
-                   (id, serial_number, name, is_active, is_lab_instrument, metadata, created_at)
-               VALUES (gen_random_uuid(), $1, $2, true, false, $3::jsonb, now())
-               ON CONFLICT (serial_number) WHERE serial_number IS NOT NULL
+                   (id, name, is_active, is_lab_instrument, data_frequency,
+                    source_system, source_key, metadata, created_at)
+               VALUES (gen_random_uuid(), $1, true, $2, $3, $4, $5, $6::jsonb, now())
+               ON CONFLICT (source_system, source_key)
+                   WHERE source_system IS NOT NULL AND source_key IS NOT NULL
                DO NOTHING
                RETURNING id"#,
-            [serial_val, name.into(), metadata_val],
+            [
+                name.into(),
+                is_lab_instrument.into(),
+                data_frequency.into(),
+                source_system.into(),
+                source_key.into(),
+                metadata_val,
+            ],
         ))
         .await?;
 
@@ -565,39 +577,41 @@ async fn insert_or_get_sensor<C: ConnectionTrait>(
         return Ok(id);
     }
 
-    // Conflict on serial: a sensor already exists (possibly a concurrent winner), reuse it.
-    let existing = find_sensor_by_serial(db, serial).await?.ok_or_else(|| {
-        AppError::Internal(
-            "sensor upsert conflicted but the existing serial row was not found".to_string(),
-        )
-    })?;
+    let existing = find_sensor_by_source(db, source_system, source_key)
+        .await?
+        .ok_or_else(|| {
+            AppError::Internal(
+                "instrument upsert conflicted but the existing provenance row was not found"
+                    .to_string(),
+            )
+        })?;
     Ok(existing.id)
 }
 
-/// Create or reuse a sensor for a data stream being paired, when the stream carries a device
-/// identity to create one from.
+/// Create or reuse the instrument for a data stream being paired, when the stream is a device feed.
 ///
-/// If the stream already has a `sensor_id`, reuses that sensor and ensures a deployment exists for
-/// the target site. Otherwise a sensor is created only when the stream's metadata names a device
-/// serial; no calibration is created, and the context carries whichever curve the sensor already
-/// has. Updates `data_streams.sensor_id` to link the stream to the sensor.
+/// If the stream already has a `sensor_id`, reuses that instrument and ensures a deployment exists
+/// for the target site. Otherwise an instrument is minted for the stream's own channel identity
+/// `(source_system, source_key)`; no calibration is created, and the context carries whichever
+/// curve the instrument already has. Updates `data_streams.sensor_id` to link the stream.
 ///
-/// `None` when neither holds. A serial is what makes a sensor an identity: `insert_or_get_sensor`
-/// deduplicates on it, and its `ON CONFLICT` is partial, so a serial-less insert conflicts with
-/// nothing and mints a fresh row every call. Portal streams carry no device serial, so creating
-/// one here would mean a distinct instrument per stream, thousands of them for one source, none of
-/// them a device. A portal instrument comes from its curves instead (`resolve_lab_instrument`),
-/// chosen in the pairing plan; an operator who wants one anyway has `POST /streams/{id}/import`.
+/// `None` when neither holds. The guard is the shape of the feed, not the presence of a serial:
+/// a device feed is one whose metadata carries a `device` block, which is what the viewLinc
+/// backend writes per channel. Portal streams carry no such block, so minting here would mean a
+/// distinct instrument per stream, thousands of them for one source, none of them a device. A
+/// portal instrument comes from its curves instead (`resolve_lab_instrument`), chosen in the
+/// pairing plan; an operator who wants one anyway has `POST /streams/{id}/import`.
 pub async fn create_sensor_for_stream<C: ConnectionTrait>(
     db: &C,
     stream: &data_streams::Model,
     parameter_id: Uuid,
     site_id: Uuid,
 ) -> AppResult<Option<SensorContext>> {
-    if stream.sensor_id.is_none() && extract_vaisala_device_serial(&stream.metadata).is_none() {
+    if stream.sensor_id.is_none() && !is_device_feed(&stream.metadata) {
         return Ok(None);
     }
-    let ctx = import_sensor_for_stream(db, stream).await?;
+    let name = slot_instrument_name(db, site_id, parameter_id).await?;
+    let ctx = import_sensor_for_stream(db, stream, name.as_deref()).await?;
     // Ensure active deployment exists for this sensor+site+parameter (None if the slot is occupied).
     let deployment_id = find_or_create_deployment(db, ctx.sensor_id, site_id, parameter_id).await?;
     Ok(Some(SensorContext {
@@ -606,28 +620,74 @@ pub async fn create_sensor_for_stream<C: ConnectionTrait>(
     }))
 }
 
-/// Import-only: create or reuse a sensor for a stream and resolve its latest calibration, WITHOUT
-/// deploying it to a site. The "imported, not adopted" state, readings get `sensor_id` (and the
-/// sensor's latest curve, if it has one) but no `deployment_id`/`site_id` until an explicit
-/// adopt. Idempotent: reuses the stream's linked sensor, else the existing `serial` sensor, else
-/// inserts one (race-safe via `insert_or_get_sensor`). Updates `data_streams.sensor_id`.
+/// A device feed is one whose stream metadata carries a `device` block. Broader than testing for a
+/// serial: viewLinc may report a channel with no `logger_serial`, and that is still a device.
+#[must_use]
+pub fn is_device_feed(stream_metadata: &serde_json::Value) -> bool {
+    stream_metadata
+        .get("device")
+        .is_some_and(|d| !d.is_null())
+}
+
+/// The name a source-registered field instrument takes: the slot it serves, "{site} {parameter}".
+/// The migration that split logger-keyed rows into per-channel ones names them the same way, so
+/// instruments minted before and after it read alike.
+async fn slot_instrument_name<C: ConnectionTrait>(
+    db: &C,
+    site_id: Uuid,
+    parameter_id: Uuid,
+) -> AppResult<Option<String>> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT s.name AS site_name, p.name AS parameter_name \
+             FROM sites s, parameters p WHERE s.id = $1 AND p.id = $2",
+            [site_id.into(), parameter_id.into()],
+        ))
+        .await?;
+    let Some(row) = row else { return Ok(None) };
+    let site: String = row.try_get("", "site_name")?;
+    let parameter: String = row.try_get("", "parameter_name")?;
+    Ok(Some(format!("{site} {parameter}")))
+}
+
+/// Import-only: create or reuse the instrument for a stream and resolve its latest calibration,
+/// WITHOUT deploying it to a site. The "imported, not adopted" state: readings get `sensor_id`
+/// (and the instrument's latest curve, if it has one) but no `deployment_id`/`site_id` until an
+/// explicit adopt. Idempotent: reuses the stream's linked instrument, else the one already holding
+/// the stream's channel identity, else mints it (race-safe via [`upsert_source_instrument`]).
+/// Updates `data_streams.sensor_id`.
+///
+/// `name_hint` is the slot name when the caller knows which slot the stream is being paired to;
+/// the import endpoint has no slot yet and passes `None`.
 pub async fn import_sensor_for_stream<C: ConnectionTrait>(
     db: &C,
     stream: &data_streams::Model,
+    name_hint: Option<&str>,
 ) -> AppResult<SensorContext> {
-    let serial = extract_vaisala_device_serial(&stream.metadata);
-
     let sensor_id = if let Some(existing_sensor_id) = stream.sensor_id {
         existing_sensor_id
     } else {
-        let sensor_name = device_instrument_name(&stream.metadata).unwrap_or_else(|| {
-            stream
-                .source_name
-                .clone()
-                .unwrap_or_else(|| format!("Stream {}", stream.source_key))
-        });
+        let sensor_name = name_hint.map_or_else(
+            || {
+                stream
+                    .source_name
+                    .clone()
+                    .unwrap_or_else(|| format!("Stream {}", stream.source_key))
+            },
+            ToString::to_string,
+        );
         let metadata = extract_source_metadata(&stream.metadata);
-        let sensor_id = insert_or_get_sensor(db, serial.as_deref(), &sensor_name, metadata).await?;
+        let sensor_id = upsert_source_instrument(
+            db,
+            &stream.source_system,
+            &stream.source_key,
+            &sensor_name,
+            false,
+            "high",
+            metadata,
+        )
+        .await?;
         link_stream_to_sensor(db, stream, sensor_id).await?;
         sensor_id
     };
@@ -955,25 +1015,6 @@ pub async fn resolve_slot_owner_for_times<C: ConnectionTrait>(
 }
 
 /// Extract the Vaisala device serial from stream metadata (for discovery response).
-/// The name a device-derived instrument gets: its model and serial, which is what it is.
-///
-/// A multi-channel device serves several parameters through several streams, and any of them may
-/// be the one that reaches `insert_or_get_sensor` first. Naming from the device rather than from
-/// that stream is what stops a four-channel logger being called after one of its channels.
-pub fn device_instrument_name(metadata: &serde_json::Value) -> Option<String> {
-    let serial = extract_vaisala_device_serial(metadata)?;
-    let model = metadata
-        .get("device")
-        .and_then(|d| d.get("logger_device"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    Some(match model {
-        Some(model) => format!("{model} {serial}"),
-        None => serial,
-    })
-}
-
 pub fn extract_vaisala_device_serial(metadata: &serde_json::Value) -> Option<String> {
     metadata
         .get("device")

@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use super::engine;
 // One hash rule for every version, shared with the seed migration that installs the shipped tools.
-pub use migration::tool_hash::{stored_version_content, version_content_hash};
+pub use crate::routes::private::tools::hash::{stored_version_content, version_content_hash};
 
 use crate::common::AppState;
 use crate::common::middleware::AuthContext;
@@ -649,7 +649,7 @@ pub async fn create_version(
     let test_cases = payload.test_cases.unwrap_or_else(|| serde_json::json!({}));
     // Hashed and stored in the form jsonb holds, so the hash on the row is recomputable from the
     // row: a fetched version re-posted unchanged is recognised as the duplicate it is.
-    let stored = migration::tool_hash::stored_version_content(
+    let stored = crate::routes::private::tools::hash::stored_version_content(
         &state.db,
         &payload.script,
         &entry,
@@ -865,7 +865,7 @@ pub async fn draft_run(
     // A draft has no stored cases, so its content identity covers the three parts it does have.
     // Normalised through jsonb like the save path, or a draft would carry a different identity
     // from the version it becomes for any manifest jsonb re-renders.
-    let content_hash = migration::tool_hash::stored_version_content(
+    let content_hash = crate::routes::private::tools::hash::stored_version_content(
         &state.db,
         &payload.script,
         &entry,

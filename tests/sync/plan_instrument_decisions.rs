@@ -1,11 +1,14 @@
 //! The instrument half of a pairing plan: which feeds are asked about, what a proposal survives,
 //! and what a device-shaped feed resolves to.
 //!
-//! Expected behaviour: a feed the source identifies by device serial is not offered a lab
-//! instrument, because its instrument is that device and pairing attaches it and opens the site
-//! slot's deployment. A feed with no device is asked once, and the answer is remembered: the
-//! proposal survives an attach so a mis-click is undoable, and a later plan reports the instrument
-//! the earlier one created rather than proposing it again.
+//! Expected behaviour: a feed the source identifies as a device is not offered a lab instrument,
+//! because its instrument is minted from the feed itself and pairing opens the site slot's
+//! deployment. One instrument serves one (site, parameter): a multi-channel logger is that many
+//! instruments, identified by each channel's `(source_system, source_key)` rather than by the
+//! logger serial, which is information the source reports and not an identity. A feed with no
+//! device is asked once, and the answer is remembered: the proposal survives an attach so a
+//! mis-click is undoable, and a later plan reports the instrument the earlier one created rather
+//! than proposing it again.
 
 use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
@@ -127,7 +130,7 @@ async fn apply_and_wait(
 
 #[tokio::test]
 #[serial]
-async fn a_device_feed_is_reported_as_its_device_and_never_offered_a_lab_instrument() {
+async fn a_device_feed_is_reported_per_channel_and_never_offered_a_lab_instrument() {
     let (app, token, db) = setup().await;
     let temp = Uuid::new_v4();
     let oxygen = Uuid::new_v4();
@@ -149,9 +152,23 @@ async fn a_device_feed_is_reported_as_its_device_and_never_offered_a_lab_instrum
         "a device feed is not a lab-instrument question: {instruments}"
     );
     let devices = instruments["devices"].as_array().expect("devices");
-    assert_eq!(devices.len(), 1, "one device, two channels: {instruments}");
-    assert_eq!(devices[0]["serial"], serde_json::json!("LOG-1"));
-    assert_eq!(devices[0]["parameters"].as_array().map(Vec::len), Some(2));
+    assert_eq!(
+        devices.len(),
+        2,
+        "one logger, two channels, an instrument each: {instruments}"
+    );
+    for device in devices {
+        assert_eq!(
+            device["serial"],
+            serde_json::json!("LOG-1"),
+            "the logger serial is reported as information: {instruments}"
+        );
+        assert_eq!(
+            device["parameters"].as_array().map(Vec::len),
+            Some(1),
+            "a channel serves one parameter: {instruments}"
+        );
+    }
 
     let (status, body) = patch_entry(
         &app,
@@ -177,23 +194,37 @@ async fn a_device_feed_is_reported_as_its_device_and_never_offered_a_lab_instrum
 
     let sensors = scalar_i64(
         &db,
-        "SELECT count(*) AS v FROM sensors WHERE serial_number = 'LOG-1'",
+        "SELECT count(*) AS v FROM sensors \
+         WHERE source_system = 'instrdec' AND source_key IN ('dev-temp', 'dev-do')",
     )
     .await;
-    assert_eq!(sensors, 1, "both channels resolve to the one device");
+    assert_eq!(sensors, 2, "each channel resolves to its own instrument");
+    let serials = scalar_i64(
+        &db,
+        "SELECT count(*) AS v FROM sensors \
+         WHERE source_system = 'instrdec' AND source_key IN ('dev-temp', 'dev-do') \
+           AND serial_number IS NOT NULL",
+    )
+    .await;
+    assert_eq!(
+        serials, 0,
+        "the logger serial is not the instrument's serial, so none is claimed"
+    );
     let deployments = scalar_i64(
         &db,
         "SELECT count(*) AS v FROM sensor_deployments d JOIN sensors s ON s.id = d.sensor_id \
-         WHERE s.serial_number = 'LOG-1' AND d.deployed_until IS NULL",
+         WHERE s.source_system = 'instrdec' AND s.source_key IN ('dev-temp', 'dev-do') \
+           AND d.deployed_until IS NULL",
     )
     .await;
     assert_eq!(
         deployments, 2,
-        "the device is stationed at the site for each channel it serves"
+        "each instrument is stationed at the slot it serves"
     );
 
-    // A later plan over the same feeds, which now name the device: it is still reported as a
-    // device, and not a second time as a lab-instrument decision.
+    // A further channel on the same logger. The two already paired drop out of the plan, and the
+    // new one is its own instrument decision rather than an attachment to the logger's existing
+    // row: one instrument serves one (site, parameter).
     seed_device_stream(
         &db,
         Uuid::new_v4(),
@@ -210,19 +241,28 @@ async fn a_device_feed_is_reported_as_its_device_and_never_offered_a_lab_instrum
         Some(0),
         "a device is not also a lab decision: {instruments}"
     );
+    let devices = instruments["devices"].as_array().expect("devices");
     assert_eq!(
-        instruments["devices"]
-            .as_array()
-            .and_then(|d| d.first())
-            .map(|d| d["instrument_name"].clone()),
-        Some(serde_json::json!("AQ600 LOG-1")),
-        "and it reports the inventory row it resolves to: {instruments}"
+        devices.len(),
+        1,
+        "only the unpaired channel is still to decide: {instruments}"
+    );
+    assert_eq!(
+        devices[0]["parameters"],
+        serde_json::json!(["conductivity"]),
+        "and it is the new one: {instruments}"
+    );
+    assert_eq!(
+        devices[0]["instrument_id"],
+        serde_json::Value::Null,
+        "a new channel on a known logger is a new instrument, not the logger's existing row: \
+         {instruments}"
     );
 }
 
 #[tokio::test]
 #[serial]
-async fn a_device_instrument_is_named_after_the_device_not_the_first_stream_that_reached_it() {
+async fn a_device_instrument_is_named_after_the_slot_it_serves() {
     let (app, token, db) = setup().await;
     seed_device_stream(
         &db,
@@ -246,20 +286,25 @@ async fn a_device_instrument_is_named_after_the_device_not_the_first_stream_that
     let plan = create_plan(&app, &token).await;
     apply_and_wait(&app, &db, &token, plan["id"].as_str().expect("plan id")).await;
 
-    let name = db
-        .query_one_raw(Statement::from_string(
+    let names = db
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT name AS v FROM sensors WHERE serial_number = 'LOG-2'".to_owned(),
+            "SELECT name AS v FROM sensors WHERE source_system = 'instrdec' \
+               AND source_key IN ('dev-temp', 'dev-do') ORDER BY name"
+                .to_owned(),
         ))
         .await
         .expect("query")
-        .expect("the device is in the inventory")
-        .try_get::<Option<String>>("", "v")
-        .expect("name");
+        .iter()
+        .map(|r| r.try_get::<String>("", "v").expect("name"))
+        .collect::<Vec<_>>();
     assert_eq!(
-        name.as_deref(),
-        Some("AQ600 LOG-2"),
-        "a multi-channel device is named by its identity, not by one of its channels"
+        names,
+        vec![
+            "Upstream Station Dissolved Oxygen".to_string(),
+            "Upstream Station Water Temperature".to_string(),
+        ],
+        "each channel of a multi-channel logger is named by the slot it serves, not by the logger"
     );
 }
 

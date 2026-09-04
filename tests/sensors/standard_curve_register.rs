@@ -97,12 +97,14 @@ async fn register_upserts_by_provenance() {
             &fx.db,
             &format!(
                 "SELECT COUNT(*) FROM sensors WHERE id = '{sensor_id}' \
-                 AND serial_number = 'cnet:DOC corr' AND is_lab_instrument"
+                 AND source_system = 'cnet' AND source_key = 'cnet:DOC corr' \
+                 AND serial_number IS NULL AND is_lab_instrument"
             ),
         )
         .await,
         1,
-        "one lab instrument minted per (source_system, instrument_label)"
+        "one lab instrument minted per (source_system, instrument_label), identified by its \
+         provenance pair; serial_number holds a real instrument serial or nothing"
     );
 
     let second = register(&fx, 2.0, 1.0).await;

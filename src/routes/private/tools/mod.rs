@@ -7,6 +7,8 @@
 pub mod chain;
 pub mod closure;
 pub mod engine;
+/// Content hashing for tool script versions, over the jsonb-normalised stored form.
+pub mod hash;
 pub mod scripts;
 
 use axum::{

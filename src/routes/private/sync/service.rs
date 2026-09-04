@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
-use crate::routes::private::sensors::operations::create_sensor_for_stream;
+use crate::routes::private::sensors::operations::{
+    create_sensor_for_stream, upsert_source_instrument,
+};
 use crate::routes::private::{
     data_streams, data_streams::pairing_plans, parameters, projects, sensors,
     sensors::standard_curves, sites, sites::parameters as site_parameters,
@@ -188,9 +190,14 @@ pub struct PlanEntry {
     pub sd_holds: i64,
     #[serde(default)]
     pub sd_population_holds: i64,
-    /// The device serial the source names for this feed. A feed with one is field-shaped: its
-    /// instrument is that device, attached from the serial when the stream is paired, and the plan
-    /// proposes no lab instrument for it.
+    /// Whether the source reports this feed as a device. That, not the presence of a serial, is
+    /// what makes a feed field-shaped: its instrument is minted from the feed's own provenance
+    /// when the stream is paired, so the plan proposes no lab instrument for it. A source may
+    /// describe a device and report no serial for it, which is why the two are separate.
+    #[serde(default)]
+    pub is_device: bool,
+    /// The device serial the source names for this feed, where it names one. Information the plan
+    /// displays; never the instrument's identity.
     #[serde(default)]
     pub device_serial: Option<String>,
     /// The device model, where the source reports one. Naming only.
@@ -834,6 +841,9 @@ pub async fn create_plan(
             ),
             sd_holds,
             sd_population_holds,
+            is_device: crate::routes::private::sensors::operations::is_device_feed(
+                &stream.metadata,
+            ),
             device_serial:
                 crate::routes::private::sensors::operations::extract_vaisala_device_serial(
                     &stream.metadata,
@@ -848,9 +858,9 @@ pub async fn create_plan(
         };
         reclassify_entry(&mut entry, &catalog);
         // A feed naming no curve column can still belong to an instrument this source created in
-        // an earlier plan. A device-shaped feed is never one of those: its instrument is resolved
-        // from the serial at pairing.
-        if entry.instrument.is_none() && entry.device_serial.is_none() {
+        // an earlier plan. A device-shaped feed is never one of those: its instrument is minted
+        // from its own provenance at pairing.
+        if entry.instrument.is_none() && !entry.is_device {
             entry.instrument =
                 resolve_parameter_instrument(source_system, &entry.parameter.name, &instruments);
         }
@@ -1429,30 +1439,20 @@ async fn mint_plan_instruments<C: ConnectionTrait>(
         }
     }
 
+    // Through `upsert_source_instrument` rather than a bare insert: this runs inside `apply_plan`'s
+    // transaction, where a unique violation on `sensors_provenance_uniq` from a concurrent apply
+    // would poison the whole plan, not just this row.
     let mut minted = HashMap::new();
     for (source_key, want) in wanted {
-        if let Some(existing) = sensors::Entity::find()
-            .filter(sensors::Column::SourceSystem.eq(source_system))
-            .filter(sensors::Column::SourceKey.eq(source_key))
-            .one(txn)
-            .await?
-        {
-            minted.insert(source_key.to_string(), existing.id);
-            continue;
-        }
-        let id = Uuid::new_v4();
-        sensors::ActiveModel {
-            id: Set(id),
-            name: Set(Some(want.name.clone())),
-            source_system: Set(Some(source_system.to_string())),
-            source_key: Set(Some(source_key.to_string())),
-            is_active: Set(Some(true)),
-            is_lab_instrument: Set(Some(true)),
-            data_frequency: Set("low".to_string()),
-            created_at: Set(Some(Utc::now())),
-            ..Default::default()
-        }
-        .insert(txn)
+        let id = upsert_source_instrument(
+            txn,
+            source_system,
+            source_key,
+            &want.name,
+            true,
+            "low",
+            None,
+        )
         .await?;
         minted.insert(source_key.to_string(), id);
     }
