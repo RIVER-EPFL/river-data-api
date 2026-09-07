@@ -70,7 +70,7 @@ async fn a_bulk_edit_meets_the_same_checks_as_one_row() {
 
     let (status, body) = patch_batch(&app, &token, &json!([{ "id": first, "slope": 0.0 }])).await;
     assert_eq!(
-        status, 400,
+        status, 422,
         "a zero slope is refused in a batch too ({status}): {body}"
     );
     assert_eq!(

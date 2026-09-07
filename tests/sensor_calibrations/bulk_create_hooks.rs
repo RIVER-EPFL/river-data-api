@@ -91,7 +91,7 @@ async fn a_calibration_batch_meets_the_same_checks_as_one_row() {
     )
     .await;
     assert_eq!(
-        status, 400,
+        status, 422,
         "a zero slope is refused in a batch too ({status}): {body}"
     );
 

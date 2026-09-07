@@ -8,7 +8,7 @@
 //! (Q36 rule 3).
 
 use axum::{Json, extract::Query, extract::State};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -89,6 +89,8 @@ impl Kind {
     /// `calibrated_value` is not among them for a value correction: a corrected value is what the
     /// curves the row names produce from its raw value, so it is recomposed after the projection
     /// rather than recorded and restored (`calibrations::service::recompose_from_own_curves`).
+    /// `ingested_at` is not among them either: it is the row's first arrival and nothing moves it,
+    /// so the arrival of the value a row currently serves is the latest correction's own `at`.
     #[must_use]
     pub fn projected_columns(self) -> &'static [&'static str] {
         match self {
@@ -98,10 +100,18 @@ impl Kind {
             Self::Curve => &["standard_curve_id"],
             Self::CalibrationPin => &["calibration_id"],
             Self::InstrumentPin => &["sensor_id"],
-            Self::ValueCorrection => &["raw_value", "ingested_at"],
+            Self::ValueCorrection => &["raw_value"],
             Self::UnverifiedEntry | Self::Verify => &["unverified"],
             Self::SlotMove | Self::Chain | Self::Detach | Self::Return | Self::Rollback => &[],
         }
+    }
+
+    /// Whether [`rollback`] accepts a decision of this kind: it restores the columns the decision
+    /// recorded, so a kind that projects none has nothing to restore. A rollback is not itself
+    /// rolled back; the decision is recorded again instead.
+    #[must_use]
+    pub fn reversible(self) -> bool {
+        self != Self::Rollback && !self.projected_columns().is_empty()
     }
 
     /// The family a decision supersedes within: the latest live decision of the same family on
@@ -289,30 +299,61 @@ pub struct DecisionRow {
     pub supersedes: Option<Uuid>,
     pub rolled_back_by: Option<Uuid>,
     pub set_id: Option<Uuid>,
+    /// Whether `rollback` accepts this kind at all. A kind that projects no column has nothing to
+    /// restore, so the reader offers no undo for it rather than learning that from a 409.
+    pub reversible: bool,
 }
 
 const ROW_COLUMNS: &str = "id, stream_id, time, replicate_index, kind, old, new, actor, at, reason, \
                            origin, supersedes, rolled_back_by, set_id";
 
+/// The row every write of a decision set returns: how many landed and the span they cover.
+#[derive(sea_orm::FromQueryResult)]
+struct RecordedSpan {
+    rows: i64,
+    lo: Option<sea_orm::prelude::DateTimeWithTimeZone>,
+    hi: Option<sea_orm::prelude::DateTimeWithTimeZone>,
+}
+
+/// The stored row, before `kind` and `origin` are parsed into their vocabularies. Decoding is
+/// derived from `ROW_COLUMNS`; the two parses stay here, because a value outside either vocabulary
+/// is a corrupt row rather than a decode failure and says so.
+#[derive(sea_orm::FromQueryResult)]
+struct StoredDecision {
+    id: Uuid,
+    stream_id: Uuid,
+    time: sea_orm::prelude::DateTimeWithTimeZone,
+    replicate_index: Option<i16>,
+    kind: String,
+    old: serde_json::Value,
+    new: serde_json::Value,
+    actor: String,
+    at: sea_orm::prelude::DateTimeWithTimeZone,
+    reason: Option<String>,
+    origin: String,
+    supersedes: Option<Uuid>,
+    rolled_back_by: Option<Uuid>,
+    set_id: Option<Uuid>,
+}
+
 fn row_from(r: &sea_orm::QueryResult) -> AppResult<DecisionRow> {
-    let kind: String = r.try_get("", "kind")?;
-    let origin: String = r.try_get("", "origin")?;
+    let stored = StoredDecision::from_query_result(r, "")?;
+    let kind = stored.kind;
+    let origin = stored.origin;
+    let parsed = Kind::parse(&kind)
+        .ok_or_else(|| AppError::Internal(format!("unknown decision kind {kind}")))?;
     Ok(DecisionRow {
-        id: r.try_get("", "id")?,
-        stream_id: r.try_get("", "stream_id")?,
-        time: r
-            .try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "time")?
-            .with_timezone(&chrono::Utc),
-        replicate_index: r.try_get("", "replicate_index")?,
-        kind: Kind::parse(&kind)
-            .ok_or_else(|| AppError::Internal(format!("unknown decision kind {kind}")))?,
-        old: r.try_get("", "old")?,
-        new: r.try_get("", "new")?,
-        actor: r.try_get("", "actor")?,
-        at: r
-            .try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "at")?
-            .with_timezone(&chrono::Utc),
-        reason: r.try_get("", "reason")?,
+        id: stored.id,
+        stream_id: stored.stream_id,
+        time: stored.time.with_timezone(&chrono::Utc),
+        replicate_index: stored.replicate_index,
+        kind: parsed,
+        reversible: parsed.reversible(),
+        old: stored.old,
+        new: stored.new,
+        actor: stored.actor,
+        at: stored.at.with_timezone(&chrono::Utc),
+        reason: stored.reason,
         origin: match origin.as_str() {
             "manual" => Origin::Manual,
             "sync" => Origin::Sync,
@@ -328,9 +369,9 @@ fn row_from(r: &sea_orm::QueryResult) -> AppResult<DecisionRow> {
                 )));
             }
         },
-        supersedes: r.try_get("", "supersedes")?,
-        rolled_back_by: r.try_get("", "rolled_back_by")?,
-        set_id: r.try_get("", "set_id")?,
+        supersedes: stored.supersedes,
+        rolled_back_by: stored.rolled_back_by,
+        set_id: stored.set_id,
     })
 }
 
@@ -786,9 +827,7 @@ pub async fn record_many<C: ConnectionTrait>(
         ))
         .await?
         .ok_or_else(|| AppError::Internal("recording decisions returned no row".to_string()))?;
-    let rows: i64 = row.try_get("", "rows")?;
-    let lo: Option<sea_orm::prelude::DateTimeWithTimeZone> = row.try_get("", "lo")?;
-    let hi: Option<sea_orm::prelude::DateTimeWithTimeZone> = row.try_get("", "hi")?;
+    let RecordedSpan { rows, lo, hi } = RecordedSpan::from_query_result(&row, "")?;
     let rows = u64::try_from(rows).unwrap_or(0);
     Ok(Recorded {
         rows,
@@ -812,6 +851,7 @@ pub async fn record_keyed<C: ConnectionTrait>(
     origin: Origin,
     mode: Keyed,
     guard: Option<&str>,
+    set_id: Option<Uuid>,
 ) -> AppResult<Recorded> {
     if rows.is_empty() {
         return Ok(Recorded::default());
@@ -846,7 +886,7 @@ pub async fn record_keyed<C: ConnectionTrait>(
          ), ins AS (
              INSERT INTO reading_decisions
                  (stream_id, time, replicate_index, kind, old, new, actor, reason, origin,
-                  supersedes)
+                  supersedes, set_id)
              SELECT t.stream_id, t.time, t.replicate_index, $5,
                     (SELECT COALESCE(jsonb_object_agg(c, t.state -> c), '{{}}'::jsonb)
                        FROM unnest($9::text[]) AS c),
@@ -855,7 +895,8 @@ pub async fn record_keyed<C: ConnectionTrait>(
                       WHERE d.stream_id = t.stream_id AND d.time = t.time
                         AND d.replicate_index IS NOT DISTINCT FROM t.replicate_index
                         AND d.kind = ANY($10) AND d.rolled_back_by IS NULL
-                      ORDER BY d.at DESC, d.id DESC LIMIT 1)
+                      ORDER BY d.at DESC, d.id DESC LIMIT 1),
+                    $11
              FROM target t
              RETURNING time
          )
@@ -876,13 +917,16 @@ pub async fn record_keyed<C: ConnectionTrait>(
                 origin.as_str().into(),
                 cols.into(),
                 family_kinds(kind).into(),
+                set_id.into(),
             ],
         ))
         .await?
         .ok_or_else(|| AppError::Internal("recording decisions returned no row".to_string()))?;
-    let rows_n: i64 = row.try_get("", "rows")?;
-    let lo: Option<sea_orm::prelude::DateTimeWithTimeZone> = row.try_get("", "lo")?;
-    let hi: Option<sea_orm::prelude::DateTimeWithTimeZone> = row.try_get("", "hi")?;
+    let RecordedSpan {
+        rows: rows_n,
+        lo,
+        hi,
+    } = RecordedSpan::from_query_result(&row, "")?;
     let mut recorded = Recorded {
         rows: u64::try_from(rows_n).unwrap_or(0),
         span: lo
@@ -957,6 +1001,7 @@ pub async fn record_value_corrections<C: ConnectionTrait>(
             origin,
             Keyed::Changed,
             None,
+            None,
         )
         .await?;
         all.rows += r.rows;
@@ -988,6 +1033,7 @@ pub async fn record_curve_claims<C: ConnectionTrait>(
             origin,
             Keyed::Claim,
             None,
+            None,
         )
         .await?;
         all.rows += r.rows;
@@ -1014,6 +1060,7 @@ pub async fn record_chain_supersessions<C: ConnectionTrait>(
             Some("superseded by a recompute"),
             Origin::Chain,
             Keyed::Changed,
+            None,
             None,
         )
         .await?;
@@ -1136,6 +1183,7 @@ pub async fn record_unverified_entries<C: ConnectionTrait>(
             origin,
             Keyed::Changed,
             None,
+            None,
         )
         .await?;
         all.rows += r.rows;
@@ -1254,12 +1302,11 @@ pub fn projected_state(newest_first: &[FoldEntry]) -> ProjectedColumns {
 /// what its live decisions say they should be. Report-only, because which side is wrong is a
 /// decision (a rollback, or a fresh decision), never something a sweep may pick.
 ///
-/// It folds every column a decision's own assertion determines. The two it cannot are
-/// `calibrated_value`, which is recomposed from the row's own curves rather than asserted, and
-/// `ingested_at`, which a correction stamps with the clock; a decision records both as `old` for a
-/// rollback to restore, and neither can be predicted from `new`. The columns only some kinds
-/// assert are compared only where a decision asserted one, so a row carrying an instrument nothing
-/// pinned is not drift.
+/// It folds every column a decision's own assertion determines. The one it cannot is
+/// `calibrated_value`, which is recomposed from the row's own curves rather than asserted, so it
+/// cannot be predicted from `new`; a decision records it as `old` for a rollback to restore. The
+/// columns only some kinds assert are compared only where a decision asserted one, so a row
+/// carrying an instrument nothing pinned is not drift.
 #[must_use]
 pub fn inconsistent_rows_sql() -> String {
     "WITH candidate AS (
@@ -1364,6 +1411,11 @@ pub struct SelectionKey {
     pub time: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub replicate_index: Option<i16>,
+    /// The corrected value for this key alone. A block of cells corrected together carries a
+    /// different number in each, so a value correction over such a selection is one decision with
+    /// a value per key rather than one call per cell.
+    #[serde(default)]
+    pub value: Option<f64>,
 }
 
 /// The readings a set decision covers: a stream, a visit, a slot, or explicit keys, each
@@ -1475,6 +1527,39 @@ async fn recompose_corrected<C: ConnectionTrait>(
     Ok(())
 }
 
+/// The per-key corrections a selection carries, grouped by stream, or None when the selection
+/// asserts one value for every row it names.
+///
+/// A block of cells corrected together carries a different number in each, so the decision cannot
+/// be one literal over a predicate. Mixing the two is refused rather than guessed: a key with no
+/// value beside keys that have one is a selection nobody meant.
+pub fn keyed_corrections(selection: &Selection) -> AppResult<Option<HashMapByStream>> {
+    if !selection.keys.iter().any(|k| k.value.is_some()) {
+        return Ok(None);
+    }
+    if selection.keys.iter().any(|k| k.value.is_none()) {
+        return Err(AppError::BadRequest(
+            "a correction naming a value per key names one for every key it selects".to_string(),
+        ));
+    }
+    let mut by_stream: HashMapByStream = std::collections::HashMap::new();
+    for key in &selection.keys {
+        let Some(value) = key.value else { continue };
+        let index = key.replicate_index.ok_or_else(|| {
+            AppError::BadRequest(
+                "a correction naming a value per key names the replicate each one belongs to"
+                    .to_string(),
+            )
+        })?;
+        by_stream.entry(key.stream_id).or_default().push((
+            key.time,
+            index,
+            serde_json::json!({ "raw_value": value }),
+        ));
+    }
+    Ok(Some(by_stream))
+}
+
 pub async fn record_set<C: ConnectionTrait>(
     conn: &C,
     kind: Kind,
@@ -1502,18 +1587,53 @@ pub async fn record_set<C: ConnectionTrait>(
         ],
     ))
     .await?;
-    let recorded = record_many(
-        conn,
-        kind,
-        &predicate,
-        binds,
-        NewValue::Literal(new),
-        actor,
-        reason,
-        origin,
-        Some(set_id),
-    )
-    .await?;
+    let recorded = match keyed_corrections(selection)? {
+        Some(by_stream) if kind == Kind::ValueCorrection => {
+            let mut all = Recorded::default();
+            for (stream_id, rows) in by_stream {
+                let one = record_keyed(
+                    conn,
+                    kind,
+                    stream_id,
+                    &rows,
+                    actor,
+                    reason,
+                    origin,
+                    Keyed::All,
+                    None,
+                    Some(set_id),
+                )
+                .await?;
+                all.rows += one.rows;
+                all.span = match (all.span, one.span) {
+                    (Some((a, b)), Some((c, d))) => Some((a.min(c), b.max(d))),
+                    (x, None) => x,
+                    (None, y) => y,
+                };
+                all.touched_events.extend(one.touched_events);
+            }
+            all
+        }
+        Some(_) => {
+            return Err(AppError::BadRequest(
+                "only a value correction names a value per key".to_string(),
+            ));
+        }
+        None => {
+            record_many(
+                conn,
+                kind,
+                &predicate,
+                binds,
+                NewValue::Literal(new),
+                actor,
+                reason,
+                origin,
+                Some(set_id),
+            )
+            .await?
+        }
+    };
     conn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "UPDATE reading_decision_sets SET rows_decided = $2 WHERE id = $1",
@@ -2043,6 +2163,7 @@ pub async fn return_output(
                 Origin::Rollback,
                 Keyed::Changed,
                 None,
+                None,
             )
             .await?;
             record(
@@ -2137,7 +2258,7 @@ pub async fn list_decisions(
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, old_state_for};
+    use super::{Kind, Selection, SelectionKey, keyed_corrections, old_state_for};
 
     #[test]
     fn every_kind_round_trips_its_name() {
@@ -2187,8 +2308,9 @@ mod tests {
         assert_eq!(Kind::CalibrationPin.projected_columns(), ["calibration_id"]);
         assert_eq!(
             Kind::ValueCorrection.projected_columns(),
-            ["raw_value", "ingested_at"],
-            "the corrected value is recomposed from the row's own curves, never recorded"
+            ["raw_value"],
+            "the corrected value is recomposed from the row's own curves, and the arrival stamp is \
+             the row's first, which no decision moves"
         );
         assert_eq!(Kind::Verify.projected_columns(), ["unverified"]);
         for k in [
@@ -2199,6 +2321,36 @@ mod tests {
             Kind::Rollback,
         ] {
             assert!(k.projected_columns().is_empty(), "{k:?}");
+        }
+    }
+
+    /// The reader asks the API which decisions it may undo rather than keeping its own copy of the
+    /// list, so this is the one place the two can disagree.
+    #[test]
+    fn reversible_is_exactly_the_kinds_rollback_accepts() {
+        for k in [
+            Kind::Flag,
+            Kind::Unflag,
+            Kind::Withdraw,
+            Kind::Reassert,
+            Kind::Reject,
+            Kind::Curve,
+            Kind::CalibrationPin,
+            Kind::InstrumentPin,
+            Kind::ValueCorrection,
+            Kind::UnverifiedEntry,
+            Kind::Verify,
+        ] {
+            assert!(k.reversible(), "{k:?} restores the columns it projected");
+        }
+        for k in [
+            Kind::SlotMove,
+            Kind::Chain,
+            Kind::Detach,
+            Kind::Return,
+            Kind::Rollback,
+        ] {
+            assert!(!k.reversible(), "{k:?} projects nothing to restore");
         }
     }
 
@@ -2226,7 +2378,7 @@ mod tests {
         );
         assert_eq!(
             old_state_for(Kind::ValueCorrection, &state),
-            serde_json::json!({ "raw_value": 1.5, "ingested_at": "2025-06-15T10:00:00Z" })
+            serde_json::json!({ "raw_value": 1.5 })
         );
         // An ownership decision records the value and the run it supersedes, and projects nothing.
         assert_eq!(
@@ -2351,11 +2503,13 @@ mod tests {
                     stream_id: uuid::Uuid::nil(),
                     time: at,
                     replicate_index: Some(1),
+                    value: None,
                 },
                 SelectionKey {
                     stream_id: uuid::Uuid::nil(),
                     time: at,
                     replicate_index: None,
+                    value: None,
                 },
             ],
             ..Default::default()
@@ -2364,6 +2518,88 @@ mod tests {
         assert!(sql.contains("r.stream_id = $1 AND r.time = $2"));
         assert!(sql.contains("$6::smallint IS NULL OR r.replicate_index = $6"));
         assert_eq!(binds.len(), 6);
+    }
+
+    #[test]
+    fn a_correction_naming_values_per_key_groups_them_by_stream() {
+        let at = chrono::Utc::now();
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let selection = Selection {
+            keys: vec![
+                SelectionKey {
+                    stream_id: a,
+                    time: at,
+                    replicate_index: Some(0),
+                    value: Some(1.5),
+                },
+                SelectionKey {
+                    stream_id: a,
+                    time: at,
+                    replicate_index: Some(1),
+                    value: Some(2.5),
+                },
+                SelectionKey {
+                    stream_id: b,
+                    time: at,
+                    replicate_index: Some(0),
+                    value: Some(3.5),
+                },
+            ],
+            ..Default::default()
+        };
+        let by_stream = keyed_corrections(&selection).unwrap().unwrap();
+        assert_eq!(by_stream.len(), 2, "one entry per stream");
+        assert_eq!(by_stream[&a].len(), 2);
+        assert_eq!(by_stream[&a][0].2, serde_json::json!({ "raw_value": 1.5 }));
+        assert_eq!(by_stream[&b].len(), 1);
+    }
+
+    #[test]
+    fn a_selection_with_no_values_is_one_assertion_over_a_predicate() {
+        let selection = Selection {
+            stream_id: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        };
+        assert!(keyed_corrections(&selection).unwrap().is_none());
+    }
+
+    #[test]
+    fn mixing_keys_with_and_without_a_value_is_refused() {
+        let at = chrono::Utc::now();
+        let stream_id = uuid::Uuid::new_v4();
+        let selection = Selection {
+            keys: vec![
+                SelectionKey {
+                    stream_id,
+                    time: at,
+                    replicate_index: Some(0),
+                    value: Some(1.0),
+                },
+                SelectionKey {
+                    stream_id,
+                    time: at,
+                    replicate_index: Some(1),
+                    value: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(keyed_corrections(&selection).is_err());
+    }
+
+    #[test]
+    fn a_per_key_correction_names_the_replicate_each_value_belongs_to() {
+        let selection = Selection {
+            keys: vec![SelectionKey {
+                stream_id: uuid::Uuid::new_v4(),
+                time: chrono::Utc::now(),
+                replicate_index: None,
+                value: Some(1.0),
+            }],
+            ..Default::default()
+        };
+        assert!(keyed_corrections(&selection).is_err());
     }
 
     #[test]

@@ -19,7 +19,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, TransactionTrait};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Statement,
+    TransactionTrait,
+};
 
 use super::job::JobRegistry;
 use super::schedule::{self, CatchupPolicy, OverlapPolicy};
@@ -222,15 +225,10 @@ async fn non_terminal_exists(
     db: &DatabaseConnection,
     job_name: &str,
 ) -> Result<bool, sea_orm::DbErr> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT 1 FROM reprocessing_jobs \
-             WHERE trigger_type = $1 \
-               AND status IN ('queued', 'pending', 'running', 'retrying') \
-             LIMIT 1",
-            [job_name.into()],
-        ))
+    let row = super::Entity::find()
+        .filter(super::Column::TriggerType.eq(job_name))
+        .filter(super::Column::Status.is_in(["queued", "pending", "running", "retrying"]))
+        .one(db)
         .await?;
     Ok(row.is_some())
 }

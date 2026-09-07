@@ -1,7 +1,7 @@
-//! `reconcile::sweep` prunes push subscriptions and deactivates subscribers whose Keycloak account
-//! resolves as `Revoked`. An active member is left alone, and an unresolvable account (`None`, e.g.
-//! Keycloak unreachable) is retained rather than swept, so a transient outage cannot deactivate a
-//! live user.
+//! `reconcile::sweep` prunes the push subscriptions of anyone whose Keycloak account resolves as
+//! `Revoked`, and leaves their preferences row alone. An active member is left alone, and an
+//! unresolvable account (`None`, e.g. Keycloak unreachable) is retained rather than swept, so a
+//! transient outage cannot cut off a live user.
 //!
 //! Run: cargo test --test notifications reconcile -- --test-threads=1
 
@@ -23,18 +23,6 @@ async fn scalar_count(db: &DatabaseConnection, sql: &str) -> i64 {
     .unwrap()
 }
 
-async fn is_active(db: &DatabaseConnection, sub: &str) -> bool {
-    db.query_one_raw(Statement::from_string(
-        DatabaseBackend::Postgres,
-        format!("SELECT is_active FROM notification_subscribers WHERE keycloak_sub = '{sub}'"),
-    ))
-    .await
-    .unwrap()
-    .unwrap()
-    .try_get::<bool>("", "is_active")
-    .unwrap()
-}
-
 async fn seed_rows(db: &DatabaseConnection, sub: &str) {
     crate::common::exec(
         db,
@@ -47,7 +35,7 @@ async fn seed_rows(db: &DatabaseConnection, sub: &str) {
     crate::common::exec(
         db,
         &format!(
-            "INSERT INTO notification_subscribers (keycloak_sub, is_active) \
+            "INSERT INTO notification_subscribers (keycloak_sub, web_push_enabled) \
              VALUES ('{sub}', TRUE)"
         ),
     )
@@ -80,7 +68,6 @@ async fn sweep_prunes_revoked_keeps_active_and_unresolvable() {
     let outcome = reconcile::sweep(&state).await.unwrap();
 
     assert_eq!(outcome.revoked, 1, "one push subscription pruned");
-    assert_eq!(outcome.deactivated, 1, "one subscriber deactivated");
 
     assert_eq!(
         scalar_count(
@@ -110,9 +97,17 @@ async fn sweep_prunes_revoked_keeps_active_and_unresolvable() {
         "unresolvable user's push subscription is retained"
     );
 
-    assert!(!is_active(&db, "sub-revoked").await, "revoked subscriber deactivated");
-    assert!(is_active(&db, "sub-active").await, "active subscriber untouched");
-    assert!(is_active(&db, "sub-none").await, "unresolvable subscriber untouched");
+    // The preferences row is the person's own and survives the revocation: deleting the push
+    // rows is the whole mechanism, and it names its own outcome.
+    assert_eq!(
+        scalar_count(
+            &db,
+            "SELECT COUNT(*) AS c FROM notification_subscribers WHERE keycloak_sub = 'sub-revoked'"
+        )
+        .await,
+        1,
+        "the revoked person's preferences row is untouched"
+    );
 
     crate::common::cleanup_test_db(&db).await;
 }

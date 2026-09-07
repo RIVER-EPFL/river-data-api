@@ -614,3 +614,61 @@ async fn seed_group_calculation(db: &sea_orm::DatabaseConnection, group_id: &str
     )
     .await;
 }
+
+/// Q95: a two-stage calculation's stage-1 values are stored parameters. The group declares them and
+/// the catalog rows are minted here, rather than being typed in one at a time before the group can
+/// name them (M114).
+#[tokio::test]
+#[serial]
+async fn declaring_intermediates_mints_the_catalog_rows_once() {
+    let (db, app, token) = setup().await;
+    let group = create_group(&app, &token, "pco2").await;
+    let group_id = group["id"].as_str().expect("group id").to_string();
+
+    let body = json!({
+        "intermediates": [
+            { "code": "CO2_HS_Um_A", "name": "CO2 headspace A", "units": "uM" },
+            { "code": "CO2_HS_Um_B", "name": "CO2 headspace B", "units": "uM" }
+        ]
+    });
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/parameter_groups/{group_id}/intermediates"),
+        &body,
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "declare ({status}): {text}");
+    let first: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(first["parameters_created"], 2, "{first}");
+    assert_eq!(first["members_created"], 2, "{first}");
+
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/parameter_groups/{group_id}/intermediates"),
+        &body,
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "re-declare ({status}): {text}");
+    let again: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(again["parameters_created"], 0, "nothing is minted twice: {again}");
+    assert_eq!(again["members_created"], 0, "and nothing joins twice: {again}");
+
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::bigint AS c FROM parameter_group_members m \
+             JOIN parameters p ON p.id = m.parameter_id \
+             WHERE m.group_id = $1 AND m.role = 'output' AND p.code LIKE 'CO2_HS_Um_%'",
+            [uuid::Uuid::parse_str(&group_id).unwrap().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.try_get::<i64>("", "c").unwrap(),
+        2,
+        "both intermediates are members the group's calculation produces"
+    );
+}

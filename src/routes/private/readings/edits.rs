@@ -145,6 +145,23 @@ pub struct EditDecision {
 }
 
 impl EditDecision {
+    /// The assertion the set records, given what the selection carries. A correction naming a
+    /// value per key has no single value to assert at set level: the values are on the rows, and
+    /// the set records only that a correction was made over them.
+    fn assertion_over(
+        &self,
+        kind: Kind,
+        selection: &Selection,
+    ) -> AppResult<(serde_json::Value, EditOption)> {
+        if kind == Kind::ValueCorrection
+            && decisions::keyed_corrections(selection)?.is_some()
+            && self.value.is_none()
+        {
+            return Ok((serde_json::json!({}), EditOption::ValueCorrection));
+        }
+        self.assertion(kind)
+    }
+
     fn parsed(&self) -> AppResult<Kind> {
         let kind = Kind::parse(&self.kind)
             .ok_or_else(|| AppError::BadRequest(format!("unknown edit kind '{}'", self.kind)))?;
@@ -488,7 +505,7 @@ async fn apply<C: ConnectionTrait>(
     actor: &str,
 ) -> AppResult<(Uuid, decisions::Recorded)> {
     let kind = decision.parsed()?;
-    let (new, _) = decision.assertion(kind)?;
+    let (new, _) = decision.assertion_over(kind, selection)?;
     decisions::record_set(
         conn,
         kind,
@@ -542,7 +559,7 @@ pub async fn preview(
 ) -> AppResult<Json<PreviewResponse>> {
     let actor = actor_label(&auth);
     let kind = req.decision.parsed()?;
-    let (_, option) = req.decision.assertion(kind)?;
+    let (_, option) = req.decision.assertion_over(kind, &req.selection)?;
     authorise(&auth, option)?;
     refuse_unrouted(&state.db, &req.selection, option).await?;
     let (predicate, binds) = req.selection.predicate()?;
@@ -632,7 +649,7 @@ pub async fn commit(
 ) -> AppResult<Json<EditResponse>> {
     let actor = actor_label(&auth);
     let kind = req.decision.parsed()?;
-    let (_, option) = req.decision.assertion(kind)?;
+    let (_, option) = req.decision.assertion_over(kind, &req.selection)?;
     authorise(&auth, option)?;
     let expected = preview_id(&req.selection, &req.decision)?;
     match req.preview_id {

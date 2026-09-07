@@ -111,7 +111,6 @@ pub async fn test_send(
 pub struct SubscriberRow {
     pub keycloak_sub: String,
     pub web_push_enabled: bool,
-    pub is_active: bool,
     pub push_subscription_count: i64,
     pub subscription_overrides: i64,
 }
@@ -135,7 +134,6 @@ pub async fn list_subscribers(
                 SELECT DISTINCT keycloak_sub FROM web_push_subscriptions \
              ) \
              SELECT s.keycloak_sub, \
-                COALESCE(ns.is_active, true) AS is_active, \
                 COALESCE(ns.web_push_enabled, true) AS web_push_enabled, \
                 (SELECT COUNT(*) FROM notification_subscriptions nsub \
                    WHERE nsub.keycloak_sub = s.keycloak_sub) AS overrides, \
@@ -153,7 +151,6 @@ pub async fn list_subscribers(
         out.push(SubscriberRow {
             keycloak_sub: r.try_get("", "keycloak_sub")?,
             web_push_enabled: r.try_get("", "web_push_enabled").unwrap_or(true),
-            is_active: r.try_get("", "is_active")?,
             push_subscription_count: r.try_get("", "push_count")?,
             subscription_overrides: r.try_get("", "overrides")?,
         });

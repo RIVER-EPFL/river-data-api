@@ -296,3 +296,89 @@ async fn a_withdrawal_through_the_primitive_is_a_stamp_a_reassert_lifts() {
         assert_eq!(stored(&f, 1).await.0, 12.0, "nothing deletes");
     }
 }
+
+/// Scenario: a block of cells is corrected in one save, each cell to a different number.
+///
+/// Expected behaviour: one preview and one commit cover the block, every value lands on its own
+/// key, and the whole block is one decision set that rolls back together.
+#[tokio::test]
+#[serial]
+async fn a_block_corrected_to_different_values_is_one_decision_set() {
+    let f = setup(&[10.0, 12.0, 14.0]).await;
+    let selection = json!({
+        "keys": [
+            { "stream_id": f.stream, "time": AT, "replicate_index": 0, "value": 20.0 },
+            { "stream_id": f.stream, "time": AT, "replicate_index": 2, "value": 24.0 },
+        ]
+    });
+    let decision = json!({ "kind": "value_correction", "reason": "pasted block" });
+
+    let (status, preview) = post(
+        &f,
+        "/api/readings/edits/preview",
+        &json!({ "selection": selection, "decision": decision }),
+    )
+    .await;
+    assert_eq!(status, 200, "preview: {preview}");
+    assert_eq!(
+        preview["rows"].as_array().map(Vec::len),
+        Some(2),
+        "the preview covers both cells: {preview}"
+    );
+    assert_eq!(
+        stored(&f, 0).await.0,
+        10.0,
+        "a preview leaves the stored value alone"
+    );
+
+    let (status, committed) = post(
+        &f,
+        "/api/readings/edits",
+        &json!({
+            "selection": selection,
+            "decision": decision,
+            "preview_id": preview["preview_id"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "commit: {committed}");
+    assert_eq!(stored(&f, 0).await.0, 20.0);
+    assert_eq!(stored(&f, 2).await.0, 24.0);
+    assert_eq!(
+        stored(&f, 1).await.0,
+        12.0,
+        "a key the block did not name is untouched"
+    );
+
+    let set_id = committed["set_id"].as_str().expect("one set for the block");
+    let (status, rolled) = post(
+        &f,
+        &format!("/api/readings/edits/sets/{set_id}/rollback"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "rollback: {rolled}");
+    assert_eq!(stored(&f, 0).await.0, 10.0, "the whole block came back");
+    assert_eq!(stored(&f, 2).await.0, 14.0);
+}
+
+/// A key with a value beside one without is a selection nobody meant, so it is refused rather
+/// than half applied.
+#[tokio::test]
+#[serial]
+async fn a_block_mixing_valued_and_unvalued_keys_is_refused() {
+    let f = setup(&[10.0, 12.0]).await;
+    let (status, body) = post(
+        &f,
+        "/api/readings/edits/preview",
+        &json!({
+            "selection": { "keys": [
+                { "stream_id": f.stream, "time": AT, "replicate_index": 0, "value": 20.0 },
+                { "stream_id": f.stream, "time": AT, "replicate_index": 1 },
+            ]},
+            "decision": { "kind": "value_correction", "reason": "half a block" },
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+}

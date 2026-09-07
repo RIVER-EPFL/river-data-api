@@ -1215,10 +1215,11 @@ pub async fn activate_version(
     ))
     .await?;
     txn.commit().await?;
-    Ok(Json(ActivateResponse {
-        script: load_script(&state, id).await?,
-        lint,
-    }))
+    let script = load_script(&state, id).await?;
+    // Same policy as a formula edit and a constant edit: the stored outputs of this calculation may
+    // now disagree with what it computes, so the edit reports and a person repairs.
+    super::calculation_versions::audit_after_activation(&state.db, &script.name).await;
+    Ok(Json(ActivateResponse { script, lint }))
 }
 
 #[derive(Debug, Serialize, ToSchema)]

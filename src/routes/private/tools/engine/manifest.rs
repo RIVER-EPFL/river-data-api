@@ -552,7 +552,8 @@ impl<'de> Deserialize<'de> for ManifestParam {
 /// the database it was authored in: the seeded tools are inserted into a fresh database where no
 /// parameter UUID exists yet, and dev and production give the same analyte different UUIDs, so a
 /// code-only output has to keep working exactly as it did.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestOutput {
     pub key: String,
     pub label: String,
@@ -580,70 +581,6 @@ pub struct ManifestOutput {
     /// value under the same key is discarded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aggregate: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ManifestOutputRaw {
-    key: String,
-    label: String,
-    #[serde(default)]
-    units: Option<String>,
-    #[serde(default)]
-    per_replicate: bool,
-    #[serde(default)]
-    aggregate_of: Option<String>,
-    #[serde(default)]
-    parameter_id: Option<Uuid>,
-    #[serde(default)]
-    suggested_parameter_code: Option<String>,
-    #[serde(default)]
-    sd_estimator: Option<String>,
-    #[serde(default)]
-    aggregate: Option<String>,
-}
-
-// Hand-written for the same reason `ManifestParam`'s is: the check runs wherever a manifest is
-// read, authoring included, rather than only where a validator is remembered.
-impl<'de> Deserialize<'de> for ManifestOutput {
-    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-        use serde::de::Error;
-        let raw = ManifestOutputRaw::deserialize(de)?;
-        if let Some(declared) = raw.sd_estimator.as_deref()
-            && !matches!(declared, "sample" | "population" | "selectable")
-        {
-            return Err(D::Error::custom(format!(
-                "output '{}': sd_estimator '{declared}' is not 'sample', 'population' or \
-                 'selectable'",
-                raw.key
-            )));
-        }
-        if let Some(agg) = raw.aggregate.as_deref() {
-            if !matches!(agg, "mean" | "sd") {
-                return Err(D::Error::custom(format!(
-                    "output '{}': aggregate '{agg}' is not 'mean' or 'sd'",
-                    raw.key
-                )));
-            }
-            if raw.aggregate_of.is_none() {
-                return Err(D::Error::custom(format!(
-                    "output '{}': aggregate needs aggregate_of naming the replicates it reduces",
-                    raw.key
-                )));
-            }
-        }
-        Ok(Self {
-            key: raw.key,
-            label: raw.label,
-            units: raw.units,
-            per_replicate: raw.per_replicate,
-            aggregate_of: raw.aggregate_of,
-            parameter_id: raw.parameter_id,
-            suggested_parameter_code: raw.suggested_parameter_code,
-            sd_estimator: raw.sd_estimator,
-            aggregate: raw.aggregate,
-        })
-    }
 }
 
 impl ManifestOutput {
@@ -790,6 +727,33 @@ struct ManifestRaw {
     match_keywords: Vec<String>,
 }
 
+/// The vocabulary checks on one output. Read wherever a manifest is read, authoring included.
+fn check_output(o: &ManifestOutput) -> Result<(), String> {
+    if let Some(declared) = o.sd_estimator.as_deref()
+        && !matches!(declared, "sample" | "population" | "selectable")
+    {
+        return Err(format!(
+            "output '{}': sd_estimator '{declared}' is not 'sample', 'population' or 'selectable'",
+            o.key
+        ));
+    }
+    if let Some(agg) = o.aggregate.as_deref() {
+        if !matches!(agg, "mean" | "sd") {
+            return Err(format!(
+                "output '{}': aggregate '{agg}' is not 'mean' or 'sd'",
+                o.key
+            ));
+        }
+        if o.aggregate_of.is_none() {
+            return Err(format!(
+                "output '{}': aggregate needs aggregate_of naming the replicates it reduces",
+                o.key
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl<'de> Deserialize<'de> for Manifest {
     fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         use serde::de::Error;
@@ -817,6 +781,7 @@ impl<'de> Deserialize<'de> for Manifest {
         // An engine-computed aggregate reduces a replicates param, so `aggregate_of` has to name
         // one; the plain display marker (aggregate_of without aggregate) stays free-form.
         for o in &raw.outputs {
+            check_output(o).map_err(D::Error::custom)?;
             if o.aggregate.is_some()
                 && let Some(source) = o.aggregate_of.as_deref()
                 && !raw

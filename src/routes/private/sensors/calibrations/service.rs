@@ -405,6 +405,24 @@ struct DerivedWork {
     derived_parameter_code: String,
 }
 
+/// The newest version of a definition's formula, which is the text this engine is about to
+/// evaluate. `None` for a definition minted before versioning, whose rows carry no version rather
+/// than a claim about which text produced them (Q89, M134).
+async fn newest_derived_version(
+    db: &DatabaseConnection,
+    definition_id: Uuid,
+) -> Result<Option<Uuid>, sea_orm::DbErr> {
+    Ok(db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM derived_parameter_definition_versions \
+              WHERE definition_id = $1 ORDER BY version_no DESC LIMIT 1",
+            [definition_id.into()],
+        ))
+        .await?
+        .and_then(|row| row.try_get::<Uuid>("", "id").ok()))
+}
+
 /// The slots this site computes. The producing definition is the one whose output is the slot's
 /// parameter; `entry_mode` is the site's own declaration that it computes the slot rather than
 /// taking it by hand.
@@ -745,6 +763,9 @@ async fn evaluate_and_upsert_derived(
     }
 
     let stream_id = get_or_create_derived_stream(db, item).await?;
+    // The row names the formula text it was made with, so a later edit cannot rewrite the story of
+    // what this number came from (Q89).
+    let version = newest_derived_version(db, item.derived_definition_id).await?;
 
     // The slot is re-asserted on conflict as well as on insert: a row this engine unattributed
     // when its inputs stopped resolving is the same row it writes when they resolve again, and
@@ -764,17 +785,18 @@ async fn evaluate_and_upsert_derived(
         db,
         Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, replicate_index, measurement_type, provenance_kind)
-          VALUES ($1, $2, $3, $4, $5, NULL, 0, 'derived', 'derived')
+            r"INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, replicate_index, measurement_type, provenance_kind, derived_version_id)
+          VALUES ($1, $2, $3, $4, $5, NULL, 0, 'derived', 'derived', $6)
           ON CONFLICT (stream_id, time, replicate_index) DO UPDATE
             SET raw_value = $5, calibrated_value = NULL, measurement_type = 'derived',
-                site_id = $2, parameter_id = $3",
+                site_id = $2, parameter_id = $3, derived_version_id = $6",
             [
                 stream_id.into(),
                 item.derived_site_id.into(),
                 item.derived_parameter_id.into(),
                 time.into(),
                 result.into(),
+                version.into(),
             ],
         ),
     )

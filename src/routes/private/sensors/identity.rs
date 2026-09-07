@@ -10,8 +10,8 @@ use sea_orm::{
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
-use crate::routes::private::{data_streams, sensors, sensors::deployments};
 use crate::routes::private::sync::replicate_audit as audit;
+use crate::routes::private::{data_streams, sensors, sensors::deployments};
 
 /// Resolved sensor context for readings.
 #[derive(Debug, Clone)]
@@ -136,11 +136,128 @@ impl InstrumentKind {
     }
 
     /// Everything that is not a field device has sat under this flag since before the kinds were
-    /// distinguished, and the inventory's Lab tab still reads it.
+    /// distinguished. Still written on every mint so a reader of the column alone sees what it
+    /// always saw; nothing decides anything from it.
     #[must_use]
     pub fn is_lab_instrument(self) -> bool {
         self != Self::Device
     }
+
+    /// The kind a stored row is, from the column that holds the fact and, for a row predating the
+    /// backfill that filled it, from the flag that is its shadow. The flag cannot tell `lab` from
+    /// the two bookkeeping kinds, so an unrecognised kind resolves to `Lab` exactly where the flag
+    /// is set and `Device` otherwise: the same fallback the client draws.
+    #[must_use]
+    pub fn of(kind: Option<&str>, is_lab_instrument: Option<bool>) -> Self {
+        match kind {
+            Some("device") => Self::Device,
+            Some("lab") => Self::Lab,
+            Some("source_parameter") => Self::SourceParameter,
+            Some("entry_channel") => Self::EntryChannel,
+            _ if is_lab_instrument.unwrap_or(false) => Self::Lab,
+            _ => Self::Device,
+        }
+    }
+
+    /// Whether a row stands for something an operator could have measured on. The two bookkeeping
+    /// kinds exist so a reading can name an instrument at all, and nothing was measured on them.
+    #[must_use]
+    pub fn is_bookkeeping(self) -> bool {
+        matches!(self, Self::SourceParameter | Self::EntryChannel)
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::InstrumentKind;
+
+    /// `kind` is the fact and `is_lab_instrument` is its shadow: the column decides, and the flag
+    /// is read only where no kind was stored.
+    #[test]
+    fn the_stored_kind_decides_and_the_flag_is_only_the_fallback() {
+        for (stored, want) in [
+            ("device", InstrumentKind::Device),
+            ("lab", InstrumentKind::Lab),
+            ("source_parameter", InstrumentKind::SourceParameter),
+            ("entry_channel", InstrumentKind::EntryChannel),
+        ] {
+            for flag in [None, Some(false), Some(true)] {
+                assert_eq!(
+                    InstrumentKind::of(Some(stored), flag),
+                    want,
+                    "{stored} with flag {flag:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_row_predating_the_backfill_falls_back_to_the_flag() {
+        assert_eq!(InstrumentKind::of(None, Some(true)), InstrumentKind::Lab);
+        assert_eq!(
+            InstrumentKind::of(None, Some(false)),
+            InstrumentKind::Device
+        );
+        assert_eq!(InstrumentKind::of(None, None), InstrumentKind::Device);
+        assert_eq!(
+            InstrumentKind::of(Some(""), Some(true)),
+            InstrumentKind::Lab
+        );
+    }
+
+    /// The collapse this replaces: to the flag alone, all three non-device kinds read as lab.
+    #[test]
+    fn only_lab_is_lab_where_the_kind_is_stored() {
+        let stored = ["lab", "source_parameter", "entry_channel"];
+        let lab: Vec<bool> = stored
+            .iter()
+            .map(|k| InstrumentKind::of(Some(k), Some(true)) == InstrumentKind::Lab)
+            .collect();
+        assert_eq!(lab, vec![true, false, false]);
+        for k in stored {
+            assert!(InstrumentKind::of(Some(k), Some(true)).is_lab_instrument());
+        }
+    }
+
+    #[test]
+    fn the_two_bookkeeping_kinds_are_the_ones_nothing_measured_on() {
+        assert!(InstrumentKind::SourceParameter.is_bookkeeping());
+        assert!(InstrumentKind::EntryChannel.is_bookkeeping());
+        assert!(!InstrumentKind::Device.is_bookkeeping());
+        assert!(!InstrumentKind::Lab.is_bookkeeping());
+    }
+}
+
+/// Refuse an instrument nothing measures on, for the writes that name one: a slot's declaration
+/// and a deployment. `subject` names the write in the message, since the operator picked the row
+/// from a list and needs to be told why this one is not an answer.
+pub async fn require_measuring_instrument<C: ConnectionTrait>(
+    db: &C,
+    sensor_id: Uuid,
+    subject: &str,
+) -> AppResult<()> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT kind, name, is_lab_instrument FROM sensors WHERE id = $1",
+            [sensor_id.into()],
+        ))
+        .await?
+        .ok_or_else(|| AppError::BadRequest(format!("Instrument {sensor_id} not found")))?;
+    let kind = InstrumentKind::of(
+        row.try_get::<Option<String>>("", "kind")?.as_deref(),
+        row.try_get::<Option<bool>>("", "is_lab_instrument")?,
+    );
+    if !kind.is_bookkeeping() {
+        return Ok(());
+    }
+    let name = row
+        .try_get::<Option<String>>("", "name")?
+        .unwrap_or_else(|| sensor_id.to_string());
+    Err(AppError::BadRequest(format!(
+        "{name} is a {} row, which records that nothing was declared; it cannot be {subject}",
+        kind.as_str()
+    )))
 }
 
 /// Insert a source-registered instrument for `(source_system, source_key)`, or return the existing
@@ -862,9 +979,7 @@ pub async fn raise_source_identity_hold<C: ConnectionTrait>(
     audit::upsert_hold(
         db,
         &audit::Hold {
-            key: audit::HoldKey::StreamStanding {
-                stream_id,
-            },
+            key: audit::HoldKey::StreamStanding { stream_id },
             kind: "source_identity_changed",
             expected: serde_json::json!({ "was": stored, "fields": changed }),
             computed: serde_json::json!({ "now": reported }),

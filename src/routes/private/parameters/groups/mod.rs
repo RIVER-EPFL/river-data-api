@@ -14,6 +14,7 @@
 //! and a consumer that rounds does it from `/sites/{id}/parameters`.
 
 pub mod definition;
+pub mod intermediates;
 pub mod group_model;
 pub mod member_model;
 pub mod operations;

@@ -61,6 +61,18 @@ pub struct ProjectResult {
 
 /// Cross-entity full-text search. Matches against sites, sensors, parameters, and
 /// projects by name (case-insensitive substring). Requires `read_metadata`.
+/// The `ILIKE` disjunction over an entity's declared fulltext columns, as `$1`. The columns come
+/// from the entity rather than from this file, so a `#[crudcrate(fulltext)]` added to a model is
+/// searched here too.
+fn fulltext_ilike<R: crudcrate::CRUDResource>(table: &str) -> String {
+    let columns = R::fulltext_searchable_columns();
+    columns
+        .iter()
+        .map(|(name, _)| format!("{table}.{name} ILIKE $1"))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
 #[utoipa::path(
     get,
     path = "/api/search",
@@ -96,21 +108,36 @@ pub async fn search(
     // there. The global measurement catalog (`parameters`) is shared reference data, not project
     // data, so it stays visible to everyone. Unscoped principals (Keycloak users, unscoped tokens)
     // search across all projects unchanged.
+    let site_match = fulltext_ilike::<crate::routes::private::sites::Site>("sites");
+    let sensor_match = fulltext_ilike::<crate::routes::private::sensors::Sensor>("sensors");
+    let project_match = fulltext_ilike::<crate::routes::private::projects::Project>("projects");
+    let parameter_match =
+        fulltext_ilike::<crate::routes::private::parameters::Parameter>("parameters");
     let (sites_sql, sensors_sql, projects_sql) = if scope.is_restricted() {
         (
-            "SELECT id, name FROM sites WHERE name ILIKE $1 AND project_id = ANY($2) ORDER BY name LIMIT 10",
-            "SELECT id, serial_number, name FROM sensors \
-             WHERE (serial_number ILIKE $1 OR name ILIKE $1) \
-               AND EXISTS (SELECT 1 FROM sensor_deployments d JOIN sites s ON s.id = d.site_id \
-                           WHERE d.sensor_id = sensors.id AND s.project_id = ANY($2)) \
-             ORDER BY serial_number LIMIT 10",
-            "SELECT id, name FROM projects WHERE name ILIKE $1 AND id = ANY($2) ORDER BY name LIMIT 10",
+            format!(
+                "SELECT id, name FROM sites WHERE ({site_match}) AND project_id = ANY($2) \
+                 ORDER BY name LIMIT 10"
+            ),
+            format!(
+                "SELECT id, serial_number, name FROM sensors WHERE ({sensor_match}) \
+                   AND EXISTS (SELECT 1 FROM sensor_deployments d JOIN sites s ON s.id = d.site_id \
+                               WHERE d.sensor_id = sensors.id AND s.project_id = ANY($2)) \
+                 ORDER BY serial_number LIMIT 10"
+            ),
+            format!(
+                "SELECT id, name FROM projects WHERE ({project_match}) AND id = ANY($2) \
+                 ORDER BY name LIMIT 10"
+            ),
         )
     } else {
         (
-            "SELECT id, name FROM sites WHERE name ILIKE $1 ORDER BY name LIMIT 10",
-            "SELECT id, serial_number, name FROM sensors WHERE serial_number ILIKE $1 OR name ILIKE $1 ORDER BY serial_number LIMIT 10",
-            "SELECT id, name FROM projects WHERE name ILIKE $1 ORDER BY name LIMIT 10",
+            format!("SELECT id, name FROM sites WHERE ({site_match}) ORDER BY name LIMIT 10"),
+            format!(
+                "SELECT id, serial_number, name FROM sensors WHERE ({sensor_match}) \
+                 ORDER BY serial_number LIMIT 10"
+            ),
+            format!("SELECT id, name FROM projects WHERE ({project_match}) ORDER BY name LIMIT 10"),
         )
     };
     let scoped_vals = || -> Vec<sea_orm::Value> {
@@ -123,25 +150,25 @@ pub async fn search(
     let (sites, sensors, parameters, projects) = tokio::try_join!(
         SiteResult::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            sites_sql,
+            &sites_sql,
             scoped_vals(),
         ))
         .all(&state.db),
         SensorResult::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            sensors_sql,
+            &sensors_sql,
             scoped_vals(),
         ))
         .all(&state.db),
         ParameterResult::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT id, code, name FROM parameters WHERE code ILIKE $1 OR name ILIKE $1 ORDER BY code LIMIT 10",
+            &format!("SELECT id, code, name FROM parameters WHERE ({parameter_match}) ORDER BY code LIMIT 10"),
             [pattern.clone().into()],
         ))
         .all(&state.db),
         ProjectResult::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            projects_sql,
+            &projects_sql,
             scoped_vals(),
         ))
         .all(&state.db),

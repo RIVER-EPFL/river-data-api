@@ -245,9 +245,17 @@ pub fn in_order(formulas: &[PinnedFormula]) -> Result<Vec<&PinnedFormula>, Strin
 /// Parameter codes a calculation produces before the formula at `index` runs. Those are satisfied
 /// from inside the calculation, so they are not declared as event inputs and are not resolved from
 /// stored readings.
+/// The parameters an earlier formula hands to a later one inside the run.
+///
+/// A per-replicate formula is not one of them. Its value exists once per index, and what a second
+/// stage reads is the family's mean, which the `samples` trigger derives after the repeats are
+/// stored and never a formula (Q95, D21). So its output stays an event input, resolved from the
+/// stored value the way any other parameter is, and the second stage converges on the pass after
+/// the repeats land rather than taking one of them.
 fn produced_before(ordered: &[&PinnedFormula], index: usize) -> Vec<String> {
     ordered[..index]
         .iter()
+        .filter(|f| f.per_replicate.is_none())
         .filter_map(|f| f.output_parameter_code.as_ref())
         .map(|c| c.to_lowercase())
         .collect()
@@ -413,7 +421,10 @@ pub fn evaluate(
             .map_err(|e| format!("formula {}: {e}", formula.code))?;
         // NaN is the portal's NA: computed, and not a number. It clears the stored value rather
         // than feeding the next formula, which would turn one NA into a whole calculation of them.
+        // A per-replicate value is one repeat, not the calculation's answer for that parameter, so
+        // it is not handed to a later formula; that one reads the stored mean instead.
         if !value.is_nan()
+            && formula.per_replicate.is_none()
             && let Some(code) = &formula.output_parameter_code
         {
             produced.insert(code.to_lowercase(), value);
@@ -1230,5 +1241,38 @@ mod tests {
             event_inputs.iter().all(|e| e["param"] != "peak"),
             "the family is not resolved as one number: {event_inputs:?}"
         );
+    }
+
+    /// A scalar formula reading a per-replicate output takes the family's stored mean, not one of
+    /// its repeats: the mean is the `samples` trigger's, so the value arrives as an event input
+    /// resolved from the store rather than as a hand-off inside the run.
+    #[test]
+    fn test_a_scalar_formula_reads_a_per_replicate_output_from_the_store() {
+        let formulas = [
+            per_replicate("stage1", 1, "peak * 2", Some("S1"), &[("peak", "Peak")], "peak"),
+            formula("stage2", 2, "s1 + 1", Some("S2"), &[("s1", "S1")]),
+        ];
+        let manifest = manifest_json("Two stage", None, &formulas).expect("manifest");
+        let event_inputs = manifest["event_inputs"].as_array().expect("event_inputs");
+        assert!(
+            event_inputs
+                .iter()
+                .any(|e| e["param"] == "s1" && e["parameter_code"] == "S1"),
+            "the second stage resolves its input from the store: {event_inputs:?}"
+        );
+
+        // The stored mean of [2, 4, 6] is 4, so the second stage is 5 whatever the repeats do.
+        let produced = evaluate_over_replicates(
+            &formulas,
+            &HashMap::from([("s1".to_string(), 4.0)]),
+            &replicates(&[("peak", &[Some(1.0), Some(2.0), Some(3.0)])]),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect("evaluates");
+        match &produced[1] {
+            Produced::Scalar(evaluated) => assert_eq!(evaluated.value, Some(5.0)),
+            other => panic!("the second stage is one number: {other:?}"),
+        }
     }
 }

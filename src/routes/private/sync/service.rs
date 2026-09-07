@@ -347,6 +347,22 @@ pub struct PlanInstrumentRef {
     /// without it, the only record of what the plan suggested is gone the moment it is overwritten.
     #[serde(default)]
     pub proposed_name: Option<String>,
+    /// An instrument that already carries the proposed name. Creating a second one under it is
+    /// allowed, and so is attaching to this one, but neither may happen by default: readings
+    /// joining an instrument that already holds data is not something a plan decides on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_conflict: Option<InstrumentNameConflict>,
+}
+
+/// The instrument a proposed name collides with, enough of it to choose by.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstrumentNameConflict {
+    pub id: Uuid,
+    pub name: String,
+    /// Where it came from, so an operator can tell a hand entry from an earlier import.
+    pub source_system: Option<String>,
+    /// True when it already carries readings; attaching adds to them.
+    pub has_readings: bool,
 }
 
 /// Replicate-family summary carried on a plan entry, from the stream's registered spec.
@@ -370,7 +386,19 @@ pub struct InstrumentCatalog {
     /// dedupes on. Looked up before anything is proposed, so a plan built after an earlier one
     /// reports the instrument it already created rather than asking to create it again.
     by_source_key: HashMap<String, Uuid>,
+    /// **Every** instrument by lowercased name, this source's and everyone else's. A name
+    /// collision is about what a person reads, so it does not stop at the source boundary: the
+    /// lab's `DOC` may have arrived by hand or from another import.
+    by_name: HashMap<String, InstrumentNameConflict>,
     curves: HashMap<Uuid, Vec<PlanCurveRef>>,
+}
+
+impl InstrumentCatalog {
+    /// The instrument already carrying this name, if any.
+    #[must_use]
+    pub fn named(&self, name: &str) -> Option<InstrumentNameConflict> {
+        self.by_name.get(&name.trim().to_lowercase()).cloned()
+    }
 }
 
 /// A curve column's stem, normalised for comparison against an instrument label:
@@ -409,6 +437,37 @@ pub async fn load_instrument_catalog(
         )
         .all(db)
         .await?;
+
+    // Names are read across every source: see `by_name`.
+    let named_rows = sensors::Entity::find().all(db).await?;
+    let with_readings: std::collections::HashSet<Uuid> = db
+        .query_all_raw(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT DISTINCT sensor_id FROM readings WHERE sensor_id IS NOT NULL".to_string(),
+        ))
+        .await?
+        .iter()
+        .filter_map(|r| r.try_get::<Uuid>("", "sensor_id").ok())
+        .collect();
+    let mut by_name: HashMap<String, InstrumentNameConflict> = HashMap::new();
+    for row in &named_rows {
+        let Some(name) = row
+            .name
+            .as_ref()
+            .map(|n| n.trim())
+            .filter(|n| !n.is_empty())
+        else {
+            continue;
+        };
+        by_name
+            .entry(name.to_lowercase())
+            .or_insert_with(|| InstrumentNameConflict {
+                id: row.id,
+                name: name.to_string(),
+                source_system: row.source_system.clone(),
+                has_readings: with_readings.contains(&row.id),
+            });
+    }
 
     let mut by_id = HashMap::new();
     let mut labels = Vec::new();
@@ -449,6 +508,7 @@ pub async fn load_instrument_catalog(
         by_id,
         labels,
         by_source_key,
+        by_name,
         curves,
     })
 }
@@ -487,6 +547,7 @@ pub fn resolve_instrument(
             stamps_readings,
             curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
             proposed_name: None,
+            name_conflict: None,
         });
     }
 
@@ -509,6 +570,7 @@ pub fn resolve_instrument(
             stamps_readings,
             curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
             proposed_name: None,
+            name_conflict: None,
         });
     }
 
@@ -532,6 +594,7 @@ pub fn resolve_instrument(
             stamps_readings,
             curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
             proposed_name: None,
+            name_conflict: None,
         });
     }
 
@@ -547,6 +610,7 @@ pub fn resolve_instrument(
         stamps_readings,
         curves: vec![],
         proposed_name: Some(name),
+        name_conflict: None,
     })
 }
 
@@ -575,7 +639,6 @@ pub fn stream_instrument_key(stream: &data_streams::Model) -> String {
 /// wants another instrument attaches it, and one who wants none has nothing to pair. `parameter`
 /// names the proposal, it does not key it.
 pub fn resolve_parameter_instrument(
-    source_system: &str,
     source_key: String,
     parameter: &str,
     catalog: &InstrumentCatalog,
@@ -593,9 +656,14 @@ pub fn resolve_parameter_instrument(
             stamps_readings: false,
             curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
             proposed_name: None,
+            name_conflict: None,
         };
     }
-    let name = format!("{parameter} ({source_system})");
+    // The lab's DOC analyser is one machine carried to every station, so it is called DOC. The
+    // source is provenance, held in `source_key`, and putting it in the name would make every
+    // import read as a different instrument to the person choosing between them.
+    let name = parameter.to_string();
+    let conflict = catalog.named(&name);
     PlanInstrumentRef {
         curve_column: None,
         id: None,
@@ -603,10 +671,13 @@ pub fn resolve_parameter_instrument(
         source_key,
         resolved_by: "parameter".to_string(),
         create: true,
-        confirmed: true,
+        // A name an instrument already carries is a decision, not a proposal: the readings would
+        // join a row that already holds data, so the operator says which they meant.
+        confirmed: conflict.is_none(),
         stamps_readings: false,
         curves: vec![],
         proposed_name: Some(name),
+        name_conflict: conflict,
     }
 }
 
@@ -892,13 +963,10 @@ pub async fn create_plan(
             sd_holds,
             sd_population_holds,
             acknowledged: false,
-            is_device: crate::routes::private::sensors::identity::is_device_feed(
+            is_device: crate::routes::private::sensors::identity::is_device_feed(&stream.metadata),
+            device_serial: crate::routes::private::sensors::identity::extract_vaisala_device_serial(
                 &stream.metadata,
             ),
-            device_serial:
-                crate::routes::private::sensors::identity::extract_vaisala_device_serial(
-                    &stream.metadata,
-                ),
             device_model: stream
                 .metadata
                 .get("device")
@@ -913,7 +981,6 @@ pub async fn create_plan(
         // from its own provenance at pairing.
         if entry.instrument.is_none() && !entry.is_device {
             entry.instrument = Some(resolve_parameter_instrument(
-                source_system,
                 stream_instrument_key(stream),
                 &entry.parameter.name,
                 &instruments,
@@ -1557,10 +1624,9 @@ async fn pair_entry_stream<C: ConnectionTrait>(
         .then_some(instrument_id)
         .flatten();
     let needs_sensor = stream.sensor_id.is_none() && from_plan.is_none();
-    let device = crate::routes::private::sensors::identity::extract_vaisala_device_serial(
-        &stream.metadata,
-    )
-    .is_some();
+    let device =
+        crate::routes::private::sensors::identity::extract_vaisala_device_serial(&stream.metadata)
+            .is_some();
     // Read once, and only for the entries that will use it: an apply runs this per stream.
     let site_id = if needs_sensor || device {
         site_parameters::Entity::find_by_id(site_parameter_id)
@@ -1582,8 +1648,7 @@ async fn pair_entry_stream<C: ConnectionTrait>(
         // opened here too. Without this the plan's own instrument choice silently costs the
         // deployment that pairing the same stream by hand would have opened.
         let opens_at =
-            crate::routes::private::sensors::identity::stream_history_start(txn, stream.id)
-                .await?;
+            crate::routes::private::sensors::identity::stream_history_start(txn, stream.id).await?;
         if let Err(e) = crate::routes::private::sensors::identity::find_or_create_deployment(
             txn,
             sensor_id,
@@ -1932,8 +1997,8 @@ fn match_entity(name: &str, existing: &[(Uuid, String)]) -> (Option<Uuid>, bool)
 }
 
 /// A stream names its column by code, display name or alias, so all three resolve. The order is
-/// canonical and shared: `resolve_or_create_param` runs it as SQL at apply time and `bulk_pair`
-/// builds the same precedence into its lookup map, so a review shows what apply will produce.
+/// canonical: `resolve_or_create_param` runs it as SQL at apply time and this builds the same
+/// precedence into the review's lookup map, so a review shows what apply will produce.
 pub fn lookup_parameter_by_code_name_or_alias(
     name: &str,
     existing: &[CatalogParam],
@@ -2408,8 +2473,24 @@ mod tests {
                 .iter()
                 .map(|(key, id)| ((*key).to_string(), *id))
                 .collect(),
+            by_name: HashMap::new(),
             curves: HashMap::new(),
         }
+    }
+
+    /// A catalog holding one instrument by name and nothing else, for the collision cases.
+    fn catalog_named(name: &str, id: Uuid, has_readings: bool) -> InstrumentCatalog {
+        let mut c = catalog(&[]);
+        c.by_name.insert(
+            name.to_lowercase(),
+            super::InstrumentNameConflict {
+                id,
+                name: name.to_string(),
+                source_system: Some("metalp".to_string()),
+                has_readings,
+            },
+        );
+        c
     }
 
     fn family_stream() -> super::data_streams::Model {
@@ -2434,6 +2515,7 @@ mod tests {
             pairing_plan_id: None,
             created_at: now,
             updated_at: now,
+            replicates: None,
         }
     }
 
@@ -2447,7 +2529,6 @@ mod tests {
         assert_ne!(suggestion, "DOC_avg_ppb", "the suggestion is a label");
 
         let proposed = resolve_parameter_instrument(
-            "cnet",
             stream_instrument_key(&stream),
             &suggestion,
             &catalog(&[]),
@@ -2460,7 +2541,6 @@ mod tests {
     fn test_resolve_parameter_instrument_takes_the_source_s_own() {
         let id = Uuid::new_v4();
         let resolved = resolve_parameter_instrument(
-            "cnet",
             "cnet:NO2_mgL".to_string(),
             "NO2_mgL",
             &catalog(&[("cnet:NO2_mgL", id)]),
@@ -2477,16 +2557,64 @@ mod tests {
     /// changes it by attaching another; leaving it alone creates the suggestion.
     #[test]
     fn test_resolve_parameter_instrument_proposes_one_already_agreed() {
-        let proposed = resolve_parameter_instrument(
-            "cnet",
-            "cnet:NO2_mgL".to_string(),
-            "NO2_mgL",
-            &catalog(&[]),
-        );
+        let proposed =
+            resolve_parameter_instrument("cnet:NO2_mgL".to_string(), "NO2_mgL", &catalog(&[]));
         assert_eq!(proposed.id, None);
         assert_eq!(proposed.source_key, "cnet:NO2_mgL");
         assert!(proposed.create && proposed.confirmed);
-        assert_eq!(proposed.proposed_name.as_deref(), Some("NO2_mgL (cnet)"));
+        assert_eq!(
+            proposed.proposed_name.as_deref(),
+            Some("NO2_mgL"),
+            "the name is the analyte; the source is provenance and lives in source_key"
+        );
+        assert_eq!(proposed.name, "NO2_mgL");
+        assert!(proposed.name_conflict.is_none());
+    }
+
+    /// Expected behaviour: the lab's DOC analyser is one machine carried to every station, so a
+    /// proposal that would create a second instrument called `DOC` is a decision, not a
+    /// suggestion. It is reported unconfirmed with the row it collides with, and apply refuses an
+    /// unconfirmed proposal, so the operator has to say which they meant.
+    #[test]
+    fn test_a_proposed_name_an_instrument_already_carries_is_put_to_the_operator() {
+        let existing = Uuid::new_v4();
+        let proposed = resolve_parameter_instrument(
+            "cnet:DOC".to_string(),
+            "DOC",
+            &catalog_named("DOC", existing, true),
+        );
+        assert!(
+            proposed.create,
+            "attaching is one of the two answers, not the default"
+        );
+        assert!(
+            !proposed.confirmed,
+            "a collision is never agreed to on the operator's behalf"
+        );
+        let conflict = proposed.name_conflict.expect("the collision is reported");
+        assert_eq!(conflict.id, existing);
+        assert_eq!(conflict.name, "DOC");
+        assert!(
+            conflict.has_readings,
+            "attaching would add to readings it already holds, which is what must be said"
+        );
+    }
+
+    /// The comparison is on the name a person reads, so case and surrounding space are not a
+    /// second instrument.
+    #[test]
+    fn test_a_collision_ignores_case_and_padding() {
+        let existing = Uuid::new_v4();
+        let proposed = resolve_parameter_instrument(
+            "cnet:doc".to_string(),
+            "  doc  ",
+            &catalog_named("DOC", existing, false),
+        );
+        assert_eq!(
+            proposed.name_conflict.map(|c| c.id),
+            Some(existing),
+            "`doc` and `DOC` are one instrument to the person choosing"
+        );
     }
 
     pub fn plan_entry(site: &str, parameter: &str, confidence: &str, warnings: usize) -> PlanEntry {

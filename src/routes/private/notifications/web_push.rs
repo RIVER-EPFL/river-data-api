@@ -91,7 +91,7 @@ const SELECT_ENABLED_SUBSCRIPTIONS: &str = "\
     SELECT wps.id, wps.keycloak_sub AS sub, wps.endpoint, wps.p256dh, wps.auth \
     FROM web_push_subscriptions wps \
     LEFT JOIN notification_subscribers ns ON ns.keycloak_sub = wps.keycloak_sub \
-    WHERE COALESCE(ns.is_active, true) AND COALESCE(ns.web_push_enabled, true)";
+    WHERE COALESCE(ns.web_push_enabled, true)";
 
 /// The most specific row the subscriber holds for this group wins: parameter, then site, then
 /// project, then the group-wide row. With none of them the group's own default stands.

@@ -224,6 +224,15 @@ pub async fn adopt_sensor(
     // Confine to the target site before any write: deploying an instrument into a project the
     // caller has no grant on is the write this refuses.
     scope::require_sites_in_scope(db, &scope, &[payload.site_id]).await?;
+    // A deployment is a statement that this instrument measures at this site, so a bookkeeping
+    // row cannot hold one: deploying one gives it a current site and a window that resolution
+    // would then honour.
+    crate::routes::private::sensors::identity::require_measuring_instrument(
+        db,
+        sensor_id,
+        "deployed to a site",
+    )
+    .await?;
     let parameter_id = resolve_sensor_parameter(db, sensor_id, payload.parameter_id).await?;
 
     let site_exists = db
@@ -466,6 +475,12 @@ pub async fn swap_sensors(
         scope::Unowned::Allow,
         "Sensor",
     )?;
+    crate::routes::private::sensors::identity::require_measuring_instrument(
+        db,
+        payload.incoming_sensor_id,
+        "deployed to a site",
+    )
+    .await?;
     let parameter_id = resolve_swap_parameter(
         db,
         payload.outgoing_sensor_id,

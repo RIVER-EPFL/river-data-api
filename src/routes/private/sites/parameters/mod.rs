@@ -1,3 +1,4 @@
+pub mod apply_group;
 pub mod declare;
 pub mod descriptor;
 pub mod model;

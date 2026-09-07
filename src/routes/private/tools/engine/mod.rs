@@ -5,7 +5,7 @@
 //! Calculation resolves constants and curves here, so the runner receives values and the
 //! provenance snapshot is taken where the data was read, then proxies to the OpenCPU runner.
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
 use serde::Serialize;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -45,7 +45,7 @@ pub struct ResolvedParameter {
     pub dangling_parameter_id: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sea_orm::FromQueryResult)]
 struct CatalogRow {
     id: Uuid,
     code: String,
@@ -165,13 +165,7 @@ pub async fn load_parameter_catalog<'a>(
         ))
         .await?;
     for row in &rows {
-        let entry = CatalogRow {
-            id: row.try_get("", "id")?,
-            code: row.try_get("", "code")?,
-            name: row.try_get("", "name")?,
-            default_units: row.try_get("", "default_units")?,
-            needs_review: row.try_get("", "needs_review")?,
-        };
+        let entry = CatalogRow::from_query_result(row, "")?;
         catalog
             .by_code
             .insert(entry.code.to_lowercase(), entry.clone());
@@ -424,23 +418,62 @@ const ACTIVE_TOOL_SQL: &str = r"
     FROM tool_scripts s
     JOIN tool_script_versions v ON v.id = s.active_version_id";
 
+/// One formula of a calculation as stored, before its `sources` blob is read into pairs.
+#[derive(FromQueryResult)]
+struct StoredFormula {
+    code: String,
+    name: String,
+    units: Option<String>,
+    formula: String,
+    ordinal: i32,
+    output_parameter_code: Option<String>,
+    curve_slot: Option<String>,
+    per_replicate: Option<String>,
+}
+
+/// A standard curve as the runner receives its coefficients.
+#[derive(FromQueryResult)]
+struct StoredCurve {
+    slope: f64,
+    intercept: f64,
+    name: Option<String>,
+}
+
+/// [`ACTIVE_TOOL_SQL`]'s row. The manifest and the engine stay parses over it: a stored manifest
+/// that no longer reads is a corrupt row, not a decode failure, and it says so by name.
+#[derive(sea_orm::FromQueryResult)]
+struct StoredActiveTool {
+    script_id: Uuid,
+    name: String,
+    label: String,
+    description: Option<String>,
+    version_id: Uuid,
+    version_no: i32,
+    script: String,
+    entry_function: String,
+    content_hash: String,
+    manifest: serde_json::Value,
+    engine: String,
+    parameter_group_id: Option<Uuid>,
+}
+
 fn row_to_active(row: &sea_orm::QueryResult) -> AppResult<ActiveTool> {
-    let name: String = row.try_get("", "name")?;
-    let manifest = stored_manifest(&name, &row.try_get::<serde_json::Value>("", "manifest")?)?;
+    let stored = StoredActiveTool::from_query_result(row, "")?;
+    let manifest = stored_manifest(&stored.name, &stored.manifest)?;
     Ok(ActiveTool {
-        script_id: row.try_get("", "script_id")?,
-        label: row.try_get("", "label")?,
-        description: row.try_get("", "description")?,
-        version_id: row.try_get("", "version_id")?,
-        version_no: row.try_get("", "version_no")?,
-        script: row.try_get("", "script")?,
-        entry_function: row.try_get("", "entry_function")?,
-        content_hash: row.try_get("", "content_hash")?,
+        script_id: stored.script_id,
+        label: stored.label,
+        description: stored.description,
+        version_id: stored.version_id,
+        version_no: stored.version_no,
+        script: stored.script,
+        entry_function: stored.entry_function,
+        content_hash: stored.content_hash,
         manifest,
-        engine: Engine::parse(&row.try_get::<String>("", "engine")?).unwrap_or(Engine::Script),
-        parameter_group_id: row.try_get("", "parameter_group_id")?,
+        engine: Engine::parse(&stored.engine).unwrap_or(Engine::Script),
+        parameter_group_id: stored.parameter_group_id,
         formulas: Vec::new(),
-        name,
+        name: stored.name,
     })
 }
 
@@ -489,18 +522,19 @@ pub async fn load_formulas(
                     .collect()
             })
             .unwrap_or_default();
+        let stored = StoredFormula::from_query_result(row, "")?;
         formulas.push((
             script_id,
             super::formula::PinnedFormula {
-                code: row.try_get("", "code")?,
-                label: row.try_get("", "name")?,
-                units: row.try_get("", "units")?,
-                formula: row.try_get("", "formula")?,
-                ordinal: row.try_get("", "ordinal")?,
-                output_parameter_code: row.try_get("", "output_parameter_code")?,
+                code: stored.code,
+                label: stored.name,
+                units: stored.units,
+                formula: stored.formula,
+                ordinal: stored.ordinal,
+                output_parameter_code: stored.output_parameter_code,
                 sources,
-                curve_slot: row.try_get("", "curve_slot")?,
-                per_replicate: row.try_get("", "per_replicate")?,
+                curve_slot: stored.curve_slot,
+                per_replicate: stored.per_replicate,
             },
         ));
     }
@@ -672,11 +706,12 @@ async fn resolve_curve(
                     slot.name
                 ))
             })?;
+        let stored = StoredCurve::from_query_result(&row, "")?;
         return Ok(ResolvedCurve {
-            slope: row.try_get("", "slope")?,
-            intercept: row.try_get("", "intercept")?,
+            slope: stored.slope,
+            intercept: stored.intercept,
             standard_curve_id: Some(id),
-            label: row.try_get("", "name").ok(),
+            label: stored.name,
         });
     }
 
@@ -1031,6 +1066,47 @@ pub fn run_fingerprint(
     }))
 }
 
+/// What a request body must be before anything is resolved from it: every key is a param or a
+/// curve the manifest declares, and every value present is of the kind and the structure its param
+/// declares. Nothing here reads the database or the runner, so the contract a caller meets is
+/// testable without either.
+///
+/// Requiredness is not checked here: a resolved site or event input fills a gap after this runs,
+/// so a field absent at this point may still be supplied.
+pub fn check_body_shape(
+    tool_name: &str,
+    manifest: &Manifest,
+    body: &serde_json::Map<String, serde_json::Value>,
+) -> AppResult<()> {
+    let param_names: Vec<&str> = manifest.params.iter().map(|p| p.name.as_str()).collect();
+    let curve_names: Vec<&str> = manifest.curves.iter().map(|c| c.name.as_str()).collect();
+
+    for key in body.keys() {
+        if !param_names.contains(&key.as_str()) && !curve_names.contains(&key.as_str()) {
+            return Err(AppError::BadRequest(format!(
+                "unknown field '{key}' for tool '{tool_name}'"
+            )));
+        }
+    }
+    for p in &manifest.params {
+        let Some(value) = body.get(&p.name).filter(|v| !v.is_null()) else {
+            continue;
+        };
+        if !kind_accepts(&p.kind, value) {
+            return Err(AppError::BadRequest(format!(
+                "Invalid request body: field '{}' must be {} for tool '{tool_name}'",
+                p.name, p.kind
+            )));
+        }
+        if let Some(structure) = &p.structure {
+            structure.check_value(&p.name, value).map_err(|e| {
+                AppError::BadRequest(format!("Invalid request body: {e} for tool '{tool_name}'"))
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// Everything [`run_tool_body`] does before the runner is called: the manifest checks, the
 /// context resolution, defaults and requiredness, curve and constant resolution.
 pub async fn resolve_run(
@@ -1055,36 +1131,7 @@ pub async fn resolve_run(
     let (site_id, collected_at) = take_context(&mut body)?;
 
     let manifest = &tool.manifest;
-    let param_names: Vec<&str> = manifest.params.iter().map(|p| p.name.as_str()).collect();
-    let curve_names: Vec<&str> = manifest.curves.iter().map(|c| c.name.as_str()).collect();
-
-    for key in body.keys() {
-        if !param_names.contains(&key.as_str()) && !curve_names.contains(&key.as_str()) {
-            return Err(AppError::BadRequest(format!(
-                "unknown field '{key}' for tool '{}'",
-                tool.name
-            )));
-        }
-    }
-    for p in &manifest.params {
-        let Some(value) = body.get(&p.name).filter(|v| !v.is_null()) else {
-            continue;
-        };
-        if !kind_accepts(&p.kind, value) {
-            return Err(AppError::BadRequest(format!(
-                "Invalid request body: field '{}' must be {} for tool '{}'",
-                p.name, p.kind, tool.name
-            )));
-        }
-        if let Some(structure) = &p.structure {
-            structure.check_value(&p.name, value).map_err(|e| {
-                AppError::BadRequest(format!(
-                    "Invalid request body: {e} for tool '{}'",
-                    tool.name
-                ))
-            })?;
-        }
-    }
+    check_body_shape(&tool.name, manifest, &body)?;
     // Resolved context values land before defaults and requiredness: a typed value wins, a
     // resolved one fills the gap, and a manifest default is the last resort.
     let site_inputs =
@@ -1249,8 +1296,9 @@ pub async fn execute_resolved(
             match entry {
                 super::formula::Produced::Scalar(evaluated) => {
                     if let Some(reason) = evaluated.skipped {
-                        skipped
-                            .push(serde_json::json!({ "output": evaluated.code, "reason": reason }));
+                        skipped.push(
+                            serde_json::json!({ "output": evaluated.code, "reason": reason }),
+                        );
                         continue;
                     }
                     // A value the formula computed as NA is an explicit null, which clears the
@@ -1500,6 +1548,73 @@ mod tests {
     }
 
     use super::{Manifest, ParamWhen, StructLayout};
+
+    /// The request-body contract: what `/tools/{name}/calculate` refuses before it resolves
+    /// anything. This was reached only through a Keycloak login, a database and the R runner.
+    mod body_shape {
+        use super::super::check_body_shape;
+        use crate::routes::private::tools::engine::Manifest;
+
+        fn doc_manifest() -> Manifest {
+            serde_json::from_value(serde_json::json!({
+                "label": "DOC",
+                "params": [
+                    { "name": "DOC", "label": "DOC", "kind": "replicates", "parameter_code": "DOC" },
+                    { "name": "dilution", "label": "Dilution", "kind": "number" },
+                    { "name": "operator", "label": "Operator", "kind": "string" },
+                ],
+                "curves": [{ "name": "std_curve", "label": "Standard curve" }],
+                "outputs": [{ "key": "doc_avg", "label": "DOC average" }],
+            }))
+            .expect("the manifest parses")
+        }
+
+        fn check(body: serde_json::Value) -> Result<(), String> {
+            let serde_json::Value::Object(map) = body else {
+                panic!("the body is an object");
+            };
+            check_body_shape("doc", &doc_manifest(), &map).map_err(|e| e.to_string())
+        }
+
+        #[test]
+        fn a_key_the_manifest_declares_nothing_for_is_refused_naming_it() {
+            let err = check(serde_json::json!({ "DOC": [1.0], "typo": 1 }))
+                .expect_err("an undeclared key is refused");
+            assert!(err.contains("typo"), "{err}");
+            assert!(err.contains("doc"), "{err}");
+        }
+
+        #[test]
+        fn a_curve_slot_is_a_declared_key_like_a_param() {
+            check(serde_json::json!({ "DOC": [1.0], "std_curve": "c1" }))
+                .expect("a declared curve slot is accepted");
+        }
+
+        #[test]
+        fn a_value_of_the_wrong_kind_is_refused_naming_the_field_and_the_kind() {
+            let err = check(serde_json::json!({ "DOC": ["not-a-number"] }))
+                .expect_err("a text cell in a numeric replicate list is refused");
+            assert!(err.contains("DOC"), "{err}");
+
+            let err = check(serde_json::json!({ "dilution": "two" }))
+                .expect_err("text in a number param is refused");
+            assert!(err.contains("dilution") && err.contains("number"), "{err}");
+        }
+
+        #[test]
+        fn an_absent_or_null_field_passes_the_shape_check() {
+            // Requiredness runs after the resolvers, which may still fill the gap.
+            check(serde_json::json!({})).expect("an empty body has no shape error");
+            check(serde_json::json!({ "DOC": serde_json::Value::Null }))
+                .expect("an explicit null is an absence, not a wrong kind");
+        }
+
+        #[test]
+        fn a_replicates_list_may_be_gapped_and_of_any_length() {
+            check(serde_json::json!({ "DOC": [1.0, null, 3.0, 4.0, 5.0, 6.0] }))
+                .expect("the operator chooses the count and a null is a repeat not measured");
+        }
+    }
 
     fn manifest_with(param: serde_json::Value) -> Result<Manifest, serde_json::Error> {
         serde_json::from_value(serde_json::json!({ "label": "T", "params": [param] }))

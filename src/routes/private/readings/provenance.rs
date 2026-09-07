@@ -5,7 +5,7 @@ use axum::{
     extract::{Query, State},
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Statement};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
@@ -77,9 +77,14 @@ pub struct OriginInfo {
     pub classification: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paired_at: Option<DateTime<Utc>>,
-    /// Latest arrival stamp in the replicate group. NULL means the rows predate tracking.
+    /// Latest first-arrival stamp in the replicate group: when these rows first existed. NULL
+    /// means they predate tracking. Nothing moves it, so a corrected row still reports its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ingested_at: Option<DateTime<Utc>>,
+    /// When the value the group currently serves arrived: the latest live value correction's `at`
+    /// where one exists, and the first arrival otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_arrived_at: Option<DateTime<Utc>>,
     /// The latest windowed-ingest pass whose claimed window covers the instant.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receipt: Option<ReceiptSummary>,
@@ -117,8 +122,13 @@ pub struct ReadingFacet {
     pub withdrawn_reason: Option<String>,
     /// A pending entry: stored and shown here, never published (Q18, Q21).
     pub unverified: bool,
+    /// When this row first existed. Nothing moves it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ingested_at: Option<DateTime<Utc>>,
+    /// When the value this row currently serves arrived: its latest live value correction's `at`,
+    /// else its first arrival.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_arrived_at: Option<DateTime<Utc>>,
     /// Where this value came from, one of `PROVENANCE_KINDS`. A `sync` or `derived` row's story is
     /// resolved from the stream, the receipt and the definition; the others carry a stored blob.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -160,6 +170,40 @@ pub struct ChainInfo {
     /// reprocess leaves alone.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub pins: Vec<PinRef>,
+}
+
+/// When the value at each replicate last changed: the latest live `value_correction`'s `at`,
+/// keyed by `(stream_id, replicate_index)`. `ingested_at` is the row's first arrival and no
+/// decision moves it, so this is what says when the number now served appeared.
+async fn load_value_arrivals(
+    db: &sea_orm::DatabaseConnection,
+    stream_ids: &[Uuid],
+    at: DateTime<Utc>,
+) -> AppResult<HashMap<(Uuid, i16), DateTime<Utc>>> {
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT stream_id, replicate_index, MAX(at) AS at
+             FROM reading_decisions
+             WHERE stream_id = ANY($1) AND time = $2
+               AND kind = 'value_correction' AND rolled_back_by IS NULL
+               AND replicate_index IS NOT NULL
+             GROUP BY stream_id, replicate_index",
+            [
+                stream_ids.to_vec().into(),
+                sea_orm::prelude::DateTimeWithTimeZone::from(at).into(),
+            ],
+        ))
+        .await?;
+    let mut out = HashMap::new();
+    for r in &rows {
+        out.insert(
+            (r.try_get("", "stream_id")?, r.try_get("", "replicate_index")?),
+            r.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "at")?
+                .with_timezone(&Utc),
+        );
+    }
+    Ok(out)
 }
 
 /// Live instrument and calibration pins on the streams' instant (ADR 0008, M59), keyed by stream.
@@ -403,15 +447,21 @@ pub async fn untold_count<C: sea_orm::ConnectionTrait>(conn: &C) -> crate::error
     let row = conn
         .query_one_raw(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            format!("SELECT count(*)::bigint AS n FROM ({}) untold", untold_rows_sql()),
+            format!(
+                "SELECT count(*)::bigint AS n FROM ({}) untold",
+                untold_rows_sql()
+            ),
         ))
         .await?
         .ok_or_else(|| {
-            crate::error::AppError::Internal("counting untold provenance returned no row".to_string())
+            crate::error::AppError::Internal(
+                "counting untold provenance returned no row".to_string(),
+            )
         })?;
     Ok(row.try_get("", "n")?)
 }
 
+#[derive(Debug, FromQueryResult)]
 pub struct RawRow {
     stream_id: Uuid,
     replicate_index: i16,
@@ -444,41 +494,6 @@ const ROW_COLUMNS: &str = "stream_id, replicate_index, site_id, parameter_id, ra
      measurement_type, is_flagged, flag_reason, sample_id, collection_event_id, \
      withdrawn_at, withdrawn_reason, unverified, ingested_at, provenance_kind, provenance, \
      label, notes, created_by";
-
-fn decode_row(row: &sea_orm::QueryResult) -> Result<RawRow, sea_orm::DbErr> {
-    let fixed = |name: &str| -> Option<DateTime<Utc>> {
-        row.try_get::<Option<DateTime<chrono::FixedOffset>>>("", name)
-            .ok()
-            .flatten()
-            .map(|t| t.with_timezone(&Utc))
-    };
-    Ok(RawRow {
-        stream_id: row.try_get("", "stream_id")?,
-        replicate_index: row.try_get("", "replicate_index")?,
-        site_id: row.try_get("", "site_id")?,
-        parameter_id: row.try_get("", "parameter_id")?,
-        raw_value: row.try_get("", "raw_value")?,
-        calibrated_value: row.try_get("", "calibrated_value")?,
-        sensor_id: row.try_get("", "sensor_id")?,
-        calibration_id: row.try_get("", "calibration_id")?,
-        standard_curve_id: row.try_get("", "standard_curve_id")?,
-        deployment_id: row.try_get("", "deployment_id")?,
-        measurement_type: row.try_get("", "measurement_type")?,
-        is_flagged: row.try_get("", "is_flagged")?,
-        flag_reason: row.try_get("", "flag_reason")?,
-        sample_id: row.try_get("", "sample_id")?,
-        collection_event_id: row.try_get("", "collection_event_id")?,
-        withdrawn_at: fixed("withdrawn_at"),
-        unverified: row.try_get("", "unverified")?,
-        withdrawn_reason: row.try_get("", "withdrawn_reason")?,
-        ingested_at: fixed("ingested_at"),
-        provenance_kind: row.try_get("", "provenance_kind")?,
-        provenance: row.try_get("", "provenance")?,
-        label: row.try_get("", "label")?,
-        notes: row.try_get("", "notes")?,
-        created_by: row.try_get("", "created_by")?,
-    })
-}
 
 /// The assembled record of one measured instant: where it came from, when it arrived, what
 /// instrument and corrections produced the stored value, the visit it belongs to, the tool run
@@ -538,7 +553,7 @@ pub async fn get_reading_provenance(
         }
     }
     .iter()
-    .map(decode_row)
+    .map(|row| RawRow::from_query_result(row, ""))
     .collect::<Result<_, _>>()?;
 
     if rows.is_empty() {
@@ -674,6 +689,7 @@ pub async fn assemble_records(
     let mut holds_by_stream = fetch_stream_holds(db, &stream_ids, time).await?;
     let mut holds_by_slot = fetch_slot_holds(db, rows, time).await?;
     let mut pins = load_pins(db, &stream_ids, time).await?;
+    let value_arrivals = load_value_arrivals(db, &stream_ids, time).await?;
     let run_sources = fetch_run_sources(db, rows).await?;
 
     let mut records = Vec::with_capacity(groups.len());
@@ -705,6 +721,10 @@ pub async fn assemble_records(
                 unverified: r.unverified.unwrap_or(false),
                 withdrawn_reason: r.withdrawn_reason.clone(),
                 ingested_at: r.ingested_at,
+                value_arrived_at: value_arrivals
+                    .get(&(*stream_id, r.replicate_index))
+                    .copied()
+                    .or(r.ingested_at),
                 provenance_kind: r.provenance_kind.clone(),
                 calibration: r.calibration_id.and_then(|id| {
                     calibration_map.get(&id).map(|c| CalibrationRef {
@@ -800,6 +820,15 @@ pub async fn assemble_records(
                 classification: classify_source(&stream.source_system).to_string(),
                 paired_at: stream.paired_at.map(|t| t.with_timezone(&Utc)),
                 ingested_at: group.iter().filter_map(|r| r.ingested_at).max(),
+                value_arrived_at: group
+                    .iter()
+                    .filter_map(|r| {
+                        value_arrivals
+                            .get(&(*stream_id, r.replicate_index))
+                            .copied()
+                            .or(r.ingested_at)
+                    })
+                    .max(),
                 receipt,
             },
             readings: readings_out,
@@ -834,7 +863,7 @@ pub async fn records_for_event(
         ))
         .await?
         .iter()
-        .map(decode_row)
+        .map(|row| RawRow::from_query_result(row, ""))
         .collect::<Result<_, _>>()?;
     Ok(assemble_records(db, &rows, collected_at)
         .await?
@@ -1072,10 +1101,19 @@ mod tests {
 
     #[test]
     fn test_provenance_kind_for_stream_matches_the_trigger_rule() {
-        assert_eq!(provenance_kind_for_stream(Some("derived"), Some("cnet")), "derived");
-        assert_eq!(provenance_kind_for_stream(Some("spot"), Some("grab_sample")), "manual");
+        assert_eq!(
+            provenance_kind_for_stream(Some("derived"), Some("cnet")),
+            "derived"
+        );
+        assert_eq!(
+            provenance_kind_for_stream(Some("spot"), Some("grab_sample")),
+            "manual"
+        );
         assert_eq!(provenance_kind_for_stream(None, Some("api")), "batch");
-        assert_eq!(provenance_kind_for_stream(Some("continuous"), Some("vaisala")), "sync");
+        assert_eq!(
+            provenance_kind_for_stream(Some("continuous"), Some("vaisala")),
+            "sync"
+        );
     }
 
     #[test]
@@ -1104,7 +1142,10 @@ mod tests {
             provenance_kind_for_run(Some("chain")),
             provenance_kind_for_run(Some("csv_import")),
         ] {
-            assert!(PROVENANCE_KINDS.contains(&kind), "{kind} is not a declared kind");
+            assert!(
+                PROVENANCE_KINDS.contains(&kind),
+                "{kind} is not a declared kind"
+            );
         }
     }
 }

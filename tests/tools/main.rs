@@ -19,3 +19,4 @@ mod scripts_authoring;
 mod scripts_lifecycle;
 mod seeded_cases;
 mod seeded_version_hashes;
+mod two_stage_calculation;

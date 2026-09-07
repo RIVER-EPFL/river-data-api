@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, EntityTrait, Statement};
+use sea_orm::{ConnectionTrait, EntityTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
@@ -335,22 +335,23 @@ pub async fn list_site_visits(
         ))
         .await?;
 
-    let mut visits = Vec::with_capacity(rows.len());
-    for r in &rows {
-        visits.push(VisitRow {
-            id: r.try_get("", "id")?,
-            collected_at: r
-                .try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "collected_at")?
-                .with_timezone(&Utc),
-            source: r.try_get("", "source")?,
-            created_by: r.try_get("", "created_by")?,
-            notes: r.try_get("", "notes")?,
-            parameters_filled: r.try_get("", "filled")?,
-            findings_open: r.try_get("", "findings_open")?,
+    let mut visits: Vec<VisitRow> = rows
+        .iter()
+        .map(|r| SiteVisitHeader::from_query_result(r, ""))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|r| VisitRow {
+            id: r.id,
+            collected_at: r.collected_at,
+            source: r.source,
+            created_by: r.created_by,
+            notes: r.notes,
+            parameters_filled: r.filled,
+            findings_open: r.findings_open,
             recompute: String::new(),
             cells: Vec::new(),
-        });
-    }
+        })
+        .collect();
     let event_ids: Vec<Uuid> = visits.iter().map(|v| v.id).collect();
     let recompute = super::recompute::status_for(&state.db, &event_ids).await?;
     for visit in &mut visits {
@@ -658,23 +659,24 @@ pub async fn list_visits(
             binds,
         ))
         .await?;
-    let mut visits = Vec::with_capacity(rows.len());
-    for r in &rows {
-        visits.push(VisitListRow {
-            id: r.try_get("", "id")?,
-            site_id: r.try_get("", "site_id")?,
-            site_name: r.try_get("", "site_name")?,
-            collected_at: r
-                .try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "collected_at")?
-                .with_timezone(&Utc),
-            source: r.try_get("", "source")?,
-            created_by: r.try_get("", "created_by")?,
-            notes: r.try_get("", "notes")?,
-            parameters_filled: r.try_get("", "filled")?,
-            findings_open: r.try_get("", "findings_open")?,
+    let mut visits: Vec<VisitListRow> = rows
+        .iter()
+        .map(|r| VisitHeader::from_query_result(r, ""))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|r| VisitListRow {
+            id: r.id,
+            site_id: r.site_id,
+            site_name: r.site_name,
+            collected_at: r.collected_at,
+            source: r.source,
+            created_by: r.created_by,
+            notes: r.notes,
+            parameters_filled: r.filled,
+            findings_open: r.findings_open,
             recompute: String::new(),
-        });
-    }
+        })
+        .collect();
     let event_ids: Vec<Uuid> = visits.iter().map(|v| v.id).collect();
     let recompute = super::recompute::status_for(&state.db, &event_ids).await?;
     for visit in &mut visits {
@@ -816,6 +818,79 @@ pub struct CellFinding {
     pub status: String,
 }
 
+/// A visit's header row as the per-site list selects it.
+#[derive(Debug, FromQueryResult)]
+struct SiteVisitHeader {
+    id: Uuid,
+    collected_at: DateTime<Utc>,
+    source: String,
+    created_by: Option<String>,
+    notes: Option<String>,
+    filled: i64,
+    findings_open: i64,
+}
+
+/// The same header with the site the cross-site list carries beside it.
+#[derive(Debug, FromQueryResult)]
+struct VisitHeader {
+    id: Uuid,
+    site_id: Uuid,
+    site_name: String,
+    collected_at: DateTime<Utc>,
+    source: String,
+    created_by: Option<String>,
+    notes: Option<String>,
+    filled: i64,
+    findings_open: i64,
+}
+
+/// One replicate row of a visit's grid, as the detail query selects it. The fold below groups
+/// these into cells; decoding them by hand was 28 `try_get` calls nothing checked against the
+/// SELECT.
+#[derive(Debug, FromQueryResult)]
+struct DetailRow {
+    parameter_id: Uuid,
+    code: String,
+    name: String,
+    stream_id: Uuid,
+    source_system: Option<String>,
+    source_key: Option<String>,
+    replicate_index: i16,
+    raw_value: f64,
+    calibrated_value: Option<f64>,
+    is_flagged: Option<bool>,
+    withdrawn: bool,
+    sample_id: Option<Uuid>,
+    sample_mean: Option<f64>,
+    sample_stdev: Option<f64>,
+    sample_n: Option<i32>,
+    stdev_sample: Option<f64>,
+    stdev_population: Option<f64>,
+    sample_median: Option<f64>,
+    sample_min: Option<f64>,
+    sample_max: Option<f64>,
+    sd_estimator: Option<String>,
+    sd_estimator_source: Option<String>,
+    flag_reason: Option<String>,
+    withdrawn_at: Option<DateTime<Utc>>,
+    calibration_id: Option<Uuid>,
+    standard_curve_id: Option<Uuid>,
+    sensor_id: Option<Uuid>,
+    has_provenance: Option<bool>,
+    provenance_kind: Option<String>,
+    tool: Option<String>,
+}
+
+/// One open finding on a visit's parameter.
+#[derive(Debug, FromQueryResult)]
+struct FindingRow {
+    id: Uuid,
+    kind: String,
+    parameter_id: Uuid,
+    tool: Option<String>,
+    status: String,
+}
+
 /// One visit's grid row: every parameter measured at the event with its replicates, sample
 /// statistics, tool provenance presence, and any open finding — plus findings for parameters
 /// the audit says are missing entirely. Requires `read_data`.
@@ -874,7 +949,10 @@ pub async fn get_event_detail(
              ORDER BY p.code, r.stream_id, r.replicate_index",
             [id.into()],
         ))
-        .await?;
+        .await?
+        .iter()
+        .map(|r| DetailRow::from_query_result(r, ""))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let findings = state
         .db
@@ -886,86 +964,76 @@ pub async fn get_event_detail(
              ORDER BY created_at",
             [event.site_id.into(), event.collected_at.into()],
         ))
-        .await?;
+        .await?
+        .iter()
+        .map(|f| FindingRow::from_query_result(f, ""))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut finding_by_param: std::collections::HashMap<Uuid, CellFinding> =
         std::collections::HashMap::new();
-    for f in &findings {
-        let parameter_id: Uuid = f.try_get("", "parameter_id")?;
-        finding_by_param.entry(parameter_id).or_insert(CellFinding {
-            id: f.try_get("", "id")?,
-            kind: f.try_get("", "kind")?,
-            tool: f.try_get("", "tool")?,
-            status: f.try_get("", "status")?,
-        });
+    for f in findings {
+        finding_by_param
+            .entry(f.parameter_id)
+            .or_insert(CellFinding {
+                id: f.id,
+                kind: f.kind,
+                tool: f.tool,
+                status: f.status,
+            });
     }
 
     // Fold reading rows into per-(parameter, stream) cells.
     let mut cells: Vec<EventCell> = Vec::new();
-    for r in &rows {
-        let parameter_id: Uuid = r.try_get("", "parameter_id")?;
-        let stream_id: Uuid = r.try_get("", "stream_id")?;
+    for r in rows {
         let replicate = CellReplicate {
-            replicate_index: r.try_get("", "replicate_index")?,
-            raw_value: r.try_get("", "raw_value")?,
-            calibrated_value: r.try_get("", "calibrated_value")?,
-            flagged: r
-                .try_get::<Option<bool>>("", "is_flagged")?
-                .unwrap_or(false),
-            flag_reason: r.try_get("", "flag_reason")?,
-            withdrawn: r.try_get("", "withdrawn")?,
-            withdrawn_at: r.try_get("", "withdrawn_at")?,
-            calibration_id: r.try_get("", "calibration_id")?,
-            standard_curve_id: r.try_get("", "standard_curve_id")?,
-            sensor_id: r.try_get("", "sensor_id")?,
+            replicate_index: r.replicate_index,
+            raw_value: r.raw_value,
+            calibrated_value: r.calibrated_value,
+            flagged: r.is_flagged.unwrap_or(false),
+            flag_reason: r.flag_reason,
+            withdrawn: r.withdrawn,
+            withdrawn_at: r.withdrawn_at,
+            calibration_id: r.calibration_id,
+            standard_curve_id: r.standard_curve_id,
+            sensor_id: r.sensor_id,
         };
         let same_cell = cells
             .last_mut()
-            .filter(|c| c.parameter_id == parameter_id && c.stream_id == stream_id);
+            .filter(|c| c.parameter_id == r.parameter_id && c.stream_id == r.stream_id);
         match same_cell {
             Some(cell) => cell.replicates.push(replicate),
             None => {
-                let source_system: Option<String> = r.try_get("", "source_system")?;
-                let sample = match r.try_get::<Option<Uuid>>("", "sample_id")? {
-                    Some(sample_id) => Some(CellSample {
-                        sample_id,
-                        mean: r.try_get("", "sample_mean")?,
-                        stdev: r.try_get("", "sample_stdev")?,
-                        stdev_sample: r.try_get("", "stdev_sample")?,
-                        stdev_population: r.try_get("", "stdev_population")?,
-                        median: r.try_get("", "sample_median")?,
-                        min: r.try_get("", "sample_min")?,
-                        max: r.try_get("", "sample_max")?,
-                        n: r.try_get::<Option<i32>>("", "sample_n")?.unwrap_or(0),
-                        sd_estimator: r
-                            .try_get::<Option<String>>("", "sd_estimator")?
-                            .unwrap_or_default(),
-                        sd_estimator_source: r
-                            .try_get::<Option<String>>("", "sd_estimator_source")?
-                            .unwrap_or_default(),
-                    }),
-                    None => None,
-                };
+                let sample = r.sample_id.map(|sample_id| CellSample {
+                    sample_id,
+                    mean: r.sample_mean,
+                    stdev: r.sample_stdev,
+                    stdev_sample: r.stdev_sample,
+                    stdev_population: r.stdev_population,
+                    median: r.sample_median,
+                    min: r.sample_min,
+                    max: r.sample_max,
+                    n: r.sample_n.unwrap_or(0),
+                    sd_estimator: r.sd_estimator.unwrap_or_default(),
+                    sd_estimator_source: r.sd_estimator_source.unwrap_or_default(),
+                });
                 cells.push(EventCell {
-                    parameter_id,
+                    parameter_id: r.parameter_id,
                     origin: crate::routes::private::readings::provenance::classify_source(
-                        source_system.as_deref().unwrap_or(""),
+                        r.source_system.as_deref().unwrap_or(""),
                     )
                     .to_string(),
-                    has_provenance: r
-                        .try_get::<Option<bool>>("", "has_provenance")?
-                        .unwrap_or(false),
-                    provenance_kind: r.try_get("", "provenance_kind")?,
-                    tool: r.try_get("", "tool")?,
-                    source_system,
-                    source_key: r.try_get("", "source_key")?,
-                    parameter_code: r.try_get("", "code")?,
-                    parameter_name: r.try_get("", "name")?,
-                    stream_id,
+                    has_provenance: r.has_provenance.unwrap_or(false),
+                    provenance_kind: r.provenance_kind,
+                    tool: r.tool,
+                    source_system: r.source_system,
+                    source_key: r.source_key,
+                    parameter_code: r.code,
+                    parameter_name: r.name,
+                    stream_id: r.stream_id,
                     served_value: None,
                     sample,
                     replicates: vec![replicate],
                     record: None,
-                    finding: finding_by_param.remove(&parameter_id),
+                    finding: finding_by_param.remove(&r.parameter_id),
                     read_by: Vec::new(),
                     written_by: None,
                 });

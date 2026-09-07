@@ -56,15 +56,6 @@ pub struct SiteAlarmsQuery {
     pub format: String,
 }
 
-/// Information about an alarm threshold configuration
-#[derive(Debug, Serialize, ToSchema)]
-pub struct AlarmThresholdInfo {
-    pub warning_min: Option<f64>,
-    pub warning_max: Option<f64>,
-    pub alarm_min: Option<f64>,
-    pub alarm_max: Option<f64>,
-}
-
 /// A single active alarm violation
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ActiveAlarm {
@@ -75,7 +66,7 @@ pub struct ActiveAlarm {
     pub current_value: f64,
     /// Cadence of the series that raised this breach: 'continuous' (sensor) or 'spot' (grab).
     pub measurement_type: String,
-    pub threshold: AlarmThresholdInfo,
+    pub threshold: crate::routes::private::alarms::thresholds::resolution::ResolvedThreshold,
     /// 1=warning, 2=alarm
     pub severity: i16,
     /// Timestamp of the latest violating reading

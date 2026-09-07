@@ -268,8 +268,10 @@ async fn slope_zero_rejected_by_validation() {
     )
     .await;
 
+    // 422 rather than 400: the check is a `Validatable` impl on the request model, and crudcrate
+    // answers a failed validation with Unprocessable Entity.
     assert_eq!(
-        status, 400,
+        status, 422,
         "slope=0 should be rejected but got {status}: {body}"
     );
 }

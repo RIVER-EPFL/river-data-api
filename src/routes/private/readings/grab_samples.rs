@@ -874,62 +874,6 @@ async fn resolve_tool_run_provenance(
     Ok(Some(blob))
 }
 
-/// Mint the site_parameter row a verified tool save lands on, `needs_review = TRUE`. The global
-/// catalog parameter must exist; that is what keeps auto-provisioning from minting identity out
-/// of a typo. Returns the new (or concurrently created) row's id.
-///
-/// A raw insert rather than the CRUD path: the CRUD hooks' auto-threshold guard would find no
-/// default thresholds on a fresh analyte anyway, and a mechanical row must never fail the save
-/// that provisions it.
-async fn provision_site_parameter(
-    db: &sea_orm::DatabaseConnection,
-    site_id: Uuid,
-    parameter_id: Uuid,
-    site_name: &str,
-) -> Result<Uuid, AppError> {
-    let parameter = db
-        .query_one_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT name FROM parameters WHERE id = $1",
-            [parameter_id.into()],
-        ))
-        .await?
-        .ok_or_else(|| {
-            AppError::BadRequest(format!(
-                "Parameter {parameter_id} is not configured for site {site_name} and is not in \
-                 the parameter catalog; create the catalog parameter first"
-            ))
-        })?;
-    let name: String = parameter.try_get("", "name").unwrap_or_default();
-
-    db.execute_raw(sea_orm::Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, is_active, \
-         is_public, needs_review, created_at)
-         VALUES ($1, $2, $3, $4, '', TRUE, FALSE, TRUE, NOW())
-         ON CONFLICT DO NOTHING",
-        [
-            Uuid::new_v4().into(),
-            site_id.into(),
-            parameter_id.into(),
-            name.into(),
-        ],
-    ))
-    .await?;
-
-    let row = db
-        .query_one_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id FROM site_parameters WHERE site_id = $1 AND parameter_id = $2",
-            [site_id.into(), parameter_id.into()],
-        ))
-        .await?
-        .ok_or_else(|| {
-            AppError::Internal("Failed to provision the site parameter for this save".to_string())
-        })?;
-    row.try_get("", "id").map_err(AppError::Database)
-}
-
 /// Insert field-collected grab sample readings (manual measurements with replicate sets).
 /// Each request creates one Sample aggregate per parameter and uses dedicated "grab_sample"
 /// streams. Requires `write_data`.
@@ -939,7 +883,7 @@ async fn provision_site_parameter(
     request_body = GrabSampleRequest,
     responses(
         (status = 200, description = "Counts of inserted readings and created Sample rows", body = GrabSampleResponse),
-        (status = 400, description = "Empty readings, parameter not configured for site, or other validation"),
+        (status = 400, description = "Empty readings, a parameter the site does not carry, or other validation"),
     ),
     tag = "ingestion"
 )]
@@ -978,45 +922,29 @@ pub async fn insert_grab_samples(
         .all(&state.db)
         .await?;
 
-    let mut valid_param_ids: std::collections::HashSet<Uuid> =
+    let valid_param_ids: std::collections::HashSet<Uuid> =
         site_params.iter().map(|sp| sp.parameter_id).collect();
-    let mut sp_lookup: HashMap<Uuid, Uuid> = site_params
+    let sp_lookup: HashMap<Uuid, Uuid> = site_params
         .iter()
         .map(|sp| (sp.parameter_id, sp.id))
         .collect();
 
-    // What each slot declares measures it. A slot minted by a tool save declares nothing, which is
-    // the undeclared state, not a reason to borrow another row's instrument.
+    // What each slot declares measures it. A slot that declares nothing is undeclared, not a
+    // reason to borrow another row's instrument.
     let slot_instruments: HashMap<Uuid, Uuid> = site_params
         .iter()
         .filter_map(|sp| sp.instrument_sensor_id.map(|sid| (sp.parameter_id, sid)))
         .collect();
 
-    // A verified tool save provisions the slot it lands on (D10): the output's identity is the
-    // run's, not the client's, so a catalog parameter the site does not carry yet gets its
-    // site_parameter minted here, flagged needs_review for an operator's look. The global
-    // parameter must already exist; a save naming an unknown parameter stays refused.
-    if payload.tool_run_id.is_some() {
-        let missing: Vec<Uuid> = param_ids
-            .iter()
-            .filter(|pid| !valid_param_ids.contains(pid))
-            .copied()
-            .collect();
-        for pid in missing {
-            if valid_param_ids.contains(&pid) {
-                continue;
-            }
-            let sp_id = provision_site_parameter(&state.db, site.id, pid, &site.name).await?;
-            valid_param_ids.insert(pid);
-            sp_lookup.insert(pid, sp_id);
-        }
-    }
-
+    // A site declares which calculations apply to it by holding their output slots (Q98), so a
+    // save landing on a slot the site does not carry is refused rather than minting one: a mint
+    // here would create the declaration it is meant to be checked against.
     for r in &payload.readings {
         if !valid_param_ids.contains(&r.parameter_id) {
             return Err(AppError::BadRequest(format!(
-                "Parameter {} is not configured for site {}",
-                r.parameter_id, site.name
+                "Parameter {} is not configured for site {}; add its parameter group to the site \
+                 first (POST /api/sites/{}/parameter_groups)",
+                r.parameter_id, site.name, site.id
             )));
         }
     }
@@ -1089,12 +1017,10 @@ pub async fn insert_grab_samples(
         .iter()
         .zip(&indices)
         .map(|(r, &replicate_index)| {
-            let base = declared_instrument(
-                r.sensor_id,
-                slot_instruments.get(&r.parameter_id).copied(),
-            )
-            .and_then(|sid| base_curves.get(&(sid, Some(r.parameter_id), r.time)))
-            .copied();
+            let base =
+                declared_instrument(r.sensor_id, slot_instruments.get(&r.parameter_id).copied())
+                    .and_then(|sid| base_curves.get(&(sid, Some(r.parameter_id), r.time)))
+                    .copied();
             let standard = r.standard_curve_id.map(|cid| {
                 let c = &standard_curves[&cid];
                 calibrations::service::Curve {
@@ -1365,6 +1291,7 @@ pub async fn insert_grab_samples(
                             origin,
                             decisions::Keyed::Changed,
                             Some(guard),
+                            None,
                         )
                         .await?;
                     }

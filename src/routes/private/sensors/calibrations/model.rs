@@ -72,3 +72,34 @@ impl Related<crate::routes::private::readings::Entity> for Entity {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
+
+// Field validation lives on the request models, where crudcrate already runs it: the generated
+// handlers call `Validatable::validate` on the create and update models before any hook, so one
+// statement of a rule covers both routes and both batch paths. A rule that has to read the
+// database (an overlapping window, a duplicate instant) stays a hook, because this sees only the
+// request.
+
+impl crudcrate::validation::Validatable for SensorCalibrationCreate {
+    fn validate(&self) -> Result<(), crudcrate::validation::ValidationError> {
+        slope_is_usable(Some(self.slope))
+    }
+}
+
+impl crudcrate::validation::Validatable for SensorCalibrationUpdate {
+    fn validate(&self) -> Result<(), crudcrate::validation::ValidationError> {
+        // An update model carries `Option<Option<T>>`: absent, explicitly null, or a value.
+        slope_is_usable(self.slope.flatten())
+    }
+}
+
+/// A zero slope maps every raw value onto the intercept, so the instrument's readings become one
+/// constant and no reprocess can recover them.
+fn slope_is_usable(slope: Option<f64>) -> Result<(), crudcrate::validation::ValidationError> {
+    if slope == Some(0.0) {
+        return Err(crudcrate::validation::ValidationError::new(
+            "slope",
+            "Slope cannot be zero: all readings would produce a constant value",
+        ));
+    }
+    Ok(())
+}

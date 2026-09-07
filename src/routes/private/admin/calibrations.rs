@@ -2,7 +2,7 @@ use axum::{
     Json,
     extract::{Path, State},
 };
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::EntityTrait;
 use uuid::Uuid;
 
 use crate::common::AppState;
@@ -24,13 +24,8 @@ pub async fn recalculate_calibration(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let row = state
-        .db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT sensor_id FROM sensor_calibrations WHERE id = $1",
-            [id.into()],
-        ))
+    let row = crate::routes::private::sensors::calibrations::Entity::find_by_id(id)
+        .one(&state.db)
         .await
         .map_err(|e| crate::error::AppError::Internal(e.to_string()))?;
 
@@ -39,9 +34,7 @@ pub async fn recalculate_calibration(
             "sensor_calibration {id} not found"
         )));
     };
-    let sensor_id: Uuid = row
-        .try_get("", "sensor_id")
-        .map_err(|e| crate::error::AppError::Internal(e.to_string()))?;
+    let sensor_id = row.sensor_id;
 
     let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
         &state.db,

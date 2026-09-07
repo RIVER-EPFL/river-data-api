@@ -1397,12 +1397,12 @@ async fn every_kind_moves_exactly_the_columns_it_declares() {
 /// Scenario: the drift report is a second spelling of the projection, and a column it does not fold
 /// is a column whose disagreement nobody is told about.
 ///
-/// Expected behaviour: it folds every column a decision asserts, and the two it cannot predict are
-/// named for the reason they cannot be.
+/// Expected behaviour: it folds every column a decision asserts, and the one it cannot predict is
+/// named for the reason it cannot be.
 #[tokio::test]
 #[serial]
 async fn the_drift_report_folds_every_column_a_decision_asserts() {
-    let derived: [&str; 2] = ["calibrated_value", "ingested_at"];
+    let derived: [&str; 1] = ["calibrated_value"];
     let sql = decisions::inconsistent_rows_sql();
     for kind in [
         Kind::Flag,
@@ -1477,4 +1477,67 @@ async fn the_drift_report_folds_every_column_a_decision_asserts() {
         1,
         "a pinned instrument taken off the row out of band is reported"
     );
+}
+
+/// Scenario: `ingested_at` is the row's first arrival, and the correction arm used to re-stamp it
+/// with the clock whenever the raw value moved (Q86).
+///
+/// Expected behaviour: no decision moves the column, so a correction and a rollback of one both
+/// leave it exactly where the row's own ingest put it.
+#[tokio::test]
+#[serial]
+async fn a_correction_and_its_rollback_leave_the_first_arrival_alone() {
+    let f = setup().await;
+    seed_group(&f, &[1.0]).await;
+    let first = "2020-03-01T07:00:00Z";
+    crate::common::exec(
+        &f.db,
+        &format!(
+            "UPDATE readings SET ingested_at = '{first}' WHERE stream_id = '{}' \
+               AND time = '{AT}' AND replicate_index = 0",
+            f.stream
+        ),
+    )
+    .await;
+
+    let correction = record(
+        &f.db,
+        decision(
+            &f,
+            Kind::ValueCorrection,
+            Some(0),
+            json!({ "raw_value": 9.5 }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        arrival(&f).await,
+        first,
+        "a correction moves the value, not the arrival of the row"
+    );
+
+    decisions::rollback(&f.db, correction, "tester", Some("undo"))
+        .await
+        .unwrap();
+    assert_eq!(
+        arrival(&f).await,
+        first,
+        "a rollback restores the value and has nothing to restore here"
+    );
+}
+
+async fn arrival(f: &Fixture) -> String {
+    f.db.query_one_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "SELECT to_char(ingested_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS v \
+             FROM readings WHERE stream_id = '{}' AND time = '{AT}' AND replicate_index = 0",
+            f.stream
+        ),
+    ))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get::<String>("", "v")
+    .unwrap()
 }

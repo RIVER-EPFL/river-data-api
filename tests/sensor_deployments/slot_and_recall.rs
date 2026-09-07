@@ -1,15 +1,16 @@
-//! Deployment-as-the-twin-of-calibration behaviours introduced in the sensor-lifecycle work:
-//! the `(site, parameter)` slot is hard-enforced (one sensor at a time), editing a deployment's
-//! start re-chains the previous deployment's `deployed_until`, and recalling a sensor un-attributes
-//! the readings logged after the recall while leaving earlier ones in place.
+//! Editing a deployment window through the API: the start re-chains the previous deployment's
+//! `deployed_until`, and a PATCH into an occupied slot is a clean client error while extending a
+//! window the instrument already holds is not a self-conflict.
 //!
-//! Run: cargo test --test e2e -- --test-threads=1
+//! The slot exclusion itself is `slot_boundaries.rs` and the recall's effect on attribution is
+//! `lifecycle_rules.rs`; both assert more than this file did.
+//!
+//! Run: cargo test --test sensor_deployments -- --test-threads=1
 
 use crate::common::e2e;
 use crate::common::sensor_lifecycle as sl;
 use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
-use std::time::Duration;
 use uuid::Uuid;
 
 async fn deployed_until(
@@ -28,68 +29,6 @@ async fn deployed_until(
     row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "deployed_until")
         .ok()
         .map(|t| t.with_timezone(&chrono::Utc))
-}
-
-#[tokio::test]
-#[serial]
-async fn slot_exclusion_rejects_a_second_sensor() {
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    sl::seed_base_entities(&db).await;
-    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
-    let app = crate::common::build_test_app(db.clone());
-
-    // Two distinct sensors measuring the SAME parameter.
-    let sensor_a = sl::create_sensor(&db, "slot-a", crate::common::GLOBAL_PARAM_TEMP_ID).await;
-    let sensor_b = sl::create_sensor(&db, "slot-b", crate::common::GLOBAL_PARAM_TEMP_ID).await;
-
-    // A takes the (site 1, Temperature) slot.
-    let _dep_a = e2e::create_deployment(
-        &app,
-        &token,
-        &sensor_a.id.to_string(),
-        crate::common::SITE1_ID,
-        crate::common::GLOBAL_PARAM_TEMP_ID,
-        "2025-06-01T00:00:00Z",
-    )
-    .await;
-
-    // B cannot occupy the same slot over an overlapping window.
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        "/api/sensor_deployments",
-        &serde_json::json!({
-            "sensor_id": sensor_b.id,
-            "site_id": crate::common::SITE1_ID,
-            "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID,
-            "deployed_from": "2025-06-01T06:00:00Z"
-        }),
-        &token,
-    )
-    .await;
-    assert!(
-        status >= 400,
-        "second sensor in an occupied slot must be rejected; got {status}: {body}"
-    );
-
-    let count: i64 = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT count(*) AS c FROM sensor_deployments \
-             WHERE site_id = $1 AND parameter_id = $2 AND deployed_until IS NULL",
-            [
-                Uuid::parse_str(crate::common::SITE1_ID).unwrap().into(),
-                Uuid::parse_str(crate::common::GLOBAL_PARAM_TEMP_ID)
-                    .unwrap()
-                    .into(),
-            ],
-        ))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get("", "c")
-        .unwrap();
-    assert_eq!(count, 1, "only one sensor may hold the slot");
 }
 
 #[tokio::test]
@@ -147,89 +86,6 @@ async fn editing_deployment_start_rechains_previous() {
         Some(sl::dt("2025-06-01T01:00:00Z")),
         "editing the later deployment's start re-chains the earlier deployment's end"
     );
-}
-
-#[tokio::test]
-#[serial]
-async fn recall_unattributes_post_recall_readings() {
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    sl::seed_base_entities(&db).await;
-    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
-    let app = crate::common::build_test_app(db.clone());
-
-    let site1 = Uuid::parse_str(crate::common::SITE1_ID).unwrap();
-
-    let sensor = sl::create_sensor(&db, "recall", crate::common::GLOBAL_PARAM_TEMP_ID).await;
-    let cal = sl::add_calibration(&db, sensor.id, 1.0, 0.0, sl::dt("2025-06-01T00:00:00Z")).await;
-    let dep = sl::deploy_sensor(
-        &db,
-        sensor.id,
-        crate::common::SITE1_ID,
-        sl::dt("2025-06-01T00:00:00Z"),
-    )
-    .await;
-    let stream = sl::create_paired_stream(&db, "recall", crate::common::PARAM_S1_TEMP_ID).await;
-    let raw: Vec<(_, f64)> = (0..6)
-        .map(|i| {
-            (
-                sl::dt(&format!("2025-06-01T00:{:02}:00Z", i * 10)),
-                10.0 + i as f64,
-            )
-        })
-        .collect();
-    sl::insert_readings(
-        &db,
-        stream,
-        crate::common::SITE1_ID,
-        crate::common::GLOBAL_PARAM_TEMP_ID,
-        sensor.id,
-        cal,
-        dep,
-        1.0,
-        0.0,
-        &raw,
-    )
-    .await;
-
-    // Recall the sensor at 00:30, everything from 00:30 onward was logged with the sensor pulled out.
-    let (status, body) = crate::common::put_json_with_token(
-        &app,
-        &format!("/api/sensor_deployments/{dep}"),
-        &serde_json::json!({ "deployed_until": "2025-06-01T00:30:00Z" }),
-        &token,
-    )
-    .await;
-    assert!((200..300).contains(&status), "recall ({status}): {body}");
-    assert!(
-        sl::wait_for_reprocessing(&db, sensor.id, Duration::from_secs(30)).await,
-        "reprocessing after recall should complete"
-    );
-
-    let rows = sl::get_readings(&db, stream).await;
-    assert_eq!(rows.len(), 6);
-    for (i, r) in rows.iter().enumerate() {
-        if i < 3 {
-            assert_eq!(
-                r.site_id,
-                Some(site1),
-                "reading[{i}] before recall stays at the site"
-            );
-            assert!(
-                r.deployment_id.is_some(),
-                "reading[{i}] before recall keeps its deployment"
-            );
-        } else {
-            assert_eq!(
-                r.site_id, None,
-                "reading[{i}] after recall is un-attributed"
-            );
-            assert_eq!(
-                r.deployment_id, None,
-                "reading[{i}] after recall has no deployment"
-            );
-        }
-    }
 }
 
 #[tokio::test]

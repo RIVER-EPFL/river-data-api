@@ -1669,16 +1669,10 @@ impl Job for PushSubscriptionReconcile {
                 if o.total() > 0 {
                     tracing::info!(
                         revoked = o.revoked,
-                        deactivated = o.deactivated,
                         "Push subscription reconciliation: users pruned"
                     );
                 }
-                ctx.report(
-                    JobReport::new()
-                        .count("revoked", o.revoked)
-                        .count("deactivated", o.deactivated),
-                )
-                .await;
+                ctx.report(JobReport::new().count("revoked", o.revoked)).await;
                 Ok(o.total() as i64)
             }
             Err(e) => Err(e),

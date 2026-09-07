@@ -7,6 +7,8 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serde_json::json;
 use serial_test::serial;
 
+use river_db::routes::private::readings::decisions;
+
 use crate::common::sensor_lifecycle::create_sensor_without_curve;
 use crate::common::{GLOBAL_PARAM_DO_ID, PARAM_S1_DO_ID, SITE1_ID};
 
@@ -440,4 +442,88 @@ async fn nothing_a_writer_lands_is_left_without_an_origin() {
         .await
         .expect("count");
     assert_eq!(untold, 1, "a tool row with no blob records nothing either");
+}
+
+/// Scenario: `ingested_at` is the row's first arrival and nothing moves it (Q86), so the panel
+/// needs a second instant to answer when the number it displays appeared.
+///
+/// Expected behaviour: `value_arrived_at` is the latest live value correction's `at` where there
+/// is one, the first arrival otherwise, and it returns to the first arrival when the correction is
+/// rolled back.
+#[tokio::test]
+#[serial]
+async fn the_arrival_of_the_current_value_is_the_correction_that_wrote_it() {
+    let (db, app, token) = setup().await;
+    save_grab(&app, &token).await;
+
+    let (_, body) = crate::common::get_json_with_token(&app, &slot_uri(T1), &token).await;
+    let rec = &body["records"][0];
+    let first = rec["origin"]["ingested_at"].as_str().unwrap().to_string();
+    assert_eq!(
+        rec["origin"]["value_arrived_at"].as_str().unwrap(),
+        first,
+        "with no correction the current value arrived when the row did: {rec}"
+    );
+
+    let stream_id: uuid::Uuid = rec["origin"]["stream_id"].as_str().unwrap().parse().unwrap();
+    let correction = decisions::Decision {
+        key: decisions::DecisionKey {
+            stream_id,
+            time: T1.parse().unwrap(),
+            replicate_index: Some(0),
+        },
+        kind: decisions::Kind::ValueCorrection,
+        new: json!({ "raw_value": 11.0 }),
+        actor: "tester".to_string(),
+        reason: Some("re-read".to_string()),
+        origin: decisions::Origin::Manual,
+        set_id: None,
+    };
+    let decision_id = river_db::common::bulk_write::guarded(&db, async |txn| {
+        decisions::record(txn, &correction).await
+    })
+    .await
+    .unwrap();
+
+    let (_, body) = crate::common::get_json_with_token(&app, &slot_uri(T1), &token).await;
+    let rec = &body["records"][0];
+    let corrected = rec["origin"]["value_arrived_at"].as_str().unwrap();
+    assert_ne!(
+        corrected, first,
+        "the corrected value arrived when the correction did: {rec}"
+    );
+    assert_eq!(
+        rec["origin"]["ingested_at"].as_str().unwrap(),
+        first,
+        "the first arrival is untouched: {rec}"
+    );
+    let corrected_row = rec["readings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["replicate_index"] == 0)
+        .unwrap();
+    assert_eq!(corrected_row["value_arrived_at"].as_str().unwrap(), corrected);
+    let other = rec["readings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["replicate_index"] == 1)
+        .unwrap();
+    assert_eq!(
+        other["value_arrived_at"], other["ingested_at"],
+        "a replicate nothing corrected still reports its own arrival: {rec}"
+    );
+
+    decisions::rollback(&db, decision_id, "tester", Some("undo"))
+        .await
+        .unwrap();
+    let (_, body) = crate::common::get_json_with_token(&app, &slot_uri(T1), &token).await;
+    assert_eq!(
+        body["records"][0]["origin"]["value_arrived_at"]
+            .as_str()
+            .unwrap(),
+        first,
+        "a rolled-back correction is not the arrival of anything: {body}"
+    );
 }

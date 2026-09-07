@@ -478,6 +478,7 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
             super::decisions::Origin::Sync,
             super::decisions::Keyed::All,
             None,
+            None,
         )
         .await?;
         outcome.withdrawn = to_withdraw.len();
@@ -498,6 +499,7 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
             Some("re-asserted by the source window"),
             super::decisions::Origin::Sync,
             super::decisions::Keyed::All,
+            None,
             None,
         )
         .await?;

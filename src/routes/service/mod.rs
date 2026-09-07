@@ -198,7 +198,6 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             "/parameter_groups",
             admin_write_crud(ParameterGroup::router(db)),
         )
-
         .nest(
             "/parameter_group_members",
             admin_write_crud(ParameterGroupMember::router(db)),
@@ -558,6 +557,10 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
     // denied (a logger key has no reason to trigger a global reprocess/merge).
     let operator_action_routes = Router::new()
         .route(
+            "/parameter_groups/{id}/intermediates",
+            post(crate::routes::private::parameters::groups::intermediates::declare_intermediates),
+        )
+        .route(
             "/actions/sensor_calibrations/{id}/recalculate",
             post(calibrations::recalculate_calibration),
         )
@@ -596,6 +599,12 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         )
         // A declaration change recomputes the slot's stored samples, the same act as the audit
         // resolution's slot scope, so it carries the same MANAGER gate rather than catalog CRUD.
+        // Applying a group is what declares a site's calculations (Q98), so it carries the same
+        // MANAGER gate the other slot-shaping actions do.
+        .route(
+            "/sites/{site_id}/parameter_groups",
+            post(crate::routes::private::sites::parameters::apply_group::apply_group),
+        )
         .route(
             "/site_parameters/{id}/declare_sd_estimator",
             post(crate::routes::private::sites::parameters::declare::declare_sd_estimator),
@@ -850,7 +859,9 @@ pub fn sync_control_router(state: &AppState) -> Router<AppState> {
     use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
     let enroll_limiter = GovernorConfigBuilder::default()
-        .key_extractor(FallbackIpKeyExtractor::new(&state.config.trusted_proxy_cidrs))
+        .key_extractor(FallbackIpKeyExtractor::new(
+            &state.config.trusted_proxy_cidrs,
+        ))
         .per_second(3)
         .burst_size(10)
         .finish()

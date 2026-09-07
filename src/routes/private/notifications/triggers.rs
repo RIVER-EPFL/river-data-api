@@ -3,11 +3,68 @@
 //! through `notification_state` so a standing condition isn't re-announced every cycle.
 
 use chrono::{DateTime, Duration, Utc};
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, FromQueryResult, Statement};
 
 use super::dispatcher::deliver;
 use super::{NotificationChannel, OutgoingMessage, Slot};
 use crate::common::AppState;
+
+/// The rows each trigger's query returns. Derived rather than hand-decoded so a column added to a
+/// query and not to its reader is a compile error rather than a field silently left behind.
+#[derive(FromQueryResult)]
+struct StaleSlot {
+    site_id: uuid::Uuid,
+    parameter_id: uuid::Uuid,
+    project_id: Option<uuid::Uuid>,
+    site_name: String,
+    param_name: String,
+    last_continuous: Option<DateTime<Utc>>,
+    last_spot: Option<DateTime<Utc>>,
+    spot_max_gap_seconds: Option<f64>,
+}
+
+#[derive(FromQueryResult)]
+struct BatteryTrend {
+    site_id: uuid::Uuid,
+    project_id: Option<uuid::Uuid>,
+    site_name: String,
+    latest: Option<f64>,
+    slope: Option<f64>,
+}
+
+#[derive(FromQueryResult)]
+struct Heartbeat {
+    instance_id: String,
+    service_type: String,
+    last_heartbeat: Option<chrono::DateTime<chrono::FixedOffset>>,
+}
+
+#[derive(FromQueryResult)]
+struct UnpairedStream {
+    id: uuid::Uuid,
+    source_system: String,
+    label: String,
+}
+
+#[derive(FromQueryResult)]
+struct HoldCount {
+    kind: String,
+    n: i64,
+}
+
+#[derive(FromQueryResult)]
+struct SyncService {
+    id: uuid::Uuid,
+    instance_id: String,
+    service_type: String,
+}
+
+#[derive(FromQueryResult)]
+struct FailureCounts {
+    n_failed: i64,
+    n_partial: i64,
+    sample_error: Option<String>,
+}
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
 const BATTERY_RENOTIFY_HOURS: i64 = 7 * 24;
@@ -230,14 +287,16 @@ async fn stale_data(
 
     let base_threshold = Duration::hours(config.stale_data_threshold_hours);
     for r in &rows {
-        let site_id: uuid::Uuid = r.try_get("", "site_id")?;
-        let parameter_id: uuid::Uuid = r.try_get("", "parameter_id")?;
-        let project_id: Option<uuid::Uuid> = r.try_get("", "project_id")?;
-        let site_name: String = r.try_get("", "site_name")?;
-        let param_name: String = r.try_get("", "param_name")?;
-        let last_continuous: Option<DateTime<Utc>> = r.try_get("", "last_continuous")?;
-        let last_spot: Option<DateTime<Utc>> = r.try_get("", "last_spot")?;
-        let spot_max_gap_seconds: Option<f64> = r.try_get("", "spot_max_gap_seconds")?;
+        let StaleSlot {
+            site_id,
+            parameter_id,
+            project_id,
+            site_name,
+            param_name,
+            last_continuous,
+            last_spot,
+            spot_max_gap_seconds,
+        } = StaleSlot::from_query_result(r, "")?;
 
         for spot in [false, true] {
             let Some(last_time) = (if spot { last_spot } else { last_continuous }) else {
@@ -347,13 +406,14 @@ async fn battery_forecast(
 
     let cutoff = config.battery_cutoff_volts;
     for r in &rows {
-        let site_id: uuid::Uuid = r.try_get("", "site_id")?;
-        let project_id: Option<uuid::Uuid> = r.try_get("", "project_id")?;
-        let site_name: String = r.try_get("", "site_name")?;
-        let (Some(latest), Some(slope)) = (
-            r.try_get::<Option<f64>>("", "latest")?,
-            r.try_get::<Option<f64>>("", "slope")?,
-        ) else {
+        let BatteryTrend {
+            site_id,
+            project_id,
+            site_name,
+            latest,
+            slope,
+        } = BatteryTrend::from_query_result(r, "")?;
+        let (Some(latest), Some(slope)) = (latest, slope) else {
             continue;
         };
         if slope >= -1e-6 || latest <= cutoff {
@@ -414,10 +474,11 @@ async fn sync_staleness(
         .await?;
 
     for svc in &services {
-        let instance: String = svc.try_get("", "instance_id")?;
-        let service_type: String = svc.try_get("", "service_type")?;
-        let last_heartbeat: Option<chrono::DateTime<chrono::FixedOffset>> =
-            svc.try_get("", "last_heartbeat")?;
+        let Heartbeat {
+            instance_id: instance,
+            service_type,
+            last_heartbeat,
+        } = Heartbeat::from_query_result(svc, "")?;
         let Some(hb) = last_heartbeat else {
             // Never enrolled to the point of a heartbeat: the enrollment path's problem, and
             // alerting on it forever would drown the signal this trigger exists for.
@@ -487,12 +548,17 @@ async fn streams_unpaired(
     let mut by_system: std::collections::BTreeMap<String, Vec<(uuid::Uuid, String)>> =
         std::collections::BTreeMap::new();
     for r in &rows {
-        let id: uuid::Uuid = r.try_get("", "id")?;
-        let source_system: String = r.try_get("", "source_system")?;
-        let label: String = r.try_get("", "label")?;
+        let UnpairedStream {
+            id,
+            source_system,
+            label,
+        } = UnpairedStream::from_query_result(r, "")?;
         // Claim the firing transition before sending so only one replica announces it.
         if claim_insert(db, "streams_unpaired", &id.to_string()).await? {
-            by_system.entry(source_system).or_default().push((id, label));
+            by_system
+                .entry(source_system)
+                .or_default()
+                .push((id, label));
         }
     }
 
@@ -555,8 +621,7 @@ async fn holds_open(
     let mut total = 0i64;
     let mut parts = Vec::new();
     for r in &rows {
-        let kind: String = r.try_get("", "kind")?;
-        let n: i64 = r.try_get("", "n")?;
+        let HoldCount { kind, n } = HoldCount::from_query_result(r, "")?;
         total += n;
         parts.push(format!("{n} {kind}"));
     }
@@ -591,9 +656,11 @@ async fn sync_failures(
         .await?;
 
     for svc in &services {
-        let service_id: uuid::Uuid = svc.try_get("", "id")?;
-        let instance: String = svc.try_get("", "instance_id")?;
-        let service_type: String = svc.try_get("", "service_type")?;
+        let SyncService {
+            id: service_id,
+            instance_id: instance,
+            service_type,
+        } = SyncService::from_query_result(svc, "")?;
         let key = instance.clone();
 
         // Count unhealthy cycles since the last time we notified for this service (24h on first run).
@@ -616,9 +683,15 @@ async fn sync_failures(
             ))
             .await?;
         let Some(count_row) = count_row else { continue };
-        let n_failed: i64 = count_row.try_get("", "n_failed").unwrap_or(0);
-        let n_partial: i64 = count_row.try_get("", "n_partial").unwrap_or(0);
-        let sample_error: Option<String> = count_row.try_get("", "sample_error").unwrap_or(None);
+        let FailureCounts {
+            n_failed,
+            n_partial,
+            sample_error,
+        } = FailureCounts::from_query_result(&count_row, "").unwrap_or(FailureCounts {
+            n_failed: 0,
+            n_partial: 0,
+            sample_error: None,
+        });
         if n_failed == 0 && n_partial == 0 {
             continue;
         }

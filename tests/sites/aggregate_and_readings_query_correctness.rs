@@ -1,6 +1,8 @@
 //! Aggregate + readings correctness: flagged readings are excluded from continuous aggregates,
-//! and the readings endpoint accepts inclusive time-range boundaries.
+//! the readings endpoint accepts inclusive time-range boundaries, and every resolution answers
+//! over one window.
 
+use crate::common::e2e;
 use sea_orm::ConnectionTrait;
 use serial_test::serial;
 
@@ -337,4 +339,63 @@ async fn measurement_type_continuous_includes_legacy_null_rows() {
     .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(count_times(&body), 9, "no filter returns all rows: {body}");
+}
+
+/// Every continuous-aggregate resolution answers over the same window, and a two-parameter
+/// readings query returns exactly those two series on one time axis, which is the shape a scatter
+/// plot consumes.
+#[tokio::test]
+#[serial]
+async fn every_resolution_and_a_paired_parameter_query_return_aligned_series() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let site1 = crate::common::SITE1_ID;
+    // The seed has readings on 2025-01-15..18; use a window covering all of January so every
+    // resolution's bucket (hour/day/week/month) falls inside the range.
+    let start = "2025-01-01T00:00:00Z";
+    let end = "2025-02-01T00:00:00Z";
+
+    // US-6.2: each resolution returns a finite average series for a seeded parameter.
+    for res in ["hourly", "daily", "weekly", "monthly"] {
+        let uri = format!("/api/sites/{site1}/aggregates/{res}?start={start}&end={end}");
+        let (status, agg) = crate::common::get_json_with_token(&app, &uri, &token).await;
+        assert_eq!(status, 200, "{res} aggregate ({status}): {agg}");
+        let avg = e2e::field_for(&agg, crate::common::GLOBAL_PARAM_DO_ID, "avg");
+        assert!(
+            avg.iter().any(|v| v.is_finite()),
+            "{res}: Dissolved_O2 should have a finite average"
+        );
+    }
+
+    // US-6.4: a two-parameter query returns aligned series (scatter data) and nothing else.
+    let uri = format!(
+        "/api/sites/{site1}/readings?parameter_ids={},{}&start={start}&end=2025-01-15T01:00:00Z",
+        crate::common::GLOBAL_PARAM_DO_ID,
+        crate::common::GLOBAL_PARAM_COND_ID
+    );
+    let (status, readings) = crate::common::get_json_with_token(&app, &uri, &token).await;
+    assert_eq!(status, 200, "paired readings ({status}): {readings}");
+    let times = readings["times"].as_array().expect("times array").len();
+    assert!(times > 0, "expected readings in the window");
+    let do_vals = e2e::values_for(&readings, crate::common::GLOBAL_PARAM_DO_ID);
+    let cond_vals = e2e::values_for(&readings, crate::common::GLOBAL_PARAM_COND_ID);
+    assert_eq!(
+        do_vals.len(),
+        times,
+        "DO series aligns with the shared time axis"
+    );
+    assert_eq!(
+        cond_vals.len(),
+        times,
+        "Conductivity series aligns with the shared time axis"
+    );
+    assert_eq!(
+        readings["parameters"].as_array().unwrap().len(),
+        2,
+        "parameter_ids filter should return exactly the two requested parameters: {readings}"
+    );
 }

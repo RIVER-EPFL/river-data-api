@@ -9,6 +9,7 @@ mod common;
 mod attribute_existing_readings;
 mod backdate_auto_deployments;
 mod channel_health_into_state;
+mod derived_definition_versions;
 mod one_doc_parameter;
 mod provenance_kind;
 mod site_parameter_entry_mode;

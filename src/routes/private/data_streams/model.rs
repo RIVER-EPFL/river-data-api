@@ -57,6 +57,13 @@ pub struct Model {
     pub created_at: DateTimeWithTimeZone,
     #[crudcrate(exclude(create, update))]
     pub updated_at: DateTimeWithTimeZone,
+    /// The authoritative replicate column-to-index mapping, ordered by index, when this stream
+    /// declares a replicate family. Sync services assign each value's `replicate_index` from it;
+    /// a retired entry keeps its index reserved for the readings already stored under it. Derived
+    /// from `metadata.replicates`, never written on its own.
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
+    pub replicates: Option<Vec<super::replicates::ColumnAssignment>>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

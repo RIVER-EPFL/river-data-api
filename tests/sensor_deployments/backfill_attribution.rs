@@ -1,10 +1,14 @@
-//! Bulk historical attribution: readings ingested before a sensor's deployment existed sit with
-//! `sensor_id NULL` (the import-backfill orphan state). `GET /actions/backfill_candidates` surfaces the
-//! open deployments that have such claimable history, and `POST /actions/backfill_attribution`
-//! backdates each deployment to its earliest claimable reading and window-reprocesses the slot so the
-//! orphans get attributed. A prior deployment bounds how far back the open one can move.
+//! Bulk historical attribution: readings ingested before a sensor's deployment existed carry no
+//! deployment. `GET /actions/backfill_candidates` surfaces the open deployments that have such
+//! claimable history, and `POST /actions/backfill_attribution` backdates each deployment to its
+//! earliest claimable reading and window-reprocesses the slot so the history is attributed. A prior
+//! deployment bounds how far back the open one can move.
 //!
-//! Run: cargo test --test e2e -- --test-threads=1
+//! What makes a reading claimable is the missing deployment, not a missing instrument: every
+//! non-derived row names an instrument from the moment it is written
+//! (`readings_instrument_required`), so `sensor_id IS NULL` describes no reachable state.
+//!
+//! Run: cargo test --test sensor_deployments -- --test-threads=1
 
 use crate::common::e2e;
 use crate::common::sensor_lifecycle as sl;
@@ -13,11 +17,12 @@ use serde_json::json;
 use serial_test::serial;
 use uuid::Uuid;
 
-async fn count_slot_orphans(db: &sea_orm::DatabaseConnection) -> i64 {
+/// Readings at the slot that no deployment covers, which is what the backfill claims.
+async fn count_unclaimed(db: &sea_orm::DatabaseConnection) -> i64 {
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT COUNT(*) AS n FROM readings WHERE site_id = $1::uuid AND parameter_id = $2::uuid AND sensor_id IS NULL",
+            "SELECT COUNT(*) AS n FROM readings WHERE site_id = $1::uuid AND parameter_id = $2::uuid AND deployment_id IS NULL",
             [crate::common::SITE1_ID.into(), crate::common::GLOBAL_PARAM_TEMP_ID.into()],
         ))
         .await
@@ -49,7 +54,7 @@ async fn backfill_attributes_pre_deployment_history() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    // Sensor deployed from T0; one in-window reading + three pre-T0 orphans at the same slot.
+    // Sensor deployed from T0; one in-window reading + three pre-T0 readings at the same slot.
     let sensor =
         sl::create_sensor(&db, "backfill-probe", crate::common::GLOBAL_PARAM_TEMP_ID).await;
     let t0 = sl::dt("2025-06-01T00:00:00Z");
@@ -83,9 +88,9 @@ async fn backfill_attributes_pre_deployment_history() {
 
     // Precondition: the gap exists.
     assert_eq!(
-        count_slot_orphans(&db).await,
+        count_unclaimed(&db).await,
         3,
-        "three pre-deployment orphans seeded"
+        "three pre-deployment readings seeded, none of them covered by a deployment"
     );
 
     // Candidates surface this deployment with the right target + count.
@@ -132,7 +137,11 @@ async fn backfill_attributes_pre_deployment_history() {
         assert_eq!(r.deployment_id, Some(dep), "reading {} deployment", r.time);
         assert!(r.calibration_id.is_some(), "reading {} calibration", r.time);
     }
-    assert_eq!(count_slot_orphans(&db).await, 0, "no orphans remain");
+    assert_eq!(
+        count_unclaimed(&db).await,
+        0,
+        "every reading at the slot is covered by a deployment"
+    );
     assert_eq!(
         &deployed_from(&db, dep).await[..10],
         "2025-03-01",
@@ -177,7 +186,7 @@ async fn backfill_is_bounded_by_a_prior_deployment() {
     )
     .await;
 
-    // Orphan inside A's window + orphan in the gap between A and B.
+    // One reading inside A's window, one in the gap between A and B.
     let stream = sl::create_paired_stream(&db, "bounded", crate::common::PARAM_S1_TEMP_ID).await;
     sl::insert_orphan_readings(
         &db,
@@ -203,7 +212,7 @@ async fn backfill_is_bounded_by_a_prior_deployment() {
     assert_eq!(
         cand["claimable_count"].as_i64().unwrap(),
         1,
-        "only the gap orphan: {body}"
+        "only the reading in the gap: {body}"
     );
     assert_eq!(&cand["target_from"].as_str().unwrap()[..10], "2025-05-01");
 

@@ -151,6 +151,34 @@ pub async fn mint_stale_formula_versions(
     Ok(())
 }
 
+/// The dedupe key an edit to one calculation audits under, so a burst of formula edits coalesces
+/// into one audit the way a burst of constant edits does.
+#[must_use]
+pub fn audit_dedupe_key(name: &str) -> String {
+    format!("event_audit:calculation:{name}")
+}
+
+/// A calculation's active version changed, so every output it has stored may disagree with what it
+/// computes now. Nothing is rewritten: the edit enqueues the report-only `event_audit`, scoped to
+/// the visits whose provenance names this calculation, and repair stays the scoped
+/// `event_recompute` a person asks for. This is the policy `constants/operations.rs` already
+/// applies to a constant edit, which is the same kind of change.
+pub async fn audit_after_activation(db: &DatabaseConnection, name: &str) {
+    let key = audit_dedupe_key(name);
+    if let Err(e) = crate::routes::private::reprocessing_jobs::worker::enqueue(
+        db,
+        "event_audit",
+        None,
+        None,
+        &serde_json::json!({ "calculation": name }),
+        Some(&key),
+    )
+    .await
+    {
+        tracing::warn!(error = %e, calculation = %name, "failed to enqueue the calculation audit");
+    }
+}
+
 async fn activate(
     db: &DatabaseConnection,
     script_id: Uuid,
@@ -177,6 +205,9 @@ async fn activate(
         [script_id.into(), to.into()],
     ))
     .await?;
+    if let Ok(Some(calculation)) = load_calculation(db, script_id).await {
+        audit_after_activation(db, &calculation.name).await;
+    }
     Ok(())
 }
 

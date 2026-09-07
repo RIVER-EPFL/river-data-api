@@ -7,7 +7,6 @@ use axum::{
 use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
-use tokio_stream::wrappers::ReceiverStream;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
@@ -227,62 +226,34 @@ pub async fn get_site_status_events(
     }
 }
 
+/// One line-oriented body from an iterator of rendered lines, each already newline-terminated.
+fn line_stream(content_type: &'static str, lines: Vec<String>) -> AppResult<Response> {
+    let lines = lines.into_iter().map(Ok::<_, std::io::Error>);
+    Response::builder()
+        .header(header::CONTENT_TYPE, HeaderValue::from_static(content_type))
+        .body(axum::body::Body::from_stream(futures::stream::iter(lines)))
+        .map_err(|e| AppError::Internal(e.to_string()))
+}
+
 /// Build a streaming CSV response for status events.
 fn build_status_events_csv(events: &[StatusEventData]) -> AppResult<Response> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
-
-    let events: Vec<StatusEventData> = events.to_vec();
-
-    tokio::spawn(async move {
-        let _ = tx
-            .send(Ok("time,parameter_id,value,sensor_id\n".to_string()))
-            .await;
-
-        for event in &events {
-            let row = crate::common::csv::row_to_string([
-                event.time.to_rfc3339(),
-                event.parameter_id.to_string(),
-                event.value.clone(),
-                event.sensor_id.map(|id| id.to_string()).unwrap_or_default(),
-            ]);
-            if tx.send(Ok(row)).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let stream = ReceiverStream::new(rx);
-    let body = axum::body::Body::from_stream(stream);
-
-    Response::builder()
-        .header(header::CONTENT_TYPE, HeaderValue::from_static("text/csv"))
-        .body(body)
-        .map_err(|e| AppError::Internal(e.to_string()))
+    let mut lines = vec!["time,parameter_id,value,sensor_id\n".to_string()];
+    lines.extend(events.iter().map(|event| {
+        crate::common::csv::row_to_string([
+            event.time.to_rfc3339(),
+            event.parameter_id.to_string(),
+            event.value.clone(),
+            event.sensor_id.map(|id| id.to_string()).unwrap_or_default(),
+        ])
+    }));
+    line_stream("text/csv", lines)
 }
 
 /// Build a streaming NDJSON response for status events.
 fn build_status_events_ndjson(events: &[StatusEventData]) -> AppResult<Response> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
-
-    let events: Vec<StatusEventData> = events.to_vec();
-
-    tokio::spawn(async move {
-        for event in &events {
-            let line = format!("{}\n", serde_json::to_string(event).unwrap_or_default());
-            if tx.send(Ok(line)).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let stream = ReceiverStream::new(rx);
-    let body = axum::body::Body::from_stream(stream);
-
-    Response::builder()
-        .header(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/x-ndjson"),
-        )
-        .body(body)
-        .map_err(|e| AppError::Internal(e.to_string()))
+    let lines = events
+        .iter()
+        .map(|event| format!("{}\n", serde_json::to_string(event).unwrap_or_default()))
+        .collect();
+    line_stream("application/x-ndjson", lines)
 }

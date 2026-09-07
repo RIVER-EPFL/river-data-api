@@ -72,6 +72,16 @@ pub struct Model {
     #[sea_orm(ignore)]
     #[crudcrate(non_db_attr = true, exclude(create, update))]
     pub last_reading_value: Option<f64>,
+    /// Standard curves fitted on this instrument. A lab instrument's row states this where a
+    /// device's states its site: a titrator has no deployment and the Site column is empty for it
+    /// however long it has been in use.
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
+    pub curve_count: Option<i64>,
+    /// The newest reading any of those curves corrected: whether the instrument is still in use.
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
+    pub last_curve_use: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

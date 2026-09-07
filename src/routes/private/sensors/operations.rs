@@ -123,14 +123,7 @@ impl CRUDOperations for SensorOperations {
     ) -> Result<(), ApiError> {
         let mut enriched = enrich(db, &[entity.id]).await?;
         if let Some(fields) = enriched.remove(&entity.id) {
-            fields.apply(
-                &mut entity.current_site_id,
-                &mut entity.current_site_name,
-                &mut entity.last_calibration_at,
-                &mut entity.last_reading_at,
-                &mut entity.last_reading_value,
-                &mut entity.reading_count,
-            );
+            fields.apply(entity);
         }
         Ok(())
     }
@@ -147,23 +140,16 @@ impl CRUDOperations for SensorOperations {
         let enriched = enrich(db, &ids).await?;
         for entity in entities.iter_mut() {
             if let Some(fields) = enriched.get(&entity.id) {
-                fields.clone().apply(
-                    &mut entity.current_site_id,
-                    &mut entity.current_site_name,
-                    &mut entity.last_calibration_at,
-                    &mut entity.last_reading_at,
-                    &mut entity.last_reading_value,
-                    &mut entity.reading_count,
-                );
+                fields.clone().apply(entity);
             }
         }
         Ok(())
     }
 }
 
-/// What both sensor read paths report over the stored row: where the instrument is, when it was
-/// last calibrated, and what it last measured. One shape, so the detail and the list cannot
-/// disagree about a sensor.
+/// What both sensor read paths report over the stored row: where a device is, when it was last
+/// calibrated, what it last measured, and what a lab instrument has instead of a deployment. One
+/// shape, so the detail and the list cannot disagree about a sensor.
 #[derive(Clone, Debug, Default)]
 struct Enrichment {
     current_site: Option<(Uuid, String)>,
@@ -171,35 +157,82 @@ struct Enrichment {
     last_reading_at: Option<DateTime<Utc>>,
     last_reading_value: Option<f64>,
     reading_count: Option<i64>,
+    curve_count: Option<i64>,
+    last_curve_use: Option<DateTime<Utc>>,
 }
 
+/// The read models this enrichment is written onto. `Sensor` and its `ListModel` are separate
+/// generated types carrying the same fields, so one trait is what lets the write be stated once.
+trait Enriched {
+    fn current_site_id(&mut self) -> &mut Option<Uuid>;
+    fn current_site_name(&mut self) -> &mut Option<String>;
+    fn last_calibration_at(&mut self) -> &mut Option<DateTime<Utc>>;
+    fn last_reading_at(&mut self) -> &mut Option<DateTime<Utc>>;
+    fn last_reading_value(&mut self) -> &mut Option<f64>;
+    fn reading_count(&mut self) -> &mut Option<i64>;
+    fn curve_count(&mut self) -> &mut Option<i64>;
+    fn last_curve_use(&mut self) -> &mut Option<DateTime<Utc>>;
+}
+
+macro_rules! enriched {
+    ($t:ty) => {
+        impl Enriched for $t {
+            fn current_site_id(&mut self) -> &mut Option<Uuid> {
+                &mut self.current_site_id
+            }
+            fn current_site_name(&mut self) -> &mut Option<String> {
+                &mut self.current_site_name
+            }
+            fn last_calibration_at(&mut self) -> &mut Option<DateTime<Utc>> {
+                &mut self.last_calibration_at
+            }
+            fn last_reading_at(&mut self) -> &mut Option<DateTime<Utc>> {
+                &mut self.last_reading_at
+            }
+            fn last_reading_value(&mut self) -> &mut Option<f64> {
+                &mut self.last_reading_value
+            }
+            fn reading_count(&mut self) -> &mut Option<i64> {
+                &mut self.reading_count
+            }
+            fn curve_count(&mut self) -> &mut Option<i64> {
+                &mut self.curve_count
+            }
+            fn last_curve_use(&mut self) -> &mut Option<DateTime<Utc>> {
+                &mut self.last_curve_use
+            }
+        }
+    };
+}
+
+enriched!(Sensor);
+enriched!(<Sensor as CRUDResource>::ListModel);
+
 impl Enrichment {
-    /// The detail and list models are separate types carrying the same six fields, so they are
-    /// written through by reference rather than by a trait neither of them implements.
-    fn apply(
-        self,
-        current_site_id: &mut Option<Uuid>,
-        current_site_name: &mut Option<String>,
-        last_calibration_at: &mut Option<DateTime<Utc>>,
-        last_reading_at: &mut Option<DateTime<Utc>>,
-        last_reading_value: &mut Option<f64>,
-        reading_count: &mut Option<i64>,
-    ) {
+    /// Write what was resolved, leaving what was not exactly as the row had it: an absent fact is
+    /// not a fact of absence.
+    fn apply(self, entity: &mut impl Enriched) {
         if let Some((site_id, site_name)) = self.current_site {
-            *current_site_id = Some(site_id);
-            *current_site_name = Some(site_name);
+            *entity.current_site_id() = Some(site_id);
+            *entity.current_site_name() = Some(site_name);
         }
         if self.last_calibration_at.is_some() {
-            *last_calibration_at = self.last_calibration_at;
+            *entity.last_calibration_at() = self.last_calibration_at;
         }
         if self.last_reading_at.is_some() {
-            *last_reading_at = self.last_reading_at;
+            *entity.last_reading_at() = self.last_reading_at;
         }
         if self.last_reading_value.is_some() {
-            *last_reading_value = self.last_reading_value;
+            *entity.last_reading_value() = self.last_reading_value;
         }
         if self.reading_count.is_some() {
-            *reading_count = self.reading_count;
+            *entity.reading_count() = self.reading_count;
+        }
+        if self.curve_count.is_some() {
+            *entity.curve_count() = self.curve_count;
+        }
+        if self.last_curve_use.is_some() {
+            *entity.last_curve_use() = self.last_curve_use;
         }
     }
 }
@@ -421,6 +454,38 @@ async fn enrich(
             .await
             .map_err(ApiError::database)?;
         record_values(&rows, &mut out);
+    }
+
+    // What a lab instrument has where a device has a deployment: the curves fitted on it, and the
+    // newest reading any of them corrected. One grouped pass over the partial index on
+    // `standard_curve_id`, which a small fraction of readings carry.
+    // Every requested instrument gets a count, so no instrument reports "no curves" as "unknown".
+    for id in ids {
+        out.entry(*id).or_default().curve_count = Some(0);
+    }
+    let curve_rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT sc.sensor_id, COUNT(DISTINCT sc.id) AS curves, MAX(r.time) AS last_use
+                  FROM standard_curves sc
+                  LEFT JOIN readings r ON r.standard_curve_id = sc.id
+                  WHERE sc.sensor_id = ANY($1)
+                  GROUP BY sc.sensor_id",
+            [ids.to_vec().into()],
+        ))
+        .await
+        .map_err(ApiError::database)?;
+    for row in &curve_rows {
+        let Ok(sensor_id) = row.try_get::<Uuid>("", "sensor_id") else {
+            continue;
+        };
+        let entry = out.entry(sensor_id).or_default();
+        entry.curve_count = row.try_get::<i64>("", "curves").ok();
+        entry.last_curve_use = row
+            .try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "last_use")
+            .ok()
+            .flatten()
+            .map(|t| t.with_timezone(&Utc));
     }
 
     Ok(out)

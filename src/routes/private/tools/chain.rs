@@ -11,8 +11,10 @@
 //! Findings land in the review queue (`replicate_audit_holds`, event kinds); the auditor never
 //! writes a value.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, Statement};
 use uuid::Uuid;
 
 use crate::common::AppState;
@@ -38,21 +40,42 @@ pub struct EventContext {
 }
 
 pub async fn load_event(db: &DatabaseConnection, id: Uuid) -> AppResult<EventContext> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT site_id, collected_at FROM collection_events WHERE id = $1",
-            [id.into()],
-        ))
+    let row = crate::routes::private::collection_events::Entity::find_by_id(id)
+        .one(db)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Collection event {id} not found")))?;
     Ok(EventContext {
         id,
-        site_id: row.try_get("", "site_id")?,
-        collected_at: row
-            .try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "collected_at")?
-            .with_timezone(&chrono::Utc),
+        site_id: row.site_id,
+        collected_at: row.collected_at.with_timezone(&chrono::Utc),
     })
+}
+
+/// The catalog parameters a site holds a slot for. The set a calculation's applicability is read
+/// against, and the only thing that declares it.
+pub async fn declared_parameters(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+) -> AppResult<HashSet<Uuid>> {
+    use crate::routes::private::sites::parameters::model as site_parameters;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+    Ok(site_parameters::Entity::find()
+        .filter(site_parameters::Column::SiteId.eq(site_id))
+        .select_only()
+        .column(site_parameters::Column::ParameterId)
+        .into_tuple::<Uuid>()
+        .all(db)
+        .await?
+        .into_iter()
+        .collect())
+}
+
+/// Whether a calculation applies at a site: the site holds a slot for at least one of its outputs.
+/// One is enough because a tool whose outputs are partly declared is a tool the site wants and a
+/// slot it is missing, which the save reports; none at all is a tool nobody asked for here.
+#[must_use]
+pub fn applies_at_site(saved_outputs: &[(String, Uuid)], declared: &HashSet<Uuid>) -> bool {
+    saved_outputs.iter().any(|(_, id)| declared.contains(id))
 }
 
 /// Order tools so producers run before consumers: an edge A→B exists when one of A's outputs
@@ -215,6 +238,10 @@ pub struct RecomputeOutcome {
     /// the column, and here the stamp is reversible.
     pub readings_withdrawn: usize,
     pub skipped: Vec<(String, String)>,
+    /// Tools the site never declared: their output slots are not configured here, so they do not
+    /// apply at this site at all (Q98). Distinct from `skipped`, which is an input that did not
+    /// resolve on a tool that does apply.
+    pub not_applicable: Vec<String>,
     /// Tools whose prior run at this event consumed exactly what a fresh run would, under the
     /// same script version, with its outputs still served: left alone, no run minted.
     pub unchanged: Vec<String>,
@@ -299,8 +326,15 @@ pub async fn recompute_event(
         readings_written: 0,
         findings_closed: 0,
         skipped: Vec::new(),
+        not_applicable: Vec::new(),
         unchanged: Vec::new(),
     };
+
+    // A calculation applies at a site when the site holds slots for its outputs (Q98): the site
+    // parameters are the declaration, so the calculation set is filtered by them before the
+    // dependency order is walked, rather than every enabled tool being run wherever its inputs
+    // happen to resolve.
+    let declared = declared_parameters(&state.db, event.site_id).await?;
 
     for i in order {
         let tool = &tools[i];
@@ -311,6 +345,10 @@ pub async fn recompute_event(
             .filter_map(|o| catalog.resolve(o).map(|p| (o.key.clone(), p.id)))
             .collect();
         if saved_outputs.is_empty() {
+            continue;
+        }
+        if !applies_at_site(&saved_outputs, &declared) {
+            outcome.not_applicable.push(tool.name.clone());
             continue;
         }
 
@@ -1072,14 +1110,15 @@ impl Job for EventRecompute {
 /// `event_audit`: the missing/stale report over one event, one site, or everything.
 pub struct EventAudit;
 
-/// The events one audit run covers, most specific scope first. A `constant` scope narrows to the
-/// visits whose stored provenance names it, so editing a constant audits what that edit could have
-/// changed rather than every visit ever recorded; a visit where the tool never ran carries no
-/// provenance and no stale output, which is the finding a constant edit cannot produce.
+/// The events one audit run covers, most specific scope first. A `constant` or `calculation` scope
+/// narrows to the visits whose stored provenance names it, so editing one audits what that edit
+/// could have changed rather than every visit ever recorded; a visit where the tool never ran
+/// carries no provenance and no stale output, which is the finding such an edit cannot produce.
 fn audit_event_set(
     event_id: Option<Uuid>,
     site_id: Option<Uuid>,
     constant: Option<&str>,
+    calculation: Option<&str>,
 ) -> (String, Vec<sea_orm::Value>) {
     let mut sql = String::from("SELECT id FROM collection_events");
     let mut binds: Vec<sea_orm::Value> = Vec::new();
@@ -1097,6 +1136,15 @@ fn audit_event_set(
             "EXISTS (SELECT 1 FROM readings r \
               WHERE r.collection_event_id = collection_events.id \
                 AND jsonb_exists(r.provenance -> 'constants', ${}))",
+            binds.len()
+        ));
+    }
+    if let Some(name) = calculation {
+        binds.push(name.into());
+        clauses.push(format!(
+            "EXISTS (SELECT 1 FROM readings r \
+              WHERE r.collection_event_id = collection_events.id \
+                AND r.provenance ->> 'tool' = ${})",
             binds.len()
         ));
     }
@@ -1139,7 +1187,17 @@ impl Job for EventAudit {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
 
-        let (sql, binds) = audit_event_set(event_id, site_id, constant.as_deref());
+        let calculation = params
+            .get("calculation")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+
+        let (sql, binds) = audit_event_set(
+            event_id,
+            site_id,
+            constant.as_deref(),
+            calculation.as_deref(),
+        );
         let event_rows = ctx
             .db()
             .query_all_raw(Statement::from_sql_and_values(
@@ -1182,13 +1240,56 @@ impl Job for EventAudit {
 }
 
 #[cfg(test)]
+mod applicability_tests {
+    use super::applies_at_site;
+    use std::collections::HashSet;
+    use uuid::Uuid;
+
+    /// A site declares which calculations apply to it by holding slots for their outputs (Q98).
+    #[test]
+    fn a_tool_applies_where_the_site_holds_one_of_its_outputs() {
+        let doc = Uuid::new_v4();
+        let dom = Uuid::new_v4();
+        let outputs = vec![("doc_avg".to_string(), doc), ("doc_sd".to_string(), dom)];
+
+        let declared: HashSet<Uuid> = [doc].into_iter().collect();
+        assert!(
+            applies_at_site(&outputs, &declared),
+            "one declared output is enough: the rest are slots the site is missing, not a tool it \
+             never wanted"
+        );
+
+        let both: HashSet<Uuid> = [doc, dom].into_iter().collect();
+        assert!(applies_at_site(&outputs, &both));
+    }
+
+    #[test]
+    fn a_tool_the_site_declared_nothing_of_does_not_apply() {
+        let outputs = vec![("doc_avg".to_string(), Uuid::new_v4())];
+        assert!(!applies_at_site(&outputs, &HashSet::new()));
+        assert!(!applies_at_site(
+            &outputs,
+            &[Uuid::new_v4()].into_iter().collect()
+        ));
+    }
+
+    #[test]
+    fn a_tool_that_saves_nothing_reaches_no_site() {
+        assert!(!applies_at_site(
+            &[],
+            &[Uuid::new_v4()].into_iter().collect()
+        ));
+    }
+}
+
+#[cfg(test)]
 mod audit_scope_tests {
     use super::audit_event_set;
     use uuid::Uuid;
 
     #[test]
     fn an_unscoped_audit_covers_every_event_and_reads_no_provenance() {
-        let (sql, binds) = audit_event_set(None, None, None);
+        let (sql, binds) = audit_event_set(None, None, None, None);
         assert_eq!(
             sql,
             "SELECT id FROM collection_events ORDER BY collected_at"
@@ -1198,7 +1299,7 @@ mod audit_scope_tests {
 
     #[test]
     fn a_constant_scope_narrows_to_the_events_whose_provenance_names_it() {
-        let (sql, binds) = audit_event_set(None, None, Some("xO2"));
+        let (sql, binds) = audit_event_set(None, None, Some("xO2"), None);
         assert!(
             sql.contains("jsonb_exists(r.provenance -> 'constants', $1)"),
             "{sql}"
@@ -1209,15 +1310,37 @@ mod audit_scope_tests {
     #[test]
     fn a_site_scope_and_a_constant_scope_both_apply_and_bind_in_order() {
         let site = Uuid::new_v4();
-        let (sql, binds) = audit_event_set(None, Some(site), Some("xO2"));
+        let (sql, binds) = audit_event_set(None, Some(site), Some("xO2"), None);
         assert!(sql.contains("site_id = $1"), "{sql}");
         assert!(sql.contains(", $2)"), "{sql}");
         assert_eq!(binds.len(), 2);
     }
 
+    /// A calculation edit audits the visits that calculation actually wrote, which is what makes
+    /// the report proportionate to the edit rather than a pass over every visit ever recorded.
+    #[test]
+    fn a_calculation_scope_narrows_to_the_visits_it_wrote() {
+        let (sql, binds) = audit_event_set(None, None, None, Some("pco2"));
+        assert!(
+            sql.contains("r.provenance ->> 'tool' = $1"),
+            "the scope reads the stored provenance: {sql}"
+        );
+        assert_eq!(binds.len(), 1);
+    }
+
+    /// The two content scopes stack, so editing a constant a calculation reads audits only where
+    /// both are named.
+    #[test]
+    fn a_constant_and_a_calculation_scope_both_apply_and_bind_in_order() {
+        let (sql, binds) = audit_event_set(None, None, Some("xO2"), Some("pco2"));
+        assert!(sql.contains("jsonb_exists(r.provenance -> 'constants', $1)"));
+        assert!(sql.contains("r.provenance ->> 'tool' = $2"));
+        assert_eq!(binds.len(), 2);
+    }
+
     #[test]
     fn an_event_scope_outranks_a_site_scope() {
-        let (sql, _) = audit_event_set(Some(Uuid::new_v4()), Some(Uuid::new_v4()), None);
+        let (sql, _) = audit_event_set(Some(Uuid::new_v4()), Some(Uuid::new_v4()), None, None);
         assert!(sql.contains("id = $1"), "{sql}");
         assert!(!sql.contains("site_id"), "{sql}");
     }

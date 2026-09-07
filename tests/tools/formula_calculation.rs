@@ -315,6 +315,90 @@ async fn a_per_replicate_formula_produces_one_value_per_index() {
     );
 }
 
+/// Scenario: an author edits a formula, which is a change to what the calculation computes.
+///
+/// Expected behaviour: the edit reports rather than rewrites, the way a constant edit does. It
+/// enqueues the report-only audit itself, so the staleness a formula edit leaves behind is found
+/// without anybody thinking to press Audit.
+#[tokio::test]
+#[serial]
+async fn a_formula_edit_enqueues_its_own_audit() {
+    let group_id = "00000000-0000-4000-c000-000000000106";
+    let (db, app, token) = setup().await;
+    seed_calculation(&db, group_id).await;
+    let script_id = calculation_id(&db).await;
+    declare_output(&db, group_id, "temp_ratio_out").await;
+
+    let audits = |db: sea_orm::DatabaseConnection| async move {
+        db.query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT count(*)::bigint AS n FROM reprocessing_jobs \
+                  WHERE trigger_type = 'event_audit' \
+                    AND params ->> 'calculation' = '{CALCULATION}'"
+            ),
+        ))
+        .await
+        .expect("query")
+        .expect("a row")
+        .try_get::<i64>("", "n")
+        .expect("n")
+    };
+
+    let (status, text) = add_formula(
+        &app,
+        &token,
+        &script_id,
+        "temp_ratio_out",
+        "DO_Temperature / Dissolved_O2",
+        1,
+    )
+    .await;
+    assert!((200..300).contains(&status), "create ({status}): {text}");
+    let created: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    let definition_id = created["id"].as_str().unwrap();
+    let after_create = audits(db.clone()).await;
+    assert!(
+        after_create >= 1,
+        "the first version is an activation and audits: {after_create}"
+    );
+
+    let (status, text) = crate::common::put_json_with_token(
+        &app,
+        &format!("/api/derived_parameters/{definition_id}"),
+        &json!({
+            "code": "temp_ratio_out",
+            "name": "temp_ratio_out",
+            "units": "ratio",
+            "formula": "Dissolved_O2 / DO_Temperature",
+            "tool_script_id": script_id,
+            "ordinal": 1,
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "edit ({status}): {text}");
+    assert!(
+        audits(db.clone()).await >= after_create,
+        "the edit audits too"
+    );
+
+    // The audit is report-only: nothing rewrote a value on the way through.
+    let rewrites = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::bigint AS n FROM reprocessing_jobs \
+              WHERE trigger_type = 'event_recompute'"
+                .to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("a row")
+        .try_get::<i64>("", "n")
+        .expect("n");
+    assert_eq!(rewrites, 0, "a formula edit repairs nothing by itself");
+}
+
 #[tokio::test]
 #[serial]
 async fn a_calculation_may_not_read_outside_its_group() {

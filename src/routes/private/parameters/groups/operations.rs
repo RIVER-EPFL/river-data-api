@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, Statement};
 use uuid::Uuid;
 
 use super::group_model::ParameterGroup;
@@ -11,26 +11,19 @@ pub struct ParameterGroupOperations;
 
 /// One membership row by id, reduced to what the reshape rules read.
 async fn member_row(db: &DatabaseConnection, id: Uuid) -> Result<Option<Member>, ApiError> {
-    let Some(row) = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT group_id, parameter_id, role FROM parameter_group_members WHERE id = $1",
-            [id.into()],
-        ))
+    let Some(row) = super::member_model::Entity::find_by_id(id)
+        .one(db)
         .await
         .map_err(ApiError::database)?
     else {
         return Ok(None);
     };
-    let role: String = row.try_get("", "role").map_err(ApiError::database)?;
-    let Some(role) = Role::parse(&role) else {
+    let Some(role) = Role::parse(&row.role) else {
         return Ok(None);
     };
     Ok(Some(Member {
-        group_id: row.try_get("", "group_id").map_err(ApiError::database)?,
-        parameter_id: row
-            .try_get("", "parameter_id")
-            .map_err(ApiError::database)?,
+        group_id: row.group_id,
+        parameter_id: row.parameter_id,
         role,
     }))
 }
@@ -68,17 +61,12 @@ async fn codes_for_statistics_rule(
     group_id: Uuid,
     parameter_id: Uuid,
 ) -> Result<(String, Vec<String>), ApiError> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT code FROM parameters WHERE id = $1",
-            [parameter_id.into()],
-        ))
+    let row = crate::routes::private::parameters::Entity::find_by_id(parameter_id)
+        .one(db)
         .await
         .map_err(ApiError::database)?;
-    let code: String = match row {
-        Some(row) => row.try_get("", "code").map_err(ApiError::database)?,
-        None => return Ok((String::new(), Vec::new())),
+    let Some(code) = row.map(|p| p.code) else {
+        return Ok((String::new(), Vec::new()));
     };
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(

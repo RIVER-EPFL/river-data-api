@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, Statement};
 use uuid::Uuid;
 
 use super::model::SensorDeployment;
@@ -102,6 +102,15 @@ impl CRUDOperations for SensorDeploymentOperations {
         data: &<SensorDeployment as CRUDResource>::CreateModel,
     ) -> Result<(), ApiError> {
         reject_inverted_window(data.deployed_from, data.deployed_until)?;
+        // A deployment says this instrument measures at this site, which a bookkeeping row cannot
+        // say. `adopt` and `swap` refuse one too; this is the same guard on the CRUD door.
+        crate::routes::private::sensors::identity::require_measuring_instrument(
+            db,
+            data.sensor_id,
+            "deployed to a site",
+        )
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
         // Every rejection comes before the recall. A refused create must leave the sensor deployed
         // exactly where it was: the recall used to run first, so a 400 still closed the open
@@ -338,12 +347,8 @@ impl CRUDOperations for SensorDeploymentOperations {
     }
 
     async fn perform_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<Uuid, ApiError> {
-        let row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT sensor_id, site_id, parameter_id FROM sensor_deployments WHERE id = $1",
-                [id.into()],
-            ))
+        let row = super::model::Entity::find_by_id(id)
+            .one(db)
             .await
             .map_err(ApiError::database)?;
 
@@ -353,11 +358,9 @@ impl CRUDOperations for SensorDeploymentOperations {
                 Some(id.to_string()),
             ));
         };
-        let sensor_id: Uuid = row.try_get("", "sensor_id").map_err(ApiError::database)?;
-        let site_id: Uuid = row.try_get("", "site_id").map_err(ApiError::database)?;
-        let parameter_id: Uuid = row
-            .try_get("", "parameter_id")
-            .map_err(ApiError::database)?;
+        let sensor_id = row.sensor_id;
+        let site_id = row.site_id;
+        let parameter_id = row.parameter_id;
 
         // readings.deployment_id has no ON DELETE action, clear references first, then delete.
         // The reprocess below re-derives deployment_id/site_id for these readings by window.

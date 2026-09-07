@@ -10,6 +10,65 @@ use crate::routes::private::tools::formula::free_identifiers;
 /// Maximum allowed derived-from-derived chain depth.
 const MAX_DERIVED_CHAIN_DEPTH: u32 = 3;
 
+/// Mint a version of a standalone definition's formula, unless the newest one already holds that
+/// text.
+///
+/// An edit is a new calculation rather than a correction of the old one (Q89), so the text a
+/// stored value was made with stays recoverable. A definition attached to a calculation is
+/// versioned by `tool_script_versions` instead, through `mint_stale_formula_versions`, so this
+/// covers only the standalone kind the per-reading engine serves.
+async fn mint_derived_version(
+    db: &DatabaseConnection,
+    definition_id: Uuid,
+    formula: &str,
+    actor: Option<&str>,
+) -> Result<(), ApiError> {
+    // The same hash the migration computes for the same text, so version 1 and every version
+    // after it are hashed one way.
+    let hash = migration::m20260910_000014_derived_definition_versions::formula_hash(formula);
+    db.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"INSERT INTO derived_parameter_definition_versions
+              (definition_id, version_no, formula, content_hash, created_by)
+          SELECT $1,
+                 COALESCE((SELECT MAX(version_no) FROM derived_parameter_definition_versions
+                            WHERE definition_id = $1), 0) + 1,
+                 $2, $3, $4
+           WHERE NOT EXISTS (
+              SELECT 1 FROM derived_parameter_definition_versions v
+               WHERE v.definition_id = $1 AND v.content_hash = $3
+                 AND v.version_no = (SELECT MAX(version_no)
+                                       FROM derived_parameter_definition_versions
+                                      WHERE definition_id = $1)
+           )",
+        [
+            definition_id.into(),
+            formula.into(),
+            hash.into(),
+            actor.map(str::to_string).into(),
+        ],
+    ))
+    .await
+    .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+    Ok(())
+}
+
+/// Whether this definition is the standalone kind, ie. not attached to a calculation.
+async fn is_standalone(db: &DatabaseConnection, definition_id: Uuid) -> Result<bool, ApiError> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT tool_script_id IS NULL AS standalone \
+               FROM derived_parameter_definitions WHERE id = $1",
+            [definition_id.into()],
+        ))
+        .await
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+    Ok(row
+        .and_then(|r| r.try_get::<bool>("", "standalone").ok())
+        .unwrap_or(false))
+}
+
 fn validate_formula(formula: &str) -> Result<(), ApiError> {
     formula
         .parse::<meval::Expr>()
@@ -460,6 +519,9 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
         crate::routes::private::tools::calculation_versions::mint_stale_formula_versions(db, None)
             .await
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        if is_standalone(db, entity.id).await? {
+            mint_derived_version(db, entity.id, &entity.formula, None).await?;
+        }
 
         // Populate the sources field on the response
         entity.sources = resolved
@@ -509,6 +571,9 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
         crate::routes::private::tools::calculation_versions::mint_stale_formula_versions(db, None)
             .await
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        if is_standalone(db, entity.id).await? {
+            mint_derived_version(db, entity.id, &entity.formula, None).await?;
+        }
 
         // Populate the sources field on the response
         entity.sources = resolved

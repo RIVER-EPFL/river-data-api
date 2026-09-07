@@ -6,24 +6,20 @@
 #[allow(dead_code, unused_imports)]
 mod common;
 
-mod aggregation_and_paired_series;
 mod alarm_annotation_note_lifecycle;
 mod atomicity_and_compression;
 mod calibration_spanning_two_sites;
 mod collection_event_chain;
 mod csv_as_tool_entry;
 mod deployment_backdate_two_sites;
-mod deployment_slot_and_recall;
 mod full_public_data_workflow;
 mod grab_aggregation_and_tool_save;
 mod ingest_and_pairing_attribution;
 mod instrument_grab_alongside_sensor;
 mod onboarding_tracks;
 mod pairing_plan_lifecycle;
-mod pairing_wizard_patch_apply;
 mod portal_curve_instrument;
 mod portal_import_to_paired;
-mod portal_migration_wizard;
 mod portal_station_pairing;
 mod provision_to_public;
 mod reactive_recompute;
@@ -32,7 +28,6 @@ mod replicates_as_readings;
 mod scoped_recompute;
 mod sd_estimator_declaration;
 mod seasonal_check_gate;
-mod sensor_backfill_attribution;
 mod sensor_deploy_move_recall;
 mod sensor_ui_lifecycle;
 mod site_parameter_merge_flag_alarm;

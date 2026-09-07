@@ -4,8 +4,8 @@ use axum::{
 };
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    Set, Statement,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
+    FromQueryResult, QueryFilter, Set, Statement,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -16,6 +16,7 @@ use crate::common::bulk_write::{self, TouchedRange};
 use crate::common::middleware::ProjectScope;
 use crate::common::scope;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::data_streams::DataStream;
 use crate::routes::private::sensors;
 use crate::routes::private::sensors::calibrations;
 use crate::routes::private::sensors::identity::{
@@ -134,15 +135,15 @@ pub async fn stream_preview(
 
     let mut instants: Vec<PreviewInstant> = Vec::new();
     for row in &rows {
-        let time: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
-        let time = time.with_timezone(&Utc);
-        let replicate_index: i16 = row.try_get("", "replicate_index").unwrap_or(0);
+        let row = PreviewRow::from_query_result(row, "")?;
+        let time = row.time.with_timezone(&Utc);
+        let replicate_index = row.replicate_index;
         let replicate = PreviewReplicate {
             replicate_index,
             column: columns.get(&replicate_index).cloned(),
-            value: row.try_get("", "value").ok(),
-            is_flagged: row.try_get("", "is_flagged").unwrap_or(false),
-            withdrawn: row.try_get("", "withdrawn").unwrap_or(false),
+            value: row.value,
+            is_flagged: row.is_flagged,
+            withdrawn: row.withdrawn,
         };
         match instants.last_mut() {
             Some(last) if last.time == time => last.replicates.push(replicate),
@@ -247,22 +248,17 @@ pub async fn stream_stats(
         ))
         .await?;
 
-    let (count, withdrawn, min_time, max_time) = if let Some(row) = row {
-        let count: i64 = row.try_get("", "count").unwrap_or(0);
-        let withdrawn: i64 = row.try_get("", "withdrawn").unwrap_or(0);
-        let min_time: Option<chrono::DateTime<chrono::FixedOffset>> =
-            row.try_get("", "min_time").ok();
-        let max_time: Option<chrono::DateTime<chrono::FixedOffset>> =
-            row.try_get("", "max_time").ok();
-        (
-            count,
-            withdrawn,
-            min_time.map(|t| t.with_timezone(&Utc)),
-            max_time.map(|t| t.with_timezone(&Utc)),
-        )
-    } else {
-        (0, 0, None, None)
-    };
+    let stats = row
+        .as_ref()
+        .map(|r| StoredStreamStats::from_query_result(r, ""))
+        .transpose()?
+        .unwrap_or_default();
+    let (count, withdrawn, min_time, max_time) = (
+        stats.count,
+        stats.withdrawn,
+        stats.min_time.map(|t| t.with_timezone(&Utc)),
+        stats.max_time.map(|t| t.with_timezone(&Utc)),
+    );
 
     // Get latest value
     let latest_row = state
@@ -293,6 +289,43 @@ pub struct ReceiptsQuery {
     /// Rows per page, default 50, max 200.
     #[serde(default)]
     pub page_size: Option<u64>,
+}
+
+/// The stored shapes the hand mappings above read. Derived, so a column added to a query and not
+/// to its reader is a compile error rather than a field left at its default.
+#[derive(FromQueryResult)]
+struct StoredReceipt {
+    id: Uuid,
+    at: chrono::DateTime<chrono::FixedOffset>,
+    window_from: Option<chrono::DateTime<chrono::FixedOffset>>,
+    window_to: Option<chrono::DateTime<chrono::FixedOffset>>,
+    submitted: i32,
+    new_rows: i32,
+    changed: i32,
+    unchanged: i32,
+    retained: i32,
+    rejected_total: i32,
+    dropped: i32,
+    withdrawn: i32,
+    braked: bool,
+}
+
+#[derive(FromQueryResult)]
+struct PreviewRow {
+    time: chrono::DateTime<chrono::FixedOffset>,
+    replicate_index: i16,
+    value: Option<f64>,
+    is_flagged: bool,
+    withdrawn: bool,
+}
+
+/// A stream with no readings at all returns no row, which is zero of everything.
+#[derive(FromQueryResult, Default)]
+struct StoredStreamStats {
+    count: i64,
+    withdrawn: i64,
+    min_time: Option<chrono::DateTime<chrono::FixedOffset>>,
+    max_time: Option<chrono::DateTime<chrono::FixedOffset>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -388,28 +421,21 @@ pub async fn stream_receipts(
         .await?;
     let mut receipts = Vec::with_capacity(rows.len());
     for r in &rows {
-        let fixed = |name: &str| -> Option<chrono::DateTime<Utc>> {
-            r.try_get::<Option<chrono::DateTime<chrono::FixedOffset>>>("", name)
-                .ok()
-                .flatten()
-                .map(|t| t.with_timezone(&Utc))
-        };
+        let row = StoredReceipt::from_query_result(r, "")?;
         receipts.push(ReceiptRow {
-            id: r.try_get("", "id")?,
-            at: r
-                .try_get::<chrono::DateTime<chrono::FixedOffset>>("", "at")?
-                .with_timezone(&Utc),
-            window_from: fixed("window_from"),
-            window_to: fixed("window_to"),
-            submitted: r.try_get("", "submitted")?,
-            new_rows: r.try_get("", "new_rows")?,
-            changed: r.try_get("", "changed")?,
-            unchanged: r.try_get("", "unchanged")?,
-            retained: r.try_get("", "retained")?,
-            rejected_total: r.try_get("", "rejected_total")?,
-            dropped: r.try_get("", "dropped")?,
-            withdrawn: r.try_get("", "withdrawn")?,
-            braked: r.try_get("", "braked")?,
+            id: row.id,
+            at: row.at.with_timezone(&Utc),
+            window_from: row.window_from.map(|t| t.with_timezone(&Utc)),
+            window_to: row.window_to.map(|t| t.with_timezone(&Utc)),
+            submitted: row.submitted,
+            new_rows: row.new_rows,
+            changed: row.changed,
+            unchanged: row.unchanged,
+            retained: row.retained,
+            rejected_total: row.rejected_total,
+            dropped: row.dropped,
+            withdrawn: row.withdrawn,
+            braked: row.braked,
         });
     }
     Ok(Json(ReceiptsResponse {
@@ -456,51 +482,6 @@ fn default_metadata() -> serde_json::Value {
     serde_json::json!({})
 }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct StreamResponse {
-    pub id: Uuid,
-    pub source_system: String,
-    pub source_key: String,
-    pub source_name: Option<String>,
-    pub source_path: Option<String>,
-    #[schema(value_type = Object)]
-    pub metadata: serde_json::Value,
-    pub site_parameter_id: Option<Uuid>,
-    pub sensor_id: Option<Uuid>,
-    pub measurement_type: Option<String>,
-    pub is_active: bool,
-    pub discovered_at: chrono::DateTime<Utc>,
-    pub paired_at: Option<chrono::DateTime<Utc>>,
-    pub last_data_time: Option<chrono::DateTime<Utc>>,
-    /// The authoritative replicate column-to-index mapping, ordered by index, when this stream
-    /// declares a replicate family. Sync services assign each value's `replicate_index` from it;
-    /// a retired entry keeps its index reserved for the readings already stored under it.
-    pub replicates: Option<Vec<super::replicates::ColumnAssignment>>,
-}
-
-impl From<data_streams::Model> for StreamResponse {
-    fn from(m: data_streams::Model) -> Self {
-        let replicates = super::replicates::ReplicateSpec::from_metadata(&m.metadata)
-            .map(|spec| spec.column_assignments());
-        Self {
-            replicates,
-            id: m.id,
-            source_system: m.source_system,
-            source_key: m.source_key,
-            source_name: m.source_name,
-            source_path: m.source_path,
-            metadata: m.metadata,
-            site_parameter_id: m.site_parameter_id,
-            sensor_id: m.sensor_id,
-            measurement_type: m.measurement_type,
-            is_active: m.is_active,
-            discovered_at: m.discovered_at.with_timezone(&Utc),
-            paired_at: m.paired_at.map(|t| t.with_timezone(&Utc)),
-            last_data_time: m.last_data_time.map(|t| t.with_timezone(&Utc)),
-        }
-    }
-}
-
 /// Upsert a data stream by (source_system, source_key). Used by sync microservices on
 /// discovery to register streams before pairing. Requires `write_metadata`.
 #[utoipa::path(
@@ -508,7 +489,7 @@ impl From<data_streams::Model> for StreamResponse {
     path = "/api/streams/register",
     request_body = RegisterStreamRequest,
     responses(
-        (status = 200, description = "Stream registered (created or updated)", body = StreamResponse),
+        (status = 200, description = "Stream registered (created or updated)", body = DataStream),
     ),
     tag = "streams"
 )]
@@ -516,7 +497,7 @@ pub async fn register_stream(
     State(state): State<AppState>,
     ProjectScope(scope): ProjectScope,
     Json(mut payload): Json<RegisterStreamRequest>,
-) -> AppResult<Json<StreamResponse>> {
+) -> AppResult<Json<DataStream>> {
     if let Some(mt) = payload.measurement_type.as_deref()
         && !matches!(mt, "continuous" | "spot" | "derived")
     {
@@ -658,7 +639,9 @@ pub async fn register_stream(
         stream = data_streams::Entity::find_by_id(stream.id)
             .one(&state.db)
             .await?
-            .ok_or_else(|| AppError::Internal("Failed to re-fetch registered stream".to_string()))?;
+            .ok_or_else(|| {
+                AppError::Internal("Failed to re-fetch registered stream".to_string())
+            })?;
     }
 
     // A feed that describes its device can report a different one than the instrument it is
@@ -678,7 +661,7 @@ pub async fn register_stream(
         tracing::warn!(error = %e, stream = %stream.id, "device identity reconciliation failed");
     }
 
-    Ok(Json(stream.into()))
+    Ok(Json(super::replicates::with_assignments(stream)))
 }
 
 /// Confine a caller-declared instrument to one the caller has a relationship to.
@@ -735,7 +718,7 @@ pub struct ImportStreamRequest {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ImportStreamResponse {
-    pub stream: StreamResponse,
+    pub stream: DataStream,
     pub sensor_id: Uuid,
     /// Readings the import moved: newly owned by the instrument, or re-corrected because the
     /// window resolved a different curve. Zero where the stream's rows already say what the import
@@ -790,7 +773,7 @@ pub async fn import_stream(
         .ok_or_else(|| AppError::Internal("Failed to fetch updated stream".to_string()))?;
 
     Ok(Json(ImportStreamResponse {
-        stream: updated.into(),
+        stream: super::replicates::with_assignments(updated),
         sensor_id: ctx.sensor_id,
         attributed,
     }))
@@ -803,7 +786,7 @@ pub struct PairStreamRequest {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PairStreamResponse {
-    pub stream: StreamResponse,
+    pub stream: DataStream,
     pub backfilled: u64,
 }
 
@@ -951,13 +934,9 @@ pub async fn pair_stream(
     // Gated on the stream holding readings at all, not on the backfill having moved rows: a stream
     // re-paired after an unpair, or one whose readings arrived already attributed, backfills nothing
     // and still needs its window resolved against the slot it now feeds.
-    let has_readings = state
-        .db
-        .query_one_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT 1 AS one FROM readings WHERE stream_id = $1 LIMIT 1",
-            [stream_id.into()],
-        ))
+    let has_readings = crate::routes::private::readings::model::Entity::find()
+        .filter(crate::routes::private::readings::model::Column::StreamId.eq(stream_id))
+        .one(&state.db)
         .await?
         .is_some();
     if backfilled > 0 || has_readings {
@@ -982,14 +961,14 @@ pub async fn pair_stream(
         .ok_or_else(|| AppError::Internal("Failed to fetch updated stream".to_string()))?;
 
     Ok(Json(PairStreamResponse {
-        stream: updated.into(),
+        stream: super::replicates::with_assignments(updated),
         backfilled,
     }))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct UnpairStreamResponse {
-    pub stream: StreamResponse,
+    pub stream: DataStream,
     pub cleared: u64,
 }
 
@@ -1057,7 +1036,7 @@ pub async fn unpair_stream(
         .ok_or_else(|| AppError::Internal("Failed to fetch updated stream".to_string()))?;
 
     Ok(Json(UnpairStreamResponse {
-        stream: updated.into(),
+        stream: super::replicates::with_assignments(updated),
         cleared,
     }))
 }

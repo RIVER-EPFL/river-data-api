@@ -1,6 +1,9 @@
-//! Every pairing path leaves the slot in the same state. A stream paired through
-//! `POST /sync/apply-discovery` carries the same samples, collection events and instrument
-//! attribution as the same stream paired through `POST /streams/{id}/pair`.
+//! Pairing leaves the slot whole. A stream paired through `POST /streams/{id}/pair` carries the
+//! samples its replicate groups form, the collection event that makes the instant addressable as a
+//! visit, and an instrument on every reading.
+//!
+//! Written against `POST /sync/apply-discovery` when that was a second pairing path; C86 deleted
+//! it, so the assertions moved to the one that remains and are unchanged.
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
@@ -57,18 +60,12 @@ async fn the_sync_pairing_path_materialises_samples_and_events() {
 
     let (status, body) = crate::common::post_json_with_token(
         &app,
-        "/api/sync/apply-discovery",
-        &serde_json::json!({ "actions": [{
-            "stream_id": stream_id,
-            "use_project_id": crate::common::PROJECT_ID,
-            "use_site_id": crate::common::SITE1_ID,
-            "use_parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID,
-            "pair_to": crate::common::PARAM_S1_TEMP_ID
-        }]}),
+        &format!("/api/streams/{stream_id}/pair"),
+        &serde_json::json!({ "site_parameter_id": crate::common::PARAM_S1_TEMP_ID }),
         &token,
     )
     .await;
-    assert_eq!(status, 200, "apply-discovery ({status}): {body}");
+    assert_eq!(status, 200, "pair ({status}): {body}");
 
     let sample_n = scalar_i64(
         &db,

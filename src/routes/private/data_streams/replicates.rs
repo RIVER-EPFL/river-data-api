@@ -385,3 +385,13 @@ mod tests {
         assert!(spec(&["DOC_rep_1", "DOC_rep_2"]).validate(None).is_err());
     }
 }
+
+/// The stream as the API serves it, with the replicate assignments read out of its metadata.
+/// The CRUD reads get this through `after_get_one`; the custom stream views call it directly.
+#[must_use]
+pub fn with_assignments(model: super::model::Model) -> super::DataStream {
+    let replicates = ReplicateSpec::from_metadata(&model.metadata).map(|s| s.column_assignments());
+    let mut stream = super::DataStream::from(model);
+    stream.replicates = replicates;
+    stream
+}

@@ -35,6 +35,92 @@ pub struct CalculationImpact {
     pub outputs: Vec<ImpactParameter>,
 }
 
+/// What a change is being asked about. Every subject resolves to the parameters it moves, and the
+/// answer is then the same walk over the same graph, so "what depends on this" has one meaning
+/// whichever end it is asked from.
+#[derive(Debug, Clone)]
+pub enum Subject {
+    /// Global parameters, the form every other subject reduces to.
+    Parameters(Vec<Uuid>),
+    /// A calibration: the parameters whose readings it corrects.
+    Calibration(Uuid),
+    /// One site parameter row.
+    Slot(Uuid),
+    /// One reading, by the key the curation routes use.
+    Reading {
+        stream_id: Uuid,
+        replicate_index: Option<i32>,
+    },
+    /// A calculation, by name: what its own outputs feed downstream.
+    Calculation(String),
+}
+
+/// The global parameters a subject moves.
+///
+/// Metadata only. A calibration's parameters come from its own declaration and its instrument's
+/// deployments rather than from a scan of the readings it corrected: the question is asked before
+/// an edit, on a page that must answer in one round trip, and the two agree wherever the
+/// attribution is right.
+pub async fn parameters_of(db: &DatabaseConnection, subject: &Subject) -> AppResult<Vec<Uuid>> {
+    let (sql, values): (&str, Vec<sea_orm::Value>) = match subject {
+        Subject::Parameters(ids) => return Ok(ids.clone()),
+        Subject::Calibration(id) => (
+            "SELECT DISTINCT p FROM (
+               SELECT c.parameter_id AS p FROM sensor_calibrations c WHERE c.id = $1
+               UNION ALL
+               SELECT d.parameter_id FROM sensor_deployments d
+                 JOIN sensor_calibrations c ON c.sensor_id = d.sensor_id
+                WHERE c.id = $1 AND c.parameter_id IS NULL
+             ) q WHERE p IS NOT NULL",
+            vec![(*id).into()],
+        ),
+        Subject::Slot(id) => (
+            "SELECT parameter_id AS p FROM site_parameters WHERE id = $1",
+            vec![(*id).into()],
+        ),
+        // A replicate of a group is the same parameter as its siblings, so the index the caller
+        // holds the reading by does not narrow the answer.
+        Subject::Reading { stream_id, .. } => (
+            "SELECT sp.parameter_id AS p
+               FROM data_streams s
+               JOIN site_parameters sp ON sp.id = s.site_parameter_id
+              WHERE s.id = $1",
+            vec![(*stream_id).into()],
+        ),
+        Subject::Calculation(name) => (
+            "SELECT DISTINCT out.id AS p
+               FROM tool_scripts s
+               JOIN tool_script_versions v ON v.id = s.active_version_id
+               CROSS JOIN LATERAL jsonb_array_elements(COALESCE(v.manifest->'outputs', '[]'::jsonb)) o
+               JOIN parameters out
+                 ON LOWER(out.code) = LOWER(o->>'suggested_parameter_code')
+              WHERE s.name = $1",
+            vec![name.clone().into()],
+        ),
+    };
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await?;
+    let mut ids = Vec::with_capacity(rows.len());
+    for row in &rows {
+        ids.push(row.try_get::<Uuid>("", "p")?);
+    }
+    Ok(ids)
+}
+
+/// [`calculations_fed_by`] for any subject.
+pub async fn calculations_fed_by_subject(
+    db: &DatabaseConnection,
+    subject: &Subject,
+) -> AppResult<Vec<CalculationImpact>> {
+    let ids = parameters_of(db, subject).await?;
+    calculations_fed_by(db, &ids).await
+}
+
 /// Every enabled calculation that reads one of `parameter_ids` at a visit, directly or through a
 /// calculation downstream of it, in the order the chain would run them. Empty when no calculation
 /// reads any of them, which is the common case for a logger parameter.
@@ -68,7 +154,127 @@ pub async fn calculations_fed_by(
             })
         })
         .collect::<AppResult<_>>()?;
-    Ok(fed_closure(&tools, &catalog, &order, &touched))
+    let mut impacts = fed_closure(&tools, &catalog, &order, &touched);
+    impacts.extend(derived_fed_by(db, &touched).await?);
+    Ok(impacts)
+}
+
+/// One standalone derived definition as an edge of the same graph: what it reads and what it
+/// writes.
+///
+/// A derived parameter attached to a calculation is already in the manifest graph, because a
+/// formula calculation presents one. A standalone definition (`tool_script_id IS NULL`) is the
+/// continuous kind the derived job and the janitor serve, and it has no manifest, so its
+/// dependants were invisible to the closure entirely.
+struct DerivedEdge {
+    code: String,
+    label: String,
+    reads: Vec<String>,
+    output: Option<ImpactParameter>,
+}
+
+async fn derived_edges(db: &DatabaseConnection) -> AppResult<Vec<DerivedEdge>> {
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT d.code, d.name, out.id AS output_id, out.code AS output_code,
+                    COALESCE(
+                      (SELECT jsonb_agg(p.code)
+                         FROM derived_parameter_sources src
+                         JOIN parameters p ON p.id = src.parameter_id
+                        WHERE src.derived_definition_id = d.id),
+                      '[]'::jsonb) AS reads
+               FROM derived_parameter_definitions d
+               LEFT JOIN parameters out ON out.id = d.output_parameter_id
+              WHERE d.tool_script_id IS NULL
+              ORDER BY d.code"
+                .to_string(),
+        ))
+        .await?;
+    let mut edges = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let reads: serde_json::Value = row.try_get("", "reads")?;
+        let output_id: Option<Uuid> = row.try_get("", "output_id")?;
+        let output_code: Option<String> = row.try_get("", "output_code")?;
+        edges.push(DerivedEdge {
+            code: row.try_get("", "code")?,
+            label: row.try_get("", "name")?,
+            reads: reads
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_lowercase))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            output: match (output_id, output_code) {
+                (Some(parameter_id), Some(parameter_code)) => Some(ImpactParameter {
+                    parameter_id,
+                    parameter_code,
+                }),
+                _ => None,
+            },
+        });
+    }
+    Ok(edges)
+}
+
+/// The standalone derived definitions a touched set feeds, in the same shape a calculation
+/// answers in. The walk repeats until nothing new is reachable, so a derived parameter feeding
+/// another is followed however the definitions happen to be ordered.
+async fn derived_fed_by(
+    db: &DatabaseConnection,
+    touched: &[ImpactParameter],
+) -> AppResult<Vec<CalculationImpact>> {
+    let edges = derived_edges(db).await?;
+    if edges.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(derived_closure(&edges, touched))
+}
+
+fn derived_closure(edges: &[DerivedEdge], touched: &[ImpactParameter]) -> Vec<CalculationImpact> {
+    let mut reachable: HashMap<String, Vec<ImpactParameter>> = HashMap::new();
+    for p in touched {
+        reachable.insert(p.parameter_code.to_lowercase(), vec![p.clone()]);
+    }
+    let mut impacts: Vec<CalculationImpact> = Vec::new();
+    // A definition reading another's output is followed by re-walking until the reachable set
+    // stops growing: the definitions carry no order of their own, unlike the manifest tools.
+    loop {
+        let before = impacts.len();
+        for edge in edges {
+            if impacts.iter().any(|i| i.tool == edge.code) {
+                continue;
+            }
+            let mut reads: Vec<ImpactParameter> = Vec::new();
+            for code in &edge.reads {
+                for root in reachable.get(code).into_iter().flatten() {
+                    if !reads.iter().any(|x| x.parameter_id == root.parameter_id) {
+                        reads.push(root.clone());
+                    }
+                }
+            }
+            if reads.is_empty() {
+                continue;
+            }
+            if let Some(output) = &edge.output {
+                reachable
+                    .entry(output.parameter_code.to_lowercase())
+                    .or_default()
+                    .extend(reads.iter().cloned());
+            }
+            impacts.push(CalculationImpact {
+                tool: edge.code.clone(),
+                label: edge.label.clone(),
+                reads,
+                outputs: edge.output.iter().cloned().collect(),
+            });
+        }
+        if impacts.len() == before {
+            return impacts;
+        }
+    }
 }
 
 /// The closure walk itself: with tools in run order, a tool is fed when an `event_input` names a
@@ -216,5 +422,63 @@ mod tests {
     fn matching_is_case_insensitive_like_the_catalog_index() {
         let fed = walk(vec![tool("b", &["a"], "B")], &["A"]);
         assert_eq!(fed.len(), 1);
+    }
+
+    fn edge(code: &str, reads: &[&str], writes: Option<&str>) -> DerivedEdge {
+        DerivedEdge {
+            code: code.to_string(),
+            label: code.to_uppercase(),
+            reads: reads.iter().map(|r| r.to_lowercase()).collect(),
+            output: writes.map(param),
+        }
+    }
+
+    #[test]
+    fn a_standalone_derived_definition_reading_the_touched_parameter_is_reported() {
+        let fed = derived_closure(&[edge("b", &["A"], Some("B"))], &[param("A")]);
+        assert_eq!(fed.len(), 1);
+        assert_eq!(fed[0].tool, "b");
+        assert_eq!(fed[0].outputs[0].parameter_code, "B");
+    }
+
+    /// The definitions carry no order of their own, so a consumer declared before its producer is
+    /// still followed.
+    #[test]
+    fn a_derived_definition_reading_another_s_output_is_followed_whatever_the_order() {
+        let fed = derived_closure(
+            &[edge("c", &["B"], Some("C")), edge("b", &["A"], Some("B"))],
+            &[param("A")],
+        );
+        let mut names: Vec<&str> = fed.iter().map(|f| f.tool.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["b", "c"]);
+        assert_eq!(
+            fed.iter().find(|f| f.tool == "c").unwrap().reads[0].parameter_code,
+            "A",
+            "traced back to the touched root"
+        );
+    }
+
+    #[test]
+    fn a_derived_definition_reading_nothing_touched_is_not_reported() {
+        assert!(derived_closure(&[edge("y", &["X"], Some("Y"))], &[param("A")]).is_empty());
+    }
+
+    /// A definition with no output parameter yet is still reported: it reads the touched value, so
+    /// an operator has to know it runs again, even though nothing downstream can read it.
+    #[test]
+    fn a_definition_with_no_output_is_reported_with_none() {
+        let fed = derived_closure(&[edge("b", &["A"], None)], &[param("A")]);
+        assert_eq!(fed.len(), 1);
+        assert!(fed[0].outputs.is_empty());
+    }
+
+    #[test]
+    fn a_cycle_among_definitions_terminates_rather_than_walking_forever() {
+        let fed = derived_closure(
+            &[edge("b", &["A", "C"], Some("B")), edge("c", &["B"], Some("C"))],
+            &[param("A")],
+        );
+        assert_eq!(fed.len(), 2, "each definition is reported once: {fed:?}");
     }
 }

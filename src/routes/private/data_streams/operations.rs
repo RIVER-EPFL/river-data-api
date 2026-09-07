@@ -78,4 +78,15 @@ impl CRUDOperations for DataStreamOperations {
         }
         Ok(updated)
     }
+
+    /// The replicate assignments, read out of the metadata the stream already carries.
+    async fn after_get_one(
+        &self,
+        _db: &DatabaseConnection,
+        entity: &mut DataStream,
+    ) -> Result<(), ApiError> {
+        entity.replicates = super::replicates::ReplicateSpec::from_metadata(&entity.metadata)
+            .map(|spec| spec.column_assignments());
+        Ok(())
+    }
 }

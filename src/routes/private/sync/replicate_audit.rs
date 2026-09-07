@@ -338,16 +338,12 @@ pub async fn latest_holds<C: ConnectionTrait>(
         .await?;
     rows.iter()
         .filter_map(|r| {
-            let entry = (|| -> Result<_, sea_orm::DbErr> {
-                Ok(LatestHold {
-                    time: r
-                        .try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "group_time")?
-                        .with_timezone(&Utc),
-                    status: r.try_get::<String>("", "status")?,
-                    id: r.try_get::<Uuid>("", "id")?,
-                    expected: r.try_get::<serde_json::Value>("", "expected")?,
-                })
-            })();
+            let entry = LatestHoldRow::from_query_result(r, "").map(|row| LatestHold {
+                time: row.group_time.with_timezone(&Utc),
+                status: row.status,
+                id: row.id,
+                expected: row.expected,
+            });
             match entry {
                 Ok(e) if wanted.contains(&e.time) => Some(Ok(e)),
                 Ok(_) => None,
@@ -797,6 +793,61 @@ pub static POPULATION_SD_SQL: std::sync::LazyLock<String> = std::sync::LazyLock:
     )
 });
 
+/// The row shapes the raw hold queries return. A derived decoder is checked against the SELECT it
+/// fills, so a column renamed in one query and not in its mapper fails where the query is written.
+#[derive(FromQueryResult)]
+struct LatestHoldRow {
+    group_time: sea_orm::prelude::DateTimeWithTimeZone,
+    status: String,
+    id: Uuid,
+    expected: serde_json::Value,
+}
+
+#[derive(FromQueryResult)]
+struct HoldCountsRow {
+    total: i64,
+    pending: i64,
+    deferred: i64,
+}
+
+#[derive(FromQueryResult)]
+struct EstimatorGateRow {
+    expected_sd: Option<f64>,
+    computed_sd: Option<f64>,
+    site_name: Option<String>,
+    parameter_name: Option<String>,
+}
+
+#[derive(FromQueryResult)]
+struct FlagHoldRow {
+    stream_id: Uuid,
+    group_time: sea_orm::prelude::DateTimeWithTimeZone,
+    resolution: Option<serde_json::Value>,
+    computed: serde_json::Value,
+}
+
+#[derive(FromQueryResult)]
+struct EstimatorHoldRow {
+    group_time: sea_orm::prelude::DateTimeWithTimeZone,
+    site_parameter_id: Uuid,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    previous: Option<String>,
+    resolution: Option<serde_json::Value>,
+}
+
+#[derive(FromQueryResult)]
+struct ReopenHoldRow {
+    stream_id: Uuid,
+    group_time: sea_orm::prelude::DateTimeWithTimeZone,
+    status: String,
+    paired: bool,
+    resolution: Option<serde_json::Value>,
+    site_parameter_id: Option<Uuid>,
+    site_id: Option<Uuid>,
+    parameter_id: Option<Uuid>,
+}
+
 #[derive(Debug, Serialize, FromQueryResult, ToSchema)]
 pub struct HoldRow {
     pub id: Uuid,
@@ -1010,9 +1061,11 @@ pub async fn list_holds(
         ))
         .await?
         .ok_or_else(|| AppError::Internal("hold count returned no row".to_string()))?;
-    let total: i64 = count_row.try_get("", "total")?;
-    let pending: i64 = count_row.try_get("", "pending")?;
-    let deferred: i64 = count_row.try_get("", "deferred")?;
+    let HoldCountsRow {
+        total,
+        pending,
+        deferred,
+    } = HoldCountsRow::from_query_result(&count_row, "")?;
 
     let mut rows = HoldRow::find_by_statement(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
@@ -1250,10 +1303,12 @@ async fn refuse_undeclared_estimator(
         ))
         .await?;
     let Some(row) = row else { return Ok(()) };
-    let expected_sd: Option<f64> = row.try_get("", "expected_sd")?;
-    let computed_sd: Option<f64> = row.try_get("", "computed_sd")?;
-    let site_name: Option<String> = row.try_get("", "site_name")?;
-    let parameter_name: Option<String> = row.try_get("", "parameter_name")?;
+    let EstimatorGateRow {
+        expected_sd,
+        computed_sd,
+        site_name,
+        parameter_name,
+    } = EstimatorGateRow::from_query_result(&row, "")?;
     let slot = format!(
         "{} / {}",
         site_name.as_deref().unwrap_or("this site"),
@@ -1449,11 +1504,12 @@ pub async fn resolve_hold(
                     .ok_or_else(|| {
                         AppError::NotFound(format!("no pending replicate audit hold {id}"))
                     })?;
-                let stream_id: Uuid = hold.try_get("", "stream_id")?;
-                let group_time =
-                    hold.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "group_time")?;
-                let prev: Option<serde_json::Value> = hold.try_get("", "resolution")?;
-                let computed: serde_json::Value = hold.try_get("", "computed")?;
+                let FlagHoldRow {
+                    stream_id,
+                    group_time,
+                    resolution: prev,
+                    computed,
+                } = FlagHoldRow::from_query_result(&hold, "")?;
 
                 // A flag resolution may only touch the replicates the hold was recorded over: the
                 // operator's decision is about those values, and any other index in the group is
@@ -1758,13 +1814,14 @@ async fn declare_estimator(
                          declared for a slot, so an unpaired stream's hold has none to declare"
                     ))
                 })?;
-            let group_time =
-                hold.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "group_time")?;
-            let site_parameter_id: Uuid = hold.try_get("", "site_parameter_id")?;
-            let site_id: Uuid = hold.try_get("", "site_id")?;
-            let parameter_id: Uuid = hold.try_get("", "parameter_id")?;
-            let previous: Option<String> = hold.try_get("", "previous")?;
-            let prev_resolution: Option<serde_json::Value> = hold.try_get("", "resolution")?;
+            let EstimatorHoldRow {
+                group_time,
+                site_parameter_id,
+                site_id,
+                parameter_id,
+                previous,
+                resolution: prev_resolution,
+            } = EstimatorHoldRow::from_query_result(&hold, "")?;
 
             let affected = if scope == "slot" {
                 txn.execute_raw(Statement::from_sql_and_values(
@@ -1929,12 +1986,16 @@ pub async fn reopen_hold(
             ))
             .await?
             .ok_or_else(|| AppError::NotFound(format!("no decided replicate audit hold {id}")))?;
-        let stream_id: Uuid = hold.try_get("", "stream_id")?;
-        let group_time =
-            hold.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "group_time")?;
-        let status: String = hold.try_get("", "status")?;
-        let paired: bool = hold.try_get("", "paired")?;
-        let prev: Option<serde_json::Value> = hold.try_get("", "resolution")?;
+        let ReopenHoldRow {
+            stream_id,
+            group_time,
+            status,
+            paired,
+            resolution: prev,
+            site_parameter_id,
+            site_id,
+            parameter_id,
+        } = ReopenHoldRow::from_query_result(&hold, "")?;
 
         let flagged = prev.as_ref().and_then(|r| {
             (r.get("action")? == "flag_replicates").then(|| {
@@ -2006,9 +2067,6 @@ pub async fn reopen_hold(
         if status == "remediated"
             && let Some((decl_scope, previous, _)) = &declared
         {
-            let site_parameter_id: Option<Uuid> = hold.try_get("", "site_parameter_id")?;
-            let site_id: Option<Uuid> = hold.try_get("", "site_id")?;
-            let parameter_id: Option<Uuid> = hold.try_get("", "parameter_id")?;
             if decl_scope == "slot" {
                 if let Some(sp_id) = site_parameter_id {
                     txn.execute_raw(Statement::from_sql_and_values(

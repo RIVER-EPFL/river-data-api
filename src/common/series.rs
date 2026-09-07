@@ -17,7 +17,6 @@ use axum::http::header::{self, HeaderValue};
 use axum::response::Response;
 use chrono::{DateTime, Utc};
 use std::future::Future;
-use tokio_stream::wrappers::ReceiverStream;
 
 use crate::error::{AppError, AppResult};
 
@@ -194,19 +193,13 @@ impl Table {
         content_type: &'static str,
         render: fn(&Self) -> Vec<String>,
     ) -> AppResult<Response> {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
-
-        tokio::spawn(async move {
-            for line in render(&self) {
-                if tx.send(Ok(format!("{line}\n"))).await.is_err() {
-                    break;
-                }
-            }
-        });
+        let lines = render(&self)
+            .into_iter()
+            .map(|line| Ok::<_, std::io::Error>(format!("{line}\n")));
 
         Response::builder()
             .header(header::CONTENT_TYPE, HeaderValue::from_static(content_type))
-            .body(axum::body::Body::from_stream(ReceiverStream::new(rx)))
+            .body(axum::body::Body::from_stream(futures::stream::iter(lines)))
             .map_err(|e| AppError::Internal(e.to_string()))
     }
 }

@@ -6,6 +6,7 @@ use sea_orm::{
 use uuid::Uuid;
 
 use super::model::SiteParameter;
+use crate::routes::private::sensors::identity::require_measuring_instrument;
 
 pub struct SiteParameterOperations;
 
@@ -70,6 +71,38 @@ impl CRUDOperations for SiteParameterOperations {
             )
             .await
             .map_err(|e| ApiError::internal(e.to_string(), None))?;
+        }
+        Ok(())
+    }
+
+    /// A slot names the instrument that measures it, so the row it names has to be one something
+    /// was measured on. A bookkeeping instrument stands in for a slot that has declared nothing,
+    /// and declaring it would record the absence of an answer as an answer.
+    async fn before_create(
+        &self,
+        db: &DatabaseConnection,
+        data: &<SiteParameter as CRUDResource>::CreateModel,
+    ) -> Result<(), ApiError> {
+        if let Some(sensor_id) = data.instrument_sensor_id {
+            require_measuring_instrument(db, sensor_id, "the instrument that measures a slot")
+                .await
+                .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// The twin of `before_create`: the declaration is patchable, and the picker that sets it is
+    /// the surface an operator reaches it through.
+    async fn before_update(
+        &self,
+        db: &DatabaseConnection,
+        _id: Uuid,
+        data: &<SiteParameter as CRUDResource>::UpdateModel,
+    ) -> Result<(), ApiError> {
+        if let Some(Some(sensor_id)) = data.instrument_sensor_id {
+            require_measuring_instrument(db, sensor_id, "the instrument that measures a slot")
+                .await
+                .map_err(|e| ApiError::bad_request(e.to_string()))?;
         }
         Ok(())
     }

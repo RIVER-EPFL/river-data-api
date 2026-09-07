@@ -297,14 +297,12 @@ pub fn validate_optional_time_range(
         private::admin::derived::recompute_derived,
         private::admin::merge::merge_site_parameters_handler,
         private::parameters::groups::definition::group_definition,
+        private::parameters::groups::intermediates::declare_intermediates,
+        private::sites::parameters::apply_group::apply_group,
         private::sites::parameters::declare::declare_sd_estimator,
         private::sites::parameters::declare::retag_sd_estimator,
         private::admin::merge::merge_parameters_handler,
         private::admin::public_config::invalidate_public_config,
-        private::sync::views::get_discovery,
-        private::sync::views::apply_discovery,
-        private::sync::views::grouped_discovery,
-        private::sync::views::bulk_pair,
         private::sync::views::create_pairing_plan,
         private::sync::views::list_pairing_plans,
         private::sync::views::get_pairing_plan,
@@ -359,7 +357,7 @@ pub fn validate_optional_time_range(
             private::sites::aggregates::AggregatesResponse,
             private::sites::aggregates::ParameterAggregateData,
             private::sites::status_events::StatusEventsResponse,
-            private::sites::annotations::AnnotationResponse,
+            private::annotations::Annotation,
             private::alarms::types::AlarmViolationsResponse,
             private::alarms::types::ParameterViolationData,
             private::alarms::types::AlarmEventResponse,
@@ -468,7 +466,7 @@ pub fn validate_optional_time_range(
             private::sync::replicate_reconciliation::FamilyCandidate,
             private::sync::replicate_reconciliation::StartReconciliationRequest,
             private::sync::replicate_reconciliation::StartReconciliationResponse,
-            private::data_streams::views::StreamResponse,
+            private::data_streams::DataStream,
             private::data_streams::views::PairStreamRequest,
             private::data_streams::views::PairStreamResponse,
             private::data_streams::views::UnpairStreamResponse,
@@ -802,8 +800,10 @@ pub fn build_router(state: AppState) -> Router {
         // A loopback origin is not served by a deployed instance: the compiled-in default is the
         // two local dev servers, and an overlay that names no origin would otherwise let anything
         // a browser loads off localhost make credentialed calls.
-        let (served, refused) =
-            crate::config::served_cors_origins(config.deployment.clone(), &config.cors_allowed_origins);
+        let (served, refused) = crate::config::served_cors_origins(
+            config.deployment.clone(),
+            &config.cors_allowed_origins,
+        );
         if !refused.is_empty() {
             tracing::error!(
                 refused = ?refused,

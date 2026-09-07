@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::annotations::Annotation;
 use crate::routes::private::{annotations, parameters};
 use crate::routes::{resolve_site, validate_optional_time_range};
 
@@ -31,21 +32,6 @@ pub struct SiteAnnotationsQuery {
     pub format: Option<String>,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct AnnotationResponse {
-    pub id: Uuid,
-    pub site_id: Uuid,
-    pub parameter_id: Uuid,
-    pub start_time: DateTime<Utc>,
-    pub end_time: DateTime<Utc>,
-    pub text: String,
-    pub category: String,
-    pub created_by: Option<String>,
-    /// The sync source that registered the annotation; NULL on hand-entered ones.
-    pub source_system: Option<String>,
-    pub created_at: Option<DateTime<Utc>>,
-}
-
 use crate::common::csv::field as csv_field;
 
 /// List annotations for a site, optionally filtered by parameter and time range
@@ -57,7 +43,7 @@ use crate::common::csv::field as csv_field;
         SiteAnnotationsQuery
     ),
     responses(
-        (status = 200, description = "Annotations retrieved successfully", body = Vec<AnnotationResponse>),
+        (status = 200, description = "Annotations retrieved successfully", body = Vec<Annotation>),
         (status = 404, description = "Site not found"),
     ),
     tag = "sites"
@@ -142,21 +128,7 @@ pub async fn get_site_annotations(
             .map_err(|e| AppError::Internal(e.to_string()));
     }
 
-    let response: Vec<AnnotationResponse> = rows
-        .into_iter()
-        .map(|a| AnnotationResponse {
-            id: a.id,
-            site_id: a.site_id,
-            parameter_id: a.parameter_id,
-            start_time: a.start_time,
-            end_time: a.end_time,
-            text: a.text,
-            category: a.category,
-            created_by: a.created_by,
-            source_system: a.source_system,
-            created_at: a.created_at,
-        })
-        .collect();
+    let response: Vec<Annotation> = rows.into_iter().map(Annotation::from).collect();
 
     Ok(Json(response).into_response())
 }

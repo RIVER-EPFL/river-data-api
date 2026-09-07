@@ -13,7 +13,7 @@ use sea_orm::{
 use uuid::Uuid;
 
 /// The four numeric bounds that define a breach for one (parameter, site) slot.
-#[derive(Debug, Clone, Copy, FromQueryResult)]
+#[derive(Debug, Clone, Copy, FromQueryResult, serde::Serialize, utoipa::ToSchema)]
 pub struct ResolvedThreshold {
     pub warning_min: Option<f64>,
     pub warning_max: Option<f64>,

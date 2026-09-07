@@ -23,10 +23,11 @@ use crate::error::{AppError, AppResult};
 use crate::routes::private::sites::parameters as site_parameters;
 use crate::routes::{cache, resolve_site_with_project, validate_time_range};
 
+use super::thresholds::resolution::ResolvedThreshold;
 use super::types::{
     AcknowledgedAlarmResponse, ActiveAlarm, ActiveAlarmsResponse, AlarmEventResponse,
     AlarmEventsQuery, AlarmEventsResponse, AlarmSeverityCounts, AlarmSiteSummary,
-    AlarmSummaryResponse, AlarmThresholdInfo, AlarmViolationsResponse, ParameterViolationData,
+    AlarmSummaryResponse, AlarmViolationsResponse, ParameterViolationData,
     SiteAlarmsQuery,
 };
 use crate::routes::private::sites::types::{ProjectRef, SiteRef};
@@ -465,6 +466,18 @@ pub(crate) struct ActiveAlarmRow {
     pub(crate) severity: i16,
 }
 
+impl ActiveAlarmRow {
+    /// The four bounds this row carries, as the one type that names them.
+    fn bounds(&self) -> ResolvedThreshold {
+        ResolvedThreshold {
+            warning_min: self.warning_min,
+            warning_max: self.warning_max,
+            alarm_min: self.alarm_min,
+            alarm_max: self.alarm_max,
+        }
+    }
+}
+
 /// Fetch active alarm violations across all sites. The sweeper reuses this as the "current breach
 /// set" so the persisted events never diverge from what `/alarms/active` would compute.
 /// `spot` selects the cadence lens: grab series and sensor series are evaluated independently,
@@ -645,18 +658,13 @@ pub async fn get_active_alarms(
         .map(|(row, cadence)| {
             let ev = open.get(&(row.site_id, row.parameter_id, cadence.to_string()));
             ActiveAlarm {
+                threshold: row.bounds(),
                 site_id: row.site_id,
                 site_name: row.site_name,
                 parameter_id: row.parameter_id,
                 parameter_name: row.parameter_name,
                 current_value: row.current_value,
                 measurement_type: cadence.to_string(),
-                threshold: AlarmThresholdInfo {
-                    warning_min: row.warning_min,
-                    warning_max: row.warning_max,
-                    alarm_min: row.alarm_min,
-                    alarm_max: row.alarm_max,
-                },
                 severity: row.severity,
                 since: row.time.with_timezone(&Utc),
                 started_at: ev.map(|e| e.started_at.with_timezone(&Utc)),

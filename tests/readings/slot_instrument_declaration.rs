@@ -147,3 +147,75 @@ async fn a_curve_fitted_on_another_instrument_is_refused_against_the_declaration
         "a curve fitted on another instrument than the slot declares is refused: {body}"
     );
 }
+
+const ENTRY_CHANNEL: &str = "00000000-0000-4000-c000-0000000000b4";
+
+/// A bookkeeping row is minted so a reading can name something where nothing was declared, so
+/// naming one as what measures a slot records the absence of an answer as an answer.
+#[tokio::test]
+#[serial]
+async fn a_bookkeeping_instrument_cannot_be_declared_as_what_measures_a_slot() {
+    let f = crate::common::seeded_app().await;
+    let (app, token, db) = (f.app, f.token, f.db);
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO sensors (id, name, is_active, is_lab_instrument, kind, source_system, source_key, created_at) \
+             VALUES ('{ENTRY_CHANNEL}', 'Saxon Water Temperature (grab entry)', true, true, \
+                     'entry_channel', 'grab_sample', 'saxon:temp', now())"
+        ),
+    )
+    .await;
+
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &format!("/api/site_parameters/{}", crate::common::PARAM_S1_TEMP_ID),
+        &serde_json::json!({ "instrument_sensor_id": ENTRY_CHANNEL }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 400, "the declaration refuses an entry channel: {body}");
+    assert!(
+        body.contains("entry_channel"),
+        "the refusal says what the row is: {body}"
+    );
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/sensors/{ENTRY_CHANNEL}/adopt"),
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID,
+            "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID,
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 400, "adopt refuses an entry channel: {body}");
+}
+
+/// The declaration itself still works: a device is what the guard admits.
+#[tokio::test]
+#[serial]
+async fn a_device_is_still_accepted_as_what_measures_a_slot() {
+    let f = crate::common::seeded_app().await;
+    let (app, token, db) = (f.app, f.token, f.db);
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO sensors (id, name, is_active, kind, created_at) \
+             VALUES ('{SLOT_INSTRUMENT}', 'Field probe', true, 'device', now())"
+        ),
+    )
+    .await;
+
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &format!("/api/site_parameters/{}", crate::common::PARAM_S1_TEMP_ID),
+        &serde_json::json!({ "instrument_sensor_id": SLOT_INSTRUMENT }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "a device is admitted: {body}");
+}

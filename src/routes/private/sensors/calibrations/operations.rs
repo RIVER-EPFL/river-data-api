@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations, CRUDResource, MergeIntoActiveModel};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, Statement};
 use uuid::Uuid;
 
 use super::model::SensorCalibration;
@@ -99,12 +99,6 @@ impl CRUDOperations for SensorCalibrationOperations {
         db: &DatabaseConnection,
         data: &<SensorCalibration as CRUDResource>::CreateModel,
     ) -> Result<(), ApiError> {
-        if data.slope == 0.0 {
-            return Err(ApiError::bad_request(
-                "Slope cannot be zero: all readings would produce a constant value".to_string(),
-            ));
-        }
-
         if duplicate_instant_exists(db, data.sensor_id, data.parameter_id, data.valid_from, None)
             .await?
         {
@@ -164,21 +158,11 @@ impl CRUDOperations for SensorCalibrationOperations {
         id: Uuid,
         data: &<SensorCalibration as CRUDResource>::UpdateModel,
     ) -> Result<(), ApiError> {
-        if data.slope == Some(Some(0.0)) {
-            return Err(ApiError::bad_request(
-                "Slope cannot be zero: all readings would produce a constant value".to_string(),
-            ));
-        }
-
         if data.valid_from.is_none() && data.valid_until.is_none() {
             return Ok(());
         }
-        let Some(existing) = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT sensor_id, parameter_id, valid_from FROM sensor_calibrations WHERE id = $1",
-                [id.into()],
-            ))
+        let Some(existing) = super::model::Entity::find_by_id(id)
+            .one(db)
             .await
             .map_err(ApiError::database)?
         else {
@@ -188,9 +172,7 @@ impl CRUDOperations for SensorCalibrationOperations {
         // Nothing here writes: `perform_update` carries the provenance flag in the row's own UPDATE,
         // so a request this hook goes on to reject leaves the chain treating the row exactly as it
         // did before.
-        let stored_from: chrono::DateTime<chrono::FixedOffset> = existing
-            .try_get("", "valid_from")
-            .map_err(ApiError::database)?;
+        let stored_from = existing.valid_from;
         if let Some(Some(until)) = data.valid_until {
             let opens_at = match data.valid_from {
                 Some(Some(patched)) => patched,
@@ -210,10 +192,8 @@ impl CRUDOperations for SensorCalibrationOperations {
         let Some(Some(new_from)) = data.valid_from else {
             return Ok(());
         };
-        let sensor_id: Uuid = existing
-            .try_get("", "sensor_id")
-            .map_err(ApiError::database)?;
-        let parameter_id: Option<Uuid> = existing.try_get("", "parameter_id").ok();
+        let sensor_id = existing.sensor_id;
+        let parameter_id = existing.parameter_id;
         let parameter_id = match data.parameter_id {
             Some(patched) => patched,
             None => parameter_id,
@@ -261,7 +241,8 @@ impl CRUDOperations for SensorCalibrationOperations {
         db: &DatabaseConnection,
         entity: &mut SensorCalibration,
     ) -> Result<(), ApiError> {
-        reprocess_after_calibration_write(db, "calibration_create", entity.sensor_id, entity.id).await
+        reprocess_after_calibration_write(db, "calibration_create", entity.sensor_id, entity.id)
+            .await
     }
 
     async fn after_update(
@@ -269,16 +250,13 @@ impl CRUDOperations for SensorCalibrationOperations {
         db: &DatabaseConnection,
         entity: &mut SensorCalibration,
     ) -> Result<(), ApiError> {
-        reprocess_after_calibration_write(db, "calibration_update", entity.sensor_id, entity.id).await
+        reprocess_after_calibration_write(db, "calibration_update", entity.sensor_id, entity.id)
+            .await
     }
 
     async fn perform_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<Uuid, ApiError> {
-        let row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT sensor_id FROM sensor_calibrations WHERE id = $1",
-                [id.into()],
-            ))
+        let row = super::model::Entity::find_by_id(id)
+            .one(db)
             .await
             .map_err(ApiError::database)?;
 
@@ -288,7 +266,7 @@ impl CRUDOperations for SensorCalibrationOperations {
                 Some(id.to_string()),
             ));
         };
-        let sensor_id: Uuid = row.try_get("", "sensor_id").map_err(ApiError::database)?;
+        let sensor_id = row.sensor_id;
 
         // The readings this curve corrected move onto whichever of the sensor's remaining curves
         // covers their time, value recomputed in the same statement, before the row goes. A

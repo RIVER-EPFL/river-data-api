@@ -114,7 +114,10 @@ async fn a_calculation_is_a_stored_run_and_the_save_carries_its_blob() {
         &intern,
     )
     .await;
-    assert_eq!(status, 200, "an intern enters field data ({status}): {entered}");
+    assert_eq!(
+        status, 200,
+        "an intern enters field data ({status}): {entered}"
+    );
     assert_eq!(
         e2e::count(
             &db,
@@ -411,10 +414,7 @@ async fn a_site_input_resolves_from_the_site_and_a_missing_property_is_refused()
         .try_get::<serde_json::Value>("", "provenance")
         .unwrap()
     };
-    assert_eq!(
-        blob["context"]["site_inputs"][0]["property"],
-        "altitude_m"
-    );
+    assert_eq!(blob["context"]["site_inputs"][0]["property"], "altitude_m");
     assert_eq!(blob["context"]["site_inputs"][0]["value"], 512.0);
     assert_eq!(
         blob["inputs"]["altitude_m"], 512.0,
@@ -467,16 +467,17 @@ async fn a_site_input_resolves_from_the_site_and_a_missing_property_is_refused()
     );
 }
 
-/// S1's Phase 3 half: a first save to a catalog parameter the site does not carry provisions the
-/// site_parameter instead of refusing the save.
+/// S1's Phase 3 half, under Q98: a site declares which calculations apply to it by holding their
+/// output slots, so a save landing on a slot the site does not carry is refused and the same save
+/// succeeds once the slot exists. A mint here would create the declaration it is checked against.
 #[tokio::test]
 #[serial]
-async fn a_first_save_provisions_the_site_parameter() {
-    if !kc::require_keycloak_or_skip("a_first_save_provisions_the_site_parameter").await {
+async fn a_save_needs_the_site_to_carry_the_slot() {
+    if !kc::require_keycloak_or_skip("a_save_needs_the_site_to_carry_the_slot").await {
         return;
     }
     if !crate::common::tools_runner::require_runner_or_skip(
-        "a_first_save_provisions_the_site_parameter",
+        "a_save_needs_the_site_to_carry_the_slot",
     )
     .await
     {
@@ -506,32 +507,45 @@ async fn a_first_save_provisions_the_site_parameter() {
         "readings": [{ "parameter_id": doc_param, "value": 120.0, "replicate_index": 0,
                         "time": "2025-06-15T13:00:00Z", "input": "DOC" }],
     });
+    let (status, refused) =
+        crate::common::post_json_with_token(&app, "/api/grab_samples", &save, &river).await;
+    assert_eq!(
+        status, 400,
+        "a save may not mint the declaration it is checked against: {refused}"
+    );
+    assert!(
+        refused.contains("parameter_groups"),
+        "the refusal names the flow that adds the slot: {refused}"
+    );
+    let minted = crate::common::e2e::count(
+        &db,
+        &format!(
+            "SELECT COUNT(*)::bigint AS n FROM site_parameters \
+             WHERE site_id = '{}' AND parameter_id = '{doc_param}'",
+            track.site_id
+        ),
+    )
+    .await;
+    assert_eq!(minted, 0, "the refused save minted nothing");
+
+    // Declaring the slot is what makes the calculation apply here.
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, \
+             is_active, is_public, needs_review, created_at) \
+             VALUES (gen_random_uuid(), '{}', '{doc_param}', 'DOC', '', TRUE, FALSE, FALSE, NOW())",
+            track.site_id
+        ),
+    )
+    .await;
+
     let (status, saved) =
         crate::common::post_json_with_token(&app, "/api/grab_samples", &save, &river).await;
-    assert_eq!(status, 200, "the first save provisions the slot: {saved}");
-
-    let (needs_review, count) = {
-        use sea_orm::{ConnectionTrait, Statement};
-        let row = db
-            .query_one_raw(Statement::from_string(
-                sea_orm::DatabaseBackend::Postgres,
-                format!(
-                    "SELECT needs_review, (SELECT COUNT(*)::bigint FROM site_parameters \
-                       WHERE site_id = '{0}' AND parameter_id = '{doc_param}') AS n \
-                     FROM site_parameters WHERE site_id = '{0}' AND parameter_id = '{doc_param}'",
-                    track.site_id
-                ),
-            ))
-            .await
-            .unwrap()
-            .expect("the site_parameter was minted");
-        (
-            row.try_get::<bool>("", "needs_review").unwrap(),
-            row.try_get::<i64>("", "n").unwrap(),
-        )
-    };
-    assert!(needs_review, "a mechanical slot awaits review");
-    assert_eq!(count, 1);
+    assert_eq!(
+        status, 200,
+        "the declared slot admits the same save: {saved}"
+    );
 
     // The reading landed attributed, and a second save reuses the slot.
     let attributed = crate::common::e2e::count(
@@ -559,7 +573,7 @@ async fn a_first_save_provisions_the_site_parameter() {
         ),
     )
     .await;
-    assert_eq!(slots, 1, "the second save reuses the provisioned slot");
+    assert_eq!(slots, 1, "the second save reuses the declared slot");
 }
 
 /// A run records the visit it was calculated for. Saving it at another station, or onto another

@@ -80,6 +80,20 @@ pub async fn count(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
     .unwrap_or_else(|e| panic!("count query has no i64 first column: {e}\n{sql}"))
 }
 
+/// The first column of a single-row query, as text.
+pub async fn scalar(db: &sea_orm::DatabaseConnection, sql: &str) -> String {
+    use sea_orm::{ConnectionTrait, Statement};
+    db.query_one_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql.to_string(),
+    ))
+    .await
+    .unwrap_or_else(|e| panic!("scalar query failed: {e}\n{sql}"))
+    .unwrap_or_else(|| panic!("scalar query returned no row: {sql}"))
+    .try_get_by_index::<String>(0)
+    .unwrap_or_else(|e| panic!("scalar query has no text first column: {e}\n{sql}"))
+}
+
 /// Percent-encode a CrudCrate `filter` value for use in a query string.
 pub fn percent_encode(s: &str) -> String {
     s.bytes()

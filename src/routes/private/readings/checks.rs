@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use axum::{Json, extract::State};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, EntityTrait, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -402,13 +402,8 @@ pub async fn seasonal_check(
     if req.values.is_empty() {
         return Err(AppError::BadRequest("No values to check".to_string()));
     }
-    let site_exists = state
-        .db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT 1 AS one FROM sites WHERE id = $1",
-            [req.site_id.into()],
-        ))
+    let site_exists = crate::routes::private::sites::Entity::find_by_id(req.site_id)
+        .one(&state.db)
         .await?
         .is_some();
     if !site_exists {

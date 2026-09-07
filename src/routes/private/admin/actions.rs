@@ -2,6 +2,7 @@ use axum::{
     Json,
     extract::{Query, State},
 };
+use sea_orm::FromQueryResult;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use utoipa::{IntoParams, ToSchema};
@@ -507,26 +508,17 @@ pub async fn rollback_deployment(
 
     // A deployment is always at a site, so its project is the site's. This deletes the row, the
     // same destruction `DELETE /sensor_deployments/{id}` performs under `enforce_scope_on_crud`.
-    let deployment_site: Uuid = target
-        .try_get("", "site_id")
+    // `deployed_until` is the boundary the rolled-back deployment vacates; the previous one
+    // re-extends to it (NULL = the target was open-ended, so the previous reopens open-ended too).
+    let target = RollbackTargetRow::from_query_result(&target, "")
         .map_err(|e| AppError::Internal(format!("{e}")))?;
-    let owner = project_of_site(db, deployment_site).await?;
+    let owner = project_of_site(db, target.site_id).await?;
     confine_target(&scope, &owner, Unowned::Deny, "deployment")?;
 
-    let sensor_id: Uuid = target
-        .try_get("", "sensor_id")
-        .map_err(|e| AppError::Internal(format!("{e}")))?;
-    let parameter_id: Uuid = target
-        .try_get("", "parameter_id")
-        .map_err(|e| AppError::Internal(format!("{e}")))?;
-    let target_deployed_from: chrono::DateTime<chrono::FixedOffset> = target
-        .try_get("", "deployed_from")
-        .map_err(|e| AppError::Internal(format!("{e}")))?;
-    // The boundary the rolled-back deployment vacates, the previous deployment re-extends to here
-    // (NULL = the target was open-ended, so the previous reopens open-ended too).
-    let target_deployed_until: Option<chrono::DateTime<chrono::FixedOffset>> = target
-        .try_get("", "deployed_until")
-        .map_err(|e| AppError::Internal(format!("{e}")))?;
+    let sensor_id = target.sensor_id;
+    let parameter_id = target.parameter_id;
+    let target_deployed_from = target.deployed_from;
+    let target_deployed_until = target.deployed_until;
 
     // 2. Find the previous deployment for the same sensor AND THE SAME PARAMETER, on a multi-channel
     //    instrument the immediately-prior deployment by time could belong to a different channel;
@@ -547,8 +539,12 @@ pub async fn rollback_deployment(
         .await
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
-    let previous_deployment_id: Option<Uuid> =
-        previous.as_ref().and_then(|r| r.try_get("", "id").ok());
+    let previous = previous
+        .as_ref()
+        .map(|r| PreviousDeploymentRow::from_query_result(r, ""))
+        .transpose()
+        .map_err(|e| AppError::Internal(format!("{e}")))?;
+    let previous_deployment_id: Option<Uuid> = previous.as_ref().map(|p| p.id);
 
     // 3-4. Clear readings' FK to the rolled-back deployment, delete it, and reopen the previous
     //    deployment, atomically, so a mid-operation failure can't leave the deployment deleted with
@@ -587,14 +583,10 @@ pub async fn rollback_deployment(
     //    Another instrument may have moved into the window the predecessor is about to reclaim. The
     //    check runs after the DELETE above so the deployment being rolled back is not itself
     //    reported as the occupant; a conflict aborts the transaction and nothing is destroyed.
-    if let Some(prev_id) = previous_deployment_id {
-        let prev = previous.as_ref().expect("previous row present with its id");
-        let prev_site: Uuid = prev
-            .try_get("", "site_id")
-            .map_err(|e| AppError::Internal(format!("{e}")))?;
-        let prev_from: chrono::DateTime<chrono::FixedOffset> = prev
-            .try_get("", "deployed_from")
-            .map_err(|e| AppError::Internal(format!("{e}")))?;
+    if let Some(prev) = &previous {
+        let prev_id = prev.id;
+        let prev_site = prev.site_id;
+        let prev_from = prev.deployed_from;
 
         let request = slots::SlotRequest {
             site_id: prev_site,
@@ -994,6 +986,10 @@ async fn fetch_backfill_candidates(
     let project_filter = project_filter_sql(scope, "s.project_id", &mut values)
         .map(|predicate| format!("AND {predicate}"))
         .unwrap_or_default();
+    // Claimable is "no deployment covers this reading", not "no instrument names it": every
+    // non-derived row names an instrument from the moment it is written
+    // (`readings_instrument_required`), and it is the deployment the backdate supplies. A derived
+    // value carries the slot and no instrument by design, so it is never claimed.
     let sql = format!(
         r"SELECT d.id AS deployment_id, d.sensor_id, d.site_id, d.parameter_id,
                  d.deployed_from, c.target_from, c.claimable_count
@@ -1010,7 +1006,9 @@ async fn fetch_backfill_candidates(
               SELECT MIN(r.time) AS target_from, COUNT(*) AS claimable_count
               FROM readings r
               WHERE r.site_id = d.site_id AND r.parameter_id = d.parameter_id
-                AND r.sensor_id IS NULL AND r.time < d.deployed_from
+                AND r.deployment_id IS NULL
+                AND r.measurement_type IS DISTINCT FROM 'derived'
+                AND r.time < d.deployed_from
                 AND (pe.prior_end IS NULL OR r.time >= pe.prior_end)
           ) c
           WHERE d.deployed_until IS NULL AND c.claimable_count > 0
@@ -1028,18 +1026,15 @@ async fn fetch_backfill_candidates(
 
     rows.iter()
         .map(|r| -> AppResult<BackfillCandidate> {
-            let deployed_from: chrono::DateTime<chrono::FixedOffset> =
-                r.try_get("", "deployed_from")?;
-            let target_from: chrono::DateTime<chrono::FixedOffset> =
-                r.try_get("", "target_from")?;
+            let row = BackfillCandidateRow::from_query_result(r, "")?;
             Ok(BackfillCandidate {
-                deployment_id: r.try_get("", "deployment_id")?,
-                sensor_id: r.try_get("", "sensor_id")?,
-                site_id: r.try_get("", "site_id")?,
-                parameter_id: r.try_get("", "parameter_id")?,
-                deployed_from: deployed_from.with_timezone(&chrono::Utc),
-                target_from: target_from.with_timezone(&chrono::Utc),
-                claimable_count: r.try_get("", "claimable_count")?,
+                deployment_id: row.deployment_id,
+                sensor_id: row.sensor_id,
+                site_id: row.site_id,
+                parameter_id: row.parameter_id,
+                deployed_from: row.deployed_from.with_timezone(&chrono::Utc),
+                target_from: row.target_from.with_timezone(&chrono::Utc),
+                claimable_count: row.claimable_count,
             })
         })
         .collect()
@@ -1485,16 +1480,15 @@ async fn fetch_orphaned_corrections(
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
     rows.iter()
-        .map(|row| {
-            let first: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "first_time")?;
-            let last: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "last_time")?;
+        .map(|r| {
+            let row = OrphanedCorrectionRow::from_query_result(r, "")?;
             Ok(OrphanedCorrection {
-                sensor_id: row.try_get("", "sensor_id")?,
-                site_id: row.try_get("", "site_id")?,
-                parameter_id: row.try_get("", "parameter_id")?,
-                count: row.try_get("", "orphan_count")?,
-                first_time: first.with_timezone(&chrono::Utc),
-                last_time: last.with_timezone(&chrono::Utc),
+                sensor_id: row.sensor_id,
+                site_id: row.site_id,
+                parameter_id: row.parameter_id,
+                count: row.orphan_count,
+                first_time: row.first_time.with_timezone(&chrono::Utc),
+                last_time: row.last_time.with_timezone(&chrono::Utc),
             })
         })
         .collect()
@@ -1653,6 +1647,45 @@ pub async fn backfill_calibrations(
 
 // ---------------------------------------------------------------------------
 // Undeclared sd estimators
+
+/// The row shapes the raw operator-action queries return, so each mapping is checked against the
+/// SELECT that fills it rather than against a column name written twice.
+#[derive(FromQueryResult)]
+struct BackfillCandidateRow {
+    deployment_id: Uuid,
+    sensor_id: Uuid,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    deployed_from: chrono::DateTime<chrono::FixedOffset>,
+    target_from: chrono::DateTime<chrono::FixedOffset>,
+    claimable_count: i64,
+}
+
+#[derive(FromQueryResult)]
+struct OrphanedCorrectionRow {
+    sensor_id: Option<Uuid>,
+    site_id: Option<Uuid>,
+    parameter_id: Option<Uuid>,
+    orphan_count: i64,
+    first_time: chrono::DateTime<chrono::FixedOffset>,
+    last_time: chrono::DateTime<chrono::FixedOffset>,
+}
+
+#[derive(FromQueryResult)]
+struct RollbackTargetRow {
+    site_id: Uuid,
+    sensor_id: Uuid,
+    parameter_id: Uuid,
+    deployed_from: chrono::DateTime<chrono::FixedOffset>,
+    deployed_until: Option<chrono::DateTime<chrono::FixedOffset>>,
+}
+
+#[derive(FromQueryResult)]
+struct PreviousDeploymentRow {
+    id: Uuid,
+    site_id: Uuid,
+    deployed_from: chrono::DateTime<chrono::FixedOffset>,
+}
 
 #[derive(Debug, Serialize, ToSchema, sea_orm::FromQueryResult)]
 pub struct UndeclaredEstimatorSlot {

@@ -9,6 +9,7 @@ mod common;
 mod import_adopt_swap_lifecycle;
 mod instrument_kinds;
 mod instruments_overview;
+mod lab_instrument_row;
 mod list_latest_reading;
 mod multi_parameter_channel;
 mod read_endpoints;

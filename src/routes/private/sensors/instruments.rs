@@ -17,6 +17,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, sensor_in_scope};
 use crate::error::{AppError, AppResult};
+use crate::routes::private::sensors::identity::InstrumentKind;
 use crate::routes::private::sensors::{self, standard_curves};
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -53,7 +54,12 @@ pub struct InstrumentOverview {
     pub serial_number: Option<String>,
     pub manufacturer: Option<String>,
     pub model: Option<String>,
+    /// Kept as the flag has always read: everything that is not a field device. `kind` is what
+    /// says which of the three.
     pub is_lab_instrument: bool,
+    /// What this row is: `device`, `lab`, `source_parameter` or `entry_channel`. Resolved from the
+    /// stored column, falling back to the flag for a row predating the backfill.
+    pub kind: String,
     pub source_system: Option<String>,
     pub source_key: Option<String>,
     pub curves: Vec<CurveOverview>,
@@ -179,23 +185,28 @@ pub async fn get_instruments_overview(
         .collect();
     let mut instruments: Vec<InstrumentOverview> = relevant
         .into_iter()
-        .map(|s| InstrumentOverview {
-            curves: curves_by_sensor.remove(&s.id).unwrap_or_default(),
-            streams: streams_by_sensor.remove(&s.id).unwrap_or_default(),
-            id: s.id,
-            name: s.name,
-            serial_number: s.serial_number,
-            manufacturer: s.manufacturer,
-            model: s.model,
-            is_lab_instrument: s.is_lab_instrument.unwrap_or(false),
-            source_system: s.source_system,
-            source_key: s.source_key,
+        .map(|s| {
+            let kind = InstrumentKind::of(Some(s.kind.as_str()), s.is_lab_instrument);
+            InstrumentOverview {
+                curves: curves_by_sensor.remove(&s.id).unwrap_or_default(),
+                streams: streams_by_sensor.remove(&s.id).unwrap_or_default(),
+                id: s.id,
+                name: s.name,
+                serial_number: s.serial_number,
+                manufacturer: s.manufacturer,
+                model: s.model,
+                is_lab_instrument: kind.is_lab_instrument(),
+                kind: kind.as_str().to_string(),
+                source_system: s.source_system,
+                source_key: s.source_key,
+            }
         })
         .collect();
-    // Lab instruments first (they own the curves this tab exists for), then by name.
+    // Lab instruments first: they own the curves this tab exists for. `kind`, not the flag, which
+    // reads every bookkeeping row as lab too and puts them in with the spectrophotometers.
     instruments.sort_by(|a, b| {
-        b.is_lab_instrument
-            .cmp(&a.is_lab_instrument)
+        (b.kind == "lab")
+            .cmp(&(a.kind == "lab"))
             .then_with(|| a.name.cmp(&b.name))
     });
 
@@ -339,7 +350,10 @@ pub async fn get_sensor_curve_usage(
     Path(sensor_id): Path<Uuid>,
 ) -> AppResult<Json<SensorCurveUsageResponse>> {
     let db = &state.db;
-    if sensors::Entity::find_by_id(sensor_id).one(db).await?.is_none()
+    if sensors::Entity::find_by_id(sensor_id)
+        .one(db)
+        .await?
+        .is_none()
         || !sensor_in_scope(db, &scope, sensor_id).await?
     {
         return Err(AppError::NotFound("Sensor not found".to_string()));

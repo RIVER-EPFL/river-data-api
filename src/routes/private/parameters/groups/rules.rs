@@ -190,6 +190,11 @@ pub fn validate_calculation(calculation: &Calculation, members: &[Member]) -> Re
     for input in &calculation.inputs {
         match role_of(*input) {
             Some(Role::Measured | Role::EntryOnly) => {}
+            // A calculation may read an output it produces itself: that is the two-stage shape
+            // Q95 decided, where stage 1 stores one value per replicate index and stage 2 reads
+            // the family's trigger-derived mean back. Any other output stays refused, so a
+            // calculation still cannot read what a different one writes.
+            Some(Role::Output) if calculation.outputs.contains(input) => {}
             _ => {
                 return Err(Refusal::InputNotDeclared {
                     parameter_id: *input,
@@ -371,6 +376,23 @@ mod tests {
                 parameter_id: id(10)
             })
         );
+    }
+
+    /// The two-stage shape: an intermediate the calculation both writes and reads back.
+    #[test]
+    fn test_validate_calculation_admits_an_intermediate_it_produces_itself() {
+        let two_stage = Calculation {
+            group_id: id(1),
+            name: "pco2".to_string(),
+            inputs: vec![id(11), id(20)],
+            outputs: vec![id(20), id(21)],
+        };
+        let members = [
+            member(1, 11, Role::Measured),
+            member(1, 20, Role::Output),
+            member(1, 21, Role::Output),
+        ];
+        assert_eq!(validate_calculation(&two_stage, &members), Ok(()));
     }
 
     #[test]

@@ -149,7 +149,10 @@ async fn apply_and_wait(
     let (status, text) =
         crate::common::post_plan_action_with_token(app, &plan_id.to_string(), "apply", token).await;
     assert!((200..300).contains(&status), "apply ({status}): {text}");
-    assert_eq!(crate::common::jobs::wait_for_job(db, &job_id_of(&text)).await, "completed");
+    assert_eq!(
+        crate::common::jobs::wait_for_job(db, &job_id_of(&text)).await,
+        "completed"
+    );
 }
 
 #[tokio::test]
@@ -332,6 +335,92 @@ async fn a_device_instrument_is_named_after_the_slot_it_serves() {
     );
 }
 
+/// Scenario: a lab feed that reached the database the way production feeds do, through
+/// `/streams/register`, which mints its instrument at registration
+/// (`sensors::operations::resolve_or_mint_stream_instrument`).
+///
+/// Expected behaviour: Q76's Option A holds on that path too. Registration having answered the
+/// question does not leave the plan with nothing to say: the entry is reported as decided, carrying
+/// the proposal the operator overrides, rather than being silently absent from the tab. Every other
+/// test in this suite seeds by hand, so this is the only one that exercises the instrument the
+/// production path actually attaches.
+#[tokio::test]
+#[serial]
+async fn a_registered_feed_reaches_the_plan_already_decided() {
+    let (app, token, db) = setup().await;
+
+    let (status, registered) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/streams/register",
+        &serde_json::json!({
+            "source_system": SOURCE,
+            "source_key": "registered-doc",
+            "source_name": "registered-doc",
+            "measurement_type": "spot",
+            "metadata": {
+                "hierarchy": {
+                    "project": "Test River Project",
+                    "site": "Upstream Station",
+                    "parameter": "doc",
+                },
+                "units": "ppb",
+            },
+        }),
+        &token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "register ({status}): {registered}"
+    );
+    let stream = registered["id"]
+        .as_str()
+        .and_then(|s| s.parse::<Uuid>().ok())
+        .unwrap_or_else(|| panic!("no stream id: {registered}"));
+
+    // Registration attached one, which is the invariant that no reading exists without an
+    // instrument. This is what used to leave the tab with nothing to ask.
+    let attached = scalar_i64(
+        &db,
+        &format!(
+            "SELECT count(*)::bigint AS v FROM data_streams \
+              WHERE id = '{stream}' AND sensor_id IS NOT NULL"
+        ),
+    )
+    .await;
+    assert_eq!(attached, 1, "registration attached an instrument");
+
+    let plan = create_plan(&app, &token).await;
+    let entry = entry_for(&plan, stream);
+    assert_eq!(
+        entry["instrument"]["confirmed"],
+        serde_json::json!(true),
+        "the entry arrives decided rather than unanswered: {entry}"
+    );
+    // Resolved from the stream, not proposed: registration already created the instrument, so the
+    // entry names an existing one (`id` and `name`) and creates nothing. A feed whose instrument
+    // does not exist yet is the other shape, `resolved_by: "parameter"` carrying a `proposed_name`,
+    // which `an_attached_instrument_returns_to_the_plan_s_own_proposal` pins.
+    assert_eq!(
+        entry["instrument"]["resolved_by"],
+        serde_json::json!("stream"),
+        "the instrument comes from the feed itself: {entry}"
+    );
+    assert_eq!(entry["instrument"]["create"], serde_json::json!(false));
+    assert!(
+        entry["instrument"]["id"].is_string() && entry["instrument"]["name"].is_string(),
+        "and it names the instrument registration minted: {entry}"
+    );
+
+    let plan_id = plan["id"].as_str().expect("plan id").to_string();
+    let instruments = plan_instruments(&app, &token, &plan_id).await;
+    assert_eq!(
+        instruments["unassigned"].as_array().map(Vec::len),
+        Some(0),
+        "nothing is left unassigned, which is Option A: {instruments}"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn an_attached_instrument_returns_to_the_plan_s_own_proposal() {
@@ -357,8 +446,8 @@ async fn an_attached_instrument_returns_to_the_plan_s_own_proposal() {
     assert_eq!(proposed["instrument"]["confirmed"], serde_json::json!(true));
     assert_eq!(
         proposed["instrument"]["proposed_name"],
-        serde_json::json!("doc (instrdec)"),
-        "the proposal reads as an identity, not as prose"
+        serde_json::json!("doc"),
+        "the proposal is the analyte; the source is provenance and lives in source_key (M130)"
     );
 
     let (status, body) = patch_entry(
@@ -678,12 +767,135 @@ async fn a_family_entry_proposes_the_instrument_key_the_pairing_mints() {
     let entry = entry_for(&plan, stream_id);
 
     assert_ne!(
-        entry["parameter"]["name"], serde_json::json!("DOC_avg_ppb"),
+        entry["parameter"]["name"],
+        serde_json::json!("DOC_avg_ppb"),
         "the family's suggested parameter is the measurand, not the statistic column: {entry}"
     );
     assert_eq!(
         entry["instrument"]["source_key"],
         serde_json::json!(format!("{SOURCE}:DOC_avg_ppb")),
         "the proposal keys on the stream, not on the suggestion: {entry}"
+    );
+}
+
+/// One instrument serves every station measuring its parameter, so its proposed name is one name.
+/// Renaming it on any entry renames it on all of them; a name held per entry would mean the apply
+/// mints whichever of the twenty-three the plan happened to read first, and the other twenty-two
+/// display a name no row carries (B180).
+#[tokio::test]
+#[serial]
+async fn renaming_a_proposal_renames_every_entry_resolving_to_it() {
+    let (app, token, db) = setup().await;
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let third = Uuid::new_v4();
+    seed_lab_stream(&db, first, "FP1:DOC", "Station One").await;
+    seed_lab_stream(&db, second, "FP2:DOC", "Station Two").await;
+    seed_lab_stream(&db, third, "FP3:DOC", "Station Three").await;
+
+    let plan = create_plan(&app, &token).await;
+    let plan_id = plan["id"].as_str().expect("plan id").to_string();
+    let key = entry_for(&plan, first)["instrument"]["source_key"].clone();
+    for stream in [second, third] {
+        assert_eq!(
+            entry_for(&plan, stream)["instrument"]["source_key"],
+            key,
+            "every station's DOC column resolves to one instrument: {plan}"
+        );
+    }
+
+    let (status, body) = patch_entry(
+        &app,
+        &token,
+        &plan_id,
+        serde_json::json!({
+            "stream_id": first,
+            "instrument_name": "DOC analyser",
+            "instrument_confirmed": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "rename ({status}): {body}");
+
+    let renamed: serde_json::Value = serde_json::from_str(&body).expect("the plan comes back");
+    for stream in [first, second, third] {
+        let instrument = entry_for(&renamed, stream)["instrument"].clone();
+        assert_eq!(
+            instrument["name"],
+            serde_json::json!("DOC analyser"),
+            "entry {stream} still shows the old name: {instrument}"
+        );
+        assert_eq!(
+            instrument["proposed_name"],
+            serde_json::json!("DOC analyser"),
+            "and its proposal is the renamed one: {instrument}"
+        );
+    }
+
+    let listed = plan_instruments(&app, &token, &plan_id).await;
+    let named: Vec<&str> = listed["groups"]
+        .as_array()
+        .expect("groups")
+        .iter()
+        .filter_map(|g| g["name"].as_str())
+        .collect();
+    assert!(
+        named.contains(&"DOC analyser"),
+        "the tab lists the renamed instrument once: {listed}"
+    );
+}
+
+/// The lab's analyser is one machine carried to every station, so it is called `DOC`. When an
+/// instrument of that name already exists, the plan reports the collision and leaves the proposal
+/// unconfirmed: attaching would add these readings to a row that already holds data, and apply
+/// refuses an unconfirmed proposal, so the operator has to say which they meant (M130).
+#[tokio::test]
+#[serial]
+async fn a_proposal_colliding_with_an_existing_instrument_is_reported_and_left_undecided() {
+    let (app, token, db) = setup().await;
+    let existing = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO sensors (id, name, is_active, is_lab_instrument, data_frequency, created_at) \
+             VALUES ('{existing}', 'doc', true, true, 'low', now())"
+        ),
+    )
+    .await;
+
+    let stream = Uuid::new_v4();
+    seed_lab_stream(&db, stream, "FP1:DOC", "Collision Station").await;
+    let plan = create_plan(&app, &token).await;
+    let plan_id = plan["id"].as_str().expect("plan id").to_string();
+
+    let instrument = entry_for(&plan, stream)["instrument"].clone();
+    assert_eq!(
+        instrument["confirmed"],
+        serde_json::json!(false),
+        "a collision is never agreed to on the operator's behalf: {instrument}"
+    );
+    assert_eq!(
+        instrument["name_conflict"]["id"],
+        serde_json::json!(existing),
+        "the plan names the instrument it collides with: {instrument}"
+    );
+    assert_eq!(
+        instrument["name_conflict"]["has_readings"],
+        serde_json::json!(false),
+        "and whether attaching would add to readings it already holds: {instrument}"
+    );
+
+    let listed = plan_instruments(&app, &token, &plan_id).await;
+    let group = listed["groups"]
+        .as_array()
+        .expect("groups")
+        .iter()
+        .find(|g| g["name"] == serde_json::json!("doc"))
+        .cloned()
+        .unwrap_or_else(|| panic!("no group for the proposal: {listed}"));
+    assert_eq!(
+        group["name_conflict"]["id"],
+        serde_json::json!(existing),
+        "the tab carries the collision too, so the choice is where the decision is made: {group}"
     );
 }

@@ -355,10 +355,13 @@ pub async fn insert_readings_without_curve(
     }
 }
 
-/// Insert orphan readings: paired to a (site, parameter) but with NO sensor/calibration/deployment,
-/// carrying a copy of the raw value in `calibrated_value`. That is the shape historical imports
-/// left behind before an uncorrected reading was spelled NULL, and rows in it are still in the
-/// database, so the repair paths are exercised against it.
+/// Insert pre-deployment readings: paired to a (site, parameter) with no deployment and no
+/// calibration, carrying a copy of the raw value in `calibrated_value`. That is the shape
+/// historical imports left behind before an uncorrected reading was spelled NULL.
+///
+/// The instrument is not left NULL, because it cannot be: `readings_instrument_required` refuses a
+/// non-derived row without one and `readings_inherit_stream_instrument` fills it from the row's
+/// stream. What a claimable row lacks today is the deployment, which is what the backfill claims.
 pub async fn insert_orphan_readings(
     db: &DatabaseConnection,
     stream_id: Uuid,

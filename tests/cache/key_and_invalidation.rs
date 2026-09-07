@@ -63,21 +63,6 @@ async fn probe(app: &Router, uri: &str, jwt: Option<&str>) -> Probe {
     }
 }
 
-/// The global parameter ids a readings or aggregates response carries, in response order.
-fn param_ids(response: &serde_json::Value) -> Vec<String> {
-    response["parameters"]
-        .as_array()
-        .unwrap_or_else(|| panic!("no 'parameters' array in {response}"))
-        .iter()
-        .map(|p| {
-            p["parameter_id"]
-                .as_str()
-                .unwrap_or_else(|| panic!("parameter entry without parameter_id: {p}"))
-                .to_string()
-        })
-        .collect()
-}
-
 struct Slot {
     project_id: String,
     site_id: String,

@@ -306,3 +306,89 @@ async fn a_flag_dry_run_reports_what_it_would_recompute() {
         "the same closure the grid shows: {body}"
     );
 }
+
+/// Expected behaviour: the same relation, asked from four ends. A calibration of the instrument
+/// measuring temperature, the temperature slot, a stream serving it, and the calculation whose
+/// output feeds the next one all reach the same calculations the parameter does (M126).
+#[tokio::test]
+#[serial]
+async fn every_subject_naming_the_same_parameter_answers_the_same_set() {
+    let (db, app, token) = setup().await;
+
+    let names = async |query: &str| -> Vec<String> {
+        let (status, body) = crate::common::get_json_with_token(
+            &app,
+            &format!("/api/calculations/closure?{query}"),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "{query}: {body}");
+        body["calculations"]
+            .as_array()
+            .expect("calculations")
+            .iter()
+            .filter_map(|c| c["tool"].as_str().map(str::to_string))
+            .collect()
+    };
+
+    let by_parameter = names(&format!("parameter_ids={GLOBAL_PARAM_TEMP_ID}")).await;
+    assert_eq!(by_parameter, vec!["closure_a", "closure_b"], "the baseline");
+
+    // The temperature slot at the seeded site, and a stream paired to it.
+    let slot: String = crate::common::e2e::scalar(
+        &db,
+        &format!(
+            "SELECT id::text AS v FROM site_parameters \
+              WHERE site_id = '{SITE1_ID}' AND parameter_id = '{GLOBAL_PARAM_TEMP_ID}' LIMIT 1"
+        ),
+    )
+    .await;
+    assert_eq!(names(&format!("site_parameter_id={slot}")).await, by_parameter);
+
+    let stream: String = crate::common::e2e::scalar(
+        &db,
+        &format!("SELECT id::text AS v FROM data_streams WHERE site_parameter_id = '{slot}' LIMIT 1"),
+    )
+    .await;
+    assert_eq!(names(&format!("stream_id={stream}")).await, by_parameter);
+
+    // A calibration declared for the temperature parameter reaches what that parameter feeds.
+    let sensor: String = crate::common::e2e::scalar(
+        &db,
+        &format!("SELECT sensor_id::text AS v FROM data_streams WHERE id = '{stream}'"),
+    )
+    .await;
+    db.execute_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "INSERT INTO sensor_calibrations (id, sensor_id, parameter_id, slope, intercept, valid_from) \
+             VALUES ('11111111-1111-1111-1111-111111111111', '{sensor}', '{GLOBAL_PARAM_TEMP_ID}', \
+                     1.0, 0.0, '2020-01-01T00:00:00Z') ON CONFLICT (id) DO NOTHING"
+        ),
+    ))
+    .await
+    .expect("a calibration for the temperature channel");
+    assert_eq!(
+        names("calibration_id=11111111-1111-1111-1111-111111111111").await,
+        by_parameter
+    );
+
+    // A calculation is asked about by what its own outputs feed: closure_a writes what closure_b
+    // reads, so asking about closure_a reaches closure_b and not itself.
+    assert_eq!(names("calculation=closure_a").await, vec!["closure_b"]);
+}
+
+/// Expected behaviour: naming two subjects at once is refused rather than ranked.
+#[tokio::test]
+#[serial]
+async fn two_subjects_at_once_are_refused() {
+    let (_db, app, token) = setup().await;
+    let (status, body) = crate::common::get_json_with_token(
+        &app,
+        "/api/calculations/closure?calibration_id=11111111-1111-1111-1111-111111111111\
+         &stream_id=22222222-2222-2222-2222-222222222222",
+        &token,
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+}

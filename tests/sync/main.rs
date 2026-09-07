@@ -7,7 +7,6 @@
 mod common;
 
 mod annotations_register;
-mod bulk_pair;
 mod control_plane;
 mod credential_listing_gate;
 mod credentials;
@@ -18,6 +17,7 @@ mod pagination;
 mod pagination_bounds;
 mod pairing_backfill_parity;
 mod pairing_plan_apply;
+mod pairing_plan_resolution;
 mod pairing_plan_hardening;
 mod plan_instrument_decisions;
 mod plan_review_progress;

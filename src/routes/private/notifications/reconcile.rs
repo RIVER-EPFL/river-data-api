@@ -11,12 +11,11 @@ const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
 #[derive(Default)]
 pub struct SweepOutcome {
     pub revoked: usize,
-    pub deactivated: usize,
 }
 
 impl SweepOutcome {
     pub fn total(&self) -> usize {
-        self.revoked + self.deactivated
+        self.revoked
     }
 }
 
@@ -44,27 +43,6 @@ pub async fn sweep(state: &AppState) -> Result<SweepOutcome, sea_orm::DbErr> {
                 .await?;
             outcome.revoked += res.rows_affected() as usize;
             tracing::info!(sub = %sub, "push_reconcile: pruned subscriptions for revoked user");
-        }
-    }
-
-    let subscribers = db
-        .query_all_raw(Statement::from_string(
-            PG,
-            "SELECT keycloak_sub FROM notification_subscribers WHERE is_active".to_string(),
-        ))
-        .await?;
-
-    for row in subscribers {
-        let sub: String = row.try_get("", "keycloak_sub")?;
-        let resolution = state.authorizer.resolve(state, &sub).await;
-        if matches!(resolution, Some(RoleResolution::Revoked)) {
-            db.execute_raw(Statement::from_sql_and_values(
-                PG,
-                "UPDATE notification_subscribers SET is_active = false WHERE keycloak_sub = $1",
-                [sub.into()],
-            ))
-            .await?;
-            outcome.deactivated += 1;
         }
     }
 

@@ -6,6 +6,7 @@
 #[allow(dead_code, unused_imports)]
 mod common;
 
+mod apply_group;
 mod create_flags;
 mod declare_sd_estimator;
 mod minimal_create;

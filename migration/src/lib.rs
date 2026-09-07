@@ -31,6 +31,10 @@ pub mod m20260910_000007_site_parameter_entry_mode;
 pub mod m20260910_000008_formula_curve_slot;
 mod m20260910_000009_slot_instrument;
 pub mod m20260910_000010_formula_per_replicate;
+mod m20260910_000011_prediction_kind_group;
+pub mod m20260910_000012_drop_subscriber_cache;
+mod m20260910_000013_ingested_at_is_first_arrival;
+pub mod m20260910_000014_derived_definition_versions;
 pub mod portal_seed;
 
 pub struct Migrator;
@@ -70,6 +74,10 @@ impl MigratorTrait for Migrator {
             Box::new(m20260910_000008_formula_curve_slot::Migration),
             Box::new(m20260910_000009_slot_instrument::Migration),
             Box::new(m20260910_000010_formula_per_replicate::Migration),
+            Box::new(m20260910_000011_prediction_kind_group::Migration),
+            Box::new(m20260910_000012_drop_subscriber_cache::Migration),
+            Box::new(m20260910_000013_ingested_at_is_first_arrival::Migration),
+            Box::new(m20260910_000014_derived_definition_versions::Migration),
         ]
     }
 }

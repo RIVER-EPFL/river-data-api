@@ -137,7 +137,10 @@ async fn sensor_curve_usage_reports_per_curve_counts() {
 
     let mut curve_ids = Vec::new();
     let mut sensor_id = String::new();
-    for (key, name) in [("standard_curves:7", "used"), ("standard_curves:8", "unused")] {
+    for (key, name) in [
+        ("standard_curves:7", "used"),
+        ("standard_curves:8", "unused"),
+    ] {
         let (status, curve) = crate::common::post_json_parse_with_token(
             &fx.app,
             "/api/standard_curves/register",
@@ -197,7 +200,11 @@ async fn sensor_curve_usage_reports_per_curve_counts() {
     .await;
     assert_eq!(status, 200, "curve usage ({status}): {usage}");
     let rows = usage["usage"].as_array().unwrap();
-    assert_eq!(rows.len(), 2, "every curve on the instrument is reported: {usage}");
+    assert_eq!(
+        rows.len(),
+        2,
+        "every curve on the instrument is reported: {usage}"
+    );
 
     let used = rows
         .iter()
@@ -213,4 +220,86 @@ async fn sensor_curve_usage_reports_per_curve_counts() {
         .expect("a curve nothing was corrected with is reported at zero");
     assert_eq!(unused["reading_count"], 0, "{usage}");
     assert_eq!(unused["first_used"], json!(null), "{usage}");
+}
+
+/// One row per kind, all four carrying `is_lab_instrument = true` as three of the minting paths
+/// leave it, so the flag alone cannot order this list: only the `lab` row belongs at the top.
+#[tokio::test]
+#[serial]
+async fn the_lab_grouping_reads_the_kind_and_not_the_flag() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    for (name, kind) in [
+        ("zeta entry channel", "entry_channel"),
+        ("alpha source parameter", "source_parameter"),
+        ("mu spectrophotometer", "lab"),
+        ("beta probe", "device"),
+    ] {
+        let (status, curve) = crate::common::post_json_parse_with_token(
+            &app,
+            "/api/standard_curves/register",
+            &json!({
+                "source_system": "cnet",
+                "source_key": format!("kinds:{kind}"),
+                "instrument_label": name,
+                "slope": 1.0,
+                "intercept": 0.0,
+                "name": format!("{name} curve"),
+                "fitted_on": "2025-01-01",
+            }),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "{curve}");
+        // The register mints every curve label as `lab`; restating the kind here is what puts one
+        // row of each on the list, which is the shape the ordering has to survive. The instrument
+        // the register minted is keyed by its label, not by the curve's own source key.
+        crate::common::exec(
+            &db,
+            &format!(
+                "UPDATE sensors SET kind = '{kind}', is_lab_instrument = TRUE \
+                 WHERE source_system = 'cnet' AND source_key = 'cnet:{name}'"
+            ),
+        )
+        .await;
+    }
+
+    let (status, body) =
+        crate::common::get_with_token(&app, "/api/instruments/overview", &token).await;
+    assert_eq!(status, 200, "{body}");
+    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let listed: Vec<(String, String)> = resp["instruments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| {
+            i["source_system"].as_str() == Some("cnet")
+                && i["source_key"]
+                    .as_str()
+                    .is_some_and(|k| k.starts_with("cnet:"))
+        })
+        .map(|i| {
+            (
+                i["kind"].as_str().unwrap_or_default().to_string(),
+                i["name"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(listed.len(), 4, "every kind is listed: {resp}");
+    assert_eq!(
+        listed[0].0, "lab",
+        "the lab instrument sorts first; the flag would have put all four there: {listed:?}"
+    );
+    assert!(
+        listed[1..].iter().all(|(kind, _)| kind != "lab"),
+        "and nothing else claims to be lab: {listed:?}"
+    );
+    let rest: Vec<&String> = listed[1..].iter().map(|(_, name)| name).collect();
+    let mut sorted = rest.clone();
+    sorted.sort();
+    assert_eq!(rest, sorted, "the rest stay ordered by name: {listed:?}");
 }
