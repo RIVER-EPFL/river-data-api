@@ -119,6 +119,10 @@ pub struct ReadingFacet {
     pub unverified: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ingested_at: Option<DateTime<Utc>>,
+    /// Where this value came from, one of `PROVENANCE_KINDS`. A `sync` or `derived` row's story is
+    /// resolved from the stream, the receipt and the definition; the others carry a stored blob.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub calibration: Option<CalibrationRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -313,6 +317,101 @@ pub fn classify_source(source_system: &str) -> &'static str {
     }
 }
 
+/// Where a reading came from, as the row itself records it.
+///
+/// Q49: a blob is stored only where nothing else records the story (a tool run, a chain, a CSV
+/// import, a hand entry, a batch); a sync or derived reading's story is resolved from the stream,
+/// the covering receipt and the definition. The discriminator is stored on every row either way,
+/// so an origin nothing recorded is a named kind rather than a NULL blob.
+pub const PROVENANCE_KINDS: [&str; 8] = [
+    "tool_run",
+    "chain",
+    "csv_import",
+    "manual",
+    "batch",
+    "sync",
+    "derived",
+    "migration",
+];
+
+/// The kind a writer with no better evidence stamps, from the row's own classification and the
+/// stream it arrived on. Mirrors `readings_default_provenance_kind`, the trigger that holds the
+/// column total for a writer that names none.
+#[must_use]
+pub fn provenance_kind_for_stream(
+    measurement_type: Option<&str>,
+    source_system: Option<&str>,
+) -> &'static str {
+    if measurement_type == Some("derived") {
+        return "derived";
+    }
+    match source_system {
+        Some("grab_sample") => "manual",
+        Some("api") => "batch",
+        Some(_) => "sync",
+        None => "migration",
+    }
+}
+
+/// The kind of a save that names a tool run, from the run's own minting path
+/// (`tool_runs.source`). A hand entry that names no run is `manual`.
+#[must_use]
+pub fn provenance_kind_for_run(run_source: Option<&str>) -> &'static str {
+    match run_source {
+        None => "manual",
+        Some("chain") => "chain",
+        Some("csv_import") => "csv_import",
+        Some(_) => "tool_run",
+    }
+}
+
+/// Whether a reading's provenance is untold: nothing on the row records where it came from, and
+/// nothing it points at can be asked.
+///
+/// The kinds that store a blob are only as good as the blob; `sync` and `derived` are resolved, so
+/// what they need is a referent that answers; `manual` is complete on its own (the person, the
+/// time and the check are on the row); `migration` is the name for an origin nobody recorded, so
+/// it is untold by definition and is what the count is mostly about.
+#[must_use]
+pub fn provenance_untold(kind: Option<&str>, has_blob: bool, referent_resolves: bool) -> bool {
+    match kind {
+        None | Some("migration") => true,
+        Some("tool_run" | "chain" | "csv_import") => !has_blob,
+        Some("derived") => !referent_resolves,
+        _ => false,
+    }
+}
+
+/// The readings [`provenance_untold`] holds, as one statement. Report-only: which side is wrong is
+/// a question about the writer, not something a sweep may decide.
+#[must_use]
+pub fn untold_rows_sql() -> String {
+    "SELECT r.stream_id, r.time, r.replicate_index, r.provenance_kind
+       FROM readings r
+      WHERE r.provenance_kind IS NULL
+         OR r.provenance_kind = 'migration'
+         OR (r.provenance_kind IN ('tool_run', 'chain', 'csv_import') AND r.provenance IS NULL)
+         OR (r.provenance_kind = 'derived' AND NOT EXISTS (
+                SELECT 1 FROM derived_parameter_definitions d
+                 WHERE d.output_parameter_id = r.parameter_id))"
+        .to_string()
+}
+
+/// How many readings say nothing about where they came from. The janitor reports it; nothing
+/// repairs it.
+pub async fn untold_count<C: sea_orm::ConnectionTrait>(conn: &C) -> crate::error::AppResult<i64> {
+    let row = conn
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT count(*)::bigint AS n FROM ({}) untold", untold_rows_sql()),
+        ))
+        .await?
+        .ok_or_else(|| {
+            crate::error::AppError::Internal("counting untold provenance returned no row".to_string())
+        })?;
+    Ok(row.try_get("", "n")?)
+}
+
 pub struct RawRow {
     stream_id: Uuid,
     replicate_index: i16,
@@ -333,6 +432,7 @@ pub struct RawRow {
     unverified: Option<bool>,
     withdrawn_reason: Option<String>,
     ingested_at: Option<DateTime<Utc>>,
+    provenance_kind: Option<String>,
     provenance: Option<serde_json::Value>,
     label: Option<String>,
     notes: Option<String>,
@@ -342,8 +442,8 @@ pub struct RawRow {
 const ROW_COLUMNS: &str = "stream_id, replicate_index, site_id, parameter_id, raw_value, \
      calibrated_value, sensor_id, calibration_id, standard_curve_id, deployment_id, \
      measurement_type, is_flagged, flag_reason, sample_id, collection_event_id, \
-     withdrawn_at, withdrawn_reason, unverified, ingested_at, provenance, label, notes, \
-     created_by";
+     withdrawn_at, withdrawn_reason, unverified, ingested_at, provenance_kind, provenance, \
+     label, notes, created_by";
 
 fn decode_row(row: &sea_orm::QueryResult) -> Result<RawRow, sea_orm::DbErr> {
     let fixed = |name: &str| -> Option<DateTime<Utc>> {
@@ -372,6 +472,7 @@ fn decode_row(row: &sea_orm::QueryResult) -> Result<RawRow, sea_orm::DbErr> {
         unverified: row.try_get("", "unverified")?,
         withdrawn_reason: row.try_get("", "withdrawn_reason")?,
         ingested_at: fixed("ingested_at"),
+        provenance_kind: row.try_get("", "provenance_kind")?,
         provenance: row.try_get("", "provenance")?,
         label: row.try_get("", "label")?,
         notes: row.try_get("", "notes")?,
@@ -604,6 +705,7 @@ pub async fn assemble_records(
                 unverified: r.unverified.unwrap_or(false),
                 withdrawn_reason: r.withdrawn_reason.clone(),
                 ingested_at: r.ingested_at,
+                provenance_kind: r.provenance_kind.clone(),
                 calibration: r.calibration_id.and_then(|id| {
                     calibration_map.get(&id).map(|c| CalibrationRef {
                         id: c.id,
@@ -932,4 +1034,77 @@ async fn slot_identity(
         row.try_get("", "units")?,
         row.try_get("", "decimal_places")?,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PROVENANCE_KINDS, provenance_kind_for_run, provenance_kind_for_stream};
+
+    #[test]
+    fn test_a_row_that_records_nothing_is_untold() {
+        assert!(super::provenance_untold(None, false, false));
+        assert!(super::provenance_untold(Some("migration"), true, true));
+    }
+
+    #[test]
+    fn test_a_stored_kind_is_only_as_good_as_its_blob() {
+        assert!(super::provenance_untold(Some("tool_run"), false, true));
+        assert!(super::provenance_untold(Some("chain"), false, true));
+        assert!(super::provenance_untold(Some("csv_import"), false, true));
+        assert!(!super::provenance_untold(Some("tool_run"), true, false));
+    }
+
+    #[test]
+    fn test_a_resolved_kind_wants_a_referent_that_answers() {
+        assert!(super::provenance_untold(Some("derived"), false, false));
+        assert!(!super::provenance_untold(Some("derived"), false, true));
+        assert!(
+            !super::provenance_untold(Some("sync"), false, false),
+            "a sync row's story is its stream and the receipt covering the instant, which the FK \
+             guarantees is there"
+        );
+        assert!(
+            !super::provenance_untold(Some("manual"), false, false),
+            "a hand entry is complete on the row: the person, the time and the check"
+        );
+        assert!(!super::provenance_untold(Some("batch"), false, false));
+    }
+
+    #[test]
+    fn test_provenance_kind_for_stream_matches_the_trigger_rule() {
+        assert_eq!(provenance_kind_for_stream(Some("derived"), Some("cnet")), "derived");
+        assert_eq!(provenance_kind_for_stream(Some("spot"), Some("grab_sample")), "manual");
+        assert_eq!(provenance_kind_for_stream(None, Some("api")), "batch");
+        assert_eq!(provenance_kind_for_stream(Some("continuous"), Some("vaisala")), "sync");
+    }
+
+    #[test]
+    fn test_a_stream_that_proves_nothing_is_stamped_migration() {
+        assert_eq!(provenance_kind_for_stream(None, None), "migration");
+    }
+
+    #[test]
+    fn test_provenance_kind_for_run_follows_the_minting_path() {
+        assert_eq!(provenance_kind_for_run(None), "manual");
+        assert_eq!(provenance_kind_for_run(Some("interactive")), "tool_run");
+        assert_eq!(provenance_kind_for_run(Some("chain")), "chain");
+        assert_eq!(provenance_kind_for_run(Some("csv_import")), "csv_import");
+    }
+
+    #[test]
+    fn test_every_kind_a_writer_can_stamp_is_a_declared_kind() {
+        for kind in [
+            provenance_kind_for_stream(Some("derived"), None),
+            provenance_kind_for_stream(None, Some("grab_sample")),
+            provenance_kind_for_stream(None, Some("api")),
+            provenance_kind_for_stream(None, Some("vaisala")),
+            provenance_kind_for_stream(None, None),
+            provenance_kind_for_run(None),
+            provenance_kind_for_run(Some("interactive")),
+            provenance_kind_for_run(Some("chain")),
+            provenance_kind_for_run(Some("csv_import")),
+        ] {
+            assert!(PROVENANCE_KINDS.contains(&kind), "{kind} is not a declared kind");
+        }
+    }
 }

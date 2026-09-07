@@ -8,6 +8,7 @@ mod common;
 
 mod alarm_backfill_slots;
 mod cancel;
+mod failure_events;
 mod job_log_tail;
 mod job_logs_and_detail;
 mod job_tracking_on_actions;
@@ -18,6 +19,7 @@ mod retention;
 mod retry_backoff;
 mod schedule_control;
 mod schedule_routes;
+mod shutdown_drain;
 mod sync_full_reassert;
 mod scheduler;
 mod sync_maintenance;

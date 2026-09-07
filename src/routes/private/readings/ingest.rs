@@ -584,6 +584,7 @@ pub async fn ingest_readings(
                 standard_curve_id: Set(standard.map(|c| c.id)),
                 collection_event_id: Set(None),
                 provenance: Set(None),
+                provenance_kind: Set(Some("sync".to_string())),
                 label: Set(None),
                 notes: Set(None),
                 created_by: Set(None),

@@ -877,6 +877,7 @@ pub async fn insert_batch_readings(
                 standard_curve_id: Set(r.standard_curve_id),
                 collection_event_id: Set(None),
                 provenance: Set(None),
+                provenance_kind: Set(Some("batch".to_string())),
                 label: Set(None),
                 notes: Set(None),
                 created_by: Set(None),

@@ -195,38 +195,41 @@ async fn commit_terminal(
 /// On a retryable failure, durably reschedule (`status='queued'`, future `next_attempt_at` with
 /// exponential backoff) until the retry budget is spent, then fail. Ownership-guarded. The backoff is
 /// computed in SQL from the *current* `retry_count` so it survives restarts (no in-process timer).
+/// Returns the status the row landed on, or `None` when another worker owned it.
 async fn reschedule_or_fail(
     db: &DatabaseConnection,
     claimed: &Claimed,
     worker_id: &str,
     policy: RetryPolicy,
     error_message: &str,
-) -> Result<(), sea_orm::DbErr> {
+) -> Result<Option<String>, sea_orm::DbErr> {
     let max_retries = i64::from(policy.max_retries);
     let backoff_base = policy.backoff_base.as_secs() as i64;
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "UPDATE reprocessing_jobs \
-         SET status = CASE WHEN retry_count < $1 THEN 'queued' ELSE 'failed' END, \
-             retry_count = retry_count + 1, \
-             error_message = $2, \
-             next_attempt_at = CASE WHEN retry_count < $1 \
-                 THEN now() + (interval '1 second' * ($3 * power(2, retry_count))) \
-                 ELSE next_attempt_at END, \
-             completed_at = CASE WHEN retry_count < $1 THEN NULL ELSE now() END, \
-             owner = NULL, lease_expires_at = NULL \
-         WHERE id = $4 AND owner = $5 AND lease_epoch = $6",
-        [
-            max_retries.into(),
-            error_message.into(),
-            backoff_base.into(),
-            claimed.id.into(),
-            worker_id.into(),
-            claimed.lease_epoch.into(),
-        ],
-    ))
-    .await?;
-    Ok(())
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE reprocessing_jobs \
+             SET status = CASE WHEN retry_count < $1 THEN 'queued' ELSE 'failed' END, \
+                 retry_count = retry_count + 1, \
+                 error_message = $2, \
+                 next_attempt_at = CASE WHEN retry_count < $1 \
+                     THEN now() + (interval '1 second' * ($3 * power(2, retry_count))) \
+                     ELSE next_attempt_at END, \
+                 completed_at = CASE WHEN retry_count < $1 THEN NULL ELSE now() END, \
+                 owner = NULL, lease_expires_at = NULL \
+             WHERE id = $4 AND owner = $5 AND lease_epoch = $6 \
+             RETURNING status",
+            [
+                max_retries.into(),
+                error_message.into(),
+                backoff_base.into(),
+                claimed.id.into(),
+                worker_id.into(),
+                claimed.lease_epoch.into(),
+            ],
+        ))
+        .await?;
+    row.map(|r| r.try_get::<String>("", "status")).transpose()
 }
 
 /// Run a single claimed job to its terminal (or rescheduled) state. Separated from [`run`] so tests
@@ -241,15 +244,15 @@ async fn execute(
 ) -> Result<(), sea_orm::DbErr> {
     let Some(job) = registry.get(&claimed.trigger_type) else {
         // No handler, fail rather than let the reaper reclaim it forever.
-        commit_terminal(
-            db,
-            &claimed,
-            worker_id,
-            "failed",
-            None,
-            Some("no handler registered for trigger_type"),
-        )
-        .await?;
+        const NO_HANDLER: &str = "no handler registered for trigger_type";
+        if commit_terminal(db, &claimed, worker_id, "failed", None, Some(NO_HANDLER)).await? {
+            let _ = events.send(crate::common::AppEvent::JobCompleted {
+                job_id: claimed.id,
+                status: "failed".to_string(),
+                readings_updated: None,
+                error_message: Some(NO_HANDLER.to_string()),
+            });
+        }
         return Ok(());
     };
 
@@ -317,7 +320,31 @@ async fn execute(
             }
         }
         Err(e) => {
-            reschedule_or_fail(db, &claimed, worker_id, policy, &e.to_string()).await?;
+            let message = e.to_string();
+            // Announce the failure the way the success arm announces completion: a watcher that only
+            // sees `JobCompleted` learns nothing of a run that failed or is waiting out its backoff.
+            match reschedule_or_fail(db, &claimed, worker_id, policy, &message)
+                .await?
+                .as_deref()
+            {
+                Some("failed") => {
+                    let _ = events.send(crate::common::AppEvent::JobCompleted {
+                        job_id: claimed.id,
+                        status: "failed".to_string(),
+                        readings_updated: None,
+                        error_message: Some(message),
+                    });
+                }
+                Some(_) => {
+                    let _ = events.send(crate::common::AppEvent::JobProgress {
+                        job_id: claimed.id,
+                        status: "retrying".to_string(),
+                        progress: None,
+                        total: None,
+                    });
+                }
+                None => {}
+            }
         }
     }
     Ok(())
@@ -370,9 +397,9 @@ pub async fn drain(
     Ok(())
 }
 
-/// This replica's worker loop: drain claimable work, then idle-poll. Runs until `shutdown` resolves,
-/// at which point it stops claiming and returns so in-flight work finishes within the k8s grace
-/// window (anything killed is recovered by lease expiry).
+/// This replica's worker loop: drain claimable work, then idle-poll. `shutdown` stops the worker
+/// claiming anything new; the job already claimed runs to completion first, so a rolled pod hands
+/// back finished work rather than a part-written row holding its lease until the reaper takes it.
 pub async fn run(
     db: DatabaseConnection,
     events: crate::common::EventSender,
@@ -383,22 +410,27 @@ pub async fn run(
     tracing::info!(worker_id = %wid, "job worker started");
     tokio::pin!(shutdown);
     loop {
-        tokio::select! {
-            biased;
-            () = &mut shutdown => {
-                tracing::info!(worker_id = %wid, "job worker draining on shutdown");
-                return;
+        // Never race the shutdown against the work: `select!` drops the loser, which would abandon
+        // a claimed job at whatever await point it had reached.
+        let idle = match run_one(&db, &events, &registry, &wid).await {
+            Ok(ran) => !ran,
+            Err(e) => {
+                tracing::warn!(error = %e, worker_id = %wid, "worker cycle failed");
+                true
             }
-            ran = run_one(&db, &events, &registry, &wid) => {
-                match ran {
-                    Ok(true) => continue, // drain: immediately try the next
-                    Ok(false) => tokio::time::sleep(Duration::from_secs(POLL_SECONDS)).await,
-                    Err(e) => {
-                        tracing::warn!(error = %e, worker_id = %wid, "worker cycle failed");
-                        tokio::time::sleep(Duration::from_secs(POLL_SECONDS)).await;
-                    }
+        };
+        if idle {
+            tokio::select! {
+                biased;
+                () = &mut shutdown => {
+                    tracing::info!(worker_id = %wid, "job worker stopping on shutdown");
+                    return;
                 }
+                () = tokio::time::sleep(Duration::from_secs(POLL_SECONDS)) => {}
             }
+        } else if (&mut shutdown).now_or_never().is_some() {
+            tracing::info!(worker_id = %wid, "job worker stopping on shutdown, claimed job finished");
+            return;
         }
     }
 }

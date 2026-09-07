@@ -9,32 +9,7 @@
 
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use serial_test::serial;
-use std::time::Duration;
 use uuid::Uuid;
-
-/// Poll `reprocessing_jobs` until the most recent `alarm_backfill` job reaches a terminal state.
-/// Returns the terminal status. Panics on timeout.
-async fn wait_for_alarm_backfill(db: &sea_orm::DatabaseConnection) -> String {
-    for _ in 0..150 {
-        let row = db
-            .query_one_raw(Statement::from_string(
-                DatabaseBackend::Postgres,
-                "SELECT status FROM reprocessing_jobs WHERE trigger_type = 'alarm_backfill' \
-                 ORDER BY created_at DESC LIMIT 1"
-                    .to_string(),
-            ))
-            .await
-            .unwrap();
-        if let Some(r) = row {
-            let status: String = r.try_get("", "status").unwrap();
-            if status == "completed" || status == "failed" {
-                return status;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    panic!("alarm_backfill job did not reach a terminal state within 30s");
-}
 
 /// (max_severity, resolved) for every alarm event at SITE1/Turbidity, ordered by start.
 async fn turbidity_episodes(db: &sea_orm::DatabaseConnection) -> Vec<(i16, bool)> {
@@ -99,7 +74,7 @@ async fn csv_import_triggers_alarm_backfill_with_warnings_and_alarms() {
         "all five rows should map to Turbidity and insert: {body}"
     );
 
-    let job_status = wait_for_alarm_backfill(&db).await;
+    let job_status = crate::common::jobs::wait_for_triggered_job(&db, "alarm_backfill", None).await;
     assert_eq!(
         job_status, "completed",
         "alarm_backfill job should complete"
@@ -197,7 +172,7 @@ async fn rebuild_alarm_events_action_is_idempotent() {
         )
         .await;
         assert!((200..300).contains(&status), "rebuild ({status}): {body}");
-        wait_for_alarm_backfill(&db).await
+        crate::common::jobs::wait_for_triggered_job(&db, "alarm_backfill", None).await
     };
 
     assert_eq!(rebuild().await, "completed");

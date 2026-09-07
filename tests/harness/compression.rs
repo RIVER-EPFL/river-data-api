@@ -92,3 +92,31 @@ async fn test_decompression_cap_rejects_unguarded_update_on_compressed_chunk() {
 
     cleanup_test_db(&db).await;
 }
+
+/// Scenario: the harness has taken the database.
+///
+/// Expected behaviour: TimescaleDB's own compression policies are gone. Left running, the
+/// scheduler fires one inside a test window and deadlocks against the cleanup TRUNCATE, which
+/// costs one test per run and reads as a defect in whatever test happened to be next.
+#[tokio::test]
+#[serial]
+async fn no_background_policy_runs_against_the_suite() {
+    let db = crate::common::setup_test_db().await;
+
+    let remaining: i64 = db
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::bigint AS n FROM timescaledb_information.jobs \
+              WHERE proc_name = 'policy_compression'"
+                .to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("a row")
+        .try_get("", "n")
+        .expect("count");
+    assert_eq!(
+        remaining, 0,
+        "a compression policy left scheduled deadlocks the next cleanup"
+    );
+}

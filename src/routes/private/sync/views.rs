@@ -1554,6 +1554,10 @@ pub struct PairingPlanSummary {
     summary: serde_json::Value,
     created_at: chrono::DateTime<chrono::FixedOffset>,
     applied_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    /// Streams of this source that are unpaired now and not in the plan, so a draft built while a
+    /// sync service was still registering says how much of the source it leaves behind. Counted for
+    /// a draft only; a plan that has been applied or superseded is history.
+    uncovered_streams: Option<i64>,
 }
 
 /// List pairing plans, newest first, optionally narrowed to one source system or one status
@@ -1612,23 +1616,55 @@ pub async fn list_pairing_plans(
         .all(&state.db)
         .await?;
 
-    Ok(Json(
-        rows.into_iter()
-            .map(
-                |(id, source_system, status, created_by, summary, created_at, applied_at)| {
-                    PairingPlanSummary {
-                        id,
-                        source_system,
-                        status,
-                        created_by,
-                        summary,
-                        created_at,
-                        applied_at,
-                    }
-                },
-            )
-            .collect(),
-    ))
+    let mut listing = Vec::with_capacity(rows.len());
+    for (id, source_system, status, created_by, summary, created_at, applied_at) in rows {
+        let uncovered = if status == "draft" {
+            uncovered_stream_count(&state.db, id, &source_system).await?
+        } else {
+            None
+        };
+        listing.push(PairingPlanSummary {
+            id,
+            source_system,
+            status,
+            created_by,
+            summary,
+            created_at,
+            applied_at,
+            uncovered_streams: uncovered,
+        });
+    }
+
+    Ok(Json(listing))
+}
+
+/// Streams a draft does not cover: unpaired now, plannable (`create_plan` skips a legacy single
+/// superseded by its `:reps` family), and named by no entry. The plan's own entries decide it, so
+/// the count is exact where comparing entry totals with a stream total is not: a replicate family
+/// is one entry over several source columns.
+async fn uncovered_stream_count(
+    db: &sea_orm::DatabaseConnection,
+    plan_id: Uuid,
+    source_system: &str,
+) -> AppResult<Option<i64>> {
+    use sea_orm::{ConnectionTrait, Statement};
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT count(*) AS n
+              FROM data_streams ds
+             WHERE ds.source_system = $2
+               AND ds.site_parameter_id IS NULL
+               AND NOT EXISTS (SELECT 1 FROM data_streams fam
+                                WHERE fam.source_system = ds.source_system
+                                  AND fam.source_key = ds.source_key || ':reps')
+               AND ds.id NOT IN (SELECT (e ->> 'stream_id')::uuid
+                                   FROM pairing_plans p, jsonb_array_elements(p.entries) e
+                                  WHERE p.id = $1)",
+            [plan_id.into(), source_system.into()],
+        ))
+        .await?;
+    Ok(row.and_then(|r| r.try_get::<i64>("", "n").ok()))
 }
 
 /// Mark a draft superseded, which is what Start over does to the draft it replaces: the decisions

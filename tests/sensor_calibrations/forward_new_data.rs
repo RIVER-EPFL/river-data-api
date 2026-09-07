@@ -17,10 +17,9 @@
 
 use axum::Router;
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::DatabaseConnection;
 use serde_json::json;
 use serial_test::serial;
-use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::common::e2e::{self, hourly_bucket, poll_job, refresh_hourly};
@@ -28,7 +27,6 @@ use crate::common::keycloak as kc;
 use crate::common::sensor_lifecycle::{ReadingRow, dt, get_readings};
 use crate::common::tracks;
 
-const JOB_WAIT: Duration = Duration::from_secs(30);
 
 /// C1 opens on the day Track B's deployment opens.
 const T0: &str = "2025-06-02T00:00:00Z";
@@ -85,43 +83,6 @@ async fn ingest_cycle(app: &Router, token: &str, stream_id: &str, rows: &[(&str,
         Some(rows.len() as u64),
         "every reading in the cycle is stored: {parsed}"
     );
-}
-
-/// Wait for the tracked job a specific entity triggered. Keyed on `trigger_id` (the calibration's
-/// own id), not merely on `trigger_type`: an earlier calibration's job already satisfies the
-/// type-wide helper, so it would report success even if this create enqueued nothing.
-async fn wait_for_job(
-    db: &DatabaseConnection,
-    trigger_type: &str,
-    trigger_id: &str,
-    timeout: Duration,
-) -> Option<String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT status FROM reprocessing_jobs \
-                 WHERE trigger_type = $1 AND trigger_id = $2::uuid",
-                [trigger_type.into(), trigger_id.into()],
-            ))
-            .await
-            .expect("query reprocessing_jobs");
-        let status: Option<String> = row.and_then(|r| r.try_get::<String>("", "status").ok());
-        let settled = matches!(
-            status.as_deref(),
-            Some("completed" | "failed" | "cancelled")
-        );
-        if settled {
-            return status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{trigger_type} job for {trigger_id} still {status:?} after {}s",
-            timeout.as_secs()
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
 }
 
 /// A sensor's calibrations, oldest window first.
@@ -305,10 +266,9 @@ async fn arrange(db: &DatabaseConnection, app: &Router, admin: &str) -> Fixture 
     let c1_uuid = Uuid::parse_str(&c1_id).expect("calibration id is a uuid");
 
     assert_eq!(
-        wait_for_job(db, "calibration_create", &c1_id, JOB_WAIT)
-            .await
-            .as_deref(),
-        Some("completed"),
+        crate::common::jobs::wait_for_triggered_job(db, "calibration_create", Some(&c1_id))
+            .await,
+        "completed",
         "recording a calibration enqueues a tracked reprocess for that calibration"
     );
 
@@ -400,10 +360,9 @@ async fn forward_calibration_closes_the_previous_window_and_leaves_history_alone
     assert_eq!(status, 201, "record C2 on top of C1: {c2}");
     let c2_id = e2e::id_of(&c2);
     assert_eq!(
-        wait_for_job(&db, "calibration_create", &c2_id, JOB_WAIT)
-            .await
-            .as_deref(),
-        Some("completed"),
+        crate::common::jobs::wait_for_triggered_job(&db, "calibration_create", Some(&c2_id))
+            .await,
+        "completed",
         "recording C2 enqueues a tracked reprocess for C2"
     );
 
@@ -510,10 +469,9 @@ async fn readings_ingested_after_the_new_calibration_carry_it_and_take_its_curve
     let c2_id = e2e::id_of(&c2);
     let c2_uuid = Uuid::parse_str(&c2_id).expect("calibration id is a uuid");
     assert_eq!(
-        wait_for_job(&db, "calibration_create", &c2_id, JOB_WAIT)
-            .await
-            .as_deref(),
-        Some("completed"),
+        crate::common::jobs::wait_for_triggered_job(&db, "calibration_create", Some(&c2_id))
+            .await,
+        "completed",
         "recording C2 enqueues a tracked reprocess for C2"
     );
 
@@ -679,10 +637,9 @@ async fn a_backdated_reading_resolves_to_the_older_window_not_the_latest_calibra
     let c2_id = e2e::id_of(&c2);
     let c2_uuid = Uuid::parse_str(&c2_id).expect("calibration id is a uuid");
     assert_eq!(
-        wait_for_job(&db, "calibration_create", &c2_id, JOB_WAIT)
-            .await
-            .as_deref(),
-        Some("completed"),
+        crate::common::jobs::wait_for_triggered_job(&db, "calibration_create", Some(&c2_id))
+            .await,
+        "completed",
         "recording C2 enqueues a tracked reprocess for C2"
     );
 
@@ -835,10 +792,9 @@ async fn aggregates_report_the_new_curve_for_the_new_bucket_and_leave_the_old_bu
     assert_eq!(status, 201, "record C2 on top of C1: {c2}");
     let c2_id = e2e::id_of(&c2);
     assert_eq!(
-        wait_for_job(&db, "calibration_create", &c2_id, JOB_WAIT)
-            .await
-            .as_deref(),
-        Some("completed"),
+        crate::common::jobs::wait_for_triggered_job(&db, "calibration_create", Some(&c2_id))
+            .await,
+        "completed",
         "recording C2 enqueues a tracked reprocess for C2"
     );
 

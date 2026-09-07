@@ -277,3 +277,167 @@ async fn the_continuous_cadence_resolves_a_derived_reading() {
     let records = body["records"].as_array().expect("records");
     assert_eq!(records.len(), 1, "{body}");
 }
+
+/// Scenario: the four write paths an operator can reach land a reading each, and a row is
+/// inserted with no origin declared at all.
+///
+/// Expected behaviour: every reading says where it came from. The paths that know stamp what they
+/// are; the row that declares nothing takes the kind its own stream proves, so the column is total
+/// and "unknown origin" is a named kind rather than a NULL.
+#[tokio::test]
+#[serial]
+async fn every_reading_says_where_it_came_from() {
+    let (db, app, token) = setup().await;
+    save_grab(&app, &token).await;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/readings/batch",
+        &json!({
+            "readings": [{
+                "site_id": SITE1_ID,
+                "parameter_id": GLOBAL_PARAM_DO_ID,
+                "time": "2025-06-01T09:00:00Z",
+                "raw_value": 4.0,
+            }],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    crate::common::seed_data_stream(
+        &db,
+        "00000000-0000-4000-c000-0000000009e2",
+        "vaisala",
+        "kind-sync",
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        "INSERT INTO readings (stream_id, time, replicate_index, raw_value) \
+         VALUES ('00000000-0000-4000-c000-0000000009e2', '2025-06-01T10:00:00Z', 0, 1.0)",
+    )
+    .await;
+
+    assert_eq!(
+        kind_of(
+            &db,
+            "SELECT r.provenance_kind AS v FROM readings r JOIN data_streams ds              ON ds.id = r.stream_id WHERE ds.source_system = 'grab_sample' LIMIT 1",
+        )
+        .await,
+        "manual",
+        "a hand entry names the person's path"
+    );
+    assert_eq!(
+        kind_of(
+            &db,
+            "SELECT r.provenance_kind AS v FROM readings r JOIN data_streams ds              ON ds.id = r.stream_id WHERE ds.source_system = 'api' LIMIT 1",
+        )
+        .await,
+        "batch"
+    );
+    assert_eq!(
+        kind_of(
+            &db,
+            "SELECT provenance_kind AS v FROM readings              WHERE stream_id = '00000000-0000-4000-c000-0000000009e2'",
+        )
+        .await,
+        "sync",
+        "a writer that declares nothing takes what its stream proves"
+    );
+
+    let untotal: i64 = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT count(*) AS v FROM readings WHERE provenance_kind IS NULL".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("a row")
+        .try_get("", "v")
+        .expect("count");
+    assert_eq!(untotal, 0, "no reading is stored without an origin");
+}
+
+async fn kind_of(db: &DatabaseConnection, sql: &str) -> String {
+    db.query_one_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        sql.to_string(),
+    ))
+    .await
+    .expect("query")
+    .expect("a reading")
+    .try_get::<String>("", "v")
+    .expect("provenance_kind")
+}
+
+/// Scenario: every write path has run, and one row is then stripped of its origin by hand.
+///
+/// Expected behaviour: the totality statement is empty over what the writers land, and names
+/// exactly the stripped row, so a new writer that records no origin is caught by a count rather
+/// than by a blank in the inspector.
+#[tokio::test]
+#[serial]
+async fn nothing_a_writer_lands_is_left_without_an_origin() {
+    let (db, app, token) = setup().await;
+    save_grab(&app, &token).await;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/readings/batch",
+        &json!({
+            "readings": [{
+                "site_id": SITE1_ID,
+                "parameter_id": GLOBAL_PARAM_DO_ID,
+                "time": "2025-06-02T09:00:00Z",
+                "raw_value": 4.0,
+            }],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    crate::common::seed_data_stream(
+        &db,
+        "00000000-0000-4000-c000-0000000009e5",
+        "cnet",
+        "kind-untold",
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        "INSERT INTO readings (stream_id, time, replicate_index, raw_value) \
+         VALUES ('00000000-0000-4000-c000-0000000009e5', '2025-06-02T10:00:00Z', 0, 1.0)",
+    )
+    .await;
+
+    let untold = river_db::routes::private::readings::provenance::untold_count(&db)
+        .await
+        .expect("count");
+    assert_eq!(untold, 0, "every writer records where its rows came from");
+
+    crate::common::exec(
+        &db,
+        "UPDATE readings SET provenance_kind = NULL \
+          WHERE stream_id = '00000000-0000-4000-c000-0000000009e5'",
+    )
+    .await;
+    let untold = river_db::routes::private::readings::provenance::untold_count(&db)
+        .await
+        .expect("count");
+    assert_eq!(untold, 1, "a row with no origin is what the statement is for");
+
+    // A stored kind is only as good as its blob, which is the other half of the rule.
+    crate::common::exec(
+        &db,
+        "UPDATE readings SET provenance_kind = 'tool_run', provenance = NULL \
+          WHERE stream_id = '00000000-0000-4000-c000-0000000009e5'",
+    )
+    .await;
+    let untold = river_db::routes::private::readings::provenance::untold_count(&db)
+        .await
+        .expect("count");
+    assert_eq!(untold, 1, "a tool row with no blob records nothing either");
+}

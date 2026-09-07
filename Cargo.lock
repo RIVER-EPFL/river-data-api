@@ -3539,6 +3539,8 @@ dependencies = [
 [[package]]
 name = "river-data-core"
 version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87c9145d9460221ea330b2977751b276f431cbd8d0d999306430b9bd576e37d1"
 dependencies = [
  "chrono",
  "serde",

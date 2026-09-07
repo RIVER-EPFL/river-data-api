@@ -7,36 +7,7 @@
 
 use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
-use std::time::{Duration, Instant};
 use uuid::Uuid;
-
-pub async fn wait_terminal(db: &sea_orm::DatabaseConnection, job_id: &str) -> String {
-    let id = Uuid::parse_str(job_id).unwrap();
-    let start = Instant::now();
-    loop {
-        let row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT status FROM reprocessing_jobs WHERE id = $1",
-                [id.into()],
-            ))
-            .await
-            .unwrap()
-            .unwrap();
-        let status: String = row.try_get("", "status").unwrap();
-        if !matches!(
-            status.as_str(),
-            "queued" | "pending" | "running" | "retrying"
-        ) {
-            return status;
-        }
-        assert!(
-            start.elapsed() < Duration::from_secs(15),
-            "job did not settle"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
 
 pub fn job_id_of(text: &str) -> String {
     serde_json::from_str::<serde_json::Value>(text).unwrap()["job_id"]
@@ -122,7 +93,7 @@ async fn apply_then_revert_pairing_plan_via_jobs() {
         (200..300).contains(&status),
         "apply should be 2xx, got {status}: {text}"
     );
-    assert_eq!(wait_terminal(&db, &job_id_of(&text)).await, "completed");
+    assert_eq!(crate::common::jobs::wait_for_job(&db, &job_id_of(&text)).await, "completed");
 
     // Plan applied, stream paired, readings backfilled with a site_id.
     let plan_status = db
@@ -162,7 +133,7 @@ async fn apply_then_revert_pairing_plan_via_jobs() {
         (200..300).contains(&status),
         "revert should be 2xx, got {status}: {text}"
     );
-    assert_eq!(wait_terminal(&db, &job_id_of(&text)).await, "completed");
+    assert_eq!(crate::common::jobs::wait_for_job(&db, &job_id_of(&text)).await, "completed");
 
     let plan_status = db
         .query_one_raw(Statement::from_string(
@@ -253,7 +224,7 @@ async fn apply_attaches_collection_events_for_spot_readings() {
         (200..300).contains(&status),
         "apply should be 2xx, got {status}: {text}"
     );
-    assert_eq!(wait_terminal(&db, &job_id_of(&text)).await, "completed");
+    assert_eq!(crate::common::jobs::wait_for_job(&db, &job_id_of(&text)).await, "completed");
 
     let events = db
         .query_all_raw(Statement::from_string(
@@ -342,7 +313,7 @@ async fn a_replayed_apply_reports_a_replay_instead_of_failing() {
         crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "apply", &token)
             .await;
     assert!((200..300).contains(&status), "apply ({status}): {text}");
-    assert_eq!(wait_terminal(&db, &job_id_of(&text)).await, "completed");
+    assert_eq!(crate::common::jobs::wait_for_job(&db, &job_id_of(&text)).await, "completed");
 
     let replay = river_db::routes::private::reprocessing_jobs::worker::enqueue(
         &db,
@@ -357,7 +328,7 @@ async fn a_replayed_apply_reports_a_replay_instead_of_failing() {
     .expect("the replay is enqueued");
 
     assert_eq!(
-        wait_terminal(&db, &replay.to_string()).await,
+        crate::common::jobs::wait_for_job(&db, &replay.to_string()).await,
         "completed",
         "a run over an applied plan is a replay, not a failure"
     );
@@ -375,6 +346,87 @@ async fn a_replayed_apply_reports_a_replay_instead_of_failing() {
         counts,
         serde_json::json!({}),
         "the replay claims none of the first run's work"
+    );
+
+    crate::common::cleanup_test_db(&db).await;
+}
+
+/// A large import has to be distinguishable from a stuck one, so the apply reports how far it has
+/// got on the job row while its single transaction is still open.
+#[tokio::test]
+#[serial]
+async fn apply_reports_its_progress_over_the_plan_s_entries() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let mut entries = Vec::new();
+    for n in 0..3 {
+        let stream_id = Uuid::new_v4();
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active) \
+                 VALUES ('{stream_id}', 'vaisala', 'loc-progress-{n}', 'Loc Progress {n}', true)"
+            ),
+        )
+        .await;
+        entries.push(serde_json::json!({
+            "stream_id": stream_id,
+            "source_key": format!("loc-progress-{n}"),
+            "source_name": format!("Loc Progress {n}"),
+            "action": "pair",
+            "project": { "id": crate::common::PROJECT_ID, "name": "Test Project", "create": false },
+            "site": { "id": crate::common::SITE1_ID, "name": "Site 1", "create": false, "latitude": null, "longitude": null, "altitude_m": null },
+            "parameter": { "id": crate::common::GLOBAL_PARAM_TEMP_ID, "name": "Temperature", "create": false, "units": "C", "group_key": null, "original_names": [] },
+            "confidence": "exact",
+            "warnings": [],
+            "original_parameter_name": null
+        }));
+    }
+
+    let plan_id = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO pairing_plans (id, source_system, status, summary, entries) \
+             VALUES ('{plan_id}', 'vaisala', 'draft', '{{}}'::jsonb, '{}'::jsonb)",
+            serde_json::Value::Array(entries)
+                .to_string()
+                .replace('\'', "''")
+        ),
+    )
+    .await;
+
+    let (status, text) =
+        crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "apply", &token)
+            .await;
+    assert!(
+        (200..300).contains(&status),
+        "apply should be 2xx, got {status}: {text}"
+    );
+    let job_id = job_id_of(&text);
+    assert_eq!(crate::common::jobs::wait_for_job(&db, &job_id).await, "completed");
+
+    let row = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT progress, total FROM reprocessing_jobs WHERE id = '{job_id}'"),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.try_get::<Option<i32>>("", "total").unwrap(),
+        Some(3),
+        "the total is the plan's pairing entries, set before the first one is applied"
+    );
+    assert_eq!(
+        row.try_get::<Option<i32>>("", "progress").unwrap(),
+        Some(3),
+        "every entry is counted as it is paired"
     );
 
     crate::common::cleanup_test_db(&db).await;

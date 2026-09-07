@@ -20,22 +20,62 @@ pub use db::*;
 pub use fixtures::*;
 pub use seed::*;
 
+/// The workers this process has spawned, so they can be stopped rather than left polling. A
+/// handle whose runtime has already gone resolves immediately, so a stale entry costs nothing.
+static TEST_WORKERS: std::sync::Mutex<
+    Vec<(tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>)>,
+> = std::sync::Mutex::new(Vec::new());
+
+/// Stop every worker this process spawned and wait for it to leave the database alone.
+///
+/// The worker claims whatever is queued, so a test that ends while its own worker is mid-statement
+/// leaves that statement running against the next test's cleanup. `cleanup_test_db` calls this
+/// first, which makes the fixture the barrier rather than each test's own habit.
+pub async fn stop_test_workers() {
+    let workers: Vec<_> = TEST_WORKERS
+        .lock()
+        .map(|mut w| std::mem::take(&mut *w))
+        .unwrap_or_default();
+    for (shutdown, handle) in workers {
+        let _ = shutdown.send(true);
+        // A worker that will not stop is holding a job open over the truncate, which is the whole
+        // hazard; say so rather than truncating around it. A handle from a runtime that has gone
+        // resolves at once.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+                .await
+                .is_ok(),
+            "a test worker did not stop; its job is still running against the cleanup"
+        );
+    }
+}
+
 /// Spawn a background job worker for the test, mirroring prod so flipped (`queued`) jobs run to
-/// completion under POST-and-poll tests. Aborted when the test's runtime drops.
+/// completion under POST-and-poll tests. Stopped by [`stop_test_workers`], which the cleanup runs.
+///
+/// `worker::run` finishes the job it has claimed before it stops, which is what makes it usable as
+/// a barrier: when the handle resolves, nothing this worker started is still writing. It finishes
+/// that one job and no more, so the wait is bounded by what is in flight rather than by how many
+/// jobs a test enqueued; the rows still queued are left for the truncate.
 fn spawn_test_worker(state: &AppState) {
     let db = state.db.clone();
     let events = state.events.clone();
     let registry =
         std::sync::Arc::new(river_db::routes::private::reprocessing_jobs::job::build_registry());
-    tokio::spawn(async move {
-        river_db::routes::private::reprocessing_jobs::worker::run(
-            db,
-            events,
-            registry,
-            std::future::pending::<()>(),
-        )
+    let (shutdown, mut stopped) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(async move {
+        river_db::routes::private::reprocessing_jobs::worker::run(db, events, registry, async move {
+            while stopped.changed().await.is_ok() {
+                if *stopped.borrow() {
+                    return;
+                }
+            }
+        })
         .await;
     });
+    if let Ok(mut workers) = TEST_WORKERS.lock() {
+        workers.push((shutdown, handle));
+    }
 }
 
 /// A seeded application: the database, a router sharing it, and a full-permission API token.

@@ -219,6 +219,78 @@ async fn ledger_retention_prunes_by_age_and_never_a_running_event() {
     crate::common::cleanup_test_db(&db).await;
 }
 
+/// Scenario: a receipt older than the retention whose window still covers a stored reading.
+/// Expected behaviour: it survives, because it is the record of how that reading arrived.
+#[tokio::test]
+#[serial]
+async fn ledger_retention_keeps_a_receipt_a_stored_reading_resolves_to() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+
+    let stream = Uuid::new_v4();
+    let sensor = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO sensors (id, serial_number) VALUES ('{sensor}', 'receipt-retention')"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO data_streams (id, source_system, source_key, sensor_id, is_active) \
+             VALUES ('{stream}', 'receipt-retention', '{stream}', '{sensor}', true)"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO readings (stream_id, time, replicate_index, raw_value, sensor_id) \
+             VALUES ('{stream}', NOW() - INTERVAL '400 days', 0, 1.0, '{sensor}')"
+        ),
+    )
+    .await;
+    // Both receipts are past the retention. The first covers the stored reading, the second's
+    // window sits a day later and covers nothing.
+    for (from, to) in [("401 days", "399 days"), ("300 days", "299 days")] {
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO ingest_receipts \
+                   (stream_id, at, window_from, window_to, submitted, new_rows, changed, \
+                    unchanged, retained, rejected_total, rejected, dropped, withdrawn) \
+                 VALUES ('{stream}', NOW() - INTERVAL '400 days', \
+                         NOW() - INTERVAL '{from}', NOW() - INTERVAL '{to}', \
+                         1, 1, 0, 0, 0, 0, '{{}}'::jsonb, 0, 0)"
+            ),
+        )
+        .await;
+    }
+
+    let config = crate::common::test_config();
+    let pruned = run_job(&db, Arc::new(SyncLedgerRetention::from_config(&config))).await;
+    assert_eq!(pruned, 1, "only the receipt nothing resolves to");
+
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM ingest_receipts \
+                  WHERE stream_id = '{stream}' \
+                    AND window_from < NOW() - INTERVAL '400 days'"
+            )
+        )
+        .await,
+        1,
+        "the receipt covering a stored reading survives its retention age"
+    );
+
+    crate::common::cleanup_test_db(&db).await;
+}
+
 /// A zero retention day count is the documented way to keep a ledger forever, so it must delete
 /// nothing rather than reading as "older than now".
 #[tokio::test]

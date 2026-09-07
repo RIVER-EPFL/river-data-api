@@ -16,6 +16,9 @@ use crate::routes::private::{
     sensors::standard_curves, sites, sites::parameters as site_parameters,
 };
 
+/// How many plan entries an apply pairs between progress reports.
+const PROGRESS_BATCH: usize = 25;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamHierarchy {
     pub project: String,
@@ -1105,7 +1108,11 @@ pub fn refuse_unconfirmed_instruments(entries: &[PlanEntry]) -> AppResult<()> {
 }
 
 /// Apply a pairing plan: create entities, pair streams, backfill readings.
-pub async fn apply_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> AppResult<ApplyResult> {
+pub async fn apply_plan(
+    db: &sea_orm::DatabaseConnection,
+    plan_id: Uuid,
+    progress: Option<&crate::routes::private::reprocessing_jobs::lifecycle::JobContext>,
+) -> AppResult<ApplyResult> {
     let plan = pairing_plans::Entity::find_by_id(plan_id)
         .one(db)
         .await?
@@ -1177,7 +1184,23 @@ pub async fn apply_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> AppR
     counters.instruments_created = minted.len() as u32;
     counters.curves_assigned = assign_plan_curves(&txn, &curve_intents, &minted).await?;
 
+    // How far the apply has got, on the pool connection rather than inside `txn`, so the operator
+    // sees an import of a couple of thousand entries move instead of a spinner.
+    let pairing_total = entries.iter().filter(|e| e.action == "pair").count();
+    if let Some(ctx) = progress {
+        ctx.set_progress(0, Some(i32::try_from(pairing_total).unwrap_or(i32::MAX)))
+            .await;
+    }
+    let mut entries_seen: usize = 0;
+
     for entry in entries.iter().filter(|e| e.action == "pair") {
+        entries_seen += 1;
+        if let Some(ctx) = progress
+            && (entries_seen % PROGRESS_BATCH == 0 || entries_seen == pairing_total)
+        {
+            ctx.set_progress(i32::try_from(entries_seen).unwrap_or(i32::MAX), None)
+                .await;
+        }
         if (entry.site.id.is_none() && entry.site.name.trim().is_empty())
             || (entry.parameter.id.is_none() && entry.parameter.name.trim().is_empty())
         {
@@ -2453,8 +2476,12 @@ mod tests {
         let suggestion = family_parameter_suggestion("DOC_avg_ppb");
         assert_ne!(suggestion, "DOC_avg_ppb", "the suggestion is a label");
 
-        let proposed =
-            resolve_parameter_instrument("cnet", stream_instrument_key(&stream), &suggestion, &catalog(&[]));
+        let proposed = resolve_parameter_instrument(
+            "cnet",
+            stream_instrument_key(&stream),
+            &suggestion,
+            &catalog(&[]),
+        );
 
         assert_eq!(proposed.source_key, "cnet:DOC_avg_ppb");
     }
@@ -2469,7 +2496,10 @@ mod tests {
             &catalog(&[("cnet:NO2_mgL", id)]),
         );
         assert_eq!(resolved.id, Some(id));
-        assert!(!resolved.create, "an instrument that exists is not created again");
+        assert!(
+            !resolved.create,
+            "an instrument that exists is not created again"
+        );
         assert!(resolved.confirmed);
     }
 
@@ -2477,8 +2507,12 @@ mod tests {
     /// changes it by attaching another; leaving it alone creates the suggestion.
     #[test]
     fn test_resolve_parameter_instrument_proposes_one_already_agreed() {
-        let proposed =
-            resolve_parameter_instrument("cnet", "cnet:NO2_mgL".to_string(), "NO2_mgL", &catalog(&[]));
+        let proposed = resolve_parameter_instrument(
+            "cnet",
+            "cnet:NO2_mgL".to_string(),
+            "NO2_mgL",
+            &catalog(&[]),
+        );
         assert_eq!(proposed.id, None);
         assert_eq!(proposed.source_key, "cnet:NO2_mgL");
         assert!(proposed.create && proposed.confirmed);
@@ -2512,25 +2546,37 @@ mod tests {
             plan_entry("FP2", "Depth", "none", 0),
         ];
 
-        assert_eq!(select_entries(&entries, &BulkWhere::default()), vec![0, 1, 2]);
+        assert_eq!(
+            select_entries(&entries, &BulkWhere::default()),
+            vec![0, 1, 2]
+        );
         assert_eq!(
             select_entries(
                 &entries,
-                &BulkWhere { confidence: Some("none".into()), ..Default::default() }
+                &BulkWhere {
+                    confidence: Some("none".into()),
+                    ..Default::default()
+                }
             ),
             vec![1, 2]
         );
         assert_eq!(
             select_entries(
                 &entries,
-                &BulkWhere { has_warnings: Some(true), ..Default::default() }
+                &BulkWhere {
+                    has_warnings: Some(true),
+                    ..Default::default()
+                }
             ),
             vec![1]
         );
         assert_eq!(
             select_entries(
                 &entries,
-                &BulkWhere { site_name: Some("fp1".into()), ..Default::default() }
+                &BulkWhere {
+                    site_name: Some("fp1".into()),
+                    ..Default::default()
+                }
             ),
             vec![0, 1],
             "the site is matched case-insensitively, as the review renders it"

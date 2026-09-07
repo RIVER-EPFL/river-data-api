@@ -6,7 +6,7 @@ use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
 use uuid::Uuid;
 
-use crate::pairing_plan_apply::{job_id_of, wait_terminal};
+use crate::pairing_plan_apply::job_id_of;
 
 async fn scalar_i64(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
     db.query_one_raw(Statement::from_string(
@@ -62,18 +62,13 @@ async fn apply_and_wait(
     token: &str,
     plan_id: Uuid,
 ) {
-    let (status, text) = crate::common::post_plan_action_with_token(
-        app,
-        &plan_id.to_string(),
-        "apply",
-        token,
-    )
-    .await;
+    let (status, text) =
+        crate::common::post_plan_action_with_token(app, &plan_id.to_string(), "apply", token).await;
     assert!(
         (200..300).contains(&status),
         "apply should be 2xx, got {status}: {text}"
     );
-    assert_eq!(wait_terminal(db, &job_id_of(&text)).await, "completed");
+    assert_eq!(crate::common::jobs::wait_for_job(db, &job_id_of(&text)).await, "completed");
 }
 
 fn entry_for(plan: &serde_json::Value, stream_id: Uuid) -> serde_json::Value {
@@ -929,7 +924,10 @@ async fn plan_listing_filters_by_source_and_status_without_entries() {
             row.get("entries").is_none(),
             "the listing is a projection, not every draft's document: {row}"
         );
-        assert!(row.get("summary").is_some(), "the summary is what it shows: {row}");
+        assert!(
+            row.get("summary").is_some(),
+            "the summary is what it shows: {row}"
+        );
     }
 
     let (status, body) =
@@ -957,13 +955,9 @@ async fn superseded_plan_is_refused_by_apply() {
     let plan_id = Uuid::new_v4();
     insert_plan(&db, plan_id, &serde_json::json!([])).await;
 
-    let (status, text) = crate::common::post_plan_action_with_token(
-        &app,
-        &plan_id.to_string(),
-        "supersede",
-        &token,
-    )
-    .await;
+    let (status, text) =
+        crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "supersede", &token)
+            .await;
     assert_eq!(status, 200, "supersede failed: {text}");
     assert_eq!(
         scalar_opt_string(
@@ -974,13 +968,9 @@ async fn superseded_plan_is_refused_by_apply() {
         Some("superseded".to_string())
     );
 
-    let (status, text) = crate::common::post_plan_action_with_token(
-        &app,
-        &plan_id.to_string(),
-        "apply",
-        &token,
-    )
-    .await;
+    let (status, text) =
+        crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "apply", &token)
+            .await;
     assert!(
         !(200..300).contains(&status),
         "a superseded draft is not appliable: {text}"
@@ -1039,7 +1029,9 @@ async fn concurrent_plan_edits_conflict_on_the_version_they_read() {
     .await;
     assert_eq!(status, 200, "create plan failed: {plan}");
     let plan_id = Uuid::parse_str(plan["id"].as_str().unwrap()).unwrap();
-    let version = plan["version"].as_i64().expect("a plan carries its version");
+    let version = plan["version"]
+        .as_i64()
+        .expect("a plan carries its version");
 
     let (status, first) = crate::common::patch_json_parse_with_token(
         &app,
@@ -1068,7 +1060,10 @@ async fn concurrent_plan_edits_conflict_on_the_version_they_read() {
         &token,
     )
     .await;
-    assert_eq!(status, 409, "the second write of the pair is refused: {text}");
+    assert_eq!(
+        status, 409,
+        "the second write of the pair is refused: {text}"
+    );
 
     let (status, plan) = crate::common::get_json_with_token(
         &app,
@@ -1199,7 +1194,10 @@ async fn a_bulk_decision_moves_every_entry_its_predicate_selects() {
     .await;
     assert_eq!(status, 200, "the bulk skip lands: {body}");
     let plan: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(entry_for(&plan, unknown)["action"], serde_json::json!("skip"));
+    assert_eq!(
+        entry_for(&plan, unknown)["action"],
+        serde_json::json!("skip")
+    );
     for stream in [known_a, known_b] {
         assert_eq!(
             entry_for(&plan, stream)["action"],
@@ -1217,7 +1215,10 @@ async fn a_bulk_decision_moves_every_entry_its_predicate_selects() {
     .await;
     assert_eq!(status, 200, "and the opposite action reverses it: {body}");
     let plan: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(entry_for(&plan, unknown)["action"], serde_json::json!("pair"));
+    assert_eq!(
+        entry_for(&plan, unknown)["action"],
+        serde_json::json!("pair")
+    );
 
     let (status, body) = crate::common::patch_plan_with_token(
         &app,
@@ -1226,7 +1227,86 @@ async fn a_bulk_decision_moves_every_entry_its_predicate_selects() {
         &token,
     )
     .await;
-    assert_eq!(status, 400, "an action that is neither pair nor skip: {body}");
+    assert_eq!(
+        status, 400,
+        "an action that is neither pair nor skip: {body}"
+    );
 
     crate::common::cleanup_test_db(&db).await;
+}
+
+/// A draft is a snapshot of the streams that existed when it was built, so one built while a sync
+/// service is still registering covers part of the source. The listing says how much it leaves.
+#[tokio::test]
+#[serial]
+async fn a_draft_reports_the_streams_registered_after_it() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    async fn register(db: &sea_orm::DatabaseConnection, key: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        crate::common::exec(
+            db,
+            &format!(
+                "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active) \
+                 VALUES ('{id}', 'vaisala', '{key}', '{key}', true)"
+            ),
+        )
+        .await;
+        id
+    }
+
+    async fn uncovered(app: &axum::Router, token: &str) -> Option<i64> {
+        let (status, body) =
+            crate::common::get_with_token(app, "/api/sync/pairing-plans?status=draft", token).await;
+        assert!((200..300).contains(&status), "list ({status}): {body}");
+        let plans: serde_json::Value = serde_json::from_str(&body).unwrap();
+        plans[0]["uncovered_streams"].as_i64()
+    }
+
+    let planned = register(&db, "loc-covered").await;
+    let plan_id = Uuid::new_v4();
+    let entries = serde_json::json!([{
+        "stream_id": planned,
+        "source_key": "loc-covered",
+        "source_name": "Loc Covered",
+        "action": "pair",
+        "project": { "id": crate::common::PROJECT_ID, "name": "Test Project", "create": false },
+        "site": { "id": crate::common::SITE1_ID, "name": "Site 1", "create": false, "latitude": null, "longitude": null, "altitude_m": null },
+        "parameter": { "id": crate::common::GLOBAL_PARAM_TEMP_ID, "name": "Temperature", "create": false, "units": "C", "group_key": null, "original_names": [] },
+        "confidence": "exact",
+        "warnings": [],
+        "original_parameter_name": null
+    }]);
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO pairing_plans (id, source_system, status, summary, entries) \
+             VALUES ('{plan_id}', 'vaisala', 'draft', '{{}}'::jsonb, '{}'::jsonb)",
+            entries.to_string().replace('\'', "''")
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        uncovered(&app, &token).await,
+        Some(0),
+        "a draft holding every unpaired stream leaves none behind"
+    );
+
+    register(&db, "loc-late").await;
+    assert_eq!(
+        uncovered(&app, &token).await,
+        Some(1),
+        "the stream registered since the draft is not covered by it"
+    );
+
+    // A legacy single superseded by its replicate family is not plannable, so it is not missing
+    // from the plan either: the family counts, the single it retires does not.
+    register(&db, "loc-legacy").await;
+    register(&db, "loc-legacy:reps").await;
+    assert_eq!(uncovered(&app, &token).await, Some(2));
 }

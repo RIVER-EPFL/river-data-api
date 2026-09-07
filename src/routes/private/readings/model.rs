@@ -36,6 +36,10 @@ pub struct Model {
     /// When the stored value arrived (DB default on insert, re-stamped when an overwrite changes
     /// the value). NULL on rows that predate tracking.
     pub ingested_at: Option<DateTimeWithTimeZone>,
+    /// Where this value came from: `tool_run` | `chain` | `csv_import` | `manual` | `batch` |
+    /// `sync` | `derived` | `migration`. Total, held by a DB trigger for a writer that names none,
+    /// so an unrecorded origin is a named kind rather than a NULL blob (Q49).
+    pub provenance_kind: Option<String>,
     /// The server-built record of what produced this value: the tool run and pinned script version,
     /// its resolved inputs, constants and curves, and the outputs it returned. Written by the grab
     /// write path from the stored `tool_runs` row, never by a client.

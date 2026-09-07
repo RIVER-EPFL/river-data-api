@@ -44,6 +44,35 @@ async fn require_connection_headroom(db: &DatabaseConnection, url: &str) {
     );
 }
 
+/// Stop TimescaleDB's own background policies on this database.
+///
+/// The baseline installs a compression policy on `readings` and on `status_events`. Its scheduler
+/// runs them inside a test's window, taking chunk locks while `cleanup_test_db` is taking
+/// ACCESS EXCLUSIVE over the same table, and the pair deadlocks: one test per run fails with a
+/// `deadlock detected` raised out of a cleanup statement, passes alone and passes on the rerun.
+/// Nothing in the suite depends on the policies firing, so the harness removes them; the tests
+/// that need a compressed chunk compress it themselves (`tests/common/compression.rs`).
+async fn stop_background_policies(db: &DatabaseConnection) {
+    let jobs = db
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT job_id FROM timescaledb_information.jobs \
+              WHERE proc_name = 'policy_compression'"
+                .to_string(),
+        ))
+        .await
+        .expect("list the background policies");
+    for row in jobs {
+        let job_id: i32 = row.try_get("", "job_id").expect("job_id");
+        db.execute_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT delete_job({job_id})"),
+        ))
+        .await
+        .expect("delete the background policy");
+    }
+}
+
 /// The session holding [`HARNESS_LOCK_KEY`], kept for the life of the process. Every test builds
 /// its own runtime, so this connection outlives the one that opened it; it is never queried again,
 /// and Postgres releases the lock when the process exits.
@@ -111,6 +140,8 @@ pub async fn setup_test_db() -> DatabaseConnection {
     migration::Migrator::up(&db, None)
         .await
         .expect("Failed to run migrations");
+
+    stop_background_policies(&db).await;
 
     // Every channel carries an instrument in the deployed system: registration mints one, and a
     // reading may not be stored without naming what measured it. A fixture stream built by raw SQL
@@ -194,6 +225,9 @@ pub const CLEANUP_DELETED_TABLES: &[&str] = &[
 pub const CLEANUP_EXEMPT_TABLES: &[&str] = &["constants", "seaql_migrations"];
 
 pub async fn cleanup_test_db(db: &DatabaseConnection) {
+    // The fixture's own writer goes first: a worker still claiming rows while this truncates is
+    // the one thing in the harness that can write between the TRUNCATE and the seed.
+    crate::common::stop_test_workers().await;
     let stmts = [
         "SELECT remove_continuous_aggregate_policy('readings_monthly', if_not_exists => true)",
         "SELECT remove_continuous_aggregate_policy('readings_weekly', if_not_exists => true)",

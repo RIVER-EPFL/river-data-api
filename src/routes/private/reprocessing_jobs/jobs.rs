@@ -1189,6 +1189,7 @@ impl CsvImport {
                 standard_curve_id: Set(None),
                 collection_event_id: Set(None),
                 provenance: Set(None),
+                provenance_kind: Set(Some("csv_import".to_string())),
                 label: Set(None),
                 notes: Set(None),
                 created_by: Set(None),
@@ -1679,7 +1680,8 @@ impl Job for PlanApply {
                 .await;
             return Ok(0);
         }
-        let result = crate::routes::private::sync::service::apply_plan(ctx.db(), plan_id)
+        let result =
+            crate::routes::private::sync::service::apply_plan(ctx.db(), plan_id, Some(&ctx))
             .await
             .map_err(|e| DbErr::Custom(e.to_string()))?;
         ctx.report(
@@ -1891,6 +1893,28 @@ impl Job for JanitorRun {
             .await;
         }
 
+        // 5. Report, never repair: readings that say nothing about where they came from. A
+        //    writer that stamps no kind, or a kind whose record is missing, is a defect in that
+        //    writer, so the sweep counts them and leaves them alone.
+        let provenance_untold =
+            match crate::routes::private::readings::provenance::untold_count(db).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Janitor: untold provenance count failed");
+                    0
+                }
+            };
+        if provenance_untold > 0 {
+            ctx.log(
+                "warn",
+                &format!(
+                    "{provenance_untold} readings record no origin; nothing was changed"
+                ),
+                serde_json::json!({}),
+            )
+            .await;
+        }
+
         // What this tick actually changed, so a run's effect is readable per job rather than only
         // in its logs.
         ctx.report(
@@ -1898,7 +1922,8 @@ impl Job for JanitorRun {
                 .scope("full_refresh", do_full)
                 .count("recomposed", recomposed)
                 .count("pruned", pruned)
-                .count("curation_drift", curation_drift),
+                .count("curation_drift", curation_drift)
+                .count("provenance_untold", provenance_untold),
         )
         .await;
         Ok(pruned as i64)
@@ -2017,8 +2042,10 @@ pub async fn sweep_stale_sync_events(
 
 /// Age-based retention for the sync ledgers. sync_events accretes one row per cycle and
 /// ingest_receipts one per windowed pass; without pruning both grow forever. Running
-/// sync_events rows are never touched (the staleness sweep owns those), and a stream's
-/// current state never rests on an old receipt: the source re-asserts its windows.
+/// sync_events rows are never touched (the staleness sweep owns those). A receipt is the record
+/// of how a stored value arrived, so age alone does not release one: a receipt whose window still
+/// covers a stored reading is kept whatever its age, and only receipts nothing resolves to are
+/// pruned.
 pub struct SyncLedgerRetention {
     sync_event_retention_days: u32,
     ingest_receipt_retention_days: u32,
@@ -2065,7 +2092,12 @@ impl Job for SyncLedgerRetention {
                 .execute_raw(sea_orm::Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
                     "DELETE FROM ingest_receipts
-                     WHERE at < NOW() - ($1 || ' days')::interval",
+                     WHERE at < NOW() - ($1 || ' days')::interval
+                       AND NOT EXISTS (
+                             SELECT 1 FROM readings r
+                              WHERE r.stream_id = ingest_receipts.stream_id
+                                AND r.time >= ingest_receipts.window_from
+                                AND r.time < ingest_receipts.window_to)",
                     [self.ingest_receipt_retention_days.to_string().into()],
                 ))
                 .await?

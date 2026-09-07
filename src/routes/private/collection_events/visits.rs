@@ -733,6 +733,11 @@ pub struct EventCell {
     pub origin: String,
     /// A server-built tool-run blob is stored on the measurement.
     pub has_provenance: bool,
+    /// Where the value came from, as the row records it: `tool_run` | `chain` | `csv_import` |
+    /// `manual` | `batch` | `sync` | `derived` | `migration`. Narrower than `origin`, which reads
+    /// the stream alone and cannot tell a hand entry from a tool save on the same channel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance_kind: Option<String>,
     /// The blob's tool name, when one exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
@@ -862,7 +867,7 @@ pub async fn get_event_detail(
                     s.sd_estimator, s.sd_estimator_source, \
                     r.flag_reason, r.withdrawn_at, r.calibration_id, r.standard_curve_id, \
                     (r.provenance IS NOT NULL) AS has_provenance, \
-                    r.provenance ->> 'tool' AS tool \
+                    r.provenance_kind, r.provenance ->> 'tool' AS tool \
              FROM readings r \
              JOIN parameters p ON p.id = r.parameter_id \
              LEFT JOIN data_streams ds ON ds.id = r.stream_id \
@@ -950,6 +955,7 @@ pub async fn get_event_detail(
                     has_provenance: r
                         .try_get::<Option<bool>>("", "has_provenance")?
                         .unwrap_or(false),
+                    provenance_kind: r.try_get("", "provenance_kind")?,
                     tool: r.try_get("", "tool")?,
                     source_system,
                     source_key: r.try_get("", "source_key")?,
@@ -992,6 +998,7 @@ pub async fn get_event_detail(
             stream_id: Uuid::nil(),
             origin: crate::routes::private::readings::provenance::classify_source("").to_string(),
             has_provenance: false,
+            provenance_kind: None,
             tool: None,
             source_system: None,
             source_key: None,

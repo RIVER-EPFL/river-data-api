@@ -10,5 +10,6 @@ mod attribute_existing_readings;
 mod backdate_auto_deployments;
 mod channel_health_into_state;
 mod one_doc_parameter;
+mod provenance_kind;
 mod source_parameter_instrument_names;
 mod synthesise_curation_record;

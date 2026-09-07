@@ -26,6 +26,7 @@ mod m20260910_000002_parameter_default_thresholds;
 mod m20260910_000003_generated_sample_stdev;
 mod m20260910_000004_rollback_restores_ingested_at;
 pub mod m20260910_000005_source_parameter_instrument_names;
+pub mod m20260910_000006_provenance_kind;
 pub mod portal_seed;
 
 pub struct Migrator;
@@ -60,6 +61,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260910_000003_generated_sample_stdev::Migration),
             Box::new(m20260910_000004_rollback_restores_ingested_at::Migration),
             Box::new(m20260910_000005_source_parameter_instrument_names::Migration),
+            Box::new(m20260910_000006_provenance_kind::Migration),
         ]
     }
 }

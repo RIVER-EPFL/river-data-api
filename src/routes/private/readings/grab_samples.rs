@@ -371,6 +371,7 @@ struct GrabFacts<'a> {
     label: Option<&'a str>,
     notes: Option<&'a str>,
     provenance: Option<&'a serde_json::Value>,
+    kind: &'a str,
 }
 
 /// The same four facts as they are stored on a reading, owned.
@@ -380,6 +381,7 @@ struct StoredFacts {
     label: Option<String>,
     notes: Option<String>,
     provenance: Option<serde_json::Value>,
+    kind: Option<String>,
 }
 
 impl StoredFacts {
@@ -412,6 +414,15 @@ impl GrabFacts<'_> {
                 .provenance
                 .cloned()
                 .or_else(|| prior.and_then(|p| p.provenance.clone())),
+            // The origin follows the blob: a rewrite that carries no run of its own keeps the one
+            // the group was computed under rather than reading as a hand entry.
+            kind: Some(if self.provenance.is_some() {
+                self.kind.to_string()
+            } else {
+                prior
+                    .and_then(|p| p.kind.clone())
+                    .unwrap_or_else(|| self.kind.to_string())
+            }),
         }
     }
 }
@@ -1128,13 +1139,13 @@ pub async fn insert_grab_samples(
 
     // Which calculations this save feeds, known before anything is written. The chain's own save
     // is the recompute: it reports nothing and enqueues nothing.
-    let writer = match tool_run_source(&state.db, payload.tool_run_id)
-        .await?
-        .as_deref()
-    {
+    let run_source = tool_run_source(&state.db, payload.tool_run_id).await?;
+    let writer = match run_source.as_deref() {
         Some("chain") => recompute::Writer::Chain,
         _ => recompute::Writer::Person,
     };
+    // Where these values come from. A save that names no run is a person typing a number.
+    let provenance_kind = super::provenance::provenance_kind_for_run(run_source.as_deref());
     let calculations = if writer == recompute::Writer::Chain {
         Vec::new()
     } else {
@@ -1346,7 +1357,7 @@ pub async fn insert_grab_samples(
                         if let Some(row) = txn
                             .query_one_raw(sea_orm::Statement::from_sql_and_values(
                                 sea_orm::DatabaseBackend::Postgres,
-                                r"SELECT label, notes, created_by, provenance FROM readings
+                                r"SELECT label, notes, created_by, provenance, provenance_kind FROM readings
                               WHERE site_id = $1 AND parameter_id = $2 AND time = $3
                                 AND measurement_type = 'spot'
                                 AND (label IS NOT NULL OR notes IS NOT NULL
@@ -1367,6 +1378,7 @@ pub async fn insert_grab_samples(
                                     notes: row.try_get("", "notes").unwrap_or(None),
                                     created_by: row.try_get("", "created_by").unwrap_or(None),
                                     provenance: row.try_get("", "provenance").unwrap_or(None),
+                                    kind: row.try_get("", "provenance_kind").unwrap_or(None),
                                 },
                             );
                         }
@@ -1444,6 +1456,7 @@ pub async fn insert_grab_samples(
                 label: payload.label.as_deref(),
                 notes: payload.notes.as_deref(),
                 provenance: provenance.as_ref(),
+                kind: provenance_kind,
             };
             let stored_facts: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), StoredFacts> = groups
                 .iter()
@@ -1485,6 +1498,7 @@ pub async fn insert_grab_samples(
                     notes: Set(stored_facts[&(r.parameter_id, r.time)].notes.clone()),
                     created_by: Set(stored_facts[&(r.parameter_id, r.time)].created_by.clone()),
                     provenance: Set(stored_facts[&(r.parameter_id, r.time)].provenance.clone()),
+                    provenance_kind: Set(stored_facts[&(r.parameter_id, r.time)].kind.clone()),
                 })
                 .collect();
 
@@ -1728,6 +1742,7 @@ mod tests {
             label: Some(label.to_string()),
             notes: Some(notes.to_string()),
             provenance: Some(serde_json::json!({ "tool": "doc" })),
+            kind: Some("tool_run".to_string()),
         }
     }
 
@@ -1739,6 +1754,7 @@ mod tests {
             label: None,
             notes: Some("corrected note"),
             provenance: None,
+            kind: "manual",
         };
         let merged = request.over(Some(&prior));
         assert_eq!(merged.label.as_deref(), Some("batch 7"));
@@ -1758,6 +1774,7 @@ mod tests {
             label: None,
             notes: None,
             provenance: None,
+            kind: "manual",
         };
         let merged = request.over(None);
         assert_eq!(merged.created_by.as_deref(), Some("evan"));
@@ -1769,6 +1786,7 @@ mod tests {
                 label: None,
                 notes: None,
                 provenance: None,
+                kind: "manual",
             }
             .over(None)
             .is_empty(),

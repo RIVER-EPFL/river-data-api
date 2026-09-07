@@ -682,8 +682,8 @@ async fn evaluate_and_upsert_derived(
         db,
         Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, replicate_index, measurement_type)
-          VALUES ($1, $2, $3, $4, $5, NULL, 0, 'derived')
+            r"INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, replicate_index, measurement_type, provenance_kind)
+          VALUES ($1, $2, $3, $4, $5, NULL, 0, 'derived', 'derived')
           ON CONFLICT (stream_id, time, replicate_index) DO UPDATE
             SET raw_value = $5, calibrated_value = NULL, measurement_type = 'derived'",
             [

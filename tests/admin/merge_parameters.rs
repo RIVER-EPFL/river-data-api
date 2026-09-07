@@ -416,7 +416,7 @@ async fn test_http_round_trip() {
         .expect("response carries job_id")
         .to_string();
     assert_eq!(
-        crate::merge_site_parameters_job::wait_terminal(&db, &job_id).await,
+        crate::common::jobs::wait_for_job(&db, &job_id).await,
         "completed"
     );
 

@@ -6,36 +6,6 @@
 
 use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
-use std::time::{Duration, Instant};
-use uuid::Uuid;
-
-pub async fn wait_terminal(db: &sea_orm::DatabaseConnection, job_id: &str) -> String {
-    let id = Uuid::parse_str(job_id).unwrap();
-    let start = Instant::now();
-    loop {
-        let row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT status FROM reprocessing_jobs WHERE id = $1",
-                [id.into()],
-            ))
-            .await
-            .unwrap()
-            .unwrap();
-        let status: String = row.try_get("", "status").unwrap();
-        if !matches!(
-            status.as_str(),
-            "queued" | "pending" | "running" | "retrying"
-        ) {
-            return status;
-        }
-        assert!(
-            start.elapsed() < Duration::from_secs(15),
-            "merge job did not settle"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
 
 async fn site_parameter_exists(db: &sea_orm::DatabaseConnection, id: &str) -> bool {
     db.query_one_raw(Statement::from_string(
@@ -78,7 +48,7 @@ async fn merge_site_parameters_runs_as_job_and_deletes_source() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(wait_terminal(&db, &job_id).await, "completed");
+    assert_eq!(crate::common::jobs::wait_for_job(&db, &job_id).await, "completed");
 
     assert!(
         !site_parameter_exists(&db, crate::common::PARAM_S1_DO_ID).await,

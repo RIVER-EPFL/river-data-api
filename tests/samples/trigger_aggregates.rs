@@ -568,7 +568,7 @@ async fn stdev_follows_the_declared_estimator_without_a_refresh() {
     let before = fetch_aggregate(&db, sample_id).await;
     assert!((before.stdev.unwrap() - stdev_sample(&values)).abs() < 1e-9);
 
-    exec(
+    crate::common::exec(
         &db,
         &format!("UPDATE samples SET sd_estimator = 'population' WHERE id = '{sample_id}'"),
     )

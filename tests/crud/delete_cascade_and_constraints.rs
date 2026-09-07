@@ -253,6 +253,68 @@ async fn delete_site_with_data_returns_error() {
     );
 }
 
+// Scenario: a stream that carries readings is deleted directly in the database.
+// Expected behaviour: the FK refuses it, because a reading resolves its origin through the stream
+// it names and a stream removed underneath it would take that record with it.
+#[tokio::test]
+#[serial]
+async fn delete_stream_with_readings_is_refused() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let (db, _app, _token) = setup().await;
+
+    let stream_id = "00000000-0000-4000-d000-000000000097";
+    let sensor_id = uuid::Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO sensors (id, serial_number) VALUES ('{sensor_id}', 'DEL-TEST-003')"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO data_streams (id, source_system, source_key, source_name, sensor_id, \
+                                       is_active) \
+             VALUES ('{stream_id}', 'test', 'del-stream', 'x', '{sensor_id}', true)"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO readings (stream_id, time, replicate_index, raw_value, sensor_id) \
+             VALUES ('{stream_id}', '2025-06-01T00:00:00Z', 0, 10.0, '{sensor_id}')"
+        ),
+    )
+    .await;
+
+    let deleted = db
+        .execute_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("DELETE FROM data_streams WHERE id = '{stream_id}'"),
+        ))
+        .await;
+    let refusal = deleted.expect_err(
+        "deleting a stream that carries readings must be refused, not cascade",
+    );
+    assert!(
+        refusal.to_string().contains("readings_stream_id_fkey"),
+        "the refusal must come from the readings FK, got: {refusal}"
+    );
+
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT count(*) AS c FROM readings WHERE stream_id = '{stream_id}'")
+        )
+        .await,
+        1,
+        "the reading is still stored"
+    );
+}
+
 async fn count(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
     use sea_orm::{ConnectionTrait, Statement};
     db.query_one_raw(Statement::from_string(

@@ -9,10 +9,8 @@
 
 use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
-use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
     let f = crate::common::seeded_app().await;
@@ -42,33 +40,6 @@ fn job_id_of(text: &str) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("response missing job_id: {json}"))
         .to_string()
-}
-
-/// Poll until the spawned job leaves `pending`/`running`. Returns the terminal status.
-/// The job is spawned detached via `tokio::spawn`, so the test must let it settle before
-/// teardown, otherwise a concurrent INSERT races the next test's `TRUNCATE`.
-async fn wait_for_terminal(db: &sea_orm::DatabaseConnection, job_id: &str) -> String {
-    let id = Uuid::parse_str(job_id).unwrap();
-    let start = Instant::now();
-    loop {
-        let row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT status FROM reprocessing_jobs WHERE id = $1",
-                [id.into()],
-            ))
-            .await
-            .unwrap()
-            .expect("reprocessing_jobs row should exist");
-        let status: String = row.try_get("", "status").unwrap();
-        if status != "queued" && status != "pending" && status != "running" {
-            return status;
-        }
-        if start.elapsed() > WAIT_TIMEOUT {
-            panic!("job {job_id} did not reach a terminal status within {WAIT_TIMEOUT:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }
 
 #[tokio::test]
@@ -123,7 +94,7 @@ async fn reprocess_creates_tracked_job_for_seeded_sensor() {
     assert_eq!(trigger_type, "manual_reprocess");
     assert_eq!(row_sensor_id, sensor_id);
 
-    wait_for_terminal(&db, &job_id).await;
+    crate::common::jobs::wait_for_job(&db, &job_id).await;
     crate::common::cleanup_test_db(&db).await;
 }
 
@@ -147,7 +118,7 @@ async fn refresh_aggregates_creates_tracked_job() {
         "refresh_aggregates should create a tracked reprocessing_jobs row for {job_id}"
     );
 
-    let terminal = wait_for_terminal(&db, &job_id).await;
+    let terminal = crate::common::jobs::wait_for_job(&db, &job_id).await;
     assert_eq!(
         terminal, "completed",
         "incremental refresh should complete, not fail"
@@ -182,7 +153,7 @@ async fn compute_derived_creates_tracked_job() {
         "compute_derived should create a tracked reprocessing_jobs row for {job_id}"
     );
 
-    let terminal = wait_for_terminal(&db, &job_id).await;
+    let terminal = crate::common::jobs::wait_for_job(&db, &job_id).await;
     assert_eq!(
         terminal, "completed",
         "compute_derived should complete, not fail"

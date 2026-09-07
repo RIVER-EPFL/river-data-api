@@ -14,7 +14,7 @@ use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
 use uuid::Uuid;
 
-use crate::pairing_plan_apply::{job_id_of, wait_terminal};
+use crate::pairing_plan_apply::job_id_of;
 
 const SOURCE: &str = "instrdec";
 
@@ -149,7 +149,7 @@ async fn apply_and_wait(
     let (status, text) =
         crate::common::post_plan_action_with_token(app, &plan_id.to_string(), "apply", token).await;
     assert!((200..300).contains(&status), "apply ({status}): {text}");
-    assert_eq!(wait_terminal(db, &job_id_of(&text)).await, "completed");
+    assert_eq!(crate::common::jobs::wait_for_job(db, &job_id_of(&text)).await, "completed");
 }
 
 #[tokio::test]
