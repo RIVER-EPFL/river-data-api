@@ -131,3 +131,64 @@ async fn a_lone_measurement_has_no_replicate_rows() {
     assert_eq!(status, 200, "replicates export ({status}): {csv}");
     assert_eq!(csv.lines().count(), 1, "header only: {csv}");
 }
+
+/// Scenario: a parameter code carrying a comma and a quote reaches the replicates export.
+/// Expected behaviour: the cell round trips and the row keeps its column count. Codes are
+/// operator-authored, so an export that concatenates them shifts every later column silently.
+#[tokio::test]
+#[serial]
+async fn an_operator_authored_code_does_not_shift_the_columns() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+    let site = crate::common::SITE1_ID;
+    let parameter = crate::common::GLOBAL_PARAM_TURB_ID;
+
+    let awkward = "DOC, \"filtered\"";
+    crate::common::exec(
+        &db,
+        &format!("UPDATE parameters SET code = '{}' WHERE id = '{parameter}'", awkward.replace('\'', "''")),
+    )
+    .await;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &serde_json::json!({
+            "site_id": site,
+            "readings": [
+                {"parameter_id": parameter, "value": 10.0, "time": AT, "replicate_index": 0},
+                {"parameter_id": parameter, "value": 12.0, "time": AT, "replicate_index": 1},
+            ],
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "grab save ({status}): {body}");
+
+    let (status, csv) = crate::common::get_csv_with_token(
+        &app,
+        &format!("/api/sites/{site}/export/replicates?{WINDOW}&format=csv"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "replicates export ({status}): {csv}");
+
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(csv.as_bytes());
+    let headers = rdr.headers().expect("header").clone();
+    let width = headers.len();
+    let records: Vec<csv::StringRecord> = rdr.records().map(Result::unwrap).collect();
+    assert_eq!(records.len(), 2, "one row per replicate: {csv}");
+    let index = headers
+        .iter()
+        .position(|c| c == "parameter")
+        .expect("parameter column");
+    for record in &records {
+        assert_eq!(record.len(), width, "the row keeps its column count: {csv}");
+        assert_eq!(&record[index], awkward, "the code round trips: {csv}");
+    }
+}

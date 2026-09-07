@@ -13,15 +13,15 @@ use crate::common::middleware::{IsSyncService, ProjectScope, enforce_project_sco
 use crate::error::{AppError, AppResult};
 use crate::routes::private::readings::batch::{Replace, admission, readings_upsert};
 use crate::routes::private::readings::tail;
-use crate::routes::private::sync::replicate_audit as audit;
 use crate::routes::private::sensors::calibrations::{
     self, resolver,
     service::{Curve, apply_curves},
 };
-use crate::routes::private::sensors::operations::{
+use crate::routes::private::sensors::identity::{
     resolve_slot_owner_for_times, resolve_windows_for_times,
 };
 use crate::routes::private::sensors::standard_curves;
+use crate::routes::private::sync::replicate_audit as audit;
 use crate::routes::private::{data_streams, readings, readings::status_events};
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -582,25 +582,13 @@ pub async fn ingest_readings(
                 .and_then(|id| standard_curves_by_id.get(&id).copied());
             readings::ActiveModel {
                 standard_curve_id: Set(standard.map(|c| c.id)),
-                collection_event_id: Set(None),
-                provenance: Set(None),
                 provenance_kind: Set(Some("sync".to_string())),
-                label: Set(None),
-                notes: Set(None),
-                created_by: Set(None),
-                withdrawn_at: Set(None),
-                withdrawn_reason: Set(None),
-                ingested_at: sea_orm::ActiveValue::NotSet,
-                stream_id: Set(payload.stream_id),
-                time: Set(r.time.into()),
-                replicate_index: Set(r.replicate_index),
                 // Pairing is what attributes a reading to a site, so an unpaired stream stores its
                 // readings unattributed even when a deployment of its sensor covers their time.
                 // Within a paired stream the deployment decides which site, since a sensor can move
                 // between sites while the stream keeps pointing at one slot.
                 site_id: Set(site_id.map(|paired| slot.and_then(|s| s.site_id).unwrap_or(paired))),
                 parameter_id: Set(parameter_id),
-                raw_value: Set(r.raw_value),
                 calibrated_value: Set(match (curve, standard) {
                     (None, None) => None,
                     (base, standard) => Some(apply_curves(r.raw_value, base, standard)),
@@ -611,7 +599,6 @@ pub async fn ingest_readings(
                     .deployment_id
                     .or_else(|| slot.and_then(|s| s.deployment_id))
                     .or_else(|| owner.and_then(|o| o.deployment_id))),
-                logged: Set(Some(true)),
                 measurement_type: Set(Some(
                     crate::routes::private::readings::measurement::resolve_measurement_type(
                         r.measurement_type.as_deref(),
@@ -620,9 +607,12 @@ pub async fn ingest_readings(
                         &sensor_types,
                     ),
                 )),
-                is_flagged: Set(Some(false)),
-                flag_reason: Set(None),
-                sample_id: Set(None),
+                ..readings::new(
+                    payload.stream_id,
+                    r.time.into(),
+                    r.replicate_index,
+                    r.raw_value,
+                )
             }
         })
         .collect();

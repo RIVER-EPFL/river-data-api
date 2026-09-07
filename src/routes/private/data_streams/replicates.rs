@@ -345,6 +345,36 @@ mod tests {
         );
     }
 
+    /// A spec stored before pinning resolves to each declared column at its
+    /// position, which is the index its readings were stored under. The sync
+    /// client reads the same metadata through `ColumnAssignment::from_metadata`
+    /// in `river-data-core` and must land on this same mapping, or a legacy
+    /// stream's replicates are indexed one way on write and another on read.
+    #[test]
+    fn an_unpinned_spec_resolves_to_column_positions() {
+        let resolved = spec(&["DOC_rep_1", "DOC_rep_2", "DOC_rep_3"]).column_assignments();
+        assert_eq!(
+            resolved,
+            vec![
+                ColumnAssignment {
+                    column: "DOC_rep_1".to_string(),
+                    index: 0,
+                    retired: false,
+                },
+                ColumnAssignment {
+                    column: "DOC_rep_2".to_string(),
+                    index: 1,
+                    retired: false,
+                },
+                ColumnAssignment {
+                    column: "DOC_rep_3".to_string(),
+                    index: 2,
+                    retired: false,
+                },
+            ]
+        );
+    }
+
     #[test]
     fn a_non_spot_stream_cannot_declare_replicates() {
         assert!(

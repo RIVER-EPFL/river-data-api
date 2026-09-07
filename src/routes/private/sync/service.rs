@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
-use crate::routes::private::sensors::operations::{
+use crate::routes::private::sensors::identity::{
     InstrumentKind, create_sensor_for_stream, upsert_source_instrument,
 };
 use crate::routes::private::{
@@ -892,11 +892,11 @@ pub async fn create_plan(
             sd_holds,
             sd_population_holds,
             acknowledged: false,
-            is_device: crate::routes::private::sensors::operations::is_device_feed(
+            is_device: crate::routes::private::sensors::identity::is_device_feed(
                 &stream.metadata,
             ),
             device_serial:
-                crate::routes::private::sensors::operations::extract_vaisala_device_serial(
+                crate::routes::private::sensors::identity::extract_vaisala_device_serial(
                     &stream.metadata,
                 ),
             device_model: stream
@@ -1553,7 +1553,7 @@ async fn pair_entry_stream<C: ConnectionTrait>(
         .then_some(instrument_id)
         .flatten();
     let needs_sensor = stream.sensor_id.is_none() && from_plan.is_none();
-    let device = crate::routes::private::sensors::operations::extract_vaisala_device_serial(
+    let device = crate::routes::private::sensors::identity::extract_vaisala_device_serial(
         &stream.metadata,
     )
     .is_some();
@@ -1578,9 +1578,9 @@ async fn pair_entry_stream<C: ConnectionTrait>(
         // opened here too. Without this the plan's own instrument choice silently costs the
         // deployment that pairing the same stream by hand would have opened.
         let opens_at =
-            crate::routes::private::sensors::operations::stream_history_start(txn, stream.id)
+            crate::routes::private::sensors::identity::stream_history_start(txn, stream.id)
                 .await?;
-        if let Err(e) = crate::routes::private::sensors::operations::find_or_create_deployment(
+        if let Err(e) = crate::routes::private::sensors::identity::find_or_create_deployment(
             txn,
             sensor_id,
             site_id,

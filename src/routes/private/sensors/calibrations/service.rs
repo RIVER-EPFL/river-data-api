@@ -212,6 +212,47 @@ fn recompose_statement(rows_sql: &str, scope_sql: &str) -> String {
     )
 }
 
+/// The one statement that repoints readings onto the calibration window covering them and rebuilds
+/// `calibrated_value` from it, the operator's standard curve re-applied on top.
+///
+/// `pick` is the lateral that ranks the windows, `selection` chooses the rows as `r`, and
+/// `returning` is appended verbatim so a caller that needs the instants it wrote can ask for them.
+/// The lateral is an outer join: a reading no window covers has to be reachable, because a repoint
+/// must be able to clear a correction as well as replace one.
+pub(super) fn repoint_statement(pick: &str, selection: &str, returning: &str) -> String {
+    let value = recomposed_value_sql(
+        "tgt.raw_value",
+        &CurveColumns {
+            id: "picked.cal_id",
+            slope: "picked.slope",
+            intercept: "picked.intercept",
+        },
+        &CurveColumns {
+            id: "sc.id",
+            slope: "sc.slope",
+            intercept: "sc.intercept",
+        },
+    );
+    format!(
+        r"UPDATE readings tgt
+            SET calibration_id = picked.cal_id,
+                calibrated_value = {value}
+            FROM (
+                SELECT r.stream_id AS p_stream_id, r.time AS p_time,
+                       r.replicate_index AS p_replicate_index,
+                       r.standard_curve_id AS p_standard_curve_id,
+                       cw.id AS cal_id, cw.slope, cw.intercept
+                FROM readings r
+                LEFT JOIN LATERAL ({pick}) cw ON true
+                WHERE {selection}
+            ) picked
+            LEFT JOIN standard_curves sc ON sc.id = picked.p_standard_curve_id
+            WHERE tgt.stream_id = picked.p_stream_id
+              AND tgt.time = picked.p_time
+              AND tgt.replicate_index = picked.p_replicate_index{returning}"
+    )
+}
+
 /// Rewrite `calibrated_value` from the curves each row itself names, for a corrected measurement.
 ///
 /// `rows_sql` narrows which readings qualify and `scope_sql` selects them as `r` against `params`.
@@ -980,43 +1021,15 @@ pub async fn reprocess(db: &DatabaseConnection, scope: Scope) -> Result<usize, s
     // write paths resolve with, so a reprocess recomputes the value ingest already stored rather
     // than a different one. Which rows a window may claim is `window_resolved_rows`; the spot rows
     // it holds back are step 3's.
-    let calibration_sql = format!(
-        r"UPDATE readings tgt
-            SET calibration_id = picked.cal_id,
-                calibrated_value = {value}
-            FROM (
-                SELECT r.stream_id AS p_stream_id, r.time AS p_time,
-                       r.replicate_index AS p_replicate_index,
-                       r.standard_curve_id AS p_standard_curve_id,
-                       cw.id AS cal_id, cw.slope, cw.intercept
-                FROM readings r
-                LEFT JOIN LATERAL ({pick}) cw ON true
-                WHERE {scope_sql}
-                  AND {windowed}
-                  AND NOT (cw.id IS NULL AND ({orphaned}))
-            ) picked
-            LEFT JOIN standard_curves sc ON sc.id = picked.p_standard_curve_id
-            WHERE tgt.stream_id = picked.p_stream_id
-              AND tgt.time = picked.p_time
-              AND tgt.replicate_index = picked.p_replicate_index
-            RETURNING tgt.site_id, tgt.time",
-        scope_sql = scope.readings_predicate(),
-        windowed = calibration_derivable("r"),
-        orphaned = orphaned_correction_rows("r"),
-        value = recomposed_value_sql(
-            "tgt.raw_value",
-            &CurveColumns {
-                id: "picked.cal_id",
-                slope: "picked.slope",
-                intercept: "picked.intercept",
-            },
-            &CurveColumns {
-                id: "sc.id",
-                slope: "sc.slope",
-                intercept: "sc.intercept",
-            },
+    let calibration_sql = repoint_statement(
+        &super::resolver::pick_calibration_lateral(scope.pick_sensor()),
+        &format!(
+            "{scope_sql} AND {windowed} AND NOT (cw.id IS NULL AND ({orphaned}))",
+            scope_sql = scope.readings_predicate(),
+            windowed = calibration_derivable("r"),
+            orphaned = orphaned_correction_rows("r"),
         ),
-        pick = super::resolver::pick_calibration_lateral(scope.pick_sensor()),
+        "\n            RETURNING tgt.site_id, tgt.time",
     );
 
     // Step 3, the grabs: they keep the curves they were entered against, and their value follows
@@ -1140,6 +1153,41 @@ mod tests {
                 .replace("r.measurement_type = 'spot'", &drifted),
             sweep,
             "the two statements differ only in which rows qualify"
+        );
+    }
+
+    /// The reprocess engine and the calibration-delete hook repoint readings by the same rule. They
+    /// were two copies of it, and a fix landing on one is the way they diverge.
+    #[test]
+    fn both_repoint_callers_emit_one_statement() {
+        let engine = repoint_statement(
+            &super::super::resolver::pick_calibration_lateral("$1"),
+            "SELECTION",
+            "",
+        );
+        let delete_hook = repoint_statement(
+            &super::super::resolver::pick_calibration_lateral_excluding("$2", Some("$1")),
+            "SELECTION",
+            "",
+        );
+        let pick_of = |sql: &str| {
+            let start = sql.find("LEFT JOIN LATERAL (").expect("lateral");
+            let end = sql.find(") cw ON true").expect("lateral close");
+            sql[start..end].to_owned()
+        };
+        assert_eq!(
+            engine.replace(&pick_of(&engine), "PICK"),
+            delete_hook.replace(&pick_of(&delete_hook), "PICK"),
+            "the two differ only in which windows the lateral ranks"
+        );
+        assert!(
+            engine.contains("LEFT JOIN LATERAL"),
+            "the lateral stays an outer join, so a reading no window covers is repointed to none \
+             rather than skipped: {engine}"
+        );
+        assert!(
+            engine.contains("LEFT JOIN standard_curves sc"),
+            "and the operator's standard curve is re-applied on top of the new base: {engine}"
         );
     }
 }

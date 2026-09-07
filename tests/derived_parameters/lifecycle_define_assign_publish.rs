@@ -289,3 +289,83 @@ async fn the_same_definitions_in_flight_backfill_is_not_duplicated() {
         "this definition's own in-flight backfill is not doubled"
     );
 }
+
+/// Scenario: two sites hold the same output parameter, and only one declares its slot computed.
+/// Expected behaviour: the declaring site gets computed values and the other is left alone. The
+/// declaration is per site, while group membership and the calculation that produces a parameter
+/// are global, so this is what stops a global rule computing over a site that measures by hand.
+#[tokio::test]
+#[serial]
+async fn a_site_that_does_not_declare_the_slot_computed_is_left_alone() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let (def_id, output_param_id) = create_derived(&app, &token).await;
+
+    // The second site holds the same output parameter as an ordinary slot, entered by hand.
+    let (status, other) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/site_parameters",
+        &serde_json::json!({
+            "site_id": crate::common::SITE2_ID, "parameter_id": output_param_id,
+            "name": "DOmgL_e2e", "display_units": "mg/L",
+        }),
+        &token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "assign plain slot ({status}): {other}"
+    );
+
+    let (status, sp) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/site_parameters",
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID, "parameter_id": output_param_id, "name": "DOmgL_e2e",
+            "sensor_type": "derived", "is_derived": true, "derived_definition_id": def_id,
+            "display_units": "mg/L",
+        }),
+        &token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "assign derived ({status}): {sp}"
+    );
+
+    assert!(
+        e2e::wait_for_jobs_by_trigger(&db, "derived_assignment", 30).await,
+        "derived_assignment backfill should run and complete"
+    );
+
+    let computed_here = count_readings(&db, crate::common::SITE1_ID, &output_param_id).await;
+    assert!(
+        computed_here > 0,
+        "the site that declares the slot computed gets values"
+    );
+
+    let computed_there = count_readings(&db, crate::common::SITE2_ID, &output_param_id).await;
+    assert_eq!(
+        computed_there, 0,
+        "the site that did not declare it computes nothing, it measures this parameter by hand"
+    );
+}
+
+async fn count_readings(db: &sea_orm::DatabaseConnection, site_id: &str, parameter_id: &str) -> i64 {
+    db.query_one_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "SELECT count(*) AS c FROM readings \
+              WHERE site_id = '{site_id}' AND parameter_id = '{parameter_id}'"
+        ),
+    ))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get::<i64>("", "c")
+    .unwrap()
+}

@@ -21,7 +21,7 @@ use crate::routes::private::data_streams::service::get_or_create_api_stream;
 use crate::routes::private::readings;
 use crate::routes::private::readings::tail;
 use crate::routes::private::sensors::calibrations;
-use crate::routes::private::sensors::operations::{ResolvedOwner, resolve_slot_owner_for_times};
+use crate::routes::private::sensors::identity::{ResolvedOwner, resolve_slot_owner_for_times};
 use crate::routes::private::sensors::standard_curves;
 
 /// What a reading must satisfy to be stored, whichever path it arrived on.
@@ -875,21 +875,9 @@ pub async fn insert_batch_readings(
             };
             readings::ActiveModel {
                 standard_curve_id: Set(r.standard_curve_id),
-                collection_event_id: Set(None),
-                provenance: Set(None),
                 provenance_kind: Set(Some("batch".to_string())),
-                label: Set(None),
-                notes: Set(None),
-                created_by: Set(None),
-                withdrawn_at: Set(None),
-                withdrawn_reason: Set(None),
-                ingested_at: sea_orm::ActiveValue::NotSet,
-                stream_id: Set(stream_id),
                 site_id: Set(attributed.then_some(r.site_id)),
                 parameter_id: Set(attributed.then_some(r.parameter_id)),
-                time: Set(r.time.into()),
-                replicate_index: Set(r.replicate_index.unwrap_or(0)),
-                raw_value: Set(r.raw_value),
                 calibrated_value: Set(calibrated_value),
                 sensor_id: Set(r
                     .sensor_id
@@ -897,11 +885,14 @@ pub async fn insert_batch_readings(
                     .or_else(|| stream_sensors.get(&stream_id).copied())),
                 calibration_id: Set(calibration_id),
                 deployment_id: Set(r.deployment_id.or(owner.deployment_id)),
-                logged: Set(Some(true)),
                 measurement_type: Set(Some(measurement_type)),
-                is_flagged: Set(Some(false)),
-                flag_reason: Set(None),
                 sample_id: Set(r.sample_id),
+                ..readings::new(
+                    stream_id,
+                    r.time.into(),
+                    r.replicate_index.unwrap_or(0),
+                    r.raw_value,
+                )
             }
         })
         .collect();

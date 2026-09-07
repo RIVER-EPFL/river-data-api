@@ -163,3 +163,71 @@ impl Related<crate::routes::private::readings::samples::Entity> for Entity {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
+
+/// A reading's key and value with every other column at what a fresh write means: no curation, no
+/// event, no origin blob, and `ingested_at` left `NotSet` so the arrival stamp is the database's.
+/// Each write path then sets the columns it actually resolves.
+#[must_use]
+pub fn new(
+    stream_id: Uuid,
+    time: DateTimeWithTimeZone,
+    replicate_index: i16,
+    raw_value: f64,
+) -> ActiveModel {
+    use sea_orm::ActiveValue::{NotSet, Set};
+    ActiveModel {
+        stream_id: Set(stream_id),
+        time: Set(time),
+        replicate_index: Set(replicate_index),
+        raw_value: Set(raw_value),
+        site_id: Set(None),
+        parameter_id: Set(None),
+        calibrated_value: Set(None),
+        sensor_id: Set(None),
+        calibration_id: Set(None),
+        standard_curve_id: Set(None),
+        deployment_id: Set(None),
+        logged: Set(Some(true)),
+        measurement_type: Set(None),
+        is_flagged: Set(Some(false)),
+        flag_reason: Set(None),
+        sample_id: Set(None),
+        collection_event_id: Set(None),
+        withdrawn_at: Set(None),
+        withdrawn_reason: Set(None),
+        ingested_at: NotSet,
+        provenance_kind: Set(None),
+        provenance: Set(None),
+        label: Set(None),
+        notes: Set(None),
+        created_by: Set(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::ActiveValue::{NotSet, Set};
+
+    /// The arrival stamp is the database's, and a fresh row carries no curation, no event and no
+    /// origin blob. Every write path builds on these, so they are stated once.
+    #[test]
+    fn test_a_new_reading_is_uncurated_and_unstamped() {
+        let model = super::new(uuid::Uuid::nil(), chrono::Utc::now().into(), 2, 7.5);
+        assert!(matches!(model.ingested_at, NotSet));
+        assert_eq!(model.replicate_index, Set(2));
+        assert_eq!(model.raw_value, Set(7.5));
+        assert_eq!(model.is_flagged, Set(Some(false)));
+        assert_eq!(model.flag_reason, Set(None));
+        assert_eq!(model.withdrawn_at, Set(None));
+        assert_eq!(model.withdrawn_reason, Set(None));
+        assert_eq!(model.collection_event_id, Set(None));
+        assert_eq!(model.sample_id, Set(None));
+        assert_eq!(model.provenance, Set(None));
+        assert_eq!(model.provenance_kind, Set(None));
+        assert_eq!(model.label, Set(None));
+        assert_eq!(model.notes, Set(None));
+        assert_eq!(model.created_by, Set(None));
+        assert_eq!(model.calibrated_value, Set(None));
+        assert_eq!(model.standard_curve_id, Set(None));
+    }
+}

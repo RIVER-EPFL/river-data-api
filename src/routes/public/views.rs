@@ -14,24 +14,10 @@ use crate::common::AppState;
 use crate::common::cache;
 use crate::common::cache_key;
 use crate::common::series::{self, Cells, Table};
+use crate::common::served::{SERVED_CONTINUOUS, SERVED_SPOT, SPOT_INSTANT_KEY, SPOT_INSTANT_ORDER};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sites::aggregates::resolution_of;
 use crate::routes::public::service::{PublicProjectConfig, PublicSiteConfig, get_public_config};
-
-/// What the public tier treats as this site's data, split by cadence so each half keeps its fast
-/// plan. Continuous and derived rows are written at `replicate_index = 0` by every continuous
-/// writer, so the plain equality is exact and keeps ordered-append scans and hash aggregation.
-/// Spot instants are replicate groups: the instant is `(stream_id, time)`, the readings primary
-/// key minus the replicate index, valued at the trigger-maintained sample mean over the group's
-/// unflagged replicates, with the lowest unflagged replicate's own value as the fallback when no
-/// sample row exists (unpaired stream, or not yet materialised). A fully flagged group serves
-/// nothing; flagging one replicate moves the served value rather than removing the instant or
-/// handing it to a different replicate. Both predicates are shared by the site-detail count and
-/// the readings query so the count and the series cannot disagree about what the site serves.
-const SERVED_CONTINUOUS: &str = "r.measurement_type IS DISTINCT FROM 'spot' \
-     AND r.replicate_index = 0 AND r.is_flagged IS NOT TRUE AND r.unverified IS NOT TRUE";
-const SERVED_SPOT: &str = "r.measurement_type = 'spot' AND r.is_flagged IS NOT TRUE \
-     AND r.withdrawn_at IS NULL AND r.unverified IS NOT TRUE";
 
 // Time Format
 
@@ -1063,6 +1049,48 @@ async fn aggregates_response_from_data(
 // Shared Helpers
 
 /// Fetch raw readings for resolved parameters, build time axis and parameter arrays.
+/// The public readings query's two serving arms. `continuous_extra` is None when the request
+/// narrows to spot, and otherwise carries any extra narrowing on the continuous arm.
+pub(crate) fn readings_sql(
+    continuous_extra: Option<&str>,
+    include_spot: bool,
+    placeholders: &str,
+    time_cond: &str,
+) -> String {
+    let mut arms: Vec<String> = Vec::new();
+    if let Some(extra) = continuous_extra {
+        arms.push(format!(
+            "SELECT r.parameter_id::TEXT AS param_id, r.time, \
+                    COALESCE(r.calibrated_value, r.raw_value) AS value, r.measurement_type, \
+                    NULL::BIGINT AS n, NULL::DOUBLE PRECISION AS mean, \
+                    NULL::DOUBLE PRECISION AS sd, NULL::DOUBLE PRECISION AS min, \
+                    NULL::DOUBLE PRECISION AS max, NULL::TEXT AS sd_estimator \
+             FROM readings r \
+             WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
+               AND {SERVED_CONTINUOUS}{time_cond}{extra}"
+        ));
+    }
+    if include_spot {
+        arms.push(format!(
+            "SELECT sp.param_id, sp.time, sp.value, sp.measurement_type, \
+                    sp.n, sp.mean, sp.sd, sp.min, sp.max, sp.sd_estimator FROM ( \
+                SELECT DISTINCT ON ({SPOT_INSTANT_KEY}) \
+                       r.parameter_id::TEXT AS param_id, r.time, \
+                       COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value, \
+                       r.measurement_type, \
+                       smp.n::BIGINT AS n, smp.mean, smp.stdev AS sd, \
+                       smp.min_value AS min, smp.max_value AS max, smp.sd_estimator \
+                FROM readings r \
+                LEFT JOIN samples smp ON smp.id = r.sample_id \
+                WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
+                  AND {SERVED_SPOT}{time_cond} \
+                ORDER BY {SPOT_INSTANT_ORDER} \
+             ) sp"
+        ));
+    }
+    arms.join(" UNION ALL ")
+}
+
 async fn fetch_readings(
     state: &AppState,
     resolved: &[&ResolvedParam],
@@ -1130,39 +1158,12 @@ async fn fetch_readings(
     };
     let include_spot = matches!(measurement_type, "" | "spot");
 
-    let mut arms: Vec<String> = Vec::new();
-    if let Some(extra) = continuous_extra {
-        arms.push(format!(
-            "SELECT r.parameter_id::TEXT AS param_id, r.time, \
-                    COALESCE(r.calibrated_value, r.raw_value) AS value, r.measurement_type, \
-                    NULL::BIGINT AS n, NULL::DOUBLE PRECISION AS mean, \
-                    NULL::DOUBLE PRECISION AS sd, NULL::DOUBLE PRECISION AS min, \
-                    NULL::DOUBLE PRECISION AS max, NULL::TEXT AS sd_estimator \
-             FROM readings r \
-             WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
-               AND {SERVED_CONTINUOUS}{time_cond}{extra}"
-        ));
-    }
-    if include_spot {
-        arms.push(format!(
-            "SELECT sp.param_id, sp.time, sp.value, sp.measurement_type, \
-                    sp.n, sp.mean, sp.sd, sp.min, sp.max, sp.sd_estimator FROM ( \
-                SELECT DISTINCT ON (r.stream_id, r.time) \
-                       r.parameter_id::TEXT AS param_id, r.time, \
-                       COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value, \
-                       r.measurement_type, \
-                       smp.n::BIGINT AS n, smp.mean, smp.stdev AS sd, \
-                       smp.min_value AS min, smp.max_value AS max, smp.sd_estimator \
-                FROM readings r \
-                LEFT JOIN samples smp ON smp.id = r.sample_id \
-                WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
-                  AND {SERVED_SPOT}{time_cond} \
-                ORDER BY r.stream_id, r.time, r.replicate_index \
-             ) sp"
-        ));
-    }
-
-    let sql = arms.join(" UNION ALL ");
+    let sql = readings_sql(
+        continuous_extra.as_deref(),
+        include_spot,
+        &placeholders,
+        &time_cond,
+    );
     let stmt = Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values);
 
     let rows: Vec<ReadingRow> = state

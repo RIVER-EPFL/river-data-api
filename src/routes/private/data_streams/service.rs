@@ -74,7 +74,7 @@ pub async fn get_or_create_api_stream(
         .one(db)
         .await?
     {
-        crate::routes::private::sensors::operations::ensure_channel_instrument(
+        crate::routes::private::sensors::identity::ensure_channel_instrument(
             db,
             &stream,
             site_id,
@@ -135,7 +135,7 @@ pub async fn get_or_create_api_stream(
 
     // The channel carries an instrument from the moment it exists, so nothing written through it
     // can land without one.
-    crate::routes::private::sensors::operations::ensure_channel_instrument(
+    crate::routes::private::sensors::identity::ensure_channel_instrument(
         db,
         &stream,
         site_id,

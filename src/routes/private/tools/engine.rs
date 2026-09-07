@@ -52,16 +52,32 @@ fn check_kind(kind: &str) -> Result<(), String> {
 /// condition on an input's value and is what makes `required` conditional. The param it names is
 /// only checked for membership, and one naming itself can never be enforced: requiredness is
 /// consulted for an absent field, so the condition reads an absent value and does not hold.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(untagged)]
 pub enum ParamWhen {
     Note(String),
     Condition(ParamCondition),
 }
 
+// Hand-written because an untagged enum reports only that no variant matched, which hides a
+// misspelled key of the condition object behind a message naming neither.
+impl<'de> Deserialize<'de> for ParamWhen {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = serde_json::Value::deserialize(de)?;
+        if let serde_json::Value::String(note) = value {
+            return Ok(Self::Note(note));
+        }
+        serde_json::from_value(value)
+            .map(Self::Condition)
+            .map_err(D::Error::custom)
+    }
+}
+
 /// `{"param": "mode", "equals": "full_pipeline"}` or
 /// `{"param": "mode", "any_of": ["p1", "p2"]}`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ParamCondition {
     pub param: String,
     #[serde(default)]
@@ -107,6 +123,7 @@ pub enum RowLabels {
 
 /// A field whose value is the difference of two other fields of the same row.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FieldFormula {
     /// `[minuend, subtrahend]`, both naming fields of the same structure.
     pub subtract: [String; 2],
@@ -130,6 +147,7 @@ pub struct ManifestField {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManifestFieldRaw {
     name: String,
     label: String,
@@ -163,6 +181,7 @@ pub struct ManifestStructure {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManifestStructureRaw {
     #[serde(default)]
     layout: Option<StructLayout>,
@@ -439,6 +458,7 @@ pub struct ManifestParam {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManifestParamRaw {
     name: String,
     label: String,
@@ -574,6 +594,7 @@ pub struct ManifestOutput {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManifestOutputRaw {
     key: String,
     label: String,
@@ -649,6 +670,7 @@ impl ManifestOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestCurve {
     pub name: String,
     pub label: String,
@@ -660,6 +682,7 @@ pub struct ManifestCurve {
 
 /// A titled group of fields on the entry form.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestSection {
     pub key: String,
     pub label: String,
@@ -696,6 +719,7 @@ const fn default_true() -> bool {
 /// request carries wins, so an operator can override the stored property exactly as the portal's
 /// forms allow. A required property the site does not hold refuses the run naming it.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestSiteInput {
     /// Column of the `sites` row, e.g. `altitude_m`.
     pub property: String,
@@ -718,6 +742,7 @@ impl ManifestSiteInput {
 /// lowest unflagged replicate). This is the portal's cross-tool prefill — pCO2 pulling field
 /// temperature, DOM pulling the DOC average — as a declaration instead of R code.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestEventInput {
     /// The manifest param this fills.
     pub param: String,
@@ -748,6 +773,7 @@ pub struct Manifest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManifestRaw {
     label: String,
     #[serde(default)]
@@ -1803,6 +1829,26 @@ pub async fn resolve_site_inputs(
     Ok(resolved)
 }
 
+/// The served spot value at one (site, parameter, instant): the sample mean, else the lowest
+/// unflagged replicate that is not withdrawn. `$1` is the site and `$3` the instant; `parameter`
+/// is the expression naming the parameter, so a statement resolving the parameter itself can
+/// pass its own column instead of a placeholder.
+#[must_use]
+pub fn served_spot_value_sql(parameter: &str) -> String {
+    format!(
+        "COALESCE(
+            (SELECT smp.mean FROM samples smp
+              WHERE smp.site_id = $1 AND smp.parameter_id = {parameter}
+                AND smp.collected_at = $3),
+            (SELECT COALESCE(r.calibrated_value, r.raw_value) FROM readings r
+              WHERE r.site_id = $1 AND r.parameter_id = {parameter} AND r.time = $3
+                AND r.measurement_type = 'spot' AND r.is_flagged IS NOT TRUE
+                AND r.withdrawn_at IS NULL
+              ORDER BY r.replicate_index LIMIT 1)
+         )"
+    )
+}
+
 /// Fill the params the manifest's `event_inputs` declare from the collection event's stored
 /// readings, where the request did not carry them. The value is the served spot value: the sample
 /// mean, else the lowest unflagged replicate. Absence is not an error here — the param's own
@@ -1828,17 +1874,11 @@ pub async fn resolve_event_inputs(
         let Some(row) = db
             .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                "SELECT p.id AS parameter_id, COALESCE(
-                    (SELECT smp.mean FROM samples smp
-                      WHERE smp.site_id = $1 AND smp.parameter_id = p.id
-                        AND smp.collected_at = $3),
-                    (SELECT COALESCE(r.calibrated_value, r.raw_value) FROM readings r
-                      WHERE r.site_id = $1 AND r.parameter_id = p.id AND r.time = $3
-                        AND r.measurement_type = 'spot' AND r.is_flagged IS NOT TRUE
-                        AND r.withdrawn_at IS NULL
-                      ORDER BY r.replicate_index LIMIT 1)
-                 ) AS value
-                 FROM parameters p WHERE LOWER(p.code) = LOWER($2)",
+                &format!(
+                    "SELECT p.id AS parameter_id, {} AS value
+                     FROM parameters p WHERE LOWER(p.code) = LOWER($2)",
+                    served_spot_value_sql("p.id")
+                ),
                 [
                     site_id.into(),
                     e.parameter_code.clone().into(),
@@ -2982,6 +3022,55 @@ mod tests {
     }
 
     #[test]
+    fn a_misspelled_manifest_key_is_refused_naming_it() {
+        use super::parse_manifest;
+        let err = parse_manifest(&serde_json::json!({
+            "label": "T",
+            "site_input": [{ "property": "altitude_m" }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("site_input"), "{err}");
+
+        let err = parse_manifest(&serde_json::json!({
+            "label": "T",
+            "params": [{ "name": "t", "label": "T", "kind": "number", "requried": true }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("requried"), "{err}");
+        assert!(err.contains("params"), "{err}");
+
+        let err = parse_manifest(&serde_json::json!({
+            "label": "T",
+            "outputs": [{ "key": "doc", "label": "DOC", "agregate": "mean" }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("agregate"), "{err}");
+
+        let err = parse_manifest(&serde_json::json!({
+            "label": "T",
+            "params": [
+                { "name": "mode", "label": "Mode", "kind": "string" },
+                { "name": "t", "label": "T", "kind": "number",
+                  "when": { "param": "mode", "equal": "full" } }
+            ]
+        }))
+        .unwrap_err();
+        assert!(err.contains("equal"), "{err}");
+    }
+
+    #[test]
+    fn the_station_inputs_spelling_of_site_inputs_still_parses() {
+        let m = manifest(serde_json::json!({
+            "label": "T",
+            "params": [{ "name": "altitude_m", "label": "Altitude", "kind": "number" }],
+            "station_inputs": [{ "property": "altitude_m" }]
+        }))
+        .unwrap();
+        assert_eq!(m.site_inputs.len(), 1);
+        assert_eq!(m.site_inputs[0].target(), "altitude_m");
+    }
+
+    #[test]
     fn a_manifest_kind_outside_the_vocabulary_is_refused() {
         let raw = serde_json::json!({
             "label": "T",
@@ -3093,5 +3182,30 @@ mod tests {
         );
         assert_eq!(by_site.site_inputs[0].target(), "alt");
         assert_eq!(by_station.site_inputs[0].target(), "alt");
+    }
+
+    /// The chain executor and the event-input resolver read the same instant, so both render
+    /// this one string. The predicates below are the spot serving contract.
+    #[test]
+    fn test_served_spot_value_sql_carries_the_serving_predicates() {
+        use super::served_spot_value_sql;
+        for parameter in ["$2", "p.id"] {
+            let sql = served_spot_value_sql(parameter);
+            assert!(sql.contains("SELECT smp.mean FROM samples smp"));
+            assert!(sql.contains("r.measurement_type = 'spot'"));
+            assert!(sql.contains("r.is_flagged IS NOT TRUE"));
+            assert!(sql.contains("r.withdrawn_at IS NULL"));
+            assert!(sql.contains("ORDER BY r.replicate_index LIMIT 1"));
+            assert_eq!(sql.matches(&format!("parameter_id = {parameter}")).count(), 2);
+        }
+    }
+
+    #[test]
+    fn test_served_spot_value_sql_differs_only_in_the_parameter_expression() {
+        use super::served_spot_value_sql;
+        assert_eq!(
+            served_spot_value_sql("p.id"),
+            served_spot_value_sql("$2").replace("$2", "p.id")
+        );
     }
 }

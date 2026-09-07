@@ -46,14 +46,7 @@ pub struct AnnotationResponse {
     pub created_at: Option<DateTime<Utc>>,
 }
 
-/// A CSV field with commas, quotes and newlines escaped.
-fn csv_field(s: &str) -> String {
-    if s.contains(',') || s.contains('"') || s.contains('\n') {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_string()
-    }
-}
+use crate::common::csv::field as csv_field;
 
 /// List annotations for a site, optionally filtered by parameter and time range
 #[utoipa::path(

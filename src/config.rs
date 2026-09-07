@@ -1,3 +1,4 @@
+use river_data_core::env::{parse_or, string_or};
 use std::env;
 
 #[derive(Debug, Clone)]
@@ -21,7 +22,6 @@ impl std::str::FromStr for Deployment {
         }
     }
 }
-
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -195,45 +195,21 @@ impl Config {
                 })?,
 
             // API settings
-            api_host: env::var("API_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
-            api_port: env::var("API_PORT")
-                .unwrap_or_else(|_| "3000".to_string())
-                .parse()
-                .unwrap_or(3000),
+            api_host: string_or("API_HOST", "0.0.0.0"),
+            api_port: parse_or("API_PORT", 3000),
 
-            disable_rate_limiting: env::var("DISABLE_RATE_LIMITING")
-                .unwrap_or_else(|_| "false".to_string())
-                .parse()
-                .unwrap_or(false),
-            bulk_concurrent_limit: env::var("BULK_CONCURRENT_LIMIT")
-                .unwrap_or_else(|_| "10".to_string())
-                .parse()
-                .unwrap_or(10),
+            disable_rate_limiting: parse_or("DISABLE_RATE_LIMITING", false),
+            bulk_concurrent_limit: parse_or("BULK_CONCURRENT_LIMIT", 10),
 
             // Caching
-            cache_ttl_seconds: env::var("CACHE_TTL_SECONDS")
-                .unwrap_or_else(|_| "300".to_string())
-                .parse()
-                .unwrap_or(300), // 5 minutes default
-            token_cache_ttl_seconds: env::var("TOKEN_CACHE_TTL_SECONDS")
-                .unwrap_or_else(|_| "5".to_string())
-                .parse()
-                .unwrap_or(5), // 5s default, tight revocation/expiry window, negligible DB load
+            cache_ttl_seconds: parse_or("CACHE_TTL_SECONDS", 300), // 5 minutes default
+            token_cache_ttl_seconds: parse_or("TOKEN_CACHE_TTL_SECONDS", 5), // 5s default, tight revocation/expiry window, negligible DB load
             // (expiry is re-checked every request; revoke/rotate bust the cache)
-            grants_cache_ttl_seconds: env::var("GRANTS_CACHE_TTL_SECONDS")
-                .unwrap_or_else(|_| "30".to_string())
-                .parse()
-                .unwrap_or(30), // per-user project grants; grant mutations bust the cache directly
-            cache_max_bytes: env::var("CACHE_MAX_BYTES")
-                .unwrap_or_else(|_| "209715200".to_string())
-                .parse()
-                .unwrap_or(209_715_200), // 200MB default
+            grants_cache_ttl_seconds: parse_or("GRANTS_CACHE_TTL_SECONDS", 30), // per-user project grants; grant mutations bust the cache directly
+            cache_max_bytes: parse_or("CACHE_MAX_BYTES", 209_715_200),          // 200MB default
 
             // Application metadata
-            deployment: env::var("DEPLOYMENT")
-                .unwrap_or_else(|_| "local".to_string())
-                .parse()
-                .unwrap_or(Deployment::Local),
+            deployment: parse_or("DEPLOYMENT", Deployment::Local),
 
             // Keycloak authentication (optional)
             keycloak_url: env::var("KEYCLOAK_URL").ok().filter(|s| !s.is_empty()),
@@ -260,184 +236,83 @@ impl Config {
                 }),
 
             // CORS
-            cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS")
-                .unwrap_or_else(|_| "http://localhost:5173,http://localhost:3005".to_string())
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
+            cors_allowed_origins: string_or(
+                "CORS_ALLOWED_ORIGINS",
+                "http://localhost:5173,http://localhost:3005",
+            )
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
 
             // Connection pool
-            db_max_connections: env::var("DB_MAX_CONNECTIONS")
-                .unwrap_or_else(|_| "25".to_string())
-                .parse()
-                .unwrap_or(25),
-            db_min_connections: env::var("DB_MIN_CONNECTIONS")
-                .unwrap_or_else(|_| "5".to_string())
-                .parse()
-                .unwrap_or(5),
+            db_max_connections: parse_or("DB_MAX_CONNECTIONS", 25),
+            db_min_connections: parse_or("DB_MIN_CONNECTIONS", 5),
 
             // Request timeout
-            request_timeout_seconds: env::var("REQUEST_TIMEOUT_SECONDS")
-                .unwrap_or_else(|_| "60".to_string())
-                .parse()
-                .unwrap_or(60),
+            request_timeout_seconds: parse_or("REQUEST_TIMEOUT_SECONDS", 60),
 
-            default_readings_lookback_days: env::var("DEFAULT_READINGS_LOOKBACK_DAYS")
-                .unwrap_or_else(|_| "7".to_string())
-                .parse()
-                .unwrap_or(7),
+            default_readings_lookback_days: parse_or("DEFAULT_READINGS_LOOKBACK_DAYS", 7),
 
             // Public API rate limit, modest by design; responses are cache-backed.
             // Defaults: burst 10, 1 token per 2s ⇒ ~30/min sustained.
-            public_rate_limit_burst: env::var("PUBLIC_RATE_LIMIT_BURST")
-                .unwrap_or_else(|_| "10".to_string())
-                .parse()
-                .unwrap_or(10),
-            public_rate_limit_period_secs: env::var("PUBLIC_RATE_LIMIT_PERIOD_SECS")
-                .unwrap_or_else(|_| "2".to_string())
-                .parse()
-                .unwrap_or(2),
+            public_rate_limit_burst: parse_or("PUBLIC_RATE_LIMIT_BURST", 10),
+            public_rate_limit_period_secs: parse_or("PUBLIC_RATE_LIMIT_PERIOD_SECS", 2),
 
-            auth_rate_limit_per_second: env::var("AUTH_RATE_LIMIT_PER_SECOND")
-                .unwrap_or_else(|_| "100".to_string())
-                .parse()
-                .unwrap_or(100),
-            auth_rate_limit_burst: env::var("AUTH_RATE_LIMIT_BURST")
-                .unwrap_or_else(|_| "200".to_string())
-                .parse()
-                .unwrap_or(200),
+            auth_rate_limit_per_second: parse_or("AUTH_RATE_LIMIT_PER_SECOND", 100),
+            auth_rate_limit_burst: parse_or("AUTH_RATE_LIMIT_BURST", 200),
 
-            audit_api_token_use: env::var("AUDIT_API_TOKEN_USE")
-                .unwrap_or_else(|_| "true".to_string())
-                .parse()
-                .unwrap_or(true),
+            audit_api_token_use: parse_or("AUDIT_API_TOKEN_USE", true),
 
-            request_summary_seconds: env::var("REQUEST_SUMMARY_SECONDS")
-                .unwrap_or_else(|_| "30".to_string())
-                .parse()
-                .unwrap_or(30),
+            request_summary_seconds: parse_or("REQUEST_SUMMARY_SECONDS", 30),
 
             tools_runner_url: env::var("TOOLS_RUNNER_URL")
                 .ok()
                 .map(|u| u.trim_end_matches('/').to_string())
                 .filter(|u| !u.is_empty()),
-            tools_runner_timeout_seconds: env::var("TOOLS_RUNNER_TIMEOUT_SECONDS")
-                .unwrap_or_else(|_| "60".to_string())
-                .parse()
-                .unwrap_or(60),
+            tools_runner_timeout_seconds: parse_or("TOOLS_RUNNER_TIMEOUT_SECONDS", 60),
 
-            meteoswiss_base_url: env::var("METEOSWISS_BASE_URL")
-                .unwrap_or_else(|_| {
-                    "https://data.geo.admin.ch/ch.meteoschweiz.ogd-smn".to_string()
-                })
-                .trim_end_matches('/')
-                .to_string(),
-            meteoswiss_interval_seconds: env::var("METEOSWISS_INTERVAL_SECONDS")
-                .unwrap_or_else(|_| "3600".to_string())
-                .parse()
-                .unwrap_or(3600),
-            meteoswiss_timeout_seconds: env::var("METEOSWISS_TIMEOUT_SECONDS")
-                .unwrap_or_else(|_| "60".to_string())
-                .parse()
-                .unwrap_or(60),
+            meteoswiss_base_url: string_or(
+                "METEOSWISS_BASE_URL",
+                "https://data.geo.admin.ch/ch.meteoschweiz.ogd-smn",
+            )
+            .trim_end_matches('/')
+            .to_string(),
+            meteoswiss_interval_seconds: parse_or("METEOSWISS_INTERVAL_SECONDS", 3600),
+            meteoswiss_timeout_seconds: parse_or("METEOSWISS_TIMEOUT_SECONDS", 60),
 
             // Derived-parameter janitor
-            janitor_interval_seconds: env::var("JANITOR_INTERVAL_SECONDS")
-                .unwrap_or_else(|_| "3600".to_string())
-                .parse()
-                .unwrap_or(3600),
-            janitor_full_refresh_seconds: env::var("JANITOR_FULL_REFRESH_SECONDS")
-                .unwrap_or_else(|_| "86400".to_string())
-                .parse()
-                .unwrap_or(86_400),
-            janitor_retention_days: env::var("JANITOR_RETENTION_DAYS")
-                .unwrap_or_else(|_| "180".to_string())
-                .parse()
-                .unwrap_or(180),
-            job_maintenance_retention_days: env::var("JOB_MAINTENANCE_RETENTION_DAYS")
-                .unwrap_or_else(|_| "14".to_string())
-                .parse()
-                .unwrap_or(14),
-            job_maintenance_max_rows: env::var("JOB_MAINTENANCE_MAX_ROWS")
-                .unwrap_or_else(|_| "50000".to_string())
-                .parse()
-                .unwrap_or(50_000),
+            janitor_interval_seconds: parse_or("JANITOR_INTERVAL_SECONDS", 3600),
+            janitor_full_refresh_seconds: parse_or("JANITOR_FULL_REFRESH_SECONDS", 86_400),
+            janitor_retention_days: parse_or("JANITOR_RETENTION_DAYS", 180),
+            job_maintenance_retention_days: parse_or("JOB_MAINTENANCE_RETENTION_DAYS", 14),
+            job_maintenance_max_rows: parse_or("JOB_MAINTENANCE_MAX_ROWS", 50_000),
 
-            alarm_sweep_interval_seconds: env::var("ALARM_SWEEP_INTERVAL_SECONDS")
-                .unwrap_or_else(|_| "300".to_string())
-                .parse()
-                .unwrap_or(300),
+            alarm_sweep_interval_seconds: parse_or("ALARM_SWEEP_INTERVAL_SECONDS", 300),
 
-            sync_event_sweep_interval_seconds: env::var("SYNC_EVENT_SWEEP_INTERVAL_SECONDS")
-                .unwrap_or_else(|_| "300".to_string())
-                .parse()
-                .unwrap_or(300),
-            sync_event_stale_after_seconds: env::var("SYNC_EVENT_STALE_AFTER_SECONDS")
-                .unwrap_or_else(|_| "3600".to_string())
-                .parse()
-                .unwrap_or(3600),
-            sync_event_retention_days: env::var("SYNC_EVENT_RETENTION_DAYS")
-                .unwrap_or_else(|_| "90".to_string())
-                .parse()
-                .unwrap_or(90),
-            ingest_receipt_retention_days: env::var("INGEST_RECEIPT_RETENTION_DAYS")
-                .unwrap_or_else(|_| "365".to_string())
-                .parse()
-                .unwrap_or(365),
+            sync_event_sweep_interval_seconds: parse_or("SYNC_EVENT_SWEEP_INTERVAL_SECONDS", 300),
+            sync_event_stale_after_seconds: parse_or("SYNC_EVENT_STALE_AFTER_SECONDS", 3600),
+            sync_event_retention_days: parse_or("SYNC_EVENT_RETENTION_DAYS", 90),
+            ingest_receipt_retention_days: parse_or("INGEST_RECEIPT_RETENTION_DAYS", 365),
 
-            sync_session_token_ttl_secs: env::var("SYNC_SESSION_TOKEN_TTL_SECS")
-                .unwrap_or_else(|_| "900".to_string())
-                .parse()
-                .unwrap_or(900),
-            sync_command_expiry_secs: env::var("SYNC_COMMAND_EXPIRY_SECS")
-                .unwrap_or_else(|_| "300".to_string())
-                .parse()
-                .unwrap_or(300),
-            sync_health_healthy_secs: env::var("SYNC_HEALTH_HEALTHY_SECS")
-                .unwrap_or_else(|_| "90".to_string())
-                .parse()
-                .unwrap_or(90),
-            sync_health_warning_secs: env::var("SYNC_HEALTH_WARNING_SECS")
-                .unwrap_or_else(|_| "300".to_string())
-                .parse()
-                .unwrap_or(300),
-            sync_client_id_prefix: env::var("SYNC_CLIENT_ID_PREFIX")
-                .unwrap_or_else(|_| "svc_".to_string()),
+            sync_session_token_ttl_secs: parse_or("SYNC_SESSION_TOKEN_TTL_SECS", 900),
+            sync_command_expiry_secs: parse_or("SYNC_COMMAND_EXPIRY_SECS", 300),
+            sync_health_healthy_secs: parse_or("SYNC_HEALTH_HEALTHY_SECS", 90),
+            sync_health_warning_secs: parse_or("SYNC_HEALTH_WARNING_SECS", 300),
+            sync_client_id_prefix: string_or("SYNC_CLIENT_ID_PREFIX", "svc_"),
 
-            job_max_retries: env::var("JOB_MAX_RETRIES")
-                .unwrap_or_else(|_| "3".to_string())
-                .parse()
-                .unwrap_or(3),
-            job_retry_backoff_seconds: env::var("JOB_RETRY_BACKOFF_SECONDS")
-                .unwrap_or_else(|_| "60".to_string())
-                .parse()
-                .unwrap_or(60),
+            job_max_retries: parse_or("JOB_MAX_RETRIES", 3),
+            job_retry_backoff_seconds: parse_or("JOB_RETRY_BACKOFF_SECONDS", 60),
 
-            notify_poll_interval_seconds: env::var("NOTIFY_POLL_INTERVAL_SECONDS")
-                .unwrap_or_else(|_| "60".to_string())
-                .parse()
-                .unwrap_or(60),
-            identity_reconcile_interval_seconds: env::var("IDENTITY_RECONCILE_INTERVAL_SECONDS")
-                .unwrap_or_else(|_| "300".to_string())
-                .parse()
-                .unwrap_or(300),
-            notify_health_interval_seconds: env::var("NOTIFY_HEALTH_INTERVAL_SECONDS")
-                .unwrap_or_else(|_| "300".to_string())
-                .parse()
-                .unwrap_or(300),
-            battery_cutoff_volts: env::var("BATTERY_CUTOFF_VOLTS")
-                .unwrap_or_else(|_| "10.5".to_string())
-                .parse()
-                .unwrap_or(10.5),
-            battery_forecast_alert_days: env::var("BATTERY_FORECAST_ALERT_DAYS")
-                .unwrap_or_else(|_| "14".to_string())
-                .parse()
-                .unwrap_or(14),
-            stale_data_threshold_hours: env::var("STALE_DATA_THRESHOLD_HOURS")
-                .unwrap_or_else(|_| "6".to_string())
-                .parse()
-                .unwrap_or(6),
+            notify_poll_interval_seconds: parse_or("NOTIFY_POLL_INTERVAL_SECONDS", 60),
+            identity_reconcile_interval_seconds: parse_or(
+                "IDENTITY_RECONCILE_INTERVAL_SECONDS",
+                300,
+            ),
+            notify_health_interval_seconds: parse_or("NOTIFY_HEALTH_INTERVAL_SECONDS", 300),
+            battery_cutoff_volts: parse_or("BATTERY_CUTOFF_VOLTS", 10.5),
+            battery_forecast_alert_days: parse_or("BATTERY_FORECAST_ALERT_DAYS", 14),
+            stale_data_threshold_hours: parse_or("STALE_DATA_THRESHOLD_HOURS", 6),
             dashboard_base_url: env::var("DASHBOARD_BASE_URL")
                 .ok()
                 .filter(|s| !s.is_empty()),
@@ -445,12 +320,8 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .map(|s| s.replace("\\n", "\n")),
-            vapid_public_key: env::var("VAPID_PUBLIC_KEY")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            vapid_subject: env::var("VAPID_SUBJECT")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            vapid_public_key: env::var("VAPID_PUBLIC_KEY").ok().filter(|s| !s.is_empty()),
+            vapid_subject: env::var("VAPID_SUBJECT").ok().filter(|s| !s.is_empty()),
         })
     }
 
@@ -518,7 +389,11 @@ mod tests {
         for deployment in [Deployment::Dev, Deployment::Stage, Deployment::Prod] {
             let (kept, dropped) = served_cors_origins(deployment, &list);
             assert_eq!(kept, origins(&["https://river-data.epfl.ch"]));
-            assert_eq!(dropped.len(), 3, "every loopback origin is named, not served");
+            assert_eq!(
+                dropped.len(),
+                3,
+                "every loopback origin is named, not served"
+            );
         }
     }
 
@@ -526,7 +401,8 @@ mod tests {
     fn test_served_cors_origins_leaves_the_deployment_with_none() {
         // Dropping every origin is not the same as allowing every origin: the caller decides what
         // an empty allowlist means, and must not read this as "unset".
-        let (kept, dropped) = served_cors_origins(Deployment::Prod, &origins(&["http://localhost:5173"]));
+        let (kept, dropped) =
+            served_cors_origins(Deployment::Prod, &origins(&["http://localhost:5173"]));
         assert!(kept.is_empty());
         assert_eq!(dropped.len(), 1);
     }

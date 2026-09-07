@@ -85,15 +85,7 @@ impl Cells {
     }
 }
 
-/// A quoted CSV field, per RFC 4180: quotes are doubled and only a field that needs it is quoted,
-/// so a plain value renders exactly as it always has.
-fn csv_cell(value: &str) -> String {
-    if value.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_string()
-    }
-}
+use crate::common::csv::field as csv_cell;
 
 #[derive(Debug, Clone)]
 struct Column {

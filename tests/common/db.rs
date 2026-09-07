@@ -78,6 +78,16 @@ async fn stop_background_policies(db: &DatabaseConnection) {
 /// and Postgres releases the lock when the process exits.
 static LOCK_SESSION: tokio::sync::OnceCell<DatabaseConnection> = tokio::sync::OnceCell::const_new();
 
+/// What the harness lock session calls itself, so the cleanup sweep can spare it: terminating it
+/// would drop [`HARNESS_LOCK_KEY`] and let a second runner in mid-suite.
+const LOCK_SESSION_APPLICATION_NAME: &str = "river-harness-lock";
+
+/// The lock session's URL, carrying the application name the sweep matches on.
+fn lock_session_url(url: &str) -> String {
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}application_name={LOCK_SESSION_APPLICATION_NAME}")
+}
+
 /// Take the database for this process, waiting for whoever holds it.
 ///
 /// `cleanup_test_db` truncates tables a concurrent suite is reading, so two runners on one database
@@ -86,7 +96,7 @@ static LOCK_SESSION: tokio::sync::OnceCell<DatabaseConnection> = tokio::sync::On
 async fn hold_the_database(url: &str) {
     LOCK_SESSION
         .get_or_init(|| async {
-            let mut opts = ConnectOptions::new(url.to_string());
+            let mut opts = ConnectOptions::new(lock_session_url(url));
             opts.max_connections(1).min_connections(1).sqlx_logging(false);
             let session = Database::connect(opts)
                 .await
@@ -224,10 +234,40 @@ pub const CLEANUP_DELETED_TABLES: &[&str] = &[
 /// Reference data a test reads and never owns.
 pub const CLEANUP_EXEMPT_TABLES: &[&str] = &["constants", "seaql_migrations"];
 
+/// End work a finished test left running, so the TRUNCATE below cannot deadlock against it.
+///
+/// `stop_test_workers` covers the job workers this process owns. It does not cover a request
+/// handler's own spawned work, and dropping a test's runtime aborts a task without rolling back
+/// what its connection already sent, so a statement can still be in flight against `readings` or
+/// `replicate_audit_holds` when the next test truncates. The TRUNCATE wants those relations in a
+/// different order and the pair deadlocks.
+///
+/// Both `active` and `idle in transaction` qualify: a backend still executing its `UPDATE` reports
+/// `active`, and that is the one that holds the row locks. Cleanup runs before a test has issued
+/// anything of its own, so any such backend belongs to a test that has already finished. The lock
+/// session is spared by name, because terminating it would release [`HARNESS_LOCK_KEY`].
+///
+/// Measured over a full `sync` run: this fires four times, every time on the detached
+/// `UPDATE api_tokens SET last_used_at` the auth layer spawns per request. `api_tokens` is in the
+/// TRUNCATE list, so that write is a deadlock partner, and no worker owns it.
+async fn end_stranded_transactions(db: &DatabaseConnection) {
+    exec(
+        db,
+        &format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+              WHERE datname = current_database() AND pid <> pg_backend_pid() \
+                AND application_name IS DISTINCT FROM '{LOCK_SESSION_APPLICATION_NAME}' \
+                AND state IN ('active', 'idle in transaction')"
+        ),
+    )
+    .await;
+}
+
 pub async fn cleanup_test_db(db: &DatabaseConnection) {
     // The fixture's own writer goes first: a worker still claiming rows while this truncates is
     // the one thing in the harness that can write between the TRUNCATE and the seed.
     crate::common::stop_test_workers().await;
+    end_stranded_transactions(db).await;
     let stmts = [
         "SELECT remove_continuous_aggregate_policy('readings_monthly', if_not_exists => true)",
         "SELECT remove_continuous_aggregate_policy('readings_weekly', if_not_exists => true)",

@@ -186,14 +186,7 @@ fn limit_clause(paging: &Paging, binds: &mut Vec<sea_orm::Value>) -> String {
     format!(" LIMIT ${limit_ref} OFFSET ${}", binds.len())
 }
 
-/// A CSV field: quoted when it carries a comma, a quote or a line break.
-fn csv_field(value: &str) -> String {
-    if value.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_string()
-    }
-}
+use crate::common::csv::field as csv_field;
 
 /// The grid as CSV: `collected_at,source,parameters_filled,<code>…`, one line per visit in the
 /// listed order, the served value in each cell and an empty cell where the grid shows none.

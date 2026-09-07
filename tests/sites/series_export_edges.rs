@@ -391,3 +391,48 @@ async fn an_empty_aggregate_window_answers_in_the_requested_format() {
     );
     assert_eq!(lines(&body).len(), 1, "header only: {body}");
 }
+
+/// Scenario: an annotation whose text carries a lone carriage return reaches the annotations CSV.
+/// Expected behaviour: the field is quoted, so the record survives a reader that treats CR as a
+/// terminator. Annotation text is operator-authored and can hold anything a keyboard produces.
+#[tokio::test]
+#[serial]
+async fn an_annotation_carrying_a_carriage_return_stays_one_record() {
+    let (db, app, token) = setup().await;
+    let site = crate::common::SITE1_ID;
+
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO annotations (site_id, parameter_id, category, text, start_time, end_time) \
+             VALUES ('{site}', '{param}', 'maintenance', \
+                     E'probe cleaned\\rsensor reseated', \
+                     '2025-01-15T00:00:00Z', '2025-01-15T01:00:00Z')",
+            param = crate::common::GLOBAL_PARAM_DO_ID,
+        ),
+    )
+    .await;
+
+    let (status, csv) = crate::common::get_csv_with_token(
+        &app,
+        &format!("/api/sites/{site}/annotations?format=csv"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "annotations export ({status}): {csv}");
+
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(csv.as_bytes());
+    let headers = rdr.headers().expect("header").clone();
+    let records: Vec<csv::StringRecord> = rdr.records().map(Result::unwrap).collect();
+    assert_eq!(records.len(), 1, "one annotation, one record: {csv}");
+    let index = headers
+        .iter()
+        .position(|c| c == "text")
+        .expect("text column");
+    assert_eq!(
+        &records[0][index], "probe cleaned\rsensor reseated",
+        "the carriage return stays inside the cell: {csv}"
+    );
+}

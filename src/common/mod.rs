@@ -4,6 +4,7 @@ pub mod bulk;
 pub mod bulk_write;
 pub mod cache;
 pub mod cache_key;
+pub mod csv;
 pub mod db_pool;
 pub mod grants;
 pub mod middleware;
@@ -11,6 +12,7 @@ pub mod rate_limit;
 pub mod request_metrics;
 pub mod scope;
 pub mod series;
+pub mod served;
 pub mod state;
 pub mod sync_state;
 

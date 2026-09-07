@@ -1,6 +1,7 @@
 //! An intern's entry is pending, and the public API does not publish a pending measurement (Q18,
 //! Q21). The row is absent from the served instant, not served with a status column, and a
-//! manager's verify is what puts it on the public arm.
+//! manager's verify is what puts it on the public arm. The private arm is the other half of that
+//! decision: it serves the entry and says it is pending, because it is the only surface that can.
 //!
 //! Run: cargo test --test public_api unverified_entries -- --test-threads=1
 
@@ -117,4 +118,65 @@ async fn a_pending_entry_is_not_published_and_a_verify_publishes_it() {
         (served(&app).await.expect("verified") - 10.0).abs() < 1e-9,
         "a verify puts the entry on the public arm"
     );
+}
+
+/// Scenario: the same pending entry, read through the private site readings arm.
+/// Expected behaviour: it is served, and it is marked pending. The public arm, the alarms and the
+/// seasonal check all leave such a reading out, so a manager who cannot see it here has no way to
+/// know there is anything to countersign.
+#[tokio::test]
+#[serial]
+async fn the_private_arm_serves_a_pending_entry_and_says_it_is_pending() {
+    let (db, app, stream) = setup().await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+
+    let flags = |body: &serde_json::Value| -> Vec<Option<bool>> {
+        body["parameters"]
+            .as_array()
+            .expect("parameters")
+            .iter()
+            .find(|p| p["parameter_id"] == crate::common::GLOBAL_PARAM_TEMP_ID)
+            .expect("the temperature slot")["unverified"]
+            .as_array()
+            .expect("unverified is always served on the private arm")
+            .iter()
+            .map(serde_json::Value::as_bool)
+            .collect()
+    };
+
+    let uri = format!(
+        "/api/sites/{}/readings?{WINDOW}&measurement_type=spot",
+        crate::common::SITE1_ID
+    );
+
+    let (status, body) = crate::common::get_json_with_token(&app, &uri, &token).await;
+    assert_eq!(status, 200, "private readings ({status}): {body}");
+    assert!(
+        flags(&body).iter().all(|f| f != &Some(true)),
+        "nothing is pending yet: {body}"
+    );
+
+    set_unverified(&db, stream, None, true).await;
+
+    let (status, body) = crate::common::get_json_with_token(&app, &uri, &token).await;
+    assert_eq!(status, 200, "private readings ({status}): {body}");
+    let values = body["parameters"]
+        .as_array()
+        .expect("parameters")
+        .iter()
+        .find(|p| p["parameter_id"] == crate::common::GLOBAL_PARAM_TEMP_ID)
+        .expect("the temperature slot")["values"]
+        .as_array()
+        .expect("values")
+        .iter()
+        .filter(|v| !v.is_null())
+        .count();
+    assert!(values > 0, "the private arm still serves the entry: {body}");
+    assert!(
+        flags(&body).contains(&Some(true)),
+        "and marks it pending, which the public arm never does: {body}"
+    );
+
+    // The public arm's answer to the same state, so the two halves are asserted together.
+    assert_eq!(served(&app).await, None, "nothing pending is published");
 }

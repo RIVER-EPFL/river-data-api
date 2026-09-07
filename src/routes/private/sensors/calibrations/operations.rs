@@ -4,7 +4,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
 use super::model::SensorCalibration;
-use super::service::{CurveColumns, recomposed_value_sql, recompute_valid_until};
+use super::service::recompute_valid_until;
 
 pub struct SensorCalibrationOperations;
 
@@ -304,41 +304,16 @@ impl CRUDOperations for SensorCalibrationOperations {
         // foreign key would then refuse the delete. The value expression is the shared
         // `recomposed_value_sql`, so a row left with neither curve reads NULL rather than its raw
         // value.
-        let value = recomposed_value_sql(
-            "tgt.raw_value",
-            &CurveColumns {
-                id: "picked.cal_id",
-                slope: "picked.slope",
-                intercept: "picked.intercept",
-            },
-            &CurveColumns {
-                id: "sc.id",
-                slope: "sc.slope",
-                intercept: "sc.intercept",
-            },
-        );
-        let repoint_sql = format!(
-            r"UPDATE readings tgt
-              SET calibration_id = picked.cal_id,
-                  calibrated_value = {value}
-              FROM (
-                  SELECT r.stream_id AS p_stream_id, r.time AS p_time,
-                         r.replicate_index AS p_replicate_index,
-                         r.standard_curve_id AS p_standard_curve_id,
-                         cw.id AS cal_id, cw.slope, cw.intercept
-                  FROM readings r
-                  LEFT JOIN LATERAL ({pick}) cw ON true
-                  WHERE r.calibration_id = $1 AND {not_pinned}
-              ) picked
-              LEFT JOIN standard_curves sc ON sc.id = picked.p_standard_curve_id
-              WHERE tgt.stream_id = picked.p_stream_id
-                AND tgt.time = picked.p_time
-                AND tgt.replicate_index = picked.p_replicate_index",
-            pick = super::resolver::pick_calibration_lateral_excluding("$2", Some("$1")),
-            not_pinned = crate::routes::private::readings::decisions::not_pinned_sql(
-                "r",
-                crate::routes::private::readings::decisions::Kind::CalibrationPin
+        let repoint_sql = super::service::repoint_statement(
+            &super::resolver::pick_calibration_lateral_excluding("$2", Some("$1")),
+            &format!(
+                "r.calibration_id = $1 AND {not_pinned}",
+                not_pinned = crate::routes::private::readings::decisions::not_pinned_sql(
+                    "r",
+                    crate::routes::private::readings::decisions::Kind::CalibrationPin
+                ),
             ),
+            "",
         );
         crate::common::bulk_write::guarded_mutation(
             db,

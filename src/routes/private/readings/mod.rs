@@ -5,6 +5,7 @@ pub mod edits;
 pub mod flags;
 pub mod grab_samples;
 pub mod import;
+pub mod import_job;
 pub mod ingest;
 pub mod measurement;
 pub mod model;

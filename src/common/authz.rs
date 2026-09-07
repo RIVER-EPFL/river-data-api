@@ -344,8 +344,22 @@ pub async fn check(
     }
 }
 
-/// Method-aware CRUD gate body: GET/HEAD need `read`, mutations need `write` (with `write_token`
-/// governing the token side of mutations; reads follow the read capability's default bit).
+/// Which gate a CRUD request faces: GET and HEAD are reads and follow the read capability's own
+/// default bit, every other method is a write under `write_token`.
+#[must_use]
+pub fn crud_gate(
+    method: &axum::http::Method,
+    read: Capability,
+    write: Capability,
+    write_token: TokenAccess,
+) -> (Capability, TokenAccess) {
+    match *method {
+        axum::http::Method::GET | axum::http::Method::HEAD => (read, TokenAccess::Same),
+        _ => (write, write_token),
+    }
+}
+
+/// Method-aware CRUD gate body: the method picks the capability and token rule, [`check`] rules.
 pub async fn check_crud(
     read: Capability,
     write: Capability,
@@ -353,23 +367,17 @@ pub async fn check_crud(
     request: Request,
     next: Next,
 ) -> Response {
-    let is_read = matches!(
-        *request.method(),
-        axum::http::Method::GET | axum::http::Method::HEAD
-    );
-    if is_read {
-        check(read, TokenAccess::Same, request, next).await
-    } else {
-        check(write, write_token, request, next).await
-    }
+    let (cap, token_rule) = crud_gate(request.method(), read, write, write_token);
+    check(cap, token_rule, request, next).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AccessScope, Capability, Role, TokenAccess, TokenBit, TokenPermissions, keycloak_allows,
-        token_allows,
+        AccessScope, Capability, Role, TokenAccess, TokenBit, TokenPermissions, crud_gate,
+        keycloak_allows, token_allows,
     };
+    use axum::http::Method;
     use std::collections::HashSet;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -492,8 +500,16 @@ mod tests {
         // the default rule refuse every token. Only an explicit Bit override admits one, which is
         // the frozen sync-service surface asserted below.
         assert_eq!(Capability::Admin.default_token_bit(), None);
-        assert!(!token_allows(&all_bits(), Capability::Admin, TokenAccess::Same));
-        assert!(!token_allows(&all_bits(), Capability::Admin, TokenAccess::Deny));
+        assert!(!token_allows(
+            &all_bits(),
+            Capability::Admin,
+            TokenAccess::Same
+        ));
+        assert!(!token_allows(
+            &all_bits(),
+            Capability::Admin,
+            TokenAccess::Deny
+        ));
     }
 
     #[test]
@@ -526,10 +542,7 @@ mod tests {
             Capability::EnterFieldData.default_token_bit(),
             Some(TokenBit::WriteData)
         );
-        assert!(keycloak_allows(
-            &[Role::Intern],
-            Capability::EnterFieldData
-        ));
+        assert!(keycloak_allows(&[Role::Intern], Capability::EnterFieldData));
         assert!(!keycloak_allows(&[Role::Intern], Capability::WriteData));
     }
 
@@ -540,6 +553,43 @@ mod tests {
         assert!(!parsed.write_metadata);
         let broken = TokenPermissions::from_json(&serde_json::json!("not an object"));
         assert!(!broken.write_metadata && !broken.write_data);
+    }
+
+    #[test]
+    fn only_get_and_head_reach_a_crud_route_s_read_capability() {
+        let gate = |method: Method| {
+            crud_gate(
+                &method,
+                Capability::ReadMetadata,
+                Capability::WriteCatalog,
+                TokenAccess::Bit(TokenBit::WriteMetadata),
+            )
+        };
+        for read in [Method::GET, Method::HEAD] {
+            assert_eq!(
+                gate(read.clone()),
+                (Capability::ReadMetadata, TokenAccess::Same),
+                "{read} is not gated as a read"
+            );
+        }
+        for write in [
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+            Method::TRACE,
+            Method::CONNECT,
+        ] {
+            assert_eq!(
+                gate(write.clone()),
+                (
+                    Capability::WriteCatalog,
+                    TokenAccess::Bit(TokenBit::WriteMetadata)
+                ),
+                "{write} is not gated as a write"
+            );
+        }
     }
 
     #[test]

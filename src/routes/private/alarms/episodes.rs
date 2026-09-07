@@ -16,6 +16,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
 use uuid::Uuid;
 
 use super::thresholds::{resolve_threshold, severity_case};
+use crate::common::served::{CONTINUOUS_ROWS, SERVED_SPOT, SPOT_INSTANT_KEY, SPOT_INSTANT_ORDER};
 
 #[derive(Debug, FromQueryResult)]
 struct EpisodeRow {
@@ -122,6 +123,36 @@ pub async fn evaluate_alarm_episodes(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The series one cadence's episodes are computed over: continuous and derived rows stay when
+/// flagged, because an out-of-range value keeps alerting, while a spot instant is served at the
+/// sample mean over its unflagged replicates, so a fully flagged group is skipped.
+pub(crate) fn ordered_sql(spot: bool) -> String {
+    if spot {
+        format!(
+            r"SELECT sp.t, sp.v FROM (
+              SELECT DISTINCT ON ({SPOT_INSTANT_KEY})
+                     r.time AS t,
+                     COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS v
+              FROM readings r
+              LEFT JOIN samples smp ON smp.id = r.sample_id
+              WHERE r.site_id = $1 AND r.parameter_id = $2
+                AND r.time >= $3 AND r.time <= $4
+                AND {SERVED_SPOT}
+              ORDER BY {SPOT_INSTANT_ORDER}
+          ) sp"
+        )
+    } else {
+        format!(
+            r"SELECT r.time AS t,
+                 COALESCE(r.calibrated_value, r.raw_value) AS v
+          FROM readings r
+          WHERE r.site_id = $1 AND r.parameter_id = $2
+            AND r.time >= $3 AND r.time <= $4
+            AND {CONTINUOUS_ROWS}"
+        )
+    }
+}
+
 async fn fetch_episodes(
     db: &DatabaseConnection,
     site_id: Uuid,
@@ -134,38 +165,15 @@ async fn fetch_episodes(
 ) -> Result<Vec<EpisodeRow>, sea_orm::DbErr> {
     // Per-instant severity, then gaps-and-islands. `ordered` is the served series for the
     // cadence: continuous and derived rows live at replicate_index 0 and stay when flagged (an
-    // out-of-range value keeps alerting); a spot instant is the replicate group `(stream_id,
-    // time)`, evaluated at the sample mean over its unflagged replicates (fallback: the lowest
+    // out-of-range value keeps alerting); a spot instant is the replicate group at its slot,
+    // evaluated at the sample mean over its unflagged replicates (fallback: the lowest
     // unflagged replicate's own value when no sample row exists), so a fully flagged group is
     // skipped. `scored` applies the severity ladder; `marked` computes the LAG/LEAD neighbours;
     // `runs` then cumulatively sums the run-start flag (a window function can't be nested inside
     // another, so these must be separate CTEs). `run_id` increments at each breach that follows a
     // non-breach, so all consecutive breaching readings share one id. `next_t`/`next_v` from the
     // run's last row is the following in-range reading (NULL when the run reaches the window edge).
-    let ordered = if spot {
-        r"SELECT sp.t, sp.v FROM (
-              SELECT DISTINCT ON (r.stream_id, r.time)
-                     r.time AS t,
-                     COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS v
-              FROM readings r
-              LEFT JOIN samples smp ON smp.id = r.sample_id
-              WHERE r.site_id = $1 AND r.parameter_id = $2
-                AND r.time >= $3 AND r.time <= $4
-                AND r.measurement_type = 'spot'
-                AND r.withdrawn_at IS NULL
-                AND r.is_flagged IS NOT TRUE
-                AND r.unverified IS NOT TRUE
-              ORDER BY r.stream_id, r.time, r.replicate_index
-          ) sp"
-    } else {
-        r"SELECT r.time AS t,
-                 COALESCE(r.calibrated_value, r.raw_value) AS v
-          FROM readings r
-          WHERE r.site_id = $1 AND r.parameter_id = $2
-            AND r.time >= $3 AND r.time <= $4
-            AND r.measurement_type IS DISTINCT FROM 'spot'
-            AND r.replicate_index = 0"
-    };
+    let ordered = ordered_sql(spot);
     let sql = format!(
         r"
         WITH ordered AS ({ordered}),

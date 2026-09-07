@@ -2,6 +2,7 @@ pub mod commands_model;
 pub mod control;
 pub mod credentials_model;
 pub mod events_model;
+pub mod matching;
 pub mod operator;
 pub mod replicate_audit;
 pub mod replicate_reconciliation;

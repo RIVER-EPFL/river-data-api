@@ -15,11 +15,11 @@
 //! The procedure has its own transaction control, so it cannot run inside a transaction block: pass
 //! a `DatabaseConnection`, after any guarded write has committed.
 
-use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, DurationRound, Months, Utc, Weekday};
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 
 use super::bulk_write::TouchedRange;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 
 /// A rollup view and its bucket width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,41 +51,42 @@ impl Resolution {
 
     /// Start of the bucket holding `t`, matching `time_bucket` on a UTC-anchored timestamptz:
     /// the hour, the UTC day, the Monday of the week, the first of the month.
-    #[must_use]
-    pub fn floor(self, t: DateTime<Utc>) -> DateTime<Utc> {
-        let date = t.date_naive();
-        match self {
-            Resolution::Hourly => t
-                .with_minute(0)
-                .and_then(|t| t.with_second(0))
-                .and_then(|t| t.with_nanosecond(0))
-                .unwrap_or(t),
-            Resolution::Daily => midnight(date.year(), date.month(), date.day()),
+    ///
+    /// `duration_trunc` anchors to the Unix epoch, a Thursday, so the weekly bucket is taken from
+    /// the Monday of `t`'s week rather than truncated to seven days.
+    pub fn floor(self, t: DateTime<Utc>) -> AppResult<DateTime<Utc>> {
+        let floor = match self {
+            Resolution::Hourly => t.duration_trunc(Duration::hours(1)),
+            Resolution::Daily => t.duration_trunc(Duration::days(1)),
             Resolution::Weekly => {
-                let back = i64::from(date.weekday().num_days_from_monday());
-                let monday = date - Duration::days(back);
-                midnight(monday.year(), monday.month(), monday.day())
+                let monday = t.date_naive().week(Weekday::Mon).first_day();
+                monday
+                    .and_hms_opt(0, 0, 0)
+                    .map(|d| d.and_utc())
+                    .ok_or(chrono::RoundingError::TimestampExceedsLimit)
             }
-            Resolution::Monthly => midnight(date.year(), date.month(), 1),
-        }
+            Resolution::Monthly => t
+                .date_naive()
+                .with_day(1)
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .map(|d| d.and_utc())
+                .ok_or(chrono::RoundingError::TimestampExceedsLimit),
+        };
+        floor.map_err(|e| {
+            AppError::Internal(format!("no {} bucket floor for {t}: {e}", self.view()))
+        })
     }
 
     /// Exclusive end of the bucket holding `t`, ie. the next bucket boundary strictly after `t`.
-    #[must_use]
-    pub fn bucket_end(self, t: DateTime<Utc>) -> DateTime<Utc> {
-        let start = self.floor(t);
+    pub fn bucket_end(self, t: DateTime<Utc>) -> AppResult<DateTime<Utc>> {
+        let start = self.floor(t)?;
         match self {
-            Resolution::Hourly => start + Duration::hours(1),
-            Resolution::Daily => start + Duration::days(1),
-            Resolution::Weekly => start + Duration::days(7),
-            Resolution::Monthly => {
-                let (year, month) = if start.month() == 12 {
-                    (start.year() + 1, 1)
-                } else {
-                    (start.year(), start.month() + 1)
-                };
-                midnight(year, month, 1)
-            }
+            Resolution::Hourly => Ok(start + Duration::hours(1)),
+            Resolution::Daily => Ok(start + Duration::days(1)),
+            Resolution::Weekly => Ok(start + Duration::days(7)),
+            Resolution::Monthly => start
+                .checked_add_months(Months::new(1))
+                .ok_or_else(|| AppError::Internal(format!("no monthly bucket after {start}"))),
         }
     }
 
@@ -98,12 +99,6 @@ impl Resolution {
             Resolution::Monthly => Duration::days(62),
         }
     }
-}
-
-fn midnight(year: i32, month: u32, day: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(year, month, day, 0, 0, 0)
-        .single()
-        .unwrap_or_else(Utc::now)
 }
 
 /// What a refresh should cover.
@@ -175,7 +170,7 @@ pub async fn refresh(db: &DatabaseConnection, window: Window) -> AppResult<()> {
         } else {
             window
         };
-        let statement = refresh_statement(resolution, view_window, now);
+        let statement = refresh_statement(resolution, view_window, now)?;
         match db.execute_raw(statement).await {
             Ok(_) => tracing::debug!(view = resolution.view(), "Continuous aggregate refreshed"),
             Err(e) => {
@@ -233,8 +228,8 @@ async fn views_missing_history(db: &DatabaseConnection) -> AppResult<Vec<Resolut
                     .ok()
                     .flatten()
             });
-        let covered =
-            min_bucket.is_some_and(|b| b.with_timezone(&Utc) <= resolution.floor(earliest));
+        let floor = resolution.floor(earliest)?;
+        let covered = min_bucket.is_some_and(|b| b.with_timezone(&Utc) <= floor);
         if !covered {
             missing.push(resolution);
         }
@@ -243,9 +238,13 @@ async fn views_missing_history(db: &DatabaseConnection) -> AppResult<Vec<Resolut
 }
 
 /// The `CALL` for one view, with the window aligned to that view's buckets.
-fn refresh_statement(resolution: Resolution, window: Window, now: DateTime<Utc>) -> Statement {
+fn refresh_statement(
+    resolution: Resolution,
+    window: Window,
+    now: DateTime<Utc>,
+) -> AppResult<Statement> {
     let view = resolution.view();
-    match window.bounds(now) {
+    Ok(match window.bounds(now) {
         None => Statement::from_string(
             DatabaseBackend::Postgres,
             format!("CALL refresh_continuous_aggregate('{view}', NULL, NULL)"),
@@ -255,8 +254,8 @@ fn refresh_statement(resolution: Resolution, window: Window, now: DateTime<Utc>)
                 Window::Recent => lo - resolution.default_lookback(),
                 _ => lo,
             };
-            let start = resolution.floor(lo);
-            let end = resolution.bucket_end(hi.max(lo));
+            let start = resolution.floor(lo)?;
+            let end = resolution.bucket_end(hi.max(lo))?;
             Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 format!(
@@ -265,7 +264,7 @@ fn refresh_statement(resolution: Resolution, window: Window, now: DateTime<Utc>)
                 [start.into(), end.into()],
             )
         }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -279,7 +278,7 @@ mod tests {
     #[test]
     fn test_floor_hourly_on_the_bucket_edge_is_the_edge() {
         assert_eq!(
-            Resolution::Hourly.floor(t("2026-08-12T14:00:00Z")),
+            Resolution::Hourly.floor(t("2026-08-12T14:00:00Z")).unwrap(),
             t("2026-08-12T14:00:00Z")
         );
     }
@@ -287,7 +286,9 @@ mod tests {
     #[test]
     fn test_floor_hourly_one_microsecond_after_the_edge() {
         assert_eq!(
-            Resolution::Hourly.floor(t("2026-08-12T14:00:00.000001Z")),
+            Resolution::Hourly
+                .floor(t("2026-08-12T14:00:00.000001Z"))
+                .unwrap(),
             t("2026-08-12T14:00:00Z")
         );
     }
@@ -295,7 +296,9 @@ mod tests {
     #[test]
     fn test_floor_hourly_mid_bucket() {
         assert_eq!(
-            Resolution::Hourly.floor(t("2026-08-12T14:22:33.456789Z")),
+            Resolution::Hourly
+                .floor(t("2026-08-12T14:22:33.456789Z"))
+                .unwrap(),
             t("2026-08-12T14:00:00Z")
         );
     }
@@ -303,15 +306,19 @@ mod tests {
     #[test]
     fn test_floor_daily_is_utc_midnight() {
         assert_eq!(
-            Resolution::Daily.floor(t("2026-08-12T00:00:00Z")),
+            Resolution::Daily.floor(t("2026-08-12T00:00:00Z")).unwrap(),
             t("2026-08-12T00:00:00Z")
         );
         assert_eq!(
-            Resolution::Daily.floor(t("2026-08-12T00:00:00.000001Z")),
+            Resolution::Daily
+                .floor(t("2026-08-12T00:00:00.000001Z"))
+                .unwrap(),
             t("2026-08-12T00:00:00Z")
         );
         assert_eq!(
-            Resolution::Daily.floor(t("2026-08-12T23:59:59.999999Z")),
+            Resolution::Daily
+                .floor(t("2026-08-12T23:59:59.999999Z"))
+                .unwrap(),
             t("2026-08-12T00:00:00Z")
         );
     }
@@ -320,20 +327,22 @@ mod tests {
     fn test_floor_weekly_is_the_monday() {
         // 2026-08-12 is a Wednesday; the week bucket starts Monday 2026-08-10.
         assert_eq!(
-            Resolution::Weekly.floor(t("2026-08-12T14:22:00Z")),
+            Resolution::Weekly.floor(t("2026-08-12T14:22:00Z")).unwrap(),
             t("2026-08-10T00:00:00Z")
         );
         assert_eq!(
-            Resolution::Weekly.floor(t("2026-08-10T00:00:00Z")),
+            Resolution::Weekly.floor(t("2026-08-10T00:00:00Z")).unwrap(),
             t("2026-08-10T00:00:00Z")
         );
         assert_eq!(
-            Resolution::Weekly.floor(t("2026-08-10T00:00:00.000001Z")),
+            Resolution::Weekly
+                .floor(t("2026-08-10T00:00:00.000001Z"))
+                .unwrap(),
             t("2026-08-10T00:00:00Z")
         );
         // A Sunday belongs to the week that started six days earlier.
         assert_eq!(
-            Resolution::Weekly.floor(t("2026-08-16T23:00:00Z")),
+            Resolution::Weekly.floor(t("2026-08-16T23:00:00Z")).unwrap(),
             t("2026-08-10T00:00:00Z")
         );
     }
@@ -341,15 +350,21 @@ mod tests {
     #[test]
     fn test_floor_monthly_is_the_first() {
         assert_eq!(
-            Resolution::Monthly.floor(t("2026-08-12T14:22:00Z")),
+            Resolution::Monthly
+                .floor(t("2026-08-12T14:22:00Z"))
+                .unwrap(),
             t("2026-08-01T00:00:00Z")
         );
         assert_eq!(
-            Resolution::Monthly.floor(t("2026-08-01T00:00:00Z")),
+            Resolution::Monthly
+                .floor(t("2026-08-01T00:00:00Z"))
+                .unwrap(),
             t("2026-08-01T00:00:00Z")
         );
         assert_eq!(
-            Resolution::Monthly.floor(t("2026-08-01T00:00:00.000001Z")),
+            Resolution::Monthly
+                .floor(t("2026-08-01T00:00:00.000001Z"))
+                .unwrap(),
             t("2026-08-01T00:00:00Z")
         );
     }
@@ -357,12 +372,12 @@ mod tests {
     #[test]
     fn test_floor_before_the_epoch() {
         assert_eq!(
-            Resolution::Daily.floor(t("1969-12-30T05:00:00Z")),
+            Resolution::Daily.floor(t("1969-12-30T05:00:00Z")).unwrap(),
             t("1969-12-30T00:00:00Z")
         );
         // 1969-12-29 is a Monday.
         assert_eq!(
-            Resolution::Weekly.floor(t("1969-12-30T05:00:00Z")),
+            Resolution::Weekly.floor(t("1969-12-30T05:00:00Z")).unwrap(),
             t("1969-12-29T00:00:00Z")
         );
     }
@@ -370,19 +385,27 @@ mod tests {
     #[test]
     fn test_bucket_end_is_the_next_boundary() {
         assert_eq!(
-            Resolution::Hourly.bucket_end(t("2026-08-12T14:00:00Z")),
+            Resolution::Hourly
+                .bucket_end(t("2026-08-12T14:00:00Z"))
+                .unwrap(),
             t("2026-08-12T15:00:00Z")
         );
         assert_eq!(
-            Resolution::Daily.bucket_end(t("2026-08-12T14:00:00Z")),
+            Resolution::Daily
+                .bucket_end(t("2026-08-12T14:00:00Z"))
+                .unwrap(),
             t("2026-08-13T00:00:00Z")
         );
         assert_eq!(
-            Resolution::Weekly.bucket_end(t("2026-08-12T14:00:00Z")),
+            Resolution::Weekly
+                .bucket_end(t("2026-08-12T14:00:00Z"))
+                .unwrap(),
             t("2026-08-17T00:00:00Z")
         );
         assert_eq!(
-            Resolution::Monthly.bucket_end(t("2026-08-12T14:00:00Z")),
+            Resolution::Monthly
+                .bucket_end(t("2026-08-12T14:00:00Z"))
+                .unwrap(),
             t("2026-09-01T00:00:00Z")
         );
     }
@@ -390,11 +413,15 @@ mod tests {
     #[test]
     fn test_bucket_end_rolls_the_year() {
         assert_eq!(
-            Resolution::Monthly.bucket_end(t("2026-12-31T23:59:59Z")),
+            Resolution::Monthly
+                .bucket_end(t("2026-12-31T23:59:59Z"))
+                .unwrap(),
             t("2027-01-01T00:00:00Z")
         );
         assert_eq!(
-            Resolution::Daily.bucket_end(t("2026-12-31T23:59:59Z")),
+            Resolution::Daily
+                .bucket_end(t("2026-12-31T23:59:59Z"))
+                .unwrap(),
             t("2027-01-01T00:00:00Z")
         );
     }
@@ -402,11 +429,15 @@ mod tests {
     #[test]
     fn test_bucket_end_crosses_a_leap_day() {
         assert_eq!(
-            Resolution::Daily.bucket_end(t("2028-02-28T12:00:00Z")),
+            Resolution::Daily
+                .bucket_end(t("2028-02-28T12:00:00Z"))
+                .unwrap(),
             t("2028-02-29T00:00:00Z")
         );
         assert_eq!(
-            Resolution::Monthly.bucket_end(t("2028-02-29T12:00:00Z")),
+            Resolution::Monthly
+                .bucket_end(t("2028-02-29T12:00:00Z"))
+                .unwrap(),
             t("2028-03-01T00:00:00Z")
         );
     }
@@ -417,7 +448,7 @@ mod tests {
         window: Window,
         now: DateTime<Utc>,
     ) -> (DateTime<Utc>, DateTime<Utc>) {
-        let statement = refresh_statement(resolution, window, now);
+        let statement = refresh_statement(resolution, window, now).unwrap();
         let values = statement
             .values
             .expect("a bounded window binds its start and end")
@@ -433,12 +464,13 @@ mod tests {
     fn test_a_single_instant_still_covers_one_whole_bucket() {
         let instant = t("2026-08-12T14:22:00Z");
         for resolution in Resolution::ALL {
-            let statement = refresh_statement(resolution, Window::Range(instant, instant), instant);
+            let statement =
+                refresh_statement(resolution, Window::Range(instant, instant), instant).unwrap();
             assert!(statement.sql.contains(resolution.view()));
             let (start, end) = window_of(resolution, Window::Range(instant, instant), instant);
-            assert_eq!(start, resolution.floor(instant));
-            assert_eq!(end, resolution.bucket_end(instant));
-            assert!(resolution.bucket_end(instant) > resolution.floor(instant));
+            assert_eq!(start, resolution.floor(instant).unwrap());
+            assert_eq!(end, resolution.bucket_end(instant).unwrap());
+            assert!(resolution.bucket_end(instant).unwrap() > resolution.floor(instant).unwrap());
         }
     }
 
@@ -487,7 +519,7 @@ mod tests {
 
     #[test]
     fn test_full_binds_no_values() {
-        let statement = refresh_statement(Resolution::Hourly, Window::Full, Utc::now());
+        let statement = refresh_statement(Resolution::Hourly, Window::Full, Utc::now()).unwrap();
         assert!(statement.sql.contains("NULL, NULL"));
         assert!(statement.values.is_none());
     }

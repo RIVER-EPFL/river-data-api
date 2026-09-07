@@ -160,23 +160,32 @@ pub async fn get_site_replicates(
         .collect();
 
     if query.format == "csv" {
-        let mut csv = String::from(
-            "time,parameter,sample_id,replicate_index,value,flagged,withdrawn,source_system,source_key\n",
-        );
+        let mut writer = crate::common::csv::CsvWriter::new();
+        writer.row([
+            "time",
+            "parameter",
+            "sample_id",
+            "replicate_index",
+            "value",
+            "flagged",
+            "withdrawn",
+            "source_system",
+            "source_key",
+        ]);
         for r in &rows {
-            csv.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{}\n",
+            writer.row([
                 r.time.with_timezone(&Utc).to_rfc3339(),
-                r.parameter,
+                r.parameter.clone(),
                 r.sample_id.map(|id| id.to_string()).unwrap_or_default(),
-                r.replicate_index,
+                r.replicate_index.to_string(),
                 r.value.map(|v| v.to_string()).unwrap_or_default(),
-                r.flagged,
-                r.withdrawn,
+                r.flagged.to_string(),
+                r.withdrawn.to_string(),
                 r.source_system.clone().unwrap_or_default(),
                 r.source_key.clone().unwrap_or_default(),
-            ));
+            ]);
         }
+        let csv = writer.finish();
         return Response::builder()
             .header(header::CONTENT_TYPE, HeaderValue::from_static("text/csv"))
             .body(axum::body::Body::from(csv))

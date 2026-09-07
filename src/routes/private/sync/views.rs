@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::routes::private::sync::matching::{DiscoveryMatch, DiscoverySuggestion, match_confidence};
 use crate::error::{AppError, AppResult};
-use crate::routes::private::sensors::operations::{
+use crate::routes::private::sensors::identity::{
     create_sensor_for_stream, extract_vaisala_device_serial,
 };
 use crate::routes::private::{
@@ -137,23 +138,6 @@ pub fn admin_routes() -> Router<AppState> {
 }
 
 #[derive(Serialize)]
-pub struct DiscoveryMatch {
-    pub id: Uuid,
-    pub name: String,
-}
-
-#[derive(Serialize)]
-pub struct DiscoverySuggestion {
-    #[serde(rename = "match")]
-    pub matched: Option<DiscoveryMatch>,
-    pub confidence: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub suggested_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub suggested_units: Option<String>,
-}
-
-#[derive(Serialize)]
 pub struct DiscoverySuggestions {
     pub project: DiscoverySuggestion,
     pub site: DiscoverySuggestion,
@@ -183,42 +167,6 @@ pub struct DiscoveryItem {
     pub action: String,
 }
 
-fn match_confidence(name: &str, candidates: &[(Uuid, String)]) -> DiscoverySuggestion {
-    let lower = name.to_lowercase();
-    // Exact case-insensitive match
-    if let Some((id, cname)) = candidates.iter().find(|(_, n)| n.to_lowercase() == lower) {
-        return DiscoverySuggestion {
-            matched: Some(DiscoveryMatch {
-                id: *id,
-                name: cname.clone(),
-            }),
-            confidence: "exact".to_string(),
-            suggested_name: None,
-            suggested_units: None,
-        };
-    }
-    // Fuzzy: substring containment
-    if let Some((id, cname)) = candidates
-        .iter()
-        .find(|(_, n)| n.to_lowercase().contains(&lower) || lower.contains(&n.to_lowercase()))
-    {
-        return DiscoverySuggestion {
-            matched: Some(DiscoveryMatch {
-                id: *id,
-                name: cname.clone(),
-            }),
-            confidence: "fuzzy".to_string(),
-            suggested_name: None,
-            suggested_units: None,
-        };
-    }
-    DiscoverySuggestion {
-        matched: None,
-        confidence: "none".to_string(),
-        suggested_name: Some(name.to_string()),
-        suggested_units: None,
-    }
-}
 
 /// Return a structured discovery report for unpaired streams, with name-match suggestions
 /// for project, site, parameter, and site_parameter resolution. Requires `read_metadata`.

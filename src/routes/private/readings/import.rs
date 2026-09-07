@@ -25,7 +25,7 @@ use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams::service::get_or_create_api_stream;
 use crate::routes::private::readings::batch::{ConflictMode, admission};
 use crate::routes::private::readings::checks;
-use crate::routes::private::sensors::operations::{ResolvedOwner, resolve_slot_owner_for_times};
+use crate::routes::private::sensors::identity::{ResolvedOwner, resolve_slot_owner_for_times};
 use crate::routes::private::sensors::standard_curves;
 use crate::routes::resolve_site_with_project;
 

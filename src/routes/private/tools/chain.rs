@@ -129,15 +129,7 @@ pub async fn served_spot_value(
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT COALESCE(
-                (SELECT smp.mean FROM samples smp
-                  WHERE smp.site_id = $1 AND smp.parameter_id = $2 AND smp.collected_at = $3),
-                (SELECT COALESCE(r.calibrated_value, r.raw_value) FROM readings r
-                  WHERE r.site_id = $1 AND r.parameter_id = $2 AND r.time = $3
-                    AND r.measurement_type = 'spot' AND r.is_flagged IS NOT TRUE
-                    AND r.withdrawn_at IS NULL
-                  ORDER BY r.replicate_index LIMIT 1)
-             ) AS value",
+            &format!("SELECT {} AS value", engine::served_spot_value_sql("$2")),
             [
                 site_id.into(),
                 parameter_id.into(),

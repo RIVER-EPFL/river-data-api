@@ -647,6 +647,15 @@ fn merged_spec(entity: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenApi {
     openapi
 }
 
+/// The router as a service that carries each connection's peer address. Without this the
+/// `ConnectInfo` extension the rate limiter keys on is absent and every caller shares one bucket.
+#[must_use]
+pub fn connected_service(
+    app: Router,
+) -> axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, std::net::SocketAddr> {
+    app.into_make_service_with_connect_info::<std::net::SocketAddr>()
+}
+
 pub fn build_router(state: AppState) -> Router {
     let config = &state.config;
 

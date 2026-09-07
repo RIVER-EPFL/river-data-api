@@ -18,6 +18,7 @@ use crate::common::scope::{
     Unowned, project_filter_sql, project_of_alarm_event, require_row_in_scope,
 };
 use crate::common::series::{self, Cells, Table};
+use crate::common::served::{CONTINUOUS_ROWS, SERVED_SPOT, SPOT_INSTANT_KEY, SPOT_INSTANT_ORDER};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sites::parameters as site_parameters;
 use crate::routes::{cache, resolve_site_with_project, validate_time_range};
@@ -114,14 +115,13 @@ pub fn violations_sql(site_id: Uuid, param_ids: Option<Vec<Uuid>>, min_severity:
             WHERE r.site_id = $1
               AND r.time >= $2
               AND r.time <= $3
-              AND r.measurement_type IS DISTINCT FROM 'spot'
-              AND r.replicate_index = 0
+              AND {CONTINUOUS_ROWS}
               AND {violation_cont}
             UNION ALL
             SELECT sp.parameter_id, sp.time, sp.value,
                    ({sev_spot})::smallint AS severity
             FROM (
-                SELECT DISTINCT ON (r.stream_id, r.time)
+                SELECT DISTINCT ON ({SPOT_INSTANT_KEY})
                     r.parameter_id,
                     r.time,
                     COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value
@@ -131,11 +131,8 @@ pub fn violations_sql(site_id: Uuid, param_ids: Option<Vec<Uuid>>, min_severity:
                   AND r.time >= $2
                   AND r.time <= $3
                   AND r.parameter_id IN (SELECT parameter_id FROM resolved_thresholds)
-                  AND r.measurement_type = 'spot'
-                  AND r.withdrawn_at IS NULL
-                  AND r.is_flagged IS NOT TRUE
-                  AND r.unverified IS NOT TRUE
-                ORDER BY r.stream_id, r.time, r.replicate_index
+                  AND {SERVED_SPOT}
+                ORDER BY {SPOT_INSTANT_ORDER}
             ) sp
             JOIN resolved_thresholds t ON sp.parameter_id = t.parameter_id
             WHERE {violation_spot}
@@ -438,8 +435,7 @@ pub(crate) fn latest_served_sql(spot: bool, site_col: &str, param_col: &str) -> 
             "SELECT COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value, r.time \
              FROM readings r LEFT JOIN samples smp ON smp.id = r.sample_id \
              WHERE r.site_id = {site_col} AND r.parameter_id = {param_col} \
-               AND r.measurement_type = 'spot' AND r.withdrawn_at IS NULL \
-               AND r.is_flagged IS NOT TRUE AND r.unverified IS NOT TRUE \
+               AND {SERVED_SPOT} \
              ORDER BY r.time DESC, r.replicate_index LIMIT 1"
         )
     } else {
@@ -447,7 +443,7 @@ pub(crate) fn latest_served_sql(spot: bool, site_col: &str, param_col: &str) -> 
             "SELECT COALESCE(r.calibrated_value, r.raw_value) AS value, r.time \
              FROM readings r \
              WHERE r.site_id = {site_col} AND r.parameter_id = {param_col} \
-               AND r.measurement_type IS DISTINCT FROM 'spot' AND r.replicate_index = 0 \
+               AND {CONTINUOUS_ROWS} \
              ORDER BY r.time DESC LIMIT 1"
         )
     }

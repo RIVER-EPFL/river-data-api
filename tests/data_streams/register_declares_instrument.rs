@@ -436,7 +436,7 @@ async fn concurrent_identity_changes_converge_on_one_hold() {
 
     let stored = json!({ "probe_serial": "PROBE-A" });
     let first = db.begin().await.expect("begin");
-    river_db::routes::private::sensors::operations::raise_source_identity_hold(
+    river_db::routes::private::sensors::identity::raise_source_identity_hold(
         &first,
         stream_id,
         &["probe_serial"],
@@ -452,7 +452,7 @@ async fn concurrent_identity_changes_converge_on_one_hold() {
         .await
         .expect("second connection");
     let raise = tokio::spawn(async move {
-        river_db::routes::private::sensors::operations::raise_source_identity_hold(
+        river_db::routes::private::sensors::identity::raise_source_identity_hold(
             &second,
             stream_id,
             &["probe_serial"],

@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors;
-use crate::routes::private::sensors::operations::{InstrumentKind, upsert_source_instrument};
+use crate::routes::private::sensors::identity::{InstrumentKind, upsert_source_instrument};
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]

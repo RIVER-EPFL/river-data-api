@@ -229,22 +229,30 @@ pub async fn get_sensor_vs_grab(
 
     if query.format == "csv" {
         let fmt = |v: Option<f64>| v.map(|x| x.to_string()).unwrap_or_default();
-        let mut csv = String::from(
-            "time,grab_value,grab_sd,grab_n,sensor_avg,sensor_sd,sensor_n,difference\n",
-        );
+        let mut writer = crate::common::csv::CsvWriter::new();
+        writer.row([
+            "time",
+            "grab_value",
+            "grab_sd",
+            "grab_n",
+            "sensor_avg",
+            "sensor_sd",
+            "sensor_n",
+            "difference",
+        ]);
         for r in &rows {
-            csv.push_str(&format!(
-                "{},{},{},{},{},{},{},{}\n",
+            writer.row([
                 r.time.to_rfc3339(),
                 fmt(r.grab_value),
                 fmt(r.grab_sd),
-                r.grab_n,
+                r.grab_n.to_string(),
                 fmt(r.sensor_avg),
                 fmt(r.sensor_sd),
-                r.sensor_n,
+                r.sensor_n.to_string(),
                 fmt(r.difference),
-            ));
+            ]);
         }
+        let csv = writer.finish();
         return Response::builder()
             .header(header::CONTENT_TYPE, HeaderValue::from_static("text/csv"))
             .body(axum::body::Body::from(csv))

@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::routes::private::sync::replicate_audit as audit;
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::error::{AppError, AppResult};
@@ -18,6 +17,7 @@ use crate::routes::private::readings::batch::{
 };
 use crate::routes::private::readings::decisions;
 use crate::routes::private::readings::tail;
+use crate::routes::private::sync::replicate_audit as audit;
 use crate::routes::private::{
     data_streams, readings, readings::sample_groups, readings::samples, readings::sd_estimator,
     sensors::calibrations, sites, sites::parameters as site_parameters,
@@ -297,7 +297,7 @@ async fn get_or_create_grab_stream(
             active.updated_at = Set(chrono::Utc::now().into());
             active.update(db).await?;
         }
-        crate::routes::private::sensors::operations::ensure_channel_instrument(
+        crate::routes::private::sensors::identity::ensure_channel_instrument(
             db,
             &stream,
             site_id,
@@ -350,7 +350,7 @@ async fn get_or_create_grab_stream(
         .await?
         .ok_or_else(|| AppError::Internal("Failed to create grab sample stream".to_string()))?;
 
-    crate::routes::private::sensors::operations::ensure_channel_instrument(
+    crate::routes::private::sensors::identity::ensure_channel_instrument(
         db,
         &stream,
         site_id,
@@ -1233,7 +1233,7 @@ pub async fn insert_grab_samples(
     // at the grab time (site-fixed to payload.site_id), instead of writing NULL. Grabs without a
     // sensor_id keep NULL deployment (manual lab values with no instrument).
     let grab_slots = {
-        use crate::routes::private::sensors::operations::{
+        use crate::routes::private::sensors::identity::{
             ResolvedSlot, resolve_windows_for_times,
         };
         let mut times_by_channel: HashMap<(Uuid, Uuid), Vec<chrono::DateTime<chrono::Utc>>> =
@@ -1469,16 +1469,8 @@ pub async fn insert_grab_samples(
                 .zip(&preview)
                 .map(|(r, p)| readings::ActiveModel {
                     standard_curve_id: Set(p.standard_curve.as_ref().map(|c| c.id)),
-                    collection_event_id: Set(None),
-                    withdrawn_at: Set(None),
-                    withdrawn_reason: Set(None),
-                    ingested_at: sea_orm::ActiveValue::NotSet,
-                    stream_id: Set(stream_cache[&r.parameter_id]),
                     site_id: Set(Some(payload.site_id)),
                     parameter_id: Set(Some(r.parameter_id)),
-                    time: Set(r.time.into()),
-                    replicate_index: Set(p.replicate_index),
-                    raw_value: Set(r.value),
                     calibrated_value: Set(p.calibrated_value),
                     sensor_id: Set(r
                         .sensor_id
@@ -1489,16 +1481,18 @@ pub async fn insert_grab_samples(
                             .get(&(sid, r.parameter_id, r.time))
                             .and_then(|s| s.deployment_id)
                     })),
-                    logged: Set(Some(true)),
                     measurement_type: Set(Some(GRAB_MEASUREMENT_TYPE.to_string())),
-                    is_flagged: Set(Some(false)),
-                    flag_reason: Set(None),
-                    sample_id: Set(None),
                     label: Set(stored_facts[&(r.parameter_id, r.time)].label.clone()),
                     notes: Set(stored_facts[&(r.parameter_id, r.time)].notes.clone()),
                     created_by: Set(stored_facts[&(r.parameter_id, r.time)].created_by.clone()),
                     provenance: Set(stored_facts[&(r.parameter_id, r.time)].provenance.clone()),
                     provenance_kind: Set(stored_facts[&(r.parameter_id, r.time)].kind.clone()),
+                    ..readings::new(
+                        stream_cache[&r.parameter_id],
+                        r.time.into(),
+                        p.replicate_index,
+                        r.value,
+                    )
                 })
                 .collect();
 

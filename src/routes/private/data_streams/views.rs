@@ -18,7 +18,7 @@ use crate::common::scope;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors;
 use crate::routes::private::sensors::calibrations;
-use crate::routes::private::sensors::operations::{
+use crate::routes::private::sensors::identity::{
     close_sensor_deployment, create_sensor_for_stream, extract_vaisala_device_serial,
 };
 use crate::routes::private::{data_streams, sites::parameters as site_parameters};
@@ -648,11 +648,11 @@ pub async fn register_stream(
         let hierarchy = crate::routes::private::sync::service::extract_hierarchy(&stream);
         let name_hint = (!hierarchy.site.is_empty() && !hierarchy.parameter.is_empty())
             .then(|| format!("{} {}", hierarchy.site, hierarchy.parameter));
-        crate::routes::private::sensors::operations::resolve_or_mint_stream_instrument(
+        crate::routes::private::sensors::identity::resolve_or_mint_stream_instrument(
             &state.db,
             &stream,
             name_hint.as_deref(),
-            crate::routes::private::sensors::operations::InstrumentKind::SourceParameter,
+            crate::routes::private::sensors::identity::InstrumentKind::SourceParameter,
         )
         .await?;
         stream = data_streams::Entity::find_by_id(stream.id)
@@ -665,7 +665,7 @@ pub async fn register_stream(
     // attached to was minted with, which is a probe swap. The channel is the identity, so nothing
     // forks: the serials are refreshed and the change goes to the review queue for an operator.
     if let Some(sensor_id) = stream.sensor_id
-        && let Err(e) = crate::routes::private::sensors::operations::reconcile_source_identity(
+        && let Err(e) = crate::routes::private::sensors::identity::reconcile_source_identity(
             &state.db,
             sensor_id,
             stream.id,
@@ -765,7 +765,7 @@ pub async fn import_stream(
     Path(stream_id): Path<Uuid>,
     Json(_payload): Json<ImportStreamRequest>,
 ) -> AppResult<Json<ImportStreamResponse>> {
-    use crate::routes::private::sensors::operations::import_sensor_for_stream;
+    use crate::routes::private::sensors::identity::import_sensor_for_stream;
     let db = &state.db;
 
     let stream = data_streams::Entity::find_by_id(stream_id)

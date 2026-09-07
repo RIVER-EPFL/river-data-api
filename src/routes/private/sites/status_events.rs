@@ -239,15 +239,12 @@ fn build_status_events_csv(events: &[StatusEventData]) -> AppResult<Response> {
             .await;
 
         for event in &events {
-            let sensor_id_str = event.sensor_id.map(|id| id.to_string()).unwrap_or_default();
-            let escaped_value = format!("\"{}\"", event.value.replace('"', "\"\""));
-            let row = format!(
-                "{},{},{},{}\n",
+            let row = crate::common::csv::row_to_string([
                 event.time.to_rfc3339(),
-                event.parameter_id,
-                escaped_value,
-                sensor_id_str
-            );
+                event.parameter_id.to_string(),
+                event.value.clone(),
+                event.sensor_id.map(|id| id.to_string()).unwrap_or_default(),
+            ]);
             if tx.send(Ok(row)).await.is_err() {
                 break;
             }

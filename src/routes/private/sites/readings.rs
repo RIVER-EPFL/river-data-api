@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
 use crate::common::series::{self, Cells, Table};
+use crate::common::served::{CONTINUOUS_ROWS, SPOT_INSTANT_KEY, SPOT_INSTANT_ORDER};
 use crate::common::{bulk, cache_key};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::{readings::samples, sites::parameters as site_parameters};
@@ -42,6 +43,10 @@ struct ReadingRow {
     /// Only selected under `include_withdrawn`; false everywhere else, since nothing else serves
     /// a retracted row.
     withdrawn: Option<bool>,
+    /// Entered by someone whose entries need countersigning. Always selected: the public arm, the
+    /// alarms and the seasonal check all exclude such a row, so the private arm has to say it is
+    /// there or nothing shows a manager what is waiting.
+    unverified: Option<bool>,
 }
 
 /// Where a row lands on the response's row axis.
@@ -150,6 +155,10 @@ pub struct ParameterData {
     /// when `include_withdrawn=true`, which is also what makes such an instant served at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub withdrawn: Option<Vec<Option<bool>>>,
+    /// Whether each served point still needs countersigning (same length as times). Always served,
+    /// because it is the one surface that shows it: the public arm, the alarms and the seasonal
+    /// check leave such a reading out entirely.
+    pub unverified: Option<Vec<Option<bool>>>,
     /// How many spot instants in the window the source has retracted in full, whether or not they
     /// are served. Present whenever the request covers the spot arm, so a chart can say a visit was
     /// taken back without fetching the points.
@@ -703,7 +712,7 @@ pub async fn get_site_readings(
         let select_clause = format!(
             "r.parameter_id, r.time, r.replicate_index, \
              COALESCE(r.calibrated_value, r.raw_value) AS value, \
-             {severity} AS severity, r.is_flagged, r.flag_reason, r.measurement_type, \
+             {severity} AS severity, r.is_flagged, r.flag_reason, r.measurement_type, r.unverified, \
              r.sample_id, r.calibration_id, r.standard_curve_id, \
              (r.withdrawn_at IS NOT NULL) AS withdrawn"
         );
@@ -749,14 +758,14 @@ pub async fn get_site_readings(
             };
         let base_cols = "r.parameter_id, r.time, r.site_id, r.is_flagged, r.flag_reason, \
              r.measurement_type, r.sample_id, r.calibration_id, r.standard_curve_id, \
-             (r.withdrawn_at IS NOT NULL) AS withdrawn";
+             (r.withdrawn_at IS NOT NULL) AS withdrawn, r.unverified";
         let mut arms: Vec<String> = Vec::new();
         if include_continuous_arm {
             arms.push(format!(
                 "SELECT COALESCE(r.calibrated_value, r.raw_value) AS value, {base_cols} \
                  FROM readings r \
                  WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
-                   AND r.replicate_index = 0 AND r.measurement_type IS DISTINCT FROM 'spot'\
+                   AND {CONTINUOUS_ROWS}\
                  {time_conditions}{continuous_extra}{flagged_condition}{sample_id_condition}"
             ));
         }
@@ -769,22 +778,17 @@ pub async fn get_site_readings(
         };
         if include_spot_arm {
             arms.push(format!(
-                // One row per slot instant, not per stream: a `(site, parameter, time)` group is
-                // one sample whatever number of streams fed it, which is already what the
-                // materialiser and the samples trigger say. De-duplicating per stream instead
-                // returned the same instant twice, and the outer ordering had no stream tiebreak,
-                // so which of the two values the column fill kept could change between requests.
-                // `stream_id` is the last ordering key so the surviving row is at least stable.
+                // One row per slot instant, not per stream; the key and its ordering are
+                // `common::served`, shared with the public arm and the alarm evaluator.
                 "SELECT sp.* FROM ( \
-                    SELECT DISTINCT ON (r.parameter_id, r.time) \
+                    SELECT DISTINCT ON ({SPOT_INSTANT_KEY}) \
                            COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value, \
                            {base_cols} \
                     FROM readings r LEFT JOIN samples smp ON smp.id = r.sample_id \
                     WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
                       AND r.measurement_type = 'spot'{spot_withdrawn_condition}\
                     {time_conditions}{flagged_condition}{sample_id_condition} \
-                    ORDER BY r.parameter_id, r.time, (r.withdrawn_at IS NOT NULL), \
-                             (r.is_flagged IS TRUE), r.replicate_index, r.stream_id \
+                    ORDER BY {SPOT_INSTANT_ORDER} \
                  ) sp"
             ));
         }
@@ -801,7 +805,7 @@ pub async fn get_site_readings(
             "SELECT sv.parameter_id, sv.time, NULL::smallint AS replicate_index, sv.value, \
                     {severity} AS severity, \
                     sv.is_flagged, sv.flag_reason, sv.measurement_type, sv.sample_id, \
-                    sv.calibration_id, sv.standard_curve_id, sv.withdrawn \
+                    sv.calibration_id, sv.standard_curve_id, sv.withdrawn, sv.unverified \
              FROM ({inner}) sv{threshold_join} \
              ORDER BY sv.parameter_id, sv.time"
         )
@@ -909,22 +913,24 @@ pub async fn get_site_readings(
     // A retracted visit is a fact about the window whether or not its points are drawn, so the
     // count is served whenever the request covers the spot arm. Only instants no live replicate
     // survives on are counted: one retracted replicate is not a retracted visit.
-    let withdrawn_counts: Option<HashMap<Uuid, i64>> = if include_replicates
-        || measurement_type_filter == "continuous"
-    {
-        None
-    } else {
-        Some(
-            count_withdrawn_instants(
-                &state.db,
-                site.id,
-                &params_list.iter().map(|sp| sp.parameter_id).collect::<Vec<_>>(),
-                effective_start,
-                effective_end,
+    let withdrawn_counts: Option<HashMap<Uuid, i64>> =
+        if include_replicates || measurement_type_filter == "continuous" {
+            None
+        } else {
+            Some(
+                count_withdrawn_instants(
+                    &state.db,
+                    site.id,
+                    &params_list
+                        .iter()
+                        .map(|sp| sp.parameter_id)
+                        .collect::<Vec<_>>(),
+                    effective_start,
+                    effective_end,
+                )
+                .await?,
             )
-            .await?,
-        )
-    };
+        };
 
     let param_data: Vec<ParameterData> = params_list
         .iter()
@@ -939,6 +945,7 @@ pub async fn get_site_readings(
             let mut standard_curve_ids = annotations.curves.then(|| vec![None; len]);
             let mut samples = annotations.sample_stats.then(|| vec![None; len]);
             let mut withdrawn = annotations.withdrawn.then(|| vec![None; len]);
+            let mut unverified = vec![None; len];
 
             if let Some(rows) = param_rows.get(&sp.parameter_id) {
                 for row in rows {
@@ -976,6 +983,7 @@ pub async fn get_site_readings(
                     if let Some(v) = withdrawn.as_mut() {
                         v[i] = row.withdrawn;
                     }
+                    unverified[i] = row.unverified;
                 }
             }
 
@@ -1002,6 +1010,7 @@ pub async fn get_site_readings(
                     .origin
                     .then(|| origin_map.get(&sp.id).cloned().unwrap_or_default()),
                 withdrawn,
+                unverified: Some(unverified),
                 withdrawn_count: withdrawn_counts
                     .as_ref()
                     .map(|counts| counts.get(&sp.parameter_id).copied().unwrap_or(0)),
@@ -1142,7 +1151,12 @@ async fn count_withdrawn_instants(
     let (time_clause, values) = match end {
         Some(e) => (
             "AND r.time >= $3 AND r.time <= $4",
-            vec![site_id.into(), parameter_ids.to_vec().into(), start.into(), e.into()],
+            vec![
+                site_id.into(),
+                parameter_ids.to_vec().into(),
+                start.into(),
+                e.into(),
+            ],
         ),
         None => (
             "AND r.time >= $3",

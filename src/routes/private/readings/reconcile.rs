@@ -167,6 +167,39 @@ pub fn refuse_dishonest_window(
     Ok(())
 }
 
+/// Which scale rule a pass trips, or `None` when it is within both. The floor is consulted first:
+/// the fractions were sized for full-history windows, so a small window reshapes freely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Brake {
+    /// The pass would change or withdraw too large a share of the window's stored rows.
+    Fraction,
+    /// One replicate index is withdrawn from too many of the groups that carry it, the shape a
+    /// truncated or mis-mapped member column takes and the row fraction cannot see.
+    IndexLoss,
+}
+
+/// `stored` is every row the window holds, `would_touch` the rows the pass would change or
+/// withdraw, and `per_index` one `(withdrawn, stored)` pair per replicate index the pass withdraws
+/// from.
+pub fn brake_verdict(
+    stored: usize,
+    would_touch: usize,
+    per_index: &[(usize, usize)],
+) -> Option<Brake> {
+    if would_touch < RECONCILE_BRAKE_MIN_ROWS {
+        return None;
+    }
+    if stored > 0 && (would_touch as f64) / (stored as f64) > RECONCILE_BRAKE_FRACTION {
+        return Some(Brake::Fraction);
+    }
+    if per_index.iter().any(|(withdrawn, total)| {
+        *total > 0 && (*withdrawn as f64) / (*total as f64) > RECONCILE_BRAKE_INDEX_FRACTION
+    }) {
+        return Some(Brake::IndexLoss);
+    }
+    None
+}
+
 pub(crate) async fn upsert_source_modified_hold<C: ConnectionTrait>(
     conn: &C,
     stream_id: Uuid,
@@ -325,31 +358,22 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
     // The brake: a pass reshaping the stored window at scale holds its corrections and
     // withdrawals for review; new rows still apply so ingestion never stops.
     let would_touch = outcome.changed + to_withdraw.len() + withdraw_touched.len();
-    let over_floor = would_touch >= RECONCILE_BRAKE_MIN_ROWS;
-    let over_fraction = over_floor
-        && !stored.is_empty()
-        && (would_touch as f64) / (stored.len() as f64) > RECONCILE_BRAKE_FRACTION;
-    let over_index_fraction = {
-        let mut groups_with_index: HashMap<i16, usize> = HashMap::new();
-        let mut withdrawn_with_index: HashMap<i16, usize> = HashMap::new();
-        for (t, i) in stored.keys() {
-            let _ = t;
-            *groups_with_index.entry(*i).or_default() += 1;
-        }
-        for (_, i) in to_withdraw
-            .iter()
-            .chain(withdraw_touched.iter().map(|(key, _)| key))
-        {
-            *withdrawn_with_index.entry(*i).or_default() += 1;
-        }
-        over_floor
-            && withdrawn_with_index.iter().any(|(i, n)| {
-                groups_with_index.get(i).is_some_and(|total| {
-                    (*n as f64) / (*total as f64) > RECONCILE_BRAKE_INDEX_FRACTION
-                })
-            })
-    };
-    if over_fraction || over_index_fraction {
+    let mut groups_with_index: HashMap<i16, usize> = HashMap::new();
+    let mut withdrawn_with_index: HashMap<i16, usize> = HashMap::new();
+    for (_, i) in stored.keys() {
+        *groups_with_index.entry(*i).or_default() += 1;
+    }
+    for (_, i) in to_withdraw
+        .iter()
+        .chain(withdraw_touched.iter().map(|(key, _)| key))
+    {
+        *withdrawn_with_index.entry(*i).or_default() += 1;
+    }
+    let per_index: Vec<(usize, usize)> = withdrawn_with_index
+        .iter()
+        .filter_map(|(i, n)| groups_with_index.get(i).map(|total| (*n, *total)))
+        .collect();
+    if brake_verdict(stored.len(), would_touch, &per_index).is_some() {
         // The release path: an operator who acknowledged this stream's brake_fired hold has
         // ruled that the reshape is legitimate, so exactly one braked-scale pass applies and the
         // ruling is consumed (hold -> remediated). The source re-asserts the same window every
@@ -536,4 +560,63 @@ pub async fn write_receipt<C: ConnectionTrait>(
     ))
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 0.15 of the stored rows, and 0.5 of a replicate index's groups. A pass that reshapes fewer
+    // than RECONCILE_BRAKE_MIN_ROWS rows is never braked, whatever the fractions say.
+
+    #[test]
+    fn test_brake_verdict_below_the_floor_is_never_braked() {
+        // 4 of 5 rows is 80%, and every group loses its index, but the floor is not reached.
+        assert_eq!(brake_verdict(5, 4, &[(4, 5)]), None);
+    }
+
+    #[test]
+    fn test_brake_verdict_at_the_floor_the_fractions_apply() {
+        assert_eq!(brake_verdict(5, 5, &[]), Some(Brake::Fraction));
+    }
+
+    #[test]
+    fn test_brake_verdict_at_the_row_fraction_passes() {
+        // 15 of 100 is exactly the threshold, which is not over it.
+        assert_eq!(brake_verdict(100, 15, &[]), None);
+    }
+
+    #[test]
+    fn test_brake_verdict_one_row_over_the_fraction_brakes() {
+        assert_eq!(brake_verdict(100, 16, &[]), Some(Brake::Fraction));
+    }
+
+    #[test]
+    fn test_brake_verdict_at_the_index_fraction_passes() {
+        // Half of the groups carrying index 1 lose it, which is not more than half.
+        assert_eq!(brake_verdict(100, 5, &[(5, 10)]), None);
+    }
+
+    #[test]
+    fn test_brake_verdict_one_group_over_the_index_fraction_brakes() {
+        assert_eq!(brake_verdict(100, 6, &[(6, 10)]), Some(Brake::IndexLoss));
+    }
+
+    #[test]
+    fn test_brake_verdict_index_loss_is_seen_where_the_row_fraction_is_not() {
+        // 6 of 200 rows is 3%, well under the row fraction, but they are every group's index 1.
+        assert_eq!(brake_verdict(200, 6, &[(6, 6)]), Some(Brake::IndexLoss));
+    }
+
+    #[test]
+    fn test_brake_verdict_index_loss_is_per_index_not_pooled() {
+        // Neither index loses more than half, though together they are half the withdrawals.
+        assert_eq!(brake_verdict(200, 10, &[(5, 10), (5, 10)]), None);
+    }
+
+    #[test]
+    fn test_brake_verdict_an_empty_window_has_no_row_fraction() {
+        // Nothing stored is nothing to reshape; only new rows can be in such a pass.
+        assert_eq!(brake_verdict(0, 9, &[]), None);
+    }
 }
