@@ -67,7 +67,6 @@ async fn test_janitor_fills_derived_gaps() {
     )
     .await;
     assert!((200..300).contains(&status));
-    let derived_def_id = def_json["id"].as_str().unwrap().to_string();
     let output_parameter_id = def_json["output_parameter_id"]
         .as_str()
         .unwrap()
@@ -77,14 +76,9 @@ async fn test_janitor_fills_derived_gaps() {
     db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"INSERT INTO site_parameters
-            (id, site_id, parameter_id, name, sensor_type, display_units, is_active, is_derived, derived_definition_id)
-          VALUES (gen_random_uuid(), $1, $2, $3, 'derived', 'mg/L', true, true, $4)",
-        [
-            site_id.into(),
-            derived_param_uuid.into(),
-            derived_name.into(),
-            Uuid::parse_str(&derived_def_id).unwrap().into(),
-        ],
+            (id, site_id, parameter_id, name, sensor_type, display_units, is_active, entry_mode)
+          VALUES (gen_random_uuid(), $1, $2, $3, 'derived', 'mg/L', true, 'tool')",
+        [site_id.into(), derived_param_uuid.into(), derived_name.into()],
     ))
     .await
     .unwrap();

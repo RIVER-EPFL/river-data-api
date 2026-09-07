@@ -7,14 +7,13 @@ pub mod version;
 
 pub use crate::common::cache;
 
-use axum::{Router, http::StatusCode, middleware, response::Response, routing::get};
+use axum::{Router, http::StatusCode, middleware, routing::get};
 use sea_orm::{
     Condition, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Statement,
     sea_query::Expr,
 };
 use std::sync::Arc;
 use std::time::Duration;
-use tower::ServiceBuilder;
 use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 use uuid::Uuid;
 
@@ -23,6 +22,8 @@ use tower_http::{
     compression::CompressionLayer,
     cors::CorsLayer,
     limit::RequestBodyLimitLayer,
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    timeout::TimeoutLayer,
     trace::{DefaultMakeSpan, TraceLayer},
 };
 use tracing::Level;
@@ -861,13 +862,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api", api_routes)
         .merge(health_routes.with_state(state.clone()))
         .merge(docs_routes)
-        .layer(
-            ServiceBuilder::new()
-                .layer(axum::error_handling::HandleErrorLayer::new(|_: tower::BoxError| async {
-                    StatusCode::REQUEST_TIMEOUT
-                }))
-                .timeout(timeout),
-        )
+        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, timeout))
         .layer(CompressionLayer::new())
         .layer(cors)
         .layer(
@@ -907,33 +902,8 @@ pub fn build_router(state: AppState) -> Router {
                     },
                 ),
         )
-        .layer(axum::middleware::from_fn(request_id_middleware))
+        // `MakeRequestUuid` keeps an inbound id and mints one otherwise, so the id a caller sent is
+        // the id the trace and the response carry. `SetRequestIdLayer` must be outermost.
+        .layer(PropagateRequestIdLayer::x_request_id())
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
 }
-
-/// Middleware that generates a unique request ID for each request.
-async fn request_id_middleware(
-    mut request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let request_id = request
-        .headers()
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-
-    request.headers_mut().insert(
-        axum::http::HeaderName::from_static("x-request-id"),
-        axum::http::HeaderValue::from_str(&request_id)
-            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("unknown")),
-    );
-
-    let mut response = next.run(request).await;
-    if let Ok(val) = axum::http::HeaderValue::from_str(&request_id) {
-        response
-            .headers_mut()
-            .insert(axum::http::HeaderName::from_static("x-request-id"), val);
-    }
-    response
-}
-

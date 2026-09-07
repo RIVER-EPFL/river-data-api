@@ -11,22 +11,13 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serial_test::serial;
 use uuid::Uuid;
 
+use crate::common::e2e::count;
+use crate::common::plans::{find_entry, run_plan_action};
+
 const SOURCE_SYSTEM: &str = "cnet";
 const STATION_UP: &str = "BER_UP";
 const STATION_DN: &str = "BER_DN";
 const DO_FIELD_DISPLAY: &str = "Dissolved Oxygen - Field [mg/L]";
-
-async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
-    let row = db
-        .query_one_raw(Statement::from_string(
-            DatabaseBackend::Postgres,
-            sql.to_string(),
-        ))
-        .await
-        .expect("query")
-        .expect("row");
-    row.try_get::<i64>("", "c").expect("c")
-}
 
 async fn scalar_opt_string(db: &DatabaseConnection, sql: &str) -> Option<String> {
     db.query_one_raw(Statement::from_string(
@@ -88,44 +79,6 @@ async fn register_portal_stream(
         "register {station}:{column} ({status}): {resp}"
     );
     resp["id"].as_str().expect("stream id").to_string()
-}
-
-fn entry_for<'a>(plan: &'a serde_json::Value, stream_id: &str) -> &'a serde_json::Value {
-    plan["entries"]
-        .as_array()
-        .unwrap_or_else(|| panic!("entries array: {plan}"))
-        .iter()
-        .find(|e| e["stream_id"] == serde_json::json!(stream_id))
-        .unwrap_or_else(|| panic!("entry for stream {stream_id} missing: {plan}"))
-}
-
-/// Post apply/revert (both tracked jobs), wait for completion, return the job's detail.counts.
-async fn run_plan_action(
-    app: &axum::Router,
-    token: &str,
-    plan_id: &str,
-    action: &str,
-) -> serde_json::Value {
-    let (status, res) = crate::common::post_plan_action_parse_with_token(
-        app,
-        &plan_id.to_string(),
-        action,
-        token,
-    )
-    .await;
-    assert_eq!(status, 200, "{action} ({status}): {res}");
-    let job_id = res["job_id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("{action} job_id: {res}"));
-    assert_eq!(
-        crate::common::e2e::poll_job(app, token, job_id, 30).await,
-        "completed",
-        "{action} job completes",
-    );
-    let (_, job) =
-        crate::common::get_json_with_token(app, &format!("/api/reprocessing_jobs/{job_id}"), token)
-            .await;
-    job["detail"]["counts"].clone()
 }
 
 async fn seed_catalog_parameters(db: &DatabaseConnection) -> (Uuid, Uuid, Uuid) {
@@ -350,25 +303,25 @@ async fn portal_migration_wizard_full_flow() {
     assert_eq!(plan["summary"]["will_pair"], 8);
     assert_eq!(plan["summary"]["sites_to_create"], 2);
 
-    let do_entry = entry_for(&plan, &streams.do_field_up);
+    let do_entry = find_entry(&plan, &streams.do_field_up);
     assert_eq!(do_entry["project"]["name"], "CNET");
     assert_eq!(do_entry["site"]["name"], STATION_UP);
     assert_eq!(do_entry["parameter"]["name"], DO_FIELD_DISPLAY);
     assert_eq!(do_entry["parameter"]["create"], true);
-    let do_entry_dn = entry_for(&plan, &streams.do_field_dn);
+    let do_entry_dn = find_entry(&plan, &streams.do_field_dn);
     assert_eq!(do_entry_dn["site"]["name"], STATION_DN);
     assert_eq!(
         do_entry_dn["parameter"]["name"], DO_FIELD_DISPLAY,
         "same display name at both stations proposes one shared parameter"
     );
 
-    let alias_entry = entry_for(&plan, &streams.alias_match);
+    let alias_entry = find_entry(&plan, &streams.alias_match);
     assert_eq!(
         alias_entry["parameter"]["id"],
         serde_json::json!(nitrate_id)
     );
     assert_eq!(alias_entry["parameter"]["create"], false);
-    let name_entry = entry_for(&plan, &streams.name_match_up);
+    let name_entry = find_entry(&plan, &streams.name_match_up);
     assert_eq!(
         name_entry["parameter"]["id"],
         serde_json::json!(water_temp_id)
@@ -380,7 +333,7 @@ async fn portal_migration_wizard_full_flow() {
         &streams.replicate_2,
         &streams.replicate_3,
     ] {
-        assert_eq!(entry_for(&plan, id)["parameter"]["create"], true);
+        assert_eq!(find_entry(&plan, id)["parameter"]["create"], true);
     }
 
     // Rename replicate 1 to a custom parameter, then converge replicate 2 onto the same
@@ -398,7 +351,7 @@ async fn portal_migration_wizard_full_flow() {
     assert_eq!(status, 200, "patch converge ({status}): {body}");
     let plan_doc: serde_json::Value = serde_json::from_str(&body).unwrap();
     for id in [&streams.replicate_1, &streams.replicate_2] {
-        let e = entry_for(&plan_doc, id);
+        let e = find_entry(&plan_doc, id);
         assert_eq!(e["parameter"]["name"], "DO Replicate");
         assert_eq!(e["parameter"]["create"], true);
         assert!(e["parameter"]["id"].is_null());
@@ -417,7 +370,7 @@ async fn portal_migration_wizard_full_flow() {
     .await;
     assert_eq!(status, 200, "patch reclassify ({status}): {body}");
     let plan_doc: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let e = entry_for(&plan_doc, &streams.replicate_3);
+    let e = find_entry(&plan_doc, &streams.replicate_3);
     assert_eq!(e["parameter"]["id"], serde_json::json!(turb_fnu_id));
     assert_eq!(e["parameter"]["create"], false);
 

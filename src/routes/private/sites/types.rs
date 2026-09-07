@@ -41,8 +41,8 @@ pub struct ParameterResponse {
     pub name: String,
     /// Resolved units: site override (`display_units`) falling back to the catalog `default_units`
     pub units: Option<String>,
-    /// Whether this is a derived (computed) parameter at this site
-    pub is_derived: bool,
+    /// How this site fills the slot: 'manual' or 'tool'
+    pub entry_mode: String,
     pub sensor_type: String,
     pub display_units: Option<String>,
     /// Display precision the client formats with; the API serves full precision.

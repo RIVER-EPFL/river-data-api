@@ -20,21 +20,30 @@ const KEYS_PER_STATEMENT: usize = 500;
 
 /// Curation moves values already served, at instants a bounded query may hold cached anywhere, and
 /// the rollups exclude what a flag hides, so the refresh is the write's own span and its failure is
-/// the caller's. Nothing arrives here, so no slot is announced and no alarm is re-evaluated.
+/// the caller's. Nothing arrives here, so no slot is announced and no alarm is re-evaluated. A
+/// derived value computed from a flagged input is one the flag has just contradicted, so the slots
+/// the write named are recomputed over the same span.
 const CURATION_TAIL: tail::Axes = tail::Axes {
     cache: tail::Cache::All,
     refresh: tail::Refresh::Range { fatal: true },
     announce: false,
     reconcile_alarms: false,
     episodes: tail::Episodes::None,
+    recompute_derived: true,
     writer: recompute::Writer::Person,
 };
 
-/// What a recorded curation left behind, in the shape the shared tail reads.
-fn written(recorded: &decisions::Recorded) -> tail::Written {
+/// What a recorded curation left behind, in the shape the shared tail reads. The keys carry the
+/// slots, which the record does not: the tail needs them to recompute what the flagged rows fed.
+fn written(recorded: &decisions::Recorded, keys: &[ReadingKey]) -> tail::Written {
+    let slots: Vec<tail::Slot> = keys
+        .iter()
+        .map(|k| tail::Slot::paired(k.site_id, k.parameter_id))
+        .collect();
     tail::Written::new(recorded.rows)
         .over(recorded.span)
         .touching(recorded.touched_events.clone())
+        .at(slots)
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -187,7 +196,7 @@ async fn apply_flags(
     })
     .await?;
 
-    tail::run(state, &written(&recorded), &CURATION_TAIL, actor).await?;
+    tail::run(state, &written(&recorded, keys), &CURATION_TAIL, actor).await?;
     Ok(recorded.rows)
 }
 
@@ -215,6 +224,17 @@ impl SlotRange {
             "r.site_id = $1 AND r.parameter_id = $2 AND r.time >= $3 AND r.time <= $4 AND {}",
             write.state_predicate()
         )
+    }
+
+    /// The slot the range covers, in the key shape the tail reads slots from.
+    fn key(&self) -> [ReadingKey; 1] {
+        [ReadingKey {
+            site_id: self.site_id,
+            parameter_id: self.parameter_id,
+            time: self.start_time,
+            replicate_index: None,
+            measurement_type: None,
+        }]
     }
 
     fn binds(&self) -> Vec<sea_orm::Value> {
@@ -278,7 +298,13 @@ async fn apply_flags_over_range(
     })
     .await?;
 
-    tail::run(state, &written(&recorded), &CURATION_TAIL, actor).await?;
+    tail::run(
+        state,
+        &written(&recorded, &range.key()),
+        &CURATION_TAIL,
+        actor,
+    )
+    .await?;
     Ok(recorded.rows)
 }
 

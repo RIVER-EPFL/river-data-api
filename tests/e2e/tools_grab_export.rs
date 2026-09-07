@@ -18,7 +18,7 @@ use serial_test::serial;
 
 use crate::common::e2e;
 use crate::common::keycloak as kc;
-use crate::common::tracks::{self, BAND_GRAB, Track};
+use crate::common::tracks::{self, BAND_GRAB};
 
 const PORTAL_GRAB_ROWS: &str = include_str!("../fixtures/portal_grab_rows_metalp.csv");
 const PORTAL_CURVES: &str = include_str!("../fixtures/portal_standard_curves_metalp.csv");
@@ -91,26 +91,6 @@ fn portal_curve(parameter: &str) -> (f64, f64) {
 // ---------------------------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------------------------
-
-/// A Keycloak fixture user at `role`, granted visibility of the track's project. Fixture passwords
-/// equal the username.
-async fn member(
-    db: &sea_orm::DatabaseConnection,
-    project_id: &str,
-    user: &str,
-    role: &str,
-) -> String {
-    kc::ensure_realm_user(user, user, &[role]).await;
-    kc::grant_project(db, &kc::keycloak_user_id(user).await, project_id).await;
-    kc::get_keycloak_jwt(user, user).await
-}
-
-/// Add a parameter to the track's site over HTTP, for slots the track itself does not provision.
-async fn add_parameter(app: &Router, admin: &str, track: &Track, code: &str, name: &str) -> String {
-    let parameter_id = e2e::create_parameter(app, admin, code, name, "ppb").await;
-    e2e::assign_site_parameter_minimal(app, admin, &track.site_id, &parameter_id).await;
-    parameter_id
-}
 
 fn parameter_block<'a>(resp: &'a serde_json::Value, parameter_id: &str) -> &'a serde_json::Value {
     resp["parameters"]
@@ -202,8 +182,8 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
         .sensor_id
         .clone()
         .expect("the grab track provisions a lab instrument");
-    let intern = member(&db, &track.project_id, "intern1", "riverdata-intern").await;
-    let river = member(&db, &track.project_id, "river1", "riverdata-river").await;
+    let intern = e2e::member(&db, &track.project_id, "intern1", "riverdata-intern").await;
+    let river = e2e::member(&db, &track.project_id, "river1", "riverdata-river").await;
 
     let doc = portal_doc_triplicate("S04", "2021-07-05");
     let (slope, intercept) = portal_curve("DOC corr");
@@ -294,11 +274,39 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
         .collect();
     let body = json!({ "site_id": track.site_id, "label": "DOC plate", "readings": readings });
 
-    let (status, refused) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &body, &intern).await;
+    // An intern enters field data, at its own instant: the entry lands unverified and may not
+    // displace what a member goes on to save here.
+    let intern_body = json!({
+        "site_id": track.site_id,
+        "label": "DOC plate",
+        "readings": readings
+            .iter()
+            .map(|r| {
+                let mut r = r.clone();
+                r["time"] = json!("2021-07-01T08:20:00Z");
+                r
+            })
+            .collect::<Vec<_>>(),
+    });
+    let (status, entered) =
+        crate::common::post_json_parse_with_token(&app, "/api/grab_samples", &intern_body, &intern)
+            .await;
     assert_eq!(
-        status, 403,
-        "grab entry is data curation, an intern must not reach it: {refused}"
+        status, 200,
+        "an intern enters field data ({status}): {entered}"
+    );
+    assert_eq!(entered["inserted"], 3, "one reading per replicate: {entered}");
+    assert_eq!(
+        e2e::count(
+            &db,
+            &format!(
+                "SELECT count(*) FROM readings WHERE time = '2021-07-01T08:20:00Z' \
+                 AND parameter_id = '{parameter_id}' AND unverified IS NOT TRUE"
+            ),
+        )
+        .await,
+        0,
+        "nothing an intern entered is verified"
     );
 
     let (status, saved) =
@@ -320,7 +328,7 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
             format!(
                 "SELECT replicate_index, raw_value, calibrated_value, calibration_id, measurement_type \
                  FROM readings WHERE site_id = '{}' AND parameter_id = '{parameter_id}' \
-                 ORDER BY replicate_index",
+                 AND time = '{at}' ORDER BY replicate_index",
                 track.site_id
             ),
         ))
@@ -482,9 +490,9 @@ async fn sensor_vs_grab_window_edges_are_inclusive_and_configurable() {
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
     let track = tracks::onboard_grab_track(&app, &admin).await;
-    let cdom = add_parameter(&app, &admin, &track, "TrkGrabCdom", "Track Grab CDOM").await;
-    let intern = member(&db, &track.project_id, "intern1", "riverdata-intern").await;
-    let river = member(&db, &track.project_id, "river1", "riverdata-river").await;
+    let cdom = e2e::provision_slot(&app, &admin, &track.site_id, "TrkGrabCdom", "Track Grab CDOM", "ppb").await;
+    let intern = e2e::member(&db, &track.project_id, "intern1", "riverdata-intern").await;
+    let river = e2e::member(&db, &track.project_id, "river1", "riverdata-river").await;
 
     // Around a 06:00 grab: 07:00 and 13:00 sit outside the default 2-6h window, 08:00 and 12:00 sit
     // exactly on its edges, 10:00 inside.
@@ -630,9 +638,9 @@ async fn sensor_vs_grab_orders_grabs_and_reports_an_empty_post_grab_window() {
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
     let track = tracks::onboard_grab_track(&app, &admin).await;
-    let cdom = add_parameter(&app, &admin, &track, "TrkGrabCdom", "Track Grab CDOM").await;
-    let intern = member(&db, &track.project_id, "intern1", "riverdata-intern").await;
-    let river = member(&db, &track.project_id, "river1", "riverdata-river").await;
+    let cdom = e2e::provision_slot(&app, &admin, &track.site_id, "TrkGrabCdom", "Track Grab CDOM", "ppb").await;
+    let intern = e2e::member(&db, &track.project_id, "intern1", "riverdata-intern").await;
+    let river = e2e::member(&db, &track.project_id, "river1", "riverdata-river").await;
 
     let (status, batch) = crate::common::post_json_parse_with_token(
         &app,
@@ -830,11 +838,11 @@ async fn sensor_vs_grab_empty_comparisons_and_invalid_windows() {
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
     let track = tracks::onboard_grab_track(&app, &admin).await;
-    let cdom = add_parameter(&app, &admin, &track, "TrkGrabCdom", "Track Grab CDOM").await;
+    let cdom = e2e::provision_slot(&app, &admin, &track.site_id, "TrkGrabCdom", "Track Grab CDOM", "ppb").await;
     let ungrabbed =
-        add_parameter(&app, &admin, &track, "TrkGrabTurb", "Track Grab Turbidity").await;
-    let intern = member(&db, &track.project_id, "intern1", "riverdata-intern").await;
-    let river = member(&db, &track.project_id, "river1", "riverdata-river").await;
+        e2e::provision_slot(&app, &admin, &track.site_id, "TrkGrabTurb", "Track Grab Turbidity", "ppb").await;
+    let intern = e2e::member(&db, &track.project_id, "intern1", "riverdata-intern").await;
+    let river = e2e::member(&db, &track.project_id, "river1", "riverdata-river").await;
 
     let (status, batch) = crate::common::post_json_parse_with_token(
         &app,

@@ -119,17 +119,8 @@ async fn two_site_fixture(db: &DatabaseConnection) -> TwoSites {
     let stream = uuid(&track.stream_ids[0]);
     let site1 = track.site_id.clone();
 
-    kc::ensure_realm_user("manager1", "manager1", &["riverdata-manager"]).await;
-    kc::ensure_realm_user("river1", "river1", &["riverdata-river"]).await;
-    kc::grant_project(
-        db,
-        &kc::keycloak_user_id("manager1").await,
-        &track.project_id,
-    )
-    .await;
-    kc::grant_project(db, &kc::keycloak_user_id("river1").await, &track.project_id).await;
-    let manager = kc::get_keycloak_jwt("manager1", "manager1").await;
-    let river = kc::get_keycloak_jwt("river1", "river1").await;
+    let manager = e2e::member(db, &track.project_id, "manager1", "riverdata-manager").await;
+    let river = e2e::member(db, &track.project_id, "river1", "riverdata-river").await;
 
     // Without the link, pairing leaves the minted sensor undeployed (the slot is already held) and
     // none of the calibration or deployment work below reaches the readings.

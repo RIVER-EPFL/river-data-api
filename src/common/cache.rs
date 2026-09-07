@@ -185,20 +185,12 @@ pub async fn get_latest_time(
         return Ok(None);
     }
 
-    let placeholders: Vec<String> = (1..=param_ids.len()).map(|i| format!("${i}")).collect();
-    let values: Vec<sea_orm::Value> = param_ids.iter().map(|id| (*id).into()).collect();
-
-    let sql = format!(
-        "SELECT MAX(time) as max_time FROM readings WHERE parameter_id IN ({})",
-        placeholders.join(",")
-    );
-
     let result = state
         .db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &sql,
-            values,
+            "SELECT MAX(time) as max_time FROM readings WHERE parameter_id = ANY($1)",
+            [param_ids.to_vec().into()],
         ))
         .await?;
 

@@ -8,63 +8,15 @@
 //! the action, waits for the job to reach `completed`, and returns its `detail.counts`, so count
 //! assertions read the job detail and DB-fact assertions run only after the job has finished.
 //!
+//! The streams are METALP's: the story is about the lifecycle, and NOMIS pairing is refused
+//! outright until its timestamps have a zone (`tests/data_streams/nomis_pairing_refused.rs`).
+//!
 //! Run: cargo test --test e2e -- --test-threads=1
 
-use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serial_test::serial;
 
-async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
-    let row = db
-        .query_one_raw(Statement::from_string(
-            DatabaseBackend::Postgres,
-            sql.to_string(),
-        ))
-        .await
-        .expect("query")
-        .expect("row");
-    row.try_get::<i64>("", "c").expect("c")
-}
-
-fn find_entry<'a>(plan: &'a serde_json::Value, stream_id: &str) -> &'a serde_json::Value {
-    plan["entries"]
-        .as_array()
-        .unwrap_or_else(|| panic!("entries array: {plan}"))
-        .iter()
-        .find(|e| e["stream_id"] == serde_json::json!(stream_id))
-        .unwrap_or_else(|| panic!("entry for stream {stream_id} missing: {plan}"))
-}
-
-/// Post `apply`/`revert` on a plan (both run as tracked `plan_apply`/`plan_revert` jobs), wait for
-/// the job to reach `completed`, and return its `detail.counts` object. The heavy work, pairing,
-/// backfill, and the plan status transition, happens in the job, so DB-fact assertions run only
-/// after this returns.
-async fn run_plan_action(
-    app: &axum::Router,
-    token: &str,
-    plan_id: &str,
-    action: &str,
-) -> serde_json::Value {
-    let (status, res) = crate::common::post_plan_action_parse_with_token(
-        app,
-        &plan_id.to_string(),
-        action,
-        token,
-    )
-    .await;
-    assert_eq!(status, 200, "{action} ({status}): {res}");
-    let job_id = res["job_id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("{action} returns a job_id: {res}"));
-    assert_eq!(
-        crate::common::e2e::poll_job(app, token, job_id, 30).await,
-        "completed",
-        "{action} job completes",
-    );
-    let (_, job) =
-        crate::common::get_json_with_token(app, &format!("/api/reprocessing_jobs/{job_id}"), token)
-            .await;
-    job["detail"]["counts"].clone()
-}
+use crate::common::e2e::count;
+use crate::common::plans::{find_entry, run_plan_action};
 
 #[tokio::test]
 #[serial]
@@ -74,9 +26,9 @@ async fn grouped_discovery_groups_unpaired_streams_by_site() {
     crate::common::seed_unpaired_stream_with_hierarchy(
         &db,
         &uuid::Uuid::new_v4().to_string(),
-        "nomis",
+        "metalp",
         "k1",
-        "NOMIS",
+        "METALP",
         "GL1_DN",
         "Conductivity",
         "uS/cm",
@@ -87,9 +39,9 @@ async fn grouped_discovery_groups_unpaired_streams_by_site() {
     crate::common::seed_unpaired_stream_with_hierarchy(
         &db,
         &uuid::Uuid::new_v4().to_string(),
-        "nomis",
+        "metalp",
         "k2",
-        "NOMIS",
+        "METALP",
         "GL1_DN",
         "Temperature",
         "degC",
@@ -100,9 +52,9 @@ async fn grouped_discovery_groups_unpaired_streams_by_site() {
     crate::common::seed_unpaired_stream_with_hierarchy(
         &db,
         &uuid::Uuid::new_v4().to_string(),
-        "nomis",
+        "metalp",
         "k3",
-        "NOMIS",
+        "METALP",
         "GL2_UP",
         "Conductivity",
         "uS/cm",
@@ -116,7 +68,7 @@ async fn grouped_discovery_groups_unpaired_streams_by_site() {
     let (status, resp) = crate::common::post_json_parse_with_token(
         &app,
         "/api/sync/grouped-discovery",
-        &serde_json::json!({"source_system": "nomis"}),
+        &serde_json::json!({"source_system": "metalp"}),
         &token,
     )
     .await;
@@ -161,9 +113,9 @@ async fn create_inspect_update_apply_revert_full_lifecycle() {
     crate::common::seed_unpaired_stream_with_hierarchy(
         &db,
         &cond1,
-        "nomis",
+        "metalp",
         "c1",
-        "NOMIS",
+        "METALP",
         "GL1_DN",
         "Conductivity",
         "uS/cm",
@@ -174,9 +126,9 @@ async fn create_inspect_update_apply_revert_full_lifecycle() {
     crate::common::seed_unpaired_stream_with_hierarchy(
         &db,
         &temp1,
-        "nomis",
+        "metalp",
         "t1",
-        "NOMIS",
+        "METALP",
         "GL1_DN",
         "Temperature",
         "degC",
@@ -187,9 +139,9 @@ async fn create_inspect_update_apply_revert_full_lifecycle() {
     crate::common::seed_unpaired_stream_with_hierarchy(
         &db,
         &cond2,
-        "nomis",
+        "metalp",
         "c2",
-        "NOMIS",
+        "METALP",
         "GL2_UP",
         "Conductivity",
         "uS/cm",
@@ -200,9 +152,9 @@ async fn create_inspect_update_apply_revert_full_lifecycle() {
     crate::common::seed_unpaired_stream_with_hierarchy(
         &db,
         &temp2,
-        "nomis",
+        "metalp",
         "t2",
-        "NOMIS",
+        "METALP",
         "GL2_UP",
         "Temperature",
         "degC",
@@ -217,7 +169,7 @@ async fn create_inspect_update_apply_revert_full_lifecycle() {
     let (status, plan) = crate::common::post_json_parse_with_token(
         &app,
         "/api/sync/pairing-plans",
-        &serde_json::json!({"source_system": "nomis"}),
+        &serde_json::json!({"source_system": "metalp"}),
         &token,
     )
     .await;
@@ -245,7 +197,7 @@ async fn create_inspect_update_apply_revert_full_lifecycle() {
     assert_eq!(plan["entries"].as_array().unwrap().len(), 4);
     let e = find_entry(&plan, &cond1);
     assert_eq!(e["action"], "pair");
-    assert_eq!(e["project"]["name"], "NOMIS");
+    assert_eq!(e["project"]["name"], "METALP");
     assert_eq!(e["site"]["create"], true);
     assert_eq!(e["parameter"]["create"], true);
     assert_eq!(e["confidence"], "none");
@@ -348,7 +300,7 @@ async fn create_inspect_update_apply_revert_full_lifecycle() {
             &db,
             &format!(
                 "SELECT count(*) AS c FROM readings r JOIN data_streams ds ON r.stream_id = ds.id \
-             WHERE ds.source_system = 'nomis' AND r.site_id IS NOT NULL"
+             WHERE ds.source_system = 'metalp' AND r.site_id IS NOT NULL"
             )
         )
         .await,
@@ -356,7 +308,7 @@ async fn create_inspect_update_apply_revert_full_lifecycle() {
         "revert re-NULLed the backfilled readings"
     );
     assert_eq!(
-        count(&db, "SELECT count(*) AS c FROM data_streams WHERE source_system = 'nomis' AND site_parameter_id IS NULL").await,
+        count(&db, "SELECT count(*) AS c FROM data_streams WHERE source_system = 'metalp' AND site_parameter_id IS NULL").await,
         4, "all streams unpaired again"
     );
     assert!(
@@ -397,7 +349,7 @@ async fn apply_reuses_existing_site_by_case_insensitive_name() {
     let site_id = uuid::Uuid::new_v4().to_string();
     crate::common::exec(
         &db,
-        &format!("INSERT INTO projects (id, name) VALUES ('{project_id}', 'NOMIS')"),
+        &format!("INSERT INTO projects (id, name) VALUES ('{project_id}', 'METALP')"),
     )
     .await;
     crate::common::exec(&db, &format!(
@@ -408,9 +360,9 @@ async fn apply_reuses_existing_site_by_case_insensitive_name() {
     crate::common::seed_unpaired_stream_with_hierarchy(
         &db,
         &stream,
-        "nomis",
+        "metalp",
         "k1",
-        "NOMIS",
+        "METALP",
         "GL1_DN",
         "Conductivity",
         "uS/cm",
@@ -424,7 +376,7 @@ async fn apply_reuses_existing_site_by_case_insensitive_name() {
     let (status, plan) = crate::common::post_json_parse_with_token(
         &app,
         "/api/sync/pairing-plans",
-        &serde_json::json!({"source_system": "nomis"}),
+        &serde_json::json!({"source_system": "metalp"}),
         &token,
     )
     .await;
@@ -464,9 +416,9 @@ async fn apply_reuses_existing_parameter_via_alias() {
     crate::common::seed_unpaired_stream_with_hierarchy(
         &db,
         &stream,
-        "nomis",
+        "metalp",
         "k1",
-        "NOMIS",
+        "METALP",
         "GL1_DN",
         "Conductivity",
         "uS/cm",
@@ -480,7 +432,7 @@ async fn apply_reuses_existing_parameter_via_alias() {
     let (status, plan) = crate::common::post_json_parse_with_token(
         &app,
         "/api/sync/pairing-plans",
-        &serde_json::json!({"source_system": "nomis"}),
+        &serde_json::json!({"source_system": "metalp"}),
         &token,
     )
     .await;
@@ -511,9 +463,9 @@ async fn apply_creates_new_site_with_metadata_coordinates() {
     crate::common::seed_unpaired_stream_with_hierarchy(
         &db,
         &stream,
-        "nomis",
+        "metalp",
         "k1",
-        "NOMIS",
+        "METALP",
         "NewSite",
         "Conductivity",
         "uS/cm",
@@ -527,7 +479,7 @@ async fn apply_creates_new_site_with_metadata_coordinates() {
     let (status, plan) = crate::common::post_json_parse_with_token(
         &app,
         "/api/sync/pairing-plans",
-        &serde_json::json!({"source_system": "nomis"}),
+        &serde_json::json!({"source_system": "metalp"}),
         &token,
     )
     .await;
@@ -561,9 +513,9 @@ async fn apply_backfills_coordinates_onto_existing_site_lacking_them() {
     crate::common::seed_unpaired_stream_with_hierarchy(
         &db,
         &stream,
-        "nomis",
+        "metalp",
         "k1",
-        "NOMIS",
+        "METALP",
         "CoordSite",
         "Conductivity",
         "uS/cm",
@@ -577,7 +529,7 @@ async fn apply_backfills_coordinates_onto_existing_site_lacking_them() {
     let (status, plan) = crate::common::post_json_parse_with_token(
         &app,
         "/api/sync/pairing-plans",
-        &serde_json::json!({"source_system": "nomis"}),
+        &serde_json::json!({"source_system": "metalp"}),
         &token,
     )
     .await;

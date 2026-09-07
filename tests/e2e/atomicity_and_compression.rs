@@ -49,14 +49,16 @@ async fn capped_app() -> (Router, DatabaseConnection) {
 
 /// Manager and river JWTs, both granted the project under test.
 async fn operator_jwts(db: &DatabaseConnection, project_id: &str) -> (String, String) {
-    kc::ensure_realm_user("manager1", "manager1", &["riverdata-manager"]).await;
-    kc::ensure_realm_user("river1", "river1", &["riverdata-river"]).await;
-    kc::grant_project(db, &kc::keycloak_user_id("manager1").await, project_id).await;
-    kc::grant_project(db, &kc::keycloak_user_id("river1").await, project_id).await;
-    (
-        kc::get_keycloak_jwt("manager1", "manager1").await,
-        kc::get_keycloak_jwt("river1", "river1").await,
+    let jwts = e2e::members(
+        db,
+        project_id,
+        &[
+            ("manager1", "riverdata-manager"),
+            ("river1", "riverdata-river"),
+        ],
     )
+    .await;
+    (jwts[0].clone(), jwts[1].clone())
 }
 
 fn day(date: &str) -> DateTime<Utc> {
@@ -148,104 +150,17 @@ async fn assert_cap_bites(capped: &DatabaseConnection, table: &str, filter: &str
     );
 }
 
-/// Every tracked job with its status, for assertion messages.
-async fn jobs_summary(db: &DatabaseConnection) -> String {
-    let rows = db
-        .query_all_raw(Statement::from_string(
-            DatabaseBackend::Postgres,
-            "SELECT trigger_type, status, retry_count, COALESCE(error_message, '') AS error \
-             FROM reprocessing_jobs ORDER BY created_at"
-                .to_string(),
-        ))
-        .await
-        .expect("job listing failed");
-    rows.iter()
-        .map(|r| {
-            let trigger: String = r.try_get("", "trigger_type").unwrap_or_default();
-            let status: String = r.try_get("", "status").unwrap_or_default();
-            let retries: i32 = r.try_get("", "retry_count").unwrap_or_default();
-            let error: String = r.try_get("", "error").unwrap_or_default();
-            format!("{trigger}={status} (retries {retries}) {error}")
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
-}
 
-/// Wait for every tracked job to reach a terminal state, so a background reprocess cannot lift the
-/// decompression cap on a fixture between the moment it is compressed and the operation under test.
-async fn drain_jobs(db: &DatabaseConnection, max_secs: u64) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
-    loop {
-        let active = e2e::count(
-            db,
-            "SELECT count(*) FROM reprocessing_jobs \
-             WHERE status IN ('pending', 'queued', 'running', 'retrying')",
-        )
-        .await;
-        if active == 0 {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "tracked jobs have not settled after {max_secs}s: {}",
-            jobs_summary(db).await
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-}
-
-/// Poll the newest job of `trigger_type` until it is terminal, returning its status and a summary.
-///
-/// A failing job returns to `queued` with an exponential retry delay rather than to `failed`, so
-/// the deadline elapsing means the retry budget outlived the test, not that the job holds the
-/// status last observed; it panics with the summary rather than reporting one.
-async fn await_job(db: &DatabaseConnection, trigger_type: &str, max_secs: u64) -> (String, String) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
-    loop {
-        let row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                "SELECT status FROM reprocessing_jobs WHERE trigger_type = $1 \
-                 ORDER BY created_at DESC LIMIT 1",
-                [trigger_type.into()],
-            ))
-            .await
-            .expect("job lookup failed");
-        let status: String = row
-            .map(|r| r.try_get("", "status").unwrap_or_default())
-            .unwrap_or_else(|| "missing".to_string());
-        if status == "completed" || status == "failed" {
-            return (status, jobs_summary(db).await);
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "{trigger_type} job still {status} after {max_secs}s: {}",
-            jobs_summary(db).await
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    }
-}
 
 /// Ingest `times` on `stream`, values counting up from `base`.
 async fn ingest(app: &Router, jwt: &str, stream: &str, times: &[DateTime<Utc>], base: f64) {
-    let readings: Vec<Value> = times
+    let rows: Vec<(String, f64)> = times
         .iter()
         .enumerate()
-        .map(|(i, t)| json!({ "time": t.to_rfc3339(), "raw_value": base + i as f64 }))
+        .map(|(i, t)| (t.to_rfc3339(), base + i as f64))
         .collect();
-    let (status, body) = crate::common::post_json_parse_with_token(
-        app,
-        "/api/ingest",
-        &json!({ "stream_id": stream, "readings": readings }),
-        jwt,
-    )
-    .await;
-    assert_eq!(status, 200, "ingest onto stream {stream}: {body}");
-    assert_eq!(
-        body["inserted"].as_u64(),
-        Some(times.len() as u64),
-        "every ingested reading lands: {body}"
-    );
+    let readings: Vec<(&str, f64)> = rows.iter().map(|(t, v)| (t.as_str(), *v)).collect();
+    e2e::ingest(app, jwt, stream, &readings).await;
 }
 
 /// Batch-insert `rows` at one slot, returning the raw response for the caller to assert on.
@@ -341,7 +256,7 @@ async fn unpairing_a_stream_clears_readings_in_compressed_chunks() {
         Some(COMPRESSED_ROWS as u64),
         "the backfill attributes every compressed row: {paired}"
     );
-    drain_jobs(&db, 60).await;
+    e2e::drain_jobs(&db, 60).await;
 
     // A second compressed chunk, written while the stream is paired so its rows land attributed.
     ingest(
@@ -415,7 +330,7 @@ async fn unpairing_a_stream_clears_readings_in_compressed_chunks() {
         .await
             >= 1,
         "clearing attribution must enqueue the refresh that drops those rows from the rollups: {}",
-        jobs_summary(&db).await
+        e2e::jobs_summary(&db).await
     );
 }
 
@@ -476,7 +391,7 @@ async fn deleting_a_calibration_or_deployment_rewrites_compressed_readings() {
         "enter a curve covering the history ({status}): {calibration}"
     );
     let calibration = e2e::id_of(&calibration);
-    drain_jobs(&db, 60).await;
+    e2e::drain_jobs(&db, 60).await;
 
     // Curve deletion: readings dated inside the curve's window, then compressed.
     ingest(
@@ -525,7 +440,7 @@ async fn deleting_a_calibration_or_deployment_rewrites_compressed_readings() {
         0,
         "no reading may still point at a deleted curve"
     );
-    drain_jobs(&db, 60).await;
+    e2e::drain_jobs(&db, 60).await;
 
     // Deployment deletion: a second fixture, written and compressed after the delete above, so it
     // meets the operation compressed rather than as a by-product of the previous statement.
@@ -635,7 +550,7 @@ async fn flagging_readings_is_all_or_nothing_and_refreshes_the_rollups() {
         .collect();
     let (status, body) = batch(&app, &river, &site, &keyed, &keyed_rows, "skip").await;
     assert_eq!(status, 200, "keyed-arm readings ingested: {body}");
-    drain_jobs(&db, 60).await;
+    e2e::drain_jobs(&db, 60).await;
     compress_day(&db, "2025-03-03").await;
     assert_cap_bites(
         &capped,
@@ -687,7 +602,7 @@ async fn flagging_readings_is_all_or_nothing_and_refreshes_the_rollups() {
     let range_rows: Vec<(DateTime<Utc>, f64)> = range_times.iter().map(|t| (*t, 10.0)).collect();
     let (status, body) = batch(&app, &river, &site, &ranged, &range_rows, "skip").await;
     assert_eq!(status, 200, "range-arm readings ingested: {body}");
-    drain_jobs(&db, 60).await;
+    e2e::drain_jobs(&db, 60).await;
     compress_day(&db, "2025-04-07").await;
     assert_cap_bites(&capped, "readings", &format!("parameter_id = '{ranged}'")).await;
 
@@ -814,7 +729,7 @@ async fn merging_site_parameters_applies_every_step_or_none() {
         status, 200,
         "status events ingested on the source slot: {body}"
     );
-    drain_jobs(&db, 60).await;
+    e2e::drain_jobs(&db, 60).await;
     compress_status_events_day(&db, "2025-03-03").await;
     assert_cap_bites(
         &capped,
@@ -835,7 +750,7 @@ async fn merging_site_parameters_applies_every_step_or_none() {
     .await;
     assert_eq!(status, 200, "the merge is accepted and queued: {queued}");
 
-    let (job_status, summary) = await_job(&db, "merge_site_parameters", 30).await;
+    let (job_status, summary) = e2e::await_job(&db, "merge_site_parameters", 30).await;
     assert_eq!(
         job_status, "completed",
         "the merge must run to completion rather than stop half-applied: {summary}"
@@ -950,7 +865,7 @@ async fn batch_overwrite_replaces_readings_in_compressed_chunks() {
     let (status, body) = batch(&app, &river, &site, &bystander, &bystander_rows, "skip").await;
     assert_eq!(status, 200, "bystander slot ingested: {body}");
 
-    drain_jobs(&db, 60).await;
+    e2e::drain_jobs(&db, 60).await;
     compress_day(&db, "2025-03-03").await;
     assert_cap_bites(
         &capped,
@@ -1073,7 +988,7 @@ async fn concurrent_pairings_of_one_stream_leave_a_single_winner() {
         );
     }
 
-    drain_jobs(&db, 60).await;
+    e2e::drain_jobs(&db, 60).await;
 
     let (status, stream_row) =
         crate::common::get_json_with_token(&app, &format!("/api/data_streams/{stream}"), &admin)

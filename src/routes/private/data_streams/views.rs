@@ -905,97 +905,19 @@ pub async fn pair_stream(
             // never completes without an instrument: a slot's readings must name what measured them.
             let sensor_ctx =
                 create_sensor_for_stream(txn, &stream, sp.parameter_id, sp.site_id).await?;
-            let sensor_id = Some(sensor_ctx.sensor_id);
             let deployment_id = sensor_ctx.deployment_id;
-            let stream = data_streams::Entity::find_by_id(stream_id)
-                .one(txn)
-                .await?
-                .ok_or_else(|| AppError::Internal("Failed to re-fetch stream".to_string()))?;
-            let stream_measurement_type = stream.measurement_type.clone();
 
-            // Backfill: update readings with site_id + parameter_id + sensor context, and adopt the
-            // stream's declared classification for its history. A per-reading measurement_type set at
-            // ingest outranks the stream declaration and must survive pairing.
-            //
-            // No curve is stamped and no value computed. The sensor context carries the instrument's
-            // NEWEST calibration, which is not in general the one covering a given reading's time, nor
-            // necessarily one authored for this parameter; applying it across a whole backfilled
-            // history would correct every row by whichever curve happens to be latest. Which curve
-            // covers a reading is a question the reading's own time answers, and the slot reprocess
-            // enqueued post-commit is what asks it, for `calibration_id` and `calibrated_value`
-            // together.
-            let backfilled = bulk_write::mutation(
-                txn,
-                Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    r"UPDATE readings
-                  SET site_id = $1, parameter_id = $2,
-                      sensor_id = $4, deployment_id = $5,
-                      measurement_type = COALESCE(measurement_type, $6)
-                  WHERE stream_id = $3 AND site_id IS NULL",
-                    [
-                        sp.site_id.into(),
-                        sp.parameter_id.into(),
-                        stream_id.into(),
-                        sensor_id.into(),
-                        deployment_id.into(),
-                        stream_measurement_type.into(),
-                    ],
-                ),
-            )
-            .await?
-            .rows;
-
-            // Replicate groups on the newly paired stream (2+ spot readings sharing a timestamp, e.g.
-            // migrated NOMIS A/B/C rows) form samples at pairing time. The row-level triggers populate
-            // the sample statistics.
-            crate::routes::private::readings::sample_groups::materialise_samples(
-                txn,
-                "r.stream_id = $1",
-                vec![stream_id.into()],
-            )
-            .await?;
-
-            // Attribution arriving is what makes these spot readings addressable as visits: attach
-            // their collection events now, deriving the source from where the stream came from.
-            crate::routes::private::collection_events::attach::attach_collection_events(
-                txn,
-                "r.stream_id = $1",
-                vec![stream_id.into()],
-                crate::routes::private::collection_events::attach::EventSource::ByStreamOrigin,
-            )
-            .await?;
-            let touched_events =
-                crate::routes::private::collection_events::recompute::touched_events(
-                    txn,
-                    "r.stream_id = $1",
-                    vec![stream_id.into()],
-                )
-                .await?;
-
-            // Also backfill status_events
-            txn.execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"UPDATE status_events
-              SET site_id = $1, parameter_id = $2, sensor_id = $4
-              WHERE stream_id = $3 AND site_id IS NULL",
-                [
-                    sp.site_id.into(),
-                    sp.parameter_id.into(),
-                    stream_id.into(),
-                    sensor_id.into(),
-                ],
-            ))
-            .await?;
-
-            // Audit mismatches recorded while the stream was unpaired become reviewable now that the
-            // data serves a slot.
-            crate::routes::private::sync::replicate_audit::repoint_holds(
+            // Everything a pairing owes the slot: readings and status events attributed,
+            // replicate groups materialised, spot instants attached as visits, deferred holds
+            // promoted. One helper, so a stream paired here and the same stream paired through a
+            // plan land in the same state.
+            let done = super::pairing::backfill(
                 txn,
                 crate::routes::private::sync::replicate_audit::HoldScope::Stream(stream_id),
-                true,
+                deployment_id,
             )
             .await?;
+            let (backfilled, touched_events) = (done.readings, done.touched_events);
 
             Ok((sp.site_id, sp.parameter_id, backfilled, touched_events))
         })

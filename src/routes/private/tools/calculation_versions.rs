@@ -73,8 +73,9 @@ pub async fn mint_formula_version(
         &calculation.label,
         calculation.description.as_deref(),
         &formulas,
-    );
-    let body = formula::render(&formulas);
+    )
+    .map_err(AppError::Conflict)?;
+    let body = formula::render(&formulas).map_err(AppError::Conflict)?;
     let content_hash = canonical_hash(&serde_json::json!({
         "script": body,
         "manifest": manifest,

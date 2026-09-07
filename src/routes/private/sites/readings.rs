@@ -622,14 +622,8 @@ pub async fn get_site_readings(
     let num_params = params_list.len();
 
     // Build parameterized raw SQL query
-    // $1 = site_id, $2..=$N+1 = parameter_ids
-    let mut values: Vec<sea_orm::Value> = vec![site.id.into()];
-    let placeholders: Vec<String> = param_ids
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("${}", i + 2))
-        .collect();
-    values.extend(param_ids.iter().map(|id| (*id).into()));
+    // $1 = site_id, $2 = the parameter ids as one array
+    let mut values: Vec<sea_orm::Value> = vec![site.id.into(), param_ids.to_vec().into()];
 
     // One row shape either way: severity is selected as NULL when the caller did not ask for it,
     // so the projection below has a single collection loop rather than one per select.
@@ -660,7 +654,7 @@ pub async fn get_site_readings(
         )
     });
 
-    let next_param = param_ids.len() + 2;
+    let next_param = values.len() + 1;
     let time_conditions = match effective_end {
         Some(end) => {
             let cond = format!(
@@ -693,7 +687,6 @@ pub async fn get_site_readings(
         String::new()
     };
 
-    let placeholders = placeholders.join(",");
     let sql = if include_replicates {
         // Every stored row, one per replicate; the caller reconstructs the groups.
         // "continuous" means everything that is not a grab: derived rows plot on the continuous
@@ -732,7 +725,7 @@ pub async fn get_site_readings(
         };
         format!(
             "SELECT {select_clause} FROM {from_clause} \
-             WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders})\
+             WHERE r.site_id = $1 AND r.parameter_id = ANY($2)\
              {time_conditions}{measurement_type_condition}{flagged_condition}{sample_id_condition}\
              {withdrawn_condition} \
              ORDER BY r.parameter_id, r.time, r.replicate_index"
@@ -764,7 +757,7 @@ pub async fn get_site_readings(
             arms.push(format!(
                 "SELECT COALESCE(r.calibrated_value, r.raw_value) AS value, {base_cols} \
                  FROM readings r \
-                 WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
+                 WHERE r.site_id = $1 AND r.parameter_id = ANY($2) \
                    AND {CONTINUOUS_ROWS}\
                  {time_conditions}{continuous_extra}{flagged_condition}{sample_id_condition}"
             ));
@@ -785,7 +778,7 @@ pub async fn get_site_readings(
                            COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value, \
                            {base_cols} \
                     FROM readings r LEFT JOIN samples smp ON smp.id = r.sample_id \
-                    WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
+                    WHERE r.site_id = $1 AND r.parameter_id = ANY($2) \
                       AND r.measurement_type = 'spot'{spot_withdrawn_condition}\
                     {time_conditions}{flagged_condition}{sample_id_condition} \
                     ORDER BY {SPOT_INSTANT_ORDER} \
@@ -1189,4 +1182,56 @@ async fn count_withdrawn_instants(
         }
     }
     Ok(counts)
+}
+
+#[cfg(test)]
+mod cache_key_tests {
+    use super::{ReadingsCacheKey, SiteReadingsQuery};
+    use crate::common::cache_key;
+
+    /// `cache_key.rs` already asserts that a flattened field separates keys. What this asserts is
+    /// the wiring: that the handler's key struct is the one carrying the query, so a filter
+    /// reaches the key rather than being listed by hand and forgotten.
+    fn key(query: serde_json::Value) -> String {
+        let query: SiteReadingsQuery =
+            serde_json::from_value(query).expect("the query deserialises");
+        cache_key::key_for(
+            "readings",
+            &ReadingsCacheKey {
+                effective_start: chrono::Utc::now(),
+                effective_end: None,
+                resolved_format: "json",
+                query: &query,
+            },
+        )
+    }
+
+    #[test]
+    fn test_a_readings_key_carries_the_parameter_filter() {
+        let base = serde_json::json!({ "start": "2026-01-15T00:00:00Z" });
+        let mut depth = base.clone();
+        depth["parameter_ids"] = serde_json::json!("11111111-1111-1111-1111-111111111111");
+        let mut turbidity = base.clone();
+        turbidity["parameter_ids"] = serde_json::json!("22222222-2222-2222-2222-222222222222");
+
+        assert_ne!(key(depth.clone()), key(turbidity));
+        assert_ne!(key(depth), key(base));
+    }
+
+    #[test]
+    fn test_a_readings_key_carries_every_annotation_opt_in() {
+        let base = serde_json::json!({ "start": "2026-01-15T00:00:00Z" });
+        for field in [
+            "include_flagged",
+            "include_sample_stats",
+            "include_curves",
+            "include_measurement_type",
+            "include_origin",
+            "include_withdrawn",
+        ] {
+            let mut on = base.clone();
+            on[field] = serde_json::json!(true);
+            assert_ne!(key(on), key(base.clone()), "{field} is absent from the key");
+        }
+    }
 }

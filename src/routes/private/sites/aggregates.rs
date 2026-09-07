@@ -344,16 +344,10 @@ pub async fn get_site_aggregates(
         HashMap::new()
     };
 
-    // $1 = site_id, $2..=$N+1 = parameter_ids, then start, end.
-    let placeholders: Vec<String> = param_ids
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("${}", i + 2))
-        .collect();
-    let mut base_values: Vec<sea_orm::Value> = vec![site.id.into()];
-    base_values.extend(param_ids.iter().map(|id| (*id).into()));
-    let start_param = param_ids.len() + 2;
-    let end_param = start_param + 1;
+    // $1 = site_id, $2 = the parameter ids as one array, $3 start, $4 end.
+    let base_values: Vec<sea_orm::Value> = vec![site.id.into(), param_ids.to_vec().into()];
+    let start_param = 3;
+    let end_param = 4;
 
     let bind = |extra: &[sea_orm::Value]| -> Vec<sea_orm::Value> {
         let mut values = base_values.clone();
@@ -383,14 +377,13 @@ pub async fn get_site_aggregates(
             SUM(count)::bigint AS count
         FROM {view}
         WHERE site_id = $1
-          AND parameter_id IN ({ids})
+          AND parameter_id = ANY($2)
           AND bucket >= ${start_param}
           AND bucket <= ${end_param}
         GROUP BY bucket, parameter_id{sensor_group}
         ORDER BY bucket ASC, parameter_id ASC{sensor_group}
         ",
         view = rollup.view(),
-        ids = placeholders.join(","),
     );
 
     let rows: Vec<AggregateRow> = state
@@ -414,7 +407,7 @@ pub async fn get_site_aggregates(
             COUNT(*)::bigint AS flagged_count
         FROM readings
         WHERE site_id = $1
-          AND parameter_id IN ({ids})
+          AND parameter_id = ANY($2)
           AND time >= ${start_param}
           AND time <= ${end_param}
           AND is_flagged = TRUE
@@ -423,7 +416,6 @@ pub async fn get_site_aggregates(
         GROUP BY bucket, parameter_id{sensor_group}
         ",
         interval = bucket_interval(rollup),
-        ids = placeholders.join(","),
     );
 
     let flagged_rows: Vec<FlaggedBucketRow> = state
@@ -552,4 +544,46 @@ pub async fn get_site_aggregates(
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod cache_key_tests {
+    use super::{AggregatesCacheKey, SiteAggregatesQuery};
+    use crate::common::cache_key;
+
+    /// The wiring assertion: the handler's key struct carries the query, so the split reaches the
+    /// key. That a flattened field separates keys at all is `cache_key.rs`'s own test.
+    fn key(split: Option<bool>, effective_split: bool) -> String {
+        let mut query = serde_json::json!({
+            "start": "2026-01-15T00:00:00Z",
+            "end": "2026-01-16T00:00:00Z",
+        });
+        if let Some(split) = split {
+            query["split_by_sensor"] = serde_json::json!(split);
+        }
+        let query: SiteAggregatesQuery =
+            serde_json::from_value(query).expect("the query deserialises");
+        cache_key::key_for(
+            "aggregates",
+            &AggregatesCacheKey {
+                resolution: "daily",
+                resolved_format: "json",
+                effective_split,
+                query: &query,
+            },
+        )
+    }
+
+    #[test]
+    fn test_an_aggregates_key_carries_the_split() {
+        assert_ne!(key(Some(true), true), key(Some(false), false));
+        assert_ne!(key(Some(false), false), key(None, false));
+    }
+
+    /// The bulk formats serve the collapsed body whatever the query asked for, so the applied
+    /// split is in the key beside the requested one and the two bodies cannot share an entry.
+    #[test]
+    fn test_a_requested_split_the_format_refuses_is_a_key_of_its_own() {
+        assert_ne!(key(Some(true), false), key(Some(true), true));
+    }
 }

@@ -16,7 +16,8 @@ pub async fn site_has_active_derived(
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT 1 FROM site_parameters \
-             WHERE site_id = $1 AND is_derived = true AND COALESCE(is_active, true) = true LIMIT 1",
+             WHERE site_id = $1 AND entry_mode = 'tool' AND COALESCE(is_active, true) = true \
+             LIMIT 1",
             [site_id.into()],
         ))
         .await?;
@@ -48,10 +49,12 @@ fn gap_scan(since: Option<chrono::DateTime<chrono::Utc>>) -> Statement {
               FROM readings r
               JOIN site_parameters sp
                 ON sp.site_id = r.site_id
-               AND sp.is_derived = true
+               AND sp.entry_mode = 'tool'
                AND COALESCE(sp.is_active, true) = true
+              JOIN derived_parameter_definitions d
+                ON d.output_parameter_id = sp.parameter_id
               JOIN derived_parameter_sources dps
-                ON dps.derived_definition_id = sp.derived_definition_id
+                ON dps.derived_definition_id = d.id
                AND dps.parameter_id = r.parameter_id
               WHERE NOT EXISTS (
                   SELECT 1 FROM readings r2

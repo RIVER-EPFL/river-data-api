@@ -34,7 +34,6 @@ async fn configure_derived_and_exposure(
         token,
     )
     .await;
-    let derived_def_id = def["id"].as_str().unwrap().to_string();
     let output_parameter_id = def["output_parameter_id"].as_str().unwrap().to_string();
 
     crate::common::post_json_with_token(
@@ -42,7 +41,7 @@ async fn configure_derived_and_exposure(
         "/api/site_parameters",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID, "parameter_id": output_parameter_id, "name": derived_name,
-            "sensor_type": "derived", "is_derived": true, "derived_definition_id": derived_def_id,
+            "sensor_type": "derived", "entry_mode": "tool",
             "display_units": "mg/L",
         }),
         token,

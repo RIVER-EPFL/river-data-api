@@ -68,7 +68,7 @@ mod tests {
     #[test]
     fn every_spot_arm_keys_on_the_slot_instant() {
         let arms = [
-            crate::routes::public::views::readings_sql(Some(""), true, "$2", ""),
+            crate::routes::public::views::readings_sql(Some(""), true, ""),
             crate::routes::private::alarms::views::violations_sql(uuid::Uuid::nil(), None, 1),
             crate::routes::private::alarms::episodes::ordered_sql(true),
         ];

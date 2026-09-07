@@ -985,6 +985,13 @@ pub async fn insert_grab_samples(
         .map(|sp| (sp.parameter_id, sp.id))
         .collect();
 
+    // What each slot declares measures it. A slot minted by a tool save declares nothing, which is
+    // the undeclared state, not a reason to borrow another row's instrument.
+    let slot_instruments: HashMap<Uuid, Uuid> = site_params
+        .iter()
+        .filter_map(|sp| sp.instrument_sensor_id.map(|sid| (sp.parameter_id, sid)))
+        .collect();
+
     // A verified tool save provisions the slot it lands on (D10): the output's identity is the
     // run's, not the client's, so a catalog parameter the site does not carry yet gets its
     // site_parameter minted here, flagged needs_review for an operator's look. The global
@@ -1051,7 +1058,10 @@ pub async fn insert_grab_samples(
         .filter_map(|r| {
             r.standard_curve_id.map(|id| CurveClaim {
                 standard_curve_id: id,
-                sensor_id: r.sensor_id,
+                sensor_id: declared_instrument(
+                    r.sensor_id,
+                    slot_instruments.get(&r.parameter_id).copied(),
+                ),
                 measurement_type: GRAB_MEASUREMENT_TYPE,
             })
         })
@@ -1066,7 +1076,10 @@ pub async fn insert_grab_samples(
         let requests: Vec<(Uuid, Option<Uuid>, chrono::DateTime<chrono::Utc>)> = payload
             .readings
             .iter()
-            .filter_map(|r| r.sensor_id.map(|sid| (sid, Some(r.parameter_id), r.time)))
+            .filter_map(|r| {
+                declared_instrument(r.sensor_id, slot_instruments.get(&r.parameter_id).copied())
+                    .map(|sid| (sid, Some(r.parameter_id), r.time))
+            })
             .collect();
         calibrations::resolver::resolve_many(&state.db, &requests).await?
     };
@@ -1076,10 +1089,12 @@ pub async fn insert_grab_samples(
         .iter()
         .zip(&indices)
         .map(|(r, &replicate_index)| {
-            let base = r
-                .sensor_id
-                .and_then(|sid| base_curves.get(&(sid, Some(r.parameter_id), r.time)))
-                .copied();
+            let base = declared_instrument(
+                r.sensor_id,
+                slot_instruments.get(&r.parameter_id).copied(),
+            )
+            .and_then(|sid| base_curves.get(&(sid, Some(r.parameter_id), r.time)))
+            .copied();
             let standard = r.standard_curve_id.map(|cid| {
                 let c = &standard_curves[&cid];
                 calibrations::service::Curve {
@@ -1233,13 +1248,13 @@ pub async fn insert_grab_samples(
     // at the grab time (site-fixed to payload.site_id), instead of writing NULL. Grabs without a
     // sensor_id keep NULL deployment (manual lab values with no instrument).
     let grab_slots = {
-        use crate::routes::private::sensors::identity::{
-            ResolvedSlot, resolve_windows_for_times,
-        };
+        use crate::routes::private::sensors::identity::{ResolvedSlot, resolve_windows_for_times};
         let mut times_by_channel: HashMap<(Uuid, Uuid), Vec<chrono::DateTime<chrono::Utc>>> =
             HashMap::new();
         for r in &payload.readings {
-            if let Some(sid) = r.sensor_id {
+            if let Some(sid) =
+                declared_instrument(r.sensor_id, slot_instruments.get(&r.parameter_id).copied())
+            {
                 times_by_channel
                     .entry((sid, r.parameter_id))
                     .or_default()
@@ -1472,11 +1487,17 @@ pub async fn insert_grab_samples(
                     site_id: Set(Some(payload.site_id)),
                     parameter_id: Set(Some(r.parameter_id)),
                     calibrated_value: Set(p.calibrated_value),
-                    sensor_id: Set(r
-                        .sensor_id
-                        .or_else(|| stream_sensors.get(&stream_cache[&r.parameter_id]).copied())),
+                    sensor_id: Set(declared_instrument(
+                        r.sensor_id,
+                        slot_instruments.get(&r.parameter_id).copied(),
+                    )
+                    .or_else(|| stream_sensors.get(&stream_cache[&r.parameter_id]).copied())),
                     calibration_id: Set(p.base_calibration.as_ref().map(|c| c.id)),
-                    deployment_id: Set(r.sensor_id.and_then(|sid| {
+                    deployment_id: Set(declared_instrument(
+                        r.sensor_id,
+                        slot_instruments.get(&r.parameter_id).copied(),
+                    )
+                    .and_then(|sid| {
                         grab_slots
                             .get(&(sid, r.parameter_id, r.time))
                             .and_then(|s| s.deployment_id)
@@ -1634,6 +1655,7 @@ pub async fn insert_grab_samples(
             announce: false,
             reconcile_alarms: true,
             episodes: tail::Episodes::Inline,
+            recompute_derived: false,
             writer,
         },
         &crate::routes::private::tools::scripts::actor_label(&auth),
@@ -1726,9 +1748,21 @@ async fn tool_run_source(
     Ok(row.and_then(|r| r.try_get("", "source").ok()))
 }
 
+/// The instrument a hand-entered or calculated reading names, declared and never implied.
+///
+/// The request's own instrument wins: it is the one the operator's chosen curve was fitted on, and
+/// it applies to the rows that curve corrected. Absent that, the slot's declaration
+/// (`site_parameters.instrument_sensor_id`) says what measures this parameter at this site. The
+/// entry channel's own instrument is the last resort and is a marker for a slot nobody has
+/// declared, so it is added at the write rather than resolving a curve or a calibration.
+#[must_use]
+pub fn declared_instrument(explicit: Option<Uuid>, slot: Option<Uuid>) -> Option<Uuid> {
+    explicit.or(slot)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{GrabFacts, StoredFacts};
+    use super::{GrabFacts, StoredFacts, declared_instrument};
 
     fn stored(label: &str, notes: &str, author: &str) -> StoredFacts {
         StoredFacts {
@@ -1738,6 +1772,27 @@ mod tests {
             provenance: Some(serde_json::json!({ "tool": "doc" })),
             kind: Some("tool_run".to_string()),
         }
+    }
+
+    #[test]
+    fn a_row_the_curve_did_not_correct_takes_the_slot_s_declaration() {
+        let curve_instrument = uuid::Uuid::new_v4();
+        let declared = uuid::Uuid::new_v4();
+        assert_eq!(
+            declared_instrument(Some(curve_instrument), Some(declared)),
+            Some(curve_instrument),
+            "the row carrying the curve names the instrument that curve was fitted on"
+        );
+        assert_eq!(
+            declared_instrument(None, Some(declared)),
+            Some(declared),
+            "every other row names what the slot says measures it"
+        );
+        assert_eq!(
+            declared_instrument(None, None),
+            None,
+            "an undeclared slot resolves nothing here; the entry channel's marker is added at the write"
+        );
     }
 
     #[test]

@@ -824,10 +824,10 @@ async fn a_withdrawal_enqueues_the_recompute_at_the_retracted_instant() {
         &fx.db,
         &format!(
             "INSERT INTO site_parameters \
-                 (id, site_id, parameter_id, name, sensor_type, is_active, is_derived) \
+                 (id, site_id, parameter_id, name, sensor_type, is_active, entry_mode) \
              VALUES ('00000000-0000-4000-a000-0000000009d1', '{site}', \
                      '00000000-0000-4000-b000-0000000009d0', 'WDiffDerived', 'WDiffDerived', \
-                     true, true)",
+                     true, 'tool')",
             site = crate::common::SITE1_ID,
         ),
     )

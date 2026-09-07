@@ -443,9 +443,9 @@ async fn recalled_inputs_take_their_derived_output_out_of_the_site() {
         &db,
         &format!(
             "INSERT INTO site_parameters \
-             (id, site_id, parameter_id, name, sensor_type, is_active, is_derived, derived_definition_id, variable_mappings) \
-             VALUES ('{derived_sp}', '{SITE1_ID}', '{derived_param}', 'TempDoubled', 'TempDoubled', true, true, \
-                     '{derived_def}', '{{\"temp\": \"{PARAM_S1_TEMP_ID}\"}}'::jsonb)"
+             (id, site_id, parameter_id, name, sensor_type, is_active, entry_mode, variable_mappings) \
+             VALUES ('{derived_sp}', '{SITE1_ID}', '{derived_param}', 'TempDoubled', 'TempDoubled', true, 'tool', \
+                     '{{\"temp\": \"{PARAM_S1_TEMP_ID}\"}}'::jsonb)"
         ),
     )
     .await;

@@ -1122,6 +1122,7 @@ pub async fn insert_batch_readings(
             announce: true,
             reconcile_alarms: true,
             episodes: tail::Episodes::Job,
+            recompute_derived: false,
             writer: crate::routes::private::collection_events::recompute::Writer::Person,
         },
         &crate::routes::private::tools::scripts::actor_label(&auth),

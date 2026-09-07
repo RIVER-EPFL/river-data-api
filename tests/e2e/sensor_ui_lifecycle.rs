@@ -25,7 +25,6 @@ use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde_json::json;
 use serial_test::serial;
-use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::common::e2e::count;
@@ -173,54 +172,9 @@ async fn earliest_curve(db: &DatabaseConnection, sensor_id: &str) -> CurveRow {
     }
 }
 
-/// Wait until at least `expected` jobs of `trigger_type` are terminal, returning
-/// `(completed, failed)`. An enqueue that never happened times out and returns a count below
-/// `expected`, so the caller's equality assertion fails instead of passing silently.
-async fn settled_jobs(
-    db: &DatabaseConnection,
-    trigger_type: &str,
-    expected: i64,
-    timeout_secs: u64,
-) -> (i64, i64) {
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        let row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT \
-                   COUNT(*) FILTER (WHERE status = 'completed') AS completed, \
-                   COUNT(*) FILTER (WHERE status = 'failed') AS failed, \
-                   COUNT(*) FILTER (WHERE status IN ('queued','pending','running','retrying')) AS active \
-                 FROM reprocessing_jobs WHERE trigger_type = $1",
-                [trigger_type.into()],
-            ))
-            .await
-            .expect("query reprocessing_jobs")
-            .expect("count row");
-        let completed: i64 = row.try_get("", "completed").expect("completed");
-        let failed: i64 = row.try_get("", "failed").expect("failed");
-        let active: i64 = row.try_get("", "active").expect("active");
-        if active == 0 && completed + failed >= expected {
-            return (completed, failed);
-        }
-        if Instant::now() >= deadline {
-            return (completed, failed);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Actors and fixture
 // ---------------------------------------------------------------------------
-
-/// A real Keycloak user at one access level, granted the track's project. Capability alone is not
-/// access here: a non-admin member is confined to the projects they hold a grant for.
-async fn actor(db: &DatabaseConnection, username: &str, role: &str, project_id: &str) -> String {
-    kc::ensure_realm_user(username, username, &[role]).await;
-    kc::grant_project(db, &kc::keycloak_user_id(username).await, project_id).await;
-    kc::get_keycloak_jwt(username, username).await
-}
 
 struct Flow {
     track: tracks::Track,
@@ -237,7 +191,7 @@ struct Flow {
 /// member: a granted user may not ingest into an unpaired stream (`enforce_ingest_scope`).
 async fn paired_flow_track(app: &Router, db: &DatabaseConnection, admin: &str) -> Flow {
     let track = tracks::onboard_sensor_flow_track(app, admin).await;
-    let (completed, failed) = settled_jobs(db, "deployment_create", 1, 60).await;
+    let (completed, failed) = e2e::settled_jobs(db, "deployment_create", 1, 60).await;
     assert_eq!(
         (completed, failed),
         (1, 0),
@@ -318,9 +272,9 @@ async fn deploy_dialog_suggestions_then_redeploy_binds_the_slot() {
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
     let flow = paired_flow_track(&app, &db, &admin).await;
-    let manager = actor(&db, "manager1", "riverdata-manager", &flow.track.project_id).await;
-    let river = actor(&db, "river1", "riverdata-river", &flow.track.project_id).await;
-    let intern = actor(&db, "intern1", "riverdata-intern", &flow.track.project_id).await;
+    let manager = e2e::member(&db, &flow.track.project_id, "manager1", "riverdata-manager").await;
+    let river = e2e::member(&db, &flow.track.project_id, "river1", "riverdata-river").await;
+    let intern = e2e::member(&db, &flow.track.project_id, "intern1", "riverdata-intern").await;
 
     // Cycle 1 starts at 00:00:10, clear of both the deployment start and the recall instant, so
     // `first_reading` cannot be satisfied by echoing either one back.
@@ -350,7 +304,7 @@ async fn deploy_dialog_suggestions_then_redeploy_binds_the_slot() {
         "a manager recalls the sensor ({status}): {body}"
     );
     assert_eq!(
-        settled_jobs(&db, "deployment_update", 1, 60).await,
+        e2e::settled_jobs(&db, "deployment_update", 1, 60).await,
         (1, 0),
         "the recall enqueues one reprocess and it succeeds"
     );
@@ -418,7 +372,7 @@ async fn deploy_dialog_suggestions_then_redeploy_binds_the_slot() {
         "the deployment binds the sensor to the slot's parameter: {redeploy}"
     );
     assert_eq!(
-        settled_jobs(&db, "deployment_create", 2, 60).await,
+        e2e::settled_jobs(&db, "deployment_create", 2, 60).await,
         (2, 0),
         "the redeploy enqueues a second reprocess and both succeed"
     );
@@ -478,8 +432,8 @@ async fn recall_then_reopen_via_edit_dates_restores_attribution() {
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
     let flow = paired_flow_track(&app, &db, &admin).await;
-    let manager = actor(&db, "manager1", "riverdata-manager", &flow.track.project_id).await;
-    let river = actor(&db, "river1", "riverdata-river", &flow.track.project_id).await;
+    let manager = e2e::member(&db, &flow.track.project_id, "manager1", "riverdata-manager").await;
+    let river = e2e::member(&db, &flow.track.project_id, "river1", "riverdata-river").await;
 
     ingest_cycle(&app, &river, &flow.stream, 0).await;
     ingest_cycle(&app, &river, &flow.stream, 1).await;
@@ -508,7 +462,7 @@ async fn recall_then_reopen_via_edit_dates_restores_attribution() {
         "a manager recalls the sensor ({status}): {body}"
     );
     assert_eq!(
-        settled_jobs(&db, "deployment_update", 1, 60).await,
+        e2e::settled_jobs(&db, "deployment_update", 1, 60).await,
         (1, 0),
         "the recall enqueues one reprocess and it succeeds"
     );
@@ -557,7 +511,7 @@ async fn recall_then_reopen_via_edit_dates_restores_attribution() {
         "a manager re-opens the deployment ({status}): {body}"
     );
     assert_eq!(
-        settled_jobs(&db, "deployment_update", 2, 60).await,
+        e2e::settled_jobs(&db, "deployment_update", 2, 60).await,
         (2, 0),
         "one reprocess per edit, both successful"
     );
@@ -622,9 +576,9 @@ async fn backdate_deployed_from_claims_unattributed_slot_history() {
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
     let flow = paired_flow_track(&app, &db, &admin).await;
-    let manager = actor(&db, "manager1", "riverdata-manager", &flow.track.project_id).await;
-    let river = actor(&db, "river1", "riverdata-river", &flow.track.project_id).await;
-    let intern = actor(&db, "intern1", "riverdata-intern", &flow.track.project_id).await;
+    let manager = e2e::member(&db, &flow.track.project_id, "manager1", "riverdata-manager").await;
+    let river = e2e::member(&db, &flow.track.project_id, "river1", "riverdata-river").await;
+    let intern = e2e::member(&db, &flow.track.project_id, "intern1", "riverdata-intern").await;
 
     ingest_cycle(&app, &river, &flow.stream, 0).await;
 
@@ -651,19 +605,22 @@ async fn backdate_deployed_from_claims_unattributed_slot_history() {
         "both history rows parse: {imported}"
     );
     assert_eq!(
-        settled_jobs(&db, "csv_import", 1, 60).await,
+        e2e::settled_jobs(&db, "csv_import", 1, 60).await,
         (1, 0),
         "the staged import job moves the rows into readings"
     );
 
-    let orphans = format!(
-        "SELECT count(*) AS c FROM readings WHERE parameter_id = '{}' AND sensor_id IS NULL",
-        flow.parameter
+    // Every reading names an instrument, so unowned history is not a null sensor: the import
+    // channel's own instrument holds it and no deployment covers it. That is what the banner reads.
+    let unowned = format!(
+        "SELECT count(*) AS c FROM readings WHERE parameter_id = '{}' \
+         AND deployment_id IS NULL AND sensor_id IS DISTINCT FROM '{}'",
+        flow.parameter, flow.sensor
     );
     assert_eq!(
-        count(&db, &orphans).await,
+        count(&db, &unowned).await,
         2,
-        "the imported history lands attributed to the slot but to no sensor"
+        "the imported history lands in the slot, held by the import channel and no deployment"
     );
 
     let series = format!("/api/sensors/{}/readings", flow.sensor);
@@ -705,7 +662,7 @@ async fn backdate_deployed_from_claims_unattributed_slot_history() {
         "a manager backdates the deployment to the slot's first reading ({status}): {body}"
     );
     assert_eq!(
-        settled_jobs(&db, "deployment_update", 1, 60).await,
+        e2e::settled_jobs(&db, "deployment_update", 1, 60).await,
         (1, 0),
         "the backdate enqueues one reprocess and it succeeds"
     );
@@ -783,9 +740,9 @@ async fn calibration_candidates_then_backfill_calibrations() {
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
     let flow = paired_flow_track(&app, &db, &admin).await;
-    let manager = actor(&db, "manager1", "riverdata-manager", &flow.track.project_id).await;
-    let river = actor(&db, "river1", "riverdata-river", &flow.track.project_id).await;
-    let intern = actor(&db, "intern1", "riverdata-intern", &flow.track.project_id).await;
+    let manager = e2e::member(&db, &flow.track.project_id, "manager1", "riverdata-manager").await;
+    let river = e2e::member(&db, &flow.track.project_id, "river1", "riverdata-river").await;
+    let intern = e2e::member(&db, &flow.track.project_id, "intern1", "riverdata-intern").await;
 
     ingest_cycle(&app, &river, &flow.stream, 0).await;
     let ingested = tracks::FLOW_READINGS_PER_CYCLE as u64;
@@ -828,7 +785,7 @@ async fn calibration_candidates_then_backfill_calibrations() {
     );
     let curve_id = uid(&e2e::id_of(&created));
     assert_eq!(
-        settled_jobs(&db, "calibration_create", 1, 60).await,
+        e2e::settled_jobs(&db, "calibration_create", 1, 60).await,
         (1, 0),
         "recording the curve reprocesses the readings it covers"
     );
@@ -1051,8 +1008,8 @@ async fn recalculate_action_rewrites_the_calibration_window() {
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
     let flow = paired_flow_track(&app, &db, &admin).await;
-    let manager = actor(&db, "manager1", "riverdata-manager", &flow.track.project_id).await;
-    let river = actor(&db, "river1", "riverdata-river", &flow.track.project_id).await;
+    let manager = e2e::member(&db, &flow.track.project_id, "manager1", "riverdata-manager").await;
+    let river = e2e::member(&db, &flow.track.project_id, "river1", "riverdata-river").await;
 
     let (status, created) = crate::common::post_json_parse_with_token(
         &app,
@@ -1072,7 +1029,7 @@ async fn recalculate_action_rewrites_the_calibration_window() {
     );
     let curve = uid(&e2e::id_of(&created));
     assert_eq!(
-        settled_jobs(&db, "calibration_create", 1, 60).await,
+        e2e::settled_jobs(&db, "calibration_create", 1, 60).await,
         (1, 0),
         "recording a curve enqueues one reprocess and it succeeds"
     );

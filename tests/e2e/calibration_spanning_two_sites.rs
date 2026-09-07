@@ -69,23 +69,6 @@ fn as_uuid(s: &str) -> Uuid {
         .unwrap_or_else(|e| panic!("expected a uuid, got '{s}': {e}"))
 }
 
-fn assert_close(actual: f64, expected: f64, what: &str) {
-    assert!(
-        (actual - expected).abs() < 1e-9,
-        "{what}: expected {expected}, got {actual}"
-    );
-}
-
-fn ingest_body(stream: &str, readings: &[(&str, f64)]) -> Value {
-    json!({
-        "stream_id": stream,
-        "readings": readings
-            .iter()
-            .map(|(t, v)| json!({ "time": t, "raw_value": v }))
-            .collect::<Vec<_>>(),
-    })
-}
-
 /// The index of a bucket in an aggregate response's `times`, or a panic carrying the body.
 fn bucket_index(resp: &Value, bucket: &str) -> usize {
     resp["times"]
@@ -241,7 +224,7 @@ impl Span {
         let served = self.served(&self.site1, &self.control_parameter).await;
         assert_eq!(served.len(), 3, "{when}: three control values are served");
         for (i, expected) in [8.0, 16.0, 24.0].iter().enumerate() {
-            assert_close(
+            e2e::assert_close(
                 served[i],
                 *expected,
                 &format!("{when}: served control value {i}"),
@@ -360,7 +343,7 @@ async fn seed_two_site_span(span_cal_from: &str, readings: &[(&str, f64)]) -> Sp
     );
     let d2 = e2e::id_of(&moved);
 
-    let body_in = ingest_body(&stream, readings);
+    let body_in = e2e::ingest_body(&stream, readings);
     let (status, body) =
         crate::common::post_json_with_token(&app, "/api/ingest", &body_in, &intern).await;
     assert_eq!(
@@ -493,7 +476,7 @@ async fn seed_control_sensor(
     let (status, body) = crate::common::post_json_parse_with_token(
         app,
         "/api/ingest",
-        &ingest_body(&stream_id, &CONTROL_READINGS),
+        &e2e::ingest_body(&stream_id, &CONTROL_READINGS),
         river,
     )
     .await;
@@ -594,7 +577,7 @@ async fn calibration_edit_recalculates_readings_at_both_sites() {
         "three upstream values are served before the edit"
     );
     for (i, expected) in [25.0, 45.0, 65.0].iter().enumerate() {
-        assert_close(
+        e2e::assert_close(
             upstream_before[i],
             *expected,
             &format!("upstream value {i} before"),
@@ -607,7 +590,7 @@ async fn calibration_edit_recalculates_readings_at_both_sites() {
         "three downstream values are served before the edit"
     );
     for (i, expected) in [85.0, 105.0, 125.0].iter().enumerate() {
-        assert_close(
+        e2e::assert_close(
             downstream_before[i],
             *expected,
             &format!("downstream value {i} before"),
@@ -660,7 +643,7 @@ async fn calibration_edit_recalculates_readings_at_both_sites() {
         "three upstream values are served after the edit"
     );
     for (i, expected) in [31.0, 61.0, 91.0].iter().enumerate() {
-        assert_close(upstream[i], *expected, &format!("upstream value {i} after"));
+        e2e::assert_close(upstream[i], *expected, &format!("upstream value {i} after"));
     }
     let downstream = span.served(&span.site2, &span.parameter).await;
     assert_eq!(
@@ -669,7 +652,7 @@ async fn calibration_edit_recalculates_readings_at_both_sites() {
         "three downstream values are served after the edit"
     );
     for (i, expected) in [121.0, 151.0, 181.0].iter().enumerate() {
-        assert_close(
+        e2e::assert_close(
             downstream[i],
             *expected,
             &format!(
@@ -686,7 +669,7 @@ async fn calibration_edit_recalculates_readings_at_both_sites() {
         window["point_count"], 6,
         "one calibration owns readings from both sites: {window}"
     );
-    assert_close(
+    e2e::assert_close(
         window["slope"].as_f64().unwrap_or(f64::NAN),
         3.0,
         "the calibration window reports the edited slope",
@@ -716,12 +699,12 @@ async fn calibration_edit_recalculates_readings_at_both_sites() {
             .unwrap_or_else(|| {
                 panic!("the spanning calibration is not marked at site {site}: {identity}")
             });
-        assert_close(
+        e2e::assert_close(
             marker["slope"].as_f64().unwrap_or(f64::NAN),
             3.0,
             &format!("marker slope at site {site}"),
         );
-        assert_close(
+        e2e::assert_close(
             marker["intercept"].as_f64().unwrap_or(f64::NAN),
             1.0,
             &format!("marker intercept at site {site}"),
@@ -760,7 +743,7 @@ async fn both_sites_aggregates_reflect_the_new_calibration() {
         "the upstream morning bucket is materialised before the edit"
     );
     let (mean, count) = before_up.unwrap();
-    assert_close(mean, 45.0, "upstream morning mean before the edit");
+    e2e::assert_close(mean, 45.0, "upstream morning mean before the edit");
     assert_eq!(
         count, 3,
         "upstream morning bucket holds three readings before the edit"
@@ -779,7 +762,7 @@ async fn both_sites_aggregates_reflect_the_new_calibration() {
         "the downstream afternoon bucket is materialised before the edit"
     );
     let (mean, count) = before_down.unwrap();
-    assert_close(mean, 105.0, "downstream afternoon mean before the edit");
+    e2e::assert_close(mean, 105.0, "downstream afternoon mean before the edit");
     assert_eq!(
         count, 3,
         "downstream afternoon bucket holds three readings before the edit"
@@ -798,7 +781,7 @@ async fn both_sites_aggregates_reflect_the_new_calibration() {
         "the co-located control bucket is materialised before the edit"
     );
     let (mean, count) = before_ctrl.unwrap();
-    assert_close(mean, 16.0, "control mean before the edit");
+    e2e::assert_close(mean, 16.0, "control mean before the edit");
     assert_eq!(
         count, 3,
         "control bucket holds three readings before the edit"
@@ -819,7 +802,7 @@ async fn both_sites_aggregates_reflect_the_new_calibration() {
         "the upstream morning bucket survives the refresh"
     );
     let (mean, count) = after_up.unwrap();
-    assert_close(mean, 61.0, "upstream morning mean tracks the new curve");
+    e2e::assert_close(mean, 61.0, "upstream morning mean tracks the new curve");
     assert_eq!(
         count, 3,
         "upstream morning bucket still holds three readings"
@@ -838,7 +821,7 @@ async fn both_sites_aggregates_reflect_the_new_calibration() {
         "the downstream afternoon bucket survives the refresh"
     );
     let (mean, count) = after_down.unwrap();
-    assert_close(
+    e2e::assert_close(
         mean,
         151.0,
         "the refresh is time-scoped, not site-scoped, so the downstream bucket moves too",
@@ -861,7 +844,7 @@ async fn both_sites_aggregates_reflect_the_new_calibration() {
         "the co-located control bucket survives the refresh"
     );
     let (mean, count) = after_ctrl.unwrap();
-    assert_close(
+    e2e::assert_close(
         mean,
         16.0,
         "a co-located parameter fed by another sensor is undisturbed",
@@ -870,17 +853,17 @@ async fn both_sites_aggregates_reflect_the_new_calibration() {
 
     let up = span.aggregates(&span.site1, "").await;
     let idx = bucket_index(&up, BUCKET_MORNING);
-    assert_close(
+    e2e::assert_close(
         e2e::field_for(&up, &span.parameter, "avg")[idx],
         61.0,
         "the upstream hourly average served over HTTP",
     );
-    assert_close(
+    e2e::assert_close(
         e2e::field_for(&up, &span.parameter, "count")[idx],
         3.0,
         "the upstream hourly count served over HTTP",
     );
-    assert_close(
+    e2e::assert_close(
         e2e::field_for(&up, &span.control_parameter, "avg")[idx],
         16.0,
         "the control average served over HTTP",
@@ -892,12 +875,12 @@ async fn both_sites_aggregates_reflect_the_new_calibration() {
 
     let down = span.aggregates(&span.site2, "").await;
     let idx = bucket_index(&down, BUCKET_AFTERNOON);
-    assert_close(
+    e2e::assert_close(
         e2e::field_for(&down, &span.parameter, "avg")[idx],
         151.0,
         "the downstream hourly average served over HTTP",
     );
-    assert_close(
+    e2e::assert_close(
         e2e::field_for(&down, &span.parameter, "count")[idx],
         3.0,
         "the downstream hourly count served over HTTP",
@@ -910,7 +893,7 @@ async fn both_sites_aggregates_reflect_the_new_calibration() {
     let up_split = span.aggregates(&span.site1, "&split_by_sensor=true").await;
     let up_series = split_series(&up_split, &span.parameter, &span.sensor);
     let idx = bucket_index(&up_split, BUCKET_MORNING);
-    assert_close(
+    e2e::assert_close(
         series_number(up_series, "avg", idx),
         61.0,
         "the per-sensor upstream series",
@@ -919,7 +902,7 @@ async fn both_sites_aggregates_reflect_the_new_calibration() {
     let down_split = span.aggregates(&span.site2, "&split_by_sensor=true").await;
     let down_series = split_series(&down_split, &span.parameter, &span.sensor);
     let idx = bucket_index(&down_split, BUCKET_AFTERNOON);
-    assert_close(
+    e2e::assert_close(
         series_number(down_series, "avg", idx),
         151.0,
         "the same sensor's downstream series, keyed by the same sensor id under a second site",
@@ -966,7 +949,7 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
         "the upstream morning bucket is materialised before the move"
     );
     let (mean, count) = before_up.unwrap();
-    assert_close(mean, 45.0, "upstream morning mean before the move");
+    e2e::assert_close(mean, 45.0, "upstream morning mean before the move");
     assert_eq!(count, 3, "three upstream readings before the move");
     assert!(
         e2e::hourly_bucket(
@@ -1076,7 +1059,7 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
         "two readings remain upstream after the correction"
     );
     for (i, expected) in [25.0, 45.0].iter().enumerate() {
-        assert_close(
+        e2e::assert_close(
             upstream[i],
             *expected,
             &format!("upstream value {i} after the move"),
@@ -1089,7 +1072,7 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
         "four readings are downstream after the correction"
     );
     for (i, expected) in [65.0, 85.0, 105.0, 125.0].iter().enumerate() {
-        assert_close(
+        e2e::assert_close(
             downstream[i],
             *expected,
             &format!("downstream value {i} after the move"),
@@ -1109,7 +1092,7 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
         "the upstream morning bucket survives the move"
     );
     let (mean, count) = after_up.unwrap();
-    assert_close(
+    e2e::assert_close(
         mean,
         35.0,
         "the upstream morning mean drops the reading that crossed",
@@ -1132,7 +1115,7 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
         "the crossing reading opens a morning bucket at the downstream site"
     );
     let (mean, count) = new_down.unwrap();
-    assert_close(
+    e2e::assert_close(
         mean,
         65.0,
         "the downstream morning bucket holds the crossing reading",
@@ -1152,7 +1135,7 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
         "the downstream afternoon bucket survives the move"
     );
     let (mean, count) = untouched.unwrap();
-    assert_close(
+    e2e::assert_close(
         mean,
         105.0,
         "the afternoon bucket is outside the correction and does not move",
@@ -1161,20 +1144,20 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
 
     let up = span.aggregates(&span.site1, "").await;
     let idx = bucket_index(&up, BUCKET_MORNING);
-    assert_close(
+    e2e::assert_close(
         e2e::field_for(&up, &span.parameter, "avg")[idx],
         35.0,
         "the rebalanced upstream average over HTTP",
     );
     let down = span.aggregates(&span.site2, "").await;
     let idx = bucket_index(&down, BUCKET_MORNING);
-    assert_close(
+    e2e::assert_close(
         e2e::field_for(&down, &span.parameter, "avg")[idx],
         65.0,
         "the new downstream morning average over HTTP",
     );
     let idx = bucket_index(&down, BUCKET_AFTERNOON);
-    assert_close(
+    e2e::assert_close(
         e2e::field_for(&down, &span.parameter, "avg")[idx],
         105.0,
         "the downstream afternoon average over HTTP is unmoved",
@@ -1195,7 +1178,7 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
         "the control bucket survives the move"
     );
     let (mean, count) = ctrl_bucket.unwrap();
-    assert_close(
+    e2e::assert_close(
         mean,
         16.0,
         "the co-located control bucket is undisturbed by the move",
@@ -1293,12 +1276,12 @@ async fn partial_calibration_window_splits_by_time_not_by_site() {
 
     let upstream = span.served(&span.site1, &span.parameter).await;
     assert_eq!(upstream.len(), 2, "two readings are served upstream");
-    assert_close(
+    e2e::assert_close(
         upstream[0],
         10.0,
         "the upstream reading that predates the window keeps the base curve, at the same site as an edited one",
     );
-    assert_close(
+    e2e::assert_close(
         upstream[1],
         91.0,
         "the upstream reading inside the window moves",
@@ -1307,7 +1290,7 @@ async fn partial_calibration_window_splits_by_time_not_by_site() {
     let downstream = span.served(&span.site2, &span.parameter).await;
     assert_eq!(downstream.len(), 2, "two readings are served downstream");
     for (i, expected) in [121.0, 181.0].iter().enumerate() {
-        assert_close(
+        e2e::assert_close(
             downstream[i],
             *expected,
             &format!("downstream value {i} after the edit"),
@@ -1319,7 +1302,7 @@ async fn partial_calibration_window_splits_by_time_not_by_site() {
         window_after["point_count"], 3,
         "window membership is unchanged by a coefficient edit: {window_after}"
     );
-    assert_close(
+    e2e::assert_close(
         window_after["slope"].as_f64().unwrap_or(f64::NAN),
         3.0,
         "the span calibration reports its new slope",
@@ -1329,7 +1312,7 @@ async fn partial_calibration_window_splits_by_time_not_by_site() {
         base_after["point_count"], 1,
         "the base curve keeps its single reading: {base_after}"
     );
-    assert_close(
+    e2e::assert_close(
         base_after["slope"].as_f64().unwrap_or(f64::NAN),
         1.0,
         "the base curve is untouched by the edit",

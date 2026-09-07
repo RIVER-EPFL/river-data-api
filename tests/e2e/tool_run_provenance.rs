@@ -15,18 +15,10 @@ use serde_json::json;
 use serial_test::serial;
 
 use crate::common::keycloak as kc;
-use crate::common::tracks;
+use crate::common::{e2e, tracks};
 
-async fn member(
-    db: &sea_orm::DatabaseConnection,
-    project_id: &str,
-    user: &str,
-    role: &str,
-) -> String {
-    kc::ensure_realm_user(user, user, &[role]).await;
-    kc::grant_project(db, &kc::keycloak_user_id(user).await, project_id).await;
-    kc::get_keycloak_jwt(user, user).await
-}
+/// The intern's entry sits at its own instant, clear of the member's save.
+const INTERN_TIME: &str = "2025-06-15T09:00:00Z";
 
 #[tokio::test]
 #[serial]
@@ -50,8 +42,8 @@ async fn a_calculation_is_a_stored_run_and_the_save_carries_its_blob() {
 
     let track = tracks::onboard_grab_track(&app, &admin).await;
     let parameter_id = track.parameter_id("TrkGrabDoc").to_string();
-    let intern = member(&db, &track.project_id, "intern1", "riverdata-intern").await;
-    let river = member(&db, &track.project_id, "river1", "riverdata-river").await;
+    let intern = e2e::member(&db, &track.project_id, "intern1", "riverdata-intern").await;
+    let river = e2e::member(&db, &track.project_id, "river1", "riverdata-river").await;
 
     // The calculation, as the member. The response names the stored run.
     let (status, tool) = crate::common::post_json_parse_with_token(
@@ -100,16 +92,59 @@ async fn a_calculation_is_a_stored_run_and_the_save_carries_its_blob() {
         "the run records the Keycloak identity that calculated: {calculated_by}"
     );
 
-    // An intern reads tools but cannot write data; the save gate refuses them.
+    // An intern's entry lands, unverified, and is held for review rather than published. It goes
+    // at its own instant: an entry already standing at this one is what the member's save would
+    // have to displace, which an intern's entry may not be used to force.
+    let intern_readings: Vec<serde_json::Value> = replicates
+        .iter()
+        .map(|r| {
+            let mut r = r.clone();
+            r["time"] = json!(INTERN_TIME);
+            r
+        })
+        .collect();
+    let (status, entered) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({
+            "site_id": track.site_id,
+            "tool_run_id": run_id,
+            "readings": intern_readings,
+        }),
+        &intern,
+    )
+    .await;
+    assert_eq!(status, 200, "an intern enters field data ({status}): {entered}");
+    assert_eq!(
+        e2e::count(
+            &db,
+            &format!(
+                "SELECT count(*) FROM readings WHERE site_id = '{}' \
+                 AND parameter_id = '{parameter_id}' AND time = '{INTERN_TIME}' \
+                 AND unverified IS TRUE",
+                track.site_id
+            ),
+        )
+        .await,
+        3,
+        "every replicate the intern entered is unverified"
+    );
+    assert_eq!(
+        e2e::count(
+            &db,
+            "SELECT count(*) FROM replicate_audit_holds \
+             WHERE kind = 'unverified_entry' AND status IN ('pending', 'deferred')",
+        )
+        .await,
+        1,
+        "the entry opens one review hold"
+    );
+
     let save_body = json!({
         "site_id": track.site_id,
         "tool_run_id": run_id,
         "readings": replicates,
     });
-    let (status, refused) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &save_body, &intern).await;
-    assert_eq!(status, 403, "an intern cannot save: {refused}");
-
     let (status, saved) =
         crate::common::post_json_parse_with_token(&app, "/api/grab_samples", &save_body, &river)
             .await;
@@ -187,7 +222,7 @@ async fn a_forged_or_edited_tool_link_is_refused_at_the_gate() {
 
     let track = tracks::onboard_grab_track(&app, &admin).await;
     let parameter_id = track.parameter_id("TrkGrabDoc").to_string();
-    let river = member(&db, &track.project_id, "river1", "riverdata-river").await;
+    let river = e2e::member(&db, &track.project_id, "river1", "riverdata-river").await;
 
     let (status, tool) = crate::common::post_json_parse_with_token(
         &app,
@@ -298,7 +333,7 @@ async fn a_site_input_resolves_from_the_site_and_a_missing_property_is_refused()
         json!({ "name": "echoes", "inputs": { "altitude_m": 100.0 }, "expected": { "alt_echo": 100.0 } }),
     )
     .await;
-    let river = member(&db, &track.project_id, "river1", "riverdata-river").await;
+    let river = e2e::member(&db, &track.project_id, "river1", "riverdata-river").await;
 
     // No site context at all: the declaration is enforced, naming what is missing.
     let (status, resp) = crate::common::post_json_with_token(
@@ -455,7 +490,7 @@ async fn a_first_save_provisions_the_site_parameter() {
     let track = tracks::onboard_grab_track(&app, &admin).await;
     // A catalog parameter matching the doc tool's replicates param, assigned to no site.
     let doc_param = crate::common::e2e::create_parameter(&app, &admin, "DOC", "DOC", "ppb").await;
-    let river = member(&db, &track.project_id, "river1", "riverdata-river").await;
+    let river = e2e::member(&db, &track.project_id, "river1", "riverdata-river").await;
 
     let (status, tool) = crate::common::post_json_parse_with_token(
         &app,
@@ -585,7 +620,7 @@ async fn a_run_cannot_be_saved_onto_another_visit() {
         json!({ "name": "echoes", "inputs": { "altitude_m": 100.0 }, "expected": { "ctx_echo": 100.0 } }),
     )
     .await;
-    let river = member(&db, &track.project_id, "river1", "riverdata-river").await;
+    let river = e2e::member(&db, &track.project_id, "river1", "riverdata-river").await;
 
     let (status, patched) = crate::common::put_json_with_token(
         &app,
@@ -671,7 +706,7 @@ async fn an_aggregate_output_cannot_be_saved_as_a_measurement() {
 
     let track = tracks::onboard_grab_track(&app, &admin).await;
     let parameter_id = track.parameter_id("TrkGrabDoc").to_string();
-    let river = member(&db, &track.project_id, "river1", "riverdata-river").await;
+    let river = e2e::member(&db, &track.project_id, "river1", "riverdata-river").await;
 
     const AT: &str = "2025-06-15T14:00:00Z";
     let values = [120.0, 125.0, 118.0];

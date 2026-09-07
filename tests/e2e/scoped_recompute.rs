@@ -246,4 +246,51 @@ async fn a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findin
     assert_eq!(e2e::poll_job(&app, &admin, &job_id, 60).await, "completed");
     assert_eq!(served_b(other_site.clone(), VISITS[0]).await, Some(25.0));
     assert!(pending_findings(other_site.clone()).await.is_empty());
+
+    // An edit to the calculation itself. Every stored B was correct under the version that made
+    // it, so judging a run only under its own version says nothing; the audit has to ask what the
+    // calculation computes now.
+    e2e::revise_tool(
+        &app,
+        &admin,
+        "scope_b",
+        "tool <- function(inputs, constants, curves) list(out_b = inputs$a + 7)",
+        json!({
+            "label": "Scope B",
+            "params": [{ "name": "a", "label": "A", "kind": "number", "required": true }],
+            "event_inputs": [{ "param": "a", "parameter_code": "ScopeA" }],
+            "outputs": [{ "key": "out_b", "label": "B", "suggested_parameter_code": "ScopeB" }],
+        }),
+        json!({ "name": "adds", "inputs": { "a": 1.0 }, "expected": { "out_b": 8.0 } }),
+    )
+    .await;
+
+    let (status, audit) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/actions/event_audit",
+        &json!({}),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "{audit}");
+    let job_id = audit["job_id"].as_str().expect("job id").to_string();
+    assert_eq!(e2e::poll_job(&app, &admin, &job_id, 60).await, "completed");
+
+    let edited = pending_findings(site_id.clone()).await;
+    assert_eq!(
+        edited.len(),
+        2,
+        "the edit leaves both visits stale and reported: {edited:?}"
+    );
+    assert_eq!(
+        edited[0]["expected"]["reason"], "calculation",
+        "the finding says the calculation moved, not the inputs: {edited:?}"
+    );
+    assert_eq!(
+        edited[0]["expected"]["value"].as_f64(),
+        Some(27.0),
+        "and what it would compute now: {edited:?}"
+    );
+    // Reporting is all it does: no value is rewritten until somebody applies the repair.
+    assert_eq!(served_b(site_id.clone(), VISITS[0]).await, Some(25.0));
 }

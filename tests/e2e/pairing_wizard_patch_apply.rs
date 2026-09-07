@@ -26,6 +26,7 @@ use serial_test::serial;
 
 use crate::common::e2e;
 use crate::common::e2e::count;
+use crate::common::plans::{create_plan, find_entry, patch_plan, run_plan_action};
 use crate::common::keycloak as kc;
 use crate::common::tracks::BAND_FLOW;
 
@@ -33,16 +34,6 @@ use crate::common::tracks::BAND_FLOW;
 /// `[since, NOW()]`, so a future-dated fixture is never materialised.
 const FIXTURE_DAY: &str = "2025-06-02";
 
-fn find_entry<'a>(plan: &'a serde_json::Value, stream_id: &str) -> &'a serde_json::Value {
-    plan["entries"]
-        .as_array()
-        .unwrap_or_else(|| panic!("entries array: {plan}"))
-        .iter()
-        .find(|e| e["stream_id"] == json!(stream_id))
-        .unwrap_or_else(|| panic!("entry for stream {stream_id} missing: {plan}"))
-}
-
-/// Register an unpaired stream carrying the hierarchy metadata the wizard reads.
 async fn register_stream(
     app: &Router,
     jwt: &str,
@@ -138,71 +129,6 @@ async fn unpaired_stream(
         ingest(app, jwt, &id, n_readings).await;
     }
     id
-}
-
-async fn create_plan(app: &Router, jwt: &str, source_system: &str) -> serde_json::Value {
-    let (status, plan) = crate::common::post_json_parse_with_token(
-        app,
-        "/api/sync/pairing-plans",
-        &json!({ "source_system": source_system }),
-        jwt,
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "create plan for {source_system} ({status}): {plan}"
-    );
-    assert_eq!(plan["status"], "draft", "a new plan is a draft: {plan}");
-    plan
-}
-
-/// One debounced PATCH batch, returning the server's snapshot of the plan. The dashboard replaces
-/// its local plan with exactly this body, so it has to carry the accumulated state.
-async fn patch_plan(
-    app: &Router,
-    jwt: &str,
-    plan_id: &str,
-    updates: serde_json::Value,
-) -> serde_json::Value {
-    let (status, body) = crate::common::patch_plan_with_token(
-        app,
-        &plan_id.to_string(),
-        &json!({ "updates": updates }),
-        jwt,
-    )
-    .await;
-    assert_eq!(status, 200, "PATCH plan ({status}): {body}");
-    serde_json::from_str(&body)
-        .unwrap_or_else(|e| panic!("PATCH response is JSON: {e}\nBody: {body}"))
-}
-
-/// Post `apply`/`revert` (both run as tracked jobs), wait for completion, return `detail.counts`.
-async fn run_plan_action(
-    app: &Router,
-    jwt: &str,
-    plan_id: &str,
-    action: &str,
-) -> serde_json::Value {
-    let (status, res) = crate::common::post_plan_action_parse_with_token(
-        app,
-        &plan_id.to_string(),
-        action,
-        jwt,
-    )
-    .await;
-    assert_eq!(status, 200, "{action} ({status}): {res}");
-    let job_id = res["job_id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("{action} returns a job_id: {res}"));
-    assert_eq!(
-        e2e::poll_job(app, jwt, job_id, 30).await,
-        "completed",
-        "{action} job completes",
-    );
-    let (_, job) =
-        crate::common::get_json_with_token(app, &format!("/api/reprocessing_jobs/{job_id}"), jwt)
-            .await;
-    job["detail"]["counts"].clone()
 }
 
 #[tokio::test]
@@ -494,7 +420,10 @@ async fn final_patch_state_is_what_applies_and_late_patch_is_rejected() {
         &admin,
     )
     .await;
-    assert_eq!(status, 400, "an applied plan is frozen: {late}");
+    assert_eq!(
+        status, 409,
+        "an applied plan is frozen, which is a conflict with its state: {late}"
+    );
 
     let (status, final_plan) = crate::common::get_json_with_token(
         &app,
@@ -1069,9 +998,9 @@ async fn bulk_pair_creates_only_what_is_missing_and_skips_unlisted_sites() {
             "SELECT count(*) AS c FROM data_streams WHERE source_system = 'bulkwiz' AND sensor_id IS NOT NULL"
         )
         .await,
-        0,
-        "none of these streams names a device serial, and a serial is what an instrument is \
-         deduplicated on, so pairing attributes no instrument rather than minting one each"
+        4,
+        "every stream carries the instrument its registration minted, whether or not its metadata \
+         names a device serial"
     );
     assert_eq!(
         count(
@@ -1242,9 +1171,8 @@ async fn apply_discovery_rolls_back_only_the_failing_action() {
         "the second action pairs to an existing slot, so it creates none: {resp}"
     );
     assert_eq!(
-        resp["sensors_created"], 1,
-        "only the stream whose metadata names a device serial; a serial is what an instrument is \
-         deduplicated on, so pairing never mints one for a stream that has none: {resp}"
+        resp["sensors_created"], 0,
+        "each stream took its instrument at registration, so the pairing mints none: {resp}"
     );
     assert_eq!(
         resp["streams_paired"], 2,
@@ -1361,8 +1289,8 @@ async fn apply_discovery_rolls_back_only_the_failing_action() {
             )
         )
         .await,
-        1,
-        "only the stream whose metadata names a device serial carries an instrument"
+        2,
+        "both streams carry the instrument their registration minted"
     );
 
     assert!(

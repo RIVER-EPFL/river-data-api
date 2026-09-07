@@ -334,6 +334,131 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
         findings.as_array().unwrap().is_empty(),
         "the filled event has no open findings: {findings}"
     );
+
+    // The two engines in one order. `chain_f` is a formula calculation reading ChainPA and writing
+    // ChainPF; `chain_g` is a script reading ChainPF. A formula calculation reaches the ordering
+    // only through the manifest its formulas synthesise, so ChainPG holding the right number is
+    // the assertion that the synthesised manifest produced the edge: it is reachable in one pass
+    // only if F was ordered before G.
+    let pf = e2e::create_parameter(&app, &admin, "ChainPF", "Chain PF", "ppb").await;
+    let pg = e2e::create_parameter(&app, &admin, "ChainPG", "Chain PG", "ppb").await;
+    let group_id = uuid::Uuid::new_v4().to_string();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO parameter_groups (id, code, label, ordinal) \
+             VALUES ('{group_id}', 'chain_group', 'Chain group', 1)"
+        ),
+    )
+    .await;
+    for (parameter, role, ordinal) in [(&pa, "measured", 1), (&pf, "output", 2)] {
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO parameter_group_members (id, group_id, parameter_id, role, ordinal) \
+                 VALUES (gen_random_uuid(), '{group_id}', '{parameter}', '{role}', {ordinal})"
+            ),
+        )
+        .await;
+    }
+    // A formula calculation is authored as a `tool_scripts` row bound to the group, then a formula
+    // in it; the version is minted from the formula set rather than posted as a body.
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO tool_scripts (name, label, engine, parameter_group_id, created_by) \
+             VALUES ('chain_f', 'Chain F', 'formula', '{group_id}', 'test')"
+        ),
+    )
+    .await;
+    let (status, scripts) =
+        crate::common::get_json_with_token(&app, "/api/tool_scripts", &admin).await;
+    assert_eq!(status, 200, "{scripts}");
+    let chain_f_id = scripts
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "chain_f")
+        .map(|s| s["id"].as_str().unwrap().to_string())
+        .expect("chain_f is listed");
+    let (status, formula) = crate::common::post_json_with_token(
+        &app,
+        "/api/derived_parameters",
+        &json!({
+            "code": "ChainPF", "name": "ChainPF", "units": "ppb",
+            "formula": "ChainPA * 2", "tool_script_id": chain_f_id, "ordinal": 1,
+        }),
+        &admin,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "the formula ({status}): {formula}"
+    );
+
+    e2e::author_tool(
+        &app,
+        &admin,
+        "chain_g",
+        "tool <- function(inputs, constants, curves) list(out_g = inputs$pf + 1)",
+        json!({
+            "label": "Chain G",
+            "params": [{ "name": "pf", "label": "PF", "kind": "number", "required": true }],
+            "event_inputs": [{ "param": "pf", "parameter_code": "ChainPF" }],
+            "outputs": [{ "key": "out_g", "label": "PG", "suggested_parameter_code": "ChainPG" }],
+        }),
+        json!({ "name": "adds one", "inputs": { "pf": 1.0 }, "expected": { "out_g": 2.0 } }),
+    )
+    .await;
+
+    let (status, recompute) = crate::common::post_json_parse_with_token(
+        &app,
+        &format!("/api/collection_events/{event_id}/recompute"),
+        &json!({}),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "recompute with both engines: {recompute}");
+    let job_id = recompute["job_id"].as_str().expect("job id").to_string();
+    assert_eq!(e2e::poll_job(&app, &admin, &job_id, 60).await, "completed");
+
+    let stored = |parameter: String| {
+        let db = db.clone();
+        let site_id = site_id.clone();
+        async move {
+            use sea_orm::ConnectionTrait;
+            db.query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT COALESCE(r.calibrated_value, r.raw_value) AS value, \
+                            r.provenance ->> 'tool' AS tool \
+                     FROM readings r \
+                     WHERE r.site_id = '{site_id}' AND r.parameter_id = '{parameter}' \
+                       AND r.withdrawn_at IS NULL ORDER BY r.replicate_index LIMIT 1"
+                ),
+            ))
+            .await
+            .unwrap()
+            .map(|r| {
+                (
+                    r.try_get::<Option<f64>>("", "value").unwrap(),
+                    r.try_get::<String>("", "tool").unwrap(),
+                )
+            })
+        }
+    };
+    // ChainPF = 42 * 2, by the formula engine.
+    assert_eq!(
+        stored(pf.clone()).await,
+        Some((Some(84.0), "chain_f".to_string())),
+        "the formula calculation stored its output"
+    );
+    // ChainPG = 84 + 1, by the script engine, from a value the formula produced in the same pass.
+    assert_eq!(
+        stored(pg.clone()).await,
+        Some((Some(85.0), "chain_g".to_string())),
+        "the script ran after the formula and read what it wrote"
+    );
 }
 
 /// Expected behaviour: an upstream correction landing while the downstream calculations are

@@ -286,14 +286,11 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
         "DELETE FROM tool_script_versions v USING tool_scripts s \
           WHERE v.tool_script_id = s.id AND s.created_by IS DISTINCT FROM 'seed'",
         // A formula calculation owns `derived_parameter_definitions` rows, which cascade with the
-        // calculation; what hangs off them does not, so the sources and the slots naming a
-        // definition go first or the delete below is refused by their foreign keys.
+        // calculation; the sources hanging off them do not, so they go first or the delete below
+        // is refused by their foreign key.
         "DELETE FROM derived_parameter_sources src \
            USING derived_parameter_definitions d JOIN tool_scripts s ON s.id = d.tool_script_id \
            WHERE src.derived_definition_id = d.id AND s.created_by IS DISTINCT FROM 'seed'",
-        "UPDATE site_parameters sp SET derived_definition_id = NULL \
-           FROM derived_parameter_definitions d JOIN tool_scripts s ON s.id = d.tool_script_id \
-          WHERE sp.derived_definition_id = d.id AND s.created_by IS DISTINCT FROM 'seed'",
         "DELETE FROM tool_scripts WHERE created_by IS DISTINCT FROM 'seed'",
         // Deleted rather than truncated: `tool_scripts.parameter_group_id` references
         // `parameter_groups`, so a TRUNCATE ... CASCADE over the groups would take the seeded

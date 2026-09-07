@@ -273,12 +273,6 @@ pub async fn get_site(
         (None, None, 0)
     } else {
         // param_ids are global parameter IDs; also filter by site_id
-        let mut placeholders_parts: Vec<String> = Vec::new();
-        for (i, _) in param_ids.iter().enumerate() {
-            placeholders_parts.push(format!("${}", i + 2));
-        }
-        let placeholders = placeholders_parts.join(", ");
-
         // The composite DISTINCT is confined to the spot subset, whose row counts are tiny; the
         // continuous half stays a plain parallel aggregate with no sort.
         let sql = format!(
@@ -287,20 +281,17 @@ pub async fn get_site(
                     c.count + sp.count AS count \
              FROM (SELECT MIN(r.time) AS min_time, MAX(r.time) AS max_time, COUNT(*) AS count \
                    FROM readings r \
-                   WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
+                   WHERE r.site_id = $1 AND r.parameter_id = ANY($2) \
                      AND {SERVED_CONTINUOUS}) c \
              CROSS JOIN \
                   (SELECT MIN(r.time) AS min_time, MAX(r.time) AS max_time, \
                           COUNT(DISTINCT (r.stream_id, r.time)) AS count \
                    FROM readings r \
-                   WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
+                   WHERE r.site_id = $1 AND r.parameter_id = ANY($2) \
                      AND {SERVED_SPOT}) sp"
         );
 
-        let mut values: Vec<sea_orm::Value> = vec![site.site_id.into()];
-        for id in &param_ids {
-            values.push((*id).into());
-        }
+        let values: Vec<sea_orm::Value> = vec![site.site_id.into(), param_ids.clone().into()];
 
         let stmt = Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, &sql, values);
 
@@ -814,14 +805,9 @@ pub async fn get_aggregates(
     // m20260603_000007. The public API has no sensor concept, so collapse the sensor dimension:
     // count-weighted avg = SUM(sum_value)/SUM(count), MIN/MAX, SUM(count). Output shape and
     // ordering (param_id as TEXT, ordered by parameter code) are preserved.
-    // $1 = site_id, $2.. = parameter_ids, then start, end.
-    let id_placeholders: Vec<String> = param_ids
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("${}", i + 2))
-        .collect();
-    let start_idx = param_ids.len() + 2;
-    let end_idx = start_idx + 1;
+    // $1 = site_id, $2 = the parameter ids as one array, $3 start, $4 end.
+    let start_idx = 3;
+    let end_idx = 4;
     let sql = format!(
         r"
         SELECT
@@ -834,19 +820,20 @@ pub async fn get_aggregates(
         FROM {view} a
         JOIN parameters p ON a.parameter_id = p.id
         WHERE a.site_id = $1
-          AND p.id IN ({ids})
+          AND p.id = ANY($2)
           AND a.bucket >= ${start_idx}
           AND a.bucket <= ${end_idx}
         GROUP BY a.bucket, p.id, p.code
         ORDER BY a.bucket ASC, p.code ASC
         ",
         view = rollup.view(),
-        ids = id_placeholders.join(","),
     );
-    let mut values: Vec<sea_orm::Value> = vec![site.site_id.into()];
-    values.extend(param_ids.iter().map(|id| (*id).into()));
-    values.push(start.into());
-    values.push(end.into());
+    let values: Vec<sea_orm::Value> = vec![
+        site.site_id.into(),
+        param_ids.to_vec().into(),
+        start.into(),
+        end.into(),
+    ];
 
     let stmt = Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, &sql, values);
 
@@ -1054,7 +1041,6 @@ async fn aggregates_response_from_data(
 pub(crate) fn readings_sql(
     continuous_extra: Option<&str>,
     include_spot: bool,
-    placeholders: &str,
     time_cond: &str,
 ) -> String {
     let mut arms: Vec<String> = Vec::new();
@@ -1066,7 +1052,7 @@ pub(crate) fn readings_sql(
                     NULL::DOUBLE PRECISION AS sd, NULL::DOUBLE PRECISION AS min, \
                     NULL::DOUBLE PRECISION AS max, NULL::TEXT AS sd_estimator \
              FROM readings r \
-             WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
+             WHERE r.site_id = $1 AND r.parameter_id = ANY($2) \
                AND {SERVED_CONTINUOUS}{time_cond}{extra}"
         ));
     }
@@ -1082,7 +1068,7 @@ pub(crate) fn readings_sql(
                        smp.min_value AS min, smp.max_value AS max, smp.sd_estimator \
                 FROM readings r \
                 LEFT JOIN samples smp ON smp.id = r.sample_id \
-                WHERE r.site_id = $1 AND r.parameter_id IN ({placeholders}) \
+                WHERE r.site_id = $1 AND r.parameter_id = ANY($2) \
                   AND {SERVED_SPOT}{time_cond} \
                 ORDER BY {SPOT_INSTANT_ORDER} \
              ) sp"
@@ -1125,14 +1111,7 @@ async fn fetch_readings(
         .map(|rp| rp.site_id)
         .ok_or_else(|| AppError::NotFound("No resolved parameters found".to_string()))?;
 
-    let mut values: Vec<sea_orm::Value> = vec![site_id.into()];
-    let placeholders: Vec<String> = param_ids
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("${}", i + 2))
-        .collect();
-    values.extend(param_ids.iter().map(|id| (*id).into()));
-    let placeholders = placeholders.join(",");
+    let mut values: Vec<sea_orm::Value> = vec![site_id.into(), param_ids.to_vec().into()];
 
     let mut time_cond = String::new();
     if let Some(s) = start {
@@ -1158,12 +1137,7 @@ async fn fetch_readings(
     };
     let include_spot = matches!(measurement_type, "" | "spot");
 
-    let sql = readings_sql(
-        continuous_extra.as_deref(),
-        include_spot,
-        &placeholders,
-        &time_cond,
-    );
+    let sql = readings_sql(continuous_extra.as_deref(), include_spot, &time_cond);
     let stmt = Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values);
 
     let rows: Vec<ReadingRow> = state

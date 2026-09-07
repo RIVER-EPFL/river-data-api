@@ -53,6 +53,7 @@ async fn resolve_or_create_site_parameter<C: ConnectionTrait>(
         .ok_or_else(|| AppError::NotFound("Parameter not found".to_string()))?;
     let sp = site_parameters::ActiveModel {
         id: Set(Uuid::new_v4()),
+        instrument_sensor_id: Set(None),
         site_id: Set(site_id),
         parameter_id: Set(parameter_id),
         name: Set(param.name),
@@ -68,8 +69,7 @@ async fn resolve_or_create_site_parameter<C: ConnectionTrait>(
         is_public: Set(Some(false)),
         needs_review: Set(false),
         sd_estimator: Set(None),
-        is_derived: Set(Some(false)),
-        derived_definition_id: Set(None),
+        entry_mode: Set("manual".to_string()),
         variable_mappings: Set(None),
         created_at: Set(Some(Utc::now())),
         updated_at: Set(Some(Utc::now())),

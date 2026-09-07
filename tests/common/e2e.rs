@@ -433,6 +433,69 @@ pub async fn author_tool(
     );
 }
 
+/// Mint and activate a further version of a tool that already exists, the shape a calculation edit
+/// takes. Returns nothing: what changed is which version the calculation activates.
+pub async fn revise_tool(
+    app: &Router,
+    admin: &str,
+    name: &str,
+    script: &str,
+    manifest: serde_json::Value,
+    case: serde_json::Value,
+) {
+    let (status, list) =
+        super::get_json_with_token(app, "/api/tool_scripts?page=1&per_page=200", admin).await;
+    assert_eq!(status, 200, "list tools ({status}): {list}");
+    let script_id = list
+        .as_array()
+        .expect("tool_scripts list is an array")
+        .iter()
+        .find(|row| row["name"] == name)
+        .map(id_of)
+        .unwrap_or_else(|| panic!("a tool named {name} exists: {list}"));
+
+    let (status, version) = crate::common::client::post_json_parse_with_token(
+        app,
+        &format!("/api/tool_scripts/{script_id}/versions"),
+        &json!({
+            "script": script,
+            "manifest": manifest,
+            "test_cases": { "cases": [case] },
+        }),
+        admin,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "revise {name} ({status}): {version}"
+    );
+    let version_id = id_of(&version["version"]);
+
+    let (status, validated) = crate::common::client::post_json_parse_with_token(
+        app,
+        &format!("/api/tool_scripts/{script_id}/versions/{version_id}/validate"),
+        &json!({}),
+        admin,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status) && validated["passed"] == true,
+        "validate {name} ({status}): {validated}"
+    );
+
+    let (status, activated) = crate::common::client::post_json_parse_with_token(
+        app,
+        &format!("/api/tool_scripts/{script_id}/versions/{version_id}/activate"),
+        &json!({}),
+        admin,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "activate {name} ({status}): {activated}"
+    );
+}
+
 /// The open event-audit findings at a site, read from the review queue the dashboard reads.
 pub async fn pending_event_findings(app: &Router, token: &str, site_id: &str) -> Vec<serde_json::Value> {
     let (status, body) = super::get_json_with_token(
@@ -449,4 +512,209 @@ pub async fn pending_event_findings(app: &Router, token: &str, site_id: &str) ->
         .filter(|h| h["stream_id"].is_null() && h["site_id"] == site_id)
         .cloned()
         .collect()
+}
+
+/// A Keycloak fixture user at `role`, granted visibility of `project_id`. Fixture passwords equal
+/// the username. The realm-user, grant and JWT steps always travel together.
+pub async fn member(
+    db: &sea_orm::DatabaseConnection,
+    project_id: &str,
+    user: &str,
+    role: &str,
+) -> String {
+    use crate::common::keycloak as kc;
+    kc::ensure_realm_user(user, user, &[role]).await;
+    kc::grant_project(db, &kc::keycloak_user_id(user).await, project_id).await;
+    kc::get_keycloak_jwt(user, user).await
+}
+
+/// [`member`] for several users at once, in the order given.
+pub async fn members(
+    db: &sea_orm::DatabaseConnection,
+    project_id: &str,
+    users: &[(&str, &str)],
+) -> Vec<String> {
+    let mut jwts = Vec::with_capacity(users.len());
+    for (user, role) in users {
+        jwts.push(member(db, project_id, user, role).await);
+    }
+    jwts
+}
+
+/// An `/api/ingest` body for one stream, `(rfc3339 time, raw value)` per reading.
+#[must_use]
+pub fn ingest_body(stream_id: &str, readings: &[(&str, f64)]) -> serde_json::Value {
+    json!({
+        "stream_id": stream_id,
+        "readings": readings
+            .iter()
+            .map(|(time, value)| json!({ "time": time, "raw_value": value }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Ingest onto one stream and assert every reading landed. Returns the response body.
+pub async fn ingest(
+    app: &Router,
+    jwt: &str,
+    stream_id: &str,
+    readings: &[(&str, f64)],
+) -> serde_json::Value {
+    let (status, body) = crate::common::post_json_parse_with_token(
+        app,
+        "/api/ingest",
+        &ingest_body(stream_id, readings),
+        jwt,
+    )
+    .await;
+    assert_eq!(status, 200, "ingest onto stream {stream_id}: {body}");
+    assert_eq!(
+        body["inserted"].as_u64(),
+        Some(readings.len() as u64),
+        "every ingested reading lands: {body}"
+    );
+    body
+}
+
+/// One line per tracked job, for a failure message that says what the queue was doing.
+pub async fn jobs_summary(db: &sea_orm::DatabaseConnection) -> String {
+    use sea_orm::{ConnectionTrait, Statement};
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT trigger_type, status, COALESCE(error_message, '') AS error              FROM reprocessing_jobs ORDER BY created_at",
+        ))
+        .await
+        .expect("query reprocessing_jobs");
+    rows.iter()
+        .map(|r| {
+            let trigger: String = r.try_get("", "trigger_type").unwrap_or_default();
+            let status: String = r.try_get("", "status").unwrap_or_default();
+            let error: String = r.try_get("", "error").unwrap_or_default();
+            if error.is_empty() {
+                format!("{trigger}={status}")
+            } else {
+                format!("{trigger}={status} ({error})")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Wait until no job of `trigger_type` is active and at least `expected` have settled, returning
+/// `(completed, failed)`. A failing job returns to `queued` with a retry delay rather than to
+/// `failed`, so the deadline elapsing means the retry budget outlived the test.
+pub async fn settled_jobs(
+    db: &sea_orm::DatabaseConnection,
+    trigger_type: &str,
+    expected: i64,
+    timeout_secs: u64,
+) -> (i64, i64) {
+    use sea_orm::{ConnectionTrait, Statement};
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT \
+                   COUNT(*) FILTER (WHERE status = 'completed') AS completed, \
+                   COUNT(*) FILTER (WHERE status = 'failed') AS failed, \
+                   COUNT(*) FILTER (WHERE status IN ('queued','pending','running','retrying')) AS active \
+                 FROM reprocessing_jobs WHERE trigger_type = $1",
+                [trigger_type.into()],
+            ))
+            .await
+            .expect("query reprocessing_jobs")
+            .expect("count row");
+        let completed: i64 = row.try_get("", "completed").expect("completed");
+        let failed: i64 = row.try_get("", "failed").expect("failed");
+        let active: i64 = row.try_get("", "active").expect("active");
+        if active == 0 && completed + failed >= expected {
+            return (completed, failed);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{trigger_type}: {completed} completed, {failed} failed, {active} active after \
+             {timeout_secs}s: {}",
+            jobs_summary(db).await
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+/// Wait for every tracked job to reach a terminal state, whatever its trigger.
+pub async fn drain_jobs(db: &sea_orm::DatabaseConnection, max_secs: u64) {
+    let deadline = Instant::now() + Duration::from_secs(max_secs);
+    loop {
+        let active = count(
+            db,
+            "SELECT count(*) FROM reprocessing_jobs \
+             WHERE status IN ('pending', 'queued', 'running', 'retrying')",
+        )
+        .await;
+        if active == 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tracked jobs have not settled after {max_secs}s: {}",
+            jobs_summary(db).await
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Poll the newest job of `trigger_type` until it is terminal, returning its status and a summary.
+pub async fn await_job(
+    db: &sea_orm::DatabaseConnection,
+    trigger_type: &str,
+    max_secs: u64,
+) -> (String, String) {
+    use sea_orm::{ConnectionTrait, Statement};
+    let deadline = Instant::now() + Duration::from_secs(max_secs);
+    loop {
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT status FROM reprocessing_jobs WHERE trigger_type = $1 \
+                 ORDER BY created_at DESC LIMIT 1",
+                [trigger_type.into()],
+            ))
+            .await
+            .expect("job lookup failed");
+        let status: String = row
+            .map(|r| r.try_get("", "status").unwrap_or_default())
+            .unwrap_or_else(|| "missing".to_string());
+        if status == "completed" || status == "failed" {
+            return (status, jobs_summary(db).await);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{trigger_type} job still {status} after {max_secs}s: {}",
+            jobs_summary(db).await
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+/// Float equality at the tolerance stored values are asserted to across these stories.
+pub fn assert_close(actual: f64, expected: f64, what: &str) {
+    assert!(
+        (actual - expected).abs() < 1e-9,
+        "{what}: expected {expected}, got {actual}"
+    );
+}
+
+/// A global parameter plus its slot at `site_id`, for slots a track does not provision itself.
+pub async fn provision_slot(
+    app: &Router,
+    admin: &str,
+    site_id: &str,
+    code: &str,
+    name: &str,
+    units: &str,
+) -> String {
+    let parameter_id = create_parameter(app, admin, code, name, units).await;
+    assign_site_parameter_minimal(app, admin, site_id, &parameter_id).await;
+    parameter_id
 }

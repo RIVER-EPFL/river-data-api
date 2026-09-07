@@ -320,6 +320,70 @@ async fn test_update_derived_parameter_formula() {
     cleanup_derived_param(&app, &token, id).await;
 }
 
+/// Scenario: a definition is updated to a formula that reads its own output parameter.
+/// Expected behaviour: the update is refused and nothing is stored, neither the formula nor the
+/// source rows the old formula declared.
+#[tokio::test]
+#[serial]
+async fn a_refused_update_stores_neither_the_formula_nor_its_sources() {
+    let (db, app, token) = setup().await;
+    let name = format!("refused_update_{}", uuid::Uuid::new_v4());
+
+    let (status, json) = create_derived_param(&app, &token, &name, "Turbidity * 2").await;
+    assert!(
+        (200..300).contains(&status),
+        "Create should succeed: {json}"
+    );
+    let id = json["id"].as_str().expect("response should have id");
+
+    let uri = format!("/api/derived_parameters/{id}");
+    let (put_status, put_text) = put_json_with_token(
+        &app,
+        &uri,
+        &serde_json::json!({ "formula": format!("{name} + 1") }),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        put_status, 400,
+        "a formula reading its own output is refused: {put_text}"
+    );
+
+    let (_, after) = crate::common::get_json_with_token(&app, &uri, &token).await;
+    assert_eq!(
+        after["formula"].as_str(),
+        Some("Turbidity * 2"),
+        "the refused formula was not stored"
+    );
+    let stored_sources: Vec<&str> = after["sources"]
+        .as_array()
+        .expect("sources should be array")
+        .iter()
+        .filter_map(|s| s["variable_name"].as_str())
+        .collect();
+    assert_eq!(
+        stored_sources,
+        vec!["Turbidity"],
+        "the source rows the refused formula would have written are absent"
+    );
+
+    use sea_orm::ConnectionTrait;
+    let count = db
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT COUNT(*) AS n FROM derived_parameter_sources WHERE derived_definition_id = $1",
+            [uuid::Uuid::parse_str(id).unwrap().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    assert_eq!(count, 1, "the stored source rows were not rewritten");
+
+    cleanup_derived_param(&app, &token, id).await;
+}
+
 // =============================================================================
 // 5. Preview derived with nonexistent site, graceful error, not 500
 // =============================================================================
@@ -473,5 +537,38 @@ fn test_formula_boundary_division_by_zero() {
     assert!(
         (normal - 2.0).abs() < 1e-10,
         "6/3 should be 2.0, got {normal}"
+    );
+}
+
+/// The validator resolves a formula variable against `parameters.code`, so the preview must too.
+/// `DO_Temperature` is a seeded code whose `name` is "Water Temperature": resolving by name finds
+/// nothing and the preview reports an empty series for a formula that saves fine.
+#[tokio::test]
+#[serial]
+async fn test_preview_resolves_variables_by_code_not_name() {
+    let (_db, app, token) = setup().await;
+
+    let body = serde_json::json!({
+        "formula": "DO_Temperature * 2",
+        "site_id": crate::common::SITE1_ID,
+        "start": "2025-01-15T00:00:00Z",
+        "end": "2025-01-16T00:00:00Z"
+    });
+    let (status, text) =
+        crate::common::post_json_with_token(&app, "/api/actions/preview_derived", &body, &token)
+            .await;
+    assert_eq!(status, 200, "preview should succeed: {text}");
+
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let sources = json["source_parameters"].as_array().unwrap();
+    assert_eq!(
+        sources.len(),
+        1,
+        "the variable should resolve to the site's slot, got {sources:?}"
+    );
+    assert_eq!(sources[0]["name"], "DO_Temperature");
+    assert!(
+        !json["times"].as_array().unwrap().is_empty(),
+        "the resolved slot's seeded readings should be in the window"
     );
 }

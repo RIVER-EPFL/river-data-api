@@ -930,6 +930,7 @@ pub async fn ingest_readings(
             announce: true,
             reconcile_alarms: true,
             episodes: tail::Episodes::Inline,
+            recompute_derived: false,
             writer: crate::routes::private::collection_events::recompute::Writer::Person,
         },
         &crate::routes::private::tools::scripts::actor_label(&auth),

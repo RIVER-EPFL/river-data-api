@@ -364,6 +364,7 @@ pub fn evaluate_formula(formula: &str, variables: &HashMap<String, f64>) -> Resu
     let expr: meval::Expr = formula.parse().map_err(|e| format!("Parse error: {e}"))?;
 
     let mut ctx = meval::Context::new();
+    register_guards(&mut ctx);
     for (name, value) in variables {
         ctx.var(name.clone(), *value);
     }
@@ -372,14 +373,41 @@ pub fn evaluate_formula(formula: &str, variables: &HashMap<String, f64>) -> Resu
         .map_err(|e| format!("Evaluation error: {e}"))
 }
 
+/// The selection and missing-value guards the portal's calculations are written with, as
+/// functions, because meval's grammar has operators for arithmetic only.
+///
+/// NaN is the portal's NA throughout: a comparison against it is false, as the portal's explicit
+/// `!is.na(x)` guards make it, and `na` is how a formula says a value could not be computed.
+/// The guards are scalar and total, so none of them can introduce iteration.
+fn register_guards(ctx: &mut meval::Context) {
+    let truthy = |x: f64| x != 0.0 && !x.is_nan();
+    ctx.func3("if", move |cond, a, b| if truthy(cond) { a } else { b });
+    ctx.func2("and", move |a, b| f64::from(truthy(a) && truthy(b)));
+    ctx.func2("or", move |a, b| f64::from(truthy(a) || truthy(b)));
+    ctx.func("not", move |a| f64::from(!truthy(a)));
+    ctx.func2("lt", |a, b| f64::from(a < b));
+    ctx.func2("le", |a, b| f64::from(a <= b));
+    ctx.func2("gt", |a, b| f64::from(a > b));
+    ctx.func2("ge", |a, b| f64::from(a >= b));
+    ctx.func2("eq", |a, b| f64::from(a == b));
+    ctx.func2("ne", |a, b| f64::from(a != b));
+    ctx.func2("coalesce", |a, b| if a.is_nan() { b } else { a });
+    ctx.func("is_missing", |a| f64::from(a.is_nan()));
+    ctx.var("na", f64::NAN);
+}
+
 struct DerivedWork {
     site_param_id: Uuid,
     derived_definition_id: Uuid,
     formula: String,
     derived_site_id: Uuid,
     derived_parameter_id: Uuid,
+    derived_parameter_code: String,
 }
 
+/// The slots this site computes. The producing definition is the one whose output is the slot's
+/// parameter; `entry_mode` is the site's own declaration that it computes the slot rather than
+/// taking it by hand.
 async fn fetch_derived_work_items(
     db: &DatabaseConnection,
     site_id: Uuid,
@@ -387,10 +415,12 @@ async fn fetch_derived_work_items(
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT sp.id, sp.derived_definition_id, d.formula, sp.site_id, sp.parameter_id
+            r"SELECT sp.id, d.id AS derived_definition_id, d.formula, sp.site_id, sp.parameter_id,
+                     p.code AS parameter_code
               FROM site_parameters sp
-              JOIN derived_parameter_definitions d ON sp.derived_definition_id = d.id
-              WHERE sp.site_id = $1 AND sp.is_derived = true",
+              JOIN derived_parameter_definitions d ON d.output_parameter_id = sp.parameter_id
+              JOIN parameters p ON p.id = sp.parameter_id
+              WHERE sp.site_id = $1 AND sp.entry_mode = 'tool'",
             [site_id.into()],
         ))
         .await?;
@@ -403,6 +433,7 @@ async fn fetch_derived_work_items(
             formula: row.try_get("", "formula")?,
             derived_site_id: row.try_get("", "site_id")?,
             derived_parameter_id: row.try_get("", "parameter_id")?,
+            derived_parameter_code: row.try_get("", "parameter_code")?,
         });
     }
     Ok(items)
@@ -415,7 +446,7 @@ async fn build_evaluation_order(
     let derived_param_ids: std::collections::HashSet<Uuid> =
         work_items.iter().map(|w| w.derived_parameter_id).collect();
 
-    let mut deps: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    let mut deps: Vec<Vec<usize>> = Vec::with_capacity(work_items.len());
     for item in work_items {
         let source_param_ids =
             source_parameter_ids_for_definition(db, item.derived_definition_id).await?;
@@ -424,25 +455,39 @@ async fn build_evaluation_order(
             if derived_param_ids.contains(&source_param_id)
                 && let Some(other) = work_items
                     .iter()
-                    .find(|w| w.derived_parameter_id == source_param_id)
+                    .position(|w| w.derived_parameter_id == source_param_id)
             {
-                item_deps.push(other.site_param_id);
+                item_deps.push(other);
             }
         }
-        deps.insert(item.site_param_id, item_deps);
+        deps.push(item_deps);
     }
 
-    let mut evaluated: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-    let mut ordered: Vec<usize> = Vec::with_capacity(work_items.len());
-    let mut remaining: Vec<usize> = (0..work_items.len()).collect();
+    evaluation_order(&deps).map_err(|cycle| {
+        let members: Vec<&str> = cycle
+            .iter()
+            .map(|&idx| work_items[idx].derived_parameter_code.as_str())
+            .collect();
+        sea_orm::DbErr::Custom(format!(
+            "Derived parameters form a dependency cycle and cannot be evaluated: {}",
+            members.join(", ")
+        ))
+    })
+}
 
-    for _ in 0..=work_items.len() {
+/// The order the site's derived items evaluate in, each after every item it reads. Items whose
+/// dependencies never resolve are a cycle, and their positions come back as the error: computing
+/// the rest and dropping them would leave the values permanently absent with nothing said.
+fn evaluation_order(deps: &[Vec<usize>]) -> Result<Vec<usize>, Vec<usize>> {
+    let mut evaluated = vec![false; deps.len()];
+    let mut ordered: Vec<usize> = Vec::with_capacity(deps.len());
+    let mut remaining: Vec<usize> = (0..deps.len()).collect();
+
+    while !remaining.is_empty() {
         let mut progress = false;
         remaining.retain(|&idx| {
-            let sp_id = work_items[idx].site_param_id;
-            let item_deps = deps.get(&sp_id).cloned().unwrap_or_default();
-            if item_deps.iter().all(|dep| evaluated.contains(dep)) {
-                evaluated.insert(sp_id);
+            if deps[idx].iter().all(|&dep| evaluated[dep]) {
+                evaluated[idx] = true;
                 ordered.push(idx);
                 progress = true;
                 false
@@ -450,18 +495,10 @@ async fn build_evaluation_order(
                 true
             }
         });
-        if remaining.is_empty() || !progress {
-            break;
+        if !progress {
+            return Err(remaining);
         }
     }
-
-    if !remaining.is_empty() {
-        tracing::warn!(
-            remaining = remaining.len(),
-            "Topological sort could not resolve all derived parameter dependencies"
-        );
-    }
-
     Ok(ordered)
 }
 
@@ -709,6 +746,10 @@ async fn evaluate_and_upsert_derived(
 
     let stream_id = get_or_create_derived_stream(db, item).await?;
 
+    // The slot is re-asserted on conflict as well as on insert: a row this engine unattributed
+    // when its inputs stopped resolving is the same row it writes when they resolve again, and
+    // leaving `site_id` NULL there would recompute a value nothing serves.
+    //
     // `raw_value` is the authoritative column for a derived reading and `calibrated_value` is
     // always NULL. A derived value is a computed quantity, not an instrument measurement plus a
     // correction: it has no sensor, no curve and therefore nothing a calibration id could point
@@ -726,7 +767,8 @@ async fn evaluate_and_upsert_derived(
             r"INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, replicate_index, measurement_type, provenance_kind)
           VALUES ($1, $2, $3, $4, $5, NULL, 0, 'derived', 'derived')
           ON CONFLICT (stream_id, time, replicate_index) DO UPDATE
-            SET raw_value = $5, calibrated_value = NULL, measurement_type = 'derived'",
+            SET raw_value = $5, calibrated_value = NULL, measurement_type = 'derived',
+                site_id = $2, parameter_id = $3",
             [
                 stream_id.into(),
                 item.derived_site_id.into(),
@@ -827,10 +869,7 @@ pub enum Scope {
     /// One instrument's own readings, wherever they sit.
     Sensor(Uuid),
     /// One (site, parameter) slot, whatever measured it.
-    Slot {
-        site_id: Uuid,
-        parameter_id: Uuid,
-    },
+    Slot { site_id: Uuid, parameter_id: Uuid },
 }
 
 impl Scope {
@@ -879,7 +918,9 @@ impl Scope {
     fn attribution_set(self) -> &'static str {
         match self {
             Self::Sensor(_) => "deployment_id = dw.id, site_id = dw.site_id",
-            Self::Slot { .. } => "sensor_id = dw.sensor_id, deployment_id = dw.id, site_id = dw.site_id",
+            Self::Slot { .. } => {
+                "sensor_id = dw.sensor_id, deployment_id = dw.id, site_id = dw.site_id"
+            }
         }
     }
 
@@ -893,7 +934,9 @@ impl Scope {
             }
             // Either the row is at the slot, or it belongs to the instrument the slot's deployment
             // names: that second half is what pulls a swapped instrument's readings back in.
-            Self::Slot { .. } => "r.parameter_id = $2 AND (r.site_id = $1 OR r.sensor_id = dw.sensor_id)",
+            Self::Slot { .. } => {
+                "r.parameter_id = $2 AND (r.site_id = $1 OR r.sensor_id = dw.sensor_id)"
+            }
         }
     }
 
@@ -1040,8 +1083,9 @@ pub async fn reprocess(db: &DatabaseConnection, scope: Scope) -> Result<usize, s
     );
 
     let recall_predicate = scope.recall_predicate();
-    let recall_sql =
-        format!("UPDATE readings r SET site_id = NULL, deployment_id = NULL WHERE {recall_predicate}");
+    let recall_sql = format!(
+        "UPDATE readings r SET site_id = NULL, deployment_id = NULL WHERE {recall_predicate}"
+    );
 
     let (readings_updated, cascade) = crate::common::bulk_write::guarded(db, async |txn| {
         let mut touched: Vec<(Uuid, DateTime<Utc>)> = Vec::new();
@@ -1127,7 +1171,6 @@ async fn write_and_collect<C: ConnectionTrait>(
     Ok(rows.len())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1189,5 +1232,29 @@ mod tests {
             engine.contains("LEFT JOIN standard_curves sc"),
             "and the operator's standard curve is re-applied on top of the new base: {engine}"
         );
+    }
+
+    /// A site's derived items evaluate after everything they read.
+    #[test]
+    fn evaluation_order_puts_an_item_after_its_inputs() {
+        // item 0 reads item 2, item 2 reads item 1, item 1 reads nothing.
+        let order = evaluation_order(&[vec![2], vec![], vec![1]]).unwrap();
+        assert_eq!(order, vec![1, 2, 0]);
+    }
+
+    /// A cycle is named, not dropped: two definitions reading each other's output leave the run
+    /// with an error carrying both, rather than a warning and two values that never appear.
+    #[test]
+    fn evaluation_order_reports_a_cycle_rather_than_dropping_it() {
+        let cycle = evaluation_order(&[vec![1], vec![0]]).unwrap_err();
+        assert_eq!(cycle, vec![0, 1]);
+    }
+
+    /// The items outside the cycle are not what the error names.
+    #[test]
+    fn evaluation_order_names_only_the_cycle_members() {
+        // 0 stands alone; 1 and 2 read each other.
+        let cycle = evaluation_order(&[vec![], vec![2], vec![1]]).unwrap_err();
+        assert_eq!(cycle, vec![1, 2]);
     }
 }

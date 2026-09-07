@@ -367,10 +367,76 @@ impl Job for ReprocessDeployment {
     }
 }
 
-/// Recompute every derived value for one derived parameter definition by backfilling from the
-/// source readings, then refresh continuous aggregates. Backs the `derived_recompute` trigger.
-/// Reads `derived_definition_id` from params.
+/// Recompute derived values from their source readings, then refresh continuous aggregates. Backs
+/// the `derived_recompute` trigger, in either of two scopes: one derived parameter definition over
+/// its whole history (`derived_definition_id`), or every definition reading a given slot over a
+/// window (`site_ids`, `parameter_ids`, `start`, `end`), which is what a curation decision leaves
+/// behind.
 pub struct DerivedRecompute;
+
+/// The `(site, time)` instants a `derived_recompute` run must recompute, in either scope.
+fn derived_recompute_instants(params: &serde_json::Value) -> Result<Statement, DbErr> {
+    if params.get("derived_definition_id").is_some() {
+        let derived_id = required_uuid(params, "derived_definition_id")?;
+        return Ok(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT DISTINCT r.site_id, r.time
+              FROM readings r
+              JOIN derived_parameter_definitions d ON d.id = $1
+              JOIN site_parameters sp
+                ON sp.site_id = r.site_id
+               AND sp.entry_mode = 'tool'
+               AND sp.parameter_id = d.output_parameter_id
+              JOIN derived_parameter_sources dps
+                ON dps.derived_definition_id = d.id
+               AND dps.parameter_id = r.parameter_id
+              ORDER BY r.site_id, r.time",
+            [derived_id.into()],
+        ));
+    }
+
+    let uuids = |key: &str| -> Result<Vec<Uuid>, DbErr> {
+        params
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+                    .collect()
+            })
+            .ok_or_else(|| DbErr::Custom(format!("derived_recompute: missing {key}")))
+    };
+    let time = |key: &str| -> Result<chrono::DateTime<chrono::Utc>, DbErr> {
+        params
+            .get(key)
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .ok_or_else(|| DbErr::Custom(format!("derived_recompute: missing {key}")))
+    };
+
+    Ok(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r"SELECT DISTINCT r.site_id, r.time
+          FROM readings r
+          JOIN derived_parameter_sources dps ON dps.parameter_id = r.parameter_id
+          JOIN derived_parameter_definitions d ON d.id = dps.derived_definition_id
+          JOIN site_parameters sp
+            ON sp.site_id = r.site_id
+           AND sp.entry_mode = 'tool'
+           AND sp.parameter_id = d.output_parameter_id
+          WHERE r.site_id = ANY($1) AND r.parameter_id = ANY($2)
+            AND r.time >= $3 AND r.time <= $4
+          ORDER BY r.site_id, r.time",
+        [
+            uuids("site_ids")?.into(),
+            uuids("parameter_ids")?.into(),
+            time("start")?.into(),
+            time("end")?.into(),
+        ],
+    ))
+}
 
 #[async_trait]
 impl Job for DerivedRecompute {
@@ -379,26 +445,10 @@ impl Job for DerivedRecompute {
     }
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
-        let derived_id = required_uuid(ctx.params(), "derived_definition_id")?;
+        let instants = derived_recompute_instants(ctx.params())?;
         let work = async {
-            tracing::info!(derived_id = %derived_id, job_id = %ctx.job_id(), "Recomputing derived parameter");
-            let rows = ctx
-                .db()
-                .query_all_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    r"SELECT DISTINCT r.site_id, r.time
-                      FROM readings r
-                      JOIN site_parameters sp
-                        ON sp.site_id = r.site_id
-                       AND sp.is_derived = true
-                       AND sp.derived_definition_id = $1
-                      JOIN derived_parameter_sources dps
-                        ON dps.derived_definition_id = sp.derived_definition_id
-                       AND dps.parameter_id = r.parameter_id
-                      ORDER BY r.site_id, r.time",
-                    [derived_id.into()],
-                ))
-                .await?;
+            tracing::info!(job_id = %ctx.job_id(), "Recomputing derived parameters");
+            let rows = ctx.db().query_all_raw(instants).await?;
 
             let total = i32::try_from(rows.len()).unwrap_or(i32::MAX);
             ctx.set_progress(0, Some(total)).await;
@@ -446,13 +496,18 @@ impl Job for DerivedRecompute {
             ctx.set_progress(total, Some(total)).await;
             ctx.report(
                 JobReport::new()
-                    .scope("derived_definition_id", derived_id.to_string())
+                    .scope_opt(
+                        "derived_definition_id",
+                        ctx.params()
+                            .get("derived_definition_id")
+                            .and_then(|v| v.as_str().map(str::to_string)),
+                    )
                     .scope_opt("earliest_filled", min_filled.map(|t| t.to_rfc3339()))
                     .count("timestamps", total)
                     .count("filled", filled),
             )
             .await;
-            tracing::info!(derived_id = %derived_id, total, filled, "Derived parameter recomputation complete");
+            tracing::info!(total, filled, "Derived parameter recomputation complete");
             Ok::<i64, DbErr>(i64::from(filled))
         };
 
@@ -1064,10 +1119,19 @@ impl Job for PlanApply {
             crate::routes::private::sync::service::apply_plan(ctx.db(), plan_id, Some(&ctx))
                 .await
                 .map_err(|e| DbErr::Custom(e.to_string()))?;
+        // Every counter the apply produced, so a reader of the run knows what it created as well
+        // as what it paired; the plan's own `apply_result` records the same nine numbers.
         ctx.report(
             JobReport::new()
                 .scope("plan_id", plan_id.to_string())
+                .count("projects_created", result.projects_created)
+                .count("sites_created", result.sites_created)
+                .count("parameters_created", result.parameters_created)
+                .count("site_parameters_created", result.site_parameters_created)
                 .count("streams_paired", result.streams_paired)
+                .count("streams_skipped", result.streams_skipped)
+                .count("instruments_created", result.instruments_created)
+                .count("curves_assigned", result.curves_assigned)
                 .count("readings_backfilled", result.readings_backfilled),
         )
         .await;

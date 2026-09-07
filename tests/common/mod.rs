@@ -5,6 +5,7 @@ pub mod e2e;
 pub mod fixtures;
 pub mod jobs;
 pub mod keycloak;
+pub mod plans;
 pub mod seed;
 pub mod sensor_lifecycle;
 pub mod tools_runner;
@@ -218,9 +219,46 @@ pub fn build_test_app_with_cache_and_state(db: DatabaseConnection) -> (axum::Rou
     (app, state)
 }
 
+/// App + shared state with the response cache on and a byte ceiling small enough to evict. The
+/// production default is 200MB, so nothing else in the estate reaches the eviction path.
+pub fn build_test_app_with_cache_ceiling(
+    db: DatabaseConnection,
+    cache_max_bytes: u64,
+) -> (axum::Router, AppState) {
+    let config = Config {
+        cache_max_bytes,
+        ..cached_test_config()
+    };
+    let state = AppState::new(db, config, None);
+    spawn_test_worker(&state);
+    let app = river_db::routes::build_router(state.clone());
+    (app, state)
+}
+
 pub fn build_test_app_with_rate_limiting(db: DatabaseConnection) -> axum::Router {
     let mut config = test_config();
     config.disable_rate_limiting = false;
+    let state = AppState::new(db, config, None);
+    spawn_test_worker(&state);
+    river_db::routes::build_router(state)
+}
+
+/// The limiter with both tiers set by the caller, for the boundary cases: `test_config` leaves the
+/// authenticated tier effectively unlimited and the public one at burst 10 / 2s.
+pub fn build_test_app_with_limits(
+    db: DatabaseConnection,
+    public_burst: u32,
+    public_period_secs: u64,
+    auth_burst: u32,
+) -> axum::Router {
+    let config = Config {
+        disable_rate_limiting: false,
+        public_rate_limit_burst: public_burst,
+        public_rate_limit_period_secs: public_period_secs,
+        auth_rate_limit_burst: auth_burst,
+        auth_rate_limit_per_second: 1,
+        ..test_config()
+    };
     let state = AppState::new(db, config, None);
     spawn_test_worker(&state);
     river_db::routes::build_router(state)

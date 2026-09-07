@@ -587,6 +587,7 @@ impl CsvImport {
                     announce: true,
                     reconcile_alarms: false,
                     episodes: tail::Episodes::Job,
+                    recompute_derived: false,
                     writer: crate::routes::private::collection_events::recompute::Writer::Person,
                 },
                 "csv_import",

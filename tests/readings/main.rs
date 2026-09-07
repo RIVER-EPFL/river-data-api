@@ -37,6 +37,7 @@ mod replicate_index_resync;
 mod sample_preview;
 mod sample_row_predicate;
 mod seasonal_check;
+mod slot_instrument_declaration;
 mod spot_instant_shape;
 mod stream_receipts;
 mod visits;

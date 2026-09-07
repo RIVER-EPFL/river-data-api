@@ -1251,17 +1251,21 @@ pub async fn apply_plan(
         counters.streams_paired += 1;
     }
 
-    let readings_backfilled = backfill_plan_readings(&txn, plan_id).await?;
-    // Audit mismatches recorded while these streams were unpaired become reviewable with the
-    // pairing they just gained.
-    crate::routes::private::sync::replicate_audit::repoint_holds(
-        &txn,
-        crate::routes::private::sync::replicate_audit::HoldScope::Plan(plan_id),
-        true,
-    )
-    .await?;
+    let backfilled = backfill_plan_readings(&txn, plan_id).await?;
+    let readings_backfilled = backfilled.readings;
     finalize_plan(&txn, plan_id, &counters, readings_backfilled).await?;
     txn.commit().await?;
+
+    // Attribution is what made these readings visit values; the calculations that read them at
+    // each manual visit run now (ADR 0007). The plan runs as a job, so the writer it records is
+    // the system rather than a person.
+    crate::routes::private::collection_events::recompute::enqueue_for(
+        db,
+        &backfilled.touched_events,
+        "system",
+        crate::routes::private::collection_events::recompute::Writer::Person,
+    )
+    .await?;
 
     // Re-derive the paired readings by the deployment + calibration windows for each touched
     // (site, parameter) slot, then a full refresh as a safety net. `backfill_plan_readings` only
@@ -1465,6 +1469,7 @@ async fn resolve_or_create_site_param<C: ConnectionTrait>(
         };
         site_parameters::ActiveModel {
             id: Set(id),
+            instrument_sensor_id: Set(None),
             site_id: Set(site_id),
             parameter_id: Set(parameter_id),
             name: Set(param_name_val),
@@ -1480,8 +1485,7 @@ async fn resolve_or_create_site_param<C: ConnectionTrait>(
             is_active: Set(Some(true)),
             is_public: Set(Some(false)),
             needs_review: Set(false),
-            is_derived: Set(Some(false)),
-            derived_definition_id: Set(None),
+            entry_mode: Set("manual".to_string()),
             variable_mappings: Set(None),
             created_at: Set(Some(Utc::now())),
             updated_at: Set(Some(Utc::now())),
@@ -1635,53 +1639,19 @@ async fn plan_reading_references<C: ConnectionTrait>(
         .collect())
 }
 
-async fn backfill_plan_readings<C: ConnectionTrait>(txn: &C, plan_id: Uuid) -> AppResult<u64> {
-    let backfill_result = txn
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings r
-          SET site_id = sp.site_id, parameter_id = sp.parameter_id,
-              measurement_type = COALESCE(r.measurement_type, ds.measurement_type)
-          FROM data_streams ds
-          JOIN site_parameters sp ON ds.site_parameter_id = sp.id
-          WHERE r.stream_id = ds.id AND r.site_id IS NULL
-            AND ds.pairing_plan_id = $1",
-            [plan_id.into()],
-        ))
-        .await?;
-
-    // Replicate groups on the newly paired streams (2+ spot readings sharing a slot and timestamp,
-    // e.g. migrated NOMIS A/B/C rows) form samples. The row-level triggers populate the statistics.
-    crate::routes::private::readings::sample_groups::materialise_samples(
+/// Attribute everything the plan's newly paired streams already hold, through the helper every
+/// pairing path runs. Deployment attribution is left to the slot reprocess the caller enqueues:
+/// a plan pairs many streams, and each reading's deployment is the one covering its own time.
+async fn backfill_plan_readings<C: ConnectionTrait>(
+    txn: &C,
+    plan_id: Uuid,
+) -> AppResult<crate::routes::private::data_streams::pairing::Backfilled> {
+    crate::routes::private::data_streams::pairing::backfill(
         txn,
-        "ds.pairing_plan_id = $1",
-        vec![plan_id.into()],
+        crate::routes::private::sync::replicate_audit::HoldScope::Plan(plan_id),
+        None,
     )
-    .await?;
-
-    // Attribution arriving is what makes these spot readings addressable as visits: attach their
-    // collection events now, deriving the source from where each stream came from.
-    crate::routes::private::collection_events::attach::attach_collection_events(
-        txn,
-        "ds.pairing_plan_id = $1",
-        vec![plan_id.into()],
-        crate::routes::private::collection_events::attach::EventSource::ByStreamOrigin,
-    )
-    .await?;
-
-    txn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE status_events se
-          SET site_id = sp.site_id, parameter_id = sp.parameter_id
-          FROM data_streams ds
-          JOIN site_parameters sp ON ds.site_parameter_id = sp.id
-          WHERE se.stream_id = ds.id AND se.site_id IS NULL
-            AND ds.pairing_plan_id = $1",
-        [plan_id.into()],
-    ))
-    .await?;
-
-    Ok(backfill_result.rows_affected())
+    .await
 }
 
 async fn finalize_plan<C: ConnectionTrait>(

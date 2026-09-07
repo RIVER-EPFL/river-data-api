@@ -216,7 +216,6 @@ async fn test_full_public_data_workflow() {
         (200..300).contains(&status),
         "create derived ({status}): {def}"
     );
-    let derived_def_id = id_of(&def);
     let derived_param_id = def["output_parameter_id"].as_str().unwrap().to_string();
 
     // 7. Assign the derived parameter to the site.
@@ -225,7 +224,7 @@ async fn test_full_public_data_workflow() {
         "/api/site_parameters",
         &serde_json::json!({
             "site_id": site_id, "parameter_id": derived_param_id, "name": "DOmgL",
-            "sensor_type": "derived", "is_derived": true, "derived_definition_id": derived_def_id,
+            "sensor_type": "derived", "entry_mode": "tool",
             "display_units": "mg/L",
         }),
         &token,

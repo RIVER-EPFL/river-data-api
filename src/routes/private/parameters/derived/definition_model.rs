@@ -36,6 +36,15 @@ pub struct Model {
     /// Evaluation order inside the calculation.
     #[crudcrate(filterable, sortable, on_create = 0)]
     pub ordinal: i32,
+    /// The curve slot this formula corrects with (M106). Its coefficients reach the formula as
+    /// `curve_slope` and `curve_intercept`, so two outputs of one calculation may take two curves.
+    #[crudcrate(filterable)]
+    pub curve_slot: Option<String>,
+    /// The variable whose replicate vector this formula evaluates over (M107), one reading per
+    /// index under its output parameter. NULL is a formula producing one number. The output's
+    /// replicate identity is the named input's, so nothing here assigns a column position.
+    #[crudcrate(filterable)]
+    pub per_replicate: Option<String>,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     #[sea_orm(ignore)]
@@ -50,16 +59,8 @@ pub struct Model {
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    #[sea_orm(has_many = "crate::routes::private::sites::parameters::Entity")]
-    SiteParameters,
     #[sea_orm(has_many = "crate::routes::private::parameters::derived::source_model::Entity")]
     DerivedParameterSources,
-}
-
-impl Related<crate::routes::private::sites::parameters::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::SiteParameters.def()
-    }
 }
 
 impl Related<crate::routes::private::parameters::derived::source_model::Entity> for Entity {

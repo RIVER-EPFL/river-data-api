@@ -17,8 +17,15 @@ unsafe_code = "forbid"
 [dependencies]
 # Web framework
 axum = { version = "0.8", features = ["macros", "multipart"] }
-tower = { version = "0.5", features = ["timeout", "limit"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "limit"] }
+tower = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.6", features = [
+    "cors",
+    "trace",
+    "compression-gzip",
+    "limit",
+    "timeout",
+    "request-id",
+] }
 
 # Database
 sea-orm = { version = "2.0", features = ["sqlx-postgres", "runtime-tokio-rustls", "with-uuid", "with-chrono", "with-json"] }
@@ -98,3 +105,10 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
+
+# The feedback loop is dominated by linking, not by compiling: 32 test binaries carry the whole
+# workspace's debug info each. Line tables are what a backtrace needs; unpacked debuginfo leaves it
+# in the object files instead of copying it into every binary.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"

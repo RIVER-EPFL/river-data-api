@@ -800,6 +800,10 @@ pub struct CellReplicate {
     /// The standard curve applied on top of the base calibration, null when none was.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub standard_curve_id: Option<Uuid>,
+    /// The instrument the replicate names. The grid offers it back as the row's declaration, so
+    /// re-entering a value does not silently re-attribute it to whatever the slot declares now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sensor_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -859,6 +863,7 @@ pub async fn get_event_detail(
                     s.min_value AS sample_min, s.max_value AS sample_max, \
                     s.sd_estimator, s.sd_estimator_source, \
                     r.flag_reason, r.withdrawn_at, r.calibration_id, r.standard_curve_id, \
+                    r.sensor_id, \
                     (r.provenance IS NOT NULL) AS has_provenance, \
                     r.provenance_kind, r.provenance ->> 'tool' AS tool \
              FROM readings r \
@@ -911,6 +916,7 @@ pub async fn get_event_detail(
             withdrawn_at: r.try_get("", "withdrawn_at")?,
             calibration_id: r.try_get("", "calibration_id")?,
             standard_curve_id: r.try_get("", "standard_curve_id")?,
+            sensor_id: r.try_get("", "sensor_id")?,
         };
         let same_cell = cells
             .last_mut()

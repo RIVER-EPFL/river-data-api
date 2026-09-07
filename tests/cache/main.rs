@@ -6,6 +6,7 @@
 #[allow(dead_code, unused_imports)]
 mod common;
 
+mod eviction;
 mod invalidation_mechanism;
 mod key_and_invalidation;
 mod key_generation;

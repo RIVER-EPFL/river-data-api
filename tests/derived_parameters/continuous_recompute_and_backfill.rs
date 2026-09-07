@@ -74,7 +74,6 @@ async fn test_continuous_derived_recompute_after_ingest() {
         (200..300).contains(&status),
         "create derived ({status}): {def_json}"
     );
-    let derived_def_id = def_json["id"].as_str().expect("def id").to_string();
     let output_parameter_id = def_json["output_parameter_id"]
         .as_str()
         .expect("derived output parameter_id must be populated by after_create hook")
@@ -86,8 +85,7 @@ async fn test_continuous_derived_recompute_after_ingest() {
         "parameter_id": output_parameter_id,
         "name": derived_name,
         "sensor_type": "derived",
-        "is_derived": true,
-        "derived_definition_id": derived_def_id,
+        "entry_mode": "tool",
         "display_units": "mg/L",
     });
     let (status, sp_text) =
@@ -209,8 +207,7 @@ async fn test_recompute_endpoint_backfills_historical_gap() {
         "parameter_id": output_parameter_id,
         "name": derived_name,
         "sensor_type": "derived",
-        "is_derived": true,
-        "derived_definition_id": derived_def_id,
+        "entry_mode": "tool",
         "display_units": "mg/L",
     });
     let (status, _) =

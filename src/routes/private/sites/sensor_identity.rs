@@ -110,13 +110,8 @@ pub async fn get_site_sensor_identity(
     if let Some(ref pids) = param_filter
         && !pids.is_empty()
     {
-        let ph: Vec<String> = pids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("${}", i + 4))
-            .collect();
-        band_sql.push_str(&format!(" AND d.parameter_id IN ({})", ph.join(",")));
-        values.extend(pids.iter().map(|id| (*id).into()));
+        band_sql.push_str(" AND d.parameter_id = ANY($4)");
+        values.push(pids.clone().into());
     }
     band_sql.push_str(" ORDER BY d.parameter_id, d.deployed_from");
 
@@ -165,12 +160,7 @@ pub async fn get_site_sensor_identity(
     if let Some(ref pids) = param_filter
         && !pids.is_empty()
     {
-        let ph: Vec<String> = pids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("${}", i + 4))
-            .collect();
-        cal_sql.push_str(&format!(" AND d.parameter_id IN ({})", ph.join(",")));
+        cal_sql.push_str(" AND d.parameter_id = ANY($4)");
     }
     cal_sql.push_str(
         r" )

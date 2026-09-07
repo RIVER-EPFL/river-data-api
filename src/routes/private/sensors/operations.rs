@@ -9,17 +9,6 @@ use super::model::Sensor;
 
 pub struct SensorOperations;
 
-fn build_in_clause(count: usize) -> String {
-    (1..=count)
-        .map(|i| format!("${i}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn uuid_values(ids: &[Uuid]) -> Vec<sea_orm::Value> {
-    ids.iter().map(|id| (*id).into()).collect()
-}
-
 #[async_trait]
 impl CRUDOperations for SensorOperations {
     type Resource = Sensor;
@@ -229,18 +218,15 @@ async fn enrich(
     if ids.is_empty() {
         return Ok(out);
     }
-    let placeholders = build_in_clause(ids.len());
-    let values = uuid_values(ids);
+    let values = [ids.to_vec().into()];
 
     // Where the instrument is now.
     let dep_rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                r"SELECT sd.sensor_id, sd.site_id, s.name AS site_name
+            r"SELECT sd.sensor_id, sd.site_id, s.name AS site_name
                   FROM sensor_deployments sd JOIN sites s ON s.id = sd.site_id
-                  WHERE sd.sensor_id IN ({placeholders}) AND sd.deployed_until IS NULL"
-            ),
+                  WHERE sd.sensor_id = ANY($1) AND sd.deployed_until IS NULL",
             values.clone(),
         ))
         .await
@@ -262,12 +248,10 @@ async fn enrich(
     let cal_rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                r"SELECT DISTINCT ON (sensor_id) sensor_id, valid_from
+            r"SELECT DISTINCT ON (sensor_id) sensor_id, valid_from
                   FROM sensor_calibrations
-                  WHERE sensor_id IN ({placeholders})
-                  ORDER BY sensor_id, valid_from DESC"
-            ),
+                  WHERE sensor_id = ANY($1)
+                  ORDER BY sensor_id, valid_from DESC",
             values.clone(),
         ))
         .await
@@ -286,10 +270,8 @@ async fn enrich(
     let count_rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT sensor_id, COALESCE(SUM(count), 0)::bigint AS n FROM readings_hourly \
-                  WHERE sensor_id IN ({placeholders}) GROUP BY sensor_id"
-            ),
+            "SELECT sensor_id, COALESCE(SUM(count), 0)::bigint AS n FROM readings_hourly \
+                  WHERE sensor_id = ANY($1) GROUP BY sensor_id",
             values.clone(),
         ))
         .await
@@ -306,12 +288,10 @@ async fn enrich(
     let spot_rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT sensor_id, COUNT(*) AS n FROM readings \
-                  WHERE sensor_id IN ({placeholders}) AND time > now() - INTERVAL '90 days' \
+            "SELECT sensor_id, COUNT(*) AS n FROM readings \
+                  WHERE sensor_id = ANY($1) AND time > now() - INTERVAL '90 days' \
                     AND measurement_type = 'spot' AND is_flagged IS NOT TRUE \
-                  GROUP BY sensor_id"
-            ),
+                  GROUP BY sensor_id",
             values.clone(),
         ))
         .await
@@ -334,12 +314,10 @@ async fn enrich(
     let cursor_rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                r"SELECT sensor_id, MAX(last_data_time) AS last_time
+            r"SELECT sensor_id, MAX(last_data_time) AS last_time
                   FROM data_streams
-                  WHERE sensor_id IN ({placeholders}) AND last_data_time IS NOT NULL
-                  GROUP BY sensor_id"
-            ),
+                  WHERE sensor_id = ANY($1) AND last_data_time IS NOT NULL
+                  GROUP BY sensor_id",
             values.clone(),
         ))
         .await
@@ -347,10 +325,8 @@ async fn enrich(
     let bucket_rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT sensor_id, MAX(bucket) AS last_bucket FROM readings_hourly \
-                  WHERE sensor_id IN ({placeholders}) GROUP BY sensor_id"
-            ),
+            "SELECT sensor_id, MAX(bucket) AS last_bucket FROM readings_hourly \
+                  WHERE sensor_id = ANY($1) GROUP BY sensor_id",
             values,
         ))
         .await
@@ -400,17 +376,14 @@ async fn enrich(
         .copied()
         .collect();
     if !uncovered.is_empty() {
-        let ph = build_in_clause(uncovered.len());
         let rows = db
             .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                format!(
-                    r"SELECT DISTINCT ON (sensor_id) sensor_id, time, COALESCE(calibrated_value, raw_value) AS value
-                      FROM readings
-                      WHERE sensor_id IN ({ph}) AND time > now() - INTERVAL '90 days'
-                      ORDER BY sensor_id, time DESC"
-                ),
-                uuid_values(&uncovered),
+                r"SELECT DISTINCT ON (sensor_id) sensor_id, time, COALESCE(calibrated_value, raw_value) AS value
+                  FROM readings
+                  WHERE sensor_id = ANY($1) AND time > now() - INTERVAL '90 days'
+                  ORDER BY sensor_id, time DESC",
+                [uncovered.into()],
             ))
             .await
             .map_err(ApiError::database)?;
@@ -431,24 +404,19 @@ async fn enrich(
             cluster.push(windows[i].0);
             i += 1;
         }
-        let cluster_ph = build_in_clause(cluster.len());
-        let mut cluster_values = uuid_values(&cluster);
-        cluster_values.push(
-            sea_orm::prelude::DateTimeWithTimeZone::from(lo - chrono::Duration::days(1)).into(),
-        );
-        let from_ref = cluster_values.len();
-        cluster_values.push(sea_orm::prelude::DateTimeWithTimeZone::from(hi).into());
-        let to_ref = cluster_values.len();
         let rows = db
             .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                format!(
-                    r"SELECT DISTINCT ON (sensor_id) sensor_id, time, COALESCE(calibrated_value, raw_value) AS value
-                      FROM readings
-                      WHERE sensor_id IN ({cluster_ph}) AND time >= ${from_ref} AND time <= ${to_ref}
-                      ORDER BY sensor_id, time DESC"
-                ),
-                cluster_values,
+                r"SELECT DISTINCT ON (sensor_id) sensor_id, time, COALESCE(calibrated_value, raw_value) AS value
+                  FROM readings
+                  WHERE sensor_id = ANY($1) AND time >= $2 AND time <= $3
+                  ORDER BY sensor_id, time DESC",
+                [
+                    cluster.into(),
+                    sea_orm::prelude::DateTimeWithTimeZone::from(lo - chrono::Duration::days(1))
+                        .into(),
+                    sea_orm::prelude::DateTimeWithTimeZone::from(hi).into(),
+                ],
             ))
             .await
             .map_err(ApiError::database)?;

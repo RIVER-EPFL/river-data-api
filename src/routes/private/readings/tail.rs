@@ -156,6 +156,10 @@ pub struct Axes {
     /// the periodic sweep.
     pub reconcile_alarms: bool,
     pub episodes: Episodes,
+    /// Whether the derived values the written slots feed are recomputed over the same span. A
+    /// derived value is computed from what its inputs served, so a decision that changes what an
+    /// input serves leaves it stating a number nothing supports any more.
+    pub recompute_derived: bool,
     /// Who wrote, which is what decides whether the visit's calculations run again.
     pub writer: Writer,
 }
@@ -173,6 +177,8 @@ pub struct Plan {
     pub reconcile: Vec<(Uuid, Uuid)>,
     pub episodes: Episodes,
     pub episode_span: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    /// The slots whose derived values are recomputed, over [`Plan::episode_span`]'s window.
+    pub recompute_derived: Vec<(Uuid, Uuid)>,
 }
 
 impl Plan {
@@ -188,6 +194,7 @@ impl Plan {
             reconcile: Vec::new(),
             episodes: Episodes::None,
             episode_span: None,
+            recompute_derived: Vec::new(),
         }
     }
 }
@@ -246,6 +253,17 @@ pub fn plan(written: &Written, axes: &Axes) -> Plan {
         },
         episodes,
         episode_span: span,
+        recompute_derived: if axes.recompute_derived && span.is_some() {
+            written
+                .slots
+                .iter()
+                .filter_map(|s| s.slot())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -361,6 +379,25 @@ pub async fn run<'a>(
         }
     }
 
+    if let (false, Some((lo, hi))) = (plan.recompute_derived.is_empty(), plan.episode_span) {
+        let sites: BTreeSet<Uuid> = plan.recompute_derived.iter().map(|(s, _)| *s).collect();
+        let parameters: BTreeSet<Uuid> = plan.recompute_derived.iter().map(|(_, p)| *p).collect();
+        crate::routes::private::reprocessing_jobs::worker::enqueue(
+            sink.db,
+            "derived_recompute",
+            None,
+            None,
+            &serde_json::json!({
+                "site_ids": sites.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "parameter_ids": parameters.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "start": lo.to_rfc3339(),
+                "end": hi.to_rfc3339(),
+            }),
+            None,
+        )
+        .await?;
+    }
+
     Ok(plan)
 }
 
@@ -384,6 +421,7 @@ mod tests {
             announce: true,
             reconcile_alarms: true,
             episodes: Episodes::Inline,
+            recompute_derived: false,
             writer: Writer::Person,
         }
     }
@@ -512,6 +550,7 @@ mod tests {
         let plan = plan(
             &write,
             &Axes {
+                recompute_derived: false,
                 writer: Writer::Chain,
                 ..axes()
             },

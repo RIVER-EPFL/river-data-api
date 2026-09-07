@@ -331,7 +331,7 @@ fn build_parameter_response(
         code: d.code,
         name: d.name,
         units: d.units,
-        is_derived: p.is_derived.unwrap_or(false),
+        entry_mode: p.entry_mode.clone(),
         sensor_type: d.sensor_type,
         display_units: d.display_units,
         decimal_places: d.decimal_places,

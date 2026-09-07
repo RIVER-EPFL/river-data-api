@@ -5,15 +5,10 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 use super::definition_model::DerivedParameterDefinition;
+use crate::routes::private::tools::formula::free_identifiers;
 
 /// Maximum allowed derived-from-derived chain depth.
 const MAX_DERIVED_CHAIN_DEPTH: u32 = 3;
-
-/// Math functions/constants recognized by meval, not variable names
-const MATH_BUILTINS: &[&str] = &[
-    "sqrt", "abs", "ln", "log", "exp", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh",
-    "tanh", "floor", "ceil", "round", "signum", "min", "max", "pi", "e",
-];
 
 fn validate_formula(formula: &str) -> Result<(), ApiError> {
     formula
@@ -22,50 +17,17 @@ fn validate_formula(formula: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Extract variable names from a formula string (identifiers that aren't math builtins)
-fn extract_variable_names(formula: &str) -> Vec<String> {
-    let builtins: HashSet<&str> = MATH_BUILTINS.iter().copied().collect();
-    let re_tokens: Vec<&str> = {
-        // Simple tokenizer: match word-character sequences
-        let mut tokens = Vec::new();
-        let mut start = None;
-        for (i, c) in formula.char_indices() {
-            if c.is_alphanumeric() || c == '_' {
-                if start.is_none() {
-                    start = Some(i);
-                }
-            } else if let Some(s) = start {
-                tokens.push(&formula[s..i]);
-                start = None;
-            }
-        }
-        if let Some(s) = start {
-            tokens.push(&formula[s..]);
-        }
-        tokens
-    };
-
-    let mut seen = HashSet::new();
-    let mut vars = Vec::new();
-    for token in re_tokens {
-        // Skip if it's a number (starts with digit)
-        if token.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        if !builtins.contains(token) && seen.insert(token.to_string()) {
-            vars.push(token.to_string());
-        }
-    }
-    vars
-}
-
 /// Resolve each formula variable to a parameter UUID, with strict validation.
 /// Returns Vec<(`variable_name`, `parameter_id`)>.
+///
+/// An identifier naming a row of `constants` is not a variable at all: it resolves to the same
+/// value at every site and instant, so it is left out of the sources and bound at evaluation from
+/// the constants table, exactly as the script engine binds a declared constant.
 async fn resolve_variables(
     db: &DatabaseConnection,
     formula: &str,
 ) -> Result<Vec<(String, Uuid)>, ApiError> {
-    let var_names = extract_variable_names(formula);
+    let var_names = free_identifiers(formula);
     let mut resolved = Vec::with_capacity(var_names.len());
 
     for var_name in &var_names {
@@ -83,9 +45,9 @@ async fn resolve_variables(
                 .try_get("", "id")
                 .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
             resolved.push((var_name.clone(), id));
-        } else {
+        } else if !names_a_constant(db, var_name).await? {
             return Err(ApiError::bad_request(format!(
-                "Formula variable '{var_name}' does not match any parameter in the catalog"
+                "Formula variable '{var_name}' does not match any parameter or constant"
             )));
         }
     }
@@ -93,112 +55,204 @@ async fn resolve_variables(
     Ok(resolved)
 }
 
-/// Check if a parameter is the output of a derived definition.
-/// Returns the `derived_definition_id` if so.
-async fn find_derived_definition_for_param(
+/// Whether the constants table holds this name.
+async fn names_a_constant(db: &DatabaseConnection, name: &str) -> Result<bool, ApiError> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT 1 FROM constants WHERE name = $1 LIMIT 1",
+            [name.into()],
+        ))
+        .await
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+    Ok(row.is_some())
+}
+
+/// What the derived definitions produce and what they read, loaded once so the cycle and depth
+/// guards are a walk over data rather than a query per node.
+///
+/// A definition is found by `output_parameter_id`, the column that says what it produces. Its own
+/// `code` names the formula, and the two are routinely spelled differently: `ensure_output_parameter`
+/// creates the output parameter rather than requiring them to agree.
+#[derive(Default)]
+struct DerivedGraph {
+    /// Output parameter id to the definition producing it.
+    definition_of: std::collections::HashMap<Uuid, Uuid>,
+    /// Definition id to the parameter ids its formula reads.
+    sources_of: std::collections::HashMap<Uuid, Vec<Uuid>>,
+}
+
+impl DerivedGraph {
+    async fn load(db: &DatabaseConnection) -> Result<Self, ApiError> {
+        let mut graph = Self::default();
+        let definitions = db
+            .query_all_raw(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT id, output_parameter_id FROM derived_parameter_definitions \
+                 WHERE output_parameter_id IS NOT NULL"
+                    .to_string(),
+            ))
+            .await
+            .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+        for row in &definitions {
+            let id: Uuid = row
+                .try_get("", "id")
+                .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+            let output: Uuid = row
+                .try_get("", "output_parameter_id")
+                .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+            graph.definition_of.insert(output, id);
+        }
+
+        let sources = db
+            .query_all_raw(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT derived_definition_id, parameter_id FROM derived_parameter_sources"
+                    .to_string(),
+            ))
+            .await
+            .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+        for row in &sources {
+            let definition_id: Uuid = row
+                .try_get("", "derived_definition_id")
+                .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+            let parameter_id: Uuid = row
+                .try_get("", "parameter_id")
+                .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+            graph
+                .sources_of
+                .entry(definition_id)
+                .or_default()
+                .push(parameter_id);
+        }
+        Ok(graph)
+    }
+
+    /// How deep the derived chain under `parameter_id` runs. Zero for a parameter nothing derives.
+    /// A cycle among the stored definitions is an error rather than an infinite walk.
+    fn chain_depth(&self, parameter_id: Uuid, visited: &mut HashSet<Uuid>) -> Result<u32, String> {
+        if !visited.insert(parameter_id) {
+            return Err("Circular dependency detected in derived parameter chain".to_string());
+        }
+        let Some(definition_id) = self.definition_of.get(&parameter_id) else {
+            return Ok(0);
+        };
+        let mut deepest = 0;
+        for source in self.sources_of.get(definition_id).into_iter().flatten() {
+            deepest = deepest.max(self.chain_depth(*source, visited)?);
+        }
+        Ok(1 + deepest)
+    }
+
+    /// Whether `target` is read, directly or through other definitions, by whatever derives
+    /// `from`. This is what makes a two-definition cycle visible: the new formula reads a
+    /// parameter whose own chain comes back to the parameter the new formula produces.
+    fn reaches(&self, from: Uuid, target: Uuid) -> bool {
+        let mut seen = HashSet::new();
+        let mut stack = vec![from];
+        while let Some(parameter_id) = stack.pop() {
+            if parameter_id == target {
+                return true;
+            }
+            if !seen.insert(parameter_id) {
+                continue;
+            }
+            if let Some(definition_id) = self.definition_of.get(&parameter_id) {
+                stack.extend(self.sources_of.get(definition_id).into_iter().flatten());
+            }
+        }
+        false
+    }
+}
+
+/// Refuse a set of formula variables that would make the definition producing `output_parameter_id`
+/// part of a cycle, or push a chain past [`MAX_DERIVED_CHAIN_DEPTH`]. `output_parameter_id` is None
+/// for a definition whose output parameter does not exist yet, which nothing can read and so cannot
+/// close a cycle.
+fn validate_dependency_chain(
+    graph: &DerivedGraph,
+    output_parameter_id: Option<Uuid>,
+    resolved_params: &[(String, Uuid)],
+) -> Result<(), String> {
+    for (var_name, parameter_id) in resolved_params {
+        if Some(*parameter_id) == output_parameter_id {
+            return Err(
+                "Circular dependency detected: formula references its own output parameter"
+                    .to_string(),
+            );
+        }
+        if let Some(output) = output_parameter_id
+            && graph.reaches(*parameter_id, output)
+        {
+            return Err(format!(
+                "Circular dependency detected: variable '{var_name}' is derived from this \
+                 definition's own output parameter"
+            ));
+        }
+
+        let mut visited = HashSet::new();
+        let depth = graph.chain_depth(*parameter_id, &mut visited)?;
+        if depth >= MAX_DERIVED_CHAIN_DEPTH {
+            return Err(format!(
+                "Derived formula chain depth exceeds maximum of {MAX_DERIVED_CHAIN_DEPTH} levels (variable '{var_name}' has depth {depth})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Load the graph and validate against it, the shape the CRUD hooks use.
+async fn validate_against_stored_graph(
     db: &DatabaseConnection,
-    parameter_id: Uuid,
+    output_parameter_id: Option<Uuid>,
+    resolved_params: &[(String, Uuid)],
+) -> Result<(), ApiError> {
+    let graph = DerivedGraph::load(db).await?;
+    validate_dependency_chain(&graph, output_parameter_id, resolved_params)
+        .map_err(ApiError::bad_request)
+}
+
+/// The catalog parameter a code already names, if any.
+async fn existing_parameter_id(
+    db: &DatabaseConnection,
+    code: &str,
 ) -> Result<Option<Uuid>, ApiError> {
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT dpd.id FROM derived_parameter_definitions dpd
-              JOIN parameters p ON p.code = dpd.code
-              WHERE p.id = $1",
-            [parameter_id.into()],
+            "SELECT id FROM parameters WHERE LOWER(code) = LOWER($1) LIMIT 1",
+            [code.into()],
         ))
         .await
         .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-
-    Ok(row.and_then(|r| r.try_get::<Uuid>("", "id").ok()))
-}
-
-/// Recursively compute the depth of a derived parameter chain.
-/// Returns 0 for non-derived parameters.
-fn compute_chain_depth<'a>(
-    db: &'a DatabaseConnection,
-    parameter_id: Uuid,
-    visited: &'a mut HashSet<Uuid>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u32, ApiError>> + Send + 'a>> {
-    Box::pin(async move {
-        if visited.contains(&parameter_id) {
-            return Err(ApiError::bad_request(
-                "Circular dependency detected in derived parameter chain".to_string(),
-            ));
-        }
-        visited.insert(parameter_id);
-
-        let def_id = match find_derived_definition_for_param(db, parameter_id).await? {
-            Some(id) => id,
-            None => return Ok(0), // Not a derived parameter
-        };
-
-        // Get this definition's sources
-        let source_rows = db
-            .query_all_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"SELECT parameter_id FROM derived_parameter_sources WHERE derived_definition_id = $1",
-                [def_id.into()],
-            ))
-            .await
-            .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-
-        let mut max_child_depth = 0u32;
-        for row in &source_rows {
-            let child_param_id: Uuid = row
-                .try_get("", "parameter_id")
-                .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-            let child_depth = compute_chain_depth(db, child_param_id, visited).await?;
-            max_child_depth = max_child_depth.max(child_depth);
-        }
-
-        Ok(1 + max_child_depth)
+    row.map(|r| {
+        r.try_get::<Uuid>("", "id")
+            .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))
     })
+    .transpose()
 }
 
-/// Validate that adding dependencies doesn't create cycles or exceed max depth.
-async fn validate_dependency_chain(
+/// The parameter a stored definition produces, and its formula.
+async fn stored_definition(
     db: &DatabaseConnection,
-    definition_name: &str,
-    resolved_params: &[(String, Uuid)],
-) -> Result<(), ApiError> {
-    for (var_name, parameter_id) in resolved_params {
-        let mut visited = HashSet::new();
-
-        // Check if this source parameter's chain leads back to our definition
-        // by checking if any ancestor has the same name as our definition
-        let depth = compute_chain_depth(db, *parameter_id, &mut visited).await?;
-
-        if depth >= MAX_DERIVED_CHAIN_DEPTH {
-            return Err(ApiError::bad_request(format!(
-                "Derived formula chain depth exceeds maximum of {MAX_DERIVED_CHAIN_DEPTH} levels (variable '{var_name}' has depth {depth})"
-            )));
-        }
-
-        // Cycle check: if the source parameter resolves to a derived definition
-        // whose chain references a parameter with the same name as this definition,
-        // that would create a cycle
-        if let Some(_def_id) = find_derived_definition_for_param(db, *parameter_id).await? {
-            // Check if any parameter in the chain matches our definition name
-            let cycle_row = db
-                .query_one_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    r"SELECT 1 FROM parameters WHERE code = $1 AND id = $2",
-                    [definition_name.into(), (*parameter_id).into()],
-                ))
-                .await
-                .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-
-            if cycle_row.is_some() {
-                return Err(ApiError::bad_request(
-                    "Circular dependency detected: formula references its own output parameter"
-                        .to_string(),
-                ));
-            }
-        }
-    }
-
-    Ok(())
+    id: Uuid,
+) -> Result<(Option<Uuid>, String), ApiError> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT output_parameter_id, formula FROM derived_parameter_definitions WHERE id = $1",
+            [id.into()],
+        ))
+        .await
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?
+        .ok_or_else(|| ApiError::not_found("Derived parameter definition", None))?;
+    let output = row
+        .try_get::<Option<Uuid>>("", "output_parameter_id")
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+    let formula = row
+        .try_get::<String>("", "formula")
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+    Ok((output, formula))
 }
 
 /// Delete existing sources and insert new ones for a derived definition.
@@ -335,7 +389,10 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
     async fn update_many(
         &self,
         db: &DatabaseConnection,
-        updates: Vec<(Uuid, <DerivedParameterDefinition as CRUDResource>::UpdateModel)>,
+        updates: Vec<(
+            Uuid,
+            <DerivedParameterDefinition as CRUDResource>::UpdateModel,
+        )>,
     ) -> Result<Vec<DerivedParameterDefinition>, ApiError> {
         let mut updated = Vec::with_capacity(updates.len());
         for (id, data) in updates {
@@ -359,6 +416,8 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
         Ok(created)
     }
 
+    /// A slot naming this definition is left as it is: `entry_mode` is the site's own declaration
+    /// that it computes the parameter, and it outlives whichever calculation produced it.
     async fn before_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<(), ApiError> {
         db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -367,14 +426,6 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
         ))
         .await
         .map_err(|e| ApiError::internal(format!("Failed to delete sources: {e}"), None))?;
-
-        db.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE site_parameters SET derived_definition_id = NULL WHERE derived_definition_id = $1",
-            [id.into()],
-        ))
-        .await
-        .map_err(|e| ApiError::internal(format!("Failed to unlink site_parameters: {e}"), None))?;
 
         Ok(())
     }
@@ -386,7 +437,10 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
     ) -> Result<(), ApiError> {
         validate_formula(&data.formula)?;
         let resolved = resolve_variables(db, &data.formula).await?;
-        validate_dependency_chain(db, &data.code, &resolved).await?;
+        // A definition being created may already have its output parameter in the catalog, and
+        // anything reading that parameter is a chain this formula would close.
+        let output = existing_parameter_id(db, &data.code).await?;
+        validate_against_stored_graph(db, output, &resolved).await?;
         Ok(())
     }
 
@@ -427,17 +481,16 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
     async fn before_update(
         &self,
         db: &DatabaseConnection,
-        _id: Uuid,
+        id: Uuid,
         data: &<DerivedParameterDefinition as CRUDResource>::UpdateModel,
     ) -> Result<(), ApiError> {
         if let Some(Some(ref formula)) = data.formula {
             validate_formula(formula)?;
-            // We validate variables here but need the definition name for cycle check.
-            // We'll do full validation in after_update when we have the entity.
             let resolved = resolve_variables(db, formula).await?;
-            // We can't easily get the name from the UpdateModel, so cycle/depth
-            // validation happens in after_update
-            drop(resolved);
+            // The stored row says what this definition produces, so the cycle and depth guards run
+            // before the write rather than after it: a refused update must leave nothing behind.
+            let (output, _) = stored_definition(db, id).await?;
+            validate_against_stored_graph(db, output, &resolved).await?;
         }
         Ok(())
     }
@@ -448,7 +501,6 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
         entity: &mut DerivedParameterDefinition,
     ) -> Result<(), ApiError> {
         let resolved = resolve_variables(db, &entity.formula).await?;
-        validate_dependency_chain(db, &entity.code, &resolved).await?;
         sync_sources(db, entity.id, &resolved).await?;
 
         // Keep the output parameter in sync
@@ -489,5 +541,95 @@ impl CRUDOperations for DerivedParameterDefinitionOperations {
         crate::routes::private::tools::calculation_versions::mint_stale_formula_versions(db, None)
             .await
             .map_err(|e| ApiError::bad_request(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DerivedGraph, MAX_DERIVED_CHAIN_DEPTH, validate_dependency_chain};
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    /// A definition producing `output`, reading `sources`. Its own code never enters the graph:
+    /// what it produces is `output_parameter_id`, and the two are routinely spelled differently.
+    fn graph(definitions: &[(Uuid, Uuid, Vec<Uuid>)]) -> DerivedGraph {
+        let mut definition_of = HashMap::new();
+        let mut sources_of = HashMap::new();
+        for (id, output, sources) in definitions {
+            definition_of.insert(*output, *id);
+            sources_of.insert(*id, sources.clone());
+        }
+        DerivedGraph {
+            definition_of,
+            sources_of,
+        }
+    }
+
+    #[test]
+    fn a_definition_is_found_by_what_it_produces() {
+        let (definition, output, input) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let g = graph(&[(definition, output, vec![input])]);
+        assert_eq!(
+            g.chain_depth(output, &mut std::collections::HashSet::new())
+                .unwrap(),
+            1,
+            "the walk reaches a definition whose code and output parameter are spelled differently"
+        );
+        assert_eq!(
+            g.chain_depth(input, &mut std::collections::HashSet::new())
+                .unwrap(),
+            0,
+            "a parameter nothing derives is the bottom of the chain"
+        );
+    }
+
+    #[test]
+    fn a_two_definition_cycle_is_refused() {
+        let (a, a_out, b, b_out) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        // A reads B's output; the formula under test produces B's output and reads A's.
+        let g = graph(&[(a, a_out, vec![b_out]), (b, b_out, vec![a_out])]);
+        let err =
+            validate_dependency_chain(&g, Some(b_out), &[("a".to_string(), a_out)]).unwrap_err();
+        assert!(err.contains("Circular dependency"), "{err}");
+    }
+
+    #[test]
+    fn a_formula_reading_its_own_output_is_refused() {
+        let output = Uuid::new_v4();
+        let err =
+            validate_dependency_chain(&graph(&[]), Some(output), &[("self".to_string(), output)])
+                .unwrap_err();
+        assert!(err.contains("its own output parameter"), "{err}");
+    }
+
+    #[test]
+    fn a_chain_at_the_depth_limit_is_refused() {
+        let outputs: Vec<Uuid> = (0..MAX_DERIVED_CHAIN_DEPTH)
+            .map(|_| Uuid::new_v4())
+            .collect();
+        let base = Uuid::new_v4();
+        let mut definitions = Vec::new();
+        let mut below = base;
+        for output in &outputs {
+            definitions.push((Uuid::new_v4(), *output, vec![below]));
+            below = *output;
+        }
+        let g = graph(&definitions);
+        let deepest = *outputs.last().unwrap();
+        let err =
+            validate_dependency_chain(&g, Some(Uuid::new_v4()), &[("x".to_string(), deepest)])
+                .unwrap_err();
+        assert!(err.contains("chain depth exceeds maximum"), "{err}");
+    }
+
+    #[test]
+    fn a_definition_with_no_output_parameter_yet_closes_no_cycle() {
+        let input = Uuid::new_v4();
+        validate_dependency_chain(&graph(&[]), None, &[("x".to_string(), input)]).unwrap();
     }
 }

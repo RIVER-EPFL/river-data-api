@@ -16,6 +16,7 @@ mod hold_kinds;
 mod notes_register;
 mod pagination;
 mod pagination_bounds;
+mod pairing_backfill_parity;
 mod pairing_plan_apply;
 mod pairing_plan_hardening;
 mod plan_instrument_decisions;

@@ -103,8 +103,8 @@ async fn test_derived_parameter_skips_infinity() {
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, is_active, is_derived, derived_definition_id, variable_mappings) \
-             VALUES ('{derived_sp_id}', '{site_id}', '{derived_param_id}', 'TempOverDO', 'TempOverDO', true, true, '{derived_def_id}', \
+            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, is_active, entry_mode, variable_mappings) \
+             VALUES ('{derived_sp_id}', '{site_id}', '{derived_param_id}', 'TempOverDO', 'TempOverDO', true, 'tool', \
              '{{\"temp\": \"{sp_temp}\", \"do_val\": \"{sp_do}\"}}'::jsonb)",
             sp_temp = crate::common::PARAM_S1_TEMP_ID,
             sp_do = crate::common::PARAM_S1_DO_ID,

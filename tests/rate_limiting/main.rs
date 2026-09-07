@@ -6,4 +6,5 @@
 #[allow(dead_code, unused_imports)]
 mod common;
 
+mod boundaries;
 mod governor_enforcement;

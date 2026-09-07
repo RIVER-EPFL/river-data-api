@@ -134,8 +134,8 @@ impl CRUDOperations for SiteParameterOperations {
         // This stays a query rather than becoming the enqueue's `dedupe_key`: the key is released
         // when the worker claims the row, so it coalesces only while a job is queued, and the
         // skip has to hold while one is running too.
-        if entity.is_derived == Some(true)
-            && let Some(def_id) = entity.derived_definition_id
+        if entity.entry_mode == "tool"
+            && let Some(def_id) = definition_producing(db, entity.parameter_id).await?
         {
             let site_id = entity.site_id;
 
@@ -200,4 +200,24 @@ impl CRUDOperations for SiteParameterOperations {
         crate::routes::private::alarms::sweeper::reconcile_all_from_hook(db).await;
         Ok(())
     }
+}
+
+/// The definition that produces a parameter, if one does. A calculation names the parameter it
+/// outputs, and an output has exactly one producer (`idx_derived_definitions_output_parameter`),
+/// so the slot needs no reference of its own.
+async fn definition_producing(
+    db: &DatabaseConnection,
+    parameter_id: Uuid,
+) -> Result<Option<Uuid>, ApiError> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT id FROM derived_parameter_definitions WHERE output_parameter_id = $1 LIMIT 1",
+            [parameter_id.into()],
+        ))
+        .await
+        .map_err(ApiError::database)?;
+    row.map(|r| r.try_get::<Uuid>("", "id"))
+        .transpose()
+        .map_err(ApiError::database)
 }

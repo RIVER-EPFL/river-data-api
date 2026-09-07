@@ -60,10 +60,17 @@ pub struct Model {
     /// goes through `POST /site_parameters/{id}/declare_sd_estimator`, which enqueues the retag.
     #[crudcrate(filterable, exclude(update))]
     pub sd_estimator: Option<String>,
+    /// How this site fills the slot: 'manual' (a person types the value) or 'tool' (a
+    /// calculation computes it here). The declaration is per site, so one site may measure a
+    /// parameter by hand while another computes it; which calculation produces it is the
+    /// parameter's group binding, never this column.
+    #[crudcrate(filterable, on_create = "manual".to_string())]
+    pub entry_mode: String,
+    /// The instrument that measures this slot, declared here rather than inferred at the write.
+    /// NULL is undeclared: a value entered there takes the entry channel's own instrument, which
+    /// is a marker for a slot nobody has declared and not a statement about what measured it.
     #[crudcrate(filterable)]
-    pub is_derived: Option<bool>,
-    #[crudcrate(filterable)]
-    pub derived_definition_id: Option<Uuid>,
+    pub instrument_sensor_id: Option<Uuid>,
     /// Stored and returned by the CRUD endpoint; no server-side reader. Derived-formula variables
     /// bind through `derived_parameter_sources.variable_name`, never through this column.
     #[sea_orm(column_type = "JsonBinary", nullable)]
@@ -95,12 +102,6 @@ pub enum Relation {
         to = "crate::routes::private::parameters::Column::Id"
     )]
     Parameter,
-    #[sea_orm(
-        belongs_to = "crate::routes::private::parameters::derived::definition_model::Entity",
-        from = "Column::DerivedDefinitionId",
-        to = "crate::routes::private::parameters::derived::definition_model::Column::Id"
-    )]
-    DerivedParameterDefinition,
 }
 
 impl Related<crate::routes::private::sites::Entity> for Entity {
@@ -112,12 +113,6 @@ impl Related<crate::routes::private::sites::Entity> for Entity {
 impl Related<crate::routes::private::parameters::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Parameter.def()
-    }
-}
-
-impl Related<crate::routes::private::parameters::derived::definition_model::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::DerivedParameterDefinition.def()
     }
 }
 

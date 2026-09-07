@@ -40,6 +40,11 @@ pub struct ToolResult {
     /// the previous number standing, so these name the stored values a save must clear.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub cleared: Vec<String>,
+    /// Formulas that did not run and why, as `{output, reason}`. An unresolved input costs its
+    /// own output and no other, so the rest of the calculation is in `results`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[schema(value_type = Vec<Object>)]
+    pub skipped: Vec<serde_json::Value>,
     pub inputs_used: Vec<String>,
     pub inputs_ignored: Vec<String>,
     /// The constant values the server resolved and passed to the runner, by name.
@@ -177,12 +182,14 @@ async fn store_run(
     let context = if outcome.site_id.is_some()
         || !outcome.site_inputs.is_empty()
         || !outcome.event_inputs.is_empty()
+        || !outcome.skipped.is_empty()
     {
         serde_json::json!({
             "site_id": outcome.site_id,
             "collected_at": outcome.collected_at,
             "site_inputs": outcome.site_inputs,
             "event_inputs": outcome.event_inputs,
+            "skipped": outcome.skipped,
         })
     } else {
         serde_json::Value::Null
@@ -216,6 +223,7 @@ async fn store_run(
         tool: tool.name.clone(),
         results,
         cleared: outcome.cleared,
+        skipped: outcome.skipped,
         inputs_used: outcome.inputs_used,
         inputs_ignored: outcome.inputs_ignored,
         constants,

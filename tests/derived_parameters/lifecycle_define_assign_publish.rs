@@ -80,7 +80,7 @@ async fn derived_definition_populates_sources_and_assigns() {
         "/api/site_parameters",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID, "parameter_id": output_param_id, "name": "DOmgL_e2e",
-            "sensor_type": "derived", "is_derived": true, "derived_definition_id": def_id, "display_units": "mg/L",
+            "sensor_type": "derived", "entry_mode": "tool", "display_units": "mg/L",
         }),
         &token,
     )
@@ -109,7 +109,7 @@ async fn derived_assignment_backfills_and_publishes() {
         "/api/site_parameters",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID, "parameter_id": output_param_id, "name": "DOmgL_e2e",
-            "sensor_type": "derived", "is_derived": true, "derived_definition_id": def_id, "display_units": "mg/L",
+            "sensor_type": "derived", "entry_mode": "tool", "display_units": "mg/L",
         }),
         &token,
     )
@@ -219,7 +219,7 @@ async fn an_unrelated_sites_import_does_not_suppress_the_assignment_backfill() {
         "/api/site_parameters",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID, "parameter_id": output_param_id, "name": "DOmgL_e2e",
-            "sensor_type": "derived", "is_derived": true, "derived_definition_id": def_id, "display_units": "mg/L",
+            "sensor_type": "derived", "entry_mode": "tool", "display_units": "mg/L",
         }),
         &token,
     )
@@ -270,7 +270,7 @@ async fn the_same_definitions_in_flight_backfill_is_not_duplicated() {
         "/api/site_parameters",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID, "parameter_id": output_param_id, "name": "DOmgL_e2e",
-            "sensor_type": "derived", "is_derived": true, "derived_definition_id": def_id, "display_units": "mg/L",
+            "sensor_type": "derived", "entry_mode": "tool", "display_units": "mg/L",
         }),
         &token,
     )
@@ -303,7 +303,7 @@ async fn a_site_that_does_not_declare_the_slot_computed_is_left_alone() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let (def_id, output_param_id) = create_derived(&app, &token).await;
+    let (_def_id, output_param_id) = create_derived(&app, &token).await;
 
     // The second site holds the same output parameter as an ordinary slot, entered by hand.
     let (status, other) = crate::common::post_json_parse_with_token(
@@ -326,7 +326,7 @@ async fn a_site_that_does_not_declare_the_slot_computed_is_left_alone() {
         "/api/site_parameters",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID, "parameter_id": output_param_id, "name": "DOmgL_e2e",
-            "sensor_type": "derived", "is_derived": true, "derived_definition_id": def_id,
+            "sensor_type": "derived", "entry_mode": "tool",
             "display_units": "mg/L",
         }),
         &token,
@@ -355,7 +355,11 @@ async fn a_site_that_does_not_declare_the_slot_computed_is_left_alone() {
     );
 }
 
-async fn count_readings(db: &sea_orm::DatabaseConnection, site_id: &str, parameter_id: &str) -> i64 {
+async fn count_readings(
+    db: &sea_orm::DatabaseConnection,
+    site_id: &str,
+    parameter_id: &str,
+) -> i64 {
     db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
@@ -368,4 +372,132 @@ async fn count_readings(db: &sea_orm::DatabaseConnection, site_id: &str, paramet
     .unwrap()
     .try_get::<i64>("", "c")
     .unwrap()
+}
+
+/// Scenario: a derived value is computed from a source reading, then the operator flags that
+/// source reading.
+///
+/// Expected behaviour: the derived value stops being served, because it was computed from a
+/// measurement the operator has just said is not one, and unflagging the source brings it back.
+#[tokio::test]
+#[serial]
+async fn flagging_a_source_reading_withdraws_the_derived_value_it_fed() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let (_def_id, output_param_id) = create_derived(&app, &token).await;
+    let (status, sp) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/site_parameters",
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID, "parameter_id": output_param_id, "name": "DOmgL_flag",
+            "sensor_type": "derived", "entry_mode": "tool", "display_units": "mg/L",
+        }),
+        &token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "assign derived ({status}): {sp}"
+    );
+    assert!(
+        e2e::wait_for_jobs_by_trigger(&db, "derived_assignment", 30).await,
+        "derived_assignment backfill should run and complete"
+    );
+
+    let window = "start=2025-01-15T00:00:00Z&end=2025-01-15T01:00:00Z";
+    let uri = format!("/api/sites/{}/readings?{window}", crate::common::SITE1_ID);
+    let (_s, before) = crate::common::get_json_with_token(&app, &uri, &token).await;
+    assert!(
+        !e2e::values_for(&before, &output_param_id).is_empty(),
+        "the derived series is served before the flag: {before}"
+    );
+
+    let flagged_time = flag_first_source_instant(&db, &app, &token, true).await;
+    assert!(
+        e2e::wait_for_jobs_by_trigger(&db, "derived_recompute", 30).await,
+        "flagging a source enqueues the derived recompute"
+    );
+    assert!(
+        !derived_served_at(&db, &output_param_id, &flagged_time).await,
+        "the derived value computed from the flagged reading is no longer served"
+    );
+
+    flag_first_source_instant(&db, &app, &token, false).await;
+    assert!(
+        e2e::wait_for_jobs_by_trigger(&db, "derived_recompute", 30).await,
+        "unflagging enqueues it again"
+    );
+    assert!(
+        derived_served_at(&db, &output_param_id, &flagged_time).await,
+        "unflagging the source brings the derived value back"
+    );
+}
+
+/// Flag or unflag the site's first seeded source reading, and return the instant it sits at.
+async fn flag_first_source_instant(
+    db: &sea_orm::DatabaseConnection,
+    app: &axum::Router,
+    token: &str,
+    flag: bool,
+) -> String {
+    let time: chrono::DateTime<chrono::FixedOffset> = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT MIN(time) AS t FROM readings WHERE site_id = '{}' \
+                 AND parameter_id = '{}'",
+                crate::common::SITE1_ID,
+                crate::common::GLOBAL_PARAM_DO_ID
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("a seeded source reading")
+        .try_get("", "t")
+        .expect("its instant");
+    let time = time.to_rfc3339();
+    let body = serde_json::json!({
+        "readings": [{
+            "site_id": crate::common::SITE1_ID,
+            "parameter_id": crate::common::GLOBAL_PARAM_DO_ID,
+            "time": time,
+        }],
+        "reason": "not a measurement",
+    });
+    let uri = if flag {
+        "/api/readings/flag"
+    } else {
+        "/api/readings/unflag"
+    };
+    let (status, text) = crate::common::patch_json_with_token(app, uri, &body, token).await;
+    assert!((200..300).contains(&status), "{uri} ({status}): {text}");
+    time
+}
+
+/// Whether the derived slot serves a value at that instant.
+async fn derived_served_at(
+    db: &sea_orm::DatabaseConnection,
+    output_param_id: &str,
+    time: &str,
+) -> bool {
+    let n: i64 = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT COUNT(*) AS n FROM readings WHERE site_id = '{}' \
+                 AND parameter_id = '{output_param_id}' AND time = '{time}' \
+                 AND is_flagged IS NOT TRUE AND raw_value IS NOT NULL",
+                crate::common::SITE1_ID
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("count row")
+        .try_get("", "n")
+        .unwrap();
+    n > 0
 }

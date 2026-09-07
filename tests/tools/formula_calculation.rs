@@ -269,6 +269,52 @@ async fn the_calculation_runs_its_formulas_without_the_runner() {
     assert!((value - 4.0).abs() < 1e-12, "8 / 2: {text}");
 }
 
+/// Scenario: the two-stage shape four of the portal's calculators have, a formula evaluating once
+/// per replicate index of the family it reads.
+///
+/// Expected behaviour: the run's output is one value per index with the gaps in place, the shape
+/// the save path stores as one reading per replicate index.
+#[tokio::test]
+#[serial]
+async fn a_per_replicate_formula_produces_one_value_per_index() {
+    let group_id = "00000000-0000-4000-c000-000000000105";
+    let (db, app, token) = setup().await;
+    seed_calculation(&db, group_id).await;
+    let script_id = calculation_id(&db).await;
+    declare_output(&db, group_id, "temp_ratio_out").await;
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        "/api/derived_parameters",
+        &json!({
+            "code": "temp_ratio_out",
+            "name": "temp_ratio_out",
+            "units": "ratio",
+            "formula": "DO_Temperature * 2",
+            "tool_script_id": script_id,
+            "ordinal": 1,
+            "per_replicate": "DO_Temperature",
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "create ({status}): {text}");
+
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/tools/{CALCULATION}/calculate"),
+        &json!({ "DO_Temperature": [1.0, null, 3.0] }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "calculate ({status}): {text}");
+    let result: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(
+        result["results"]["temp_ratio_out"],
+        json!([2.0, null, 6.0]),
+        "one value per index, the unmeasured repeat still at index 1: {text}"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn a_calculation_may_not_read_outside_its_group() {

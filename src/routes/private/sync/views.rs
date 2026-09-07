@@ -6,7 +6,7 @@ use axum::{
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, Set,
-    Statement, TransactionTrait, sea_query::Expr,
+    TransactionTrait, sea_query::Expr,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -463,6 +463,8 @@ struct ActionStats {
     /// The `(site, parameter)` slot the stream landed in, so the caller can re-derive its readings
     /// by window once the pairing transaction has committed.
     slot: (Uuid, Uuid),
+    /// The visits the newly attributed readings belong to, whose calculations run post-commit.
+    touched_events: Vec<crate::routes::private::collection_events::recompute::TouchedEvent>,
 }
 
 /// `POST /api/admin/sync/apply-discovery`, batch-processes discovery actions.
@@ -484,6 +486,7 @@ struct ActionStats {
 )]
 pub async fn apply_discovery(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(req): Json<ApplyDiscoveryRequest>,
 ) -> AppResult<Json<ApplyDiscoveryResponse>> {
     let db = &state.db;
@@ -503,6 +506,7 @@ pub async fn apply_discovery(
 
     let mut backfilled_slots: std::collections::HashSet<(Uuid, Uuid)> =
         std::collections::HashSet::new();
+    let mut touched_events = Vec::new();
 
     for action in req.actions {
         // Each action runs in a savepoint so a failure is reported without aborting the rest.
@@ -521,6 +525,7 @@ pub async fn apply_discovery(
                 if stats.backfilled > 0 {
                     backfilled_slots.insert(stats.slot);
                 }
+                touched_events.extend(stats.touched_events);
             }
             Err(e) => {
                 savepoint.rollback().await?;
@@ -533,6 +538,16 @@ pub async fn apply_discovery(
     txn.commit().await?;
 
     enqueue_slot_reprocess(db, &backfilled_slots).await?;
+
+    // Attribution is what made these readings visit values; the calculations that read them at
+    // each manual visit run now (ADR 0007).
+    crate::routes::private::collection_events::recompute::enqueue_for(
+        db,
+        &touched_events,
+        &crate::routes::private::tools::scripts::actor_label(&auth),
+        crate::routes::private::collection_events::recompute::Writer::Person,
+    )
+    .await?;
 
     // Refresh aggregates as a tracked job so a failure is visible and rerunnable
     if resp.total_backfilled > 0 {
@@ -727,6 +742,7 @@ async fn resolve_or_create_site_parameter<C: ConnectionTrait>(
         .ok_or("Parameter not found")?;
     let sp = site_parameters::ActiveModel {
         id: Set(Uuid::new_v4()),
+        instrument_sensor_id: Set(None),
         site_id: Set(site_id),
         parameter_id: Set(parameter_id),
         name: Set(param.name),
@@ -742,8 +758,7 @@ async fn resolve_or_create_site_parameter<C: ConnectionTrait>(
         is_public: Set(Some(false)),
         needs_review: Set(false),
         sd_estimator: Set(None),
-        is_derived: Set(Some(false)),
-        derived_definition_id: Set(None),
+        entry_mode: Set("manual".to_string()),
         variable_mappings: Set(None),
         created_at: Set(Some(Utc::now())),
         updated_at: Set(Some(Utc::now())),
@@ -753,15 +768,23 @@ async fn resolve_or_create_site_parameter<C: ConnectionTrait>(
     Ok((inserted.id, true))
 }
 
+/// What one paired stream cost and what it owes once the transaction commits.
+struct PairedStream {
+    sensors_created: u32,
+    backfilled: u64,
+    touched_events: Vec<crate::routes::private::collection_events::recompute::TouchedEvent>,
+}
+
 /// Pair a stream to a site_parameter, create sensor, and backfill readings/status_events.
 ///
 /// Runs inside the caller's transaction, so the window re-derivation it needs (which opens its own
-/// transaction and refreshes continuous aggregates) is left to the caller to enqueue post-commit.
+/// transaction and refreshes continuous aggregates) is left to the caller to enqueue post-commit,
+/// along with the recompute the visits it touched are owed.
 async fn pair_and_backfill<C: ConnectionTrait>(
     db: &C,
     stream_id: Uuid,
     site_parameter_id: Uuid,
-) -> Result<(u32, u64), String> {
+) -> Result<PairedStream, String> {
     let stream = data_streams::Entity::find_by_id(stream_id)
         .one(db)
         .await
@@ -787,7 +810,6 @@ async fn pair_and_backfill<C: ConnectionTrait>(
         .await
         .map_err(|e| e.to_string())?;
     let sensors_created = u32::from(stream.sensor_id.is_none());
-    let sensor_id = Some(sensor_ctx.sensor_id);
     let deployment_id = sensor_ctx.deployment_id;
 
     // Re-fetch stream (sensor_id may have been updated by create_sensor_for_stream)
@@ -804,49 +826,24 @@ async fn pair_and_backfill<C: ConnectionTrait>(
     active.updated_at = Set(now.into());
     active.update(db).await.map_err(|e| e.to_string())?;
 
-    // Attribution only: site, parameter, the owning instrument and its deployment. No curve is
-    // stamped here. The context carries the sensor's newest calibration, which is neither the curve
-    // whose window covers a given reading nor necessarily one authored for this parameter, so
-    // claiming it on a whole backfilled history would assert a correction that was never applied.
-    // Both callers enqueue a slot reprocess post-commit; that is what resolves `calibration_id` and
-    // `calibrated_value` per reading, from the reading's own time.
-    let result = db
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings r
-          SET site_id = $1, parameter_id = $2,
-              sensor_id = $4, deployment_id = $5,
-              measurement_type = COALESCE(r.measurement_type, ds.measurement_type)
-          FROM data_streams ds
-          WHERE r.stream_id = ds.id AND ds.id = $3 AND r.site_id IS NULL",
-            [
-                sp.site_id.into(),
-                sp.parameter_id.into(),
-                stream_id.into(),
-                sensor_id.into(),
-                deployment_id.into(),
-            ],
-        ))
-        .await
-        .map_err(|e| e.to_string())?;
-    let backfilled = result.rows_affected();
-
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE status_events
-          SET site_id = $1, parameter_id = $2, sensor_id = $4
-          WHERE stream_id = $3 AND site_id IS NULL",
-        [
-            sp.site_id.into(),
-            sp.parameter_id.into(),
-            stream_id.into(),
-            sensor_id.into(),
-        ],
-    ))
+    // Attribution, samples, visits and the deferred holds, through the one helper every pairing
+    // path runs. No curve is stamped here: the context carries the sensor's newest calibration,
+    // which is neither the curve whose window covers a given reading nor necessarily one authored
+    // for this parameter. Both callers enqueue a slot reprocess post-commit; that is what resolves
+    // `calibration_id` and `calibrated_value` per reading, from the reading's own time.
+    let done = crate::routes::private::data_streams::pairing::backfill(
+        db,
+        crate::routes::private::sync::replicate_audit::HoldScope::Stream(stream_id),
+        deployment_id,
+    )
     .await
     .map_err(|e| e.to_string())?;
 
-    Ok((sensors_created, backfilled))
+    Ok(PairedStream {
+        sensors_created,
+        backfilled: done.readings,
+        touched_events: done.touched_events,
+    })
 }
 
 /// Process a single apply-discovery action using extracted helpers.
@@ -887,18 +884,18 @@ async fn process_action<C: ConnectionTrait>(
         parameter_id,
     )
     .await?;
-    let (sensors_created, backfilled) =
-        pair_and_backfill(db, action.stream_id, site_parameter_id).await?;
+    let paired = pair_and_backfill(db, action.stream_id, site_parameter_id).await?;
 
     Ok(ActionStats {
         projects_created: u32::from(proj_new),
         sites_created: u32::from(site_new),
         parameters_created: u32::from(param_new),
         site_parameters_created: u32::from(sp_new),
-        sensors_created,
+        sensors_created: paired.sensors_created,
         streams_paired: 1,
-        backfilled,
+        backfilled: paired.backfilled,
         slot: (site_id, parameter_id),
+        touched_events: paired.touched_events,
     })
 }
 
@@ -1162,6 +1159,7 @@ pub struct BulkPairResponse {
 )]
 pub async fn bulk_pair(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(req): Json<BulkPairRequest>,
 ) -> AppResult<Json<BulkPairResponse>> {
     use std::collections::HashMap;
@@ -1357,6 +1355,7 @@ pub async fn bulk_pair(
                 .unwrap_or_default();
             site_parameters::ActiveModel {
                 id: Set(id),
+                instrument_sensor_id: Set(None),
                 site_id: Set(site_id),
                 parameter_id: Set(parameter_id),
                 name: Set(param_name_val),
@@ -1372,8 +1371,7 @@ pub async fn bulk_pair(
                 is_public: Set(Some(false)),
                 needs_review: Set(false),
                 sd_estimator: Set(None),
-                is_derived: Set(Some(false)),
-                derived_definition_id: Set(None),
+                entry_mode: Set("manual".to_string()),
                 variable_mappings: Set(None),
                 created_at: Set(Some(Utc::now())),
                 updated_at: Set(Some(Utc::now())),
@@ -1401,17 +1399,19 @@ pub async fn bulk_pair(
         sp_cache.iter().map(|(&slot, &sp)| (sp, slot)).collect();
     let mut backfilled_slots: std::collections::HashSet<(Uuid, Uuid)> =
         std::collections::HashSet::new();
+    let mut touched_events = Vec::new();
     for (stream_id, sp_id) in stream_to_sp {
         if sp_id.is_nil() {
             skipped.push(stream_id.to_string());
             continue;
         }
         match pair_and_backfill(&txn, stream_id, sp_id).await {
-            Ok((_, backfilled)) => {
+            Ok(done) => {
                 paired += 1;
-                if let Some(&slot) = slot_of_sp.get(&sp_id).filter(|_| backfilled > 0) {
+                if let Some(&slot) = slot_of_sp.get(&sp_id).filter(|_| done.backfilled > 0) {
                     backfilled_slots.insert(slot);
                 }
+                touched_events.extend(done.touched_events);
             }
             Err(e) => {
                 skipped.push(format!("{stream_id}: {e}"));
@@ -1422,6 +1422,16 @@ pub async fn bulk_pair(
     txn.commit().await?;
 
     enqueue_slot_reprocess(db, &backfilled_slots).await?;
+
+    // Attribution is what made these readings visit values; the calculations that read them at
+    // each manual visit run now (ADR 0007).
+    crate::routes::private::collection_events::recompute::enqueue_for(
+        db,
+        &touched_events,
+        &crate::routes::private::tools::scripts::actor_label(&auth),
+        crate::routes::private::collection_events::recompute::Writer::Person,
+    )
+    .await?;
 
     // Refresh aggregates as a tracked job so a failure is visible and rerunnable
     if paired > 0 {

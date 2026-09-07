@@ -71,16 +71,11 @@ async fn deployment_sites(
     if deployment_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let ids: Vec<sea_orm::Value> = deployment_ids.iter().map(|id| (*id).into()).collect();
-    let placeholders: Vec<String> = (1..=ids.len()).map(|n| format!("${n}")).collect();
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT DISTINCT site_id FROM sensor_deployments WHERE id IN ({})",
-                placeholders.join(",")
-            ),
-            ids,
+            "SELECT DISTINCT site_id FROM sensor_deployments WHERE id = ANY($1)",
+            [deployment_ids.to_vec().into()],
         ))
         .await
         .map_err(AppError::Database)?;
@@ -713,43 +708,6 @@ pub struct DerivedSeries {
     pub errors: Vec<Option<String>>,
 }
 
-/// Math builtins recognized by meval, not treated as variable names
-const MATH_BUILTINS: &[&str] = &[
-    "sqrt", "abs", "ln", "log", "exp", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh",
-    "tanh", "floor", "ceil", "round", "signum", "min", "max", "pi", "e",
-];
-
-/// Extract variable names from a formula (identifiers that aren't math builtins)
-fn extract_variables(formula: &str) -> Vec<String> {
-    let builtins: HashSet<&str> = MATH_BUILTINS.iter().copied().collect();
-    let mut tokens = Vec::new();
-    let mut start = None;
-    for (i, c) in formula.char_indices() {
-        if c.is_alphanumeric() || c == '_' {
-            if start.is_none() {
-                start = Some(i);
-            }
-        } else if let Some(s) = start {
-            tokens.push(&formula[s..i]);
-            start = None;
-        }
-    }
-    if let Some(s) = start {
-        tokens.push(&formula[s..]);
-    }
-
-    let mut seen = HashSet::new();
-    tokens
-        .into_iter()
-        .filter(|t| {
-            !t.chars().next().is_some_and(|c| c.is_ascii_digit())
-                && !builtins.contains(t)
-                && seen.insert(t.to_string())
-        })
-        .map(std::string::ToString::to_string)
-        .collect()
-}
-
 /// Preview a derived parameter formula against historical source readings at a given site,
 /// WITHOUT writing anything to the database. Used by the formula builder UI to validate
 /// formulas before saving. Requires `read_data`.
@@ -803,7 +761,7 @@ pub async fn preview_derived(
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
     // Extract variable names from formula
-    let var_names = extract_variables(&payload.formula);
+    let var_names = crate::routes::private::tools::formula::free_identifiers(&payload.formula);
 
     if var_names.is_empty() {
         return Ok(Json(PreviewDerivedResponse {
@@ -832,7 +790,7 @@ pub async fn preview_derived(
                 r"SELECT sp.id as sp_id, sp.parameter_id, COALESCE(sp.display_units, '') as units
                   FROM site_parameters sp
                   JOIN parameters pt ON pt.id = sp.parameter_id
-                  WHERE sp.site_id = $1 AND pt.name = $2
+                  WHERE sp.site_id = $1 AND pt.code = $2
                   LIMIT 1",
                 [payload.site_id.into(), var_name.clone().into()],
             ))

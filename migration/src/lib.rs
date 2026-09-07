@@ -27,6 +27,10 @@ mod m20260910_000003_generated_sample_stdev;
 mod m20260910_000004_rollback_restores_ingested_at;
 pub mod m20260910_000005_source_parameter_instrument_names;
 pub mod m20260910_000006_provenance_kind;
+pub mod m20260910_000007_site_parameter_entry_mode;
+pub mod m20260910_000008_formula_curve_slot;
+mod m20260910_000009_slot_instrument;
+pub mod m20260910_000010_formula_per_replicate;
 pub mod portal_seed;
 
 pub struct Migrator;
@@ -62,6 +66,10 @@ impl MigratorTrait for Migrator {
             Box::new(m20260910_000004_rollback_restores_ingested_at::Migration),
             Box::new(m20260910_000005_source_parameter_instrument_names::Migration),
             Box::new(m20260910_000006_provenance_kind::Migration),
+            Box::new(m20260910_000007_site_parameter_entry_mode::Migration),
+            Box::new(m20260910_000008_formula_curve_slot::Migration),
+            Box::new(m20260910_000009_slot_instrument::Migration),
+            Box::new(m20260910_000010_formula_per_replicate::Migration),
         ]
     }
 }
